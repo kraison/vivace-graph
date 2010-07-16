@@ -1,33 +1,16 @@
 (in-package :vivace-graph)
 
-;;; Pseudo-random number generator from FreeBSD.  Thanks to Manuel Odendahl <manuel@bl0rg.net>.
-(defparameter *random-n*
-  (the fixnum (get-internal-real-time))
-  "Internal status of the pseudo-random number generator.")
-
-(defun random-seed (seed)
-  "Seed the pseudo-random number generator."
-  (setf *random-n* seed))
-
-(defun sl-random ()
-  "Pseudo-random number generator from FreeBSD, returns NIL 3/4 of the time."
-  (declare (optimize (speed 3))
-	   (type integer *random-n*))
-  (logtest (logand most-positive-fixnum
-		   (setf *random-n*
-			 (mod (+ (the number (* *random-n* 1103515245)) 12345)
-			      2147483648)))
-	   (ash 1 (- (integer-length most-positive-fixnum) 1))))
-
 (defconstant +max-level+ (the fixnum 32)
   "Maximum level of skip-list, should be enough for 2^32 elements.")
 
 (defun random-level ()
-  "Returns a random level for a new skip-list node, with SL-RANDOM p for each level."
+  "Returns a random level for a new skip-list node, following Pugh's pattern of 
+L1: 50%, L2: 25%, L3: 12.5%, ..."
   (declare (optimize speed))
   (do ((level 1 (1+ level)))
       ((or (= level +max-level+)
-	   (sl-random)) level)
+	   (= (mt-random 4 (make-mt-random-state)) 3)) ;; 
+       level)
     (declare (type fixnum level))))
 
 ;;; A node is a SIMPLE-VECTOR containing KEY, VALUE, LEVEL and the forward pointers
@@ -64,7 +47,7 @@
   (value-equal #'equal)
   (value-sort #'less-than)
   (greater-than #'greater-than)
-  (duplicates-allowed? nil) ;; Can be: nil, t, and :as-list
+  (duplicates-allowed? nil)
   (length 0 :type (UNSIGNED-BYTE 64)))
 
 (defun print-skip-list (sl stream depth)
@@ -111,7 +94,9 @@
 	nil)))
 
 (defmethod skip-list-add ((sl skip-list) key value &key replace?)
-  (let ((new-node (make-skip-node key value (random-level))))
+  (let* ((new-level (random-level))
+	 (new-node (make-skip-node key value new-level)))
+    (format t "New level is ~A~%" new-level)
     (multiple-value-bind (left-list right-list) (skip-list-search sl key)
       (if (and (svref right-list 0) 
 	       (funcall (skip-list-key-equal sl) key (skip-node-key (svref right-list 0))))
@@ -151,6 +136,7 @@
 	    success?)))))
 
 (defmethod skip-list-delete ((sl skip-list) key &optional value)
+  "FIXME: needs to handle multiple values"
   (multiple-value-bind (left-list right-list) (skip-list-search sl key)
     (let ((x (svref right-list 0)))
       (if (or (null x) (not (equal (skip-node-key x) key)))
@@ -158,22 +144,25 @@
 	  (let ((old-value (skip-node-value x)))
 	    (if (eq nil old-value)
 		nil
-		(let ((success?
-		       (with-mcas (:equality #'equal)
-			 (loop for i from 0 to (1- (skip-node-level x)) do
-			      (let ((next-node (mcas-read (skip-node-forward x) i)))
-				(if (and next-node
-					 (funcall (skip-list-greater-than sl) 
-						  (skip-node-key x) (skip-node-key next-node)))
-				    nil
-				    (progn
-				      (mcas-set (skip-node-forward (svref left-list i)) i
-						x
-						next-node)
-				      (mcas-set (skip-node-forward x) i
-						next-node
-						(svref left-list i))))))
-			 (mcas-set x +skip-node-value+ old-value nil))))
+		(let ((success? nil))
+		  (loop until (eq success? +mcas-succeeded+) do
+		       (setq success?
+			     (with-mcas (:equality #'equal)
+			       (loop for i from 0 to (1- (skip-node-level x)) do
+				    (let ((next-node (mcas-read (skip-node-forward x) i)))
+				      (if (and next-node
+					       (funcall (skip-list-greater-than sl) 
+							(skip-node-key x) 
+							(skip-node-key next-node)))
+					  nil
+					  (progn
+					    (mcas-set (skip-node-forward (svref left-list i)) i
+						      x
+						      next-node)
+					    (mcas-set (skip-node-forward x) i
+						      next-node
+						      (svref left-list i))))))
+			       (mcas-set x +skip-node-value+ old-value nil))))
 		  (when (eq +mcas-succeeded+ success?)
 		    (sb-ext:atomic-decf (skip-list-length sl)))
 		  success?)))))))
@@ -194,6 +183,7 @@
 	  (format t "~A~%" (skip-list-to-list sl)))))
   
 ;;; cursors
+#|
 (defclass skip-list-cursor ()
   ((node :initarg :node :accessor skip-list-cursor-node)))
 
@@ -233,7 +223,7 @@
       (progn (setf (skip-list-cursor-node cursor)
 		   (node-forward (skip-list-header sl)))
 	     cursor)
-      (make-instance class :node (node-forward (skip-list-header sl)))))
+     (make-instance class :node (node-forward (skip-list-header sl)))))
 
 (defmethod skip-list-values-cursor ((sl vector))
   (skip-list-cursor sl :class 'skip-list-value-cursor))
@@ -268,4 +258,4 @@
 	      (sl-cursor-next cursor (skip-list< sl))))
 	((null val))
       (funcall fun val))))
-
+|#
