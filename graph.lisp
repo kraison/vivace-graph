@@ -36,9 +36,7 @@
 
 (defun make-new-graph (&key name location)
   (let ((graph (make-graph)))
-    (setf (graph-name graph) (or name (graph-uuid graph)))
-    (setf (graph-location graph) 
-	  (or (and location (probe-file location)) (graph-location graph)))
-    (setf (gethash (graph-uuid graph) *graph-table*) graph)
+    (setf (graph-name graph) (or name (graph-uuid graph))
+	  (graph-location graph) (or (and location (probe-file location)) (graph-location graph))
+	  (gethash (graph-uuid graph) *graph-table*) graph)
     graph))
-

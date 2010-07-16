@@ -65,21 +65,22 @@
 
 (defmethod make-new-triple ((graph graph) (subject node) (predicate node) (object node))
   (or (lookup-triple subject predicate object graph)
-      (let ((triple (make-instance 'triple :graph graph :subject subject 
+      (let ((triple (make-instance 'triple 
+				   :graph graph :subject subject 
 				   :predicate predicate :object object)))
 	(prog1
 	    (insert-triple triple)
-	  (sb-concurrency:enqueue triple (needs-indexing-q (graph triple)))))))
+	  (sb-concurrency:enqueue triple (needs-indexing-q (triple-graph triple)))))))
 
 (defmethod delete-triple ((triple triple))
   (prog1
       (setf (triple-deleted? triple) t)
-    (setf (gethash (triple-uuid triple) (deleted-triples (graph triple))) triple)
-    (remhash (triple-uuid triple) (triples (graph triple)))
-    (sb-concurrency:enqueue triple (delete-queue (graph triple)))))
+    (setf (gethash (triple-uuid triple) (deleted-triples (triple-graph triple))) triple)
+    (remhash (triple-uuid triple) (triples (triple-graph triple)))
+    (sb-concurrency:enqueue triple (delete-queue (triple-graph triple)))))
   
 (defmethod insert-triple ((triple triple))
-  (setf (gethash (triple-uuid triple) (triples (graph triple))) triple))
+  (setf (gethash (triple-uuid triple) (triples (triple-graph triple))) triple))
 
 (defmethod index-subject ((triple triple) (graph graph))
   (pushnew (triple-uuid triple) (gethash (node-value (triple-subject triple)) (subject-idx graph))))

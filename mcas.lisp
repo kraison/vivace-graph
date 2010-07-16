@@ -1,15 +1,4 @@
-;;(in-package #:vivace-graph)
-
-(require :sb-concurrency)
-
-(defvar *log-stream* t)
-;; MCAS status markers
-(defconstant +mcas-undecided+ :undecided)
-(defconstant +mcas-failed+ :failed)
-(defconstant +mcas-succeeded+ :succeeded)
-
-;; MCAS transaction global
-(defvar *mcas* nil)
+(in-package #:vivace-graph)
 
 (defmacro while (test &rest body)
   `(loop until (not ,test) do
@@ -41,10 +30,10 @@
 	     (:predicate mcas-descriptor?)
 	     (:conc-name mcas-)
 	     :named)
-  (status +mcas-undecided+) (count 0) updates (equality #'equal))
+  (status +mcas-undecided+) (count 0) updates (equality #'equal) success-actions failure-actions)
 
 (defun ccas-help (cd)
-  ;; FIXME: write barrier?
+  ;; FIXME: read barrier
   (if (eq (svref (cd-control-vector cd) (cd-control-index cd)) +mcas-undecided+)
       (cas (svref (cd-vector cd) (cd-index cd)) cd (cd-new cd))
       (cas (svref (cd-vector cd) (cd-index cd)) cd (cd-old cd))))
@@ -68,6 +57,7 @@
 				  :old old
 				  :new new
 				  :equality equality)))
+    ;; FIXME: read barrier
     (let ((r (cas (svref vector index) old cd)))
       (while (not (funcall equality r old))
 	(if (not (ccas-descriptor? r))
@@ -78,7 +68,8 @@
     (ccas-help cd)))
 
 (defun mcas-help (md)
-  (let ((desired-state +mcas-failed+))
+  "This function is a direct mapping from Keir Fraser's pseudocode.  GO is evil; needs rewrite."
+  (let ((state +mcas-failed+))
     (tagbody
        (dotimes (i (mcas-count md))
 	 (let ((update (elt (mcas-updates md) i)))
@@ -97,9 +88,11 @@
 		      ((not (mcas-descriptor? r))
 		       (go decision-point))
 		      (t (mcas-help r)))))))
-       (setq desired-state +mcas-succeeded+)
+       (setq state +mcas-succeeded+)
      decision-point
-       (cas (svref md 1) +mcas-undecided+ desired-state)
+       ;; Write barrier needed for non-x86 (Alpha / Sparc)
+       (cas (svref md 1) +mcas-undecided+ state)
+       ;; Write barrier needed for non-x86 (Alpha / Sparc)
        (dotimes (i (mcas-count md))
 	 (let ((update (elt (mcas-updates md) i)))
 	   (cas (svref (update-vector update) (update-index update)) md
@@ -138,11 +131,39 @@
       (error "MCAS-SET must be called within the body of with-mcas")))
 
 (defmacro with-mcas (lambda-list &body body)
-  `(let ((*mcas* (make-mcas-descriptor ,@lambda-list)))
-     (progn
-       ,@body)
-     (mcas *mcas*)))
+  (let ((args (gensym))
+	(equality (get-prop lambda-list :equality))
+	(success-action (get-prop lambda-list :success-action))
+	(failure-action (get-prop lambda-list :failure-action)))
+    `(if (mcas-descriptor? *mcas*)
+	 (progn
+	   (when (functionp ,success-action)
+	     (push ,success-action (mcas-success-actions *mcas*)))
+	   (when (functionp ,failure-action)
+	     (push ,failure-action (mcas-failure-actions *mcas*)))
+	   ,@body)
+	 (let ((,args nil))
+	   (when (functionp ,equality)
+	     (push ,equality ,args)
+	     (push :equality ,args))
+	   (when (functionp ,success-action)
+	     (push (list ,success-action) ,args)
+	     (push :success-actions ,args))
+	   (when (functionp ,failure-action)
+	     (push (list ,failure-action) ,args)
+	     (push :failure-actions ,args))
+	   (let ((*mcas* (apply #'make-mcas-descriptor ,args)))
+	     (progn
+	       ,@body)
+	     (let ((mcas-status (mcas *mcas*)))
+	       (if (eq +mcas-succeeded+ mcas-status)
+		   (dolist (func (reverse (mcas-success-actions *mcas*)))
+		     (funcall func))
+		   (dolist (func (reverse (mcas-failure-actions *mcas*)))
+		     (funcall func)))
+	       mcas-status))))))
 
+#|
 (defun mcas-test (&key (threads 4)(size 100))
   (sb-profile:reset)
   (sb-profile:profile get-vector-addr 
@@ -183,3 +204,4 @@
       (format t "~A: V 0 = ~A~%" thread (mcas-read v 0)))
     (format t "v[0] = ~A & v[~A] = ~A~%" (svref v 0) (1- size) (svref v (1- size))))
   (sb-profile:report))
+|#

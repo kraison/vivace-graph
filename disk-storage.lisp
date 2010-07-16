@@ -1,6 +1,6 @@
-;(in-package #:vivace-graph)
-(asdf:oos 'asdf:load-op 'cffi)
-(cffi:defctype size :unsigned-int)
+(in-package #:vivace-graph)
+;(asdf:oos 'asdf:load-op 'cffi)
+;(cffi:defctype size :unsigned-int)
 
 (defstruct (mapped-file
 	     (:predicate mapped-file?))

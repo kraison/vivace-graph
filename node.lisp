@@ -22,7 +22,7 @@
   (uuid (make-uuid) :type uuid:uuid)
   (type +unknown+ :type integer)
   (value "")
-  (ref-count 0 :type integer)
+  (ref-count 0 :type (UNSIGNED-BYTE 64))
   (graph *graph*))
 
 (defmethod print-node (node stream depth)

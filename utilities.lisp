@@ -63,6 +63,13 @@
   (:method ((x uuid:uuid) (y symbol)) (string>= (uuid:print-bytes nil x) (symbol-name y)))
   (:method ((x uuid:uuid) (y number)) (string>= (uuid:print-bytes nil x) (write-to-string y))))
 
+;; Plists
+(defun get-prop (plist prop)
+   (cond ((null plist) nil)
+	 ((eql (car plist) prop)
+	  (cadr plist))
+	 (t (get-prop (cddr plist) prop))))
+
 ;; UUID goodness
 (defun make-uuid ()
   (uuid:make-v1-uuid))

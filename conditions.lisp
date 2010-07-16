@@ -1,5 +1,12 @@
 (in-package #:vivace-graph)
 
+(define-condition skip-list-duplicate-error (error)
+  ((key :initarg :key)
+   (value :initarg :value))
+  (:report (lambda (error stream)
+	     (with-slots (key value) error
+	       (format stream "Skip list already has node with key ~A and value ~A." key value)))))
+
 (define-condition revision-error (error)
   ((instance :initarg :instance)
    (revision-number :initarg :revision))
