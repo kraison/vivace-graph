@@ -1,7 +1,6 @@
 (in-package #:vivace-graph)
 
 (defgeneric add-triple (subject predicate object &optional graph))
-(defgeneric get-triple-by-id (uuid &optional graph))
 
 (defmethod add-triple ((subject node) (predicate node) (object node) &optional graph)
   (let ((*graph* (or graph *graph*)))
@@ -22,29 +21,11 @@
 		(make-new-node :value object)
 		*graph*)))
 
-(defmethod get-triple-by-id ((uuid uuid:uuid) &optional graph)
-  (gethash uuid (triples (or graph *graph*))))
-
-(defmethod get-triple-by-id ((uuid string) &optional graph)
-  (get-triple-by-id (uuid:make-uuid-from-string uuid) graph))
-
-(defmethod get-triple-by-id ((uuid vector) &optional graph)
-  (get-triple-by-id (uuid:byte-array-to-uuid uuid) graph))
-
 (defun get-triples-list (&key limit graph)
   (let ((*graph* (or graph *graph*)))
     (let ((result nil) (count 0))
-      (sb-ext:with-locked-hash-table ((triples *graph*))
-	(block hash
-	  (maphash #'(lambda (k v) 
-		       (declare (ignore k))
-		       (if limit 
-			   (if (> count limit) 
-			       (return-from hash)
-			       (incf count)))
-		       (push v result))
-		   (triples *graph*))))
-      result)))
+      (map-skip-list-values #'(lambda (triple) (push triple result)) (triples *graph*))
+      (nreverse result))))
 
 (defun get-triples (&key s p o g)
   (let ((*graph* (or g *graph*)) (nodes nil))
@@ -57,7 +38,7 @@
 	(if (or p s)
 	    (setq nodes (intersection nodes (get-objects o)))
 	    (setq nodes (get-objects o))))
-    (mapcar #'get-triple-by-id nodes)))
+    (mapcar #'lookup-triple-by-id nodes)))
 
 (defun triple-count (&optional graph)
-  (hash-table-count (node-idx (or graph *graph*))))
+  (skip-list-length (triples (or graph *graph*))))

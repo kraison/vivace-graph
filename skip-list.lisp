@@ -81,7 +81,10 @@ L1: 50%, L2: 25%, L3: 12.5%, ..."
   (= (skip-list-length sl) 0))
 
 (defun node-forward (node)
-  (svref (skip-node-forward node) 0))
+  (declare (type (or null simple-vector) node))
+  (if node
+      (svref (skip-node-forward node) 0)
+      nil))
 
 (defmethod skip-list-to-list ((sl skip-list))
   (let ((node (skip-list-head sl)))
@@ -152,7 +155,8 @@ Use skip-list-replace-kv for that.  Be prepared to catch a 'skip-list-duplicate-
 			     new-node)))))))))
 
 (defmethod skip-list-delete ((sl skip-list) key &optional value)
-  "FIXME: needs to handle multiple values"
+  "Delete a key or k/v pair from the skip list.  If no value is specified and duplicates are
+allowed, it will delete the first key it finds."
   (multiple-value-bind (left-list right-list) (skip-list-search sl key value)
     (let ((match-node (svref right-list 0)))
       (if (or (null match-node) (not (equal (skip-node-key match-node) key)))
@@ -179,16 +183,18 @@ Use skip-list-replace-kv for that.  Be prepared to catch a 'skip-list-duplicate-
 					 (svref left-list i))))))
 		  (mcas-set match-node +skip-node-value+ old-value nil))))))))
 
-;;; cursors
+;;; cursors, some code borrowed from Manuel Odendahl <manuel@bl0rg.net>'s skip list code
 (defclass skip-list-cursor ()
-  ((node :initarg :node :accessor skip-list-cursor-node)))
+  ((node :initarg :node :accessor skip-list-cursor-node)
+   (skip-list :initarg :skip-list :accessor skip-list)))
 
-(defmethod sl-cursor-next ((slc skip-list-cursor) lt-func &optional eoc)
+(defmethod sl-cursor-next ((slc skip-list-cursor) &optional eoc)
   (with-slots (node) slc
     (if node
 	(let ((result (list (skip-node-key node)
 			    (skip-node-value node))))
 	  (setf node (node-forward node))
+	  ;;(format t "node-forward from ~A is ~A~%" result node)
 	  result)
 	eoc)))
 
@@ -199,7 +205,7 @@ Use skip-list-replace-kv for that.  Be prepared to catch a 'skip-list-duplicate-
 (defclass skip-list-value-cursor (skip-list-cursor)
   ())
 
-(defmethod sl-cursor-next :around ((slc skip-list-value-cursor) lt-func &optional eoc)
+(defmethod sl-cursor-next :around ((slc skip-list-value-cursor) &optional eoc)
   (let ((result (call-next-method)))
     (if (eql result eoc)
 	eoc
@@ -208,7 +214,7 @@ Use skip-list-replace-kv for that.  Be prepared to catch a 'skip-list-duplicate-
 (defclass skip-list-key-cursor (skip-list-cursor)
   ())
 
-(defmethod sl-cursor-next :around ((slc skip-list-key-cursor) lt-func &optional eoc)
+(defmethod sl-cursor-next :around ((slc skip-list-key-cursor) &optional eoc)
   (let ((result (call-next-method)))
     (if (eql result eoc)
 	eoc
@@ -219,7 +225,7 @@ Use skip-list-replace-kv for that.  Be prepared to catch a 'skip-list-duplicate-
       (progn (setf (skip-list-cursor-node cursor)
 		   (node-forward (skip-list-head sl)))
 	     cursor)
-     (make-instance class :node (node-forward (skip-list-head sl)))))
+     (make-instance class :node (node-forward (skip-list-head sl)) :skip-list sl)))
 
 (defmethod skip-list-values-cursor ((sl skip-list))
   (skip-list-cursor sl :class 'skip-list-value-cursor))
@@ -230,9 +236,13 @@ Use skip-list-replace-kv for that.  Be prepared to catch a 'skip-list-duplicate-
 (defclass skip-list-range-cursor (skip-list-cursor)
   ((end :initarg :end :reader slrc-end)))
 
-(defmethod sl-cursor-next :around ((slc skip-list-range-cursor) lt-func &optional eoc)
+(defmethod sl-cursor-next :around ((slc skip-list-range-cursor) &optional eoc)
   (with-slots (node end) slc
-    (if (and node (funcall lt-func (skip-node-key node) end))
+;    (format t "node is ~A~%" node)
+    (if (and node 
+	     (or 
+	      (funcall (skip-list-comparison (skip-list slc)) (skip-node-key node) end)
+	      (funcall (skip-list-key-equal (skip-list slc)) (skip-node-key node) end)))
 	(call-next-method)
 	eoc)))
 
@@ -240,25 +250,40 @@ Use skip-list-replace-kv for that.  Be prepared to catch a 'skip-list-duplicate-
   (multiple-value-bind (left-list right-list) (skip-list-search sl start)
     (let ((right-node (svref right-list 0))
 	  (left-node (svref left-list 0)))
+;      (format t "Left  is ~A~%" (and left-node (skip-node-key left-node)))
+;      (format t "Right is ~A~%" (and right-node (skip-node-key right-node)))
       (cond ((and left-node (funcall (skip-list-key-equal sl) start (skip-node-key left-node)))
-	     (make-instance 'skip-list-range-cursor :node left-node :end end))
+	     (make-instance 'skip-list-range-cursor 
+			    :node left-node :end end :skip-list sl))
 	    ((and right-node (funcall (skip-list-key-equal sl) start (skip-node-key right-node)))
-	     (make-instance 'skip-list-range-cursor :node right-node :end end))))))
+	     (make-instance 'skip-list-range-cursor 
+			    :node right-node :end end :skip-list sl))))))
 
 (defmethod map-skip-list (fun (sl skip-list))
   (let ((cursor (skip-list-cursor sl)))
-    (do ((val (sl-cursor-next cursor (skip-list-comparison sl)) 
-	      (sl-cursor-next cursor (skip-list-comparison sl))))
+    (do ((val (sl-cursor-next cursor) 
+	      (sl-cursor-next cursor)))
 	((null val))
       (apply fun val))))
 
 (defmethod map-skip-list-values (fun (sl skip-list))
   (let ((cursor (skip-list-values-cursor sl)))
-    (do ((val (sl-cursor-next cursor (skip-list-comparison sl)) 
-	      (sl-cursor-next cursor (skip-list-comparison sl))))
+    (do ((val (sl-cursor-next cursor) 
+	      (sl-cursor-next cursor)))
 	((null val))
       (funcall fun val))))
 
+(defmethod skip-list-fetch-all ((sl skip-list) key)
+  (let ((cursor (skip-list-range-cursor sl key key))
+	(result nil))
+    (if cursor
+	(progn
+	  (do ((node (sl-cursor-next cursor) (sl-cursor-next cursor)))
+	      ((null node))
+	    (push (second node) result))
+	  (nreverse result))
+	nil)))
+      
 (defun sl-test ()
   (let ((sl (make-skip-list :duplicates-allowed? t)))
     (dotimes (i 1000)

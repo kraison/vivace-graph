@@ -13,13 +13,20 @@
 (defmethod uuid-eql ((uuid1 uuid) (uuid2 uuid))
   (equalp (uuid-to-byte-array uuid1) (uuid-to-byte-array uuid2)))
 
+(defmethod uuid-eql ((uuid1 uuid) uuid2)
+  nil)
+
+(defmethod uuid-eql (uuid1 (uuid2 uuid))
+  nil)
+
 (defun uuid-to-byte-array (uuid &optional (type-specifier nil))
   "Converts an uuid to byte-array"
   (if type-specifier
       (let ((array (make-array 18 :element-type '(unsigned-byte 8))))
 	(setf (aref array 0) type-specifier)
 	(setf (aref array 1) 16)
-	(with-slots (time-low time-mid time-high-and-version clock-seq-and-reserved clock-seq-low node)
+	(with-slots 
+	      (time-low time-mid time-high-and-version clock-seq-and-reserved clock-seq-low node)
 	    uuid
 	  (loop for i from 3 downto 0
 	     do (setf (aref array (+ 2 (- 3 i))) (ldb (byte 8 (* 8 i)) time-low)))
@@ -33,7 +40,8 @@
 	     do (setf (aref array (+ 2 i)) (ldb (byte 8 (* 8 (- 15 i))) node)))
 	  array))
       (let ((array (make-array 16 :element-type '(unsigned-byte 8))))
-	(with-slots (time-low time-mid time-high-and-version clock-seq-and-reserved clock-seq-low node)
+	(with-slots 
+	      (time-low time-mid time-high-and-version clock-seq-and-reserved clock-seq-low node)
 	    uuid
 	  (loop for i from 3 downto 0
 	     do (setf (aref array (- 3 i)) (ldb (byte 8 (* 8 i)) time-low)))

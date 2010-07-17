@@ -2,6 +2,26 @@
 
 (defgeneric serialize (object))
 (defgeneric deserialize (become object))
+(defgeneric deserialize-raw (object))
+
+(defmethod deserialize-raw ((a array))
+  (declare (optimize speed))
+  (deserialize (aref a 0) (subseq a 2)))
+
+(defmethod serialized-eq ((x array) (y array))
+  (equalp x y))
+
+(defmethod serialized-lt ((x array) (y array))
+  "Compare two serialized items.
+FIXME: there is a way to do this without deserializing, it will just take some time to get right."
+  (declare (optimize speed))
+  (less-than (deserialize-raw x) (deserialize-raw y)))
+
+(defmethod serialized-gt ((x array) (y array))
+  "Compare two serialized items.
+FIXME: there is a way to do this without deserializing, it will just take some time to get right."
+  (declare (optimize speed))
+  (greater-than (deserialize-raw x) (deserialize-raw y)))
 
 (defmethod deserialize :around (become object)
   (handler-case
@@ -121,13 +141,15 @@
 
 (defmethod serialize ((string string))
   "Unicode aware string encoding. Not as efficient as it could be: creates 2 arrays: one to get 
-sbcl's internal byte representation of the string, and then another for prepending out code and
+sbcl's internal byte representation of the string, and then another for prepending our code and
 the length of the object."
   (let* ((unicode (sb-ext:string-to-octets string))
 	 (vector-length (length unicode))
 	 (vec (make-array (+ 2 vector-length) 
 			  :fill-pointer t :adjustable t :element-type '(unsigned-byte 8))))
-    (setf (aref vec 0) +string+)
+    (if (< (length string) 256)
+	(setf (aref vec 0) +string+)
+	(setf (aref vec 0) +clob+))
     (setf (aref vec 1) vector-length)
     (dotimes (i vector-length)
       (setf (aref vec (+ 2 i)) (aref unicode i)))

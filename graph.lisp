@@ -2,6 +2,11 @@
 
 (setq *graph-table* (make-uuid-table :synchronized t))
 
+;; FIXME: need to reorganize files so that graph depends on serialize
+(defgeneric serialized-eq (x y)) 
+(defgeneric serialized-lt (x y))
+(defgeneric serialized-gt (x y))
+
 (defstruct (graph
 	     (:predicate graph?)
 	     (:conc-name nil)
@@ -10,15 +15,15 @@
   (graph-name nil)
   (shutdown? nil)
   (graph-location #P".")
-  (nodes (make-instance 'skip-list := 'uuid:uuid-eql))
-  (triples (make-instance 'skip-list := 'uuid:uuid-eql))
-  (deleted-triples (make-instance 'skip-list := 'uuid:uuid-eql))
+  (nodes (make-skip-list :key-equal 'uuid:uuid-eql))
+  (triples (make-skip-list :key-equal 'uuid:uuid-eql))
+  (deleted-triples (make-skip-list :key-equal 'uuid:uuid-eql))
   (delete-queue (sb-concurrency:make-queue))
   (needs-indexing-q (sb-concurrency:make-queue))
-  (node-idx (make-instance 'skip-list))
-  (subject-idx (make-instance 'skip-list))
-  (predicate-idx (make-instance 'skip-list))
-  (object-idx (make-instance 'skip-list)))
+  (node-idx (make-skip-list))
+  (subject-idx (make-skip-list :duplicates-allowed? t))
+  (predicate-idx (make-skip-list :duplicates-allowed? t))
+  (object-idx (make-skip-list :duplicates-allowed? t)))
 
 (defmethod print-graph (graph stream depth)
   (declare (ignore depth))

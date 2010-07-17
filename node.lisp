@@ -1,88 +1,57 @@
 (in-package #:vivace-graph)
 
-#|
-(defclass node ()
-  ((uuid :accessor uuid :initarg :uuid :initform (make-uuid))
-   (node-type :accessor node-type :initarg :type :initform +string+)
-   (value :accessor value :initarg :value :initform "")
-   (graph :accessor graph :initarg :graph :initform :default)))
-
-(defmethod print-object ((node node) stream)
-  (format stream "#<~A>" (value node)))
-
-(defgeneric node? (thing)
-  (:method ((thing node)) t)
-  (:method (thing) nil))
-|#
-
 (defstruct (node
 	     (:conc-name node-)
-	     (:print-function print-node)
 	     (:predicate node?))
-  (uuid (make-uuid) :type uuid:uuid)
-  (type +unknown+ :type integer)
-  (value "")
+  (uuid (make-uuid))
+  (type +unknown+)
+  (value nil)
   (ref-count 0 :type (UNSIGNED-BYTE 64))
   (graph *graph*))
-
-(defmethod print-node (node stream depth)
-  (declare (ignore depth))
-  (format stream "#<~A>" (deserialize (aref (node-value node) 0) 
-				      (subseq (node-value node) 2))))
 
 (defgeneric lookup-node (value graph &optional serialized?))
 (defgeneric make-anonymous-node-name (uuid))
 
+(defun lookup-node-by-id (uuid)
+  (skip-list-lookup (nodes *graph*) uuid))
+
 (defmethod lookup-node (value (graph graph) &optional serialized?)
   ;;(format t "lookup-node: *graph* is ~A for ~A~%" graph value)
-  (gethash (if serialized? value (serialize value)) (node-idx graph)))
+  (lookup-node-by-id
+   (skip-list-lookup (node-idx graph) (if serialized? (deserialize-raw value) value))))
 
 (defun list-nodes (&optional graph)
   (let ((*graph* (or graph *graph*)) (result nil))
-    (sb-ext:with-locked-hash-table ((node-idx *graph*))
-      (maphash #'(lambda (k v)
-		   (declare (ignore k))
-		   (push v result))
-	       (node-idx *graph*)))
-    result))
+    (let ((result nil))
+      (map-skip-list-values #'(lambda (node) (push node result)) (nodes *graph*)))
+    (nreverse result)))
 
 (defmethod make-anonymous-node-name ((uuid uuid:uuid))
-  (serialize (format nil "_anon:~A" uuid)))
+  (format nil "_anon:~A" uuid))
 
 (defun make-anonymous-node (&key graph)
   (let ((*graph* (or graph *graph*)))
-    (let* ((uuid (make-uuid)) (serialized-value (make-anonymous-node-name uuid)))
+    (let* ((uuid (make-uuid)) 
+	   (value (make-anonymous-node-name uuid))
+	   (serialized-value (serialize value)))
       (let ((node (make-node 
 		   :uuid uuid 
-		   :value serialized-value
-		   :type (aref serialized-value 1)
+		   :value value
 		   :graph *graph*)))
-	(setf (gethash serialized-value (node-idx *graph*)) node)))))
+	(with-mcas (:equality 'equal)
+	  (skip-list-add (nodes *graph*) uuid node)
+	  (skip-list-add (node-idx *graph*) value uuid))
+	node))))
 
-(defun make-new-node (&key value graph )
-  )
-;(defun make-new-node (&key value graph (mailbox (sb-concurrency:make-mailbox :name val;ue)))
-;  (let ((*graph* (or graph *graph*)))
-;    (let ((serialized-value (serialize value)))
-;      (sb-concurrency:send-message 
-;       (graph-mailbox *graph*)
-;       (make-message;
-;	:content serialized-value
-;	:sender mailbox
-;	:task nil))
-;      (msg-content (sb-concurrency:receive-message mailbox)))))
-
-(defun make-new-node-ht (&key value graph)
+(defun make-new-node (&key value graph)
   (let ((*graph* (or graph *graph*)))
-    (let* ((uuid (make-uuid)) (serialized-value (serialize value)))
-      (let ((node (make-node 
-		   :uuid uuid 
-		   :value serialized-value
-		   :type (aref serialized-value 1)
-		   :graph *graph*)))
-	;;(sb-ext:with-locked-hash-table ((node-idx *graph*))
-	(or (lookup-node serialized-value *graph* t)
-	    (setf (gethash serialized-value (node-idx *graph*)) node))))))
-
-
+    (or (lookup-node value *graph*)
+	(let* ((serialized-value (serialize value))
+	       (node (make-node 
+		      :value value
+		      :graph *graph*)))
+	  (with-mcas (:equality 'equal)
+	    (skip-list-add (nodes *graph*) (node-uuid node) node)
+	    (skip-list-add (node-idx *graph*) value (node-uuid node)))
+	  node))))
 
