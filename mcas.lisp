@@ -30,16 +30,24 @@
 	     (:predicate mcas-descriptor?)
 	     (:conc-name mcas-)
 	     :named)
-  (status +mcas-undecided+) (count 0) updates (equality #'equal) success-actions failure-actions)
+  (status +mcas-undecided+) 
+  (count 0) 
+  updates 
+  (equality #'equal) 
+  success-actions 
+  (durable-changes nil)
+  (durability-thread nil)
+  (retries 0)
+  (timestamp (gettimeofday)))
 
 (defun ccas-help (cd)
-  ;; FIXME: read barrier
+  ;; FIXME: add read barrier
   (if (eq (svref (cd-control-vector cd) (cd-control-index cd)) +mcas-undecided+)
       (cas (svref (cd-vector cd) (cd-index cd)) cd (cd-new cd))
       (cas (svref (cd-vector cd) (cd-index cd)) cd (cd-old cd))))
 
 (defun ccas-read (vector index)
-  ;; FIXME: read barrier
+  ;; FIXME: add read barrier
   (let ((r (svref vector index)))
     (if (ccas-descriptor? r)
 	(progn
@@ -57,7 +65,7 @@
 				  :old old
 				  :new new
 				  :equality equality)))
-    ;; FIXME: read barrier
+    ;; FIXME: add read barrier
     (let ((r (cas (svref vector index) old cd)))
       (while (not (funcall equality r old))
 	(if (not (ccas-descriptor? r))
@@ -68,41 +76,65 @@
     (ccas-help cd)))
 
 (defun mcas-help (md)
-  "This function is a direct mapping from Keir Fraser's pseudocode.  GO is evil; needs rewrite."
+  "This is the bulk of the transaction logic.  Includes durability."
   (let ((state +mcas-failed+))
     (tagbody
        (dotimes (i (mcas-count md))
 	 (let ((update (elt (mcas-updates md) i)))
 	   (loop
-	      ;; FIXME: embed ccas desriptior in mcas struct and reuse?
+	      ;; Try to replace the slot with our mcas descriptor.
 	      (ccas (update-vector update) (update-index update) 
 		    md 1 
 		    (update-old update) md
 		    (mcas-equality md))
 	      (let ((r (svref (update-vector update) (update-index update))))
 		(cond ((and (eq (mcas-status md) +mcas-undecided+) 
-			    (equal (update-old update) r))
+			    (funcall (mcas-equality md) (update-old update) r))
+		       ;; Got old value, not our mcas descriptor. Try again.
 		       t)
 		      ((eq r md)
-		       (return))
+		       ;; This slot has been successfully replaced by our mcas descriptor. Next.
+		       (return)) 
 		      ((not (mcas-descriptor? r))
+		       ;; Oops, someone else changed this slot.  Abort.
 		       (go decision-point))
-		      (t (mcas-help r)))))))
-       (setq state +mcas-succeeded+)
+		      (t 
+		       ;; Someone else has a transaction active on this slot. Help them out.
+		       (mcas-help r))))))) 
+       (setq state +mcas-make-durable+)
      decision-point
-       ;; Write barrier needed for non-x86 (Alpha / Sparc)
+       ;; FIXME: Add write barrier needed for non-x86 (Alpha / Sparc)
        (cas (svref md 1) +mcas-undecided+ state)
-       ;; Write barrier needed for non-x86 (Alpha / Sparc)
-       (dotimes (i (mcas-count md))
-	 (let ((update (elt (mcas-updates md) i)))
-	   (cas (svref (update-vector update) (update-index update)) md
-		(if (eq (mcas-status md) +mcas-succeeded+)
-		    (update-new update)
-		    (update-old update)))))))
+       (when (eq (mcas-status md) +mcas-make-durable+)
+	 (if (null (mcas-durable-changes md))
+	     (cas (svref md 1) +mcas-make-durable+ +mcas-succeeded+)
+	     (when (null (cas (svref md 7) nil (current-thread))) ;; Set durability-thread to me!
+	       (handler-case
+		   (make-durable (mcas-timestamp md) (reverse (mcas-durable-changes md)))
+		 (error (condition)
+		   (format t "Could not make ~A durable: ~A" md condition)
+		   (cas (svref md 1) +mcas-make-durable+ +mcas-failed+))
+		 (:no-error (durability-successful?)
+		   (if durability-successful?
+		       (cas (svref md 1) +mcas-make-durable+ +mcas-succeeded+)
+		       (cas (svref md 1) +mcas-make-durable+ +mcas-failed+)))))))
+       ;; FIXME: add write barrier needed for non-x86 (Alpha / Sparc)
+       (cond ((eq (mcas-status md) +mcas-succeeded+)
+	      (dotimes (i (mcas-count md))
+		(let ((update (elt (mcas-updates md) i)))
+		  (cas (svref (update-vector update) (update-index update)) 
+		       md 
+		       (update-new update)))))
+	     ((eq (mcas-status md) +mcas-failed+)
+	      (dotimes (i (mcas-count md))
+		(let ((update (elt (mcas-updates md) i)))
+		  (cas (svref (update-vector update) (update-index update)) 
+		       md 
+		       (update-old update))))))))
   (mcas-status md))
 
 (defun mcas-read (vector index)
-  ;; FIXME: read barrier
+  ;; FIXME: add read barrier
   (let ((r (svref vector index)))
     (if (mcas-descriptor? r)
 	(progn
@@ -130,41 +162,76 @@
 	(incf (mcas-count *mcas*)))
       (error "MCAS-SET must be called within the body of with-mcas")))
 
+(defun reset-mcas (mcas)
+  (setf (mcas-status mcas)            +mcas-undecided+
+	(mcas-count mcas)             0
+	(mcas-updates mcas)           nil
+	(mcas-success-actions mcas)   nil
+	(mcas-durable-changes mcas)   nil
+	(mcas-durability-thread mcas) nil
+	(mcas-timestamp mcas)         (gettimeofday))
+  mcas)
+
+(defgeneric mcas-successful? (thing))
+
+(defmethod mcas-successful? ((md array))
+  (eq +mcas-succeeded+ (mcas-status md)))
+
+(defmethod mcas-successful? ((s symbol))
+  (eq +mcas-succeeded+ s))
+
+(defun make-durable (object)
+  (if (mcas-descriptor? *mcas*)
+      (push (list :add object) (mcas-durable-changes *mcas*))
+      (error "make-durable must be called within the body of with-mcas")))
+
+(defun delete-durable (object)
+  (if (mcas-descriptor? *mcas*)
+      (push (list :delete object) (mcas-durable-changes *mcas*))
+      (error "delete-durable must be called within the body of with-mcas")))
+
 (defmacro with-mcas (lambda-list &body body)
   (let ((args (gensym))
 	(equality (get-prop lambda-list :equality))
-	(success-action (get-prop lambda-list :success-action))
-	(failure-action (get-prop lambda-list :failure-action)))
+	(success-action (get-prop lambda-list :success-action)))
+    `(let ((,args nil))
+       (when (functionp ,equality)
+	 (push ,equality ,args)
+	 (push :equality ,args))
+       (when (functionp ,success-action)
+	 (push (list ,success-action) ,args)
+	 (push :success-actions ,args))
+       (let ((*mcas* (apply #'make-mcas-descriptor ,args)))
+	 (unwind-protect
+	      (loop
+		 for retries from 0 to 199
+		 do 
+		   (progn ,@body)
+		   (mcas *mcas*)
+		   (if (eq +mcas-succeeded+ (mcas-status *mcas*))
+		       (return)
+		       (progn
+			 (incf (mcas-retries *mcas*))
+			 (sleep (* 0.000002 (nth (random 3) (list 0 1 retries))))
+			 (reset-mcas *mcas*))))
+	   (if (eq +mcas-succeeded+ (mcas-status *mcas*))
+	       (dolist (func (reverse (mcas-success-actions *mcas*)))
+		 (funcall func))
+	       (error 'transaction-error :instance *mcas* :reason "Unknown")))
+	 (mcas-status *mcas*)))))
+
+(defmacro with-recursive-mcas (lambda-list &body body)
+  (let ((success-action (get-prop lambda-list :success-action)))
     `(if (mcas-descriptor? *mcas*)
 	 (progn
 	   (when (functionp ,success-action)
 	     (push ,success-action (mcas-success-actions *mcas*)))
-	   (when (functionp ,failure-action)
-	     (push ,failure-action (mcas-failure-actions *mcas*)))
 	   ,@body)
-	 (let ((,args nil))
-	   (when (functionp ,equality)
-	     (push ,equality ,args)
-	     (push :equality ,args))
-	   (when (functionp ,success-action)
-	     (push (list ,success-action) ,args)
-	     (push :success-actions ,args))
-	   (when (functionp ,failure-action)
-	     (push (list ,failure-action) ,args)
-	     (push :failure-actions ,args))
-	   (let ((*mcas* (apply #'make-mcas-descriptor ,args)))
-	     (progn
-	       ,@body)
-	     (let ((mcas-status (mcas *mcas*)))
-	       (if (eq +mcas-succeeded+ mcas-status)
-		   (dolist (func (reverse (mcas-success-actions *mcas*)))
-		     (funcall func))
-		   (dolist (func (reverse (mcas-failure-actions *mcas*)))
-		     (funcall func)))
-	       mcas-status))))))
+	 (with-mcas ,lambda-list
+	   ,@body))))
+  
 
-#|
-(defun mcas-test (&key (threads 4)(size 100))
+(defun mcas-test (&key (threads 4) (size 100))
   (sb-profile:reset)
   (sb-profile:profile get-vector-addr 
 		      print-ccas-descriptor 
@@ -204,4 +271,3 @@
       (format t "~A: V 0 = ~A~%" thread (mcas-read v 0)))
     (format t "v[0] = ~A & v[~A] = ~A~%" (svref v 0) (1- size) (svref v (1- size))))
   (sb-profile:report))
-|#

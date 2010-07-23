@@ -2,6 +2,7 @@
 
 (defvar *graph* nil)
 (defvar *graph-table* nil)
+(defvar *active-transactions* nil)
 (defvar *syslog-program* "vivace-graph")
 (defvar *syslog-facility* sb-posix:log-local7)
 (progn

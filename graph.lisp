@@ -2,11 +2,6 @@
 
 (setq *graph-table* (make-uuid-table :synchronized t))
 
-;; FIXME: need to reorganize files so that graph depends on serialize
-(defgeneric serialized-eq (x y)) 
-(defgeneric serialized-lt (x y))
-(defgeneric serialized-gt (x y))
-
 (defstruct (graph
 	     (:predicate graph?)
 	     (:conc-name nil)
@@ -15,12 +10,11 @@
   (graph-name nil)
   (shutdown? nil)
   (graph-location #P".")
-  (nodes (make-skip-list :key-equal 'uuid:uuid-eql))
-  (triples (make-skip-list :key-equal 'uuid:uuid-eql))
-  (deleted-triples (make-skip-list :key-equal 'uuid:uuid-eql))
+  (tx-log-mailbox (sb-concurrency:make-mailbox))
+  (nodes (make-skip-list))
+  (triples (make-hash-table :test 'equal :synchronized t))
   (delete-queue (sb-concurrency:make-queue))
   (needs-indexing-q (sb-concurrency:make-queue))
-  (node-idx (make-skip-list))
   (subject-idx (make-skip-list :duplicates-allowed? t))
   (predicate-idx (make-skip-list :duplicates-allowed? t))
   (object-idx (make-skip-list :duplicates-allowed? t)))
@@ -34,7 +28,7 @@
 (defgeneric shutdown-graph (graph &key waitp))
 
 (defmethod needs-indexing? ((graph graph))
-  (null (sb-concurrency:queue-empty-p (needs-indexing-q graph))))
+  (not (sb-concurrency:queue-empty-p (needs-indexing-q graph))))
 
 (defun load-graph! (location)
   )

@@ -101,12 +101,12 @@ L1: 50%, L2: 25%, L3: 12.5%, ..."
 	nil)))
 
 (defmethod skip-list-replace-kv ((sl skip-list) key new-value &optional old-value)
-  "Replaces a node's with new-value.  If old-value is supplied, will only replace the value if it
-matches old-value."
+  "Replaces a node's value with new-value.  If old-value is supplied, will only replace the value 
+if it matches old-value, otherwise throws 'skip-list-kv-not-found-error."
   (multiple-value-bind (left-list right-list) (skip-list-search sl key old-value)
     (declare (ignore left-list))
     (let ((node (svref right-list 0)))
-      (when (and (svref right-list 0)
+      (when (and node
 		 (funcall (skip-list-key-equal sl) key (skip-node-key node)))
 	(if old-value
 	    (let ((read-value (skip-node-value node)))
@@ -118,7 +118,7 @@ matches old-value."
 				    new-value))
 		      +mcas-succeeded+
 		      +mcas-failed+)
-		  (error "KV pair ~A/~A not in skip list." key old-value)))
+		  (error 'skip-list-kv-not-found-error :key key :value old-value)))
 	    (let ((read-value (skip-node-value node)))
 	      (if (funcall (skip-list-value-equal sl)
 			   read-value
@@ -145,9 +145,10 @@ Use skip-list-replace-kv for that.  Be prepared to catch a 'skip-list-duplicate-
 		    (not (skip-list-duplicates-allowed? sl)))
 	       (error 'skip-list-duplicate-error :key key :value (skip-node-value left-node)))
 	      (t
-	       (with-mcas (:equality #'equal
-				     :success-action 
-				     #'(lambda () (sb-ext:atomic-incf (skip-list-length sl))))
+	       (with-recursive-mcas (:equality #'equal
+					       :success-action 
+					       #'(lambda () 
+						   (sb-ext:atomic-incf (skip-list-length sl))))
 		 (dotimes (i (skip-node-level new-node))
 		   (setf (svref (skip-node-forward new-node) i) (svref right-list i))
 		   (mcas-set (skip-node-forward (svref left-list i)) i
@@ -164,9 +165,10 @@ allowed, it will delete the first key it finds."
 	  (let ((old-value (skip-node-value match-node)))
 	    (if (eq nil old-value)
 		nil
-		(with-mcas (:equality #'equal 
-				      :success-action 
-				      #'(lambda () (sb-ext:atomic-decf (skip-list-length sl))))
+		(with-recursive-mcas (:equality #'equal 
+						:success-action 
+						#'(lambda () 
+						    (sb-ext:atomic-decf (skip-list-length sl))))
 		  (loop for i from 0 to (1- (skip-node-level match-node)) do
 		       (let ((next-node (mcas-read (skip-node-forward match-node) i)))
 			 (if (and next-node
@@ -194,13 +196,8 @@ allowed, it will delete the first key it finds."
 	(let ((result (list (skip-node-key node)
 			    (skip-node-value node))))
 	  (setf node (node-forward node))
-	  ;;(format t "node-forward from ~A is ~A~%" result node)
 	  result)
 	eoc)))
-
-(defmethod sl-cursor-prev ((slc skip-list-cursor) &optional eoc)
-  (declare (ignore eoc))
-  (error "Can not move backward in skip-list"))
 
 (defclass skip-list-value-cursor (skip-list-cursor)
   ())
@@ -238,7 +235,6 @@ allowed, it will delete the first key it finds."
 
 (defmethod sl-cursor-next :around ((slc skip-list-range-cursor) &optional eoc)
   (with-slots (node end) slc
-;    (format t "node is ~A~%" node)
     (if (and node 
 	     (or 
 	      (funcall (skip-list-comparison (skip-list slc)) (skip-node-key node) end)
@@ -250,8 +246,6 @@ allowed, it will delete the first key it finds."
   (multiple-value-bind (left-list right-list) (skip-list-search sl start)
     (let ((right-node (svref right-list 0))
 	  (left-node (svref left-list 0)))
-;      (format t "Left  is ~A~%" (and left-node (skip-node-key left-node)))
-;      (format t "Right is ~A~%" (and right-node (skip-node-key right-node)))
       (cond ((and left-node (funcall (skip-list-key-equal sl) start (skip-node-key left-node)))
 	     (make-instance 'skip-list-range-cursor 
 			    :node left-node :end end :skip-list sl))
@@ -274,6 +268,7 @@ allowed, it will delete the first key it finds."
       (funcall fun val))))
 
 (defmethod skip-list-fetch-all ((sl skip-list) key)
+  "Return all values for a key in a skip list where duplicates are allowed."
   (let ((cursor (skip-list-range-cursor sl key key))
 	(result nil))
     (if cursor

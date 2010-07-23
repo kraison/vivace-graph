@@ -1,25 +1,11 @@
 (in-package #:vivace-graph)
 
-(defgeneric add-triple (subject predicate object &optional graph))
-
-(defmethod add-triple ((subject node) (predicate node) (object node) &optional graph)
+(defun add-triple (subject predicate object &optional graph)
   (let ((*graph* (or graph *graph*)))
-    (make-new-triple *graph* subject predicate object)))
-
-(defmethod add-triple ((subject triple) (predicate node) (object node) &optional graph)
-  (let ((*graph* (or graph *graph*)))
-    (make-new-triple *graph* subject predicate object)))
-
-(defmethod add-triple ((subject uuid:uuid) (predicate uuid:uuid) (object uuid:uuid) &optional graph)
-  (let ((*graph* (or graph *graph*)))
-    (make-new-triple *graph* subject predicate object)))
-
-(defmethod add-triple (subject predicate object &optional graph)
-  (let ((*graph* (or graph *graph*)))
-    (add-triple (make-new-node :value subject)
-		(make-new-node :value predicate)
-		(make-new-node :value object)
-		*graph*)))
+    (let ((subject (or (lookup-node subject *graph*) (make-new-node :value subject)))
+	  (predicate (or (lookup-node predicate *graph*) (make-new-node :value predicate)))
+	  (object (or (lookup-node object *graph*) (make-new-node :value object))))
+      (make-new-triple *graph* subject predicate object))))
 
 (defun get-triples-list (&key limit graph)
   (let ((*graph* (or graph *graph*)))
@@ -29,16 +15,19 @@
 
 (defun get-triples (&key s p o g)
   (let ((*graph* (or g *graph*)) (nodes nil))
-    (if s (setq nodes (get-subjects s)))
-    (if p 
-	(if s
-	    (setq nodes (intersection nodes (get-predicates p)))
-	    (setq nodes (get-predicates p))))
-    (if o 
-	(if (or p s)
-	    (setq nodes (intersection nodes (get-objects o)))
-	    (setq nodes (get-objects o))))
-    (mapcar #'lookup-triple-by-id nodes)))
+    (if (and s p o)
+	(lookup-triple s p o :g *graph*)
+	(progn
+	  (if s (setq nodes (get-subjects s)))
+	  (if p 
+	      (if s
+		  (setq nodes (intersection nodes (get-predicates p)))
+		  (setq nodes (get-predicates p))))
+	  (if o 
+	      (if (or p s)
+		  (setq nodes (intersection nodes (get-objects o)))
+		  (setq nodes (get-objects o))))
+	  nodes))))
 
 (defun triple-count (&optional graph)
   (skip-list-length (triples (or graph *graph*))))

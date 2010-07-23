@@ -3,7 +3,11 @@
 (defgeneric serialize (object))
 (defgeneric deserialize (become object))
 (defgeneric deserialize-raw (object))
+(defgeneric serialized-eq (x y)) 
+(defgeneric serialized-lt (x y))
+(defgeneric serialized-gt (x y))
 
+(declaim (inline deserialize-raw))
 (defmethod deserialize-raw ((a array))
   (declare (optimize speed))
   (deserialize (aref a 0) (subseq a 2)))
@@ -42,16 +46,6 @@ FIXME: there is a way to do this without deserializing, it will just take some t
 (defmethod serialize ((uuid uuid:uuid))
   "Encode a UUID."
   (uuid:uuid-to-byte-array uuid +uuid+))
-
-(defmethod deserialize ((become (eql +triple+)) bytes)
-  "Decode a triple."
-  (make-instance 'triple))
-
-(defmethod serialize ((triple triple))
-  "Encode a triple."
-  (let ((vec (make-array 16 :fill-pointer t :adjustable t :element-type '(unsigned-byte 8))))
-    (serialize (triple-uuid triple))
-    ()))
 
 (defmethod deserialize ((become (eql +positive-integer+)) bytes)
   "Decode a positive integer."
