@@ -1,5 +1,6 @@
 (in-package #:vivace-graph)
 
+#|
 (defgeneric persist-object (object)
   (:documentation "Defined for each type to make durable. Returns bytes to write to disk."))
 (defgeneric load-object (binary)
@@ -16,4 +17,4 @@
   (loop
      (destructuring-bind (timestamp items) (sb-concurrency:receive-message mailbox)
        )))
-       
+|#

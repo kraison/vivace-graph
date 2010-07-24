@@ -21,22 +21,31 @@
 
 ;; Built-in type identifiers for serializing
 (defconstant +unknown+ 0)
-(defconstant +positive-integer+ 1)
-(defconstant +negative-integer+ 2)
+(defconstant +positive-integer+ 2)
+(defconstant +negative-integer+ 1)
 (defconstant +character+ 3)
 (defconstant +symbol+ 4)
-(defconstant +string+ 5) ;; Strings up to 255 characters
+(defconstant +string+ 5)
 (defconstant +list+ 6)
-(defconstant +vector+ 6)
-(defconstant +single-float+ 7)
-(defconstant +double-float+ 8)
-(defconstant +ratio+ 9)
-(defconstant +t+ 10)
-(defconstant +null+ 11)
-(defconstant +clob+ 12) ;; Strings over 255 characters
-(defconstant +blob+ 13)
+(defconstant +vector+ 7)
+(defconstant +single-float+ 8)
+(defconstant +double-float+ 9)
+(defconstant +ratio+ 10)
+(defconstant +t+ 11)
+(defconstant +null+ 12)
+(defconstant +blob+ 13) ;; Uninterpreted octets
 
 ;; User-defined type identifiers for serializing. Start at 100
 (defconstant +uuid+ 100)
 (defconstant +triple+ 101)
 (defconstant +node+ 102)
+
+;; Tags for sorting entry types in tokyo cabinet
+(defconstant +triple-key+ 1)
+(defconstant +node-key+ 2)
+(defconstant +triple-subject+ 3)
+(defconstant +triple-predicate+ 4)
+(defconstant +triple-object+ 5)
+(defconstant +node-ref-count+ 6)
+(defconstant +deleted-triple-key+ 7)
+(defconstant +text-index+ 8)

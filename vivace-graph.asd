@@ -16,32 +16,29 @@
 	       :cffi
 	       :sb-concurrency
 	       :sb-posix
-	       ;:cl-store
-	       ;:montezuma
 	       :cl-tokyo-cabinet
-	       :cl-containers
+	       :montezuma
 	       :py-configparser
 	       :usocket
-	       :clpython
 	       :js
 	       :protobuf
 	       :hunchentoot)
   :components ((:file "uuid")
 	       (:file "vivace-graph-package" :depends-on ("uuid"))
+	       (:file "gettimeofday" :depends-on ("vivace-graph-package"))
+	       (:file "random" :depends-on ("vivace-graph-package"))
 	       (:file "conditions" :depends-on ("vivace-graph-package"))
 	       (:file "constants" :depends-on ("conditions"))
 	       (:file "globals" :depends-on ("constants"))
 	       (:file "utilities" :depends-on ("globals"))
-	       (:file "random" :depends-on ("utilities"))
-	       (:file "mcas" :depends-on ("utilities"))
+	       (:file "disk-storage" :depends-on ("utilities"))
+	       (:file "serialize" :depends-on ("disk-storage"))
+	       (:file "tx-log" :depends-on ("serialize" "gettimeofday"))
+	       (:file "mcas" :depends-on ("tx-log"))
 	       (:file "skip-list" :depends-on ("mcas" "random"))
 	       (:file "rete" :depends-on ("skip-list"))
 	       (:file "graph" :depends-on ("rete"))
 	       (:file "node" :depends-on ("graph"))
 	       (:file "triples" :depends-on ("node"))
-	       (:file "disk-storage" :depends-on ("graph" "triples"))
-	       (:file "serialize" :depends-on ("disk-storage"))
-	       (:file "tx-log" :depends-on ("serialize"))
-	       (:file "transactions" :depends-on ("tx-log"))
-	       (:file "prolog" :depends-on ("transactions"))
+	       (:file "prolog" :depends-on ("triples"))
 	       (:file "interface" :depends-on ("prolog"))))
