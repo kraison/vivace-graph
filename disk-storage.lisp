@@ -9,6 +9,15 @@
 (defun close-store (db)
   (dbm-close db))
 
+(defun open-hash (file)
+  (let ((db (make-instance 'tc-hdb)))
+    ;;(dbm-cache db :non-leaf 2048 :leaf 10240)
+    (dbm-open db file :READ :WRITE :CREATE)
+    db))
+
+(defun close-hash (db)
+  (dbm-close db))
+
 (defun lookup-object (db key)
   (dbm-get db key :octets))
 

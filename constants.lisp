@@ -21,8 +21,8 @@
 
 ;; Built-in type identifiers for serializing
 (defconstant +unknown+ 0)
-(defconstant +positive-integer+ 2)
 (defconstant +negative-integer+ 1)
+(defconstant +positive-integer+ 2)
 (defconstant +character+ 3)
 (defconstant +symbol+ 4)
 (defconstant +string+ 5)
@@ -41,11 +41,11 @@
 (defconstant +node+ 102)
 
 ;; Tags for sorting entry types in tokyo cabinet
-(defconstant +triple-key+ 1)
-(defconstant +node-key+ 2)
-(defconstant +triple-subject+ 3)
-(defconstant +triple-predicate+ 4)
-(defconstant +triple-object+ 5)
-(defconstant +node-ref-count+ 6)
-(defconstant +deleted-triple-key+ 7)
-(defconstant +text-index+ 8)
+(defconstant +triple-key+ 201)
+(defconstant +node-key+ 202)
+(defconstant +triple-subject+ 203)
+(defconstant +triple-predicate+ 204)
+(defconstant +triple-object+ 205)
+(defconstant +node-ref-count+ 206)
+(defconstant +deleted-triple-key+ 207)
+(defconstant +text-index+ 208)

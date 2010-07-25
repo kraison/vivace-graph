@@ -1,9 +1,9 @@
 (in-package #:vivace-graph)
 
 (defgeneric serialize (object))
-(defgeneric deserialize (become object))
+(defgeneric deserialize-help (become object))
 (defgeneric make-serialized-key (object))
-(defgeneric deserialize-raw (object))
+(defgeneric deserialize (object))
 (defgeneric serialized-eq (x y)) 
 (defgeneric serialized-lt (x y))
 (defgeneric serialized-gt (x y))
@@ -36,16 +36,25 @@
 	       ;; FIXME: ratios should be variable length, given that they encode 2 integers
 	       (= id-byte +ratio+))
 	   (values (aref a 1) 2))
-	  (t ;; strings, symbols, lists, vectors, blobs, nodes, triples have variable bytes
+	  (t ;; strings, lists, vectors, blobs, nodes, triples have variable bytes
 	   (let ((header-length (+ 2 (aref a 1))))
 	     (values (decode-length (subseq a 2 header-length)) header-length))))))
 
-(declaim (inline deserialize-raw))
-(defmethod deserialize-raw ((a array))
+(defun extract-all-subseqs (a)
+  (declare (optimize (speed 3)))
+  (cond ((= 0 (length a)) 
+	 nil)
+	(t 
+	 (multiple-value-bind (data-length header-length) (extract-length a)
+	   (cons (subseq a 0 (+ header-length data-length))
+		 (extract-all-subseqs (subseq a (+ header-length data-length))))))))
+
+(declaim (inline deserialize))
+(defmethod deserialize ((a array))
   (declare (optimize speed))
   (multiple-value-bind (data-length header-length) (extract-length a)
     (declare (ignore data-length))
-    (deserialize (aref a 0) (subseq a header-length))))
+    (deserialize-help (aref a 0) (subseq a header-length))))
 
 (defmethod serialized-eq ((x array) (y array))
   (equalp x y))
@@ -54,15 +63,15 @@
   "Compare two serialized items.
 FIXME: there is a way to do this without deserializing, it will just take some time to get right."
   (declare (optimize speed))
-  (less-than (deserialize-raw x) (deserialize-raw y)))
+  (less-than (deserialize x) (deserialize y)))
 
 (defmethod serialized-gt ((x array) (y array))
   "Compare two serialized items.
 FIXME: there is a way to do this without deserializing, it will just take some time to get right."
   (declare (optimize speed))
-  (greater-than (deserialize-raw x) (deserialize-raw y)))
+  (greater-than (deserialize x) (deserialize y)))
 
-(defmethod deserialize :around (become object)
+(defmethod deserialize :around (object)
   (handler-case
       (call-next-method)
     (error (condition)
@@ -74,7 +83,7 @@ FIXME: there is a way to do this without deserializing, it will just take some t
     (error (condition)
       (error 'serialization-error :instance object :reason condition))))
 
-(defmethod deserialize ((become (eql +uuid+)) bytes)
+(defmethod deserialize-help ((become (eql +uuid+)) bytes)
   "Decode a UUID."
   (uuid:byte-array-to-uuid bytes))
 
@@ -82,16 +91,16 @@ FIXME: there is a way to do this without deserializing, it will just take some t
   "Encode a UUID."
   (uuid:uuid-to-byte-array uuid +uuid+))
 
-(defmethod deserialize ((become (eql +positive-integer+)) bytes)
+(defmethod deserialize-help ((become (eql +positive-integer+)) bytes)
   "Decode a positive integer."
   (let ((int 0) (n-bytes (length bytes)))
     (dotimes (i n-bytes)
       (setq int (dpb (elt bytes i) (byte 8 (* i 8)) int)))
     int))
  
-(defmethod deserialize ((become (eql +negative-integer+)) bytes)
+(defmethod deserialize-help ((become (eql +negative-integer+)) bytes)
   "Decode a negative integer."
-  (- (deserialize +positive-integer+ bytes)))
+  (- (deserialize-help +positive-integer+ bytes)))
 
 (defmethod serialize ((int integer))
   "Encodes integers between (- (1- (expt 2 (* 8 255)))) and (1- (expt 2 (* 8 255)))"
@@ -108,25 +117,25 @@ FIXME: there is a way to do this without deserializing, it will just take some t
       (setq int (ash int -8)))
     vec))
 
-(defmethod deserialize ((become (eql +single-float+)) bytes)
-  (ieee-floats:decode-float32 (deserialize +positive-integer+ bytes)))
+(defmethod deserialize-help ((become (eql +single-float+)) bytes)
+  (ieee-floats:decode-float32 (deserialize-help +positive-integer+ bytes)))
 
 (defmethod serialize ((float single-float))
   (let ((vec (serialize (ieee-floats:encode-float32 float))))
     (setf (aref vec 0) +single-float+)
     vec))
 
-(defmethod deserialize ((become (eql +double-float+)) bytes)
-  (ieee-floats:decode-float64 (deserialize +positive-integer+ bytes)))
+(defmethod deserialize-help ((become (eql +double-float+)) bytes)
+  (ieee-floats:decode-float64 (deserialize-help +positive-integer+ bytes)))
 
 (defmethod serialize ((float double-float))
   (let ((vec (serialize (ieee-floats:encode-float64 float))))
     (setf (aref vec 0) +double-float+)
     vec))
 
-(defmethod deserialize ((become (eql +ratio+)) bytes)
-  (let ((numerator (deserialize +positive-integer+ (subseq bytes 1 (+ 1 (elt bytes 0)))))
-	(denominator (deserialize +positive-integer+ (subseq bytes (+ 2 (elt bytes 0))))))
+(defmethod deserialize-help ((become (eql +ratio+)) bytes)
+  (let ((numerator (deserialize-help +positive-integer+ (subseq bytes 1 (+ 1 (elt bytes 0)))))
+	(denominator (deserialize-help +positive-integer+ (subseq bytes (+ 2 (elt bytes 0))))))
     (/ numerator denominator)))
 
 (defmethod serialize ((ratio ratio))
@@ -145,7 +154,7 @@ FIXME: there is a way to do this without deserializing, it will just take some t
       (setf (aref vec 1) (- (length vec) 2))
       vec)))
     
-(defmethod deserialize ((become (eql +character+)) bytes)
+(defmethod deserialize-help ((become (eql +character+)) bytes)
   "Decode a Unicode-encoded byte sequence."
   (let ((int 0) (n-bytes (length bytes)))
     (dotimes (i n-bytes)
@@ -165,7 +174,7 @@ FIXME: there is a way to do this without deserializing, it will just take some t
       (setq code (ash code -8)))
     vec))
 
-(defmethod deserialize ((become (eql +string+)) bytes)
+(defmethod deserialize-help ((become (eql +string+)) bytes)
   (sb-ext:octets-to-string bytes))
 
 (defmethod serialize ((string string))
@@ -186,13 +195,9 @@ the length of the object."
       (setf (aref vec (+ 1 length-of-encoded-length i)) (aref unicode i)))
     vec))
 
-(defmethod deserialize ((become (eql +symbol+)) bytes)
-  "FIXME: adjust to new encoding."
-  (let* ((symbol-size (elt bytes 0))
-	 (package-size (elt bytes (1+ symbol-size))))
-    (intern (sb-ext:octets-to-string (subseq bytes 1 (1+ symbol-size)))
-	    (find-package (sb-ext:octets-to-string 
-			   (subseq bytes (+ 2 symbol-size) (+ 2 symbol-size package-size)))))))
+(defmethod deserialize-help ((become (eql +symbol+)) bytes)
+  (destructuring-bind (symbol package) (extract-all-subseqs bytes)
+    (intern (deserialize symbol) (find-package (deserialize package)))))
 
 (defmethod serialize ((symbol symbol))
   (declare (optimize (speed 3)))

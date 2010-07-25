@@ -14,7 +14,7 @@
 ;      (nreverse result))))
 
 (defun get-triples (&key s p o g)
-  (let ((*graph* (or g *graph*)) (nodes nil))
+  (let ((*graph* (or g *graph*)) (triples nil))
     (if (and s p o)
 	(lookup-triple s p o :g *graph*)
 	(progn
@@ -27,7 +27,7 @@
 	      (if (or p s)
 		  (setq triples (intersection triples (get-objects o)))
 		  (setq triples (get-objects o))))
-	  nodes))))
+	  triples))))
 
 ;(defun triple-count (&optional graph)
 ;  (skip-list-length (triples (or graph *graph*))))
