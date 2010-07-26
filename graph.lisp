@@ -19,7 +19,7 @@
   (delete-queue (sb-concurrency:make-queue))
   (needs-indexing-q (sb-concurrency:make-queue)))
 
-(defmethod print-graph (graph stream depth)
+(defun print-graph (graph stream depth)
   (declare (ignore depth))
   (format stream "#<GRAPH #~A: ~A>" (graph-uuid graph) (graph-name graph)))
 
@@ -28,9 +28,6 @@
 
 (defmethod needs-indexing? ((graph graph))
   (not (sb-concurrency:queue-empty-p (needs-indexing-q graph))))
-
-(defmethod do-indexing ((graph graph))
-  graph)
 
 (defun load-graph! (file)
   (let ((config (py-configparser:make-config)))

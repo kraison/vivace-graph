@@ -6,18 +6,9 @@
 (defconstant +mcas-undecided+ :undecided)
 (defconstant +mcas-failed+ :failed)
 (defconstant +mcas-succeeded+ :succeeded)
-(defconstant +mcas-make-durable+ :make-durable)
 
 ;; MCAS transaction global
 (defvar *mcas* nil)
-
-;; Higher level transaction status markers
-(defconstant +tx-undecided+ :undecided)
-(defconstant +tx-failed+ :failed)
-(defconstant +tx-succeeded+ :succeeded)
-
-;; Higher level transaction global
-(defvar *transaction* nil)
 
 ;; Built-in type identifiers for serializing
 (defconstant +unknown+ 0)

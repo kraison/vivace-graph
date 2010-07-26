@@ -17,6 +17,8 @@
 	       :sb-concurrency
 	       :sb-posix
 	       :cl-tokyo-cabinet
+	       :cl-skip-list
+	       :local-time
 	       :montezuma
 	       :py-configparser
 	       :usocket
@@ -33,12 +35,9 @@
 	       (:file "utilities" :depends-on ("globals"))
 	       (:file "disk-storage" :depends-on ("utilities"))
 	       (:file "serialize" :depends-on ("disk-storage"))
-	       (:file "tx-log" :depends-on ("serialize" "gettimeofday"))
-	       (:file "mcas" :depends-on ("tx-log"))
-	       (:file "skip-list" :depends-on ("mcas" "random"))
-	       (:file "rete" :depends-on ("skip-list"))
-	       (:file "graph" :depends-on ("rete"))
+	       (:file "graph" :depends-on ("serialize"))
 	       (:file "node" :depends-on ("graph"))
 	       (:file "triples" :depends-on ("node"))
-	       (:file "prolog" :depends-on ("triples"))
+	       (:file "rete" :depends-on ("triples"))
+	       (:file "prolog" :depends-on ("rete"))
 	       (:file "interface" :depends-on ("prolog"))))

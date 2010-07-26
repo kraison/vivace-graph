@@ -20,11 +20,11 @@
   (:method ((n1 node) (n2 node)) (uuid:uuid-eql (node-uuid n1) (node-uuid n2)))
   (:method (n1 n2) (error "Both arguments to node-eql must be nodes.")))
 
-(defgeneric node-equalp (n1 n2)
+(defgeneric node-equal (n1 n2)
   (:method ((n1 node) (n2 node)) 
     (and (uuid:uuid-eql (node-uuid n1) (node-uuid n2))
-	 (equalp (node-value n1) (node-value n2))))
-  (:method (n1 n2) (error "Both arguments to node-equalp must be nodes.")))
+	 (equal (node-value n1) (node-value n2))))
+  (:method (n1 n2) (error "Both arguments to node-equal must be nodes.")))
 
 (defmethod serialize ((node node))
   "FIXME: add ref count to serialized value?"
@@ -135,4 +135,3 @@
 	      (declare (ignore status))
 	      (when cache? (cache-node node))
 	      node))))))
-

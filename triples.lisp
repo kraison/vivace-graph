@@ -33,14 +33,14 @@
   (:method ((t1 triple) (t2 triple)) (uuid:uuid-eql (triple-uuid t1) (triple-uuid t2)))
   (:method (t1 t2) (error "Both arguments to triple-eql must be triples.")))
 
-(defgeneric triple-equalp (t1 t2)
+(defgeneric triple-equal (t1 t2)
   (:method ((t1 triple) (t2 triple)) 
     (and (uuid:uuid-eql (triple-uuid t1) (triple-uuid t2))
-	 (node-equalp (triple-subject t1) (triple-subject t2))
-	 (node-equalp (triple-predicate t1) (triple-predicate t2))
-	 (node-equalp (triple-object t1) (triple-object t2))))
+	 (node-equal (triple-subject t1) (triple-subject t2))
+	 (node-equal (triple-predicate t1) (triple-predicate t2))
+	 (node-equal (triple-object t1) (triple-object t2))))
   (:method (t1 t2) 
-    (error "Both arguments to triple-equalp must be triples.")))
+    (error "Both arguments to triple-equal must be triples.")))
 
 (defmethod deserialize-help ((become (eql +triple+)) bytes)
   "Decode a triple."

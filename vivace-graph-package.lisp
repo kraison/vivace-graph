@@ -1,7 +1,7 @@
 (in-package #:cl-user)
 
 (defpackage #:vivace-graph
-  (:use #:cl #:cffi #:bordeaux-threads #:tokyo-cabinet #:tokyo-cabinet-ffi)
+  (:use #:cl #:cffi #:bordeaux-threads #:tokyo-cabinet #:tokyo-cabinet-ffi #:local-time)
   (:export 
    #:graph?
    #:load-graph!
