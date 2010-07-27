@@ -30,10 +30,13 @@
 (defconstant +uuid+ 100)
 (defconstant +triple+ 101)
 (defconstant +node+ 102)
+(defconstant +predicate+ 103)
+(defconstant +timestamp+ 104)
 
 ;; Tags for sorting entry types in tokyo cabinet
 (defconstant +triple-key+ 201)
 (defconstant +node-key+ 202)
+(defconstant +predicate-key+ 209)
 (defconstant +triple-subject+ 203)
 (defconstant +triple-predicate+ 204)
 (defconstant +triple-object+ 205)

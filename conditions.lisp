@@ -1,5 +1,12 @@
 (in-package #:vivace-graph)
 
+(define-condition persistence-error (error)
+  ((instance :initarg :instance)
+   (reason :initarg :reason))
+  (:report (lambda (error stream)
+	     (with-slots (instance reason) error
+	       (format stream "Persistence failed for ~a because of ~a." instance reason)))))
+
 (define-condition skip-list-duplicate-error (error)
   ((key :initarg :key)
    (value :initarg :value))

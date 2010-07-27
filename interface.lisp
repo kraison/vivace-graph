@@ -3,7 +3,7 @@
 (defun add-triple (subject predicate object &optional graph)
   (let ((*graph* (or graph *graph*)))
     (let ((subject (or (lookup-node subject *graph*) (make-new-node :value subject)))
-	  (predicate (or (lookup-node predicate *graph*) (make-new-node :value predicate)))
+	  (predicate (or (lookup-predicate predicate *graph*) (make-new-predicate :name predicate)))
 	  (object (or (lookup-node object *graph*) (make-new-node :value object))))
       (make-new-triple *graph* subject predicate object))))
 

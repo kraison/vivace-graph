@@ -41,8 +41,7 @@
     (dotimes (i (length serialized-id))
       (setf (aref vec (+ 1 length-of-encoded-length i)) (aref serialized-id i)))
     (dotimes (i (length serialized-value))
-      (setf (aref vec (+ 1 length-of-encoded-length 
-			 (length serialized-id) i)) 
+      (setf (aref vec (+ 1 length-of-encoded-length (length serialized-id) i))
 	    (aref serialized-value i)))
     vec))
 
@@ -128,7 +127,7 @@
 	(let ((node (make-node :value value :graph *graph*)))
 	  (handler-case
 	      (save-node node)
-	    (dbm-error (condition)
+	    (persistence-error (condition)
 	      (declare (ignore condition))
 	      (lookup-node value *graph*))
 	    (:no-error (status)
