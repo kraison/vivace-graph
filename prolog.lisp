@@ -135,7 +135,7 @@
 
 (defun get-clauses (predicate)
   (let ((p (lookup-predicate predicate *graph*)))
-    (append (get-predicates predicate) (pred-clauses p))))
+    (nconc (get-predicates predicate) (pred-clauses p))))
 
 (defmethod predicate ((triple triple))
   (pred-name (triple-predicate triple)))
