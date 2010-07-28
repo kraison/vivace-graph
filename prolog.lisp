@@ -73,8 +73,13 @@
 	(t nil)))
 
 (defun unify (x y &optional (bindings +no-bindings+))
-  (cond ((eq bindings +fail+) +fail+)
-	((equal x y) bindings)
+  (format t "unifying ~A (~a) / ~A (~a)~%" x (type-of x) y (type-of y))
+  (cond ((eq bindings +fail+) 
+	 (format t "FAIL for ~A / ~A~%" x y)
+	 +fail+)
+	((equal x y) 
+	 (format t "EQUAL for ~A / ~A~%" x y)
+	 bindings)
 	((variable-p x) (unify-variable x y bindings))
 	((variable-p y) (unify-variable y x bindings))
 	((and (consp x) (consp y))
@@ -113,21 +118,24 @@
   (subst-bindings (unify x y) x))
 
 (defmethod clause-head ((triple triple))
+  (format t "IN CLAUSE-HEAD FOR ~A~%" triple)
   (list (pred-name (triple-predicate triple))
 	(node-value (triple-subject triple)) 
 	(node-value (triple-object triple))))
 
-(defmethod clause-head ((tuple list))
-  tuple)
+(defmethod clause-head ((list list))
+  (format t "IN CLAUSE-HEAD FOR ~A~%" list)
+  (first list))
 
 (defmethod clause-body ((triple triple))
   nil)
 
-(defmethod clause-body ((tuple list))
-  tuple)
+(defmethod clause-body ((list list))
+  (rest list))
 
 (defun get-clauses (predicate)
-  (get-predicates predicate))
+  (let ((p (lookup-predicate predicate *graph*)))
+    (append (get-predicates predicate) (pred-clauses p))))
 
 (defmethod predicate ((triple triple))
   (pred-name (triple-predicate triple)))
@@ -145,15 +153,14 @@
 
 (defun add-clause (clause)
   "add a clause to the triple store. Order of args: predicate, subject, object."
-  (let ((predicate-name (first clause)))
+  (let ((predicate-name (predicate (clause-head clause))))
     (assert (and (atom predicate-name) (not (variable-p predicate-name))))
     (when (stringp predicate-name) (setq predicate-name (intern predicate-name)))
-    (if (and (= 3 (length clause))
-	     (atom (second clause))
-	     (atom (third clause))
-	     (not (variable-p (second clause)))
-	     (not (variable-p (third clause))))
-	(add-triple (second clause) predicate-name (third clause) *graph*)
+    (if (and (= 1 (length clause))
+	     (= 3 (length (first clause)))
+	     (not (variable-p (second (first clause))))
+	     (not (variable-p (third (first clause)))))
+	(add-triple (second (first clause)) predicate-name (third (first clause)) *graph*)
 	(let ((predicate (make-new-predicate :name predicate-name)))
 	  (add-rule predicate clause)
 	  predicate-name))))
@@ -164,7 +171,7 @@
 (defmacro rule (&rest clauses)
   `(add-rule ',(replace-?-vars clauses) ,*graph*))
 
-(defmacro <- (clause)
+(defmacro <- (&rest clause)
   "add a clause to the triple store. Order of args: predicate, subject, object."
   `(add-clause ',(replace-?-vars clause)))
 
@@ -187,14 +194,18 @@
 	  x))
 
 (defun prove (goal bindings)
+  (format t "Proving ~A~%" goal)
   (when (stringp (first goal)) (setf (nth 0 goal) (intern (nth 0 goal))))
   (mapcan #'(lambda (clause)
 	      (let ((new-clause (rename-variables clause)))
+		(format t "  Proving ~A~%" new-clause)
+		(format t "  proving clause body: ~A~%" (clause-body new-clause))
 		(prove-all (clause-body new-clause)
 			   (unify goal (clause-head new-clause) bindings))))
 	  (get-clauses (predicate goal))))
 
 (defun prove-all (goals bindings)
+  (format t "prove-all: ~A~%" goals)
   (cond ((eq bindings +fail+) +fail+)
 	((null goals) (list bindings))
 	(t (mapcan #'(lambda (goal1-solution)
@@ -215,7 +226,12 @@
   (values))
 
 (defun top-level-prove (goals)
-  (show-prolog-solutions (variables-in goals) (prove-all goals +no-bindings+)))
+  (show-prolog-solutions (variables-in goals) 
+			 (prove-all (mapcar #'(lambda (g)
+						(when (stringp (first g)) 
+						  (setf (nth 0 g) (intern (nth 0 g))))
+						g)
+					    goals) +no-bindings+)))
 
 (defmacro ?- (&rest goals)
   `(let ((*trail* (make-array 200 :fill-pointer 0 :adjustable t))

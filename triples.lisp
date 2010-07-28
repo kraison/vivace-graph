@@ -296,6 +296,7 @@
 	   (add-triple "Echo" "loves" "cat nip")
 	   (add-triple "Echo" "is-a" "cat")
 	   (add-triple "Kevin" "is-a" "Homo Sapien")
+	   (add-triple "Dustie" "is-a" "Homo Sapien")
 	   ;;(format t "NODES ~A:~%~A~%" (nodes *graph*) (skip-list-to-list (nodes *graph*)))
 	   (format t "Who loves whom? -> ~A~%" (get-triples :p "loves"))
 	   (format t "What species? -> ~A~%" (get-triples :p "is-a"))

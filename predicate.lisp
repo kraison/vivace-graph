@@ -127,6 +127,11 @@
 
 (defmethod add-rule ((predicate predicate) clause)
   "Lock the predicate for compilation, add the clause, persist it and recompile."
+  (setq clause (mapcar #'(lambda (g)
+			   (when (stringp (first g)) 
+			     (setf (nth 0 g) (intern (nth 0 g))))
+			   g)
+		       clause))
   (with-recursive-lock-held ((pred-lock predicate))
     (setf (pred-clauses predicate) (nconc (pred-clauses predicate) (list clause)))
     (update-predicate predicate)
