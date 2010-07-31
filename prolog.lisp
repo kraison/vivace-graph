@@ -73,12 +73,12 @@
 	(t nil)))
 
 (defun unify (x y &optional (bindings +no-bindings+))
-  (format t "unifying ~A (~a) / ~A (~a)~%" x (type-of x) y (type-of y))
+  ;(format t "unifying ~A (~a) / ~A (~a)~%" x (type-of x) y (type-of y))
   (cond ((eq bindings +fail+) 
-	 (format t "FAIL for ~A / ~A~%" x y)
+	 ;(format t "FAIL for ~A / ~A~%" x y)
 	 +fail+)
 	((equal x y) 
-	 (format t "EQUAL for ~A / ~A~%" x y)
+	 ;(format t "EQUAL for ~A / ~A~%" x y)
 	 bindings)
 	((variable-p x) (unify-variable x y bindings))
 	((variable-p y) (unify-variable y x bindings))
@@ -118,13 +118,13 @@
   (subst-bindings (unify x y) x))
 
 (defmethod clause-head ((triple triple))
-  (format t "IN CLAUSE-HEAD FOR ~A~%" triple)
+  ;(format t "IN CLAUSE-HEAD FOR ~A~%" triple)
   (list (pred-name (triple-predicate triple))
 	(node-value (triple-subject triple)) 
 	(node-value (triple-object triple))))
 
 (defmethod clause-head ((list list))
-  (format t "IN CLAUSE-HEAD FOR ~A~%" list)
+  ;(format t "IN CLAUSE-HEAD FOR ~A~%" list)
   (first list))
 
 (defmethod clause-body ((triple triple))
@@ -132,10 +132,6 @@
 
 (defmethod clause-body ((list list))
   (rest list))
-
-(defun get-clauses (predicate)
-  (let ((p (lookup-predicate predicate *graph*)))
-    (nconc (get-predicates predicate) (pred-clauses p))))
 
 (defmethod predicate ((triple triple))
   (pred-name (triple-predicate triple)))
@@ -145,7 +141,7 @@
 
 (defun replace-?-vars (exp)
   "Replace any ? within exp with a var of the form ?123."
-  (cond ((eq exp '?) (gensym "?"))
+  (cond ((eq exp '?) (intern (symbol-name (gensym "?"))))
 	((atom exp) exp)
 	(t (reuse-cons (replace-?-vars (first exp))
 		       (replace-?-vars (rest exp))
@@ -154,6 +150,7 @@
 (defun add-clause (clause)
   "add a clause to the triple store. Order of args: predicate, subject, object."
   (let ((predicate-name (predicate (clause-head clause))))
+    (format t "1. Adding clause ~A: ~A~%" predicate-name clause)
     (assert (and (atom predicate-name) (not (variable-p predicate-name))))
     (when (stringp predicate-name) (setq predicate-name (intern predicate-name)))
     (if (and (= 1 (length clause))
@@ -163,7 +160,7 @@
 	(add-triple (second (first clause)) predicate-name (third (first clause)) *graph*)
 	(let ((predicate (make-new-predicate :name predicate-name)))
 	  (add-rule predicate clause)
-	  predicate-name))))
+	  predicate))))
 
 (defmacro fact (&rest clause)
   `(add-triple ,(second clause) ,(first clause) ,(third clause)))
@@ -171,9 +168,9 @@
 (defmacro rule (&rest clauses)
   `(add-rule ',(replace-?-vars clauses) ,*graph*))
 
-(defmacro <- (&rest clause)
+(defmacro <- (&rest clauses)
   "add a clause to the triple store. Order of args: predicate, subject, object."
-  `(add-clause ',(replace-?-vars clause)))
+  `(add-clause ',(replace-?-vars clauses)))
 
 (defun unique-find-anywhere-if (predicate tree &optional found-so-far)
   (if (atom tree)
@@ -192,20 +189,23 @@
   (sublis (mapcar #'(lambda (var) (cons var (gensym (string var))))
 		  (variables-in x))
 	  x))
+(defun get-clauses (predicate)
+  (let ((p (lookup-predicate predicate *graph*)))
+    (nconc (get-predicates predicate) (pred-clauses p))))
 
 (defun prove (goal bindings)
-  (format t "Proving ~A~%" goal)
+  ;(format t "Proving ~A~%" goal)
   (when (stringp (first goal)) (setf (nth 0 goal) (intern (nth 0 goal))))
   (mapcan #'(lambda (clause)
 	      (let ((new-clause (rename-variables clause)))
-		(format t "  Proving ~A~%" new-clause)
-		(format t "  proving clause body: ~A~%" (clause-body new-clause))
+		;(format t "  Proving ~A~%" new-clause)
+		;(format t "  proving clause body: ~A~%" (clause-body new-clause))
 		(prove-all (clause-body new-clause)
 			   (unify goal (clause-head new-clause) bindings))))
 	  (get-clauses (predicate goal))))
 
 (defun prove-all (goals bindings)
-  (format t "prove-all: ~A~%" goals)
+  ;(format t "prove-all: ~A~%" goals)
   (cond ((eq bindings +fail+) +fail+)
 	((null goals) (list bindings))
 	(t (mapcan #'(lambda (goal1-solution)
@@ -237,3 +237,39 @@
   `(let ((*trail* (make-array 200 :fill-pointer 0 :adjustable t))
 	 (*var-counter* 0))
      (top-level-prove ',(replace-?-vars goals))))
+
+#|
+(defun ptest ()
+  (<- (member ?item (?item . ?rest)))
+  (<- (member ?item (?x . ?rest)) (member ?item ?rest))
+  (<- (nextto ?x ?y ?list) (iright ?x ?y ?list))
+  (<- (nextto ?x ?y ?list) (iright ?y ?x ?list))
+  (<- (iright ?left ?right (?left ?right . ?rest)))
+  (<- (iright ?left ?right (?x . ?rest))
+      (iright ?left ?right ?rest))
+  (<- (= ?x ?x))
+  (<- (zebra ?h ?w ?z)
+      (= ?h ((house norwegian ? ? ? ?)
+	     ?
+	     (house ? ? ? milk ?) ? ?))
+      (member (house englishman ? ? ? red) ?h)
+      (member (house spaniard dog ? ? ?) ?h)
+      (member (house ? ? ? coffee green) ?h)
+      (member (house ukranian ? ? tea ?) ?h)
+      (iright (house ? ? ? ? ivory)
+	      (house ? ? ? ? green) ?h)
+      (member (house ? snails winston ? ?) ?h)
+      (member (house ? ? kools ? yellow) ?h)
+      (nextto (house ? ? chesterfield ? ?)
+	      (house ? fox ? ? ?) ?h)
+      (nextto (house ? ? kools ? ?)
+	      (house ? horse ? ? ?) ?h)
+      (member (house ? ? luckystrike orange-juice ?) ?h)
+      (member (house japanese ? parliaments ? ?) ?h)
+      (nextto (house norwegian ? ? ? ?)
+	      (house ? ? ? ? blue) ?h)
+      (member (house ?w ? ? water ?) ?h)
+      (member (house ?z zebra ? ? ?) ?h)))
+
+  (?- (zebra ?houses ?water-drinker ?zebra-owner))) ;; 4.1 seconds in interpreted mode
+|#

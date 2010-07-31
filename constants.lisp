@@ -25,6 +25,7 @@
 (defconstant +t+ 11)
 (defconstant +null+ 12)
 (defconstant +blob+ 13) ;; Uninterpreted octets
+(defconstant +dotted-list+ 14)
 
 ;; User-defined type identifiers for serializing. Start at 100
 (defconstant +uuid+ 100)
@@ -40,6 +41,9 @@
 (defconstant +triple-subject+ 203)
 (defconstant +triple-predicate+ 204)
 (defconstant +triple-object+ 205)
-(defconstant +node-ref-count+ 206)
-(defconstant +deleted-triple-key+ 207)
-(defconstant +text-index+ 208)
+(defconstant +triple-subject-predicate+ 206)
+(defconstant +triple-subject-object+ 207)
+(defconstant +triple-predicate-object+ 208)
+(defconstant +node-ref-count+ 209)
+(defconstant +deleted-triple-key+ 210)
+(defconstant +text-index+ 211)

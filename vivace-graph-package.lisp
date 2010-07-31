@@ -3,6 +3,7 @@
 (defpackage #:vivace-graph
   (:use #:cl #:cffi #:bordeaux-threads #:tokyo-cabinet #:tokyo-cabinet-ffi #:local-time)
   (:export 
+   #:*graph*
    #:graph?
    #:load-graph!
    #:make-new-graph
@@ -34,6 +35,7 @@
    #:delete-rule
 
    #:<-
+   #:?-
    #:prolog
    #:query
    #:traverse

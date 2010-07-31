@@ -12,7 +12,6 @@
   (graph *graph*))
 
 (defgeneric save-predicate (predicate))
-(defgeneric prolog-compile (name &optional clauses))
 
 (defgeneric predicate-eql (p1 p2)
   (:method ((p1 predicate) (p2 predicate)) (eql (pred-name p1) (pred-name p2)))
@@ -78,15 +77,12 @@
 (defmethod save-predicate ((predicate predicate))
   (let ((key (make-serialized-key predicate))
 	(value (serialize predicate)))
-    (store-object (graph-db (pred-graph predicate)) key value :mode :keep)))
+    (store-object (rules-db (pred-graph predicate)) key value :mode :keep)))
 
 (defmethod update-predicate ((predicate predicate))
   (let ((key (make-serialized-key predicate))
 	(value (serialize predicate)))
-    (store-object (graph-db (pred-graph predicate)) key value :mode :replace)))
-
-(defun prolog-compile (n i)
-  i)
+    (store-object (rules-db (pred-graph predicate)) key value :mode :replace)))
 
 (defgeneric lookup-predicate (name graph)
   (:method ((predicate predicate) (graph graph))
@@ -98,16 +94,15 @@
     (lookup-predicate (intern name) graph))
   (:method ((name symbol) (graph graph))
     (or (gethash name (predicate-cache graph))
-	(let ((raw (lookup-object (graph-db graph) (make-predicate-key-from-name name))))
+	(let ((raw (lookup-object (rules-db graph) (make-predicate-key-from-name name))))
 	  (when (vectorp raw)
 	    (let ((predicate (deserialize raw)))
 	      (when (predicate? predicate)
-		(setf (pred-graph predicate) graph)
-		(setf (pred-key predicate) (make-predicate-key-from-name name))
+		(setf (pred-graph predicate) graph
+		      (pred-key predicate) (make-predicate-key-from-name name))
 		(when (pred-clauses predicate)
-		  (setf (pred-func predicate) (prolog-compile name (pred-clauses predicate))))
-		(cache-predicate predicate)
-		predicate)))))))
+		  (setf (pred-func predicate) (prolog-compile predicate)))
+		(cache-predicate predicate))))))))
 
 (defun make-new-predicate (&key name graph)
   (let ((name (or (and (symbolp name) name)
@@ -125,6 +120,13 @@
 	  (cache-predicate predicate)
 	  predicate)))))
 
+(defmethod add-default-rule ((predicate predicate))
+  "Lock the predicate for compilation, add the clause, persist it and recompile."
+  (format t "2. Adding default functor for ~A~%" predicate)
+  (with-recursive-lock-held ((pred-lock predicate))
+    (prolog-compile predicate))
+  predicate)
+
 (defmethod add-rule ((predicate predicate) clause)
   "Lock the predicate for compilation, add the clause, persist it and recompile."
   (setq clause (mapcar #'(lambda (g)
@@ -132,10 +134,18 @@
 			     (setf (nth 0 g) (intern (nth 0 g))))
 			   g)
 		       clause))
+  (format t "2. Adding clause ~A / ~A~%" (pred-name predicate) clause)
   (with-recursive-lock-held ((pred-lock predicate))
-    (setf (pred-clauses predicate) (nconc (pred-clauses predicate) (list clause)))
+    (let ((old-clauses (pred-clauses predicate)))
+      (setf (pred-clauses predicate) (append old-clauses (list clause))))
     (update-predicate predicate)
-    (cas (pred-func predicate) 
-	 (pred-func predicate)
-	 (prolog-compile (pred-name predicate) (pred-clauses predicate))))
-  t)
+    (prolog-compile predicate))
+  (pred-clauses predicate))
+
+(defmethod delete-rule (name)
+  (let ((name (or (and (symbolp name) name)
+		  (and (stringp name) (intern name)))))
+    (remhash name (predicate-cache *graph*))
+    (delete-object (rules-db *graph*) (make-predicate-key-from-name name))))
+
+

@@ -88,7 +88,7 @@
 (defun make-triple-key-from-values (s p o)
   (declare (optimize (speed 3)))
   (let ((serialized-s (serialize s))
-	(serialized-p (serialize p))
+	(serialized-p (serialize (or (and (symbolp p) p) (intern p))))
 	(serialized-o (serialize o)))
     (let* ((s-length (length serialized-s))
 	   (p-length (length serialized-p))
@@ -124,6 +124,24 @@
 	(setf (aref vec (1+ i)) (aref serialized-value i)))
       vec)))
     
+(defun make-combined-triple-key (v1 v2 index-type)
+  (make-triple-index-key (format nil "~A~A~A" v1 #\Nul v2) index-type))
+
+(defmethod make-triple-sp-key ((triple triple))
+  (make-combined-triple-key (node-value (triple-subject triple)) 
+			    (pred-name (triple-predicate triple)) 
+			    +triple-subject-predicate+))
+
+(defmethod make-triple-so-key ((triple triple))
+  (make-combined-triple-key (node-value (triple-subject triple)) 
+			    (node-value (triple-object triple))
+			    +triple-subject-object+))
+
+(defmethod make-triple-po-key ((triple triple))
+  (make-combined-triple-key (pred-name (triple-predicate triple)) 
+			    (node-value (triple-object triple))
+			    +triple-predicate-object+))
+
 (defun get-indexed-triples (value index-type &optional graph)
   (mapcar #'(lambda (vec) (deserialize (lookup-object (graph-db (or graph *graph*)) vec)))
 	  (lookup-objects (graph-db (or graph *graph*)) 
@@ -138,6 +156,27 @@
 (defun get-objects (value &optional graph)
   (get-indexed-triples value +triple-object+ graph))
 
+(defun get-subjects-predicates (subject predicate &optional graph)
+  (get-indexed-triples 
+   (format nil "~A~A~A" 
+	   (if (node? subject) (node-value subject) subject) #\Nul
+	   (if (predicate? predicate) (pred-name predicate) predicate))
+   +triple-subject-predicate+ graph))
+
+(defun get-subjects-objects (subject object &optional graph)
+  (get-indexed-triples 
+   (format nil "~A~A~A"
+	   (if (node? subject) (node-value subject) subject) #\Nul
+	   (if (node? object) (node-value object) object))
+   +triple-subject-object+ graph))
+
+(defun get-predicates-objects (predicate object &optional graph)
+  (get-indexed-triples 
+   (format nil "~A~A~A"
+	   (if (predicate? predicate) (pred-name predicate) predicate) #\Nul
+	   (if (node? object) (node-value object) object))
+   +triple-predicate-object+ graph))
+  
 (defmethod lookup-triple ((subject node) (predicate predicate) (object node) &key g)
   (or (gethash (list subject predicate object) (triple-cache (or g *graph*)))
       (lookup-triple (node-value subject) (pred-name predicate) (node-value object) 
@@ -238,10 +277,17 @@
 					      +triple-predicate+))
 	(object-key (make-triple-index-key (node-value (triple-object triple)) 
 					   +triple-object+))
+	(sp-key (make-triple-sp-key triple))
+	(so-key (make-triple-so-key triple))
+	(po-key (make-triple-po-key triple))
 	(triple-key (make-serialized-key triple)))
-    (store-object (graph-db (triple-graph triple)) subject-key triple-key :mode :duplicate)
-    (store-object (graph-db (triple-graph triple)) predicate-key triple-key :mode :duplicate)
-    (store-object (graph-db (triple-graph triple)) object-key triple-key :mode :duplicate)))
+    (with-transaction ((graph-db (triple-graph triple)))
+      (store-object (graph-db (triple-graph triple)) sp-key triple-key :mode :duplicate)
+      (store-object (graph-db (triple-graph triple)) so-key triple-key :mode :duplicate)
+      (store-object (graph-db (triple-graph triple)) po-key triple-key :mode :duplicate)
+      (store-object (graph-db (triple-graph triple)) subject-key triple-key :mode :duplicate)
+      (store-object (graph-db (triple-graph triple)) predicate-key triple-key :mode :duplicate)
+      (store-object (graph-db (triple-graph triple)) object-key triple-key :mode :duplicate))))
 
 (defmethod do-indexing ((graph graph))
   (loop until (sb-concurrency:queue-empty-p (needs-indexing-q graph)) do
@@ -264,9 +310,10 @@
 (defun triple-test-1 ()
   (let ((*graph* (make-new-graph :name "test graph" :location "/var/tmp")))
     (unwind-protect
-	 (with-transaction ((graph-db *graph*))
-	   (dotimes (i 10000)
-	     (add-triple (format nil "S~A" i) (format nil "P~A" i) (format nil "O~A" i))))
+	 (time
+	  (with-transaction ((graph-db *graph*))
+	    (dotimes (i 10000)
+	      (add-triple (format nil "S~A" i) (format nil "P~A" i) (format nil "O~A" i)))))
       (progn
 	(if (graph? *graph*) (shutdown-graph *graph*))
 	(delete-file "/var/tmp/triples")

@@ -41,5 +41,5 @@
 	       (:file "node" :depends-on ("graph" "data-types"))
 	       (:file "triples" :depends-on ("predicate" "node"))
 	       (:file "rules" :depends-on ("triples"))
-	       (:file "prolog" :depends-on ("rules"))
-	       (:file "interface" :depends-on ("prolog"))))
+	       (:file "prologc" :depends-on ("rules"))
+	       (:file "interface" :depends-on ("prologc"))))

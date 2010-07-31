@@ -20,5 +20,3 @@
 	     (:conc-name rete-))
   type children parent tokens graph)
 
-(defun add-rule (s p o &optional g)
-  )
