@@ -184,12 +184,17 @@
 
 (declaim (inline lookup-triple-in-db))
 (defun lookup-triple-in-db (s p o g)
-  (let ((key (make-triple-key-from-values s p o)))
-    (let ((raw (lookup-object (graph-db (or g *graph*)) key)))
-      (when (vectorp raw)
-	(let ((triple (deserialize raw)))
-	  (setf (triple-graph triple) (or g *graph*))
-	  triple)))))
+  (handler-case
+      (let ((key (make-triple-key-from-values s p o)))
+	(let ((raw (lookup-object (graph-db (or g *graph*)) key)))
+	  (when (vectorp raw)
+	    (let ((triple (deserialize raw)))
+	      (setf (triple-graph triple) (or g *graph*))
+	      triple))))
+    (serialization-error (condition)
+      (declare (ignore condition))
+      (format t "Cannot lookup ~A/~A/~A~%" s p o)
+      nil)))
 
 (defmethod lookup-triple (s p o &key g)
   (or (gethash (list s p o) (triple-cache (or g *graph*)))

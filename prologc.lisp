@@ -92,10 +92,10 @@
 (defmethod prolog-compile ((predicate predicate))
   (if (null (pred-clauses predicate))
       (progn
-	(format t "Compiling search-only functor for ~A~%" (pred-name predicate))
+	;(format t "Compiling search-only functor for ~A~%" (pred-name predicate))
 	(prolog-compile-search predicate))
       (progn
-	(format t "Compiling normal functor for ~A~%" (pred-name predicate))
+	;(format t "Compiling normal functor for ~A~%" (pred-name predicate))
 	(prolog-compile-help predicate (pred-clauses predicate)))))
 
 (defun clauses-with-arity (clauses test arity)
@@ -340,7 +340,7 @@
 (defun add-clause (clause)
   "add a clause to the triple store. Order of args: predicate, subject, object."
   (let ((predicate-name (predicate (clause-head clause))))
-    (format t "1. Adding clause ~A: ~A~%" predicate-name clause)
+    ;(format t "1. Adding clause ~A: ~A~%" predicate-name clause)
     (assert (and (atom predicate-name) (not (variable-p predicate-name))))
     (when (stringp predicate-name) (setq predicate-name (intern predicate-name)))
     (if (and (= 1 (length clause))
@@ -405,6 +405,7 @@
 
 (defun compile-triple-search (s p o)
   `(cond ((and (not (has-variable-p (var-deref ,s))) (not (has-variable-p (var-deref ,o)))
+	       (not (consp ,s)) (not (consp ,o))
 	       (or (not (var-p ,s)) (and (var-p ,s) (bound-p ,s)))
 	       (or (not (var-p ,o)) (and (var-p ,o) (bound-p ,o))))
 	  (let ((triple (lookup-triple (var-deref ,s) ,p (var-deref ,o))))
@@ -416,10 +417,10 @@
 		  (undo-bindings! old-trail)))))
 	 (t
 	  (let ((triples 
-		 (cond ((and (not (has-variable-p ,s)) 
+		 (cond ((and (not (has-variable-p ,s)) (not (consp ,s))
 			     (or (not (var-p ,s)) (and (var-p ,s) (bound-p ,s))))
 			(get-triples :s (var-deref ,s) :p ,p))
-		       ((and (not (has-variable-p ,o))
+		       ((and (not (has-variable-p ,o)) (not (consp ,o))
 			     (or (not (var-p ,o)) (and (var-p ,o) (bound-p ,o))))
 			(get-triples :o (var-deref ,o) :p ,p))
 		       (t
@@ -441,7 +442,7 @@
 		  ,(compile-triple-search (first parameters) 
 					  `',(pred-name predicate)
 					  (second parameters))))))
-      (format t "prolog-compile-search:~%~A~%~%" func)
+      ;(format t "prolog-compile-search:~%~A~%~%" func)
       (setf (gethash *predicate* (functors (pred-graph predicate)))
 	    (eval func)))))
   
@@ -461,7 +462,7 @@
 		     (mapcar #'(lambda (clause)
 				 (compile-clause parameters clause 'cont))
 			     clauses))))))
-      (format t "compile-predicate: ~%~A~%~%" func)
+      ;(format t "compile-predicate: ~%~A~%~%" func)
       (setf (gethash *predicate* (functors (pred-graph predicate)))
 	    (eval func)))))
 
@@ -536,7 +537,7 @@
 	       (setf (gethash *predicate* (functors *graph*)) (eval func)))
 	     (funcall (gethash *predicate* (functors *graph*)) #'prolog-ignore)))
       (remhash *predicate* (functors *graph*)))
-    (reverse *select-list*)))
+    (nreverse *select-list*)))
 
 (defmacro select (vars &rest goals)
   `(top-level-select ',vars ',(replace-?-vars goals)))
@@ -545,7 +546,7 @@
   (setf (gethash 'show-prolog-vars/2 (functors graph))
 	#'(lambda (var-names vars cont)
 	    (block show-prolog-vars/2
-	      (format t "show-prolog-vars/2: ~A ; ~A ; ~A~%" var-names vars cont)
+	      ;(format t "show-prolog-vars/2: ~A ; ~A ; ~A~%" var-names vars cont)
 	      (if (null vars)
 		  (format t "~&Yes")
 		  (loop for name in var-names
@@ -557,7 +558,7 @@
   (setf (gethash 'select/2 (functors graph))
 	#'(lambda (var-names vars cont)
 	    (block select/2
-	      (format t "select/2: ~A ; ~A ; ~A~%" var-names vars cont)
+	      ;(format t "select/2: ~A ; ~A ; ~A~%" var-names vars cont)
 	      (if (null vars)
 		  nil
 		  (push 
@@ -568,7 +569,7 @@
 	      (funcall cont)))))
 
 
-(defun prolog-test ()
+(defun ptest1 ()
   (let ((*graph* (make-new-graph :name "test graph" :location "/var/tmp")))
     (unwind-protect
 	 (progn
@@ -590,11 +591,57 @@
 	   (format t "(\"loves\" \"Kevin\" ?y)) -> ~%")
 	   (?- ("loves" "Kevin" ?y))
 	   (<- ("likes" "Robin" "cats"))
+	   (<- ("likes" "Kevin" "cats"))
 	   (<- ("likes" "Sandy" ?x) ("likes" ?x "cats"))
-	   (format t "(?- (\"likes\" \"Sandy\" ?who?)) ->~%")
-	   (?- ("likes" "Sandy" ?who)))
+	   (format t "(select (?who) (\"likes\" \"Sandy\" ?who)) ->~%")
+	   (format t "~A~%" (select (?who) ("likes" "Sandy" ?who))))
       (progn
 	(shutdown-graph *graph*)
 	(delete-file "/var/tmp/triples")
 	(delete-file "/var/tmp/rules")
 	(delete-file "/var/tmp/config.ini")))))
+
+(defun ptest2 ()
+  ;; 4.10 seconds in interpreted mode
+  ;; 0.28 seconds in compiled mode
+  (let ((*graph* (make-new-graph :name "test graph" :location "/var/tmp")))
+    (unwind-protect
+	 (progn
+	   (<- (member ?item (?item . ?rest)))
+	   (<- (member ?item (?x . ?rest)) (member ?item ?rest))
+	   (<- (nextto ?x ?y ?list) (iright ?x ?y ?list))
+	   (<- (nextto ?x ?y ?list) (iright ?y ?x ?list))
+	   (<- (iright ?left ?right (?left ?right . ?rest)))
+	   (<- (iright ?left ?right (?x . ?rest))
+	       (iright ?left ?right ?rest))
+	   (<- (= ?x ?x))
+	   (<- (zebra ?h ?w ?z)
+	       (= ?h ((house norwegian ? ? ? ?)
+		      ?
+		      (house ? ? ? milk ?) ? ?))
+	       (member (house englishman ? ? ? red) ?h)
+	       (member (house spaniard dog ? ? ?) ?h)
+	       (member (house ? ? ? coffee green) ?h)
+	       (member (house ukranian ? ? tea ?) ?h)
+	       (iright (house ? ? ? ? ivory)
+		       (house ? ? ? ? green) ?h)
+	       (member (house ? snails winston ? ?) ?h)
+	       (member (house ? ? kools ? yellow) ?h)
+	       (nextto (house ? ? chesterfield ? ?)
+		       (house ? fox ? ? ?) ?h)
+	       (nextto (house ? ? kools ? ?)
+		       (house ? horse ? ? ?) ?h)
+	       (member (house ? ? luckystrike orange-juice ?) ?h)
+	       (member (house japanese ? parliaments ? ?) ?h)
+	       (nextto (house norwegian ? ? ? ?)
+		       (house ? ? ? ? blue) ?h)
+	       (member (house ?w ? ? water ?) ?h)
+	       (member (house ?z zebra ? ? ?) ?h))
+	   (time (select (?houses ?water-drinker ?zebra-owner) 
+			 (zebra ?houses ?water-drinker ?zebra-owner))))
+      (progn
+	(shutdown-graph *graph*)
+	(delete-file "/var/tmp/triples")
+	(delete-file "/var/tmp/rules")
+	(delete-file "/var/tmp/config.ini")))))
+

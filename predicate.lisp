@@ -122,7 +122,7 @@
 
 (defmethod add-default-rule ((predicate predicate))
   "Lock the predicate for compilation, add the clause, persist it and recompile."
-  (format t "2. Adding default functor for ~A~%" predicate)
+  ;(format t "2. Adding default functor for ~A~%" predicate)
   (with-recursive-lock-held ((pred-lock predicate))
     (prolog-compile predicate))
   predicate)
@@ -134,7 +134,7 @@
 			     (setf (nth 0 g) (intern (nth 0 g))))
 			   g)
 		       clause))
-  (format t "2. Adding clause ~A / ~A~%" (pred-name predicate) clause)
+  ;(format t "2. Adding clause ~A / ~A~%" (pred-name predicate) clause)
   (with-recursive-lock-held ((pred-lock predicate))
     (let ((old-clauses (pred-clauses predicate)))
       (setf (pred-clauses predicate) (append old-clauses (list clause))))
