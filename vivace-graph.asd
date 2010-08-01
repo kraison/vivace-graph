@@ -42,4 +42,5 @@
 	       (:file "triples" :depends-on ("predicate" "node"))
 	       (:file "rules" :depends-on ("triples"))
 	       (:file "prologc" :depends-on ("rules"))
-	       (:file "interface" :depends-on ("prologc"))))
+	       (:file "prolog-functors" :depends-on ("prologc"))
+	       (:file "interface" :depends-on ("prolog-functors"))))

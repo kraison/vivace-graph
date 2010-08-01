@@ -8,6 +8,7 @@
 
 (defconstant +unbound+ :unbound)
 (defconstant +no-bindings+ '((t . t)))
+(defconstant +fail+ nil)
 
 (defparameter *occurs-check* t)
 
@@ -125,7 +126,11 @@
 (defun compile-call (predicate args cont)
   "Compile a call to a prolog predicate."
   ;;`(,predicate ,@args ,cont))
-  `(funcall (gethash ',predicate (functors *graph*)) ,@args ,cont))
+  (let ((func (gensym)))
+    `(let ((,func (gethash ',predicate (functors *graph*))))
+       (if (or (functionp ,func) (and (symbolp ,func) (fboundp ,func)))
+	   (funcall ,func ,@args ,cont)
+	   (error "Functor ~A is not defined." ',predicate)))))
 
 (defun prolog-compiler-macro (name)
   "Fetch the compiler macro for a Prolog predicate."
@@ -181,6 +186,15 @@
           ,@(loop for exp in (rest compiled-exps)
                   collect '(undo-bindings! old-trail)
                   collect exp)))))
+
+(defmacro with-undo-bindings (&body body)
+  (if (length=1 body)
+      (first body)
+      `(let ((old-trail (fill-pointer *trail*)))
+	 ,(first body)
+	 ,@(loop for exp in (rest body)
+	      collect '(undo-bindings! old-trail)
+	      collect exp))))
 
 (defun variables-in (exp)
   (unique-find-anywhere-if #'variable-p exp))
@@ -317,6 +331,28 @@
             code1
             (compile-body body cont bindings1))))))
 
+(def-prolog-compiler-macro true (goal body cont bindings)
+  (declare (ignore goal))
+  (compile-body body cont bindings))
+
+(def-prolog-compiler-macro false (goal body cont bindings)
+  (declare (ignore goal body cont bindings))
+  nil)
+
+(def-prolog-compiler-macro and (goal body cont bindings)
+  (compile-body (append (args goal) body) cont bindings))
+
+(def-prolog-compiler-macro or (goal body cont bindings)
+  (let ((disjuncts (args goal)))
+    (case (length disjuncts)
+      (0 +fail+)
+      (1 (compile-body (cons (first disjuncts) body) cont bindings))
+      (t (let ((fn (gensym "F")))
+	   `(flet ((,fn () ,(compile-body body cont bindings)))
+	      .,(maybe-add-undo-bindings
+		 (loop for g in disjuncts collect
+		      (compile-body (list g) `#',fn bindings)))))))))
+
 (defmethod clause-body ((triple triple))
   nil)
 
@@ -334,7 +370,7 @@
 	    (clause-body clause))
 	   cont
 	   (mapcar #'self-cons parms)))))
-    ;(format t "BODY: ~A~%" body)
+    ;;(format t "BODY: ~A~%" body)
     body))
 
 (defun add-clause (clause)
@@ -402,6 +438,13 @@
         (deref-exp (first exp))
         (deref-exp (rest exp))
         exp)))
+
+(defun deref-equal (x y)
+  (or (equal (var-deref x) (var-deref y))
+      (and (consp x)
+	   (consp y)
+	   (deref-equal (first x) (first y))
+	   (deref-equal (rest x) (rest y)))))
 
 (defun compile-triple-search (s p o)
   `(cond ((and (not (has-variable-p (var-deref ,s))) (not (has-variable-p (var-deref ,o)))
@@ -519,7 +562,7 @@
 		(*predicate* (make-functor top-level-query 0))
 		(parameters (make-parameters 0))
 		(goals (mapcar #'(lambda (g)
-				   (when (stringp (first g)) 
+				   (when (stringp (first g))
 				     (setf (nth 0 g) (intern (nth 0 g))))
 				   g)
 			       goals)))
@@ -542,32 +585,22 @@
 (defmacro select (vars &rest goals)
   `(top-level-select ',vars ',(replace-?-vars goals)))
 
-(defun load-prolog-default-functors (graph)
-  (setf (gethash 'show-prolog-vars/2 (functors graph))
-	#'(lambda (var-names vars cont)
-	    (block show-prolog-vars/2
-	      ;(format t "show-prolog-vars/2: ~A ; ~A ; ~A~%" var-names vars cont)
-	      (if (null vars)
-		  (format t "~&Yes")
-		  (loop for name in var-names
-		     for var in vars do
-		       (format t "~&~a = ~a" name (deref-exp var))))
-	      (if (continue-p)
-		  (funcall cont)
-		  (throw 'top-level-prove nil)))))
-  (setf (gethash 'select/2 (functors graph))
-	#'(lambda (var-names vars cont)
-	    (block select/2
-	      ;(format t "select/2: ~A ; ~A ; ~A~%" var-names vars cont)
-	      (if (null vars)
-		  nil
-		  (push 
-		   (loop for name in var-names
-		      for var in vars
-		      collect (deref-exp var))
-		   *select-list*))
-	      (funcall cont)))))
 
+(defun reload-testdb ()
+  (shutdown-graph *graph*)
+  (delete-file "db/rules")
+  (delete-file "db/triples")
+  (load-graph! "db/config.ini")
+  (<- (member ?item (?item . ?rest)))
+  (<- (member ?item (?x . ?rest)) (member ?item ?rest))
+  (<- ("loves" "Kevin" "Dustie"))
+  (<- ("loves" "Dustie" "Kevin"))
+  (<- ("loves" "Kevin" "Echo"))
+  (<- ("loves" "Echo" "cat nip"))
+  (<- ("likes" "Robin" "cats"))
+  (<- ("likes" "Kevin" "cats"))
+  (<- ("likes" "Sandy" ?x) ("likes" ?x "cats"))
+  *graph*)
 
 (defun ptest1 ()
   (let ((*graph* (make-new-graph :name "test graph" :location "/var/tmp")))

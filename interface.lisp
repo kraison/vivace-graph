@@ -55,6 +55,7 @@
 		      (gethash (graph-uuid graph) *graph-table*) graph
 		      *graph* graph))))))
     (load-prolog-default-functors *graph*)
+    ;; FIXME: load rules!!
     *graph*))
 
 (defun make-new-graph (&key name location)

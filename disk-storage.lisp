@@ -31,9 +31,11 @@
       (error 'persistence-error :instance db :reason condition))))
 
 (defun lookup-object (db key)
+  ;;(format t "lookup-object ~A: ~A~%" db key)
   (handler-case
       (dbm-get db key :octets)
     (error (condition)
+      ;;(format t "ERROR: ~A~%" condition)
       (error 'persistence-error :instance (list :db db :key key) :reason condition))))    
 
 (defun lookup-objects (db key)

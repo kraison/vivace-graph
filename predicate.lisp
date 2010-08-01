@@ -147,5 +147,3 @@
 		  (and (stringp name) (intern name)))))
     (remhash name (predicate-cache *graph*))
     (delete-object (rules-db *graph*) (make-predicate-key-from-name name))))
-
-
