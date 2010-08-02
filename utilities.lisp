@@ -63,6 +63,11 @@
   (:method ((x uuid:uuid) (y symbol)) (string>= (uuid:print-bytes nil x) (symbol-name y)))
   (:method ((x uuid:uuid) (y number)) (string>= (uuid:print-bytes nil x) (write-to-string y))))
 
+;; Timestamp misc.
+(defgeneric timestamp? (thing)
+  (:method ((thing timestamp)) t)
+  (:method (thing) nil))
+
 ;; Plists
 (defun get-prop (plist prop)
    (cond ((null plist) nil)

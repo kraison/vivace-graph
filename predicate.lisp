@@ -53,7 +53,7 @@
 
 (defun make-predicate-key-from-name (name)
   (declare (optimize (speed 3)))
-  (let* ((serialized-name (serialize name))
+  (let* ((serialized-name (serialize (if (symbolp name) (symbol-name name) name)))
 	 (encoded-length (encode-length (length serialized-name)))
 	 (length-of-encoded-length (length encoded-length)))
     (let ((key (make-array (+ 1 length-of-encoded-length (length serialized-name)) 
@@ -91,7 +91,7 @@
   (:method ((octets vector) (graph graph))
     (lookup-predicate (deserialize octets) graph))
   (:method ((name string) (graph graph))
-    (lookup-predicate (intern name) graph))
+    (lookup-predicate (intern (string-upcase name)) graph))
   (:method ((name symbol) (graph graph))
     (or (gethash name (predicate-cache graph))
 	(let ((raw (lookup-object (rules-db graph) (make-predicate-key-from-name name))))
@@ -105,9 +105,9 @@
 		(cache-predicate predicate))))))))
 
 (defun make-new-predicate (&key name graph)
-  (let ((name (or (and (symbolp name) name)
-		  (and (stringp name) (intern name)))))
-    (when (null name) (error "predicate name cannot be nil!"))
+  (let ((name (or (and (symbolp name) (intern (string-upcase (symbol-name name))))
+		  (and (stringp name) (intern (string-upcase name)))
+		  (error "predicate name cannot be nil!"))))
     (let* ((*graph* (or graph *graph*))
 	   (predicate (make-predicate :name name :graph *graph*)))
       (handler-case
@@ -129,11 +129,6 @@
 
 (defmethod add-rule ((predicate predicate) clause)
   "Lock the predicate for compilation, add the clause, persist it and recompile."
-  (setq clause (mapcar #'(lambda (g)
-			   (when (stringp (first g)) 
-			     (setf (nth 0 g) (intern (nth 0 g))))
-			   g)
-		       clause))
   ;(format t "2. Adding clause ~A / ~A~%" (pred-name predicate) clause)
   (with-recursive-lock-held ((pred-lock predicate))
     (let ((old-clauses (pred-clauses predicate)))
@@ -142,8 +137,8 @@
     (prolog-compile predicate))
   (pred-clauses predicate))
 
-(defmethod delete-rule (name)
+(defmethod retract-rule (name)
   (let ((name (or (and (symbolp name) name)
-		  (and (stringp name) (intern name)))))
+		  (and (stringp name) (intern (string-upcase name))))))
     (remhash name (predicate-cache *graph*))
     (delete-object (rules-db *graph*) (make-predicate-key-from-name name))))

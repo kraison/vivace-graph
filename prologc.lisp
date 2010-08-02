@@ -1,9 +1,7 @@
 ;;;; -*- Mode: Lisp; Syntax: Common-Lisp -*-
-;;;; Code from Paradigms of AI Programming
+;;;; This is Kevin Raison's customization of Mr. Norvig's PAIP Prolog.  Thanks Mr. Norvig!
+;;;; Some code from Paradigms of AI Programming
 ;;;; Copyright (c) 1991 Peter Norvig
-
-;;;; File prologc.lisp: Final version of the compiler,
-;;;; including all improvements from the chapter.
 (in-package #:vivace-graph)
 
 (defconstant +unbound+ :unbound)
@@ -46,9 +44,21 @@
 
 (defun bound-p (var) (not (eq (var-binding var) +unbound+)))
 
+(defgeneric prolog-equal (x y)
+  (:method ((x number) (y number)) (= x y))
+  (:method ((x string) (y string)) (string= x y))
+  (:method ((x character) (y character)) (char= x y))
+  (:method ((x timestamp) (y timestamp))
+    (= (timestamp-to-universal x) (timestamp-to-universal y)))
+  (:method ((x timestamp) (y integer)) (= (timestamp-to-universal x) y))
+  (:method ((x integer) (y timestamp)) (= (timestamp-to-universal y) x))
+  (:method ((x node) (y node)) (node-equal x y))
+  (:method ((x triple) (y triple)) (triple-equal x y))
+  (:method (x y) (equal x y)))
+
 (defun unify! (x y)
   "Destructively unify two expressions"
-  (cond ((equal (var-deref x) (var-deref y)) t)
+  (cond ((prolog-equal (var-deref x) (var-deref y)) t)
         ((var-p x) (set-binding! x y))
         ((var-p y) (set-binding! y x))
         ((and (consp x) (consp y))
@@ -126,11 +136,15 @@
 (defun compile-call (predicate args cont)
   "Compile a call to a prolog predicate."
   ;;`(,predicate ,@args ,cont))
-  (let ((func (gensym)))
-    `(let ((,func (gethash ',predicate (functors *graph*))))
-       (if (or (functionp ,func) (and (symbolp ,func) (fboundp ,func)))
-	   (funcall ,func ,@args ,cont)
-	   (error "Functor ~A is not defined." ',predicate)))))
+  `(funcall (or (gethash ',predicate (functors *graph*))
+		(gethash ',predicate *prolog-global-functors*))
+	    ,@args ,cont))
+;  (let ((func (gensym)))
+;    `(let ((,func (or (gethash ',predicate (functors *graph*))
+;		      (gethash ',predicate *prolog-global-functors*))))
+;       (if (or (functionp ,func) (and (symbolp ,func) (fboundp ,func)))
+;	   (funcall ,func ,@args ,cont)
+;	   (error "Functor ~A is not defined." ',predicate)))))
 
 (defun prolog-compiler-macro (name)
   "Fetch the compiler macro for a Prolog predicate."
@@ -199,6 +213,9 @@
 (defun variables-in (exp)
   (unique-find-anywhere-if #'variable-p exp))
 
+(defun unbound-var-p (exp)
+  (and (var-p exp) (not (bound-p exp))))
+
 (defun bind-unbound-vars (parameters exp)
   "If there are any variables in exp (besides the parameters)
   then bind them to new vars."
@@ -248,7 +265,7 @@
   (cond
     ;; Unify constants and conses:                       ; Case
     ((not (or (has-variable-p x) (has-variable-p y)))    ; 1,2
-     (values (equal x y) bindings))
+     (values (prolog-equal x y) bindings))
     ((and (consp x) (consp y))                           ; 3
      (multiple-value-bind (code1 bindings1)
          (compile-unify (first x) (first y) bindings)
@@ -280,7 +297,7 @@
          (y1 (if yb (cdr yb) y)))
     (cond                                                 ; Case:
       ((or (eq x '?) (eq y '?)) (values t bindings))      ; 12
-      ((not (and (equal x x1) (equal y y1)))              ; deref
+      ((not (and (prolog-equal x x1) (prolog-equal y y1)))              ; deref
        (compile-unify x1 y1 bindings))
       ((find-anywhere x1 y1) (values nil bindings))       ; 11
       ((consp y1)                                         ; 7,10
@@ -335,7 +352,7 @@
   (declare (ignore goal))
   (compile-body body cont bindings))
 
-(def-prolog-compiler-macro false (goal body cont bindings)
+(def-prolog-compiler-macro fail (goal body cont bindings)
   (declare (ignore goal body cont bindings))
   nil)
 
@@ -378,7 +395,8 @@
   (let ((predicate-name (predicate (clause-head clause))))
     ;(format t "1. Adding clause ~A: ~A~%" predicate-name clause)
     (assert (and (atom predicate-name) (not (variable-p predicate-name))))
-    (when (stringp predicate-name) (setq predicate-name (intern predicate-name)))
+    (when (stringp predicate-name) 
+      (setq predicate-name (intern (string-upcase predicate-name))))
     (if (and (= 1 (length clause))
 	     (= 3 (length (first clause)))
 	     (not (variable-p (second (first clause))))
@@ -405,13 +423,7 @@
     (unwind-protect
 	 (let* ((vars (delete '? (variables-in goals)))
 		(*predicate* (make-functor top-level-query 0))
-		(parameters (make-parameters 0))
-		(goals (mapcar #'(lambda (g)
-				   (when (stringp (first g)) 
-				     ;(format t "Making ~A a symbol~%" (first g))
-				     (setf (nth 0 g) (intern (nth 0 g))))
-				   g)
-			       goals)))
+		(parameters (make-parameters 0)))
 	   (catch 'top-level-prove
 	     (let ((func
 		    `#'(lambda (,@parameters cont)
@@ -430,6 +442,11 @@
       (remhash *predicate* (functors *graph*)))
     (values)))
 
+(defun deref-copy (exp)
+  (sublis (mapcar #'(lambda (var) (cons (var-deref var) (?)))
+		  (unique-find-anywhere-if #'var-p exp))
+	  exp))
+
 (defun deref-exp (exp)
   "Build something equivalent to EXP with variables dereferenced."
   (if (atom (var-deref exp))
@@ -440,41 +457,11 @@
         exp)))
 
 (defun deref-equal (x y)
-  (or (equal (var-deref x) (var-deref y))
+  (or (prolog-equal (var-deref x) (var-deref y))
       (and (consp x)
 	   (consp y)
 	   (deref-equal (first x) (first y))
 	   (deref-equal (rest x) (rest y)))))
-
-(defun compile-triple-search (s p o)
-  `(cond ((and (not (has-variable-p (var-deref ,s))) (not (has-variable-p (var-deref ,o)))
-	       (not (consp ,s)) (not (consp ,o))
-	       (or (not (var-p ,s)) (and (var-p ,s) (bound-p ,s)))
-	       (or (not (var-p ,o)) (and (var-p ,o) (bound-p ,o))))
-	  (let ((triple (lookup-triple (var-deref ,s) ,p (var-deref ,o))))
-	    (if (triple? triple) 
-		(let ((old-trail (fill-pointer *trail*)))
-		  (if (unify! ,s (node-value (triple-subject triple)))
-		      (if (unify! ,o (node-value (triple-object triple)))
-			  (funcall cont)))
-		  (undo-bindings! old-trail)))))
-	 (t
-	  (let ((triples 
-		 (cond ((and (not (has-variable-p ,s)) (not (consp ,s))
-			     (or (not (var-p ,s)) (and (var-p ,s) (bound-p ,s))))
-			(get-triples :s (var-deref ,s) :p ,p))
-		       ((and (not (has-variable-p ,o)) (not (consp ,o))
-			     (or (not (var-p ,o)) (and (var-p ,o) (bound-p ,o))))
-			(get-triples :o (var-deref ,o) :p ,p))
-		       (t
-			(get-triples :p ,p)))))
-	    (if triples
-		(let ((old-trail (fill-pointer *trail*)))
-		  (dolist (triple triples)
-		    (if (unify! ,s (node-value (triple-subject triple)))
-			(if (unify! ,o (node-value (triple-object triple)))
-			    (funcall cont)))
-		    (undo-bindings! old-trail))))))))
 
 (defmethod prolog-compile-search ((predicate predicate))
   (let ((*predicate* (make-functor (pred-name predicate) 2))
@@ -482,13 +469,12 @@
     (let ((func
 	   `#'(lambda (,@parameters cont)
 		(block ,*predicate*
-		  ,(compile-triple-search (first parameters) 
-					  `',(pred-name predicate)
-					  (second parameters))))))
-      ;(format t "prolog-compile-search:~%~A~%~%" func)
+		  (triple-search/3 
+		   ',(pred-name predicate) ,(first parameters) ,(second parameters) cont)))))
+      ;;(format t "prolog-compile-search:~%~A~%~%" func)
       (setf (gethash *predicate* (functors (pred-graph predicate)))
 	    (eval func)))))
-  
+
 (defun compile-predicate (predicate arity clauses)
   "Compile all the clauses for a given symbol/arity
   into a single LISP function."
@@ -498,14 +484,13 @@
 	   `#'(lambda (,@parameters cont)
 		(block ,*predicate*
 		  ,(if (= arity 2)
-		       (compile-triple-search (first parameters) 
-					      `',(pred-name predicate)
-					      (second parameters)))
+		       `(triple-search/3 
+			 ',(pred-name predicate) ,(first parameters) ,(second parameters) cont))
 		  .,(maybe-add-undo-bindings
 		     (mapcar #'(lambda (clause)
 				 (compile-clause parameters clause 'cont))
 			     clauses))))))
-      ;(format t "compile-predicate: ~%~A~%~%" func)
+      ;;(format t "compile-predicate: ~%~A~%~%" func)
       (setf (gethash *predicate* (functors (pred-graph predicate)))
 	    (eval func)))))
 
@@ -514,7 +499,8 @@
   (cond
     ((null body)
      `(funcall ,cont))
-    ((eq (first body) '!)                              ;*** 
+    ((eq (first body) '!)
+     ;;(format t "Encountered the CUT operator: ~A / ~A~%" *predicate* body)
      `(progn ,(compile-body (rest body) cont bindings) ;***
              (return-from ,*predicate* nil)))          ;***
     (t (let* ((goal (first body))
@@ -560,12 +546,7 @@
     (unwind-protect
 	 (let* (;(vars (delete '? (variables-in goals)))
 		(*predicate* (make-functor top-level-query 0))
-		(parameters (make-parameters 0))
-		(goals (mapcar #'(lambda (g)
-				   (when (stringp (first g))
-				     (setf (nth 0 g) (intern (nth 0 g))))
-				   g)
-			       goals)))
+		(parameters (make-parameters 0)))
 	   (catch 'top-level-prove
 	     (let ((func
 		    `#'(lambda (,@parameters cont)
@@ -585,21 +566,29 @@
 (defmacro select (vars &rest goals)
   `(top-level-select ',vars ',(replace-?-vars goals)))
 
-
+#|
 (defun reload-testdb ()
-  (shutdown-graph *graph*)
-  (delete-file "db/rules")
-  (delete-file "db/triples")
+  (if (graph? *graph*) (shutdown-graph *graph*))
+  (ignore-errors 
+    (delete-file "db/rules")
+    (delete-file "db/triples"))
   (load-graph! "db/config.ini")
   (<- (member ?item (?item . ?rest)))
   (<- (member ?item (?x . ?rest)) (member ?item ?rest))
-  (<- ("loves" "Kevin" "Dustie"))
-  (<- ("loves" "Dustie" "Kevin"))
-  (<- ("loves" "Kevin" "Echo"))
-  (<- ("loves" "Echo" "cat nip"))
-  (<- ("likes" "Robin" "cats"))
-  (<- ("likes" "Kevin" "cats"))
-  (<- ("likes" "Sandy" ?x) ("likes" ?x "cats"))
+  (<- (if ?test ?then) (if ?then ?else (fail)))
+  (<- (if ?test ?then ?else) (call ?test) ! (call ?then))
+  (<- (if ?test ?then ?else) (call ?else))
+  (<- (is-of-age ?x) (has-age ?x ?y) (>= ?y 21))
+  (<- (has-age "Kevin" 35))
+  (<- (has-age "Dustie" 35))
+  (<- (has-age "Echo" 11))
+  (<- (loves "Kevin" "Dustie"))
+  (<- (loves "Dustie" "Kevin"))
+  (<- (loves "Kevin" "Echo"))
+  (<- (loves "Echo" "cat nip"))
+  (<- (likes "Robin" "cats"))
+  (<- (likes "Kevin" "cats"))
+  (<- (likes "Sandy" ?x) (likes ?x "cats"))
   *graph*)
 
 (defun ptest1 ()
@@ -613,21 +602,21 @@
 	   (format t "~%(member ?x (1 2 3 4)) ->~%")
 	   (?- (member ?x (1 2 3 4)))
 	   (format t "~%Adding triples:~%")
-	   (<- ("loves" "Kevin" "Dustie"))
-	   (<- ("loves" "Dustie" "Kevin"))
-	   (<- ("loves" "Kevin" "Echo"))
-	   (<- ("loves" "Echo" "cat nip"))
-	   (format t "(\"loves\" ?x ?y)) -> ~%")
-	   (?- ("loves" ?x ?y))
-	   (format t "(\"loves\" \"Kevin\" \"Dustie\")) -> ~%")
-	   (?- ("loves" "Kevin" "Dustie"))
-	   (format t "(\"loves\" \"Kevin\" ?y)) -> ~%")
-	   (?- ("loves" "Kevin" ?y))
-	   (<- ("likes" "Robin" "cats"))
-	   (<- ("likes" "Kevin" "cats"))
-	   (<- ("likes" "Sandy" ?x) ("likes" ?x "cats"))
-	   (format t "(select (?who) (\"likes\" \"Sandy\" ?who)) ->~%")
-	   (format t "~A~%" (select (?who) ("likes" "Sandy" ?who))))
+	   (<- (loves "Kevin" "Dustie"))
+	   (<- (loves "Dustie" "Kevin"))
+	   (<- (loves "Kevin" "Echo"))
+	   (<- (loves "Echo" "cat nip"))
+	   (format t "(loves ?x ?y)) -> ~%")
+	   (?- (loves ?x ?y))
+	   (format t "(loves \"Kevin\" \"Dustie\")) -> ~%")
+	   (?- (loves "Kevin" "Dustie"))
+	   (format t "(loves \"Kevin\" ?y)) -> ~%")
+	   (?- (loves "Kevin" ?y))
+	   (<- (likes "Robin" "cats"))
+	   (<- (likes "Kevin" "cats"))
+	   (<- (likes "Sandy" ?x) ("likes" ?x "cats"))
+	   (format t "(select (?who) (likes \"Sandy\" ?who)) ->~%")
+	   (format t "~A~%" (select (?who) (likes "Sandy" ?who))))
       (progn
 	(shutdown-graph *graph*)
 	(delete-file "/var/tmp/triples")
@@ -678,3 +667,4 @@
 	(delete-file "/var/tmp/rules")
 	(delete-file "/var/tmp/config.ini")))))
 
+|#

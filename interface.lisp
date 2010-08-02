@@ -54,8 +54,7 @@
 		      (rules-db graph) (open-hash (format nil "~A/rules" (graph-location graph)))
 		      (gethash (graph-uuid graph) *graph-table*) graph
 		      *graph* graph))))))
-    (load-prolog-default-functors *graph*)
-    ;; FIXME: load rules!!
+    ;; FIXME: load graph-specific rules!!
     *graph*))
 
 (defun make-new-graph (&key name location)
@@ -75,7 +74,7 @@
   (declare (ignore waitp))
   (sb-ext:with-locked-hash-table (*graph-table*)
     (setf (shutdown? graph) t)
-    (when (eq *graph* graph) (setq *graph* nil))
+    (when (eql *graph* graph) (setq *graph* nil))
     (close-hash (rules-db graph))
     (close-store (graph-db graph))
     (remhash (graph-uuid graph) *graph-table*)))
