@@ -50,11 +50,14 @@
 						    config "default" "name")
 				       :graph-location (py-configparser:get-option 
 							config "default" "location"))))
-		(setf (graph-db graph) (open-store (format nil "~A/triples" (graph-location graph)))
-		      (rules-db graph) (open-hash (format nil "~A/rules" (graph-location graph)))
+		(setf (triple-db graph) (open-store 
+					 (format nil "~A/triples" (graph-location graph)))
+		      (rule-db graph) (open-hash (format nil "~A/rules" (graph-location graph)))
+		      (functor-db graph) (open-hash 
+					  (format nil "~A/functors" (graph-location graph)))
 		      (gethash (graph-uuid graph) *graph-table*) graph
 		      *graph* graph))))))
-    ;; FIXME: load graph-specific rules!!
+    ;; FIXME: load graph-specific rules and functors!!
     *graph*))
 
 (defun make-new-graph (&key name location)
@@ -75,9 +78,7 @@
   (sb-ext:with-locked-hash-table (*graph-table*)
     (setf (shutdown? graph) t)
     (when (eql *graph* graph) (setq *graph* nil))
-    (close-hash (rules-db graph))
-    (close-store (graph-db graph))
+    (close-hash (functor-db graph))
+    (close-hash (rule-db graph))
+    (close-store (triple-db graph))
     (remhash (graph-uuid graph) *graph-table*)))
-
-
-

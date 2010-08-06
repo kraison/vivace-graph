@@ -36,14 +36,14 @@
 	       (= id-byte +ratio+))
 	   (values (aref a 1) 2))
 	  ((or (= id-byte +t+) (= id-byte +null+))
-	   (values 0 0))
+	   (values 1 0))
 	  (t ;; strings, lists, vectors, blobs, nodes, triples have variable bytes
 	   (let ((header-length (+ 2 (aref a 1))))
 	     (values (decode-length (subseq a 2 header-length)) header-length))))))
 
 (defun extract-all-subseqs (a)
   (declare (optimize (speed 3)))
-  (cond ((= 0 (length a)) 
+  (cond ((= 0 (length a))
 	 nil)
 	(t 
 	 (multiple-value-bind (data-length header-length) (extract-length a)
@@ -61,14 +61,12 @@
   (equalp x y))
 
 (defmethod serialized-lt ((x array) (y array))
-  "Compare two serialized items.
-FIXME: there is a way to do this without deserializing, it will just take some time to get right."
+  "Compare two serialized items."
   (declare (optimize speed))
   (less-than (deserialize x) (deserialize y)))
 
 (defmethod serialized-gt ((x array) (y array))
-  "Compare two serialized items.
-FIXME: there is a way to do this without deserializing, it will just take some time to get right."
+  "Compare two serialized items."
   (declare (optimize speed))
   (greater-than (deserialize x) (deserialize y)))
 
@@ -83,6 +81,48 @@ FIXME: there is a way to do this without deserializing, it will just take some t
       (call-next-method)
     (error (condition)
       (error 'serialization-error :instance object :reason condition))))
+
+(defun serialize-multiple (type-specifier &rest slots)
+  (declare (optimize (speed 3)))
+  (let* ((serialized-slots (mapcar #'serialize slots))
+	 (serialized-slot-lengths (mapcar #'length serialized-slots))
+	 (total-length (apply #'+ serialized-slot-lengths))
+	 (encoded-length (encode-length total-length))
+	 (length-of-encoded-length (length encoded-length)))
+    (let ((a (make-array (+ 1 length-of-encoded-length total-length) 
+			 :element-type '(unsigned-byte 8))))
+      (setf (aref a 0) type-specifier)
+      (dotimes (i length-of-encoded-length)
+	(setf (aref a (1+ i)) (aref encoded-length i)))
+      (dotimes (i (length serialized-slots))
+	(dotimes (j (nth i serialized-slot-lengths))
+	  (setf (aref a (+ 1 
+			   length-of-encoded-length 
+			   j 
+			   (apply #'+ (subseq serialized-slot-lengths 0 i))))
+		(aref (nth i serialized-slots) j))))
+      a)))
+
+(defmethod deserialize-help ((become (eql +vector+)) bytes)
+  (let ((items (extract-all-subseqs bytes)))
+    (map 'vector #'deserialize items)))
+
+(defmethod serialize ((v vector))
+  (declare (optimize (speed 3)))
+  (if (equal (array-element-type v) '(unsigned-byte 8))
+      v
+      (let* ((serialized-items (map 'list #'serialize v))
+	     (total-length (reduce #'+ (mapcar #'length serialized-items)))
+	     (encoded-length (encode-length total-length))
+	     (length-of-encoded-length (length encoded-length))
+	     (vec (make-array 1 :fill-pointer 0 :adjustable t :element-type '(unsigned-byte 8))))
+	(vector-push-extend +vector+ vec)
+	(dotimes (i length-of-encoded-length)
+	  (vector-push-extend (aref encoded-length i) vec))
+	(dolist (item serialized-items)
+	  (dotimes (i (length item))
+	    (vector-push-extend (aref item i) vec)))
+	vec)))
 
 (defmethod deserialize-help ((become (eql +uuid+)) bytes)
   "Decode a UUID."

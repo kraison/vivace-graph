@@ -13,6 +13,7 @@
   :depends-on (:bordeaux-threads
 	       :uuid
 	       :ieee-floats
+	       :parse-number
 	       :cffi
 	       :sb-concurrency
 	       :sb-posix
@@ -26,6 +27,8 @@
 	       :protobuf
 	       :hunchentoot)
   :components ((:file "uuid")
+	       (:file "locatives")
+	       (:file "eval" :depends-on ("locatives"))
 	       (:file "vivace-graph-package" :depends-on ("uuid"))
 	       (:file "gettimeofday" :depends-on ("vivace-graph-package"))
 	       (:file "random" :depends-on ("vivace-graph-package"))
@@ -36,11 +39,13 @@
 	       (:file "disk-storage" :depends-on ("utilities"))
 	       (:file "serialize" :depends-on ("disk-storage"))
 	       (:file "data-types" :depends-on ("serialize"))
-	       (:file "graph" :depends-on ("serialize"))
+	       (:file "certainty-factors" :depends-on ("constants"))
+	       (:file "graph" :depends-on ("serialize" "certainty-factors"))
 	       (:file "predicate" :depends-on ("graph"))
 	       (:file "node" :depends-on ("graph" "data-types"))
 	       (:file "triples" :depends-on ("predicate" "node"))
-	       (:file "rules" :depends-on ("triples"))
-	       (:file "prologc" :depends-on ("rules"))
+	       (:file "prologc" :depends-on ("triples" "eval"))
 	       (:file "prolog-functors" :depends-on ("prologc"))
+	       (:file "rete" :depends-on ("prolog-functors"))
+	       (:file "rules" :depends-on ("rete"))
 	       (:file "interface" :depends-on ("prolog-functors"))))

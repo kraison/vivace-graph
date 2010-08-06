@@ -76,6 +76,10 @@
 	 (t (get-prop (cddr plist) prop))))
 
 ;; Norvig utilities
+(defun rest2 (x)
+  "The rest of a list after the first TWO elements."
+  (rest (rest x)))
+
 (defun continue-p ()
   "Ask user if we should continue looking for solutions."
   (case (read-char)

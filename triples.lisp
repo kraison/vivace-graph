@@ -8,6 +8,8 @@
   (subject nil)
   (predicate nil)
   (object nil)
+  (belief-factor +cf-true+)
+  (derived? nil)
   (deleted? nil)
   (graph *graph*))
 
@@ -31,78 +33,43 @@
 
 (defgeneric triple-eql (t1 t2)
   (:method ((t1 triple) (t2 triple)) (uuid:uuid-eql (triple-uuid t1) (triple-uuid t2)))
-  (:method (t1 t2) (error "Both arguments to triple-eql must be triples.")))
+  (:method (t1 t2) nil))
 
 (defgeneric triple-equal (t1 t2)
   (:method ((t1 triple) (t2 triple)) 
-    (and (uuid:uuid-eql (triple-uuid t1) (triple-uuid t2))
+    (and (triple-eql t1 t2)
 	 (node-equal (triple-subject t1) (triple-subject t2))
 	 (predicate-eql (triple-predicate t1) (triple-predicate t2))
 	 (node-equal (triple-object t1) (triple-object t2))))
-  (:method (t1 t2) 
-    (error "Both arguments to triple-equal must be triples.")))
+  (:method (t1 t2) nil))
+
+(defmethod belief-factor ((triple triple))
+  (triple-belief-factor triple))
 
 (defmethod deserialize-help ((become (eql +triple+)) bytes)
-  "Decode a triple."
+  "Decode a triple. FIXME: add support for derived? field."
   (declare (optimize (speed 3)))
-  (destructuring-bind (subject predicate object id) (extract-all-subseqs bytes)
+  (destructuring-bind (subject predicate object belief id derived?) (extract-all-subseqs bytes)
     (make-triple
      :uuid (deserialize id)
+     :belief-factor (deserialize belief)
+     :derived? derived?
      :subject (lookup-node subject *graph* t)
      :predicate (lookup-predicate predicate *graph*)
      :object (lookup-node object *graph* t))))
 
 (defmethod serialize ((triple triple))
   "Encode a triple for storage."
-  (declare (optimize (speed 3)))
-  (let ((serialized-s (make-serialized-key (triple-subject triple)))
-	(serialized-p (make-serialized-key (triple-predicate triple)))
-	(serialized-o (make-serialized-key (triple-object triple)))
-	(serialized-id (serialize (triple-uuid triple))))
-    (let* ((s-length (length serialized-s))
-	   (p-length (length serialized-p))
-	   (o-length (length serialized-o))
-	   (id-length (length serialized-id))
-	   (total-length (+ s-length p-length o-length id-length))
-	   (encoded-length (encode-length total-length))
-	   (length-of-encoded-length (length encoded-length)))
-      (let ((serialized-triple (make-array (+ 1 length-of-encoded-length total-length) 
-					   :element-type '(unsigned-byte 8))))
-	(setf (aref serialized-triple 0) +triple+)
-	(dotimes (i length-of-encoded-length)
-	  (setf (aref serialized-triple (1+ i)) (aref encoded-length i)))
-	(dotimes (i s-length)
-	  (setf (aref serialized-triple (+ 1 length-of-encoded-length i)) (aref serialized-s i)))
-	(dotimes (i p-length)
-	  (setf (aref serialized-triple (+ 1 length-of-encoded-length s-length i)) 
-		(aref serialized-p i)))
-	(dotimes (i o-length)
-	  (setf (aref serialized-triple (+ 1 length-of-encoded-length s-length p-length i)) 
-		(aref serialized-o i)))
-	(dotimes (i id-length)
-	  (setf (aref serialized-triple 
-		      (+ 1 length-of-encoded-length s-length p-length o-length i)) 
-		(aref serialized-id i)))
-	serialized-triple))))
+  (serialize-multiple +triple+ 
+		      (make-serialized-key (triple-subject triple))
+		      (make-serialized-key (triple-predicate triple))
+		      (make-serialized-key (triple-object triple))
+		      (triple-belief-factor triple) 
+		      (triple-uuid triple)
+		      (triple-derived? triple)))
 
 (defun make-triple-key-from-values (s p o)
-  (declare (optimize (speed 3)))
-  (let ((serialized-s (serialize s))
-	(serialized-p (serialize (or (and (symbolp p) p) (intern p))))
-	(serialized-o (serialize o)))
-    (let* ((s-length (length serialized-s))
-	   (p-length (length serialized-p))
-	   (o-length (length serialized-o))
-	   (total-length (+ s-length p-length o-length)))
-      (let ((key (make-array (1+ total-length) :element-type '(unsigned-byte 8))))
-	(setf (aref key 0) +triple-key+)
-	(dotimes (i s-length)
-	  (setf (aref key (1+ i)) (aref serialized-s i)))
-	(dotimes (i p-length)
-	  (setf (aref key (+ i 1 s-length)) (aref serialized-p i)))
-	(dotimes (i o-length)
-	  (setf (aref key (+ i 1 s-length p-length)) (aref serialized-o i)))
-	key))))
+  (serialize-multiple +triple-key+ s (or (and (symbolp p) p) (intern p)) o))
 
 (defmethod make-serialized-key ((triple triple))
   (declare (optimize (speed 3)))
@@ -113,16 +80,10 @@
 (defmethod save-triple ((triple triple))
   (let ((key (make-serialized-key triple))
 	(value (serialize triple)))
-    (store-object (graph-db (triple-graph triple)) key value :mode :keep)))
+    (store-object (triple-db (triple-graph triple)) key value :mode :keep)))
 
 (defun make-triple-index-key (item key-type)
-  (let* ((serialized-value (serialize item))
-	 (length (length serialized-value)))
-    (let ((vec (make-array (1+ length) :element-type '(unsigned-byte 8))))
-      (setf (aref vec 0) key-type)
-      (dotimes (i length)
-	(setf (aref vec (1+ i)) (aref serialized-value i)))
-      vec)))
+  (serialize-multiple key-type item))
     
 (defun make-combined-triple-key (v1 v2 index-type)
   (make-triple-index-key (format nil "~A~A~A" v1 #\Nul v2) index-type))
@@ -143,8 +104,8 @@
 			    +triple-predicate-object+))
 
 (defun get-indexed-triples (value index-type &optional graph)
-  (mapcar #'(lambda (vec) (deserialize (lookup-object (graph-db (or graph *graph*)) vec)))
-	  (lookup-objects (graph-db (or graph *graph*)) 
+  (mapcar #'(lambda (vec) (deserialize (lookup-object (triple-db (or graph *graph*)) vec)))
+	  (lookup-objects (triple-db (or graph *graph*)) 
 			  (make-triple-index-key value index-type))))
 
 (defun get-subjects (value &optional graph)
@@ -186,7 +147,7 @@
 (defun lookup-triple-in-db (s p o g)
   (handler-case
       (let ((key (make-triple-key-from-values s p o)))
-	(let ((raw (lookup-object (graph-db (or g *graph*)) key)))
+	(let ((raw (lookup-object (triple-db (or g *graph*)) key)))
 	  (when (vectorp raw)
 	    (let ((triple (deserialize raw)))
 	      (setf (triple-graph triple) (or g *graph*))
@@ -203,7 +164,7 @@
 (defmethod save-triple ((triple triple))
   (let ((key (make-serialized-key triple))
 	(value (serialize triple)))
-    (store-object (graph-db (triple-graph triple)) key value :mode :keep)))
+    (store-object (triple-db (triple-graph triple)) key value :mode :keep)))
 
 (defmethod cache-triple ((triple triple))
   (setf (gethash (list (node-value (triple-subject triple))
@@ -218,14 +179,18 @@
 	triple))
 
 (defmethod make-new-triple ((graph graph) (subject node) (predicate predicate) (object node) 
-			    &key (index-immediate? t))
-  (let ((triple (make-triple :graph graph :subject subject :predicate predicate :object object)))
+			    &key (index-immediate? t) (certainty-factor +cf-true+))
+  (let ((triple (make-triple :graph graph 
+			     :subject subject :predicate predicate :object object 
+			     :belief-factor certainty-factor)))
     (handler-case
-	(with-transaction ((graph-db graph))
+	(with-transaction ((triple-db graph))
 	  (save-triple triple)
 	  (incf-ref-count subject)
 	  (incf-ref-count object)
-	  (index-triple triple))
+	  (if index-immediate? 
+	      (index-triple triple)
+	      (sb-concurrency:enqueue triple (needs-indexing-q graph))))
       (persistence-error (condition)
 	(or (lookup-triple subject predicate object)
 	    (error condition)))
@@ -236,13 +201,15 @@
 (defmethod bulk-add-triples ((graph graph) tuple-list &key cache?)
   (let ((new-triples nil))
     (handler-case
-	(with-transaction ((graph-db graph))
+	(with-transaction ((triple-db graph))
 	  (dolist (tuple tuple-list)
 	    (let ((s (make-new-node :value (elt tuple 0)))
 		  (p (make-new-predicate :name (elt tuple 1)))
-		  (o (make-new-node :value (elt tuple 2))))
+		  (o (make-new-node :value (elt tuple 2)))
+		  (b (or (belief-factor tuple) +cf-true+)))
 	      (or (lookup-triple-in-db (node-value s) (pred-name p) (node-value o) graph)
-		  (let ((triple (make-triple :graph graph :subject s :predicate p :object o)))
+		  (let ((triple (make-triple :graph graph 
+					     :subject s :predicate p :object o :belief-factor b)))
 		    (save-triple triple)
 		    (incf-ref-count s)
 		    (incf-ref-count o)
@@ -257,8 +224,8 @@
 (defmethod delete-triple ((triple triple))
   (if (null (cas (triple-deleted? triple) nil t))
       (handler-case
-	  (with-transaction ((graph-db (triple-graph triple)))
-	    (delete-object (graph-db (triple-graph triple)) (make-serialized-key triple))
+	  (with-transaction ((triple-db (triple-graph triple)))
+	    (delete-object (triple-db (triple-graph triple)) (make-serialized-key triple))
 	    (deindex-triple triple)
 	    (decf-ref-count (triple-subject triple))
 	    (decf-ref-count (triple-object triple)))
@@ -286,13 +253,13 @@
 	(so-key (make-triple-so-key triple))
 	(po-key (make-triple-po-key triple))
 	(triple-key (make-serialized-key triple)))
-    (with-transaction ((graph-db (triple-graph triple)))
-      (store-object (graph-db (triple-graph triple)) sp-key triple-key :mode :duplicate)
-      (store-object (graph-db (triple-graph triple)) so-key triple-key :mode :duplicate)
-      (store-object (graph-db (triple-graph triple)) po-key triple-key :mode :duplicate)
-      (store-object (graph-db (triple-graph triple)) subject-key triple-key :mode :duplicate)
-      (store-object (graph-db (triple-graph triple)) predicate-key triple-key :mode :duplicate)
-      (store-object (graph-db (triple-graph triple)) object-key triple-key :mode :duplicate))))
+    (with-transaction ((triple-db (triple-graph triple)))
+      (store-object (triple-db (triple-graph triple)) sp-key triple-key :mode :duplicate)
+      (store-object (triple-db (triple-graph triple)) so-key triple-key :mode :duplicate)
+      (store-object (triple-db (triple-graph triple)) po-key triple-key :mode :duplicate)
+      (store-object (triple-db (triple-graph triple)) subject-key triple-key :mode :duplicate)
+      (store-object (triple-db (triple-graph triple)) predicate-key triple-key :mode :duplicate)
+      (store-object (triple-db (triple-graph triple)) object-key triple-key :mode :duplicate))))
 
 (defmethod do-indexing ((graph graph))
   (loop until (sb-concurrency:queue-empty-p (needs-indexing-q graph)) do
@@ -306,9 +273,9 @@
 	(object-key (make-triple-index-key (node-value (triple-object triple)) 
 					   +triple-object+))
 	(triple-key (make-serialized-key triple)))
-    (delete-object (graph-db (triple-graph triple)) subject-key triple-key)
-    (delete-object (graph-db (triple-graph triple)) predicate-key triple-key)
-    (delete-object (graph-db (triple-graph triple)) object-key triple-key)))
+    (delete-object (triple-db (triple-graph triple)) subject-key triple-key)
+    (delete-object (triple-db (triple-graph triple)) predicate-key triple-key)
+    (delete-object (triple-db (triple-graph triple)) object-key triple-key)))
 
 
 
@@ -316,13 +283,14 @@
   (let ((*graph* (make-new-graph :name "test graph" :location "/var/tmp")))
     (unwind-protect
 	 (time
-	  (with-transaction ((graph-db *graph*))
+	  (with-transaction ((triple-db *graph*))
 	    (dotimes (i 10000)
 	      (add-triple (format nil "S~A" i) (format nil "P~A" i) (format nil "O~A" i)))))
       (progn
 	(if (graph? *graph*) (shutdown-graph *graph*))
 	(delete-file "/var/tmp/triples")
 	(delete-file "/var/tmp/rules")
+	(delete-file "/var/tmp/functors")
 	(delete-file "/var/tmp/config.ini")))))
 
 (defun triple-test-2 ()
@@ -336,6 +304,7 @@
 	(if (graph? *graph*) (shutdown-graph *graph*))
 	(delete-file "/var/tmp/triples")
 	(delete-file "/var/tmp/rules")
+	(delete-file "/var/tmp/functors")
 	(delete-file "/var/tmp/config.ini")))))
 
 (defun triple-test-3 ()
@@ -357,5 +326,6 @@
 	(shutdown-graph *graph*)
 	(delete-file "/var/tmp/triples")
 	(delete-file "/var/tmp/rules")
+	(delete-file "/var/tmp/functors")
 	(delete-file "/var/tmp/config.ini")))))
 

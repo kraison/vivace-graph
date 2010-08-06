@@ -2,6 +2,11 @@
 
 (cffi:defctype size :unsigned-int)
 
+;; Certainty factors
+(defconstant +cf-true+ 1.0)
+(defconstant +cf-false+ -1.0)
+(defconstant +cf-unknown+ 0.0)
+
 ;; MCAS status markers
 (defconstant +mcas-undecided+ :undecided)
 (defconstant +mcas-failed+ :failed)
@@ -33,6 +38,7 @@
 (defconstant +node+ 102)
 (defconstant +predicate+ 103)
 (defconstant +timestamp+ 104)
+(defconstant +rule+ 105)
 
 ;; Tags for sorting entry types in tokyo cabinet
 (defconstant +triple-key+ 201)
@@ -47,3 +53,4 @@
 (defconstant +node-ref-count+ 209)
 (defconstant +deleted-triple-key+ 210)
 (defconstant +text-index+ 211)
+(defconstant +rule-key+ 212)

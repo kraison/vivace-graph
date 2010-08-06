@@ -4,7 +4,7 @@
 
 ;;;; File prolog.lisp: prolog from (11.3), with interactive backtracking.
 
-(requires "unify") ; does not require "prolog1"
+(load "unify.lisp") ; does not require "prolog1"
 
 ;;;; does not include destructive unification (11.6); see prologc.lisp
 

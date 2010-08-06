@@ -80,3 +80,20 @@
     (error (condition)
       (error 'persistence-error 
 	     :instance (list :db db :key key :value value) :reason condition))))
+
+(defun map-hash-objects (db func &key collect?)
+  (let ((cursor nil))
+    (handler-case
+	(unwind-protect
+	     (let ((result nil))
+	       (setq cursor (iter-open db))
+	       (do ((ikey (iter-next cursor) (iter-next cursor)))
+		   ((null ikey))
+		 (let ((r (funcall func (iter-key cursor :octets))))
+		   (when collect? (push r result))))
+	       (nreverse result))
+	  (iter-close cursor))
+      (error (condition)
+	(error 'persistence-error 
+	       :instance (list :db db) :reason condition)))))
+

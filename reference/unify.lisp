@@ -4,14 +4,15 @@
 
 ;;;; File unify.lisp: Unification functions
 
-(requires "patmatch")
+(load "patmatch.lisp")
 
 (defparameter *occurs-check* t "Should we do the occurs check?")
 
 (defun unify (x y &optional (bindings no-bindings))
   "See if x and y match with given bindings."
+  (format t "unifying ~A and ~A~%" x y)
   (cond ((eq bindings fail) fail)
-        ((eql x y) bindings)
+        ((equal x y) bindings)
         ((variable-p x) (unify-variable x y bindings))
         ((variable-p y) (unify-variable y x bindings))
         ((and (consp x) (consp y))

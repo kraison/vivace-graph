@@ -1,10 +1,5 @@
 (in-package #:vivace-graph)
 
-(defstruct (rule 
-	     (:predicate rule?)
-	     (:conc-name rule-))
-  name s-expr graph)
-
 (defstruct (alpha-memory
 	     (:predicate alpha-memory?)
 	     (:conc-name alpha-))

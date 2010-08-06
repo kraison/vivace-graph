@@ -57,8 +57,19 @@
       (funcall cont)))
 
 (def-global-prolog-functor lisp/2 (?result exp cont)
-  (if (and (consp (var-deref exp))
-	   (unify! ?result (apply (first exp) (rest exp))))
+  (if (unify! ?result (eval (deref-exp exp)))
+      (funcall cont)))
+
+(def-global-prolog-functor regex-match/2 (?arg1 ?arg2 cont)
+  (if (and (stringp (var-deref ?arg1)) (stringp (var-deref ?arg2)) (cl-ppcre:scan ?arg1 ?arg2))
+      (funcall cont)))
+
+(def-global-prolog-functor var/1 (?arg1 cont)
+  (if (unbound-var-p ?arg1) (funcall cont)))
+
+(def-global-prolog-functor is/2 (var exp cont)
+  (if (and (not (find-if-anywhere #'unbound-var-p exp))
+	   (unify! var (eval (deref-exp exp))))
       (funcall cont)))
 
 (def-global-prolog-functor call/1 (goal cont)
@@ -66,7 +77,7 @@
   (let ((functor (make-functor (first goal) (length (args goal)))))
     (apply (or (gethash functor (functors *graph*)) 
 	       (gethash functor *prolog-global-functors*)
-	       (error "Unknown Prolog functor ~A." functor))
+	       (error 'prolog-error :reason (format nil "Unknown Prolog functor ~A" functor)))
 	   (append (args goal) (list cont)))))
 
 (def-global-prolog-functor not/1 (relation cont)	      
@@ -88,14 +99,6 @@
 	     (unify! result (delete-duplicates answers :test #'deref-equal)))
 	(funcall cont))))
 
-(def-global-prolog-functor var/1 (?arg1 cont)
-  (if (unbound-var-p ?arg1) (funcall cont)))
-
-(def-global-prolog-functor is/2 (var exp cont)
-  (if (and (not (find-if-anywhere #'unbound-var-p exp))
-	   (unify! var (eval (deref-exp exp))))
-      (funcall cont)))
-
 (def-global-prolog-functor show-prolog-vars/2 (var-names vars cont)
   (if (null vars)
       (format t "~&Yes")
@@ -112,6 +115,15 @@
       (push (loop for name in var-names
 	       for var in vars
 	       collect (deref-exp var))
+	    *select-list*))
+  (funcall cont))
+
+(def-global-prolog-functor select-as-bind-alist/2 (var-names vars cont)
+  (if (null vars)
+      nil
+      (push (loop for name in var-names
+	       for var in vars
+	       collect (cons (or (and (stringp name) (intern name)) name) (deref-exp var)))
 	    *select-list*))
   (funcall cont))
 

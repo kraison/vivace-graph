@@ -8,6 +8,8 @@
 
 ;;; The basic are in auxfns.lisp; look for "PATTERN MATCHING FACILITY"
 
+(load "auxfns.lisp")
+
 (defun variable-p (x)
   "Is x a variable (a symbol beginning with `?')?"
   (and (symbolp x) (equal (elt (symbol-name x) 0) #\?)))

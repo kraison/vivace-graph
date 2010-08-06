@@ -17,3 +17,4 @@
   (setf (gethash :info *syslog-priorities*) sb-posix:log-info)
   (setf (gethash :debug *syslog-priorities*) sb-posix:log-debug))
 
+(defvar *prolog-global-functors* (make-hash-table :synchronized t))
