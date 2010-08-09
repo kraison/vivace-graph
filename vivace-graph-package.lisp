@@ -31,6 +31,9 @@
 	   #:add-triple
 	   #:get-triples
 	   #:bulk-add-triples
+	   #:map-text-search
+	   #:delete-triple
+	   #:erase-triple
 
 	   #:rule?
 	   #:defrule

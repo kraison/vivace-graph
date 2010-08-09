@@ -19,6 +19,8 @@
 (defgeneric index-subject (triple))
 (defgeneric index-predicate (triple))
 (defgeneric index-object (triple))
+(defgeneric index-text (triple))
+(defgeneric deindex-text (triple))
 (defgeneric do-indexing (graph))
 (defgeneric delete-triple (triple))
 (defgeneric lookup-triple (s p o &key g))
@@ -77,7 +79,7 @@
     (make-triple
      :uuid (deserialize id)
      :belief-factor (deserialize belief)
-     :derived? derived?
+     :derived? (deserialize derived?)
      :subject (lookup-node subject *graph* t)
      :predicate (lookup-predicate predicate *graph*)
      :object (lookup-node object *graph* t))))
@@ -109,6 +111,9 @@
 (defun make-triple-index-key (item key-type)
   (serialize-multiple key-type item))
     
+(defmethod make-triple-uuid-key ((uuid uuid:uuid))
+  (serialize uuid))
+
 (defun make-combined-triple-key (v1 v2 index-type)
   (make-triple-index-key (format nil "~A~A~A" v1 #\Nul v2) index-type))
 
@@ -183,12 +188,29 @@
   (or (gethash (list s p o) (triple-cache (or g *graph*)))
       (lookup-triple-in-db s p o (or g *graph*))))
 
+(defmethod lookup-triple-by-id (uuid &key g)
+  (or (gethash (if (uuid:uuid? uuid) (format nil "~A" uuid) uuid)
+	       (triple-cache (or g *graph*)))
+      (handler-case
+	  (let ((raw-key (lookup-object (triple-db (or g *graph*)) 
+					(make-triple-uuid-key 
+					 (if (uuid:uuid? uuid) 
+					     uuid 
+					     (uuid:make-uuid-from-string uuid))))))
+	    (when (vectorp raw-key)
+	      (let ((raw (lookup-object (triple-db (or g *graph*)) raw-key)))
+		(deserialize raw))))
+	(serialization-error (condition)
+	  (format t "Cannot lookup ~A: ~A~%" uuid condition)
+	  nil))))
+
 (defmethod save-triple ((triple triple))
   (let ((key (make-serialized-key triple))
 	(value (serialize triple)))
     (store-object (triple-db *graph*) key value :mode :keep)))
 
 (defmethod cache-triple ((triple triple))
+  (setf (gethash (format nil "~A" (triple-uuid triple)) (triple-cache *graph*)) triple)
   (setf (gethash (list (node-value (triple-subject triple))
 		       (pred-name (triple-predicate triple))
 		       (node-value (triple-object triple)))
@@ -201,10 +223,10 @@
 	triple))
 
 (defmethod make-new-triple ((graph graph) (subject node) (predicate predicate) (object node) 
-			    &key (index-immediate? t) (certainty-factor +cf-true+))
+			    &key (index-immediate? t) (certainty-factor +cf-true+) derived?)
   (or (lookup-triple subject predicate object)
       (let ((triple (make-triple :subject subject :predicate predicate :object object 
-				 :belief-factor certainty-factor)))
+				 :belief-factor certainty-factor :derived? derived?)))
 	(handler-case
 	    (with-transaction ((triple-db graph))
 	      (save-triple triple)
@@ -245,25 +267,27 @@
 	  t)))))
   
 (defmethod delete-triple ((triple triple))
-  (if (null (cas (triple-deleted? triple) nil t))
-      (handler-case
-	  (with-transaction ((triple-db *graph*))
-	    (delete-object (triple-db *graph*) (make-serialized-key triple))
-	    (deindex-triple triple)
-	    (decf-ref-count (triple-subject triple))
-	    (decf-ref-count (triple-object triple)))
-	(persistence-error (condition)
-	  (format t "Cannot delete triple ~A: ~A~%" triple condition))
-	(:no-error (status)
-	  (declare (ignore status))
-	  (remhash (list (triple-subject triple) (triple-predicate triple) (triple-object triple))
-		   (triple-cache *graph*))
-	  (remhash (list (node-value (triple-subject triple)) 
-			 (pred-name (triple-predicate triple)) 
-			 (node-value (triple-object triple)))
-		   (triple-cache *graph*))
-	  t))
-      t))
+  (cas (triple-deleted? triple) nil t))
+
+(defmethod erase-triple ((triple triple))
+  (handler-case
+      (with-transaction ((triple-db *graph*))
+	(delete-object (triple-db *graph*) (make-serialized-key triple))
+	(deindex-triple triple)
+	(decf-ref-count (triple-subject triple))
+	(decf-ref-count (triple-object triple)))
+    (persistence-error (condition)
+      (format t "Cannot erase triple ~A: ~A~%" triple condition))
+    (:no-error (status)
+      (declare (ignore status))
+      (setf (gethash (format nil "~A" (triple-uuid triple)) (triple-cache *graph*)) triple)
+      (remhash (list (triple-subject triple) (triple-predicate triple) (triple-object triple))
+	       (triple-cache *graph*))
+      (remhash (list (node-value (triple-subject triple)) 
+		     (pred-name (triple-predicate triple)) 
+		     (node-value (triple-object triple)))
+	       (triple-cache *graph*))
+      t)))
 
 (defmethod index-triple ((triple triple))
   (let ((subject-key (make-triple-index-key (node-value (triple-subject triple)) 
@@ -275,14 +299,17 @@
 	(sp-key (make-triple-sp-key triple))
 	(so-key (make-triple-so-key triple))
 	(po-key (make-triple-po-key triple))
+	(uuid-key (make-triple-uuid-key (triple-uuid triple)))
 	(triple-key (make-serialized-key triple)))
     (with-transaction ((triple-db *graph*))
+      (store-object (triple-db *graph*) uuid-key triple-key :mode :duplicate)
       (store-object (triple-db *graph*) sp-key triple-key :mode :duplicate)
       (store-object (triple-db *graph*) so-key triple-key :mode :duplicate)
       (store-object (triple-db *graph*) po-key triple-key :mode :duplicate)
       (store-object (triple-db *graph*) subject-key triple-key :mode :duplicate)
       (store-object (triple-db *graph*) predicate-key triple-key :mode :duplicate)
-      (store-object (triple-db *graph*) object-key triple-key :mode :duplicate))))
+      (store-object (triple-db *graph*) object-key triple-key :mode :duplicate))
+    (index-text triple)))
 
 (defmethod do-indexing ((graph graph))
   (loop until (sb-concurrency:queue-empty-p (needs-indexing-q graph)) do
@@ -298,14 +325,60 @@
 	(sp-key (make-triple-sp-key triple))
 	(so-key (make-triple-so-key triple))
 	(po-key (make-triple-po-key triple))
+	(uuid-key (make-triple-uuid-key (triple-uuid triple)))
 	(triple-key (make-serialized-key triple)))
+    (deindex-text triple)
     (with-transaction ((triple-db *graph*))
+      (delete-object (triple-db *graph*) uuid-key triple-key)
       (delete-object (triple-db *graph*) sp-key triple-key)
       (delete-object (triple-db *graph*) so-key triple-key)
       (delete-object (triple-db *graph*) po-key triple-key)
       (delete-object (triple-db *graph*) subject-key triple-key)
       (delete-object (triple-db *graph*) predicate-key triple-key)
       (delete-object (triple-db *graph*) object-key triple-key))))
+
+(defmethod index-text ((triple triple))
+  (when (or (stringp (node-value (triple-subject triple)))
+	    (stringp (node-value (triple-object triple))))
+    (let ((doc (make-instance 'montezuma:document)))
+      (montezuma:add-field 
+       doc (montezuma:make-field "uuid" 
+				 (format nil "~A" (triple-uuid triple))
+				 :stored t :index :untokenized))
+      (when (stringp (node-value (triple-subject triple)))
+	(montezuma:add-field 
+	 doc (montezuma:make-field "subject" (node-value (triple-subject triple)) 
+				   :stored t :index :tokenized)))
+      (when (stringp (node-value (triple-object triple)))
+	(montezuma:add-field 
+	 doc (montezuma:make-field "object" (node-value (triple-object triple))
+				   :stored t :index :tokenized)))
+      (montezuma:add-document-to-index (full-text-idx *graph*) doc))))
+
+(defmethod deindex-text ((triple triple)) 
+  (let ((docs nil))
+    (montezuma:search-each 
+     (full-text-idx *graph*)
+     (uuid:print-bytes nil (triple-uuid triple))
+     #'(lambda (doc score) (declare (ignore score)) (push doc docs)))
+    (dolist (doc docs)
+      (montezuma:delete-document (full-text-idx *graph*) doc))))
+ 
+(defun map-text-search (string fn &key collect)
+  (let ((result nil))
+    (montezuma:search-each 
+     (full-text-idx *graph*)
+     string
+     #'(lambda (doc score)
+	 (declare (ignore score))
+	 (let ((r
+		(funcall fn
+			 (lookup-triple-by-id
+			  (montezuma:document-value 
+ (montezuma:get-document (full-text-idx *graph*) doc) "uuid")))))
+	   (if collect (push r result)))))
+    (nreverse result)))
+
 
 
 

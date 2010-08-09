@@ -55,6 +55,12 @@
 		      (rule-db graph) (open-hash (format nil "~A/rules.kch" (graph-location graph)))
 		      (functor-db graph) (open-hash 
 					  (format nil "~A/functors.kch" (graph-location graph)))
+		      (full-text-idx graph)
+		      (make-instance 'montezuma:index 
+				     :default-field "*"
+				     :fields '("subject" "object")
+				     :min-merge-docs 5000 
+				     :path (format nil "~A/full-text-idx" (graph-location graph)))
 		      (gethash (graph-uuid graph) *graph-table*) graph
 		      *graph* graph))))))
     ;; FIXME: load graph-specific rules and functors!!

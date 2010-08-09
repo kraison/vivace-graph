@@ -594,6 +594,7 @@
 (defun reload-testdb ()
   (if (graph? *graph*) (shutdown-graph *graph*))
   (ignore-errors 
+    (cl-fad:delete-directory-and-files "db/full-text-idx")
     (delete-file "db/functors.kch")
     (delete-file "db/rules.kch")
     (delete-file "db/triples.kct"))

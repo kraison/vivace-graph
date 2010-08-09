@@ -34,11 +34,7 @@
       (%node-uuid node)))
 
 (defmethod node-value ((node node))
-  (if (eq (%node-value node) +needs-lookup+)
-      (setf (%node-value node) 
-	    (deserialize (lookup-object (triple-db *graph*) 
-					(make-slot-key (node-value node) "value"))))
-      (%node-value node)))
+  (%node-value node))
 
 (defmethod node-ref-count ((node node))
   (let ((count (lookup-object (triple-db *graph*) (make-slot-key (node-value node) "ref-count"))))
@@ -123,3 +119,8 @@
 		  (declare (ignore status))
 		  (when cache? (cache-node node))
 		  node)))))))
+
+(defmethod delete-node ((node node))
+  (with-transaction ((triple-db *graph*))
+    node))
+

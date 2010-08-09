@@ -15,12 +15,13 @@
   (rule-db nil)
   (rete-net nil)
   (full-text-idx nil)
+  (templates (make-hash-table :synchronized t))
   (functors (make-hash-table :synchronized t))
   (prolog-compiler-macros (make-hash-table :synchronized t))
   (rule-cache (make-hash-table :synchronized t))
   (predicate-cache (make-hash-table :synchronized t))
-  (node-cache (make-hash-table :test 'equal :synchronized t :weakness :key-or-value))
-  (triple-cache (make-hash-table :test 'equal :synchronized t :weakness :key-or-value))
+  (node-cache (make-hash-table :test 'equal :synchronized t)) ;:weakness :key-or-value))
+  (triple-cache (make-hash-table :test 'equal :synchronized t)) ;:weakness :key-or-value))
   (delete-queue (sb-concurrency:make-queue))
   (needs-indexing-q (sb-concurrency:make-queue)))
 
@@ -33,4 +34,3 @@
 
 (defmethod needs-indexing? ((graph graph))
   (not (sb-concurrency:queue-empty-p (needs-indexing-q graph))))
-

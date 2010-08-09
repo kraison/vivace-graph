@@ -12,6 +12,7 @@
   :long-description "Vivace Graph Store."
   :depends-on (:bordeaux-threads
 	       :uuid
+	       :cl-fad
 	       :ieee-floats
 	       :parse-number
 	       :cffi

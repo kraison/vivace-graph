@@ -133,7 +133,7 @@
 	      (or (not (var-p s)) (and (var-p s) (bound-p s)))
 	      (or (not (var-p o)) (and (var-p o) (bound-p o))))
 	 (let ((triple (lookup-triple (var-deref s) p (var-deref o))))
-	   (if (triple? triple) 
+	   (if (and (triple? triple) (not (triple-deleted? triple)))
 	       (let ((old-trail (fill-pointer *trail*)))
 		 (if (unify! s (node-value (triple-subject triple)))
 		     (if (unify! o (node-value (triple-object triple)))
@@ -152,10 +152,11 @@
 	   (if triples
 	       (let ((old-trail (fill-pointer *trail*)))
 		 (dolist (triple triples)
-		   (if (unify! s (node-value (triple-subject triple)))
-		       (if (unify! o (node-value (triple-object triple)))
-			   (funcall cont)))
-		   (undo-bindings! old-trail))))))))
+		   (if (and (triple? triple) (not (triple-deleted? triple)))
+		       (if (unify! s (node-value (triple-subject triple)))
+			   (if (unify! o (node-value (triple-object triple)))
+			       (funcall cont)))
+		       (undo-bindings! old-trail)))))))))
 
 #|
 (defmethod load-all-functors ((graph graph))

@@ -9,6 +9,11 @@
 (export 'time-high-and-version)
 (export 'clock-seq-and-reserved)
 (export 'uuid-eql)
+(export 'uuid?)
+
+(defgeneric uuid? (thing)
+  (:method ((thing uuid)) t)
+  (:method (thing) nil))
 
 (defmethod uuid-eql ((uuid1 uuid) (uuid2 uuid))
   (equalp (uuid-to-byte-array uuid1) (uuid-to-byte-array uuid2)))
