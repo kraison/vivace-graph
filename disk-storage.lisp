@@ -2,6 +2,7 @@
 
 (defun open-store (file)
     (handler-case
+	;;(let ((db (make-instance 'kc-dbm)))
 	(let ((db (make-instance 'tc-bdb)))
 	  ;;(dbm-cache db :non-leaf 2048 :leaf 10240)
 	  (dbm-open db file :READ :WRITE :CREATE)
@@ -17,6 +18,7 @@
 
 (defun open-hash (file)
   (handler-case
+      ;;(let ((db (make-instance 'kc-dbm)))
       (let ((db (make-instance 'tc-hdb)))
 	;;(dbm-cache db :non-leaf 2048 :leaf 10240)
 	(dbm-open db file :READ :WRITE :CREATE)

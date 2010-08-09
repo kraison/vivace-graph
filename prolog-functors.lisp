@@ -157,3 +157,13 @@
 			   (funcall cont)))
 		   (undo-bindings! old-trail))))))))
 
+#|
+(defmethod load-all-functors ((graph graph))
+  (let ((iter (iter-open (functor-db graph))))
+    (iter-first iter)
+    (loop
+       (multiple-value-bind (key val) (iter-item iter :key-type :octets) 
+	 (format t "~A: ~A~%" key val)
+	 (if (null key) (return)))
+       (iter-next iter))))
+|#

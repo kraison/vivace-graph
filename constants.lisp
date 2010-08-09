@@ -7,15 +7,8 @@
 (defconstant +cf-false+ -1.0)
 (defconstant +cf-unknown+ 0.0)
 
-;; MCAS status markers
-(defconstant +mcas-undecided+ :undecided)
-(defconstant +mcas-failed+ :failed)
-(defconstant +mcas-succeeded+ :succeeded)
-
-;; MCAS transaction global
-(defvar *mcas* nil)
-
 ;; Built-in type identifiers for serializing
+(defconstant +needs-lookup+ :needs-lookup)
 (defconstant +unknown+ 0)
 (defconstant +negative-integer+ 1)
 (defconstant +positive-integer+ 2)
@@ -31,6 +24,7 @@
 (defconstant +null+ 12)
 (defconstant +blob+ 13) ;; Uninterpreted octets
 (defconstant +dotted-list+ 14)
+(defconstant +slot-key+ 15)
 
 ;; User-defined type identifiers for serializing. Start at 100
 (defconstant +uuid+ 100)

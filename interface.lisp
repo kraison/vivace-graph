@@ -51,10 +51,10 @@
 				       :graph-location (py-configparser:get-option 
 							config "default" "location"))))
 		(setf (triple-db graph) (open-store 
-					 (format nil "~A/triples" (graph-location graph)))
-		      (rule-db graph) (open-hash (format nil "~A/rules" (graph-location graph)))
+					 (format nil "~A/triples.kct" (graph-location graph)))
+		      (rule-db graph) (open-hash (format nil "~A/rules.kch" (graph-location graph)))
 		      (functor-db graph) (open-hash 
-					  (format nil "~A/functors" (graph-location graph)))
+					  (format nil "~A/functors.kch" (graph-location graph)))
 		      (gethash (graph-uuid graph) *graph-table*) graph
 		      *graph* graph))))))
     ;; FIXME: load graph-specific rules and functors!!

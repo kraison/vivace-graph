@@ -1,7 +1,10 @@
 (in-package #:cl-user)
 
 (defpackage #:vivace-graph
-  (:use #:cl #:cffi #:bordeaux-threads #:tokyo-cabinet #:tokyo-cabinet-ffi #:local-time)
+  (:use #:cl #:cffi #:bordeaux-threads 
+	#:tokyo-cabinet #:tokyo-cabinet-ffi 
+	;;#:kyoto-cabinet #:kyoto-cabinet-ffi
+	#:local-time)
   (:export #:*graph*
 	   #:graph?
 	   #:load-graph!
@@ -30,12 +33,38 @@
 	   #:bulk-add-triples
 
 	   #:rule?
-	   #:add-rule
-	   #:delete-rule
+	   #:defrule
+	   #:get-rule
+	   #:retract-rule
 
 	   #:<-
 	   #:?-
 	   #:prolog
-	   #:query
-	   #:traverse
+	   #:select
+	   #:select-flat
+	   #:read/1
+	   #:wrte/1
+	   #:nl/0
+	   #:repeat/0
+	   #:fail/0
+	   #:=/2
+	   #:==/2
+	   #:/=/2
+	   #:>/2
+	   #:</2
+	   #:>=/2
+	   #:<=/2
+	   #:lisp/2
+	   #:regex-match/2
+	   #:var/1
+	   #:is/2
+	   #:call/1
+	   #:not/1
+	   #:bagof/3
+	   #:setof/3
+
+	   #:timestamp?
+	   #:universal-to-timestamp
+	   #:timestamp-to-universal
+	   #:decode-timestamp
 	   ))

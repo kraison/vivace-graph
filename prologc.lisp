@@ -38,12 +38,6 @@
       (format stream "?~a" (var-name var))
       (write var :stream stream)))
 
-(defmethod predicate ((triple triple))
-  (pred-name (triple-predicate triple)))
-
-(defmethod predicate ((tuple list))
-  (first tuple))
-
 (defun bound-p (var) (not (eq (var-binding var) +unbound+)))
 
 (defgeneric prolog-equal (x y)
@@ -229,8 +223,7 @@
            ,exp)
         exp)))
 
-(defun make-anonymous (exp &optional
-                       (anon-vars (anonymous-variables-in exp)))
+(defun make-anonymous (exp &optional (anon-vars (anonymous-variables-in exp)))
   "Replace variables that are only used once with ?."
   (cond ((consp exp)
          (reuse-cons (make-anonymous (first exp) anon-vars)
@@ -404,10 +397,7 @@
 		   (= 3 (length (first clause)))
 		   (not (variable-p (second (first clause))))
 		   (not (variable-p (third (first clause)))))
-	      (prog1
-		  (add-triple (second (first clause)) predicate-name (third (first clause)) *graph*)
-		(unless (gethash (make-functor predicate-name 2) (functors *graph*))
-		  (add-default-functor (make-new-predicate :name predicate-name))))
+	      (add-triple (second (first clause)) predicate-name (third (first clause)) *graph*)
 	      (let ((predicate (make-new-predicate :name predicate-name)))
 		(add-functor predicate clause)
 		predicate))))))
@@ -438,11 +428,10 @@
 	(parameters (make-parameters 2)))
     (declare (ignore parameters))
     (let ((func
-	   #'(lambda (?arg1 ?arg2 cont)
-	       (let ((*predicate* *predicate*))
-		 (block *predicate*
-		   (triple-search/3 (pred-name predicate) ?arg1 ?arg2 cont))))))
-      (setf (gethash *predicate* (functors (pred-graph predicate))) func))))
+	   `#'(lambda (?arg1 ?arg2 cont)
+		(block ,*predicate*
+		  (triple-search/3 ',(pred-name predicate) ?arg1 ?arg2 cont)))))
+      (setf (gethash *predicate* (functors (pred-graph predicate))) (eval func)))))
 
 (defun compile-predicate (predicate arity clauses)
   "Compile all the clauses for a given symbol/arity
@@ -605,9 +594,9 @@
 (defun reload-testdb ()
   (if (graph? *graph*) (shutdown-graph *graph*))
   (ignore-errors 
-    (delete-file "db/functors")
-    (delete-file "db/rules")
-    (delete-file "db/triples"))
+    (delete-file "db/functors.kch")
+    (delete-file "db/rules.kch")
+    (delete-file "db/triples.kct"))
   (load-graph! "db/config.ini")
   (<- (member ?item (?item . ?rest)))
   (<- (member ?item (?x . ?rest)) (member ?item ?rest))
@@ -632,7 +621,7 @@
 
 (defun who-likes (person)
   (declare (special person))
-  (select0 (?x) (lisp ?y (princ-to-string person)) (likes ?x ?y)))
+  (select-flat (?x) (lisp ?y (princ-to-string person)) (likes ?x ?y)))
 
 (defun ptest1 ()
   (let ((*graph* (make-new-graph :name "test graph 1" :location "/var/tmp")))
