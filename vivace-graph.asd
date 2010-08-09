@@ -4,12 +4,12 @@
 (in-package :vivace-graph-system)
 
 (defsystem vivace-graph
-  :name "Vivace Graph Store Library"
+  :name "Vivace Graph"
   :maintainer "Kevin Raison"
   :author "Kevin Raison <last name @ chatsubo dot net>"
   :version "0.1"
-  :description "Vivace Graph Store"
-  :long-description "Vivace Graph Store."
+  :description "Vivace Graph"
+  :long-description "Vivace Graph."
   :depends-on (:bordeaux-threads
 	       :uuid
 	       :cl-fad
