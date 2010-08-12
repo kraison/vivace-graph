@@ -77,8 +77,17 @@
   (let ((functor (make-functor (first goal) (length (args goal)))))
     (apply (or (gethash functor (functors *graph*)) 
 	       (gethash functor *prolog-global-functors*)
-	       (error 'prolog-error :reason (format nil "Unknown Prolog functor ~A" functor)))
+	       (error 'prolog-error :reason (format nil "Unknown Prolog functorin call/1 ~A" 
+						    functor)))
 	   (append (args goal) (list cont)))))
+
+(def-global-prolog-functor if/2 (?test ?then cont)
+  (call/1 ?test #'(lambda () (call/1 ?then #'(lambda () nil))))
+  (funcall cont))
+
+(def-global-prolog-functor if/3 (?test ?then ?else cont)
+  (call/1 ?test #'(lambda () (call/1 ?then #'(lambda () (funcall cont) (return-from if/3)))))
+  (call/1 ?else #'(lambda () (funcall cont) (return-from if/3))))
 
 (def-global-prolog-functor not/1 (relation cont)	      
   (with-undo-bindings
@@ -155,16 +164,17 @@
 		   (if (and (triple? triple) (not (triple-deleted? triple)))
 		       (if (unify! s (node-value (triple-subject triple)))
 			   (if (unify! o (node-value (triple-object triple)))
-			       (funcall cont)))
-		       (undo-bindings! old-trail)))))))))
+			       (funcall cont))))
+		   (undo-bindings! old-trail))))))))
 
-#|
 (defmethod load-all-functors ((graph graph))
-  (let ((iter (iter-open (functor-db graph))))
-    (iter-first iter)
-    (loop
-       (multiple-value-bind (key val) (iter-item iter :key-type :octets) 
-	 (format t "~A: ~A~%" key val)
-	 (if (null key) (return)))
-       (iter-next iter))))
-|#
+  (map-hash-objects (functor-db graph)
+		    #'(lambda (key val)
+			(declare (ignore key))
+			(let ((predicate (deserialize val)))
+			  (when (predicate? predicate)
+			    (setf (pred-graph predicate) graph
+				  (pred-key predicate) (make-serialized-key predicate))
+			    (prolog-compile predicate)
+			    (cache-predicate predicate))))))
+

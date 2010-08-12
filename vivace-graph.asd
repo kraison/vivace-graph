@@ -18,8 +18,8 @@
 	       :cffi
 	       :sb-concurrency
 	       :sb-posix
-	       :cl-tokyo-cabinet
-	       ;;:cl-kyoto-cabinet
+	       ;;:cl-tokyo-cabinet
+	       :cl-kyoto-cabinet
 	       :cl-skip-list
 	       :local-time
 	       :montezuma
@@ -47,8 +47,6 @@
 	       (:file "templates" :depends-on ("triples"))
 	       (:file "prologc" :depends-on ("templates"))
 	       (:file "prolog-functors" :depends-on ("prologc"))
-	       ;;(:file "rete" :depends-on ("prolog-functors"))
-	       (:file "leaps" :depends-on ("prolog-functors"))
-	       (:file "rules" :depends-on ("leaps"))
+	       (:file "rules" :depends-on ("prolog-functors"))
 	       (:file "gc" :depends-on ("rules" "triples" "node"))
-	       (:file "interface" :depends-on ("prolog-functors"))))
+	       (:file "interface" :depends-on ("rules"))))

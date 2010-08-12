@@ -94,22 +94,16 @@
 	  (cache-predicate predicate)
 	  predicate)))))
 
-(defmethod add-default-functor ((predicate predicate))
-  "Lock the predicate for compilation, add the clause, persist it and recompile."
-  ;(format t "2. Adding default functor for ~A~%" predicate)
-  (with-recursive-lock-held ((pred-lock predicate))
-    (prolog-compile predicate))
-  predicate)
-
-(defmethod add-functor ((predicate predicate) clause)
+(defmethod add-functor ((predicate predicate) &optional clause)
   "Lock the predicate for compilation, add the clause, persist it and recompile."
   ;(format t "2. Adding clause ~A / ~A~%" (pred-name predicate) clause)
   (with-recursive-lock-held ((pred-lock predicate))
-    (let ((old-clauses (pred-clauses predicate)))
-      (setf (pred-clauses predicate) (append old-clauses (list clause))))
-    (update-predicate predicate)
-    (prolog-compile predicate))
-  (pred-clauses predicate))
+    (when clause
+      (let ((old-clauses (pred-clauses predicate)))
+	(setf (pred-clauses predicate) (append old-clauses (list clause))))
+      (update-predicate predicate))
+    (prolog-compile predicate)
+    (or (pred-clauses predicate) predicate)))
 
 (defmethod delete-functor (name)
   (let* ((name (or (and (symbolp name) name)
@@ -117,5 +111,13 @@
 	 (predicate (lookup-predicate name *graph*)))
     (with-recursive-lock-held ((pred-lock predicate))
       (remhash name (predicate-cache *graph*))
-      (delete-object (functor-db *graph*) (make-predicate-key-from-name name))
-      (add-default-functor predicate))))
+      (delete-object (functor-db *graph*) (make-predicate-key-from-name name)))))
+
+(defmethod reset-functor (name)
+  (let* ((name (or (and (symbolp name) name)
+		   (and (stringp name) (intern (string-upcase name)))))
+	 (predicate (lookup-predicate name *graph*)))
+    (with-recursive-lock-held ((pred-lock predicate))  
+      (setf (pred-clauses predicate) nil)
+      (add-functor predicate))))
+

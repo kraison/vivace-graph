@@ -13,15 +13,16 @@
   (triple-db nil)
   (functor-db nil)
   (rule-db nil)
-  (rete-net nil)
   (full-text-idx nil)
+  (rule-idx (make-hash-table :synchronized t :test 'equal))
   (templates (make-hash-table :synchronized t))
   (functors (make-hash-table :synchronized t))
-  (prolog-compiler-macros (make-hash-table :synchronized t))
   (rule-cache (make-hash-table :synchronized t))
   (predicate-cache (make-hash-table :synchronized t))
   (node-cache (make-hash-table :test 'equal :synchronized t)) ;:weakness :key-or-value))
   (triple-cache (make-hash-table :test 'equal :synchronized t)) ;:weakness :key-or-value))
+  (production-pq (make-skip-pq :key-equal #'timestamp= :comparison #'timestamp>
+			       :head-value (make-timestamp :day -1000000 :sec 0 :nsec 0)))
   (delete-queue (sb-concurrency:make-queue))
   (needs-indexing-q (sb-concurrency:make-queue)))
 

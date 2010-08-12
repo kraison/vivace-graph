@@ -63,6 +63,9 @@
   (:method ((x uuid:uuid) (y symbol)) (string>= (uuid:print-bytes nil x) (symbol-name y)))
   (:method ((x uuid:uuid) (y number)) (string>= (uuid:print-bytes nil x) (write-to-string y))))
 
+(defun print-hash (ht)
+  (maphash #'(lambda (k v) (format t "~A: ~A~%" k v)) ht))
+
 ;; Timestamp misc.
 (defgeneric timestamp? (thing)
   (:method ((thing timestamp)) t)

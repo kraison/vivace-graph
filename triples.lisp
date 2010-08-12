@@ -75,13 +75,15 @@
 (defmethod deserialize-help ((become (eql +triple+)) bytes)
   "Decode a triple. FIXME: add support for derived? field."
   (declare (optimize (speed 3)))
-  (destructuring-bind (subject predicate object belief id derived?) (extract-all-subseqs bytes)
+  (destructuring-bind (subject predicate object belief id timestamp derived? deleted?) 
+      (extract-all-subseqs bytes)
     (make-triple
      :uuid (deserialize id)
      :belief-factor (deserialize belief)
      :derived? (deserialize derived?)
      :subject (lookup-node subject *graph* t)
      :predicate (lookup-predicate predicate *graph*)
+     :deleted? (deserialize deleted?)
      :object (lookup-node object *graph* t))))
 
 (defmethod serialize ((triple triple))
@@ -92,7 +94,9 @@
 		      (node-value (triple-object triple))
 		      (triple-belief-factor triple) 
 		      (triple-uuid triple)
-		      (triple-derived? triple)))
+		      (triple-timestamp triple)
+		      (triple-derived? triple)
+		      (triple-deleted? triple)))
 
 (defun make-triple-key-from-values (s p o)
   (serialize-multiple +triple-key+ s (or (and (symbolp p) p) (intern p)) o))
@@ -178,7 +182,7 @@
       (let ((key (make-triple-key-from-values s p o)))
 	(let ((raw (lookup-object (triple-db (or g *graph*)) key)))
 	  (when (vectorp raw)
-	    (deserialize raw))))
+	    (cache-triple (deserialize raw)))))
     (serialization-error (condition)
       (declare (ignore condition))
       (format t "Cannot lookup ~A/~A/~A~%" s p o)
@@ -231,7 +235,7 @@
 	    (with-transaction ((triple-db graph))
 	      (save-triple triple)
 	      (unless (gethash (make-functor (pred-name predicate) 2) (functors graph))
-		(add-default-functor (make-new-predicate :name (pred-name predicate))))
+		(add-functor (make-new-predicate :name (pred-name predicate))))
 	      (incf-ref-count subject)
 	      (incf-ref-count object)
 	      (if index-immediate? 
@@ -242,9 +246,10 @@
 		(error condition)))
 	  (:no-error (status)
 	    (declare (ignore status))
-	    (cache-triple triple))))))
+	    (cache-triple triple)
+	    (skip-list-add (production-pq *graph*) (triple-timestamp triple) triple))))))
 
-(defmethod bulk-add-triples ((graph graph) tuple-list &key cache?)
+(defmethod bulk-add-triples ((graph graph) tuple-list &key cache? trigger?)
   (let ((new-triples nil))
     (handler-case
 	(with-transaction ((triple-db graph))
@@ -261,13 +266,17 @@
 		    (index-triple triple)
 		    (when cache? (push triple new-triples)))))))
       (:no-error (success?)
-	(when (and success? cache?)
+	(when (and success? new-triples)
 	  (dolist (triple new-triples)
-	    (cache-triple triple))
-	  t)))))
+	    (when cache?
+	      (cache-triple triple))
+	    (when trigger?
+	      (skip-list-add (production-pq *graph*) (triple-timestamp triple) triple))))
+	t))))
   
 (defmethod delete-triple ((triple triple))
-  (cas (triple-deleted? triple) nil t))
+  (when (null (cas (triple-deleted? triple) nil t))
+    (cas (triple-timestamp triple) (triple-timestamp triple) (now))))
 
 (defmethod erase-triple ((triple triple))
   (handler-case
@@ -302,13 +311,13 @@
 	(uuid-key (make-triple-uuid-key (triple-uuid triple)))
 	(triple-key (make-serialized-key triple)))
     (with-transaction ((triple-db *graph*))
-      (store-object (triple-db *graph*) uuid-key triple-key :mode :duplicate)
-      (store-object (triple-db *graph*) sp-key triple-key :mode :duplicate)
-      (store-object (triple-db *graph*) so-key triple-key :mode :duplicate)
-      (store-object (triple-db *graph*) po-key triple-key :mode :duplicate)
-      (store-object (triple-db *graph*) subject-key triple-key :mode :duplicate)
-      (store-object (triple-db *graph*) predicate-key triple-key :mode :duplicate)
-      (store-object (triple-db *graph*) object-key triple-key :mode :duplicate))
+      (store-object (triple-db *graph*) uuid-key triple-key :mode :concat)
+      (store-object (triple-db *graph*) sp-key triple-key :mode :concat)
+      (store-object (triple-db *graph*) so-key triple-key :mode :concat)
+      (store-object (triple-db *graph*) po-key triple-key :mode :concat)
+      (store-object (triple-db *graph*) subject-key triple-key :mode :concat)
+      (store-object (triple-db *graph*) predicate-key triple-key :mode :concat)
+      (store-object (triple-db *graph*) object-key triple-key :mode :concat))
     (index-text triple)))
 
 (defmethod do-indexing ((graph graph))
@@ -387,28 +396,32 @@
     (unwind-protect
 	 (time
 	  (with-transaction ((triple-db *graph*))
-	    (dotimes (i 10000)
+	    (dotimes (i 1000)
 	      (add-triple (format nil "S~A" i) (format nil "P~A" i) (format nil "O~A" i)))))
       (progn
 	(if (graph? *graph*) (shutdown-graph *graph*))
-	(delete-file "/var/tmp/triples")
-	(delete-file "/var/tmp/rules")
-	(delete-file "/var/tmp/functors")
-	(delete-file "/var/tmp/config.ini")))))
+	(ignore-errors 
+	  (cl-fad:delete-directory-and-files "/var/tmp/full-text-idx")
+	  (delete-file "/var/tmp/functors.kch")
+	  (delete-file "/var/tmp/rules.kch")
+	  (delete-file "/var/tmp/triples.kct")
+	  (delete-file "/var/tmp/config.ini"))))))
 
 (defun triple-test-2 ()
   (let ((*graph* (make-new-graph :name "test graph" :location "/var/tmp")))
     (unwind-protect
 	 (let ((tuples nil))
-	   (dotimes (i 10000)
+	   (dotimes (i 1000)
 	     (push (list (format nil "S~A" i) (format nil "P~A" i) (format nil "O~A" i)) tuples))
 	   (time (bulk-add-triples *graph* tuples)))
       (progn
 	(if (graph? *graph*) (shutdown-graph *graph*))
-	(delete-file "/var/tmp/triples")
-	(delete-file "/var/tmp/rules")
-	(delete-file "/var/tmp/functors")
-	(delete-file "/var/tmp/config.ini")))))
+	(ignore-errors 
+	  (cl-fad:delete-directory-and-files "/var/tmp/full-text-idx")
+	  (delete-file "/var/tmp/functors.kch")
+	  (delete-file "/var/tmp/rules.kch")
+	  (delete-file "/var/tmp/triples.kct")
+	  (delete-file "/var/tmp/config.ini"))))))
 
 (defun triple-test-3 ()
   (let ((*graph* (make-new-graph :name "test graph" :location "/var/tmp")))

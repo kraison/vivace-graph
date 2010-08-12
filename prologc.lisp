@@ -379,7 +379,7 @@
 	    (clause-body clause))
 	   cont
 	   (mapcar #'self-cons parms)))))
-    ;;(format t "BODY: ~A~%" body)
+    ;(format t "~A BODY: ~A~%" (clause-head clause) body)
     body))
 
 (defun add-clause (clause &key (persist? t))
@@ -590,6 +590,7 @@
 	  (remhash *predicate* (functors *graph*)))
 	(nreverse *select-list*)))))
 
+
 #|
 (defun reload-testdb ()
   (if (graph? *graph*) (shutdown-graph *graph*))
@@ -601,9 +602,9 @@
   (load-graph! "db/config.ini")
   (<- (member ?item (?item . ?rest)))
   (<- (member ?item (?x . ?rest)) (member ?item ?rest))
-  (<- (if ?test ?then) (if ?then ?else (fail)))
-  (<- (if ?test ?then ?else) (call ?test) ! (call ?then))
-  (<- (if ?test ?then ?else) (call ?else))
+;  (<- (if ?test ?then) (if ?then ?else (fail)))
+;  (<- (if ?test ?then ?else) (call ?test) ! (call ?then))
+;  (<- (if ?test ?then ?else) (call ?else))
   (<- (is-of-age ?x) (has-age ?x ?y) (>= ?y 21) !)
   (<- (lovers ?x ?y) (loves ?x ?y) (loves ?y ?x))
   (<- (has-age "Kevin" 35))

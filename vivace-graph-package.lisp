@@ -2,9 +2,10 @@
 
 (defpackage #:vivace-graph
   (:use #:cl #:cffi #:bordeaux-threads 
-	#:tokyo-cabinet #:tokyo-cabinet-ffi 
-	;;#:kyoto-cabinet #:kyoto-cabinet-ffi
-	#:local-time)
+	;;#:tokyo-cabinet #:tokyo-cabinet-ffi 
+	#:kyoto-cabinet #:kyoto-cabinet-ffi
+	#:local-time
+	#:cl-skip-list)
   (:export #:*graph*
 	   #:graph?
 	   #:load-graph!
@@ -39,6 +40,9 @@
 	   #:defrule
 	   #:get-rule
 	   #:retract-rule
+	   #:deftemplate
+	   #:fact
+	   #:deffacts
 
 	   #:<-
 	   #:?-

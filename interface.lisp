@@ -63,7 +63,8 @@
 				     :path (format nil "~A/full-text-idx" (graph-location graph)))
 		      (gethash (graph-uuid graph) *graph-table*) graph
 		      *graph* graph))))))
-    ;; FIXME: load graph-specific rules and functors!!
+    (load-all-functors *graph*)
+    (load-all-rules *graph*)
     *graph*))
 
 (defun make-new-graph (&key name location)
