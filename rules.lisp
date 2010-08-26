@@ -35,33 +35,6 @@
       (when (and (eq kind 'conclusion) (not (member op *conclusion-operators*)))
 	(error "Rule ~A: Illegal operator (~A) in conclusion: ~A" rule-name op condition)))))
 
-(defmethod deserialize-help ((become (eql +rule+)) bytes)
-  "Decode a rule."
-  (declare (optimize (speed 3)))
-  (destructuring-bind (name premises conclusions cf) (extract-all-subseqs bytes)
-    (let ((rule (make-rule :name (deserialize name)
-			   :premises (deserialize premises)
-			   :conclusions (deserialize conclusions)
-			   :cf (deserialize cf))))
-      (cache-rule rule))))
-
-(defmethod serialize ((rule rule))
-  "Encode a rule for storage."
-  (serialize-multiple +rule+ 
-		      (rule-name rule)
-		      (rule-premises rule)
-		      (rule-conclusions rule)
-		      (rule-cf rule)))
-
-(defun make-rule-key-from-name (name)
-  (serialize-multiple +rule-key+ (princ-to-string name)))
-
-(defmethod make-serialized-key ((rule rule))
-  (make-rule-key-from-name (rule-name rule)))
-
-(defun make-premise-idx (p)
-  (mapcar #'(lambda (i) (if (variable-p i) +wildcard+ i)) p))
-
 (defun map-premises (fn p)
   (cond ((atom p) nil)
 	((and (consp p) (every #'atom p))
@@ -76,17 +49,6 @@
   (let ((count 0))
     (map-premises #'(lambda (p1) (declare (ignore p1)) (incf count)) p)
     count))
-
-(defmethod index-rule ((rule rule))
-  (map-premises #'(lambda (p) 
-		    (pushnew rule (gethash (make-premise-idx p) (rule-idx *graph*))))
-		(copy-tree (rule-premises rule))))
-
-(defmethod deindex-rule ((rule rule))
-  (map-premises #'(lambda (p) 
-		    (setf (gethash (make-premise-idx p) (rule-idx *graph*))
-			  (remove rule (gethash (make-premise-idx p) (rule-idx *graph*)))))
-		(copy-tree (rule-premises rule))))
 
 (defmethod compile-rule ((rule rule))
   rule)
@@ -149,26 +111,52 @@
 		     (push (re-triple e) (gethash (rule-name (re-rule e)) triggered-rules))
 		     (format t "Got rule execution ~A~%" (rule-name (re-rule e)))))))))))
 
-(defmethod save-rule ((rule rule))
-  (store-object (rule-db *graph*) (make-serialized-key rule) (serialize rule))
-  (index-rule rule)
-  (cache-rule rule))
-
 (defmethod cache-rule ((rule rule))
   (setf (gethash (rule-name rule) (rule-cache *graph*)) rule))
 
+(defmethod index-rule ((rule rule))
+  (map-premises #'(lambda (p) 
+		    (pushnew rule (gethash (make-premise-idx p) (rule-idx *graph*))))
+		(copy-tree (rule-premises rule))))
+
+(defmethod deindex-rule ((rule rule))
+  (map-premises #'(lambda (p) 
+		    (setf (gethash (make-premise-idx p) (rule-idx *graph*))
+			  (remove rule (gethash (make-premise-idx p) (rule-idx *graph*)))))
+		(copy-tree (rule-premises rule))))
+
+(defmethod save-rule ((rule rule))
+  (let ((db (rule-db *graph*)) (id (rule-name rule)))
+    (with-transaction (db)
+      (set-phash db (make-slot-key id "name") (rule-name rule))
+      (set-phash db (make-slot-key id "premises") (rule-premises rule))
+      (set-phash db (make-slot-key id "conclusions") (rule-conclusions rule))
+      (set-phash db (make-slot-key id "cf") (rule-cf rule))))
+  (index-rule rule)
+  (cache-rule rule))
+
 (defun get-rule (name)
-  (or (gethash (cond ((or (symbolp name) (numberp name)) name)
-		     ((stringp name)
-		      (if (cl-ppcre:scan "^[0-9]+\.*[0-9]*$" name)
-			  (parse-number:parse-number name)
-			  (intern (string-upcase name))))
-		     (t (error "Unknown type for rule name ~A: ~A" name (type-of name))))
-	       (rule-cache *graph*))
-      (let ((raw-rule (lookup-object (rule-db *graph*) (make-rule-key-from-name name))))
-	(if (vectorp raw-rule)
-	    (cache-rule (deserialize raw-rule))
-	    nil))))
+  (let ((name (cond ((or (symbolp name) (numberp name)) name)
+		    ((stringp name)
+		     (if (cl-ppcre:scan "^[0-9]+\.*[0-9]*$" name)
+			 (parse-number:parse-number name)
+			 (intern (string-upcase name))))
+		    (t (error "Unknown type for rule name ~A: ~A" name (type-of name))))))
+    (or (gethash name (rule-cache *graph*))
+	(let ((name (get-phash (rule-db *graph*) (make-slot-key name "name")))
+	      (db (rule-db *graph*)))
+	  (when name
+	    (with-transaction (db)
+	      (let ((rule (make-rule 
+			   :name name
+			   :premises (get-phash db (make-slot-key name "premises"))
+			   :conclusions (get-phash db (make-slot-key name "conclusions"))
+			   :cf (get-phash db (make-slot-key name "cf")))))
+		(index-rule rule)
+		(cache-rule rule))))))))
+
+(defun make-premise-idx (p)
+  (mapcar #'(lambda (i) (if (variable-p i) +wildcard+ i)) p))
 
 (defun retract-rule (name)
   (let ((rule (get-rule name)))
@@ -177,7 +165,12 @@
 	  ;; FIXME: delete all facts derived by this rule!
 	  (remhash (rule-name rule) (rule-cache *graph*))
 	  (deindex-rule rule)
-	  (delete-object (rule-db *graph*) (make-serialized-key rule)))
+	  (let ((db (rule-db *graph*)))
+	    (with-transaction (db)
+	      (rem-phash db (make-slot-key name "name"))
+	      (rem-phash db (make-slot-key name "premises"))
+	      (rem-phash db (make-slot-key name "conclusions"))
+	      (rem-phash db (make-slot-key name "cf")))))
 	(warn "Rule ~A is undefined, cannot retract it." name))))
 
 (defmacro defrule (name &body body)
@@ -218,44 +211,10 @@
       (compile-rule rule))))
 
 (defmethod load-all-rules ((graph graph))
-  (map-hash-objects (rule-db graph)
-		    #'(lambda (key val)
-			(declare (ignore key))
-			(let ((rule (deserialize val)))
-			  (when (rule? rule)
-			    (cache-rule rule))))))
-
-#|
-(defrule t1
-  if 
-  (or (is-a ?x "dog") (is-a ?x "human"))
-  (or (likes ?x "cats") (likes ?x "lizards"))
-  then
-  (trigger (format t "~A is a strange beast!~%" ?x)))
-
-(defrule t2
-  if 
-  (or
-   (and (is-a ?x "dog") (likes ?x "cats"))
-   (and (is-a ?x "dog") (likes ?x "lizards"))
-   (and (is-a ?x "human") (likes ?x "lizards")))
-  then
-  (trigger (format t "~A is a strange beast!~%" ?x)))
-
-(defrule t3
-  if 
-  (or
-   (and (is-a ?x "dog") (likes ?x "cats")
-	(is-a ?y "dog") (likes ?y "cats"))
-   (and (is-a ?x "human") (likes ?x "lizards")
-	(is-a ?y "human") (likes ?y "lizards")))
-  then
-  (trigger (format t "~A is a strange beast!~%" ?x)))
-
-(defun test-rules ()
-  (match-rules (lookup-triple "Kevin" 'likes "cats"))
-  (run-rules *graph*)
-  (format t "DONE. SKIP LIST SHOULD BE EMPTY, LENGTH IS ~A:~%" 
-	  (skip-list-length (production-pq *graph*)))
-  (map-skip-list #'(lambda (k v) (format t "~A: ~A~%" k (type-of v))) (production-pq *graph*)))
-|#
+  (map-phash #'(lambda (key val)
+		 (let ((pieces (split key '(#\Nul))))
+		   (format t "Got key pieces: ~A~%" pieces)
+		   (when (equal (second pieces) "name")
+		     (format t "Loading rule ~A~%" val)
+		     (get-rule val))))
+	     (rule-db graph)))

@@ -1,5 +1,7 @@
 (in-package #:vivace-graph)
 
+(declaim (optimize (speed 3)))
+
 (defgeneric serialize (object))
 (defgeneric deserialize-help (become object))
 (defgeneric make-serialized-key (object))
@@ -8,22 +10,28 @@
 (defgeneric serialized-lt (x y))
 (defgeneric serialized-gt (x y))
 
-(defun encode-length (int)
-  (let* ((n-bytes (ceiling (integer-length int) 8))
-	 (vec (make-array (+ 1 n-bytes) :element-type '(unsigned-byte 8))))
-    (setf (aref vec 0) n-bytes)
-    (dotimes (i n-bytes)
-      (setf (aref vec (+ 1 i)) (ldb (byte 8 0) int))
-      (setq int (ash int -8)))
-    vec))
+(let ((length-table (make-hash-table :synchronized t)))
+  (defun encode-length (int)
+    (declare (type integer int))
+    (or (gethash int length-table)
+	(let* ((n-bytes (ceiling (integer-length int) 8))
+	       (original-int int)
+	       (vec (make-array (+ 1 n-bytes) :element-type '(unsigned-byte 8))))
+	  (setf (aref vec 0) n-bytes)
+	  (dotimes (i n-bytes)
+	    (setf (aref vec (+ 1 i)) (ldb (byte 8 0) int))
+	    (setq int (ash int -8)))
+	  (setf (gethash original-int length-table) vec)))))
 
 (defun decode-length (bytes)
+  (declare (type (simple-array (unsigned-byte 8)) bytes))
   (let ((int 0) (n-bytes (length bytes)))
     (dotimes (i n-bytes)
-      (setq int (dpb (elt bytes i) (byte 8 (* i 8)) int)))
+      (setq int (dpb (aref bytes i) (byte 8 (* i 8)) int)))
     int))
 
 (defun extract-length (a)
+  (declare (type (simple-array (unsigned-byte 8)) a))
   (let ((id-byte (aref a 0)))
     (cond ((or (= id-byte +uuid+) ;; These are all fixed length
 	       (= id-byte +positive-integer+)
@@ -42,7 +50,7 @@
 	     (values (decode-length (subseq a 2 header-length)) header-length))))))
 
 (defun extract-all-subseqs (a)
-  (declare (optimize (speed 3)))
+  (declare (type (simple-array (unsigned-byte 8)) a))
   (cond ((= 0 (length a))
 	 nil)
 	(t 
@@ -52,22 +60,23 @@
 
 (declaim (inline deserialize))
 (defmethod deserialize ((a array))
-  (declare (optimize speed))
+  (declare (type (simple-array (unsigned-byte 8)) a))
   (multiple-value-bind (data-length header-length) (extract-length a)
     (declare (ignore data-length))
     (deserialize-help (aref a 0) (subseq a header-length))))
 
 (defmethod serialized-eq ((x array) (y array))
+  (declare (type (simple-array (unsigned-byte 8)) x y))
   (equalp x y))
 
 (defmethod serialized-lt ((x array) (y array))
   "Compare two serialized items."
-  (declare (optimize speed))
+  (declare (type (simple-array (unsigned-byte 8)) x y))
   (less-than (deserialize x) (deserialize y)))
 
 (defmethod serialized-gt ((x array) (y array))
   "Compare two serialized items."
-  (declare (optimize speed))
+  (declare (type (simple-array (unsigned-byte 8)) x y))
   (greater-than (deserialize x) (deserialize y)))
 
 (defmethod deserialize :around (object)
@@ -83,12 +92,14 @@
       (error 'serialization-error :instance object :reason condition))))
 
 (defun serialize-multiple (type-specifier &rest slots)
-  (declare (optimize (speed 3)))
+  (declare (type integer type-specifier))
   (let* ((serialized-slots (mapcar #'serialize slots))
 	 (serialized-slot-lengths (mapcar #'length serialized-slots))
 	 (total-length (apply #'+ serialized-slot-lengths))
 	 (encoded-length (encode-length total-length))
 	 (length-of-encoded-length (length encoded-length)))
+    (declare (type fixnum total-length length-of-encoded-length))
+    (declare (type (simple-array (unsigned-byte 8)) encoded-length))
     (let ((a (make-array (+ 1 length-of-encoded-length total-length) 
 			 :element-type '(unsigned-byte 8))))
       (setf (aref a 0) type-specifier)
@@ -104,11 +115,11 @@
       a)))
 
 (defmethod make-slot-key (id slot-name)
-  (declare (optimize (speed 3)))
   (if (symbolp slot-name) (setq slot-name (symbol-name slot-name)))
   (let* ((serialized-id (serialize id))
 	 (serialized-slot-name (serialize slot-name))
 	 (total-length (+ (length serialized-id) (length serialized-slot-name))))
+    (declare (type fixnum total-length))
     (let ((a (make-array (+ 1 total-length) :element-type '(unsigned-byte 8))))
       (setf (aref a 0) +slot-key+)
       (dotimes (i (length serialized-id))
@@ -118,11 +129,11 @@
       a)))
   
 (defmethod deserialize-help ((become (eql +vector+)) bytes)
-  (let ((items (extract-all-subseqs bytes)))
-    (map 'vector #'deserialize items)))
+  (declare (type (simple-array (unsigned-byte 8)) bytes))
+  (declare (type integer become))
+  (map 'vector #'deserialize (extract-all-subseqs bytes)))
 
 (defmethod serialize ((v vector))
-  (declare (optimize (speed 3)))
   (if (equal (array-element-type v) '(unsigned-byte 8))
       v
       (let* ((serialized-items (map 'list #'serialize v))
@@ -130,6 +141,8 @@
 	     (encoded-length (encode-length total-length))
 	     (length-of-encoded-length (length encoded-length))
 	     (vec (make-array 1 :fill-pointer 0 :adjustable t :element-type '(unsigned-byte 8))))
+	(declare (type fixnum total-length length-of-encoded-length))
+	(declare (type (simple-array (unsigned-byte 8)) encoded-length))
 	(vector-push-extend +vector+ vec)
 	(dotimes (i length-of-encoded-length)
 	  (vector-push-extend (aref encoded-length i) vec))
@@ -140,6 +153,8 @@
 
 (defmethod deserialize-help ((become (eql +uuid+)) bytes)
   "Decode a UUID."
+  (declare (type (simple-array (unsigned-byte 8)) bytes))
+  (declare (type integer become))
   (uuid:byte-array-to-uuid bytes))
 
 (defmethod serialize ((uuid uuid:uuid))
@@ -148,6 +163,8 @@
 
 (defmethod deserialize-help ((become (eql +positive-integer+)) bytes)
   "Decode a positive integer."
+  (declare (type (simple-array (unsigned-byte 8)) bytes))
+  (declare (type integer become))
   (let ((int 0) (n-bytes (length bytes)))
     (dotimes (i n-bytes)
       (setq int (dpb (elt bytes i) (byte 8 (* i 8)) int)))
@@ -155,6 +172,8 @@
  
 (defmethod deserialize-help ((become (eql +negative-integer+)) bytes)
   "Decode a negative integer."
+  (declare (type (simple-array (unsigned-byte 8)) bytes))
+  (declare (type integer become))
   (- (deserialize-help +positive-integer+ bytes)))
 
 (defmethod serialize ((int integer))
@@ -173,6 +192,8 @@
     vec))
 
 (defmethod deserialize-help ((become (eql +single-float+)) bytes)
+  (declare (type (simple-array (unsigned-byte 8)) bytes))
+  (declare (type integer become))
   (ieee-floats:decode-float32 (deserialize-help +positive-integer+ bytes)))
 
 (defmethod serialize ((float single-float))
@@ -181,6 +202,8 @@
     vec))
 
 (defmethod deserialize-help ((become (eql +double-float+)) bytes)
+  (declare (type (simple-array (unsigned-byte 8)) bytes))
+  (declare (type integer become))
   (ieee-floats:decode-float64 (deserialize-help +positive-integer+ bytes)))
 
 (defmethod serialize ((float double-float))
@@ -189,6 +212,8 @@
     vec))
 
 (defmethod deserialize-help ((become (eql +ratio+)) bytes)
+  (declare (type (simple-array (unsigned-byte 8)) bytes))
+  (declare (type integer become))
   (let ((numerator (deserialize-help +positive-integer+ (subseq bytes 1 (+ 1 (elt bytes 0)))))
 	(denominator (deserialize-help +positive-integer+ (subseq bytes (+ 2 (elt bytes 0))))))
     (/ numerator denominator)))
@@ -211,6 +236,8 @@
     
 (defmethod deserialize-help ((become (eql +character+)) bytes)
   "Decode a Unicode-encoded byte sequence."
+  (declare (type (simple-array (unsigned-byte 8)) bytes))
+  (declare (type integer become))
   (let ((int 0) (n-bytes (length bytes)))
     (dotimes (i n-bytes)
       (setq int (dpb (elt bytes i) (byte 8 (* i 8)) int)))
@@ -229,6 +256,8 @@
     vec))
 
 (defmethod deserialize-help ((become (eql +string+)) bytes)
+  (declare (type (simple-array (unsigned-byte 8)) bytes))
+  (declare (type integer become))
   (sb-ext:octets-to-string bytes))
 
 (defmethod serialize ((string string))
@@ -255,11 +284,12 @@ the length of the object."
   nil)
 
 (defmethod deserialize-help ((become (eql +symbol+)) bytes)
+  (declare (type (simple-array (unsigned-byte 8)) bytes))
+  (declare (type integer become))
   (destructuring-bind (symbol package) (extract-all-subseqs bytes)
     (intern (deserialize symbol) (find-package (deserialize package)))))
 
 (defmethod serialize ((symbol symbol))
-  (declare (optimize (speed 3)))
   (or (and (null symbol) #(#.+null+))
       (and (eq symbol t) #(#.+t+))
       (let* ((symbol-name (serialize (symbol-name symbol)))
@@ -280,10 +310,13 @@ the length of the object."
 	vec)))
 
 (defmethod deserialize-help ((become (eql +list+)) bytes)
-  (let ((items (extract-all-subseqs bytes)))
-    (mapcar #'deserialize items)))
+  (declare (type (simple-array (unsigned-byte 8)) bytes))
+  (declare (type integer become))
+  (mapcar #'deserialize (extract-all-subseqs bytes)))
 
 (defmethod deserialize-help ((become (eql +dotted-list+)) bytes)
+  (declare (type (simple-array (unsigned-byte 8)) bytes))
+  (declare (type integer become))
   (let* ((items (extract-all-subseqs bytes))
 	 (result nil))
     (loop for i downfrom (- (length items) 2) to 0 do
@@ -291,7 +324,6 @@ the length of the object."
     (nconc result (deserialize (car (last items))))))
 
 (defmethod serialize ((list list))
-  (declare (optimize (speed 3)))
   (if (proper-listp list)
       (let* ((serialized-items (mapcar #'serialize list))
 	     (total-length (reduce #'+ (mapcar #'length serialized-items)))
@@ -308,7 +340,6 @@ the length of the object."
       (let ((vec (make-array 1 :fill-pointer 0 :adjustable t :element-type '(unsigned-byte 8)))
 	    (serialized-items nil))
 	(loop for elt on list do
-	     ;;(format t "Serializing ~A~%" (car elt))
 	     (push (serialize (car elt)) serialized-items)
 	     (when (atom (cdr elt))
 	       ;; The last element
@@ -323,7 +354,3 @@ the length of the object."
 	    (dotimes (i (length item))
 	      (vector-push-extend (aref item i) vec)))
 	  vec))))
-
-
-
-

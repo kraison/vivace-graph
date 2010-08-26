@@ -1,9 +1,10 @@
 (in-package #:cl-user)
 
 (defpackage #:vivace-graph
-  (:use #:cl #:cffi #:bordeaux-threads 
-	;;#:tokyo-cabinet #:tokyo-cabinet-ffi 
-	#:kyoto-cabinet #:kyoto-cabinet-ffi
+  (:use #:cl 
+	#:cffi 
+	#:bordeaux-threads 
+	#:kyoto-persistence
 	#:local-time
 	#:cl-skip-list)
   (:export #:*graph*
@@ -49,6 +50,7 @@
 	   #:prolog
 	   #:select
 	   #:select-flat
+	   #:exec-rule
 	   #:read/1
 	   #:wrte/1
 	   #:nl/0
@@ -61,6 +63,7 @@
 	   #:</2
 	   #:>=/2
 	   #:<=/2
+	   #:??
 	   #:lisp/2
 	   #:regex-match/2
 	   #:var/1
@@ -69,6 +72,17 @@
 	   #:not/1
 	   #:bagof/3
 	   #:setof/3
+	   #:if/2
+	   #:if/3
+	   #:is-valid/1
+	   #:is-invalid/1
+	   #:trigger/1
+	   #:assert/1
+	   #:retract/1
+	   #:show-prolog-vars/2
+	   #:select/2
+	   #:select-as-bind-alist/2
+	   #:triple-search/3
 
 	   #:timestamp?
 	   #:universal-to-timestamp

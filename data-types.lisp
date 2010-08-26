@@ -1,12 +1,20 @@
 (in-package #:vivace-graph)
 
+;;; UUIDs
+(defun make-uuid ()
+  "Create a new UUID."
+  (uuid:make-v1-uuid))
+
+(defun sxhash-uuid (uuid) (sxhash (uuid:print-bytes nil uuid)))
+
+(sb-ext:define-hash-table-test uuid:uuid-eql sxhash-uuid)
+
+(defun make-uuid-table (&key synchronized) 
+  (make-hash-table :test 'uuid:uuid-eql :synchronized synchronized))
+
+
+;;; Dates
 ;;; timestamps provided by local-time lib
-(defmethod serialize ((timestamp timestamp))
-  (let ((universal-time (serialize (timestamp-to-universal timestamp))))
-    (setf (aref universal-time 0) +timestamp+)
-    universal-time))
-
-(defmethod deserialize-help ((become (eql +timestamp+)) bytes)
-  (let ((universal-time (deserialize-help +positive-integer+ bytes)))
-    (universal-to-timestamp universal-time)))
-
+(defgeneric timestamp? (thing)
+  (:method ((thing timestamp)) t)
+  (:method (thing) nil))

@@ -39,7 +39,7 @@
 ;    (let ((arg1 (funcall (arg1-field test) wme)))
 ;      (dolist
 	  
-(defmethod left-activate ((node rete-node) (token token) &optional (wme triple))
+(defmethod left-activate ((node rete-node) (token token) &optional wme)
   (case (rete-node-type node)
     (+beta-memory+
      (let ((token (make-token :parent token :triple wme)))

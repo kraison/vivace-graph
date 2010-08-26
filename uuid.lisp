@@ -13,16 +13,17 @@
 
 (defgeneric uuid? (thing)
   (:method ((thing uuid)) t)
-  (:method (thing) nil))
+  (:method (thing) nil)
+  (:documentation "UUID type predicate."))
 
-(defmethod uuid-eql ((uuid1 uuid) (uuid2 uuid))
-  (equalp (uuid-to-byte-array uuid1) (uuid-to-byte-array uuid2)))
-
-(defmethod uuid-eql ((uuid1 uuid) uuid2)
-  nil)
-
-(defmethod uuid-eql (uuid1 (uuid2 uuid))
-  nil)
+(defgeneric uuid-eql (uuid1 uuid2)
+  (:method ((uuid1 uuid) (uuid2 uuid))
+    (equalp (uuid-to-byte-array uuid1) (uuid-to-byte-array uuid2)))
+  (:method ((uuid1 uuid) uuid2)
+    nil)
+  (:method (uuid1 (uuid2 uuid))
+    nil)
+  (:documentation "Equality check for UUIDs."))
 
 (defun uuid-to-byte-array (uuid &optional (type-specifier nil))
   "Converts an uuid to byte-array"

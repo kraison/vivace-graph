@@ -1,24 +1,6 @@
-;;;; -*- Mode: Lisp; Syntax: Common-Lisp -*-
 ;;;; This is Kevin Raison's customization of Mr. Norvig's PAIP Prolog.  Thanks Mr. Norvig!
-;;;; Some code from Paradigms of AI Programming
 ;;;; Copyright (c) 1991 Peter Norvig
 (in-package #:vivace-graph)
-
-(defconstant +unbound+ :unbound)
-(defconstant +no-bindings+ '((t . t)))
-(defconstant +fail+ nil)
-
-(defparameter *occurs-check* t)
-
-(defvar *trail* (make-array 200 :fill-pointer 0 :adjustable t))
-(defvar *var-counter* 0)
-(defvar *uncompiled* nil 
-  "Prolog symbols that have not been compiled.")
-(defvar *predicate* nil
-  "The Prolog predicate currently being compiled")
-(defvar *search-cut-off* nil)
-(defvar *select-list*)
-(defvar *special* :global)
 
 (defstruct (var (:constructor ? ())
                 (:print-function print-var))
@@ -41,6 +23,8 @@
 (defun bound-p (var) (not (eq (var-binding var) +unbound+)))
 
 (defgeneric prolog-equal (x y)
+  (:documentation "Generic equality operator for prolog unification. Specialize this for new 
+types that will be stored in the db.")
   (:method ((x number) (y number)) (= x y))
   (:method ((x string) (y string)) (string= x y))
   (:method ((x character) (y character)) (char= x y))
@@ -59,8 +43,10 @@
 
 (defun unify! (x y)
   "Destructively unify two expressions.  Look for Lisp call-outs using ?? and execute."
-  (setq x (eval-?? x)
-	y (eval-?? y))
+  (if (and (consp x) (eq '?? (first x)))
+      (setq x (eval (deref-exp (second x)))))
+  (if (and (consp y) (eq '?? (first y)))
+      (setq y (eval (deref-exp (second y)))))
   (cond ((prolog-equal (var-deref x) (var-deref y)) t)
         ((var-p x) (set-binding! x y))
         ((var-p y) (set-binding! y x))
@@ -83,7 +69,7 @@
      do (setf (var-binding (vector-pop *trail*)) +unbound+)))
 
 (defun get-clauses (predicate)
-  (let ((p (lookup-predicate predicate *graph*)))
+  (let ((p (lookup-predicate predicate)))
     (when (predicate? p)
       (nconc (get-predicates predicate) (pred-clauses p)))))
 
@@ -131,13 +117,14 @@
 
 (defun make-= (x y) `(= ,x ,y))
 
-(defun compile-call (predicate args cont)
+(defun compile-call (predicate arity args cont)
   "Compile a call to a prolog predicate."
-  ;;`(,predicate ,@args ,cont))
-  `(funcall (or (gethash ',predicate (functors *graph*))
-		(gethash ',predicate *prolog-global-functors*)
-		(error 'prolog-error :reason (format nil "Functor ~A is not defined" ',predicate)))
-	    ,@args ,cont))
+  (if (and (variable-p predicate) (= 2 arity))
+      `(triple-search/3 ,predicate ,@args ,cont)
+      (let ((functor (make-functor predicate arity)))
+	`(funcall (or (gethash ',functor (functors *graph*)) 
+		      (gethash ',functor *prolog-global-functors*))
+		  ,@args ,cont))))
 
 (defun prolog-compiler-macro (name)
   "Fetch the compiler macro for a Prolog predicate."
@@ -379,13 +366,13 @@
 	    (clause-body clause))
 	   cont
 	   (mapcar #'self-cons parms)))))
-    ;(format t "~A BODY: ~A~%" (clause-head clause) body)
+    ;;(format t "~A BODY:~% ~A~%" (clause-head clause) body)
     body))
 
-(defun add-clause (clause &key (persist? t))
+(defun add-clause (clause)
   "add a clause to the triple store. Order of args: predicate, subject, object."
   (let* ((predicate-name (predicate (clause-head clause))))
-    ;(format t "1. Adding clause ~A: ~A~%" predicate-name clause)
+    ;;(format t "1. Adding clause ~A: ~A~%" predicate-name clause)
     (assert (and (atom predicate-name) (not (variable-p predicate-name))))
     (when (stringp predicate-name) 
       (setq predicate-name (intern (string-upcase predicate-name))))
@@ -398,9 +385,10 @@
 		   (not (variable-p (second (first clause))))
 		   (not (variable-p (third (first clause)))))
 	      (add-triple (second (first clause)) predicate-name (third (first clause)) *graph*)
-	      (let ((predicate (make-new-predicate :name predicate-name)))
-		(add-functor predicate clause)
-		predicate))))))
+	      (let ((p (lookup-predicate predicate-name)))
+		(if (predicate? p)
+		    (add-functor p clause)
+		    (make-new-predicate :name predicate-name :clauses (list clause)))))))))
 
 (defun deref-copy (exp)
   (sublis (mapcar #'(lambda (var) (cons (var-deref var) (?)))
@@ -424,32 +412,26 @@
 	   (deref-equal (rest x) (rest y)))))
 
 (defmethod prolog-compile-search ((predicate predicate))
-  (let ((*predicate* (make-functor (pred-name predicate) 2))
-	(parameters (make-parameters 2)))
-    (declare (ignore parameters))
-    (let ((func
-	   `#'(lambda (?arg1 ?arg2 cont)
-		(block ,*predicate*
-		  (triple-search/3 ',(pred-name predicate) ?arg1 ?arg2 cont)))))
-      (setf (gethash *predicate* (functors (pred-graph predicate))) (eval func)))))
+  (let ((*predicate* (make-functor (pred-name predicate) 2)))
+    (setf (gethash *predicate* (functors (pred-graph predicate))) 
+	  (eval `#'(lambda (?arg1 ?arg2 cont)
+		     (block ,*predicate*
+		       (triple-search/3 ',(pred-name predicate) ?arg1 ?arg2 cont)))))))
 
 (defun compile-predicate (predicate arity clauses)
-  "Compile all the clauses for a given symbol/arity
-  into a single LISP function."
+  "Compile all the clauses for a given symbol/arity into a single LISP function."
   (let ((*predicate* (make-functor (pred-name predicate) arity))
 	(parameters (make-parameters arity)))
     (let ((func
 	   `#'(lambda (,@parameters cont)
-	       (block ,*predicate*
-		 ;;(format t "in ~A for ~A~%" ',*predicate* ',parameters)
-		  ,(if (= arity 2)
+		(block ,*predicate*
+		  ,(if (and (= arity 2) (not (default-functor? *predicate*)))
 		       `(triple-search/3 
 			 ',(pred-name predicate) ,(first parameters) ,(second parameters) cont))
 		  .,(maybe-add-undo-bindings
 		     (mapcar #'(lambda (clause)
 				 (compile-clause parameters clause 'cont))
 			     clauses))))))
-      ;;(format t "compile-predicate: ~%~A~%~%" func)
       (setf (gethash *predicate* (functors (pred-graph predicate))) (eval func)))))
 
 (defun compile-body (body cont bindings)
@@ -458,15 +440,14 @@
     ((null body)
      `(funcall ,cont))
     ((eq (first body) '!)
-     ;;(format t "Encountered the CUT operator: ~A / ~A~%" *predicate* body)
-     `(progn ,(compile-body (rest body) cont bindings) ;***
-             (return-from ,*predicate* nil)))          ;***
+     `(progn ,(compile-body (rest body) cont bindings)
+             (return-from ,*predicate* nil)))
     (t (let* ((goal (first body))
               (macro (prolog-compiler-macro (predicate goal)))
               (macro-val (if macro (funcall macro goal (rest body) cont bindings))))
 	 (if (and macro (not (eq macro-val :pass)))
 	     macro-val
-	     (compile-call (make-functor (predicate goal) (relation-arity goal))
+	     (compile-call (predicate goal) (relation-arity goal)
 			   (mapcar #'(lambda (arg)
 				       (compile-arg arg bindings))
 				   (args goal))
@@ -494,30 +475,32 @@
   nil)
 
 (defmacro ?- (&rest goals)
-;;  `(top-level-prove ',(replace-?-vars goals)))
   (let* ((goals (replace-?-vars goals))
 	 (vars (delete '? (variables-in goals)))
 	 (top-level-query (gensym "PROVE"))
 	 (*predicate* (make-functor top-level-query 0)))
     `(let* ((*trail* (make-array 200 :fill-pointer 0 :adjustable t))
 	    (*var-counter* 0)
+	    (*predicate* ',*predicate*)
 	    (*select-list* nil))
        (unwind-protect
 	    (catch 'top-level-prove
 	      (let ((func #'(lambda (cont) 
-			      (block ,*predicate*
-				;;(format t "in ~A for ~A~%" ',*predicate* ',goals)
-				.,(maybe-add-undo-bindings
-				   (mapcar #'(lambda (clause)
-					       (compile-clause nil clause 'cont))
-					   `(((,top-level-query)
-					      ,@goals
-					      (show-prolog-vars ,(mapcar #'symbol-name vars)
-								,vars)))))))))
+			      (handler-case
+				  (block ,*predicate*
+				    .,(maybe-add-undo-bindings
+				       (mapcar #'(lambda (clause)
+						   (compile-clause nil clause 'cont))
+					       `(((,top-level-query)
+						  ,@goals
+						  (show-prolog-vars ,(mapcar #'symbol-name vars)
+								    ,vars))))))
+				(undefined-function (condition)
+				  (error 'prolog-error :reason condition))))))
 		(setf (gethash ',*predicate* (functors *graph*)) func)
 		(funcall (gethash ',*predicate* (functors *graph*)) #'prolog-ignore)
 		(format t "~&No.~%")))
-	 (remhash *predicate* (functors *graph*)))
+	 (remhash ',*predicate* (functors *graph*)))
        (values))))
 
 (defmacro select (vars &rest goals)
@@ -526,20 +509,23 @@
 	 (*predicate* (make-functor top-level-query 0)))
     `(let* ((*trail* (make-array 200 :fill-pointer 0 :adjustable t))
 	    (*var-counter* 0)
+	    (*predicate* ',*predicate*)
 	    (*select-list* nil))
        (unwind-protect
 	    (let ((func #'(lambda (cont) 
-			    (block ,*predicate*
-			      ;;(format t "in ~A for ~A~%" ',*predicate* ',goals)
-			      .,(maybe-add-undo-bindings
-				 (mapcar #'(lambda (clause)
-					     (compile-clause nil clause 'cont))
-					 `(((,top-level-query)
-					    ,@goals
-					    (select ,(mapcar #'symbol-name vars) ,vars)))))))))
+			    (handler-case
+				(block ,*predicate*
+				  .,(maybe-add-undo-bindings
+				     (mapcar #'(lambda (clause)
+						 (compile-clause nil clause 'cont))
+					     `(((,top-level-query)
+						,@goals
+						(select ,(mapcar #'symbol-name vars) ,vars))))))
+			      (undefined-function (condition)
+				(error 'prolog-error :reason condition))))))
 	      (setf (gethash ',*predicate* (functors *graph*)) func)
 	      (funcall (gethash ',*predicate* (functors *graph*)) #'prolog-ignore))
-	 (remhash *predicate* (functors *graph*)))
+	 (remhash ',*predicate* (functors *graph*)))
        (nreverse *select-list*))))
 
 (defmacro select-flat (vars &rest goals)
@@ -548,159 +534,48 @@
 	 (*predicate* (make-functor top-level-query 0)))
     `(let* ((*trail* (make-array 200 :fill-pointer 0 :adjustable t))
 	    (*var-counter* 0)
+	    (*predicate* ',*predicate*)
 	    (*select-list* nil))
        (unwind-protect
 	    (let ((func #'(lambda (cont) 
-			    (block ,*predicate*
-			      ;;(format t "in ~A for ~A~%" ',*predicate* ',goals)
-			      .,(maybe-add-undo-bindings
-				 (mapcar #'(lambda (clause)
-					     (compile-clause nil clause 'cont))
-					 `(((,top-level-query)
-					    ,@goals
-					    (select ,(mapcar #'symbol-name vars) ,vars)))))))))
+			    (handler-case
+				(block ,*predicate*
+				  .,(maybe-add-undo-bindings
+				     (mapcar #'(lambda (clause)
+						 (compile-clause nil clause 'cont))
+					     `(((,top-level-query)
+						,@goals
+						(select ,(mapcar #'symbol-name vars) ,vars))))))
+			      (undefined-function (condition)
+				(error 'prolog-error :reason condition))))))
 	      (setf (gethash ',*predicate* (functors *graph*)) func)
 	      (funcall (gethash ',*predicate* (functors *graph*)) #'prolog-ignore))
-	 (remhash *predicate* (functors *graph*)))
+	 (remhash ',*predicate* (functors *graph*)))
        (flatten (nreverse *select-list*)))))
 
-(defun exec-rule (goals)
-  (format t "GOALS ARE ~A~%" goals)
-  (let* ((goals (replace-?-vars goals))
-	 (vars (variables-in goals))
+(defun exec-rule (goals action)
+  (let* ((rule (append (replace-?-vars goals) (list '! action)))
+	 (vars (variables-in rule))
 	 (top-level-query (gensym "PROVE"))
 	 (*predicate* (make-functor top-level-query 0)))
     (eval
      `(let* ((*trail* (make-array 200 :fill-pointer 0 :adjustable t))
 	     (*var-counter* 0)
+	     (*predicate* ',*predicate*)
 	     (*select-list* nil))
 	(unwind-protect
 	     (let ((func #'(lambda (cont) 
 			     (block ,*predicate*
-			       ;;(format t "in ~A for ~A~%" ',*predicate* ',goals)
 			       .,(maybe-add-undo-bindings
 				  (mapcar #'(lambda (clause)
 					      (compile-clause nil clause 'cont))
 					  `(((,top-level-query)
-					     ,@goals
+					     ,@rule
 					     (select-as-bind-alist 
 					      ,(mapcar #'symbol-name vars) ,vars)))))))))
 	       (setf (gethash ',*predicate* (functors *graph*)) func)
 	       (funcall (gethash ',*predicate* (functors *graph*)) #'prolog-ignore))
-	  (remhash *predicate* (functors *graph*)))
+	  (remhash ',*predicate* (functors *graph*)))
 	(nreverse *select-list*)))))
 
 
-#|
-(defun reload-testdb ()
-  (if (graph? *graph*) (shutdown-graph *graph*))
-  (ignore-errors 
-    (cl-fad:delete-directory-and-files "db/full-text-idx")
-    (delete-file "db/functors.kch")
-    (delete-file "db/rules.kch")
-    (delete-file "db/triples.kct"))
-  (load-graph! "db/config.ini")
-  (<- (member ?item (?item . ?rest)))
-  (<- (member ?item (?x . ?rest)) (member ?item ?rest))
-;  (<- (if ?test ?then) (if ?then ?else (fail)))
-;  (<- (if ?test ?then ?else) (call ?test) ! (call ?then))
-;  (<- (if ?test ?then ?else) (call ?else))
-  (<- (is-of-age ?x) (has-age ?x ?y) (>= ?y 21) !)
-  (<- (lovers ?x ?y) (loves ?x ?y) (loves ?y ?x))
-  (<- (has-age "Kevin" 35))
-  (<- (has-age "Dustie" 35))
-  (<- (has-age "Echo" 11))
-  (<- (loves "Sonny" "Cher"))
-  (<- (loves "Cher" "Sonny"))
-  (<- (loves "Kevin" "Dustie"))
-  (<- (loves "Dustie" "Kevin"))
-  (<- (loves "Kevin" "Echo"))
-  (<- (loves "Echo" "cat nip"))
-  (<- (likes "Robin" "cats"))
-  (<- (likes "Kevin" "cats"))
-  (<- (likes "Sandy" ?x) (likes ?x "cats"))
-  *graph*)
-
-(defun who-likes (person)
-  (declare (special person))
-  (select-flat (?x) (lisp ?y (princ-to-string person)) (likes ?x ?y)))
-
-(defun ptest1 ()
-  (let ((*graph* (make-new-graph :name "test graph 1" :location "/var/tmp")))
-    (unwind-protect
-	 (progn
-	   (<- (member ?item (?item . ?rest)))
-	   (<- (member ?item (?x . ?rest)) (member ?item ?rest))
-	   (format t "~%(?- (member 1 (4 3 2 1))) ->~%")
-	   (?- (member 1 (4 3 2 1)))
-	   (format t "~%(member ?x (1 2 3 4)) ->~%")
-	   (?- (member ?x (1 2 3 4)))
-	   (format t "~%Adding triples:~%")
-	   (<- (loves "Kevin" "Dustie"))
-	   (<- (loves "Dustie" "Kevin"))
-	   (<- (loves "Kevin" "Echo"))
-	   (<- (loves "Echo" "cat nip"))
-	   (format t "(loves ?x ?y)) -> ~%")
-	   (?- (loves ?x ?y))
-	   (format t "(loves \"Kevin\" \"Dustie\")) -> ~%")
-	   (?- (loves "Kevin" "Dustie"))
-	   (format t "(loves \"Kevin\" ?y)) -> ~%")
-	   (?- (loves "Kevin" ?y))
-	   (<- (likes "Robin" "cats"))
-	   (<- (likes "Kevin" "cats"))
-	   (<- (likes "Sandy" ?x) (likes ?x "cats"))
-	   (format t "(select-flat (?who) (likes \"Sandy\" ?who)) ->~%")
-	   (format t "~A~%" (select-flat (?who) (likes "Sandy" ?who))))
-      (progn
-	(shutdown-graph *graph*)
-	(delete-file "/var/tmp/triples")
-	(delete-file "/var/tmp/functors")
-	(delete-file "/var/tmp/rules")
-	(delete-file "/var/tmp/config.ini")))))
-
-(defun ptest2 ()
-  ;; 4.10 seconds in interpreted mode
-  ;; 0.28 seconds in compiled mode
-  (let ((*graph* (make-new-graph :name "test graph 2" :location "/var/tmp")))
-    (unwind-protect
-	 (progn
-	   (<- (member ?item (?item . ?rest)))
-	   (<- (member ?item (?x . ?rest)) (member ?item ?rest))
-	   (<- (nextto ?x ?y ?list) (iright ?x ?y ?list))
-	   (<- (nextto ?x ?y ?list) (iright ?y ?x ?list))
-	   (<- (iright ?left ?right (?left ?right . ?rest)))
-	   (<- (iright ?left ?right (?x . ?rest))
-	       (iright ?left ?right ?rest))
-	   ;;(<- (= ?x ?x))
-	   (<- (zebra ?h ?w ?z)
-	       (= ?h ((house norwegian ? ? ? ?)
-		      ?
-		      (house ? ? ? milk ?) ? ?))
-	       (member (house englishman ? ? ? red) ?h)
-	       (member (house spaniard dog ? ? ?) ?h)
-	       (member (house ? ? ? coffee green) ?h)
-	       (member (house ukranian ? ? tea ?) ?h)
-	       (iright (house ? ? ? ? ivory)
-		       (house ? ? ? ? green) ?h)
-	       (member (house ? snails winston ? ?) ?h)
-	       (member (house ? ? kools ? yellow) ?h)
-	       (nextto (house ? ? chesterfield ? ?)
-		       (house ? fox ? ? ?) ?h)
-	       (nextto (house ? ? kools ? ?)
-		       (house ? horse ? ? ?) ?h)
-	       (member (house ? ? luckystrike orange-juice ?) ?h)
-	       (member (house japanese ? parliaments ? ?) ?h)
-	       (nextto (house norwegian ? ? ? ?)
-		       (house ? ? ? ? blue) ?h)
-	       (member (house ?w ? ? water ?) ?h)
-	       (member (house ?z zebra ? ? ?) ?h))
-	   (time (select (?houses ?water-drinker ?zebra-owner) 
-			 (zebra ?houses ?water-drinker ?zebra-owner))))
-      (progn
-	(shutdown-graph *graph*)
-	(delete-file "/var/tmp/triples")
-	(delete-file "/var/tmp/functors")
-	(delete-file "/var/tmp/rules")
-	(delete-file "/var/tmp/config.ini")))))
-
-|#
