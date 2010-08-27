@@ -553,7 +553,7 @@ types that will be stored in the db.")
 	 (remhash ',*predicate* (functors *graph*)))
        (flatten (nreverse *select-list*)))))
 
-(defun exec-rule (goals action)
+(defun select-bind-list (goals action)
   (let* ((rule (append (replace-?-vars goals) (list '! action)))
 	 (vars (variables-in rule))
 	 (top-level-query (gensym "PROVE"))
@@ -577,5 +577,26 @@ types that will be stored in the db.")
 	       (funcall (gethash ',*predicate* (functors *graph*)) #'prolog-ignore))
 	  (remhash ',*predicate* (functors *graph*)))
 	(nreverse *select-list*)))))
+
+(defun exec-rule (goals action)
+  (let* ((rule (append (replace-?-vars goals) (list '! action)))
+	 (top-level-query (gensym "PROVE"))
+	 (*predicate* (make-functor top-level-query 0)))
+    (eval
+     `(let* ((*trail* (make-array 200 :fill-pointer 0 :adjustable t))
+	     (*var-counter* 0)
+	     (*predicate* ',*predicate*))
+	(unwind-protect
+	     (let ((func #'(lambda (cont) 
+			     (block ,*predicate*
+			       .,(maybe-add-undo-bindings
+				  (mapcar #'(lambda (clause)
+					      (compile-clause nil clause 'cont))
+					  `(((,top-level-query)
+					     ,@rule))))))))
+	       (setf (gethash ',*predicate* (functors *graph*)) func)
+	       (funcall (gethash ',*predicate* (functors *graph*)) #'prolog-ignore))
+	  (remhash ',*predicate* (functors *graph*)))
+	t))))
 
 

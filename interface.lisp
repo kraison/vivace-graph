@@ -9,7 +9,7 @@
 		      (make-new-node :value object))))
       (make-new-triple *graph* subject predicate object))))
 
-(defun get-triples (&key s p o g)
+(defun get-triples (&key s p o g (decode? t))
   (let ((*graph* (or g *graph*)) (klist nil))
     (cond ((and s p o)
 	   (let ((triple (lookup-triple s p o :g *graph*)))
@@ -25,10 +25,12 @@
 	  (p
 	   (setq klist (get-predicates p)))
 	  (o
-	   (setq klist (get-objects o)))
-	  (t nil))
-    (when (klist? klist)
-      (map-klist #'(lambda (i) (lookup-triple-by-id i)) klist :collect? t))))
+	   (setq klist (get-objects o))))
+    (if (and decode? (klist? klist))
+	(unwind-protect
+	     (map-klist #'(lambda (i) (lookup-triple-by-id i)) klist :collect? t)
+	  (klist-free klist))
+	klist)))
 
 (defun load-graph! (file)
   (let ((config (py-configparser:make-config)))
