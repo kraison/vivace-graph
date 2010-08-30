@@ -14,6 +14,13 @@
 	   #:shutdown-graph
 	   #:needs-indexing?
 	   #:do-indexing
+	   #:with-transaction
+	   #:*in-transaction-p*
+	   #:dbm-rollback
+	   #:dbm-commit
+	   #:dbm-begin
+	   #:triple-db
+	   #:functors
 
 	   #:node?
 	   #:node-value
@@ -47,9 +54,12 @@
 
 	   #:<-
 	   #:?-
+	   #:!
 	   #:prolog
 	   #:select
 	   #:select-flat
+	   #:select-bind-list
+	   #:do-query
 	   #:exec-rule
 	   #:read/1
 	   #:wrte/1
@@ -83,6 +93,13 @@
 	   #:select/2
 	   #:select-as-bind-alist/2
 	   #:triple-search/3
+	   #:*trail*
+	   #:*var-counter*
+	   #:*predicate*
+	   #:*select-list*
+	   #:*prolog-global-functors*
+	   #:*prolog-trace*
+	   #:prolog-error
 
 	   #:timestamp?
 	   #:universal-to-timestamp

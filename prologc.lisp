@@ -2,6 +2,8 @@
 ;;;; Copyright (c) 1991 Peter Norvig
 (in-package #:vivace-graph)
 
+(defparameter *prolog-trace* t)
+
 (defstruct (var (:constructor ? ())
                 (:print-function print-var))
   (name (incf *var-counter*))
@@ -120,11 +122,17 @@ types that will be stored in the db.")
 (defun compile-call (predicate arity args cont)
   "Compile a call to a prolog predicate."
   (if (and (variable-p predicate) (= 2 arity))
-      `(triple-search/3 ,predicate ,@args ,cont)
+      `(progn
+	 (when *prolog-trace*
+	   (format t "TRACE: (SEARCH) ~A/~A~A~%" ',predicate ',arity ',args))
+	 (triple-search/3 ,predicate ,@args ,cont))
       (let ((functor (make-functor predicate arity)))
-	`(funcall (or (gethash ',functor (functors *graph*)) 
-		      (gethash ',functor *prolog-global-functors*))
-		  ,@args ,cont))))
+	`(let ((func (or (gethash ',functor (functors *graph*)) 
+			 (gethash ',functor *prolog-global-functors*))))
+	   (when *prolog-trace*
+	     (format t "TRACE: ~A/~A~A~%" ',predicate ',arity ',args))
+	   (if (functionp func)
+	       (funcall func ,@args ,cont))))))
 
 (defun prolog-compiler-macro (name)
   "Fetch the compiler macro for a Prolog predicate."
@@ -504,8 +512,8 @@ types that will be stored in the db.")
        (values))))
 
 (defmacro select (vars &rest goals)
-  (let* ((goals (replace-?-vars goals))
-	 (top-level-query (gensym "PROVE"))
+  (let* ((top-level-query (gensym "PROVE"))
+	 (goals (replace-?-vars goals))
 	 (*predicate* (make-functor top-level-query 0)))
     `(let* ((*trail* (make-array 200 :fill-pointer 0 :adjustable t))
 	    (*var-counter* 0)
@@ -521,6 +529,32 @@ types that will be stored in the db.")
 					     `(((,top-level-query)
 						,@goals
 						(select ,(mapcar #'symbol-name vars) ,vars))))))
+			      (undefined-function (condition)
+				(error 'prolog-error :reason condition))))))
+	      (setf (gethash ',*predicate* (functors *graph*)) func)
+	      (funcall (gethash ',*predicate* (functors *graph*)) #'prolog-ignore))
+	 (remhash ',*predicate* (functors *graph*)))
+       (nreverse *select-list*))))
+
+(defmacro select-bind-list (vars &rest goals)
+  (let* ((top-level-query (gensym "PROVE"))
+	 (goals (replace-?-vars goals))
+	 (*predicate* (make-functor top-level-query 0)))
+    `(let* ((*trail* (make-array 200 :fill-pointer 0 :adjustable t))
+	    (*var-counter* 0)
+	    (*predicate* ',*predicate*)
+	    (*select-list* nil))
+       (unwind-protect
+	    (let ((func #'(lambda (cont) 
+			    (handler-case
+				(block ,*predicate*
+				  .,(maybe-add-undo-bindings
+				     (mapcar #'(lambda (clause)
+						 (compile-clause nil clause 'cont))
+					     `(((,top-level-query)
+						,@goals
+						(select-as-bind-alist
+						 ,(mapcar #'symbol-name vars) ,vars))))))
 			      (undefined-function (condition)
 				(error 'prolog-error :reason condition))))))
 	      (setf (gethash ',*predicate* (functors *graph*)) func)
@@ -553,30 +587,28 @@ types that will be stored in the db.")
 	 (remhash ',*predicate* (functors *graph*)))
        (flatten (nreverse *select-list*)))))
 
-(defun select-bind-list (goals action)
-  (let* ((rule (append (replace-?-vars goals) (list '! action)))
-	 (vars (variables-in rule))
-	 (top-level-query (gensym "PROVE"))
+(defmacro do-query (vars &rest goals)
+  (let* ((top-level-query (gensym "PROVE"))
+	 (goals (replace-?-vars goals))
 	 (*predicate* (make-functor top-level-query 0)))
-    (eval
-     `(let* ((*trail* (make-array 200 :fill-pointer 0 :adjustable t))
-	     (*var-counter* 0)
-	     (*predicate* ',*predicate*)
-	     (*select-list* nil))
-	(unwind-protect
-	     (let ((func #'(lambda (cont) 
-			     (block ,*predicate*
-			       .,(maybe-add-undo-bindings
-				  (mapcar #'(lambda (clause)
-					      (compile-clause nil clause 'cont))
-					  `(((,top-level-query)
-					     ,@rule
-					     (select-as-bind-alist 
-					      ,(mapcar #'symbol-name vars) ,vars)))))))))
-	       (setf (gethash ',*predicate* (functors *graph*)) func)
-	       (funcall (gethash ',*predicate* (functors *graph*)) #'prolog-ignore))
-	  (remhash ',*predicate* (functors *graph*)))
-	(nreverse *select-list*)))))
+    `(let* ((*trail* (make-array 200 :fill-pointer 0 :adjustable t))
+	    (*var-counter* 0)
+	    (*predicate* ',*predicate*))
+       (unwind-protect
+	    (let ((func #'(lambda (cont) 
+			    (handler-case
+				(block ,*predicate*
+				  .,(maybe-add-undo-bindings
+				     (mapcar #'(lambda (clause)
+						 (compile-clause nil clause 'cont))
+					     `(((,top-level-query)
+						,@goals)))))
+			      (undefined-function (condition)
+				(error 'prolog-error :reason condition))))))
+	      (setf (gethash ',*predicate* (functors *graph*)) func)
+	      (funcall (gethash ',*predicate* (functors *graph*)) #'prolog-ignore))
+	 (remhash ',*predicate* (functors *graph*)))
+       t)))
 
 (defun exec-rule (goals action)
   (let* ((rule (append (replace-?-vars goals) (list '! action)))

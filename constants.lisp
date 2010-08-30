@@ -4,7 +4,7 @@
 
 ;; Prolog constants and specials
 (defconstant +unbound+ :unbound)
-(defconstant +no-bindings+ '((t . t)))
+(ignore-errors (defconstant +no-bindings+ '((t . t))))
 (defconstant +fail+ nil)
 
 ;; Certainty factors

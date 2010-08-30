@@ -13,7 +13,7 @@
   (let ((*graph* (or g *graph*)) (klist nil))
     (cond ((and s p o)
 	   (let ((triple (lookup-triple s p o :g *graph*)))
-	     (when triple (return-from get-triples (list triple)))))
+	     (when triple (return-from get-triples triple))))
 	  ((and s p)
 	   (setq klist (get-subjects-predicates s p)))
 	  ((and s o)
