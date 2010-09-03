@@ -10,10 +10,10 @@
   (binding +unbound+))
 
 (defmacro var-deref (exp)
-  "Follow pointers for bound variables."
+  "Follow pointers for bound variables and dereference node values."
   `(progn (loop while (and (var-p ,exp) (bound-p ,exp))
              do (setf ,exp (var-binding ,exp)))
-          ,exp))
+          (if (node? ,exp) (setf ,exp (node-value ,exp)) ,exp)))
 
 (defun print-var (var stream depth)
   (if (or (and *print-level*
@@ -34,6 +34,8 @@ types that will be stored in the db.")
   (:method ((x timestamp) (y integer)) (= (timestamp-to-universal x) y))
   (:method ((x integer) (y timestamp)) (= (timestamp-to-universal y) x))
   (:method ((x node) (y node)) (node-equal x y))
+  (:method ((x node) y) (prolog-equal (node-value x) y))
+  (:method (x (y node)) (prolog-equal x (node-value y)))
   (:method ((x triple) (y triple)) (triple-equal x y))
   (:method ((x uuid:uuid) (y uuid:uuid)) (uuid:uuid-eql x y))
   (:method (x y) (equal x y)))
@@ -44,11 +46,11 @@ types that will be stored in the db.")
       exp))
 
 (defun unify! (x y)
-  "Destructively unify two expressions.  Look for Lisp call-outs using ?? and execute."
-  (if (and (consp x) (eq '?? (first x)))
-      (setq x (eval (deref-exp (second x)))))
-  (if (and (consp y) (eq '?? (first y)))
-      (setq y (eval (deref-exp (second y)))))
+  "Destructively unify two expressions."
+;  (if (and (consp x) (eq '?? (first x)))
+;      (setq x (eval (deref-exp (second x)))))
+;  (if (and (consp y) (eq '?? (first y)))
+;      (setq y (eval (deref-exp (second y)))))
   (cond ((prolog-equal (var-deref x) (var-deref y)) t)
         ((var-p x) (set-binding! x y))
         ((var-p y) (set-binding! y x))
@@ -151,7 +153,8 @@ types that will be stored in the db.")
   (assoc var bindings))
 
 (defun variable-p (x)
-  (and (symbolp x) (not (eq x '??)) (equal (char (symbol-name x) 0) #\?)))
+  ;;(and (symbolp x) (not (eq x '??)) (equal (char (symbol-name x) 0) #\?)))
+  (and (symbolp x) (equal (char (symbol-name x) 0) #\?)))
 
 (defun compile-arg (arg bindings)
   "Generate code for an argument to a goal in the body."
@@ -587,7 +590,7 @@ types that will be stored in the db.")
 	 (remhash ',*predicate* (functors *graph*)))
        (flatten (nreverse *select-list*)))))
 
-(defmacro do-query (vars &rest goals)
+(defmacro do-query (&rest goals)
   (let* ((top-level-query (gensym "PROVE"))
 	 (goals (replace-?-vars goals))
 	 (*predicate* (make-functor top-level-query 0)))
@@ -598,6 +601,8 @@ types that will be stored in the db.")
 	    (let ((func #'(lambda (cont) 
 			    (handler-case
 				(block ,*predicate*
+				  (when *prolog-trace*
+				    (format t "TRACE: do-query for ~A~%" ',goals))
 				  .,(maybe-add-undo-bindings
 				     (mapcar #'(lambda (clause)
 						 (compile-clause nil clause 'cont))

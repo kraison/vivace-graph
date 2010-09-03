@@ -35,14 +35,15 @@
 (defun load-graph! (file)
   (let ((config (py-configparser:make-config)))
     (py-configparser:read-files config (list file))
-    (let ((uuid (uuid:make-uuid-from-string (py-configparser:get-option config "default" "uuid"))))
+    (let ((name (py-configparser:get-option config "default" "name")))
       (sb-ext:with-locked-hash-table (*graph-table*)
-	(let ((graph (gethash uuid *graph-table*)))
+	(let ((graph (gethash name *graph-table*)))
 	  (if (and (graph? graph) (not (shutdown? graph)))
 	      (setq *graph* graph)
-	      (let ((graph (make-graph :graph-uuid uuid
-				       :graph-name (py-configparser:get-option 
-						    config "default" "name")
+	      (let ((graph (make-graph :graph-uuid (uuid:make-uuid-from-string
+						    (py-configparser:get-option
+						     config "default" "uuid"))
+				       :graph-name name
 				       :graph-location (py-configparser:get-option 
 							config "default" "location"))))
 		(setf (triple-db graph) 
@@ -61,7 +62,7 @@
 				     :fields '("subject" "object")
 				     :min-merge-docs 5000 
 				     :path (format nil "~A/full-text-idx" (graph-location graph)))
-		      (gethash (graph-uuid graph) *graph-table*) graph
+		      (gethash (graph-name graph) *graph-table*) graph
 		      *graph* graph))))))
     (load-all-functors *graph*)
     (load-all-rules *graph*)
@@ -88,4 +89,4 @@
     (close-phash (rule-db graph))
     (close-btree (triple-db graph))
     (close-btree (deleted-triple-db graph))
-    (remhash (graph-uuid graph) *graph-table*)))
+    (remhash (graph-name graph) *graph-table*)))

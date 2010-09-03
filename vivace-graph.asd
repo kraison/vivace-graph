@@ -11,6 +11,10 @@
   :description "Vivace Graph"
   :long-description "Vivace Graph."
   :depends-on (:bordeaux-threads
+	       :usocket
+	       :protobuf
+	       :hunchentoot
+	       :cl-json
 	       :uuid
 	       :cl-fad
 	       :ieee-floats
@@ -24,10 +28,8 @@
 	       :date-calc
 	       :montezuma
 	       :py-configparser
-	       :usocket
 	       :js
-	       :protobuf
-	       :hunchentoot)
+	       :split-sequence)
   :components ((:file "uuid")
 	       (:file "vivace-graph-package" :depends-on ("uuid"))
 	       (:file "gettimeofday" :depends-on ("vivace-graph-package"))
@@ -47,4 +49,9 @@
 	       (:file "prolog-functors" :depends-on ("prologc"))
 	       (:file "rules" :depends-on ("prolog-functors"))
 	       (:file "gc" :depends-on ("rules" "triples" "node"))
-	       (:file "interface" :depends-on ("rules"))))
+	       (:file "interface" :depends-on ("rules"))
+;	       (:file "session" :depends-on ("interface"))
+;	       (:file "listener" :depends-on ("session"))
+	       (:file "json-rpc" :depends-on ("interface"))
+	       (:file "json-functions" :depends-on ("json-rpc"))
+	       (:file "server" :depends-on ("json-functions"))))

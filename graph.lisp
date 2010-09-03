@@ -1,6 +1,6 @@
 (in-package #:vivace-graph)
 
-(setq *graph-table* (make-uuid-table :synchronized t))
+(setq *graph-table* (make-hash-table :synchronized t :test 'equalp))
 
 (defstruct (graph
 	     (:predicate graph?)
@@ -37,3 +37,6 @@
 
 (defmethod needs-indexing? ((graph graph))
   (not (sb-concurrency:queue-empty-p (needs-indexing-q graph))))
+
+(defun lookup-graph (name)
+  (gethash name *graph-table*))

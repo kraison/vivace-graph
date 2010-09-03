@@ -1,8 +1,11 @@
 (in-package #:vivace-graph)
 
-(defun logger (level msg &rest args)
+(defmacro logger (level msg &rest args)
   "Syslogger"
-  (sb-posix:syslog (gethash level *syslog-priorities*) msg args))
+  `(funcall #'sb-posix:syslog (gethash ',level *syslog-priorities*) ,msg ,@args))
+
+(defun ip-to-string (ip)
+  (format nil "~A.~A.~A.~A" (aref ip 0) (aref ip 1) (aref ip 2) (aref ip 3)))
 
 (defgeneric less-than (x y)
   (:documentation "Generic less-than operator.  Allows comparison of apples and oranges.")

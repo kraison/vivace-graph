@@ -1,0 +1,109 @@
+<html><head><title>Prolog Test</title>
+<script type='text/javascript'>
+//<![CDATA[ 
+function DumpObjectIndented(obj, indent)
+{
+  var result = "";
+  if (indent == null) indent = "";
+
+  for (var property in obj)
+  {
+    var value = obj[property];
+    if (typeof value == 'string')
+      value = "'" + value + "'";
+    else if (typeof value == 'object')
+    {
+      //if (value instanceof Array)
+      //{
+        // Just let JS convert the Array to a string!
+       // value = "[ " + value + " ]";
+      //}
+      //else
+      //{
+        // Recursive dump
+        // (replace "  " by "\t" or something else if you prefer)
+        var od = DumpObjectIndented(value, indent + "  ");
+        // If you like { on the same line as the key
+        //value = "{\n" + od + "\n" + indent + "}";
+        // If you prefer { and } to be aligned
+        value = "\n" + indent + "{\n" + od + "\n" + indent + "}";
+      //}
+    }
+    result += indent + "'" + property + "' : " + value + ",\n";
+  }
+  return result.replace(/,\n$/, "");
+}
+
+function fetchURI(uri, params, callback) {
+  var request;
+  if (window.XMLHttpRequest) { request = new XMLHttpRequest(); }
+  else {
+    try { request = new ActiveXObject("Msxml2.XMLHTTP"); } catch (e) {
+      try { request = new ActiveXObject("Microsoft.XMLHTTP"); } catch (ee) {
+        request = null;
+      }}}
+  if (!request) alert("Browser couldn't make a request object.");
+
+  request.open('POST', uri, true);
+  request.onreadystatechange = function() {
+    if (request.readyState != 4) return;
+    if (((request.status>=200) && (request.status<300)) || (request.status == 304)) {
+      var data = request.responseText;
+      if (callback!=null) { callback(data); }
+    }
+    else { 
+      alert('Error while fetching URI ' + uri);
+    }
+  }
+  request.setRequestHeader("Content-type", "application/x-www-form-urlencoded");
+  request.setRequestHeader("Content-length", params.length);
+  request.setRequestHeader("Connection", "close");
+  request.send(params);
+  delete request;
+}
+
+function ajax_call(func, callback, args) {
+  var uri = '/prolog/' + encodeURIComponent(func) + '/';
+  var i;
+  var params;
+  if (args.length > 0) {
+    for (i = 0; i < args.length; ++i) {
+      if (i > 0) { params += '&' };
+      params += 'arg' + i + '=' + encodeURIComponent(args[i]);
+    }
+  }
+  fetchURI(uri, params, callback);
+}
+
+function ajax_query (graph, query, callback) {
+    ajax_call('QUERY', callback, [graph, query]);
+}
+
+function callback(response) {
+  var r = eval('(' + response + ')');
+  var itemDiv = document.getElementById("r1");
+  itemDiv.innerHTML = "<P>Answer: <PRE>" + DumpObjectIndented(r,"") + "</PRE></P>";
+}
+
+function queryProlog(form) {
+    ajax_query(form.graph.value,form.query.value,callback);
+}
+//]]>
+</script>
+</head>
+<body>
+<center>
+<table border=1>
+<tr>
+<td valign=top>
+<form name=prolog>
+Graph: <input type=text name=graph><br>
+Query:<br><textarea rows="24" cols="80" name=query></textarea><br>
+<input type=button name=submit value="Do Query" onClick="queryProlog(this.form)">
+</form>
+</td><td valign=top>
+<div id="r1"><P>No data.</P></div>
+</td></tr></table>
+</center>
+</body>
+</html>

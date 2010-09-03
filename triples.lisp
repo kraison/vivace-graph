@@ -250,9 +250,9 @@
 		   (triple 
 		    (make-triple 
 		     :uuid uuid
-		     :subject (lookup-node (get-phash db (make-slot-key ukey "subject")))
-		     :predicate (lookup-predicate (get-phash db (make-slot-key ukey "predicate")))
-		     :object (lookup-node (get-phash db (make-slot-key ukey "object")))
+		     :subject (lookup-node (get-btree db (make-slot-key ukey "subject")))
+		     :predicate (lookup-predicate (get-btree db (make-slot-key ukey "predicate")))
+		     :object (lookup-node (get-btree db (make-slot-key ukey "object")))
 		     :timestamp +needs-lookup+
 		     :belief-factor +needs-lookup+
 		     :derived? +needs-lookup+

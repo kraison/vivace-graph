@@ -60,11 +60,21 @@
       (funcall cont)))
 
 (def-global-prolog-functor lisp/2 (?result exp cont)
-  (if (unify! ?result (eval (deref-exp exp)))
-      (funcall cont)))
+  (when *prolog-trace* (format t "TRACE: lisp/2 ?result <- ~A~%" exp))
+  (let ((exp (var-deref exp)))
+    (cond ((consp exp)
+	   (if (unify! ?result (eval exp))
+	       (funcall cont)))
+	  ((and (symbolp exp) (boundp exp))
+	   (if (unify! ?result (eval exp))
+	       (funcall cont)))
+	  (t
+	   (if (unify! ?result exp)
+	       (funcall cont))))))
 
 (def-global-prolog-functor regex-match/2 (?arg1 ?arg2 cont)
-  (if (and (stringp (var-deref ?arg1)) (stringp (var-deref ?arg2)) (cl-ppcre:scan ?arg1 ?arg2))
+  (if (and (stringp (var-deref ?arg1)) (stringp (var-deref ?arg2))
+	   (cl-ppcre:scan ?arg1 ?arg2))
       (funcall cont)))
 
 (def-global-prolog-functor var/1 (?arg1 cont)
@@ -78,11 +88,24 @@
 (def-global-prolog-functor call/1 (goal cont)
   (var-deref goal)
   (let* ((functor (make-functor (first goal) (length (args goal)))))
-    (let ((func (or (gethash functor (functors *graph*)) 
-		    (gethash functor *prolog-global-functors*)
-		    (error 'prolog-error 
-			   :reason (format nil "Unknown Prolog functor in call/1 ~A" functor)))))
-      (apply func (append (args goal) (list cont))))))
+    (let ((fn (or (gethash functor (functors *graph*)) 
+		  (gethash functor *prolog-global-functors*))))
+      (if (functionp fn)
+	  (apply fn (append (args goal) (list cont)))
+	  (if (= 2 (relation-arity goal))
+	      (triple-search/3 (first goal) (second goal) (third goal) cont)
+	      (error 'prolog-error 
+		     :reason 
+		     (format nil "Unknown Prolog functor in call/1 ~A" functor)))))))
+
+(def-global-prolog-functor if/2 (?test ?then cont)
+  (when *prolog-trace* (format t "TRACE: IF/2(~A ~A)~%" ?test ?then))
+  (call/1 ?test #'(lambda () (call/1 ?then cont))))
+
+(def-global-prolog-functor if/3 (?test ?then ?else cont)
+  (when *prolog-trace* (format t "TRACE: IF/3(~A ~A ~A)~%" ?test ?then ?else))
+  (call/1 ?test #'(lambda () (call/1 ?then #'(lambda () (funcall cont) (return-from if/3)))))
+  (call/1 ?else cont))
 
 (def-global-prolog-functor is-valid/1 (item cont)
   (var-deref item)
@@ -93,6 +116,12 @@
     (and (add-triple item 'has-property "valid")
 	 (funcall cont))))
 
+(def-global-prolog-functor is-valid?/1 (item cont)
+  (var-deref item)
+  (let ((triple (lookup-triple item 'has-property "valid")))
+    (when (triple? triple)
+      (funcall cont))))
+
 (def-global-prolog-functor is-invalid/1 (item cont)
   (var-deref item)
   (with-transaction ((triple-db *graph*))
@@ -102,42 +131,54 @@
     (and (add-triple item 'has-property "invalid")
 	 (funcall cont))))
 
+(def-global-prolog-functor is-invalid?/1 (item cont)
+  (var-deref item)
+  (let ((triple (lookup-triple item 'has-property "invalid")))
+    (when (triple? triple)
+      (funcall cont))))
+
+(def-global-prolog-functor valid-date?/1 (date cont)
+  "FIXME: This needs to be fleshed out with a more comprehensive regex."
+  (var-deref date)
+  (if (timestamp? date) 
+      (funcall cont)
+      (if (and (stringp date)
+	       (cl-ppcre:scan 
+		"^(19|20)\\d\\d[\-\ \/\.](0[1-9]|1[012])[\-\ \/\.](0[1-9]|[12][0-9]|3[01])$" date))
+	  (funcall cont))))
+
 (def-global-prolog-functor trigger/1 (exp cont)
   (eval (deref-exp exp))
   (funcall cont))
 
 (def-global-prolog-functor assert/1 (clause cont)
   (when (consp clause)
-    (var-deref clause)
+    (setq clause (mapcar #'(lambda (c) (var-deref c)) clause))
+    (when *prolog-trace* (format t "TRACE: Asserting ~A~%" clause))
     (if (and (= 3 (length clause)) (not (some #'var-p clause)))
-	(when (triple? (add-triple (second clause) (first clause) (third clause)))
-	  (funcall cont))
+	(let ((triple (add-triple (second clause) (first clause) (third clause))))
+	  (when *prolog-trace* (format t "TRACE: Asserted new triple ~A~%" triple))
+	  (when (triple? triple)
+	    (funcall cont)))
 	(call/1 clause cont))))
 
 (def-global-prolog-functor retract/1 (clause cont)
   (when (consp clause)
-    (var-deref clause)
+    (setq clause (mapcar #'(lambda (c) (var-deref c)) clause))
     (when (= (length clause) 3)
       (handler-case
 	  (with-transaction ((triple-db *graph*))
+	    (when *prolog-trace* (format t "TRACE: Retracting fact ~A~%" clause))
 	    (let ((triple (lookup-triple (second clause) (first clause) (third clause))))
 	      (if (triple? triple)
 		  (delete-triple triple)
 		  (error 'prolog-error 
-			 :reason (format nil "Clause ~A does not represent a fact." clause)))))
+			 :reason (format nil "clause ~A does not represent a fact" clause)))))
 	(prolog-error (condition)
 	  (format t "Cannot retract ~A: ~A~%" clause condition))
 	(:no-error (result)
 	  (declare (ignore result))
 	  (funcall cont))))))
-
-(def-global-prolog-functor if/2 (?test ?then cont)
-  (call/1 ?test #'(lambda () (call/1 ?then #'(lambda () nil))))
-  (funcall cont))
-
-(def-global-prolog-functor if/3 (?test ?then ?else cont)
-  (call/1 ?test #'(lambda () (call/1 ?then #'(lambda () (funcall cont) (return-from if/3)))))
-  (call/1 ?else #'(lambda () (funcall cont) (return-from if/3))))
 
 (def-global-prolog-functor not/1 (relation cont)	      
   (with-undo-bindings
@@ -188,7 +229,7 @@
 
 (def-global-prolog-functor triple-search/3 (p s o cont)
   (when *prolog-trace*
-    (format t "TRACE triple-search/3(~A ~A ~A)~%" p s o))
+    (format t "TRACE: triple-search/3(~A ~A ~A)~%" p s o))
   (when (and (not (consp p)) (not (consp s)) (not (consp o)))
     (let ((triples (get-triples 
 		    :p (and (or (not (var-p p)) (and (var-p p) (bound-p p))) (var-deref p))

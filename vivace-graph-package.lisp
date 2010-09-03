@@ -6,7 +6,8 @@
 	#:bordeaux-threads 
 	#:kyoto-persistence
 	#:local-time
-	#:cl-skip-list)
+	#:cl-skip-list
+	#:hunchentoot)
   (:export #:*graph*
 	   #:graph?
 	   #:load-graph!
@@ -85,7 +86,10 @@
 	   #:if/2
 	   #:if/3
 	   #:is-valid/1
+	   #:is-valid?/1
 	   #:is-invalid/1
+	   #:is-invalid?/1
+	   #:valid-date?/1
 	   #:trigger/1
 	   #:assert/1
 	   #:retract/1
@@ -93,6 +97,7 @@
 	   #:select/2
 	   #:select-as-bind-alist/2
 	   #:triple-search/3
+	   #:valid-date?
 	   #:*trail*
 	   #:*var-counter*
 	   #:*predicate*
