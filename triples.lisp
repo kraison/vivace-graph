@@ -129,7 +129,9 @@
   (triple-belief-factor triple))
 
 (defmethod as-list ((triple triple))
-  (list (triple-predicate triple) (triple-subject triple) (triple-object triple)))
+  (list (pred-name (triple-predicate triple)) 
+	(node-value (triple-subject triple)) 
+	(node-value (triple-object triple))))
 
 (defmethod make-spo-key (value)
   (make-serialized-key +triple-key+ value))

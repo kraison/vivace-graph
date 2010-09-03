@@ -57,6 +57,7 @@
 	   #:?-
 	   #:!
 	   #:prolog
+	   #:insert
 	   #:select
 	   #:select-flat
 	   #:select-bind-list

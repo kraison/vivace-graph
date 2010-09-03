@@ -48,7 +48,7 @@
     :type string
     :documentation "The uri which is used to handle ajax request")
    (content-type :initarg :content-type :type string
-     :accessor content-type :initform "text/xml; charset=\"utf-8\""
+     :accessor content-type :initform "text/x-json; charset=\"utf-8\""
      :documentation "The http content type that is sent with each response")
    (reply-external-format 
     :initarg :reply-external-format :type flexi-streams::external-format
@@ -79,7 +79,7 @@ function ~a (~{~a, ~}callback) {
                        (mapcar #'make-js-symbol params) 
                        name)))
     `(progn
-       (defun ,name ,params ,@body)
+       (defun ,name (&key ,@params) ,@body)
        (setf (gethash (symbol-name ',name) (lisp-fns ,processor)) ',name)
        (setf (gethash (symbol-name ',name) (js-fns ,processor)) ',js-fn))))
 
@@ -106,7 +106,7 @@ function fetchURI(uri, params, callback) {
   request.onreadystatechange = function() {
     if (request.readyState != 4) return;
     if (((request.status>=200) && (request.status<300)) || (request.status == 304)) {
-      var data = request.responseXML;
+      var data = request.responseText;
       if (callback!=null) { callback(data); }
     }
     else { 
@@ -139,22 +139,59 @@ function ajax_call(func, callback, args) {
 </script>")))
 
 
+(defun encode-json-for-web (&key result error id)
+  (json:encode-json-to-string `((result . ,result)
+                                (error . ,error)
+                                (id . ,id))))
+
+(defun make-rpc-response (processor &key result error id)
+  "Adjusted for our custom response structure.  Called by call-lisp-function to format the 
+generated response."
+  (setf (hunchentoot:reply-external-format*) (reply-external-format processor))
+  (setf (hunchentoot:content-type*) (content-type processor))
+  (hunchentoot:no-cache)
+  (encode-json-for-web :result result :error error :id id))
 
 (defun call-lisp-function (processor)
   "This is called from hunchentoot on each ajax request. It parses the 
    parameters from the http request, calls the lisp function and returns
    the response."
   (let* ((fn-name (string-trim "/" (subseq (hunchentoot:script-name* hunchentoot:*request*)
-                                           (length (server-uri processor)))))
-         (fn (gethash fn-name (lisp-fns processor)))
-         (args (mapcar #'cdr (hunchentoot:post-parameters* hunchentoot:*request*))))
-    (unless fn
-      (error "Error in call-lisp-function: no such function: ~A" fn-name))
-    
-    (setf (hunchentoot:reply-external-format*) (reply-external-format processor))
-    (setf (hunchentoot:content-type*) (content-type processor))
-    (hunchentoot:no-cache)
-    (apply fn args)))
+					   (length (server-uri processor)))))
+	 (fn (gethash fn-name (lisp-fns processor)))
+	 (id (uuid:print-bytes nil (make-uuid)))
+	 ;;(args (mapcar #'cdr (hunchentoot:post-parameters* hunchentoot:*request*))))
+	 (args (hunchentoot:post-parameters* hunchentoot:*request*)))
+    (handler-case
+	(restart-case
+	    (if fn
+		(progn
+		  (let ((args-plist 
+			 (flatten
+			  (mapcar #'(lambda (i)
+				      (list (if (symbolp (car i))
+						(intern (symbol-name (car i)) :keyword) 
+						(intern (string-upcase (car i)) :keyword))
+					    (cdr i)))
+				  args))))
+		    (make-rpc-response processor 
+				       :id id 
+				       :result (restart-case (apply fn args-plist)
+						 (use-value (value) value)))))
+		(make-rpc-response processor 
+				   :id id :error (format nil "Function not found: ~a." fn)))
+	  (send-error (error-message)
+	    (make-rpc-response processor :id id :error error-message))
+	  (send-nothing () nil)
+	  (send-internal-error ()
+	    (make-rpc-response processor
+			       :id id
+			       :error "An internal error occurred on the server.")))
+      (error (condition)
+	(make-rpc-response processor
+			   :id nil
+			   :error (format nil "Bad input ~a: ~a" args condition))))))
+
 
 (defun create-ajax-dispatcher (processor)
   "Creates a hunchentoot dispatcher for an ajax processor"

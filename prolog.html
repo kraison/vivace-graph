@@ -76,7 +76,9 @@ function ajax_call(func, callback, args) {
 }
 
 function ajax_query (graph, query, callback) {
-    ajax_call('QUERY', callback, [graph, query]);
+  var uri = '/prolog/QUERY/';
+  var params = 'graph=' + encodeURIComponent(graph) + '&query=' + encodeURIComponent(query);
+  fetchURI(uri, params, callback);
 }
 
 function callback(response) {

@@ -3,15 +3,6 @@
 (defparameter *prolog-rpc* (make-instance 'ajax-processor :server-uri "/prolog"))
 (defparameter *prolog-server* nil)
 
-(defun valid-prolog-query? (form)
-  (case (first form)
-    (select t)
-    (select-flat t)
-    (<- t)
-    (select-bind-list t)
-    (do-query t)
-    (otherwise nil)))
-
 (defun json-eval (string)
   (in-package #:vivace-graph)
   (let ((form (read-from-string string)))
@@ -29,9 +20,9 @@
 	      (logger :err "GRAPH ~A IS ~A / QUERY IS ~A" graph *graph* query)
 	      (let ((result (json-eval query)))
 		(logger :err "Sending ~A" result)
-		(json:encode-json-to-string (list result))))
-	    (progn
-	      (logger :err "[\"Unknown graph: ~A\"]" graph)
-	      (format nil "[\"Unknown graph: ~A\"]" graph))))
+		(typecase result
+		  (triple (as-list result))
+		  (otherwise result))))
+	    (invoke-restart 'send-error (format nil "unknown graph ~A" graph))))
     (error (c)
-      (json:encode-json-to-string (list (format nil "~A" c))))))
+      (invoke-restart 'send-error (format nil "~A" c)))))

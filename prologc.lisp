@@ -481,6 +481,15 @@ types that will be stored in the db.")
   "Add a clause to the data base."
   `(let ((*predicate* nil)) (add-clause ',(make-anonymous clause))))
 
+(defmacro insert (&rest clauses)
+  "Add clauses to the data base."
+  `(let ((count 0))
+     (with-transaction ((triple-db *graph*))
+       (dolist (clause ',(make-anonymous clauses))
+	 (let ((*predicate* nil)) (add-clause (list clause)))
+	 (incf count)))
+     count))
+
 (defun prolog-ignore (&rest args)
   (declare (ignore args))
   nil)
@@ -635,5 +644,15 @@ types that will be stored in the db.")
 	       (funcall (gethash ',*predicate* (functors *graph*)) #'prolog-ignore))
 	  (remhash ',*predicate* (functors *graph*)))
 	t))))
+
+(defun valid-prolog-query? (form)
+  (case (first form)
+    (select t)
+    (select-flat t)
+    (select-bind-list t)
+    (<- t)
+    (insert t)
+    (do-query t)
+    (otherwise nil)))
 
 
