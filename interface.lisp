@@ -1,6 +1,7 @@
 (in-package #:vivace-graph)
 
 (defun add-triple (subject predicate object &optional graph)
+  "Add a triple to the datastore.  Subject, predicate and object can be nodes or atomic data types."
   (let ((*graph* (or graph *graph*)))
     (let ((subject (or (lookup-node subject) 
 		       (make-new-node :value subject)))
@@ -10,6 +11,9 @@
       (make-new-triple *graph* subject predicate object))))
 
 (defun get-triples (&key s p o g (decode? t))
+  "Lookup triples by subject, predicate, and / or object. Currently returns one of three types of 
+results: either a klist of undecoded triples, a list of triples or a single triple. This 
+inconsistency should be eliminated at some point."
   (let ((*graph* (or g *graph*)) (klist nil))
     (cond ((and s p o)
 	   (let ((triple (lookup-triple s p o :g *graph*)))
@@ -33,6 +37,7 @@
 	klist)))
 
 (defun load-graph! (file)
+  "Load a graph form configuration file (file).  Sets *graph* to the newly opened graph."
   (let ((config (py-configparser:make-config)))
     (py-configparser:read-files config (list file))
     (let ((name (py-configparser:get-option config "default" "name")))
@@ -46,6 +51,7 @@
 				       :graph-name name
 				       :graph-location (py-configparser:get-option 
 							config "default" "location"))))
+		(format t "Created ~A~%" graph)
 		(setf (triple-db graph) 
 		      (open-btree (format nil "~A/triples.kct" (graph-location graph))
 				  :duplicates-allowed? t)
@@ -69,6 +75,8 @@
     *graph*))
 
 (defun make-new-graph (&key name location)
+  "Create a new graph in the directory LOCATION with name NAME.  Sets *graph* to the newly created
+graph."
   (let ((graph (make-graph))
 	(config-file (format nil "~A/config.ini" location)))
     (with-open-file (stream config-file
@@ -82,6 +90,7 @@
     (load-graph! config-file)))
 
 (defmethod shutdown-graph ((graph graph))
+  "Close the given GRAPH."
   (sb-ext:with-locked-hash-table (*graph-table*)
     (setf (shutdown? graph) t)
     (when (eql *graph* graph) (setq *graph* nil))

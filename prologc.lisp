@@ -482,7 +482,7 @@ types that will be stored in the db.")
   `(let ((*predicate* nil)) (add-clause ',(make-anonymous clause))))
 
 (defmacro insert (&rest clauses)
-  "Add clauses to the data base."
+  "Add clauses to the data base. Wraps all additions in a single transaction."
   `(let ((count 0))
      (with-transaction ((triple-db *graph*))
        (dolist (clause ',(make-anonymous clauses))
@@ -495,6 +495,7 @@ types that will be stored in the db.")
   nil)
 
 (defmacro ?- (&rest goals)
+  "Execute an interactive prolog query."
   (let* ((goals (replace-?-vars goals))
 	 (vars (delete '? (variables-in goals)))
 	 (top-level-query (gensym "PROVE"))
@@ -524,6 +525,8 @@ types that will be stored in the db.")
        (values))))
 
 (defmacro select (vars &rest goals)
+  "Select specific variables as a list of lists using the following form:
+ (select (?x ?y) (is-a ?x ?y)) could return ((Joe Human) (Spot Dog))"
   (let* ((top-level-query (gensym "PROVE"))
 	 (goals (replace-?-vars goals))
 	 (*predicate* (make-functor top-level-query 0)))
@@ -549,6 +552,8 @@ types that will be stored in the db.")
        (nreverse *select-list*))))
 
 (defmacro select-bind-list (vars &rest goals)
+  "Select specific variables as a list of assoc lists using the following form:
+ (select-bind-list (?x ?y) (is-a ?x ?y)) could return ((?x . Joe) (?y . Human))"
   (let* ((top-level-query (gensym "PROVE"))
 	 (goals (replace-?-vars goals))
 	 (*predicate* (make-functor top-level-query 0)))
@@ -575,6 +580,8 @@ types that will be stored in the db.")
        (nreverse *select-list*))))
 
 (defmacro select-flat (vars &rest goals)
+  "Select specific variables as a flattened list of values using the following form:
+ (select-flat (?x) (is-a ?x Human)) could return (Joe Henry Jill)"
   (let* ((goals (replace-?-vars goals))
 	 (top-level-query (gensym "PROVE"))
 	 (*predicate* (make-functor top-level-query 0)))
@@ -600,6 +607,7 @@ types that will be stored in the db.")
        (flatten (nreverse *select-list*)))))
 
 (defmacro do-query (&rest goals)
+  "Execute a prolog query, ignoring the results."
   (let* ((top-level-query (gensym "PROVE"))
 	 (goals (replace-?-vars goals))
 	 (*predicate* (make-functor top-level-query 0)))

@@ -27,39 +27,49 @@
   nil)
 
 (def-global-prolog-functor =/2 (?arg1 ?arg2 cont)
+  "Unifies two prolog variables."
   (if (unify! ?arg1 ?arg2) (funcall cont)))
 
 (def-global-prolog-functor ==/2 (?arg1 ?arg2 cont)	       
+  "Checks equality of the values of two prolog variables."
   (if (deref-equal ?arg1 ?arg2) (funcall cont)))
 
-(def-global-prolog-functor /=/2 (?arg1 ?arg2 cont)	       
+(def-global-prolog-functor /=/2 (?arg1 ?arg2 cont)
+  "Checks inequality of the values of two prolog variables."
   (if (not (deref-equal ?arg1 ?arg2)) (funcall cont)))
 
-(def-global-prolog-functor >/2 (?arg1 ?arg2 cont)	      
+(def-global-prolog-functor >/2 (?arg1 ?arg2 cont)
+  "Prolog greater than functor."
   (if (or (and (numberp (var-deref ?arg1)) (numberp (var-deref ?arg2)) (> ?arg1 ?arg2)) 
 	  (and (timestamp? (var-deref ?arg1)) (timestamp? (var-deref ?arg2))
 	       (timestamp> ?arg1 ?arg2)))
       (funcall cont)))
 
 (def-global-prolog-functor </2 (?arg1 ?arg2 cont)
+  "Prolog less than functor."
   (if (or (and (numberp (var-deref ?arg1)) (numberp (var-deref ?arg2)) (< ?arg1 ?arg2))
 	  (and (timestamp? (var-deref ?arg1)) (timestamp? (var-deref ?arg2))
 	       (timestamp< ?arg1 ?arg2)))
       (funcall cont)))
 
 (def-global-prolog-functor >=/2 (?arg1 ?arg2 cont)	      
+  "Prolog greater than or equal to functor."
   (if (or (and (numberp (var-deref ?arg1)) (numberp (var-deref ?arg2)) (>= ?arg1 ?arg2)) 
 	  (and (timestamp? (var-deref ?arg1)) (timestamp? (var-deref ?arg2))
 	       (timestamp>= ?arg1 ?arg2)))
       (funcall cont)))
 
 (def-global-prolog-functor <=/2 (?arg1 ?arg2 cont)
+  "Prolog less than or equal to functor."
   (if (or (and (numberp (var-deref ?arg1)) (numberp (var-deref ?arg2)) (<= ?arg1 ?arg2)) 
 	  (and (timestamp? (var-deref ?arg1)) (timestamp? (var-deref ?arg2))
 	       (timestamp<= ?arg1 ?arg2)))
       (funcall cont)))
 
 (def-global-prolog-functor lisp/2 (?result exp cont)
+  "Call out to lisp from with a Prolog query.  Assigns result to the supplied Prolog var.
+ (lisp ?result (+ 1 2)).  Any lisp variables that you wish to access within a prolog query using
+the lisp functor should be declared special."
   (when *prolog-trace* (format t "TRACE: lisp/2 ?result <- ~A~%" exp))
   (let ((exp (var-deref exp)))
     (cond ((consp exp)
@@ -73,6 +83,8 @@
 	       (funcall cont))))))
 
 (def-global-prolog-functor regex-match/2 (?arg1 ?arg2 cont)
+  "Functor that treats first arg as a regex and uses cl-ppcre:scan to check for the pattern in the
+second arg."
   (if (and (stringp (var-deref ?arg1)) (stringp (var-deref ?arg2))
 	   (cl-ppcre:scan ?arg1 ?arg2))
       (funcall cont)))
@@ -81,11 +93,13 @@
   (if (unbound-var-p ?arg1) (funcall cont)))
 
 (def-global-prolog-functor is/2 (var exp cont)
+  "Similar to lisp/2, but unifies instead of assigns the lisp return value."
   (if (and (not (find-if-anywhere #'unbound-var-p exp))
 	   (unify! var (eval (deref-exp exp))))
       (funcall cont)))
 
 (def-global-prolog-functor call/1 (goal cont)
+  "Call a prolog form."
   (var-deref goal)
   (let* ((functor (make-functor (first goal) (length (args goal)))))
     (let ((fn (or (gethash functor (functors *graph*)) 
@@ -108,6 +122,7 @@
   (call/1 ?else cont))
 
 (def-global-prolog-functor is-valid/1 (item cont)
+  "Mark a triple as VALID and remove and INVALID marker."
   (var-deref item)
   (with-transaction ((triple-db *graph*))
     (let ((triple (lookup-triple item 'has-property "invalid")))
@@ -117,12 +132,14 @@
 	 (funcall cont))))
 
 (def-global-prolog-functor is-valid?/1 (item cont)
+  "Ask if a triple is valid."
   (var-deref item)
   (let ((triple (lookup-triple item 'has-property "valid")))
     (when (triple? triple)
       (funcall cont))))
 
 (def-global-prolog-functor is-invalid/1 (item cont)
+  "Mark a triple as INVALID and remove and VALID marker."
   (var-deref item)
   (with-transaction ((triple-db *graph*))
     (let ((triple (lookup-triple item 'has-property "valid")))
@@ -132,13 +149,14 @@
 	 (funcall cont))))
 
 (def-global-prolog-functor is-invalid?/1 (item cont)
+  "Ask if a triple is invalid."
   (var-deref item)
   (let ((triple (lookup-triple item 'has-property "invalid")))
     (when (triple? triple)
       (funcall cont))))
 
 (def-global-prolog-functor valid-date?/1 (date cont)
-  "FIXME: This needs to be fleshed out with a more comprehensive regex."
+  "Date validation functor. FIXME: This needs to be fleshed out with a more comprehensive regex."
   (var-deref date)
   (if (timestamp? date) 
       (funcall cont)
@@ -148,10 +166,12 @@
 	  (funcall cont))))
 
 (def-global-prolog-functor trigger/1 (exp cont)
+  "Call out to lisp ignoring the return value."
   (eval (deref-exp exp))
   (funcall cont))
 
 (def-global-prolog-functor assert/1 (clause cont)
+  "Add a clause to the datastore."
   (when (consp clause)
     (setq clause (mapcar #'(lambda (c) (var-deref c)) clause))
     (when *prolog-trace* (format t "TRACE: Asserting ~A~%" clause))
@@ -163,6 +183,7 @@
 	(call/1 clause cont))))
 
 (def-global-prolog-functor retract/1 (clause cont)
+  "Retract a fact from the datastore."
   (when (consp clause)
     (setq clause (mapcar #'(lambda (c) (var-deref c)) clause))
     (when (= (length clause) 3)
@@ -180,7 +201,8 @@
 	  (declare (ignore result))
 	  (funcall cont))))))
 
-(def-global-prolog-functor not/1 (relation cont)	      
+(def-global-prolog-functor not/1 (relation cont)
+  "Prolog negation.  Does not retract, simply negates in the context of the query."
   (with-undo-bindings
     (call/1 relation #'(lambda () (return-from not/1 nil)))
     (funcall cont)))
@@ -228,8 +250,7 @@
   (funcall cont))
 
 (def-global-prolog-functor triple-search/3 (p s o cont)
-  (when *prolog-trace*
-    (format t "TRACE: triple-search/3(~A ~A ~A)~%" p s o))
+  (when *prolog-trace* (format t "TRACE: triple-search/3(~A ~A ~A)~%" p s o))
   (when (and (not (consp p)) (not (consp s)) (not (consp o)))
     (let ((triples (get-triples 
 		    :p (and (or (not (var-p p)) (and (var-p p) (bound-p p))) (var-deref p))
@@ -262,8 +283,6 @@
 (defmethod load-all-functors ((graph graph))
   (map-phash #'(lambda (key val)
 		 (let ((pieces (split key '(#\Nul))))
-		   (format t "Got key pieces: ~A~%" pieces)
 		   (when (equal (second pieces) "name")
-		     (format t "Loading predicate ~A~%" val)
 		     (lookup-predicate val))))
 	     (functor-db graph)))

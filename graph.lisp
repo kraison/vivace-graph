@@ -36,6 +36,7 @@
 (defgeneric shutdown-graph (graph))
 
 (defmethod needs-indexing? ((graph graph))
+  "Are there pending indexing jobs to be done for GRAPH?"
   (not (sb-concurrency:queue-empty-p (needs-indexing-q graph))))
 
 (defun lookup-graph (name)

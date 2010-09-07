@@ -1,6 +1,7 @@
 (in-package #:vivace-graph)
 
 ;;;;; Some code in this file is subject to this license:
+;;;;;
 ;;;;; Copyright (c) 2010, Martin Loetzsch
 ;;;;; All rights reserved.
 
@@ -153,9 +154,8 @@ generated response."
   (encode-json-for-web :result result :error error :id id))
 
 (defun call-lisp-function (processor)
-  "This is called from hunchentoot on each ajax request. It parses the 
-   parameters from the http request, calls the lisp function and returns
-   the response."
+  "This is called from hunchentoot on each ajax request. It parses the parameters from the http 
+request, calls the lisp function and returns the response."
   (let* ((fn-name (string-trim "/" (subseq (hunchentoot:script-name* hunchentoot:*request*)
 					   (length (server-uri processor)))))
 	 (fn (gethash fn-name (lisp-fns processor)))
@@ -191,7 +191,6 @@ generated response."
 	(make-rpc-response processor
 			   :id nil
 			   :error (format nil "Bad input ~a: ~a" args condition))))))
-
 
 (defun create-ajax-dispatcher (processor)
   "Creates a hunchentoot dispatcher for an ajax processor"

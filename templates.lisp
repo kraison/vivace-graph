@@ -1,13 +1,14 @@
 (in-package #:vivace-graph)
 
-#|
-(deftemplate person
-  (slot has-name)
-  (slot has-age)
-  (slot has-eye-color)
-  (slot has-hair-color)) 
-|#
 (defmacro deftemplate (name &rest slots)
+  "Define a template:
+ (deftemplate person
+   (slot has-name)
+   (slot has-age)
+   (slot has-eye-color)
+   (slot has-hair-color)) 
+A function is added to the template table of *graph* with name NAME.  This function will be used to
+create groups of triples conforming to this template. See FACT and DEFFACTS."
   (unless (graph? *graph*)
     (error "deftemplate ~A: *graph* is not bound to a proper graph!" name))
   (let ((node (gensym)))
@@ -22,13 +23,12 @@
 			      slots)
 		    ,node)))))))
 
-#|
-(fact (person (has-name “John Q. Public”)
-	      (has-age 23)
-	      (has-eye-color blue)
-	      (has-hair-color black)))
-|#
 (defmacro fact (template)
+  "Create a group of triples using the named template as defined in DEFTEMPLATE:
+ (fact (person (has-name “John Q. Public”)
+ 	      (has-age 23)
+ 	      (has-eye-color blue)
+ 	      (has-hair-color black)))" 
   (let ((tmpl-name (first template)))
     `(funcall (gethash ',tmpl-name (templates *graph*))
 	      ,@(flatten (mapcar #'(lambda (slot)
@@ -36,14 +36,13 @@
 					,(second slot)))
 				 (rest template))))))
     
-#|
-(deffacts
-    (person (has-name “John Q. Public”) (has-age 23)
-	    (has-eye-color blue) (has-hair-color black))
-    (person (has-name “Jane S. Public”) (has-age 24)
-	    (has-eye-color blue) (has-hair-color blond)))
-|#
 (defmacro deffacts (&rest templates)
+  "Create a set of triple groups conforming to the named template as defined by DEFTEMPLATE:
+ (deffacts
+     (person (has-name “John Q. Public”) (has-age 23) 
+ 	    (has-eye-color blue) (has-hair-color black))
+     (person (has-name “Jane S. Public”) (has-age 24)
+  	    (has-eye-color blue) (has-hair-color blond)))"
   (let ((template (gensym)))
     `(mapcar #'(lambda (,template)
 		 (let ((tmpl-name (first ,template)))

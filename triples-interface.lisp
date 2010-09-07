@@ -3,6 +3,7 @@
 (defmethod make-new-triple ((graph graph) (subject node) (predicate predicate) (object node) 
 			    &key (index-immediate? t) (certainty-factor +cf-true+) derived?
 			    (enqueue-for-rules-check? nil))
+  "Add a new triple to the datastore."
   (or (lookup-triple subject predicate object)
       (let ((triple (make-triple :subject subject :predicate predicate :object object 
 				 :belief-factor certainty-factor :derived? derived?)))
@@ -25,6 +26,7 @@
 		  (skip-list-add (production-pq *graph*) (triple-timestamp triple) triple))))))))
 
 (defmethod bulk-add-triples ((graph graph) tuple-list &key cache? trigger?)
+  "Add a list of (p s o) tuples to the database in a single transaction."
   (handler-case
       (with-transaction ((triple-db graph))
 	(let ((new-triples nil))
@@ -50,33 +52,13 @@
 	      (skip-list-add (production-pq *graph*) (triple-timestamp triple) triple))))
 	t)))
   
-(defmethod delete-triple ((triple triple))
-  (when (not (triple-deleted? triple))
-    (when (null (cas (%triple-deleted? triple) nil t))
-      (cas (%triple-timestamp triple) (%triple-timestamp triple) (now))
-      (sb-concurrency:enqueue triple (delete-queue *graph*)))))
-
-(defmethod shadow-triple ((triple triple))
-  (handler-case
-      (progn
-	(with-transaction ((deleted-triple-db *graph*))
-	  (save-triple triple (deleted-triple-db *graph*))
-	  (index-triple triple (deleted-triple-db *graph*)))
-	(with-transaction ((triple-db *graph*))
-	  ;; FIXME: need to remove slots from db!
-	  (deindex-triple triple)))
-    (persistence-error (condition)
-      (format t "Cannot shadow deleted triple ~A: ~A~%" triple condition))
-    (:no-error (status)
-      (declare (ignore status))
-      (uncache-triple triple)
-      (cache-triple (deleted-triple-cache *graph*)))))
-
 (defmethod index-triple ((triple triple) &optional db)
+  "Index a triple."
   (with-transaction (db)
     (index-triple-unsafe triple db)))
 
 (defmethod deindex-triple ((triple triple) &optional db)
+  "Remove a triple from the indices."
   (let ((db (or db (triple-db *graph*))))
     (with-transaction (db)
       (rem-btree db (triple-subject triple) :value (triple-uuid triple)
@@ -91,3 +73,29 @@
 		 :key-serializer #'make-triple-so-key)
       (rem-btree db triple :value (triple-uuid triple)
 		 :key-serializer #'make-triple-po-key))))
+
+(defmethod delete-triple ((triple triple))
+  "Delete a triple;  this actually marks the triple as deleted and adds it to the delete-queue. The
+triple is thus scheduled to be shadowed."
+  (when (not (triple-deleted? triple))
+    (when (null (cas (%triple-deleted? triple) nil t))
+      (cas (%triple-timestamp triple) (%triple-timestamp triple) (now))
+      (sb-concurrency:enqueue triple (delete-queue *graph*)))))
+
+(defmethod shadow-triple ((triple triple))
+  "Move a deleted triple from the active btree to the shadow btree."
+  (handler-case
+      (progn
+	(with-transaction ((deleted-triple-db *graph*))
+	  (save-triple triple (deleted-triple-db *graph*))
+	  (index-triple triple (deleted-triple-db *graph*)))
+	(with-transaction ((triple-db *graph*))
+	  (remove-triple triple)
+	  (deindex-triple triple)))
+    (persistence-error (condition)
+      (format t "Cannot shadow deleted triple ~A: ~A~%" triple condition))
+    (:no-error (status)
+      (declare (ignore status))
+      (uncache-triple triple)
+      (cache-triple (deleted-triple-cache *graph*)))))
+

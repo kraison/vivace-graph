@@ -41,9 +41,11 @@
 
 ;; FIXME: this whole mess should be implemented via the MOP.  So messy...
 (defmethod triple-uuid ((triple triple))
+  "Return the decoded UUID of the triple."
   (%triple-uuid triple))
 
 (defmethod triple-predicate ((triple triple))
+  "Return the decoded predicate of the triple."
   (if (eql +needs-lookup+ (%triple-predicate triple))
       (setf (%triple-predicate triple) 
 	    (lookup-predicate
@@ -51,6 +53,7 @@
       (%triple-predicate triple)))
 
 (defmethod triple-subject ((triple triple))
+  "Return the decoded subject of the triple."
   (if (eql +needs-lookup+ (%triple-subject triple))
       (setf (%triple-subject triple) 
 	    (lookup-node
@@ -58,6 +61,7 @@
       (%triple-subject triple)))
 
 (defmethod triple-object ((triple triple))
+  "Return the decoded object of the triple."
   (if (eql +needs-lookup+ (%triple-object triple))
       (setf (%triple-object triple) 
 	    (lookup-node
@@ -65,34 +69,40 @@
       (%triple-object triple)))
 
 (defmethod triple-timestamp ((triple triple))
+  "Return the decoded timestamp of the triple."
   (if (eql +needs-lookup+ (%triple-timestamp triple))
       (setf (%triple-timestamp triple) 
 	    (get-btree (triple-db *graph*) (make-slot-key (triple-uuid triple) "timestamp")))
       (%triple-timestamp triple)))
 
 (defmethod triple-belief-factor ((triple triple))
+  "Return the decoded belief factor of the triple."
   (if (eql +needs-lookup+ (%triple-belief-factor triple))
       (setf (%triple-belief-factor triple) 
 	    (get-btree (triple-db *graph*) (make-slot-key (triple-uuid triple) "belief-factor")))
       (%triple-belief-factor triple)))
   
 (defmethod triple-deleted? ((triple triple))
+  "Is the triple marked as deleted?"
   (if (eql +needs-lookup+ (%triple-deleted? triple))
       (setf (%triple-deleted? triple) 
 	    (get-btree (triple-db *graph*) (make-slot-key (triple-uuid triple) "deleted?")))
       (%triple-deleted? triple)))
 
 (defmethod triple-derived? ((triple triple))
+  "Is this triple derived from a rule?"
   (if (eql +needs-lookup+ (%triple-derived? triple))
       (setf (%triple-derived? triple) 
 	    (get-btree (triple-db *graph*) (make-slot-key (triple-uuid triple) "derived?")))
       (%triple-derived? triple)))
 
 (defgeneric triple-eql (t1 t2)
+  (:documentation "Compare the UUIDs of two triples.")
   (:method ((t1 triple) (t2 triple)) (uuid:uuid-eql (triple-uuid t1) (triple-uuid t2)))
   (:method (t1 t2) nil))
 
 (defgeneric triple-equal (t1 t2)
+  (:documentation "Compare the subject, predicate and object of two triples using node-equal and predicate-eql.")
   (:method ((t1 triple) (t2 triple)) 
     (and (triple-eql t1 t2)
 	 (node-equal (triple-subject t1) (triple-subject t2))
@@ -108,27 +118,41 @@
 	  (node-value (triple-object triple))))
 
 (defmethod predicate ((triple triple))
+  "Return the predicate name of the triple's predicate."
   (pred-name (triple-predicate triple)))
 
 (defmethod predicate ((tuple list))
-  (first tuple))
+  "Return the predicate name of the triple's predicate."
+  (if (predicate? (first tuple))
+      (pred-name (first tuple))
+      (first tuple)))
 
 (defmethod subject ((triple triple))
+  "Return the node value of the triple's subject."
   (node-value (triple-subject triple)))
 
 (defmethod subject ((tuple list))
-  (second tuple))
+  "Return the node value of the triple's subject."
+  (if (node? (second tuple))
+      (node-value (second tuple))
+      (second tuple)))
 
 (defmethod object ((triple triple))
+  "Return the node value of the triple's object."
   (node-value (triple-object triple)))
 
 (defmethod object ((tuple list))
-  (third tuple))
+  "Return the node value of the triple's object."
+  (if (node? (third tuple))
+      (node-value (third tuple))
+      (third tuple)))
 
 (defmethod belief-factor ((triple triple))
+  "Return the belief factor of a triple."
   (triple-belief-factor triple))
 
 (defmethod as-list ((triple triple))
+  "Translate the triple into a list of (predicate subject object)."
   (list (pred-name (triple-predicate triple)) 
 	(node-value (triple-subject triple)) 
 	(node-value (triple-object triple))))
@@ -140,6 +164,7 @@
   (format nil "~A~A~A~A~A" s #\Nul p #\Nul o))
 
 (defmethod save-triple ((triple triple) &optional db)
+  "Persist triple."
   (let ((db (or db (triple-db *graph*))))
     (let ((key (uuid:print-bytes nil (triple-uuid triple)))
 	  (spo-key (make-triple-key-from-values (node-value (triple-subject triple))
@@ -159,6 +184,28 @@
 		   (triple-belief-factor triple))
 	(set-btree (triple-db *graph*) (make-slot-key key "derived?") (triple-derived? triple))
 	(set-btree (triple-db *graph*) (make-slot-key key "deleted?") (triple-deleted? triple))))))
+
+(defmethod remove-triple ((triple triple) &optional db)
+  "Remove a triple."
+  (let ((db (or db (triple-db *graph*))))
+    (let ((key (uuid:print-bytes nil (triple-uuid triple)))
+	  (spo-key (make-triple-key-from-values (node-value (triple-subject triple))
+						(pred-name (triple-predicate triple))
+						(node-value (triple-object triple)))))
+      (with-transaction (db)
+	(rem-btree (triple-db *graph*) spo-key (triple-uuid triple) :key-serializer #'make-spo-key)
+	(rem-btree (triple-db *graph*) (make-slot-key key "uuid") (triple-uuid triple))
+	(rem-btree (triple-db *graph*) (make-slot-key key "subject") 
+		   (node-value (triple-subject triple)))
+	(rem-btree (triple-db *graph*) (make-slot-key key "predicate")
+		   (string-downcase (symbol-name (pred-name (triple-predicate triple)))))
+	(rem-btree (triple-db *graph*) (make-slot-key key "object") 
+		   (node-value (triple-object triple)))
+	(rem-btree (triple-db *graph*) (make-slot-key key "timestamp") (triple-timestamp triple))
+	(rem-btree (triple-db *graph*) (make-slot-key key "belief-factor") 
+		   (triple-belief-factor triple))
+	(rem-btree (triple-db *graph*) (make-slot-key key "derived?") (triple-derived? triple))
+	(rem-btree (triple-db *graph*) (make-slot-key key "deleted?") (triple-deleted? triple))))))
 
 (defmethod make-subject-key ((node node))
   (make-serialized-key +triple-subject+ (node-value node)))
@@ -364,6 +411,7 @@
     (nreverse result)))
 
 (defmethod do-indexing ((graph graph))
+  "Index all pending triples for GRAPH."
   (loop until (sb-concurrency:queue-empty-p (needs-indexing-q graph)) do
        (index-triple (sb-concurrency:dequeue (needs-indexing-q graph)))))
 

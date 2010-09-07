@@ -17,31 +17,37 @@
 (defgeneric node-ref-count (node))
 
 (defgeneric node-eql (n1 n2)
+  (:documentation "Compares the UUIDs of two nodes.")
   (:method ((n1 node) (n2 node)) (uuid:uuid-eql (node-uuid n1) (node-uuid n2)))
   (:method (n1 n2) nil))
 
 (defgeneric node-equal (n1 n2)
+  (:documentation "Compares the values of two nodes using EQUAL.")
   (:method ((n1 node) (n2 node)) 
     (and (uuid:uuid-eql (node-uuid n1) (node-uuid n2))
 	 (equal (node-value n1) (node-value n2))))
   (:method (n1 n2) nil))
 
 (defmethod node-uuid ((node node))
+  "Access the decoded node UUID."
   (if (eq (%node-uuid node) +needs-lookup+)
       (setf (%node-uuid node) 
 	    (get-btree (triple-db *graph*) (make-slot-key (node-value node) "uuid")))
       (%node-uuid node)))
 
 (defmethod node-value ((node node))
+  "Access the decoded node value."
   (%node-value node))
 
 (defmethod node-ref-count ((node node))
+  "Access the decoded node reference count."
   (let ((count (get-btree (triple-db *graph*) (make-slot-key (node-value node) "ref-count"))))
     (if (numberp count)
 	count
 	0)))
 
 (defmethod save-node ((node node))
+  "Save a node to the datastore."
   (with-transaction ((triple-db *graph*))
     (set-btree (triple-db *graph*) (make-slot-key (node-value node) "value") (node-value node))
     (set-btree (triple-db *graph*) (make-slot-key (node-value node) "uuid") (node-uuid node))
@@ -49,15 +55,17 @@
 	       (make-slot-key (node-value node) "ref-count") (node-ref-count node))))
 
 (defmethod cache-node ((node node))
+  "Cache the node using its value as the lookup key."
   (setf (gethash (node-value node) (node-cache *graph*)) node))
 
 (defmethod lookup-node ((node node) &optional serialized?)
+  "Lookup a node."
   (declare (ignore serialized?))
   node)
 
 (defmethod lookup-node (value &optional serialized?)
+  "Lookup a node."
   (declare (ignore serialized?))
-  ;;(if serialized? (setq value (deserialize value)))
   (or (gethash value (node-cache *graph*))
       (let ((value (get-btree (triple-db *graph*) (make-slot-key value "value"))))
 	(if value
@@ -66,6 +74,7 @@
 	    nil))))
 
 (defmethod incf-ref-count ((node node))  
+  "Increment a node's reference count."
   (set-btree (triple-db *graph*) 
 	     (make-slot-key (node-value node) "ref-count") 
 	     (1+ (node-ref-count node))
@@ -73,6 +82,7 @@
   (node-ref-count node))
 
 (defmethod decf-ref-count ((node node))
+  "Decrement a node's reference count."
   (set-btree (triple-db *graph*)
 	     (make-slot-key (node-value node) "ref-count") 
 	     (1- (node-ref-count node))
@@ -85,6 +95,7 @@
   (format nil "_anon:~A" uuid))
 
 (defun make-anonymous-node (&key graph (cache? t))
+  "Create a unique anonymous node."
   (let ((*graph* (or graph *graph*)))
     (let* ((uuid (make-uuid)) 
 	   (value (make-anonymous-node-name uuid)))
@@ -95,6 +106,7 @@
 	node))))
 
 (defun make-new-node (&key value graph (cache? t))
+  "Create a new node with value VALUE.  Return the existing node if already present in the db."
   (if (node? value)
       value
       (let ((*graph* (or graph *graph*)))
@@ -111,6 +123,7 @@
 		  node)))))))
 
 (defmethod delete-node ((node node))
+  "Delete a node.  Does nothing at the moment, as nodes are never deleted."
   (with-transaction ((triple-db *graph*))
     node))
 

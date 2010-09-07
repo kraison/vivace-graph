@@ -111,4 +111,6 @@
 	   #:universal-to-timestamp
 	   #:timestamp-to-universal
 	   #:decode-timestamp
+
+	   #:flatten
 	   ))
