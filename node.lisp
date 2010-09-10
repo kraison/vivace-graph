@@ -1,5 +1,22 @@
 (in-package #:vivace-graph)
 
+(defmethod make-anonymous-node-name ((uuid uuid:uuid))
+  (format nil "_anon:~A" uuid))
+
+(defun make-anonymous-node (&key graph (cache? t))
+  "Create a unique anonymous node."
+  (declare (ignore cache?))
+  (format nil "_anon:~A" (make-uuid)))
+;  (let ((*graph* (or graph *graph*)))
+;    (let* ((uuid (make-uuid)) 
+;	   (value (make-anonymous-node-name uuid)))
+;      (let ((node (make-node :uuid uuid 
+;			     :value value)))
+;	(save-node node)
+;	(when cache? (cache-node node))
+;	node))))
+
+#|
 (defstruct (node
 	     (:conc-name %node-)
 	     (:predicate node?))
@@ -91,20 +108,6 @@
     (if (= 0 count) (sb-concurrency:enqueue node (delete-queue *graph*)))
     count))
 
-(defmethod make-anonymous-node-name ((uuid uuid:uuid))
-  (format nil "_anon:~A" uuid))
-
-(defun make-anonymous-node (&key graph (cache? t))
-  "Create a unique anonymous node."
-  (let ((*graph* (or graph *graph*)))
-    (let* ((uuid (make-uuid)) 
-	   (value (make-anonymous-node-name uuid)))
-      (let ((node (make-node :uuid uuid 
-			     :value value)))
-	(save-node node)
-	(when cache? (cache-node node))
-	node))))
-
 (defun make-new-node (&key value graph (cache? t))
   "Create a new node with value VALUE.  Return the existing node if already present in the db."
   (if (node? value)
@@ -124,11 +127,10 @@
 
 (defmethod delete-node ((node node))
   "Delete a node.  Does nothing at the moment, as nodes are never deleted."
-  (with-transaction ((triple-db *graph*))
-    node))
+  node)
 
 (defun make-new-node-unsafe (&key value)
   (let ((node (make-node :value value)))
     (save-node node)
     (cache-node node)))
-
+|#

@@ -3,11 +3,11 @@
 (defun add-triple (subject predicate object &optional graph)
   "Add a triple to the datastore.  Subject, predicate and object can be nodes or atomic data types."
   (let ((*graph* (or graph *graph*)))
-    (let ((subject (or (lookup-node subject) 
-		       (make-new-node :value subject)))
-	  (predicate (make-new-predicate :name predicate))
-	  (object (or (lookup-node object) 
-		      (make-new-node :value object))))
+    (let ((predicate (make-new-predicate :name predicate)))
+;           (subject (or (lookup-node subject) 
+;		       (make-new-node :value subject)))   
+;	  (object (or (lookup-node object) 
+;		      (make-new-node :value object))))
       (make-new-triple *graph* subject predicate object))))
 
 (defun get-triples (&key s p o g (decode? t))

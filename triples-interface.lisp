@@ -1,6 +1,6 @@
 (in-package #:vivace-graph)
 
-(defmethod make-new-triple ((graph graph) (subject node) (predicate predicate) (object node) 
+(defmethod make-new-triple ((graph graph) subject (predicate predicate) object
 			    &key (index-immediate? t) (certainty-factor +cf-true+) derived?
 			    (enqueue-for-rules-check? nil))
   "Add a new triple to the datastore."
@@ -10,8 +10,8 @@
 	(handler-case
 	    (with-transaction ((triple-db graph))
 	      (save-triple triple)
-	      (incf-ref-count subject)
-	      (incf-ref-count object)
+;	      (incf-ref-count subject)
+;	      (incf-ref-count object)
 	      (if index-immediate? 
 		  (index-triple triple)
 		  (sb-concurrency:enqueue triple (needs-indexing-q graph))))
@@ -32,14 +32,14 @@
 	(let ((new-triples nil))
 	  (dolist (tuple tuple-list)
 	    (or (triple? (lookup-triple-in-db (elt tuple 0) (elt tuple 1) (elt tuple 2) graph))
-		(let ((s (make-new-node :value (elt tuple 0)))
+		(let ((s (elt tuple 0)) ;;(make-new-node :value (elt tuple 0)))
 		      (p (make-new-predicate :name (elt tuple 1)))
-		      (o (make-new-node :value (elt tuple 2)))
+		      (o (elt tuple 2)) ;;(make-new-node :value (elt tuple 2)))
 		      (b (or (belief-factor tuple) +cf-true+)))
 		  (let ((triple (make-triple :subject s :predicate p :object o :belief-factor b)))
 		    (save-triple triple)
-		    (incf-ref-count s)
-		    (incf-ref-count o)
+;		    (incf-ref-count s)
+;		    (incf-ref-count o)
 		    (sb-concurrency:enqueue triple (needs-indexing-q graph))
 		    (push triple new-triples)))))
 	  new-triples))

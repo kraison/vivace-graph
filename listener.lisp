@@ -1,8 +1,6 @@
 (in-package #:vivace-graph)
 
 (defparameter *stop-listener* nil)
-(defparameter *eoc* 0)
-(defparameter +max-bytes+ 10240)
 
 (define-condition listener-error (error)
   ((reason :initarg :reason))
@@ -11,53 +9,17 @@
                  error
                (format stream "Listener error: ~A." reason)))))
 
-(defmethod data-received-handler ((session session))
-  (let ((buffer (session-buffer session)))
-    (do ((fin nil))
-	(fin t)
-      (let ((len
-	     (do ((byte (read-byte (session-stream session) nil :eof)
-			(read-byte (session-stream session) nil :eof))
-		  (count 0 (incf count)))
-		 ((or (= (fill-pointer (session-buffer session)) +buflen+)
-		      (eq byte :eof))
-		  count)
-	       (vector-push-extend byte (session-buffer session))
-	       (if (eql byte *eoc*) (return count)))))
-	(if (= 0 len)
-	    (setf fin t)
-	    (setf (fill-pointer buffer) len)))
-      (cond ((= (length buffer) 0)
-	     (logger :debug "Got 0 bytes, closing session ~A" session)
-	     (setf fin t)
-	     (setf (session-finished? session) t))
-	    (fin 
-	     (logger :debug "Got NIL for ~A, returning from data-received-handler" session)
-	     (setf (session-finished? session) t))
-	    ((and (= (fill-pointer (session-buffer session)) +buflen+)
-		  (not (= *eoc* (aref (session-buffer session) 
-				      (1- (fill-pointer (session-buffer session)))))))
-	     (logger :crit "Buffer overrun attempt for ~A: ~A" session (session-buffer session))
-	     (setf (session-finished? session) t))
-	    (t
-	     (logger :debug "Read ~A bytes for ~A: ~A~%" 
-		     (length buffer) session buffer)
-	     (dotimes (i (length buffer))
-	       (logger :debug "Sending byte ~A: ~A to client" i (aref buffer i))
-	       (write-byte (aref buffer i) (session-stream session)))
-	     (force-output (session-stream session)))))))
-
 (defun client-loop ()
   (handler-case
       (progn
         (loop until *stop-listener*
            do
            (let ((socket
-		  (usocket:wait-for-input (session-socket *session*) :ready-only t :timeout 1)))
+		  (usocket:wait-for-input (v-session-socket *session*) :ready-only t :timeout 1)))
              (when socket
                (let ((status (data-received-handler *session*)))
 		 (logger :debug "client-loop got status ~A" status)
-		 (if (session-finished? *session*) (return))))))
+		 (if (v-session-finished? *session*) (return))))))
         (shutdown-session *session*)
         (logger :debug "Session ended normally: ~A" *session*))
     (end-of-file (c)
@@ -77,8 +39,8 @@
          (handler-case
              (let ((stream (usocket:socket-stream socket)))
                (setf *session* (start-session stream socket))
-               (force-output (session-stream *session*))
-               (setf (session-thread *session*) (current-thread))
+               (force-output (v-session-stream *session*))
+               (setf (v-session-thread *session*) (current-thread))
                (initiate-session *session*))
            (end-of-file (c)
              (declare (ignore c))

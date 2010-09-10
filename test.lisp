@@ -37,7 +37,7 @@
 	 (let ((tuples nil))
 	   (dotimes (i 1000)
 	     (push (list (format nil "S~A" i) (format nil "P~A" i) (format nil "O~A" i)) tuples))
-	   (bulk-add-triples *graph* tuples))
+	   (time (bulk-add-triples *graph* tuples)))
       (progn
 	(if (graph? *graph*) (shutdown-graph *graph*))
 	(ignore-errors 
@@ -82,12 +82,15 @@
 	  (delete-file "/var/tmp/config.ini"))))))
 
 (defun triple-test-4 ()
-  (let ((*graph* (make-new-graph :name "test graph" :location "/var/tmp")))
+  (let ((*graph* (make-new-graph :name "test graph 4" :location "/var/tmp")))
     (unwind-protect
-	 (let ((predicate (make-new-predicate :name 'has-relationship)))
-	   (time (dotimes (i 100000)
-	     (make-new-node-unsafe :value i)))
-	   (format t "Added 100k nodes.  Adding triples...~%")
+	 (let ((predicates (make-array 0 :adjustable t :fill-pointer t)))
+	   (time
+	    (dotimes (i 2000)
+	      (vector-push-extend (make-new-predicate :name (format nil "P~A" i)) predicates)))
+;	   (time (dotimes (i 100000)
+;	     (make-new-node-unsafe :value i)))
+;	   (format t "Added 100k nodes.  Adding triples...~%")
 	   (let ((c 0))
 	     (declare (type fixnum c))
 	     (time (dotimes (i 1000)
@@ -96,12 +99,20 @@
 			  (when (= 0 (mod c 1000))
 			    (format t "On triple ~A~%" c))
 			  (add-triple-unsafe *graph* 
-					     (lookup-node i *graph*) 
-					     predicate 
-					     (lookup-node j *graph*)))))
-	     (format t "Finished adding ~A triples.  Indexing...~%" c))
-	   (time (loop until (sb-concurrency:queue-empty-p (needs-indexing-q *graph*)) do
-		      (index-triple-unsafe (sb-concurrency:dequeue (needs-indexing-q *graph*)))))
+					     ;;(lookup-node i *graph*) 
+					     i
+					     (aref predicates (random 2000))
+	                                     ;;(lookup-node j *graph*)))))
+					     j 
+					     :cache? nil
+					     :index? t))))
+	     (format t "Finished adding and indexing ~A triples.~%" c))
+;	   (let ((c 0))
+;	     (time (loop until (sb-concurrency:queue-empty-p (needs-indexing-q *graph*)) do
+;			(incf c)
+;			(when (= 0 (mod c 1000))
+;			  (format t "Indexing triple ~A~%" c))
+;			(index-triple-unsafe (sb-concurrency:dequeue (needs-indexing-q *graph*))))))
 	   (format t "Added all triples~%"))
       (progn
 	(if (graph? *graph*) (shutdown-graph *graph*))

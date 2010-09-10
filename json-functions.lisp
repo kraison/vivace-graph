@@ -6,20 +6,20 @@
 (defun json-eval (string)
   (in-package #:vivace-graph)
   (let ((form (read-from-string string)))
-    (logger :debug "GOT FORM ~A" form)
+    (logger :debug "JSON-EVAL GOT FORM ~A" form)
     (unless (valid-prolog-query? form)
       (error "Error: '~A' is not a valid prolog query." string))
     (eval form)))
 
 (defun-ajax query (graph query) (*prolog-rpc*)
-  (logger :debug "RPC TEST GOT: ~A / ~A" graph query)
+  (logger :debug "QUERY GOT: ~A / ~A" graph query)
   (handler-case
       (let ((*graph* (lookup-graph graph)))
 	(if (graph? *graph*)
 	    (progn
-	      (logger :debug "GRAPH ~A IS ~A / QUERY IS ~A" graph *graph* query)
+	      (logger :debug "QUERY: GRAPH ~A IS ~A / QUERY IS ~A" graph *graph* query)
 	      (let ((result (json-eval query)))
-		(logger :debug "Sending ~A" result)
+		(logger :debug "QUERY: Sending ~A" result)
 		(typecase result
 		  (triple (as-list result))
 		  (otherwise result))))

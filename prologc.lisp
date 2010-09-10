@@ -2,7 +2,7 @@
 ;;;; Copyright (c) 1991 Peter Norvig
 (in-package #:vivace-graph)
 
-(defparameter *prolog-trace* t)
+(defparameter *prolog-trace* nil)
 
 (defstruct (var (:constructor ? ())
                 (:print-function print-var))
@@ -10,10 +10,11 @@
   (binding +unbound+))
 
 (defmacro var-deref (exp)
-  "Follow pointers for bound variables and dereference node values."
+  "Follow pointers for bound variables."
   `(progn (loop while (and (var-p ,exp) (bound-p ,exp))
              do (setf ,exp (var-binding ,exp)))
-          (if (node? ,exp) (setf ,exp (node-value ,exp)) ,exp)))
+	  ,exp))
+          ;;(if (node? ,exp) (setf ,exp (node-value ,exp)) ,exp)))
 
 (defun print-var (var stream depth)
   (if (or (and *print-level*
@@ -33,9 +34,9 @@ types that will be stored in the db.")
   (:method ((x timestamp) (y timestamp)) (timestamp= x y))
   (:method ((x timestamp) (y integer)) (= (timestamp-to-universal x) y))
   (:method ((x integer) (y timestamp)) (= (timestamp-to-universal y) x))
-  (:method ((x node) (y node)) (node-equal x y))
-  (:method ((x node) y) (prolog-equal (node-value x) y))
-  (:method (x (y node)) (prolog-equal x (node-value y)))
+  ;;(:method ((x node) (y node)) (node-equal x y))
+  ;;(:method ((x node) y) (prolog-equal (node-value x) y))
+  ;;(:method (x (y node)) (prolog-equal x (node-value y)))
   (:method ((x triple) (y triple)) (triple-equal x y))
   (:method ((x uuid:uuid) (y uuid:uuid)) (uuid:uuid-eql x y))
   (:method (x y) (equal x y)))
@@ -79,8 +80,9 @@ types that will be stored in the db.")
 
 (defmethod clause-head ((triple triple))
   (list (pred-name (triple-predicate triple))
-	(node-value (triple-subject triple)) 
-	(node-value (triple-object triple))))
+	(triple-subject triple) (triple-object triple)))
+	;;(node-value (triple-subject triple)) 
+	;;(node-value (triple-object triple))))
 
 (defmethod clause-head ((list list))
   (first list))

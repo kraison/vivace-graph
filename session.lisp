@@ -13,29 +13,26 @@
                  error
                (format stream "Session error: ~A." reason)))))
 
-(defstruct (session
+(defstruct (v-session
              (:print-function print-session)
              (:predicate session?)
-             (:conc-name session-))
+             (:conc-name v-session-))
   (uuid (uuid:make-v1-uuid))
   (thread nil)
-  (lock (make-recursive-lock))
   (finished? nil)
   (stream nil)
   (host nil)
   (socket nil)
   (buffer (make-array 0
                       :element-type '(unsigned-byte 8)
-                      :adjustable nil
+                      :adjustable t
                       :fill-pointer t))
-  (error-handler #'(lambda (s)
-                     (logger :err "DEFAULT ERROR HANDLER: ERROR IN SESSION ~A." s)))
-  (cache (make-hash-table :test 'equalp))
+  (query-cache (make-hash-table :test 'equalp))
   (history nil))
 
 (defun print-session (session stream depth)
   (declare (ignore depth))
-  (format stream "#<SESSION ~A FROM ~A>" (session-uuid session) (session-host session)))
+  (format stream "#<SESSION ~A FROM ~A>" (v-session-uuid session) (v-session-host session)))
 
 (defun apply-sessions (func)
   (sb-ext:with-locked-hash-table (*sessions*)
@@ -43,32 +40,32 @@
                  (funcall func session))
              *sessions*)))
 
-(defun kill-all-sessions ()
-  (apply-sessions #'shutdown-session))
-
 (defun remove-thread (thread)
   (with-recursive-lock-held (*thread-list-lock*)
-    (setf *thread-list* (remove thread *thread-list*))))
+    (setf *thread-list* (delete thread *thread-list*))))
 
 (defun add-thread (thread)
   (with-recursive-lock-held (*thread-list-lock*)
     (push thread *thread-list*)))
 
 (defun start-session (stream socket)
-  (let ((session (make-session :stream stream 
-			       :socket socket 
-			       :host (ip-to-string (usocket:get-peer-name socket)))))
-    (setf (gethash (session-uuid session) *sessions*) session)))
+  (let ((session (make-v-session :stream stream 
+				 :socket socket 
+				 :host (ip-to-string (usocket:get-peer-name socket)))))
+    (setf (gethash (v-session-uuid session) *sessions*) session)))
 
-(defmethod initiate-session ((session session))
-  )
+(defmethod initiate-session ((session v-session))
+  session)
 
-(defmethod shutdown-session ((session session))
+(defmethod shutdown-session ((session v-session))
   "Close socket and remove its event handler and clear the session object."
   (logger :debug "terminating ~A" session)
-  (ignore-errors (usocket:socket-close (session-socket session)))
-  (remove-thread (session-thread session))
+  (ignore-errors (usocket:socket-close (v-session-socket session)))
+  (remove-thread (v-session-thread session))
+  (remhash (v-session-uuid session) *sessions*)
   (logger :debug "~A terminated" session)
-  (remhash (session-uuid session) *sessions*)
   (setf session nil))
+
+(defun kill-all-sessions ()
+  (apply-sessions #'shutdown-session))
 

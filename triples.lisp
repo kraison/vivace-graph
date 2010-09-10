@@ -5,9 +5,9 @@
 	     (:print-function print-triple)
 	     (:conc-name %triple-))
   (uuid (make-uuid) :type uuid:uuid)
-  (subject nil :type node)
+  (subject nil)
   (predicate nil :type predicate)
-  (object nil :type node)
+  (object nil)
   (timestamp (now))
   (belief-factor +cf-true+)
   (derived? nil)
@@ -56,16 +56,16 @@
   "Return the decoded subject of the triple."
   (if (eql +needs-lookup+ (%triple-subject triple))
       (setf (%triple-subject triple) 
-	    (lookup-node
-	     (get-btree (triple-db *graph*) (make-slot-key (triple-uuid triple) "subject"))))
+	    ;;(lookup-node
+	     (get-btree (triple-db *graph*) (make-slot-key (triple-uuid triple) "subject"))) ;;)
       (%triple-subject triple)))
 
 (defmethod triple-object ((triple triple))
   "Return the decoded object of the triple."
   (if (eql +needs-lookup+ (%triple-object triple))
       (setf (%triple-object triple) 
-	    (lookup-node
-	     (get-btree (triple-db *graph*) (make-slot-key (triple-uuid triple) "object"))))
+	    ;;(lookup-node
+	     (get-btree (triple-db *graph*) (make-slot-key (triple-uuid triple) "object"))) ;;)
       (%triple-object triple)))
 
 (defmethod triple-timestamp ((triple triple))
@@ -105,17 +105,21 @@
   (:documentation "Compare the subject, predicate and object of two triples using node-equal and predicate-eql.")
   (:method ((t1 triple) (t2 triple)) 
     (and (triple-eql t1 t2)
-	 (node-equal (triple-subject t1) (triple-subject t2))
+	 ;;(node-equal (triple-subject t1) (triple-subject t2))
+	 (equal (triple-subject t1) (triple-subject t2))
 	 (predicate-eql (triple-predicate t1) (triple-predicate t2))
-	 (node-equal (triple-object t1) (triple-object t2))))
+	 ;;(node-equal (triple-object t1) (triple-object t2))))
+	 (equal (triple-object t1) (triple-object t2))))
   (:method (t1 t2) nil))
 
 (defun print-triple (triple stream depth)
   (declare (ignore depth))
   (format stream "#<TRIPLE: '~A' '~A' '~A'>" 
-	  (node-value (triple-subject triple))
+	  ;;(node-value (triple-subject triple))
+	  (triple-subject triple)
 	  (pred-name (triple-predicate triple))
-	  (node-value (triple-object triple))))
+	  ;;(node-value (triple-object triple))))
+	  (triple-object triple)))
 
 (defmethod predicate ((triple triple))
   "Return the predicate name of the triple's predicate."
@@ -128,24 +132,26 @@
       (first tuple)))
 
 (defmethod subject ((triple triple))
-  "Return the node value of the triple's subject."
-  (node-value (triple-subject triple)))
+  "Return the value of the triple's subject."
+  ;;(node-value (triple-subject triple)))
+  (triple-subject triple))
 
 (defmethod subject ((tuple list))
   "Return the node value of the triple's subject."
-  (if (node? (second tuple))
-      (node-value (second tuple))
-      (second tuple)))
+;  (if (node? (second tuple))
+;      (node-value (second tuple))
+      (second tuple))
 
 (defmethod object ((triple triple))
   "Return the node value of the triple's object."
-  (node-value (triple-object triple)))
+  ;;(node-value (triple-object triple)))
+  (triple-object triple))
 
 (defmethod object ((tuple list))
   "Return the node value of the triple's object."
-  (if (node? (third tuple))
-      (node-value (third tuple))
-      (third tuple)))
+;  (if (node? (third tuple))
+;      (node-value (third tuple))
+      (third tuple))
 
 (defmethod belief-factor ((triple triple))
   "Return the belief factor of a triple."
@@ -154,8 +160,10 @@
 (defmethod as-list ((triple triple))
   "Translate the triple into a list of (predicate subject object)."
   (list (pred-name (triple-predicate triple)) 
-	(node-value (triple-subject triple)) 
-	(node-value (triple-object triple))))
+	;;(node-value (triple-subject triple)) 
+	;;(node-value (triple-object triple))))
+	(triple-subject triple)
+	(triple-object triple)))
 
 (defmethod make-spo-key (value)
   (make-serialized-key +triple-key+ value))
@@ -167,57 +175,72 @@
   "Persist triple."
   (let ((db (or db (triple-db *graph*))))
     (let ((key (uuid:print-bytes nil (triple-uuid triple)))
-	  (spo-key (make-triple-key-from-values (node-value (triple-subject triple))
-						(pred-name (triple-predicate triple))
-						(node-value (triple-object triple)))))
+	  (spo-key (make-triple-key-from-values 
+		    ;;(node-value (triple-subject triple))
+		    (triple-subject triple)
+		    (pred-name (triple-predicate triple))
+		    ;;(node-value (triple-object triple)))))
+		    (triple-object triple))))
       (with-transaction (db)
 	(set-btree (triple-db *graph*) spo-key (triple-uuid triple) :key-serializer #'make-spo-key)
 	(set-btree (triple-db *graph*) (make-slot-key key "uuid") (triple-uuid triple))
 	(set-btree (triple-db *graph*) (make-slot-key key "subject") 
-		   (node-value (triple-subject triple)))
+		   ;;(node-value (triple-subject triple)))
+		   (triple-subject triple))
 	(set-btree (triple-db *graph*) (make-slot-key key "predicate")
 		   (string-downcase (symbol-name (pred-name (triple-predicate triple)))))
 	(set-btree (triple-db *graph*) (make-slot-key key "object") 
-		   (node-value (triple-object triple)))
+		   ;;(node-value (triple-object triple)))
+		   (triple-object triple))
 	(set-btree (triple-db *graph*) (make-slot-key key "timestamp") (triple-timestamp triple))
 	(set-btree (triple-db *graph*) (make-slot-key key "belief-factor") 
 		   (triple-belief-factor triple))
-	(set-btree (triple-db *graph*) (make-slot-key key "derived?") (triple-derived? triple))
-	(set-btree (triple-db *graph*) (make-slot-key key "deleted?") (triple-deleted? triple))))))
+	(when (%triple-derived? triple)
+	  (set-btree (triple-db *graph*) (make-slot-key key "derived?") (triple-derived? triple)))
+	(when (%triple-deleted? triple)
+	  (set-btree (triple-db *graph*) (make-slot-key key "deleted?") 
+		     (triple-deleted? triple)))))))
 
 (defmethod remove-triple ((triple triple) &optional db)
   "Remove a triple."
   (let ((db (or db (triple-db *graph*))))
     (let ((key (uuid:print-bytes nil (triple-uuid triple)))
-	  (spo-key (make-triple-key-from-values (node-value (triple-subject triple))
-						(pred-name (triple-predicate triple))
-						(node-value (triple-object triple)))))
+	  (spo-key (make-triple-key-from-values 
+		    ;;(node-value (triple-subject triple))
+		    (triple-subject triple)
+		    (pred-name (triple-predicate triple))
+		    ;;(node-value (triple-object triple)))))
+		    (triple-object triple))))
       (with-transaction (db)
 	(rem-btree (triple-db *graph*) spo-key (triple-uuid triple) :key-serializer #'make-spo-key)
 	(rem-btree (triple-db *graph*) (make-slot-key key "uuid") (triple-uuid triple))
 	(rem-btree (triple-db *graph*) (make-slot-key key "subject") 
-		   (node-value (triple-subject triple)))
+		   ;;(node-value (triple-subject triple)))
+		   (triple-subject triple))
 	(rem-btree (triple-db *graph*) (make-slot-key key "predicate")
 		   (string-downcase (symbol-name (pred-name (triple-predicate triple)))))
 	(rem-btree (triple-db *graph*) (make-slot-key key "object") 
-		   (node-value (triple-object triple)))
+		   ;;(node-value (triple-object triple)))
+		   (triple-object triple))
 	(rem-btree (triple-db *graph*) (make-slot-key key "timestamp") (triple-timestamp triple))
 	(rem-btree (triple-db *graph*) (make-slot-key key "belief-factor") 
 		   (triple-belief-factor triple))
-	(rem-btree (triple-db *graph*) (make-slot-key key "derived?") (triple-derived? triple))
-	(rem-btree (triple-db *graph*) (make-slot-key key "deleted?") (triple-deleted? triple))))))
+	(ignore-errors
+	  (rem-btree (triple-db *graph*) (make-slot-key key "derived?") (triple-derived? triple))
+	  (rem-btree (triple-db *graph*) (make-slot-key key "deleted?") 
+		     (triple-deleted? triple)))))))
 
-(defmethod make-subject-key ((node node))
-  (make-serialized-key +triple-subject+ (node-value node)))
+;(defmethod make-subject-key ((node node))
+;  (make-serialized-key +triple-subject+ (node-value node)))
 
-(defmethod make-subject-key (thing)
-  (make-serialized-key +triple-subject+ thing))
+(defun make-subject-key (node)
+  (make-serialized-key +triple-subject+ node))
 
-(defmethod make-object-key ((node node))
-  (make-serialized-key +triple-object+ (node-value node)))
+;(defmethod make-object-key ((node node))
+;  (make-serialized-key +triple-object+ (node-value node)))
 
-(defmethod make-object-key (thing)
-  (make-serialized-key +triple-object+ thing))
+(defun make-object-key (node)
+  (make-serialized-key +triple-object+ node))
 
 (defmethod make-predicate-key ((predicate predicate))
   (make-serialized-key +triple-predicate+ (string-downcase (symbol-name (pred-name predicate)))))
@@ -235,25 +258,32 @@
   (make-serialized-key index-type (concat-keys v1 v2)))
 
 (defmethod make-triple-sp-key ((triple triple))
-  (make-combined-triple-key (node-value (triple-subject triple)) 
-			    (pred-name (triple-predicate triple)) 
-			    +triple-subject-predicate+))
+  (make-combined-triple-key 
+   ;;(node-value (triple-subject triple)) 
+   (triple-subject triple)
+   (pred-name (triple-predicate triple)) 
+   +triple-subject-predicate+))
 
 (defmethod make-triple-sp-key-from-string (string)
   (make-serialized-key +triple-subject-predicate+ string))
 
 (defmethod make-triple-so-key ((triple triple))
-  (make-combined-triple-key (node-value (triple-subject triple)) 
-			    (node-value (triple-object triple))
-			    +triple-subject-object+))
+  (make-combined-triple-key 
+   ;;(node-value (triple-subject triple)) 
+   ;;(node-value (triple-object triple))
+   (triple-subject triple)
+   (triple-object triple)
+   +triple-subject-object+))
 
 (defmethod make-triple-so-key-from-string (string)
   (make-serialized-key +triple-subject-object+ string))
 
 (defmethod make-triple-po-key ((triple triple))
-  (make-combined-triple-key (pred-name (triple-predicate triple)) 
-			    (node-value (triple-object triple))
-			    +triple-predicate-object+))
+  (make-combined-triple-key 
+   (pred-name (triple-predicate triple)) 
+   ;;(node-value (triple-object triple))
+   (triple-object triple)
+   +triple-predicate-object+))
 
 (defmethod make-triple-po-key-from-string (string)
   (make-serialized-key +triple-predicate-object+ string))
@@ -274,18 +304,23 @@
   (get-indexed-triples value #'make-object-key))
 
 (defun get-subjects-predicates (subject predicate)
-  (get-indexed-triples (concat-keys (if (node? subject) (node-value subject) subject)
-				    (if (predicate? predicate) (pred-name predicate) predicate))
+  (get-indexed-triples (concat-keys 
+			;;(if (node? subject) (node-value subject) subject)
+			subject
+			(if (predicate? predicate) (pred-name predicate) predicate))
 		       #'make-triple-sp-key-from-string))
 
 (defun get-subjects-objects (subject object)
-  (get-indexed-triples (concat-keys (if (node? subject) (node-value subject) subject)
-				    (if (node? object) (node-value object) object))
+  (get-indexed-triples (concat-keys subject object)
+			;;(if (node? subject) (node-value subject) subject)
+			;;(if (node? object) (node-value object) object))
 		       #'make-triple-so-key-from-string))
 
 (defun get-predicates-objects (predicate object)
-  (get-indexed-triples (concat-keys (if (predicate? predicate) (pred-name predicate) predicate)
-				    (if (node? object) (node-value object) object))
+  (get-indexed-triples (concat-keys 
+			(if (predicate? predicate) (pred-name predicate) predicate)
+			;;(if (node? object) (node-value object) object))
+			object)
 		       #'make-triple-po-key-from-string))
   
 (defun lookup-triple-in-db (s p o g)
@@ -299,9 +334,11 @@
 		   (triple 
 		    (make-triple 
 		     :uuid uuid
-		     :subject (lookup-node (get-btree db (make-slot-key ukey "subject")))
+		     ;;:subject (lookup-node (get-btree db (make-slot-key ukey "subject")))
+		     :subject (get-btree db (make-slot-key ukey "subject"))
 		     :predicate (lookup-predicate (get-btree db (make-slot-key ukey "predicate")))
-		     :object (lookup-node (get-btree db (make-slot-key ukey "object")))
+		     ;;:object (lookup-node (get-btree db (make-slot-key ukey "object")))
+		     :object (get-btree db (make-slot-key ukey "object"))
 		     :timestamp +needs-lookup+
 		     :belief-factor +needs-lookup+
 		     :derived? +needs-lookup+
@@ -316,10 +353,10 @@
   (or (gethash (list s p o) (triple-cache (or g *graph*)))
       (lookup-triple-in-db s p o (or g *graph*))))
 
-(defmethod lookup-triple ((subject node) (predicate predicate) (object node) &key g)
-  (or (gethash (list subject predicate object) (triple-cache (or g *graph*)))
-      (lookup-triple (node-value subject) (pred-name predicate) (node-value object) 
-		     :g (or g *graph*))))
+;(defmethod lookup-triple ((subject node) (predicate predicate) (object node) &key g)
+;  (or (gethash (list subject predicate object) (triple-cache (or g *graph*)))
+;      (lookup-triple (node-value subject) (pred-name predicate) (node-value object) 
+;		     :g (or g *graph*))))
 
 (defmethod lookup-triple-by-id (uuid &key g)
   (or (gethash (if (uuid:uuid? uuid) (uuid:print-bytes nil uuid) uuid)
@@ -328,9 +365,11 @@
 	  (let* ((ukey (uuid:print-bytes nil uuid)) (db (triple-db *graph*)))
 	    (let ((uuid (get-btree db (make-slot-key ukey "uuid"))))
 	      (when (uuid:uuid? uuid)
-		(let ((s (lookup-node (get-btree db (make-slot-key ukey "subject"))))
-		      (o (lookup-node (get-btree db (make-slot-key ukey "object"))))
-		      (p (lookup-predicate (get-btree db (make-slot-key ukey "predicate")))))
+		(let ((p (lookup-predicate (get-btree db (make-slot-key ukey "predicate"))))
+		      ;;(s (lookup-node (get-btree db (make-slot-key ukey "subject"))))
+		      ;;(o (lookup-node (get-btree db (make-slot-key ukey "object")))))
+		      (s (get-btree db (make-slot-key ukey "subject")))
+		      (o (get-btree db (make-slot-key ukey "object"))))
 		  (let ((triple (make-triple :uuid uuid
 					     :subject s
 					     :predicate p
@@ -349,17 +388,23 @@
     (remhash (uuid:print-bytes nil (triple-uuid triple)) ht)
     (remhash (list (triple-subject triple) (triple-predicate triple) (triple-object triple))
 	     ht)
-    (remhash (list (node-value (triple-subject triple)) 
-		   (pred-name (triple-predicate triple)) 
-		   (node-value (triple-object triple)))
+    (remhash (list 
+	      ;;(node-value (triple-subject triple)) 
+	      (triple-subject triple)
+	      (pred-name (triple-predicate triple)) 
+	      ;;(node-value (triple-object triple)))
+	      (triple-object triple))
 	     ht)))
 
 (defmethod cache-triple ((triple triple) &optional ht)
   (let ((ht (or ht (triple-cache *graph*))))
     (setf (gethash (uuid:print-bytes nil (triple-uuid triple)) ht) triple)
-    (setf (gethash (list (node-value (triple-subject triple))
-			 (pred-name (triple-predicate triple))
-			 (node-value (triple-object triple)))
+    (setf (gethash (list 
+		    ;;(node-value (triple-subject triple))
+		    (triple-subject triple)
+		    (pred-name (triple-predicate triple))
+		    ;;(node-value (triple-object triple)))
+		    (triple-object triple))
 		   ht)
 	  triple)
     (setf (gethash (list (triple-subject triple) 
@@ -369,20 +414,32 @@
 	  triple)))
 
 (defmethod index-text ((triple triple))
-  (when (or (stringp (node-value (triple-subject triple)))
-	    (stringp (node-value (triple-object triple))))
+  (when (or (stringp 
+	     ;;(node-value (triple-subject triple)))
+	     (triple-subject triple))
+	    (stringp 
+	     ;;(node-value (triple-object triple))))
+	     (triple-object triple)))
     (let ((doc (make-instance 'montezuma:document)))
       (montezuma:add-field 
        doc (montezuma:make-field "uuid" 
 				 (format nil "~A" (triple-uuid triple))
 				 :stored t :index :untokenized))
-      (when (stringp (node-value (triple-subject triple)))
+      (when (stringp 
+	     ;;(node-value (triple-subject triple)))
+	     (triple-subject triple))
 	(montezuma:add-field 
-	 doc (montezuma:make-field "subject" (node-value (triple-subject triple)) 
+	 doc (montezuma:make-field "subject" 
+				   ;;(node-value (triple-subject triple)) 
+				   (triple-subject triple)
 				   :stored t :index :tokenized)))
-      (when (stringp (node-value (triple-object triple)))
+      (when (stringp 
+	     ;;(node-value (triple-object triple)))
+	     (triple-object triple))
 	(montezuma:add-field 
-	 doc (montezuma:make-field "object" (node-value (triple-object triple))
+	 doc (montezuma:make-field "object" 
+				   ;;(node-value (triple-object triple))
+				   (triple-object triple)
 				   :stored t :index :tokenized)))
       (montezuma:add-document-to-index (full-text-idx *graph*) doc))))
 
@@ -415,13 +472,13 @@
   (loop until (sb-concurrency:queue-empty-p (needs-indexing-q graph)) do
        (index-triple (sb-concurrency:dequeue (needs-indexing-q graph)))))
 
-(defmethod add-triple-unsafe ((graph graph) (subject node) (predicate predicate) (object node) 
+(defmethod add-triple-unsafe ((graph graph) subject (predicate predicate) object
 			      &key (certainty-factor +cf-true+))
   (let ((triple (make-triple :subject subject :predicate predicate :object object 
 			     :belief-factor certainty-factor)))
     (save-triple triple)
-    (incf-ref-count subject)
-    (incf-ref-count object)
+;    (incf-ref-count subject)
+;    (incf-ref-count object)
     (sb-concurrency:enqueue triple (needs-indexing-q graph))
     (cache-triple triple)))
 

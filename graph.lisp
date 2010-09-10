@@ -20,7 +20,7 @@
   (functors (make-hash-table :synchronized t))
   (rule-cache (make-hash-table :synchronized t))
   (predicate-cache (make-hash-table :synchronized t))
-  (node-cache (make-hash-table :test 'equal :synchronized t))
+  ;;(node-cache (make-hash-table :test 'equal :synchronized t))
   (triple-cache (make-hash-table :test 'equal :synchronized t))
   (deleted-triple-cache (make-hash-table :test 'equal :synchronized t))
   (production-pq (make-skip-pq :key-equal #'timestamp= :comparison #'timestamp>
