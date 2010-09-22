@@ -60,6 +60,7 @@
 (defmethod deindex-triple ((triple triple) &optional db)
   "Remove a triple from the indices."
   (let ((db (or db (triple-db *graph*))))
+    (deindex-text triple)
     (with-transaction (db)
       (rem-btree db (triple-subject triple) :value (triple-uuid triple)
 		 :key-serializer #'make-subject-key)

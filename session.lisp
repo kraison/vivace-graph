@@ -23,11 +23,10 @@
   (stream nil)
   (host nil)
   (socket nil)
-  (buffer (make-array 0
-                      :element-type '(unsigned-byte 8)
-                      :adjustable t
-                      :fill-pointer t))
-  (query-cache (make-hash-table :test 'equalp))
+  (buffer nil)
+  (buffer-length 0)
+  (query-continuation nil)
+  (result-set nil)
   (history nil))
 
 (defun print-session (session stream depth)

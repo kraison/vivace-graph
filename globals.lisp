@@ -24,5 +24,6 @@
 (defvar *trail* (make-array 200 :fill-pointer 0 :adjustable t))
 (defvar *var-counter* 0 "Counter for generating variable names.")
 (defvar *predicate* nil "The Prolog predicate currently being compiled.")
-(defvar *select-list* "Accumulator for prolog selects.")
+(defvar *select-list* nil "Accumulator for prolog selects.")
+(defvar *cont* nil "Continuation container for step-wise queries.")
 (defvar *prolog-global-functors* (make-hash-table :synchronized t))

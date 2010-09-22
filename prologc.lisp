@@ -504,8 +504,7 @@ types that will be stored in the db.")
 	 (*predicate* (make-functor top-level-query 0)))
     `(let* ((*trail* (make-array 200 :fill-pointer 0 :adjustable t))
 	    (*var-counter* 0)
-	    (*predicate* ',*predicate*)
-	    (*select-list* nil))
+	    (*predicate* ',*predicate*))
        (unwind-protect
 	    (catch 'top-level-prove
 	      (let ((func #'(lambda (cont) 

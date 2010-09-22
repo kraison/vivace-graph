@@ -26,7 +26,7 @@
 	       :cl-skip-list
 	       :local-time
 	       :date-calc
-	       :montezuma
+	       ;;:montezuma
 	       :py-configparser
 	       :js
 	       :split-sequence)
@@ -43,7 +43,9 @@
 	       (:file "predicate" :depends-on ("graph"))
 	       (:file "node" :depends-on ("graph" "data-types"))
 	       (:file "triples" :depends-on ("predicate" "node"))
-	       (:file "triples-interface" :depends-on ("triples"))
+	       (:file "tokenizer")
+	       (:file "full-text-index" :depends-on ("triples" "tokenizer"))
+	       (:file "triples-interface" :depends-on ("full-text-index"))
 	       (:file "templates" :depends-on ("triples-interface"))
 	       (:file "prologc" :depends-on ("templates"))
 	       (:file "prolog-functors" :depends-on ("prologc"))

@@ -5,7 +5,7 @@
 
 
 (defun triple-test-1 ()
-  (let ((*graph* (make-new-graph :name "test graph" :location "/var/tmp")) (p1 nil))
+  (let ((*graph* (make-new-graph :name "test graph 1" :location "/var/tmp")) (p1 nil))
     (unwind-protect
 	 (progn
 	   (with-transaction ((triple-db *graph*))
@@ -24,7 +24,7 @@
       (progn
 	(if (graph? *graph*) (shutdown-graph *graph*))
 	(ignore-errors 
-	  (cl-fad:delete-directory-and-files "/var/tmp/full-text-idx")
+	  (delete-file "/var/tmp/full-text-idx.kct")
 	  (delete-file "/var/tmp/functors.kch")
 	  (delete-file "/var/tmp/rules.kch")
 	  (delete-file "/var/tmp/deleted-triples.kct")
@@ -32,7 +32,7 @@
 	  (delete-file "/var/tmp/config.ini"))))))
 
 (defun triple-test-2 ()
-  (let ((*graph* (make-new-graph :name "test graph" :location "/var/tmp")))
+  (let ((*graph* (make-new-graph :name "test graph 2" :location "/var/tmp")))
     (unwind-protect
 	 (let ((tuples nil))
 	   (dotimes (i 1000)
@@ -41,7 +41,7 @@
       (progn
 	(if (graph? *graph*) (shutdown-graph *graph*))
 	(ignore-errors 
-	  (cl-fad:delete-directory-and-files "/var/tmp/full-text-idx")
+	  (delete-file "/var/tmp/full-text-idx.kct")
 	  (delete-file "/var/tmp/functors.kch")
 	  (delete-file "/var/tmp/deleted-triples.kct")
 	  (delete-file "/var/tmp/rules.kch")
@@ -49,7 +49,7 @@
 	  (delete-file "/var/tmp/config.ini"))))))
 
 (defun triple-test-3 ()
-  (let ((*graph* (make-new-graph :name "test graph" :location "/var/tmp")))
+  (let ((*graph* (make-new-graph :name "test graph 3" :location "/var/tmp")))
     (unwind-protect
 	 (progn
 ;	   (make-new-node :value "Kevin")
@@ -74,7 +74,7 @@
       (progn
 	(if (graph? *graph*) (shutdown-graph *graph*))
 	(ignore-errors 
-	  (cl-fad:delete-directory-and-files "/var/tmp/full-text-idx")
+	  (delete-file "/var/tmp/full-text-idx.kct")
 	  (delete-file "/var/tmp/functors.kch")
 	  (delete-file "/var/tmp/deleted-triples.kct")
 	  (delete-file "/var/tmp/rules.kch")
@@ -117,7 +117,7 @@
       (progn
 	(if (graph? *graph*) (shutdown-graph *graph*))
 	(ignore-errors 
-	  (cl-fad:delete-directory-and-files "/var/tmp/full-text-idx")
+	  (delete-file "/var/tmp/full-text-idx.kct")
 	  (delete-file "/var/tmp/functors.kch")
 	  (delete-file "/var/tmp/rules.kch")
 	  (delete-file "/var/tmp/triples.kct")
@@ -145,7 +145,7 @@
 (defun reload-testdb ()
   (if (graph? *graph*) (shutdown-graph *graph*))
   (ignore-errors 
-    (cl-fad:delete-directory-and-files "/home/raison/work/vivace-graph/db/full-text-idx")
+    (delete-file "/home/raison/work/vivace-graph/db/full-text-idx.kct")
     (delete-file "/home/raison/work/vivace-graph/db/functors.kch")
     (delete-file "/home/raison/work/vivace-graph/db/rules.kch")
     (delete-file "/home/raison/work/vivace-graph/db/deleted-triples.kct")
@@ -201,7 +201,7 @@
 	   (format t "~A~%" (select-flat (?who) (likes "Sandy" ?who))))
       (progn
 	(shutdown-graph *graph*)
-	(cl-fad:delete-directory-and-files "/var/tmp/full-text-idx")
+	(delete-file "/var/tmp/full-text-idx.kct")
 	(delete-file "/var/tmp/triples.kct")
 	(delete-file "/var/tmp/deleted-triples.kct")
 	(delete-file "/var/tmp/functors.kch")
@@ -211,7 +211,7 @@
 (defun ptest2 ()
   ;; 4.10 seconds in interpreted mode
   ;; 0.083 seconds in compiled mode
-  (let ((*graph* (make-new-graph :name "test graph 2" :location "/var/tmp")))
+  (let ((*graph* (make-new-graph :name "test graph logic" :location "/var/tmp")))
     (unwind-protect
 	 (progn
 	   (<- (member ?item (?item . ?rest)))
@@ -248,7 +248,7 @@
 			 (zebra ?houses ?water-drinker ?zebra-owner))))
       (progn
 	(shutdown-graph *graph*)
-	(cl-fad:delete-directory-and-files "/var/tmp/full-text-idx")
+	(delete-file "/var/tmp/full-text-idx.kct ")
 	(delete-file "/var/tmp/triples.kct")
 	(delete-file "/var/tmp/deleted-triples.kct")
 	(delete-file "/var/tmp/functors.kch")

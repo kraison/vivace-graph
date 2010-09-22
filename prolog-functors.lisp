@@ -231,6 +231,20 @@ second arg."
       (funcall cont)
       (throw 'top-level-prove nil)))
 
+(def-global-prolog-functor prolog-step-query/2 (var-names vars cont)
+  (format t "in prolog-step-query/2 for ~A / ~A~%" var-names vars)
+  (if (null vars)
+      (progn
+	(setf *cont* nil)
+	(setf *select-list* t))
+      (progn
+	(setf *cont* cont)
+	(push (loop 
+		 for name in var-names
+		 for var in vars 
+		 collect (deref-exp var))
+	      *select-list*))))
+
 (def-global-prolog-functor select/2 (var-names vars cont)
   (if (null vars)
       nil
@@ -264,8 +278,6 @@ second arg."
 				   (let ((old-trail (fill-pointer *trail*)))
 				     (when (and (triple? triple) (not (triple-deleted? triple)))
 				       (when (unify! p (pred-name (triple-predicate triple)))
-;					 (when (unify! s (node-value (triple-subject triple)))
-;					   (when (unify! o (node-value (triple-object triple)))
 					 (when (unify! s (triple-subject triple))
 					   (when (unify! o (triple-object triple))
 					     (funcall cont))))
@@ -276,8 +288,6 @@ second arg."
 	     (let ((old-trail (fill-pointer *trail*)))
 	       (when (not (triple-deleted? triples))
 		 (when (unify! p (pred-name (triple-predicate triples)))
-;		   (when (unify! s (node-value (triple-subject triples)))
-;		     (when (unify! o (node-value (triple-object triples)))
 		   (when (unify! s (triple-subject triples))
 		     (when (unify! o (triple-object triples))
 		       (funcall cont))))

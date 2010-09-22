@@ -37,7 +37,7 @@ inconsistency should be eliminated at some point."
 	klist)))
 
 (defun load-graph! (file)
-  "Load a graph form configuration file (file).  Sets *graph* to the newly opened graph."
+  "Load a graph from configuration file (file).  Sets *graph* to the newly opened graph."
   (let ((config (py-configparser:make-config)))
     (py-configparser:read-files config (list file))
     (let ((name (py-configparser:get-option config "default" "name")))
@@ -58,16 +58,13 @@ inconsistency should be eliminated at some point."
 		      (deleted-triple-db graph) 
 		      (open-btree (format nil "~A/deleted-triples.kct" (graph-location graph))
 				  :duplicates-allowed? t)
+		      (full-text-idx graph) 
+		      (open-btree (format nil "~A/full-text-idx.kct" (graph-location graph))
+				  :duplicates-allowed? t)
 		      (rule-db graph) 
 		      (open-phash (format nil "~A/rules.kch" (graph-location graph)))
 		      (functor-db graph) 
 		      (open-phash (format nil "~A/functors.kch" (graph-location graph)))
-		      (full-text-idx graph)
-		      (make-instance 'montezuma:index 
-				     :default-field "*"
-				     :fields '("subject" "object")
-				     :min-merge-docs 5000 
-				     :path (format nil "~A/full-text-idx" (graph-location graph)))
 		      (gethash (graph-name graph) *graph-table*) graph
 		      *graph* graph))))))
     (load-all-functors *graph*)
@@ -96,6 +93,7 @@ graph."
     (when (eql *graph* graph) (setq *graph* nil))
     (close-phash (functor-db graph))
     (close-phash (rule-db graph))
+    (close-btree (full-text-idx graph))
     (close-btree (triple-db graph))
     (close-btree (deleted-triple-db graph))
     (remhash (graph-name graph) *graph-table*)))
