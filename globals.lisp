@@ -27,3 +27,19 @@
 (defvar *select-list* nil "Accumulator for prolog selects.")
 (defvar *cont* nil "Continuation container for step-wise queries.")
 (defvar *prolog-global-functors* (make-hash-table :synchronized t))
+
+;; Shortened slot identifiers for slot keys
+(defparameter +predicate-slot+ #x00)
+(defparameter +subject-slot+ #x01)
+(defparameter +object-slot+ #x02)
+(defparameter +timestamp-slot+ #x03)
+(defparameter +belief-factor-slot+ #x04)
+(defparameter +deleted?-slot+ #x04)
+(defparameter +derived?-slot+ #x05)
+(defparameter +uuid-slot+ #x06)
+(defparameter +name-slot+ #x07)
+(defparameter +clauses-slot+ #x08)
+(defparameter +premises-slot+ #x09)
+(defparameter +conclusions-slot+ #x10)
+(defparameter +cf-slot+ #x11)
+

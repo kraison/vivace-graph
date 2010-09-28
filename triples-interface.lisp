@@ -98,5 +98,5 @@ triple is thus scheduled to be shadowed."
     (:no-error (status)
       (declare (ignore status))
       (uncache-triple triple)
-      (cache-triple (deleted-triple-cache *graph*)))))
+      (cache-triple triple (deleted-triple-cache *graph*)))))
 

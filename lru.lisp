@@ -1,0 +1,51 @@
+(in-package #:vivace-graph)
+
+(defstruct (lru (:predicate lru?))
+  (max-size 1000)
+  (test 'equal)
+  (cache (make-hash-table :test 'equal :synchronized t) :type hash-table)
+  (age (make-skip-pq)))
+
+(defun make-lru-cache (&key (test 'equal) (max-size 1000))
+  (make-lru :cache (make-hash-table :test test :size max-size :rehash-size 1 :synchronized t)
+	    :test test
+	    :max-size max-size))
+
+(defmethod touch-lru ((lru lru) key &optional old-time)
+  (let ((old-time (or old-time (second (gethash key (lru-cache lru))))))
+    (skip-list-delete (lru-age lru) old-time key)
+    (skip-list-add (lru-age lru) (gettimeofday) key)))
+
+(defmethod get-lru ((lru lru) key)
+  (let ((entry (gethash key (lru-cache lru))))
+    (when entry
+      (touch-lru lru key (second entry))
+      (values (first entry) (second entry)))))
+
+(defmethod rem-lru ((lru lru) key)
+  (multiple-value-bind (value time) (get-lru lru key)
+    (declare (ignore value))
+    (remhash key (lru-cache lru))
+    (skip-list-delete (lru-age lru) time key)))
+
+(defmethod put-lru ((lru lru) key value)
+  (when (= (lru-max-size lru) (hash-table-count (lru-cache lru)))
+    (let ((kv (delete-min (lru-age lru))))
+      (remhash (second kv) (lru-cache lru))))
+  (multiple-value-bind (old-value old-time) (get-lru lru key)
+    (if (equal value old-value)
+	(touch-lru lru key old-time)
+	(let ((time (gettimeofday)))
+	  (if old-value (rem-lru lru key))
+	  (setf (gethash key (lru-cache lru)) (list value time))
+	  (skip-list-add (lru-age lru) time key)))))
+
+(defun test-lru ()
+  (let ((lru (make-lru-cache :max-size 100)))
+    (format t "LRU: ~A size of ~A~%" lru (lru-max-size lru))
+    (dotimes (i 200)
+      (when (= i 103)
+	(get-lru lru 20))
+      (put-lru lru i (format nil "V~A" i)))
+    (maphash #'(lambda (k v) (format t "~A: ~A~%" k v)) (lru-cache lru))
+    (sort (skip-list-to-list (lru-age lru)) #'< :key 'cadr)))

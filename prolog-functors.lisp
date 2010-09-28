@@ -66,6 +66,12 @@
 	       (timestamp<= ?arg1 ?arg2)))
       (funcall cont)))
 
+;(def-global-prolog-functor member/2 (?item list cont)
+;  (var-deref ?item)
+;  (when (and (listp list)
+;	     (member ?item list :test #'(lambda (x y) (var-deref y) (prolog-equal x y))))
+;    (funcall cont)))
+
 (def-global-prolog-functor lisp/2 (?result exp cont)
   "Call out to lisp from with a Prolog query.  Assigns result to the supplied Prolog var.
  (lisp ?result (+ 1 2)).  Any lisp variables that you wish to access within a prolog query using
@@ -85,7 +91,8 @@ the lisp functor should be declared special."
 (def-global-prolog-functor regex-match/2 (?arg1 ?arg2 cont)
   "Functor that treats first arg as a regex and uses cl-ppcre:scan to check for the pattern in the
 second arg."
-  (if (and (stringp (var-deref ?arg1)) (stringp (var-deref ?arg2))
+  (if (and (stringp (var-deref ?arg1)) 
+	   (stringp (var-deref ?arg2))
 	   (cl-ppcre:scan ?arg1 ?arg2))
       (funcall cont)))
 
@@ -284,15 +291,15 @@ second arg."
 				       (undo-bindings! old-trail)))))
 			     triples)
 	       (klist-free triples)))
-	    ((triple? triples)
-	     (let ((old-trail (fill-pointer *trail*)))
-	       (when (not (triple-deleted? triples))
-		 (when (unify! p (pred-name (triple-predicate triples)))
-		   (when (unify! s (triple-subject triples))
-		     (when (unify! o (triple-object triples))
-		       (funcall cont))))
+	    ((and (listp triples) (triple? (first triples)))
+	     (let ((triple (first triples)))
+	       (let ((old-trail (fill-pointer *trail*)))
+		 (when (not (triple-deleted? triple))
+		   (when (unify! p (pred-name (triple-predicate triple)))
+		     (when (unify! s (triple-subject triple))
+		       (when (unify! o (triple-object triple))
+			 (funcall cont)))))
 		 (undo-bindings! old-trail))))))))
-
 
 (defmethod load-all-functors ((graph graph))
   (map-phash #'(lambda (key val)

@@ -23,22 +23,23 @@
 (defmethod save-predicate ((predicate predicate))
   (with-transaction ((functor-db *graph*))
     (let ((key (string-downcase (symbol-name (pred-name predicate)))))
-      (set-phash (functor-db *graph*) (make-slot-key key "uuid") (pred-uuid predicate))
-      (set-phash (functor-db *graph*) (make-slot-key key "name") (pred-name predicate))
-      (set-phash (functor-db *graph*) (make-slot-key key "clauses") (pred-clauses predicate)))))
+      (set-phash (functor-db *graph*) (make-slot-key key +uuid-slot+) (pred-uuid predicate))
+      (set-phash (functor-db *graph*) (make-slot-key key +name-slot+) (pred-name predicate))
+      (set-phash (functor-db *graph*) (make-slot-key key +clauses-slot+) 
+		 (pred-clauses predicate)))))
 
 (defmethod delete-predicate ((predicate predicate))
   (with-transaction ((functor-db *graph*))
     (let ((key (string-downcase (symbol-name (pred-name predicate)))))
-      (rem-phash (functor-db *graph*) (make-slot-key key "uuid"))
-      (rem-phash (functor-db *graph*) (make-slot-key key "name"))
-      (rem-phash (functor-db *graph*) (make-slot-key key "clauses")))))
+      (rem-phash (functor-db *graph*) (make-slot-key key +uuid-slot+))
+      (rem-phash (functor-db *graph*) (make-slot-key key +name-slot+))
+      (rem-phash (functor-db *graph*) (make-slot-key key +clauses-slot+)))))
 
 (defmethod update-predicate ((predicate predicate))
   (with-transaction ((functor-db *graph*))
     (let ((key (string-downcase (symbol-name (pred-name predicate)))))
       (set-phash (functor-db *graph*) 
-		 (make-slot-key key "clauses") (pred-clauses predicate) :mode :replace))))
+		 (make-slot-key key +clauses-slot+) (pred-clauses predicate) :mode :replace))))
 
 (defmethod cache-predicate ((predicate predicate))
   (setf (gethash (pred-name predicate) (predicate-cache (pred-graph predicate))) predicate))
@@ -51,14 +52,14 @@
   (:method ((name symbol))
     (or (gethash name (predicate-cache *graph*))
 	(let ((key (string-downcase (symbol-name name))))
-	  (let ((uuid (get-phash (functor-db *graph*) (make-slot-key key "uuid"))))
+	  (let ((uuid (get-phash (functor-db *graph*) (make-slot-key key +uuid-slot+))))
 	    (when (uuid:uuid? uuid)
 	      (let ((p (make-predicate 
 			:uuid uuid
 			:graph *graph*
-			:name (get-phash (functor-db *graph*) (make-slot-key key "name"))
+			:name (get-phash (functor-db *graph*) (make-slot-key key +name-slot+))
 			:clauses (get-phash (functor-db *graph*)
-					    (make-slot-key key "clauses")))))
+					    (make-slot-key key +clauses-slot+)))))
 		(prolog-compile p)
 		(cache-predicate p))))))))
 

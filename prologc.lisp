@@ -42,16 +42,13 @@ types that will be stored in the db.")
   (:method (x y) (equal x y)))
 
 (defun eval-?? (exp)
+  "Disused function for evaluating Lisp clauses from within Prolog.  Use lisp/2 instead."
   (if (and (consp exp) (eq '?? (first exp)))
       (eval (deref-exp (second exp)))
       exp))
 
 (defun unify! (x y)
   "Destructively unify two expressions."
-;  (if (and (consp x) (eq '?? (first x)))
-;      (setq x (eval (deref-exp (second x)))))
-;  (if (and (consp y) (eq '?? (first y)))
-;      (setq y (eval (deref-exp (second y)))))
   (cond ((prolog-equal (var-deref x) (var-deref y)) t)
         ((var-p x) (set-binding! x y))
         ((var-p y) (set-binding! y x))
@@ -102,8 +99,7 @@ types that will be stored in the db.")
 (defun clauses-with-arity (clauses test arity)
   "Return all clauses whose head has given arity."
   (find-all arity clauses
-            :key #'(lambda (clause)
-                     (relation-arity (clause-head clause)))
+            :key #'(lambda (clause) (relation-arity (clause-head clause)))
             :test test))
 
 (defun relation-arity (relation)
@@ -126,15 +122,16 @@ types that will be stored in the db.")
 (defun compile-call (predicate arity args cont)
   "Compile a call to a prolog predicate."
   (if (and (variable-p predicate) (= 2 arity))
+      ;; FIXME: this doesn't do the right thing when the args contain functors. 
       `(progn
-	 (when *prolog-trace*
-	   (format t "TRACE: (SEARCH) ~A/~A~A~%" ',predicate ',arity ',args))
+	 ,(when *prolog-trace*
+		`(format t "TRACE: (SEARCH) ~A/~A~A~%" ',predicate ',arity ',args))
 	 (triple-search/3 ,predicate ,@args ,cont))
       (let ((functor (make-functor predicate arity)))
 	`(let ((func (or (gethash ',functor (functors *graph*)) 
 			 (gethash ',functor *prolog-global-functors*))))
-	   (when *prolog-trace*
-	     (format t "TRACE: ~A/~A~A~%" ',predicate ',arity ',args))
+	   ,(when *prolog-trace*
+		  `(format t "TRACE: ~A/~A~A~%" ',predicate ',arity ',args))
 	   (if (functionp func)
 	       (funcall func ,@args ,cont))))))
 
@@ -379,7 +376,7 @@ types that will be stored in the db.")
 	    (clause-body clause))
 	   cont
 	   (mapcar #'self-cons parms)))))
-    ;;(format t "~A BODY:~% ~A~%" (clause-head clause) body)
+    (when *prolog-trace* (format t "TRACE: ~A BODY:~% ~A~%" (clause-head clause) body))
     body))
 
 (defun add-clause (clause)
@@ -619,8 +616,8 @@ types that will be stored in the db.")
 	    (let ((func #'(lambda (cont) 
 			    (handler-case
 				(block ,*predicate*
-				  (when *prolog-trace*
-				    (format t "TRACE: do-query for ~A~%" ',goals))
+				  ,(when *prolog-trace*
+					 `(format t "TRACE: do-query for ~A~%" ',goals))
 				  .,(maybe-add-undo-bindings
 				     (mapcar #'(lambda (clause)
 						 (compile-clause nil clause 'cont))

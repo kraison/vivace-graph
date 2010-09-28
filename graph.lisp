@@ -21,12 +21,15 @@
   (rule-cache (make-hash-table :synchronized t))
   (predicate-cache (make-hash-table :synchronized t))
   ;;(node-cache (make-hash-table :test 'equal :synchronized t))
-  (triple-cache (make-hash-table :test 'equal :synchronized t))
-  (deleted-triple-cache (make-hash-table :test 'equal :synchronized t))
+  ;;(triple-cache (make-hash-table :test 'equal :synchronized t))
+  (triple-cache (make-lru-cache :test 'equal :max-size 100000))
+  ;;(deleted-triple-cache (make-hash-table :test 'equal :synchronized t))
+  (deleted-triple-cache (make-lru-cache :test 'equal :max-size 10000))
   (production-pq (make-skip-pq :key-equal #'timestamp= :comparison #'timestamp>
 			       :head-value (make-timestamp :day -1000000 :sec 0 :nsec 0)))
   (delete-queue (sb-concurrency:make-queue))
-  (needs-indexing-q (sb-concurrency:make-queue)))
+  (needs-indexing-q (sb-concurrency:make-queue))
+  (worker-thread nil))
 
 (defun print-graph (graph stream depth)
   (declare (ignore depth))

@@ -49,49 +49,50 @@
   (if (eql +needs-lookup+ (%triple-predicate triple))
       (setf (%triple-predicate triple) 
 	    (lookup-predicate
-	     (get-btree (triple-db *graph*) (make-slot-key (triple-uuid triple) "predicate"))))
+	     (get-btree (triple-db *graph*) (make-slot-key (triple-uuid triple) +predicate-slot+))))
       (%triple-predicate triple)))
 
 (defmethod triple-subject ((triple triple))
   "Return the decoded subject of the triple."
   (if (eql +needs-lookup+ (%triple-subject triple))
       (setf (%triple-subject triple) 
-	     (get-btree (triple-db *graph*) (make-slot-key (triple-uuid triple) "subject")))
+	     (get-btree (triple-db *graph*) (make-slot-key (triple-uuid triple) +subject-slot+)))
       (%triple-subject triple)))
 
 (defmethod triple-object ((triple triple))
   "Return the decoded object of the triple."
   (if (eql +needs-lookup+ (%triple-object triple))
       (setf (%triple-object triple) 
-	     (get-btree (triple-db *graph*) (make-slot-key (triple-uuid triple) "object")))
+	     (get-btree (triple-db *graph*) (make-slot-key (triple-uuid triple) +object-slot+)))
       (%triple-object triple)))
 
 (defmethod triple-timestamp ((triple triple))
   "Return the decoded timestamp of the triple."
   (if (eql +needs-lookup+ (%triple-timestamp triple))
       (setf (%triple-timestamp triple) 
-	    (get-btree (triple-db *graph*) (make-slot-key (triple-uuid triple) "timestamp")))
+	    (get-btree (triple-db *graph*) (make-slot-key (triple-uuid triple) +timestamp-slot+)))
       (%triple-timestamp triple)))
 
 (defmethod triple-belief-factor ((triple triple))
   "Return the decoded belief factor of the triple."
   (if (eql +needs-lookup+ (%triple-belief-factor triple))
       (setf (%triple-belief-factor triple) 
-	    (get-btree (triple-db *graph*) (make-slot-key (triple-uuid triple) "belief-factor")))
+	    (get-btree (triple-db *graph*) 
+		       (make-slot-key (triple-uuid triple) +belief-factor-slot+)))
       (%triple-belief-factor triple)))
   
 (defmethod triple-deleted? ((triple triple))
   "Is the triple marked as deleted?"
   (if (eql +needs-lookup+ (%triple-deleted? triple))
       (setf (%triple-deleted? triple) 
-	    (get-btree (triple-db *graph*) (make-slot-key (triple-uuid triple) "deleted?")))
+	    (get-btree (triple-db *graph*) (make-slot-key (triple-uuid triple) +deleted?-slot+)))
       (%triple-deleted? triple)))
 
 (defmethod triple-derived? ((triple triple))
   "Is this triple derived from a rule?"
   (if (eql +needs-lookup+ (%triple-derived? triple))
       (setf (%triple-derived? triple) 
-	    (get-btree (triple-db *graph*) (make-slot-key (triple-uuid triple) "derived?")))
+	    (get-btree (triple-db *graph*) (make-slot-key (triple-uuid triple) +derived?-slot+)))
       (%triple-derived? triple)))
 
 (defgeneric triple-eql (t1 t2)
@@ -167,20 +168,22 @@
 		    (triple-object triple))))
       (with-transaction (db)
 	(set-btree (triple-db *graph*) spo-key (triple-uuid triple) :key-serializer #'make-spo-key)
-	(set-btree (triple-db *graph*) (make-slot-key key "uuid") (triple-uuid triple))
-	(set-btree (triple-db *graph*) (make-slot-key key "subject") 
+	(set-btree (triple-db *graph*) (make-slot-key key +uuid-slot+) (triple-uuid triple))
+	(set-btree (triple-db *graph*) (make-slot-key key +subject-slot+) 
 		   (triple-subject triple))
-	(set-btree (triple-db *graph*) (make-slot-key key "predicate")
+	(set-btree (triple-db *graph*) (make-slot-key key +predicate-slot+)
 		   (string-downcase (symbol-name (pred-name (triple-predicate triple)))))
-	(set-btree (triple-db *graph*) (make-slot-key key "object") 
+	(set-btree (triple-db *graph*) (make-slot-key key +object-slot+) 
 		   (triple-object triple))
-	(set-btree (triple-db *graph*) (make-slot-key key "timestamp") (triple-timestamp triple))
-	(set-btree (triple-db *graph*) (make-slot-key key "belief-factor") 
+	(set-btree (triple-db *graph*) (make-slot-key key +timestamp-slot+) 
+		   (triple-timestamp triple))
+	(set-btree (triple-db *graph*) (make-slot-key key +belief-factor-slot+) 
 		   (triple-belief-factor triple))
 	(when (%triple-derived? triple)
-	  (set-btree (triple-db *graph*) (make-slot-key key "derived?") (triple-derived? triple)))
+	  (set-btree (triple-db *graph*) (make-slot-key key +derived?-slot+) 
+		     (triple-derived? triple)))
 	(when (%triple-deleted? triple)
-	  (set-btree (triple-db *graph*) (make-slot-key key "deleted?") 
+	  (set-btree (triple-db *graph*) (make-slot-key key +deleted?-slot+) 
 		     (triple-deleted? triple)))))))
 
 (defmethod remove-triple ((triple triple) &optional db)
@@ -193,20 +196,22 @@
 		    (triple-object triple))))
       (with-transaction (db)
 	(rem-btree (triple-db *graph*) spo-key (triple-uuid triple) :key-serializer #'make-spo-key)
-	(rem-btree (triple-db *graph*) (make-slot-key key "uuid") (triple-uuid triple))
-	(rem-btree (triple-db *graph*) (make-slot-key key "subject") 
+	(rem-btree (triple-db *graph*) (make-slot-key key +uuid-slot+) (triple-uuid triple))
+	(rem-btree (triple-db *graph*) (make-slot-key key +subject-slot+) 
 		   (triple-subject triple))
-	(rem-btree (triple-db *graph*) (make-slot-key key "predicate")
+	(rem-btree (triple-db *graph*) (make-slot-key key +predicate-slot+)
 		   (string-downcase (symbol-name (pred-name (triple-predicate triple)))))
-	(rem-btree (triple-db *graph*) (make-slot-key key "object") 
+	(rem-btree (triple-db *graph*) (make-slot-key key +object-slot+) 
 		   (triple-object triple))
-	(rem-btree (triple-db *graph*) (make-slot-key key "timestamp") (triple-timestamp triple))
-	(rem-btree (triple-db *graph*) (make-slot-key key "belief-factor") 
+	(rem-btree (triple-db *graph*) (make-slot-key key +timestamp-slot+) 
+		   (triple-timestamp triple))
+	(rem-btree (triple-db *graph*) (make-slot-key key +belief-factor-slot+) 
 		   (triple-belief-factor triple))
 	(ignore-errors
-	  (rem-btree (triple-db *graph*) (make-slot-key key "derived?") (triple-derived? triple)))
+	  (rem-btree (triple-db *graph*) (make-slot-key key +derived?-slot+) 
+		     (triple-derived? triple)))
 	(ignore-errors
-	  (rem-btree (triple-db *graph*) (make-slot-key key "deleted?") 
+	  (rem-btree (triple-db *graph*) (make-slot-key key +deleted?-slot+) 
 		     (triple-deleted? triple)))))))
 
 (defun make-subject-key (node)
@@ -299,9 +304,10 @@
 		   (triple 
 		    (make-triple 
 		     :uuid uuid
-		     :subject (get-btree db (make-slot-key ukey "subject"))
-		     :predicate (lookup-predicate (get-btree db (make-slot-key ukey "predicate")))
-		     :object (get-btree db (make-slot-key ukey "object"))
+		     :subject (get-btree db (make-slot-key ukey +subject-slot+))
+		     :predicate (lookup-predicate 
+				 (get-btree db (make-slot-key ukey +predicate-slot+)))
+		     :object (get-btree db (make-slot-key ukey +object-slot+))
 		     :timestamp +needs-lookup+
 		     :belief-factor +needs-lookup+
 		     :derived? +needs-lookup+
@@ -313,19 +319,19 @@
       nil)))
 
 (defmethod lookup-triple (s p o &key g)
-  (or (gethash (list s p o) (triple-cache (or g *graph*)))
+  (or (get-lru (triple-cache (or g *graph*)) (list s p o))
       (lookup-triple-in-db s p o (or g *graph*))))
 
 (defmethod lookup-triple-by-id (uuid &key g)
-  (or (gethash (if (uuid:uuid? uuid) (uuid:print-bytes nil uuid) uuid)
-	       (triple-cache (or g *graph*)))
+  (or (get-lru (triple-cache (or g *graph*))
+	       (if (uuid:uuid? uuid) (uuid:print-bytes nil uuid) uuid))
       (handler-case
 	  (let* ((ukey (uuid:print-bytes nil uuid)) (db (triple-db *graph*)))
-	    (let ((uuid (get-btree db (make-slot-key ukey "uuid"))))
+	    (let ((uuid (get-btree db (make-slot-key ukey +uuid-slot+))))
 	      (when (uuid:uuid? uuid)
-		(let ((p (lookup-predicate (get-btree db (make-slot-key ukey "predicate"))))
-		      (s (get-btree db (make-slot-key ukey "subject")))
-		      (o (get-btree db (make-slot-key ukey "object"))))
+		(let ((p (lookup-predicate (get-btree db (make-slot-key ukey +predicate-slot+))))
+		      (s (get-btree db (make-slot-key ukey +subject-slot+)))
+		      (o (get-btree db (make-slot-key ukey +object-slot+))))
 		  (let ((triple (make-triple :uuid uuid
 					     :subject s
 					     :predicate p
@@ -339,31 +345,24 @@
 	  (format t "Cannot lookup ~A: ~A~%" uuid condition)
 	  nil))))
 
-(defmethod uncache-triple ((triple triple) &optional ht)
-  (let ((ht (or ht (triple-cache *graph*))))
-    (remhash (uuid:print-bytes nil (triple-uuid triple)) ht)
-    (remhash (list (triple-subject triple) (triple-predicate triple) (triple-object triple))
-	     ht)
-    (remhash (list 
-	      (triple-subject triple)
-	      (pred-name (triple-predicate triple)) 
-	      (triple-object triple))
-	     ht)))
+(defmethod uncache-triple ((triple triple) &optional lru)
+  (let ((lru (or lru (triple-cache *graph*))))
+    (rem-lru lru (uuid:print-bytes nil (triple-uuid triple)))
+    (rem-lru lru (list (triple-subject triple) (triple-predicate triple) (triple-object triple)))
+    (rem-lru lru (list (triple-subject triple)
+		       (pred-name (triple-predicate triple)) 
+		       (triple-object triple)))))
 
-(defmethod cache-triple ((triple triple) &optional ht)
-  (let ((ht (or ht (triple-cache *graph*))))
-    (setf (gethash (uuid:print-bytes nil (triple-uuid triple)) ht) triple)
-    (setf (gethash (list 
-		    (triple-subject triple)
-		    (pred-name (triple-predicate triple))
-		    (triple-object triple))
-		   ht)
-	  triple)
-    (setf (gethash (list (triple-subject triple) 
-			 (triple-predicate triple) 
-			 (triple-object triple))
-		   ht)
-	  triple)))
+(defmethod cache-triple ((triple triple) &optional lru)
+  (let ((lru (or lru (triple-cache *graph*))))
+    (put-lru lru (uuid:print-bytes nil (triple-uuid triple)) triple)
+    (put-lru lru (list (triple-subject triple)
+		       (pred-name (triple-predicate triple))
+		       (triple-object triple)) triple)
+    (put-lru lru (list (triple-subject triple) 
+		       (triple-predicate triple) 
+		       (triple-object triple))
+	     triple)))
 
 (defmethod do-indexing ((graph graph))
   "Index all pending triples for GRAPH."

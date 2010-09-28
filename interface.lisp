@@ -11,13 +11,15 @@
       (make-new-triple *graph* subject predicate object))))
 
 (defun get-triples (&key s p o g (decode? t))
-  "Lookup triples by subject, predicate, and / or object. Currently returns one of three types of 
-results: either a klist of undecoded triples, a list of triples or a single triple. This 
-inconsistency should be eliminated at some point."
+  "Lookup triples by subject, predicate, and / or object. Currently returns one of two types of 
+results: either a klist of undecoded triples or a list of triples. If a single triple is found,
+a klist cannot be returned for reasons too complex to discuss here.  In this scenario, a list of
+one triple is returned no matter whether or not decode? was specified.  This inconsistency should 
+be eliminated at some point."
   (let ((*graph* (or g *graph*)) (klist nil))
     (cond ((and s p o)
 	   (let ((triple (lookup-triple s p o :g *graph*)))
-	     (when triple (return-from get-triples triple))))
+	     (when triple (return-from get-triples (list triple)))))
 	  ((and s p)
 	   (setq klist (get-subjects-predicates s p)))
 	  ((and s o)
@@ -35,6 +37,15 @@ inconsistency should be eliminated at some point."
 	     (map-klist #'(lambda (i) (lookup-triple-by-id i)) klist :collect? t)
 	  (klist-free klist))
 	klist)))
+
+(defun make-graph-worker-thread (graph)
+  (make-thread #'(lambda ()
+		   (let ((*graph* graph))
+		     (loop until (shutdown? *graph*) do
+			  (vivace-gc *graph*)
+			  (when (needs-indexing? *graph*) (do-indexing *graph*))
+			  (sleep 0.1))))
+	       :name (format nil "~A worker" graph)))
 
 (defun load-graph! (file)
   "Load a graph from configuration file (file).  Sets *graph* to the newly opened graph."
@@ -55,17 +66,25 @@ inconsistency should be eliminated at some point."
 		(setf (triple-db graph) 
 		      (open-btree (format nil "~A/triples.kct" (graph-location graph))
 				  :duplicates-allowed? t)
+
 		      (deleted-triple-db graph) 
 		      (open-btree (format nil "~A/deleted-triples.kct" (graph-location graph))
 				  :duplicates-allowed? t)
+
 		      (full-text-idx graph) 
 		      (open-btree (format nil "~A/full-text-idx.kct" (graph-location graph))
 				  :duplicates-allowed? t)
+
 		      (rule-db graph) 
 		      (open-phash (format nil "~A/rules.kch" (graph-location graph)))
+
 		      (functor-db graph) 
 		      (open-phash (format nil "~A/functors.kch" (graph-location graph)))
+
 		      (gethash (graph-name graph) *graph-table*) graph
+
+		      (worker-thread graph) (make-graph-worker-thread graph)
+
 		      *graph* graph))))))
     (load-all-functors *graph*)
     (load-all-rules *graph*)
@@ -90,10 +109,31 @@ graph."
   "Close the given GRAPH."
   (sb-ext:with-locked-hash-table (*graph-table*)
     (setf (shutdown? graph) t)
+    (when (threadp (worker-thread *graph*)) 
+      (format t "Waiting on worker thread ~A~%" (worker-thread *graph*))
+      (join-thread (worker-thread *graph*))
+      (setf (worker-thread *graph*) nil)
+      (format t "worker thread ~A finished.~%" (worker-thread *graph*)))
     (when (eql *graph* graph) (setq *graph* nil))
     (close-phash (functor-db graph))
     (close-phash (rule-db graph))
     (close-btree (full-text-idx graph))
     (close-btree (triple-db graph))
     (close-btree (deleted-triple-db graph))
+    (setf (triple-db graph) nil
+	  (deleted-triple-db graph) nil
+	  (full-text-idx graph) nil
+	  (rule-db graph) nil
+	  (functor-db graph) nil
+	  (rule-idx graph) nil
+	  (templates graph) nil
+	  (functors graph) nil
+	  (rule-cache graph) nil
+	  (predicate-cache graph) nil
+	  (triple-cache graph) nil
+	  (deleted-triple-cache graph) nil
+	  (production-pq graph) nil
+	  (delete-queue graph) nil
+	  (needs-indexing-q graph) nil)
+    (sb-ext:gc :full t)
     (remhash (graph-name graph) *graph-table*)))

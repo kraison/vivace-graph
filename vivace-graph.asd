@@ -26,7 +26,6 @@
 	       :cl-skip-list
 	       :local-time
 	       :date-calc
-	       ;;:montezuma
 	       :py-configparser
 	       :js
 	       :split-sequence)
@@ -37,13 +36,14 @@
 	       (:file "constants" :depends-on ("conditions"))
 	       (:file "globals" :depends-on ("constants"))
 	       (:file "utilities" :depends-on ("globals"))
+	       (:file "lru" :depends-on ("utilities"))
 	       (:file "data-types" :depends-on ("utilities"))
 	       (:file "certainty-factors" :depends-on ("constants"))
-	       (:file "graph" :depends-on ("data-types" "certainty-factors"))
+	       (:file "graph" :depends-on ("data-types" "certainty-factors" "lru"))
 	       (:file "predicate" :depends-on ("graph"))
 	       (:file "node" :depends-on ("graph" "data-types"))
 	       (:file "triples" :depends-on ("predicate" "node"))
-	       (:file "tokenizer")
+	       (:file "tokenizer" :depends-on ("vivace-graph-package"))
 	       (:file "full-text-index" :depends-on ("triples" "tokenizer"))
 	       (:file "triples-interface" :depends-on ("full-text-index"))
 	       (:file "templates" :depends-on ("triples-interface"))

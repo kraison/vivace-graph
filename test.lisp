@@ -158,6 +158,9 @@
   (<- (has-age "Kevin" 35))
   (<- (has-age "Dustie" 35))
   (<- (has-age "Echo" 11))
+  (<- (is-a "Echo" "cat"))
+  (<- (is-a "Kevin" "human"))
+  (<- (is-a "Dustie" "human"))
   (<- (loves "Sonny" "Cher"))
   (<- (loves "Cher" "Sonny"))
   (<- (loves "Kevin" "Dustie"))
@@ -177,8 +180,8 @@
   (let ((*graph* (make-new-graph :name "test graph 1" :location "/var/tmp")))
     (unwind-protect
 	 (progn
-	   (<- (member ?item (?item . ?rest)))
-	   (<- (member ?item (?x . ?rest)) (member ?item ?rest))
+	   ;(<- (member ?item (?item . ?rest)))
+	   ;(<- (member ?item (?x . ?rest)) (member ?item ?rest))
 	   (format t "~%(?- (member 1 (4 3 2 1))) ->~%")
 	   (?- (member 1 (4 3 2 1)))
 	   (format t "~%(member ?x (1 2 3 4)) ->~%")
@@ -214,8 +217,8 @@
   (let ((*graph* (make-new-graph :name "test graph logic" :location "/var/tmp")))
     (unwind-protect
 	 (progn
-	   (<- (member ?item (?item . ?rest)))
-	   (<- (member ?item (?x . ?rest)) (member ?item ?rest))
+	   ;(<- (member ?item (?item . ?rest)))
+	   ;(<- (member ?item (?x . ?rest)) (member ?item ?rest))
 	   (<- (nextto ?x ?y ?list) (iright ?x ?y ?list))
 	   (<- (nextto ?x ?y ?list) (iright ?y ?x ?list))
 	   (<- (iright ?left ?right (?left ?right . ?rest)))
