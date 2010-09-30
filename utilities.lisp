@@ -54,7 +54,7 @@
   (:method ((x uuid:uuid) (y number)) (string> (uuid:print-bytes nil x) (write-to-string y))))
 
 (defun uri? (string)
-  (cl-ppcre:scan "^https?\:\/\/[a-zA-Z0-9\-\.]+\.[a-zA-Z]{2,3}(\/.*)?$" string))
+  (cl-ppcre:scan "^(https?|ftp)\:\/\/[a-zA-Z0-9\-\.]+\.[a-zA-Z]{2,3}(\/.*)?$" string))
 
 (defun make-slot-key (id slot)
   (format nil "~A~A~A" id #\Nul slot))

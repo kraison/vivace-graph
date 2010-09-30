@@ -1,6 +1,6 @@
 (in-package #:vivace-graph)
 
-(defun start-json-rpc (&optional (port 9999))
+(defun start-json-rpc (&key (port 9999))
   (let ((rpc-server (hunchentoot:start (make-instance 'hunchentoot:acceptor :port port))))
     (setq hunchentoot:*dispatch-table* 
 	  (list 'hunchentoot:dispatch-easy-handlers 

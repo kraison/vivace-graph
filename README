@@ -1,2 +1,37 @@
 A free competitor to Franz's AllegroGraph by Kevin Raison.
 
+At the moment, this code is in a state of rapid flux.  Please don't expect 
+it to behave consistently from one check-in to another.
+
+The goal is to build a fast, robust, distributed graph database with optional
+RDF semantics built-in.  The primary query language is Prolog (based on PAIP),
+but I have plans to add Javascript and maybe Sparql at a later date.  At the
+moment, the underlying storage engine relies on Kyoto Cabinet;  this is going
+to change very soon.  I am working on a native SBCL memory mapped persistence
+library that will give me some variation on btrees and hashes.  WHen this is
+complete, the current performance issues with Vivace Graph should disappear.
+
+The code checked-in as of 2010/09/30 works fairly well, but should be
+considered alpha quality.  In order to get it working, you will need the
+following:
+
+SBCL 1.0.42 or higher: http://www.sbcl.org/platform-table.html
+Kyoto Cabinet 1.2.14: http://fallabs.com/kyotocabinet/pkg/kyotocabinet-1.2.14.tar.gz
+cl-skip-list: http://www.cliki.net/cl-skip-list
+cl-kyoto-cabinet: http://github.com/kraison/cl-kyoto-cabinet
+kyoto-persistence: http://github.com/kraison/kyoto-persistence
+bordeaux-threads: http://common-lisp.net/project/bordeaux-threads/
+usocket: http://common-lisp.net/project/usocket/
+protobuf: http://common-lisp.net/project/protobuf/
+hunchentoot: http://weitz.de/hunchentoot/
+cl-json: http://common-lisp.net/project/cl-json/
+uuid: http://www.dardoria.net/software/uuid.html
+cl-fad: http://weitz.de/cl-fad/
+ieee-floats: http://common-lisp.net/project/ieee-floats/
+parse-number: http://www.cliki.net/PARSE-NUMBER
+cffi: http://common-lisp.net/project/cffi/
+local-time: http://common-lisp.net/project/local-time/
+date-calc: http://common-lisp.net/project/cl-date-calc/
+py-configparser: http://common-lisp.net/project/py-configparser/
+js: http://github.com/akapav/js
+split-sequence: http://www.cliki.net/SPLIT-SEQUENCE
