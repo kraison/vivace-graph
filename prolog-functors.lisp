@@ -1,17 +1,18 @@
 (in-package #:vivace-graph)
 
-(defvar *prolog-global-functors* (make-hash-table :synchronized t))
+(defvar *prolog-global-functors* (make-hash-table :synchronized t :test 'equalp))
 
 (defmacro def-global-prolog-functor (name lambda-list &body body)
   `(prog1
        (defun ,name ,lambda-list ,@body)
-     (setf (gethash ',name *prolog-global-functors*) #',name)))
+     (setf (gethash ',name *prolog-global-functors*) #',name)
+     (setf (gethash ,(symbol-name name) *prolog-global-functors*) #',name)))
 
 (defun default-functor? (symbol)
   (gethash symbol *prolog-global-functors*))
 
 (def-global-prolog-functor read/1 (exp cont)
-  (if (unify! exp (read)) (funcall cont)))
+  (if (unify exp (read)) (funcall cont)))
 
 (def-global-prolog-functor write/1 (exp cont)
   (format t "~A" (deref-exp exp)) (funcall cont))
@@ -28,7 +29,7 @@
 
 (def-global-prolog-functor =/2 (?arg1 ?arg2 cont)
   "Unifies two prolog variables."
-  (if (unify! ?arg1 ?arg2) (funcall cont)))
+  (if (unify ?arg1 ?arg2) (funcall cont)))
 
 (def-global-prolog-functor ==/2 (?arg1 ?arg2 cont)	       
   "Checks equality of the values of two prolog variables."
@@ -79,13 +80,13 @@ the lisp functor should be declared special."
   (when *prolog-trace* (format t "TRACE: lisp/2 ?result <- ~A~%" exp))
   (let ((exp (var-deref exp)))
     (cond ((consp exp)
-	   (if (unify! ?result (eval exp))
+	   (if (unify ?result (eval exp))
 	       (funcall cont)))
 	  ((and (symbolp exp) (boundp exp))
-	   (if (unify! ?result (eval exp))
+	   (if (unify ?result (eval exp))
 	       (funcall cont)))
 	  (t
-	   (if (unify! ?result exp)
+	   (if (unify ?result exp)
 	       (funcall cont))))))
 
 (def-global-prolog-functor regex-match/2 (?arg1 ?arg2 cont)
@@ -102,7 +103,7 @@ second arg."
 (def-global-prolog-functor is/2 (var exp cont)
   "Similar to lisp/2, but unifies instead of assigns the lisp return value."
   (if (and (not (find-if-anywhere #'unbound-var-p exp))
-	   (unify! var (eval (deref-exp exp))))
+	   (unify var (eval (deref-exp exp))))
       (funcall cont)))
 
 (def-global-prolog-functor call/1 (goal cont)
@@ -218,14 +219,14 @@ second arg."
   (let ((answers nil))
     (call/1 goal #'(lambda () (push (deref-copy exp) answers)))
     (if (and (not (null answers))
-	     (unify! result (nreverse answers)))
+	     (unify result (nreverse answers)))
 	(funcall cont))))
 
 (def-global-prolog-functor setof/3 (exp goal result cont)
   (let ((answers nil))
     (call/1 goal #'(lambda () (push (deref-copy exp) answers)))
     (if (and (not (null answers))
-	     (unify! result (delete-duplicates answers :test #'deref-equal)))
+	     (unify result (delete-duplicates answers :test #'deref-equal)))
 	(funcall cont))))
 
 (def-global-prolog-functor show-prolog-vars/2 (var-names vars cont)
@@ -284,26 +285,27 @@ second arg."
 				 (let ((triple (lookup-triple-by-id id)))
 				   (let ((old-trail (fill-pointer *trail*)))
 				     (when (and (triple? triple) (not (triple-deleted? triple)))
-				       (when (unify! p (pred-name (triple-predicate triple)))
-					 (when (unify! s (triple-subject triple))
-					   (when (unify! o (triple-object triple))
+				       (when (unify p (pred-name (triple-predicate triple)))
+					 (when (unify s (triple-subject triple))
+					   (when (unify o (triple-object triple))
 					     (funcall cont))))
-				       (undo-bindings! old-trail)))))
+				       (undo-bindings old-trail)))))
 			     triples)
 	       (klist-free triples)))
 	    ((and (listp triples) (triple? (first triples)))
 	     (let ((triple (first triples)))
 	       (let ((old-trail (fill-pointer *trail*)))
 		 (when (not (triple-deleted? triple))
-		   (when (unify! p (pred-name (triple-predicate triple)))
-		     (when (unify! s (triple-subject triple))
-		       (when (unify! o (triple-object triple))
+		   (when (unify p (pred-name (triple-predicate triple)))
+		     (when (unify s (triple-subject triple))
+		       (when (unify o (triple-object triple))
 			 (funcall cont)))))
-		 (undo-bindings! old-trail))))))))
+		 (undo-bindings old-trail))))))))
 
 (defmethod load-all-functors ((graph graph))
   (map-phash #'(lambda (key val)
 		 (let ((pieces (split key '(#\Nul))))
-		   (when (equal (second pieces) "name")
+		   (when (and (cl-ppcre:scan "^[0-9]+$" (second pieces))
+			      (= (parse-integer (second pieces)) +name-slot+))
 		     (lookup-predicate val))))
-	     (functor-db graph)))
+	     (predicate-db graph)))

@@ -47,17 +47,17 @@ types that will be stored in the db.")
       (eval (deref-exp (second exp)))
       exp))
 
-(defun unify! (x y)
+(defun unify (x y)
   "Destructively unify two expressions."
   (cond ((prolog-equal (var-deref x) (var-deref y)) t)
-        ((var-p x) (set-binding! x y))
-        ((var-p y) (set-binding! y x))
+        ((var-p x) (set-binding x y))
+        ((var-p y) (set-binding y x))
         ((and (consp x) (consp y))
-         (and (unify! (first x) (first y))
-              (unify! (rest x) (rest y))))
+         (and (unify (first x) (first y))
+              (unify (rest x) (rest y))))
         (t nil)))
 
-(defun set-binding! (var value)
+(defun set-binding (var value)
   "Set var's binding to value, after saving the variable
   in the trail.  Always returns t."
   (unless (eq var value)
@@ -65,7 +65,7 @@ types that will be stored in the db.")
     (setf (var-binding var) value))
   t)
 
-(defun undo-bindings! (old-trail)
+(defun undo-bindings (old-trail)
   "Undo all bindings back to a given point in the trail."
   (loop until (= (fill-pointer *trail*) old-trail)
      do (setf (var-binding (vector-pop *trail*)) +unbound+)))
@@ -138,7 +138,10 @@ types that will be stored in the db.")
 (defun prolog-compiler-macro (name)
   "Fetch the compiler macro for a Prolog predicate."
   ;; Note NAME is the raw name, not the name/arity
-  (get name 'prolog-compiler-macro))
+  (typecase name
+    (string (get (intern (string-upcase name)) 'prolog-compiler-macro))
+    (symbol (get name 'prolog-compiler-macro))
+    (otherwise nil)))
 
 (defmacro def-prolog-compiler-macro (name arglist &body body)
   "Define a compiler macro for Prolog."
@@ -188,7 +191,7 @@ types that will be stored in the db.")
       `((let ((old-trail (fill-pointer *trail*)))
           ,(first compiled-exps)
           ,@(loop for exp in (rest compiled-exps)
-                  collect '(undo-bindings! old-trail)
+                  collect '(undo-bindings old-trail)
                   collect exp)))))
 
 (defmacro with-undo-bindings (&body body)
@@ -197,7 +200,7 @@ types that will be stored in the db.")
       `(let ((old-trail (fill-pointer *trail*)))
 	 ,(first body)
 	 ,@(loop for exp in (rest body)
-	      collect '(undo-bindings! old-trail)
+	      collect '(undo-bindings old-trail)
 	      collect exp))))
 
 (defun variables-in (exp)
@@ -290,13 +293,13 @@ types that will be stored in the db.")
        (compile-unify x1 y1 bindings))
       ((find-anywhere x1 y1) (values nil bindings))       ; 11
       ((consp y1)                                         ; 7,10
-       (values `(unify! ,x1 ,(compile-arg y1 bindings))
+       (values `(unify ,x1 ,(compile-arg y1 bindings))
                (bind-variables-in y1 bindings)))
       ((not (null xb))
        ;; i.e. x is an ?arg variable
        (if (and (variable-p y1) (null yb))
            (values 't (extend-bindings y1 x1 bindings))   ; 4
-           (values `(unify! ,x1 ,(compile-arg y1 bindings))
+           (values `(unify ,x1 ,(compile-arg y1 bindings))
                    (extend-bindings x1 y1 bindings))))    ; 5,6
       ((not (null yb))
        (compile-unify-variable y1 x1 bindings))
@@ -384,8 +387,6 @@ types that will be stored in the db.")
   (let* ((predicate-name (predicate (clause-head clause))))
     ;;(format t "1. Adding clause ~A: ~A~%" predicate-name clause)
     (assert (and (atom predicate-name) (not (variable-p predicate-name))))
-    (when (stringp predicate-name) 
-      (setq predicate-name (intern (string-upcase predicate-name))))
     (let* ((arity (relation-arity (clause-head clause)))
 	   (functor (make-functor predicate-name arity)))
       (if (gethash functor *prolog-global-functors*)
@@ -449,7 +450,7 @@ types that will be stored in the db.")
   (cond
     ((null body)
      `(funcall ,cont))
-    ((eq (first body) '!)
+    ((or (eq (first body) 'cut) (equalp (first body) "cut"))
      `(progn ,(compile-body (rest body) cont bindings)
              (return-from ,*predicate* nil)))
     (t (let* ((goal (first body))
@@ -631,7 +632,7 @@ types that will be stored in the db.")
        t)))
 
 (defun exec-rule (goals action)
-  (let* ((rule (append (replace-?-vars goals) (list '! action)))
+  (let* ((rule (append (replace-?-vars goals) (list 'cut action)))
 	 (top-level-query (gensym "PROVE"))
 	 (*predicate* (make-functor top-level-query 0)))
     (eval

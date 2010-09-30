@@ -47,7 +47,7 @@ be eliminated at some point."
 			  (sleep 0.1))))
 	       :name (format nil "~A worker" graph)))
 
-(defun load-graph! (file)
+(defun load-graph (file)
   "Load a graph from configuration file (file).  Sets *graph* to the newly opened graph."
   (let ((config (py-configparser:make-config)))
     (py-configparser:read-files config (list file))
@@ -71,6 +71,9 @@ be eliminated at some point."
 		      (open-btree (format nil "~A/deleted-triples.kct" (graph-location graph))
 				  :duplicates-allowed? t)
 
+		      (namespace-db graph)
+		      (open-phash (format nil "~A/namespaces.kch" (graph-location graph)))
+
 		      (full-text-idx graph) 
 		      (open-btree (format nil "~A/full-text-idx.kct" (graph-location graph))
 				  :duplicates-allowed? t)
@@ -78,8 +81,8 @@ be eliminated at some point."
 		      (rule-db graph) 
 		      (open-phash (format nil "~A/rules.kch" (graph-location graph)))
 
-		      (functor-db graph) 
-		      (open-phash (format nil "~A/functors.kch" (graph-location graph)))
+		      (predicate-db graph) 
+		      (open-phash (format nil "~A/predicatess.kch" (graph-location graph)))
 
 		      (gethash (graph-name graph) *graph-table*) graph
 
@@ -103,7 +106,7 @@ graph."
       (format stream "uuid=~A~%" (print-object (graph-uuid graph) nil))
       (format stream "name=~A~%" name)
       (format stream "location=~A~%" location))
-    (load-graph! config-file)))
+    (load-graph config-file)))
 
 (defmethod shutdown-graph ((graph graph))
   "Close the given GRAPH."
@@ -115,7 +118,8 @@ graph."
       (setf (worker-thread *graph*) nil)
       (format t "worker thread ~A finished.~%" (worker-thread *graph*)))
     (when (eql *graph* graph) (setq *graph* nil))
-    (close-phash (functor-db graph))
+    (close-phash (namespace-db graph))
+    (close-phash (predicate-db graph))
     (close-phash (rule-db graph))
     (close-btree (full-text-idx graph))
     (close-btree (triple-db graph))
@@ -124,7 +128,9 @@ graph."
 	  (deleted-triple-db graph) nil
 	  (full-text-idx graph) nil
 	  (rule-db graph) nil
-	  (functor-db graph) nil
+	  (namespaces graph) nil
+	  (namespace-db graph) nil
+	  (predicate-db graph) nil
 	  (rule-idx graph) nil
 	  (templates graph) nil
 	  (functors graph) nil

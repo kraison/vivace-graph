@@ -111,10 +111,15 @@
 
 (defun print-triple (triple stream depth)
   (declare (ignore depth))
-  (format stream "#<TRIPLE: '~A' '~A' '~A'>" 
-	  (triple-subject triple)
-	  (pred-name (triple-predicate triple))
-	  (triple-object triple)))
+  (if (namespace-reader-enabled?)
+      (format stream "#<TRIPLE: '~A' '~A' '~A'>" 
+	      (shorten-namespace (triple-subject triple))
+	      (shorten-namespace (pred-name (triple-predicate triple)))
+	      (shorten-namespace (triple-object triple)))
+      (format stream "#<TRIPLE: '~A' '~A' '~A'>" 
+	      (triple-subject triple)
+	      (pred-name (triple-predicate triple))
+	      (triple-object triple))))
 
 (defmethod predicate ((triple triple))
   "Return the predicate name of the triple's predicate."
@@ -172,7 +177,7 @@
 	(set-btree (triple-db *graph*) (make-slot-key key +subject-slot+) 
 		   (triple-subject triple))
 	(set-btree (triple-db *graph*) (make-slot-key key +predicate-slot+)
-		   (string-downcase (symbol-name (pred-name (triple-predicate triple)))))
+		   (pred-name (triple-predicate triple)))
 	(set-btree (triple-db *graph*) (make-slot-key key +object-slot+) 
 		   (triple-object triple))
 	(set-btree (triple-db *graph*) (make-slot-key key +timestamp-slot+) 
@@ -195,24 +200,26 @@
 		    (pred-name (triple-predicate triple))
 		    (triple-object triple))))
       (with-transaction (db)
-	(rem-btree (triple-db *graph*) spo-key (triple-uuid triple) :key-serializer #'make-spo-key)
-	(rem-btree (triple-db *graph*) (make-slot-key key +uuid-slot+) (triple-uuid triple))
+	(rem-btree (triple-db *graph*) spo-key 
+		   :value (triple-uuid triple) 
+		   :key-serializer #'make-spo-key)
+	(rem-btree (triple-db *graph*) (make-slot-key key +uuid-slot+) :value (triple-uuid triple))
 	(rem-btree (triple-db *graph*) (make-slot-key key +subject-slot+) 
-		   (triple-subject triple))
+		   :value (triple-subject triple))
 	(rem-btree (triple-db *graph*) (make-slot-key key +predicate-slot+)
-		   (string-downcase (symbol-name (pred-name (triple-predicate triple)))))
+		   :value (pred-name (triple-predicate triple)))
 	(rem-btree (triple-db *graph*) (make-slot-key key +object-slot+) 
-		   (triple-object triple))
+		   :value (triple-object triple))
 	(rem-btree (triple-db *graph*) (make-slot-key key +timestamp-slot+) 
-		   (triple-timestamp triple))
+		   :value (triple-timestamp triple))
 	(rem-btree (triple-db *graph*) (make-slot-key key +belief-factor-slot+) 
-		   (triple-belief-factor triple))
+		   :value (triple-belief-factor triple))
 	(ignore-errors
 	  (rem-btree (triple-db *graph*) (make-slot-key key +derived?-slot+) 
-		     (triple-derived? triple)))
+		     :value (triple-derived? triple)))
 	(ignore-errors
 	  (rem-btree (triple-db *graph*) (make-slot-key key +deleted?-slot+) 
-		     (triple-deleted? triple)))))))
+		     :value (triple-deleted? triple)))))))
 
 (defun make-subject-key (node)
   (make-serialized-key +triple-subject+ node))
@@ -221,13 +228,13 @@
   (make-serialized-key +triple-object+ node))
 
 (defmethod make-predicate-key ((predicate predicate))
-  (make-serialized-key +triple-predicate+ (string-downcase (symbol-name (pred-name predicate)))))
+  (make-serialized-key +triple-predicate+ (pred-name predicate)))
 
 (defmethod make-predicate-key ((symbol symbol))
-  (make-serialized-key +triple-predicate+ (string-downcase (symbol-name symbol))))
+  (make-serialized-key +triple-predicate+ (symbol-name symbol)))
 
 (defmethod make-predicate-key ((string string))
-  (make-serialized-key +triple-predicate+ (string-downcase string)))
+  (make-serialized-key +triple-predicate+ string))
 
 (defun concat-keys (k1 k2)
   (format nil "~A~A~A" k1 #\Nul k2))

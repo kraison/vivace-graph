@@ -4,7 +4,9 @@
 	     (:conc-name pred-)
 	     (:predicate predicate?))
   (uuid (make-uuid) :type uuid:uuid)
-  (name nil :type symbol)
+  (uri nil)
+  (short-name "" :type string)
+  (name "" :type string)
   (clauses nil :type list)
   (lock (make-recursive-lock) :type sb-thread:mutex)
   (graph *graph* :type graph))
@@ -17,28 +19,28 @@
 (defgeneric reset-functor (name))
 
 (defgeneric predicate-eql (p1 p2)
-  (:method ((p1 predicate) (p2 predicate)) (eql (pred-name p1) (pred-name p2)))
+  (:method ((p1 predicate) (p2 predicate)) (equal (pred-name p1) (pred-name p2)))
   (:method (p1 p2) nil))
 
 (defmethod save-predicate ((predicate predicate))
-  (with-transaction ((functor-db *graph*))
-    (let ((key (string-downcase (symbol-name (pred-name predicate)))))
-      (set-phash (functor-db *graph*) (make-slot-key key +uuid-slot+) (pred-uuid predicate))
-      (set-phash (functor-db *graph*) (make-slot-key key +name-slot+) (pred-name predicate))
-      (set-phash (functor-db *graph*) (make-slot-key key +clauses-slot+) 
+  (with-transaction ((predicate-db *graph*))
+    (let ((key (pred-name predicate)))
+      (set-phash (predicate-db *graph*) (make-slot-key key +uuid-slot+) (pred-uuid predicate))
+      (set-phash (predicate-db *graph*) (make-slot-key key +name-slot+) (pred-name predicate))
+      (set-phash (predicate-db *graph*) (make-slot-key key +clauses-slot+)
 		 (pred-clauses predicate)))))
 
 (defmethod delete-predicate ((predicate predicate))
-  (with-transaction ((functor-db *graph*))
-    (let ((key (string-downcase (symbol-name (pred-name predicate)))))
-      (rem-phash (functor-db *graph*) (make-slot-key key +uuid-slot+))
-      (rem-phash (functor-db *graph*) (make-slot-key key +name-slot+))
-      (rem-phash (functor-db *graph*) (make-slot-key key +clauses-slot+)))))
+  (with-transaction ((predicate-db *graph*))
+    (let ((key (pred-name predicate)))
+      (rem-phash (predicate-db *graph*) (make-slot-key key +uuid-slot+))
+      (rem-phash (predicate-db *graph*) (make-slot-key key +name-slot+))
+      (rem-phash (predicate-db *graph*) (make-slot-key key +clauses-slot+)))))
 
 (defmethod update-predicate ((predicate predicate))
-  (with-transaction ((functor-db *graph*))
-    (let ((key (string-downcase (symbol-name (pred-name predicate)))))
-      (set-phash (functor-db *graph*) 
+  (with-transaction ((predicate-db *graph*))
+    (let ((key (pred-name predicate)))
+      (set-phash (predicate-db *graph*) 
 		 (make-slot-key key +clauses-slot+) (pred-clauses predicate) :mode :replace))))
 
 (defmethod cache-predicate ((predicate predicate))
@@ -47,31 +49,29 @@
 (defgeneric lookup-predicate (name)
   (:method ((predicate predicate))
     predicate)
-  (:method ((name string))
-    (lookup-predicate (intern (string-upcase name))))
   (:method ((name symbol))
+    (or (lookup-predicate (symbol-name name))
+	(lookup-predicate (string-downcase (symbol-name name)))))
+  (:method ((name string))
     (or (gethash name (predicate-cache *graph*))
-	(let ((key (string-downcase (symbol-name name))))
-	  (let ((uuid (get-phash (functor-db *graph*) (make-slot-key key +uuid-slot+))))
-	    (when (uuid:uuid? uuid)
-	      (let ((p (make-predicate 
-			:uuid uuid
-			:graph *graph*
-			:name (get-phash (functor-db *graph*) (make-slot-key key +name-slot+))
-			:clauses (get-phash (functor-db *graph*)
-					    (make-slot-key key +clauses-slot+)))))
-		(prolog-compile p)
-		(cache-predicate p))))))))
-
-(defun lookup-predicate-functor (name)
-  (gethash name (functors *graph*)))
+	(let ((uuid (get-phash (predicate-db *graph*) (make-slot-key name +uuid-slot+))))
+	  (when (uuid:uuid? uuid)
+	    (let ((p (make-predicate 
+		      :uuid uuid
+		      :graph *graph*
+		      :name (get-phash (predicate-db *graph*) (make-slot-key name +name-slot+))
+		      :clauses (get-phash (predicate-db *graph*)
+					  (make-slot-key name +clauses-slot+)))))
+	      (prolog-compile p)
+	      (cache-predicate p)))))))
 
 (defun make-new-predicate (&key name graph clauses)
   "Create a new predicate with name."
   (let ((*graph* (or graph *graph*))
-	(name (or (and (symbolp name) (intern (string-upcase (symbol-name name))))
-		  (and (stringp name) (intern (string-upcase name)))
-		  (error "predicate name must be either a string or a symbol!"))))
+	(name (typecase name
+		(string name)
+		(symbol (symbol-name name))
+		(otherwise (error "predicate name must be either a string or a symbol!")))))
     (or (lookup-predicate name)
 	(let ((predicate (make-predicate :name name :graph *graph* :clauses clauses)))
 	  (handler-case
@@ -93,8 +93,11 @@
     (or (pred-clauses predicate) predicate)))
 
 (defmethod delete-functor (name)
-  (let* ((name (or (and (symbolp name) name)
-		   (and (stringp name) (intern (string-upcase name)))))
+  (let* ((name (typecase name
+		 (string name)
+		 (symbol (symbol-name name))
+		 (otherwise (error "delete-functor: ~A is a ~A, should be string or symbol" 
+				   name (type-of name)))))
 	 (predicate (lookup-predicate name)))
     (with-recursive-lock-held ((pred-lock predicate))
       (remhash name (predicate-cache *graph*))
@@ -102,8 +105,11 @@
 
 (defmethod reset-functor (name)
   "Remove all clauses from a functor, making is a search-only predicate."
-  (let* ((name (or (and (symbolp name) name)
-		   (and (stringp name) (intern (string-upcase name)))))
+  (let* ((name (typecase name
+		 (string name)
+		 (symbol (symbol-name name))
+		 (otherwise (error "delete-functor: ~A is a ~A, should be string or symbol" 
+				   name (type-of name)))))
 	 (predicate (lookup-predicate name)))
     (with-recursive-lock-held ((pred-lock predicate))  
       (setf (pred-clauses predicate) nil)

@@ -10,7 +10,7 @@
 	#:hunchentoot)
   (:export #:*graph*
 	   #:graph?
-	   #:load-graph!
+	   #:load-graph
 	   #:make-new-graph
 	   #:shutdown-graph
 	   #:needs-indexing?
@@ -22,15 +22,10 @@
 	   #:dbm-begin
 	   #:triple-db
 	   #:functors
-
-	   #:node?
-	   #:node-value
-	   #:node-uuid
-	   #:node-eql
-	   #:node-equalp
-	   #:lookup-node
-	   #:make-anonymous-node
-	   #:make-new-node
+	   #:enable-!-reader
+	   #:disable-!-reader
+	   #:register-namespace
+	   #:display-namespaces
 
 	   #:triple?
 	   #:triple-subject
@@ -53,9 +48,10 @@
 	   #:fact
 	   #:deffacts
 
+	   #:!
 	   #:<-
 	   #:?-
-	   #:!
+	   #:cut
 	   #:prolog
 	   #:insert
 	   #:select
