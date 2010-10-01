@@ -35,3 +35,17 @@ date-calc: http://common-lisp.net/project/cl-date-calc/
 py-configparser: http://common-lisp.net/project/py-configparser/
 js: http://github.com/akapav/js
 split-sequence: http://www.cliki.net/SPLIT-SEQUENCE
+
+
+To get you started:
+
+(asdf:oos 'asdf:load-op 'vivace-graph)
+(in-package #:vivace-graph)
+(make-new-graph :name "test graph" :location "/var/tmp")
+(<- ("is-a" "Kevin" "human"))
+(<- ("is-a" "Joe" "human"))
+(<- ("is-a" "Fido" "dog"))
+(<- ("likes" "Kevin" "Fido"))
+(<- ("likes" "Joe" ?x) ("is-a" ?y "dog") ("likes" ?x ?y))
+(select (?x ?y) ("likes" ?x ?y))
+(shutdown-graph *graph*)
