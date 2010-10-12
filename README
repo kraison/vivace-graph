@@ -8,7 +8,7 @@ RDF semantics built-in.  The primary query language is Prolog (based on PAIP),
 but I have plans to add Javascript and maybe Sparql at a later date.  At the
 moment, the underlying storage engine relies on Kyoto Cabinet;  this is going
 to change very soon.  I am working on a native SBCL memory mapped persistence
-library that will give me some variation on btrees and hashes.  WHen this is
+library that will give me some variation on btrees and hashes.  When this is
 complete, the current performance issues with Vivace Graph should disappear.
 
 The code checked-in as of 2010/09/30 works fairly well, but should be
@@ -22,7 +22,6 @@ cl-kyoto-cabinet: http://github.com/kraison/cl-kyoto-cabinet
 kyoto-persistence: http://github.com/kraison/kyoto-persistence
 bordeaux-threads: http://common-lisp.net/project/bordeaux-threads/
 usocket: http://common-lisp.net/project/usocket/
-protobuf: http://common-lisp.net/project/protobuf/
 hunchentoot: http://weitz.de/hunchentoot/
 cl-json: http://common-lisp.net/project/cl-json/
 uuid: http://www.dardoria.net/software/uuid.html
@@ -48,4 +47,6 @@ To get you started:
 (<- ("likes" "Kevin" "Fido"))
 (<- ("likes" "Joe" ?x) ("is-a" ?y "dog") ("likes" ?x ?y))
 (select (?x ?y) ("likes" ?x ?y))
+(get-triples :s "Kevin")
+(get-triples :p "is-a")
 (shutdown-graph *graph*)

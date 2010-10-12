@@ -12,7 +12,6 @@
   :long-description "Vivace Graph."
   :depends-on (:bordeaux-threads
 	       :usocket
-	       :protobuf
 	       :hunchentoot
 	       :cl-json
 	       :uuid

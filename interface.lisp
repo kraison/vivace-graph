@@ -34,7 +34,11 @@ be eliminated at some point."
 	   (setq klist (get-objects o))))
     (if (and decode? (klist? klist))
 	(unwind-protect
-	     (map-klist #'(lambda (i) (lookup-triple-by-id i)) klist :collect? t)
+	     (map-klist #'(lambda (i) 
+			    (let ((triple (lookup-triple-by-id i)))
+			      (format t "GOT ~A~%" triple)
+			      triple))
+			klist :collect? t)
 	  (klist-free klist))
 	klist)))
 

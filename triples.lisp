@@ -319,7 +319,8 @@
 		     :belief-factor +needs-lookup+
 		     :derived? +needs-lookup+
 		     :deleted? +needs-lookup+)))
-	      (cache-triple triple)))))
+	      (cache-triple triple)
+	      triple))))
     (serialization-error (condition)
       (declare (ignore condition))
       (format t "Cannot lookup ~A/~A/~A~%" s p o)
@@ -347,7 +348,8 @@
 					     :belief-factor +needs-lookup+
 					     :derived? +needs-lookup+
 					     :deleted? +needs-lookup+)))
-		    (cache-triple triple))))))
+		    (cache-triple triple)
+		    triple)))))
 	(serialization-error (condition)
 	  (format t "Cannot lookup ~A: ~A~%" uuid condition)
 	  nil))))
@@ -384,7 +386,8 @@
     (if index?
 	(index-triple-unsafe triple)
 	(sb-concurrency:enqueue triple (needs-indexing-q graph)))
-    (when cache? (cache-triple triple))))
+    (when cache? (cache-triple triple))
+    triple))
 
 (defmethod index-triple-unsafe ((triple triple) &optional db)
   (let ((db (or db (triple-db *graph*))))
