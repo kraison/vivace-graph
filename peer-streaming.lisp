@@ -768,6 +768,9 @@ reports + resets that accumulator, a :shutdown op ends the thread."
     (loop
       (let ((op (receive-message mailbox :timeout 1)))
         (when op
+          ;; Progress heartbeat: PEER-SYNC's barrier wait reads this to distinguish a
+          ;; slow-but-advancing apply from a wedged writer (see PEER-SYNC).
+          (incf (peer-writer-progress graph))
           (ecase (peer-op-kind op)
             (:state-create
              ;; A membership-create: a node ENTERING the device's scope.  Its id
@@ -885,7 +888,35 @@ time).  Returns the acked feed-seq."
         (persist-peer-push-ack acked graph))
       (or acked from))))
 
-(defun peer-sync (graph &key (attempts 10) full-resync)
+(defun %peer-await-barrier (graph reply poll stall)
+  "Wait for the writer's :barrier reply on REPLY.  The apply of an initial pull can
+take arbitrarily long -- it scales with the pulled node count and device speed (a
+765-node pull is ~41 s on an ECL/Android device; a bigger working set, minutes) --
+so we must NOT race a wall-clock deadline: that spuriously abandons a healthy but
+slow apply, leaving the membership un-acked (the hub then re-ships the whole scope
+every pull, and purge never fires).  Instead re-check writer LIVENESS every POLL
+seconds and keep waiting while the writer thread is alive and its progress counter
+is advancing.  Give up only on a genuine fault: the writer thread died, or it is
+alive but made no progress for STALL seconds (wedged -- shouldn't happen in the
+single-writer funnel, but bounds an otherwise-infinite hang).  Returns the reply
+plist or signals an error."
+  (let ((writer (peer-writer-thread graph))
+        (last (peer-writer-progress graph))
+        (idle 0))
+    (loop
+      (let ((r (receive-message reply :timeout poll)))
+        (when r (return r))
+        (let ((now (peer-writer-progress graph)))
+          (cond
+            ((not (and (threadp writer) (thread-alive-p writer)))
+             (error "peer-sync: device writer thread died while applying the pull"))
+            ((> now last) (setf last now idle 0))            ; progressing -> keep waiting
+            (t (incf idle poll)
+               (when (>= idle stall)
+                 (error "peer-sync: device writer made no progress for ~D s (wedged?)"
+                        stall)))))))))
+
+(defun peer-sync (graph &key (attempts 10) full-resync (barrier-poll 30) (barrier-stall 300))
   "Device entry point: connect to the hub, handshake (same-major schema gate,
 WP-6/PT-6), receive one authority-scoped DELTA pull, apply it through the single
 writer (WP-8), advance the pull-cursor to the hub frontier T, and ACK the
@@ -922,7 +953,7 @@ re-ship.  Returns the ack result plist (:created / :purged id lists)."
              (let ((reply (make-mailbox)))
                (send-message mailbox (make-peer-op :kind :barrier :tx-id frontier
                                                    :reply reply))
-               (let ((result (receive-message reply :timeout 30)))
+               (let ((result (%peer-await-barrier graph reply barrier-poll barrier-stall)))
                  (peer-write-plist
                   (list :created (peer-ids->string (getf result :created))
                         :purged  (peer-ids->string (getf result :purged))

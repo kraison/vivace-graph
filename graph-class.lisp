@@ -182,6 +182,11 @@
                         go through a single writer and never contend on OCC (PT-5).")
    (peer-writer-thread :accessor peer-writer-thread :initarg :peer-writer-thread
                        :initform nil)
+   (peer-writer-progress :accessor peer-writer-progress :initform 0
+                         :documentation "Device role: a monotonically increasing count
+                        of peer ops the writer has applied.  PEER-SYNC watches it to tell
+                        a slow-but-healthy apply (progress advancing) from a wedged writer
+                        (alive but stalled), so the barrier wait need not race a wall clock.")
    (stop-replication-p :accessor stop-replication-p :initarg :stop-replication-p
                        :initform nil)
    (peer-thread :accessor peer-thread :initarg :peer-thread :initform nil)))
