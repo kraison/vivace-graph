@@ -90,16 +90,41 @@
                (:file "interface" :depends-on ("schema" "edge" "vertex" "views"))
                (:file "traverse" :depends-on ("interface"))))
 
-;; FULL: core + the network layers.  transaction-streaming (usocket master/slave
-;; replication transport) and rest (clack/ningle HTTP API).  graph-db/core has
-;; already compiled+loaded all engine files, so these two need no intra-file
-;; :depends-on -- the system-level dependency guarantees order.
+;; REPLICATION: core + the usocket network transport, but NO HTTP server.  This is
+;; the master/slave + hub/peer replication layer -- transaction-streaming (usocket
+;; framing + master/slave packet primitives), peer-merge (the pure per-field Branch B
+;; conflict resolver), and peer-streaming (hub/device pull+push transport).  It drops
+;; :hunchentoot :ningle :clack, so it is loadable under ECL and is the target for the
+;; offline Android field device (which must replicate but cannot run the HTTP stack).
+;; graph-db/core has already compiled+loaded all engine files, so these need no
+;; intra-file :depends-on -- the system-level dependency guarantees order.
+(defsystem graph-db/replication
+  :name "VivaceGraph (replication transport)"
+  :maintainer "Kevin Raison"
+  :author "Kevin Raison <last name @ chatsubo dot net>"
+  :version "2.0"
+  :depends-on (:graph-db/core
+               :usocket)
+  :serial t
+  :components ((:file "transaction-streaming")
+               ;; peer replication Branch B: the pure per-field conflict resolver
+               ;; (loaded before the transport that will call it).
+               (:file "peer-merge")
+               ;; peer replication transport (hub/device pull); needs usocket and
+               ;; the master/slave packet primitives in transaction-streaming.
+               (:file "peer-streaming")))
+
+;; FULL: replication + the HTTP API leaf (rest, clack/ningle).  graph-db/replication
+;; (and transitively graph-db/core) has already compiled+loaded the engine + transport,
+;; so rest needs no intra-file :depends-on -- the system-level dependency guarantees
+;; order.  Stays behaviour-identical for existing consumers (mine-action, odm), which
+;; keep depending on :graph-db.
 (defsystem graph-db
   :name "VivaceGraph"
   :maintainer "Kevin Raison"
   :author "Kevin Raison <last name @ chatsubo dot net>"
   :version "2.0"
-  :depends-on (:graph-db/core
+  :depends-on (:graph-db/replication
                :hunchentoot
                :ningle
                :clack
@@ -112,14 +137,7 @@
                :usocket
                :trivial-shell)
   :serial t
-  :components ((:file "transaction-streaming")
-               ;; peer replication Branch B: the pure per-field conflict resolver
-               ;; (loaded before the transport that will call it).
-               (:file "peer-merge")
-               ;; peer replication transport (hub/device pull); needs usocket and
-               ;; the master/slave packet primitives in transaction-streaming.
-               (:file "peer-streaming")
-               (:file "rest"))
+  :components ((:file "rest"))
   :in-order-to ((test-op (test-op :graph-db/test))))
 
 (defsystem graph-db/concurrency-test
