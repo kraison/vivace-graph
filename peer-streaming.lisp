@@ -437,11 +437,13 @@ on the listener so accepted sockets are binary on CCL)."
 ;;; ---------------------------------------------------------------------------
 
 (defstruct (peer-op (:constructor make-peer-op))
-  kind        ; :state-create :authored :purge :barrier :shutdown
+  kind        ; :state-create :authored :purge :barrier :shutdown :local-write
   op-id origin lamport tx-id
   writes      ; list of tx-write (state-create / authored)
   ids         ; list of node-ids (purge)
-  reply)      ; reply mailbox (barrier)
+  thunk       ; a 0-arg fn to run on the writer thread (:local-write) -- funnels a
+              ; user/app write through the SAME single writer as replication apply
+  reply)      ; reply mailbox (barrier / local-write)
 
 ;;; ---------------------------------------------------------------------------
 ;;; Branch B: apply an authored op THROUGH the merge resolver (B2d).
@@ -802,8 +804,32 @@ reports + resets that accumulator, a :shutdown op ends the thread."
                            (list :created (copy-list created)
                                  :purged (copy-list purged)))
              (setf created '() purged '()))
+            (:local-write
+             ;; A user/app write funneled here (WP-8) so it runs on the SAME thread as
+             ;; the replication apply -- never a second writer contending with this loop
+             ;; (intermittent deadlock on ECL otherwise).  Run the thunk, reply its value
+             ;; (or the error), protecting the writer thread from a throw.
+             (when (peer-op-reply op)
+               (send-message (peer-op-reply op)
+                             (list (handler-case (funcall (peer-op-thunk op))
+                                     (error (e) (format nil "local-write ERROR: ~A" e)))))))
             (:shutdown
              (return))))))))
+
+(defun peer-enqueue-write (graph thunk)
+  "Run THUNK (a graph mutation) on GRAPH's single writer thread and return its value.
+Funnels an app/user write through the SAME writer as the replication apply (WP-8), so
+on ECL a user write never runs concurrently with the writer-loop (which otherwise
+deadlocks intermittently).  Blocks until the writer applies it -- while it waits, it
+re-checks writer liveness (see %PEER-AWAIT-BARRIER) rather than racing a deadline, so a
+write queued behind a long pull-apply still completes.  Requires GRAPH be a :peer-role
+:device peer (its writer-loop is running); signals an error otherwise."
+  (let ((mailbox (peer-writer-mailbox graph)))
+    (unless mailbox
+      (error "peer-enqueue-write: no writer mailbox (graph is not a :device peer)"))
+    (let ((reply (make-mailbox)))
+      (send-message mailbox (make-peer-op :kind :local-write :thunk thunk :reply reply))
+      (car (%peer-await-barrier graph reply 30 300)))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Device: receive a pull and ack it.
