@@ -88,7 +88,8 @@
                (:file "prolog-functors" :depends-on ("prologc" "geometry" "geometry-ops"))
                (:file "spatial-query" :depends-on ("prolog-functors" "transactions" "spatial-index" "geometry-ops"))
                (:file "interface" :depends-on ("schema" "edge" "vertex" "views"))
-               (:file "traverse" :depends-on ("interface"))))
+               (:file "traverse" :depends-on ("interface"))
+               (:file "memory-graph" :depends-on ("traverse" "transactions" "graph"))))
 
 ;; REPLICATION: core + the usocket network transport, but NO HTTP server.  This is
 ;; the master/slave + hub/peer replication layer -- transaction-streaming (usocket
