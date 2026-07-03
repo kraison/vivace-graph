@@ -37,7 +37,7 @@ the graph predates the spatial index (backward compatible)."
                                    replication-filter
                                    peer-role origin-id peer-host
                                    export-predicate device-registry merge-policy
-                                   reference-classes)
+                                   reference-classes (peer-schema-version '(1 0)))
   "Create a brand-new graph named NAME with its on-disk files under the
 directory LOCATION, register it (so LOOKUP-GRAPH and *GRAPH* can find it), and
 return it.  The directory is created if necessary and must not already contain
@@ -158,6 +158,7 @@ to disk and remove it."
               (merge-policy graph) merge-policy
               (device-registry graph) device-registry
               (reference-classes graph) reference-classes
+              (peer-schema-version graph) peer-schema-version
               ;; B1/PT-8: reload the durable Lamport clock so it never resets on
               ;; restart (0 for a fresh graph, the persisted value on reopen).
               (lamport-counter graph) (load-lamport-counter graph)
@@ -185,7 +186,8 @@ to disk and remove it."
                    (accept-versions (list +storage-version+))
                    keep-revisions
                    peer-role origin-id peer-host
-                   export-predicate device-registry merge-policy)
+                   export-predicate device-registry merge-policy
+                   reference-classes (peer-schema-version '(1 0)))
   "Open the existing graph named NAME whose files live under directory
 LOCATION, register it, and return it.  Use this to reopen a graph created
 earlier with MAKE-GRAPH; the keyword arguments mirror MAKE-GRAPH's.
@@ -285,6 +287,7 @@ CLOSE-GRAPH when finished."
               (merge-policy graph) merge-policy
               (device-registry graph) device-registry
               (reference-classes graph) reference-classes
+              (peer-schema-version graph) peer-schema-version
               ;; B1/PT-8: recover the durable Lamport clock (monotonic across
               ;; restarts -- a reset would lose LWW races on post-restart writes).
               (lamport-counter graph) (load-lamport-counter graph)
