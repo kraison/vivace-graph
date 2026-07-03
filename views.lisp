@@ -484,6 +484,29 @@ once per entry you want the node to contribute (zero, one, or many times)."
 (defun view-less-than (key1 key2)
   (less-than (first key1) (first key2)))
 
+(defgeneric make-view-skip-list (graph view)
+  (:documentation "Create the ordered map backing VIEW.  A normal graph uses a
+heap skip-list (persisted via VIEW-POINTER); a memory-graph overrides this to
+return an in-RAM mem-skip-list.")
+  (:method ((graph graph) view)
+    (make-skip-list
+     :heap (indexes graph)
+     :duplicates-allowed-p nil
+     :key-equal 'reduce-equal
+     :key-comparison (if (eql :greaterp (view-sort-order view))
+                         'reduce-comp-greaterp 'reduce-comp-lessp)
+     :head-key (if (eql :greaterp (view-sort-order view))
+                   (list +max-sentinel+ +max-key+) (list +min-sentinel+ +null-key+))
+     :head-value nil
+     :tail-key (if (eql :greaterp (view-sort-order view))
+                   (list +min-sentinel+ +null-key+) (list +max-sentinel+ +max-key+))
+     :tail-value nil
+     :value-equal 'equal
+     :key-serializer 'view-key-serialize
+     :key-deserializer 'view-key-deserialize
+     :value-serializer 'serialize
+     :value-deserializer 'deserialize)))
+
 (defmethod regenerate-view ((graph graph) (class-name symbol) (view-name symbol))
   "Regenerate this view's index"
   (with-write-locked-view-group (class-name graph)
@@ -495,32 +518,14 @@ once per entry you want the node to contribute (zero, one, or many times)."
       ;; First, if exists, delete skip list
       (when (skip-list-p (view-skip-list view))
         (delete-skip-list (view-skip-list view)))
-      ;; Then, create a new skip list
-      (let ((sl (make-skip-list
-                 :heap (indexes graph)
-                 :duplicates-allowed-p nil
-                 ;;:key-equal 'view-key-equal
-                 ;;:key-comparison 'view-less-than
-                 :key-equal 'reduce-equal
-                 :key-comparison (if (eql :greaterp (view-sort-order view))
-                                     'reduce-comp-greaterp
-                                     'reduce-comp-lessp)
-                 :head-key (if (eql :greaterp (view-sort-order view))
-                               (list +max-sentinel+ +max-key+)
-                               (list +min-sentinel+ +null-key+))
-                 :head-value nil
-                 :tail-key (if (eql :greaterp (view-sort-order view))
-                               (list +min-sentinel+ +null-key+)
-                               (list +max-sentinel+ +max-key+))
-                 :tail-value nil
-                 :value-equal 'equal
-                 :key-serializer 'view-key-serialize
-                 :key-deserializer 'view-key-deserialize
-                 :value-serializer 'serialize
-                 :value-deserializer 'deserialize)))
-        (setf (view-skip-list view) sl
-              (view-pointer view) (%sl-address sl)
-              (view-heap view) (indexes graph)))
+      ;; Then, create a new skip list.  MAKE-VIEW-SKIP-LIST dispatches: a heap
+      ;; skip-list for a normal graph (persisted via VIEW-POINTER), an in-RAM
+      ;; mem-skip-list for a memory-graph (no pointer / heap).
+      (let ((sl (make-view-skip-list graph view)))
+        (setf (view-skip-list view) sl)
+        (when (skip-list-p sl)
+          (setf (view-pointer view) (%sl-address sl)
+                (view-heap view) (indexes graph))))
       (save-views graph)
       (cond ((subtypep class-name 'vertex)
              (map-vertices (lambda (vertex)

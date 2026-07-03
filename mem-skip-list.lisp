@@ -191,6 +191,33 @@ the leftmost match.  Returns the removed node or NIL."
           do (let ((r (funcall fn node))) (when collect-p (push r acc))))
     (when collect-p (nreverse acc))))
 
+;; find-in-skip-list / update-in-skip-list -- used by map-reduce views on the
+;; view's ordered map.  Return values mirror the on-disk methods (node + level).
+(defmethod find-in-skip-list ((sl mem-skip-list) key &optional preds succs)
+  (with-read-lock ((mem-skip-list-lock sl))
+    (let ((preds (or preds (make-array (mem-skip-list-max-level sl))))
+          (succs (or succs (make-array (mem-skip-list-max-level sl)))))
+      (%mem-find sl key preds succs)
+      (let ((node (aref succs 0)))
+        (if (and (not (eq node (mem-skip-list-tail sl)))
+                 (funcall (mem-skip-list-key-equal sl) key (%sn-key node)))
+            (values node 0 preds succs)
+            (values nil -1 preds succs))))))
+
+(defmethod update-in-skip-list ((sl mem-skip-list) key value &optional old-value)
+  "In-place update of the value under KEY (nodes are live, so just SETF the
+slot).  Returns the node, or NIL if KEY is absent."
+  (declare (ignore old-value))
+  (with-write-lock ((mem-skip-list-lock sl))
+    (let ((preds (make-array (mem-skip-list-max-level sl)))
+          (succs (make-array (mem-skip-list-max-level sl))))
+      (%mem-find sl key preds succs)
+      (let ((node (aref succs 0)))
+        (when (and (not (eq node (mem-skip-list-tail sl)))
+                   (funcall (mem-skip-list-key-equal sl) key (%sn-key node)))
+          (setf (%sn-value node) value)
+          node)))))
+
 (defun mem-skip-list-lookup (sl key &optional value value-p)
   "The value stored under KEY (or the (KEY,VALUE) node's value), or NIL."
   (with-read-lock ((mem-skip-list-lock sl))

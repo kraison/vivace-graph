@@ -257,7 +257,9 @@ journal + image, so an unclean shutdown is recovered, not an error)."
       (setf (gethash name *graphs*) graph)
       ;; Recovery runs BEFORE the transaction-manager is installed (the reaper
       ;; tolerates the unbound slot); the retain hook keeps the journal.
-      (recover-transactions graph))
+      (recover-transactions graph)
+      ;; Rebuild views in-RAM from the restored nodes (design §6).
+      (restore-views graph))
     (setf (transaction-manager graph)
           (make-instance 'transaction-manager :graph graph))
     (ensure-directories-exist (persistent-transaction-directory graph))
@@ -471,3 +473,38 @@ journal + image, so an unclean shutdown is recovered, not an error)."
                  (when collect-p (push r result))))
              (mem-table-data table))
     (when collect-p (nreverse result))))
+
+;;; ---------------------------------------------------------------------------
+;;; Step 4c -- views on the in-RAM skip-list.
+;;;
+;;; A view's ordered map is created through MAKE-VIEW-SKIP-LIST (the seam added in
+;;; views.lisp); a memory-graph returns an in-RAM mem-skip-list with the same view
+;;; comparison/sentinels the heap list uses, so all view maintenance (add-to-view
+;;; / update-in-views / remove-from-views) and querying (map-view /
+;;; invoke-graph-view / map-reduced-view) run UNCHANGED -- add/remove/find/update-
+;;; in-skip-list and the cursors are all generic now.
+;;; ---------------------------------------------------------------------------
+
+(defmethod make-view-skip-list ((graph memory-graph-mixin) view)
+  (make-mem-skip-list
+   :key-equal 'reduce-equal
+   :key-comparison (if (eql :greaterp (view-sort-order view))
+                       'reduce-comp-greaterp 'reduce-comp-lessp)
+   :value-equal 'equal
+   :head-key (if (eql :greaterp (view-sort-order view))
+                 (list +max-sentinel+ +max-key+) (list +min-sentinel+ +null-key+))
+   :head-value nil
+   :tail-key (if (eql :greaterp (view-sort-order view))
+                 (list +min-sentinel+ +null-key+) (list +max-sentinel+ +max-key+))
+   :tail-value nil
+   :duplicates-allowed-p nil))
+
+;; On open, the base RESTORE-VIEWS reconstructs the view objects from views.dat
+;; (a memory-graph's views have no heap pointer, so it opens no skip-list -- the
+;; view-skip-list is left NIL), then REGENERATE-ALL-VIEWS builds each view's
+;; mem-skip-list (via MAKE-VIEW-SKIP-LIST above) and repopulates it by scanning
+;; the restored nodes -- the design-§6 rebuild-on-open for views.
+(defmethod restore-views ((graph memory-graph-mixin))
+  (call-next-method)
+  (let ((*graph* graph))
+    (regenerate-all-views graph)))

@@ -505,7 +505,11 @@ L1: 50%, L2: 25%, L3: 12.5%, ..."
                        (aref succs level) curr)))))
     (values the-node level-found preds succs)))
 
-(defun find-in-skip-list (skip-list key &optional preds succs)
+;; Generic so a memory-graph's MEM-SKIP-LIST can supply its own (used by
+;; map-reduce views); the on-disk (heap) list is the method below.
+(defgeneric find-in-skip-list (skip-list key &optional preds succs))
+
+(defmethod find-in-skip-list ((skip-list skip-list) key &optional preds succs)
   (with-sl-read-lock (skip-list)
     (%find-in-skip-list skip-list key preds succs)))
 
@@ -610,7 +614,9 @@ L1: 50%, L2: 25%, L3: 12.5%, ..."
                    (unlock-skip-node skip-list lock)
                    (log:info "SKIP-LIST: Got null lock in ~A / ~A" key value)))))))))
 
-(defun update-in-skip-list (skip-list key value &optional old-value)
+(defgeneric update-in-skip-list (skip-list key value &optional old-value))
+
+(defmethod update-in-skip-list ((skip-list skip-list) key value &optional old-value)
   (with-sl-write-lock (skip-list)
     (let ((lock nil))
       (let ((node (%find-in-skip-list skip-list key)))
