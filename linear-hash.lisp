@@ -771,18 +771,22 @@
       (error c)))
   (read-lhash-count lhash))
 
-(defun map-lhash (fn lhash &key collect-p)
-  (with-read-lock ((%lhash-split-lock lhash))
-    (let ((result nil) (bucket-count (%bucket-count lhash)))
-      (dotimes (bucket bucket-count)
-        (let* ((offset (bucket-offset lhash bucket))
-               (items (read-bucket lhash (%lhash-table lhash) offset)))
-          (dolist (item items)
-            (if collect-p
-                (push (funcall fn item) result)
-                (funcall fn item)))))
-      (when collect-p
-        (nreverse result)))))
+;; Generic so an alternative table backend (the in-RAM MEM-TABLE of a
+;; memory-graph) can supply its own scan; FN is called with a (KEY . VALUE) cons,
+;; the same shape the lhash method yields.
+(defgeneric map-lhash (fn table &key collect-p)
+  (:method (fn (lhash lhash) &key collect-p)
+    (with-read-lock ((%lhash-split-lock lhash))
+      (let ((result nil) (bucket-count (%bucket-count lhash)))
+        (dotimes (bucket bucket-count)
+          (let* ((offset (bucket-offset lhash bucket))
+                 (items (read-bucket lhash (%lhash-table lhash) offset)))
+            (dolist (item items)
+              (if collect-p
+                  (push (funcall fn item) result)
+                  (funcall fn item)))))
+        (when collect-p
+          (nreverse result))))))
 
 (defun analyze-lhash (lhash)
   (with-read-lock ((%lhash-split-lock lhash))

@@ -113,11 +113,11 @@ Shared by MAKE-MEMORY-GRAPH and OPEN-MEMORY-GRAPH."
                  :edge-table (make-mem-table)
                  :heap nil
                  :indexes nil
-                 :ve-index-in nil
-                 :ve-index-out nil
-                 :vev-index nil
-                 :vertex-index nil
-                 :edge-index nil
+                 :ve-index-in (make-mem-ve-index)
+                 :ve-index-out (make-mem-ve-index)
+                 :vev-index (make-mem-vev-index)
+                 :vertex-index (make-mem-type-index)
+                 :edge-index (make-mem-type-index)
                  :spatial-index nil))
 
 (defun %write-dirty-marker (path)
@@ -193,7 +193,15 @@ was restored, NIL if none was present."
           (cl-store:restore file)
         (declare (ignore version highest-tx-id))
         (dolist (v vertices) (mem-table-put (vertex-table graph) (id v) v))
-        (dolist (e edges)     (mem-table-put (edge-table graph) (id e) e)))
+        (dolist (e edges)     (mem-table-put (edge-table graph) (id e) e))
+        ;; The image pickles only the node tables; the indexes are derived, so
+        ;; rebuild them from the restored nodes (cheap; the "rebuild on open"
+        ;; shortcut of design §6, here for the ve/vev/type indexes).  Idempotent:
+        ;; mem-index-list is a set.  Deleted nodes stay indexed (parity), scans
+        ;; filter them.
+        (let ((*graph* graph))
+          (dolist (v vertices) (add-node-to-indexes v graph :unless-present t))
+          (dolist (e edges)     (add-node-to-indexes e graph :unless-present t))))
       t)))
 
 (defun clear-memory-journal (graph)
@@ -274,7 +282,12 @@ journal + image, so an unclean shutdown is recovered, not an error)."
           (written-p node) t
           (commit-epoch node) *commit-epoch*
           (prev-pointer node) 0)
-    (mem-table-put table (id node) node))
+    (mem-table-put table (id node) node)
+    ;; Index maintenance mirrors the on-disk tx-create: type-index for every node,
+    ;; plus ve/vev adjacency for edges (add-node-to-indexes dispatches).  Update /
+    ;; delete don't touch the indexes (parity); the id stays and scans filter it.
+    (add-node-to-indexes node graph
+                         :unless-present *add-to-indexes-unless-present-p*))
   write)
 
 ;; Update (and, by inheritance, delete -- the node then carries DELETED-P):
@@ -308,3 +321,132 @@ journal + image, so an unclean shutdown is recovered, not an error)."
 
 (defmethod snapshot ((graph memory-graph-mixin) &key &allow-other-keys)
   nil)
+
+;;; ---------------------------------------------------------------------------
+;;; Step 3 -- in-RAM index mirrors (decision #2: mirror ve/vev/type-index shapes).
+;;;
+;;; Each on-disk index maps a key to an INDEX-LIST (a heap pcons chain of ids);
+;;; the in-RAM analogue maps the same key to a MEM-INDEX-LIST -- a hash set of
+;;; ids (equalp on uuid arrays).  The high-level scans (MAP-VERTICES / MAP-EDGES /
+;;; OUTGOING-EDGES / traversal) are unchanged: their primitives (GET-TYPE-INDEX-
+;;; LIST, LOOKUP-VE-*-INDEX-LIST, LOOKUP-VEV-INDEX-LIST, MAP-INDEX-LIST, MAP-LHASH)
+;;; are generic and dispatch onto these mem types.  Because a MEM-INDEX-LIST is a
+;;; set, adds are inherently pushnew (dedup), so replay/rebuild is idempotent.
+;;;
+;;; Only tx-create touches the indexes (mirroring the on-disk path); a delete is a
+;;; soft-delete that leaves the id in the index, and the scans filter it via the
+;;; per-node DELETED-P / ACTIVE-EDGE-P guard after LOOKUP -- exact parity.
+;;; ---------------------------------------------------------------------------
+
+(defstruct (mem-index-list (:constructor %make-mem-index-list)
+                           (:predicate mem-index-list-p))
+  (ids (make-hash-table :test 'equalp)))  ; id (uuid) -> t ; set semantics
+
+(declaim (inline make-mem-index-list))
+(defun make-mem-index-list () (%make-mem-index-list))
+(defun mem-index-list-add (mil id) (setf (gethash id (mem-index-list-ids mil)) t))
+(defun mem-index-list-del (mil id) (remhash id (mem-index-list-ids mil)))
+
+(defmethod map-index-list (fn (il mem-index-list) &key collect-p include-deleted-p)
+  ;; The set holds ids only; the caller filters deleted nodes after LOOKUP, so
+  ;; INCLUDE-DELETED-P is irrelevant here (mirrors how map-vertices/edges work).
+  (declare (ignore include-deleted-p))
+  (let ((acc '()))
+    (maphash (lambda (id v)
+               (declare (ignore v))
+               (let ((r (funcall fn id))) (when collect-p (push r acc))))
+             (mem-index-list-ids il))
+    (when collect-p (nreverse acc))))
+
+;;; type-index: type-id (integer) -> mem-index-list of node ids.
+(defstruct (mem-type-index (:constructor %make-mem-type-index)
+                           (:predicate mem-type-index-p))
+  (data (make-hash-table :test 'eql
+                         #+sbcl :synchronized #+sbcl t
+                         #+ccl :shared #+ccl t
+                         #+lispworks :single-thread #+lispworks nil)))
+(defun make-mem-type-index () (%make-mem-type-index))
+
+(defun %mem-ti-list (idx type-id &optional create)
+  (or (gethash type-id (mem-type-index-data idx))
+      (when create
+        (setf (gethash type-id (mem-type-index-data idx)) (make-mem-index-list)))))
+
+(defmethod get-type-index-list ((idx mem-type-index) (type-id integer))
+  (%mem-ti-list idx type-id))
+
+(defmethod type-index-push ((uuid array) (type-id integer) (idx mem-type-index)
+                            &key unless-present)
+  (declare (ignore unless-present))     ; set semantics => always pushnew
+  (mem-index-list-add (%mem-ti-list idx type-id t) uuid))
+
+(defmethod type-index-remove ((uuid array) (type-id integer) (idx mem-type-index))
+  (let ((il (%mem-ti-list idx type-id)))
+    (when il (mem-index-list-del il uuid))))
+
+;;; ve-index: ve-key -> mem-index-list of edge ids (in and out are separate
+;;; instances, as on disk).  ve-key / vev-key are structs, so EQUALP hashing keys
+;;; them by (id-array, type-id) content -- the same identity VE-KEY-EQUAL uses.
+(defstruct (mem-ve-index (:constructor %make-mem-ve-index)
+                         (:predicate mem-ve-index-p))
+  (data (make-hash-table :test 'equalp
+                         #+sbcl :synchronized #+sbcl t
+                         #+ccl :shared #+ccl t
+                         #+lispworks :single-thread #+lispworks nil)))
+(defun make-mem-ve-index () (%make-mem-ve-index))
+
+(defmethod ve-index-push ((idx mem-ve-index) (key ve-key) (id array)
+                          &key unless-present)
+  (declare (ignore unless-present))
+  (let ((il (or (gethash key (mem-ve-index-data idx))
+                (setf (gethash key (mem-ve-index-data idx)) (make-mem-index-list)))))
+    (mem-index-list-add il id)))
+
+(defmethod ve-index-remove ((idx mem-ve-index) (key ve-key) (id array))
+  (let ((il (gethash key (mem-ve-index-data idx))))
+    (when il (mem-index-list-del il id))))
+
+(defmethod lookup-ve-in-index-list ((key ve-key) (graph memory-graph-mixin))
+  (gethash key (mem-ve-index-data (ve-index-in graph))))
+
+(defmethod lookup-ve-out-index-list ((key ve-key) (graph memory-graph-mixin))
+  (gethash key (mem-ve-index-data (ve-index-out graph))))
+
+;;; vev-index: vev-key -> mem-index-list of edge ids.  add-to-vev-index inlines
+;;; its lhash ops on disk (no vev-index-push generic), so override it directly.
+(defstruct (mem-vev-index (:constructor %make-mem-vev-index)
+                          (:predicate mem-vev-index-p))
+  (data (make-hash-table :test 'equalp
+                         #+sbcl :synchronized #+sbcl t
+                         #+ccl :shared #+ccl t
+                         #+lispworks :single-thread #+lispworks nil)))
+(defun make-mem-vev-index () (%make-mem-vev-index))
+
+(defmethod add-to-vev-index ((edge edge) (graph memory-graph-mixin) &key unless-present)
+  (declare (ignore unless-present))
+  (let* ((idx (vev-index graph))
+         (key (make-vev-key :in-id (to edge) :out-id (from edge)
+                            :type-id (type-id edge)))
+         (il (or (gethash key (mem-vev-index-data idx))
+                 (setf (gethash key (mem-vev-index-data idx)) (make-mem-index-list)))))
+    (mem-index-list-add il (id edge))))
+
+(defmethod remove-from-vev-index ((edge edge) (graph memory-graph-mixin))
+  (let* ((idx (vev-index graph))
+         (key (make-vev-key :in-id (to edge) :out-id (from edge)
+                            :type-id (type-id edge)))
+         (il (gethash key (mem-vev-index-data idx))))
+    (when il (mem-index-list-del il (id edge)))))
+
+(defmethod lookup-vev-index-list ((key vev-key) (graph memory-graph-mixin))
+  (gethash key (mem-vev-index-data (vev-index graph))))
+
+;;; Untyped MAP-VERTICES / MAP-EDGES scan: walk the mem-table, yielding the same
+;;; (id . node) cons the lhash method yields.
+(defmethod map-lhash (fn (table mem-table) &key collect-p)
+  (let ((result nil))
+    (maphash (lambda (id node)
+               (let ((r (funcall fn (cons id node))))
+                 (when collect-p (push r result))))
+             (mem-table-data table))
+    (when collect-p (nreverse result))))
