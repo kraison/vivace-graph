@@ -138,6 +138,59 @@ open).  Registers the graph and returns it."
       graph)))
 
 ;;; ---------------------------------------------------------------------------
+;;; Step 2 -- node-op overrides for the mem-table path.
+;;;
+;;; The heap/allocator helpers (MAYBE-WRITE-TO-HEAP, ARCHIVE-NODE-VERSION,
+;;; REAP-NODE-CHAIN) are plain DEFUNs, so the memory path simply never invokes
+;;; them: a memory node keeps DATA live and DATA-POINTER 0.  That single fact
+;;; makes ENSURE-NODE-BYTES a natural no-op (it only touches the heap when
+;;; data-pointer > 0), and makes RESOLVE-VERSION-AT-EPOCH and REAP-OLD-VERSIONS
+;;; short-circuit on the empty (prev-pointer 0) version chain without ever
+;;; dereferencing the (nil) heap.  So the only overrides Step 2 needs are the two
+;;; write appliers, the table lookup, and a no-op spatial pass (the real indexes,
+;;; views and spatial index arrive in the next increments).
+;;; ---------------------------------------------------------------------------
+
+;; Read: the mem-table IS the authoritative store -- return the live node.
+(defmethod lookup-node ((table mem-table) key graph)
+  (declare (ignore graph))
+  (mem-table-get table key))
+
+;; Create: publish the live node into the mem-table.  No heap write, no index
+;; update yet (Step 3), no version chain (MVCC dropped).  Mirrors the on-disk
+;; tx-create's node-head bookkeeping (revision / written-p / commit-epoch) so the
+;; OCC validator and the read guards behave identically.
+(defmethod apply-tx-write ((write tx-create) (graph memory-graph-mixin))
+  (let ((table (tx-write-table write graph))
+        (node (node write)))
+    (setf (revision node) 0
+          (written-p node) t
+          (commit-epoch node) *commit-epoch*
+          (prev-pointer node) 0)
+    (mem-table-put table (id node) node))
+  write)
+
+;; Update (and, by inheritance, delete -- the node then carries DELETED-P):
+;; publish the new immutable node by atomic slot replacement, so a lock-free
+;; reader sees the whole old or new node, never a torn one.  No archive:
+;; prev-pointer stays 0.
+(defmethod apply-tx-write ((write tx-update) (graph memory-graph-mixin))
+  (let ((new-node (node write))
+        (old-node (old-node write))
+        (table (tx-write-table write graph)))
+    (setf (revision new-node) (ldb (byte 32 0) (1+ (revision old-node)))
+          (commit-epoch new-node) *commit-epoch*
+          (prev-pointer new-node) 0)
+    (mem-table-put table (id new-node) new-node))
+  write)
+
+;; The spatial index is a first-class v1 feature, but it arrives in Step 4; until
+;; then a memory-graph has no spatial-index, so its apply pass is a no-op.
+(defmethod apply-tx-writes-to-spatial-index (writes (graph memory-graph-mixin))
+  (declare (ignore writes))
+  nil)
+
+;;; ---------------------------------------------------------------------------
 ;;; Snapshot stub.  A memory-graph rebuilds from snapshot + journal on open; the
 ;;; real snapshot writer arrives with the durability increment.  For now CLOSE-
 ;;; GRAPH's default :SNAPSHOT-P T must not error, so provide a no-op that logs.
