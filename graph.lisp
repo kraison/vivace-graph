@@ -36,7 +36,8 @@ the graph predates the spatial index (backward compatible)."
                                    (spatial-precision 7)
                                    replication-filter
                                    peer-role origin-id peer-host
-                                   export-predicate device-registry merge-policy)
+                                   export-predicate device-registry merge-policy
+                                   reference-classes)
   "Create a brand-new graph named NAME with its on-disk files under the
 directory LOCATION, register it (so LOOKUP-GRAPH and *GRAPH* can find it), and
 return it.  The directory is created if necessary and must not already contain
@@ -156,6 +157,7 @@ to disk and remove it."
               (export-predicate graph) export-predicate
               (merge-policy graph) merge-policy
               (device-registry graph) device-registry
+              (reference-classes graph) reference-classes
               ;; B1/PT-8: reload the durable Lamport clock so it never resets on
               ;; restart (0 for a fresh graph, the persisted value on reopen).
               (lamport-counter graph) (load-lamport-counter graph)
@@ -282,6 +284,7 @@ CLOSE-GRAPH when finished."
               (export-predicate graph) export-predicate
               (merge-policy graph) merge-policy
               (device-registry graph) device-registry
+              (reference-classes graph) reference-classes
               ;; B1/PT-8: recover the durable Lamport clock (monotonic across
               ;; restarts -- a reset would lose LWW races on post-restart writes).
               (lamport-counter graph) (load-lamport-counter graph)

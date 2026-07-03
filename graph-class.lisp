@@ -156,6 +156,12 @@
                  a locally-held node.  Mirrors EXPORT-PREDICATE -- domain (bucketing +
                  safety semantics) in the app, mechanism in the engine.  NIL = no
                  merge (an incoming edit just overwrites, i.e. Branch A behaviour).")
+   (reference-classes :accessor reference-classes :initarg :reference-classes :initform nil
+                      :documentation "Hub role: a list of vertex-type names shipped to EVERY
+                      device by CLASS -- global reference data (e.g. the ordnance catalogue)
+                      that is not reachable from any device's site roots.  SCOPE-NODE-SET
+                      unions every disclosable vertex of these classes (subclass-inclusive)
+                      into the pulled set, independent of the roots walk.")
    (peer-conflicts :accessor peer-conflicts :initarg :peer-conflicts :initform nil
                    :documentation "Branch B: surfaced field conflicts retained for the
                    app review surface (a list of PEER-CONFLICT for now; B3 makes it a

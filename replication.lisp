@@ -70,7 +70,18 @@ node-id -> node, holding exactly the disclosable closure."
                 (when (and other (disc other))
                   ;; both endpoints disclosable -> keep the edge (closed rule)
                   (setf (gethash (id e) eset) e)
-                  (visit other))))))))
+                  (visit other))))))
+        ;; Reference-set (hub role): ship global reference data by CLASS -- every
+        ;; disclosable vertex of a REFERENCE-CLASS (subclass-inclusive), independent of
+        ;; the roots walk.  Added to VSET but NOT enqueued, so its own edges are never
+        ;; followed -> no walk-back into out-of-scope neighbours.  E.g. the ordnance
+        ;; catalogue: the device gets every ordnance-type so it can classify new finds,
+        ;; while the hub-only ordnance-detail/country neighbours stay behind.
+        (dolist (class (and (typep graph 'peer-graph) (reference-classes graph)))
+          (map-vertices (lambda (v)
+                          (when (and (not (gethash (id v) vset)) (disc v))
+                            (setf (gethash (id v) vset) v)))
+                        graph :vertex-type class :include-subclasses-p t))))
     (values vset eset)))
 
 (defun reconcile-manifest (graph roots device-scope manifest &key edge-types)
