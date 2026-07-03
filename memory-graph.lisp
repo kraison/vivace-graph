@@ -97,6 +97,20 @@ generics dispatch on this class."))
 ;;; type-guarded teardown tolerates.
 ;;; ---------------------------------------------------------------------------
 
+(defun make-mem-spatial-index (&key (precision 7))
+  "A spatial-index whose skip-list slot is an in-RAM mem-skip-list (geohash
+string -> node id, duplicates allowed).  Every spatial op -- insert / remove /
+query-bbox / query-radius -- goes through spatial-index-skip-list ->
+add-to-skip-list / make-range-cursor, which dispatch to the mem list, so all of
+spatial-index.lisp (and the base apply-tx-write-to-spatial-index maintenance)
+runs UNCHANGED on a memory-graph.  All the geohash covering math is reused as-is."
+  (%make-spatial-index
+   :skip-list (make-mem-skip-list :key-comparison #'string< :key-equal #'string=
+                                  :value-equal #'equalp :duplicates-allowed-p t
+                                  :head-key +spatial-min-key+ :head-value +null-key+
+                                  :tail-key +spatial-max-key+ :tail-value +max-key+)
+   :heap nil :precision precision))
+
 (defun %make-empty-memory-graph (name location)
   "A fresh MEMORY-GRAPH shell with empty in-RAM tables (no schema/txn wiring yet).
 Shared by MAKE-MEMORY-GRAPH and OPEN-MEMORY-GRAPH."
@@ -118,7 +132,7 @@ Shared by MAKE-MEMORY-GRAPH and OPEN-MEMORY-GRAPH."
                  :vev-index (make-mem-vev-index)
                  :vertex-index (make-mem-type-index)
                  :edge-index (make-mem-type-index)
-                 :spatial-index nil))
+                 :spatial-index (make-mem-spatial-index)))
 
 (defun %write-dirty-marker (path)
   (with-open-file (out (format nil "~A/.dirty" path) :direction :output
@@ -201,7 +215,16 @@ was restored, NIL if none was present."
         ;; filter them.
         (let ((*graph* graph))
           (dolist (v vertices) (add-node-to-indexes v graph :unless-present t))
-          (dolist (e edges)     (add-node-to-indexes e graph :unless-present t))))
+          (dolist (e edges)     (add-node-to-indexes e graph :unless-present t))
+          ;; Rebuild the spatial index too (derived; the image pickles only nodes).
+          (let ((idx (spatial-index graph)))
+            (when idx
+              (flet ((reindex (n)
+                       (let ((geom (node-geometry n)))
+                         (when (and geom (not (deleted-p n)))
+                           (spatial-index-insert idx (id n) geom)))))
+                (dolist (v vertices) (reindex v))
+                (dolist (e edges)    (reindex e)))))))
       t)))
 
 (defun clear-memory-journal (graph)
@@ -304,11 +327,9 @@ journal + image, so an unclean shutdown is recovered, not an error)."
     (mem-table-put table (id new-node) new-node))
   write)
 
-;; The spatial index is a first-class v1 feature, but it arrives in Step 4; until
-;; then a memory-graph has no spatial-index, so its apply pass is a no-op.
-(defmethod apply-tx-writes-to-spatial-index (writes (graph memory-graph-mixin))
-  (declare (ignore writes))
-  nil)
+;; Spatial index maintenance (Step 4b): a memory-graph now carries a mem-backed
+;; spatial-index (make-mem-spatial-index), so the BASE apply-tx-writes-to-spatial-
+;; index runs unchanged -- no memory override needed (the Step-2 no-op is gone).
 
 ;;; ---------------------------------------------------------------------------
 ;;; Portable s-expr SNAPSHOT.  Durability on a memory-graph is the cl-store image
