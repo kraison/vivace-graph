@@ -2179,10 +2179,19 @@ See CALL-WITH-READ-SNAPSHOT."
         (when (and tmp (not renamed))
           (ignore-errors (delete-file tmp)))))))
 
+(defgeneric retain-committed-transaction-p (graph)
+  (:documentation "When true, GRAPH keeps committed .txn files as its durable
+journal instead of discarding them after apply.  On-disk graphs return NIL -- the
+mmap heap is the durable copy, so the write-ahead entry is dropped once applied.
+A memory-graph returns T: it has no heap, so the journal (compacted by a cl-store
+image / snapshot at each clean close) is its only durable record.")
+  (:method (graph) (declare (ignore graph)) nil))
+
 (defmethod cleanup-transaction ((tx tx))
   (let ((transaction-manager (transaction-manager tx)))
     (if (eql (state tx) :committed)
-        (mark-as-committed (transaction-pathname tx))
+        (unless (retain-committed-transaction-p (graph tx))
+          (mark-as-committed (transaction-pathname tx)))
         (remove-transaction tx transaction-manager))))
 
 
@@ -2246,7 +2255,11 @@ Signals NO-TRANSACTION-IN-PROGRESS if none is active."
       (let ((transaction (load-recovery-transaction transaction-file))
             (*add-to-indexes-unless-present-p* t))
         (apply-transaction transaction graph)
-        (mark-as-committed transaction-file)))))
+        ;; A memory-graph keeps its journal until a clean-close checkpoint clears
+        ;; it, so replay must not consume the tail (a crash between open and the
+        ;; next checkpoint would otherwise lose it).
+        (unless (retain-committed-transaction-p graph)
+          (mark-as-committed transaction-file))))))
 
 (defclass restore-transaction (recovery-transaction) ()
   (:default-initargs
