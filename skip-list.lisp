@@ -545,7 +545,12 @@ L1: 50%, L2: 25%, L3: 12.5%, ..."
   (with-sl-read-lock (skip-list)
     (%find-kv-in-skip-list skip-list key value preds succs)))
 
-(defun add-to-skip-list (skip-list key value)
+;; Generic so an alternative ordered-map backend (the in-RAM MEM-SKIP-LIST used
+;; by a memory-graph) can supply its own insert; the on-disk (heap) list is the
+;; method below.  Consumers -- views, spatial index -- call this unchanged.
+(defgeneric add-to-skip-list (skip-list key value))
+
+(defmethod add-to-skip-list ((skip-list skip-list) key value)
   (with-sl-write-lock (skip-list)
     (log:debug "ADDING ~A/~A TO ~A" key value skip-list)
     (let ((top-level (random-level (%sl-max-level skip-list)))
@@ -656,7 +661,10 @@ L1: 50%, L2: 25%, L3: 12.5%, ..."
        (= (%sn-level node) (1+ level))
        (not (%sn-marked-p skip-list node))))
 
-(defun remove-from-skip-list (skip-list key &optional (value nil value-supplied-p))
+(defgeneric remove-from-skip-list (skip-list key &optional value))
+
+(defmethod remove-from-skip-list ((skip-list skip-list) key
+                                  &optional (value nil value-supplied-p))
   "Remove a node from SKIP-LIST.  With VALUE, removes the specific key/value
 pair (needed for duplicate-key lists); without it, removes one occurrence of
 KEY (arbitrary when duplicates exist).  Returns T if a node was removed, NIL if

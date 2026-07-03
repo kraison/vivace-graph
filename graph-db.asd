@@ -61,6 +61,7 @@
                (:file "cursors" :depends-on ("package"))
                (:file "skip-list" :depends-on ("allocator" "linear-hash"))
                (:file "skip-list-cursors" :depends-on ("skip-list" "cursors"))
+               (:file "mem-skip-list" :depends-on ("skip-list-cursors"))
                (:file "spatial-index" :depends-on ("skip-list-cursors" "geometry" "geohash" "geometry-ops"))
                (:file "index-list" :depends-on ("linear-hash" "allocator"))
                (:file "ve-index" :depends-on ("skip-list-cursors" "index-list" "graph-class"))
@@ -89,7 +90,7 @@
                (:file "spatial-query" :depends-on ("prolog-functors" "transactions" "spatial-index" "geometry-ops"))
                (:file "interface" :depends-on ("schema" "edge" "vertex" "views"))
                (:file "traverse" :depends-on ("interface"))
-               (:file "memory-graph" :depends-on ("traverse" "transactions" "graph"))))
+               (:file "memory-graph" :depends-on ("traverse" "transactions" "graph" "mem-skip-list"))))
 
 ;; REPLICATION: core + the usocket network transport, but NO HTTP server.  This is
 ;; the master/slave + hub/peer replication layer -- transaction-streaming (usocket
