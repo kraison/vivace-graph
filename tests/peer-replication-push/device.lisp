@@ -64,14 +64,24 @@
         (format t "~&DEVICE: hub never became ready~%") (dexit 1))
       (let* ((dir  (uiop:getenv "REPL_DEVICE_DIR"))
              (port (parse-integer (uiop:getenv "REPL_PORT")))
-             (g (make-graph :push-test-app dir
-                            :peer-role :device
-                            :origin-id *device-origin*
-                            :peer-host "localhost"
-                            :replication-port port
-                            :replication-key "peer-secret"
-                            :merge-policy (push-merge-policy)
-                            :buffer-pool-size 1000)))
+             ;; REPL_DEVICE_MEMORY -> in-memory device (memory-peer-graph); the
+             ;; authored-write / push path is identical (the ship mobile config).
+             (g (if (uiop:getenv "REPL_DEVICE_MEMORY")
+                    (make-memory-graph :push-test-app dir
+                                       :peer-role :device
+                                       :origin-id *device-origin*
+                                       :peer-host "localhost"
+                                       :replication-port port
+                                       :replication-key "peer-secret"
+                                       :merge-policy (push-merge-policy))
+                    (make-graph :push-test-app dir
+                                :peer-role :device
+                                :origin-id *device-origin*
+                                :peer-host "localhost"
+                                :replication-port port
+                                :replication-key "peer-secret"
+                                :merge-policy (push-merge-policy)
+                                :buffer-pool-size 1000))))
         (let ((*graph* g))
           (flet ((the-find ()
                    (first (map-vertices #'identity g :collect-p t :vertex-type 'pf-find))))

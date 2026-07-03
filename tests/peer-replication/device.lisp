@@ -77,13 +77,24 @@
         (format t "~&DEVICE: hub never became ready~%") (dexit 1))
       (let* ((dir  (uiop:getenv "REPL_DEVICE_DIR"))
              (port (parse-integer (uiop:getenv "REPL_PORT")))
-             (g (make-graph :peer-test-app dir
-                            :peer-role :device
-                            :origin-id *device-origin*
-                            :peer-host "localhost"
-                            :replication-port port
-                            :replication-key "peer-secret"
-                            :buffer-pool-size 1000)))
+             ;; REPL_DEVICE_MEMORY opts the device into the in-memory backend
+             ;; (memory-peer-graph) instead of the on-disk one; the peer transport
+             ;; and every check below are identical -- this exercises the exact
+             ;; mobile ship path (SBCL hub <-> in-memory ECL device).
+             (g (if (uiop:getenv "REPL_DEVICE_MEMORY")
+                    (make-memory-graph :peer-test-app dir
+                                       :peer-role :device
+                                       :origin-id *device-origin*
+                                       :peer-host "localhost"
+                                       :replication-port port
+                                       :replication-key "peer-secret")
+                    (make-graph :peer-test-app dir
+                                :peer-role :device
+                                :origin-id *device-origin*
+                                :peer-host "localhost"
+                                :replication-port port
+                                :replication-key "peer-secret"
+                                :buffer-pool-size 1000))))
         ;; Run the device a MINOR version ahead of the hub (1 3) vs (1 0): a
         ;; same-major drift that must still sync degraded-safe (WP-6/PT-6).
         (setf (peer-schema-version g) '(1 3))

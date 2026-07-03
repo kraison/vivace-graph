@@ -85,6 +85,18 @@ generics dispatch on this class."))
   ()
   (:documentation "A standalone in-memory graph (no replication)."))
 
+;; The in-memory peer: memory storage backend x peer replication role.  The peer
+;; transport (peer-sync / peer-writer-loop / peer-enqueue-write, in
+;; graph-db/replication) dispatches on PEER-GRAPH, and every node mutation funnels
+;; through the shared apply seam (apply-transaction / apply-tx-write), so the
+;; memory apply methods (specialized on MEMORY-GRAPH-MIXIN) maintain the in-RAM
+;; store for both pulled and locally-authored ops.  The peer's own durable state
+;; (applied-op-ids lhash, lamport / field-stamps / conflict files) stays
+;; file-backed, orthogonal to the in-RAM node storage.
+(defclass memory-peer-graph (memory-graph-mixin peer-graph)
+  ()
+  (:documentation "An in-memory peer-graph (hub or device)."))
+
 (defgeneric memory-graph-p (thing)
   (:method ((graph memory-graph-mixin)) graph)
   (:method (thing) (declare (ignore thing)) nil))
@@ -111,12 +123,16 @@ runs UNCHANGED on a memory-graph.  All the geohash covering math is reused as-is
                                   :tail-key +spatial-max-key+ :tail-value +max-key+)
    :heap nil :precision precision))
 
-(defun %make-empty-memory-graph (name location)
-  "A fresh MEMORY-GRAPH shell with empty in-RAM tables (no schema/txn wiring yet).
-Shared by MAKE-MEMORY-GRAPH and OPEN-MEMORY-GRAPH."
-  (make-instance 'memory-graph
+(defun %make-empty-memory-graph (name location &key (class 'memory-graph)
+                                                 replication-key replication-port)
+  "A fresh CLASS shell with empty in-RAM tables (no schema/txn wiring yet).
+Shared by MAKE-MEMORY-GRAPH and OPEN-MEMORY-GRAPH; CLASS is MEMORY-GRAPH or
+MEMORY-PEER-GRAPH."
+  (make-instance class
                  :graph-name name
                  :location location
+                 :replication-key replication-key
+                 :replication-port replication-port
                  :views
                  #+sbcl (make-hash-table :synchronized t)
                  #+ccl (make-hash-table :shared t)
@@ -139,18 +155,63 @@ Shared by MAKE-MEMORY-GRAPH and OPEN-MEMORY-GRAPH."
                                                      :if-exists :supersede)
     (format out "~S" (get-universal-time))))
 
-(defun make-memory-graph (name location &key package)
-  "Create a brand-new in-memory graph named NAME.  LOCATION is still used for the
+(defun %validate-peer-role (peer-role origin-id)
+  (when (and peer-role (not (member peer-role '(:hub :device))))
+    (error ":PEER-ROLE must be :HUB or :DEVICE, got ~S" peer-role))
+  (when (and (eq peer-role :device) (null origin-id))
+    (error "a :DEVICE memory-peer-graph requires a hub-minted :ORIGIN-ID")))
+
+(defun %init-memory-peer-slots (graph mode path peer-role origin-id peer-host
+                                export-predicate device-registry merge-policy
+                                reference-classes peer-schema-version)
+  "Populate a memory-peer-graph's peer slots, mirroring MAKE-GRAPH/OPEN-GRAPH's
+peer branch.  The peer state is file/lhash-backed (orthogonal to the in-RAM node
+store): the durable Lamport clock, per-field stamps, conflict records, and the
+applied-op-id dedup lhash (opened when MODE is :OPEN and it already exists)."
+  (setf (peer-role graph) peer-role
+        (origin-id graph) origin-id
+        (peer-host graph) peer-host
+        (export-predicate graph) export-predicate
+        (merge-policy graph) merge-policy
+        (device-registry graph) device-registry
+        (reference-classes graph) reference-classes
+        (peer-schema-version graph) peer-schema-version
+        (lamport-counter graph) (load-lamport-counter graph)
+        (field-stamps graph) (load-field-stamps graph)
+        (peer-conflicts graph) (load-peer-conflicts graph)
+        (applied-op-ids graph)
+        (let ((loc (format nil "~A/applied-ops/" path)))
+          (if (and (eq mode :open) (probe-file (format nil "~Astruct.dat" loc)))
+              (open-lhash loc)
+              (make-lhash :location loc :buckets 8)))))
+
+(defun make-memory-graph (name location
+                          &key package replication-port replication-key
+                            peer-role origin-id peer-host
+                            export-predicate device-registry merge-policy
+                            reference-classes (peer-schema-version '(1 0)))
+  "Create a brand-new in-memory graph named NAME.  LOCATION is used for the
 durable journal, cl-store image and schema (the RAM structures are rebuilt from
-them on OPEN-MEMORY-GRAPH).  Registers the graph and returns it."
+them on OPEN-MEMORY-GRAPH).  With :PEER-ROLE (:HUB or :DEVICE, a :DEVICE also
+needs a hub-minted :ORIGIN-ID) a MEMORY-PEER-GRAPH is built and the peer
+replication path is wired.  Registers the graph and returns it."
+  (%validate-peer-role peer-role origin-id)
   (ensure-directories-exist location)
   (let* ((path (pathname location))
-         (graph (%make-empty-memory-graph name path)))
+         (graph (%make-empty-memory-graph
+                 name path
+                 :class (if peer-role 'memory-peer-graph 'memory-graph)
+                 :replication-key replication-key
+                 :replication-port replication-port)))
     (let ((*graph* graph))
       (init-schema graph)
       (update-schema graph)
       (%write-dirty-marker path)
       (setf (gethash name *graphs*) graph))
+    (when peer-role
+      (%init-memory-peer-slots graph :make path peer-role origin-id peer-host
+                               export-predicate device-registry merge-policy
+                               reference-classes peer-schema-version))
     (setf (transaction-manager graph)
           (make-instance 'transaction-manager :graph graph))
     (ensure-directories-exist (persistent-transaction-directory graph))
@@ -234,15 +295,25 @@ was restored, NIL if none was present."
                          :defaults (persistent-transaction-directory graph))))
     (ignore-errors (delete-file f))))
 
-(defun open-memory-graph (name location &key package)
+(defun open-memory-graph (name location
+                          &key package replication-port replication-key
+                            peer-role origin-id peer-host
+                            export-predicate device-registry merge-policy
+                            reference-classes (peer-schema-version '(1 0)))
   "Reopen the in-memory graph NAME from LOCATION: restore the schema, restore the
 cl-store image checkpoint (if any), then replay the retained .txn journal tail.
 Tolerates a .dirty marker (a memory-graph always rebuilds from its durable
-journal + image, so an unclean shutdown is recovered, not an error)."
+journal + image, so an unclean shutdown is recovered, not an error).  :PEER-ROLE
+and the peer keys mirror MAKE-MEMORY-GRAPH, reopening a MEMORY-PEER-GRAPH."
+  (%validate-peer-role peer-role origin-id)
   (ensure-directories-exist location)
   (let* ((path (pathname location))
          (schema-file (format nil "~A/schema.dat" location))
-         (graph (%make-empty-memory-graph name path)))
+         (graph (%make-empty-memory-graph
+                 name path
+                 :class (if peer-role 'memory-peer-graph 'memory-graph)
+                 :replication-key replication-key
+                 :replication-port replication-port)))
     (let ((*graph* graph))
       (if (probe-file schema-file)
           (progn
@@ -260,6 +331,10 @@ journal + image, so an unclean shutdown is recovered, not an error)."
       (recover-transactions graph)
       ;; Rebuild views in-RAM from the restored nodes (design §6).
       (restore-views graph))
+    (when peer-role
+      (%init-memory-peer-slots graph :open path peer-role origin-id peer-host
+                               export-predicate device-registry merge-policy
+                               reference-classes peer-schema-version))
     (setf (transaction-manager graph)
           (make-instance 'transaction-manager :graph graph))
     (ensure-directories-exist (persistent-transaction-directory graph))
@@ -303,10 +378,16 @@ journal + image, so an unclean shutdown is recovered, not an error)."
 (defmethod apply-tx-write ((write tx-create) (graph memory-graph-mixin))
   (let ((table (tx-write-table write graph))
         (node (node write)))
+    ;; DATA-POINTER 0 is essential: a node pulled from a hub arrives carrying the
+    ;; HUB's heap address, but a memory node has no heap (data lives on the node),
+    ;; so leaving it non-zero makes ensure-node-bytes / maybe-init-node-data try to
+    ;; read the nil heap.  The wire/serialized bytes are already present, so the
+    ;; data stays live.
     (setf (revision node) 0
           (written-p node) t
           (commit-epoch node) *commit-epoch*
-          (prev-pointer node) 0)
+          (prev-pointer node) 0
+          (data-pointer node) 0)
     (mem-table-put table (id node) node)
     ;; Index maintenance mirrors the on-disk tx-create: type-index for every node,
     ;; plus ve/vev adjacency for edges (add-node-to-indexes dispatches).  Update /
@@ -325,7 +406,8 @@ journal + image, so an unclean shutdown is recovered, not an error)."
         (table (tx-write-table write graph)))
     (setf (revision new-node) (ldb (byte 32 0) (1+ (revision old-node)))
           (commit-epoch new-node) *commit-epoch*
-          (prev-pointer new-node) 0)
+          (prev-pointer new-node) 0
+          (data-pointer new-node) 0)      ; never a heap address (see tx-create)
     (mem-table-put table (id new-node) new-node))
   write)
 
@@ -463,6 +545,14 @@ journal + image, so an unclean shutdown is recovered, not an error)."
 
 (defmethod lookup-vev-index-list ((key vev-key) (graph memory-graph-mixin))
   (gethash key (mem-vev-index-data (vev-index graph))))
+
+;; Hard node removal from the table -- used by the peer scope-exit purge
+;; (PEER-PURGE-NODE), which drops a node that left the device's authority scope
+;; straight from the vertex/edge table.  (The rest of that purge --
+;; remove-from-{ve,vev,type}-index, remove-from-views, spatial-index-remove -- is
+;; already generic and runs on the mem backing.)
+(defmethod lhash-remove ((table mem-table) key)
+  (mem-table-rem table key))
 
 ;;; Untyped MAP-VERTICES / MAP-EDGES scan: walk the mem-table, yielding the same
 ;;; (id . node) cons the lhash method yields.

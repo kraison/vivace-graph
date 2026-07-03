@@ -759,7 +759,12 @@
       (log:error "ERROR IN ~A LHASH-GET(~A): ~A" lhash key c)
       (error c))))
 
-(defun lhash-remove (lhash key)
+;; Generic so a memory-graph's MEM-TABLE (used as the vertex/edge table) can
+;; supply its own removal -- e.g. the peer scope-exit purge (PEER-PURGE-NODE)
+;; hard-deletes a node straight from the table.  The on-disk lhash is the method.
+(defgeneric lhash-remove (table key))
+
+(defmethod lhash-remove ((lhash lhash) key)
   (handler-case
       (with-read-lock ((%lhash-split-lock lhash))
         (let* ((bucket (hash lhash (%lhash-level lhash) key)))
