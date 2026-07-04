@@ -295,6 +295,22 @@ was restored, NIL if none was present."
                          :defaults (persistent-transaction-directory graph))))
     (ignore-errors (delete-file f))))
 
+(defun checkpoint-memory-graph (graph)
+  "Persist GRAPH's current in-RAM state to its cl-store image now, then clear the
+superseded journal -- the same checkpoint CLOSE-GRAPH does, but callable at any
+time.
+
+IMPORTANT for a peer DEVICE: pulled state is applied directly (APPLY-PEER-CREATE-
+WRITES) and is NOT journaled, so between opens it is durable ONLY through this
+image.  Call CHECKPOINT-MEMORY-GRAPH after a PEER-SYNC so the pulled subgraph
+survives a restart (or an unclean shutdown) without having to re-sync -- otherwise
+the next OPEN-MEMORY-GRAPH restores whatever the last image held (possibly empty)
+and the app re-cold-syncs.  Cheap: ~0.06 s / 0.2 MB for ~800 nodes."
+  (check-type graph memory-graph-mixin)
+  (write-memory-image graph)
+  (clear-memory-journal graph)
+  graph)
+
 (defun open-memory-graph (name location
                           &key package replication-port replication-key
                             peer-role origin-id peer-host

@@ -211,6 +211,27 @@ transactions and rebuilt in-RAM on reopen."
           (ignore-errors (close-graph g2 :snapshot-p nil))
           (collect-garbage))))))
 
+(test checkpoint-persists-without-clean-close
+  "CHECKPOINT-MEMORY-GRAPH writes the image + clears the journal, so state survives
+a restart with NO clean close of the checkpointed instance -- the durability a peer
+device needs for pulled state (applied directly, never journaled).  This is the
+on-device reopen gap: without a post-sync checkpoint the next open restores an
+empty/stale image and the app re-cold-syncs."
+  (with-temp-directory (dir)
+    (let ((loc (namestring dir)) id)
+      (let ((g (graph-db::make-memory-graph *mem-test-graph-name* loc)))
+        (let ((*graph* g))
+          (with-transaction () (setq id (id (make-m-person :name "keep" :age 7))))
+          ;; checkpoint (image) but DO NOT close g -- simulated crash after.
+          (graph-db::checkpoint-memory-graph g)))
+      (let ((g2 (graph-db::open-memory-graph *mem-test-graph-name* loc)))
+        (unwind-protect
+             (let ((*graph* g2))
+               (is (= 1 (graph-db::mem-table-count (graph-db::vertex-table g2))))
+               (is (string= "keep" (slot-value (lookup-vertex id) 'name))))
+          (ignore-errors (close-graph g2 :snapshot-p nil))
+          (collect-garbage))))))
+
 (test reduce-view-remove-re-reduces
   "Deleting a node from a map-reduce view re-reduces the aggregate via
 GET-NON-AGGREGATE-PAIRS / GET-ALL-AGGREGATE-PAIRS on the mem-skip-list -- the
