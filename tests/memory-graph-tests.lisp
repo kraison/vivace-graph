@@ -463,3 +463,66 @@ access."
                                             'm-person 'lz-cnt :graph g2 :collect-p t))))
           (ignore-errors (close-graph g2 :snapshot-p nil))
           (collect-garbage))))))
+
+;;; --- declarative def-view (#49) on the memory backend ---------------------
+;;; (*view49-regens* + the regenerate-view :after counter are defined in
+;;; view-tests.lisp, which loads before this file in the graph-db/test system.)
+
+(test def-view-memory-restart-is-o1
+  "Issue #49 on the in-memory (eager) backend: reopening does NOT rebuild an unchanged
+view -- the restored index is kept (O(1)) and the reduce view is correct."
+  (reset-mem-view-registry)
+  (with-temp-directory (dir)
+    (let ((loc (namestring dir)))
+      (let ((g (graph-db::make-memory-graph *mem-test-graph-name* loc)))
+        (let ((*graph* g))
+          (def-view m49-dec :lessp (m-person :graph-db-memory-test)
+            (:map (lambda (p) (yield (floor (slot-value p 'age) 10) 1)))
+            (:reduce (lambda (keys vals &optional r)
+                       (declare (ignore keys r)) (reduce #'+ vals))))
+          (with-transaction () (dotimes (i 20) (make-m-person :name "x" :age (+ 20 i)))))
+        (close-graph g :snapshot-p t))
+      (let ((*view49-regens* (list 0)))
+        (let ((g2 (graph-db::open-memory-graph *mem-test-graph-name* loc)))
+          (unwind-protect
+               (progn
+                 (is (= 0 (car *view49-regens*))
+                     "memory restart keeps the view (no rebuild)")
+                 (is (equal '((2 . 10) (3 . 10))
+                            (map-reduced-view
+                             (lambda (k id v) (declare (ignore id)) (cons k v))
+                             'm-person 'm49-dec :graph g2 :collect-p t))))
+            (ignore-errors (close-graph g2 :snapshot-p nil))
+            (collect-garbage)))))))
+
+(test def-view-memory-lazy-restart-no-rebuild
+  "Issue #49 x fault-on-access: reopening a LAZY memory graph keeps the view WITHOUT
+rebuilding -- proven by the nodes staying LZNODE blobs (a rebuild would scan and thus
+materialize them), while the reduce view still answers correctly."
+  (reset-mem-view-registry)
+  (flet ((all-lznodes-p (g)
+           (loop for v being the hash-values of
+                 (graph-db::mem-table-data (graph-db::vertex-table g))
+                 always (graph-db::lznode-p v))))
+    (with-temp-directory (dir)
+      (let ((loc (namestring dir)))
+        (let ((g (graph-db::make-memory-graph *mem-test-graph-name* loc :lazy t)))
+          (let ((*graph* g))
+            (def-view lz49-dec :lessp (m-person :graph-db-memory-test)
+              (:map (lambda (p) (yield (floor (slot-value p 'age) 10) 1)))
+              (:reduce (lambda (keys vals &optional r)
+                         (declare (ignore keys r)) (reduce #'+ vals))))
+            (with-transaction () (dotimes (i 20) (make-m-person :name "x" :age (+ 20 i)))))
+          (close-graph g :snapshot-p t))
+        (let ((g2 (graph-db::open-memory-graph *mem-test-graph-name* loc :lazy t)))
+          (unwind-protect
+               (progn
+                 (is (equal '((2 . 10) (3 . 10))
+                            (map-reduced-view
+                             (lambda (k id v) (declare (ignore id)) (cons k v))
+                             'm-person 'lz49-dec :graph g2 :collect-p t))
+                     "lazy reduce view is correct after restart")
+                 (is-true (all-lznodes-p g2)
+                          "install-views did NOT rebuild: nodes remain unmaterialized"))
+            (ignore-errors (close-graph g2 :snapshot-p nil))
+            (collect-garbage)))))))

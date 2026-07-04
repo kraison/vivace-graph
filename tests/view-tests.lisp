@@ -388,3 +388,143 @@ registers -- no error, no rebuild -- and open-graph builds it."
                  (is (equal '((2 . 10)) (view49-buckets g2))))
             (ignore-errors (close-graph g2 :snapshot-p nil))
             (collect-garbage)))))))
+
+;; Variants that differ from define-view49-view/10 in exactly one dimension, to
+;; exercise each arm of VIEW-SPEC-UNCHANGED-P, plus a second independent view.
+(defun define-view49-view/10-desc ()
+  "Same :MAP + :REDUCE as /10, but :GREATERP -- only the sort order differs."
+  (def-view vv-by-bucket :greaterp (vv-item :graph-db-view49-test)
+    (:map (lambda (x) (yield (floor (slot-value x 'bucket) 10) 1)))
+    (:reduce (lambda (keys vals &optional r) (declare (ignore keys r)) (reduce #'+ vals)))))
+
+(defun define-view49-view/10-max ()
+  "Same :MAP + sort as /10, but a different :REDUCE (max, not sum)."
+  (def-view vv-by-bucket :lessp (vv-item :graph-db-view49-test)
+    (:map (lambda (x) (yield (floor (slot-value x 'bucket) 10) 1)))
+    (:reduce (lambda (keys vals &optional r) (declare (ignore keys r)) (reduce #'max vals)))))
+
+(defun define-view49-raw-view ()
+  "A second, independent map-only view over the same class (keyed by raw bucket)."
+  (def-view vv-raw :lessp (vv-item :graph-db-view49-test)
+    (:map (lambda (x) (yield (slot-value x 'bucket) nil)))))
+
+(test def-view-sort-order-change-rebuilds
+  "Changing only the sort order (:lessp -> :greaterp) counts as a change and rebuilds."
+  (with-temp-directory (dir)
+    (reset-view49-registry)
+    (let ((path (namestring dir)))
+      (let ((g (make-graph *view49-graph-name* path :buffer-pool-size 1000)))
+        (unwind-protect
+             (progn
+               (let ((*graph* g))
+                 (define-view49-schema)
+                 (define-view49-view/10)
+                 (with-transaction () (dotimes (i 20) (make-vv-item :bucket (+ 20 i)))))
+               (let ((*view49-regens* (list 0)))
+                 (let ((*graph* g)) (define-view49-view/10-desc))
+                 (is (= 1 (car *view49-regens*)) "a sort-order change rebuilds"))
+               (is (equal '((3 . 10) (2 . 10))
+                          (let ((*graph* g))
+                            (map-reduced-view (lambda (k id v) (declare (ignore id)) (cons k v))
+                                              'vv-item 'vv-by-bucket :graph g :collect-p t)))
+                   "the rebuilt view now scans keys descending"))
+          (ignore-errors (close-graph g :snapshot-p nil))
+          (collect-garbage))))))
+
+(test def-view-reduce-change-rebuilds
+  "Changing only the :REDUCE code rebuilds, and the new aggregation takes effect."
+  (with-temp-directory (dir)
+    (reset-view49-registry)
+    (let ((path (namestring dir)))
+      (let ((g (make-graph *view49-graph-name* path :buffer-pool-size 1000)))
+        (unwind-protect
+             (progn
+               (let ((*graph* g))
+                 (define-view49-schema)
+                 (define-view49-view/10)                 ; reduce = sum -> counts
+                 (with-transaction () (dotimes (i 20) (make-vv-item :bucket (+ 20 i)))))
+               (is (equal '((2 . 10) (3 . 10)) (view49-buckets g)))
+               (let ((*view49-regens* (list 0)))
+                 (let ((*graph* g)) (define-view49-view/10-max)) ; reduce = max of the 1s
+                 (is (= 1 (car *view49-regens*)) "a :reduce change rebuilds"))
+               (is (equal '((2 . 1) (3 . 1)) (view49-buckets g))
+                   "max of the per-node 1s is 1, not the count"))
+          (ignore-errors (close-graph g :snapshot-p nil))
+          (collect-garbage))))))
+
+(test def-view-only-changed-view-rebuilds
+  "With two views on a class, reloading both rebuilds ONLY the one that changed."
+  (with-temp-directory (dir)
+    (reset-view49-registry)
+    (let ((path (namestring dir)))
+      (let ((g (make-graph *view49-graph-name* path :buffer-pool-size 1000)))
+        (unwind-protect
+             (progn
+               (let ((*graph* g))
+                 (define-view49-schema)
+                 (define-view49-view/10)                 ; view A (reduce)
+                 (define-view49-raw-view)                ; view B (map-only)
+                 (with-transaction () (dotimes (i 20) (make-vv-item :bucket (+ 20 i)))))
+               (let ((*view49-regens* (list 0)))
+                 (let ((*graph* g))
+                   (define-view49-view/5)                ; A changed
+                   (define-view49-raw-view))             ; B unchanged
+                 (is (= 1 (car *view49-regens*))
+                     "only the changed view rebuilds; the unchanged one is kept"))
+               (is (equal '((4 . 5) (5 . 5) (6 . 5) (7 . 5)) (view49-buckets g))
+                   "changed view A reflects the new mapping")
+               ;; invoke-graph-view on a MAP view materializes nodes via the lookup-fn,
+               ;; which reads the dynamic *graph* -- bind it.
+               (is (= 20 (let ((*graph* g))
+                           (length (invoke-graph-view 'vv-item 'vv-raw :graph g))))
+                   "unchanged view B stays intact and queryable"))
+          (ignore-errors (close-graph g :snapshot-p nil))
+          (collect-garbage))))))
+
+(test def-view-registry-newest-wins
+  "A view registered more than once (redefined) before open: INSTALL-VIEWS dedups by
+(class . name) and installs the NEWEST spec exactly once."
+  (with-temp-directory (dir)
+    (reset-view49-registry)
+    (let ((path (namestring dir)))
+      (let ((g (make-graph *view49-graph-name* path :buffer-pool-size 1000)))
+        (let ((*graph* g))
+          (define-view49-schema)
+          (with-transaction () (dotimes (i 20) (make-vv-item :bucket (+ 20 i)))))
+        (close-graph g :snapshot-p nil))
+      ;; graph closed: two competing definitions merely register (newest = /5)
+      (define-view49-view/10)
+      (define-view49-view/5)
+      (let ((*view49-regens* (list 0)))
+        (let ((g2 (open-graph *view49-graph-name* path)))
+          (unwind-protect
+               (progn
+                 (is (= 1 (car *view49-regens*)) "the deduped newest spec builds exactly once")
+                 (is (equal '((4 . 5) (5 . 5) (6 . 5) (7 . 5)) (view49-buckets g2))
+                     "the NEWEST definition (/5) wins"))
+            (ignore-errors (close-graph g2 :snapshot-p nil))
+            (collect-garbage)))))))
+
+(test def-view-restart-then-incremental-maintenance
+  "After an O(1) restart (the view is kept, not rebuilt) the kept view still maintains
+incrementally: a node saved post-restart is indexed -- its map/reduce fns compile
+lazily on the next add-to-view."
+  (with-temp-directory (dir)
+    (reset-view49-registry)
+    (let ((path (namestring dir)))
+      (let ((g (make-graph *view49-graph-name* path :buffer-pool-size 1000)))
+        (let ((*graph* g))
+          (define-view49-schema)
+          (define-view49-view/10)
+          (with-transaction () (dotimes (i 20) (make-vv-item :bucket (+ 20 i)))))
+        (close-graph g :snapshot-p nil))
+      (let ((*view49-regens* (list 0)))
+        (let ((g2 (open-graph *view49-graph-name* path)))
+          (unwind-protect
+               (let ((*graph* g2))
+                 (is (= 0 (car *view49-regens*)) "restart kept the view (no rebuild)")
+                 (with-transaction () (make-vv-item :bucket 25)) ; decade 2, post-restart
+                 (is (equal '((2 . 11) (3 . 10)) (view49-buckets g2))
+                     "the kept view indexes the new node (decade 2 now 11)"))
+            (ignore-errors (close-graph g2 :snapshot-p nil))
+            (collect-garbage)))))))
