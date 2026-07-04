@@ -184,7 +184,7 @@ to disk and remove it."
                    replication-key package (buffer-pool-p t) (gc-heap-p t)
                    (buffer-pool-size 100000)
                    (accept-versions (list +storage-version+))
-                   keep-revisions
+                   keep-revisions regenerate-views
                    peer-role origin-id peer-host
                    export-predicate device-registry merge-policy
                    reference-classes (peer-schema-version '(1 0)))
@@ -195,8 +195,10 @@ earlier with MAKE-GRAPH; the keyword arguments mirror MAKE-GRAPH's.
 Signals an error if LOCATION holds a .dirty marker, which means the graph was
 not closed cleanly and must be recovered first (see RECOVER-TRANSACTIONS and
 the backup/recovery chapter).  By default the heap is garbage-collected
-(:GC-HEAP-P) and outstanding transactions are recovered on open.  Always
-CLOSE-GRAPH when finished."
+(:GC-HEAP-P) and outstanding transactions are recovered on open.  Views are
+reconciled against their declarative definitions and kept as-is unless changed
+(see DEF-VIEW); pass :REGENERATE-VIEWS T to force-rebuild every view on open.
+Always CLOSE-GRAPH when finished."
   (when (and peer-role (or master-p slave-p))
     (error ":PEER-ROLE is mutually exclusive with :MASTER-P / :SLAVE-P"))
   (when (and peer-role (not (member peer-role '(:hub :device))))
@@ -270,6 +272,13 @@ CLOSE-GRAPH when finished."
           (setf (schema-keep-revisions (schema graph)) keep-revisions))
         (update-schema graph)
         (restore-views graph)
+        ;; Reconcile the declarative view registry against the restored views
+        ;; (issue #49): keep unchanged persisted indexes O(1), rebuild changed ones.
+        ;; Runs after RESTORE-VIEWS (and UPDATE-SCHEMA) so the node types the views
+        ;; scan are already instantiated.  :REGENERATE-VIEWS forces a full rebuild.
+        (install-views graph)
+        (when regenerate-views
+          (regenerate-all-views graph))
         (restore-spatial-index graph)
         (with-open-file (out dirty-file :direction :output)
           (format out "~S" (get-universal-time)))

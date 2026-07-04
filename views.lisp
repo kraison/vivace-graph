@@ -782,47 +782,144 @@ not exist."
   (let ((*package* (find-package :keyword)))
     (format nil "~S" expression)))
 
-(defmacro def-view (name sort-order parents &body body)
-  "Define a view (a secondary index) named NAME over a node type.
+;;; ---------------------------------------------------------------------------
+;;; Declarative, idempotent view definition (issue #49).
+;;;
+;;; DEF-VIEW mirrors the schema two-phase pattern that DEF-VERTEX/DEF-EDGE use
+;;; (see DEF-NODE-TYPE / UPDATE-SCHEMA in schema.lisp):
+;;;
+;;;   Phase 1 -- DEF-VIEW registers a VIEW-SPEC in *SCHEMA-VIEW-METADATA* (no open
+;;;     graph required) and, if the graph is already open, reconciles it now.
+;;;   Phase 2 -- INSTALL-VIEWS, called at open right after RESTORE-VIEWS, walks the
+;;;     registry and reconciles each spec against the restored view.
+;;;
+;;; Reconciliation keeps an already-persisted index whose definition is unchanged
+;;; (an O(1) restart -- RESTORE-VIEWS already reopened its skip-list), rebuilds one
+;;; whose :MAP/:REDUCE/sort-order changed (with a LOG:WARN), and builds a brand-new
+;;; one.  This replaces the old DEF-VIEW, which required an open graph and rebuilt
+;;; the index unconditionally on every load.
+;;; ---------------------------------------------------------------------------
 
-PARENTS is (CLASS-NAME GRAPH-NAME).  SORT-ORDER is the key comparator, e.g.
-:LESSP or :GREATERP.  BODY holds a (:MAP lambda) and optionally a (:REDUCE
-lambda):
+(defvar *schema-view-metadata* (make-hash-table)
+  "graph-name (symbol) -> list of VIEW-SPECs (newest pushed on the front): the
+declarative registry DEF-VIEW writes and INSTALL-VIEWS reconciles at open.")
+
+(defstruct (view-spec (:constructor make-view-spec))
+  name class-name graph-name lookup-fn map-code reduce-code (sort-order :lessp))
+
+(defun register-view-spec (spec)
+  "Phase 1: record SPEC in the registry.  Duplicates accumulate (like the schema
+registry); INSTALL-VIEWS resolves them newest-wins."
+  (push spec (gethash (view-spec-graph-name spec) *schema-view-metadata*))
+  spec)
+
+(defun view-spec-unchanged-p (spec view)
+  "True when the restored VIEW already matches SPEC -- same :MAP/:REDUCE code and
+sort order -- so its persisted index can be kept as-is.  The map/reduce code is
+stored keyword-package-printed, so STRING= is an exact comparison."
+  (and (equal (view-spec-map-code spec) (view-map-code view))
+       (equal (view-spec-reduce-code spec) (view-reduce-code view))
+       (eql (view-spec-sort-order spec) (view-sort-order view))))
+
+(defun %spec->view (spec graph)
+  (make-view :name (view-spec-name spec)
+             :class-name (view-spec-class-name spec)
+             :graph-name (view-spec-graph-name spec)
+             :lookup-fn (view-spec-lookup-fn spec)
+             :heap (indexes graph)
+             :map-code (view-spec-map-code spec)
+             :reduce-code (view-spec-reduce-code spec)
+             :map-fn nil :reduce-fn nil
+             :sort-order (view-spec-sort-order spec)))
+
+(defmethod install-view ((spec view-spec) (graph graph))
+  "Phase-2 reconcile of one registered view SPEC against GRAPH (issue #49): KEEP an
+already-persisted index whose definition is unchanged (O(1)); REBUILD it -- with a
+LOG:WARN -- when the :MAP/:REDUCE/sort-order changed; BUILD it when the view is new
+or has no persisted index.  REGENERATE-VIEW dispatches to the on-disk or in-RAM
+skip-list via MAKE-VIEW-SKIP-LIST, so this is backend-agnostic.  Returns the view."
+  (let ((class-name (view-spec-class-name spec))
+        (view-name (view-spec-name spec))
+        (graph-name (view-spec-graph-name spec)))
+    ;; Ensure the view-group exists (creates it on this class's first view), so
+    ;; WITH-WRITE-LOCKED-VIEW-GROUP has a group to lock.
+    (get-view-table-for-class graph class-name)
+    (with-write-locked-view-group (class-name graph)
+      (let* ((table (view-group-table (lookup-view-group class-name graph)))
+             (existing (gethash view-name table)))
+        (cond
+          ;; KEEP: a live, persisted index whose definition is unchanged -> O(1).
+          ;; RESTORE-VIEWS already reopened the skip-list; the view self-compiles
+          ;; its map/reduce fns on the next maintenance op, so there is nothing to do.
+          ((and existing (view-skip-list existing) (view-spec-unchanged-p spec existing))
+           existing)
+          ;; REBUILD: the definition changed -- adopt the new code and rescan.
+          (existing
+           (log:warn "def-view ~S of ~S in ~S changed since last load; regenerating its index."
+                     view-name class-name graph-name)
+           (setf (view-map-code existing) (view-spec-map-code spec)
+                 (view-reduce-code existing) (view-spec-reduce-code spec)
+                 (view-sort-order existing) (view-spec-sort-order spec)
+                 (view-lookup-fn existing) (view-spec-lookup-fn spec)
+                 (view-map-fn existing) nil
+                 (view-reduce-fn existing) nil)
+           (regenerate-view graph class-name view-name))
+          ;; BUILD: a brand-new view (or one whose index did not persist).
+          (t
+           (setf (gethash view-name table) (%spec->view spec graph))
+           (save-views graph)
+           (regenerate-view graph class-name view-name)))))))
+
+(defmethod install-views ((graph graph))
+  "Phase 2 (issue #49; mirror of UPDATE-SCHEMA): reconcile every VIEW-SPEC
+registered for GRAPH against its restored views.  Called at open right after
+RESTORE-VIEWS, so the node types the views scan are already instantiated (a
+regenerate does MAP-VERTICES/-EDGES + SUBTYPEP on the class).  De-dupes the
+push-registry by (class . name), newest-wins."
+  (let ((seen (make-hash-table :test 'equal)))
+    (dolist (spec (gethash (graph-name graph) *schema-view-metadata*))
+      (let ((key (cons (view-spec-class-name spec) (view-spec-name spec))))
+        (unless (gethash key seen)
+          (setf (gethash key seen) t)
+          (install-view spec graph))))))
+
+(defmacro def-view (name sort-order parents &body body)
+  "Define a view (a secondary index) named NAME over a node type.  Declarative and
+idempotent (issue #49): like DEF-VERTEX/DEF-EDGE, it registers a spec and reconciles
+against the graph, rebuilding the index ONLY when the definition actually changed.
+
+PARENTS is (CLASS-NAME GRAPH-NAME).  SORT-ORDER is the key comparator, e.g. :LESSP
+or :GREATERP.  BODY holds a (:MAP lambda) and optionally a (:REDUCE lambda):
   - the :MAP lambda receives a node and calls YIELD to emit key/value entries;
   - the optional :REDUCE lambda receives (keys values) and aggregates them,
     making this a map-reduce view.
 
-The graph named GRAPH-NAME must already exist when DEF-VIEW runs (define views
-after MAKE-GRAPH/OPEN-GRAPH).  Once defined, the view is maintained
-incrementally as matching nodes are saved.  Query it with INVOKE-GRAPH-VIEW,
-MAP-VIEW, or MAP-REDUCED-VIEW.  Example:
+The graph need NOT be open when DEF-VIEW runs -- a view may be co-located with its
+DEF-VERTEX/DEF-EDGE and loaded before OPEN-GRAPH, which reconciles it at open time.
+If the graph IS already open (the classic MAKE-GRAPH -> DEF-VIEW ordering), the view
+is reconciled immediately.  Re-evaluating an UNCHANGED DEF-VIEW (or restarting) does
+NOT rebuild the persisted index -- restart is O(1); changing the :MAP/:REDUCE/sort
+order rebuilds it and emits a LOG:WARN.  Force a rebuild with REGENERATE-VIEW (one
+view), REGENERATE-ALL-VIEWS, or OPEN-GRAPH's :REGENERATE-VIEWS T.
+
+Once defined, the view is maintained incrementally as matching nodes are saved.
+Query it with INVOKE-GRAPH-VIEW, MAP-VIEW, or MAP-REDUCED-VIEW.  Example:
   (def-view user-by-username :lessp (user :social-app)
     (:map (lambda (u) (when (username u) (yield (username u) nil)))))"
-  (with-gensyms (view-name class-name graph-name graph lookup-fn view-sort-order)
-    (let ((map-code (cadr (assoc :map body)))
-          (reduce-code (cadr (assoc :reduce body))))
-      `(let* ((,view-name ',name)
-              (,class-name ',(first parents))
-              (,graph-name ',(second parents))
-              (,graph (or (lookup-graph ,graph-name)
-                          (error "Unknown graph ~S" ,graph-name)))
-              (,lookup-fn ',(intern (format nil "LOOKUP-~A" (first parents))))
-              (,view-sort-order ',sort-order)
-              (view (make-view :name ,view-name
-                               :class-name ,class-name
-                               :graph-name ,graph-name
-                               :lookup-fn ,lookup-fn
-                               :heap (indexes ,graph)
-                               :map-code ,(fully-qualified-expression-string map-code)
-                               :reduce-code ,(when reduce-code
-                                                   (fully-qualified-expression-string reduce-code))
-                               :map-fn nil
-                               :sort-order ,view-sort-order
-                               :reduce-fn nil)))
-         (log:info "MAKING ~S" view)
-         (let* ((table (get-view-table-for-class ,graph-name ,class-name)))
-           (with-write-locked-view-group (,class-name ,graph-name)
-             (setf (gethash ,view-name table) view)
-             (save-views ,graph)
-             (regenerate-view ,graph ,class-name ,view-name)
-             ))))))
+  (let ((map-code (cadr (assoc :map body)))
+        (reduce-code (cadr (assoc :reduce body))))
+    `(let ((spec (make-view-spec
+                  :name ',name
+                  :class-name ',(first parents)
+                  :graph-name ',(second parents)
+                  :lookup-fn ',(intern (format nil "LOOKUP-~A" (first parents)))
+                  :map-code ,(fully-qualified-expression-string map-code)
+                  :reduce-code ,(when reduce-code
+                                  (fully-qualified-expression-string reduce-code))
+                  :sort-order ',sort-order)))
+       (register-view-spec spec)
+       ;; Reconcile now if the graph is already open; otherwise INSTALL-VIEWS does it
+       ;; at open (a view can thus be defined before its graph exists).
+       (let ((g (lookup-graph ',(second parents))))
+         (when g (install-view spec g)))
+       spec)))

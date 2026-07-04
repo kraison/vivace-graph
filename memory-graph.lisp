@@ -651,7 +651,7 @@ and the app re-cold-syncs.  Cheap: ~0.06 s / 0.2 MB for ~800 nodes."
 
 (defun open-memory-graph (name location
                           &key package replication-port replication-key
-                            peer-role origin-id peer-host lazy
+                            peer-role origin-id peer-host lazy regenerate-views
                             export-predicate device-registry merge-policy
                             reference-classes (peer-schema-version '(1 0)))
   "Reopen the in-memory graph NAME from LOCATION: restore the schema, restore the
@@ -693,7 +693,12 @@ as deferred blobs and materialize on first touch (needs a VG-native image)."
           ;; v1 / no image: load the journal tail into the tables first, then
           ;; rebuild views in-RAM from ALL restored nodes (rebuild-on-open fallback).
           (progn (recover-transactions graph)
-                 (restore-views graph))))
+                 (restore-views graph)))
+      ;; Reconcile the declarative view registry (issue #49) after views are
+      ;; restored AND the journal tail is replayed, so any regenerate sees all nodes.
+      (install-views graph)
+      (when regenerate-views
+        (regenerate-all-views graph)))
     (when peer-role
       (%init-memory-peer-slots graph :open path peer-role origin-id peer-host
                                export-predicate device-registry merge-policy

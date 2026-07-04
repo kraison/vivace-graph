@@ -139,8 +139,10 @@
            #:delete-view
            #:save-views
            #:restore-views
+           #:install-views
            #:get-view-table-for-class
            #:regenerate-view
+           #:regenerate-all-views
            #:lookup-view-group
            #:lookup-view
            #:with-write-locked-view-group

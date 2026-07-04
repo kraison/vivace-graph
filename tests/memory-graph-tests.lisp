@@ -9,9 +9,18 @@
 
 (defparameter *mem-test-graph-name* :graph-db-memory-test)
 
-;; Clean slate so reloading doesn't double-register the type metadata.
+;; Clean slate so reloading doesn't double-register the type/view metadata.
 (eval-when (:load-toplevel :execute)
-  (setf (gethash *mem-test-graph-name* graph-db::*schema-node-metadata*) nil))
+  (setf (gethash *mem-test-graph-name* graph-db::*schema-node-metadata*) nil)
+  (remhash *mem-test-graph-name* graph-db::*schema-view-metadata*))
+
+(defun reset-mem-view-registry ()
+  "Isolate a test's view registry from earlier tests: the global
+*SCHEMA-VIEW-METADATA* accumulates specs by graph-name across the whole run, so
+INSTALL-VIEWS at open would otherwise (re)build every view any prior test defined
+over m-person -- which, on a lazy graph, materializes nodes and breaks the
+fault-on-access invariant.  Call at the start of any test that reopens a graph."
+  (remhash *mem-test-graph-name* graph-db::*schema-view-metadata*))
 
 (def-vertex m-person ()
   ((name :type string)
@@ -183,6 +192,7 @@ is rebuilt on reopen."
 (test map-and-reduce-views-with-reopen
   "A map view (sorted) and a map-reduce view (aggregate) are maintained through
 transactions and rebuilt in-RAM on reopen."
+  (reset-mem-view-registry)
   (with-temp-directory (dir)
     (let ((loc (namestring dir)))
       (let ((g (graph-db::make-memory-graph *mem-test-graph-name* loc)))
@@ -305,6 +315,7 @@ checkpoint).  On open the image's 10 nodes restore as LZNODE blobs (unmaterializ
 while recover-transactions replays the 5 journaled nodes as LIVE nodes; the two
 coexist in the table and the reduce view reflects BOTH the image aggregate and the
 replayed tail."
+  (reset-mem-view-registry)
   (flet ((n-materialized (g)
            (loop for v being the hash-values of
                  (graph-db::mem-table-data (graph-db::vertex-table g))
@@ -376,6 +387,7 @@ LZNODE blobs, materialized to live nodes only on first touch (open pays no
 MAKE-INSTANCE, ~85% of eager open on ECL, #50).  A reduce (aggregate) view is
 answered WITHOUT materializing any node.  Asserts table STATE directly (robust to
 compiler inlining of the materializer)."
+  (reset-mem-view-registry)
   (flet ((all-lznodes-p (g)
            (loop for v being the hash-values of
                  (graph-db::mem-table-data (graph-db::vertex-table g))

@@ -234,3 +234,157 @@ restored (restore-views) and remains queryable without re-defining it."
                                  'g-likes 'likes-received :count 2 :collect-p t)))
       (is (= 3 (length all)) "three liked targets -> three groups")
       (is (= 2 (length two)) ":count 2 limits to two groups"))))
+
+;;; ---------------------------------------------------------------------------
+;;; Declarative / idempotent def-view  --  issue #49
+;;;
+;;; def-view registers a spec and reconciles against the graph (like def-vertex),
+;;; rebuilding the persisted index ONLY when the definition actually changed.  The
+;;; tests instrument regenerate-view to prove a restart / unchanged reload is O(1).
+;;; ---------------------------------------------------------------------------
+
+(defvar *view49-regens* nil
+  "When bound to a cons, REGENERATE-VIEW increments its car -- lets a test assert
+that a restart / unchanged reload does NOT rebuild the index.")
+
+(defmethod graph-db::regenerate-view :after
+    ((graph graph-db::graph) (class-name symbol) (view-name symbol))
+  (when *view49-regens* (incf (car *view49-regens*))))
+
+(defparameter *view49-graph-name* :graph-db-view49-test)
+
+(defun define-view49-schema ()
+  (def-vertex vv-item () ((bucket :initarg :bucket :accessor vv-bucket))
+    :graph-db-view49-test))
+
+;; Two literal view definitions -- distinct :MAP code, so VIEW-SPEC-DIFF sees the
+;; second as a change (the code is marshalled to a string, so it cannot close over
+;; a runtime divisor).
+(defun define-view49-view/10 ()
+  (def-view vv-by-bucket :lessp (vv-item :graph-db-view49-test)
+    (:map (lambda (x) (yield (floor (slot-value x 'bucket) 10) 1)))
+    (:reduce (lambda (keys vals &optional r) (declare (ignore keys r)) (reduce #'+ vals)))))
+
+(defun define-view49-view/5 ()
+  (def-view vv-by-bucket :lessp (vv-item :graph-db-view49-test)
+    (:map (lambda (x) (yield (floor (slot-value x 'bucket) 5) 1)))
+    (:reduce (lambda (keys vals &optional r) (declare (ignore keys r)) (reduce #'+ vals)))))
+
+(defun view49-buckets (graph)
+  (let ((*graph* graph))
+    (sort (map-reduced-view (lambda (k id v) (declare (ignore id)) (cons k v))
+                            'vv-item 'vv-by-bucket :graph graph :collect-p t)
+          #'< :key #'car)))
+
+(defun reset-view49-registry ()
+  "Isolate a test's view registry from earlier tests (specs accumulate globally)."
+  (remhash *view49-graph-name* graph-db::*schema-view-metadata*))
+
+(test def-view-restart-is-o1
+  "Restart does NOT rebuild an unchanged persisted view (issue #49 core): after
+close + open the index is restored and queryable with ZERO regenerate-view calls."
+  (with-temp-directory (dir)
+    (reset-view49-registry)
+    (let ((path (namestring dir)))
+      (let ((g (make-graph *view49-graph-name* path :buffer-pool-size 1000)))
+        (let ((*graph* g))
+          (define-view49-schema)
+          (define-view49-view/10)
+          (with-transaction () (dotimes (i 20) (make-vv-item :bucket (+ 20 i)))))
+        (is (equal '((2 . 10) (3 . 10)) (view49-buckets g)))
+        (close-graph g :snapshot-p nil))
+      (let ((*view49-regens* (list 0)))
+        (let ((g2 (open-graph *view49-graph-name* path)))
+          (unwind-protect
+               (progn
+                 (is (= 0 (car *view49-regens*))
+                     "reopen must NOT regenerate an unchanged view (got ~D)"
+                     (car *view49-regens*))
+                 (is (equal '((2 . 10) (3 . 10)) (view49-buckets g2))
+                     "restored view is queryable and correct"))
+            (ignore-errors (close-graph g2 :snapshot-p nil))
+            (collect-garbage)))))))
+
+(test def-view-reload-unchanged-is-o1
+  "Re-evaluating an UNCHANGED def-view on an open graph does not rebuild."
+  (with-temp-directory (dir)
+    (reset-view49-registry)
+    (let ((path (namestring dir)))
+      (let ((g (make-graph *view49-graph-name* path :buffer-pool-size 1000)))
+        (unwind-protect
+             (progn
+               (let ((*graph* g))
+                 (define-view49-schema)
+                 (define-view49-view/10)
+                 (with-transaction () (dotimes (i 10) (make-vv-item :bucket (+ 20 i)))))
+               (let ((*view49-regens* (list 0)))
+                 (let ((*graph* g)) (define-view49-view/10)) ; re-eval, unchanged
+                 (is (= 0 (car *view49-regens*))
+                     "re-evaluating an unchanged def-view must not rebuild")))
+          (ignore-errors (close-graph g :snapshot-p nil))
+          (collect-garbage))))))
+
+(test def-view-change-rebuilds
+  "Changing a view's :MAP rebuilds the index once, and the new results reflect the
+new mapping."
+  (with-temp-directory (dir)
+    (reset-view49-registry)
+    (let ((path (namestring dir)))
+      (let ((g (make-graph *view49-graph-name* path :buffer-pool-size 1000)))
+        (unwind-protect
+             (progn
+               (let ((*graph* g))
+                 (define-view49-schema)
+                 (define-view49-view/10)
+                 (with-transaction () (dotimes (i 20) (make-vv-item :bucket (+ 20 i)))))
+               (is (equal '((2 . 10) (3 . 10)) (view49-buckets g)))
+               (let ((*view49-regens* (list 0)))
+                 (let ((*graph* g)) (define-view49-view/5)) ; changed :MAP
+                 (is (= 1 (car *view49-regens*)) "a changed def-view rebuilds once"))
+               (is (equal '((4 . 5) (5 . 5) (6 . 5) (7 . 5)) (view49-buckets g))
+                   "rebuilt view reflects the new mapping"))
+          (ignore-errors (close-graph g :snapshot-p nil))
+          (collect-garbage))))))
+
+(test def-view-before-open
+  "A view can be defined while the graph is CLOSED (declarative): def-view just
+registers -- no error, no rebuild -- and open-graph builds it."
+  (with-temp-directory (dir)
+    (reset-view49-registry)
+    (let ((path (namestring dir)))
+      (let ((g (make-graph *view49-graph-name* path :buffer-pool-size 1000)))
+        (let ((*graph* g))
+          (define-view49-schema)
+          (with-transaction () (dotimes (i 10) (make-vv-item :bucket (+ 20 i)))))
+        (close-graph g :snapshot-p nil))
+      (let ((*view49-regens* (list 0)))
+        (finishes (define-view49-view/10))
+        (is (= 0 (car *view49-regens*)) "def-view on a closed graph must not rebuild"))
+      (let ((*view49-regens* (list 0)))
+        (let ((g2 (open-graph *view49-graph-name* path)))
+          (unwind-protect
+               (progn
+                 (is (= 1 (car *view49-regens*)) "open builds the co-located view once")
+                 (is (equal '((2 . 10)) (view49-buckets g2))))
+            (ignore-errors (close-graph g2 :snapshot-p nil))
+            (collect-garbage)))))))
+
+(test open-graph-regenerate-views-forces-rebuild
+  "open-graph :regenerate-views t forcibly rebuilds all views even when unchanged."
+  (with-temp-directory (dir)
+    (reset-view49-registry)
+    (let ((path (namestring dir)))
+      (let ((g (make-graph *view49-graph-name* path :buffer-pool-size 1000)))
+        (let ((*graph* g))
+          (define-view49-schema)
+          (define-view49-view/10)
+          (with-transaction () (dotimes (i 10) (make-vv-item :bucket (+ 20 i)))))
+        (close-graph g :snapshot-p nil))
+      (let ((*view49-regens* (list 0)))
+        (let ((g2 (open-graph *view49-graph-name* path :regenerate-views t)))
+          (unwind-protect
+               (progn
+                 (is (= 1 (car *view49-regens*)) ":regenerate-views t forces one rebuild")
+                 (is (equal '((2 . 10)) (view49-buckets g2))))
+            (ignore-errors (close-graph g2 :snapshot-p nil))
+            (collect-garbage)))))))

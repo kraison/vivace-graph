@@ -1007,6 +1007,22 @@ Let's create two essential indexes for our social application.
 
 That's it! VivaceGraph will now automatically maintain these indexes. When you create a new user, an entry will be added to the `user-by-username` view. If you update a user's name, the view will be automatically updated to reflect the change.
 
+**** Declarative and Idempotent: Restarts are O(1)
+
+~def-view~ is *declarative and idempotent*, exactly like ~def-vertex~ and ~def-edge~.  You can keep your ~def-view~ forms right next to the ~def-vertex~ forms they index and load them once at application startup; you do not have to guard them or re-run them conditionally.
+
+- *Define before or after the graph is open.*  A ~def-view~ registers the view's specification and reconciles it with the graph.  If the graph is already open (the classic ~make-graph~ → ~def-view~ ordering) it reconciles immediately; if not, ~open-graph~ reconciles every registered view at open time.  So a view may be co-located with its node type and loaded before the graph exists.
+
+- *An unchanged view is never rebuilt.*  The view's on-disk index is persistent and is reopened at open time (~restore-views~).  Re-evaluating an unchanged ~def-view~ form — or simply restarting the application — leaves that index untouched: the restart is O(1), not an O(N) re-scan of every node.  This matters enormously for applications that define all their views on every load.
+
+- *A changed view is rebuilt automatically.*  If you change a view's ~:map~/~:reduce~ code or its sort order, the next reconcile detects the difference, rebuilds the index from scratch, and emits a ~log:warn~.  This is the safe default: serving queries from an index built by an *old* ~:map~ lambda would be a subtle, hard-to-find bug.
+
+- *Forcing a rebuild.*  Use ~regenerate-view~ to force one view, ~regenerate-all-views~ to force all of them, or pass ~:regenerate-views t~ to ~open-graph~ (or ~open-memory-graph~) to rebuild everything at open.
+
+- *Removing a view.*  Deleting a ~def-view~ form does not drop the persisted index (just as deleting a ~def-vertex~ form does not drop the persisted type).  Call ~delete-view~ to remove it explicitly.
+
+These semantics apply uniformly to the on-disk and in-memory backends (see the In-Memory Backend chapter): for a memory-graph the index lives in RAM and is restored from the checkpoint image, but the "unchanged → keep, changed → rebuild" reconcile is identical.
+
 *** Defining Map-Reduce Views for Aggregation
 
 Views can do more than just create simple lookup indexes. They can also perform powerful data aggregations using a *map-reduce* pattern. This is perfect for pre-calculating values like counts, sums, or averages.
@@ -2116,7 +2132,7 @@ This chapter provides a categorized reference for the most important exported sy
 
 **** Views & Indexing
 - ~def-view (view-name sort-order (class-name graph-name) &body body)~ ::
-  Defines a new view (index). The body must contain a ~:map~ clause and may contain an optional ~:reduce~ clause for aggregation.
+  Defines a new view (index). The body must contain a ~:map~ clause and may contain an optional ~:reduce~ clause for aggregation.  *Declarative and idempotent* (like ~def-vertex~/~def-edge~): the graph need not be open when ~def-view~ runs — a view can be co-located with its ~def-vertex~/~def-edge~ and loaded before ~open-graph~, which reconciles it at open time.  Re-evaluating an *unchanged* ~def-view~ (or simply restarting) does **not** rebuild the persisted index — restart is O(1).  Changing the ~:map~/~:reduce~ code or sort order rebuilds the index and emits a ~log:warn~.  Deleting a ~def-view~ form does not drop the persisted index; use ~delete-view~ for that.
 
 - ~invoke-graph-view (class-name view-name &key key start-key end-key ... )~ ::
   The primary function for querying a view. Use the `:key` argument for point lookups or `:start-key` and `:end-key` for range scans. Use `:group-p t` to query the aggregated results of a reduce view.
@@ -2128,7 +2144,10 @@ This chapter provides a categorized reference for the most important exported sy
   Iterates over the aggregated results of a map-reduce view.
 
 - ~regenerate-view (graph class-name view-name)~ ::
-  Deletes and rebuilds the index for a specific view from scratch. Useful if the view's definition changes.
+  Force-rebuilds one view's index from scratch (delete + full rescan).  Rarely needed by hand — ~def-view~ rebuilds automatically when its definition changes — but available as the single-view force hammer.
+
+- ~regenerate-all-views (graph)~ ::
+  Force-rebuilds every view in the graph.  ~open-graph~ (and ~open-memory-graph~) accept ~:regenerate-views t~ to run this at open time.
 
 **** Graph Traversal & Mapping
 - ~map-vertices (function graph &key vertex-type include-vertex-types exclude-vertex-types include-subclasses-p ... )~ ::
