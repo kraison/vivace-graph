@@ -1,5 +1,10 @@
 (in-package :graph-db)
 
+;; Defined in unique-constraint.lisp (loaded after this file); declared so the
+;; OPEN-GRAPH / CLOSE-GRAPH hooks below compile without forward-reference warnings.
+(declaim (ftype (function (t) t)
+                rebuild-unique-indexes save-unique-index-roots restore-unique-index-roots))
+
 (defun spatial-index-root-file (location)
   (format nil "~A/spatial-index.root" location))
 
@@ -286,10 +291,11 @@ Always CLOSE-GRAPH when finished."
         (when gc-heap-p
           (gc-heap graph))
         (recover-transactions graph)
-        ;; Unique constraints (issue #6): rebuild the in-RAM unique indexes from the
-        ;; restored nodes (v1; persistence is the follow-up).  After recovery, so both
-        ;; heap and journal-tail nodes are indexed.  No-op if no :UNIQUE slots exist.
-        (rebuild-unique-indexes graph))
+        ;; Unique constraints (issue #6): reopen the persistent unique skip-lists from
+        ;; the sidecar (durable, no scan); only rebuild from nodes if there is no
+        ;; sidecar -- a fresh graph, or a crash before CLOSE-GRAPH saved the roots.
+        (unless (restore-unique-index-roots graph)
+          (rebuild-unique-indexes graph)))
       (when slave-p
         (setf (master-host graph) master-host))
       (when peer-role
@@ -334,6 +340,9 @@ in place, forcing recovery on the next OPEN-GRAPH."
   (when (graph-open-p graph)
     (stop-replication graph)
     (remhash (graph-name graph) *graphs*)
+    ;; Unique constraints (#6): persist the on-disk unique skip-lists' roots while the
+    ;; heap is still open, so OPEN can reopen them without a scan.  No-op on memory.
+    (save-unique-index-roots graph)
     (when snapshot-p
       (log:info "Snapshotting ~A" graph)
       (snapshot graph))

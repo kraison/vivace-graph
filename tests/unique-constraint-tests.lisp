@@ -42,7 +42,7 @@
 
 (defun uq-index-size (g owner slot)
   (let ((uix (gethash (cons owner slot) (graph-db::unique-indexes g))))
-    (and uix (hash-table-count (graph-db::unique-index-table uix)))))
+    (and uix (graph-db::uix-count uix))))
 
 (test reject-duplicate-create
   "A create duplicating a live node's unique value is rejected, and the rejected
@@ -112,8 +112,9 @@ a UQ-ADMIN cannot take a UNAME already held by a UQ-USER."
     (is (= 1 (uq-index-size g 'uq-user 'uname))
         "one shared uq-user/uname index owns both types' claims")))
 
-(test reopen-rebuilds-and-enforces
-  "After close + open the unique index is rebuilt from the restored nodes and still
+(test reopen-restores-durable-index-and-enforces
+  "On-disk the unique index is a persistent skip-list: close saves its root, open
+reopens it from the sidecar WITHOUT scanning nodes (rebuild not called), and it still
 enforces."
   (with-temp-directory (dir)
     (let ((path (namestring dir)))
@@ -123,15 +124,24 @@ enforces."
             (make-uq-user :uname "alice" :email "a@x.com")
             (make-uq-user :uname "bob"   :email "b@x.com")))
         (close-graph g))
-      (let ((g2 (open-graph *uq-graph-name* path)))
+      (is-true (probe-file (graph-db::unique-index-root-file path))
+               "close-graph saved the unique-index root sidecar")
+      (let ((rebuilt nil) (orig (fdefinition 'graph-db::rebuild-unique-indexes)))
         (unwind-protect
-             (let ((*graph* g2))
-               (is (= 2 (uq-index-size g2 'uq-user 'uname)) "index rebuilt on open")
-               (signals graph-db:unique-constraint-violation
-                 (with-transaction () (make-uq-user :uname "alice" :email "c@x.com")))
-               (finishes (with-transaction () (make-uq-user :uname "carol" :email "c@x.com"))))
-          (ignore-errors (close-graph g2))
-          (collect-garbage))))))
+             (progn
+               (setf (fdefinition 'graph-db::rebuild-unique-indexes)
+                     (lambda (gr) (setf rebuilt t) (funcall orig gr)))
+               (let ((g2 (open-graph *uq-graph-name* path)))
+                 (unwind-protect
+                      (let ((*graph* g2))
+                        (is (null rebuilt) "reopen restored from the sidecar, no scan")
+                        (is (= 2 (uq-index-size g2 'uq-user 'uname)) "index restored")
+                        (signals graph-db:unique-constraint-violation
+                          (with-transaction () (make-uq-user :uname "alice" :email "c@x.com")))
+                        (finishes (with-transaction () (make-uq-user :uname "carol" :email "c@x.com"))))
+                   (ignore-errors (close-graph g2))
+                   (collect-garbage))))
+          (setf (fdefinition 'graph-db::rebuild-unique-indexes) orig))))))
 
 (test concurrent-race-exactly-one-wins
   "The phantom the commit lock defeats: N threads racing to create the same unique

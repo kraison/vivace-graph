@@ -3,14 +3,15 @@
 **Status:** v1 **implemented** on branch `unique-constraint` (`unique-constraint.lisp`):
 slot-level `:unique` (`t`/`equal`/`equalp`/canonicalizer), commit-boundary enforcement
 (check in `validate` / maintain in `apply`), NULL-exempt, cross-subtype, on-disk **and**
-memory backends, `:local` + degenerate `:origin`. **Memory-backend persistence is done**
-— the unique index rides the checkpoint image (dumped at checkpoint, restored on open,
-no scan, lazy-safe: it does not materialize nodes). **On-disk persistence is the
-remaining follow-up** — on-disk still rebuilds the in-RAM index on open; the durable
-form there is an incremental mmap skip-list (address in a sidecar, like the spatial
-index). NB a cl-store-of-contents sidecar on close is *not* correct on-disk: after a
-crash, nodes committed since the last close are in the heap but absent from the sidecar,
-so a duplicate could slip through — hence the mmap skip-list, not a contents dump. The
+memory backends, `:local` + degenerate `:origin`. **Durable on both backends.** Memory: the unique index rides the checkpoint image
+(dumped at checkpoint, restored on open, no scan, lazy-safe — it does not materialize
+nodes). On-disk: each unique index is a persistent heap skip-list (view-style composite
+`(key id)` key), maintained incrementally in `apply` (mmap-durable, journal-replayable);
+its root address is saved to a sidecar (`unique-indexes.dat`) at close and reopened at
+open — no scan.  (A cl-store of the index *contents* on close would be wrong: stale
+after a crash, since nodes committed since the last close are in the heap but not the
+sidecar — so only the address is persisted; the contents live in the mmap skip-list.)
+`rebuild-unique-indexes` remains the fallback (fresh graph / no sidecar / crash). The
 design below is the reference; this note records what is built.
 
 ## Motivation

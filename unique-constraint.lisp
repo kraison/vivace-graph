@@ -88,7 +88,62 @@ test + canonicalizer are resolved lazily when the index is created."
 ;;; ---------------------------------------------------------------------------
 
 (defstruct (unique-index (:constructor %make-unique-index))
-  owner-name slot-name spec test canonicalizer scope table)
+  owner-name slot-name spec test canonicalizer scope
+  ;; Backing store -- exactly one is set.  TABLE: an in-RAM hash (memory backend;
+  ;; persisted via the #50 checkpoint image).  SKIP-LIST: a persistent heap skip-list
+  ;; keyed by the composite (canonical-key id) via REDUCE-COMP-LESSP, like a view (on-
+  ;; disk backend; durable + incremental via mmap, address saved in a sidecar).
+  table skip-list)
+
+;;; Backend-agnostic operations over the backing store (K = canonical key).
+(defun make-unique-skip-list (graph)
+  "The persistent skip-list backing an on-disk unique index -- a view-style ordered
+map (composite key, REDUCE-COMP-LESSP), so it reopens with the same params as a view."
+  (make-view-skip-list graph (make-view :sort-order :lessp)))
+
+(defun %open-unique-skip-list (graph address)
+  (open-skip-list :address address :heap (indexes graph)
+                  :key-equal 'reduce-equal :key-comparison 'reduce-comp-lessp
+                  :duplicates-allowed-p nil :value-equal 'equal
+                  :key-serializer 'view-key-serialize :key-deserializer 'view-key-deserialize
+                  :value-serializer 'serialize :value-deserializer 'deserialize))
+
+(defun uix-lookup (uix key)
+  "The id currently holding canonical KEY in UIX, or NIL."
+  (let ((tbl (unique-index-table uix)))
+    (if tbl
+        (gethash key tbl)
+        (let* ((cur (make-range-cursor (unique-index-skip-list uix)
+                                       (list key +null-key+) (list key +max-key+)))
+               (node (cursor-next cur)))
+          (when node (second (%sn-key node)))))))
+
+(defun uix-put (uix key id)
+  "Claim canonical KEY for node ID."
+  (let ((tbl (unique-index-table uix)))
+    (if tbl
+        (setf (gethash key tbl) id)
+        ;; The id lives in the composite key's second slot (read back by UIX-LOOKUP);
+        ;; the skip-list VALUE is unused -- store NIL, not the raw id byte array (which
+        ;; SERIALIZE cannot round-trip).
+        (add-to-skip-list (unique-index-skip-list uix) (list key id) nil))))
+
+(defun uix-remove (uix key id)
+  "Release node ID's claim on canonical KEY (only)."
+  (let ((tbl (unique-index-table uix)))
+    (if tbl
+        (when (equalp (gethash key tbl) id) (remhash key tbl))
+        ;; the composite (key id) is specific to this node -- removes only its entry
+        (remove-from-skip-list (unique-index-skip-list uix) (list key id)))))
+
+(defun uix-count (uix)
+  "Number of live entries in UIX (backend-agnostic)."
+  (let ((tbl (unique-index-table uix)))
+    (if tbl
+        (hash-table-count tbl)
+        (let ((cur (make-cursor (unique-index-skip-list uix))) (n 0))
+          (loop for node = (cursor-next cur) while node do (incf n))
+          n))))
 
 (defun %node-origin (node graph)
   "The origin an :ORIGIN-scoped key is partitioned by.  v1: the graph's own
@@ -120,13 +175,17 @@ from SPEC on creation."
            (key (cons owner-name slot-name)))
       (or (gethash key reg)
           (multiple-value-bind (test canon) (%resolve-unique-canonicalizer spec)
-            (setf (gethash key reg)
-                  (%make-unique-index
-                   :owner-name owner-name :slot-name slot-name :spec spec :test test
-                   :canonicalizer canon :scope scope
-                   :table (make-hash-table :test test
-                                           #+sbcl :synchronized #+sbcl t
-                                           #+ccl :shared #+ccl t))))))))
+            (let ((uix (%make-unique-index
+                        :owner-name owner-name :slot-name slot-name :spec spec
+                        :test test :canonicalizer canon :scope scope)))
+              ;; On-disk (a heap is present) -> a persistent skip-list; memory -> a hash.
+              (if (indexes graph)
+                  (setf (unique-index-skip-list uix) (make-unique-skip-list graph))
+                  (setf (unique-index-table uix)
+                        (make-hash-table :test test
+                                         #+sbcl :synchronized #+sbcl t
+                                         #+ccl :shared #+ccl t)))
+              (setf (gethash key reg) uix)))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Maintenance (APPLY, post-durability, journal-replayable)
@@ -137,16 +196,14 @@ from SPEC on creation."
   (dolist (d (class-unique-slots (class-of node)))
     (let* ((uix (%unique-index-for graph d))
            (key (%unique-key uix (slot-value node (first d)) node graph)))
-      (when key (setf (gethash key (unique-index-table uix)) (id node))))))
+      (when key (uix-put uix key (id node))))))
 
 (defun %uix-release (node graph)
-  "Release NODE's unique keys (delete / old value of an update).  Guarded so it
-never removes another node's claim."
+  "Release NODE's unique keys (delete / old value of an update)."
   (dolist (d (class-unique-slots (class-of node)))
     (let* ((uix (%unique-index-for graph d))
            (key (%unique-key uix (slot-value node (first d)) node graph)))
-      (when (and key (equalp (gethash key (unique-index-table uix)) (id node)))
-        (remhash key (unique-index-table uix))))))
+      (when key (uix-remove uix key (id node))))))
 
 (defgeneric apply-tx-write-to-unique-indexes (write graph)
   (:method (write graph) (declare (ignore write graph)) nil))
@@ -187,7 +244,7 @@ aborts before anything is journaled."
               (when key
                 ;; (a) against already-committed nodes (the index reflects them, since
                 ;; prior commits' APPLY ran under this same lock)
-                (let ((holder (gethash key (unique-index-table uix))))
+                (let ((holder (uix-lookup uix key)))
                   (when (and holder (not (equalp holder (id node))))
                     (error 'unique-constraint-violation
                            :class-name (unique-index-owner-name uix)
@@ -228,12 +285,12 @@ memory-graph this materializes the scanned nodes; persistence (v1.1) removes it.
                    (let* ((uix (%unique-index-for graph d))
                           (key (%unique-key uix (slot-value node (first d)) node graph)))
                      (when key
-                       (let ((existing (gethash key (unique-index-table uix))))
+                       (let ((existing (uix-lookup uix key)))
                          (if (and existing (not (equalp existing (id node))))
                              (log:warn "unique-index ~S.~S: pre-existing duplicate key ~S (~A / ~A); keeping first"
                                        (unique-index-owner-name uix) (unique-index-slot-name uix)
                                        key (string-id existing) (string-id (id node)))
-                             (setf (gethash key (unique-index-table uix)) (id node))))))))))
+                             (uix-put uix key (id node))))))))))
         (map-vertices #'index-node graph)
         (map-edges #'index-node graph)))))
 
@@ -254,12 +311,13 @@ the image codec's tagged value writer handles the byte-array ids."
     (when (unique-indexes graph)
       (maphash (lambda (k uix)
                  (declare (ignore k))
-                 (let ((pairs '()))
-                   (maphash (lambda (key id) (push (list key id) pairs))
-                            (unique-index-table uix))
-                   (push (list (unique-index-owner-name uix) (unique-index-slot-name uix)
-                               (unique-index-spec uix) (unique-index-scope uix) pairs)
-                         acc)))
+                 (when (unique-index-table uix)   ; hash-backed (memory) indexes only
+                   (let ((pairs '()))
+                     (maphash (lambda (key id) (push (list key id) pairs))
+                              (unique-index-table uix))
+                     (push (list (unique-index-owner-name uix) (unique-index-slot-name uix)
+                                 (unique-index-spec uix) (unique-index-scope uix) pairs)
+                           acc))))
                (unique-indexes graph)))
     acc))
 
@@ -273,3 +331,51 @@ scan.  Sets *MEMORY-IMAGE-UNIQUE-LOADED* so OPEN skips the rebuild."
           (destructuring-bind (key id) p
             (setf (gethash key (unique-index-table uix)) id))))))
   (setf *memory-image-unique-loaded* t))
+
+;;; ---------------------------------------------------------------------------
+;;; Durable persistence -- ON-DISK backend.  Each unique index is a persistent heap
+;;; skip-list, maintained incrementally in APPLY (mmap-durable, journal-replayable).
+;;; Its heap address is saved in a sidecar at CLOSE-GRAPH and reopened at OPEN, like
+;;; the spatial index -- so no open-time scan.  (A cl-store of the index *contents*
+;;; would be wrong: stale after a crash, since nodes committed since the last close
+;;; are in the heap but not the sidecar.  Only the address is persisted here; the
+;;; contents live in the mmap skip-list.)
+;;; ---------------------------------------------------------------------------
+
+(defun unique-index-root-file (location)
+  (format nil "~A/unique-indexes.dat" location))
+
+(defun save-unique-index-roots (graph)
+  "Persist the on-disk unique indexes' roots (owner slot spec scope address).  No-op
+with no heap (memory) or no unique indexes.  Called at CLOSE-GRAPH."
+  (when (and (indexes graph) (unique-indexes graph))
+    (let ((roots '()))
+      (maphash (lambda (k uix)
+                 (declare (ignore k))
+                 (when (unique-index-skip-list uix)
+                   (push (list (unique-index-owner-name uix) (unique-index-slot-name uix)
+                               (unique-index-spec uix) (unique-index-scope uix)
+                               (%sl-address (unique-index-skip-list uix)))
+                         roots)))
+               (unique-indexes graph))
+      (cl-store:store roots (unique-index-root-file (location graph))))))
+
+(defun restore-unique-index-roots (graph)
+  "Reopen the on-disk unique indexes from the sidecar -- no node scan.  Returns T if a
+sidecar was present (caller skips REBUILD-UNIQUE-INDEXES); NIL to fall back to rebuild
+(a fresh graph, or a crash before the roots were saved)."
+  (let ((file (unique-index-root-file (location graph))))
+    (when (probe-file file)
+      (let ((reg (or (unique-indexes graph)
+                     (setf (unique-indexes graph)
+                           (make-hash-table :test 'equal
+                                            #+sbcl :synchronized #+sbcl t
+                                            #+ccl :shared #+ccl t)))))
+        (dolist (r (cl-store:restore file))
+          (destructuring-bind (owner slot spec scope address) r
+            (multiple-value-bind (test canon) (%resolve-unique-canonicalizer spec)
+              (setf (gethash (cons owner slot) reg)
+                    (%make-unique-index :owner-name owner :slot-name slot :spec spec
+                                        :test test :canonicalizer canon :scope scope
+                                        :skip-list (%open-unique-skip-list graph address)))))))
+      t)))
