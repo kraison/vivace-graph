@@ -698,7 +698,11 @@ as deferred blobs and materialize on first touch (needs a VG-native image)."
       ;; restored AND the journal tail is replayed, so any regenerate sees all nodes.
       (install-views graph)
       (when regenerate-views
-        (regenerate-all-views graph)))
+        (regenerate-all-views graph))
+      ;; Unique constraints (issue #6): rebuild the in-RAM unique indexes from the
+      ;; restored nodes.  NOTE on a lazy graph this materializes the scanned nodes;
+      ;; persistence (v1.1) removes the scan.
+      (rebuild-unique-indexes graph))
     (when peer-role
       (%init-memory-peer-slots graph :open path peer-role origin-id peer-host
                                export-predicate device-registry merge-policy

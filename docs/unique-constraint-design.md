@@ -1,6 +1,11 @@
 # Unique constraints for VivaceGraph (`:unique`) — design (issue #6)
 
-**Status:** design / plan (pre-implementation).
+**Status:** v1 **implemented** on branch `unique-constraint` (`unique-constraint.lisp`):
+slot-level `:unique` (`t`/`equal`/`equalp`/canonicalizer), commit-boundary enforcement
+(check in `validate` / maintain in `apply`), NULL-exempt, cross-subtype, on-disk **and**
+memory backends, `:local` + degenerate `:origin`, with an in-RAM index **rebuilt on
+open** (persistence is the follow-up — see "v1 scope vs deferred"). The design below is
+the reference; this note records that it is built.
 
 ## Motivation
 

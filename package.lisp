@@ -128,6 +128,10 @@
            #:save
            #:mark-deleted
            #:stale-revision-error
+           ;; unique constraints (issue #6)
+           #:unique-constraint-violation
+           #:ucv-class-name #:ucv-slot-name #:ucv-value #:ucv-existing-id
+           #:rebuild-unique-indexes
 
            #:def-view
            #:*view-rv*

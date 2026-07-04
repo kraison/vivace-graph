@@ -285,7 +285,11 @@ Always CLOSE-GRAPH when finished."
         (setf (gethash name *graphs*) graph)
         (when gc-heap-p
           (gc-heap graph))
-        (recover-transactions graph))
+        (recover-transactions graph)
+        ;; Unique constraints (issue #6): rebuild the in-RAM unique indexes from the
+        ;; restored nodes (v1; persistence is the follow-up).  After recovery, so both
+        ;; heap and journal-tail nodes are indexed.  No-op if no :UNIQUE slots exist.
+        (rebuild-unique-indexes graph))
       (when slave-p
         (setf (master-host graph) master-host))
       (when peer-role

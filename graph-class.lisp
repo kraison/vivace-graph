@@ -32,6 +32,10 @@
    (vertex-index :accessor vertex-index :initarg :vertex-index)
    (edge-index :accessor edge-index :initarg :edge-index)
    (spatial-index :accessor spatial-index :initarg :spatial-index :initform nil)
+   ;; Unique constraints (issue #6): (owner-class . slot-name) -> UNIQUE-INDEX.
+   ;; A derived structure (v1: rebuilt on open); enforcement is at the commit
+   ;; boundary.  See unique-constraint.lisp / docs/unique-constraint-design.md.
+   (unique-indexes :accessor unique-indexes :initarg :unique-indexes :initform nil)
    (views-lock :accessor views-lock :initarg :views-lock
                :initform (make-recursive-lock))
    (views :accessor views :initarg :views)

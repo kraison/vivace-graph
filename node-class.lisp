@@ -11,13 +11,27 @@
   ((persistent :accessor persistent-p :initarg :persistent :initform t :allocation :instance)
    (indexed :accessor indexed-p :initarg :index :initform nil :allocation :instance)
    (ephemeral :accessor ephemeral-p :initarg :ephemeral :initform nil :allocation :instance)
-   (meta :accessor meta-p :initarg :meta :initform nil :allocation :instance)))
+   (meta :accessor meta-p :initarg :meta :initform nil :allocation :instance)
+   ;; Uniqueness constraint (issue #6).  UNIQUE-SPEC is the :UNIQUE slot option:
+   ;;   NIL (default) | T/EQUAL | EQUALP | a function designator / lambda form
+   ;; (a 1-arg canonicalizer; uniqueness is EQUAL on the canonical key).  SCOPE is
+   ;; the cross-peer scope: :LOCAL (default) or :ORIGIN.  See
+   ;; docs/unique-constraint-design.md.
+   (unique :accessor unique-spec :initarg :unique :initform nil :allocation :instance)
+   (unique-scope :accessor unique-scope :initarg :scope :initform :local
+                 :allocation :instance)))
 
 (defmethod persistent-p (slot-def)
   nil)
 
 (defmethod indexed-p (slot-def)
   nil)
+
+(defmethod unique-spec (slot-def)
+  nil)
+
+(defmethod unique-scope (slot-def)
+  :local)
 
 (defmethod ephemeral-p (slot-def)
   nil)
@@ -103,6 +117,13 @@
       (setf (slot-value slot 'indexed) t)
       ;; FIXME: Generate index if needed
       )
+    ;; Inherit the uniqueness constraint from the declaring direct slot (issue #6),
+    ;; so a :UNIQUE slot on a parent enforces across its subclasses.
+    (let ((u (find-if #'unique-spec direct-slots)))
+      (when (or (unique-spec slot) u)
+        (setf (slot-value slot 'unique) (or (unique-spec slot) (unique-spec u))
+              (slot-value slot 'unique-scope) (or (and u (unique-scope u))
+                                                  (unique-scope slot)))))
     slot))
 
 (defmethod find-all-subclasses ((class class))
