@@ -40,6 +40,34 @@ checkpoint; open restores it (or replays the journal after a crash).
 image, the schema, and the peer state (lamport clock, field-stamps, applied-op-id
 index).
 
+## Device durability — **call `checkpoint-memory-graph` after `peer-sync`**
+
+This is the fix for the reopen-restore issue in `memory-backend-perf.md`.
+
+**Pulled state is applied directly and is NOT journaled** — between opens it is
+durable *only* through the cl-store image, which is written at clean close. If the
+app's close runs on a nearly-empty instance (the 5 KB image you saw), the next open
+restores empty and re-cold-syncs. The image round-trip itself is fine (verified:
+800 nodes → 188 KB → 800 restored); the gap is purely *when* the image gets written.
+
+So on the device, after a sync:
+
+```lisp
+(peer-sync g)
+(graph-db::checkpoint-memory-graph g)   ; write image + clear journal, now
+```
+
+`checkpoint-memory-graph` = the same checkpoint `close-graph` does, callable any
+time (~0.06 s / 0.2 MB for ~800 nodes). Call it after every sync (and it's cheap
+enough to call after a batch of `record-find`s too). Then the next
+`open-memory-graph` restores the full subgraph and the app should **not** re-sync.
+
+**Restore-vs-resync decision:** don't use a fresh-detection heuristic — check the
+restored node count directly. Right after `open-memory-graph`, if
+`(graph-db::mem-table-count (graph-db::vertex-table g))` is what you expect, restore
+worked; only re-sync if it's ~0. (An app-side `nativeQuery("open-bench")` that opens
+and returns that count would settle the on-device measurement cleanly.)
+
 ## What's validated
 
 - **FiveAM regression suite** (`tests/memory-graph-tests.lisp`): 27/27 on **SBCL
