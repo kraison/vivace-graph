@@ -3,9 +3,15 @@
 **Status:** v1 **implemented** on branch `unique-constraint` (`unique-constraint.lisp`):
 slot-level `:unique` (`t`/`equal`/`equalp`/canonicalizer), commit-boundary enforcement
 (check in `validate` / maintain in `apply`), NULL-exempt, cross-subtype, on-disk **and**
-memory backends, `:local` + degenerate `:origin`, with an in-RAM index **rebuilt on
-open** (persistence is the follow-up — see "v1 scope vs deferred"). The design below is
-the reference; this note records that it is built.
+memory backends, `:local` + degenerate `:origin`. **Memory-backend persistence is done**
+— the unique index rides the checkpoint image (dumped at checkpoint, restored on open,
+no scan, lazy-safe: it does not materialize nodes). **On-disk persistence is the
+remaining follow-up** — on-disk still rebuilds the in-RAM index on open; the durable
+form there is an incremental mmap skip-list (address in a sidecar, like the spatial
+index). NB a cl-store-of-contents sidecar on close is *not* correct on-disk: after a
+crash, nodes committed since the last close are in the heap but absent from the sidecar,
+so a duplicate could slip through — hence the mmap skip-list, not a contents dump. The
+design below is the reference; this note records what is built.
 
 ## Motivation
 

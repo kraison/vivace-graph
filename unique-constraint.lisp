@@ -72,23 +72,23 @@ enforces across its subclasses through one shared index)."
     (class-name (or owner class))))
 
 (defun class-unique-slots (class)
-  "List of (SLOT-NAME OWNER-NAME TEST CANONICALIZER SCOPE) for CLASS's :UNIQUE
-effective slots.  NIL for a class with none (the common case)."
+  "List of (SLOT-NAME OWNER-NAME SPEC SCOPE) for CLASS's :UNIQUE effective slots.
+NIL for a class with none (the common case).  SPEC is the raw :UNIQUE value; the
+test + canonicalizer are resolved lazily when the index is created."
   (when (class-finalized-p class)
     (loop for s in (class-slots class)
           for spec = (unique-spec s)
           when spec
-          collect (multiple-value-bind (test canon) (%resolve-unique-canonicalizer spec)
-                    (list (slot-definition-name s)
-                          (%unique-slot-owner-name class (slot-definition-name s))
-                          test canon (unique-scope s))))))
+          collect (list (slot-definition-name s)
+                        (%unique-slot-owner-name class (slot-definition-name s))
+                        spec (unique-scope s)))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; The index + the graph's registry
 ;;; ---------------------------------------------------------------------------
 
 (defstruct (unique-index (:constructor %make-unique-index))
-  owner-name slot-name test canonicalizer scope table)
+  owner-name slot-name spec test canonicalizer scope table)
 
 (defun %node-origin (node graph)
   "The origin an :ORIGIN-scoped key is partitioned by.  v1: the graph's own
@@ -108,9 +108,10 @@ a NULL/unbound value (which is exempt from the constraint, SQL-style)."
           k))))
 
 (defun %unique-index-for (graph descriptor)
-  "Get-or-create the (empty) UNIQUE-INDEX for DESCRIPTOR = (slot owner test canon
-scope), keyed by (owner . slot) in GRAPH's registry."
-  (destructuring-bind (slot-name owner-name test canon scope) descriptor
+  "Get-or-create the (empty) UNIQUE-INDEX for DESCRIPTOR = (slot owner spec scope),
+keyed by (owner . slot) in GRAPH's registry.  Resolves the test + canonicalizer
+from SPEC on creation."
+  (destructuring-bind (slot-name owner-name spec scope) descriptor
     (let* ((reg (or (unique-indexes graph)
                     (setf (unique-indexes graph)
                           (make-hash-table :test 'equal
@@ -118,13 +119,14 @@ scope), keyed by (owner . slot) in GRAPH's registry."
                                            #+ccl :shared #+ccl t))))
            (key (cons owner-name slot-name)))
       (or (gethash key reg)
-          (setf (gethash key reg)
-                (%make-unique-index
-                 :owner-name owner-name :slot-name slot-name :test test
-                 :canonicalizer canon :scope scope
-                 :table (make-hash-table :test test
-                                         #+sbcl :synchronized #+sbcl t
-                                         #+ccl :shared #+ccl t)))))))
+          (multiple-value-bind (test canon) (%resolve-unique-canonicalizer spec)
+            (setf (gethash key reg)
+                  (%make-unique-index
+                   :owner-name owner-name :slot-name slot-name :spec spec :test test
+                   :canonicalizer canon :scope scope
+                   :table (make-hash-table :test test
+                                           #+sbcl :synchronized #+sbcl t
+                                           #+ccl :shared #+ccl t))))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Maintenance (APPLY, post-durability, journal-replayable)
@@ -234,3 +236,40 @@ memory-graph this materializes the scanned nodes; persistence (v1.1) removes it.
                              (setf (gethash key (unique-index-table uix)) (id node))))))))))
         (map-vertices #'index-node graph)
         (map-edges #'index-node graph)))))
+
+;;; ---------------------------------------------------------------------------
+;;; Durable persistence -- MEMORY backend (rides the #50 checkpoint image, so no
+;;; open-time scan and no lazy-materialization).  On-disk persistence (an
+;;; incremental mmap skip-list) is the follow-up; on-disk still rebuilds on open.
+;;; ---------------------------------------------------------------------------
+
+;; *MEMORY-IMAGE-UNIQUE-LOADED* is defined in memory-graph.lisp (bound by
+;; OPEN-MEMORY-GRAPH, which loads before this file).
+
+(defun %dump-unique-indexes (graph)
+  "Self-contained snapshot of GRAPH's unique indexes for the checkpoint image:
+a list of (owner slot spec scope ((canonical-key id) ...)).  Proper-list pairs so
+the image codec's tagged value writer handles the byte-array ids."
+  (let ((acc '()))
+    (when (unique-indexes graph)
+      (maphash (lambda (k uix)
+                 (declare (ignore k))
+                 (let ((pairs '()))
+                   (maphash (lambda (key id) (push (list key id) pairs))
+                            (unique-index-table uix))
+                   (push (list (unique-index-owner-name uix) (unique-index-slot-name uix)
+                               (unique-index-spec uix) (unique-index-scope uix) pairs)
+                         acc)))
+               (unique-indexes graph)))
+    acc))
+
+(defun %load-unique-indexes (graph dump)
+  "Restore GRAPH's unique indexes from a %DUMP-UNIQUE-INDEXES snapshot -- no node
+scan.  Sets *MEMORY-IMAGE-UNIQUE-LOADED* so OPEN skips the rebuild."
+  (dolist (u dump)
+    (destructuring-bind (owner slot spec scope pairs) u
+      (let ((uix (%unique-index-for graph (list slot owner spec scope))))
+        (dolist (p pairs)
+          (destructuring-bind (key id) p
+            (setf (gethash key (unique-index-table uix)) id))))))
+  (setf *memory-image-unique-loaded* t))

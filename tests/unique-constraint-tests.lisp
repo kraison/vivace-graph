@@ -169,8 +169,60 @@ checkpoint + reopen."
       (let ((g2 (graph-db::open-memory-graph *uq-graph-name* path)))
         (unwind-protect
              (let ((*graph* g2))
-               (is (= 1 (uq-index-size g2 'uq-user 'uname)) "index rebuilt on memory reopen")
+               (is (= 1 (uq-index-size g2 'uq-user 'uname)) "index restored on memory reopen")
                (signals graph-db:unique-constraint-violation
                  (with-transaction () (make-uq-user :uname "alice" :email "c@x.com"))))
+          (ignore-errors (close-graph g2 :snapshot-p nil))
+          (collect-garbage))))))
+
+(test memory-index-is-durable-not-rebuilt
+  "The memory-backend unique index is DURABLE: it rides the checkpoint image, so a
+reopen restores it WITHOUT scanning nodes (REBUILD-UNIQUE-INDEXES is not called)."
+  (with-temp-directory (dir)
+    (let ((path (namestring dir)))
+      (let ((g (graph-db::make-memory-graph *uq-graph-name* path)))
+        (let ((*graph* g))
+          (with-transaction ()
+            (make-uq-user :uname "alice" :email "a@x.com")
+            (make-uq-user :uname "bob"   :email "b@x.com")))
+        (close-graph g :snapshot-p t))
+      (let ((rebuilt nil) (orig (fdefinition 'graph-db::rebuild-unique-indexes)))
+        (unwind-protect
+             (progn
+               (setf (fdefinition 'graph-db::rebuild-unique-indexes)
+                     (lambda (gr) (setf rebuilt t) (funcall orig gr)))
+               (let ((g2 (graph-db::open-memory-graph *uq-graph-name* path)))
+                 (unwind-protect
+                      (let ((*graph* g2))
+                        (is (null rebuilt) "reopen loaded the index from the image, no scan")
+                        (is (= 2 (uq-index-size g2 'uq-user 'uname)) "restored from image")
+                        (signals graph-db:unique-constraint-violation
+                          (with-transaction () (make-uq-user :uname "alice" :email "c@x.com"))))
+                   (ignore-errors (close-graph g2 :snapshot-p nil))
+                   (collect-garbage))))
+          (setf (fdefinition 'graph-db::rebuild-unique-indexes) orig))))))
+
+(test memory-index-durable-lazy-does-not-materialize
+  "On a LAZY memory graph, restoring the unique index from the image does NOT
+materialize nodes (they stay LZNODE blobs) -- the durable index is fault-on-access
+safe, unlike rebuild-on-open."
+  (with-temp-directory (dir)
+    (let ((path (namestring dir)))
+      (let ((g (graph-db::make-memory-graph *uq-graph-name* path :lazy t)))
+        (let ((*graph* g))
+          (with-transaction ()
+            (dotimes (i 20) (make-uq-user :uname (format nil "u~D" i)
+                                          :email (format nil "u~D@x.com" i)))))
+        (close-graph g :snapshot-p t))
+      (let ((g2 (graph-db::open-memory-graph *uq-graph-name* path :lazy t)))
+        (unwind-protect
+             (let ((*graph* g2))
+               (is (= 20 (uq-index-size g2 'uq-user 'uname)) "all keys restored from image")
+               (is-true (loop for v being the hash-values of
+                              (graph-db::mem-table-data (graph-db::vertex-table g2))
+                              always (graph-db::lznode-p v))
+                        "no node was materialized by the unique-index restore")
+               (signals graph-db:unique-constraint-violation
+                 (with-transaction () (make-uq-user :uname "u7" :email "dup@x.com"))))
           (ignore-errors (close-graph g2 :snapshot-p nil))
           (collect-garbage))))))
