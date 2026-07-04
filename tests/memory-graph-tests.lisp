@@ -297,6 +297,50 @@ reflect BOTH the image aggregate and the replayed tail."
           (ignore-errors (close-graph g2 :snapshot-p nil))
           (collect-garbage))))))
 
+(test lazy-restore-plus-journal-tail
+  "The LAZY (fault-on-access) crash-recovery path: a stale native-image checkpoint
+plus a journal tail authored after it -- the device's real crash path (checkpoint
+after peer-sync, author record-finds that journal, killed before the next
+checkpoint).  On open the image's 10 nodes restore as LZNODE blobs (unmaterialized)
+while recover-transactions replays the 5 journaled nodes as LIVE nodes; the two
+coexist in the table and the reduce view reflects BOTH the image aggregate and the
+replayed tail."
+  (flet ((n-materialized (g)
+           (loop for v being the hash-values of
+                 (graph-db::mem-table-data (graph-db::vertex-table g))
+                 count (graph-db::node-p v)))
+         (n-lznodes (g)
+           (loop for v being the hash-values of
+                 (graph-db::mem-table-data (graph-db::vertex-table g))
+                 count (graph-db::lznode-p v))))
+    (with-temp-directory (dir)
+      (let ((loc (namestring dir)))
+        (let ((g (graph-db::make-memory-graph *mem-test-graph-name* loc :lazy t)))
+          (let ((*graph* g))
+            (def-view lt-tail :lessp (m-person :graph-db-memory-test)
+              (:map (lambda (p) (yield (floor (slot-value p 'age) 10) 1)))
+              (:reduce (lambda (keys values &optional r)
+                         (declare (ignore keys r)) (reduce #'+ values))))
+            (with-transaction () (dotimes (i 10) (make-m-person :name "a" :age 25)))
+            (graph-db::checkpoint-memory-graph g)            ; native image: decade 2 x10
+            (with-transaction () (dotimes (i 5) (make-m-person :name "b" :age 35)))
+            ;; simulated crash: no close -- the 5 decade-3 nodes are journaled only
+            ))
+        (let ((g2 (graph-db::open-memory-graph *mem-test-graph-name* loc :lazy t)))
+          (unwind-protect
+               (let ((*graph* g2))
+                 (is (= 15 (graph-db::mem-table-count (graph-db::vertex-table g2))))
+                 ;; mixed state: the 10 image nodes are still blobs; the 5 replayed
+                 ;; journal-tail nodes were applied live by recover-transactions.
+                 (is (= 10 (n-lznodes g2)))
+                 (is (= 5 (n-materialized g2)))
+                 (is (equal '((2 . 10) (3 . 5))
+                            (map-reduced-view
+                             (lambda (k id v) (declare (ignore id)) (cons k v))
+                             'm-person 'lt-tail :graph g2 :collect-p t))))
+            (ignore-errors (close-graph g2 :snapshot-p nil))
+            (collect-garbage)))))))
+
 (test reduce-view-remove-re-reduces
   "Deleting a node from a map-reduce view re-reduces the aggregate via
 GET-NON-AGGREGATE-PAIRS / GET-ALL-AGGREGATE-PAIRS on the mem-skip-list -- the
