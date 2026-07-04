@@ -147,6 +147,7 @@ size(8) flags(1) type(1=#\\U) count(8) then count*16 raw uuid bytes."
   (roots '())                  ; scope roots: list of vertices/ids for SCOPE-NODE-SET
   (scope nil)                  ; opaque device-scope handed to DISCLOSABLE-P
   (edge-types nil)             ; optional edge-type bound for the closure walk
+  (key nil)                    ; per-device replication key (string); NIL = fall back to the hub's shared key
   (manifest '())               ; node-ids the device is KNOWN to hold (PT-4)
   (pull-cursor 0)              ; highest hub authored-feed seq the device applied
   (push-ack 0)                 ; highest device-seq the hub acknowledged (Branch B)
@@ -164,16 +165,23 @@ size(8) flags(1) type(1=#\\U) count(8) then count*16 raw uuid bytes."
   (let ((reg (device-registry hub)))
     (and reg (gethash origin-id reg))))
 
-(defun register-peer-device (hub &key origin-id roots scope edge-types
+(defun register-peer-device (hub &key origin-id roots scope edge-types key
                                    (manifest '()))
   "Register (or replace) a device in HUB's registry.  The app calls this to grant
-ORIGIN-ID a clearance SCOPE rooted at ROOTS; the engine consumes it on pull.
-Returns the PEER-DEVICE."
+ORIGIN-ID a clearance SCOPE rooted at ROOTS; the engine consumes it on pull.  KEY is the
+device's own replication key (per-device provisioning); NIL falls back to the hub's shared
+REPLICATION-KEY at authentication.  Returns the PEER-DEVICE."
   (let ((reg (ensure-device-registry hub))
         (dev (%make-peer-device :origin-id origin-id :roots roots :scope scope
-                                :edge-types edge-types :manifest manifest)))
+                                :edge-types edge-types :key key :manifest manifest)))
     (setf (gethash origin-id reg) dev)
     dev))
+
+(defun unregister-peer-device (hub origin-id)
+  "Remove ORIGIN-ID from HUB's device registry (revocation): it can no longer authenticate or
+pull.  Targeted -- leaves every other device's manifest/cursors intact.  Returns T if present."
+  (let ((reg (device-registry hub)))
+    (and reg (remhash origin-id reg))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Hub: send a node as a state-sync create, and send a purge op.
@@ -300,12 +308,12 @@ safe integers; schema-digest carried as a within-major integrity signal)."
         :schema-digest (schema-digest (schema graph))))
 
 (defun peer-authenticate-device (graph auth)
-  "Validate a device AUTH plist against GRAPH (the hub): replication-key, the
-same-major schema gate (WP-6/PT-6), and a known origin in the device registry.
-Returns the PEER-DEVICE, or signals.  Records the device's last-pushed schema
-version for the drain-and-update barrier signal (§14)."
-  (unless (equal (getf auth :replication-key) (replication-key graph))
-    (error 'invalid-auth-data-error))
+  "Validate a device AUTH plist against GRAPH (the hub): the same-major schema gate
+(WP-6/PT-6), a known origin in the device registry, and the replication key.  The key
+checked is the device's OWN key when it has one (per-device provisioning), else the hub's
+shared REPLICATION-KEY (back-compat for un-keyed devices).  The device is looked up FIRST
+so its key is known before the key check.  Returns the PEER-DEVICE, or signals.  Records the
+device's last-pushed schema version for the drain-and-update barrier signal (§14)."
   (let ((hub-version (peer-schema-version graph))
         (dev-version (list (getf auth :schema-major) (getf auth :schema-minor))))
     (unless (peer-schema-compatible-p hub-version dev-version)
@@ -315,6 +323,9 @@ version for the drain-and-update barrier signal (§14)."
            (device (find-peer-device graph origin)))
       (unless device
         (error 'invalid-auth-data-error))
+      (let ((expected (or (peer-device-key device) (replication-key graph))))
+        (unless (and expected (equal (getf auth :replication-key) expected))
+          (error 'invalid-auth-data-error)))
       (setf (peer-device-last-pushed-schema-version device) dev-version)
       device)))
 
