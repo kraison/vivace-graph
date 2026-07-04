@@ -37,10 +37,16 @@
   ;; Writes are single-threaded (the transaction-manager lock serializes commit
   ;; apply), so this lock only guards the rare non-commit mutation; reads are
   ;; lock-free and see a whole node via atomic slot replacement.
-  (lock (make-recursive-lock "mem-table")))
+  (lock (make-recursive-lock "mem-table"))
+  ;; Back-references for lazy (fault-on-access) materialization: KIND (:vertex or
+  ;; :edge) picks the node constructor, GRAPH gives the schema for type-id->class.
+  ;; A lazy table's values are LZNODEs (parsed head + deferred data blob) until
+  ;; first touch; see MEM-MATERIALIZE.  Both stay NIL for a non-lazy table.
+  (kind nil)
+  (graph nil))
 
 (declaim (inline make-mem-table mem-table-get mem-table-put mem-table-rem))
-(defun make-mem-table () (%make-mem-table))
+(defun make-mem-table (&key kind graph) (%make-mem-table :kind kind :graph graph))
 
 (defun mem-table-get (table key)
   "The node stored under KEY, or NIL."
@@ -76,7 +82,12 @@ whole old or new node, never a torn one)."
 ;;; ---------------------------------------------------------------------------
 
 (defclass memory-graph-mixin ()
-  ()
+  ((lazy-p :initarg :lazy :accessor lazy-p :initform nil
+           :documentation "When true, OPEN restores nodes as LZNODE blobs (parsed
+head + deferred data) and materializes each live node only on first touch
+(fault-on-access) -- open pays no MAKE-INSTANCE, which is ~85% of eager open cost
+on ECL (#50).  Implies the VG-native image format (per-node blobs); the default
+(NIL) keeps the eager cl-store path unchanged."))
   (:documentation "Storage-backend mixin marking a graph whose tables/indexes/
 views live in RAM as live objects rather than in mmap'd files.  The node-op
 generics dispatch on this class."))
@@ -124,31 +135,40 @@ runs UNCHANGED on a memory-graph.  All the geohash covering math is reused as-is
    :heap nil :precision precision))
 
 (defun %make-empty-memory-graph (name location &key (class 'memory-graph)
-                                                 replication-key replication-port)
+                                                 replication-key replication-port
+                                                 lazy)
   "A fresh CLASS shell with empty in-RAM tables (no schema/txn wiring yet).
 Shared by MAKE-MEMORY-GRAPH and OPEN-MEMORY-GRAPH; CLASS is MEMORY-GRAPH or
-MEMORY-PEER-GRAPH."
-  (make-instance class
-                 :graph-name name
-                 :location location
-                 :replication-key replication-key
-                 :replication-port replication-port
-                 :views
-                 #+sbcl (make-hash-table :synchronized t)
-                 #+ccl (make-hash-table :shared t)
-                 #+lispworks (make-hash-table :single-thread nil)
-                 #+ecl (make-hash-table)
-                 :cache (make-id-table :synchronized t :weakness :value)
-                 :vertex-table (make-mem-table)
-                 :edge-table (make-mem-table)
-                 :heap nil
-                 :indexes nil
-                 :ve-index-in (make-mem-ve-index)
-                 :ve-index-out (make-mem-ve-index)
-                 :vev-index (make-mem-vev-index)
-                 :vertex-index (make-mem-type-index)
-                 :edge-index (make-mem-type-index)
-                 :spatial-index (make-mem-spatial-index)))
+MEMORY-PEER-GRAPH.  With LAZY, the node tables materialize on first touch."
+  (let ((graph (make-instance class
+                              :graph-name name
+                              :location location
+                              :lazy lazy
+                              :replication-key replication-key
+                              :replication-port replication-port
+                              :views
+                              #+sbcl (make-hash-table :synchronized t)
+                              #+ccl (make-hash-table :shared t)
+                              #+lispworks (make-hash-table :single-thread nil)
+                              #+ecl (make-hash-table)
+                              :cache (make-id-table :synchronized t :weakness :value)
+                              :vertex-table (make-mem-table)
+                              :edge-table (make-mem-table)
+                              :heap nil
+                              :indexes nil
+                              :ve-index-in (make-mem-ve-index)
+                              :ve-index-out (make-mem-ve-index)
+                              :vev-index (make-mem-vev-index)
+                              :vertex-index (make-mem-type-index)
+                              :edge-index (make-mem-type-index)
+                              :spatial-index (make-mem-spatial-index))))
+    ;; Wire the node tables back to the graph + their kind, so lazy materialization
+    ;; (MEM-MATERIALIZE) is self-contained (needs the schema + the right ctor).
+    (setf (mem-table-kind (vertex-table graph)) :vertex
+          (mem-table-graph (vertex-table graph)) graph
+          (mem-table-kind (edge-table graph)) :edge
+          (mem-table-graph (edge-table graph)) graph)
+    graph))
 
 (defun %write-dirty-marker (path)
   (with-open-file (out (format nil "~A/.dirty" path) :direction :output
@@ -187,20 +207,23 @@ applied-op-id dedup lhash (opened when MODE is :OPEN and it already exists)."
 
 (defun make-memory-graph (name location
                           &key package replication-port replication-key
-                            peer-role origin-id peer-host
+                            peer-role origin-id peer-host lazy
                             export-predicate device-registry merge-policy
                             reference-classes (peer-schema-version '(1 0)))
   "Create a brand-new in-memory graph named NAME.  LOCATION is used for the
 durable journal, cl-store image and schema (the RAM structures are rebuilt from
 them on OPEN-MEMORY-GRAPH).  With :PEER-ROLE (:HUB or :DEVICE, a :DEVICE also
 needs a hub-minted :ORIGIN-ID) a MEMORY-PEER-GRAPH is built and the peer
-replication path is wired.  Registers the graph and returns it."
+replication path is wired.  With :LAZY, the graph uses the VG-native image format
+and materializes nodes on first touch (fault-on-access) for a near-instant open.
+Registers the graph and returns it."
   (%validate-peer-role peer-role origin-id)
   (ensure-directories-exist location)
   (let* ((path (pathname location))
          (graph (%make-empty-memory-graph
                  name path
                  :class (if peer-role 'memory-peer-graph 'memory-graph)
+                 :lazy lazy
                  :replication-key replication-key
                  :replication-port replication-port)))
     (let ((*graph* graph))
@@ -301,25 +324,255 @@ structurally instead of regenerating them.")
              (views graph))
     acc))
 
+;;; ===========================================================================
+;;; VG-native image format (v3) + fault-on-access (lazy) materialization.
+;;;
+;;; WHY a second format: on ECL, restoring the image is ~85% MAKE-INSTANCE cost
+;;; (building the live CLOS nodes), ~15% deserialize, ~0.5% byte-parse -- so the
+;;; wire format is NOT the lever (a cl-store->native swap is a wash).  The lever is
+;;; NOT building the nodes you don't touch.  cl-store can't do that (it inlines a
+;;; whole instance per node); the native format stores each node as a compact
+;;; record -- head fields packed raw + the SAME data blob VG's on-disk heap writes
+;;; ((serialize (data node))) -- so open can stop at the blob (an LZNODE) and defer
+;;; MAKE-INSTANCE to first touch.  SERIALIZE-MULTIPLE is O(k^2) per call, so every
+;;; SERIALIZE here is on ONE small object (a node's data alist / one key / value),
+;;; never the aggregate.
+;;; ===========================================================================
+
+;;; ---- write: growable little-endian byte buffer ----
+(defun ni-mkbuf () (make-array 65536 :element-type '(unsigned-byte 8)
+                               :adjustable t :fill-pointer 0))
+(declaim (inline ni-u8 ni-uint ni-bytes ni-blob ni-lisp))
+(defun ni-u8 (buf b) (vector-push-extend b buf))
+(defun ni-uint (buf n nbytes)
+  (dotimes (i nbytes) (vector-push-extend (ldb (byte 8 (* i 8)) n) buf)))
+(defun ni-bytes (buf vec)
+  (let ((n (length vec))) (dotimes (i n) (vector-push-extend (aref vec i) buf))))
+(defun ni-blob (buf vec) (ni-uint buf (length vec) 4) (ni-bytes buf vec))
+(defun ni-lisp (buf val) (ni-blob buf (serialize val)))
+
+;;; ---- read: cursor over a byte array ----
+(defstruct (ric (:constructor ni-ric (bytes))) bytes (i 0 :type fixnum))
+(declaim (inline ri-u8 ri-uint ri-bytes ri-blob ri-lisp))
+(defun ri-u8 (rc) (prog1 (aref (ric-bytes rc) (ric-i rc)) (incf (ric-i rc))))
+(defun ri-uint (rc nbytes)
+  (let ((n 0) (i (ric-i rc)) (b (ric-bytes rc)))
+    (dotimes (k nbytes) (setf n (dpb (aref b (+ i k)) (byte 8 (* k 8)) n)))
+    (setf (ric-i rc) (+ i nbytes)) n))
+(defun ri-bytes (rc n)
+  (let* ((i (ric-i rc)) (v (subseq (ric-bytes rc) i (+ i n))))
+    (setf (ric-i rc) (+ i n)) v))
+(defun ri-blob (rc) (ri-bytes rc (ri-uint rc 4)))
+(defun ri-lisp (rc) (deserialize (ri-blob rc)))
+
+;;; ---- LZNODE: a not-yet-materialized node.  Parsed head (cheap; ~0.5% of open)
+;;; + the deferred data blob.  Deliberately NOT a node instance -- MAKE-INSTANCE is
+;;; the ~85% cost we defer to first touch (MEM-MATERIALIZE).  A lazy mem-table's
+;;; values are LZNODEs until touched, then swapped for the live node.
+(defstruct (lznode (:constructor make-lznode) (:predicate lznode-p))
+  (type-id 0) (deleted-p nil) (revision 0) (commit-epoch 0)
+  from to (weight 1.0) (data-blob nil))
+
+;;; node record = raw head fields + length-prefixed data blob (edges add from/to/
+;;; weight before data).  Writer handles a live node OR an LZNODE (untouched nodes
+;;; pass their blob straight through -- no re-serialize on checkpoint).
+(defun ni-node (buf id x edge-p)
+  (if (lznode-p x)
+      (progn
+        (ni-uint buf (lznode-type-id x) 2) (ni-blob buf id)
+        (ni-u8 buf (if (lznode-deleted-p x) 1 0))
+        (ni-uint buf (lznode-revision x) 4) (ni-uint buf (lznode-commit-epoch x) 8)
+        (when edge-p (ni-blob buf (lznode-from x)) (ni-blob buf (lznode-to x))
+              (ni-lisp buf (lznode-weight x)))
+        (ni-blob buf (lznode-data-blob x)))
+      (progn
+        (ni-uint buf (type-id x) 2) (ni-blob buf id)
+        (ni-u8 buf (if (deleted-p x) 1 0))
+        (ni-uint buf (revision x) 4) (ni-uint buf (commit-epoch x) 8)
+        (when edge-p (ni-blob buf (from x)) (ni-blob buf (to x)) (ni-lisp buf (weight x)))
+        (ni-blob buf (serialize (data x))))))
+
+(defun ri-node (rc edge-p)
+  "Read one record into (values ID LZNODE) -- head parsed, data blob deferred."
+  (let* ((type-id (ri-uint rc 2)) (id (ri-blob rc)) (del (= 1 (ri-u8 rc)))
+         (rev (ri-uint rc 4)) (ce (ri-uint rc 8))
+         (from (when edge-p (ri-blob rc))) (to (when edge-p (ri-blob rc)))
+         (weight (if edge-p (ri-lisp rc) 1.0))
+         (blob (ri-blob rc)))
+    (values id (make-lznode :type-id type-id :deleted-p del :revision rev
+                            :commit-epoch ce :from from :to to :weight weight
+                            :data-blob blob))))
+
+;;; ---- materialize: LZNODE -> live node (the deferred MAKE-INSTANCE + deserialize)
+(defun %lznode->node (table id lz)
+  (let* ((graph (mem-table-graph table))
+         (edge-p (eq (mem-table-kind table) :edge))
+         (type-id (lznode-type-id lz))
+         (class (node-type-name
+                 (lookup-node-type-by-id type-id (if edge-p :edge :vertex) :graph graph)))
+         (blob (lznode-data-blob lz))
+         (data (when blob (deserialize blob))))
+    (if edge-p
+        (%make-edge :id id :type-id type-id :revision (lznode-revision lz)
+                    :commit-epoch (lznode-commit-epoch lz) :deleted-p (lznode-deleted-p lz)
+                    :from (lznode-from lz) :to (lznode-to lz) :weight (lznode-weight lz)
+                    :data data :bytes blob :written-p t :data-pointer 0 :class class)
+        (%make-vertex :id id :type-id type-id :revision (lznode-revision lz)
+                      :commit-epoch (lznode-commit-epoch lz) :deleted-p (lznode-deleted-p lz)
+                      :data data :bytes blob :written-p t :data-pointer 0 :class class))))
+
+(defun mem-materialize (table id lz)
+  "Build the live node from LZ and atomically swap it into TABLE under ID (so later
+lookups return the live object).  Returns the node."
+  (let ((node (%lznode->node table id lz)))
+    (mem-table-put table id node)
+    node))
+
+;;; ---- derived-structure sections (id-based; identical whether lazy or eager) ----
+(defun ni-index (buf dump keyfn)     ; dump = list of (key . id-list)
+  (ni-uint buf (length dump) 4)
+  (dolist (pair dump)
+    (funcall keyfn buf (car pair))
+    (let ((ids (cdr pair)))
+      (ni-uint buf (length ids) 4)
+      (dolist (id ids) (ni-blob buf id)))))
+(defun ri-index (rc keyrd)
+  (let ((n (ri-uint rc 4)) (acc '()))
+    (dotimes (i n)
+      (let ((key (funcall keyrd rc)) (m (ri-uint rc 4)) (ids '()))
+        (dotimes (j m) (push (ri-blob rc) ids))
+        (push (cons key (nreverse ids)) acc)))
+    (nreverse acc)))
+(defun ni-key-type (buf k) (ni-uint buf k 2))
+(defun ri-key-type (rc) (ri-uint rc 2))
+(defun ni-key-ve (buf k) (ni-blob buf (ve-key-id k)) (ni-uint buf (ve-key-type-id k) 2))
+(defun ri-key-ve (rc) (let ((id (ri-blob rc)) (ti (ri-uint rc 2))) (make-ve-key :id id :type-id ti)))
+(defun ni-key-vev (buf k)
+  (ni-blob buf (vev-key-out-id k)) (ni-blob buf (vev-key-in-id k)) (ni-uint buf (vev-key-type-id k) 2))
+(defun ri-key-vev (rc)
+  (let ((o (ri-blob rc)) (in (ri-blob rc)) (ti (ri-uint rc 2)))
+    (make-vev-key :out-id o :in-id in :type-id ti)))
+;; Tagged value codec for spatial values / view keys: VG's SERIALIZE cannot
+;; round-trip a bare (unsigned-byte 8) array (ids/uuids -- the on-disk path always
+;; handles those as raw bytes), and view keys are composite lists that CONTAIN id
+;; arrays.  So encode byte arrays as raw blobs (tag 1), lists element-wise (tag 2),
+;; and everything else via SERIALIZE (tag 3).
+(defun ni-val (buf v)
+  (cond
+    ((typep v '(array (unsigned-byte 8) (*))) (ni-u8 buf 1) (ni-blob buf v))
+    ((and (consp v) (null (cdr (last v))))    (ni-u8 buf 2) (ni-uint buf (length v) 4)
+                                              (dolist (e v) (ni-val buf e)))
+    ((null v)                                 (ni-u8 buf 2) (ni-uint buf 0 4))
+    (t                                        (ni-u8 buf 3) (ni-blob buf (serialize v)))))
+(defun ri-val (rc)
+  (ecase (ri-u8 rc)
+    (1 (ri-blob rc))
+    (2 (let ((n (ri-uint rc 4))) (loop repeat n collect (ri-val rc))))
+    (3 (deserialize (ri-blob rc)))))
+
+(defun ni-pairs (buf dump)           ; skip-list dump = list of (key . value)
+  (ni-uint buf (length dump) 4)
+  (dolist (p dump) (ni-val buf (car p)) (ni-val buf (cdr p))))
+(defun ri-pairs (rc)
+  (let ((n (ri-uint rc 4)) (acc '()))
+    (dotimes (i n) (push (cons (ri-val rc) (ri-val rc)) acc))
+    (nreverse acc)))
+(defun ni-views (buf graph)
+  (let ((dump (%dump-views graph)))
+    (ni-uint buf (length dump) 4)
+    (dolist (vd dump)
+      (destructuring-bind (class-name view-name entries) vd
+        (ni-lisp buf class-name) (ni-lisp buf view-name) (ni-pairs buf entries)))))
+(defun ri-views (rc)
+  (let ((n (ri-uint rc 4)) (acc '()))
+    (dotimes (i n) (push (list (ri-lisp rc) (ri-lisp rc) (ri-pairs rc)) acc))
+    (nreverse acc)))
+
+(defparameter *native-image-magic* #(86 71 77 73)) ; "VGMI"
+
+(defun %native-image-p (file)
+  (with-open-file (s file :element-type '(unsigned-byte 8))
+    (and (>= (file-length s) 4)
+         (loop for b across *native-image-magic* always (eql b (read-byte s))))))
+
+(defun write-memory-image-native (graph)
+  "Write GRAPH's full state in the VG-native (v3) format: per-node blob records +
+the same structural derived dumps.  Untouched LZNODEs pass their blob through."
+  (let ((buf (ni-mkbuf)))
+    (ni-bytes buf *native-image-magic*) (ni-uint buf 3 4)
+    (ni-uint buf (load-highest-transaction-id graph) 8)
+    (let ((vt (mem-table-data (vertex-table graph)))
+          (et (mem-table-data (edge-table graph))))
+      (ni-uint buf (hash-table-count vt) 4)
+      (maphash (lambda (id x) (ni-node buf id x nil)) vt)
+      (ni-uint buf (hash-table-count et) 4)
+      (maphash (lambda (id x) (ni-node buf id x t)) et))
+    (ni-index buf (%dump-mem-index (mem-type-index-data (vertex-index graph))) #'ni-key-type)
+    (ni-index buf (%dump-mem-index (mem-type-index-data (edge-index graph)))   #'ni-key-type)
+    (ni-index buf (%dump-mem-index (mem-ve-index-data (ve-index-in graph)))    #'ni-key-ve)
+    (ni-index buf (%dump-mem-index (mem-ve-index-data (ve-index-out graph)))   #'ni-key-ve)
+    (ni-index buf (%dump-mem-index (mem-vev-index-data (vev-index graph)))     #'ni-key-vev)
+    (let ((idx (spatial-index graph)))
+      (ni-pairs buf (if idx (%dump-mem-skip-list (spatial-index-skip-list idx)) '())))
+    (ni-views buf graph)
+    (with-open-file (s (memory-image-file (location graph)) :direction :output
+                       :element-type '(unsigned-byte 8) :if-exists :supersede
+                       :if-does-not-exist :create)
+      (write-sequence buf s))))
+
+(defun restore-memory-image-native (graph file)
+  "Restore a VG-native (v3) image.  When GRAPH is LAZY, node tables receive LZNODE
+blobs (no MAKE-INSTANCE -- fault-on-access); otherwise each node is materialized
+now.  Indexes/spatial/views are restored structurally either way.  Returns
+:STRUCTURAL and stashes the view dump in *MEMORY-IMAGE-VIEW-DUMP*."
+  (let* ((bytes (with-open-file (s file :element-type '(unsigned-byte 8))
+                  (let ((a (make-array (file-length s) :element-type '(unsigned-byte 8))))
+                    (read-sequence a s) a)))
+         (rc (ni-ric bytes))
+         (lazy (lazy-p graph))
+         (vtable (vertex-table graph))
+         (etable (edge-table graph)))
+    (ri-bytes rc 4) (ri-uint rc 4) (ri-uint rc 8) ; magic, version, highest-tx-id
+    (let ((nv (ri-uint rc 4)))
+      (dotimes (i nv)
+        (multiple-value-bind (id lz) (ri-node rc nil)
+          (mem-table-put vtable id (if lazy lz (%lznode->node vtable id lz))))))
+    (let ((ne (ri-uint rc 4)))
+      (dotimes (i ne)
+        (multiple-value-bind (id lz) (ri-node rc t)
+          (mem-table-put etable id (if lazy lz (%lznode->node etable id lz))))))
+    (%load-mem-index (mem-type-index-data (vertex-index graph)) (ri-index rc #'ri-key-type))
+    (%load-mem-index (mem-type-index-data (edge-index graph))   (ri-index rc #'ri-key-type))
+    (%load-mem-index (mem-ve-index-data (ve-index-in graph))    (ri-index rc #'ri-key-ve))
+    (%load-mem-index (mem-ve-index-data (ve-index-out graph))   (ri-index rc #'ri-key-ve))
+    (%load-mem-index (mem-vev-index-data (vev-index graph))     (ri-index rc #'ri-key-vev))
+    (let ((idx (spatial-index graph)) (sp (ri-pairs rc)))
+      (when idx (%load-mem-skip-list (spatial-index-skip-list idx) sp)))
+    (setf *memory-image-view-dump* (or (ri-views rc) '()))
+    :structural))
+
 (defun write-memory-image (graph)
-  "Pickle GRAPH's full in-RAM state -- node tables AND every derived structure
-(ve/vev/type indexes, spatial grid, view ordered-maps) -- to its cl-store image in
-one write.  Persisting the derived structures (vs rebuilding on open) is what keeps
-OPEN-MEMORY-GRAPH fast."
-  (cl-store:store
-   (list :version 2
-         :highest-tx-id (load-highest-transaction-id graph)
-         :vertices (map-mem-table #'identity (vertex-table graph) :collect-p t)
-         :edges (map-mem-table #'identity (edge-table graph) :collect-p t)
-         :type-vertex (%dump-mem-index (mem-type-index-data (vertex-index graph)))
-         :type-edge   (%dump-mem-index (mem-type-index-data (edge-index graph)))
-         :ve-in       (%dump-mem-index (mem-ve-index-data (ve-index-in graph)))
-         :ve-out      (%dump-mem-index (mem-ve-index-data (ve-index-out graph)))
-         :vev         (%dump-mem-index (mem-vev-index-data (vev-index graph)))
-         :spatial     (let ((idx (spatial-index graph)))
-                        (and idx (%dump-mem-skip-list (spatial-index-skip-list idx))))
-         :views       (%dump-views graph))
-   (memory-image-file (location graph))))
+  "Persist GRAPH's full in-RAM state -- node tables AND every derived structure
+(ve/vev/type indexes, spatial grid, view ordered-maps) -- to its image file in one
+write.  A LAZY graph uses the VG-native format (per-node blobs, so open can defer
+materialization); otherwise the cl-store v2 format.  Persisting the derived
+structures (vs rebuilding on open) is what keeps OPEN-MEMORY-GRAPH fast."
+  (if (lazy-p graph)
+      (write-memory-image-native graph)
+      (cl-store:store
+       (list :version 2
+             :highest-tx-id (load-highest-transaction-id graph)
+             :vertices (map-mem-table #'identity (vertex-table graph) :collect-p t)
+             :edges (map-mem-table #'identity (edge-table graph) :collect-p t)
+             :type-vertex (%dump-mem-index (mem-type-index-data (vertex-index graph)))
+             :type-edge   (%dump-mem-index (mem-type-index-data (edge-index graph)))
+             :ve-in       (%dump-mem-index (mem-ve-index-data (ve-index-in graph)))
+             :ve-out      (%dump-mem-index (mem-ve-index-data (ve-index-out graph)))
+             :vev         (%dump-mem-index (mem-vev-index-data (vev-index graph)))
+             :spatial     (let ((idx (spatial-index graph)))
+                            (and idx (%dump-mem-skip-list (spatial-index-skip-list idx))))
+             :views       (%dump-views graph))
+       (memory-image-file (location graph)))))
 
 (defun %rebuild-derived-from-nodes (graph vertices edges)
   "v1 fallback: rebuild indexes + spatial from the restored nodes (idempotent;
@@ -346,6 +599,8 @@ stashed in *MEMORY-IMAGE-VIEW-DUMP* for RESTORE-VIEWS."
   (setf *memory-image-view-dump* :none)
   (let ((file (memory-image-file (location graph))))
     (when (probe-file file)
+      (when (%native-image-p file)
+        (return-from restore-memory-image (restore-memory-image-native graph file)))
       (destructuring-bind (&key version highest-tx-id vertices edges
                                 type-vertex type-edge ve-in ve-out vev spatial views
                            &allow-other-keys)
@@ -396,14 +651,15 @@ and the app re-cold-syncs.  Cheap: ~0.06 s / 0.2 MB for ~800 nodes."
 
 (defun open-memory-graph (name location
                           &key package replication-port replication-key
-                            peer-role origin-id peer-host
+                            peer-role origin-id peer-host lazy
                             export-predicate device-registry merge-policy
                             reference-classes (peer-schema-version '(1 0)))
   "Reopen the in-memory graph NAME from LOCATION: restore the schema, restore the
-cl-store image checkpoint (if any), then replay the retained .txn journal tail.
-Tolerates a .dirty marker (a memory-graph always rebuilds from its durable
-journal + image, so an unclean shutdown is recovered, not an error).  :PEER-ROLE
-and the peer keys mirror MAKE-MEMORY-GRAPH, reopening a MEMORY-PEER-GRAPH."
+image checkpoint (if any), then replay the retained .txn journal tail.  Tolerates a
+.dirty marker (a memory-graph always rebuilds from its durable journal + image, so
+an unclean shutdown is recovered, not an error).  :PEER-ROLE and the peer keys
+mirror MAKE-MEMORY-GRAPH, reopening a MEMORY-PEER-GRAPH.  With :LAZY, nodes restore
+as deferred blobs and materialize on first touch (needs a VG-native image)."
   (%validate-peer-role peer-role origin-id)
   (ensure-directories-exist location)
   (let* ((path (pathname location))
@@ -411,6 +667,7 @@ and the peer keys mirror MAKE-MEMORY-GRAPH, reopening a MEMORY-PEER-GRAPH."
          (graph (%make-empty-memory-graph
                  name path
                  :class (if peer-role 'memory-peer-graph 'memory-graph)
+                 :lazy lazy
                  :replication-key replication-key
                  :replication-port replication-port)))
     (let ((*graph* graph) (*memory-image-view-dump* :none))
@@ -472,10 +729,13 @@ and the peer keys mirror MAKE-MEMORY-GRAPH, reopening a MEMORY-PEER-GRAPH."
 ;;; views and spatial index arrive in the next increments).
 ;;; ---------------------------------------------------------------------------
 
-;; Read: the mem-table IS the authoritative store -- return the live node.
+;; Read: the mem-table IS the authoritative store -- return the live node.  On a
+;; LAZY table an untouched node is an LZNODE blob; materialize it on first touch
+;; (fault-on-access) and swap the live node in, so subsequent lookups are direct.
 (defmethod lookup-node ((table mem-table) key graph)
   (declare (ignore graph))
-  (mem-table-get table key))
+  (let ((v (mem-table-get table key)))
+    (if (lznode-p v) (mem-materialize table key v) v)))
 
 ;; Create: publish the live node into the mem-table.  No heap write, no index
 ;; update yet (Step 3), no version chain (MVCC dropped).  Mirrors the on-disk
@@ -661,11 +921,14 @@ and the peer keys mirror MAKE-MEMORY-GRAPH, reopening a MEMORY-PEER-GRAPH."
   (mem-table-rem table key))
 
 ;;; Untyped MAP-VERTICES / MAP-EDGES scan: walk the mem-table, yielding the same
-;;; (id . node) cons the lhash method yields.
+;;; (id . node) cons the lhash method yields.  An untyped scan inherently touches
+;;; every node, so on a LAZY table it materializes each LZNODE (swapping the live
+;;; node in) -- callers always receive live nodes.
 (defmethod map-lhash (fn (table mem-table) &key collect-p)
   (let ((result nil))
-    (maphash (lambda (id node)
-               (let ((r (funcall fn (cons id node))))
+    (maphash (lambda (id v)
+               (let* ((node (if (lznode-p v) (mem-materialize table id v) v))
+                      (r (funcall fn (cons id node))))
                  (when collect-p (push r result))))
              (mem-table-data table))
     (when collect-p (nreverse result))))

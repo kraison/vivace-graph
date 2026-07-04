@@ -323,3 +323,87 @@ never calls them, so the earlier map-reduce test missed this)."
       (is (equal '((3 . 2))
                  (map-reduced-view (lambda (k id v) (declare (ignore id)) (cons k v))
                                    'm-person 'm-cnt :graph g :collect-p t))))))
+
+;;; --- lazy (fault-on-access) --------------------------------------------------
+
+(test lazy-open-defers-materialization
+  "Fault-on-access (:LAZY t): OPEN builds NO live nodes -- the vertex table holds
+LZNODE blobs, materialized to live nodes only on first touch (open pays no
+MAKE-INSTANCE, ~85% of eager open on ECL, #50).  A reduce (aggregate) view is
+answered WITHOUT materializing any node.  Asserts table STATE directly (robust to
+compiler inlining of the materializer)."
+  (flet ((all-lznodes-p (g)
+           (loop for v being the hash-values of
+                 (graph-db::mem-table-data (graph-db::vertex-table g))
+                 always (graph-db::lznode-p v)))
+         (n-materialized (g)
+           (loop for v being the hash-values of
+                 (graph-db::mem-table-data (graph-db::vertex-table g))
+                 count (graph-db::node-p v))))
+    (with-temp-directory (dir)
+      (let ((loc (namestring dir)) last-id)
+        (let ((g (graph-db::make-memory-graph *mem-test-graph-name* loc :lazy t)))
+          (let ((*graph* g))
+            (def-view lz-decade :lessp (m-person :graph-db-memory-test)
+              (:map (lambda (p) (yield (floor (slot-value p 'age) 10) 1)))
+              (:reduce (lambda (keys values &optional r)
+                         (declare (ignore keys r)) (reduce #'+ values))))
+            (with-transaction ()
+              (dotimes (i 20)
+                (setq last-id (id (make-m-person :name (format nil "p~D" i) :age (+ 20 i)))))))
+          (close-graph g :snapshot-p t))
+        (let ((g2 (graph-db::open-memory-graph *mem-test-graph-name* loc :lazy t)))
+          (unwind-protect
+               (let ((*graph* g2))
+                 (is-true (all-lznodes-p g2))   ; open built no live node
+                 (is (= 20 (graph-db::mem-table-count (graph-db::vertex-table g2))))
+                 (is (equal '((2 . 10) (3 . 10))
+                            (map-reduced-view
+                             (lambda (k id v) (declare (ignore id)) (cons k v))
+                             'm-person 'lz-decade :graph g2 :collect-p t)))
+                 (is-true (all-lznodes-p g2))   ; aggregate materialized no node
+                 (let ((v (lookup-vertex last-id)))
+                   (is-true (graph-db::node-p v))                 ; materialized on touch
+                   (is-true (graph-db::node-p                     ; and swapped into the table
+                             (graph-db::mem-table-get (graph-db::vertex-table g2) last-id)))
+                   (is (= 1 (n-materialized g2)))                 ; exactly one built
+                   (is (string= "p19" (slot-value v 'name)))))
+            (ignore-errors (close-graph g2 :snapshot-p nil))
+            (collect-garbage)))))))
+
+(test lazy-roundtrip-all-features
+  "A :LAZY graph round-trips CRUD, edge adjacency, spatial and a reduce view through
+the VG-native image; every query returns correct data with nodes materializing on
+access."
+  (with-temp-directory (dir)
+    (let ((loc (namestring dir)) a b)
+      (let ((g (graph-db::make-memory-graph *mem-test-graph-name* loc :lazy t)))
+        (let ((*graph* g))
+          (def-view lz-cnt :lessp (m-person :graph-db-memory-test)
+            (:map (lambda (p) (yield (floor (slot-value p 'age) 10) 1)))
+            (:reduce (lambda (keys values &optional r)
+                       (declare (ignore keys r)) (reduce #'+ values))))
+          (with-transaction ()
+            (setq a (id (make-m-person :name "Ann" :age 30))
+                  b (id (make-m-person :name "Bo"  :age 31)))
+            (make-m-knows :from a :to b))
+          (with-transaction ()
+            (make-m-place :label "site" :geom (graph-db::make-point 36.3d0 50.0d0))))
+        (close-graph g :snapshot-p t))
+      (let ((g2 (graph-db::open-memory-graph *mem-test-graph-name* loc :lazy t)))
+        (unwind-protect
+             (let ((*graph* g2))
+               ;; vertex data materializes correctly on lookup
+               (is (string= "Ann" (slot-value (lookup-vertex a) 'name)))
+               ;; edge adjacency (ve-index restored; endpoints materialize on access)
+               (is (= 1 (length (outgoing-edges (lookup-vertex a)))))
+               (is (= 1 (length (incoming-edges (lookup-vertex b)))))
+               ;; spatial bbox (restored structurally; hit id -> materialize)
+               (is (= 1 (length (graph-db::spatial-index-query-bbox
+                                 (graph-db::spatial-index g2) 22.0d0 48.0d0 40.0d0 51.0d0))))
+               ;; reduce view (decade 3 = Ann + Bo = 2), no node materialization
+               (is (equal '((3 . 2))
+                          (map-reduced-view (lambda (k id v) (declare (ignore id)) (cons k v))
+                                            'm-person 'lz-cnt :graph g2 :collect-p t))))
+          (ignore-errors (close-graph g2 :snapshot-p nil))
+          (collect-garbage))))))
