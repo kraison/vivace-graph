@@ -232,6 +232,71 @@ empty/stale image and the app re-cold-syncs."
           (ignore-errors (close-graph g2 :snapshot-p nil))
           (collect-garbage))))))
 
+(test open-restores-derived-structurally-without-regen
+  "A v2 image restores views / indexes / spatial STRUCTURALLY: OPEN-MEMORY-GRAPH does
+NOT call regenerate-all-views (the ~23 s on-device view rebuild, #50 / mine-action
+open-bench), yet the reduce view and node tables come back correct.  This is the
+boot-latency fix -- rebuild-on-open is gone for a clean/checkpointed image."
+  (with-temp-directory (dir)
+    (let ((loc (namestring dir)) (regen 0))
+      (let ((g (graph-db::make-memory-graph *mem-test-graph-name* loc)))
+        (let ((*graph* g))
+          (def-view mt-decade :lessp (m-person :graph-db-memory-test)
+            (:map (lambda (p) (yield (floor (slot-value p 'age) 10) 1)))
+            (:reduce (lambda (keys values &optional r)
+                       (declare (ignore keys r)) (reduce #'+ values))))
+          (with-transaction ()
+            (dotimes (i 20) (make-m-person :name (format nil "p~D" i) :age (+ 20 i)))))
+        (close-graph g :snapshot-p t))
+      (let ((orig (fdefinition 'graph-db::regenerate-all-views)))
+        (unwind-protect
+             (progn
+               (setf (fdefinition 'graph-db::regenerate-all-views)
+                     (lambda (&rest a) (incf regen) (apply orig a)))
+               (let ((g2 (graph-db::open-memory-graph *mem-test-graph-name* loc)))
+                 (unwind-protect
+                      (let ((*graph* g2))
+                        (is (= 0 regen)) ; structural restore -> no rebuild-on-open
+                        (is (= 20 (graph-db::mem-table-count (graph-db::vertex-table g2))))
+                        ;; ages 20..39 -> decade 2 (20-29): 10, decade 3 (30-39): 10
+                        (is (equal '((2 . 10) (3 . 10))
+                                   (map-reduced-view
+                                    (lambda (k id v) (declare (ignore id)) (cons k v))
+                                    'm-person 'mt-decade :graph g2 :collect-p t))))
+                   (ignore-errors (close-graph g2 :snapshot-p nil))
+                   (collect-garbage))))
+          (setf (fdefinition 'graph-db::regenerate-all-views) orig))))))
+
+(test structural-restore-plus-journal-tail
+  "The v2 image restores views structurally, THEN the journal tail (authored writes
+committed after the checkpoint) updates the restored views incrementally on open --
+restore-views runs before recover-transactions in the structural path.  Checkpoint
+10 (decade 2), journal 5 more (decade 3) uncheckpointed, crash-open: the view must
+reflect BOTH the image aggregate and the replayed tail."
+  (with-temp-directory (dir)
+    (let ((loc (namestring dir)))
+      (let ((g (graph-db::make-memory-graph *mem-test-graph-name* loc)))
+        (let ((*graph* g))
+          (def-view mt-tail :lessp (m-person :graph-db-memory-test)
+            (:map (lambda (p) (yield (floor (slot-value p 'age) 10) 1)))
+            (:reduce (lambda (keys values &optional r)
+                       (declare (ignore keys r)) (reduce #'+ values))))
+          (with-transaction () (dotimes (i 10) (make-m-person :name "a" :age 25)))
+          (graph-db::checkpoint-memory-graph g)                   ; image: decade 2 x10
+          (with-transaction () (dotimes (i 5) (make-m-person :name "b" :age 35)))
+          ;; simulated crash: no close -- the 5 decade-3 nodes are journaled only
+          ))
+      (let ((g2 (graph-db::open-memory-graph *mem-test-graph-name* loc)))
+        (unwind-protect
+             (let ((*graph* g2))
+               (is (= 15 (graph-db::mem-table-count (graph-db::vertex-table g2))))
+               (is (equal '((2 . 10) (3 . 5))
+                          (map-reduced-view
+                           (lambda (k id v) (declare (ignore id)) (cons k v))
+                           'm-person 'mt-tail :graph g2 :collect-p t))))
+          (ignore-errors (close-graph g2 :snapshot-p nil))
+          (collect-garbage))))))
+
 (test reduce-view-remove-re-reduces
   "Deleting a node from a map-reduce view re-reduces the aggregate via
 GET-NON-AGGREGATE-PAIRS / GET-ALL-AGGREGATE-PAIRS on the mem-skip-list -- the

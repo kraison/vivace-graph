@@ -249,44 +249,127 @@ replication path is wired.  Registers the graph and returns it."
 (defun memory-image-file (location)
   (format nil "~A/graph.img" location))
 
+;;; Derived-structure persistence (#50 / mine-action perf): rebuilding the derived
+;;; structures on open -- above all the aggregate (reduce) VIEWS -- is the dominant
+;;; on-device open cost (~23 s for the app's eo-find rollups, paid every open).  So
+;;; the image pickles them too, as FLAT dumps (no mem struct with its rw-lock /
+;;; function refs goes on the wire), and open restores them STRUCTURALLY -- direct
+;;; skip-list / index inserts, no map / reduce / geohash recompute.
+
+(defvar *memory-image-view-dump* :none
+  "Bound during OPEN-MEMORY-GRAPH to the image's per-view entry dumps (or :NONE
+for a v1 / absent image), so RESTORE-VIEWS repopulates the view skip-lists
+structurally instead of regenerating them.")
+
+(defun %dump-mem-index (data-ht)
+  "Flat (key . id-list) dump of a mem-*-index's DATA hashtable."
+  (let ((acc '()))
+    (maphash (lambda (k il)
+               (let ((ids '()))
+                 (maphash (lambda (id v) (declare (ignore v)) (push id ids))
+                          (mem-index-list-ids il))
+                 (push (cons k ids) acc)))
+             data-ht)
+    acc))
+
+(defun %load-mem-index (data-ht dump)
+  (dolist (pair dump)
+    (let ((il (make-mem-index-list)))
+      (dolist (id (cdr pair)) (mem-index-list-add il id))
+      (setf (gethash (car pair) data-ht) il))))
+
+(defun %dump-mem-skip-list (sl)
+  "In-order (key . value) dump of a mem-skip-list (the spatial grid, a view)."
+  (let ((c (make-cursor sl)) (acc '()))
+    (loop for node = (cursor-next c :eoc) until (eq node :eoc)
+          do (push (cons (%sn-key node) (%sn-value node)) acc))
+    (nreverse acc)))
+
+(defun %load-mem-skip-list (sl entries)
+  (dolist (e entries) (add-to-skip-list sl (car e) (cdr e))))
+
+(defun %dump-views (graph)
+  "Per-view (class-name view-name entries) for every mem-backed view."
+  (let ((acc '()))
+    (maphash (lambda (class-name view-group)
+               (maphash (lambda (view-name view)
+                          (when (mem-skip-list-p (view-skip-list view))
+                            (push (list class-name view-name
+                                        (%dump-mem-skip-list (view-skip-list view)))
+                                  acc)))
+                        (view-group-table view-group)))
+             (views graph))
+    acc))
+
 (defun write-memory-image (graph)
-  "Pickle GRAPH's live vertex/edge tables to its cl-store image in one write."
+  "Pickle GRAPH's full in-RAM state -- node tables AND every derived structure
+(ve/vev/type indexes, spatial grid, view ordered-maps) -- to its cl-store image in
+one write.  Persisting the derived structures (vs rebuilding on open) is what keeps
+OPEN-MEMORY-GRAPH fast."
   (cl-store:store
-   (list :version 1
+   (list :version 2
          :highest-tx-id (load-highest-transaction-id graph)
          :vertices (map-mem-table #'identity (vertex-table graph) :collect-p t)
-         :edges (map-mem-table #'identity (edge-table graph) :collect-p t))
+         :edges (map-mem-table #'identity (edge-table graph) :collect-p t)
+         :type-vertex (%dump-mem-index (mem-type-index-data (vertex-index graph)))
+         :type-edge   (%dump-mem-index (mem-type-index-data (edge-index graph)))
+         :ve-in       (%dump-mem-index (mem-ve-index-data (ve-index-in graph)))
+         :ve-out      (%dump-mem-index (mem-ve-index-data (ve-index-out graph)))
+         :vev         (%dump-mem-index (mem-vev-index-data (vev-index graph)))
+         :spatial     (let ((idx (spatial-index graph)))
+                        (and idx (%dump-mem-skip-list (spatial-index-skip-list idx))))
+         :views       (%dump-views graph))
    (memory-image-file (location graph))))
 
+(defun %rebuild-derived-from-nodes (graph vertices edges)
+  "v1 fallback: rebuild indexes + spatial from the restored nodes (idempotent;
+mem-index-list is a set, deleted nodes stay indexed and scans filter them)."
+  (let ((*graph* graph))
+    (dolist (v vertices) (add-node-to-indexes v graph :unless-present t))
+    (dolist (e edges)     (add-node-to-indexes e graph :unless-present t))
+    (let ((idx (spatial-index graph)))
+      (when idx
+        (flet ((reindex (n)
+                 (let ((geom (node-geometry n)))
+                   (when (and geom (not (deleted-p n)))
+                     (spatial-index-insert idx (id n) geom)))))
+          (dolist (v vertices) (reindex v))
+          (dolist (e edges)    (reindex e)))))))
+
 (defun restore-memory-image (graph)
-  "Populate GRAPH's mem-tables from its cl-store image if one exists (the schema
-must already be restored so the node classes are defined).  Returns T if an image
-was restored, NIL if none was present."
+  "Populate GRAPH's mem-tables -- and, for a v2 image, its derived structures --
+from its cl-store image if one exists (the schema must already be restored so the
+node classes are defined).  Returns :STRUCTURAL when a v2 image restored the
+indexes/spatial/views directly (no rebuild), :REBUILT when a v1 (nodes-only) image
+was rebuilt from the nodes, or NIL when no image was present.  The per-view dump is
+stashed in *MEMORY-IMAGE-VIEW-DUMP* for RESTORE-VIEWS."
+  (setf *memory-image-view-dump* :none)
   (let ((file (memory-image-file (location graph))))
     (when (probe-file file)
-      (destructuring-bind (&key version highest-tx-id vertices edges)
+      (destructuring-bind (&key version highest-tx-id vertices edges
+                                type-vertex type-edge ve-in ve-out vev spatial views
+                           &allow-other-keys)
           (cl-store:restore file)
-        (declare (ignore version highest-tx-id))
+        (declare (ignore highest-tx-id))
         (dolist (v vertices) (mem-table-put (vertex-table graph) (id v) v))
         (dolist (e edges)     (mem-table-put (edge-table graph) (id e) e))
-        ;; The image pickles only the node tables; the indexes are derived, so
-        ;; rebuild them from the restored nodes (cheap; the "rebuild on open"
-        ;; shortcut of design §6, here for the ve/vev/type indexes).  Idempotent:
-        ;; mem-index-list is a set.  Deleted nodes stay indexed (parity), scans
-        ;; filter them.
-        (let ((*graph* graph))
-          (dolist (v vertices) (add-node-to-indexes v graph :unless-present t))
-          (dolist (e edges)     (add-node-to-indexes e graph :unless-present t))
-          ;; Rebuild the spatial index too (derived; the image pickles only nodes).
-          (let ((idx (spatial-index graph)))
-            (when idx
-              (flet ((reindex (n)
-                       (let ((geom (node-geometry n)))
-                         (when (and geom (not (deleted-p n)))
-                           (spatial-index-insert idx (id n) geom)))))
-                (dolist (v vertices) (reindex v))
-                (dolist (e edges)    (reindex e)))))))
-      t)))
+        (cond
+          ((and (eql version 2) type-vertex)
+           ;; Structural restore -- direct index/skip-list inserts, no map/reduce/
+           ;; geohash recompute.  This is what keeps open fast (#50).
+           (%load-mem-index (mem-type-index-data (vertex-index graph)) type-vertex)
+           (%load-mem-index (mem-type-index-data (edge-index graph))   type-edge)
+           (%load-mem-index (mem-ve-index-data (ve-index-in graph))    ve-in)
+           (%load-mem-index (mem-ve-index-data (ve-index-out graph))   ve-out)
+           (%load-mem-index (mem-vev-index-data (vev-index graph))     vev)
+           (let ((idx (spatial-index graph)))
+             (when (and idx spatial)
+               (%load-mem-skip-list (spatial-index-skip-list idx) spatial)))
+           (setf *memory-image-view-dump* (or views '()))
+           :structural)
+          (t
+           (%rebuild-derived-from-nodes graph vertices edges)
+           :rebuilt))))))
 
 (defun clear-memory-journal (graph)
   "Delete every retained .txn journal file (called after an image checkpoint)."
@@ -330,7 +413,7 @@ and the peer keys mirror MAKE-MEMORY-GRAPH, reopening a MEMORY-PEER-GRAPH."
                  :class (if peer-role 'memory-peer-graph 'memory-graph)
                  :replication-key replication-key
                  :replication-port replication-port)))
-    (let ((*graph* graph))
+    (let ((*graph* graph) (*memory-image-view-dump* :none))
       (if (probe-file schema-file)
           (progn
             (setf (schema graph) (cl-store:restore schema-file))
@@ -338,15 +421,22 @@ and the peer keys mirror MAKE-MEMORY-GRAPH, reopening a MEMORY-PEER-GRAPH."
           (init-schema graph))
       (setf (schema-lock (schema graph)) (make-recursive-lock))
       (update-schema graph)
-      ;; Checkpoint first, then the journal tail committed after it.
-      (restore-memory-image graph)
       (%write-dirty-marker path)
       (setf (gethash name *graphs*) graph)
+      ;; Restore the checkpoint, then replay the journal tail committed after it.
       ;; Recovery runs BEFORE the transaction-manager is installed (the reaper
       ;; tolerates the unbound slot); the retain hook keeps the journal.
-      (recover-transactions graph)
-      ;; Rebuild views in-RAM from the restored nodes (design §6).
-      (restore-views graph))
+      (if (eq (restore-memory-image graph) :structural)
+          ;; v2 image: views/indexes/spatial were restored structurally.  Create +
+          ;; populate the views from the image dump, THEN replay the journal tail so
+          ;; its authored ops update the already-restored derived structures
+          ;; incrementally (fast open -- no map/reduce regen; #50).
+          (progn (restore-views graph)
+                 (recover-transactions graph))
+          ;; v1 / no image: load the journal tail into the tables first, then
+          ;; rebuild views in-RAM from ALL restored nodes (rebuild-on-open fallback).
+          (progn (recover-transactions graph)
+                 (restore-views graph))))
     (when peer-role
       (%init-memory-peer-slots graph :open path peer-role origin-id peer-host
                                export-predicate device-registry merge-policy
@@ -605,12 +695,23 @@ and the peer keys mirror MAKE-MEMORY-GRAPH, reopening a MEMORY-PEER-GRAPH."
    :tail-value nil
    :duplicates-allowed-p nil))
 
-;; On open, the base RESTORE-VIEWS reconstructs the view objects from views.dat
-;; (a memory-graph's views have no heap pointer, so it opens no skip-list -- the
-;; view-skip-list is left NIL), then REGENERATE-ALL-VIEWS builds each view's
-;; mem-skip-list (via MAKE-VIEW-SKIP-LIST above) and repopulates it by scanning
-;; the restored nodes -- the design-§6 rebuild-on-open for views.
+;; On open, the base RESTORE-VIEWS reconstructs the view OBJECTS from views.dat (a
+;; memory-graph's views have no heap pointer, so it opens no skip-list -- the
+;; view-skip-list is left NIL).  Then, if the image carried a view dump
+;; (*MEMORY-IMAGE-VIEW-DUMP*, a v2 image), each view's mem-skip-list is rebuilt via
+;; MAKE-VIEW-SKIP-LIST and repopulated STRUCTURALLY from the dumped entries -- no
+;; map, no reduce, no node scan (the fast-open path, #50).  Otherwise it falls back
+;; to REGENERATE-ALL-VIEWS (rebuild-on-open) from the restored nodes.
 (defmethod restore-views ((graph memory-graph-mixin))
   (call-next-method)
-  (let ((*graph* graph))
-    (regenerate-all-views graph)))
+  (let ((*graph* graph)
+        (dump *memory-image-view-dump*))
+    (if (listp dump)
+        (dolist (vd dump)
+          (destructuring-bind (class-name view-name entries) vd
+            (let ((view (lookup-view graph class-name view-name)))
+              (when view
+                (let ((sl (make-view-skip-list graph view)))
+                  (setf (view-skip-list view) sl)
+                  (%load-mem-skip-list sl entries))))))
+        (regenerate-all-views graph))))

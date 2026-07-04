@@ -97,12 +97,23 @@ Xcode). On Kevin's Mac this is worked around in `~/.eclrc` (points ECL at
 Homebrew `llvm@18`). The **Android NDK build uses NDK clang (~18)**, a different
 toolchain, so it should be unaffected — but confirm on the first device build.
 
-## Known gaps / caveats (v1)
+## Fast open — derived structures are persisted (no rebuild-on-open)
 
-- **Rebuild-on-open**: indexes, views and the spatial grid are rebuilt from the
-  restored nodes on open (not pickled). Fine at the app's scale (~800 nodes,
-  ~40 ms); a persistent representation is a documented follow-up if open latency
-  ever matters.
+**This is the boot-latency fix** for the ~36 s open in `memory-backend-perf.md`.
+That open was dominated by rebuilding the aggregate (`eo-find`) views from the nodes
+(~23 s) on *every* open. The image is now **v2**: it pickles the ve/vev/type indexes,
+the spatial grid, and every view's ordered-map (as flat dumps), and open restores
+them **structurally** — direct inserts, **no map / reduce / geohash recompute**.
+`open-memory-graph` no longer calls `regenerate-all-views` for a clean/checkpointed
+image (verified: 0 calls, view + spatial still correct). The journal tail committed
+after the checkpoint is still replayed on top, so authored writes since the last
+checkpoint update the restored views/indexes incrementally.
+
+Nothing changes in the app API — just re-run a checkpoint (or clean close) so the
+device writes a v2 image, and the next open skips the rebuild. A v1 image still opens
+(it falls back to rebuild-on-open), so old images aren't a hard break.
+
+## Known gaps / caveats (v1)
 - **cl-store image is local-only** (not portable across Lisp impls) — it's the
   fast clean-open path; the journal is the crash-safety net; the portable s-expr
   snapshot is a deferred compaction path.
