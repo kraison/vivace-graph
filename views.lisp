@@ -397,6 +397,36 @@ once per entry you want the node to contribute (zero, one, or many times)."
              (push (%sn-value node) values))))
     (values keys values)))
 
+;;; mem-skip-list variants (in-memory backend, #50).  The mem cursor exposes the same
+;;; make-range-cursor / make-cursor / cursor-next / %sn-key / %sn-value protocol as the
+;;; on-disk skip-list, so these are the on-disk methods above verbatim with the specializer
+;;; swapped.  Without them, maintaining a REDUCE (aggregate) view on a memory-graph signals
+;;; "no applicable method for get-non-aggregate-pairs on MEM-SKIP-LIST" -- which is what the
+;;; mine-action app's eo-find rollup views hit during peer-sync.
+(defmethod get-non-aggregate-pairs ((skip-list mem-skip-list) key)
+  (let ((keys nil) (values nil))
+    (let ((cursor (make-range-cursor skip-list
+                                     (list key +null-key+)
+                                     (list key +max-key+))))
+      (loop for node = (cursor-next cursor :eoc)
+         until (eql node :eoc)
+         do
+           (unless (equalp +null-key+ (second (%sn-key node)))
+             (push (first (%sn-key node)) keys)
+             (push (%sn-value node) values))))
+    (values keys values)))
+
+(defmethod get-all-aggregate-pairs ((skip-list mem-skip-list))
+  (let ((keys nil) (values nil))
+    (let ((cursor (make-cursor skip-list)))
+      (loop for node = (cursor-next cursor :eoc)
+         until (eql node :eoc)
+         do
+           (when (equalp +null-key+ (second (%sn-key node)))
+             (push (first (%sn-key node)) keys)
+             (push (%sn-value node) values))))
+    (values keys values)))
+
 (defmethod remove-from-view ((graph graph) (view view) (node node))
   "Remove node from view."
   (compile-view-code view)

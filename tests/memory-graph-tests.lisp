@@ -210,3 +210,30 @@ transactions and rebuilt in-RAM on reopen."
                                             'm-person 'm-by-decade :graph g2 :collect-p t))))
           (ignore-errors (close-graph g2 :snapshot-p nil))
           (collect-garbage))))))
+
+(test reduce-view-remove-re-reduces
+  "Deleting a node from a map-reduce view re-reduces the aggregate via
+GET-NON-AGGREGATE-PAIRS / GET-ALL-AGGREGATE-PAIRS on the mem-skip-list -- the
+maintenance path the on-device eo-find rollup views hit during peer-sync (adding
+never calls them, so the earlier map-reduce test missed this)."
+  (with-test-memory-graph (g)
+    (declare (ignorable g))
+    (def-view m-cnt :lessp (m-person :graph-db-memory-test)
+      (:map (lambda (p) (yield (floor (slot-value p 'age) 10) 1)))
+      (:reduce (lambda (keys values &optional rereduce)
+                 (declare (ignore keys rereduce))
+                 (reduce #'+ values))))
+    (let (ids)
+      (with-transaction ()
+        (setq ids (list (id (make-m-person :name "a" :age 30))
+                        (id (make-m-person :name "b" :age 31))
+                        (id (make-m-person :name "c" :age 32)))))
+      ;; decade 3 aggregate = 3
+      (is (equal '((3 . 3))
+                 (map-reduced-view (lambda (k id v) (declare (ignore id)) (cons k v))
+                                   'm-person 'm-cnt :graph g :collect-p t)))
+      ;; delete one -> remove-from-view -> re-reduce over the remaining pairs
+      (with-transaction () (mark-deleted (lookup-vertex (first ids))))
+      (is (equal '((3 . 2))
+                 (map-reduced-view (lambda (k id v) (declare (ignore id)) (cons k v))
+                                   'm-person 'm-cnt :graph g :collect-p t))))))
