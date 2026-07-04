@@ -151,6 +151,20 @@ just checkpoint/close once on this build). A full scan (`map-vertices` over ever
 still materializes everything — lazy wins for partial working sets, which is the field
 case. `:lazy` composes with the peer device (it's just a storage-mode flag).
 
+**Proven end-to-end** on the ship config (SBCL hub ↔ ECL in-memory device): both
+two-process harnesses pass with a lazy device, including a fault-on-access reopen that
+confirms open builds no live node and the synced/authored data materializes on access.
+Reproduce with the extra `REPL_DEVICE_LAZY=1` knob:
+
+```bash
+# pull:
+REPL_DEVICE_MEMORY=1 REPL_DEVICE_LAZY=1 REPL_HUB_LISP_CMD="sbcl --non-interactive --load" \
+  REPL_DEVICE_LISP_CMD="ecl --load" tests/peer-replication/run-peer-test.sh
+# push:
+REPL_DEVICE_MEMORY=1 REPL_DEVICE_LAZY=1 REPL_HUB_LISP_CMD="sbcl --non-interactive --load" \
+  REPL_DEVICE_LISP_CMD="ecl --load" tests/peer-replication-push/run-push-test.sh
+```
+
 ## Known gaps / caveats (v1)
 - **cl-store image is local-only** (not portable across Lisp impls) — it's the
   fast clean-open path; the journal is the crash-safety net; the portable s-expr
