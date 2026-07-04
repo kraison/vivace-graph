@@ -73,7 +73,8 @@
                                        :peer-host "localhost"
                                        :replication-port port
                                        :replication-key "peer-secret"
-                                       :merge-policy (push-merge-policy))
+                                       :merge-policy (push-merge-policy)
+                                       :lazy (and (uiop:getenv "REPL_DEVICE_LAZY") t))
                     (make-graph :push-test-app dir
                                 :peer-role :device
                                 :origin-id *device-origin*
@@ -112,7 +113,25 @@
           (write-flag "pushed")
           ;; Let the hub verify its re-homed state before we tear down the socket.
           (wait-flag "hub-verified")
-          (close-graph g :snapshot-p nil)))
+          ;; --- LAZY: fault-on-access reopen of the authored subgraph ---
+          (if (uiop:getenv "REPL_DEVICE_LAZY")
+              (progn
+                (checkpoint-memory-graph g)
+                (close-graph g :snapshot-p nil)
+                (let ((g2 (open-memory-graph :push-test-app dir :lazy t)))
+                  (let ((*graph* g2))
+                    (check (loop for v being the hash-values of
+                                 (mem-table-data (vertex-table g2))
+                                 always (lznode-p v))
+                           "lazy: reopen built no live node (fault-on-access)")
+                    (let ((f (first (map-vertices #'identity g2 :collect-p t
+                                                          :vertex-type 'pf-find))))
+                      (check (and f (equal "SAFE" (slot-value f 'hazard)))
+                             "lazy: authored hazard SAFE survives reopen + materializes")
+                      (check (and f (equal "device-note" (slot-value f 'note)))
+                             "lazy: authored note survives reopen + materializes")))
+                  (close-graph g2 :snapshot-p nil)))
+              (close-graph g :snapshot-p nil))))
       (write-flag "device-done")
       (if (zerop *fails*)
           (progn (format t "~&DEVICE: PASS~%") (finish-output) (dexit 0))

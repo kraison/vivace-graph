@@ -81,13 +81,17 @@
              ;; (memory-peer-graph) instead of the on-disk one; the peer transport
              ;; and every check below are identical -- this exercises the exact
              ;; mobile ship path (SBCL hub <-> in-memory ECL device).
+             ;; REPL_DEVICE_LAZY (with REPL_DEVICE_MEMORY) also opts the in-memory
+             ;; device into fault-on-access: nodes materialize on first touch and a
+             ;; reopen verification runs at the end (below).
              (g (if (uiop:getenv "REPL_DEVICE_MEMORY")
                     (make-memory-graph :peer-test-app dir
                                        :peer-role :device
                                        :origin-id *device-origin*
                                        :peer-host "localhost"
                                        :replication-port port
-                                       :replication-key "peer-secret")
+                                       :replication-key "peer-secret"
+                                       :lazy (and (uiop:getenv "REPL_DEVICE_LAZY") t))
                     (make-graph :peer-test-app dir
                                 :peer-role :device
                                 :origin-id *device-origin*
@@ -136,7 +140,28 @@
               (check rejected "schema: major mismatch (2 x) vs hub (1 x) rejected"))
             (check (= 1 (vcount 'p-survey))
                    "schema: device data intact after a rejected major-mismatch sync"))
-          (close-graph g :snapshot-p nil)))
+          ;; --- LAZY: fault-on-access reopen of the peer-synced subgraph ---
+          ;; Checkpoint (writes the VG-native image), close, reopen with :LAZY t,
+          ;; and confirm (a) OPEN built NO live node (all LZNODE blobs) and (b) the
+          ;; retained site+survey still materialize correctly on first access.
+          (if (uiop:getenv "REPL_DEVICE_LAZY")
+              (progn
+                (checkpoint-memory-graph g)
+                (close-graph g :snapshot-p nil)
+                (let ((g2 (open-memory-graph :peer-test-app dir :lazy t)))
+                  (let ((*graph* g2))
+                    (check (loop for v being the hash-values of
+                                 (mem-table-data (vertex-table g2))
+                                 always (lznode-p v))
+                           "lazy: reopen built no live node (fault-on-access)")
+                    (check (= 1 (length (map-vertices #'identity g2 :collect-p t
+                                                              :vertex-type 'p-site)))
+                           "lazy: site survives native-image reopen + materializes")
+                    (check (= 1 (length (map-vertices #'identity g2 :collect-p t
+                                                              :vertex-type 'p-survey)))
+                           "lazy: survey survives native-image reopen + materializes"))
+                  (close-graph g2 :snapshot-p nil)))
+              (close-graph g :snapshot-p nil))))
       (write-flag "device-done")
       (if (zerop *fails*)
           (progn (format t "~&DEVICE: PASS~%") (finish-output) (dexit 0))
