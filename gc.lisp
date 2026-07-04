@@ -153,6 +153,12 @@ data structure in GRAPH to T. Used for debugging, not used in GC."
   "Garbage-collect the heap of GRAPH by calling FREE on any
 allocations that are not referenced through any data structure in
 GRAPH."
+  ;; A memory-graph has no mmap heap (nodes are live objects, DATA-POINTER 0),
+  ;; so heap GC is a no-op -- there is nothing to reclaim and (HEAP GRAPH) is NIL.
+  ;; Guard so an explicit GC-HEAP on a memory-graph is safe rather than a nil-heap
+  ;; dereference.
+  (unless (heap graph)
+    (return-from gc-heap nil))
   (log:debug "gc-ing graph database heap.")
   (let ((allocation-table (heap-allocation-table graph))
         (heap (heap graph)))
