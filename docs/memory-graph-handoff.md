@@ -113,6 +113,44 @@ Nothing changes in the app API — just re-run a checkpoint (or clean close) so 
 device writes a v2 image, and the next open skips the rebuild. A v1 image still opens
 (it falls back to rebuild-on-open), so old images aren't a hard break.
 
+## Fault-on-access (`:lazy t`) — near-instant open
+
+The remaining open cost after the fix above is **`make-instance`** — building the live
+CLOS node objects. On ECL that's ~85% of the restore time (measured), and it's
+unavoidable *per node you actually touch*. The `:lazy` flag stops paying it for nodes
+you **don't** touch:
+
+```lisp
+(make-memory-graph :peer-test-app dir :peer-role :device :origin-id oid
+                   :peer-host host :replication-port port :replication-key key
+                   :lazy t)                 ; <-- opt in
+(open-memory-graph  :peer-test-app dir :peer-role :device ... :lazy t)
+```
+
+A lazy graph writes a **VG-native image** (per-node blobs) and, on open, loads each
+node as a lightweight blob (`lznode`) with **no `make-instance`**. The live object is
+built on first lookup and cached; later reads are full-speed. Measured on ECL:
+
+| | eager open | **lazy open** |
+|---|---|---|
+| 800 nodes | 502 ms | **7 ms** (~71×) |
+| 2000 nodes | 1269 ms | **18 ms** (~70×) |
+
+What this means for the app's boot:
+
+- **Open is ~instant** regardless of scope size.
+- **Aggregate/reduce views (`summary`) touch zero nodes** — they read the persisted
+  aggregates, so they're instant with no materialization at all.
+- **Rendering N finds** materializes exactly those N (deferred off the open path); the
+  total node-build cost is conserved but spread to what's on screen, and never paid for
+  nodes the user doesn't view.
+- **Lower RAM** — untouched nodes stay compact blobs instead of live CLOS instances.
+
+Caveats: `:lazy t` requires the VG-native image (a lazy graph writes it automatically;
+just checkpoint/close once on this build). A full scan (`map-vertices` over everything)
+still materializes everything — lazy wins for partial working sets, which is the field
+case. `:lazy` composes with the peer device (it's just a storage-mode flag).
+
 ## Known gaps / caveats (v1)
 - **cl-store image is local-only** (not portable across Lisp impls) — it's the
   fast clean-open path; the journal is the crash-safety net; the portable s-expr
