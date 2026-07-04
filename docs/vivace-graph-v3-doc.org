@@ -32,8 +32,8 @@ VivaceGraph is a persistent graph database designed from the ground up in Common
 
 At its heart, VivaceGraph is built on several key architectural pillars:
 
-  - *Persistent On-Disk Storage*
-    Unlike in-memory databases, VivaceGraph stores all data directly on disk using memory-mapped files (see ~mmap.lisp~ and ~allocator.lisp~). This allows it to handle graphs that are much larger than the available system RAM and ensures that your data is durable between application restarts.
+  - *Persistent On-Disk Storage (with an in-memory option)*
+    By default VivaceGraph stores all data directly on disk using memory-mapped files (see ~mmap.lisp~ and ~allocator.lisp~), so it can handle graphs much larger than system RAM while keeping your data durable between restarts. For graphs that fit in memory — and for mobile/ECL deployments where read latency matters most — an optional *in-memory backend* (~make-memory-graph~) instead keeps the graph as live Lisp objects, trading that scalability for the fastest possible reads. Both share the same schema, transactions, and query surface. See Chapter 15.
 
   - *An Object-Oriented Lisp Environment*
     Vertices and edges in your graph are not just abstract data containers; they are first-class CLOS (Common Lisp Object System) objects. You define your graph's structure by creating Lisp classes with standard slots, inheritance, and methods (see ~node-class.lisp~).
@@ -49,6 +49,9 @@ At its heart, VivaceGraph is built on several key architectural pillars:
 
   - *Built for Concurrency*
     The database is designed for multi-threaded access, with a fine-grained locking system to manage concurrent reads and writes safely (see ~rw-lock.lisp~).
+
+  - *Replication and Offline-First Sync*
+    VivaceGraph offers two replication modes. Classic *master-slave* replication (Chapter 10) streams the whole database to always-connected, read-only replicas for high availability and read scaling. *Peer replication* (Chapter 16) is a bidirectional, offline-first hub-and-spoke mode for intermittently connected fleets — each device syncs only the authorized subset it is cleared to see, and can author changes locally while disconnected.
 
 *** Core Philosophy: Graphs as Lisp Objects
 
@@ -412,6 +415,10 @@ How can VivaceGraph ensure it wasn't terminated abruptly, leaving the database i
   - If the file *is* present, it means the application crashed or was killed before ~close-graph~ could complete. The database is potentially in an inconsistent state, and ~open-graph~ will signal an error, refusing to open and instructing the user to run recovery procedures.
 
 This mechanism prevents the use of a potentially corrupted database, safeguarding your data integrity.
+
+*** An alternative: the in-memory backend
+
+Everything above describes the *on-disk* storage engine, VivaceGraph's default. For graphs that fit in RAM — and especially for mobile/ECL deployments where per-read deserialization is costly — VivaceGraph also ships an *in-memory* backend that holds the graph as live Lisp objects, constructed with ~make-memory-graph~ instead of ~make-graph~. It reuses the same journal for durability (plus a checkpoint image) but replaces the heap and linear-hash tables with in-RAM structures. See Chapter 15.
 
 
 ** Chapter 4: The Object Model
@@ -1326,6 +1333,10 @@ The communication protocol between master and slave is designed for efficiency a
 
 4.  *Reconnection:* The connection between master and slave can be interrupted at any time (e.g., due to a network partition). The slave is designed to handle this gracefully. Upon detecting a disconnection, it will automatically enter a retry loop, attempting to reconnect to the master with an exponential backoff. Once reconnected, the handshake process starts over, and the slave will request all transactions it missed while it was disconnected, ensuring it eventually regains full consistency with the master.
 
+*** Beyond master-slave: peer replication
+
+Master-slave suits always-connected, read-only replicas that mirror the *whole* master. For an offline-first fleet — intermittently connected devices that each hold only an *authorized subset* of the data and must *author* changes locally — VivaceGraph provides a separate, bidirectional *peer replication* mode built on the same durable change feed. See Chapter 16.
+
 
 ** Chapter 11: Backup and Recovery
 
@@ -1825,6 +1836,189 @@ The predicates are ~shortest-path/4~ (From To Path Cost), ~distance/3~, ~reachab
 - *Recompute cost.* ~page-rank/2~, ~authority-value/2~, and ~hub-value/2~ recompute the whole ranking on each call; for repeated use, call the Lisp ~page-rank~ / ~hub-authority-values~ once and keep the result.
 - *Not ported (broken upstream).* The Karzanov max-flow algorithm, the Viger–Latapy generator, and node-capacity max-flow were intentionally left out of the port — the source implementations did not satisfy the max-flow invariant, hung, or were otherwise unreliable. Only edge capacities are supported for flow.
 
+
+** Chapter 15: The In-Memory Backend (~memory-graph~)
+
+Everything in Chapters 3–14 assumed VivaceGraph's on-disk storage engine — the memory-mapped heap, the linear-hash tables, deserialize-on-read. VivaceGraph also ships a second, explicitly-constructed storage backend that keeps the entire graph as *live Lisp objects in RAM*. It is a drop-in alternative: the same schema, transactions, Prolog queries, views, spatial index, and even (peer) replication all work unchanged. Only the construction call differs.
+
+Why a second backend? The on-disk engine's great strength — working with a graph far larger than RAM, paged in and out by the operating system (Chapter 3) — becomes a cost on a small graph that fits in memory. There, every read pays *deserialization* (rebuilding a Lisp object from the heap's bytes) and every adjacency walk chases persistent cons cells. The in-memory backend removes both: a read returns the live object itself, and adjacency is an in-RAM hash set. On a small, hot working set — a mobile field application, an ECL image running on a phone — this is dramatically faster; on real on-device query/render workloads it is 8–80× quicker once loaded, at the cost of holding the whole graph resident.
+
+*** Constructing an in-memory graph
+
+Swap ~make-graph~ / ~open-graph~ for ~make-memory-graph~ / ~open-memory-graph~. Everything else is identical:
+
+#+BEGIN_SRC lisp
+  (defvar *g* (make-memory-graph :my-app "/var/tmp/mem-app/"))
+  (let ((*graph* *g*))
+    (with-transaction ()
+      (make-person :name "Alice" :age 30))
+    (select-flat (?p) (is-a ?p person)))     ; queries work exactly as before
+#+END_SRC
+
+The ~location~ directory is still required, but it now holds only the *durable* artifacts — the transaction journal, the schema, a checkpoint image, and (for a peer) the peer state. The RAM structures are rebuilt from them on ~open-memory-graph~.
+
+An in-memory graph is a distinct graph *class*, chosen at construction; the on-disk engine is left entirely untouched. It has no memory-mapped heap (~(heap g)~ is ~nil~), no buffer pool, and no persistent free list, so you pass neither ~:buffer-pool-size~ nor any heap-tuning option.
+
+*** What changes under the hood
+
+The graph model, transaction machinery, and query surface are all shared; the in-memory backend simply overrides the small set of storage primitives they call:
+
+| On disk | In memory |
+|---|---|
+| Linear-hash vertex/edge tables (~linear-hash.lisp~) | A hash table of UUID → live node object |
+| Heap-stored, serialized slot data; deserialize on read | Slot data lives on the live object; no per-read work |
+| Persistent ~index-list~ adjacency (ve/vev/type indexes) | In-RAM hash sets mirroring the same index shapes |
+| On-disk skip-lists for views and the spatial grid | In-RAM skip-lists (~mem-skip-list~) with the same cursor API |
+| Heap allocate/free + MVCC version chains | Atomic hash-table swap of an immutable node; no heap |
+
+Because the graph model, `with-transaction`, OCC validation, and the Prolog engine are unchanged, code written against an on-disk graph runs against an in-memory graph verbatim.
+
+*** Durability: journal + checkpoint image
+
+Having no heap, an in-memory graph's durable record is the same write-ahead transaction journal (the ~.txn~ files) the on-disk engine produces — here *retained* rather than folded into a heap. On top of the journal it keeps a *checkpoint image*: a single file (~graph.img~) written at each clean ~close-graph~ that captures the whole graph — the node tables *and* the derived structures (indexes, spatial grid, views). Opening restores that image in one read, then replays any journal entries committed after it.
+
+- *Clean close* → the image is written and the journal cleared; the next open restores the image quickly.
+- *Crash* (no clean close) → the retained journal replays on the next open. An in-memory graph tolerates a ~.dirty~ marker: it always rebuilds from its durable journal + image, so an unclean shutdown is *recovered*, not an error (contrast Chapter 3).
+
+Persisting the derived structures in the image — rather than rebuilding them on open — is what keeps open fast; rebuilding aggregate (reduce) views in particular is expensive.
+
+You may force a checkpoint at any time with ~checkpoint-memory-graph~, which writes the image and clears the journal *now*, without closing. This matters for a *peer device* (Chapter 16): pulled state is applied directly and is not journaled, so it is durable only through the image. Call ~checkpoint-memory-graph~ after a ~peer-sync~ so a restart need not re-sync the pulled subgraph.
+
+*** Eager vs. lazy: the open-latency trade-off
+
+The one tuning decision an in-memory graph exposes is *when* it builds the live node objects. Constructing a node — a CLOS instance carrying its slot data — is the dominant cost of opening a large in-memory graph (on ECL, roughly 85% of restore time; the wire format and byte-parsing are almost free by comparison). The ~:lazy~ option chooses whether you pay that cost up front or on demand.
+
+**** Eager (the default)
+
+With no ~:lazy~ argument, ~make-memory-graph~ / ~open-memory-graph~ build *every* node at open. Steady-state reads are then a bare hash-table lookup — the fastest possible — but open pays to construct every node whether or not you go on to touch it. Prefer eager when the whole graph *is* the working set, or when open latency simply does not matter.
+
+**** Lazy — fault-on-access (~:lazy t~)
+
+#+BEGIN_SRC lisp
+  (make-memory-graph :my-app dir :lazy t)
+  (open-memory-graph  :my-app dir :lazy t)
+#+END_SRC
+
+A lazy graph loads each node as a compact *blob* (its parsed head plus its still-serialized slot data) and builds the live object only on first touch, caching it thereafter. Open therefore does *no* object construction — it is near-instant regardless of graph size. The consequences:
+
+- *Open is ~O(1)~* in the number of nodes, dominated only by reading the image bytes. Measured on ECL: ≈502 ms → 7 ms (800 nodes) and ≈1269 ms → 18 ms (2000 nodes) — about 71× faster.
+- *Aggregate (reduce) views touch zero nodes* — they read the persisted aggregates, so a ~summary~-style query is instant with no materialization at all.
+- *Rendering N objects* builds exactly those N (deferred off the open path). Total build cost is conserved, but it is paid only for what you use, never for untouched nodes.
+- *Lower RAM* — untouched nodes stay compact blobs rather than full CLOS instances.
+
+Caveats: a *full* scan (e.g. ~map-vertices~ over everything) still materializes everything — lazy wins for *partial* working sets, which is the field case. A lazy graph uses the VG-native image format (written automatically on checkpoint/close), so run one checkpoint on it before relying on the fast open. ~:lazy~ composes with the peer device — it is purely a storage-mode flag.
+
+| | Eager (default) | Lazy (~:lazy t~) |
+|---|---|---|
+| Open latency | Builds every node (~O(nodes)~) | Near-instant (~O(1)~) |
+| First touch of a node | Free (already built) | Builds + caches it |
+| Aggregate views | Instant | Instant (touch no node) |
+| Full scan | Same as eager | Materializes everything |
+| Resident RAM | All nodes as objects | Untouched nodes stay blobs |
+| Best for | Whole graph is the working set | Large scope, partial reads, fast boot |
+
+*** What the in-memory backend omits
+
+Two on-disk features are deliberately dropped:
+
+- *MVCC version chains.* On disk, an update archives the prior version's head into the heap and chains to it (Chapter 12). An in-memory graph is single-writer and publishes a new immutable node by an atomic hash-table swap, so a lock-free reader always observes a whole node, never a torn one. The ~with-read-snapshot~ / ~:snapshot~ API is kept (as a writer-excluding read lock), but there is no version *history* to reconstruct.
+- *Heap garbage collection.* There is no heap to compact; ~gc-heap~ is a safe no-op on an in-memory graph.
+
+*** When to use it
+
+- The graph (or the working set you keep open) fits comfortably in RAM.
+- Read/traversal latency matters more than resident memory — interactive or mobile use.
+- You are targeting ECL on a device, where per-read deserialization is especially costly.
+- You want a general-purpose in-memory graph for a non-replicated, ephemeral, or test workload.
+
+Reach for the on-disk engine instead when the graph is larger than RAM, when you need the MVCC version history, or when a modest resident-memory footprint is more important than read latency.
+
+*** See also
+
+- ~docs/memory-graph-design.md~ — the full design and rationale.
+- ~docs/memory-graph-handoff.md~ — a practical operator's guide (durability, the ~:lazy~ flag, on-device benchmarks).
+- ~docs/mmap-native-arena-design.md~ — deferred R&D toward mmap-backed *native* Lisp heaps (near-native persistence without serialization).
+
+
+** Chapter 16: Peer Replication — Offline-First Hub-and-Spoke
+
+The master-slave replication of Chapter 10 assumes always-connected, read-only replicas that mirror the *entire* master. That model does not fit an offline-first mobile fleet, where each device is only intermittently connected, holds just the *subset* of data it is authorized to see, and must *author* changes locally while disconnected. VivaceGraph's *peer replication* (in the ~graph-db/replication~ system) addresses exactly this, through a separate ~peer-graph~ abstraction. The master/slave classes and protocol of Chapter 10 are left byte-for-byte as they are; peer replication is an additional mode, not a change to the old one.
+
+*** The model
+
+- *Star topology.* One *hub* and many *devices*. Devices sync only with the hub, never peer-to-peer. Every sync cursor is a single scalar per directed feed — there are no vector clocks anywhere.
+- *Bidirectional.* A device *pulls* the authority-scoped subset it is allowed to see, and *pushes* the changes it authored while offline. The hub is the single linearization point.
+- *Authority-scoped, fail-closed.* Each device receives only the *closed subgraph* it is cleared for. A vertex ships only if it is disclosable to that device; an edge ships only if *both* of its endpoints are — otherwise it is omitted entirely. VivaceGraph never ships a read-only stub, because a stub would leak the very existence and id of undisclosed work. When a node enters a device's scope it ships as a create; when it leaves, the hub sends a *purge*.
+
+*** Four identities
+
+Peer replication is careful to keep four distinct identities apart — conflating any two of them is a whole class of bug:
+
+1. *Node UUID* — the identity of the thing (vertex or edge). The idempotency key for state-sync.
+2. *Original-op id* — the identity of an authored change *event*; minted by the authoring replica and stable across re-homing. It is the dedup key, so an op a device authored, which later bounces back to it through the hub feed, is recognized and not re-applied.
+3. *Per-origin feed sequence* — a position in a directed feed (the existing per-graph ~tx-id~). It drives the resumable pull cursor. Re-homing re-assigns it.
+4. *Lamport stamp* — the conflict order for per-field last-writer-wins. It travels with the field value and *survives* re-homing.
+
+Identity 2 answers "have I already applied this event?"; identity 4 answers "which of two conflicting values wins?" — different jobs, never the same field.
+
+*** Two op classes
+
+The feed carries two kinds of traffic, with different rules:
+
+- *Authored ops* — a user or automation change (a create, a field edit, an authored delete). They carry origin-id + original-op-id + Lamport stamp, are deduped by op-id, and are *bidirectional* (devices author them; the hub re-homes them onto its own feed).
+- *State-sync ops* — the hub asserting the *current membership* of a device's authority scope. They are keyed by node UUID (idempotent by identity), flow hub→device only, and are never deduped by op-id, propagated back, or merged. A node entering scope ships as a full create; a node leaving scope ships as a *purge* — "remove this from *your* replica," distinct from a delete (the node still exists on the hub).
+
+*** Conflict resolution
+
+When two replicas edit the same node, the hub re-homes the device's authored op and resolves it per field by Lamport-ordered last-writer-wins, with an app-supplied *merge policy* for safety-bearing fields. A rejected change is not silently dropped — it surfaces as a *conflict record* the application can inspect. Safety-critical fields resolve by *semantics, not clock*: for example, a hazard *release* loses to a hazard *assertion* regardless of which carries the later timestamp.
+
+*** Setting up a hub and a device
+
+The hub authors data normally (Chapters 4–5) and additionally exposes an *export predicate* — the app-owned ~disclosable-p~ function that decides, per vertex and per requesting device, what may be shared. (The device registry mapping a device to a person/team and a clearance scope is likewise app-owned; the engine consumes only the resulting origin-id + predicate + cursors.)
+
+#+BEGIN_SRC lisp
+  ;; Hub process:
+  (defvar *hub*
+    (make-graph :field-app "/var/tmp/hub/"
+                :peer-role :hub
+                :replication-port 7979
+                :replication-key "shared-secret"
+                :export-predicate #'my-disclosable-p))
+#+END_SRC
+
+A device is constructed with a hub-minted ~:origin-id~ (an opaque 16-byte id) and the hub's address, then calls ~peer-sync~ to both pull its scope and push what it authored:
+
+#+BEGIN_SRC lisp
+  ;; Device process:
+  (defvar *dev*
+    (make-graph :field-app "/var/tmp/device/"
+                :peer-role :device
+                :origin-id *my-hub-minted-origin*
+                :peer-host "hub.example.org"
+                :replication-port 7979
+                :replication-key "shared-secret"))
+
+  ;; author locally, even while offline...
+  (let ((*graph* *dev*))
+    (with-transaction () (make-observation :note "found something")))
+
+  ;; ...then reconcile when connectivity returns: pull scope + push authored ops
+  (peer-sync *dev*)
+#+END_SRC
+
+As with master/slave, a *minor* schema drift (same major version) still syncs, degraded-safe; a *major* mismatch is rejected before any data moves.
+
+*** Peer replication over the in-memory backend
+
+The storage backend is orthogonal to the replication role: ~make-memory-graph~ accepts the very same peer arguments, yielding an *in-memory peer device* — the intended mobile/ECL configuration. Combined with ~:lazy t~ and a post-sync ~checkpoint-memory-graph~, such a device gets a near-instant open plus fault-on-access reads of its synced subgraph (Chapter 15).
+
+*** See also
+
+- ~docs/peer-replication-design.md~ — the full Branch A/B protocol design.
+- ~docs/peer-replication-status.md~ — implementation status and test coverage.
+- ~docs/peer-replication-proposal.md~ — the originally approved proposal.
+
+
 ** API Reference
 
 This chapter provides a categorized reference for the most important exported symbols from the ~graph-db~ package. It is not an exhaustive list of every internal function but focuses on the public API you will use most often when building applications.
@@ -1838,8 +2032,17 @@ This chapter provides a categorized reference for the most important exported sy
 - ~open-graph (name location &key ... )~ ::
   Opens an existing graph database from ~location~. Fails if the database was not closed cleanly (i.e., if the ~.dirty~ file exists). Returns a `graph` object.
 
+- ~make-memory-graph (name location &key lazy peer-role origin-id peer-host ... )~ ::
+  Like ~make-graph~, but constructs an *in-memory* graph (Chapter 15): the graph lives as live Lisp objects in RAM, with the same schema/transaction/query API. ~location~ still holds the durable journal, checkpoint image, schema and peer state. Pass ~:lazy t~ for fault-on-access materialization (near-instant open); accepts the same peer arguments as ~make-graph~ for an in-memory peer device.
+
+- ~open-memory-graph (name location &key lazy peer-role ... )~ ::
+  Reopens an in-memory graph, restoring it from its checkpoint image and replaying the retained journal tail. Tolerates a ~.dirty~ marker (it always rebuilds from the durable journal + image). Pass ~:lazy t~ to restore nodes as deferred blobs.
+
+- ~checkpoint-memory-graph (graph)~ ::
+  Forces an in-memory graph to write its checkpoint image and clear the journal *now*, without closing. Call after a ~peer-sync~ on a device so pulled (un-journaled) state survives a restart.
+
 - ~close-graph (graph &key snapshot-p)~ ::
-  Safely closes the graph database, ensuring all data is written to disk and all file locks are released. By default, it creates a final snapshot before closing.
+  Safely closes the graph database, ensuring all data is written to disk and all file locks are released. By default, it creates a final snapshot before closing. For an in-memory graph this writes the checkpoint image and clears the journal.
 
 - ~lookup-graph (name)~ ::
   Retrieves a handle to an already opened graph by its keyword ~name~.
@@ -1949,6 +2152,16 @@ This chapter provides a categorized reference for the most important exported sy
 
 - ~stop-replication (graph)~ ::
   Safely stops the replication threads.
+
+**** Peer Replication (offline-first; see Chapter 16)
+- ~make-graph / make-memory-graph (... :peer-role :hub :export-predicate fn)~ ::
+  Constructs a *hub* peer graph. ~:export-predicate~ is the app-owned per-vertex ~disclosable-p~ function that scopes what each device may see.
+
+- ~make-graph / make-memory-graph (... :peer-role :device :origin-id id :peer-host host :replication-port p :replication-key k)~ ::
+  Constructs a *device* peer graph bound to a hub. ~:origin-id~ is the opaque, hub-minted 16-byte device identity.
+
+- ~peer-sync (graph)~ ::
+  On a device, reconciles with the hub: pulls the current authority-scoped subgraph (creates for nodes that entered scope, purges for nodes that left) and pushes the ops authored locally since the last sync.
 
 **** Backup & Recovery
 - ~snapshot (graph &key ... )~ ::
