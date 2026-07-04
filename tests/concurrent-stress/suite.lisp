@@ -135,19 +135,19 @@ slower machines or bumped for deeper stress.  Must be ≥ 4.")
            (collect-garbage))))))
 
 ;;; ---------------------------------------------------------------------------
-;;; run-threads — barrier-synchronized, impl-aware deadlock timeout (60s; 240s ECL)
+;;; run-threads — barrier-synchronized deadlock timeout (60s, all impls)
 ;;; ---------------------------------------------------------------------------
 
-;;; TIMEOUT is implementation-aware.  ECL needs a much larger budget than
-;;; SBCL/CCL: FULL-SYSTEM-STORM runs in ~28s in isolation but ~140s when it runs
-;;; late in the suite, at a ~4 GB Boehm heap.  That is NOT a leak (CLOSE-GRAPH
-;;; releases cleanly -- RSS plateaus across repeated open/insert/close) and NOT a
-;;; hang; it is ECL GC mark-cost over the cumulative live set, dominated by the
-;;; global buffer pool's millions of pre-allocated objects, which every GC marks.
-;;; Bumping the budget is a workaround for the suite; the real fix is to cap/tune
-;;; that pool on ECL (see issue #43).  SBCL/CCL keep the tight 60s budget so a
-;;; genuine deadlock still trips quickly there.
-(defun run-threads (n fn &key (timeout #+ecl 240 #-ecl 60))
+;;; TIMEOUT is a deadlock detector, not a performance gate.  ECL previously needed
+;;; a much larger budget (240s) because FULL-SYSTEM-STORM went GC-bound late in the
+;;; suite: ECL GC mark-cost over the global buffer pool's *millions* of
+;;; pre-allocated objects, which every GC marked (issue #43).  Fixed by #48 (the
+;;; buffer pool is now bounded by *buffer-pool-size* + resizable) and #47 (the
+;;; vertex/edge pools are gone on ECL, since ECL builds subclasses directly), so
+;;; the pool no longer grows unbounded and the storm runs fast on ECL too
+;;; (~4 s in isolation).  All impls now share the tight 60 s budget, so a genuine
+;;; deadlock trips quickly everywhere.
+(defun run-threads (n fn &key (timeout 60))
   "Spawn N threads, barrier-synchronize, release, join.  *GRAPH* is captured
 and rebound in each child.  Errors in children are re-raised in the caller."
   (let* ((captured-graph *graph*)
