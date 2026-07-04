@@ -515,6 +515,12 @@ L1: 50%, L2: 25%, L3: 12.5%, ..."
 
 (defun %find-kv-in-skip-list (skip-list key value &optional preds succs)
   ;; Lock-free core; caller holds the sl read or write lock (WITH-SL-READ-LOCK).
+  ;; NOTE: PRED is re-initialized to the head at EACH level (rather than carried
+  ;; down as in %FIND-IN-SKIP-LIST).  That is deliberate and required for the
+  ;; duplicate-key case: a taller tower node that shares KEY but has a different
+  ;; value would make a carried PRED overshoot the specific (key,value) target at
+  ;; the base level.  Duplicate-free lists take the O(log n) fast path in
+  ;; REMOVE-FROM-SKIP-LIST instead of this function.
   (let ((the-node nil) (level-found -1))
     (loop for level from (1- (%sl-max-level skip-list)) downto 0 do
          (let ((pred (%sl-head skip-list)))
@@ -696,7 +702,21 @@ none matched."
       (unwind-protect
            (loop
               (multiple-value-bind (node level-found)
-                  (%find-kv-in-skip-list skip-list key target-value preds succs)
+                  ;; Duplicate-free lists (views, unique indexes): KEY alone
+                  ;; identifies the node, so %FIND-IN-SKIP-LIST descends in
+                  ;; O(log n) and returns correct preds/succs (leftmost match ==
+                  ;; the only match).  %FIND-KV re-walks the base list from the
+                  ;; head at every level -- O(n) -- and is only needed to pick a
+                  ;; specific value out of DUPLICATE keys.  Confirm the located
+                  ;; node's value still matches the target before deleting.
+                  (if (%sl-duplicates-allowed-p skip-list)
+                      (%find-kv-in-skip-list skip-list key target-value preds succs)
+                      (multiple-value-bind (n lvl)
+                          (%find-in-skip-list skip-list key preds succs)
+                        (if (and n (funcall (%sl-value-equal skip-list)
+                                            target-value (%sn-value n)))
+                            (values n lvl)
+                            (values nil -1))))
                 (unless node (return-from remove-from-skip-list nil))
                 (when (or marked-p
                           (and node (ok-to-delete-p skip-list node level-found)))
