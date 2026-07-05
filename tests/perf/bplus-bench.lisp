@@ -130,24 +130,30 @@ counts the leaf-chain nodes yielded (the dominant, scattered cost)."
 ;;; The benchmark
 ;;; ---------------------------------------------------------------------------
 
-(defun bplus-bench (&key (sizes '(10000 100000 500000))
+(defun bplus-bench (&key (sizes '(10000 100000 500000 1000000))
                          (page-size 4096)
                          (lookup-sample 5000)
                          (range-span 1000)
                          (heap-mb 256))
   "Compare the mmap B+ tree and skip list on integer keys at each N in SIZES.
-NOTE: running the full dual-structure bench at N=1e6 in one process trips a
-deterministic memory fault that is NOT in the B+ tree (each structure passes at
-1e6 in isolation; see docs/bplus-tree-experiment.md \"1M anomaly\").  Kept out of
-the default SIZES until isolated."
+Runs cleanly through N=1e6.  (heap-mb sizes the per-structure heap; at 1e6 the
+skip list uses ~52 MB and the B+ tree ~23 MB, so 256 MB is ample.)"
   (format t "~&~%############  B+ TREE  vs  SKIP-LIST  (~A, page ~A B)  ############~%"
           (lisp-implementation-type) page-size)
   (dolist (n sizes)
     (let* ((sl-path (format nil "/var/tmp/bench-sl-~A.dat" n))
            (bp-path (format nil "/var/tmp/bench-bp-~A.dat" n))
-           (sl-heap (create-memory sl-path (* 1024 1024 heap-mb)))
-           (bp-heap (create-memory bp-path (* 1024 1024 heap-mb))))
+           ;; CREATE-MEMORY does NOT truncate an existing file -- it maps it at its
+           ;; current size.  A stale file left by a prior crashed/oversized run
+           ;; (e.g. a 1 GB file from :heap-mb 1024) is then reused with a
+           ;; size/header mismatch and later faults with a wild-address SEGV.
+           ;; Always start from a fresh file.
+           (sl-heap (progn (ignore-errors (delete-file sl-path))
+                           (create-memory sl-path (* 1024 1024 heap-mb))))
+           (bp-heap (progn (ignore-errors (delete-file bp-path))
+                           (create-memory bp-path (* 1024 1024 heap-mb)))))
       (unwind-protect
+           (progn
            (format t "~&[N=~:D] building...~%" n) (finish-output)
            ;; Shuffle a VECTOR (elt is O(1)); nshuffle on a list is O(n^2) and
            ;; effectively hangs at n=1e6.
@@ -212,7 +218,7 @@ the default SIZES until isolated."
                             :range-span range-span
                             :sl-nodes sl-nodes :sl-bytes sl-bytes :sl-maxlvl sl-maxlvl
                             :bp-pages bp-pages
-                            :bp-height (%bpt-height bp))))))))))
+                            :bp-height (%bpt-height bp)))))))))))
         (progn (close-memory sl-heap) (close-memory bp-heap)
                (ignore-errors (delete-file sl-path))
                (ignore-errors (delete-file bp-path))))))

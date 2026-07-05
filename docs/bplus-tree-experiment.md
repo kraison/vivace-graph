@@ -80,11 +80,15 @@ Ratio column = **skip-list / b+tree**; **>1× means the B+ tree wins**.
 | **pages / point-lookup** (cold) | 10k | 17.3 | **2.0** | **8.6×** |
 |  | 100k | 22.0 | **3.0** | **7.3×** |
 |  | 500k | 27.3 | **3.0** | **9.1×** |
+|  | 1M | 26.6 | **3.0** | **8.9×** |
 | **pages / 1000-scan** (cold) | 10k | 156 | **7.9** | **19.7×** |
 |  | 100k | 741 | **8.3** | **89×** |
-|  | 500k | **942** | **8.7** | **108×** |
-| **bytes/key** | 500k | 51.9 | **23.2** | 2.2× smaller |
-| height / max-level | 500k | 49 lvls | **3** | — |
+|  | 500k | 942 | **8.7** | **108×** |
+|  | 1M | **969** | **8.3** | **117×** |
+| **warm point-lookup** µs | 1M | 30.5 | **5.0** | **6.1×** |
+| **warm range-scan** µs/ent | 1M | 2.63 | **0.46** | **5.7×** |
+| **bytes/key** | 1M | 52.0 | **22.8** | 2.3× smaller |
+| height / max-level | 1M | 53 lvls | **3** | — |
 
 **500k row in full** — insert 16.0 / 99.1 µs (0.16×), point-lookup 30.9 / **4.8** µs
 (**6.5×**), range-scan 2.66 / **0.46** µs/ent (**5.8×**), remove 15.4 / 34.8 µs
@@ -93,39 +97,40 @@ pointer-chases ~27 scattered nodes) while the B+ tree holds at ~5 µs — the wa
 gap widens with N, mirroring the cold page-touch gap.
 
 The monotonic progression is the story: skip-list cold pages/scan climb
-156 → 741 → 942 as its nodes scatter across ever more pages, while the B+ tree
-stays flat at ~8 (contiguous leaves); warm point-lookup speedup grows 1.7× →
-3.1× → 6.5×.
+156 → 741 → 942 → 969 as its nodes scatter across ever more pages, while the B+
+tree stays flat at ~8 (contiguous leaves); warm point-lookup speedup grows 1.7×
+→ 3.1× → 6.5× → 6.1×, and the skip-list's warm point lookup *degrades to ~30 µs*
+at 500k–1M (pointer-chasing ~27 scattered nodes) while the B+ tree holds at ~5 µs.
 
-### The 1M anomaly (open, not a B+ tree bug)
+### The 1M "anomaly" — root-caused: stale benchmark files (RESOLVED)
 
-Running the **full dual-structure bench at N=1,000,000 in one process** hits a
-*deterministic* memory fault (a wild-address SEGV at a near-constant address
-`0x1899…0F8D1` across runs). It is **not a B+ tree correctness bug** — the
-following all pass cleanly at 1e6:
+For a while the full bench at N=1e6 tripped a *deterministic* wild-address SEGV
+(`0x1899…0F8D1`), always **before the build even started**. It was **not** a B+
+tree bug (every operation passed at 1e6 standalone, alongside a skip list, and
+under forced heap growth; the page-I/O bounds guard never fired). The real cause:
 
-- B+ tree build + point-lookup + range-scan + page-touch trace + full walk +
-  500k removes, standalone (256 MB heap).
-- Skip-list build, standalone.
-- B+ tree build under a heap forced to grow 9× from 2 MB (cached-mmap safe).
-- **Both** structures built to 1e6 in one process (two 256 MB heaps) + 20k
-  interleaved sl/bp lookups.
+- The bench names its heap files `bench-{sl,bp}-<N>.dat`. An early `heap-mb 1024`
+  run created **1 GB** files, then crashed (leaving them behind).
+- `create-memory` **does not truncate** an existing file — it opens it and maps
+  it at its *current* size. So a later `heap-mb 256` run remapped the stale 1 GB
+  file while recording `memory-size` = 256 MB — a size/header mismatch whose
+  first mapped access faulted at a wild address, deterministically.
 
-A bounds-check guard was added to the B+ tree page I/O (converting any bad-address
-`memcpy` into a catchable error); it does **not** fire, confirming the fault is
-outside the B+ tree's page path. The remaining suspects are the bench's own
-skip-list measurement helpers or peak-memory interaction when the entire 1e6
-dual-structure sequence runs end-to-end. Left as a follow-up; N=500k is the
-authoritative large-N full-bench point and is kept as the default ceiling.
+Fix: the bench now `delete-file`s each path before `create-memory`. With fresh
+files the full bench runs clean through **1e6** (numbers above). A permanent
+bounds-check guard was also added to the B+ tree page I/O (turns any bad-address
+`memcpy` into a catchable error). Sharp edge worth noting: `create-memory` is
+only safe on a *fresh* path — it silently reuses (does not truncate) an existing
+file.
 
 ## Reading the results
 
 - **Locality (the thesis) is confirmed decisively.** Cold, the B+ tree faults
-  **7–9× fewer pages per point lookup** and **20–90× fewer per range scan**, and
-  the skip-list's range-scan page count **grows with N** (156 → 741 from 10k →
-  100k) as its nodes scatter across ever more pages, while the B+ tree stays flat
-  (~8 pages, contiguous leaves). This is exactly where the win matters most:
-  cold cache, large indexes, mobile/ECL.
+  **7–9× fewer pages per point lookup** and **20–117× fewer per range scan**, and
+  the skip-list's range-scan page count **grows with N** (156 → 741 → 942 → 969
+  from 10k → 1M) as its nodes scatter across ever more pages, while the B+ tree
+  stays flat (~8 pages, contiguous leaves). This is exactly where the win matters
+  most: cold cache, large indexes, mobile/ECL.
 - **Warm point lookup and range scan also win** (1.7–3× and 1.4–4.9×) once the
   read path binary-searches within the page instead of decoding it wholesale —
   fewer, denser objects beat pointer-chasing even when everything is cached. (An
