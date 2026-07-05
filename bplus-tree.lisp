@@ -415,16 +415,6 @@ internal node without decoding it wholesale."
 ;;; Navigation
 ;;; ---------------------------------------------------------------------------
 
-(defun %bpt-choose-child (tree link entries dkey)
-  "For an internal node with leftmost child LINK (P0) and ENTRIES, return the
-child address to descend into for DKEY: P0 if DKEY < first key, else the child of
-the last entry whose key <= DKEY."
-  (let ((child link))
-    (dolist (e entries child)
-      (if (bpt-key< tree dkey (first e))
-          (return child)
-          (setf child (third e))))))
-
 (defun %bpt-descend-to-leaf (tree dkey)
   "Return (values LEAF-ADDR LEAF-BUF LEAF-LINK LEAF-ENTRIES) for the leaf that
 would hold DKEY.  Internal nodes are binary-searched (not decoded); only the
@@ -454,8 +444,107 @@ Fully lean: binary-search all the way down, decode only the one matching cell."
             (values nil nil))))))
 
 ;;; ---------------------------------------------------------------------------
+;;; Slotted-page in-place cell edits (the write-cost path)
+;;; ---------------------------------------------------------------------------
+;;; A non-splitting insert / a delete edits ONE cell in the page buffer -- shift
+;;; the sorted slot directory by one entry and (for insert) drop the new cell into
+;;; the free gap -- instead of decoding every cell and re-encoding the whole page.
+;;; Deletes leave the vacated cell bytes as a hole; an insert that no longer fits
+;;; the contiguous free gap first COMPACTS (repacks live cells, reclaiming holes),
+;;; and only splits when the page is genuinely full.  Cells are moved as raw bytes
+;;; (SUBSEQ / REPLACE), never deserialized.  The split path still decodes (rare).
+
+(declaim (inline %bpt-slot-off (setf %bpt-slot-off)))
+(defun %bpt-slot-off (buf i)
+  "Byte offset of cell I (its content), read from the slot directory."
+  (buf-u16 buf (+ +bpt-p-slots-offset+ (* i 2))))
+(defun (setf %bpt-slot-off) (value buf i)
+  (setf (buf-u16 buf (+ +bpt-p-slots-offset+ (* i 2))) value))
+
+(defun %bpt-cell-size-at (buf slot leaf-p)
+  "Total bytes of the cell whose content starts at SLOT."
+  (let ((klen (buf-u16 buf slot)))
+    (if leaf-p
+        (+ 2 klen 2 (buf-u16 buf (+ slot 2 klen)))  ; klen + key + vlen + val
+        (+ 2 klen 8))))                              ; klen + key + child
+
+(defun %bpt-cell-sval (buf slot)
+  "The serialized value bytes of the leaf cell at SLOT."
+  (let* ((klen (buf-u16 buf slot))
+         (voff (+ slot 2 klen))
+         (vlen (buf-u16 buf voff)))
+    (subseq buf (+ voff 2) (+ voff 2 vlen))))
+
+(defun %bpt-live-bytes (buf n leaf-p)
+  "Sum of the live cells' sizes (excludes holes left by deleted cells)."
+  (let ((sum 0))
+    (dotimes (i n sum) (incf sum (%bpt-cell-size-at buf (%bpt-slot-off buf i) leaf-p)))))
+
+(defun %bpt-compact-page (tree buf leaf-p)
+  "Repack the live cells contiguously against the end of the page (reclaiming
+holes) and reset the free pointer.  Cells move as raw bytes -- no decode."
+  (let* ((ps (%bpt-page-size tree))
+         (n (buf-u16 buf +bpt-p-count-offset+))
+         (cells (make-array n))
+         (free ps))
+    (dotimes (i n)
+      (let* ((slot (%bpt-slot-off buf i))
+             (sz (%bpt-cell-size-at buf slot leaf-p)))
+        (setf (aref cells i) (subseq buf slot (+ slot sz)))))
+    (dotimes (i n)
+      (let* ((bytes (aref cells i)) (sz (length bytes)) (cell (- free sz)))
+        (replace buf bytes :start1 cell)
+        (setf (%bpt-slot-off buf i) cell
+              free cell)))
+    (setf (buf-u16 buf +bpt-p-free-offset+) free)))
+
+(defun %bpt-page-insert-at (tree buf leaf-p idx skey payload)
+  "Insert a cell (SKEY + PAYLOAD, where PAYLOAD is the serialized value for a leaf
+or the child address for an internal node) at slot position IDX, compacting first
+if the free gap is too small.  Return T on success, NIL if the page is genuinely
+full (caller must split).  On NIL the buffer is left UNCHANGED."
+  (let* ((ps (%bpt-page-size tree))
+         (n (buf-u16 buf +bpt-p-count-offset+))
+         (klen (length skey))
+         (csize (if leaf-p (+ 2 klen 2 (length payload)) (+ 2 klen 8)))
+         (need (+ csize 2))                                  ; cell + its new slot
+         (dir-end (+ +bpt-p-slots-offset+ (* n 2)))
+         (free (buf-u16 buf +bpt-p-free-offset+)))
+    (when (< (- free dir-end) need)
+      ;; Not enough contiguous gap -- compact if the live data would fit, else full.
+      (when (> (+ +bpt-p-slots-offset+ (* (1+ n) 2) (%bpt-live-bytes buf n leaf-p) csize) ps)
+        (return-from %bpt-page-insert-at nil))
+      (%bpt-compact-page tree buf leaf-p)
+      (setf free (buf-u16 buf +bpt-p-free-offset+)))
+    (let ((cell (- free csize)))
+      (setf (buf-u16 buf cell) klen)
+      (replace buf skey :start1 (+ cell 2))
+      (if leaf-p
+          (progn (setf (buf-u16 buf (+ cell 2 klen)) (length payload))
+                 (replace buf payload :start1 (+ cell 2 klen 2)))
+          (setf (buf-u64 buf (+ cell 2 klen)) payload))
+      ;; Shift slots [IDX..n-1] up by one, then drop the new slot in at IDX.
+      (loop for i from n downto (1+ idx)
+            do (setf (%bpt-slot-off buf i) (%bpt-slot-off buf (1- i))))
+      (setf (%bpt-slot-off buf idx) cell
+            (buf-u16 buf +bpt-p-count-offset+) (1+ n)
+            (buf-u16 buf +bpt-p-free-offset+) cell)
+      t)))
+
+(defun %bpt-page-delete-at (buf idx)
+  "Remove slot IDX (shift the slot directory down); the vacated cell bytes become
+a hole reclaimed on the next compaction.  Count decremented; free pointer unchanged."
+  (let ((n (buf-u16 buf +bpt-p-count-offset+)))
+    (loop for i from idx below (1- n)
+          do (setf (%bpt-slot-off buf i) (%bpt-slot-off buf (1+ i))))
+    (setf (buf-u16 buf +bpt-p-count-offset+) (1- n))
+    t))
+
+;;; ---------------------------------------------------------------------------
 ;;; Insert (recursive, with split propagation)
 ;;; ---------------------------------------------------------------------------
+;;; A non-splitting insert edits one cell in place (%BPT-PAGE-INSERT-AT); only an
+;;; overflowing page falls back to the decode/partition/encode split path.
 ;;; %BPT-INSERT returns:
 ;;;   :dup                             key already present (no-op)
 ;;;   :no-split                        inserted, page did not split
@@ -528,23 +617,51 @@ or (SEP-DKEY SEP-SKEY RIGHT-ADDR)."
                                  (%bpt-encode-page tree nil link left))
                 (list (first mid-entry) (second mid-entry) right-addr)))))))
 
+(defun %bpt-split-leaf (tree addr buf dkey skey sval)
+  "Overflowing leaf: decode BUF, add the new entry, partition into two pages.
+Returns (SEP-DKEY SEP-SKEY RIGHT-ADDR)."
+  (multiple-value-bind (lp link entries) (%bpt-decode-page tree buf)
+    (declare (ignore lp))
+    (%bpt-store-or-split tree addr t link
+                         (%bpt-insert-sorted-leaf tree entries dkey skey sval))))
+
+(defun %bpt-split-internal (tree addr buf sep-dkey sep-skey right-addr)
+  "Overflowing internal node: decode BUF, add the separator, partition."
+  (multiple-value-bind (lp link entries) (%bpt-decode-page tree buf)
+    (declare (ignore lp))
+    (%bpt-store-or-split tree addr nil link
+                         (%bpt-insert-sorted-internal tree entries sep-dkey sep-skey right-addr))))
+
 (defun %bpt-insert (tree addr dkey skey sval)
-  (multiple-value-bind (leaf-p link entries)
-      (%bpt-decode-page tree (%bpt-read-page tree addr))
-    (if leaf-p
-        (let ((new (%bpt-insert-sorted-leaf tree entries dkey skey sval)))
-          (if (eq new :dup)
+  (let* ((buf (%bpt-read-page tree addr))
+         (n (buf-u16 buf +bpt-p-count-offset+)))
+    (if (%bpt-leaf-p buf)
+        ;; Leaf: locate the key; equal => duplicate no-op; else insert after the
+        ;; last key < DKEY, in place if it fits, otherwise split.
+        (multiple-value-bind (idx exact) (%bpt-page-bsearch tree buf n dkey)
+          (if exact
               :dup
-              (%bpt-store-or-split tree addr t link new)))
-        (let ((child (%bpt-choose-child tree link entries dkey)))
-          (let ((res (%bpt-insert tree child dkey skey sval)))
+              (let ((ins (1+ idx)))
+                (if (%bpt-page-insert-at tree buf t ins skey sval)
+                    (progn (%bpt-write-page tree addr buf) :no-split)
+                    (%bpt-split-leaf tree addr buf dkey skey sval)))))
+        ;; Internal: descend to the right child, then absorb any split it returns.
+        (multiple-value-bind (idx exact) (%bpt-page-bsearch tree buf n dkey)
+          (declare (ignore exact))
+          (let* ((child (if (< idx 0) (buf-u64 buf +bpt-p-link-offset+) (%bpt-slot-child buf idx)))
+                 (res (%bpt-insert tree child dkey skey sval)))
             (cond ((eq res :dup) :dup)
                   ((eq res :no-split) :no-split)
-                  (t ;; child split -> insert separator here
+                  (t
                    (destructuring-bind (sep-dkey sep-skey right-addr) res
-                     (let ((new (%bpt-insert-sorted-internal
-                                 tree entries sep-dkey sep-skey right-addr)))
-                       (%bpt-store-or-split tree addr nil link new))))))))))
+                     ;; BUF is our snapshot; the recursion only touched descendants,
+                     ;; so it is still valid.  Insert the separator in place or split.
+                     (multiple-value-bind (sidx sx) (%bpt-page-bsearch tree buf n sep-dkey)
+                       (declare (ignore sx))
+                       (let ((sins (1+ sidx)))
+                         (if (%bpt-page-insert-at tree buf nil sins sep-skey right-addr)
+                             (progn (%bpt-write-page tree addr buf) :no-split)
+                             (%bpt-split-internal tree addr buf sep-dkey sep-skey right-addr))))))))))))
 
 (defun bpt-insert (tree dkey skey sval)
   "Insert DKEY -> value.  DKEY is the deserialized key; SKEY / SVAL the serialized
@@ -574,25 +691,24 @@ key / value bytes.  Duplicate keys are a no-op (returns NIL); returns T on inser
 
 (defun bpt-remove (tree dkey &optional (sval nil sval-p) value-equal)
   "Remove DKEY from its leaf.  With SVAL given, only remove when the stored value
-also matches (via VALUE-EQUAL or the tree's).  Returns T if a key was removed."
+also matches (via VALUE-EQUAL or the tree's).  Returns T if a key was removed.
+Lazy: drops the leaf cell in place, no merge/rebalance (see A3)."
   (with-bpt-write-lock (tree)
-    (multiple-value-bind (addr buf link entries) (%bpt-descend-to-leaf tree dkey)
-      (declare (ignore buf))
-      (let ((veq (or value-equal (%bpt-value-equal tree)))
-            (found nil))
-        (let ((kept (remove-if (lambda (e)
-                                 (when (and (not found)
-                                            (bpt-key= tree dkey (first e))
-                                            (or (not sval-p)
-                                                (funcall veq sval (third e))))
-                                   (setf found t)))
-                               entries)))
-          (when found
-            ;; Leaf never overflows on removal, so encode always fits.
-            (%bpt-write-page tree addr (%bpt-encode-page tree t link kept))
-            (decf (%bpt-count tree))
-            (%bpt-sync-count tree))
-          found)))))
+    (let* ((addr (%bpt-descend-leaf-addr tree dkey))
+           (buf (%bpt-read-page tree addr))
+           (n (buf-u16 buf +bpt-p-count-offset+))
+           (veq (or value-equal (%bpt-value-equal tree))))
+      (multiple-value-bind (idx exact) (%bpt-page-bsearch tree buf n dkey)
+        (if (and exact
+                 (or (not sval-p)
+                     (funcall veq sval (%bpt-cell-sval buf (%bpt-slot-off buf idx)))))
+            (progn
+              (%bpt-page-delete-at buf idx)
+              (%bpt-write-page tree addr buf)
+              (decf (%bpt-count tree))
+              (%bpt-sync-count tree)
+              t)
+            nil)))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Cursors -- leaf-linked forward scan (the range-scan locality payoff)

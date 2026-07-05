@@ -139,11 +139,28 @@ file.
   was the cost.)
 - **The B+ tree is ~2.4× more space-efficient** (22 vs 51 bytes/key) — no
   per-node tower pointers, no per-node allocation header.
-- **Insert/remove are 3–7× slower warm** — entirely the whole-page
-  read-modify-write. This is a prototype simplification, not fundamental; in-place
-  cell insert/delete (shift the slot directory + splice one cell) removes it. VG
-  index writes also happen under a commit/manager lock and are far rarer than
-  reads, so this is the right thing to leave for last.
+- **Insert/remove *were* 3–7× slower warm** — the whole-page read-modify-write.
+  **Fixed by A1 (in-place cell edits, below): the B+ tree is now faster than the
+  skip list on writes too.**
+
+### A1 — in-place cell edits (write-cost killer, done)
+
+A non-splitting insert / a delete now edits **one cell** in the page buffer —
+shift the sorted slot directory by one and drop the new cell into the free gap
+(compacting to reclaim delete-holes only when the gap is too small; splitting only
+when the page is genuinely full) — instead of decoding every cell and re-encoding
+the whole page. Cells move as raw bytes, never deserialized; the split path still
+decodes (rare). Result at 500k (ratio = skip-list ÷ b+tree, >1 = B+ tree wins):
+
+| metric | before A1 | after A1 | vs skip-list |
+|---|--:|--:|--:|
+| insert µs/op | ~99 | **6.9** | **2.33×** |
+| remove µs/op | ~35 | **6.4** | **2.48×** |
+
+Reads/locality/space are unchanged (point-lookup 4.9×, range-scan 6.2×, cold
+pages 8–109× fewer, 2.3× smaller). **The B+ tree now wins on every operation.**
+Verified: the smoke + a randomized 200k/300k-op churn test vs a reference model
+(point/count/full-scan/range), and the `view-suite` still 56/56 on both backends.
 
 ## Verdict
 
@@ -198,10 +215,11 @@ specifically because the B+ tree's page I/O is a raw CFFI `memcpy` through
 including reopen.
 
 ### Before it graduates from a prototype
-1. **In-place insert/delete** to kill the whole-page RMW write cost.
+1. ~~**In-place insert/delete** to kill the whole-page RMW write cost.~~ **DONE (A1).**
 2. **Concurrency:** page-latch crabbing or a COW/versioned-root story to restore
-   fully lock-free reads (today: one per-tree rw-lock).
-3. **Rebalancing/merge** on delete (today: lazy, space-leaky under churn).
+   fully lock-free reads (today: one per-tree rw-lock). *Chosen: COW, deferred —
+   land A1 + A3 under the rw-lock first, then COW as its own phase.*
+3. **Rebalancing/merge** on delete (today: lazy, space-leaky under churn). *(A3, next.)*
 4. **Reopen + format version** wired through the sidecars, with detect-and-rebuild
    of an old skip-list-format index (template: `restore-spatial-index`).
 5. **Both impls:** re-run the suite on ECL (raw-bytes encoding is already
