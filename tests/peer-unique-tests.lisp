@@ -67,6 +67,32 @@ blind to replicated nodes."
     ;; a distinct email still commits fine.
     (finishes (with-transaction () (make-pu-user :code "c3" :email "ok@y.com")))))
 
+(test state-sync-create-maintains-index
+  "GAP 1 via the STATE-SYNC path (APPLY-PEER-CREATE-WRITES, not the authored path):
+a pulled node's global-unique value lands in the device index, so a later LOCAL
+duplicate is rejected."
+  (with-pu-device (g)
+    (let* ((tid (graph-db::node-type-id
+                 (graph-db::lookup-node-type-by-name 'pu-user :vertex :graph g)))
+           (n (make-instance 'pu-user :id (gen-id) :type-id tid :revision 0)))
+      (setf (graph-db::data n) '((:code . "s1") (:email . "sync@x.com")))
+      (graph-db::apply-peer-create-writes
+       g 7777 (list (make-instance 'graph-db::tx-create :node n)) *pu-hub-origin*))
+    (signals graph-db:unique-constraint-violation
+      (with-transaction () (make-pu-user :code "s2" :email "sync@x.com")))))
+
+(test purge-releases-unique-keys
+  "PEER-PURGE-NODE releases a purged node's unique keys, so its value frees up -- the
+index must not keep a stale holder that would falsely reject a reuse."
+  (with-pu-device (g)
+    (let ((vid (id (with-transaction () (make-pu-user :code "p1" :email "p@x.com")))))
+      ;; while the holder is live, reusing its (global) email is rejected.
+      (signals graph-db:unique-constraint-violation
+        (with-transaction () (make-pu-user :code "p2" :email "p@x.com")))
+      (graph-db::apply-peer-purge g (list vid))
+      ;; after the purge the email is free again.
+      (finishes (with-transaction () (make-pu-user :code "p3" :email "p@x.com"))))))
+
 (test origin-scope-partitions-by-author
   "GAP 2: an :ORIGIN-scoped value collides only WITHIN an origin.  A pulled node and
 a local node may share a code (different authors -> different partitions), but two
