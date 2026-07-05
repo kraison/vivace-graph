@@ -62,6 +62,11 @@
                (:file "skip-list" :depends-on ("allocator" "linear-hash"))
                (:file "skip-list-cursors" :depends-on ("skip-list" "cursors"))
                (:file "mem-skip-list" :depends-on ("skip-list-cursors"))
+               ;; EXPERIMENTAL third ordered-map backend: an mmap-backed B+ tree
+               ;; (locality-oriented alternative to the skip list; see
+               ;; docs/next-work-handoff.md).  Reuses skip-list-cursors' SKIP-NODE
+               ;; struct + cursor protocol; lives in the same heap as the skip list.
+               (:file "bplus-tree" :depends-on ("skip-list-cursors" "allocator"))
                (:file "spatial-index" :depends-on ("skip-list-cursors" "geometry" "geohash" "geometry-ops"))
                (:file "index-list" :depends-on ("linear-hash" "allocator"))
                (:file "ve-index" :depends-on ("skip-list-cursors" "index-list" "graph-class"))
@@ -222,7 +227,10 @@
   :serial t
   :components ((:file "package")
                (:file "suite")
-               (:file "benchmarks"))
+               (:file "benchmarks")
+               ;; B+ tree vs skip-list side-by-side (in-package :graph-db so it can
+               ;; trace both read paths); entry point (graph-db::bplus-bench).
+               (:file "bplus-bench"))
   :perform (test-op (op c)
                     (uiop:symbol-call :graph-db/perf-test :run-perf)))
 
