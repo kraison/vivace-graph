@@ -612,7 +612,15 @@ high-level lookup."
   (if (lookup-view-group class-name graph)
       (let ((thunk
              (lambda ()
-               (let ((view (lookup-view graph class-name view-name)))
+               ;; Resolve nodes (the view's LOOKUP-FN -> LOOKUP-<type> -> LOOKUP-VERTEX)
+               ;; from the GRAPH being queried, not the ambient *GRAPH*.  Otherwise
+               ;; MAP-VIEW/INVOKE-GRAPH-VIEW with an explicit :GRAPH reads the index
+               ;; from that graph but resolves node ids against *GRAPH* -- so querying
+               ;; any graph that is not the current *GRAPH* (e.g. right after a reopen,
+               ;; or a second graph) looks the node up in the wrong (or a closed) graph
+               ;; and hits (VERTEX-TABLE NIL) -> no-applicable-method on LOOKUP-NODE.
+               (let ((*graph* graph))
+                 (let ((view (lookup-view graph class-name view-name)))
                  (unless view
                    (error 'invalid-view-error
                           :class-name class-name
@@ -670,7 +678,7 @@ high-level lookup."
                                            (second (%sn-key node))
                                            (%sn-value node)))))))
                    (when collect-p
-                     (values (nreverse result) found-count)))))))
+                     (values (nreverse result) found-count))))))))
         (if write-p
             (with-write-locked-view-group (class-name graph)
               (funcall thunk))

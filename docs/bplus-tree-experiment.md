@@ -283,13 +283,21 @@ spatial queries stay correct, and it survives a plain reopen.
 > unique didn't). The new function frees the old unique stores first, rebuilds on
 > the current backend, and re-persists the sidecar tags.
 
-**Not recommended: snapshot + replay into a fresh graph.** It *does* rebuild all
-three index families on the target's backend (replay re-inserts nodes through the
-maintained `apply-transaction` path), but replaying into a *different, fresh*
-graph is an under-tested corner for graphs with views: `lookup-<type>`-by-id (used
-by view queries) resolves a NIL node table there — and this reproduces with
-skip-list → skip-list too, so it is a pre-existing snapshot/replay + schema/type-id
-concern, unrelated to the backend. The in-place reindex avoids it entirely.
+**Snapshot + replay into a fresh graph also works** (verified end-to-end: snapshot
+a skip-list graph, `make-graph … :index-backend :bplus-tree`, adopt the source
+schema, `replay` — all three index families rebuild on the target's backend
+because replay re-inserts nodes through the maintained `apply-transaction` path,
+and view lookups / unique enforcement / spatial queries are correct through a
+reopen). For a *pure backend switch* the in-place reindex above is simpler (one
+graph, node data untouched), but the snapshot/replay idiom is sound.
+
+> **Bug fixed here (`map-view`, backend-independent).** Chasing this exposed a real
+> flaw in the view-query path: `invoke-graph-view`/`map-view` read the index from
+> their `:graph` argument but resolved node ids via the view's `lookup-<type>`,
+> which uses the dynamic `*graph*`. So `invoke-graph-view … :graph G` looked nodes
+> up in `*graph*` instead of `G` — wrong (or a crash on `(vertex-table nil)`)
+> whenever the two differ, e.g. querying a just-reopened graph, a second graph, or
+> a replay target. `map-view` now binds `*graph*` to its `graph` argument.
 
 ### Before it graduates from a prototype
 1. ~~**In-place insert/delete** to kill the whole-page RMW write cost.~~ **DONE (A1).**
