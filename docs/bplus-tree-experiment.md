@@ -162,6 +162,24 @@ pages 8–109× fewer, 2.3× smaller). **The B+ tree now wins on every operation
 Verified: the smoke + a randomized 200k/300k-op churn test vs a reference model
 (point/count/full-scan/range), and the `view-suite` still 56/56 on both backends.
 
+### A3 — merge-on-delete (space reclamation, done)
+
+A delete removes the leaf cell in place; if the leaf then **underflows** (empty,
+or under half full) the parent **merges** it with an adjacent sibling when the two
+fit in one page — freeing the vacated page and dropping the separator. Underflow
+propagates up, and an internal root left with only its `P0` child **collapses**
+(the tree loses a level). It is **merge-only**: a merge only ever *shrinks* the
+parent, so it can never overflow it — unlike borrow/redistribute, which can grow
+a variable-length separator and overflow the parent (deferred as a refinement). An
+empty page always merges (its sibling alone fits), so **empty pages never linger**;
+a still-underfull node whose neighbours are both too full is simply left until a
+later delete shrinks one.
+
+Verified: the churn test now **drains** every key after the random phase and
+asserts the tree collapses to a single empty leaf (count 0, **height 1**, empty
+scan) and still works after refill — 0 failures at 200k + 300k ops on tiny (256 B)
+and realistic (4 KB) pages; `view-suite` still 56/56 on both backends.
+
 ## Verdict
 
 The B+ tree **wins on the axes that motivated the experiment** — cold-cache
@@ -219,7 +237,9 @@ including reopen.
 2. **Concurrency:** page-latch crabbing or a COW/versioned-root story to restore
    fully lock-free reads (today: one per-tree rw-lock). *Chosen: COW, deferred —
    land A1 + A3 under the rw-lock first, then COW as its own phase.*
-3. **Rebalancing/merge** on delete (today: lazy, space-leaky under churn). *(A3, next.)*
+3. ~~**Rebalancing/merge** on delete (today: lazy, space-leaky under churn).~~
+   **DONE (A3): merge-only.** Borrow/redistribute (keep every node ≥ half full) is
+   the remaining refinement.
 4. **Reopen + format version** wired through the sidecars, with detect-and-rebuild
    of an old skip-list-format index (template: `restore-spatial-index`).
 5. **Both impls:** re-run the suite on ECL (raw-bytes encoding is already

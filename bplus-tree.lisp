@@ -686,27 +686,130 @@ key / value bytes.  Duplicate keys are a no-op (returns NIL); returns T on inser
              t)))))
 
 ;;; ---------------------------------------------------------------------------
-;;; Remove (lazy: drop the leaf cell, no merge/rebalance)
+;;; Remove (with merge-on-delete rebalancing)
 ;;; ---------------------------------------------------------------------------
+;;; A delete removes the leaf cell in place (cheap).  If the leaf then UNDERFLOWS
+;;; (drops below half full, or empties), the parent MERGES it with an adjacent
+;;; sibling when the two fit in one page, freeing the vacated page and dropping the
+;;; separator -- which only ever SHRINKS the parent, so a merge never overflows.
+;;; Underflow then propagates up; an internal root left with only its P0 child
+;;; collapses (the tree shrinks by one level).  Merge-only (no borrow): an empty
+;;; page always merges (its sibling alone fits), so empty pages never linger; a
+;;; still-underfull node whose siblings are both too full to absorb it is simply
+;;; left until a later delete shrinks a neighbour.  (Borrow/redistribute -- which
+;;; would keep every node >= half full but can grow a variable-length separator
+;;; and overflow the parent -- is a later refinement.)
+
+(defun %bpt-usable (tree) (- (%bpt-page-size tree) +bpt-p-slots-offset+))
+
+(defun %bpt-page-underflow-p (tree buf leaf-p)
+  "True if BUF is a non-root page that should try to merge: empty, or under half
+full by live bytes."
+  (let ((n (buf-u16 buf +bpt-p-count-offset+)))
+    (or (zerop n)
+        (< (* 2 (%bpt-live-bytes buf n leaf-p)) (%bpt-usable tree)))))
+
+(defun %bpt-child-decode (tree addr)
+  "Decode the page at ADDR -> (values LEAF-P LINK ENTRIES)."
+  (%bpt-decode-page tree (%bpt-read-page tree addr)))
+
+(defun %bpt-rebalance-child (tree paddr cidx)
+  "Try to MERGE the underflowed child (at parent slot CIDX; -1 = P0) with an
+adjacent sibling: combine two adjacent children into the left one, free the right
+one, and drop the separator from the parent.  Prefers the left sibling.  No-op if
+neither adjacent merge fits in a page."
+  (multiple-value-bind (pleaf plink pentries) (%bpt-decode-page tree (%bpt-read-page tree paddr))
+    (declare (ignore pleaf))
+    (let* ((pvec (coerce pentries 'vector))
+           (nch (1+ (length pvec)))              ; child count: P0 + one per entry
+           (ci (1+ cidx)))                        ; child index in [0..nch-1]; 0 = P0
+      (labels ((child-addr (k) (if (= k 0) plink (third (aref pvec (1- k)))))
+               (try (left-idx)                    ; merge children[left-idx] & [left-idx+1]
+                 (let* ((sep (aref pvec left-idx))          ; separator (key . right-addr)
+                        (left-addr (child-addr left-idx))
+                        (right-addr (third sep)))
+                   (multiple-value-bind (leaf-p llink lentries) (%bpt-child-decode tree left-addr)
+                     (multiple-value-bind (rlp rlink rentries) (%bpt-child-decode tree right-addr)
+                       (declare (ignore rlp))
+                       (let* ((combined (if leaf-p
+                                            (append lentries rentries)
+                                            ;; internal: the parent separator drops
+                                            ;; DOWN, paired with RIGHT's P0 child.
+                                            (append lentries
+                                                    (list (list (first sep) (second sep) rlink))
+                                                    rentries)))
+                              (new-link (if leaf-p rlink llink))  ; leaf: absorb right's next
+                              (buf (%bpt-encode-page tree leaf-p new-link combined)))
+                         (when buf                            ; fits -> perform the merge
+                           (%bpt-write-page tree left-addr buf)
+                           (free (%bpt-heap tree) right-addr)
+                           (%bpt-write-page
+                            tree paddr
+                            (%bpt-encode-page tree nil plink
+                                              (append (subseq pentries 0 left-idx)
+                                                      (subseq pentries (1+ left-idx)))))
+                           t)))))))
+        (cond ((>= (1- ci) 0)                     ; has a left sibling -> prefer it
+               (or (try (1- ci))
+                   (when (<= (1+ ci) (1- nch)) (try ci))))
+              ((<= (1+ ci) (1- nch)) (try ci))     ; only a right sibling
+              (t nil))))))
+
+(defun %bpt-delete (tree addr dkey sval sval-p veq root-p)
+  "Recursive delete.  Returns (values STATUS UNDERFLOW-P) where STATUS is :REMOVED
+or :NOT-FOUND, and UNDERFLOW-P says whether ADDR is now underfull (never for the
+root).  A child's underflow is resolved by merging it here before we report our own."
+  (let* ((buf (%bpt-read-page tree addr))
+         (n (buf-u16 buf +bpt-p-count-offset+)))
+    (if (%bpt-leaf-p buf)
+        (multiple-value-bind (idx exact) (%bpt-page-bsearch tree buf n dkey)
+          (if (and exact
+                   (or (not sval-p)
+                       (funcall veq sval (%bpt-cell-sval buf (%bpt-slot-off buf idx)))))
+              (progn
+                (%bpt-page-delete-at buf idx)
+                (%bpt-write-page tree addr buf)
+                (values :removed (and (not root-p) (%bpt-page-underflow-p tree buf t))))
+              (values :not-found nil)))
+        (multiple-value-bind (idx exact) (%bpt-page-bsearch tree buf n dkey)
+          (declare (ignore exact))
+          (let ((child (if (< idx 0) (buf-u64 buf +bpt-p-link-offset+) (%bpt-slot-child buf idx))))
+            (multiple-value-bind (status child-underflow)
+                (%bpt-delete tree child dkey sval sval-p veq nil)
+              (if (eq status :not-found)
+                  (values :not-found nil)
+                  (progn
+                    (when child-underflow (%bpt-rebalance-child tree addr idx))
+                    ;; Re-read: a merge may have shrunk this node.
+                    (let ((buf2 (%bpt-read-page tree addr)))
+                      (values :removed
+                              (and (not root-p) (%bpt-page-underflow-p tree buf2 nil))))))))))))
+
+(defun %bpt-maybe-collapse-root (tree)
+  "While the root is an internal node holding only its P0 child, make P0 the new
+root and drop a level."
+  (loop
+    (let ((buf (%bpt-read-page tree (%bpt-root tree))))
+      (if (and (not (%bpt-leaf-p buf)) (zerop (buf-u16 buf +bpt-p-count-offset+)))
+          (let ((p0 (buf-u64 buf +bpt-p-link-offset+)) (old (%bpt-root tree)))
+            (free (%bpt-heap tree) old)
+            (setf (%bpt-root tree) p0)
+            (when (> (%bpt-height tree) 1) (decf (%bpt-height tree))))
+          (return)))))
 
 (defun bpt-remove (tree dkey &optional (sval nil sval-p) value-equal)
   "Remove DKEY from its leaf.  With SVAL given, only remove when the stored value
 also matches (via VALUE-EQUAL or the tree's).  Returns T if a key was removed.
-Lazy: drops the leaf cell in place, no merge/rebalance (see A3)."
+Merges underfull pages on the way up and collapses a degenerate root."
   (with-bpt-write-lock (tree)
-    (let* ((addr (%bpt-descend-leaf-addr tree dkey))
-           (buf (%bpt-read-page tree addr))
-           (n (buf-u16 buf +bpt-p-count-offset+))
-           (veq (or value-equal (%bpt-value-equal tree))))
-      (multiple-value-bind (idx exact) (%bpt-page-bsearch tree buf n dkey)
-        (if (and exact
-                 (or (not sval-p)
-                     (funcall veq sval (%bpt-cell-sval buf (%bpt-slot-off buf idx)))))
+    (let ((veq (or value-equal (%bpt-value-equal tree))))
+      (multiple-value-bind (status)
+          (%bpt-delete tree (%bpt-root tree) dkey sval sval-p veq t)
+        (if (eq status :removed)
             (progn
-              (%bpt-page-delete-at buf idx)
-              (%bpt-write-page tree addr buf)
+              (%bpt-maybe-collapse-root tree)
               (decf (%bpt-count tree))
-              (%bpt-sync-count tree)
+              (%bpt-sync-root tree)
               t)
             nil)))))
 
