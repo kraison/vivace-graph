@@ -1,5 +1,10 @@
 (in-package :graph-db)
 
+;; Defined in unique-constraint.lisp (loaded after this file); declared here so the
+;; %COMMIT / APPLY-TRANSACTION hooks below compile without a forward-reference warning.
+(declaim (ftype (function (t t) t)
+                validate-unique-constraints apply-tx-writes-to-unique-indexes))
+
 (defvar *transaction* nil)
 (defvar *end-of-transaction-action* '%commit)
 (defparameter *maximum-transaction-attempts* 8
@@ -975,6 +980,7 @@ With no FILTER, returns WRITES unchanged."
             (funcall hook)))
         (apply-tx-writes-to-views writes graph)
         (apply-tx-writes-to-spatial-index writes graph)
+        (apply-tx-writes-to-unique-indexes writes graph)   ; issue #6
         (reap-old-versions writes graph)
         (persist-highest-transaction-id (transaction-id transaction) graph)))))
 
@@ -2156,6 +2162,10 @@ See CALL-WITH-READ-SNAPSHOT."
                (setf (finish-tx-id tx) (tx-id-counter tm))
                (unless (validate tx)
                  (error 'validation-conflict :transaction tx))
+               ;; Unique constraints (issue #6): a pre-durability check under the same
+               ;; manager lock -- a violation aborts before FINALIZE-TX-PERSISTENCE, so
+               ;; nothing is journaled (the UNWIND-PROTECT below drops the temp file).
+               (validate-unique-constraints tx (graph tx))
                (setf (transaction-id tx) (tx-id-counter tm))
                (incf (tx-id-counter tm))
                (prune-committed-transactions tm)

@@ -90,7 +90,8 @@
                (:file "spatial-query" :depends-on ("prolog-functors" "transactions" "spatial-index" "geometry-ops"))
                (:file "interface" :depends-on ("schema" "edge" "vertex" "views"))
                (:file "traverse" :depends-on ("interface"))
-               (:file "memory-graph" :depends-on ("traverse" "transactions" "graph" "mem-skip-list"))))
+               (:file "memory-graph" :depends-on ("traverse" "transactions" "graph" "mem-skip-list"))
+               (:file "unique-constraint" :depends-on ("traverse" "transactions" "graph" "memory-graph" "node-class" "schema"))))
 
 ;; REPLICATION: core + the usocket network transport, but NO HTTP server.  This is
 ;; the master/slave + hub/peer replication layer -- transaction-streaming (usocket
@@ -361,7 +362,9 @@
                (:file "rest-tests")
                (:file "rest-http-tests")
                (:file "prolog-stress-tests")
-               (:file "memory-graph-tests"))
+               (:file "memory-graph-tests")
+               (:file "unique-constraint-tests")
+               (:file "peer-unique-tests"))
   :perform (test-op (op c)
                     (unless (uiop:symbol-call :graph-db/test :run-tests)
                       (error "graph-db test suite failed."))))

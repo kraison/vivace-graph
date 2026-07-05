@@ -1121,6 +1121,54 @@ You can also use ~invoke-graph-view~ on a reduce view by passing the `:group-p t
 
 Views are the cornerstone of building high-performance VivaceGraph applications. They provide a flexible and powerful mechanism for both secondary indexing and real-time data aggregation.
 
+*** Unique constraints (~:unique~)
+
+A slot can carry a *uniqueness constraint*: no two live nodes of the same type may share its value. Mark the slot ~:unique~ in ~def-vertex~ / ~def-edge~:
+
+#+BEGIN_SRC lisp
+  (def-vertex user ()
+    ((username :type string :unique t)                 ; identity uniqueness
+     (email    :type string :unique string-downcase))  ; case-insensitive
+    :social-app)
+#+END_SRC
+
+The value of ~:unique~ is the *uniqueness key* — it says how two values are compared:
+
+- ~t~ or ~equal~ — the value itself (identity).
+- ~equalp~ — case/relaxed equality.
+- a *canonicalizer* — a symbol, ~#'function~, or ~lambda~ of one argument that maps a value to its canonical form; two values collide when their canonical forms are ~equal~. ~string-downcase~ above makes ~"Bob@x.com"~ and ~"bob@x.com"~ the same email.
+
+Semantics:
+
+- *NULL-exempt* — a node whose unique slot is ~nil~/unbound is unconstrained (many are allowed), matching SQL's treatment of NULL.
+- *Cross-subtype* — a constraint declared on a parent type is shared across its subclasses (one index), so a ~user~ and an ~admin~ subclass cannot collide on the same value.
+- *Enforced at the commit boundary* — the check runs inside the committing transaction, so a violation aborts the whole transaction cleanly (nothing is written) by signalling ~unique-constraint-violation~. Concurrent commits racing for the same value are serialized, so exactly one wins and the rest are rejected.
+- *Durable* — the constraint is backed by a *persistent* unique index (an on-disk skip list, or the in-RAM map on a memory-graph), reopened with the graph; it is not rebuilt by scanning every node on open.
+
+Handle a violation like any other condition (readers ~ucv-class-name~, ~ucv-slot-name~, ~ucv-value~, ~ucv-existing-id~):
+
+#+BEGIN_SRC lisp
+  (handler-case
+      (with-transaction () (make-user :username "alice"))
+    (unique-constraint-violation (c)
+      (format t "~A is already taken by node ~A~%"
+              (ucv-value c) (ucv-existing-id c))))
+#+END_SRC
+
+**** Scope: uniqueness under peer replication
+
+By default a constraint is ~:scope :local~ — the value is unique within *this* graph. Global uniqueness across a whole fleet is not a coordination-free property, so peer replication (Chapter 16) offers a second scope for VivaceGraph-minted values:
+
+#+BEGIN_SRC lisp
+  (def-vertex ticket ()
+    ((code :type string :unique t :scope :origin))   ; unique *per authoring device*
+    :field-app)
+#+END_SRC
+
+~:scope :origin~ *partitions* the constraint by the node's authoring origin: two devices may each mint a ~code~ of ~"A-1"~ without colliding (they are different authors), while a single device may not reuse its own. This is the recommended default for offline-first fleets — it needs no coordination. Devices also maintain the constraint index for *pulled* nodes, so a locally-authored value is checked against everything the device holds, not only what it authored. On a non-peer graph there is a single origin, so ~:origin~ collapses to ~:local~.
+
+Truly global uniqueness — a value that must be unique across *all* devices (~:scope :local~, or a future ~:scope :hub~, in a peer setting) — requires the hub to arbitrate cross-device collisions. That arbiter is not yet built (tracked as issue #51); until then, prefer ~:origin~ for peer-replicated unique values.
+
 * Part IV: Advanced Topics & API
 
 This final part of the manual covers advanced features that allow VivaceGraph to integrate with a broader ecosystem of tools and services. We will explore the built-in REST API, the replication system for high availability, and the procedures for backing up and restoring your database.
@@ -1639,7 +1687,7 @@ Two read styles are provided, both refining the index's candidates with exact ge
 
 *** Under the hood, and a few caveats
 
-- *The index* is a skip list (in the graph's index region, ~indexes.dat~) keyed by fixed-precision *geohash* strings; each node id is stored under every grid cell its geometry occupies (duplicates allowed). A query computes the set of same-precision cells its window covers and looks each one up directly, so it touches only the cells in view. The grid precision is set with ~make-graph~'s ~:spatial-precision~ keyword (default 7, ≈150 m cells; 9 ≈ 5 m); it is persisted with the index and read back by ~open-graph~.
+- *The index* is a skip list (in the graph's index region, ~indexes.dat~) keyed by the composite ~(geohash-cell . node-id)~: a node's id is entered under every fixed-precision grid cell its geometry occupies. Folding the id into the key keeps the index *duplicate-free*, so insert and — especially — *remove* are O(log n) (an older duplicate-cell layout made removal O(n)). A query covers its window with as few, possibly coarser, cells as it can and does one *prefix range scan* per covering cell — geohash keys are prefix-nested, so every finer cell within a coarse one sorts inside its range — touching only the cells in view. The grid precision is set with ~make-graph~'s ~:spatial-precision~ keyword (default 7, ≈150 m cells; 9 ≈ 5 m); it is persisted with the index and read back by ~open-graph~, which rebuilds an index written in the older format from node geometries on first open.
 - *Matching uses a representative point*: a ~:point~ matches exactly; an extended geometry (line, polygon) is matched by the centre of its bounding box, so radius/containment results for extended geometries are approximate. Point-in-polygon refinement honours holes.
 - *Distance* is the haversine great-circle distance — accurate to roughly half a percent, ample for most uses; a more precise geodesic can replace it later without changing the API.
 - *Heavier topology* (intersection, union, validity repair) is intentionally out of this dependency-free core and is left to an optional GEOS-backed module.
@@ -1987,6 +2035,8 @@ The feed carries two kinds of traffic, with different rules:
 *** Conflict resolution
 
 When two replicas edit the same node, the hub re-homes the device's authored op and resolves it per field by Lamport-ordered last-writer-wins, with an app-supplied *merge policy* for safety-bearing fields. A rejected change is not silently dropped — it surfaces as a *conflict record* the application can inspect. Safety-critical fields resolve by *semantics, not clock*: for example, a hazard *release* loses to a hazard *assertion* regardless of which carries the later timestamp.
+
+The merge above is *per field of the same node* (keyed by UUID). Unique-slot constraints (Chapter 8) are a different axis — two *different* nodes claiming one value — and are handled by *scope*. A ~:scope :origin~ constraint partitions by authoring device, so it never collides across devices and each device enforces it locally against everything it holds; this is the recommended choice under peer replication. A value that must be unique across the *whole* fleet (~:scope :local~/~:hub~) needs the hub to arbitrate colliding claims — that arbiter is not yet built (issue #51).
 
 *** Setting up a hub and a device
 

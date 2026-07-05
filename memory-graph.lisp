@@ -201,6 +201,7 @@ applied-op-id dedup lhash (opened when MODE is :OPEN and it already exists)."
         (peer-schema-version graph) peer-schema-version
         (lamport-counter graph) (load-lamport-counter graph)
         (field-stamps graph) (load-field-stamps graph)
+        (node-origins graph) (load-node-origins graph)   ; #6 :ORIGIN partitions
         (peer-conflicts graph) (load-peer-conflicts graph)
         (applied-op-ids graph)
         (let ((loc (format nil "~A/applied-ops/" path)))
@@ -286,6 +287,15 @@ Registers the graph and returns it."
   "Bound during OPEN-MEMORY-GRAPH to the image's per-view entry dumps (or :NONE
 for a v1 / absent image), so RESTORE-VIEWS repopulates the view skip-lists
 structurally instead of regenerating them.")
+
+;; Unique constraints (#6): the dump/load helpers live in unique-constraint.lisp
+;; (loaded after this file); forward-declared so the image codec here compiles clean.
+;; The "was it loaded?" flag is defined HERE because OPEN-MEMORY-GRAPH binds it.
+(declaim (ftype (function (t) t) %dump-unique-indexes rebuild-unique-indexes)
+         (ftype (function (t t) t) %load-unique-indexes))
+(defvar *memory-image-unique-loaded* nil
+  "Bound NIL by OPEN-MEMORY-GRAPH; set T by the image restore when the unique-index
+dump was loaded, so OPEN skips the fresh-graph / crash REBUILD-UNIQUE-INDEXES.")
 
 (defun %dump-mem-index (data-ht)
   "Flat (key . id-list) dump of a mem-*-index's DATA hashtable."
@@ -502,7 +512,7 @@ lookups return the live object).  Returns the node."
   "Write GRAPH's full state in the VG-native (v3) format: per-node blob records +
 the same structural derived dumps.  Untouched LZNODEs pass their blob through."
   (let ((buf (ni-mkbuf)))
-    (ni-bytes buf *native-image-magic*) (ni-uint buf 4 4)   ; v4 = composite-key spatial pairs
+    (ni-bytes buf *native-image-magic*) (ni-uint buf 5 4)   ; v4 added :unique; v5 = composite-key spatial pairs
     (ni-uint buf (load-highest-transaction-id graph) 8)
     (let ((vt (mem-table-data (vertex-table graph)))
           (et (mem-table-data (edge-table graph))))
@@ -518,6 +528,7 @@ the same structural derived dumps.  Untouched LZNODEs pass their blob through."
     (let ((idx (spatial-index graph)))
       (ni-pairs buf (if idx (%dump-mem-skip-list (spatial-index-skip-list idx)) '())))
     (ni-views buf graph)
+    (ni-val buf (%dump-unique-indexes graph))   ; unique constraints (#6)
     (with-open-file (s (memory-image-file (location graph)) :direction :output
                        :element-type '(unsigned-byte 8) :if-exists :supersede
                        :if-does-not-exist :create)
@@ -537,12 +548,12 @@ now.  Indexes/spatial/views are restored structurally either way.  Returns
          (etable (edge-table graph)))
     (ri-bytes rc 4)                                ; magic
     (let ((ver (ri-uint rc 4)))                    ; format version
-      ;; v4 changed the spatial dump to composite (cell . id) keys -- a mid-stream
-      ;; layout change that cannot be read positionally by older parsers or vice
-      ;; versa.  Reject a stale image loudly rather than misparse it; the memory
-      ;; graph then rebuilds from its transaction journal (or is re-checkpointed).
-      (unless (= ver 4)
-        (error "Unsupported memory-image format v~D (this build writes/reads v4). ~
+      ;; v5 changed the spatial dump to composite (cell . id) keys AND added the
+      ;; :unique dump -- a mid-stream layout change that cannot be read positionally
+      ;; by older parsers or vice versa.  Reject a stale image loudly rather than
+      ;; misparse it; the memory graph then rebuilds from its transaction journal.
+      (unless (= ver 5)
+        (error "Unsupported memory-image format v~D (this build writes/reads v5). ~
 Delete the stale image at ~A and reopen to rebuild from the journal."
                ver file)))
     (ri-uint rc 8)                                 ; highest-tx-id
@@ -562,6 +573,10 @@ Delete the stale image at ~A and reopen to rebuild from the journal."
     (let ((idx (spatial-index graph)) (sp (ri-pairs rc)))
       (when idx (%load-mem-skip-list (spatial-index-skip-list idx) sp)))
     (setf *memory-image-view-dump* (or (ri-views rc) '()))
+    ;; unique constraints (#6): present only in v4+ images -- guard on remaining bytes
+    ;; so a v3 image (pre-#6) restores cleanly.
+    (when (< (ric-i rc) (length (ric-bytes rc)))
+      (%load-unique-indexes graph (ri-val rc)))
     :structural))
 
 (defun write-memory-image (graph)
@@ -584,7 +599,8 @@ structures (vs rebuilding on open) is what keeps OPEN-MEMORY-GRAPH fast."
              :vev         (%dump-mem-index (mem-vev-index-data (vev-index graph)))
              :spatial     (let ((idx (spatial-index graph)))
                             (and idx (%dump-mem-skip-list (spatial-index-skip-list idx))))
-             :views       (%dump-views graph))
+             :views       (%dump-views graph)
+             :unique      (%dump-unique-indexes graph))   ; #6
        (memory-image-file (location graph)))))
 
 (defun %rebuild-derived-from-nodes (graph vertices edges)
@@ -616,6 +632,7 @@ stashed in *MEMORY-IMAGE-VIEW-DUMP* for RESTORE-VIEWS."
         (return-from restore-memory-image (restore-memory-image-native graph file)))
       (destructuring-bind (&key version highest-tx-id vertices edges
                                 type-vertex type-edge ve-in ve-out vev spatial views
+                                unique
                            &allow-other-keys)
           (cl-store:restore file)
         (declare (ignore highest-tx-id))
@@ -636,6 +653,7 @@ stashed in *MEMORY-IMAGE-VIEW-DUMP* for RESTORE-VIEWS."
              (when (and idx spatial)
                (%load-mem-skip-list (spatial-index-skip-list idx) spatial)))
            (setf *memory-image-view-dump* (or views '()))
+           (when unique (%load-unique-indexes graph unique))   ; #6
            :structural)
           (t
            (%rebuild-derived-from-nodes graph vertices edges)
@@ -685,7 +703,8 @@ as deferred blobs and materialize on first touch (needs a VG-native image)."
                  :lazy lazy
                  :replication-key replication-key
                  :replication-port replication-port)))
-    (let ((*graph* graph) (*memory-image-view-dump* :none))
+    (let ((*graph* graph) (*memory-image-view-dump* :none)
+          (*memory-image-unique-loaded* nil))
       (if (probe-file schema-file)
           (progn
             (setf (schema graph) (cl-store:restore schema-file))
@@ -713,7 +732,13 @@ as deferred blobs and materialize on first touch (needs a VG-native image)."
       ;; restored AND the journal tail is replayed, so any regenerate sees all nodes.
       (install-views graph)
       (when regenerate-views
-        (regenerate-all-views graph)))
+        (regenerate-all-views graph))
+      ;; Unique constraints (issue #6): the image restore (structural or cl-store)
+      ;; loads the unique indexes -- so scan-rebuild only when it did NOT (a fresh
+      ;; graph, or a pre-#6 v3 image / crash fallback).  This is the durable path on
+      ;; the memory backend: no open-time scan, no lazy-node materialization.
+      (unless *memory-image-unique-loaded*
+        (rebuild-unique-indexes graph)))
     (when peer-role
       (%init-memory-peer-slots graph :open path peer-role origin-id peer-host
                                export-predicate device-registry merge-policy

@@ -502,16 +502,19 @@ policy or no local copy, applies verbatim and stamps every field with the incomi
                           collect (list nid slot (car stamp) (cdr stamp)))
                     conflicts))))))
 
-(defun apply-peer-create-writes (graph tx-id writes)
+(defun apply-peer-create-writes (graph tx-id writes &optional origin)
   "Apply state-sync create WRITES on the device with no cursor advance (state-sync
 is out of the authored-feed band -- it must not move the pull cursor).  Idempotent
 upsert by node UUID: *ADD-TO-INDEXES-UNLESS-PRESENT-P* makes a refresh re-pull
-safe.  TX-ID is the shipped node's hub commit epoch, used as the MVCC stamp."
+safe.  TX-ID is the shipped node's hub commit epoch, used as the MVCC stamp.  ORIGIN
+is the shipped node's origin, recorded for any :ORIGIN-scoped unique partition (#6)."
   (let ((*commit-epoch* tx-id)
-        (*add-to-indexes-unless-present-p* t))
+        (*add-to-indexes-unless-present-p* t)
+        (*peer-apply-origin* origin))
     (apply-tx-writes writes graph)
     (apply-tx-writes-to-views writes graph)
     (apply-tx-writes-to-spatial-index writes graph)
+    (apply-tx-writes-to-unique-indexes writes graph)   ; #6: keep the device index complete
     (reap-old-versions writes graph)
     ;; Keep the device's tx-id-counter above this pulled node's hub epoch so a later
     ;; LOCAL edit transaction can see (and thus modify) it (B2d-2b).
@@ -530,6 +533,7 @@ ops."
       nil
       (let ((*commit-epoch* (peer-op-tx-id op))
             (*add-to-indexes-unless-present-p* t)
+            (*peer-apply-origin* (peer-op-origin op))   ; #6 :ORIGIN partition
             (lamport (peer-op-lamport op))
             (origin (peer-op-origin op))
             (final-writes '())
@@ -546,6 +550,7 @@ ops."
         (apply-tx-writes final-writes graph)
         (apply-tx-writes-to-views final-writes graph)
         (apply-tx-writes-to-spatial-index final-writes graph)
+        (apply-tx-writes-to-unique-indexes final-writes graph)   ; #6: index pulled nodes
         (reap-old-versions final-writes graph)
         ;; Persist the per-field stamps of the fields that took a new value, and
         ;; retain any surfaced conflicts.
@@ -742,6 +747,12 @@ PUSH-ACK below it, so the device re-streams it next time (re-deduped by op-id)."
 spatial index for a geometry vertex), then from its lhash table and the cache.
 Unlike a tombstone this leaves NO trace -- a captured device must not even reveal
 the existence/id of purged (undisclosed) work (design §7)."
+  ;; #6: release the node's unique keys BEFORE removal (reads its :ORIGIN partition,
+  ;; still recorded) so the index does not keep a stale holder that would falsely
+  ;; reject a future value; then drop its origin.  Guarded so a graph that never
+  ;; used unique constraints pays nothing.
+  (when (unique-indexes graph)
+    (%uix-release node graph))
   (etypecase node
     (edge
      (remove-from-ve-index node graph)
@@ -757,6 +768,7 @@ the existence/id of purged (undisclosed) work (design §7)."
      (remove-from-type-index node graph)
      (remove-from-views graph node)
      (lhash-remove (vertex-table graph) (id node))))
+  (remove-node-origin graph (id node))
   (remhash (id node) (cache graph)))
 
 (defun apply-peer-purge (graph ids)
@@ -788,7 +800,8 @@ reports + resets that accumulator, a :shutdown op ends the thread."
             (:state-create
              ;; A membership-create: a node ENTERING the device's scope.  Its id
              ;; joins the manifest (reported at the barrier).
-             (apply-peer-create-writes graph (peer-op-tx-id op) (peer-op-writes op))
+             (apply-peer-create-writes graph (peer-op-tx-id op) (peer-op-writes op)
+                                       (peer-op-origin op))
              (dolist (w (peer-op-writes op))
                (pushnew (id (node w)) created :test #'equalp)))
             (:authored
