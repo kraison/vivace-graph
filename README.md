@@ -19,6 +19,16 @@ A comprehensive developer's manual lives in [`docs/vivace-graph-v3-doc.org`](doc
 
 This manual was written by [Gwang-Jin Kim (@gwangjinkim)](https://github.com/gwangjinkim) — the project's first thorough documentation, and a great piece of work. Many thanks to him. It has been adopted here and is maintained alongside the code; newer chapters (such as Chapter 12 on MVCC) are maintainer additions written in his style.
 
+### Announcement, 2026-07-05 — Repository renamed to `vivace-graph`
+
+This repository was renamed from **`vivace-graph-v3`** to **`vivace-graph`**. The "v3" marked the third ground-up redesign over 20+ years of work; that history has served its purpose, and the plain name is clearer going forward.
+
+**Nothing you depend on changes.** GitHub permanently redirects the old URLs — web, `git clone` / `fetch` / `push` over both HTTPS and SSH, and the API — so existing clones keep working untouched. The ASDF system is still `graph-db`, so `(ql:quickload :graph-db)` and `:depends-on (:graph-db)` are unaffected. To tidy an existing checkout, you can repoint the remote:
+
+```
+git remote set-url origin git@github.com:kraison/vivace-graph.git
+```
+
 ### Announcement, 2026-07-05 — VivaceGraph 2.1.0
 
 A large, **backward-compatible** feature release. Highlights:
