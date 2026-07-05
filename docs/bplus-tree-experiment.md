@@ -216,8 +216,25 @@ and the B+ tree. Everything else (add/remove/find/update, cursors,
 cell scans) was already the shared ordered-map protocol, so **no consumer logic
 changed**.
 
-Scope: `*index-backend*` governs **views, `:unique`, and spatial** — every
-heap-backed index. User-facing ini/config selection is Phase C.
+Scope: this governs **views, `:unique`, and spatial** — every heap-backed index.
+
+**Choosing it (Phase C).** The backend is a **per-graph** property, exposed on the
+graph entry points:
+
+```lisp
+(make-graph name loc :index-backend :bplus-tree)   ; or :skip-list (default)
+(open-graph name loc)                              ; reopens each index as written
+```
+
+`make-graph` / `open-graph` take an `:index-backend` keyword (default: the global
+`graph-db:*index-backend*`); it is captured in the graph's `index-backend` slot,
+which every index-creation path consults. Reopen ignores it for *existing* indexes
+(each carries its own persisted backend tag) and applies it only to indexes created
+afterward. graph-db doesn't read an ini file itself — set `*index-backend*` or pass
+`:index-backend` from your application's own config. Validated: a graph made with
+each backend builds its view + spatial (+ unique) indexes on that engine, the views
+work, and after close/reopen (no keyword) every index comes back on the engine it
+was written with.
 
 **Validation.** Views (map/map-reduce, asc/desc, `:key`/range/paging, delete,
 **reopen**), unique (enforcement, cross-subtype, NULL-exempt, **durable reopen

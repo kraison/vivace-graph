@@ -52,14 +52,16 @@
 ;; codec is VIEW-KEY-SERIALIZE (payload string + 16-byte id), shared with views
 ;; and unique indexes.
 ;; Created through the shared MAKE-HEAP-INDEX (bplus-tree.lisp), so the spatial
-;; index follows *INDEX-BACKEND* (skip list or B+ tree) like views and unique.
-(defun %spatial-make-sl (heap)
-  (make-heap-index *index-backend* heap 'reduce-comp-lessp))
+;; index follows the graph's chosen backend (skip list or B+ tree) like views and
+;; unique.  INIT-SPATIAL-INDEX passes (GRAPH-INDEX-BACKEND GRAPH).
+(defun %spatial-make-sl (heap backend)
+  (make-heap-index backend heap 'reduce-comp-lessp))
 
-(defun make-spatial-index (heap &key (precision 7))
+(defun make-spatial-index (heap &key (precision 7) (backend *index-backend*))
   "Create a new spatial index in HEAP (a MEMORY).  PRECISION sets the geohash
-grid resolution (7 ~ 150 m cells, 9 ~ 5 m)."
-  (%make-spatial-index :skip-list (%spatial-make-sl heap)
+grid resolution (7 ~ 150 m cells, 9 ~ 5 m).  BACKEND (:skip-list / :bplus-tree)
+picks the ordered-map engine."
+  (%make-spatial-index :skip-list (%spatial-make-sl heap backend)
                        :heap heap :precision precision))
 
 (defun open-spatial-index (heap address &key (precision 7) (backend *index-backend*))

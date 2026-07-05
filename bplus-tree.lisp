@@ -962,16 +962,8 @@ the right opener.")
 ;;; spatial-index.lisp / views.lisp) so all three consumers can call it.  The
 ;;; composite-key codec symbols (VIEW-KEY-SERIALIZE / REDUCE-* -- defined later in
 ;;; views.lisp) are referenced only as quoted runtime function designators, so
-;;; there is no load-order problem.
-
-(defparameter *index-backend* :skip-list
-  "Ordered-map backend for a NEW or regenerated HEAP-backed index on a normal graph
--- views, :unique, and the spatial index: :SKIP-LIST (default) or :BPLUS-TREE.
-Both speak the same ordered-map protocol over the same (payload . node-id)
-composite keys, so an index behaves identically on either.  The choice is
-PERSISTED per index (views: the :BACKEND view-alist key; unique + spatial: a tag in
-their root sidecar) so a graph reopens each index with the backend it was written
-with -- flipping this never disturbs an existing graph (a missing tag => :skip-list).")
+;;; there is no load-order problem.  (*INDEX-BACKEND* -- the DEFAULT backend -- is
+;;; defined in globals.lisp so the graph class's INDEX-BACKEND slot can default to it.)
 
 (defun make-heap-index (backend heap comparison)
   "Create a fresh heap-backed composite-key ordered map (skip list or B+ tree) with

@@ -558,7 +558,8 @@ heap-backed index -- a skip list or (when *INDEX-BACKEND* is :BPLUS-TREE) a
 B+ tree, persisted via VIEW-POINTER; a memory-graph overrides this to return an
 in-RAM mem-skip-list.")
   (:method ((graph graph) view)
-    (make-heap-index *index-backend* (indexes graph) (view-index-comparison view))))
+    (make-heap-index (graph-index-backend graph) (indexes graph)
+                     (view-index-comparison view))))
 
 (defmethod regenerate-view ((graph graph) (class-name symbol) (view-name symbol))
   "Regenerate this view's index"

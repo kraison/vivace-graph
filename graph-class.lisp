@@ -32,6 +32,13 @@
    (vertex-index :accessor vertex-index :initarg :vertex-index)
    (edge-index :accessor edge-index :initarg :edge-index)
    (spatial-index :accessor spatial-index :initarg :spatial-index :initform nil)
+   ;; Which ordered-map backend NEW heap-backed indexes (views, :unique, spatial)
+   ;; on THIS graph are built with: :SKIP-LIST or :BPLUS-TREE.  Defaults to the
+   ;; global *INDEX-BACKEND* at creation; overridable per graph via MAKE-GRAPH /
+   ;; OPEN-GRAPH :INDEX-BACKEND.  Reopen of EXISTING indexes ignores this (each
+   ;; index carries its own persisted backend tag); this only governs new ones.
+   (index-backend :accessor graph-index-backend :initarg :index-backend
+                  :initform *index-backend*)
    ;; Unique constraints (issue #6): (owner-class . slot-name) -> UNIQUE-INDEX.
    ;; A derived structure (v1: rebuilt on open); enforcement is at the commit
    ;; boundary.  See unique-constraint.lisp / docs/unique-constraint-design.md.

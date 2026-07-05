@@ -24,6 +24,8 @@
   (:export #:make-graph
            #:*default-heap-size*
            #:*default-index-size*
+           #:*index-backend*
+           #:graph-index-backend
            #:open-graph
            #:close-graph
            #:lookup-graph

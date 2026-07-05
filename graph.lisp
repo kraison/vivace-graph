@@ -12,7 +12,8 @@
   "Create GRAPH's spatial index (at geohash PRECISION) in its indexes heap and
 persist the skip-list root pointer + precision to a sidecar file (mirrors how
 views persist their pointer).  PRECISION is read back by RESTORE-SPATIAL-INDEX."
-  (let ((idx (make-spatial-index (indexes graph) :precision precision)))
+  (let ((idx (make-spatial-index (indexes graph) :precision precision
+                                 :backend (graph-index-backend graph))))
     (setf (spatial-index graph) idx)
     (cl-store:store (list :format +spatial-index-format+
                           :address (spatial-index-address idx)
@@ -53,7 +54,8 @@ composite-key format (RESTORE runs after the node tables are open)."
                                    replication-filter
                                    peer-role origin-id peer-host
                                    export-predicate device-registry merge-policy
-                                   reference-classes (peer-schema-version '(1 0)))
+                                   reference-classes (peer-schema-version '(1 0))
+                                   (index-backend *index-backend*))
   "Create a brand-new graph named NAME with its on-disk files under the
 directory LOCATION, register it (so LOOKUP-GRAPH and *GRAPH* can find it), and
 return it.  The directory is created if necessary and must not already contain
@@ -76,6 +78,16 @@ Keyword arguments:
   :SPATIAL-PRECISION      geohash precision of the spatial index grid (default 7,
                           ~150 m cells; 9 ~ 5 m).  Persisted with the index and
                           read back on OPEN-GRAPH.  See Chapter 13.
+  :INDEX-BACKEND          ordered-map engine for this graph's heap-backed indexes
+                          (views, :unique, spatial): :SKIP-LIST (default) or
+                          :BPLUS-TREE (mmap B+ tree -- better cold-cache locality,
+                          faster reads and writes, ~2x smaller).  Defaults to the
+                          global *INDEX-BACKEND*.  Each index also records its own
+                          backend, so OPEN-GRAPH reopens existing indexes with the
+                          engine they were written with regardless of this; the
+                          value here governs indexes CREATED on this graph.  Wire
+                          it from your app's own config.  See
+                          docs/bplus-tree-experiment.md.
   :REPLICATION-FILTER     (slaves only) a predicate (NODE) -> boolean; the slave
                           applies only replicated writes whose node it accepts,
                           so it holds just a subset (e.g. its area of operations).
@@ -114,6 +126,7 @@ to disk and remove it."
                    (t 'graph))
              :graph-name name
              :location path
+             :index-backend index-backend
              :views
              #+sbcl (make-hash-table :synchronized t)
              #+ccl (make-hash-table :shared t)
@@ -205,7 +218,8 @@ to disk and remove it."
                    keep-revisions regenerate-views
                    peer-role origin-id peer-host
                    export-predicate device-registry merge-policy
-                   reference-classes (peer-schema-version '(1 0)))
+                   reference-classes (peer-schema-version '(1 0))
+                   (index-backend *index-backend*))
   "Open the existing graph named NAME whose files live under directory
 LOCATION, register it, and return it.  Use this to reopen a graph created
 earlier with MAKE-GRAPH; the keyword arguments mirror MAKE-GRAPH's.
@@ -245,6 +259,7 @@ Always CLOSE-GRAPH when finished."
                    (t 'graph))
              :graph-name name
              :location path
+             :index-backend index-backend
              :views
              #+sbcl (make-hash-table :synchronized t)
              #+ccl (make-hash-table :shared t)
