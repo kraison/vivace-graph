@@ -254,6 +254,43 @@ specifically because the B+ tree's page I/O is a raw CFFI `memcpy` through
 `with-pointer-to-vector-data`; it round-trips the view codec correctly on ECL,
 including reopen.
 
+## Migrating an existing (skip-list) graph to B+ trees
+
+`:index-backend` governs only *new* indexes, so a graph already on disk keeps its
+skip lists until you rebuild them. A backend switch changes only the **derived
+indexes** — the node data is untouched — so the clean migration is an **in-place
+reindex**: reopen with the new backend and rebuild the three index families from
+the live nodes.
+
+```lisp
+(let ((g (open-graph name loc :index-backend :bplus-tree)))
+  (regenerate-all-views g)        ; views      -> B+ tree
+  (regenerate-unique-indexes g)   ; :unique    -> B+ tree
+  (rebuild-spatial-index g)       ; spatial    -> B+ tree
+  (close-graph g))                ; persists each index's new backend tag
+;; henceforth (open-graph name loc) reopens everything as B+ trees.
+```
+
+Each of these frees the old backing store and rebuilds via a type-scan
+(`map-vertices`/`map-edges`, which is backend-agnostic), then persists the new
+backend tag, so a subsequent plain `open-graph` reopens on B+ trees. Verified
+end-to-end: all three index types switch, view lookups + unique enforcement +
+spatial queries stay correct, and it survives a plain reopen.
+
+> **`regenerate-unique-indexes`** was added for this: `rebuild-unique-indexes` is
+> get-or-create, so on a reopened graph it would repopulate the *existing*
+> skip-list rather than switch backends (views/spatial already delete-then-rebuild;
+> unique didn't). The new function frees the old unique stores first, rebuilds on
+> the current backend, and re-persists the sidecar tags.
+
+**Not recommended: snapshot + replay into a fresh graph.** It *does* rebuild all
+three index families on the target's backend (replay re-inserts nodes through the
+maintained `apply-transaction` path), but replaying into a *different, fresh*
+graph is an under-tested corner for graphs with views: `lookup-<type>`-by-id (used
+by view queries) resolves a NIL node table there — and this reproduces with
+skip-list → skip-list too, so it is a pre-existing snapshot/replay + schema/type-id
+concern, unrelated to the backend. The in-place reindex avoids it entirely.
+
 ### Before it graduates from a prototype
 1. ~~**In-place insert/delete** to kill the whole-page RMW write cost.~~ **DONE (A1).**
 2. **Concurrency:** page-latch crabbing or a COW/versioned-root story to restore

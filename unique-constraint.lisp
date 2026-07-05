@@ -325,6 +325,27 @@ memory-graph this materializes the scanned nodes; persistence (v1.1) removes it.
         (map-vertices #'index-node graph)
         (map-edges #'index-node graph)))))
 
+(defun regenerate-unique-indexes (graph)
+  "Drop every on-disk unique index and rebuild it using GRAPH's CURRENT index
+backend (its INDEX-BACKEND slot -- see MAKE-GRAPH / OPEN-GRAPH :INDEX-BACKEND).
+Use this to switch a graph's unique indexes to a different backend in place (e.g.
+skip list -> B+ tree): reopen with :INDEX-BACKEND :BPLUS-TREE, then call this (the
+parallel of REGENERATE-ALL-VIEWS / REBUILD-SPATIAL-INDEX).  Unlike REBUILD-UNIQUE-
+INDEXES, which reuses whatever index is already present, this frees the old backing
+stores first so the rebuild creates fresh ones on the new backend, then persists
+the new backend tags to the sidecar."
+  (when (unique-indexes graph)
+    (maphash (lambda (k uix)
+               (declare (ignore k))
+               (let ((sl (unique-index-skip-list uix)))
+                 (when (and sl (view-index-p sl))
+                   (delete-view-index sl))))     ; free the old heap pages
+             (unique-indexes graph))
+    (clrhash (unique-indexes graph)))            ; %UNIQUE-INDEX-FOR now recreates fresh
+  (rebuild-unique-indexes graph)                 ; repopulate on the current backend
+  (save-unique-index-roots graph)                ; persist new backend tags
+  graph)
+
 ;;; ---------------------------------------------------------------------------
 ;;; Durable persistence -- MEMORY backend (rides the #50 checkpoint image, so no
 ;;; open-time scan and no lazy-materialization).  On-disk persistence (an
