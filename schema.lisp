@@ -296,13 +296,15 @@ be defined before or after the graph is created."
                                    (data-slots (find-class ',name))))))
                       ,(if (eql (last1 parent-types) 'edge)
                            `(make-edge (node-type-id
-                                        (lookup-node-type-by-name ',name :edge))
+                                        (lookup-node-type-by-name ',name :edge
+                                                                  :graph graph))
                                        from to weight
                                        slots ;(list ,@slots)
                                        :id id :revision revision :deleted-p deleted-p
                                        :graph graph)
                            `(make-vertex (node-type-id
-                                          (lookup-node-type-by-name ',name :vertex))
+                                          (lookup-node-type-by-name ',name :vertex
+                                                                    :graph graph))
                                          slots ;(list ,@slots)
                                          :id id :revision revision :deleted-p deleted-p
                                          :graph graph)))))

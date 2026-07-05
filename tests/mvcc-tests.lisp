@@ -349,6 +349,31 @@ invisible to a lookup in our transaction (no phantom)."
                      "node committed after snapshot start is invisible to lookup")))
           (ignore-errors (graph-db::remove-transaction txn-a tm)))))))
 
+(test is-a-unbound-type-honors-snapshot
+  "is-a/2 with BOTH arguments unbound -- (is-a ?n ?type) -- enumerates vertices
+via per-type scans (each through lookup-vertex), so it is snapshot-consistent: a
+vertex committed after our snapshot started is invisible.  Previously this branch
+did a single untyped lhash scan that read live versions and leaked the phantom."
+  (with-test-graph (g)
+    (let ((tm (graph-db::transaction-manager g)))
+      (with-transaction () (make-g-person :name "S" :age 0))
+      (let ((txn-a (graph-db::create-transaction tm)))
+        (unwind-protect
+             (progn
+               ;; A concurrent committed insert adds a second person AFTER A began.
+               (with-transaction () (make-g-person :name "T" :age 1))
+               ;; Through A's snapshot, the unbound is-a sees only the pre-snapshot
+               ;; vertex -- not the phantom committed after A started.
+               (let ((graph-db:*transaction* txn-a))
+                 (is (= 1 (length (select (:flat nil) (?n ?type) (is-a ?n ?type))))
+                     "snapshot is-a (unbound type) sees only pre-snapshot vertices"))
+               ;; A fresh transaction (snapshot starts after both commits) sees both,
+               ;; confirming the enumeration itself is complete.
+               (let ((graph-db:*transaction* (graph-db::create-transaction tm)))
+                 (is (= 2 (length (select (:flat nil) (?n ?type) (is-a ?n ?type))))
+                     "a later snapshot sees the full live set")))
+          (ignore-errors (graph-db::remove-transaction txn-a tm)))))))
+
 ;;; ---------------------------------------------------------------------------
 ;;; Snapshot query mode (#45 Phase 1): SELECT :snapshot t runs a query under a
 ;;; single consistent MVCC read snapshot.

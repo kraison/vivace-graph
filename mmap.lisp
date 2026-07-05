@@ -8,8 +8,8 @@
 (deftype uint64 () '(integer 0 18446744073709551615))
 
 (defstruct (mapped-file
-	     (:conc-name m-)
-	     (:predicate mapped-file-p))
+             (:conc-name m-)
+             (:predicate mapped-file-p))
   path pointer fd
   ;; Length, in bytes, of the virtual-address window reserved for this mapping
   ;; (see *mmap-reservation-size*).  POINTER is fixed at the base of that window
@@ -29,7 +29,7 @@
 (defstruct mpointer mmap loc)
 
 (defmethod mapped-file-length ((mapped-file mapped-file))
-  (osicat-posix:stat-size (osicat-posix:fstat (m-fd mapped-file))))
+  (%posix-file-size-fd (m-fd mapped-file)))
 
 (defmethod set-byte :around (mf offset byte)
   (handler-case
@@ -156,7 +156,7 @@
   vec)
 
 (defmethod size-of ((mmap mapped-file))
-  (osicat-posix:stat-size (osicat-posix:stat (m-path mmap))))
+  (%file-size (m-path mmap)))
 
 (defun mmap-file (file &key (create-p t) (size (* 4096 25600)) reservation)
   "Use mmap() to map FILE into memory.
@@ -171,75 +171,73 @@ times SIZE (floored at *MMAP-MIN-RESERVATION*); pass RESERVATION to override."
   (log:debug "Opening mmap ~A" file)
   (when (and (not create-p) (not (probe-file file)))
     (error "mmap-file: ~A does not exist and create-p is not true." file))
-  (let* ((fd (osicat-posix:open
+  (let* ((fd (%posix-open
               file
               (if create-p
-                  (logior osicat-posix:O-CREAT osicat-posix:O-RDWR)
-                  osicat-posix:O-RDWR))))
+                  (logior +o-creat+ +o-rdwr+)
+                  +o-rdwr+))))
     (when create-p
-      (osicat-posix:lseek fd (1- size) osicat-posix:seek-set)
+      (%posix-lseek fd (1- size) +seek-set+)
       (cffi:with-foreign-string (null (format nil "~A" (code-char 0)))
         (cffi:foreign-funcall "write"
                               :int fd
                               :pointer null
                               size 1))
-      ;; The file is created with no permission bits on this osicat/platform
-      ;; (the open mode argument is not honored), so a later open-memory /
-      ;; open-lhash would fail with EACCES.  Set the mode explicitly to
-      ;; #o640 (owner rw, group r) so database files are reopenable without
-      ;; being world-accessible.
-      (osicat-posix:fchmod fd #o640))
+      ;; Belt-and-suspenders: set the mode explicitly to #o640 (owner rw, group
+      ;; r) so database files are reopenable without being world-accessible,
+      ;; even if the open() mode argument is not honored on some platform.
+      (%posix-fchmod fd #o640))
     ;; Make sure the file size is set right!
-    (setq size (osicat-posix:stat-size (osicat-posix:fstat fd)))
+    (setq size (%posix-file-size-fd fd))
     (let* ((reserved (max (or reservation
                               (* *mmap-reservation-multiplier* size))
                           *mmap-min-reservation*
                           size))
            ;; Reserve the address window with no access and no backing.
-           (base (osicat-posix:mmap
+           (base (%posix-mmap
                   (cffi:null-pointer)
                   reserved
-                  osicat-posix:prot-none
-                  (logior osicat-posix:map-private
-                          osicat-posix:map-anonymous
-                          osicat-posix:map-noreserve)
+                  +prot-none+
+                  (logior +map-private+
+                          +map-anonymous+
+                          +map-noreserve+)
                   -1
                   0))
            ;; Map the file over the head of the reservation (replaces the
            ;; PROT_NONE pages for [base, base+size); MAP_FIXED keeps the addr).
-           (pointer (osicat-posix:mmap
+           (pointer (%posix-mmap
                      base
                      size
-                     (logior osicat-posix:prot-read osicat-posix:prot-write)
-                     (logior osicat-posix:map-shared osicat-posix:map-fixed)
+                     (logior +prot-read+ +prot-write+)
+                     (logior +map-shared+ +map-fixed+)
                      fd
                      0)))
       (make-mapped-file :path (truename file)
-			:fd fd
-			:pointer pointer
-			:reserved-size reserved))))
+                        :fd fd
+                        :pointer pointer
+                        :reserved-size reserved))))
 
 (defmethod sync-region ((mapped-file mapped-file) &key addr length
-			(sync osicat-posix:ms-sync))
-  (osicat-posix:msync (or addr (m-pointer mapped-file))
-                      (or length (mapped-file-length mapped-file))
-                      sync))
+                        (sync +ms-sync+))
+  (%posix-msync (or addr (m-pointer mapped-file))
+                (or length (mapped-file-length mapped-file))
+                sync))
 
 (defmethod munmap-file ((mapped-file mapped-file) &key (save-p nil)
-			(sync osicat-posix:ms-sync))
+                        (sync +ms-sync+))
   (when save-p
     ;;(log:debug "Calling msync on ~S" mapped-file)
     ;; Only the file-backed head is dirty/syncable, not the reserved tail.
-    (osicat-posix:msync (m-pointer mapped-file)
-                        (mapped-file-length mapped-file)
-                        sync))
+    (%posix-msync (m-pointer mapped-file)
+                  (mapped-file-length mapped-file)
+                  sync))
   ;;(log:debug "Calling munmap on ~S" mapped-file)
   ;; Release the whole reserved window (file mapping + PROT_NONE tail).
-  (osicat-posix:munmap (m-pointer mapped-file)
-                       (if (plusp (m-reserved-size mapped-file))
-                           (m-reserved-size mapped-file)
-                           (mapped-file-length mapped-file)))
-  (osicat-posix:close (m-fd mapped-file))
+  (%posix-munmap (m-pointer mapped-file)
+                 (if (plusp (m-reserved-size mapped-file))
+                     (m-reserved-size mapped-file)
+                     (mapped-file-length mapped-file)))
+  (%posix-close (m-fd mapped-file))
   (setf (m-pointer mapped-file) nil)
   nil)
 
@@ -259,19 +257,19 @@ Raise *mmap-reservation-size* (or MAKE-GRAPH's heap/index size) before creating 
 the graph."
              (m-path mapped-file) new-len (m-reserved-size mapped-file)))
     ;; Extend the backing file first so the newly mapped pages have storage.
-    (osicat-posix:lseek (m-fd mapped-file) (1- new-len) osicat-posix:seek-set)
+    (%posix-lseek (m-fd mapped-file) (1- new-len) +seek-set+)
     (cffi:with-foreign-string (null (format nil "~A" (code-char 0)))
       (cffi:foreign-funcall "write"
                             :int (m-fd mapped-file)
                             :pointer null
                             size 1))
     ;; Re-map [0, new-len) over the reserved window at the same base.
-    (osicat-posix:mmap (m-pointer mapped-file)
-                       new-len
-                       (logior osicat-posix:prot-read osicat-posix:prot-write)
-                       (logior osicat-posix:map-shared osicat-posix:map-fixed)
-                       (m-fd mapped-file)
-                       0)
+    (%posix-mmap (m-pointer mapped-file)
+                 new-len
+                 (logior +prot-read+ +prot-write+)
+                 (logior +map-shared+ +map-fixed+)
+                 (m-fd mapped-file)
+                 0)
     mapped-file))
 
 (defmethod serialize-uint64 ((mf mapped-file) int offset)

@@ -68,9 +68,9 @@
 ;;; ---------------------------------------------------------------------------
 
 (defstruct (rw-lock
-	     (:conc-name lock-)
-	     (:print-function print-rw-lock)
-	     (:predicate rw-lock-p))
+             (:conc-name lock-)
+             (:print-function print-rw-lock)
+             (:predicate rw-lock-p))
   #+sbcl(lock (sb-thread:make-mutex) :type sb-thread:mutex)
   #+lispworks(lock (mp:make-lock) :type mp:lock)
   #+ecl(lock (mp:make-lock))
@@ -192,9 +192,9 @@ Old ECL: readers poll, so nothing to signal."
 
 (defmacro with-read-lock ((rw-lock) &body body)
   `(unwind-protect
-	(if (rw-lock-p (acquire-read-lock ,rw-lock))
-	    (progn ,@body)
-	    (error "Unable to get rw-lock: ~A" ,rw-lock))
+        (if (rw-lock-p (acquire-read-lock ,rw-lock))
+            (progn ,@body)
+            (error "Unable to get rw-lock: ~A" ,rw-lock))
      (release-read-lock ,rw-lock)))
 
 ;;; ---------------------------------------------------------------------------
@@ -205,15 +205,15 @@ Old ECL: readers poll, so nothing to signal."
   (with-recursive-lock-held ((lock-lock rw-lock))
     (if (%next-in-queue-p rw-lock (current-thread))
         (dequeue (lock-writer-queue rw-lock))
-	(error "Cannot release lock I don't own!"))
+        (error "Cannot release lock I don't own!"))
     (if (%next-in-queue-p rw-lock (current-thread))
-	;; Recursive ownership: another entry of ours is still at the front.
-	nil
-	(progn
-	  (setf (lock-writer rw-lock) nil)
-	  (when reading-p
-	    ;; Downgrade: we revert to holding a read lock.
-	    (incf (lock-readers rw-lock)))
+        ;; Recursive ownership: another entry of ours is still at the front.
+        nil
+        (progn
+          (setf (lock-writer rw-lock) nil)
+          (when reading-p
+            ;; Downgrade: we revert to holding a read lock.
+            (incf (lock-readers rw-lock)))
           ;; Targeted wakeup: hand off to exactly the next writer, or release
           ;; all readers if none is queued.
           (if (empty-queue-p (lock-writer-queue rw-lock))
@@ -289,9 +289,9 @@ Old ECL: readers poll, so nothing to signal."
 
 (defmacro with-write-lock ((rw-lock &key reading-p) &body body)
   `(unwind-protect
-	(if (rw-lock-p (acquire-write-lock ,rw-lock :reading-p ,reading-p))
-	    (progn ,@body)
-	    (error "Unable to get rw-lock: ~A" ,rw-lock))
+        (if (rw-lock-p (acquire-write-lock ,rw-lock :reading-p ,reading-p))
+            (progn ,@body)
+            (error "Unable to get rw-lock: ~A" ,rw-lock))
      (release-write-lock ,rw-lock :reading-p ,reading-p)))
 
 #|
@@ -299,39 +299,39 @@ Old ECL: readers poll, so nothing to signal."
   (let ((lock (make-rw-lock)))
     (make-thread
      #'(lambda () (with-write-lock (lock)
-		    (format t "1 got write lock.  Sleeping.~%")
-		    (sleep 5)
-		    (with-write-lock (lock)
-		      (format t "1 acquired recursive lock.~%")
-		      (sleep 5)
-		      (with-write-lock (lock)
-			(format t "1 acquired recursive lock.~%")
-			(sleep 5)
-			(format t "1 releasing recursive write lock.~%"))
-		      (format t "1 releasing recursive write lock.~%"))
-		    (format t "1 releasing write lock.~%"))))
+                    (format t "1 got write lock.  Sleeping.~%")
+                    (sleep 5)
+                    (with-write-lock (lock)
+                      (format t "1 acquired recursive lock.~%")
+                      (sleep 5)
+                      (with-write-lock (lock)
+                        (format t "1 acquired recursive lock.~%")
+                        (sleep 5)
+                        (format t "1 releasing recursive write lock.~%"))
+                      (format t "1 releasing recursive write lock.~%"))
+                    (format t "1 releasing write lock.~%"))))
     (make-thread
      #'(lambda () (with-read-lock (lock) (format t "2 got read lock~%") (sleep 5))))
     (make-thread
      #'(lambda () (with-read-lock (lock) (format t "3 got read lock~%") (sleep 5))))
     (make-thread
      #'(lambda () (with-write-lock (lock)
-		    (format t "4 got write lock.  Sleeping.~%")
-		    (sleep 5)
-		    (with-write-lock (lock)
-		      (format t "4 acquired recursive lock.~%")
-		      (sleep 5)
-		      (with-write-lock (lock)
-			(format t "4 acquired recursive lock.~%")
-			(sleep 5)
-			(format t "4 releasing recursive write lock.~%"))
-		      (format t "4 releasing recursive write lock.~%"))
-		    (format t "4 releasing write lock.~%"))))
+                    (format t "4 got write lock.  Sleeping.~%")
+                    (sleep 5)
+                    (with-write-lock (lock)
+                      (format t "4 acquired recursive lock.~%")
+                      (sleep 5)
+                      (with-write-lock (lock)
+                        (format t "4 acquired recursive lock.~%")
+                        (sleep 5)
+                        (format t "4 releasing recursive write lock.~%"))
+                      (format t "4 releasing recursive write lock.~%"))
+                    (format t "4 releasing write lock.~%"))))
     (make-thread
      #'(lambda () (with-write-lock (lock)
-		    (format t "5 got write lock.  Sleeping.~%")
-		    (sleep 5)
-		    (format t "5 releasing write lock.~%"))))
+                    (format t "5 got write lock.  Sleeping.~%")
+                    (sleep 5)
+                    (format t "5 releasing write lock.~%"))))
     (make-thread
      #'(lambda () (with-read-lock (lock) (format t "6 got read lock~%") (sleep 5))))
     (make-thread

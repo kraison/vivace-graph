@@ -16,6 +16,31 @@
   (let ((node (find-in-skip-list sl key)))
     (and node (%sn-value node))))
 
+(test list-comparators-are-a-strict-total-order
+  "LESS-THAN / GREATER-THAN order LISTS lexicographically -- and a list is NOT
+strictly ordered against an EQUAL list.  Regression: the recursion once bottomed
+out at (less-than NIL NIL) -> T, so an equal (or prefix) list compared as strictly
+less than itself, corrupting any skip list keyed by composite (list ...) keys (the
+:ORIGIN unique key (origin value), map-reduce views with list keys)."
+  (flet ((lt (a b) (graph-db::less-than a b))
+         (gt (a b) (graph-db::greater-than a b)))
+    ;; equal lists: neither precedes, in either direction
+    (is (not (lt '("o" "v") '("o" "v"))) "equal 2-lists are not <")
+    (is (not (gt '("o" "v") '("o" "v"))) "equal 2-lists are not >")
+    (is (not (lt '() '())) "equal empty lists are not <")
+    ;; strict ordering by first then second element
+    (is (lt '("o" "a") '("o" "b")) "same head, a<b")
+    (is (gt '("o" "b") '("o" "a")) "same head, b>a")
+    (is (lt '("a" "z") '("b" "a")) "head dominates")
+    ;; prefix: shorter precedes longer
+    (is (lt '("o") '("o" "v")) "a proper prefix precedes the longer list")
+    (is (not (lt '("o" "v") '("o"))) "the longer list does not precede its prefix")
+    (is (gt '("o" "v") '("o")) "the longer list follows its prefix")
+    ;; antisymmetry on a handful of distinct pairs
+    (dolist (pair '((("a") . ("a" "a")) (("a" "a") . ("a" "b")) (("a") . ("b"))))
+      (is (eq t (and (lt (car pair) (cdr pair)) (not (lt (cdr pair) (car pair)))))
+          "exactly one direction is < for distinct keys"))))
+
 (defun sl-live-count (sl)
   "Number of live entries, counted by walking the level-0 chain.
 NB: we deliberately do NOT use graph-db's SKIP-LIST-COUNT here -- it has an

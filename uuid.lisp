@@ -70,7 +70,7 @@
       (set-byte mfp offset type-specifier)
       (decf offset))
   (with-slots
-	(time-low time-mid time-high-and-version clock-seq-and-reserved clock-seq-low node)
+        (time-low time-mid time-high-and-version clock-seq-and-reserved clock-seq-low node)
       uuid
     (loop for i from 3 downto 0
        do (set-byte mfp (incf offset) (ldb (byte 8 (* 8 i)) time-low)))

@@ -1,8 +1,8 @@
 (in-package #:graph-db)
 
 (defstruct (functor
-	     (:constructor %make-functor)
-	     (:predicate functor-p))
+             (:constructor %make-functor)
+             (:predicate functor-p))
   name fn clauses (lock (make-recursive-lock)))
 
 (defgeneric prolog-compile (functor))
@@ -21,11 +21,11 @@
 (defun make-functor (&key name clauses)
   (or (lookup-functor name)
       (let ((functor (%make-functor :name name :clauses clauses)))
-	(with-recursive-lock-held ((functor-lock functor))
-	  (prog1
-	      (with-user-functors-lock
+        (with-recursive-lock-held ((functor-lock functor))
+          (prog1
+              (with-user-functors-lock
                 (setf (gethash name *user-functors*) functor))
-	    (prolog-compile functor))))))
+            (prolog-compile functor))))))
 
 (defun add-functor-clause (functor clause)
   (with-recursive-lock-held ((functor-lock functor))
@@ -54,6 +54,6 @@
     (when *prolog-trace*
       (format t "TRACE: set-functor-fn for ~A got ~A~%" functor-symbol f))
     (if (functor-p f)
-	(setf (functor-fn f) fn)
-	(error 'prolog-error
-	       :reason (format nil "unknown functor ~A" functor-symbol)))))
+        (setf (functor-fn f) fn)
+        (error 'prolog-error
+               :reason (format nil "unknown functor ~A" functor-symbol)))))

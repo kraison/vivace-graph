@@ -105,7 +105,7 @@ present, so an error from the continuation after Goal succeeds is not caught.")
   "Follow pointers for bound variables."
   `(progn (loop while (and (var-p ,exp) (bound-p ,exp))
              do (setf ,exp (var-binding ,exp)))
-	  ,exp))
+          ,exp))
 
 (defun print-var (var stream depth)
   (if (or (and *print-level*
@@ -199,12 +199,12 @@ present, so an error from the continuation after Goal succeeds is not caught.")
   "Compile a call to a prolog predicate."
   (let ((functor (make-functor-symbol predicate arity)))
     `(let ((func (or (get-functor-fn ',functor)
-		     (gethash ',functor *prolog-global-functors*))))
+                     (gethash ',functor *prolog-global-functors*))))
        (%tick)                          ; account one inference / enforce bounds
        (when *prolog-trace*
-	 (format t "TRACE: ~A/~A~A~%" ',predicate ',arity ',args))
+         (format t "TRACE: ~A/~A~A~%" ',predicate ',arity ',args))
        (if (functionp func)
-	   (funcall func ,@args ,cont)
+           (funcall func ,@args ,cont)
            ;; Unknown predicate: stay noisy (a mistyped goal surfaces) but carry
            ;; an existence_error ball so catch/3 can recover from it.
            (error 'prolog-error
@@ -279,10 +279,10 @@ present, so an error from the continuation after Goal succeeds is not caught.")
   (if (length=1 body)
       (first body)
       `(let ((old-trail (fill-pointer *trail*)))
-	 ,(first body)
-	 ,@(loop for exp in (rest body)
-	      collect '(undo-bindings old-trail)
-	      collect exp))))
+         ,(first body)
+         ,@(loop for exp in (rest body)
+              collect '(undo-bindings old-trail)
+              collect exp))))
 
 (defun variables-in (exp)
   (unique-find-anywhere-if #'variable-p exp))
@@ -294,7 +294,7 @@ present, so an error from the continuation after Goal succeeds is not caught.")
   "If there are any variables in exp (besides the parameters)
   then bind them to new vars."
   (let ((exp-vars (remove '? (set-difference (variables-in exp)
-					     parameters))))
+                                             parameters))))
     (if exp-vars
         `(let ,(mapcar #'(lambda (var) `(,var (?)))
                        exp-vars)
@@ -355,9 +355,9 @@ present, so an error from the continuation after Goal succeeds is not caught.")
 
 (defun extend-bindings (var val bindings)
   (cons (cons var val)
-	(if (eq bindings +no-bindings+)
-	    nil
-	    bindings)))
+        (if (eq bindings +no-bindings+)
+            nil
+            bindings)))
 
 (defun compile-unify-variable (x y bindings)
   "X is a variable, and Y may be."
@@ -441,10 +441,10 @@ present, so an error from the continuation after Goal succeeds is not caught.")
       (0 +fail+)
       (1 (compile-body (cons (first disjuncts) body) cont bindings))
       (t (let ((fn (prolog-gensym "F")))
-	   `(flet ((,fn () ,(compile-body body cont bindings)))
-	      .,(maybe-add-undo-bindings
-		 (loop for g in disjuncts collect
-		      (compile-body (list g) `#',fn bindings)))))))))
+           `(flet ((,fn () ,(compile-body body cont bindings)))
+              .,(maybe-add-undo-bindings
+                 (loop for g in disjuncts collect
+                      (compile-body (list g) `#',fn bindings)))))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Control-flow core (#45 Phase 0).
@@ -611,14 +611,14 @@ inline, composing with cut and the control constructs.  When Goal is a variable
 (defun compile-clause (parms clause cont)
   "Transform away the head, and compile the resulting body."
   (let ((body
-	 (bind-unbound-vars
-	  parms
-	  (compile-body
-	   (nconc
-	    (mapcar #'make-= parms (args (clause-head clause)))
-	    (clause-body clause))
-	   cont
-	   (mapcar #'self-cons parms)))))
+         (bind-unbound-vars
+          parms
+          (compile-body
+           (nconc
+            (mapcar #'make-= parms (args (clause-head clause)))
+            (clause-body clause))
+           cont
+           (mapcar #'self-cons parms)))))
     (when *prolog-trace*
       (format t "TRACE: ~A BODY:~% ~A~%" (clause-head clause) body))
     body))
@@ -629,37 +629,37 @@ inline, composing with cut and the control constructs.  When Goal is a variable
     (when *prolog-trace* (format t "TRACE:  Adding clause ~A~%" clause))
     (assert (and (atom functor-name) (not (variable-p functor-name))))
     (let* ((arity (relation-arity (clause-head clause)))
-	   (functor (make-functor-symbol functor-name arity)))
+           (functor (make-functor-symbol functor-name arity)))
       (if (gethash functor *prolog-global-functors*)
-	  (error 'prolog-error
-		 :reason
-		 (format nil "Cannot override default functor ~A." functor))
-	  (let ((f (lookup-functor functor)))
-	    (if (functor-p f)
-		(add-functor-clause f clause)
-		(make-functor :name functor :clauses (list clause))))))))
+          (error 'prolog-error
+                 :reason
+                 (format nil "Cannot override default functor ~A." functor))
+          (let ((f (lookup-functor functor)))
+            (if (functor-p f)
+                (add-functor-clause f clause)
+                (make-functor :name functor :clauses (list clause))))))))
 
 ;(defun deref-copy (exp)
 ;  (sublis (mapcar #'(lambda (var) (cons (var-deref var) (?)))
-;		  (unique-find-anywhere-if #'var-p exp))
-;	  exp))
+;                 (unique-find-anywhere-if #'var-p exp))
+;         exp))
 
 (defun deref-copy (exp)
   (let ((var-alist nil))
     (labels ((walk (exp)
-	       (deref-exp exp)
-	       (cond ((consp exp)
-		      (reuse-cons (walk (first exp))
-				  (walk (rest exp))
-				  exp))
-		     ((var-p exp)
-		      (let ((entry (assoc exp var-alist)))
-			(if (not (null entry))
-			    (cdr entry)
-			    (let ((var-copy (?)))
-			      (push (cons exp var-copy) var-alist)
-			      var-copy))))
-		     (t exp))))
+               (deref-exp exp)
+               (cond ((consp exp)
+                      (reuse-cons (walk (first exp))
+                                  (walk (rest exp))
+                                  exp))
+                     ((var-p exp)
+                      (let ((entry (assoc exp var-alist)))
+                        (if (not (null entry))
+                            (cdr entry)
+                            (let ((var-copy (?)))
+                              (push (cons exp var-copy) var-alist)
+                              var-copy))))
+                     (t exp))))
       (walk exp))))
 
 (defun deref-exp (exp)
@@ -674,24 +674,24 @@ inline, composing with cut and the control constructs.  When Goal is a variable
 (defun deref-equal (x y)
   (or (prolog-equal (var-deref x) (var-deref y))
       (and (consp x)
-	   (consp y)
-	   (deref-equal (first x) (first y))
-	   (deref-equal (rest x) (rest y)))))
+           (consp y)
+           (deref-equal (first x) (first y))
+           (deref-equal (rest x) (rest y)))))
 
 (defmethod prolog-compile-null ((functor functor))
   (let ((*functor* (functor-name functor)))
     (set-functor-fn *functor*
-		    #'(lambda (&rest args) (declare (ignore args)) nil))))
+                    #'(lambda (&rest args) (declare (ignore args)) nil))))
 
 (defun compile-functor (functor arity clauses)
   "Compile all the clauses for a given symbol/arity into a single LISP
  function."
   (let ((*functor* (functor-name functor))
-	(parameters (make-parameters arity)))
+        (parameters (make-parameters arity)))
     (let ((func `#'(lambda (,@parameters cont)
-		     (block ,*functor*
-		       .,(maybe-add-undo-bindings
-			  (mapcar
+                     (block ,*functor*
+                       .,(maybe-add-undo-bindings
+                          (mapcar
                            #'(lambda (clause)
                                (compile-clause parameters clause 'cont))
                            clauses))))))
@@ -736,10 +736,10 @@ inline, composing with cut and the control constructs.  When Goal is a variable
 (defun replace-?-vars (exp)
   "Replace any ? within exp with a var of the form ?123."
   (cond ((eq exp '?) (intern (symbol-name (gensym "?"))))
-	((atom exp) exp)
-	(t (reuse-cons (replace-?-vars (first exp))
-		       (replace-?-vars (rest exp))
-		       exp))))
+        ((atom exp) exp)
+        (t (reuse-cons (replace-?-vars (first exp))
+                       (replace-?-vars (rest exp))
+                       exp))))
 
 (defmacro <- (&rest clause)
   "Add a user-defined functor, or add clauses to an existing functor."
@@ -752,32 +752,32 @@ inline, composing with cut and the control constructs.  When Goal is a variable
 (defmacro ?- (&rest goals)
   "Execute an interactive prolog query."
   (let* ((goals (replace-?-vars goals))
-	 (vars (delete '? (variables-in goals)))
-	 (top-level-query (prolog-gensym "PROVE"))
-	 (*functor* (make-functor-symbol top-level-query 0)))
+         (vars (delete '? (variables-in goals)))
+         (top-level-query (prolog-gensym "PROVE"))
+         (*functor* (make-functor-symbol top-level-query 0)))
     `(let* ((*trail* (make-array 200 :fill-pointer 0 :adjustable t))
-	    (*var-counter* 0)
-	    (*functor* ',*functor*)
-	    (functor (make-functor :name *functor* :clauses nil)))
+            (*var-counter* 0)
+            (*functor* ',*functor*)
+            (functor (make-functor :name *functor* :clauses nil)))
        (unwind-protect
-	    (catch 'top-level-prove
-	      (let ((func #'(lambda (cont)
-			      (handler-case
-				  (block ,*functor*
-				    .,(maybe-add-undo-bindings
-				       (mapcar
-					#'(lambda (clause)
-					    (compile-clause nil clause 'cont))
-					`(((,top-level-query)
-					   ,@goals
-					   (show-prolog-vars
-					    ,(mapcar #'symbol-name vars)
-					    ,vars))))))
-				(undefined-function (condition)
-				  (error 'prolog-error :reason condition))))))
-		(set-functor-fn *functor* func)
-		(funcall func #'prolog-ignore)
-		(format t "~&No.~%")))
+            (catch 'top-level-prove
+              (let ((func #'(lambda (cont)
+                              (handler-case
+                                  (block ,*functor*
+                                    .,(maybe-add-undo-bindings
+                                       (mapcar
+                                        #'(lambda (clause)
+                                            (compile-clause nil clause 'cont))
+                                        `(((,top-level-query)
+                                           ,@goals
+                                           (show-prolog-vars
+                                            ,(mapcar #'symbol-name vars)
+                                            ,vars))))))
+                                (undefined-function (condition)
+                                  (error 'prolog-error :reason condition))))))
+                (set-functor-fn *functor* func)
+                (funcall func #'prolog-ignore)
+                (format t "~&No.~%")))
          (progn
            (delete-functor functor)
            (release-prolog-symbol ,top-level-query)))
@@ -795,30 +795,30 @@ inline, composing with cut and the control constructs.  When Goal is a variable
             (*functor* (make-functor-symbol top-level-query 0))
             (*trail* (make-array 200 :fill-pointer 0 :adjustable t))
             (*var-counter* 0)
-	    (*select-list* nil)
-	    (functor (make-functor :name *functor* :clauses nil)))
+            (*select-list* nil)
+            (functor (make-functor :name *functor* :clauses nil)))
        (unwind-protect
-	    (let ((func
-		   #'(lambda (cont)
-		       (handler-case
-			   (block ,*functor*
-			     .,(maybe-add-undo-bindings
-				(mapcar #'(lambda (clause)
-					    (compile-clause nil clause 'cont))
-					`(((top-level-query)
-					   ,@goals
-					   (select
-					    ,(mapcar
-					      #'(lambda (var)
-						  (typecase var
-						    (symbol (symbol-name var))
-						    (list (first var))))
-					      vars) ,vars))))))
-			 (undefined-function (condition)
-			   (error 'prolog-error :reason condition))))))
-	      (set-functor-fn *functor* func)
-	      (funcall func #'prolog-ignore))
-	 (delete-functor functor))
+            (let ((func
+                   #'(lambda (cont)
+                       (handler-case
+                           (block ,*functor*
+                             .,(maybe-add-undo-bindings
+                                (mapcar #'(lambda (clause)
+                                            (compile-clause nil clause 'cont))
+                                        `(((top-level-query)
+                                           ,@goals
+                                           (select
+                                            ,(mapcar
+                                              #'(lambda (var)
+                                                  (typecase var
+                                                    (symbol (symbol-name var))
+                                                    (list (first var))))
+                                              vars) ,vars))))))
+                         (undefined-function (condition)
+                           (error 'prolog-error :reason condition))))))
+              (set-functor-fn *functor* func)
+              (funcall func #'prolog-ignore))
+         (delete-functor functor))
        (nreverse *select-list*))))
 |#
 
@@ -980,7 +980,7 @@ SELECT-FIRST for common shorthands."
             (*functor* (make-functor-symbol top-level-query 0))
             (*trail* (make-array 200 :fill-pointer 0 :adjustable t))
             (*var-counter* 0)
-	    (*select-list* nil)
+            (*select-list* nil)
             (*select-flat* ,(cdr (assoc :flat options)))
             (*select-limit* ,(cdr (assoc :limit options)))
             (*select-skip* ,(cdr (assoc :skip options)))
@@ -999,10 +999,10 @@ SELECT-FIRST for common shorthands."
             (*select-count-only* ,(cdr (assoc :count options)))
             (*select-callback* ,(cdr (assoc :callback options)))
             (*seen-table* (make-hash-table)) ;; For unique values
-	    (functor (make-functor :name *functor* :clauses nil)))
+            (functor (make-functor :name *functor* :clauses nil)))
        (unwind-protect
-	    (let ((func
-		   (lambda (cont)
+            (let ((func
+                   (lambda (cont)
                      (handler-case
                          (block :prolog-select
                            (catch :prolog-limit-reached
@@ -1020,7 +1020,7 @@ SELECT-FIRST for common shorthands."
                                               vars) ,vars)))))))
                        (undefined-function (condition)
                          (error 'prolog-error :reason condition))))))
-	      (set-functor-fn *functor* func)
+              (set-functor-fn *functor* func)
               ,(if (cdr (assoc :snapshot options))
                    ;; Run the query under one consistent MVCC read snapshot:
                    ;; all reads resolve at a single epoch (lock-free, stable
@@ -1075,32 +1075,32 @@ goals like (trigger ...) or (retract ...)."
             (*functor* (make-functor-symbol top-level-query 0))
             (*trail* (make-array 200 :fill-pointer 0 :adjustable t))
             (*var-counter* 0)
-	    (*select-list* nil)
-	    (functor (make-functor :name *functor* :clauses nil)))
+            (*select-list* nil)
+            (functor (make-functor :name *functor* :clauses nil)))
        (unwind-protect
-	    (let ((func
-		   #'(lambda (cont)
-		       (handler-case
-			   (block ,*functor*
-			     .,(maybe-add-undo-bindings
-				(mapcar #'(lambda (clause)
-					    (compile-clause nil clause 'cont))
-					`(((top-level-query)
-					   ,@goals
-					   (map-query
+            (let ((func
+                   #'(lambda (cont)
+                       (handler-case
+                           (block ,*functor*
+                             .,(maybe-add-undo-bindings
+                                (mapcar #'(lambda (clause)
+                                            (compile-clause nil clause 'cont))
+                                        `(((top-level-query)
+                                           ,@goals
+                                           (map-query
                                             ,fn
-					    ,(mapcar
-					      #'(lambda (var)
-						  (typecase var
-						    (symbol (symbol-name var))
-						    (list (first var))))
-					      vars) ,vars
+                                            ,(mapcar
+                                              #'(lambda (var)
+                                                  (typecase var
+                                                    (symbol (symbol-name var))
+                                                    (list (first var))))
+                                              vars) ,vars
                                               ,collect-p ,remove-nulls-p))))))
-			 (undefined-function (condition)
-			   (error 'prolog-error :reason condition))))))
-	      (set-functor-fn *functor* func)
-	      (funcall func #'prolog-ignore))
-	 (delete-functor functor))
+                         (undefined-function (condition)
+                           (error 'prolog-error :reason condition))))))
+              (set-functor-fn *functor* func)
+              (funcall func #'prolog-ignore))
+         (delete-functor functor))
        (nreverse *select-list*))))
 |#
 
@@ -1109,11 +1109,11 @@ goals like (trigger ...) or (retract ...)."
  results of each application of fn."
   (with-gensyms (result)
     (if collect-p
-	`(mapcar (lambda (,result)
+        `(mapcar (lambda (,result)
                    (apply ,fn ,result))
-		 ,query)
-	`(dolist (,result ,query)
-	   (apply ,fn ,result)))))
+                 ,query)
+        `(dolist (,result ,query)
+           (apply ,fn ,result)))))
 
 (defun valid-prolog-query-p (form)
   (case (first form)

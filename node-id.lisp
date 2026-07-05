@@ -1,14 +1,20 @@
 (in-package :graph-db)
 
-(let ((random-states (list (make-random-state)
-                           (progn (sleep 1) (make-random-state)))))
+;; NOTE: (make-random-state) with a NIL arg copies the *current* *random-state*; it does
+;; NOT reseed from the clock, so both elements below are identical regardless of any delay
+;; between them.  A former (sleep 1) between the two calls therefore bought nothing but a
+;; full second of load-time latency -- run at module-init, it added ~1 s to every image
+;; boot (device AND hub).  Removed.  (If genuinely-distinct entropy is ever wanted here,
+;; use (make-random-state t) per element -- a behavioural change, tracked separately.)
+(let ((random-states (list (make-random-state t)
+                           (make-random-state t))))
 
   (defun generate-uuid-name ()
     "Generate a byte array for V5 UUID generation using time and random bytes"
     (declare (optimize (speed 3) (safety 0)))
     (multiple-value-bind (sec msec)
         #+sbcl (sb-ext:get-time-of-day)
-        #-sbcl (osicat-posix:gettimeofday)
+        #-sbcl (%posix-gettimeofday)
         (let* ((total-bytes 40)
                (vec (make-array total-bytes :element-type '(unsigned-byte 8)))
                (offset 0))

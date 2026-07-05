@@ -164,7 +164,7 @@
               (cache-index-list (ve-index-out graph) key il)))))))
 
 (defmethod ve-index-push ((idx ve-index) (key ve-key) (id array)
-                          &key unless-present)
+                          &key unless-present heap)
   (let ((table (ve-index-table idx)))
     (with-locked-hash-key (table key)
       ;;(log:debug "ve-index-push ~A:~A" key id)
@@ -179,8 +179,13 @@
               ;;(log:debug "add-to-ve-index: AFTER PUSH: ~A" index-list)
               )
             (progn
+              ;; Allocate the new index-list in the OWNING graph's heap (passed
+              ;; in by the caller), not (heap *graph*) -- else an edge inserted
+              ;; while *graph* names a different graph (slave apply, replay, a
+              ;; second open graph) stores an index-list head that points into a
+              ;; foreign heap.  Sibling ADD-TO-VEV-INDEX threads (heap graph) too.
               (setq index-list
-                    (make-index-list (heap *graph*) id))
+                    (make-index-list (or heap (heap *graph*)) id))
               ;;(log:debug "add-to-ve-index: Made new ~A" index-list)
               (%lhash-insert table key index-list)))
         (cache-index-list idx key index-list)))))

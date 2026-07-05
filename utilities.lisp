@@ -278,6 +278,14 @@ characters.~@:>" string (length string)))
                                           (uuid:print-bytes nil x)
                                           (uuid:print-bytes nil y)))
 
+  ;; Lexicographic list ordering base cases.  Without these, the recursion bottoms
+  ;; out at (less-than NIL NIL) -> T via ((x null) y), so an equal list compares as
+  ;; LESS THAN itself -- which silently corrupts a skip list keyed by composite
+  ;; (list ...) keys (e.g. an :ORIGIN-scoped unique key (origin value)).  These
+  ;; must precede the null/list catch-alls below (they are strictly more specific).
+  (:method ((x null) (y null))           nil)   ; equal empty lists -- neither precedes
+  (:method ((x cons) (y null))           nil)   ; a non-empty list is NOT < the empty list
+  (:method ((x null) (y cons))           t)     ; the empty list precedes any non-empty one
   (:method ((x list) (y list))           (or (less-than (car x) (car y))
                                              (and (equal (car x) (car y))
                                                   (less-than (cdr x) (cdr y)))))
@@ -371,6 +379,10 @@ characters.~@:>" string (length string)))
                                           (uuid:print-bytes nil x)
                                           (uuid:print-bytes nil y)))
 
+  ;; Lexicographic list ordering base cases (symmetric with LESS-THAN's).
+  (:method ((x null) (y null))           nil)   ; equal empty lists
+  (:method ((x cons) (y null))           t)     ; a non-empty list follows the empty one
+  (:method ((x null) (y cons))           nil)   ; the empty list is NOT > a non-empty one
   (:method ((x list) (y list))           (or (greater-than (car x) (car y))
                                              (and (equal (car x) (car y))
                                                   (greater-than (cdr x) (cdr y)))))

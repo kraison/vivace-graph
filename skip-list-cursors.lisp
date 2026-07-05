@@ -95,35 +95,35 @@
 ;;; lock-free %CURSOR-NEXT so the per-step read lock is not re-entered.
 (defmethod map-skip-list (fn (sl skip-list) &key collect-p)
   (with-sl-read-lock (sl)
-  (let ((cursor (make-cursor sl)) (result nil))
-    (do ((node (%cursor-next cursor)
-              (%cursor-next cursor)))
-        ((null node))
-      (if collect-p
-          (push (funcall fn node) result)
-          (funcall fn node)))
-    (when collect-p
-      (nreverse result)))))
+    (let ((cursor (make-cursor sl)) (result nil))
+      (do ((node (%cursor-next cursor)
+                (%cursor-next cursor)))
+          ((null node))
+        (if collect-p
+            (push (funcall fn node) result)
+            (funcall fn node)))
+      (when collect-p
+        (nreverse result)))))
 
 (defmethod map-skip-list-keys (fn (sl skip-list) &key collect-p)
   (with-sl-read-lock (sl)
-  (let ((cursor (make-cursor sl)) (result nil))
-    (do ((node (%cursor-next cursor)
-              (%cursor-next cursor)))
-        ((null node))
-      (if collect-p
-          (push (funcall fn (%sn-key node)) result)
-          (funcall fn (%sn-key node))))
-    (when collect-p
-      (nreverse result)))))
+    (let ((cursor (make-cursor sl)) (result nil))
+      (do ((node (%cursor-next cursor)
+                (%cursor-next cursor)))
+          ((null node))
+        (if collect-p
+            (push (funcall fn (%sn-key node)) result)
+            (funcall fn (%sn-key node))))
+      (when collect-p
+        (nreverse result)))))
 
 (defmethod map-skip-list-values (fn (sl skip-list))
   (with-sl-read-lock (sl)
-  (let ((cursor (make-values-cursor sl)))
-    (do ((val (%cursor-next cursor)
-              (%cursor-next cursor)))
-        ((null val))
-      (funcall fn val)))))
+    (let ((cursor (make-values-cursor sl)))
+      (do ((val (%cursor-next cursor)
+                (%cursor-next cursor)))
+          ((null val))
+        (funcall fn val)))))
 
 (defmethod skip-list-fetch-all ((sl skip-list) key)
   "Return all values for a key in a skip list where duplicates are allowed."

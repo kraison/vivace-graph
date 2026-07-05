@@ -339,17 +339,17 @@ JSON line and sets the application/x-ndjson content type."
 
 (defmacro def-rest-procedure (name lambda-list &body body)
   (with-gensyms (params)
-  `(let ((fn (lambda (,params)
-               (let (,@(mapcar (lambda (var)
-                                 (list var
-                                       `(get-param ,params
-                                                   ,(json:lisp-to-camel-case
-                                                     (symbol-name var)))))
-                               lambda-list))
-                 (progn
-                   ,@body)))))
-     (setf (gethash ,name *rest-procedures*) fn)
-     (setf (gethash ,(json:lisp-to-camel-case (symbol-name name)) *rest-procedures*) fn))))
+    `(let ((fn (lambda (,params)
+                 (let (,@(mapcar (lambda (var)
+                                   (list var
+                                         `(get-param ,params
+                                                     ,(json:lisp-to-camel-case
+                                                       (symbol-name var)))))
+                                 lambda-list))
+                   (progn
+                     ,@body)))))
+       (setf (gethash ,name *rest-procedures*) fn)
+       (setf (gethash ,(json:lisp-to-camel-case (symbol-name name)) *rest-procedures*) fn))))
 
 (defun call-rest-procedure (name params)
   (with-rest-auth ((get-param params "username") (get-param params "password"))
@@ -567,7 +567,8 @@ result string.  Read-only, snapshot-isolated, and bounded; the client :limit is
 capped at *QUERY-DEFAULT-LIMIT*.  A \"format\":\"ndjson\" field streams the rows
 as newline-delimited JSON instead of an array."
   (multiple-value-bind (vars goals limit skip pkg) (compile-pattern-query dsl graph)
-    (let* ((*package* pkg)
+    (let* ((*graph* graph)   ; the eval'd SELECT / node-slot-value goals key off *GRAPH*
+           (*package* pkg)
            (cap (if (and (integerp limit) (plusp limit))
                     (min limit *query-default-limit*)
                     *query-default-limit*))

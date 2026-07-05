@@ -104,16 +104,16 @@ goal's argument count."
   (let ((exp (deref-exp exp)))
     (when *prolog-trace* (format t "TRACE: LISP/2 ?result <- ~A~%" exp))
     (cond ((consp exp)
-	   (if (unify ?result (eval exp))
-	   ;;(if (unify ?result (apply (first exp) (rest exp)))
-	       (funcall cont)))
-	  ((symbolp exp)
-	   ;;(if (unify ?result (eval exp))
-	   (if (unify ?result (funcall #'symbol-value exp))
-	       (funcall cont)))
-	  (t
-	   (if (unify ?result exp)
-	       (funcall cont))))))
+           (if (unify ?result (eval exp))
+           ;;(if (unify ?result (apply (first exp) (rest exp)))
+               (funcall cont)))
+          ((symbolp exp)
+           ;;(if (unify ?result (eval exp))
+           (if (unify ?result (funcall #'symbol-value exp))
+               (funcall cont)))
+          (t
+           (if (unify ?result exp)
+               (funcall cont))))))
 
 (def-global-prolog-functor lispp/1 (exp cont)
   "Call out to lisp from within a Prolog query and throws away the result.
@@ -123,19 +123,19 @@ goal's argument count."
   (let ((exp (deref-exp exp)))
     (when *prolog-trace* (format t "TRACE: LISPP/1 ~A~%" exp))
     (cond ((consp exp)
-	   ;;(format t "applying ~A to ~A~%" (first exp) (rest exp))
-	   (eval exp))
-	   ;;(apply (first exp) (rest exp)))
-	  ((and (symbolp exp) (boundp exp)) (funcall #'identity exp))
-	  (t exp))
+           ;;(format t "applying ~A to ~A~%" (first exp) (rest exp))
+           (eval exp))
+           ;;(apply (first exp) (rest exp)))
+          ((and (symbolp exp) (boundp exp)) (funcall #'identity exp))
+          (t exp))
     (funcall cont)))
 
 (def-global-prolog-functor regex-match/2 (?arg1 ?arg2 cont)
   "Functor that treats first arg as a regex and uses cl-ppcre:scan to check
  for the pattern in the second arg."
   (if (and (stringp (var-deref ?arg1))
-	   (stringp (var-deref ?arg2))
-	   (cl-ppcre:scan ?arg1 ?arg2))
+           (stringp (var-deref ?arg2))
+           (cl-ppcre:scan ?arg1 ?arg2))
       (funcall cont)))
 
 (def-global-prolog-functor var/1 (?arg1 cont)
@@ -155,7 +155,7 @@ permitted even under the strictest effect policy (:effects nil)."
   "Similar to lisp/2, but unifies instead of assigns the lisp return value."
   (require-effect :eval)
   (if (and (not (find-if-anywhere #'unbound-var-p exp))
-	   (unify var (eval (deref-exp exp))))
+           (unify var (eval (deref-exp exp))))
       (funcall cont)))
 
 ;;; ---------------------------------------------------------------------------
@@ -511,8 +511,8 @@ order of terms with duplicates removed."
   (if (null vars)
       (format t "~&Yes")
       (loop for name in var-names
-	 for var in vars do
-	   (format t "~&~a = ~a" name (deref-exp var))))
+         for var in vars do
+           (format t "~&~a = ~a" name (deref-exp var))))
   (if (continue-p)
       (funcall cont)
       (throw 'top-level-prove nil)))
@@ -521,21 +521,21 @@ order of terms with duplicates removed."
 #|
   (def-global-prolog-functor select/2 (var-names vars cont)
     (if (null vars)
-	nil
-	(push (loop for name in var-names
-		 for var in vars
-		 collect (let ((var (deref-exp var)))
-			   (cond ((and (symbolp var)
-				       (eq graph-pkg (symbol-package var)))
-				  (symbol-name var))
-				 ((and (consp var)
-				       (eq (first var) name)
-				       (symbolp (second var))
-				       (eq graph-pkg
-					   (symbol-package (second var))))
-				  (list name (symbol-name (second var))))
-				 (t var))))
-	      *select-list*))
+        nil
+        (push (loop for name in var-names
+                 for var in vars
+                 collect (let ((var (deref-exp var)))
+                           (cond ((and (symbolp var)
+                                       (eq graph-pkg (symbol-package var)))
+                                  (symbol-name var))
+                                 ((and (consp var)
+                                       (eq (first var) name)
+                                       (symbolp (second var))
+                                       (eq graph-pkg
+                                           (symbol-package (second var))))
+                                  (list name (symbol-name (second var))))
+                                 (t var))))
+              *select-list*))
     (funcall cont))
 |#
 
@@ -584,10 +584,10 @@ order of terms with duplicates removed."
       (fn var-names vars collect-p remove-nulls-p cont)
     (when *prolog-trace*
       (format t "TRACE: MAP-QUERY/5 FN (~A) IS ~A~%COLLECT-P is ~A~%"
-	      (type-of fn) fn collect-p))
+              (type-of fn) fn collect-p))
     (if (null vars)
-	nil
-	(let ((new-vars
+        nil
+        (let ((new-vars
                (loop for name in var-names
                   for var in vars
                   collect (let ((var (deref-exp var)))
@@ -601,8 +601,8 @@ order of terms with duplicates removed."
                                             (symbol-package (second var))))
                                    (list name (symbol-name (second var))))
                                   (t var))))))
-	  (let ((result (eval `(apply ,fn ',new-vars))))
-	    (when collect-p
+          (let ((result (eval `(apply ,fn ',new-vars))))
+            (when collect-p
               (unless (and remove-nulls-p (null result))
                 (push result *select-list*))))))
     (funcall cont)))
@@ -847,14 +847,23 @@ order of terms with duplicates removed."
               (undo-bindings old-trail)))
           *graph* :vertex-type type))
         (t
-         (map-vertices
-          (lambda (vertex)
-            (let ((old-trail (fill-pointer *trail*)))
-              (when (unify node vertex)
-                (when (unify type (type-of vertex))
-                  (funcall cont)))
-              (undo-bindings old-trail)))
-          *graph*))))
+         ;; Both NODE and TYPE unbound: enumerate every vertex.  Rather than a
+         ;; single untyped lhash scan (which reads LIVE versions, bypassing
+         ;; snapshot isolation), delegate to per-type scans -- each goes through
+         ;; LOOKUP-VERTEX, so under a snapshot transaction every vertex resolves
+         ;; at the reader's epoch.  :INCLUDE-SUBCLASSES-P NIL visits each vertex
+         ;; exactly once, under its own type-id (vertex type-ids start at 1, so
+         ;; the 0 sentinel from LIST-VERTEX-TYPES never resolves and is skipped).
+         (dolist (type-id (list-vertex-types *graph*))
+           (when (lookup-node-type-by-id type-id :vertex)
+             (map-vertices
+              (lambda (vertex)
+                (let ((old-trail (fill-pointer *trail*)))
+                  (when (unify node vertex)
+                    (when (unify type (type-of vertex))
+                      (funcall cont)))
+                  (undo-bindings old-trail)))
+              *graph* :vertex-type type-id :include-subclasses-p nil))))))
 
 (def-global-prolog-functor retract/1 (node cont)
   (require-effect :write)

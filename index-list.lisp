@@ -62,12 +62,16 @@
   ;;(log:debug "RETURNING OFFSET ~A" offset)
   offset)
 
-(defmethod deserialize-index-list ((mf mapped-file) (offset integer))
+(defmethod deserialize-index-list ((mf mapped-file) (offset integer)
+                                   &optional (heap (heap *graph*)))
+  ;; HEAP defaults to the current graph's heap (the :value-deserializer callers in
+  ;; ve-index/vev-index rely on that), but callers without *GRAPH* bound -- e.g.
+  ;; the lazy type-index %TI-LIST (#46) -- pass it explicitly.
   (let ((il (%make-index-list))
         (flags (get-byte mf offset)))
     (setf (index-list-dirty-p il) (ldb-test (byte 1 0) flags)
           (index-list-head il) (deserialize-uint64 mf (incf offset))
-          (index-list-heap il) (heap *graph*))
+          (index-list-heap il) heap)
     il))
 
 (defmethod %map-index-list (fn (il index-list) &key collect-p include-deleted-p)
@@ -164,7 +168,7 @@
                 (when (index-list-cache il)
                   (setf (gethash uuid-address (index-list-cache il))
                         pcons))
-              (setq prev uuid-address))))
+                (setq prev uuid-address))))
           (setf (index-list-head il) prev)
           il)
       (error (c)

@@ -451,15 +451,9 @@ retryable network error, retries with an exponential retry timeout."
 
 ;;; Starting/stopping replication
 
-(defmethod start-replication ((graph graph) &key package)
-  (declare (ignore package))
-  ;;noop
-  )
-
-(defmethod stop-replication ((graph graph))
-  ;;noop
-  )
-
+;; Base no-op start/stop-replication methods on the plain GRAPH class moved to
+;; graph-class.lisp (graph-db/core) so the embeddable core can open a graph
+;; without this network-transport file.  Only the master/slave methods remain.
 (defmethod start-replication ((graph master-graph) &key (package :graph-db))
   (declare (ignore package))
   (setf (stop-replication-p graph) nil)

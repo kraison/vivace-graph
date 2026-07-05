@@ -15,16 +15,16 @@
 (defgeneric uuid-array-equal (x y &optional offset1 offset2))
 
 (defstruct (lhash
-	     (:conc-name %lhash-)
-	     (:constructor %make-lhash)
-	     (:print-function
+             (:conc-name %lhash-)
+             (:constructor %make-lhash)
+             (:print-function
               (lambda (lhash stream depth)
                 (declare (ignore depth))
                 (format stream
                         "#<LHASH :TEST ~A :LOCATION ~A>"
                         (%lhash-test lhash)
                         (%lhash-location lhash))))
-	     (:predicate lhash-p))
+             (:predicate lhash-p))
   (test 'uuid-array-equal)
   (base-buckets 4)
   (level 0 :type (UNSIGNED-BYTE 64))
@@ -759,7 +759,12 @@
       (log:error "ERROR IN ~A LHASH-GET(~A): ~A" lhash key c)
       (error c))))
 
-(defun lhash-remove (lhash key)
+;; Generic so a memory-graph's MEM-TABLE (used as the vertex/edge table) can
+;; supply its own removal -- e.g. the peer scope-exit purge (PEER-PURGE-NODE)
+;; hard-deletes a node straight from the table.  The on-disk lhash is the method.
+(defgeneric lhash-remove (table key))
+
+(defmethod lhash-remove ((lhash lhash) key)
   (handler-case
       (with-read-lock ((%lhash-split-lock lhash))
         (let* ((bucket (hash lhash (%lhash-level lhash) key)))
@@ -771,18 +776,22 @@
       (error c)))
   (read-lhash-count lhash))
 
-(defun map-lhash (fn lhash &key collect-p)
-  (with-read-lock ((%lhash-split-lock lhash))
-    (let ((result nil) (bucket-count (%bucket-count lhash)))
-      (dotimes (bucket bucket-count)
-        (let* ((offset (bucket-offset lhash bucket))
-               (items (read-bucket lhash (%lhash-table lhash) offset)))
-          (dolist (item items)
-            (if collect-p
-                (push (funcall fn item) result)
-                (funcall fn item)))))
-      (when collect-p
-        (nreverse result)))))
+;; Generic so an alternative table backend (the in-RAM MEM-TABLE of a
+;; memory-graph) can supply its own scan; FN is called with a (KEY . VALUE) cons,
+;; the same shape the lhash method yields.
+(defgeneric map-lhash (fn table &key collect-p)
+  (:method (fn (lhash lhash) &key collect-p)
+    (with-read-lock ((%lhash-split-lock lhash))
+      (let ((result nil) (bucket-count (%bucket-count lhash)))
+        (dotimes (bucket bucket-count)
+          (let* ((offset (bucket-offset lhash bucket))
+                 (items (read-bucket lhash (%lhash-table lhash) offset)))
+            (dolist (item items)
+              (if collect-p
+                  (push (funcall fn item) result)
+                  (funcall fn item)))))
+        (when collect-p
+          (nreverse result))))))
 
 (defun analyze-lhash (lhash)
   (with-read-lock ((%lhash-split-lock lhash))

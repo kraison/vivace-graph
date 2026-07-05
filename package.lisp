@@ -24,6 +24,8 @@
   (:export #:make-graph
            #:*default-heap-size*
            #:*default-index-size*
+           #:*index-backend*
+           #:graph-index-backend
            #:open-graph
            #:close-graph
            #:lookup-graph
@@ -52,6 +54,8 @@
            #:start-replication
            #:stop-replication
            #:stop-buffer-pool
+           #:set-buffer-pool-size
+           #:*buffer-pool-size*
 
            #:start-rest
            #:stop-rest
@@ -126,6 +130,11 @@
            #:save
            #:mark-deleted
            #:stale-revision-error
+           ;; unique constraints (issue #6)
+           #:unique-constraint-violation
+           #:ucv-class-name #:ucv-slot-name #:ucv-value #:ucv-existing-id
+           #:rebuild-unique-indexes
+           #:regenerate-unique-indexes
 
            #:def-view
            #:*view-rv*
@@ -137,8 +146,10 @@
            #:delete-view
            #:save-views
            #:restore-views
+           #:install-views
            #:get-view-table-for-class
            #:regenerate-view
+           #:regenerate-all-views
            #:lookup-view-group
            #:lookup-view
            #:with-write-locked-view-group
@@ -287,4 +298,54 @@
            #:geo-distance/5
            #:geo-near/5
            #:geo-within/3
+           ;; graph algorithms (optional graph-db/algorithms add-on)
+           ;; -- shared
+           #:with-algorithm-snapshot
+           #:algorithm-vertex
+           #:adjacent-vertices
+           #:all-vertices
+           ;; -- shortest paths (Mode B native)
+           #:shortest-path
+           #:a-star
+           #:single-source-shortest-paths
+           ;; -- structure (Mode B native)
+           #:out-degree
+           #:in-degree
+           #:degree
+           #:degree-distribution
+           #:distance-map
+           #:connected-components
+           #:spanning-tree
+           #:eccentricity
+           #:graph-center
+           ;; -- ranking (Mode B native)
+           #:page-rank
+           #:page-rank-distribution
+           #:hub-authority-values
+           #:sim-rank
+           ;; -- in-memory projection (Mode A)
+           #:with-graph-projection
+           #:build-projection
+           #:projection
+           #:projection-index
+           #:projection-vertex
+           #:projection-shortest-path
+           ;; -- dense / matrix family (Mode A projection)
+           #:all-pairs-shortest-paths
+           #:all-pairs-result
+           #:apsp-distance
+           #:apsp-path
+           #:graph-clustering
+           #:minimum-cut
+           ;; -- flow family (Mode A projection)
+           #:maximum-flow
+           #:bipartite-p
+           #:maximum-matching
+           ;; -- random graph generation (transactional builders)
+           #:generate-graph
+           ;; -- io: import + Graphviz export (optional graph-db/algorithms-io)
+           #:import-gml
+           #:import-pajek
+           #:graph->dot
+           #:visualize
            ))

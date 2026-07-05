@@ -28,6 +28,20 @@
 
 (defvar *cache-enabled* t)
 
+(defparameter *index-backend* :skip-list
+  "DEFAULT ordered-map backend for a NEW graph's heap-backed indexes -- views,
+:unique, and the spatial index: :SKIP-LIST (the original; default) or :BPLUS-TREE
+(mmap B+ tree -- better cold-cache locality, faster reads AND writes, ~2x smaller;
+see docs/bplus-tree-experiment.md).  Both speak the same ordered-map protocol over
+the same (payload . node-id) composite keys, so an index behaves identically on
+either.  This is only the DEFAULT: MAKE-GRAPH / OPEN-GRAPH take an :INDEX-BACKEND
+keyword to choose PER GRAPH (captured in the graph's INDEX-BACKEND slot, which every
+index-creation path consults).  The choice is persisted per index (views: the
+view-alist :BACKEND key; unique + spatial: their root sidecar), so reopening a graph
+uses each index's own written backend -- flipping this never disturbs an existing
+graph (a missing tag => :skip-list).  Set this (or pass :INDEX-BACKEND) from your
+application's own config; graph-db does not read an ini file itself.")
+
 (alexandria:define-constant +db-version+ 1)
 
 (defvar *graph* nil)

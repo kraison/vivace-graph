@@ -163,21 +163,13 @@ once per entry you want the node to contribute (zero, one, or many times)."
                                    :sort-order (cdr (assoc :sort-order view))
                                    :pointer (cdr (assoc :pointer view)))))
                 (if (view-pointer v)
+                    ;; Reopen with the backend the index was written with (:backend
+                    ;; absent on pre-B+-tree graphs -> defaults to :skip-list).
                     (setf (view-skip-list v)
-                          (open-skip-list :address (cdr (assoc :pointer view))
-                                          :heap (indexes graph)
-                                          :duplicates-allowed-p nil
-                                          ;;:key-equal 'view-key-equal
-                                          ;;:key-comparison 'view-less-than
-                                          :key-equal 'reduce-equal
-                                          :key-comparison (if (eql (view-sort-order v) :greaterp)
-                                                              'reduce-comp-greaterp
-                                                              'reduce-comp-lessp)
-                                          :value-equal 'equal
-                                          :key-serializer 'view-key-serialize
-                                          :key-deserializer 'view-key-deserialize
-                                          :value-serializer 'serialize
-                                          :value-deserializer 'deserialize))
+                          (open-heap-index (or (cdr (assoc :backend view)) :skip-list)
+                                           :address (cdr (assoc :pointer view))
+                                           :heap (indexes graph)
+                                           :comparison (view-index-comparison v)))
                     ;;(log:info "~A didn't have a pointer; cannot restore skip list!" v)
                     )
                 (setf (gethash view-name (view-group-table view-group)) v)))))))
@@ -198,6 +190,15 @@ once per entry you want the node to contribute (zero, one, or many times)."
                 (setq view-alist (acons :map-code (view-map-code view) view-alist))
                 (setq view-alist (acons :reduce-code (view-reduce-code view) view-alist))
                 (setq view-alist (acons :pointer (view-pointer view) view-alist))
+                ;; Persist which ordered-map backend this index uses so RESTORE-VIEWS
+                ;; reopens it correctly.  A memory-graph's in-RAM index (and any view
+                ;; without a heap index) has no backend tag -> restore defaults to
+                ;; :skip-list (harmless: memory-graphs rebuild views on open).
+                (setq view-alist
+                      (acons :backend
+                             (let ((sl (view-skip-list view)))
+                               (when (view-index-p sl) (view-index-backend-tag sl)))
+                             view-alist))
                 (setq view-alist (acons :sort-order (view-sort-order view) view-alist))
                 (push view-alist views)))
             (view-group-table view-group))
@@ -215,8 +216,8 @@ once per entry you want the node to contribute (zero, one, or many times)."
         (error "Cannot delete view ~A/~A: view does not exist"
                class-name view-name))
       ;;(log:info "Deleting ~A" view)
-      (when (skip-list-p (view-skip-list view))
-        (delete-skip-list (view-skip-list view)))
+      (when (view-index-p (view-skip-list view))
+        (delete-view-index (view-skip-list view)))
       (remhash view-name (view-group-table
                           (gethash class-name (views graph))))))
   (save-views graph))
@@ -397,6 +398,65 @@ once per entry you want the node to contribute (zero, one, or many times)."
              (push (%sn-value node) values))))
     (values keys values)))
 
+;;; mem-skip-list variants (in-memory backend, #50).  The mem cursor exposes the same
+;;; make-range-cursor / make-cursor / cursor-next / %sn-key / %sn-value protocol as the
+;;; on-disk skip-list, so these are the on-disk methods above verbatim with the specializer
+;;; swapped.  Without them, maintaining a REDUCE (aggregate) view on a memory-graph signals
+;;; "no applicable method for get-non-aggregate-pairs on MEM-SKIP-LIST" -- which is what the
+;;; mine-action app's eo-find rollup views hit during peer-sync.
+(defmethod get-non-aggregate-pairs ((skip-list mem-skip-list) key)
+  (let ((keys nil) (values nil))
+    (let ((cursor (make-range-cursor skip-list
+                                     (list key +null-key+)
+                                     (list key +max-key+))))
+      (loop for node = (cursor-next cursor :eoc)
+         until (eql node :eoc)
+         do
+           (unless (equalp +null-key+ (second (%sn-key node)))
+             (push (first (%sn-key node)) keys)
+             (push (%sn-value node) values))))
+    (values keys values)))
+
+(defmethod get-all-aggregate-pairs ((skip-list mem-skip-list))
+  (let ((keys nil) (values nil))
+    (let ((cursor (make-cursor skip-list)))
+      (loop for node = (cursor-next cursor :eoc)
+         until (eql node :eoc)
+         do
+           (when (equalp +null-key+ (second (%sn-key node)))
+             (push (first (%sn-key node)) keys)
+             (push (%sn-value node) values))))
+    (values keys values)))
+
+;;; bplus-tree variants (the B+ tree ordered-map backend).  The B+ tree cursor
+;;; exposes the SAME make-range-cursor / make-cursor / cursor-next / %sn-key /
+;;; %sn-value protocol, so these are the on-disk skip-list methods above verbatim
+;;; with the specializer swapped -- needed so a REDUCE (aggregate) view maintained
+;;; on a B+ tree-backed graph can roll up its aggregates.
+(defmethod get-non-aggregate-pairs ((skip-list bplus-tree) key)
+  (let ((keys nil) (values nil))
+    (let ((cursor (make-range-cursor skip-list
+                                     (list key +null-key+)
+                                     (list key +max-key+))))
+      (loop for node = (cursor-next cursor :eoc)
+         until (eql node :eoc)
+         do
+           (unless (equalp +null-key+ (second (%sn-key node)))
+             (push (first (%sn-key node)) keys)
+             (push (%sn-value node) values))))
+    (values keys values)))
+
+(defmethod get-all-aggregate-pairs ((skip-list bplus-tree))
+  (let ((keys nil) (values nil))
+    (let ((cursor (make-cursor skip-list)))
+      (loop for node = (cursor-next cursor :eoc)
+         until (eql node :eoc)
+         do
+           (when (equalp +null-key+ (second (%sn-key node)))
+             (push (first (%sn-key node)) keys)
+             (push (%sn-value node) values))))
+    (values keys values)))
+
 (defmethod remove-from-view ((graph graph) (view view) (node node))
   "Remove node from view."
   (compile-view-code view)
@@ -484,6 +544,23 @@ once per entry you want the node to contribute (zero, one, or many times)."
 (defun view-less-than (key1 key2)
   (less-than (first key1) (first key2)))
 
+;; *INDEX-BACKEND*, MAKE-HEAP-INDEX and OPEN-HEAP-INDEX live in bplus-tree.lisp
+;; (loaded before spatial-index.lisp and this file) so views, :unique, and spatial
+;; all share one create/open.
+
+(defun view-index-comparison (view)
+  (if (eql :greaterp (view-sort-order view))
+      'reduce-comp-greaterp 'reduce-comp-lessp))
+
+(defgeneric make-view-skip-list (graph view)
+  (:documentation "Create the ordered map backing VIEW.  A normal graph uses a
+heap-backed index -- a skip list or (when *INDEX-BACKEND* is :BPLUS-TREE) a
+B+ tree, persisted via VIEW-POINTER; a memory-graph overrides this to return an
+in-RAM mem-skip-list.")
+  (:method ((graph graph) view)
+    (make-heap-index (graph-index-backend graph) (indexes graph)
+                     (view-index-comparison view))))
+
 (defmethod regenerate-view ((graph graph) (class-name symbol) (view-name symbol))
   "Regenerate this view's index"
   (with-write-locked-view-group (class-name graph)
@@ -492,35 +569,17 @@ once per entry you want the node to contribute (zero, one, or many times)."
         (error 'invalid-view-error
                :class-name class-name
                :view-name view-name))
-      ;; First, if exists, delete skip list
-      (when (skip-list-p (view-skip-list view))
-        (delete-skip-list (view-skip-list view)))
-      ;; Then, create a new skip list
-      (let ((sl (make-skip-list
-                 :heap (indexes graph)
-                 :duplicates-allowed-p nil
-                 ;;:key-equal 'view-key-equal
-                 ;;:key-comparison 'view-less-than
-                 :key-equal 'reduce-equal
-                 :key-comparison (if (eql :greaterp (view-sort-order view))
-                                     'reduce-comp-greaterp
-                                     'reduce-comp-lessp)
-                 :head-key (if (eql :greaterp (view-sort-order view))
-                               (list +max-sentinel+ +max-key+)
-                               (list +min-sentinel+ +null-key+))
-                 :head-value nil
-                 :tail-key (if (eql :greaterp (view-sort-order view))
-                               (list +min-sentinel+ +null-key+)
-                               (list +max-sentinel+ +max-key+))
-                 :tail-value nil
-                 :value-equal 'equal
-                 :key-serializer 'view-key-serialize
-                 :key-deserializer 'view-key-deserialize
-                 :value-serializer 'serialize
-                 :value-deserializer 'deserialize)))
-        (setf (view-skip-list view) sl
-              (view-pointer view) (%sl-address sl)
-              (view-heap view) (indexes graph)))
+      ;; First, if exists, delete the old index (skip list or B+ tree)
+      (when (view-index-p (view-skip-list view))
+        (delete-view-index (view-skip-list view)))
+      ;; Then, create a new index.  MAKE-VIEW-SKIP-LIST dispatches: a heap-backed
+      ;; skip-list or B+ tree for a normal graph (persisted via VIEW-POINTER), an
+      ;; in-RAM mem-skip-list for a memory-graph (no pointer / heap).
+      (let ((sl (make-view-skip-list graph view)))
+        (setf (view-skip-list view) sl)
+        (when (view-index-p sl)
+          (setf (view-pointer view) (view-index-address sl)
+                (view-heap view) (indexes graph))))
       (save-views graph)
       (cond ((subtypep class-name 'vertex)
              (map-vertices (lambda (vertex)
@@ -553,7 +612,15 @@ high-level lookup."
   (if (lookup-view-group class-name graph)
       (let ((thunk
              (lambda ()
-               (let ((view (lookup-view graph class-name view-name)))
+               ;; Resolve nodes (the view's LOOKUP-FN -> LOOKUP-<type> -> LOOKUP-VERTEX)
+               ;; from the GRAPH being queried, not the ambient *GRAPH*.  Otherwise
+               ;; MAP-VIEW/INVOKE-GRAPH-VIEW with an explicit :GRAPH reads the index
+               ;; from that graph but resolves node ids against *GRAPH* -- so querying
+               ;; any graph that is not the current *GRAPH* (e.g. right after a reopen,
+               ;; or a second graph) looks the node up in the wrong (or a closed) graph
+               ;; and hits (VERTEX-TABLE NIL) -> no-applicable-method on LOOKUP-NODE.
+               (let ((*graph* graph))
+                 (let ((view (lookup-view graph class-name view-name)))
                  (unless view
                    (error 'invalid-view-error
                           :class-name class-name
@@ -579,39 +646,39 @@ high-level lookup."
                                                        (list (cond (key key)
                                                                    (start-key start-key)
                                                                    (t start-sentinel))
-                                                      start-id)
-                                                (list (cond (key key)
-                                                            (end-key end-key)
-                                                            (t end-sentinel))
-                                                      end-id))))
-                 (result nil) (found-count 0) (cursor-count 0))
-            (loop
-               for node = (cursor-next cursor)
-               until (or (null node) (and count (= found-count count)))
-               do
-               ;;(log:debug "~S" node)
-                 ;; Count VISIBLE (non-deleted) entries for paging, then SKIP the
-                 ;; first SKIP of them.  cursor-count must advance per visible
-                 ;; entry -- previously it was incremented only inside the skip
-                 ;; guard, so (> 0 skip) was never true and :skip dropped every
-                 ;; result.
-                 (let ((pnode (funcall lookup-fn (second (%sn-key node)))))
-                   (unless (or include-deleted-p (null pnode) (deleted-p pnode))
-                     (incf cursor-count)
-                     (when (or (null skip) (> cursor-count skip))
-                       (incf found-count)
-                       (if collect-p
-                           (push (funcall fn
-                                          (first (%sn-key node))
-                                          (second (%sn-key node))
-                                          (%sn-value node))
-                                 result)
-                           (funcall fn
-                                    (first (%sn-key node))
-                                    (second (%sn-key node))
-                                    (%sn-value node)))))))
-            (when collect-p
-              (values (nreverse result) found-count)))))))
+                                                             start-id)
+                                                       (list (cond (key key)
+                                                                   (end-key end-key)
+                                                                   (t end-sentinel))
+                                                             end-id))))
+                        (result nil) (found-count 0) (cursor-count 0))
+                   (loop
+                      for node = (cursor-next cursor)
+                      until (or (null node) (and count (= found-count count)))
+                      do
+                      ;;(log:debug "~S" node)
+                        ;; Count VISIBLE (non-deleted) entries for paging, then SKIP the
+                        ;; first SKIP of them.  cursor-count must advance per visible
+                        ;; entry -- previously it was incremented only inside the skip
+                        ;; guard, so (> 0 skip) was never true and :skip dropped every
+                        ;; result.
+                        (let ((pnode (funcall lookup-fn (second (%sn-key node)))))
+                          (unless (or include-deleted-p (null pnode) (deleted-p pnode))
+                            (incf cursor-count)
+                            (when (or (null skip) (> cursor-count skip))
+                              (incf found-count)
+                              (if collect-p
+                                  (push (funcall fn
+                                                 (first (%sn-key node))
+                                                 (second (%sn-key node))
+                                                 (%sn-value node))
+                                        result)
+                                  (funcall fn
+                                           (first (%sn-key node))
+                                           (second (%sn-key node))
+                                           (%sn-value node)))))))
+                   (when collect-p
+                     (values (nreverse result) found-count))))))))
         (if write-p
             (with-write-locked-view-group (class-name graph)
               (funcall thunk))
@@ -715,7 +782,7 @@ not exist."
                                        :start-key start-key
                                        :end-key end-key
                                        :skip skip :count count
-                                       :collect-p t))
+                                       :collect-p t :graph graph))
                     (t
                      (let ((node (find-in-skip-list (view-skip-list view)
                                                     (list +reduce-master-key+
@@ -747,47 +814,144 @@ not exist."
   (let ((*package* (find-package :keyword)))
     (format nil "~S" expression)))
 
-(defmacro def-view (name sort-order parents &body body)
-  "Define a view (a secondary index) named NAME over a node type.
+;;; ---------------------------------------------------------------------------
+;;; Declarative, idempotent view definition (issue #49).
+;;;
+;;; DEF-VIEW mirrors the schema two-phase pattern that DEF-VERTEX/DEF-EDGE use
+;;; (see DEF-NODE-TYPE / UPDATE-SCHEMA in schema.lisp):
+;;;
+;;;   Phase 1 -- DEF-VIEW registers a VIEW-SPEC in *SCHEMA-VIEW-METADATA* (no open
+;;;     graph required) and, if the graph is already open, reconciles it now.
+;;;   Phase 2 -- INSTALL-VIEWS, called at open right after RESTORE-VIEWS, walks the
+;;;     registry and reconciles each spec against the restored view.
+;;;
+;;; Reconciliation keeps an already-persisted index whose definition is unchanged
+;;; (an O(1) restart -- RESTORE-VIEWS already reopened its skip-list), rebuilds one
+;;; whose :MAP/:REDUCE/sort-order changed (with a LOG:WARN), and builds a brand-new
+;;; one.  This replaces the old DEF-VIEW, which required an open graph and rebuilt
+;;; the index unconditionally on every load.
+;;; ---------------------------------------------------------------------------
 
-PARENTS is (CLASS-NAME GRAPH-NAME).  SORT-ORDER is the key comparator, e.g.
-:LESSP or :GREATERP.  BODY holds a (:MAP lambda) and optionally a (:REDUCE
-lambda):
+(defvar *schema-view-metadata* (make-hash-table)
+  "graph-name (symbol) -> list of VIEW-SPECs (newest pushed on the front): the
+declarative registry DEF-VIEW writes and INSTALL-VIEWS reconciles at open.")
+
+(defstruct (view-spec (:constructor make-view-spec))
+  name class-name graph-name lookup-fn map-code reduce-code (sort-order :lessp))
+
+(defun register-view-spec (spec)
+  "Phase 1: record SPEC in the registry.  Duplicates accumulate (like the schema
+registry); INSTALL-VIEWS resolves them newest-wins."
+  (push spec (gethash (view-spec-graph-name spec) *schema-view-metadata*))
+  spec)
+
+(defun view-spec-unchanged-p (spec view)
+  "True when the restored VIEW already matches SPEC -- same :MAP/:REDUCE code and
+sort order -- so its persisted index can be kept as-is.  The map/reduce code is
+stored keyword-package-printed, so STRING= is an exact comparison."
+  (and (equal (view-spec-map-code spec) (view-map-code view))
+       (equal (view-spec-reduce-code spec) (view-reduce-code view))
+       (eql (view-spec-sort-order spec) (view-sort-order view))))
+
+(defun %spec->view (spec graph)
+  (make-view :name (view-spec-name spec)
+             :class-name (view-spec-class-name spec)
+             :graph-name (view-spec-graph-name spec)
+             :lookup-fn (view-spec-lookup-fn spec)
+             :heap (indexes graph)
+             :map-code (view-spec-map-code spec)
+             :reduce-code (view-spec-reduce-code spec)
+             :map-fn nil :reduce-fn nil
+             :sort-order (view-spec-sort-order spec)))
+
+(defmethod install-view ((spec view-spec) (graph graph))
+  "Phase-2 reconcile of one registered view SPEC against GRAPH (issue #49): KEEP an
+already-persisted index whose definition is unchanged (O(1)); REBUILD it -- with a
+LOG:WARN -- when the :MAP/:REDUCE/sort-order changed; BUILD it when the view is new
+or has no persisted index.  REGENERATE-VIEW dispatches to the on-disk or in-RAM
+skip-list via MAKE-VIEW-SKIP-LIST, so this is backend-agnostic.  Returns the view."
+  (let ((class-name (view-spec-class-name spec))
+        (view-name (view-spec-name spec))
+        (graph-name (view-spec-graph-name spec)))
+    ;; Ensure the view-group exists (creates it on this class's first view), so
+    ;; WITH-WRITE-LOCKED-VIEW-GROUP has a group to lock.
+    (get-view-table-for-class graph class-name)
+    (with-write-locked-view-group (class-name graph)
+      (let* ((table (view-group-table (lookup-view-group class-name graph)))
+             (existing (gethash view-name table)))
+        (cond
+          ;; KEEP: a live, persisted index whose definition is unchanged -> O(1).
+          ;; RESTORE-VIEWS already reopened the skip-list; the view self-compiles
+          ;; its map/reduce fns on the next maintenance op, so there is nothing to do.
+          ((and existing (view-skip-list existing) (view-spec-unchanged-p spec existing))
+           existing)
+          ;; REBUILD: the definition changed -- adopt the new code and rescan.
+          (existing
+           (log:warn "def-view ~S of ~S in ~S changed since last load; regenerating its index."
+                     view-name class-name graph-name)
+           (setf (view-map-code existing) (view-spec-map-code spec)
+                 (view-reduce-code existing) (view-spec-reduce-code spec)
+                 (view-sort-order existing) (view-spec-sort-order spec)
+                 (view-lookup-fn existing) (view-spec-lookup-fn spec)
+                 (view-map-fn existing) nil
+                 (view-reduce-fn existing) nil)
+           (regenerate-view graph class-name view-name))
+          ;; BUILD: a brand-new view (or one whose index did not persist).
+          (t
+           (setf (gethash view-name table) (%spec->view spec graph))
+           (save-views graph)
+           (regenerate-view graph class-name view-name)))))))
+
+(defmethod install-views ((graph graph))
+  "Phase 2 (issue #49; mirror of UPDATE-SCHEMA): reconcile every VIEW-SPEC
+registered for GRAPH against its restored views.  Called at open right after
+RESTORE-VIEWS, so the node types the views scan are already instantiated (a
+regenerate does MAP-VERTICES/-EDGES + SUBTYPEP on the class).  De-dupes the
+push-registry by (class . name), newest-wins."
+  (let ((seen (make-hash-table :test 'equal)))
+    (dolist (spec (gethash (graph-name graph) *schema-view-metadata*))
+      (let ((key (cons (view-spec-class-name spec) (view-spec-name spec))))
+        (unless (gethash key seen)
+          (setf (gethash key seen) t)
+          (install-view spec graph))))))
+
+(defmacro def-view (name sort-order parents &body body)
+  "Define a view (a secondary index) named NAME over a node type.  Declarative and
+idempotent (issue #49): like DEF-VERTEX/DEF-EDGE, it registers a spec and reconciles
+against the graph, rebuilding the index ONLY when the definition actually changed.
+
+PARENTS is (CLASS-NAME GRAPH-NAME).  SORT-ORDER is the key comparator, e.g. :LESSP
+or :GREATERP.  BODY holds a (:MAP lambda) and optionally a (:REDUCE lambda):
   - the :MAP lambda receives a node and calls YIELD to emit key/value entries;
   - the optional :REDUCE lambda receives (keys values) and aggregates them,
     making this a map-reduce view.
 
-The graph named GRAPH-NAME must already exist when DEF-VIEW runs (define views
-after MAKE-GRAPH/OPEN-GRAPH).  Once defined, the view is maintained
-incrementally as matching nodes are saved.  Query it with INVOKE-GRAPH-VIEW,
-MAP-VIEW, or MAP-REDUCED-VIEW.  Example:
+The graph need NOT be open when DEF-VIEW runs -- a view may be co-located with its
+DEF-VERTEX/DEF-EDGE and loaded before OPEN-GRAPH, which reconciles it at open time.
+If the graph IS already open (the classic MAKE-GRAPH -> DEF-VIEW ordering), the view
+is reconciled immediately.  Re-evaluating an UNCHANGED DEF-VIEW (or restarting) does
+NOT rebuild the persisted index -- restart is O(1); changing the :MAP/:REDUCE/sort
+order rebuilds it and emits a LOG:WARN.  Force a rebuild with REGENERATE-VIEW (one
+view), REGENERATE-ALL-VIEWS, or OPEN-GRAPH's :REGENERATE-VIEWS T.
+
+Once defined, the view is maintained incrementally as matching nodes are saved.
+Query it with INVOKE-GRAPH-VIEW, MAP-VIEW, or MAP-REDUCED-VIEW.  Example:
   (def-view user-by-username :lessp (user :social-app)
     (:map (lambda (u) (when (username u) (yield (username u) nil)))))"
-  (with-gensyms (view-name class-name graph-name graph lookup-fn view-sort-order)
-    (let ((map-code (cadr (assoc :map body)))
-          (reduce-code (cadr (assoc :reduce body))))
-      `(let* ((,view-name ',name)
-              (,class-name ',(first parents))
-              (,graph-name ',(second parents))
-              (,graph (or (lookup-graph ,graph-name)
-                          (error "Unknown graph ~S" ,graph-name)))
-              (,lookup-fn ',(intern (format nil "LOOKUP-~A" (first parents))))
-              (,view-sort-order ',sort-order)
-              (view (make-view :name ,view-name
-                               :class-name ,class-name
-                               :graph-name ,graph-name
-                               :lookup-fn ,lookup-fn
-                               :heap (indexes ,graph)
-                               :map-code ,(fully-qualified-expression-string map-code)
-                               :reduce-code ,(when reduce-code
-						   (fully-qualified-expression-string reduce-code))
-                               :map-fn nil
-                               :sort-order ,view-sort-order
-                               :reduce-fn nil)))
-         (log:info "MAKING ~S" view)
-         (let* ((table (get-view-table-for-class ,graph-name ,class-name)))
-           (with-write-locked-view-group (,class-name ,graph-name)
-             (setf (gethash ,view-name table) view)
-             (save-views ,graph)
-             (regenerate-view ,graph ,class-name ,view-name)
-             ))))))
+  (let ((map-code (cadr (assoc :map body)))
+        (reduce-code (cadr (assoc :reduce body))))
+    `(let ((spec (make-view-spec
+                  :name ',name
+                  :class-name ',(first parents)
+                  :graph-name ',(second parents)
+                  :lookup-fn ',(intern (format nil "LOOKUP-~A" (first parents)))
+                  :map-code ,(fully-qualified-expression-string map-code)
+                  :reduce-code ,(when reduce-code
+                                  (fully-qualified-expression-string reduce-code))
+                  :sort-order ',sort-order)))
+       (register-view-spec spec)
+       ;; Reconcile now if the graph is already open; otherwise INSTALL-VIEWS does it
+       ;; at open (a view can thus be defined before its graph exists).
+       (let ((g (lookup-graph ',(second parents))))
+         (when g (install-view spec g)))
+       spec)))

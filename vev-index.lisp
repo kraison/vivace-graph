@@ -88,7 +88,7 @@
   (cache (make-vev-cache)))
 
 (defmethod serialize-vev-key-mmap ((mf mapped-file) (vev-key vev-key)
-                                  (offset integer))
+                                   (offset integer))
   (declare (type word offset))
   (dotimes (i 16)
     (set-byte mf offset (aref (vev-key-out-id vev-key) i))

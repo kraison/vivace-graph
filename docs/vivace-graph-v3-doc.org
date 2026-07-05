@@ -32,8 +32,8 @@ VivaceGraph is a persistent graph database designed from the ground up in Common
 
 At its heart, VivaceGraph is built on several key architectural pillars:
 
-  - *Persistent On-Disk Storage*
-    Unlike in-memory databases, VivaceGraph stores all data directly on disk using memory-mapped files (see ~mmap.lisp~ and ~allocator.lisp~). This allows it to handle graphs that are much larger than the available system RAM and ensures that your data is durable between application restarts.
+  - *Persistent On-Disk Storage (with an in-memory option)*
+    By default VivaceGraph stores all data directly on disk using memory-mapped files (see ~mmap.lisp~ and ~allocator.lisp~), so it can handle graphs much larger than system RAM while keeping your data durable between restarts. For graphs that fit in memory — and for mobile/ECL deployments where read latency matters most — an optional *in-memory backend* (~make-memory-graph~) instead keeps the graph as live Lisp objects, trading that scalability for the fastest possible reads. Both share the same schema, transactions, and query surface. See Chapter 15.
 
   - *An Object-Oriented Lisp Environment*
     Vertices and edges in your graph are not just abstract data containers; they are first-class CLOS (Common Lisp Object System) objects. You define your graph's structure by creating Lisp classes with standard slots, inheritance, and methods (see ~node-class.lisp~).
@@ -45,10 +45,13 @@ At its heart, VivaceGraph is built on several key architectural pillars:
     Data is retrieved from the graph using a powerful, Prolog-like query language embedded directly in Lisp. This allows you to express complex graph traversals and pattern-matching queries in a clean, declarative style (see ~prologc.lisp~ and the ~select~ macro).
 
   - *High-Performance Indexing via Views*
-    For fast lookups on node properties, VivaceGraph uses a concept called "views". A view is a secondary index (implemented as a persistent skip-list) that you can define on any vertex or edge property, dramatically speeding up queries that don't start with a known node ID (see ~views.lisp~).
+    For fast lookups on node properties, VivaceGraph uses a concept called "views". A view is a secondary index (a persistent ordered index — a skip list by default, or a B+ tree; see Chapter 3) that you can define on any vertex or edge property, dramatically speeding up queries that don't start with a known node ID (see ~views.lisp~).
 
   - *Built for Concurrency*
     The database is designed for multi-threaded access, with a fine-grained locking system to manage concurrent reads and writes safely (see ~rw-lock.lisp~).
+
+  - *Replication and Offline-First Sync*
+    VivaceGraph offers two replication modes. Classic *master-slave* replication (Chapter 10) streams the whole database to always-connected, read-only replicas for high availability and read scaling. *Peer replication* (Chapter 16) is a bidirectional, offline-first hub-and-spoke mode for intermittently connected fleets — each device syncs only the authorized subset it is cleared to see, and can author changes locally while disconnected.
 
 *** Core Philosophy: Graphs as Lisp Objects
 
@@ -401,6 +404,48 @@ For these primary node tables, the *key* is the node's 16-byte UUID, and the *va
 
 The first 15 bytes are byte-for-byte identical to the original (v1) head; ~commit-epoch~ and ~prev-pointer~ were *appended*, which is what makes the v1→v2 migration a simple matter (see Chapter 12, "MVCC: Immutable Versioned Nodes"). ~data-pointer~ is the all-important offset to the node's data in the heap file; ~commit-epoch~ and ~prev-pointer~ drive the versioning machinery described in that chapter. The on-disk storage version is recorded in each memory-mapped region; opening a v1 graph with a v2 build signals an error directing you to ~migrate-graph~.
 
+*** Ordered indexes and pluggable backends (~indexes.dat~)
+
+Beyond the primary UUID→head tables, VivaceGraph maintains *secondary ordered indexes* — the map/reduce *views* (Chapter 8), ~:unique~ *constraints* (Chapter 8), and the *spatial* index (Chapter 13). These all live in the graph's index region (~indexes.dat~) and are built on a single ordered-map abstraction: an on-disk structure that keeps keys in sorted order and supports point lookup, ordered range scans, insert, update and delete.
+
+Two interchangeable *backends* implement that abstraction:
+
+- *Skip list* (~skip-list.lisp~) — the default. A probabilistic ordered structure with O(log n) expected operations and simple, lock-friendly concurrency; range scans walk the bottom-level linked list.
+- *B+ tree* (~bplus-tree.lisp~) — a page-oriented alternative (4 KB slotted pages). On disk it beats the skip list on every operation once warm: keys are packed by the page, so a lookup touches far fewer cache lines and disk pages, range scans are sequential within a leaf, and it uses less space. It supports in-place cell edits and merge-on-delete rebalancing.
+
+Both implement the same internal ordered-map protocol, so views, unique indexes and the spatial index are all *backend-agnostic* — the choice is transparent to your application code.
+
+**Choosing a backend.** The backend is a *per-graph* property.
+
+#+BEGIN_SRC lisp
+  ;; Global default for graphs that don't specify one (default :skip-list):
+  (setf graph-db:*index-backend* :bplus-tree)
+
+  ;; Or per graph, at creation / open time:
+  (make-graph :my-app "/var/tmp/my-app/" :index-backend :bplus-tree)
+  (open-graph :my-app "/var/tmp/my-app/" :index-backend :bplus-tree)
+#+END_SRC
+
+VivaceGraph does *not* read a configuration file for this — set the global ~*index-backend*~ or pass ~:index-backend~ from your own application's configuration. The value is captured in the graph's ~index-backend~ slot (~graph-index-backend~).
+
+**How it is persisted.** Each index records the backend it was written with (views keep a ~:backend~ key in the view metadata; the unique and spatial indexes keep a tag in their on-disk root sidecar). On ~open-graph~, every existing index is reopened with *its own* recorded backend — regardless of the ~:index-backend~ you pass. The ~:index-backend~ argument therefore governs only *new* indexes created afterward. This is exactly what lets one graph safely hold indexes on different backends while you migrate between them.
+
+**Migrating an existing graph from skip lists to B+ trees.** Because the secondary indexes are *derived* from the nodes — they can always be rebuilt from the primary tables — switching backends never touches your data; it only rebuilds the index structures.
+
+The recommended path is an *in-place reindex*: reopen the graph on the new backend and rebuild the three index families, which re-persists each index's backend tag.
+
+#+BEGIN_SRC lisp
+  (let ((g (open-graph :my-app "/var/tmp/my-app/" :index-backend :bplus-tree)))
+    (regenerate-all-views g)          ; map/reduce views
+    (regenerate-unique-indexes g)     ; :unique constraints
+    (rebuild-spatial-index g)         ; spatial index
+    (close-graph g))                  ; persists the new backend tags
+#+END_SRC
+
+Each ~regenerate-*~ / ~rebuild-*~ drops the old on-disk index and rebuilds it by scanning the nodes (via the backend-agnostic ~map-vertices~ / ~map-edges~) on the graph's *current* backend, then persists the new tag; a subsequent plain ~open-graph~ then reopens on B+ trees. Your node data is left in place throughout. (Omit any family your schema doesn't use.)
+
+A logical *snapshot + replay into a fresh graph* also works and rebuilds every index on the target's backend (see Chapter 11, "Backup and Recovery"): snapshot the source, ~make-graph~ the target with ~:index-backend :bplus-tree~, adopt the source schema, and ~replay~. For a pure backend switch the in-place reindex above is simpler — one graph, node data untouched — but snapshot/replay is a sound alternative and the right tool when you also want a clean, defragmented copy.
+
 *** Durability and the Dirty File (~graph.lisp~)
 
 How can VivaceGraph ensure it wasn't terminated abruptly, leaving the database in an inconsistent state? It uses a simple but effective mechanism: the "dirty file."
@@ -412,6 +457,10 @@ How can VivaceGraph ensure it wasn't terminated abruptly, leaving the database i
   - If the file *is* present, it means the application crashed or was killed before ~close-graph~ could complete. The database is potentially in an inconsistent state, and ~open-graph~ will signal an error, refusing to open and instructing the user to run recovery procedures.
 
 This mechanism prevents the use of a potentially corrupted database, safeguarding your data integrity.
+
+*** An alternative: the in-memory backend
+
+Everything above describes the *on-disk* storage engine, VivaceGraph's default. For graphs that fit in RAM — and especially for mobile/ECL deployments where per-read deserialization is costly — VivaceGraph also ships an *in-memory* backend that holds the graph as live Lisp objects, constructed with ~make-memory-graph~ instead of ~make-graph~. It reuses the same journal for durability (plus a checkpoint image) but replaces the heap and linear-hash tables with in-RAM structures. See Chapter 15.
 
 
 ** Chapter 4: The Object Model
@@ -947,7 +996,7 @@ A view in VivaceGraph is like creating a new, specialized card catalog for your 
 
 When you later query for a user by name, VivaceGraph can consult this sorted list (the view's index) to find the answer instantly, without having to scan all the user nodes.
 
-Under the hood, VivaceGraph implements these view indexes using a persistent, on-disk *skip-list* data structure (see ~skip-list.lisp~), which provides very fast lookups, insertions, and deletions, making it perfect for maintaining real-time indexes.
+Under the hood, VivaceGraph implements these view indexes as persistent, on-disk *ordered indexes* — a *skip list* (~skip-list.lisp~) by default, or a *B+ tree* (~bplus-tree.lisp~) if the graph selects that backend (see Chapter 3, "Ordered indexes and pluggable backends"). Either provides very fast lookups, insertions, and deletions, making it perfect for maintaining real-time indexes.
 
 *** Defining Map-Only Views (~def-view~ with ~:map~) for Secondary Indexes
 
@@ -999,6 +1048,22 @@ Let's create two essential indexes for our social application.
 #+END_SRC
 
 That's it! VivaceGraph will now automatically maintain these indexes. When you create a new user, an entry will be added to the `user-by-username` view. If you update a user's name, the view will be automatically updated to reflect the change.
+
+**** Declarative and Idempotent: Restarts are O(1)
+
+~def-view~ is *declarative and idempotent*, exactly like ~def-vertex~ and ~def-edge~.  You can keep your ~def-view~ forms right next to the ~def-vertex~ forms they index and load them once at application startup; you do not have to guard them or re-run them conditionally.
+
+- *Define before or after the graph is open.*  A ~def-view~ registers the view's specification and reconciles it with the graph.  If the graph is already open (the classic ~make-graph~ → ~def-view~ ordering) it reconciles immediately; if not, ~open-graph~ reconciles every registered view at open time.  So a view may be co-located with its node type and loaded before the graph exists.
+
+- *An unchanged view is never rebuilt.*  The view's on-disk index is persistent and is reopened at open time (~restore-views~).  Re-evaluating an unchanged ~def-view~ form — or simply restarting the application — leaves that index untouched: the restart is O(1), not an O(N) re-scan of every node.  This matters enormously for applications that define all their views on every load.
+
+- *A changed view is rebuilt automatically.*  If you change a view's ~:map~/~:reduce~ code or its sort order, the next reconcile detects the difference, rebuilds the index from scratch, and emits a ~log:warn~.  This is the safe default: serving queries from an index built by an *old* ~:map~ lambda would be a subtle, hard-to-find bug.
+
+- *Forcing a rebuild.*  Use ~regenerate-view~ to force one view, ~regenerate-all-views~ to force all of them, or pass ~:regenerate-views t~ to ~open-graph~ (or ~open-memory-graph~) to rebuild everything at open.
+
+- *Removing a view.*  Deleting a ~def-view~ form does not drop the persisted index (just as deleting a ~def-vertex~ form does not drop the persisted type).  Call ~delete-view~ to remove it explicitly.
+
+These semantics apply uniformly to the on-disk and in-memory backends (see the In-Memory Backend chapter): for a memory-graph the index lives in RAM and is restored from the checkpoint image, but the "unchanged → keep, changed → rebuild" reconcile is identical.
 
 *** Defining Map-Reduce Views for Aggregation
 
@@ -1097,6 +1162,54 @@ You can also use ~invoke-graph-view~ on a reduce view by passing the `:group-p t
 #+END_SRC
 
 Views are the cornerstone of building high-performance VivaceGraph applications. They provide a flexible and powerful mechanism for both secondary indexing and real-time data aggregation.
+
+*** Unique constraints (~:unique~)
+
+A slot can carry a *uniqueness constraint*: no two live nodes of the same type may share its value. Mark the slot ~:unique~ in ~def-vertex~ / ~def-edge~:
+
+#+BEGIN_SRC lisp
+  (def-vertex user ()
+    ((username :type string :unique t)                 ; identity uniqueness
+     (email    :type string :unique string-downcase))  ; case-insensitive
+    :social-app)
+#+END_SRC
+
+The value of ~:unique~ is the *uniqueness key* — it says how two values are compared:
+
+- ~t~ or ~equal~ — the value itself (identity).
+- ~equalp~ — case/relaxed equality.
+- a *canonicalizer* — a symbol, ~#'function~, or ~lambda~ of one argument that maps a value to its canonical form; two values collide when their canonical forms are ~equal~. ~string-downcase~ above makes ~"Bob@x.com"~ and ~"bob@x.com"~ the same email.
+
+Semantics:
+
+- *NULL-exempt* — a node whose unique slot is ~nil~/unbound is unconstrained (many are allowed), matching SQL's treatment of NULL.
+- *Cross-subtype* — a constraint declared on a parent type is shared across its subclasses (one index), so a ~user~ and an ~admin~ subclass cannot collide on the same value.
+- *Enforced at the commit boundary* — the check runs inside the committing transaction, so a violation aborts the whole transaction cleanly (nothing is written) by signalling ~unique-constraint-violation~. Concurrent commits racing for the same value are serialized, so exactly one wins and the rest are rejected.
+- *Durable* — the constraint is backed by a *persistent* unique index (an on-disk ordered index — skip list by default, or a B+ tree; see Chapter 3, "Ordered indexes and pluggable backends" — or the in-RAM map on a memory-graph), reopened with the graph; it is not rebuilt by scanning every node on open.
+
+Handle a violation like any other condition (readers ~ucv-class-name~, ~ucv-slot-name~, ~ucv-value~, ~ucv-existing-id~):
+
+#+BEGIN_SRC lisp
+  (handler-case
+      (with-transaction () (make-user :username "alice"))
+    (unique-constraint-violation (c)
+      (format t "~A is already taken by node ~A~%"
+              (ucv-value c) (ucv-existing-id c))))
+#+END_SRC
+
+**** Scope: uniqueness under peer replication
+
+By default a constraint is ~:scope :local~ — the value is unique within *this* graph. Global uniqueness across a whole fleet is not a coordination-free property, so peer replication (Chapter 16) offers a second scope for VivaceGraph-minted values:
+
+#+BEGIN_SRC lisp
+  (def-vertex ticket ()
+    ((code :type string :unique t :scope :origin))   ; unique *per authoring device*
+    :field-app)
+#+END_SRC
+
+~:scope :origin~ *partitions* the constraint by the node's authoring origin: two devices may each mint a ~code~ of ~"A-1"~ without colliding (they are different authors), while a single device may not reuse its own. This is the recommended default for offline-first fleets — it needs no coordination. Devices also maintain the constraint index for *pulled* nodes, so a locally-authored value is checked against everything the device holds, not only what it authored. On a non-peer graph there is a single origin, so ~:origin~ collapses to ~:local~.
+
+Truly global uniqueness — a value that must be unique across *all* devices (~:scope :local~, or a future ~:scope :hub~, in a peer setting) — requires the hub to arbitrate cross-device collisions. That arbiter is not yet built (tracked as issue #51); until then, prefer ~:origin~ for peer-replicated unique values.
 
 * Part IV: Advanced Topics & API
 
@@ -1325,6 +1438,10 @@ The communication protocol between master and slave is designed for efficiency a
 3.  *Real-Time Replication:* Once the slave is fully caught up with the historical logs, the master keeps the connection open. Whenever a new transaction is committed on the master, the `replicate-transaction` method is called, which immediately broadcasts the serialized transaction packet to all connected slaves.
 
 4.  *Reconnection:* The connection between master and slave can be interrupted at any time (e.g., due to a network partition). The slave is designed to handle this gracefully. Upon detecting a disconnection, it will automatically enter a retry loop, attempting to reconnect to the master with an exponential backoff. Once reconnected, the handshake process starts over, and the slave will request all transactions it missed while it was disconnected, ensuring it eventually regains full consistency with the master.
+
+*** Beyond master-slave: peer replication
+
+Master-slave suits always-connected, read-only replicas that mirror the *whole* master. For an offline-first fleet — intermittently connected devices that each hold only an *authorized subset* of the data and must *author* changes locally — VivaceGraph provides a separate, bidirectional *peer replication* mode built on the same durable change feed. See Chapter 16.
 
 
 ** Chapter 11: Backup and Recovery
@@ -1612,7 +1729,7 @@ Two read styles are provided, both refining the index's candidates with exact ge
 
 *** Under the hood, and a few caveats
 
-- *The index* is a skip list (in the graph's index region, ~indexes.dat~) keyed by fixed-precision *geohash* strings; each node id is stored under every grid cell its geometry occupies (duplicates allowed). A query computes the set of same-precision cells its window covers and looks each one up directly, so it touches only the cells in view. The grid precision is set with ~make-graph~'s ~:spatial-precision~ keyword (default 7, ≈150 m cells; 9 ≈ 5 m); it is persisted with the index and read back by ~open-graph~.
+- *The index* is an ordered index (in the graph's index region, ~indexes.dat~) — a skip list by default, or a B+ tree if the graph's ~:index-backend~ selects one (see Chapter 3) — keyed by the composite ~(geohash-cell . node-id)~: a node's id is entered under every fixed-precision grid cell its geometry occupies. Folding the id into the key keeps the index *duplicate-free*, so insert and — especially — *remove* are O(log n) (an older duplicate-cell layout made removal O(n)). A query covers its window with as few, possibly coarser, cells as it can and does one *prefix range scan* per covering cell — geohash keys are prefix-nested, so every finer cell within a coarse one sorts inside its range — touching only the cells in view. The grid precision is set with ~make-graph~'s ~:spatial-precision~ keyword (default 7, ≈150 m cells; 9 ≈ 5 m); it is persisted with the index and read back by ~open-graph~, which rebuilds an index written in the older format from node geometries on first open.
 - *Matching uses a representative point*: a ~:point~ matches exactly; an extended geometry (line, polygon) is matched by the centre of its bounding box, so radius/containment results for extended geometries are approximate. Point-in-polygon refinement honours holes.
 - *Distance* is the haversine great-circle distance — accurate to roughly half a percent, ample for most uses; a more precise geodesic can replace it later without changing the API.
 - *Heavier topology* (intersection, union, validity repair) is intentionally out of this dependency-free core and is left to an optional GEOS-backed module.
@@ -1661,6 +1778,355 @@ The add-on /upgrades/ a set of generic functions in place (no API change). When 
 
 Threading: GEOS's reentrant API forbids sharing a context between concurrent threads, and VivaceGraph runs transactions in the caller's thread. The add-on keeps a process-global **borrow/return context pool** (~with-geos-context~): each operation checks out a context for its duration, so a context is only ever used by one thread at a time, and contexts are reused across threads (bounded by peak concurrency). ~geos-shutdown~ releases the pool. This is validated under a concurrency storm and cross-checked against Python ~shapely~ in =tests/geos/=.
 
+** Chapter 14: Graph Algorithms
+
+VivaceGraph ships an optional *graph-algorithms* add-on — classic analysis algorithms (shortest paths, ranking, components, flow, random-graph generation) that run over a real, persistent graph. It is the ~graph-db/algorithms~ system, and it depends only on the embeddable core (~graph-db/core~), so it is usable from a headless deployment with no HTTP layer:
+
+#+BEGIN_SRC lisp
+  (ql:quickload :graph-db/algorithms)
+#+END_SRC
+
+*** Two execution modes
+
+The algorithms come in two families, chosen by how they relate to scale:
+
+- *Native (streaming).* Algorithms that walk the live adjacency indexes directly, keyed by node id (UUID), under a single consistent read snapshot. They never materialize the whole graph, so they suit large, persistent data. This family covers shortest paths, BFS structure, degree, and the ranking algorithms.
+- *Projection (in-memory).* Algorithms that are inherently global — all-pairs shortest paths, clustering, max-flow — need a compact, freely-mutable working copy. ~with-graph-projection~ materializes (a slice of) the graph into an in-memory copy under a snapshot, runs the algorithm there, and maps results back to vertices. The persistent graph is *never mutated*; clustering and flow disturb only the throwaway projection.
+
+Every algorithm is *read-only* with respect to the stored graph and runs under the MVCC read-snapshot machinery (Chapter 12), so a long analysis sees a stable view even under concurrent writers. Nodes are ordinary vertex objects, exactly as the rest of the API produces and consumes them; a "node designator" argument also accepts a vertex's id (a key vector or its string form).
+
+*** Shortest paths
+
+~shortest-path~ is weighted Dijkstra by default (edge ~weight~ is the cost); pass ~:unweighted t~ for hop counts, or a ~:heuristic~ to turn it into A*. It returns ~(values path cost)~ — the ordered vertex list and its total weight — or ~(values nil nil)~ when the target is unreachable.
+
+#+BEGIN_SRC lisp
+  ;; weighted shortest path between two vertices:
+  (shortest-path origin destination)                 ; => (values (v0 v1 .. vn) cost)
+
+  ;; treat edges as undirected, count hops not weights:
+  (shortest-path a b :direction :both :unweighted t)
+
+  ;; A* with an admissible heuristic h(vertex, target) -> estimated remaining cost:
+  (a-star a b (lambda (v target) (straight-line-km v target)))
+
+  ;; distances from one source to every reachable node, ascending:
+  (single-source-shortest-paths origin)              ; => ((vertex . distance) ...)
+#+END_SRC
+
+~:direction~ is ~:out~ (default), ~:in~, or ~:both~; ~:edge-type~ restricts the walk to a single edge type /or a list of edge types/ (their union); ~:weight-fn~ overrides how an edge's cost is read. Dijkstra/A* require non-negative weights. Throughout the algorithm layer, every ~:edge-type~ argument accepts either a single type or a list of types.
+
+*** Structure
+
+Matrix-free structural queries, all native:
+
+#+BEGIN_SRC lisp
+  (degree v)                 ; total incident edges (in + out); also out-degree / in-degree
+  (degree-distribution)      ; sorted ((degree . count) ...), :which :total|:out|:in
+  (distance-map source)      ; BFS hop distances: ((vertex . hops) ...), ascending
+  (connected-components)     ; list of vertex lists, largest first (weakly connected)
+  (spanning-tree :root v)    ; (values tree-edges root); edges are (parent . child) conses
+  (graph-center)             ; (values center-vertices min-eccentricity)
+#+END_SRC
+
+~connected-components~ and ~graph-center~ default to ~:direction :both~ (undirected semantics). ~graph-center~ is the BFS-eccentricity form — a breadth-first search per vertex, O(V·(V+E)); scope it with ~:vertex-type~ on a large graph, or use the projection all-pairs (below) for the matrix form.
+
+*** Ranking
+
+#+BEGIN_SRC lisp
+  ;; PageRank: (values ranked-list iterations), ranked descending as (vertex . rank).
+  ;; Iterates to an L1 convergence tolerance (not a fixed step count), redistributes
+  ;; dangling-node mass so ranks sum to 1, and caps iterations.
+  (page-rank :damping 0.85d0 :tolerance 1d-6)
+
+  ;; HITS hubs & authorities: (values authorities hubs iterations).
+  ;; Both vectors are L2-normalized every iteration.
+  (hub-authority-values)
+
+  ;; SimRank similarity of two nodes (recursive, depth-bounded, memoized):
+  (sim-rank a b :max-depth 5 :decay 0.8d0)
+#+END_SRC
+
+*** All-pairs, clustering, and cut (projection)
+
+These build an in-memory projection. ~all-pairs-shortest-paths~ (Floyd–Warshall) returns a result object you query, rather than an O(V²) table of vertex pairs:
+
+#+BEGIN_SRC lisp
+  (let ((apsp (all-pairs-shortest-paths :directed t)))
+    (apsp-distance apsp a b)    ; shortest distance, or NIL if unreachable
+    (apsp-path apsp a b))       ; ordered vertex list, or NIL
+
+  ;; edge-betweenness (default) or edge-span clustering; removes the top edges and
+  ;; returns them as (from-vertex to-vertex score):
+  (graph-clustering :method :edge-betweenness :edge-removal-count 1)
+
+  ;; a minimal edge cut, as (from-vertex to-vertex) pairs:
+  (minimum-cut)
+#+END_SRC
+
+All-pairs is O(V²) memory / O(V³) time — it warns you to scope large graphs with ~:vertex-type~. For direct control of the working copy, ~with-graph-projection~ binds a projection you can query with ~projection-index~ / ~projection-vertex~.
+
+*** Maximum flow and matching (projection)
+
+Edge ~weight~ is treated as capacity. Flow runs on a residual copy, so the stored graph is untouched.
+
+#+BEGIN_SRC lisp
+  ;; (values flow-value flow-edges); flow-edges are (from to flow).
+  (maximum-flow source sink :algorithm :dinic)
+
+  ;; is the graph bipartite? -> (values t partition-a partition-b) or (values nil ..):
+  (bipartite-p)
+
+  ;; maximum bipartite matching as (vertex1 vertex2) pairs:
+  (maximum-matching :algorithm :dinic)
+#+END_SRC
+
+Three max-flow algorithms are available — ~:edmonds-karp~ (default), ~:dinic~, and ~:goldberg-tarjan~ (push-relabel) — and all agree on the (unique) maximum-flow value.
+
+*** Generating random graphs
+
+The generators persist a random topology into a real graph in one transaction. They are schema-agnostic: you supply the constructors, the model decides the wiring.
+
+#+BEGIN_SRC lisp
+  ;; an Erdős–Rényi G(n, p) of 100 'city' vertices joined by 'road' edges:
+  (generate-graph :erdos-renyi 100 :p 0.05
+                  :vertex-constructor (lambda (i) (make-city :name (format nil "c~D" i)))
+                  :edge-constructor   (lambda (from to) (make-road :from from :to to)))
+
+  ;; Barabási–Albert preferential attachment:
+  (generate-graph :barabasi-albert 100 :vertex-constructor #'... :edge-constructor #'...)
+#+END_SRC
+
+~:vertex-constructor~ is called with each node index ~(0 … size-1)~ and returns a vertex; ~:edge-constructor~ is called with ~(from-vertex to-vertex)~. Both run inside the builder's transaction.
+
+*** Importing and visualizing (~graph-db/algorithms-io~)
+
+Import from standard graph file formats and export to Graphviz live in a *separate* optional system, ~graph-db/algorithms-io~, so its parsing dependencies (~yacc~, ~dso-lex~, ~parse-number~) stay out of the core add-on:
+
+#+BEGIN_SRC lisp
+  (ql:quickload :graph-db/algorithms-io)
+
+  ;; import a GML or Pajek (.net) file; same schema-agnostic constructor contract
+  ;; as generate-graph, plus a label / weight from the file:
+  (import-gml   "graph.gml"
+                :vertex-constructor (lambda (i label) (make-city :name label))
+                :edge-constructor   (lambda (from to weight)
+                                      (make-road :from from :to to :weight weight)))
+  (import-pajek "graph.net" :vertex-constructor #'... :edge-constructor #'...)
+
+  ;; write a DOT file and render it (needs Graphviz's `dot` on PATH):
+  (visualize :file "/tmp/g.dot" :render :hierarchical :format "svg"
+             :label-fn (lambda (v) (slot-value v 'name)))
+  ;; or just emit DOT to a stream:
+  (graph->dot :stream *standard-output* :label-fn #'...)
+#+END_SRC
+
+*** Prolog predicates
+
+The native algorithms are also exposed as Prolog functors, so analysis composes with the query language (Chapter 6). Like the spatial functors, they /yield/ solutions:
+
+#+BEGIN_SRC lisp
+  ;; the weighted shortest path (and its cost) between two pinned vertices:
+  (select (:flat nil) (?path ?cost)
+    (is-a ?from city) (node-slot-value ?from name "A")
+    (is-a ?to   city) (node-slot-value ?to   name "Z")
+    (shortest-path ?from ?to ?path ?cost))
+
+  ;; every node's PageRank (the node arg may be bound to filter, or unbound to enumerate):
+  (select (:flat nil) (?node ?rank) (page-rank ?node ?rank))
+#+END_SRC
+
+The predicates are ~shortest-path/4~ (From To Path Cost), ~distance/3~, ~reachable/2~, ~connected-component/2~, ~degree/2~, ~page-rank/2~, ~authority-value/2~, and ~hub-value/2~. They are pure reads, so they run even under a read-only ~:effects nil~ query. (As with any functor, a query written in a package other than ~graph-db~ must import the predicate's ~name/arity~ symbol — see Chapter 7.)
+
+*** Caveats
+
+- *Recompute cost.* ~page-rank/2~, ~authority-value/2~, and ~hub-value/2~ recompute the whole ranking on each call; for repeated use, call the Lisp ~page-rank~ / ~hub-authority-values~ once and keep the result.
+- *Not ported (broken upstream).* The Karzanov max-flow algorithm, the Viger–Latapy generator, and node-capacity max-flow were intentionally left out of the port — the source implementations did not satisfy the max-flow invariant, hung, or were otherwise unreliable. Only edge capacities are supported for flow.
+
+
+** Chapter 15: The In-Memory Backend (~memory-graph~)
+
+Everything in Chapters 3–14 assumed VivaceGraph's on-disk storage engine — the memory-mapped heap, the linear-hash tables, deserialize-on-read. VivaceGraph also ships a second, explicitly-constructed storage backend that keeps the entire graph as *live Lisp objects in RAM*. It is a drop-in alternative: the same schema, transactions, Prolog queries, views, spatial index, and even (peer) replication all work unchanged. Only the construction call differs.
+
+Why a second backend? The on-disk engine's great strength — working with a graph far larger than RAM, paged in and out by the operating system (Chapter 3) — becomes a cost on a small graph that fits in memory. There, every read pays *deserialization* (rebuilding a Lisp object from the heap's bytes) and every adjacency walk chases persistent cons cells. The in-memory backend removes both: a read returns the live object itself, and adjacency is an in-RAM hash set. On a small, hot working set — a mobile field application, an ECL image running on a phone — this is dramatically faster; on real on-device query/render workloads it is 8–80× quicker once loaded, at the cost of holding the whole graph resident.
+
+*** Constructing an in-memory graph
+
+Swap ~make-graph~ / ~open-graph~ for ~make-memory-graph~ / ~open-memory-graph~. Everything else is identical:
+
+#+BEGIN_SRC lisp
+  (defvar *g* (make-memory-graph :my-app "/var/tmp/mem-app/"))
+  (let ((*graph* *g*))
+    (with-transaction ()
+      (make-person :name "Alice" :age 30))
+    (select-flat (?p) (is-a ?p person)))     ; queries work exactly as before
+#+END_SRC
+
+The ~location~ directory is still required, but it now holds only the *durable* artifacts — the transaction journal, the schema, a checkpoint image, and (for a peer) the peer state. The RAM structures are rebuilt from them on ~open-memory-graph~.
+
+An in-memory graph is a distinct graph *class*, chosen at construction; the on-disk engine is left entirely untouched. It has no memory-mapped heap (~(heap g)~ is ~nil~), no buffer pool, and no persistent free list, so you pass neither ~:buffer-pool-size~ nor any heap-tuning option.
+
+*** What changes under the hood
+
+The graph model, transaction machinery, and query surface are all shared; the in-memory backend simply overrides the small set of storage primitives they call:
+
+| On disk | In memory |
+|---|---|
+| Linear-hash vertex/edge tables (~linear-hash.lisp~) | A hash table of UUID → live node object |
+| Heap-stored, serialized slot data; deserialize on read | Slot data lives on the live object; no per-read work |
+| Persistent ~index-list~ adjacency (ve/vev/type indexes) | In-RAM hash sets mirroring the same index shapes |
+| On-disk ordered indexes (skip list or B+ tree) for views and the spatial grid | In-RAM skip-lists (~mem-skip-list~) with the same cursor API |
+| Heap allocate/free + MVCC version chains | Atomic hash-table swap of an immutable node; no heap |
+
+Because the graph model, `with-transaction`, OCC validation, and the Prolog engine are unchanged, code written against an on-disk graph runs against an in-memory graph verbatim.
+
+*** Durability: journal + checkpoint image
+
+Having no heap, an in-memory graph's durable record is the same write-ahead transaction journal (the ~.txn~ files) the on-disk engine produces — here *retained* rather than folded into a heap. On top of the journal it keeps a *checkpoint image*: a single file (~graph.img~) written at each clean ~close-graph~ that captures the whole graph — the node tables *and* the derived structures (indexes, spatial grid, views). Opening restores that image in one read, then replays any journal entries committed after it.
+
+- *Clean close* → the image is written and the journal cleared; the next open restores the image quickly.
+- *Crash* (no clean close) → the retained journal replays on the next open. An in-memory graph tolerates a ~.dirty~ marker: it always rebuilds from its durable journal + image, so an unclean shutdown is *recovered*, not an error (contrast Chapter 3).
+
+Persisting the derived structures in the image — rather than rebuilding them on open — is what keeps open fast; rebuilding aggregate (reduce) views in particular is expensive.
+
+You may force a checkpoint at any time with ~checkpoint-memory-graph~, which writes the image and clears the journal *now*, without closing. This matters for a *peer device* (Chapter 16): pulled state is applied directly and is not journaled, so it is durable only through the image. Call ~checkpoint-memory-graph~ after a ~peer-sync~ so a restart need not re-sync the pulled subgraph.
+
+*** Eager vs. lazy: the open-latency trade-off
+
+The one tuning decision an in-memory graph exposes is *when* it builds the live node objects. Constructing a node — a CLOS instance carrying its slot data — is the dominant cost of opening a large in-memory graph (on ECL, roughly 85% of restore time; the wire format and byte-parsing are almost free by comparison). The ~:lazy~ option chooses whether you pay that cost up front or on demand.
+
+**** Eager (the default)
+
+With no ~:lazy~ argument, ~make-memory-graph~ / ~open-memory-graph~ build *every* node at open. Steady-state reads are then a bare hash-table lookup — the fastest possible — but open pays to construct every node whether or not you go on to touch it. Prefer eager when the whole graph *is* the working set, or when open latency simply does not matter.
+
+**** Lazy — fault-on-access (~:lazy t~)
+
+#+BEGIN_SRC lisp
+  (make-memory-graph :my-app dir :lazy t)
+  (open-memory-graph  :my-app dir :lazy t)
+#+END_SRC
+
+A lazy graph loads each node as a compact *blob* (its parsed head plus its still-serialized slot data) and builds the live object only on first touch, caching it thereafter. Open therefore does *no* object construction — it is near-instant regardless of graph size. The consequences:
+
+- *Open is ~O(1)~* in the number of nodes, dominated only by reading the image bytes. Measured on ECL: ≈502 ms → 7 ms (800 nodes) and ≈1269 ms → 18 ms (2000 nodes) — about 71× faster.
+- *Aggregate (reduce) views touch zero nodes* — they read the persisted aggregates, so a ~summary~-style query is instant with no materialization at all.
+- *Rendering N objects* builds exactly those N (deferred off the open path). Total build cost is conserved, but it is paid only for what you use, never for untouched nodes.
+- *Lower RAM* — untouched nodes stay compact blobs rather than full CLOS instances.
+
+Caveats: a *full* scan (e.g. ~map-vertices~ over everything) still materializes everything — lazy wins for *partial* working sets, which is the field case. A lazy graph uses the VG-native image format (written automatically on checkpoint/close), so run one checkpoint on it before relying on the fast open. ~:lazy~ composes with the peer device — it is purely a storage-mode flag.
+
+| | Eager (default) | Lazy (~:lazy t~) |
+|---|---|---|
+| Open latency | Builds every node (~O(nodes)~) | Near-instant (~O(1)~) |
+| First touch of a node | Free (already built) | Builds + caches it |
+| Aggregate views | Instant | Instant (touch no node) |
+| Full scan | Same as eager | Materializes everything |
+| Resident RAM | All nodes as objects | Untouched nodes stay blobs |
+| Best for | Whole graph is the working set | Large scope, partial reads, fast boot |
+
+*** What the in-memory backend omits
+
+Two on-disk features are deliberately dropped:
+
+- *MVCC version chains.* On disk, an update archives the prior version's head into the heap and chains to it (Chapter 12). An in-memory graph is single-writer and publishes a new immutable node by an atomic hash-table swap, so a lock-free reader always observes a whole node, never a torn one. The ~with-read-snapshot~ / ~:snapshot~ API is kept (as a writer-excluding read lock), but there is no version *history* to reconstruct.
+- *Heap garbage collection.* There is no heap to compact; ~gc-heap~ is a safe no-op on an in-memory graph.
+
+*** When to use it
+
+- The graph (or the working set you keep open) fits comfortably in RAM.
+- Read/traversal latency matters more than resident memory — interactive or mobile use.
+- You are targeting ECL on a device, where per-read deserialization is especially costly.
+- You want a general-purpose in-memory graph for a non-replicated, ephemeral, or test workload.
+
+Reach for the on-disk engine instead when the graph is larger than RAM, when you need the MVCC version history, or when a modest resident-memory footprint is more important than read latency.
+
+*** See also
+
+- ~docs/memory-graph-design.md~ — the full design and rationale.
+- ~docs/memory-graph-handoff.md~ — a practical operator's guide (durability, the ~:lazy~ flag, on-device benchmarks).
+- ~docs/mmap-native-arena-design.md~ — deferred R&D toward mmap-backed *native* Lisp heaps (near-native persistence without serialization).
+
+
+** Chapter 16: Peer Replication — Offline-First Hub-and-Spoke
+
+The master-slave replication of Chapter 10 assumes always-connected, read-only replicas that mirror the *entire* master. That model does not fit an offline-first mobile fleet, where each device is only intermittently connected, holds just the *subset* of data it is authorized to see, and must *author* changes locally while disconnected. VivaceGraph's *peer replication* (in the ~graph-db/replication~ system) addresses exactly this, through a separate ~peer-graph~ abstraction. The master/slave classes and protocol of Chapter 10 are left byte-for-byte as they are; peer replication is an additional mode, not a change to the old one.
+
+*** The model
+
+- *Star topology.* One *hub* and many *devices*. Devices sync only with the hub, never peer-to-peer. Every sync cursor is a single scalar per directed feed — there are no vector clocks anywhere.
+- *Bidirectional.* A device *pulls* the authority-scoped subset it is allowed to see, and *pushes* the changes it authored while offline. The hub is the single linearization point.
+- *Authority-scoped, fail-closed.* Each device receives only the *closed subgraph* it is cleared for. A vertex ships only if it is disclosable to that device; an edge ships only if *both* of its endpoints are — otherwise it is omitted entirely. VivaceGraph never ships a read-only stub, because a stub would leak the very existence and id of undisclosed work. When a node enters a device's scope it ships as a create; when it leaves, the hub sends a *purge*.
+
+*** Four identities
+
+Peer replication is careful to keep four distinct identities apart — conflating any two of them is a whole class of bug:
+
+1. *Node UUID* — the identity of the thing (vertex or edge). The idempotency key for state-sync.
+2. *Original-op id* — the identity of an authored change *event*; minted by the authoring replica and stable across re-homing. It is the dedup key, so an op a device authored, which later bounces back to it through the hub feed, is recognized and not re-applied.
+3. *Per-origin feed sequence* — a position in a directed feed (the existing per-graph ~tx-id~). It drives the resumable pull cursor. Re-homing re-assigns it.
+4. *Lamport stamp* — the conflict order for per-field last-writer-wins. It travels with the field value and *survives* re-homing.
+
+Identity 2 answers "have I already applied this event?"; identity 4 answers "which of two conflicting values wins?" — different jobs, never the same field.
+
+*** Two op classes
+
+The feed carries two kinds of traffic, with different rules:
+
+- *Authored ops* — a user or automation change (a create, a field edit, an authored delete). They carry origin-id + original-op-id + Lamport stamp, are deduped by op-id, and are *bidirectional* (devices author them; the hub re-homes them onto its own feed).
+- *State-sync ops* — the hub asserting the *current membership* of a device's authority scope. They are keyed by node UUID (idempotent by identity), flow hub→device only, and are never deduped by op-id, propagated back, or merged. A node entering scope ships as a full create; a node leaving scope ships as a *purge* — "remove this from *your* replica," distinct from a delete (the node still exists on the hub).
+
+*** Conflict resolution
+
+When two replicas edit the same node, the hub re-homes the device's authored op and resolves it per field by Lamport-ordered last-writer-wins, with an app-supplied *merge policy* for safety-bearing fields. A rejected change is not silently dropped — it surfaces as a *conflict record* the application can inspect. Safety-critical fields resolve by *semantics, not clock*: for example, a hazard *release* loses to a hazard *assertion* regardless of which carries the later timestamp.
+
+The merge above is *per field of the same node* (keyed by UUID). Unique-slot constraints (Chapter 8) are a different axis — two *different* nodes claiming one value — and are handled by *scope*. A ~:scope :origin~ constraint partitions by authoring device, so it never collides across devices and each device enforces it locally against everything it holds; this is the recommended choice under peer replication. A value that must be unique across the *whole* fleet (~:scope :local~/~:hub~) needs the hub to arbitrate colliding claims — that arbiter is not yet built (issue #51).
+
+*** Setting up a hub and a device
+
+The hub authors data normally (Chapters 4–5) and additionally exposes an *export predicate* — the app-owned ~disclosable-p~ function that decides, per vertex and per requesting device, what may be shared. (The device registry mapping a device to a person/team and a clearance scope is likewise app-owned; the engine consumes only the resulting origin-id + predicate + cursors.)
+
+#+BEGIN_SRC lisp
+  ;; Hub process:
+  (defvar *hub*
+    (make-graph :field-app "/var/tmp/hub/"
+                :peer-role :hub
+                :replication-port 7979
+                :replication-key "shared-secret"
+                :export-predicate #'my-disclosable-p))
+#+END_SRC
+
+A device is constructed with a hub-minted ~:origin-id~ (an opaque 16-byte id) and the hub's address, then calls ~peer-sync~ to both pull its scope and push what it authored:
+
+#+BEGIN_SRC lisp
+  ;; Device process:
+  (defvar *dev*
+    (make-graph :field-app "/var/tmp/device/"
+                :peer-role :device
+                :origin-id *my-hub-minted-origin*
+                :peer-host "hub.example.org"
+                :replication-port 7979
+                :replication-key "shared-secret"))
+
+  ;; author locally, even while offline...
+  (let ((*graph* *dev*))
+    (with-transaction () (make-observation :note "found something")))
+
+  ;; ...then reconcile when connectivity returns: pull scope + push authored ops
+  (peer-sync *dev*)
+#+END_SRC
+
+As with master/slave, a *minor* schema drift (same major version) still syncs, degraded-safe; a *major* mismatch is rejected before any data moves.
+
+*** Peer replication over the in-memory backend
+
+The storage backend is orthogonal to the replication role: ~make-memory-graph~ accepts the very same peer arguments, yielding an *in-memory peer device* — the intended mobile/ECL configuration. Combined with ~:lazy t~ and a post-sync ~checkpoint-memory-graph~, such a device gets a near-instant open plus fault-on-access reads of its synced subgraph (Chapter 15).
+
+*** See also
+
+- ~docs/peer-replication-design.md~ — the full Branch A/B protocol design.
+- ~docs/peer-replication-status.md~ — implementation status and test coverage.
+- ~docs/peer-replication-proposal.md~ — the originally approved proposal.
+
+
 ** API Reference
 
 This chapter provides a categorized reference for the most important exported symbols from the ~graph-db~ package. It is not an exhaustive list of every internal function but focuses on the public API you will use most often when building applications.
@@ -1668,14 +2134,23 @@ This chapter provides a categorized reference for the most important exported sy
 *** A categorized list of the most important exported functions and macros
 
 **** Graph Management
-- ~make-graph (name location &key ... )~ ::
-  Creates a new, empty graph database at the specified ~location~. The ~name~ must be a keyword and should match the graph name used in your schema definitions. Returns a `graph` object.
+- ~make-graph (name location &key index-backend ... )~ ::
+  Creates a new, empty graph database at the specified ~location~. The ~name~ must be a keyword and should match the graph name used in your schema definitions. ~:index-backend~ (~:skip-list~, the default, or ~:bplus-tree~) selects the ordered-index engine for this graph's views/unique/spatial indexes; it defaults to the global ~*index-backend*~. Returns a `graph` object. See Chapter 3, "Ordered indexes and pluggable backends."
 
-- ~open-graph (name location &key ... )~ ::
-  Opens an existing graph database from ~location~. Fails if the database was not closed cleanly (i.e., if the ~.dirty~ file exists). Returns a `graph` object.
+- ~open-graph (name location &key index-backend ... )~ ::
+  Opens an existing graph database from ~location~. Fails if the database was not closed cleanly (i.e., if the ~.dirty~ file exists). ~:index-backend~ governs only *new* indexes created after open; each existing index reopens on the backend it was written with (its persisted tag). Returns a `graph` object.
+
+- ~make-memory-graph (name location &key lazy peer-role origin-id peer-host ... )~ ::
+  Like ~make-graph~, but constructs an *in-memory* graph (Chapter 15): the graph lives as live Lisp objects in RAM, with the same schema/transaction/query API. ~location~ still holds the durable journal, checkpoint image, schema and peer state. Pass ~:lazy t~ for fault-on-access materialization (near-instant open); accepts the same peer arguments as ~make-graph~ for an in-memory peer device.
+
+- ~open-memory-graph (name location &key lazy peer-role ... )~ ::
+  Reopens an in-memory graph, restoring it from its checkpoint image and replaying the retained journal tail. Tolerates a ~.dirty~ marker (it always rebuilds from the durable journal + image). Pass ~:lazy t~ to restore nodes as deferred blobs.
+
+- ~checkpoint-memory-graph (graph)~ ::
+  Forces an in-memory graph to write its checkpoint image and clear the journal *now*, without closing. Call after a ~peer-sync~ on a device so pulled (un-journaled) state survives a restart.
 
 - ~close-graph (graph &key snapshot-p)~ ::
-  Safely closes the graph database, ensuring all data is written to disk and all file locks are released. By default, it creates a final snapshot before closing.
+  Safely closes the graph database, ensuring all data is written to disk and all file locks are released. By default, it creates a final snapshot before closing. For an in-memory graph this writes the checkpoint image and clears the journal.
 
 - ~lookup-graph (name)~ ::
   Retrieves a handle to an already opened graph by its keyword ~name~.
@@ -1749,7 +2224,7 @@ This chapter provides a categorized reference for the most important exported sy
 
 **** Views & Indexing
 - ~def-view (view-name sort-order (class-name graph-name) &body body)~ ::
-  Defines a new view (index). The body must contain a ~:map~ clause and may contain an optional ~:reduce~ clause for aggregation.
+  Defines a new view (index). The body must contain a ~:map~ clause and may contain an optional ~:reduce~ clause for aggregation.  *Declarative and idempotent* (like ~def-vertex~/~def-edge~): the graph need not be open when ~def-view~ runs — a view can be co-located with its ~def-vertex~/~def-edge~ and loaded before ~open-graph~, which reconciles it at open time.  Re-evaluating an *unchanged* ~def-view~ (or simply restarting) does **not** rebuild the persisted index — restart is O(1).  Changing the ~:map~/~:reduce~ code or sort order rebuilds the index and emits a ~log:warn~.  Deleting a ~def-view~ form does not drop the persisted index; use ~delete-view~ for that.
 
 - ~invoke-graph-view (class-name view-name &key key start-key end-key ... )~ ::
   The primary function for querying a view. Use the `:key` argument for point lookups or `:start-key` and `:end-key` for range scans. Use `:group-p t` to query the aggregated results of a reduce view.
@@ -1761,20 +2236,26 @@ This chapter provides a categorized reference for the most important exported sy
   Iterates over the aggregated results of a map-reduce view.
 
 - ~regenerate-view (graph class-name view-name)~ ::
-  Deletes and rebuilds the index for a specific view from scratch. Useful if the view's definition changes.
+  Force-rebuilds one view's index from scratch (delete + full rescan).  Rarely needed by hand — ~def-view~ rebuilds automatically when its definition changes — but available as the single-view force hammer.
+
+- ~regenerate-all-views (graph)~ ::
+  Force-rebuilds every view in the graph.  ~open-graph~ (and ~open-memory-graph~) accept ~:regenerate-views t~ to run this at open time.  Also the views half of an index-backend migration: after reopening with a new ~:index-backend~, this rebuilds every view on the current backend (see Chapter 3).
+
+- ~regenerate-unique-indexes (graph)~ ::
+  Drops and rebuilds every ~:unique~ constraint index on the graph's *current* index backend, re-persisting each index's backend tag.  The unique-index half of an in-place skip-list→B+ tree migration (paired with ~regenerate-all-views~ and ~rebuild-spatial-index~; see Chapter 3).
 
 **** Graph Traversal & Mapping
-- ~map-vertices (function graph &key vertex-type ... )~ ::
-  Applies a Lisp ~function~ to every vertex in the graph. Can be filtered by ~vertex-type~. Avoid using on large graphs without a filter, as it performs a full scan.
+- ~map-vertices (function graph &key vertex-type include-vertex-types exclude-vertex-types include-subclasses-p ... )~ ::
+  Applies a Lisp ~function~ to every vertex.  Filter with ~vertex-type~ (a single type) and/or ~include-vertex-types~ (a list); ~exclude-vertex-types~ removes types; unless ~include-subclasses-p~ is NIL (default T) a named type also matches its subtypes.  The fully-untyped scan is a full lhash scan (and reads live versions -- see the function docstring), so avoid it on large graphs without a filter.
 
-- ~map-edges (function graph &key edge-type vertex direction ... )~ ::
-  Applies a ~function~ to every edge. Can be filtered by ~edge-type~ or constrained to a specific ~vertex~ and ~direction~ (:in or :out).
+- ~map-edges (function graph &key edge-type include-edge-types exclude-edge-types include-subclasses-p vertex direction ... )~ ::
+  Applies a ~function~ to every edge.  Filter with ~edge-type~ (single) and/or ~include-edge-types~ (a list), ~exclude-edge-types~, and ~include-subclasses-p~ (default T, so a parent edge type also matches its subtypes -- mirroring ~map-vertices~); or constrain to a ~vertex~ + ~direction~ (:in/:out) or a ~from-vertex~/~to-vertex~ pair.
 
-- ~outgoing-edges (vertex &key edge-type)~ ::
-  A convenience function that returns a list of all outgoing edges from a given vertex.
+- ~outgoing-edges (vertex &key edge-type include-edge-types include-subclasses-p)~ ::
+  A convenience function that returns a list of a vertex's outgoing edges. ~edge-type~ (single) / ~include-edge-types~ (list) filter by type; subtypes are included unless ~include-subclasses-p~ is NIL.
 
-- ~incoming-edges (vertex &key edge-type)~ ::
-  A convenience function that returns a list of all incoming edges for a given vertex.
+- ~incoming-edges (vertex &key edge-type include-edge-types include-subclasses-p)~ ::
+  As ~outgoing-edges~, for incoming edges.
 
 - ~traverse (vertex &key ... )~ ::
   Performs a breadth-first search traversal starting from a given vertex.
@@ -1785,6 +2266,16 @@ This chapter provides a categorized reference for the most important exported sy
 
 - ~stop-replication (graph)~ ::
   Safely stops the replication threads.
+
+**** Peer Replication (offline-first; see Chapter 16)
+- ~make-graph / make-memory-graph (... :peer-role :hub :export-predicate fn)~ ::
+  Constructs a *hub* peer graph. ~:export-predicate~ is the app-owned per-vertex ~disclosable-p~ function that scopes what each device may see.
+
+- ~make-graph / make-memory-graph (... :peer-role :device :origin-id id :peer-host host :replication-port p :replication-key k)~ ::
+  Constructs a *device* peer graph bound to a hub. ~:origin-id~ is the opaque, hub-minted 16-byte device identity.
+
+- ~peer-sync (graph)~ ::
+  On a device, reconciles with the hub: pulls the current authority-scoped subgraph (creates for nodes that entered scope, purges for nodes that left) and pushes the ops authored locally since the last sync.
 
 **** Backup & Recovery
 - ~snapshot (graph &key ... )~ ::
@@ -1857,4 +2348,51 @@ This chapter provides a categorized reference for the most important exported sy
 
 - ~with-write-lock ((lock) &body body)~ ::
   Executes the body of code after acquiring an exclusive write lock.
+
+**** Graph Algorithms (optional ~graph-db/algorithms~ add-on)
+See Chapter 14. All are read-only over a consistent snapshot; "node" arguments
+accept a vertex or its id.
+
+- ~shortest-path (from to &key direction edge-type weight-fn unweighted heuristic graph)~ ::
+  Weighted Dijkstra (or A* with ~:heuristic~) shortest path; ~(values path cost)~,
+  or ~(values nil nil)~ if unreachable. ~a-star~ and ~single-source-shortest-paths~
+  are companions. ~:edge-type~ accepts a single type or a list of types (as do all
+  the algorithm-layer ~:edge-type~ arguments).
+
+- ~degree (v &key edge-type graph)~ / ~out-degree~ / ~in-degree~ / ~degree-distribution~ ::
+  Vertex degree (in+out) and the sorted degree histogram.
+
+- ~distance-map (source &key direction edge-type graph)~ ::
+  BFS hop distances to every reachable node, as ascending ~(vertex . hops)~.
+
+- ~connected-components (&key direction edge-type vertex-type graph)~ / ~spanning-tree~ / ~graph-center~ / ~eccentricity~ ::
+  Weakly-connected components, a DFS spanning tree, and the BFS-eccentricity center.
+
+- ~page-rank (&key damping max-iterations tolerance use-weights-p graph)~ ::
+  Converging PageRank with dangling-mass redistribution; ~(values ranked iterations)~.
+  ~page-rank-distribution~ bins it.
+
+- ~hub-authority-values (&key max-iterations tolerance graph)~ / ~sim-rank (a b &key max-depth decay graph)~ ::
+  HITS hubs/authorities (L2-normalized each iteration) and pairwise SimRank.
+
+- ~all-pairs-shortest-paths (&key directed use-weights-p vertex-type graph)~ ::
+  Floyd–Warshall (in-memory projection); query the result with ~apsp-distance~ /
+  ~apsp-path~. O(V²) memory — scope large graphs with ~:vertex-type~.
+
+- ~graph-clustering (&key method edge-removal-count directed graph)~ / ~minimum-cut~ ::
+  Edge-betweenness / edge-span clustering and a minimal edge cut (projection).
+
+- ~maximum-flow (source sink &key algorithm edge-type graph)~ ::
+  Max-flow with edge ~weight~ as capacity; ~:edmonds-karp~ / ~:dinic~ /
+  ~:goldberg-tarjan~. ~bipartite-p~ and ~maximum-matching~ build on it.
+
+- ~generate-graph (model size &key vertex-constructor edge-constructor p saturation-point graph)~ ::
+  Persist a random ~:erdos-renyi~ / ~:barabasi-albert~ graph via caller-supplied
+  vertex/edge constructors, in one transaction.
+
+- ~import-gml (file ...)~ / ~import-pajek (file ...)~ / ~graph->dot~ / ~visualize~ ::
+  GML/Pajek import and Graphviz export — the separate ~graph-db/algorithms-io~ system.
+
+- ~(shortest-path ?from ?to ?path ?cost)~ / ~(distance ?from ?to ?d)~ / ~(reachable ?from ?to)~ / ~(connected-component ?node ?member)~ / ~(degree ?node ?d)~ / ~(page-rank ?node ?rank)~ / ~(authority-value ?node ?v)~ / ~(hub-value ?node ?v)~ ::
+  Prolog functors exposing the native algorithms; composable in ~select~ queries.
 

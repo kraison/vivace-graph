@@ -1,5 +1,10 @@
 (in-package :graph-db)
 
+;; Defined in unique-constraint.lisp (loaded after this file); declared here so the
+;; %COMMIT / APPLY-TRANSACTION hooks below compile without a forward-reference warning.
+(declaim (ftype (function (t t) t)
+                validate-unique-constraints apply-tx-writes-to-unique-indexes))
+
 (defvar *transaction* nil)
 (defvar *end-of-transaction-action* '%commit)
 (defparameter *maximum-transaction-attempts* 8
@@ -959,6 +964,12 @@ With no FILTER, returns WRITES unchanged."
   (:method (transaction graph)
     (with-transaction-lock (transaction)
       (let ((writes (writes transaction))
+            ;; Bind *GRAPH* to the target so every index-maintenance sink that
+            ;; still defaults its graph/heap to *GRAPH* (e.g. index-list
+            ;; deserialization) targets THIS graph, not whatever is ambient on a
+            ;; slave/replay/multi-graph apply thread.  Defense-in-depth: the
+            ;; helpers below already thread GRAPH explicitly.
+            (*graph* graph)
             ;; MVCC: every write in this transaction is stamped with this id.
             (*commit-epoch* (transaction-id transaction)))
         ;; Subset replication: on a slave with a replication-filter, drop the
@@ -975,6 +986,7 @@ With no FILTER, returns WRITES unchanged."
             (funcall hook)))
         (apply-tx-writes-to-views writes graph)
         (apply-tx-writes-to-spatial-index writes graph)
+        (apply-tx-writes-to-unique-indexes writes graph)   ; issue #6
         (reap-old-versions writes graph)
         (persist-highest-transaction-id (transaction-id transaction) graph)))))
 
@@ -1478,6 +1490,194 @@ crash orphans one."
 ;;; header format entirely, or a stable-id scheme) once the rw-lock work lands.
 ;;; -------------------------------------------------------------------------
 
+;;; ---------------------------------------------------------------------------
+;;; Peer replication (WP-0): the peer-meta packet.
+;;;
+;;; A peer-graph prefixes each transaction it journals to its feed with a
+;;; self-size-framed peer-meta packet carrying the authored op's identity and
+;;; logical clock, so the op can be deduped across re-homing (design §3) and
+;;; ordered for conflict resolution (Branch B).  The inner transaction (tx-header
+;;; + tx-writes) follows in the standard format, so the peer transport reads the
+;;; peer-meta packet first, then the ordinary tx packets.  Layout:
+;;;   size(8) flags(1) type(1=#\M) origin-id(16) op-id(16) lamport(8) op-class(1)
+;;; ---------------------------------------------------------------------------
+
+(alexandria:define-constant +peer-meta-type-code+ (char-code #\M))
+(alexandria:define-constant +peer-meta-packet-size+ (+ 8 1 1 16 16 8 1)) ; 51
+(alexandria:define-constant +peer-op-authored+ 0)      ; an authored user/automation op
+(alexandria:define-constant +peer-op-state-create+ 1)  ; hub membership-create (WP-5)
+(alexandria:define-constant +peer-op-purge+ 2)         ; hub scope-exit purge (WP-5)
+(alexandria:define-constant +peer-null-origin+
+    (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0)
+  :test 'equalp)
+
+(defun gen-op-id ()
+  "A fresh 16-byte op-id (random v4 uuid) identifying an authored change event.
+Stable across re-homing -- the hub never re-mints it (design §3 #2)."
+  (uuid:uuid-to-byte-array (uuid:make-v4-uuid)))
+
+(defvar *peer-rehome-op* nil
+  "Bound to (OP-ID ORIGIN LAMPORT) while a hub re-homes a device-pushed authored op
+through a journaling transaction (peer-streaming REHOME-AUTHORED-OP, Branch B).  It
+tells FINALIZE-TX-PERSISTENCE to preserve the ORIGINAL op identity on the
+re-journaled feed entry (design §5) instead of minting a fresh one, and to skip the
+whole-diff field stamping (the re-home caller applies the merge's per-field stamps,
+which the diff would stamp with the wrong lamport for a field the local copy won).")
+
+;;; Durable Lamport clock (PT-8).  The counter must be monotonic ACROSS restarts:
+;;; if it reset to 0 after a crash, a replica's post-restart authored ops would get
+;;; tiny stamps and silently lose every LWW race (safety data dropped).  So we
+;;; persist it on every advance and reload it on open.  Wall-clock skew is
+;;; irrelevant -- Lamport is logical -- a real win for GPS/EW-denied field devices.
+
+(defgeneric lamport-counter-file (graph)
+  (:method (graph)
+    (make-pathname :name "lamport" :type "dat" :defaults (location graph))))
+
+(defgeneric persist-lamport-counter (graph)
+  (:method ((graph peer-graph))
+    (let ((serialized (make-byte-vector 8)))
+      (serialize-uint64 serialized (lamport-counter graph) 0)
+      (with-open-file (stream (lamport-counter-file graph)
+                              :direction :output :element-type '(unsigned-byte 8)
+                              :if-does-not-exist :create :if-exists :overwrite)
+        (write-sequence serialized stream))
+      (lamport-counter graph)))
+  (:method ((graph graph)) nil))
+
+(defgeneric load-lamport-counter (graph)
+  (:method (graph)
+    (let ((file (lamport-counter-file graph))
+          (serialized (make-byte-vector 8)))
+      (if (probe-file file)
+          (with-open-file (stream file :direction :input :element-type '(unsigned-byte 8))
+            (if (= 8 (read-sequence serialized stream))
+                (deserialize-uint64 serialized 0)
+                0))
+          0))))
+
+;;; Device pull-cursor (Branch B).  Kept SEPARATE from HIGHEST-TRANSACTION-ID: the
+;;; latter is the graph's OWN feed-seq (advanced + persisted on every local commit,
+;;; APPLY-TRANSACTION), and a Branch B device authors locally, so overloading it as
+;;; the pull-cursor would conflate the device's own feed-seq (device tx-id space)
+;;; with the highest HUB feed-seq it has applied (hub tx-id space) -- corrupting both
+;;; the pull position and the device's tx-id-counter restore on open.  A read-only
+;;; Branch A device never writes, so the two coincided; once a device writes they do
+;;; not.  So the pull-cursor gets its own durable scalar.
+(defgeneric peer-pull-cursor-file (graph)
+  (:method (graph)
+    (make-pathname :name "pull-cursor" :type "dat" :defaults (location graph))))
+
+(defgeneric persist-peer-pull-cursor (cursor graph)
+  (:method (cursor (graph peer-graph))
+    (let ((serialized (make-byte-vector 8)))
+      (serialize-uint64 serialized cursor 0)
+      (with-open-file (stream (peer-pull-cursor-file graph)
+                              :direction :output :element-type '(unsigned-byte 8)
+                              :if-does-not-exist :create :if-exists :overwrite)
+        (write-sequence serialized stream))
+      cursor))
+  (:method (cursor (graph graph)) (declare (ignore cursor)) nil))
+
+(defgeneric load-peer-pull-cursor (graph)
+  (:method (graph)
+    (let ((file (peer-pull-cursor-file graph))
+          (serialized (make-byte-vector 8)))
+      (if (probe-file file)
+          (with-open-file (stream file :direction :input :element-type '(unsigned-byte 8))
+            (if (= 8 (read-sequence serialized stream)) (deserialize-uint64 serialized 0) 0))
+          0))))
+
+;;; Device push-ack (Branch B): the highest of the device's OWN feed-seqs that the
+;;; hub has confirmed it re-homed.  The push feed's lower bound -- the device streams
+;;; its own authored ops with feed-seq > push-ack.  Its own durable scalar (device
+;;; tx-id space), distinct from the pull-cursor (hub tx-id space) and the own feed-seq.
+;;; Only an optimization: the hub dedups every op by op-id, so a device that loses its
+;;; push-ack merely re-streams already-applied ops (re-deduped), never double-applies.
+(defgeneric peer-push-ack-file (graph)
+  (:method (graph)
+    (make-pathname :name "push-ack" :type "dat" :defaults (location graph))))
+
+(defgeneric persist-peer-push-ack (ack graph)
+  (:method (ack (graph peer-graph))
+    (let ((serialized (make-byte-vector 8)))
+      (serialize-uint64 serialized ack 0)
+      (with-open-file (stream (peer-push-ack-file graph)
+                              :direction :output :element-type '(unsigned-byte 8)
+                              :if-does-not-exist :create :if-exists :overwrite)
+        (write-sequence serialized stream))
+      ack))
+  (:method (ack (graph graph)) (declare (ignore ack)) nil))
+
+(defgeneric load-peer-push-ack (graph)
+  (:method (graph)
+    (let ((file (peer-push-ack-file graph))
+          (serialized (make-byte-vector 8)))
+      (if (probe-file file)
+          (with-open-file (stream file :direction :input :element-type '(unsigned-byte 8))
+            (if (= 8 (read-sequence serialized stream)) (deserialize-uint64 serialized 0) 0))
+          0))))
+
+(defun peer-next-lamport (graph)
+  "Advance and return GRAPH's Lamport clock, persisting the new value (PT-8).
+Called under the replication-log lock while journaling an authored op; the
+lamport-lock (innermost) makes the read-modify-write atomic against a concurrent
+PEER-OBSERVE-LAMPORT on another thread."
+  (with-recursive-lock-held ((lamport-lock graph))
+    (prog1 (incf (lamport-counter graph))
+      (persist-lamport-counter graph))))
+
+(defun peer-observe-lamport (graph received)
+  "Advance GRAPH's Lamport clock to at least RECEIVED (a stamp carried by an
+applied op), so the replica's next mint is causally after everything it has seen
+(PT-8: on receipt, advance to MAX(local,received); the +1 happens at the next
+mint).  Persists if it moved.  A NIL/zero RECEIVED is a no-op."
+  (when (and received (> received 0) (typep graph 'peer-graph))
+    (with-recursive-lock-held ((lamport-lock graph))
+      (when (> received (lamport-counter graph))
+        (setf (lamport-counter graph) received)
+        (persist-lamport-counter graph))))
+  graph)
+
+(defun peer-observe-epoch (graph epoch)
+  "Advance GRAPH's TX-ID-COUNTER so it STRICTLY EXCEEDS EPOCH -- the MVCC commit
+epoch of an op this peer just APPLIED from a remote origin (a pulled node carries the
+HUB's epoch).  A device seeds its counter from its OWN feed-seq; without this the
+counter can sit at or below the epochs it applied, so a subsequent LOCAL edit
+transaction starts at a START-TX-ID that MVCC-hides the very node it means to edit
+(the node is invisible until the counter passes its epoch).  Under the tm lock, so it
+composes with CREATE-TRANSACTION; idempotent + monotonic; a NIL/zero EPOCH is a no-op.
+The durable side is the pull-cursor, which the barrier advances to the pull frontier T
+(>= every applied epoch) and which TX-ID-COUNTER is re-seeded from on open."
+  (when (and epoch (> epoch 0) (typep graph 'peer-graph))
+    (let ((tm (transaction-manager graph)))
+      (with-recursive-lock-held ((lock tm))
+        (when (>= epoch (tx-id-counter tm))
+          (setf (tx-id-counter tm) (1+ epoch))))))
+  graph)
+
+(defun serialize-peer-meta (origin-id op-id lamport op-class)
+  "Build the 51-byte peer-meta packet (see layout above)."
+  (let ((v (make-byte-vector +peer-meta-packet-size+)) (i 0))
+    (serialize-uint64 v +peer-meta-packet-size+ i) (incf i 8)
+    (setf (aref v i) 0) (incf i)                       ; flags (unused)
+    (setf (aref v i) +peer-meta-type-code+) (incf i)   ; type
+    (replace v origin-id :start1 i :end2 16) (incf i 16)
+    (replace v op-id :start1 i :end2 16) (incf i 16)
+    (serialize-uint64 v (or lamport 0) i) (incf i 8)
+    (setf (aref v i) op-class)
+    v))
+
+(defun deserialize-peer-meta (vector &optional (offset 0))
+  "Parse a peer-meta packet at OFFSET.  Returns (values origin-id op-id lamport
+op-class).  Asserts the packet's type byte."
+  (assert (= (aref vector (+ offset 9)) +peer-meta-type-code+))
+  (let ((i (+ offset 10)))
+    (values (subseq vector i (+ i 16))
+            (subseq vector (+ i 16) (+ i 32))
+            (deserialize-uint64 vector (+ i 32))
+            (aref vector (+ i 40)))))
+
 (defun prepare-tx-persistence (transaction)
   "Serialize TRANSACTION to a temp file and populate its BYTES slot.  Runs BEFORE
 the transaction-manager lock, so the bulk serialization + disk write (and the
@@ -1509,18 +1709,51 @@ and it reads these patched bytes, never the .txn files)."
   ;; Use POSIX rename(2) (atomic; replaces an existing target) rather than
   ;; cl:rename-file.  SBCL/ECL's rename-file already overwrites per POSIX, but
   ;; CCL's signals "File exists" when the target exists — which intermittently
-  ;; crashed concurrent-stress on CCL.  osicat-posix:rename gives portable,
-  ;; atomic, overwrite-on-rename behavior across all implementations.
-  (osicat-posix:rename (namestring tmp)
-                       (namestring (transaction-pathname transaction)))
+  ;; crashed concurrent-stress on CCL.  %posix-rename gives portable, atomic,
+  ;; overwrite-on-rename behavior across all implementations.
+  (%posix-rename (namestring tmp)
+                 (namestring (transaction-pathname transaction)))
   (let ((tm (transaction-manager transaction)))
-    (when (master-graph-p (graph tm))
+    ;; peer-replication WP-2: generalized from MASTER-GRAPH-P so a peer-graph also
+    ;; journals its own committed writes (a device's push feed / a hub's pull feed).
+    ;; The patched-in transaction-id is the per-origin feed sequence (design §3 #3).
+    (when (journals-own-feed-p (graph tm))
       (serialize-uint64 (bytes transaction)
                         (transaction-id transaction)
                         +tx-header-id-offset+)
       (let ((repl-stream (replication-log tm))
-            (lock (replication-log-lock tm)))
+            (lock (replication-log-lock tm))
+            (gr (graph tm)))
         (with-recursive-lock-held (lock)
+          ;; peer-replication WP-0: a peer-graph prefixes the feed entry with a
+          ;; peer-meta packet (op identity + lamport), then records that it has
+          ;; applied its own authored op so a re-homed bounce-back is deduped
+          ;; (design §6).  A master journals plain tx bytes, unchanged.
+          (when (peer-graph-p gr)
+            (if *peer-rehome-op*
+                ;; B2d-2: a hub re-home preserves the ORIGINAL op's identity on the
+                ;; feed entry (design §5) so device E pulls it as the author's op and
+                ;; the author dedups its own bounce-back; the re-home caller applies
+                ;; the merge's per-field stamps, so finalize does not stamp here.
+                (destructuring-bind (rop-id rorigin rlamport) *peer-rehome-op*
+                  (write-sequence
+                   (serialize-peer-meta rorigin rop-id rlamport +peer-op-authored+)
+                   repl-stream)
+                  (record-applied-op gr rop-id rlamport))
+                (let ((op-id (gen-op-id))
+                      (lamport (peer-next-lamport gr))
+                      (origin (or (origin-id gr) +peer-null-origin+)))
+                  (write-sequence
+                   (serialize-peer-meta origin op-id lamport +peer-op-authored+)
+                   repl-stream)
+                  (record-applied-op gr op-id lamport)
+                  ;; B2b: stamp every field this locally-authored op changed with
+                  ;; (lamport . origin) -- the LWW basis a later concurrent edit
+                  ;; from another replica compares against.
+                  (dolist (w (writes transaction))
+                    (let ((nid (id (node w))))
+                      (dolist (slot (authored-changed-slots w))
+                        (set-node-field-stamp gr nid slot lamport origin)))))))
           (write-sequence (bytes transaction) repl-stream)
           (finish-output repl-stream))))))
 
@@ -1707,7 +1940,14 @@ stops appearing in queries.  MARK-DELETED is the usual entry point.")
 (defmethod initialize-instance :after ((instance transaction-manager)
                                        &key &allow-other-keys)
   (let* ((graph (graph instance))
-         (tx-id-counter (1+ (load-highest-transaction-id graph))))
+         ;; A peer device applies pulled nodes at the HUB's epoch, so its counter
+         ;; must dominate the pull-cursor (the pull frontier T >= every applied
+         ;; epoch) as well as its own feed-seq -- else a local edit transaction
+         ;; opens below a pulled node's epoch and MVCC-hides it (peer-observe-epoch).
+         (tx-id-counter (1+ (max (load-highest-transaction-id graph)
+                                 (if (peer-graph-p graph)
+                                     (load-peer-pull-cursor graph)
+                                     0)))))
     (setf (tx-id-counter instance) tx-id-counter)
     (setf (replication-log-file instance)
           (make-pathname :name (format nil "replication-~16,'0X"
@@ -1928,6 +2168,10 @@ See CALL-WITH-READ-SNAPSHOT."
                (setf (finish-tx-id tx) (tx-id-counter tm))
                (unless (validate tx)
                  (error 'validation-conflict :transaction tx))
+               ;; Unique constraints (issue #6): a pre-durability check under the same
+               ;; manager lock -- a violation aborts before FINALIZE-TX-PERSISTENCE, so
+               ;; nothing is journaled (the UNWIND-PROTECT below drops the temp file).
+               (validate-unique-constraints tx (graph tx))
                (setf (transaction-id tx) (tx-id-counter tm))
                (incf (tx-id-counter tm))
                (prune-committed-transactions tm)
@@ -1951,10 +2195,19 @@ See CALL-WITH-READ-SNAPSHOT."
         (when (and tmp (not renamed))
           (ignore-errors (delete-file tmp)))))))
 
+(defgeneric retain-committed-transaction-p (graph)
+  (:documentation "When true, GRAPH keeps committed .txn files as its durable
+journal instead of discarding them after apply.  On-disk graphs return NIL -- the
+mmap heap is the durable copy, so the write-ahead entry is dropped once applied.
+A memory-graph returns T: it has no heap, so the journal (compacted by a cl-store
+image / snapshot at each clean close) is its only durable record.")
+  (:method (graph) (declare (ignore graph)) nil))
+
 (defmethod cleanup-transaction ((tx tx))
   (let ((transaction-manager (transaction-manager tx)))
     (if (eql (state tx) :committed)
-        (mark-as-committed (transaction-pathname tx))
+        (unless (retain-committed-transaction-p (graph tx))
+          (mark-as-committed (transaction-pathname tx)))
         (remove-transaction tx transaction-manager))))
 
 
@@ -2018,7 +2271,11 @@ Signals NO-TRANSACTION-IN-PROGRESS if none is active."
       (let ((transaction (load-recovery-transaction transaction-file))
             (*add-to-indexes-unless-present-p* t))
         (apply-transaction transaction graph)
-        (mark-as-committed transaction-file)))))
+        ;; A memory-graph keeps its journal until a clean-close checkpoint clears
+        ;; it, so replay must not consume the tail (a crash between open and the
+        ;; next checkpoint would otherwise lose it).
+        (unless (retain-committed-transaction-p graph)
+          (mark-as-committed transaction-file))))))
 
 (defclass restore-transaction (recovery-transaction) ()
   (:default-initargs

@@ -11,13 +11,27 @@
   ((persistent :accessor persistent-p :initarg :persistent :initform t :allocation :instance)
    (indexed :accessor indexed-p :initarg :index :initform nil :allocation :instance)
    (ephemeral :accessor ephemeral-p :initarg :ephemeral :initform nil :allocation :instance)
-   (meta :accessor meta-p :initarg :meta :initform nil :allocation :instance)))
+   (meta :accessor meta-p :initarg :meta :initform nil :allocation :instance)
+   ;; Uniqueness constraint (issue #6).  UNIQUE-SPEC is the :UNIQUE slot option:
+   ;;   NIL (default) | T/EQUAL | EQUALP | a function designator / lambda form
+   ;; (a 1-arg canonicalizer; uniqueness is EQUAL on the canonical key).  SCOPE is
+   ;; the cross-peer scope: :LOCAL (default) or :ORIGIN.  See
+   ;; docs/unique-constraint-design.md.
+   (unique :accessor unique-spec :initarg :unique :initform nil :allocation :instance)
+   (unique-scope :accessor unique-scope :initarg :scope :initform :local
+                 :allocation :instance)))
 
 (defmethod persistent-p (slot-def)
   nil)
 
 (defmethod indexed-p (slot-def)
   nil)
+
+(defmethod unique-spec (slot-def)
+  nil)
+
+(defmethod unique-scope (slot-def)
+  :local)
 
 (defmethod ephemeral-p (slot-def)
   nil)
@@ -103,6 +117,13 @@
       (setf (slot-value slot 'indexed) t)
       ;; FIXME: Generate index if needed
       )
+    ;; Inherit the uniqueness constraint from the declaring direct slot (issue #6),
+    ;; so a :UNIQUE slot on a parent enforces across its subclasses.
+    (let ((u (find-if #'unique-spec direct-slots)))
+      (when (or (unique-spec slot) u)
+        (setf (slot-value slot 'unique) (or (unique-spec slot) (unique-spec u))
+              (slot-value slot 'unique-scope) (or (and u (unique-scope u))
+                                                  (unique-scope slot)))))
     slot))
 
 (defmethod find-all-subclasses ((class class))
@@ -120,6 +141,47 @@
 
 (defmethod find-all-subclass-names ((class class))
   (mapcar 'class-name (find-all-subclasses class)))
+
+(defun resolve-node-type-ids (designator kind &key (include-subclasses-p t)
+                                                (graph *graph*))
+  "Resolve a node-type DESIGNATOR -- a type name (symbol), a numeric type-id, or
+a LIST of either -- into a deduplicated list of integer type-ids of KIND
+\(:VERTEX or :EDGE) registered in GRAPH.
+
+When INCLUDE-SUBCLASSES-P (the default), each named type is expanded to itself
+PLUS every CLOS subclass of it that is registered as a type of KIND.  This
+expansion is necessary because a node is indexed only under its OWN type-id (the
+type/ve/vev indexes are keyed by exact type-id), so a parent-type query must scan
+each subtype's index explicitly -- this is the same compensation MAP-VERTICES has
+always performed, here factored out so MAP-EDGES can share it.
+
+Designators that resolve to no registered type of KIND are skipped (so the 0
+sentinel and cross-graph subclasses simply drop out).  Order of first appearance
+is preserved."
+  (let ((seen (make-hash-table))
+        (ids nil))
+    (labels ((add-id (id)
+               (when (and id (not (gethash id seen)))
+                 (setf (gethash id seen) t)
+                 (push id ids)))
+             (add-one (d)
+               (let ((meta (if (integerp d)
+                               (lookup-node-type-by-id d kind :graph graph)
+                               (lookup-node-type-by-name d kind :graph graph))))
+                 (when meta
+                   (add-id (node-type-id meta))
+                   (when include-subclasses-p
+                     (let ((class (find-class (node-type-name meta) nil)))
+                       (when class
+                         (dolist (sub (find-all-subclass-names class))
+                           (let ((sub-meta (lookup-node-type-by-name sub kind
+                                                                     :graph graph)))
+                             (when sub-meta
+                               (add-id (node-type-id sub-meta))))))))))))
+      (if (listp designator)
+          (dolist (d designator) (add-one d))
+          (add-one designator)))
+    (nreverse ids)))
 
 (defmethod find-ancestor-classes ((class-name symbol))
   (find-ancestor-classes (find-class class-name)))

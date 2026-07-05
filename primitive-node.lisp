@@ -180,8 +180,33 @@ replaced the lhash value-finalizer (which copied under the bucket lock)."
                                          :loc dp))))))
   node)
 
+(defvar *initializing-node* nil
+  "Bound true around CHANGE-CLASS of a node under construction (see
+CHANGE-NODE-CLASS).  A node's user-defined slot VALUES live in the DATA alist,
+not in real CLOS slots; CHANGE-CLASS re-runs slot initialization and, on some
+implementations (notably ECL), invokes SLOT-MAKUNBOUND-USING-CLASS on those
+persistent slots.  That must NOT destroy the DATA we just populated, so while
+this is bound the persistent branch of SLOT-MAKUNBOUND-USING-CLASS defers to the
+standard (no-op-on-the-alist) method.  Explicit user SLOT-MAKUNBOUND -- this
+unbound -- still drops the alist entry.
+
+Why it matters under concurrency: clearing a freshly-created node's DATA leaves
+the cached node with DATA = NIL but BYTES intact, so the first concurrent readers
+all race to lazily re-materialize DATA from BYTES (MAYBE-INIT-NODE-DATA mutating
+the shared cached node) -- on ECL that surfaced as transient NIL slot reads.
+
+It ALSO guards MAYBE-INIT-NODE-DATA: a node being re-typed under construction
+(e.g. DESERIALIZE-VERTEX-HEAD on a wire/disk record) still carries the AUTHOR's
+DATA-POINTER, a heap address meaningless in THIS image.  On ECL, CHANGE-CLASS
+reads a persistent slot during re-init -> NODE-SLOT-VALUE -> MAYBE-INIT-NODE-DATA,
+which would dereference that foreign pointer into the local heap and deserialize
+garbage.  So MAYBE-INIT-NODE-DATA no-ops while this is bound; the data is set
+explicitly afterward (the transaction-node path) or materialized lazily later
+(the lhash path, when this is NIL and the pointer is local).")
+
 (defun maybe-init-node-data (node &key (graph *graph*))
-  (when (> (data-pointer node) 0)
+  (when (and (not *initializing-node*)
+             (> (data-pointer node) 0))
     ;; Ensure the raw bytes are present.  The read paths (lookup-object's bare
     ;; branch and the map-vertices/map-edges scans) already materialized them via
     ;; ENSURE-NODE-BYTES under a read pin, and transactional reads are covered by
@@ -204,7 +229,7 @@ replaced the lhash value-finalizer (which copied under the bucket lock)."
   (or (and *cache-enabled*
            (let ((node (gethash key (cache graph))))
              (when node
-               (record-graph-read)
+               (record-graph-read graph)
                node)))
       (let ((node (lhash-get table key)))
         (when (node-p node)
@@ -213,7 +238,7 @@ replaced the lhash value-finalizer (which copied under the bucket lock)."
           ;;(maybe-init-node-data node :graph graph)
           (when *cache-enabled*
             (setf (gethash key (cache graph)) node))
-          (record-graph-read)
+          (record-graph-read graph)
           node))))
 
 (defun save-node (node table &key (graph *graph*))
@@ -257,7 +282,7 @@ replaced the lhash value-finalizer (which copied under the bucket lock)."
       ;;(log:info "UPDATING LHASH FOR ~A" (string-id node))
       (%lhash-update table (id node) node)
       ;;(log:info "RECORDING WRITE FOR ~A" (string-id node))
-      (record-graph-write)
+      (record-graph-write graph)
       ;;(log:info "CACHING NEW REV OF ~A" (string-id node))
       (setf (gethash (id node) (cache graph)) node))
     (when (/= 0 (data-pointer old-node))
@@ -373,20 +398,8 @@ to NIL is bound.  Materializes the data first (mirrors NODE-SLOT-VALUE)."
           (t
            (call-next-method)))))
 
-(defvar *initializing-node* nil
-  "Bound true around CHANGE-CLASS of a node under construction (see
-CHANGE-NODE-CLASS).  A node's user-defined slot VALUES live in the DATA alist,
-not in real CLOS slots; CHANGE-CLASS re-runs slot initialization and, on some
-implementations (notably ECL), invokes SLOT-MAKUNBOUND-USING-CLASS on those
-persistent slots.  That must NOT destroy the DATA we just populated, so while
-this is bound the persistent branch of SLOT-MAKUNBOUND-USING-CLASS defers to the
-standard (no-op-on-the-alist) method.  Explicit user SLOT-MAKUNBOUND -- this
-unbound -- still drops the alist entry.
-
-Why it matters under concurrency: clearing a freshly-created node's DATA leaves
-the cached node with DATA = NIL but BYTES intact, so the first concurrent readers
-all race to lazily re-materialize DATA from BYTES (MAYBE-INIT-NODE-DATA mutating
-the shared cached node) -- on ECL that surfaced as transient NIL slot reads.")
+;; *INITIALIZING-NODE* is defvar'd above MAYBE-INIT-NODE-DATA (it guards that
+;; function too); see there for the full rationale.
 
 (defmacro change-node-class (node subclass)
   "CHANGE-CLASS NODE to SUBCLASS with *INITIALIZING-NODE* bound, so the
