@@ -953,3 +953,64 @@ explicitly.  NIL for the in-RAM mem-skip-list and everything else.")
 the right opener.")
   (:method ((index skip-list)) :skip-list)
   (:method ((index bplus-tree)) :bplus-tree))
+
+;;; ---------------------------------------------------------------------------
+;;; Shared heap-index factory (views + :unique + spatial)
+;;; ---------------------------------------------------------------------------
+;;; One CREATE and one OPEN for every heap-backed composite-key index, so the
+;;; skip-list-vs-B+-tree choice lives in exactly one place.  Defined here (before
+;;; spatial-index.lisp / views.lisp) so all three consumers can call it.  The
+;;; composite-key codec symbols (VIEW-KEY-SERIALIZE / REDUCE-* -- defined later in
+;;; views.lisp) are referenced only as quoted runtime function designators, so
+;;; there is no load-order problem.
+
+(defparameter *index-backend* :skip-list
+  "Ordered-map backend for a NEW or regenerated HEAP-backed index on a normal graph
+-- views, :unique, and the spatial index: :SKIP-LIST (default) or :BPLUS-TREE.
+Both speak the same ordered-map protocol over the same (payload . node-id)
+composite keys, so an index behaves identically on either.  The choice is
+PERSISTED per index (views: the :BACKEND view-alist key; unique + spatial: a tag in
+their root sidecar) so a graph reopens each index with the backend it was written
+with -- flipping this never disturbs an existing graph (a missing tag => :skip-list).")
+
+(defun make-heap-index (backend heap comparison)
+  "Create a fresh heap-backed composite-key ordered map (skip list or B+ tree) with
+the shared view/unique/spatial codec.  COMPARISON is REDUCE-COMP-LESSP or
+REDUCE-COMP-GREATERP (it also picks the skip list's head/tail sentinels)."
+  (ecase backend
+    (:skip-list
+     (let ((greaterp (eq comparison 'reduce-comp-greaterp)))
+       (make-skip-list
+        :heap heap :duplicates-allowed-p nil
+        :key-equal 'reduce-equal :key-comparison comparison
+        :head-key (if greaterp (list +max-sentinel+ +max-key+) (list +min-sentinel+ +null-key+))
+        :head-value nil
+        :tail-key (if greaterp (list +min-sentinel+ +null-key+) (list +max-sentinel+ +max-key+))
+        :tail-value nil
+        :value-equal 'equal
+        :key-serializer 'view-key-serialize :key-deserializer 'view-key-deserialize
+        :value-serializer 'serialize :value-deserializer 'deserialize)))
+    (:bplus-tree
+     (make-bplus-tree
+      :heap heap :key-equal 'reduce-equal :key-comparison comparison
+      :value-equal 'equal
+      :key-serializer 'view-key-serialize :key-deserializer 'view-key-deserialize
+      :value-serializer 'serialize :value-deserializer 'deserialize))))
+
+(defun open-heap-index (backend &key address heap comparison)
+  "Reopen a persisted heap-backed composite-key index at ADDRESS with BACKEND's
+opener and the shared codec.  BACKEND defaults to :skip-list for a pre-B+-tree
+sidecar/alist with no tag."
+  (ecase (or backend :skip-list)
+    (:skip-list
+     (open-skip-list :address address :heap heap :duplicates-allowed-p nil
+                     :key-equal 'reduce-equal :key-comparison comparison
+                     :value-equal 'equal
+                     :key-serializer 'view-key-serialize :key-deserializer 'view-key-deserialize
+                     :value-serializer 'serialize :value-deserializer 'deserialize))
+    (:bplus-tree
+     (open-bplus-tree :address address :heap heap
+                      :key-equal 'reduce-equal :key-comparison comparison
+                      :value-equal 'equal
+                      :key-serializer 'view-key-serialize :key-deserializer 'view-key-deserialize
+                      :value-serializer 'serialize :value-deserializer 'deserialize))))

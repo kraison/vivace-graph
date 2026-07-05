@@ -166,10 +166,10 @@ once per entry you want the node to contribute (zero, one, or many times)."
                     ;; Reopen with the backend the index was written with (:backend
                     ;; absent on pre-B+-tree graphs -> defaults to :skip-list).
                     (setf (view-skip-list v)
-                          (open-view-index (or (cdr (assoc :backend view)) :skip-list)
+                          (open-heap-index (or (cdr (assoc :backend view)) :skip-list)
                                            :address (cdr (assoc :pointer view))
                                            :heap (indexes graph)
-                                           :sort-order (view-sort-order v)))
+                                           :comparison (view-index-comparison v)))
                     ;;(log:info "~A didn't have a pointer; cannot restore skip list!" v)
                     )
                 (setf (gethash view-name (view-group-table view-group)) v)))))))
@@ -544,42 +544,13 @@ once per entry you want the node to contribute (zero, one, or many times)."
 (defun view-less-than (key1 key2)
   (less-than (first key1) (first key2)))
 
-(defparameter *index-backend* :skip-list
-  "Ordered-map backend used for a NEW or regenerated HEAP-backed index on a normal
-graph -- views AND :unique indexes: :SKIP-LIST (default) or :BPLUS-TREE.  Both
-implement the same ordered-map protocol (add/remove/find/update-in-skip-list + the
-cursor protocol) over the same (user-key . node-id) composite keys, so an index
-works identically on either.  The choice is persisted per index (views: the
-:BACKEND view alist key; unique: the sidecar tuple) so a graph reopens each index
-with the backend it was written with -- an existing graph is never disturbed by
-flipping this.  (The spatial index is not yet wired to this.)")
+;; *INDEX-BACKEND*, MAKE-HEAP-INDEX and OPEN-HEAP-INDEX live in bplus-tree.lisp
+;; (loaded before spatial-index.lisp and this file) so views, :unique, and spatial
+;; all share one create/open.
 
 (defun view-index-comparison (view)
   (if (eql :greaterp (view-sort-order view))
       'reduce-comp-greaterp 'reduce-comp-lessp))
-
-(defun open-view-index (backend &key address heap sort-order)
-  "Reopen a persisted view index (heap-backed) with the view's composite-key
-codec.  BACKEND selects the structure (:skip-list default for pre-B+-tree graphs)."
-  (let ((comparison (if (eql :greaterp sort-order)
-                        'reduce-comp-greaterp 'reduce-comp-lessp)))
-    (ecase (or backend :skip-list)
-      (:skip-list
-       (open-skip-list :address address :heap heap :duplicates-allowed-p nil
-                       :key-equal 'reduce-equal :key-comparison comparison
-                       :value-equal 'equal
-                       :key-serializer 'view-key-serialize
-                       :key-deserializer 'view-key-deserialize
-                       :value-serializer 'serialize
-                       :value-deserializer 'deserialize))
-      (:bplus-tree
-       (open-bplus-tree :address address :heap heap
-                        :key-equal 'reduce-equal :key-comparison comparison
-                        :value-equal 'equal
-                        :key-serializer 'view-key-serialize
-                        :key-deserializer 'view-key-deserialize
-                        :value-serializer 'serialize
-                        :value-deserializer 'deserialize)))))
 
 (defgeneric make-view-skip-list (graph view)
   (:documentation "Create the ordered map backing VIEW.  A normal graph uses a
@@ -587,35 +558,7 @@ heap-backed index -- a skip list or (when *INDEX-BACKEND* is :BPLUS-TREE) a
 B+ tree, persisted via VIEW-POINTER; a memory-graph overrides this to return an
 in-RAM mem-skip-list.")
   (:method ((graph graph) view)
-    (ecase *index-backend*
-      (:skip-list
-       (make-skip-list
-        :heap (indexes graph)
-        :duplicates-allowed-p nil
-        :key-equal 'reduce-equal
-        :key-comparison (view-index-comparison view)
-        :head-key (if (eql :greaterp (view-sort-order view))
-                      (list +max-sentinel+ +max-key+) (list +min-sentinel+ +null-key+))
-        :head-value nil
-        :tail-key (if (eql :greaterp (view-sort-order view))
-                      (list +min-sentinel+ +null-key+) (list +max-sentinel+ +max-key+))
-        :tail-value nil
-        :value-equal 'equal
-        :key-serializer 'view-key-serialize
-        :key-deserializer 'view-key-deserialize
-        :value-serializer 'serialize
-        :value-deserializer 'deserialize))
-      ;; B+ tree: same codec, no head/tail sentinels (an empty tree is an empty leaf).
-      (:bplus-tree
-       (make-bplus-tree
-        :heap (indexes graph)
-        :key-equal 'reduce-equal
-        :key-comparison (view-index-comparison view)
-        :value-equal 'equal
-        :key-serializer 'view-key-serialize
-        :key-deserializer 'view-key-deserialize
-        :value-serializer 'serialize
-        :value-deserializer 'deserialize)))))
+    (make-heap-index *index-backend* (indexes graph) (view-index-comparison view))))
 
 (defmethod regenerate-view ((graph graph) (class-name symbol) (view-name symbol))
   "Regenerate this view's index"

@@ -51,18 +51,10 @@
 ;; the key's second element; the skip-node value is unused (NIL).  The composite
 ;; codec is VIEW-KEY-SERIALIZE (payload string + 16-byte id), shared with views
 ;; and unique indexes.
+;; Created through the shared MAKE-HEAP-INDEX (bplus-tree.lisp), so the spatial
+;; index follows *INDEX-BACKEND* (skip list or B+ tree) like views and unique.
 (defun %spatial-make-sl (heap)
-  (make-skip-list :heap heap
-                  :key-equal 'reduce-equal
-                  :key-comparison 'reduce-comp-lessp
-                  :head-key (list +min-sentinel+ +null-key+) :head-value nil
-                  :tail-key (list +max-sentinel+ +max-key+)  :tail-value nil
-                  :duplicates-allowed-p nil
-                  :value-equal 'equal
-                  :key-serializer 'view-key-serialize
-                  :key-deserializer 'view-key-deserialize
-                  :value-serializer 'serialize
-                  :value-deserializer 'deserialize))
+  (make-heap-index *index-backend* heap 'reduce-comp-lessp))
 
 (defun make-spatial-index (heap &key (precision 7))
   "Create a new spatial index in HEAP (a MEMORY).  PRECISION sets the geohash
@@ -70,25 +62,28 @@ grid resolution (7 ~ 150 m cells, 9 ~ 5 m)."
   (%make-spatial-index :skip-list (%spatial-make-sl heap)
                        :heap heap :precision precision))
 
-(defun open-spatial-index (heap address &key (precision 7))
-  "Reopen the spatial index whose skip list is rooted at ADDRESS in HEAP.
-PRECISION must match the value used at creation."
+(defun open-spatial-index (heap address &key (precision 7) (backend *index-backend*))
+  "Reopen the spatial index whose ordered map is rooted at ADDRESS in HEAP, with
+BACKEND's opener.  PRECISION must match the value used at creation.  BACKEND
+defaults to the current *INDEX-BACKEND* for the raw API; RESTORE-SPATIAL-INDEX
+passes the tag persisted in the sidecar (authoritative -- a pre-B+-tree sidecar
+has no tag and restores as :skip-list)."
   (%make-spatial-index
-   :skip-list (open-skip-list :address address :heap heap
-                              :key-equal 'reduce-equal :key-comparison 'reduce-comp-lessp
-                              :duplicates-allowed-p nil :value-equal 'equal
-                              :key-serializer 'view-key-serialize
-                              :key-deserializer 'view-key-deserialize
-                              :value-serializer 'serialize :value-deserializer 'deserialize)
+   :skip-list (open-heap-index backend :address address :heap heap
+                               :comparison 'reduce-comp-lessp)
    :heap heap :precision precision))
 
 (defun spatial-index-address (idx)
-  "Root heap address of IDX's skip list -- persist this to reopen the index."
-  (%sl-address (spatial-index-skip-list idx)))
+  "Root heap address of IDX's ordered map -- persist this to reopen the index."
+  (view-index-address (spatial-index-skip-list idx)))
+
+(defun spatial-index-backend (idx)
+  "Backend tag of IDX's ordered map -- persist alongside the address."
+  (view-index-backend-tag (spatial-index-skip-list idx)))
 
 (defun delete-spatial-index (idx)
-  "Free the index's skip list from its heap."
-  (delete-skip-list (spatial-index-skip-list idx)))
+  "Free the index's ordered map from its heap."
+  (delete-view-index (spatial-index-skip-list idx)))
 
 (defun %bbox-cells (geom precision)
   (multiple-value-bind (min-lon min-lat max-lon max-lat) (geometry-bbox geom)

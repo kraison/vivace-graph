@@ -199,34 +199,37 @@ The B+ tree is a **selectable backend for heap-backed indexes**, proving the
 (defparameter *index-backend* :skip-list)   ; or :bplus-tree
 ```
 
-`make-view-skip-list` (the one seam where a heap-backed ordered map is created —
-shared by views **and** the `:unique` index) dispatches on it, and the choice is
-**persisted per index** (views: a `:backend` key in the view alist; unique: a tag
-in the `unique-indexes.dat` sidecar tuple) so a graph reopens each index with the
-backend it was written with — an existing graph is never disturbed by flipping the
-switch (a missing tag ⇒ `:skip-list`). The lifecycle touches that weren't already
-generic — create, heap-address, type check, delete, and reopen — go through a
-small backend-agnostic protocol (`view-index-p` / `view-index-address` /
-`delete-view-index` / `view-index-backend-tag`, plus `open-view-index`)
-implemented by both the skip list and the B+ tree. Everything else
-(add/remove/find/update, cursors, `%sn-key`/`%sn-value`, map-reduce roll-ups, the
-unique `uix-*` ops) was already the shared ordered-map protocol, so **no
-view/unique logic changed**.
+One shared factory — `make-heap-index` / `open-heap-index` (in `bplus-tree.lisp`,
+before all three consumers) — creates/reopens every heap-backed composite-key
+index, dispatching on `*index-backend*`. Views (`make-view-skip-list`), the
+`:unique` index (`make-unique-skip-list`), and the spatial index
+(`%spatial-make-sl`) all route through it. The choice is **persisted per index**
+(views: a `:backend` key in the view alist; unique + spatial: a tag in their root
+sidecar) so a graph reopens each index with the backend it was written with — an
+existing graph is never disturbed by flipping the switch (a missing tag ⇒
+`:skip-list`). The lifecycle touches that weren't already generic — create,
+heap-address, type check, delete, and reopen — go through a small backend-agnostic
+protocol (`view-index-p` / `view-index-address` / `delete-view-index` /
+`view-index-backend-tag`, plus `open-heap-index`) implemented by both the skip list
+and the B+ tree. Everything else (add/remove/find/update, cursors,
+`%sn-key`/`%sn-value`, map-reduce roll-ups, the unique `uix-*` ops, the spatial
+cell scans) was already the shared ordered-map protocol, so **no consumer logic
+changed**.
 
-Scope: `*index-backend*` governs **views and `:unique`**. The spatial index builds
-its own `make-skip-list` and is the remaining spot to wire (Phase B step 3);
-user-facing ini/config selection is Phase C.
+Scope: `*index-backend*` governs **views, `:unique`, and spatial** — every
+heap-backed index. User-facing ini/config selection is Phase C.
 
-**Validation.** The `view-suite` (map views, map-reduce, asc/desc order,
-`:key`/range/paging, delete, **and close/reopen persistence**) and the
-`unique-constraint-suite` (enforcement, cross-subtype, NULL-exempt, **and durable
-reopen from the sidecar**) pass **identically under both backends**:
+**Validation.** Views (map/map-reduce, asc/desc, `:key`/range/paging, delete,
+**reopen**), unique (enforcement, cross-subtype, NULL-exempt, **durable reopen
+from sidecar**), and the full spatial suite set (index/query/hook/intersect/
+prolog/graph-spatial, incl. **reopen**) pass **identically under both backends**:
 
 | suite | skip-list | b+tree |
 |---|--:|--:|
 | SBCL `view-suite` | 56/56 | 56/56 |
 | ECL `view-suite`  | 56/56 | 56/56 |
 | SBCL `unique-constraint-suite` | 30/30 | 30/30 |
+| SBCL spatial suites (6, 174 checks) | ✓ | ✓ |
 
 The whole `graph-db-suite` is **1956/0** on SBCL with the default (skip-list)
 backend — the wiring is a **zero-regression** change. The ECL pass matters

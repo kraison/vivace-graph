@@ -105,8 +105,9 @@ REOPEN uses the right opener (see SAVE/RESTORE-UNIQUE-INDEX-ROOTS)."
 
 (defun %open-unique-skip-list (graph address &optional (backend :skip-list))
   "Reopen the unique index at ADDRESS with BACKEND's opener (same composite-key
-codec as a view; :sort-order :lessp)."
-  (open-view-index backend :address address :heap (indexes graph) :sort-order :lessp))
+codec as a view; REDUCE-COMP-LESSP order)."
+  (open-heap-index backend :address address :heap (indexes graph)
+                   :comparison 'reduce-comp-lessp))
 
 (defun uix-lookup (uix key)
   "The id currently holding canonical KEY in UIX, or NIL."

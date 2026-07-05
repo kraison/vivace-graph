@@ -16,7 +16,9 @@ views persist their pointer).  PRECISION is read back by RESTORE-SPATIAL-INDEX."
     (setf (spatial-index graph) idx)
     (cl-store:store (list :format +spatial-index-format+
                           :address (spatial-index-address idx)
-                          :precision (spatial-index-precision idx))
+                          :precision (spatial-index-precision idx)
+                          ;; backend tag -> RESTORE reopens with the right opener
+                          :backend (spatial-index-backend idx))
                     (spatial-index-root-file (location graph)))
     idx))
 
@@ -27,11 +29,13 @@ predates the spatial index, is rebuilt from live node geometries into the curren
 composite-key format (RESTORE runs after the node tables are open)."
   (let ((file (spatial-index-root-file (location graph))))
     (if (probe-file file)
-        (destructuring-bind (&key address precision format &allow-other-keys)
+        (destructuring-bind (&key address precision format (backend :skip-list)
+                             &allow-other-keys)
             (cl-store:restore file)
           (if (eql format +spatial-index-format+)
               (setf (spatial-index graph)
-                    (open-spatial-index (indexes graph) address :precision (or precision 7)))
+                    (open-spatial-index (indexes graph) address :precision (or precision 7)
+                                        :backend backend))
               ;; v1 / unversioned on disk -> rebuild into v2 (drops old, re-scans nodes).
               (rebuild-spatial-index graph :precision (or precision 7))))
         (init-spatial-index graph))))
