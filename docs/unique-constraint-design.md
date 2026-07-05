@@ -222,28 +222,46 @@ Is the value VG-minted (an id/code we generate)?
 - NULL-exempt, enforced across subtypes, persistent index (memory: in the derived set).
 - Cross-peer scope: `:origin` and `:local`. A `unique-constraint-violation` condition.
 
-**Deferred:**
-- `:hub` reserve-online path (the hub-authoritative reservation + provisional/ack flow).
+**Done since v1 (commit `f81759c`) — peer-replication gaps 1+2:**
+- Uniqueness index is now **maintained on replicated/pulled applies**:
+  `apply-peer-create-writes` (state-sync) and `apply-peer-authored-op` (authored) run
+  `apply-tx-writes-to-unique-indexes`, and `peer-purge-node` releases a purged node's
+  unique keys. A device's index therefore reflects everything it holds, and a local
+  commit is enforced against pulled values. (Enforcement itself is still on the
+  authoring commit / hub re-home, both of which go through `%commit`.)
+- **Real per-node `:origin`** (Option A): a `node-origins` side-store on peer graphs
+  (node-id → the authoring origin captured once at create, fixed for life), persisted
+  like `field-stamps`. `%node-origin` reads it; `:origin` keys on `(origin-token . value)`
+  so two devices minting the same value are distinct keys. Non-peer graphs have one
+  origin, so `:origin` == `:local`.
+- Fixed a latent `less-than`/`greater-than` bug (equal/nested lists ranked strictly
+  less-than themselves) that the `:origin` composite key surfaced.
+
+**Still deferred:**
+- **Global-scope (`:local`/`:hub`) cross-device collision arbiter** — the hub keep-winner
+  + surface-loser + compensate-forward flow. Tracked as **GH #51**. (The hub already
+  enforces on re-home via `%commit`, but a violation there currently aborts the push
+  session rather than resolving it.)
+- `:hub` reserve-online path (hub-authoritative reservation + provisional/ack flow).
 - Composite / multi-slot uniqueness (a class-level declaration).
-- Uniqueness on replicated/pulled applies (v1 enforces on the authoring commit only;
-  `apply-peer-create-writes` bypasses `%commit`, by design).
 - Range queries on a unique field (would want a skip-list backing rather than a hash).
 
 ## Acceptance criteria (v1)
 
-- [ ] `:unique t` on a slot rejects a create/update that duplicates another live
+- [x] `:unique t` on a slot rejects a create/update that duplicates another live
       node's value with `unique-constraint-violation`; the transaction aborts cleanly
       (nothing journaled), distinct from a retriable OCC `validation-conflict`.
-- [ ] `:unique <canonicalizer>` (e.g. `#'string-downcase`) enforces equality on the
+- [x] `:unique <canonicalizer>` (e.g. `#'string-downcase`) enforces equality on the
       canonical key; `:unique equalp` case-folds.
-- [ ] Concurrent commits racing the same value: exactly one wins; the other gets a
+- [x] Concurrent commits racing the same value: exactly one wins; the other gets a
       `unique-constraint-violation` (verified under the manager lock, no phantom).
-- [ ] NULL/unbound values never collide; `mark-deleted` releases the value for reuse;
+- [x] NULL/unbound values never collide; `mark-deleted` releases the value for reuse;
       an update that changes the value releases the old key.
-- [ ] Works on the on-disk **and** memory (eager + lazy) backends; the unique index is
+- [x] Works on the on-disk **and** memory (eager + lazy) backends; the unique index is
       persisted/opened, not rebuilt on open.
-- [ ] `:scope :origin` makes two origins' identical raw values non-colliding.
-- [ ] Docs (`docs/vivace-graph-v3-doc.org`, `def-vertex`/`def-edge` docstrings) updated.
+- [x] `:scope :origin` makes two origins' identical raw values non-colliding (per-node
+      origin under peer replication; a device also enforces pulled values).
+- [x] Docs (`docs/vivace-graph-v3-doc.org` Chapter 8 + Chapter 16) updated.
 
 ## Implementation sketch (files likely touched)
 
