@@ -19,6 +19,19 @@ A comprehensive developer's manual lives in [`docs/vivace-graph-v3-doc.org`](doc
 
 This manual was written by [Gwang-Jin Kim (@gwangjinkim)](https://github.com/gwangjinkim) — the project's first thorough documentation, and a great piece of work. Many thanks to him. It has been adopted here and is maintained alongside the code; newer chapters (such as Chapter 12 on MVCC) are maintainer additions written in his style.
 
+### Announcement, 2026-07-05 — VivaceGraph 2.1.0
+
+A large, **backward-compatible** feature release. Highlights:
+
+- **Pluggable ordered-index backend.** Views, `:unique` constraints and the spatial index can now run on a page-oriented **B+ tree** instead of the skip list — selected per graph with `:index-backend :bplus-tree` on `make-graph` / `open-graph` (default stays `:skip-list`). On disk the B+ tree wins on every operation once warm. Each index remembers its own backend, and an existing graph is migrated in place with `regenerate-all-views` / `regenerate-unique-indexes` / `rebuild-spatial-index`. (Manual Chapter 3.)
+- **`:unique` slot constraints (issue #6).** Declare `(slot … :unique t | equal | equalp | <canonicalizer>)`; enforced atomically at the commit boundary, NULL-exempt, backed by a durable per-graph index. (Chapter 8.)
+- **Offline-first peer replication (Chapter 16).** A bidirectional hub-and-spoke *peer* mode for mobile/edge fleets: each device syncs only the authorized subset it may see, authors locally while disconnected, and reconciles on reconnect.
+- **In-memory backend — `make-memory-graph` (issue #50, Chapter 15).** The whole graph as live Lisp objects for lowest-latency reads, with the same API; eager or lazy open.
+- **Modernized Prolog engine + safe web query surface (issues #44/#45).** First-class control flow (`\+`, `->`/`;`, `once`, `forall`, `call/N`), `findall`/`bagof`/`setof`, ISO `catch`/`throw`, per-query resource bounds and effect policies, and read-only JSON/`def-query` HTTP endpoints.
+- **Correctness.** A codebase-wide sweep fixed a class of "wrong-graph" bugs (operations resolving against the dynamic `*graph*` instead of the graph in hand).
+
+**No migration required** — existing on-disk v2 graphs open unchanged. See [`CHANGELOG.md`](CHANGELOG.md) for the full list.
+
 ### Announcement, 2026-06-06 — MVCC and storage format v2 (breaking)
 
 The MVCC release adds immutable, versioned nodes (issue #19): each update now retains the previous version of a node in a heap-backed chain, reclaimed by a lazy, epoch-gated reaper according to a configurable `:keep-revisions` policy. This brings configurable history, snapshot-isolation reads for transactional lookups, and — as a bonus — finally dissolves the long-standing node-data read-after-free race at its source.

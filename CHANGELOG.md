@@ -2,9 +2,68 @@
 
 All notable changes to VivaceGraph are recorded here.
 
-## Unreleased
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html):
+`MAJOR.MINOR.PATCH` — MAJOR for incompatible changes (including on-disk storage
+format bumps), MINOR for backward-compatible features, PATCH for backward-compatible
+fixes. The `## [Unreleased]` section accumulates changes on the `experiment` branch
+between releases; cutting a release renames it to the new version and dates it.
+
+## [Unreleased]
+
+Nothing yet.
+
+## [2.1.0] - 2026-07-05
+
+A large, backward-compatible feature release: a pluggable ordered-index backend
+(an mmap B+ tree alongside the skip list), `:unique` slot constraints, offline-first
+peer replication, an in-memory backend, idempotent views, a modernized Prolog engine
+with a safe web query surface, and cross-cutting correctness fixes. Existing on-disk
+v2 graphs open without migration.
 
 ### Added
+- **Pluggable ordered-index backend — an mmap B+ tree (opt-in).** All heap-backed
+  ordered indexes (map/reduce views, `:unique` constraints, the spatial index) are
+  now built on a shared ordered-map protocol with two interchangeable backends: the
+  skip list (default) and a new page-oriented (4 KB slotted-page) **B+ tree**
+  (`bplus-tree.lisp`). The backend is a per-graph choice — `:index-backend
+  :bplus-tree` on `make-graph`/`open-graph`, or the global `graph-db:*index-backend*`
+  — and each index persists the backend it was written with, so a graph reopens
+  every index on its own engine. On disk the B+ tree beats the skip list on every
+  operation once warm (page-packed keys → far fewer cache-line and page misses,
+  sequential in-leaf range scans, less space), with in-place cell edits and
+  merge-on-delete rebalancing. Existing graphs migrate in place via
+  `regenerate-all-views` / `regenerate-unique-indexes` / `rebuild-spatial-index`
+  (or snapshot + replay). (Manual Chapter 3.)
+- **`:unique` slot constraints (issue #6).** `def-vertex` / `def-edge` slots may
+  carry `:unique t | equal | equalp | <canonicalizer>` (the value is the uniqueness
+  key — identity, case/edge folding, or an arbitrary canonical form). Enforced at
+  the commit boundary: a violation aborts the whole transaction with
+  `unique-constraint-violation`; NULL-exempt (SQL-style); shared across subclasses
+  of the declaring type; commits racing for the same value are serialized so exactly
+  one wins. Backed by a persistent, per-graph unique index (skip-list or B+ tree;
+  in-RAM map on a memory-graph) reopened with the graph — not rebuilt by scanning on
+  open. (Manual Chapter 8. Distributed cross-device arbitration is tracked in #51.)
+- **Peer replication — offline-first, hub-and-spoke sync (Chapter 16).** A
+  bidirectional *peer* mode for mobile/edge fleets, alongside the existing
+  master/slave replication: each device is synced only the authorized subset of the
+  graph it may see (`:export-predicate`), authors locally while disconnected, and
+  reconciles on reconnect. Closed-subgraph export + manifest reconciliation, node
+  re-homing, per-node origin identity, Lamport clocks, and a pluggable
+  conflict-resolution policy (`:origin` partitioning by default). Runs on both the
+  on-disk and in-memory backends (verified SBCL hub ↔ ECL device).
+- **In-memory backend — `make-memory-graph` (issue #50, Chapter 15).** An in-RAM
+  storage backend that holds the whole graph as live Lisp objects, eliminating
+  per-read deserialization and pcons-chain walking — lowest-latency reads when the
+  graph fits in memory (aimed at mobile/ECL). Durable via the same journal plus a
+  checkpoint image; eager or fault-on-access (lazy) open. The graph model,
+  `with-transaction`, OCC validation, views, spatial, `:unique`, peer replication,
+  and the Prolog engine all work against it unchanged.
+- **Idempotent `def-view` (issue #49).** `def-view` is now declarative and
+  idempotent: redefining a view with an unchanged definition is O(1) at open (no
+  rescan), and a changed definition is diffed and rebuilt automatically via a
+  two-phase registry. `open-graph` / `open-memory-graph` install views on open and
+  accept `:regenerate-views t`; `regenerate-all-views` forces a full rebuild.
 - **Streaming results: `select` `:callback` + NDJSON web responses (issue #44).**
   `select` accepts `:callback FN`, which hands each result row to `FN` as it is
   produced -- consing nothing onto a result list -- and returns the row count.
@@ -127,6 +186,16 @@ All notable changes to VivaceGraph are recorded here.
   shape as `def-query`.
 
 ### Fixed
+- **Wrong-graph (`*graph*`) leaks across the core node/index/query layer.** A class
+  of latent bug where code holding a specific graph resolved node ids or schema
+  type-ids through the dynamic `*graph*` instead — so it operated on the *wrong*
+  graph whenever `*graph*` differed (a reopened graph, a second open graph, a
+  snapshot/replay target, or a slave/peer graph). Fixed in `map-view` /
+  `invoke-graph-view`, `traverse`, `edge-exists-p`, the generated `make-<type>`
+  type-id resolution, the `ve-index` index-list heap (a foreign-heap allocation that
+  could corrupt adjacency), and `apply-transaction` (now binds `*graph*` to the
+  target as a structural guard). Makes the snapshot/replay-into-a-fresh-graph idiom
+  correct for graphs with views. A cross-graph regression test guards it.
 - **REST procedure/query POST routes never worked over HTTP.** Their ningle
   handlers were quoted lambdas (`'(lambda (params) ...)`) -- a *list*, not a
   function -- so the server returned the list verbatim and the response was
@@ -163,7 +232,7 @@ All notable changes to VivaceGraph are recorded here.
   concurrently with readers (torn-read safety preserved); concurrent readers now
   run in parallel.  No-op on non-ECL (those keep the lock-free design).
 
-## 2.0.0
+## [2.0.0] - 2026-06-11
 
 A major release: MVCC versioned nodes, a geohash spatial extension, a full
 cross-implementation port (SBCL/CCL/ECL) with a comprehensive automated test
@@ -238,3 +307,7 @@ suite, and an ACID-compliance audit.
   macOS.
 - LispWorks support is currently **untested** (no license access; the free
   Personal Edition's heap is too small to compile VivaceGraph).
+
+[Unreleased]: https://github.com/kraison/vivace-graph-v3/compare/v2.1.0...HEAD
+[2.1.0]: https://github.com/kraison/vivace-graph-v3/compare/v2.0...v2.1.0
+[2.0.0]: https://github.com/kraison/vivace-graph-v3/releases/tag/v2.0
