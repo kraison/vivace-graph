@@ -701,3 +701,36 @@ entry with key >= DKEY in the leaf that would hold DKEY."
   ;; Duplicate-free composite keys: replace = remove + add.
   (bpt-remove tree key)
   (add-to-skip-list tree key value))
+
+;;; ---------------------------------------------------------------------------
+;;; Backend-agnostic view-index protocol
+;;; ---------------------------------------------------------------------------
+;;; A view (and the :unique / spatial indexes) persists a heap-backed ordered map
+;;; and reopens it by address.  Both the skip list and the B+ tree qualify; the
+;;; in-RAM MEM-SKIP-LIST does NOT (it has no heap pointer and is rebuilt on open).
+;;; These generics let VIEWS.LISP treat "which backend" uniformly, so a view's
+;;; ordered map can be a skip list or a B+ tree with no other code change.
+
+(defgeneric view-index-p (index)
+  (:documentation "True if INDEX is a persistent, heap-backed ordered-map index
+(skip list or B+ tree) -- i.e. one that owns a heap address and is freed
+explicitly.  NIL for the in-RAM mem-skip-list and everything else.")
+  (:method (index) (declare (ignore index)) nil)
+  (:method ((index skip-list)) t)
+  (:method ((index bplus-tree)) t))
+
+(defgeneric view-index-address (index)
+  (:documentation "INDEX's heap address (persisted as the view pointer).")
+  (:method ((index skip-list)) (%sl-address index))
+  (:method ((index bplus-tree)) (%bpt-address index)))
+
+(defgeneric delete-view-index (index)
+  (:documentation "Free INDEX's heap storage.")
+  (:method ((index skip-list)) (delete-skip-list index))
+  (:method ((index bplus-tree)) (delete-bplus-tree index)))
+
+(defgeneric view-index-backend-tag (index)
+  (:documentation "Keyword naming INDEX's backend, persisted so reopen selects
+the right opener.")
+  (:method ((index skip-list)) :skip-list)
+  (:method ((index bplus-tree)) :bplus-tree))

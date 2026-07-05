@@ -98,8 +98,12 @@ test + canonicalizer are resolved lazily when the index is created."
 ;;; Backend-agnostic operations over the backing store (K = canonical key).
 (defun make-unique-skip-list (graph)
   "The persistent skip-list backing an on-disk unique index -- a view-style ordered
-map (composite key, REDUCE-COMP-LESSP), so it reopens with the same params as a view."
-  (make-view-skip-list graph (make-view :sort-order :lessp)))
+map (composite key, REDUCE-COMP-LESSP), so it reopens with the same params as a view.
+Pinned to the skip-list backend: %OPEN-UNIQUE-SKIP-LIST still hardcodes OPEN-SKIP-LIST,
+so unique indexes must not follow *VIEW-INDEX-BACKEND* until unique reopen is made
+backend-aware (a separate step)."
+  (let ((*view-index-backend* :skip-list))
+    (make-view-skip-list graph (make-view :sort-order :lessp))))
 
 (defun %open-unique-skip-list (graph address)
   (open-skip-list :address address :heap (indexes graph)

@@ -155,6 +155,48 @@ behind the unchanged ordered-map interface (`make-view-skip-list` + the `open-*`
 paths + sidecar root pointers) and, per the hand-off, building **Piece 2 (the
 general ordered index)** on it.
 
+## Drop-in behind `make-view-skip-list` (validated)
+
+The B+ tree is wired in as a **selectable backend for view indexes**, proving the
+"drop-in" claim end to end. The switch is one special variable:
+
+```lisp
+(defparameter *view-index-backend* :skip-list)   ; or :bplus-tree
+```
+
+`make-view-skip-list` (the one seam where a view's ordered map is created)
+dispatches on it, and the choice is **persisted per view** so a graph reopens
+each index with the backend it was written with. The lifecycle touches that
+weren't already generic — create, heap-address (for the view pointer), type
+check, delete, and reopen — go through a small backend-agnostic protocol
+(`view-index-p` / `view-index-address` / `delete-view-index` /
+`view-index-backend-tag`, plus `open-view-index`) implemented by both the skip
+list and the B+ tree. Everything else (add/remove/find/update, cursors,
+`%sn-key`/`%sn-value`, map-reduce roll-ups) was already the shared ordered-map
+protocol, so **no view logic changed**.
+
+Scope: `*view-index-backend*` governs view indexes only. The `:unique` index
+(which shares `make-view-skip-list`) is pinned to the skip list for now because
+its reopen path still hardcodes `open-skip-list`; the spatial index builds its
+own `make-skip-list` and is untouched. Both are follow-ups when the substrate
+migrates for real.
+
+**Validation.** The full `view-suite` (map views, map-reduce, ascending +
+descending order, `:key` / range / paging, delete, **and close/reopen
+persistence**) passes **identically under both backends**, on **both
+implementations**:
+
+| | skip-list | b+tree |
+|---|--:|--:|
+| SBCL `view-suite` | 56/56 | 56/56 |
+| ECL `view-suite`  | 56/56 | 56/56 |
+
+The whole `graph-db-suite` is **1956/0** on SBCL with the default (skip-list)
+backend — the wiring is a **zero-regression** change. The ECL pass matters
+specifically because the B+ tree's page I/O is a raw CFFI `memcpy` through
+`with-pointer-to-vector-data`; it round-trips the view codec correctly on ECL,
+including reopen.
+
 ### Before it graduates from a prototype
 1. **In-place insert/delete** to kill the whole-page RMW write cost.
 2. **Concurrency:** page-latch crabbing or a COW/versioned-root story to restore
