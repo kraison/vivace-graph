@@ -201,6 +201,7 @@ applied-op-id dedup lhash (opened when MODE is :OPEN and it already exists)."
         (peer-schema-version graph) peer-schema-version
         (lamport-counter graph) (load-lamport-counter graph)
         (field-stamps graph) (load-field-stamps graph)
+        (node-origins graph) (load-node-origins graph)   ; #6 :ORIGIN partitions
         (peer-conflicts graph) (load-peer-conflicts graph)
         (applied-op-ids graph)
         (let ((loc (format nil "~A/applied-ops/" path)))

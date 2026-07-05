@@ -175,6 +175,16 @@
                    :documentation "Durable OP-ID -> lamport dedup index (WP-3), checked
                    before apply so a re-homed op bouncing back is not duplicated.  NIL
                    until WP-3 wires it.")
+   (node-origins :accessor node-origins :initarg :node-origins :initform nil
+                 :documentation "Unique-constraint :ORIGIN scope (#6): node-id ->
+                 the authoring origin captured when the node was first created on
+                 this replica, FIXED for the node's lifetime.  An :ORIGIN-scoped
+                 unique value partitions by this origin, so two devices minting the
+                 same value are distinct composite keys (no coordination).  Set-once
+                 in %UIX-CLAIM, read by %NODE-ORIGIN; persisted on open/close like
+                 FIELD-STAMPS.  NIL on a non-peer graph (which has one origin, so
+                 :ORIGIN falls back to the graph origin).")
+   (node-origins-lock :accessor node-origins-lock :initform (make-recursive-lock "node-origins"))
    (peer-schema-version :accessor peer-schema-version :initarg :peer-schema-version
                         :initform '(1 0)
                         :documentation "This replica's (MAJOR MINOR) schema version

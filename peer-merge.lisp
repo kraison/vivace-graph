@@ -165,6 +165,72 @@ NIL origin sorts lowest (an unstamped local field always loses a real op)."
                                                    (and origin-hex (peer-hex->id origin-hex)))))))))))
     (setf (field-stamps graph) tbl)))
 
+;;; ---------------------------------------------------------------------------
+;;; Node-origins side-store (#6, unique :ORIGIN scope): node-id -> the authoring
+;;; origin captured at CREATE, fixed for the node's lifetime.  Same substrate and
+;;; persistence shape as FIELD-STAMPS (an in-memory map snapshotted on open/close).
+;;; ---------------------------------------------------------------------------
+
+;; NODE-ORIGINS is a PEER-GRAPH slot; a plain graph (including a peer graph reopened
+;; without :PEER-ROLE) has no such slot.  A NIL fallback keeps every reader safe there
+;; -- %NODE-ORIGIN then falls back to the graph origin, i.e. :ORIGIN == :LOCAL.
+(defmethod node-origins ((graph graph)) nil)
+
+(defun ensure-node-origins (graph)
+  (or (node-origins graph)
+      (setf (node-origins graph) (make-hash-table :test 'equalp))))
+
+(defun get-node-origin (graph node-id)
+  "The creation origin recorded for NODE-ID, or NIL if none (or not a peer graph)."
+  (and (node-origins graph)
+       (with-recursive-lock-held ((node-origins-lock graph))
+         (gethash node-id (node-origins graph)))))
+
+(defun set-node-origin (graph node-id origin)
+  "Record NODE-ID's creation ORIGIN once; a later call never overwrites it (the
+partition is fixed at create).  No-op when ORIGIN is NIL."
+  (when origin
+    (with-recursive-lock-held ((node-origins-lock graph))
+      (let ((tbl (ensure-node-origins graph)))
+        (unless (gethash node-id tbl)
+          (setf (gethash node-id tbl) origin)))))
+  origin)
+
+(defun remove-node-origin (graph node-id)
+  "Drop NODE-ID's origin (on purge/hard-delete)."
+  (when (node-origins graph)
+    (with-recursive-lock-held ((node-origins-lock graph))
+      (remhash node-id (node-origins graph)))))
+
+(defgeneric node-origins-file (graph)
+  (:method (graph)
+    (make-pathname :name "node-origins" :type "dat" :defaults (location graph))))
+
+(defun persist-node-origins (graph)
+  (when (node-origins graph)
+    (with-recursive-lock-held ((node-origins-lock graph))
+      (with-open-file (s (node-origins-file graph) :direction :output
+                         :if-exists :supersede :if-does-not-exist :create)
+        (with-standard-io-syntax
+          (let ((*package* (find-package :graph-db)))
+            (write
+             (loop for id being the hash-keys of (node-origins graph) using (hash-value origin)
+                   collect (cons (peer-id->hex id) (and origin (peer-id->hex origin))))
+             :stream s))))))
+  graph)
+
+(defun load-node-origins (graph)
+  (let ((tbl (make-hash-table :test 'equalp))
+        (file (node-origins-file graph)))
+    (when (probe-file file)
+      (with-open-file (s file :direction :input)
+        (with-standard-io-syntax
+          (let ((*package* (find-package :graph-db)) (*read-eval* nil))
+            (dolist (entry (read s nil nil))
+              (setf (gethash (peer-hex->id (car entry)) tbl)
+                    (and (cdr entry) (peer-hex->id (cdr entry)))))))))
+    (setf (node-origins graph) tbl)))
+
 (defun authored-changed-slots (write)
   "The slots an authored WRITE actually changed -- all of a create's data, or the
 diff of an update's new vs old.  Used to stamp locally-authored edits."

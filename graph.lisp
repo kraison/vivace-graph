@@ -176,6 +176,8 @@ to disk and remove it."
               (lamport-counter graph) (load-lamport-counter graph)
               ;; B2b: recover per-field Lamport stamps (v1 in-memory snapshot).
               (field-stamps graph) (load-field-stamps graph)
+              ;; #6: recover the :ORIGIN-scope per-node origin partitions.
+              (node-origins graph) (load-node-origins graph)
               ;; B3: recover the durable conflict records for the review surface.
               (peer-conflicts graph) (load-peer-conflicts graph)
               ;; WP-3: durable applied-op-id dedup index -- op-id (16-byte uuid key)
@@ -319,6 +321,8 @@ Always CLOSE-GRAPH when finished."
               (lamport-counter graph) (load-lamport-counter graph)
               ;; B2b: recover per-field Lamport stamps (v1 in-memory snapshot).
               (field-stamps graph) (load-field-stamps graph)
+              ;; #6: recover the :ORIGIN-scope per-node origin partitions.
+              (node-origins graph) (load-node-origins graph)
               ;; B3: recover the durable conflict records for the review surface.
               (peer-conflicts graph) (load-peer-conflicts graph)
               ;; WP-3: open the applied-op-id index (create it if this peer-graph
@@ -401,6 +405,8 @@ in place, forcing recovery on the next OPEN-GRAPH."
   (declare (ignore snapshot-p))
   ;; B2b: snapshot the per-field Lamport stamps (v1 substrate persists on close).
   (ignore-errors (persist-field-stamps graph))
+  ;; #6: snapshot the :ORIGIN-scope per-node origin partitions.
+  (ignore-errors (persist-node-origins graph))
   ;; B3: snapshot the durable conflict records for the review surface.
   (ignore-errors (persist-peer-conflicts graph))
   (when (and (slot-boundp graph 'applied-op-ids)

@@ -145,12 +145,35 @@ map (composite key, REDUCE-COMP-LESSP), so it reopens with the same params as a 
           (loop for node = (cursor-next cur) while node do (incf n))
           n))))
 
+(defvar *peer-apply-origin* nil
+  "Bound during device pull-apply (APPLY-PEER-CREATE-WRITES / APPLY-PEER-AUTHORED-OP)
+to the incoming op's origin, so a node created off the %COMMIT path still records the
+authoring origin for its :ORIGIN partition (#6).")
+
+(defun %current-authoring-origin (graph)
+  "The origin to attribute a node CREATED in the current apply context to: the
+re-homed op's original author (hub), the pulled op's origin (device), else this
+graph's own origin (a local authored commit)."
+  (or (and (boundp '*peer-rehome-op*) *peer-rehome-op* (second *peer-rehome-op*))
+      *peer-apply-origin*
+      (ignore-errors (origin-id graph))
+      :graph))
+
 (defun %node-origin (node graph)
-  "The origin an :ORIGIN-scoped key is partitioned by.  v1: the graph's own
-origin-id (a constant within one graph, so :ORIGIN degenerates to :LOCAL for a
-single graph; full per-node origin is the peer-model refinement)."
-  (declare (ignore node))
-  (or (ignore-errors (origin-id graph)) :graph))
+  "The origin an :ORIGIN-scoped unique value partitions by: the node's FIXED creation
+origin if recorded (a peer graph's NODE-ORIGINS store), else the current authoring
+context (a node being created now).  A non-peer graph has no store and a single
+origin, so :ORIGIN collapses to :LOCAL there."
+  (or (and (node-origins graph) (get-node-origin graph (id node)))
+      (%current-authoring-origin graph)))
+
+(defun %origin-token (origin)
+  "A comparable, content-equal token for ORIGIN inside a composite unique key.  A
+16-byte id array has no LESS-THAN/EQUAL content semantics (both are identity-ish on
+raw ub8 vectors), so render it as its hex string; a keyword/NIL passes through."
+  (cond ((typep origin '(array (unsigned-byte 8) (*))) (peer-id->hex origin))
+        ((null origin) :graph)
+        (t origin)))
 
 (defun %unique-key (uix value node graph)
   "The canonical key VALUE maps to in UIX (canonicalizer + scope applied), or NIL for
@@ -159,7 +182,7 @@ a NULL/unbound value (which is exempt from the constraint, SQL-style)."
     (let ((k (let ((c (unique-index-canonicalizer uix)))
                (if c (funcall c value) value))))
       (if (eq (unique-index-scope uix) :origin)
-          (list (%node-origin node graph) k)
+          (list (%origin-token (%node-origin node graph)) k)
           k))))
 
 (defun %unique-index-for (graph descriptor)
@@ -193,10 +216,17 @@ from SPEC on creation."
 
 (defun %uix-claim (node graph)
   "Claim NODE's unique keys (create / new value of an update)."
-  (dolist (d (class-unique-slots (class-of node)))
-    (let* ((uix (%unique-index-for graph d))
-           (key (%unique-key uix (slot-value node (first d)) node graph)))
-      (when key (uix-put uix key (id node))))))
+  (let ((slots (class-unique-slots (class-of node))))
+    ;; Fix this node's :ORIGIN partition at create (set-once): record the authoring
+    ;; origin now, while the apply context still names it, so a later RELEASE (on
+    ;; update/delete) recomputes the SAME composite key even though the context is
+    ;; gone.  Only on a peer graph with an :ORIGIN-scoped slot; a no-op otherwise.
+    (when (and (node-origins graph) (find :origin slots :key #'fourth))
+      (set-node-origin graph (id node) (%current-authoring-origin graph)))
+    (dolist (d slots)
+      (let* ((uix (%unique-index-for graph d))
+             (key (%unique-key uix (slot-value node (first d)) node graph)))
+        (when key (uix-put uix key (id node)))))))
 
 (defun %uix-release (node graph)
   "Release NODE's unique keys (delete / old value of an update)."
