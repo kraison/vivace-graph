@@ -123,6 +123,30 @@ bounded), while a tiny window still resolves to the index's full precision."
       (spatial-index-remove idx (bid 5) g)
       (is (not (has-p (bid 5) (spatial-index-query-bbox idx 37.16d0 49.19d0 37.19d0 49.21d0)))))))
 
+(test remove-among-many-same-cell
+  "Many nodes share ONE cell; removing arbitrary (including middle) ids removes
+exactly those and leaves the rest.  Guards the duplicate-key defects the
+composite (cell . id) key fixed: an O(n) from-the-head rescan on the on-disk
+list, and a silent %MEM-FIND overshoot in RAM that dropped the wrong node (a
+middle same-cell remove used to no-op).  Runs on BOTH backends."
+  (labels ((exercise (idx)
+             (let ((g (pt *eo-a*)) (n 30) (removed '(15 4 22 9 17 0 29)))
+               (dotimes (i n) (spatial-index-insert idx (bid i) g))
+               (is (= n (length (spatial-index-query-bbox idx 37.16d0 49.19d0 37.19d0 49.21d0)))
+                   "all n distinct ids indexed under the shared cell")
+               (dolist (i removed) (spatial-index-remove idx (bid i) g))
+               (let ((cands (spatial-index-query-bbox idx 37.16d0 49.19d0 37.19d0 49.21d0)))
+                 (is (= (- n (length removed)) (length cands))
+                     "exactly the removed ids are gone")
+                 (dolist (i removed)
+                   (is (not (has-p (bid i) cands)) "a removed id must be absent"))
+                 (dotimes (i n)
+                   (unless (member i removed)
+                     (is (has-p (bid i) cands) "a surviving id must remain")))))))
+    (with-temp-memory (heap)                 ; on-disk backend
+      (exercise (make-spatial-index heap :precision 7)))
+    (exercise (graph-db::make-mem-spatial-index :precision 7))))  ; in-RAM backend
+
 (test persistence-reopen-from-disk
   "An index reopened from its on-disk heap at its root address still answers."
   (with-temp-directory (dir)

@@ -14,19 +14,26 @@ persist the skip-list root pointer + precision to a sidecar file (mirrors how
 views persist their pointer).  PRECISION is read back by RESTORE-SPATIAL-INDEX."
   (let ((idx (make-spatial-index (indexes graph) :precision precision)))
     (setf (spatial-index graph) idx)
-    (cl-store:store (list :address (spatial-index-address idx)
+    (cl-store:store (list :format +spatial-index-format+
+                          :address (spatial-index-address idx)
                           :precision (spatial-index-precision idx))
                     (spatial-index-root-file (location graph)))
     idx))
 
 (defun restore-spatial-index (graph)
-  "Reopen GRAPH's spatial index from its root sidecar, or create a fresh one if
-the graph predates the spatial index (backward compatible)."
+  "Reopen GRAPH's spatial index from its root sidecar.  A sidecar written in the
+older on-disk format (v1: bare-string keys, duplicate cells), or a graph that
+predates the spatial index, is rebuilt from live node geometries into the current
+composite-key format (RESTORE runs after the node tables are open)."
   (let ((file (spatial-index-root-file (location graph))))
     (if (probe-file file)
-        (destructuring-bind (&key address precision) (cl-store:restore file)
-          (setf (spatial-index graph)
-                (open-spatial-index (indexes graph) address :precision precision)))
+        (destructuring-bind (&key address precision format &allow-other-keys)
+            (cl-store:restore file)
+          (if (eql format +spatial-index-format+)
+              (setf (spatial-index graph)
+                    (open-spatial-index (indexes graph) address :precision (or precision 7)))
+              ;; v1 / unversioned on disk -> rebuild into v2 (drops old, re-scans nodes).
+              (rebuild-spatial-index graph :precision (or precision 7))))
         (init-spatial-index graph))))
 
 (defun make-graph (name location &key master-p slave-p master-host

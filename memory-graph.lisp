@@ -121,17 +121,20 @@ generics dispatch on this class."))
 ;;; ---------------------------------------------------------------------------
 
 (defun make-mem-spatial-index (&key (precision 7))
-  "A spatial-index whose skip-list slot is an in-RAM mem-skip-list (geohash
-string -> node id, duplicates allowed).  Every spatial op -- insert / remove /
-query-bbox / query-radius -- goes through spatial-index-skip-list ->
-add-to-skip-list / make-range-cursor, which dispatch to the mem list, so all of
-spatial-index.lisp (and the base apply-tx-write-to-spatial-index maintenance)
-runs UNCHANGED on a memory-graph.  All the geohash covering math is reused as-is."
+  "A spatial-index whose skip-list slot is an in-RAM mem-skip-list, keyed by the
+same composite (cell . node-id) as the on-disk index (duplicate-free).  Every
+spatial op -- insert / remove / query-bbox / query-radius -- goes through
+spatial-index-skip-list -> add-to-skip-list / make-range-cursor, which dispatch
+to the mem list, so all of spatial-index.lisp (and the base
+apply-tx-write-to-spatial-index maintenance) runs UNCHANGED on a memory-graph.
+The composite key also removes the duplicate-key %mem-find overshoot that made
+in-RAM REMOVE silently drop the wrong node."
   (%make-spatial-index
-   :skip-list (make-mem-skip-list :key-comparison #'string< :key-equal #'string=
-                                  :value-equal #'equalp :duplicates-allowed-p t
-                                  :head-key +spatial-min-key+ :head-value +null-key+
-                                  :tail-key +spatial-max-key+ :tail-value +max-key+)
+   :skip-list (make-mem-skip-list :key-comparison 'reduce-comp-lessp
+                                  :key-equal 'reduce-equal
+                                  :value-equal 'equal :duplicates-allowed-p nil
+                                  :head-key (list +min-sentinel+ +null-key+) :head-value nil
+                                  :tail-key (list +max-sentinel+ +max-key+)  :tail-value nil)
    :heap nil :precision precision))
 
 (defun %make-empty-memory-graph (name location &key (class 'memory-graph)
@@ -508,7 +511,7 @@ lookups return the live object).  Returns the node."
   "Write GRAPH's full state in the VG-native (v3) format: per-node blob records +
 the same structural derived dumps.  Untouched LZNODEs pass their blob through."
   (let ((buf (ni-mkbuf)))
-    (ni-bytes buf *native-image-magic*) (ni-uint buf 4 4)   ; format v4 adds :unique
+    (ni-bytes buf *native-image-magic*) (ni-uint buf 5 4)   ; v4 added :unique; v5 = composite-key spatial pairs
     (ni-uint buf (load-highest-transaction-id graph) 8)
     (let ((vt (mem-table-data (vertex-table graph)))
           (et (mem-table-data (edge-table graph))))
@@ -542,7 +545,17 @@ now.  Indexes/spatial/views are restored structurally either way.  Returns
          (lazy (lazy-p graph))
          (vtable (vertex-table graph))
          (etable (edge-table graph)))
-    (ri-bytes rc 4) (ri-uint rc 4) (ri-uint rc 8) ; magic, version, highest-tx-id
+    (ri-bytes rc 4)                                ; magic
+    (let ((ver (ri-uint rc 4)))                    ; format version
+      ;; v5 changed the spatial dump to composite (cell . id) keys -- a mid-stream
+      ;; layout change that cannot be read positionally by older parsers or vice
+      ;; versa.  Reject a stale image loudly rather than misparse it; the memory
+      ;; graph then rebuilds from its transaction journal (or is re-checkpointed).
+      (unless (= ver 5)
+        (error "Unsupported memory-image format v~D (this build writes/reads v5). ~
+Delete the stale image at ~A and reopen to rebuild from the journal."
+               ver file)))
+    (ri-uint rc 8)                                 ; highest-tx-id
     (let ((nv (ri-uint rc 4)))
       (dotimes (i nv)
         (multiple-value-bind (id lz) (ri-node rc nil)
@@ -574,7 +587,7 @@ structures (vs rebuilding on open) is what keeps OPEN-MEMORY-GRAPH fast."
   (if (lazy-p graph)
       (write-memory-image-native graph)
       (cl-store:store
-       (list :version 2
+       (list :version 3   ; v3: composite-key spatial dump (v2 keyed cells by bare string)
              :highest-tx-id (load-highest-transaction-id graph)
              :vertices (map-mem-table #'identity (vertex-table graph) :collect-p t)
              :edges (map-mem-table #'identity (edge-table graph) :collect-p t)
@@ -625,9 +638,11 @@ stashed in *MEMORY-IMAGE-VIEW-DUMP* for RESTORE-VIEWS."
         (dolist (v vertices) (mem-table-put (vertex-table graph) (id v) v))
         (dolist (e edges)     (mem-table-put (edge-table graph) (id e) e))
         (cond
-          ((and (eql version 2) type-vertex)
+          ((and (eql version 3) type-vertex)
            ;; Structural restore -- direct index/skip-list inserts, no map/reduce/
-           ;; geohash recompute.  This is what keeps open fast (#50).
+           ;; geohash recompute.  This is what keeps open fast (#50).  A v2 image
+           ;; (bare-string spatial keys) falls through to the rebuild branch below,
+           ;; which re-indexes geometry through the current composite-key insert.
            (%load-mem-index (mem-type-index-data (vertex-index graph)) type-vertex)
            (%load-mem-index (mem-type-index-data (edge-index graph))   type-edge)
            (%load-mem-index (mem-ve-index-data (ve-index-in graph))    ve-in)
