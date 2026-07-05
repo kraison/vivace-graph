@@ -912,8 +912,10 @@ as deferred blobs and materialize on first touch (needs a VG-native image)."
 (defun make-mem-ve-index () (%make-mem-ve-index))
 
 (defmethod ve-index-push ((idx mem-ve-index) (key ve-key) (id array)
-                          &key unless-present)
-  (declare (ignore unless-present))
+                          &key unless-present heap)
+  ;; HEAP accepted for lambda-list congruence with the on-disk method; the
+  ;; in-memory index-list needs no heap.
+  (declare (ignore unless-present heap))
   (let ((il (or (gethash key (mem-ve-index-data idx))
                 (setf (gethash key (mem-ve-index-data idx)) (make-mem-index-list)))))
     (mem-index-list-add il id)))

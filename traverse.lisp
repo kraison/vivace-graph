@@ -33,7 +33,11 @@
   ;; FIXME: respect order and uniqueness
   ;;        currently bfs, global uniqueness.
   (declare (ignore order uniqueness))
-  (let ((queue (make-queue :elements
+  ;; Resolve edge endpoints (LOOKUP-VERTEX below) in the graph being traversed,
+  ;; not the ambient *GRAPH*: (traverse v :graph G) scans G's adjacency but the
+  ;; endpoint ids are G's, so they must be looked up in G.
+  (let ((*graph* graph)
+        (queue (make-queue :elements
                            (list
                             (make-instance 'traversal
                                            :end-vertex vertex))))

@@ -567,7 +567,8 @@ result string.  Read-only, snapshot-isolated, and bounded; the client :limit is
 capped at *QUERY-DEFAULT-LIMIT*.  A \"format\":\"ndjson\" field streams the rows
 as newline-delimited JSON instead of an array."
   (multiple-value-bind (vars goals limit skip pkg) (compile-pattern-query dsl graph)
-    (let* ((*package* pkg)
+    (let* ((*graph* graph)   ; the eval'd SELECT / node-slot-value goals key off *GRAPH*
+           (*package* pkg)
            (cap (if (and (integerp limit) (plusp limit))
                     (min limit *query-default-limit*)
                     *query-default-limit*))

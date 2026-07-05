@@ -68,10 +68,8 @@
                      report))))
     report))
 
-(defun record-graph-write ()
-  (incf (gethash (get-universal-time) (write-stats *graph*) 0))
-  )
+(defun record-graph-write (&optional (graph *graph*))
+  (incf (gethash (get-universal-time) (write-stats graph) 0)))
 
-(defun record-graph-read ()
-  (incf (gethash (get-universal-time) (read-stats *graph*) 0))
-  )
+(defun record-graph-read (&optional (graph *graph*))
+  (incf (gethash (get-universal-time) (read-stats graph) 0)))

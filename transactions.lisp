@@ -964,6 +964,12 @@ With no FILTER, returns WRITES unchanged."
   (:method (transaction graph)
     (with-transaction-lock (transaction)
       (let ((writes (writes transaction))
+            ;; Bind *GRAPH* to the target so every index-maintenance sink that
+            ;; still defaults its graph/heap to *GRAPH* (e.g. index-list
+            ;; deserialization) targets THIS graph, not whatever is ambient on a
+            ;; slave/replay/multi-graph apply thread.  Defense-in-depth: the
+            ;; helpers below already thread GRAPH explicitly.
+            (*graph* graph)
             ;; MVCC: every write in this transaction is stamped with this id.
             (*commit-epoch* (transaction-id transaction)))
         ;; Subset replication: on a slave with a replication-filter, drop the

@@ -782,7 +782,7 @@ not exist."
                                        :start-key start-key
                                        :end-key end-key
                                        :skip skip :count count
-                                       :collect-p t))
+                                       :collect-p t :graph graph))
                     (t
                      (let ((node (find-in-skip-list (view-skip-list view)
                                                     (list +reduce-master-key+

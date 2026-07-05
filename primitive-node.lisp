@@ -229,7 +229,7 @@ explicitly afterward (the transaction-node path) or materialized lazily later
   (or (and *cache-enabled*
            (let ((node (gethash key (cache graph))))
              (when node
-               (record-graph-read)
+               (record-graph-read graph)
                node)))
       (let ((node (lhash-get table key)))
         (when (node-p node)
@@ -238,7 +238,7 @@ explicitly afterward (the transaction-node path) or materialized lazily later
           ;;(maybe-init-node-data node :graph graph)
           (when *cache-enabled*
             (setf (gethash key (cache graph)) node))
-          (record-graph-read)
+          (record-graph-read graph)
           node))))
 
 (defun save-node (node table &key (graph *graph*))
@@ -282,7 +282,7 @@ explicitly afterward (the transaction-node path) or materialized lazily later
       ;;(log:info "UPDATING LHASH FOR ~A" (string-id node))
       (%lhash-update table (id node) node)
       ;;(log:info "RECORDING WRITE FOR ~A" (string-id node))
-      (record-graph-write)
+      (record-graph-write graph)
       ;;(log:info "CACHING NEW REV OF ~A" (string-id node))
       (setf (gethash (id node) (cache graph)) node))
     (when (/= 0 (data-pointer old-node))

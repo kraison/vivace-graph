@@ -171,6 +171,64 @@ when *graph* is bound to a different graph (or nil)."
       (is (= 2 (length (map-vertices #'identity g :collect-p t))))
       (is (= 1 (length (map-edges #'identity g :collect-p t)))))))
 
+;;; ---------------------------------------------------------------------------
+;;; TRAVERSE / EDGE-EXISTS-P / MAKE-<type> must operate on their :GRAPH argument
+;;; -- resolving both node ids AND schema type-ids there -- even when *graph* is
+;;; bound to a DIFFERENT open graph.  This is the wrong-graph (*graph*) class of
+;;; bug: the index / adjacency is read from :GRAPH, but id/type resolution used
+;;; to leak to the dynamic *graph* (traverse endpoints via LOOKUP-VERTEX,
+;;; edge-exists-p's type lookup + ACTIVE-EDGE-P, MAKE-<type>'s type-id, and the
+;;; ve-index index-list heap).  With *graph* pointing at a graph that lacks the
+;;; g-* schema, the leak is unmistakable.
+;;; ---------------------------------------------------------------------------
+
+(test cross-graph-ops-target-explicit-graph
+  "Graph ops with an explicit :GRAPH resolve node ids and schema type-ids in that
+graph, not the ambient *graph*, when the two differ."
+  (with-test-graph (b)
+    (let (aid bid cid)
+      ;; Populate B (a-knows->b, a-knows->c); *graph* is B inside with-test-graph.
+      (with-transaction ()
+        (let ((va (make-g-person :name "A"))
+              (vb (make-g-person :name "B"))
+              (vc (make-g-person :name "C")))
+          (setq aid (id va) bid (id vb) cid (id vc))
+          (make-g-knows :from va :to vb)
+          (make-g-knows :from va :to vc)))
+      ;; A second, unrelated open graph whose schema does NOT know the g-* types.
+      (with-temp-directory (dir-a)
+        (let ((a (make-graph :cross-graph-decoy (namestring dir-a)
+                             :buffer-pool-size 1000)))
+          (unwind-protect
+               ;; Bind *graph* to the WRONG graph; every op below names B.
+               (let ((*graph* a))
+                 ;; traverse: edge endpoints must resolve in B.
+                 (is (= 2 (length (traverse (lookup-vertex aid :graph b)
+                                            :graph b :direction :out
+                                            :edge-type 'g-knows))))
+                 ;; edge-exists-p: type-id + endpoint liveness must resolve in B.
+                 (is (graph-db:edge-exists-p 'g-knows
+                                             (lookup-vertex aid :graph b)
+                                             (lookup-vertex bid :graph b)
+                                             :graph b))
+                 ;; make-<type>: type-id must come from B's schema (pre-fix: erred
+                 ;; on (node-type-id NIL) because it looked g-knows up in *graph*).
+                 (with-transaction ((graph-db::transaction-manager b))
+                   (make-g-knows :from (lookup-vertex bid :graph b)
+                                 :to (lookup-vertex cid :graph b)
+                                 :graph b))
+                 (is (graph-db:edge-exists-p 'g-knows
+                                             (lookup-vertex bid :graph b)
+                                             (lookup-vertex cid :graph b)
+                                             :graph b))
+                 ;; ve-index index-list heap: B's adjacency stays sound.
+                 (is (= 2 (length (outgoing-edges (lookup-vertex aid :graph b)
+                                                  :graph b))))
+                 (is (= 1 (length (outgoing-edges (lookup-vertex bid :graph b)
+                                                  :graph b)))))
+            (ignore-errors (close-graph a :snapshot-p nil))
+            (collect-garbage)))))))
+
 (test close-graph-default-snapshot-without-current-graph
   "CLOSE-GRAPH with the default :SNAPSHOT-P T succeeds even when *graph* is not
 bound to the graph being closed (snapshot walks the graph via map-vertices)."

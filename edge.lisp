@@ -141,9 +141,9 @@ generated LOOKUP-<type> functions filter deleted edges."
   (let ((in-ve-key (make-ve-key :id (to edge) :type-id (type-id edge)))
         (out-ve-key (make-ve-key :id (from edge) :type-id (type-id edge))))
     (ve-index-push (ve-index-in graph) in-ve-key (id edge)
-                   :unless-present unless-present)
+                   :unless-present unless-present :heap (heap graph))
     (ve-index-push (ve-index-out graph) out-ve-key (id edge)
-                   :unless-present unless-present)))
+                   :unless-present unless-present :heap (heap graph))))
 
 (defmethod remove-from-ve-index ((edge edge) (graph graph))
   (let ((in-ve-key (make-ve-key :id (to edge) :type-id (type-id edge)))
@@ -294,8 +294,8 @@ regenerates the id on a duplicate-key collision."
 (defmethod edge-exists-p (edge-type (vertex1 vertex) (vertex2 vertex)
                           &key (graph *graph*))
   (let ((type-meta (or (and (integerp edge-type)
-                            (lookup-node-type-by-id edge-type :edge))
-                       (lookup-node-type-by-name edge-type :edge))))
+                            (lookup-node-type-by-id edge-type :edge :graph graph))
+                       (lookup-node-type-by-name edge-type :edge :graph graph))))
     (when type-meta
       (let* ((vev-key (make-vev-key :in-id (id vertex2)
                                     :out-id (id vertex1)
@@ -306,7 +306,7 @@ regenerates the id on a duplicate-key collision."
            (lambda (edge-id)
              (let ((edge (lookup-edge edge-id :graph graph)))
                (when (and edge (written-p edge)
-                          (active-edge-p edge))
+                          (active-edge-p edge :graph graph))
                  (return-from edge-exists-p edge))))
            index-list))))))
 
