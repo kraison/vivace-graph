@@ -97,20 +97,16 @@ test + canonicalizer are resolved lazily when the index is created."
 
 ;;; Backend-agnostic operations over the backing store (K = canonical key).
 (defun make-unique-skip-list (graph)
-  "The persistent skip-list backing an on-disk unique index -- a view-style ordered
-map (composite key, REDUCE-COMP-LESSP), so it reopens with the same params as a view.
-Pinned to the skip-list backend: %OPEN-UNIQUE-SKIP-LIST still hardcodes OPEN-SKIP-LIST,
-so unique indexes must not follow *VIEW-INDEX-BACKEND* until unique reopen is made
-backend-aware (a separate step)."
-  (let ((*view-index-backend* :skip-list))
-    (make-view-skip-list graph (make-view :sort-order :lessp))))
+  "The persistent ordered-map backing an on-disk unique index -- a view-style
+composite (canonical-key id) map under REDUCE-COMP-LESSP.  Follows *INDEX-BACKEND*
+(skip list or B+ tree); the chosen backend is persisted per index in the sidecar so
+REOPEN uses the right opener (see SAVE/RESTORE-UNIQUE-INDEX-ROOTS)."
+  (make-view-skip-list graph (make-view :sort-order :lessp)))
 
-(defun %open-unique-skip-list (graph address)
-  (open-skip-list :address address :heap (indexes graph)
-                  :key-equal 'reduce-equal :key-comparison 'reduce-comp-lessp
-                  :duplicates-allowed-p nil :value-equal 'equal
-                  :key-serializer 'view-key-serialize :key-deserializer 'view-key-deserialize
-                  :value-serializer 'serialize :value-deserializer 'deserialize))
+(defun %open-unique-skip-list (graph address &optional (backend :skip-list))
+  "Reopen the unique index at ADDRESS with BACKEND's opener (same composite-key
+codec as a view; :sort-order :lessp)."
+  (open-view-index backend :address address :heap (indexes graph) :sort-order :lessp))
 
 (defun uix-lookup (uix key)
   "The id currently holding canonical KEY in UIX, or NIL."
@@ -389,7 +385,9 @@ with no heap (memory) or no unique indexes.  Called at CLOSE-GRAPH."
                  (when (unique-index-skip-list uix)
                    (push (list (unique-index-owner-name uix) (unique-index-slot-name uix)
                                (unique-index-spec uix) (unique-index-scope uix)
-                               (%sl-address (unique-index-skip-list uix)))
+                               (view-index-address (unique-index-skip-list uix))
+                               ;; backend tag -> reopen with the right opener
+                               (view-index-backend-tag (unique-index-skip-list uix)))
                          roots)))
                (unique-indexes graph))
       (cl-store:store roots (unique-index-root-file (location graph))))))
@@ -406,10 +404,12 @@ sidecar was present (caller skips REBUILD-UNIQUE-INDEXES); NIL to fall back to r
                                             #+sbcl :synchronized #+sbcl t
                                             #+ccl :shared #+ccl t)))))
         (dolist (r (cl-store:restore file))
-          (destructuring-bind (owner slot spec scope address) r
+          ;; BACKEND is absent in pre-B+-tree sidecars (5-tuples) -> defaults to
+          ;; :skip-list, so an existing graph reopens exactly as before.
+          (destructuring-bind (owner slot spec scope address &optional (backend :skip-list)) r
             (multiple-value-bind (test canon) (%resolve-unique-canonicalizer spec)
               (setf (gethash (cons owner slot) reg)
                     (%make-unique-index :owner-name owner :slot-name slot :spec spec
                                         :test test :canonicalizer canon :scope scope
-                                        :skip-list (%open-unique-skip-list graph address)))))))
+                                        :skip-list (%open-unique-skip-list graph address backend)))))))
       t)))

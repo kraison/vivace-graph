@@ -544,13 +544,15 @@ once per entry you want the node to contribute (zero, one, or many times)."
 (defun view-less-than (key1 key2)
   (less-than (first key1) (first key2)))
 
-(defparameter *view-index-backend* :skip-list
-  "Ordered-map backend used for a NEW or regenerated view index on a normal graph:
-:SKIP-LIST (default) or :BPLUS-TREE.  Both implement the same ordered-map protocol
-(add/remove/find/update-in-skip-list + the cursor protocol) over the same
-(user-key . node-id) composite keys, so a view works identically on either.  The
-choice is persisted per view (see SAVE-VIEWS / RESTORE-VIEWS) so a graph reopens
-each index with the backend it was written with.")
+(defparameter *index-backend* :skip-list
+  "Ordered-map backend used for a NEW or regenerated HEAP-backed index on a normal
+graph -- views AND :unique indexes: :SKIP-LIST (default) or :BPLUS-TREE.  Both
+implement the same ordered-map protocol (add/remove/find/update-in-skip-list + the
+cursor protocol) over the same (user-key . node-id) composite keys, so an index
+works identically on either.  The choice is persisted per index (views: the
+:BACKEND view alist key; unique: the sidecar tuple) so a graph reopens each index
+with the backend it was written with -- an existing graph is never disturbed by
+flipping this.  (The spatial index is not yet wired to this.)")
 
 (defun view-index-comparison (view)
   (if (eql :greaterp (view-sort-order view))
@@ -581,11 +583,11 @@ codec.  BACKEND selects the structure (:skip-list default for pre-B+-tree graphs
 
 (defgeneric make-view-skip-list (graph view)
   (:documentation "Create the ordered map backing VIEW.  A normal graph uses a
-heap-backed index -- a skip list or (when *VIEW-INDEX-BACKEND* is :BPLUS-TREE) a
+heap-backed index -- a skip list or (when *INDEX-BACKEND* is :BPLUS-TREE) a
 B+ tree, persisted via VIEW-POINTER; a memory-graph overrides this to return an
 in-RAM mem-skip-list.")
   (:method ((graph graph) view)
-    (ecase *view-index-backend*
+    (ecase *index-backend*
       (:skip-list
        (make-skip-list
         :heap (indexes graph)
