@@ -45,7 +45,7 @@ At its heart, VivaceGraph is built on several key architectural pillars:
     Data is retrieved from the graph using a powerful, Prolog-like query language embedded directly in Lisp. This allows you to express complex graph traversals and pattern-matching queries in a clean, declarative style (see ~prologc.lisp~ and the ~select~ macro).
 
   - *High-Performance Indexing via Views*
-    For fast lookups on node properties, VivaceGraph uses a concept called "views". A view is a secondary index (implemented as a persistent skip-list) that you can define on any vertex or edge property, dramatically speeding up queries that don't start with a known node ID (see ~views.lisp~).
+    For fast lookups on node properties, VivaceGraph uses a concept called "views". A view is a secondary index (a persistent ordered index — a skip list by default, or a B+ tree; see Chapter 3) that you can define on any vertex or edge property, dramatically speeding up queries that don't start with a known node ID (see ~views.lisp~).
 
   - *Built for Concurrency*
     The database is designed for multi-threaded access, with a fine-grained locking system to manage concurrent reads and writes safely (see ~rw-lock.lisp~).
@@ -403,6 +403,48 @@ For these primary node tables, the *key* is the node's 16-byte UUID, and the *va
 #+END_EXAMPLE
 
 The first 15 bytes are byte-for-byte identical to the original (v1) head; ~commit-epoch~ and ~prev-pointer~ were *appended*, which is what makes the v1→v2 migration a simple matter (see Chapter 12, "MVCC: Immutable Versioned Nodes"). ~data-pointer~ is the all-important offset to the node's data in the heap file; ~commit-epoch~ and ~prev-pointer~ drive the versioning machinery described in that chapter. The on-disk storage version is recorded in each memory-mapped region; opening a v1 graph with a v2 build signals an error directing you to ~migrate-graph~.
+
+*** Ordered indexes and pluggable backends (~indexes.dat~)
+
+Beyond the primary UUID→head tables, VivaceGraph maintains *secondary ordered indexes* — the map/reduce *views* (Chapter 8), ~:unique~ *constraints* (Chapter 8), and the *spatial* index (Chapter 13). These all live in the graph's index region (~indexes.dat~) and are built on a single ordered-map abstraction: an on-disk structure that keeps keys in sorted order and supports point lookup, ordered range scans, insert, update and delete.
+
+Two interchangeable *backends* implement that abstraction:
+
+- *Skip list* (~skip-list.lisp~) — the default. A probabilistic ordered structure with O(log n) expected operations and simple, lock-friendly concurrency; range scans walk the bottom-level linked list.
+- *B+ tree* (~bplus-tree.lisp~) — a page-oriented alternative (4 KB slotted pages). On disk it beats the skip list on every operation once warm: keys are packed by the page, so a lookup touches far fewer cache lines and disk pages, range scans are sequential within a leaf, and it uses less space. It supports in-place cell edits and merge-on-delete rebalancing.
+
+Both implement the same internal ordered-map protocol, so views, unique indexes and the spatial index are all *backend-agnostic* — the choice is transparent to your application code.
+
+**Choosing a backend.** The backend is a *per-graph* property.
+
+#+BEGIN_SRC lisp
+  ;; Global default for graphs that don't specify one (default :skip-list):
+  (setf graph-db:*index-backend* :bplus-tree)
+
+  ;; Or per graph, at creation / open time:
+  (make-graph :my-app "/var/tmp/my-app/" :index-backend :bplus-tree)
+  (open-graph :my-app "/var/tmp/my-app/" :index-backend :bplus-tree)
+#+END_SRC
+
+VivaceGraph does *not* read a configuration file for this — set the global ~*index-backend*~ or pass ~:index-backend~ from your own application's configuration. The value is captured in the graph's ~index-backend~ slot (~graph-index-backend~).
+
+**How it is persisted.** Each index records the backend it was written with (views keep a ~:backend~ key in the view metadata; the unique and spatial indexes keep a tag in their on-disk root sidecar). On ~open-graph~, every existing index is reopened with *its own* recorded backend — regardless of the ~:index-backend~ you pass. The ~:index-backend~ argument therefore governs only *new* indexes created afterward. This is exactly what lets one graph safely hold indexes on different backends while you migrate between them.
+
+**Migrating an existing graph from skip lists to B+ trees.** Because the secondary indexes are *derived* from the nodes — they can always be rebuilt from the primary tables — switching backends never touches your data; it only rebuilds the index structures.
+
+The recommended path is an *in-place reindex*: reopen the graph on the new backend and rebuild the three index families, which re-persists each index's backend tag.
+
+#+BEGIN_SRC lisp
+  (let ((g (open-graph :my-app "/var/tmp/my-app/" :index-backend :bplus-tree)))
+    (regenerate-all-views g)          ; map/reduce views
+    (regenerate-unique-indexes g)     ; :unique constraints
+    (rebuild-spatial-index g)         ; spatial index
+    (close-graph g))                  ; persists the new backend tags
+#+END_SRC
+
+Each ~regenerate-*~ / ~rebuild-*~ drops the old on-disk index and rebuilds it by scanning the nodes (via the backend-agnostic ~map-vertices~ / ~map-edges~) on the graph's *current* backend, then persists the new tag; a subsequent plain ~open-graph~ then reopens on B+ trees. Your node data is left in place throughout. (Omit any family your schema doesn't use.)
+
+A logical *snapshot + replay into a fresh graph* also works and rebuilds every index on the target's backend (see Chapter 11, "Backup and Recovery"): snapshot the source, ~make-graph~ the target with ~:index-backend :bplus-tree~, adopt the source schema, and ~replay~. For a pure backend switch the in-place reindex above is simpler — one graph, node data untouched — but snapshot/replay is a sound alternative and the right tool when you also want a clean, defragmented copy.
 
 *** Durability and the Dirty File (~graph.lisp~)
 
@@ -954,7 +996,7 @@ A view in VivaceGraph is like creating a new, specialized card catalog for your 
 
 When you later query for a user by name, VivaceGraph can consult this sorted list (the view's index) to find the answer instantly, without having to scan all the user nodes.
 
-Under the hood, VivaceGraph implements these view indexes using a persistent, on-disk *skip-list* data structure (see ~skip-list.lisp~), which provides very fast lookups, insertions, and deletions, making it perfect for maintaining real-time indexes.
+Under the hood, VivaceGraph implements these view indexes as persistent, on-disk *ordered indexes* — a *skip list* (~skip-list.lisp~) by default, or a *B+ tree* (~bplus-tree.lisp~) if the graph selects that backend (see Chapter 3, "Ordered indexes and pluggable backends"). Either provides very fast lookups, insertions, and deletions, making it perfect for maintaining real-time indexes.
 
 *** Defining Map-Only Views (~def-view~ with ~:map~) for Secondary Indexes
 
@@ -1143,7 +1185,7 @@ Semantics:
 - *NULL-exempt* — a node whose unique slot is ~nil~/unbound is unconstrained (many are allowed), matching SQL's treatment of NULL.
 - *Cross-subtype* — a constraint declared on a parent type is shared across its subclasses (one index), so a ~user~ and an ~admin~ subclass cannot collide on the same value.
 - *Enforced at the commit boundary* — the check runs inside the committing transaction, so a violation aborts the whole transaction cleanly (nothing is written) by signalling ~unique-constraint-violation~. Concurrent commits racing for the same value are serialized, so exactly one wins and the rest are rejected.
-- *Durable* — the constraint is backed by a *persistent* unique index (an on-disk skip list, or the in-RAM map on a memory-graph), reopened with the graph; it is not rebuilt by scanning every node on open.
+- *Durable* — the constraint is backed by a *persistent* unique index (an on-disk ordered index — skip list by default, or a B+ tree; see Chapter 3, "Ordered indexes and pluggable backends" — or the in-RAM map on a memory-graph), reopened with the graph; it is not rebuilt by scanning every node on open.
 
 Handle a violation like any other condition (readers ~ucv-class-name~, ~ucv-slot-name~, ~ucv-value~, ~ucv-existing-id~):
 
@@ -1687,7 +1729,7 @@ Two read styles are provided, both refining the index's candidates with exact ge
 
 *** Under the hood, and a few caveats
 
-- *The index* is a skip list (in the graph's index region, ~indexes.dat~) keyed by the composite ~(geohash-cell . node-id)~: a node's id is entered under every fixed-precision grid cell its geometry occupies. Folding the id into the key keeps the index *duplicate-free*, so insert and — especially — *remove* are O(log n) (an older duplicate-cell layout made removal O(n)). A query covers its window with as few, possibly coarser, cells as it can and does one *prefix range scan* per covering cell — geohash keys are prefix-nested, so every finer cell within a coarse one sorts inside its range — touching only the cells in view. The grid precision is set with ~make-graph~'s ~:spatial-precision~ keyword (default 7, ≈150 m cells; 9 ≈ 5 m); it is persisted with the index and read back by ~open-graph~, which rebuilds an index written in the older format from node geometries on first open.
+- *The index* is an ordered index (in the graph's index region, ~indexes.dat~) — a skip list by default, or a B+ tree if the graph's ~:index-backend~ selects one (see Chapter 3) — keyed by the composite ~(geohash-cell . node-id)~: a node's id is entered under every fixed-precision grid cell its geometry occupies. Folding the id into the key keeps the index *duplicate-free*, so insert and — especially — *remove* are O(log n) (an older duplicate-cell layout made removal O(n)). A query covers its window with as few, possibly coarser, cells as it can and does one *prefix range scan* per covering cell — geohash keys are prefix-nested, so every finer cell within a coarse one sorts inside its range — touching only the cells in view. The grid precision is set with ~make-graph~'s ~:spatial-precision~ keyword (default 7, ≈150 m cells; 9 ≈ 5 m); it is persisted with the index and read back by ~open-graph~, which rebuilds an index written in the older format from node geometries on first open.
 - *Matching uses a representative point*: a ~:point~ matches exactly; an extended geometry (line, polygon) is matched by the centre of its bounding box, so radius/containment results for extended geometries are approximate. Point-in-polygon refinement honours holes.
 - *Distance* is the haversine great-circle distance — accurate to roughly half a percent, ample for most uses; a more precise geodesic can replace it later without changing the API.
 - *Heavier topology* (intersection, union, validity repair) is intentionally out of this dependency-free core and is left to an optional GEOS-backed module.
@@ -1932,7 +1974,7 @@ The graph model, transaction machinery, and query surface are all shared; the in
 | Linear-hash vertex/edge tables (~linear-hash.lisp~) | A hash table of UUID → live node object |
 | Heap-stored, serialized slot data; deserialize on read | Slot data lives on the live object; no per-read work |
 | Persistent ~index-list~ adjacency (ve/vev/type indexes) | In-RAM hash sets mirroring the same index shapes |
-| On-disk skip-lists for views and the spatial grid | In-RAM skip-lists (~mem-skip-list~) with the same cursor API |
+| On-disk ordered indexes (skip list or B+ tree) for views and the spatial grid | In-RAM skip-lists (~mem-skip-list~) with the same cursor API |
 | Heap allocate/free + MVCC version chains | Atomic hash-table swap of an immutable node; no heap |
 
 Because the graph model, `with-transaction`, OCC validation, and the Prolog engine are unchanged, code written against an on-disk graph runs against an in-memory graph verbatim.
@@ -2092,11 +2134,11 @@ This chapter provides a categorized reference for the most important exported sy
 *** A categorized list of the most important exported functions and macros
 
 **** Graph Management
-- ~make-graph (name location &key ... )~ ::
-  Creates a new, empty graph database at the specified ~location~. The ~name~ must be a keyword and should match the graph name used in your schema definitions. Returns a `graph` object.
+- ~make-graph (name location &key index-backend ... )~ ::
+  Creates a new, empty graph database at the specified ~location~. The ~name~ must be a keyword and should match the graph name used in your schema definitions. ~:index-backend~ (~:skip-list~, the default, or ~:bplus-tree~) selects the ordered-index engine for this graph's views/unique/spatial indexes; it defaults to the global ~*index-backend*~. Returns a `graph` object. See Chapter 3, "Ordered indexes and pluggable backends."
 
-- ~open-graph (name location &key ... )~ ::
-  Opens an existing graph database from ~location~. Fails if the database was not closed cleanly (i.e., if the ~.dirty~ file exists). Returns a `graph` object.
+- ~open-graph (name location &key index-backend ... )~ ::
+  Opens an existing graph database from ~location~. Fails if the database was not closed cleanly (i.e., if the ~.dirty~ file exists). ~:index-backend~ governs only *new* indexes created after open; each existing index reopens on the backend it was written with (its persisted tag). Returns a `graph` object.
 
 - ~make-memory-graph (name location &key lazy peer-role origin-id peer-host ... )~ ::
   Like ~make-graph~, but constructs an *in-memory* graph (Chapter 15): the graph lives as live Lisp objects in RAM, with the same schema/transaction/query API. ~location~ still holds the durable journal, checkpoint image, schema and peer state. Pass ~:lazy t~ for fault-on-access materialization (near-instant open); accepts the same peer arguments as ~make-graph~ for an in-memory peer device.
@@ -2197,7 +2239,10 @@ This chapter provides a categorized reference for the most important exported sy
   Force-rebuilds one view's index from scratch (delete + full rescan).  Rarely needed by hand — ~def-view~ rebuilds automatically when its definition changes — but available as the single-view force hammer.
 
 - ~regenerate-all-views (graph)~ ::
-  Force-rebuilds every view in the graph.  ~open-graph~ (and ~open-memory-graph~) accept ~:regenerate-views t~ to run this at open time.
+  Force-rebuilds every view in the graph.  ~open-graph~ (and ~open-memory-graph~) accept ~:regenerate-views t~ to run this at open time.  Also the views half of an index-backend migration: after reopening with a new ~:index-backend~, this rebuilds every view on the current backend (see Chapter 3).
+
+- ~regenerate-unique-indexes (graph)~ ::
+  Drops and rebuilds every ~:unique~ constraint index on the graph's *current* index backend, re-persisting each index's backend tag.  The unique-index half of an in-place skip-list→B+ tree migration (paired with ~regenerate-all-views~ and ~rebuild-spatial-index~; see Chapter 3).
 
 **** Graph Traversal & Mapping
 - ~map-vertices (function graph &key vertex-type include-vertex-types exclude-vertex-types include-subclasses-p ... )~ ::
