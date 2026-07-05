@@ -308,6 +308,6 @@ suite, and an ACID-compliance audit.
 - LispWorks support is currently **untested** (no license access; the free
   Personal Edition's heap is too small to compile VivaceGraph).
 
-[Unreleased]: https://github.com/kraison/vivace-graph-v3/compare/v2.1.0...HEAD
-[2.1.0]: https://github.com/kraison/vivace-graph-v3/compare/v2.0...v2.1.0
-[2.0.0]: https://github.com/kraison/vivace-graph-v3/releases/tag/v2.0
+[Unreleased]: https://github.com/kraison/vivace-graph/compare/v2.1.0...HEAD
+[2.1.0]: https://github.com/kraison/vivace-graph/compare/v2.0...v2.1.0
+[2.0.0]: https://github.com/kraison/vivace-graph/releases/tag/v2.0
