@@ -211,3 +211,43 @@ its :canonicalize (string-downcase) makes it case-insensitive."
                (is (= 2 (length (index-range b 'ix-person 'age :start 30 :end 30)))))
           (ignore-errors (close-graph a :snapshot-p nil))
           (collect-garbage))))))
+
+;;; --- memory backend ---------------------------------------------------------
+
+(defmacro with-ix-memory-graph ((g) &body body)
+  "A fresh in-memory graph named *IX-GRAPH-NAME*, in a temp dir."
+  (let ((dir (gensym)))
+    `(with-temp-directory (,dir)
+       (let ((,g (graph-db::make-memory-graph *ix-graph-name* (namestring ,dir))))
+         (unwind-protect (let ((*graph* ,g)) ,@body)
+           (ignore-errors (close-graph ,g :snapshot-p nil))
+           (collect-garbage))))))
+
+(test memory-backend-equality-and-range
+  "The index works on a memory-graph (mem-skip-list backing), :index t and def-index."
+  (with-ix-memory-graph (g)
+    (with-transaction ()
+      (make-ix-person :name "a" :age 30 :note "Hi")
+      (make-ix-person :name "b" :age 30)
+      (make-ix-person :name "c" :age 40))
+    (is (equal '("a" "b") (ix-names (index-lookup g 'ix-person 'age 30))))
+    (is (equal '(30 30 40) (mapcar #'ix-age (index-range g 'ix-person 'age))))
+    (is (equal '("a") (ix-names (index-lookup g 'ix-person 'note "HI"))))))
+
+(test memory-backend-reopen-rebuilds
+  "A memory-graph rebuilds its indexes on reopen from the restored nodes."
+  (with-temp-directory (dir)
+    (let ((g (graph-db::make-memory-graph *ix-graph-name* (namestring dir))))
+      (unwind-protect
+           (let ((*graph* g))
+             (with-transaction ()
+               (make-ix-person :name "a" :age 30 :note "Hi")
+               (make-ix-person :name "b" :age 30)))
+        (close-graph g)))            ; checkpoint image + journal
+    (let ((g (graph-db::open-memory-graph *ix-graph-name* (namestring dir))))
+      (unwind-protect
+           (progn
+             (is (equal '("a" "b") (ix-names (index-lookup g 'ix-person 'age 30))))
+             (is (equal '("a") (ix-names (index-lookup g 'ix-person 'note "HI")))))
+        (ignore-errors (close-graph g))
+        (collect-garbage)))))

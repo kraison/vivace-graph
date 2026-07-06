@@ -185,6 +185,18 @@ included; a value shared by many nodes; reopen restores (on-disk sidecar + memor
 dual-backend (skip list + B+ tree); the wrong-graph guard (query graph B while `*graph*`=A,
 per the audit's `cross-graph-ops` test). SBCL + ECL.
 
+## 11a. Known limitation: LAZY memory graphs
+
+A **lazy** (fault-on-access) memory-graph does NOT rebuild its secondary indexes on
+reopen: rebuilding scans every node, which would materialize the LZNODE blobs and
+defeat the whole point of lazy open (a geometry `:index` slot alone trips the scan).
+Non-lazy memory graphs and on-disk graphs are unaffected. A lazy graph still
+maintains its indexes *in-session* via the apply path; the proper fix is to persist
+the secondary indexes in the checkpoint image (mirroring the `:unique` v1.1 → v1.2
+progression: rebuild-on-open first, then image persistence). Until then, `index-lookup`
+on a reopened lazy graph returns an empty result — use a non-lazy memory graph if you
+need general indexes to survive a lazy reopen.
+
 ## 12. Deferred (designed-for, not built)
 
 Multi-slot/composite keys (codec already polymorphic — `less-than` orders lists); true
