@@ -136,6 +136,7 @@
            #:rebuild-unique-indexes
            #:regenerate-unique-indexes
            ;; general ordered index (:index slot option / def-index)
+           #:def-index
            #:index-lookup #:index-range #:map-index
            #:rebuild-secondary-indexes #:regenerate-secondary-indexes
 

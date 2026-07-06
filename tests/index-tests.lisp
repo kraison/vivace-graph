@@ -22,6 +22,11 @@
   ((title :initarg :title :accessor ix-title))
   :graph-db-index-test)
 
+;; The standalone declaration surface: index NOTE, which is NOT marked :index t on
+;; the slot, with a canonicalizer.  Declared before any graph is open -> registered,
+;; then built at open (or maintained on apply for a fresh make-graph).
+(def-index ix-person note :graph-db-index-test :canonicalize string-downcase)
+
 (def-suite index-suite
   :description "General ordered secondary index (:INDEX / def-index)."
   :in graph-db-suite)
@@ -75,11 +80,37 @@ index is a legitimate empty result, not an error."
     ;; querying a declared index for a value nobody holds -> empty, not an error
     (is (null (index-lookup g 'ix-person 'email "nobody@x")))))
 
-(test unindexed-slot-errors
-  "index-lookup on a slot with no :index is a programming error (signals)."
+;;; --- def-index (standalone declaration surface) -----------------------------
+
+(test def-index-maintains-and-queries
+  "A def-index on a slot NOT marked :index t is maintained on apply and queryable;
+its :canonicalize (string-downcase) makes it case-insensitive."
   (with-ix-graph (g)
-    (with-transaction () (make-ix-person :name "a" :age 30 :note "hi"))
-    (signals error (index-lookup g 'ix-person 'note "hi"))))
+    (with-transaction ()
+      (make-ix-person :name "a" :note "Hello")
+      (make-ix-person :name "b" :note "world")
+      (make-ix-person :name "c" :note "hello"))
+    (is (equal '("a" "c") (ix-names (index-lookup g 'ix-person 'note "HELLO"))))
+    (is (equal '("b")     (ix-names (index-lookup g 'ix-person 'note "world"))))))
+
+(test def-index-empty-is-nil-not-error
+  "Querying a declared def-index with no entries yet is an empty result, not an error."
+  (with-ix-graph (g)
+    (is (null (index-lookup g 'ix-person 'note "nobody")))))
+
+(test def-index-reopen
+  "A def-index'd index is durable and reopens from the sidecar."
+  (with-temp-directory (dir)
+    (let ((g (make-graph *ix-graph-name* (namestring dir) :buffer-pool-size 1000)))
+      (unwind-protect
+           (let ((*graph* g))
+             (with-transaction () (make-ix-person :name "a" :note "Hi")))
+        (close-graph g)))
+    (let ((g (open-graph *ix-graph-name* (namestring dir) :buffer-pool-size 1000)))
+      (unwind-protect
+           (is (equal '("a") (ix-names (index-lookup g 'ix-person 'note "HI"))))
+        (ignore-errors (close-graph g))
+        (collect-garbage)))))
 
 ;;; --- range ------------------------------------------------------------------
 

@@ -5,7 +5,7 @@
 (declaim (ftype (function (t) t)
                 rebuild-unique-indexes save-unique-index-roots restore-unique-index-roots
                 rebuild-secondary-indexes save-secondary-index-roots
-                restore-secondary-index-roots))
+                restore-secondary-index-roots install-secondary-indexes))
 
 (defun spatial-index-root-file (location)
   (format nil "~A/spatial-index.root" location))
@@ -328,7 +328,10 @@ Always CLOSE-GRAPH when finished."
           (rebuild-unique-indexes graph))
         ;; General ordered indexes: same reopen-or-rebuild story as unique.
         (unless (restore-secondary-index-roots graph)
-          (rebuild-secondary-indexes graph)))
+          (rebuild-secondary-indexes graph))
+        ;; Build any def-index'd index not covered by the sidecar (declared before
+        ;; this graph existed, or added since the last close); no-op otherwise.
+        (install-secondary-indexes graph))
       (when slave-p
         (setf (master-host graph) master-host))
       (when peer-role
