@@ -147,21 +147,27 @@
 (defmethod cache-index-list ((index ve-index) (key ve-key) (il index-list))
   (setf (gethash key (ve-index-cache index)) il))
 
+;; Both bind *GRAPH* to the OWNING graph so the lhash value-deserializer
+;; (DESERIALIZE-INDEX-LIST, which defaults the index-list heap to (HEAP *GRAPH*))
+;; resolves against GRAPH, not the ambient *GRAPH* -- else a cross-graph read binds
+;; the list to the wrong heap and poisons the cache (wrong-graph audit SUSPECT #3).
 (defmethod lookup-ve-in-index-list ((key ve-key) (graph graph))
-  (or (gethash key (ve-index-cache (ve-index-in graph)))
-      (let ((table (ve-index-table (ve-index-in graph))))
-        (with-locked-hash-key (table key)
-          (let ((il (lhash-get table key)))
-            (when il
-              (cache-index-list (ve-index-in graph) key il)))))))
+  (let ((*graph* graph))
+    (or (gethash key (ve-index-cache (ve-index-in graph)))
+        (let ((table (ve-index-table (ve-index-in graph))))
+          (with-locked-hash-key (table key)
+            (let ((il (lhash-get table key)))
+              (when il
+                (cache-index-list (ve-index-in graph) key il))))))))
 
 (defmethod lookup-ve-out-index-list ((key ve-key) (graph graph))
-  (or (gethash key (ve-index-cache (ve-index-out graph)))
-      (let ((table (ve-index-table (ve-index-out graph))))
-        (with-locked-hash-key (table key)
-          (let ((il (lhash-get table key)))
-            (when il
-              (cache-index-list (ve-index-out graph) key il)))))))
+  (let ((*graph* graph))
+    (or (gethash key (ve-index-cache (ve-index-out graph)))
+        (let ((table (ve-index-table (ve-index-out graph))))
+          (with-locked-hash-key (table key)
+            (let ((il (lhash-get table key)))
+              (when il
+                (cache-index-list (ve-index-out graph) key il))))))))
 
 (defmethod ve-index-push ((idx ve-index) (key ve-key) (id array)
                           &key unless-present heap)
