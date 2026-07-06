@@ -13,6 +13,23 @@ between releases; cutting a release renames it to the new version and dates it.
 
 Nothing yet.
 
+## [2.1.1] - 2026-07-06
+
+A bug-fix release.
+
+### Fixed
+- **ECL: cross-graph `edge-exists-p` / adjacency read the wrong heap.** A ve/vev
+  index lookup for a graph other than the current `*graph*` deserialized its
+  index-list against `(heap *graph*)` — the `deserialize-index-list` default — instead
+  of the owning graph's heap. So a cold `(edge-exists-p … :graph B)` (or a generated
+  `make-<type>`'s type-id resolution) while `*graph*` named a *different* graph walked
+  the wrong heap and returned NIL, and the per-index cache was then poisoned with the
+  mis-bound list. Fixed by binding `*graph*` to the owning graph at the
+  `lookup-vev-index-list` / `lookup-ve-in-index-list` / `lookup-ve-out-index-list`
+  read boundaries. It manifested on **ECL** (SBCL's cache/timing masked it in the
+  regression test), but the underlying flaw was implementation-independent. Full test
+  suite green on both SBCL and ECL.
+
 ## [2.1.0] - 2026-07-05
 
 A large, backward-compatible feature release: a pluggable ordered-index backend
@@ -308,6 +325,7 @@ suite, and an ACID-compliance audit.
 - LispWorks support is currently **untested** (no license access; the free
   Personal Edition's heap is too small to compile VivaceGraph).
 
-[Unreleased]: https://github.com/kraison/vivace-graph/compare/v2.1.0...HEAD
+[Unreleased]: https://github.com/kraison/vivace-graph/compare/v2.1.1...HEAD
+[2.1.1]: https://github.com/kraison/vivace-graph/compare/v2.1.0...v2.1.1
 [2.1.0]: https://github.com/kraison/vivace-graph/compare/v2.0...v2.1.0
 [2.0.0]: https://github.com/kraison/vivace-graph/releases/tag/v2.0
