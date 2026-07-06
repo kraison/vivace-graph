@@ -175,12 +175,18 @@
   (setf (gethash key (vev-index-cache index)) il))
 
 (defmethod lookup-vev-index-list ((key vev-key) (graph graph))
-  (or (gethash key (vev-index-cache (vev-index graph)))
-      (let ((table (vev-index-table (vev-index graph))))
-        (with-locked-hash-key (table key)
-          (let ((il (lhash-get table key)))
-            (when il
-              (cache-index-list (vev-index graph) key il)))))))
+  ;; Bind *GRAPH* to the OWNING graph: the lhash value-deserializer
+  ;; (DESERIALIZE-INDEX-LIST) defaults the index-list's heap to (HEAP *GRAPH*), so a
+  ;; cross-graph read (GRAPH /= *GRAPH*) would bind the list to the wrong heap -- and
+  ;; CACHE-INDEX-LIST would then poison the cache with it.  (Surfaced as an ECL-only
+  ;; cross-graph EDGE-EXISTS-P failure; the wrong-graph audit's deferred SUSPECT #3.)
+  (let ((*graph* graph))
+    (or (gethash key (vev-index-cache (vev-index graph)))
+        (let ((table (vev-index-table (vev-index graph))))
+          (with-locked-hash-key (table key)
+            (let ((il (lhash-get table key)))
+              (when il
+                (cache-index-list (vev-index graph) key il))))))))
 
 (defgeneric add-to-vev-index (edge graph &key unless-present))
 (defgeneric remove-from-vev-index (edge graph))
