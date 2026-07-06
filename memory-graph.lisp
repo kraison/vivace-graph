@@ -291,7 +291,8 @@ structurally instead of regenerating them.")
 ;; Unique constraints (#6): the dump/load helpers live in unique-constraint.lisp
 ;; (loaded after this file); forward-declared so the image codec here compiles clean.
 ;; The "was it loaded?" flag is defined HERE because OPEN-MEMORY-GRAPH binds it.
-(declaim (ftype (function (t) t) %dump-unique-indexes rebuild-unique-indexes)
+(declaim (ftype (function (t) t) %dump-unique-indexes rebuild-unique-indexes
+                                 rebuild-secondary-indexes install-secondary-indexes)
          (ftype (function (t t) t) %load-unique-indexes))
 (defvar *memory-image-unique-loaded* nil
   "Bound NIL by OPEN-MEMORY-GRAPH; set T by the image restore when the unique-index
@@ -738,7 +739,17 @@ as deferred blobs and materialize on first touch (needs a VG-native image)."
       ;; graph, or a pre-#6 v3 image / crash fallback).  This is the durable path on
       ;; the memory backend: no open-time scan, no lazy-node materialization.
       (unless *memory-image-unique-loaded*
-        (rebuild-unique-indexes graph)))
+        (rebuild-unique-indexes graph))
+      ;; General ordered indexes: rebuild-on-open on the memory backend (image
+      ;; persistence is a follow-up, mirroring unique's v1).  REBUILD covers the MOP
+      ;; :INDEX slots; INSTALL covers DEF-INDEX declarations.  NOT on a LAZY graph:
+      ;; rebuilding scans every node and would thus MATERIALIZE the LZNODE blobs,
+      ;; defeating fault-on-access (a geometry :INDEX slot alone would trip it).  A
+      ;; lazy graph maintains its indexes in-session via APPLY; persisting them in the
+      ;; checkpoint image (so a lazy reopen needs no scan) is the deferred follow-up.
+      (unless (lazy-p graph)
+        (rebuild-secondary-indexes graph)
+        (install-secondary-indexes graph)))
     (when peer-role
       (%init-memory-peer-slots graph :open path peer-role origin-id peer-host
                                export-predicate device-registry merge-policy

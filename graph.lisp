@@ -3,7 +3,9 @@
 ;; Defined in unique-constraint.lisp (loaded after this file); declared so the
 ;; OPEN-GRAPH / CLOSE-GRAPH hooks below compile without forward-reference warnings.
 (declaim (ftype (function (t) t)
-                rebuild-unique-indexes save-unique-index-roots restore-unique-index-roots))
+                rebuild-unique-indexes save-unique-index-roots restore-unique-index-roots
+                rebuild-secondary-indexes save-secondary-index-roots
+                restore-secondary-index-roots install-secondary-indexes))
 
 (defun spatial-index-root-file (location)
   (format nil "~A/spatial-index.root" location))
@@ -323,7 +325,13 @@ Always CLOSE-GRAPH when finished."
         ;; the sidecar (durable, no scan); only rebuild from nodes if there is no
         ;; sidecar -- a fresh graph, or a crash before CLOSE-GRAPH saved the roots.
         (unless (restore-unique-index-roots graph)
-          (rebuild-unique-indexes graph)))
+          (rebuild-unique-indexes graph))
+        ;; General ordered indexes: same reopen-or-rebuild story as unique.
+        (unless (restore-secondary-index-roots graph)
+          (rebuild-secondary-indexes graph))
+        ;; Build any def-index'd index not covered by the sidecar (declared before
+        ;; this graph existed, or added since the last close); no-op otherwise.
+        (install-secondary-indexes graph))
       (when slave-p
         (setf (master-host graph) master-host))
       (when peer-role
@@ -373,6 +381,7 @@ in place, forcing recovery on the next OPEN-GRAPH."
     ;; Unique constraints (#6): persist the on-disk unique skip-lists' roots while the
     ;; heap is still open, so OPEN can reopen them without a scan.  No-op on memory.
     (save-unique-index-roots graph)
+    (save-secondary-index-roots graph)
     (when snapshot-p
       (log:info "Snapshotting ~A" graph)
       (snapshot graph))

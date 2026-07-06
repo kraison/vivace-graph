@@ -113,10 +113,11 @@
           (t
            (setf (slot-value slot 'persistent) nil)
            (setf (slot-value slot 'ephemeral) t)))
-    (when (or (indexed-p slot) (some 'indexed-p direct-slots))
-      (setf (slot-value slot 'indexed) t)
-      ;; FIXME: Generate index if needed
-      )
+    ;; Inherit the :INDEX spec (T or a canonicalizer) from the declaring direct slot,
+    ;; so an :INDEX slot on a parent indexes across its subclasses (general index).
+    (let ((i (find-if #'indexed-p direct-slots)))
+      (when (or (indexed-p slot) i)
+        (setf (slot-value slot 'indexed) (or (indexed-p slot) (indexed-p i)))))
     ;; Inherit the uniqueness constraint from the declaring direct slot (issue #6),
     ;; so a :UNIQUE slot on a parent enforces across its subclasses.
     (let ((u (find-if #'unique-spec direct-slots)))

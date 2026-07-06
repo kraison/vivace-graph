@@ -515,6 +515,7 @@ is the shipped node's origin, recorded for any :ORIGIN-scoped unique partition (
     (apply-tx-writes-to-views writes graph)
     (apply-tx-writes-to-spatial-index writes graph)
     (apply-tx-writes-to-unique-indexes writes graph)   ; #6: keep the device index complete
+    (apply-tx-writes-to-secondary-indexes writes graph) ; general ordered index
     (reap-old-versions writes graph)
     ;; Keep the device's tx-id-counter above this pulled node's hub epoch so a later
     ;; LOCAL edit transaction can see (and thus modify) it (B2d-2b).
@@ -551,6 +552,7 @@ ops."
         (apply-tx-writes-to-views final-writes graph)
         (apply-tx-writes-to-spatial-index final-writes graph)
         (apply-tx-writes-to-unique-indexes final-writes graph)   ; #6: index pulled nodes
+        (apply-tx-writes-to-secondary-indexes final-writes graph) ; general ordered index
         (reap-old-versions final-writes graph)
         ;; Persist the per-field stamps of the fields that took a new value, and
         ;; retain any surfaced conflicts.
@@ -753,6 +755,10 @@ the existence/id of purged (undisclosed) work (design §7)."
   ;; used unique constraints pays nothing.
   (when (unique-indexes graph)
     (%uix-release node graph))
+  ;; General ordered index: release the purged node's index entries too (guarded, so
+  ;; a graph with no secondary indexes pays nothing).
+  (when (secondary-indexes graph)
+    (%ix-release node graph))
   (etypecase node
     (edge
      (remove-from-ve-index node graph)

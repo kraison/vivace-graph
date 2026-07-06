@@ -112,6 +112,19 @@
   ()
   :graph-db-perf-test)
 
+;; A :UNIQUE-constrained type and an :INDEX-ed type for the unique / general-index
+;; benchmarks (bench-unique / bench-index).  Separate types so they don't perturb
+;; the other benchmarks' node path.
+(def-vertex pu-node ()
+  ((uval :unique t)
+   (label))
+  :graph-db-perf-test)
+
+(def-vertex pi-node ()
+  ((ival :index t)
+   (label))
+  :graph-db-perf-test)
+
 (defun define-perf-views ()
   "Define the perf view against the current *graph* (call after make-graph)."
   (def-view p-node-by-val :lessp (p-node :graph-db-perf-test)

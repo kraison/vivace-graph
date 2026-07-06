@@ -438,6 +438,7 @@ The recommended path is an *in-place reindex*: reopen the graph on the new backe
   (let ((g (open-graph :my-app "/var/tmp/my-app/" :index-backend :bplus-tree)))
     (regenerate-all-views g)          ; map/reduce views
     (regenerate-unique-indexes g)     ; :unique constraints
+    (regenerate-secondary-indexes g)  ; general ordered indexes (:index / def-index)
     (rebuild-spatial-index g)         ; spatial index
     (close-graph g))                  ; persists the new backend tags
 #+END_SRC
@@ -1210,6 +1211,50 @@ By default a constraint is ~:scope :local~ — the value is unique within *this*
 ~:scope :origin~ *partitions* the constraint by the node's authoring origin: two devices may each mint a ~code~ of ~"A-1"~ without colliding (they are different authors), while a single device may not reuse its own. This is the recommended default for offline-first fleets — it needs no coordination. Devices also maintain the constraint index for *pulled* nodes, so a locally-authored value is checked against everything the device holds, not only what it authored. On a non-peer graph there is a single origin, so ~:origin~ collapses to ~:local~.
 
 Truly global uniqueness — a value that must be unique across *all* devices (~:scope :local~, or a future ~:scope :hub~, in a peer setting) — requires the hub to arbitrate cross-device collisions. That arbiter is not yet built (tracked as issue #51); until then, prefer ~:origin~ for peer-replicated unique values.
+
+*** General ordered indexes (~:index~ / ~def-index~)
+
+A *view* is the most general secondary index — you write a ~:map~ lambda that emits arbitrary keys. When all you want is "index a slot for fast equality and range queries," VivaceGraph offers a lighter, declarative *ordered index* on a slot. It is, in effect, a ~:unique~ index without the enforcement: the same durable, backend-agnostic ordered map (skip list or B+ tree; an in-RAM map on a memory-graph), maintained on the commit path, but a value may be shared by many nodes and nothing is ever rejected.
+
+Declare one in either of two ways. As a *slot option*, symmetric with ~:unique~:
+
+#+BEGIN_SRC lisp
+  (def-vertex user ()
+    ((username :type string :index t)                 ; ordered index on username
+     (email    :type string :index string-downcase)   ; case-insensitive index
+     (age      :index t))                              ; numeric range index
+    :social-app)
+#+END_SRC
+
+or, for a slot you would rather not annotate on the class, with the standalone ~def-index~ (declarative and idempotent like ~def-view~; also the intended home for future composite/multi-slot indexes):
+
+#+BEGIN_SRC lisp
+  (def-index user email :social-app :canonicalize string-downcase)
+#+END_SRC
+
+Both forms produce the same index; ~def-index~ may even be evaluated before its graph exists (it is reconciled at open, like ~def-view~).
+
+Semantics:
+
+- *Scope* — an index on a class covers that class *and its subclasses* (a subtype IS-A), rooted at the class you name. So an index on ~user.email~ also indexes an ~admin~ subclass; ~(def-index user email …)~ indexes the ~user~ subtree even if ~email~ is declared on a parent.
+- *Any slot is indexable* — a declared ~:type~ is *not* required. The type is a *hint*: with it, the index validates values and advertises ordered/range support; without it, the index is equality-first and range scans are meaningful only for homogeneous (mutually comparable) values, exactly the contract untyped slots carry everywhere in VivaceGraph.
+- *NULL-exempt* — a node whose indexed slot is ~nil~/unbound is not indexed (like ~:unique~; also keeps the index proportional to nodes that actually have the value). Ordered iteration therefore omits value-less nodes.
+- *Collation* — an optional canonicalizer (a 1-arg function: a symbol, ~#'fn~, or a lambda; e.g. ~string-downcase~) transforms the value before keying, for case-insensitive or normalized indexes. A canonicalized index orders by the canonical form, so you get case-insensitive lookup at the cost of original-case ordering from that same index. *Descending* order is a query-time concern (reverse the result), not a separate index.
+
+Query with three functions, each taking the graph explicitly and resolving nodes in *that* graph:
+
+#+BEGIN_SRC lisp
+  (index-lookup graph 'user 'email "alice@x.com")     ; => list of matching nodes (equality)
+  (index-range  graph 'user 'age :start 18 :end 65)   ; => nodes in [18,65], ascending
+  (index-range  graph 'user 'age :start 18)           ; open-ended range
+  (map-index (lambda (u) ...) graph 'user 'age)       ; stream every user in age order
+#+END_SRC
+
+Querying a *declared* index that happens to hold no matching value returns an empty result; only a slot with no index at all signals an error.
+
+Like views, unique, and spatial, an ordered index is *backend-agnostic* — skip list or B+ tree per the graph's ~:index-backend~ (Chapter 3) — durable on the on-disk backend (reopened from a sidecar, no scan), and rebuilt on open on the memory backend. Devices maintain it for *pulled* nodes too, so a replicated node is findable by index the same as a locally-authored one. Switch a graph's ordered indexes to a different backend in place with ~regenerate-secondary-indexes~ (the parallel of ~regenerate-all-views~; see Chapter 3).
+
+When to reach for which: use a *view* when the index key is computed or you need map-reduce aggregation; use an *ordered index* when you simply want a slot indexed for equality and range. (Two current limitations: multi-slot/composite keys and true reverse-streaming cursors are not yet built but are designed for; and a *lazy* memory-graph does not rebuild its ordered indexes on reopen — see Chapter 3 — so use a non-lazy memory graph if you need them to survive a lazy reopen.)
 
 * Part IV: Advanced Topics & API
 
@@ -2243,6 +2288,16 @@ This chapter provides a categorized reference for the most important exported sy
 
 - ~regenerate-unique-indexes (graph)~ ::
   Drops and rebuilds every ~:unique~ constraint index on the graph's *current* index backend, re-persisting each index's backend tag.  The unique-index half of an in-place skip-list→B+ tree migration (paired with ~regenerate-all-views~ and ~rebuild-spatial-index~; see Chapter 3).
+
+**** General ordered indexes (~:index~ / ~def-index~; see Chapter 8)
+- ~def-index (owner-class slot graph-name &key canonicalize)~ ::
+  Declares an ordered secondary index on ~owner-class.slot~ (spanning subclasses) in ~graph-name~; declarative and idempotent like ~def-view~.  The slot-option form ~(slot :index t | <canonicalizer>)~ is equivalent for a single slot.  ~:canonicalize~ is an optional 1-arg function applied before keying (e.g. ~string-downcase~).
+- ~index-lookup (graph class slot value &key (collect-p t))~ ::
+  The nodes of ~class~ (and subclasses) whose ~slot~ equals ~value~, via the ordered index (equality).  Resolves nodes in ~graph~.  A declared-but-empty index returns an empty result; an unindexed slot signals an error.
+- ~index-range (graph class slot &key start end)~ / ~map-index (function graph class slot &key start end)~ ::
+  The nodes whose ~slot~ is in ~[start,end]~ (inclusive; open-ended when ~nil~), in ascending value order — collected, or streamed to ~function~.
+- ~regenerate-secondary-indexes (graph)~ ::
+  Drops and rebuilds every ordered index on the graph's *current* index backend — the ~:index~/~def-index~ half of an in-place backend migration (paired with ~regenerate-all-views~, ~regenerate-unique-indexes~, ~rebuild-spatial-index~; see Chapter 3).
 
 **** Graph Traversal & Mapping
 - ~map-vertices (function graph &key vertex-type include-vertex-types exclude-vertex-types include-subclasses-p ... )~ ::

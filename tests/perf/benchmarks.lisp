@@ -86,6 +86,55 @@
       (timed-ops ("view-lookup" q)
         (dotimes (i q) (invoke-graph-view 'p-node 'p-node-by-val :key (mod i n)))))))
 
+(defun bench-unique ()
+  "insert throughput WITH a :unique constraint (commit-boundary enforcement) vs the
+same inserts with no constraint -- the delta is the enforcement overhead."
+  (let ((n (scale 20000)) (batch 1000))
+    (with-perf-graph (g)
+      (timed-ops ("unique-insert" n)
+        (let ((i 0))
+          (loop while (< i n) do
+            (with-transaction ()
+              (dotimes (k (min batch (- n i)))
+                (make-pu-node :uval i :label "u") (incf i)))))))
+    (with-perf-graph (g)
+      (timed-ops ("unique-baseline-plain-insert" n)
+        (let ((i 0))
+          (loop while (< i n) do
+            (with-transaction ()
+              (dotimes (k (min batch (- n i)))
+                (make-p-node :val i :label "u") (incf i)))))))))
+
+(defun bench-index ()
+  "general ordered index: indexed-insert throughput (maintenance overhead),
+index-lookup (equality) throughput, index-range scan throughput, and index-lookup
+vs a full type scan for the same equality query."
+  (let ((n (scale 20000)) (batch 1000) (q (scale 20000)))
+    (with-perf-graph (g)
+      (timed-ops ("indexed-insert" n)
+        (let ((i 0))
+          (loop while (< i n) do
+            (with-transaction ()
+              (dotimes (k (min batch (- n i)))
+                (make-pi-node :ival i :label "x") (incf i))))))
+      (timed-ops ("index-lookup-eq" q)
+        (dotimes (i q) (index-lookup g 'pi-node 'ival (mod i n))))
+      ;; range scans covering ~1% of the key space each
+      (let ((span (max 1 (floor n 100))) (r (scale 2000)))
+        (timed-ops ("index-range-1pct" r)
+          (dotimes (i r)
+            (let ((s (mod (* i span) n)))
+              (index-range g 'pi-node 'ival :start s :end (+ s span))))))
+      ;; full-scan equality for comparison (O(n) each) -- far fewer iterations
+      (let ((fs (scale 200 20)))
+        (timed-ops ("index-fullscan-eq" fs)
+          (dotimes (i fs)
+            (let ((target (mod i n)) (hit nil))
+              (map-vertices (lambda (v)
+                              (when (eql (slot-value v 'ival) target) (setq hit v)))
+                            g :vertex-type 'pi-node)
+              hit)))))))
+
 (defun bench-prolog ()
   "prolog select throughput: type scan + edge join."
   (let ((n (scale 10000)) (batch 1000))
@@ -199,6 +248,8 @@ Measurement-only; always returns T."
     (bench-crud)
     (bench-edges)
     (bench-view)
+    (bench-unique)
+    (bench-index)
     (bench-prolog)
     (bench-commit-overhead)
     (bench-concurrent-rw)
