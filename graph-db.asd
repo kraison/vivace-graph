@@ -14,7 +14,7 @@
   :name "VivaceGraph (embeddable core)"
   :maintainer "Kevin Raison"
   :author "Kevin Raison <last name @ chatsubo dot net>"
-  :version "2.1.0"
+  :version "2.1.1"
   :depends-on (:bordeaux-threads
                :alexandria
                :iterate
@@ -110,7 +110,7 @@
   :name "VivaceGraph (replication transport)"
   :maintainer "Kevin Raison"
   :author "Kevin Raison <last name @ chatsubo dot net>"
-  :version "2.1.0"
+  :version "2.1.1"
   :depends-on (:graph-db/core
                :usocket)
   :serial t
@@ -131,7 +131,7 @@
   :name "VivaceGraph"
   :maintainer "Kevin Raison"
   :author "Kevin Raison <last name @ chatsubo dot net>"
-  :version "2.1.0"
+  :version "2.1.1"
   :depends-on (:graph-db/replication
                :hunchentoot
                :ningle
