@@ -126,6 +126,17 @@ Prints a summary line and pushes structured data into *TIMING-REPORT*."
   ()
   :graph-db-stress-test)
 
+;; :UNIQUE-constrained + :INDEX-ed types for the unique-stress / index-stress tests.
+(def-vertex su-item ()
+  ((ukey :unique t)
+   (label))
+  :graph-db-stress-test)
+
+(def-vertex si-item ()
+  ((ikey :index t)
+   (label))
+  :graph-db-stress-test)
+
 (defmacro with-stress-graph ((g) &body body)
   "Bind G and *GRAPH* to a fresh on-disk graph; tear it down afterwards."
   (let ((dir (gensym "DIR")))

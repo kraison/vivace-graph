@@ -28,6 +28,10 @@
                 #:invoke-graph-view
                 #:map-view
                 #:map-reduced-view
+                #:index-lookup
+                #:index-range
+                #:map-index
+                #:unique-constraint-violation
                 #:yield
                 #:def-view
                 ;; prolog

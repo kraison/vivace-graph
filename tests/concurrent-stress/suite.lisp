@@ -118,6 +118,17 @@ slower machines or bumped for deeper stress.  Must be ≥ 4.")
   ()
   :graph-db-concurrent-stress-test)
 
+;; :UNIQUE-constrained + :INDEX-ed types for the unique-storm / index-storm tests.
+(def-vertex cu-item ()
+  ((ukey :unique t)
+   (label))
+  :graph-db-concurrent-stress-test)
+
+(def-vertex ci-item ()
+  ((ikey :index t)
+   (label))
+  :graph-db-concurrent-stress-test)
+
 ;;; ---------------------------------------------------------------------------
 ;;; Graph fixture
 ;;; ---------------------------------------------------------------------------
