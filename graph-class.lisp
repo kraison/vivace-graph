@@ -43,6 +43,9 @@
    ;; A derived structure (v1: rebuilt on open); enforcement is at the commit
    ;; boundary.  See unique-constraint.lisp / docs/unique-constraint-design.md.
    (unique-indexes :accessor unique-indexes :initarg :unique-indexes :initform nil)
+   ;; General ordered secondary indexes (:INDEX slot option / DEF-INDEX); keyed by
+   ;; (owner-name . slot-name).  See index.lisp / docs/general-index-design.md.
+   (secondary-indexes :accessor secondary-indexes :initarg :secondary-indexes :initform nil)
    (views-lock :accessor views-lock :initarg :views-lock
                :initform (make-recursive-lock))
    (views :accessor views :initarg :views)

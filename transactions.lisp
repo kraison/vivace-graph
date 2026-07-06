@@ -3,7 +3,8 @@
 ;; Defined in unique-constraint.lisp (loaded after this file); declared here so the
 ;; %COMMIT / APPLY-TRANSACTION hooks below compile without a forward-reference warning.
 (declaim (ftype (function (t t) t)
-                validate-unique-constraints apply-tx-writes-to-unique-indexes))
+                validate-unique-constraints apply-tx-writes-to-unique-indexes
+                apply-tx-writes-to-secondary-indexes))
 
 (defvar *transaction* nil)
 (defvar *end-of-transaction-action* '%commit)
@@ -987,6 +988,7 @@ With no FILTER, returns WRITES unchanged."
         (apply-tx-writes-to-views writes graph)
         (apply-tx-writes-to-spatial-index writes graph)
         (apply-tx-writes-to-unique-indexes writes graph)   ; issue #6
+        (apply-tx-writes-to-secondary-indexes writes graph) ; general ordered index
         (reap-old-versions writes graph)
         (persist-highest-transaction-id (transaction-id transaction) graph)))))
 

@@ -161,6 +161,9 @@
                 #:end-vertex
                 #:map-vertices
                 #:map-edges
+                #:index-lookup
+                #:index-range
+                #:map-index
                 #:weight
                 #:to
                 #:from
