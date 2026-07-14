@@ -363,6 +363,7 @@
                (:file "peer-rehome-tests")
                (:file "peer-conflict-tests")
                (:file "peer-type-table-tests")
+               (:file "peer-scope-tests")
                (:file "view-tests")
                (:file "query-tests")
                (:file "prolog-mutation-tests")
