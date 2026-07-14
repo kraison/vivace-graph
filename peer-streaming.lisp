@@ -69,6 +69,94 @@ list of 16-byte ids."
   (loop for start from 0 below (length string) by 32
         collect (peer-hex->id (subseq string start (+ start 32)))))
 
+;;; ---------------------------------------------------------------------------
+;;; The type table: (kind, id, name, direct-super), for non-Lisp peers.
+;;;
+;;; A TYPE-ID is an opaque uint16 on the wire and NO type NAME ever crosses it --
+;;; a receiver resolves the raw id against its OWN schema (vertex.lisp).  A Lisp
+;;; device gets away with that only because it evaluates the same schema.lisp; a
+;;; Kotlin/SQLite peer cannot.  So the hub ships the mapping in the auth-ok plist.
+;;; ---------------------------------------------------------------------------
+
+(defun %peer-split (char string)
+  "Split STRING on CHAR.  Empty fields are preserved, so a trailing separator
+yields a trailing empty string (which the type-table format relies on: an empty
+DIRECT-SUPER field means \"roots directly at VERTEX/EDGE\")."
+  (loop with start = 0
+        for pos = (position char string :start start)
+        collect (subseq string start (or pos (length string)))
+        while pos
+        do (setf start (1+ pos))))
+
+(defun %peer-type-direct-super (name)
+  "The downcased name of type NAME's direct graph superclass, or NIL when NAME roots
+directly at VERTEX/EDGE.
+
+This CANNOT come from NODE-TYPE-PARENT-TYPE: that slot holds :VERTEX or :EDGE -- the
+KIND, not the superclass (DEF-NODE-TYPE sets it from (LAST1 PARENT-TYPES)).  The
+inheritance graph lives only in CLOS, never in the persisted schema.
+FIND-GRAPH-PARENT-CLASSES is also wrong here: it returns TRANSITIVE ancestors, and we
+want only the direct parent so the consumer can rebuild the closure itself."
+  (let* ((class (find-class name nil))
+         (super (and class
+                     (first (remove-if
+                             (lambda (c)
+                               (member (class-name c)
+                                       '(vertex edge primitive-node node standard-object t)))
+                             (class-direct-superclasses class))))))
+    (and super (string-downcase (symbol-name (class-name super))))))
+
+(defun peer-type-table-string (&optional (graph *graph*))
+  "Encode GRAPH's node-type registry as ONE delimited string, for the plist control
+channel.  A nested list would trip PLIST-TOO-FANCY-ERROR, so the table rides as a
+single string -- the same dodge as PEER-IDS->STRING.
+
+Format: records separated by #\\; , fields by #\\, :
+
+    kind,id,name,direct-super
+
+KIND is \"v\" or \"e\"; ID is the decimal type-id; NAME is the downcased type name;
+DIRECT-SUPER is the downcased direct graph superclass, or EMPTY when the type roots
+directly at VERTEX/EDGE.  Example:
+
+    v,1,site,;v,2,ord-mine,ordnance-type;e,1,find-of-type,
+
+Both KIND and ID are required: NEXT-VERTEX-ID and NEXT-EDGE-ID are separate counters
+that BOTH start at 1 (schema.lisp), so a vertex type and an edge type routinely share
+a numeric id.  A consumer must key on (KIND . ID), never ID alone.
+
+The sub-tables are triple-keyed (id -> meta, symbol -> id, keyword -> id; see
+UPDATE-NODE-TYPE in schema.lisp), hence the (INTEGERP K) filter -- without it every
+type is emitted three times."
+  (with-output-to-string (s)
+    (let ((firstp t))
+      (dolist (kind '(:vertex :edge))
+        (let ((sub (gethash kind (schema-type-table (schema graph)))))
+          (when sub
+            (dolist (id (sort (loop for k being the hash-keys in sub
+                                    when (integerp k) collect k)
+                              #'<))
+              (let ((meta (gethash id sub)))
+                (when (node-type-p meta)
+                  (if firstp (setf firstp nil) (write-char #\; s))
+                  (format s "~A,~D,~A,~A"
+                          (if (eq kind :vertex) "v" "e")
+                          id
+                          (string-downcase (symbol-name (node-type-name meta)))
+                          (or (%peer-type-direct-super (node-type-name meta)) "")))))))))))
+
+(defun peer-parse-type-table (string)
+  "Inverse of PEER-TYPE-TABLE-STRING.  Returns a list of (KIND ID NAME SUPER), where
+KIND is :VERTEX or :EDGE, ID an integer, NAME a string, and SUPER a string or NIL.
+NIL or \"\" (an old hub that sends no table) parses to NIL."
+  (unless (or (null string) (string= string ""))
+    (loop for record in (%peer-split #\; string)
+          collect (destructuring-bind (kind id name &optional (super "")) (%peer-split #\, record)
+                    (list (if (string= kind "v") :vertex :edge)
+                          (parse-integer id)
+                          name
+                          (if (string= super "") nil super))))))
+
 (defun peer-portable-string (value)
   "Coerce a STRING VALUE to a general (CHARACTER) string; pass non-strings through.
 The plist control channel serializes with *PRINT-READABLY* T (via
