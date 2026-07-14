@@ -487,8 +487,13 @@ replayed onto the device."
 
 (defun make-peer-session-handler (graph socket)
   "Return a thunk handling one device connection on SOCKET (hub side): announce,
-authenticate, serve one pull, then RECEIVE the device's push and re-home it, close.
-Models MAKE-SLAVE-SESSION-HANDLER but stays distinct from it."
+authenticate, ship the schema type table, serve one pull, then RECEIVE the device's
+push and re-home it, close.  Models MAKE-SLAVE-SESSION-HANDLER but stays distinct
+from it.
+
+The auth-ok plist carries :TYPE-TABLE (PEER-TYPE-TABLE-STRING) so a non-Lisp peer can
+resolve a raw type-id to a type NAME.  It is not otherwise recoverable: ids come from
+DEF-VERTEX/DEF-EDGE evaluation order and no name crosses the wire."
   (lambda ()
     (let ((*graph* graph))
       (handler-case
@@ -497,7 +502,14 @@ Models MAKE-SLAVE-SESSION-HANDLER but stays distinct from it."
                  (peer-write-plist (peer-hub-handshake-plist graph) socket)
                  (let* ((auth (read-plist-packet socket))
                         (device (peer-authenticate-device graph auth)))
-                   (peer-write-plist (list :peer-control :auth-ok) socket)
+                   ;; The type table rides on auth-ok, not on the hello: this is
+                   ;; POST-authentication, so an unauthenticated peer never sees the
+                   ;; schema.  Additive and back-compatible -- every peer-path plist
+                   ;; read on both sides is a bare GETF, so an old device simply never
+                   ;; asks for this key, and a new device against an old hub gets NIL.
+                   (peer-write-plist (list :peer-control :auth-ok
+                                           :type-table (peer-type-table-string graph))
+                                     socket)
                    (peer-pull-phase graph socket device
                                     :full-resync-p (and (getf auth :full-resync) t)
                                     :min-cursor (or (getf auth :pull-cursor) 0))
