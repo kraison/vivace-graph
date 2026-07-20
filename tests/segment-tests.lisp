@@ -107,7 +107,15 @@ and must be rejected, not stored (else a reopen would misread it as free)."
            (let ((s (open-vector-segment path)))
              (unwind-protect
                   (progn
-                    (is (every #'= (%vec 48 1.0) (segment-get s (%id 1))))
-                    (is (every #'= (%vec 48 2.0) (segment-get s (%id 2)))))
+                    (let ((back (segment-get s (%id 1))))
+                      (is (typep back '(simple-array single-float (*)))
+                          "id 1 did not survive reopen (segment-get returned ~S)" back)
+                      (is (= 48 (length back)))
+                      (is (every #'= (%vec 48 1.0) back)))
+                    (let ((back (segment-get s (%id 2))))
+                      (is (typep back '(simple-array single-float (*)))
+                          "id 2 did not survive reopen (segment-get returned ~S)" back)
+                      (is (= 48 (length back)))
+                      (is (every #'= (%vec 48 2.0) back))))
                (close-vector-segment s))))
       (ignore-errors (delete-file path)))))
