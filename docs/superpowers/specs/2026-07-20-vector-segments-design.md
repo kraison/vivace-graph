@@ -228,6 +228,67 @@ and its ceiling is known before it is built. **If scoring dominates instead**, t
 attribution is wrong and this design must be revisited before implementation, not
 after. Record the numbers in this document either way.
 
+### 10.1 Results (measured)
+
+Measured with `cl-llm.bench:run-attribution` / `report-attribution`
+(`cl-llm` branch `segment-attribution-benchmark`, commit `d4be10f`), invoked as:
+
+```
+sbcl --dynamic-space-size 8192 --non-interactive \
+     --eval '(ql:quickload :cl-llm/bench)' \
+     --eval '(cl-llm.bench:report-attribution (cl-llm.bench:run-attribution N 1024 :runs 5))'
+```
+
+Machine: Apple M3 Pro, macOS 26.5.1 (Darwin 25.5.0, arm64). SBCL 2.5.5
+(`(lisp-implementation-version)`). A/B/C/D are the median of 5 warm runs (one
+discarded warm-up); E is a single cold-process-reopen sample (see the
+docstrings in `bench/attribution.lisp` for exactly what "cold" does and does
+not mean — it is a lower bound on true disk-cold I/O, not the number itself).
+
+Both the reference shape and the 250,000-row synthetic completed on the first
+attempt — no fallback to smaller sizes was needed.
+
+| n | dim | A (ms) | B (ms) | C (ms) | D (ms) | E (ms) | B/A | D/C |
+|---|---|---|---|---|---|---|---|---|
+| 19,973 | 1024 | 2287.4 | 2101.9 | 14.9 | 14.8 | 2649.3 | 91.9% | 99.3% |
+| 250,000 | 1024 | 34166.6 | 31707.3 | 183.4 | 179.7 | 33127.3 | 92.8% | 98.0% |
+
+Predicted segment latency (D) and predicted win (A − D):
+
+| n | predicted segment latency (D) | predicted win (A − D) |
+|---|---|---|
+| 19,973 | 14.8 ms | 2272.6 ms |
+| 250,000 | 179.7 ms | 33986.9 ms |
+
+No larger size was attempted and none failed — 250,000 × 1024 (the largest
+size called for by the plan) ran to completion without exhausting memory or
+disk (peak disk usage during the run left 13 GiB free of 926 GiB; the graph's
+`heap.dat`/`indexes.dat` grew to ~1.2 GB, consistent with ~1 GB of embeddings
+plus text and index overhead).
+
+**Reading the two watch conditions from §2.2/§10:**
+- **Loading dominates at both sizes**: B is 91.9% of A at 19,973 and 92.8% of
+  A at 250,000 — both comfortably over the report's own 60% threshold, and the
+  fraction is stable (even slightly growing) as the corpus scales 12.5×. This
+  is the design's central premise, borne out at both points on the curve.
+- **D ≈ C, not D ≪ C, at both sizes**: D is 99.3% of C at 19,973 and 98.0% of
+  C at 250,000 — well above the report's 70% "contiguity matters" threshold,
+  meaning contiguity itself buys next to nothing over scoring the same
+  already-resident vectors scattered. A segment's predicted win (A − D) comes
+  almost entirely from *not loading whole nodes to reach the embedding* (i.e.
+  from keeping vectors resident and avoiding per-node deserialization/pointer
+  chasing), not from sequential-scan speed. **This is a different
+  justification than the one implied by "contiguous storage is faster to
+  scan" — it must be read as "segments win by skipping node materialization,
+  not by being a tighter memory layout,"** and the design write-up (§4
+  onward) should be understood in that light rather than as a cache-locality
+  argument.
+
+**Determination: attribution holds — node loading dominates warm search at
+both measured corpus sizes, so building the segment (§4–§9) is the right fix,
+with the caveat above that its win is attributable to skipping node
+materialization rather than to contiguous-scan speed.**
+
 ## 11. Testing
 
 Ordinary unit coverage: put/get/remove, free-list reuse, dimension validation,
