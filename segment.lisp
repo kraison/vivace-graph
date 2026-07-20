@@ -95,3 +95,93 @@ on-disk id array is authoritative; the map is never persisted)."
   ;; Filled in in a later task; the header round-trip test does not exercise it.
   (declare (ignore segment))
   nil)
+
+(defun %seg-id-offset (slot)
+  (+ +segment-id-array-offset+ (* slot +key-bytes+)))
+
+(defun %seg-vec-offset (segment slot)
+  (+ (%seg-vblock-offset (segment-capacity segment))
+     (* slot (segment-dimension segment) 4)))
+
+(defun %seg-read-vector (segment slot)
+  "Read slot SLOT's vector as a fresh (simple-array single-float (*))."
+  (let* ((dim (segment-dimension segment))
+         (off (%seg-vec-offset segment slot))
+         (bytes (get-bytes (segment-mmap segment) off (* dim 4)))
+         (v (make-array dim :element-type 'single-float)))
+    (dotimes (i dim v)
+      (let ((bits 0) (b (* i 4)))
+        (dotimes (k 4)
+          (setf bits (dpb (aref bytes (+ b k)) (byte 8 (* k 8)) bits)))
+        (setf (aref v i) (ieee-floats:decode-float32 bits))))))
+
+(defun %seg-write-vector (segment slot vector)
+  "Write VECTOR into slot SLOT's vector-block region."
+  (declare (type (simple-array single-float (*)) vector))
+  (let* ((dim (segment-dimension segment))
+         (off (%seg-vec-offset segment slot))
+         (bytes (make-array (* dim 4) :element-type '(unsigned-byte 8))))
+    (dotimes (i dim)
+      (let ((bits (ieee-floats:encode-float32 (aref vector i)))
+            (b (* i 4)))
+        (dotimes (k 4)
+          (setf (aref bytes (+ b k)) (ldb (byte 8 (* k 8)) bits)))))
+    (set-bytes (segment-mmap segment) bytes off (* dim 4))))
+
+(defun %seg-write-id (segment slot id)
+  ;; The free-list scheme marks a free cell by all-ones in its first 8 bytes, so
+  ;; a real id whose first 8 bytes are all-ones would be misread as free after a
+  ;; reopen (sec 5.1 rebuild).  Engine ids are uuids and never all-ones, but an
+  ;; arbitrary caller-supplied id could be; reject it loudly rather than corrupt
+  ;; silently.
+  (let ((first8 0))
+    (dotimes (k 8) (setf first8 (dpb (aref id k) (byte 8 (* k 8)) first8)))
+    (when (= first8 +free-slot-marker+)
+      (error "node id's first 8 bytes are all-ones, colliding with the segment ~
+              free-slot marker")))
+  (set-bytes (segment-mmap segment) id (%seg-id-offset slot) +key-bytes+))
+
+(defun %seg-slot-of (segment id)
+  "Slot index storing ID, or NIL."
+  (gethash id (segment-id->slot segment)))
+
+(defun %seg-claim-slot (segment)
+  "Return a slot index to write a NEW id into: the free-list head if any, else
+the next slot past live-count when capacity allows.  Signals when full -- Task 5
+replaces this with growth."
+  (let* ((mmap (segment-mmap segment))
+         (free-head (%seg-free-head segment)))
+    (if (/= free-head +no-slot+)
+        ;; Pop the free list: its cell's second 8 bytes hold the next free slot.
+        (let ((next (deserialize-uint64 mmap (+ (%seg-id-offset free-head) 8))))
+          (serialize-uint64 mmap next 48)   ; free-head := next
+          free-head)
+        (let ((cap (segment-capacity segment))
+              (live (segment-live-count segment)))
+          (when (>= live cap)
+            (error "segment full: capacity ~D (growth is Task 5)" cap))
+          live))))
+
+(defun segment-put (segment id vector)
+  "Store VECTOR under the 16-byte ID.  Overwrites if ID is present; else takes a
+free slot (or the next free index).  Returns the slot index.  VECTOR's length
+must equal the segment's dimension, or this signals."
+  (check-type vector (simple-array single-float (*)))
+  (unless (= (length vector) (segment-dimension segment))
+    (error "vector length ~D does not match segment dimension ~D"
+           (length vector) (segment-dimension segment)))
+  (let ((existing (%seg-slot-of segment id)))
+    (if existing
+        (progn (%seg-write-vector segment existing vector) existing)
+        (let ((slot (%seg-claim-slot segment)))
+          (%seg-write-id segment slot id)
+          (%seg-write-vector segment slot vector)
+          (setf (gethash id (segment-id->slot segment)) slot)
+          (serialize-uint64 (segment-mmap segment)
+                            (1+ (segment-live-count segment)) 40)
+          slot))))
+
+(defun segment-get (segment id)
+  "The vector stored under ID as a fresh (simple-array single-float (*)), or NIL."
+  (let ((slot (%seg-slot-of segment id)))
+    (when slot (%seg-read-vector segment slot))))

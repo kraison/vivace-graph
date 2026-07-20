@@ -152,6 +152,8 @@
                 #:segment-capacity
                 #:segment-live-count
                 #:segment-dimension
+                #:segment-put
+                #:segment-get
                 ;; type index
                 #:make-type-index
                 #:close-type-index
