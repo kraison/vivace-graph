@@ -146,6 +146,14 @@ snapshot in the single-writer case.
 **Rebuild on open** when the segment file is absent or its format version is stale,
 following the `+spatial-index-format+` v1→v2 precedent.
 
+**Rebuild runs quiescent** — at open, before the graph accepts writes. There is no
+supported way to rebuild a live segment. This is a decision, not an omission: a
+rebuild walks `map-vertices`, and a typed scan skips ids whose lookup returns `NIL`
+mid-commit (`vertex.lisp:207-216`). That behaviour is snapshot-correct for a reader,
+but a *rebuild* that skipped a concurrently-committing node would bake the omission
+into the segment permanently — a missing vector, silently, with the node intact.
+Requiring quiescence removes the possibility rather than reasoning about the odds.
+
 ## 7. API
 
 ```lisp
@@ -272,11 +280,9 @@ they were already planned.
   every corruption state is recoverable by rebuild.
 - **Growth during an in-flight scan.** Mitigated by the existing stable-address mmap;
   a test should exercise growth concurrent with a scan rather than assuming it.
-- **`map-vertices` typed scans skip ids whose lookup returns NIL during a commit**
-  (`vertex.lisp:207-216`). Verified during Phase 1 as snapshot-correct, not data
-  loss — but a *rebuild* walks that same path, so a rebuild running concurrently
-  with writes could produce an incomplete segment. Rebuild should run quiescent, or
-  the plan should establish that it does not matter.
+- ~~Rebuild concurrent with writes could produce an incomplete segment.~~
+  **Resolved (§6): rebuild runs quiescent, at open, before the graph accepts
+  writes.** No supported live rebuild.
 
 ## 14. Deferred
 
