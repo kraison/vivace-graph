@@ -21,6 +21,7 @@
                 #:decode-length
                 #:+float-vector+
                 #:+fv-single-float+
+                #:serialization-error
                 ;; geometry (spatial extension)
                 #:make-point
                 #:make-linestring

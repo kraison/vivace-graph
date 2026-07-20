@@ -241,6 +241,28 @@ generic vector path's one allocation per element."
             (setf (aref vec (+ off b)) (ldb (byte 8 (* b 8)) bits))))))
     vec))
 
+(defmethod deserialize-help ((become (eql +float-vector+)) (bytes array))
+  "Decode a contiguous float32 block into a fresh (simple-array single-float (*)).
+BYTES is the payload only: a type byte followed by DIM*4 little-endian float32s."
+  (declare (type (array (unsigned-byte 8)) bytes))
+  (let ((etype (aref bytes 0)))
+    (unless (= etype +fv-single-float+)
+      (error "unknown float-vector element type ~A" etype))
+    ;; Guard the alignment rather than truncating: FLOOR alone would silently
+    ;; yield a short vector on a corrupt or misaligned payload, on a codec that
+    ;; will outlive everyone's memory of this plan.
+    (unless (zerop (mod (- (length bytes) 1) 4))
+      (error "float-vector payload is not 4-byte aligned: ~A bytes after the type byte"
+             (- (length bytes) 1)))
+    (let* ((dim (floor (- (length bytes) 1) 4))
+           (v (make-array dim :element-type 'single-float)))
+      (dotimes (i dim v)
+        (let ((bits 0)
+              (off (+ 1 (* 4 i))))
+          (dotimes (b 4)
+            (setf bits (dpb (aref bytes (+ off b)) (byte 8 (* b 8)) bits)))
+          (setf (aref v i) (ieee-floats:decode-float32 bits)))))))
+
 (defmethod serialize ((v vector))
   (cond
     ((equal (array-element-type v) '(unsigned-byte 8))

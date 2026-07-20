@@ -119,3 +119,78 @@ UUID (compared by string form, since uuid objects aren't EQUAL)."
       (is (= 13 payload-length))
       (is (= (+ header-length 13) (length bytes)))
       (is (= +fv-single-float+ (aref bytes header-length))))))
+
+(test float-vector-round-trip
+  "Float vectors round-trip exactly, preserving element type and dimension."
+  (dolist (v (list (fv)
+                   (fv 0.0)
+                   (fv 1.0 -1.0 0.5 -0.5)
+                   (fv 3.14159 -2.71828 1.0e10 -1.0e-10)))
+    (let ((back (deserialized v)))
+      (is (typep back '(simple-array single-float (*)))
+          "round-tripped value has the wrong type: ~S" (type-of back))
+      (is (= (length v) (length back)))
+      (dotimes (i (length v))
+        (is (= (aref v i) (aref back i))
+            "element ~A differs: ~A vs ~A" i (aref v i) (aref back i))))))
+
+(test float-vector-extremes
+  "Boundary float32 values survive the round trip bit-exactly."
+  (let ((v (fv most-positive-single-float most-negative-single-float
+               least-positive-single-float least-negative-single-float)))
+    (let ((back (deserialized v)))
+      (dotimes (i (length v))
+        (is (= (aref v i) (aref back i)))))))
+
+(test float-vector-large-dimension
+  "A realistic embedding dimension round-trips (exercises multi-byte lengths)."
+  (let ((v (make-array 1536 :element-type 'single-float)))
+    (dotimes (i 1536)
+      (setf (aref v i) (coerce (/ (- i 768) 768.0) 'single-float)))
+    (let ((back (deserialized v)))
+      (is (= 1536 (length back)))
+      (is (every #'= v back)))))
+
+(test float-vector-rejects-misaligned-payload
+  "A corrupt payload errors rather than silently decoding to a short vector."
+  (let ((bytes (serialize (fv 1.0 2.0))))
+    ;; drop one trailing byte: payload is now 8 bytes after the type byte, not 9
+    (let ((truncated (subseq bytes 0 (1- (length bytes)))))
+      (signals error (deserialize truncated)))))
+
+(test float-vector-nan-and-infinity-behaviour
+  "Pin whatever ieee-floats does with non-finite values, so a later change to
+that library cannot alter stored data silently. Embeddings must never contain
+these -- AS-EMBEDDING rejects them at ingest (Task 4) -- but the codec's
+behaviour should still be known rather than assumed.
+
+Probed directly against this repo's live serialize/deserialize path (SBCL
+2.5.5, 2026-07-20): IEEE-FLOATS:ENCODE-FLOAT32 signals a SIMPLE-ERROR (\"Can't
+decode NaN or infinity: ...\") for both single-float-positive-infinity and a
+quiet NaN.  That happens at the ENCODE step inside SERIALIZE -- never even
+reaching the DESERIALIZE-HELP decoder added in this task -- and SERIALIZE's
+:AROUND method wraps it into a GRAPH-DB:SERIALIZATION-ERROR.  So the codec does
+not silently corrupt non-finite data: it refuses to store it at all."
+  (let ((inf #+sbcl sb-ext:single-float-positive-infinity
+             #+ecl si:single-float-positive-infinity))
+    (let ((v (make-array 1 :element-type 'single-float :initial-element inf)))
+      (signals serialization-error (deserialized v)))))
+
+(test generic-vectors-unaffected
+  "Non-single-float vectors still take their existing paths."
+  (let ((tv (vector 1 "two" :three)))
+    (is (equalp tv (deserialized tv))))
+  ;; A (unsigned-byte 8) vector is NOT round-tripped through SERIALIZE/DESERIALIZE
+  ;; -- that is not a bug, it's the contract.  SERIALIZE treats such a vector as
+  ;; "these are already the bytes to store" and returns it unchanged (EQ, not a
+  ;; copy): it has no tag/length header of its own, so DESERIALIZE cannot be
+  ;; called on it directly.  Two independent call sites already depend on this
+  ;; identity behaviour: memory-graph.lisp:472-485 (NI-VAL/RI-VAL) stores byte
+  ;; arrays raw under its own tag rather than routing them through SERIALIZE's
+  ;; header format, and edge.lisp:225 serializes already-byte data and writes
+  ;; the (identical) result straight to the heap.  There is no wrapped-blob
+  ;; codec to round-trip against: +blob+ (globals.lisp) has no encoder or
+  ;; decoder anywhere in the codebase.
+  (let ((bv (make-array 3 :element-type '(unsigned-byte 8)
+                          :initial-contents '(1 2 3))))
+    (is (eq bv (serialize bv)))))
