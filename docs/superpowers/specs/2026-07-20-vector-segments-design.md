@@ -284,10 +284,46 @@ plus text and index overhead).
   onward) should be understood in that light rather than as a cache-locality
   argument.
 
-**Determination: attribution holds — node loading dominates warm search at
-both measured corpus sizes, so building the segment (§4–§9) is the right fix,
-with the caveat above that its win is attributable to skipping node
-materialization rather than to contiguous-scan speed.**
+**Reading the magnitude, not just the threshold.** The gate asked "does B ≥
+60% of A." It is 92%. But the absolute numbers say more than the ratio: a
+*warm* search over the 19,973-chunk reference corpus takes **2.3 seconds**, and
+250,000 chunks takes **34 seconds** — extrapolating linearly, the 1M-vector
+design target is roughly **140 seconds per query**. The mmap `:scan` path is not
+slightly slow; it is unusable for RAG at the target scale. So the segment is not
+an optimisation of a working system — it is what makes the mmap store viable for
+retrieval at all. That reframes the priority: this is load-bearing for the whole
+correlation substrate, not a nicety.
+
+**The three-way comparison the benchmark actually measured.** C scores vectors
+already resident in RAM, and `cached-graph-store`'s search
+(`vivace/store.lisp:302`) delegates to exactly such an in-RAM `memory-store`. So
+C is not a synthetic — it is the current `:cache` strategy's real cost. The three
+strategies therefore stand as:
+
+| strategy | warm search @ 19,973 | memory model |
+|---|---|---|
+| `:scan` (load nodes per query) | ~2287 ms (A) | pageable, but 150× too slow |
+| `:cache` (in-RAM mirror) | ~15 ms (C) | fast, but 4.3 GB of GC-scanned live objects at 1M |
+| `:segment` (predicted) | ~15 ms (D) | fast **and** a pageable mmap |
+
+This is what "the win is resident memory, not scan speed" means concretely: the
+segment does **not** beat `:cache` on speed — they are equal. It beats `:cache`
+on memory model, giving `:cache`'s latency without `:cache`'s unpageable
+footprint, which is precisely the reason the Phase 1 spec §2.1 said `:cache`
+"does not survive the target corpus size." Against `:scan` the win is 150×
+speed; against `:cache` the win is pageability. The spec's original
+contiguous-scan-bandwidth rationale (§2.3, "~215 ms for 4.3 GB") is **not** where
+the value comes from and should be corrected — scoring resident vectors is already
+sub-second; the 2.3 s is entirely node materialization.
+
+**Determination: attribution holds, decisively — node loading is 92% of warm
+search at both measured sizes, and the absolute latency (2.3 s at 20k, ~140 s
+extrapolated at 1M) makes the segment load-bearing rather than optional. Build
+it (§4–§9). Two corrections to the design's stated rationale, both from the
+D ≈ C result: (1) the win is skipping node materialization, not tighter memory
+layout or faster scanning; (2) the segment's advantage over the existing `:cache`
+strategy is pageable memory at equal speed, not lower latency — §2.3 and §5
+should be read in that light.**
 
 ## 11. Testing
 
