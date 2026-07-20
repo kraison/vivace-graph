@@ -52,6 +52,13 @@ of the segment.  Returns an open VECTOR-SEGMENT."
                        :capacity initial-capacity
                        :live-count 0
                        :free-head +no-slot+)
+    ;; A freshly created (or freshly extended-by-mmap-file) region is zero-
+    ;; filled, not free-marked: without this, the never-written tail
+    ;; [0, initial-capacity) reads as an all-zero id at reopen-time sweep
+    ;; (a real bug caught before this shipped -- see %seg-mark-free-range).
+    ;; Marking it here makes "never written" and "removed" the same on-disk
+    ;; state, which the sweep already knows how to skip.
+    (%seg-mark-free-range mmap 0 initial-capacity)
     (%make-vector-segment :mmap mmap
                           :dimension dimension
                           :id->slot (make-hash-table :test 'equalp))))
@@ -108,6 +115,19 @@ The id array is authoritative (sec 5.1).  A slot whose first 8 bytes are
 (defun %seg-id-offset (slot)
   (+ +segment-id-array-offset+ (* slot +key-bytes+)))
 
+(defun %seg-mark-free-range (mmap start-slot end-slot)
+  "Mark id-array cells [START-SLOT, END-SLOT) free: +FREE-SLOT-MARKER+ in both
+8-byte halves.  The first half is what the rebuild sweep checks; the second
+half doubles as a free-list \"next\" pointer of +NO-SLOT+ (same bit pattern),
+so these cells are indistinguishable from a properly terminated free chain
+even though they are not yet threaded onto one.  Used by CREATE-VECTOR-SEGMENT
+for the initial capacity and by %SEG-GROW for newly added capacity, so a
+never-written cell and a removed cell are the same on-disk state."
+  (loop for slot from start-slot below end-slot
+        for off = (%seg-id-offset slot)
+        do (serialize-uint64 mmap +free-slot-marker+ off)
+           (serialize-uint64 mmap +free-slot-marker+ (+ off 8))))
+
 (defun %seg-vec-offset (segment slot)
   (+ (%seg-vblock-offset (segment-capacity segment))
      (* slot (segment-dimension segment) 4)))
@@ -137,27 +157,72 @@ The id array is authoritative (sec 5.1).  A slot whose first 8 bytes are
           (setf (aref bytes (+ b k)) (ldb (byte 8 (* k 8)) bits)))))
     (set-bytes (segment-mmap segment) bytes off (* dim 4))))
 
-(defun %seg-write-id (segment slot id)
+(defun %seg-check-id (id)
   ;; The free-list scheme marks a free cell by all-ones in its first 8 bytes, so
   ;; a real id whose first 8 bytes are all-ones would be misread as free after a
   ;; reopen (sec 5.1 rebuild).  Engine ids are uuids and never all-ones, but an
   ;; arbitrary caller-supplied id could be; reject it loudly rather than corrupt
   ;; silently.
+  ;;
+  ;; This MUST run before any slot is claimed (i.e. before %SEG-CLAIM-SLOT),
+  ;; not inside %SEG-WRITE-ID after the fact: %seg-claim-slot can pop a slot
+  ;; off the free list as a side effect, and if the id were only validated
+  ;; afterward, a rejected put would still have popped and orphaned that slot.
+  ;; SEGMENT-PUT calls this first, before claiming anything.
   (let ((first8 0))
     (dotimes (k 8) (setf first8 (dpb (aref id k) (byte 8 (* k 8)) first8)))
     (when (= first8 +free-slot-marker+)
       (error "node id's first 8 bytes are all-ones, colliding with the segment ~
-              free-slot marker")))
+              free-slot marker"))))
+
+(defun %seg-write-id (segment slot id)
+  "Write ID into slot SLOT's id-array cell.  Caller must have already
+validated ID via %SEG-CHECK-ID."
   (set-bytes (segment-mmap segment) id (%seg-id-offset slot) +key-bytes+))
 
 (defun %seg-slot-of (segment id)
   "Slot index storing ID, or NIL."
   (gethash id (segment-id->slot segment)))
 
+(defun %seg-grow (segment)
+  "Double the segment's capacity in place.  Because the vector block starts
+after the id array and the id array's size is capacity*16, growing capacity
+moves the vector block: extend the file, then relocate the existing vectors
+from the OLD block offset to the NEW one, high slot first so the copy never
+overwrites unread source bytes.  The base pointer never moves (extend-mapped-
+file remaps into the reserved window), so a concurrent read never faults.
+Returns OLD-CAP, the first fresh (unclaimed) slot index."
+  (let* ((mmap (segment-mmap segment))
+         (dim (segment-dimension segment))
+         (old-cap (segment-capacity segment))
+         (new-cap (* 2 old-cap))
+         (old-vblock (%seg-vblock-offset old-cap))
+         (new-vblock (%seg-vblock-offset new-cap))
+         (needed (%seg-file-bytes new-cap dim))
+         (have (mapped-file-length mmap)))
+    (when (> needed have)
+      (extend-mapped-file mmap (- needed have)))
+    ;; Relocate vectors, HIGH slot first: new-vblock > old-vblock, so copying
+    ;; slot i from old+i*w to new+i*w with i descending never overwrites a
+    ;; not-yet-copied source region.
+    (let ((w (* dim 4)))
+      (loop for i from (1- old-cap) downto 0
+            for src = (+ old-vblock (* i w))
+            for dst = (+ new-vblock (* i w))
+            do (set-bytes mmap (get-bytes mmap src w) dst w)))
+    ;; The newly added id-array cells [old-cap, new-cap) currently sit where
+    ;; stale vector bytes (already relocated above) or freshly extended file
+    ;; bytes live -- neither is free-marked.  Mark them, same as create does
+    ;; for the initial capacity, so an untouched cell never sweeps as a
+    ;; phantom id.
+    (%seg-mark-free-range mmap old-cap new-cap)
+    (serialize-uint64 mmap new-cap 32)         ; capacity := new-cap
+    old-cap))                                  ; first fresh slot index
+
 (defun %seg-claim-slot (segment)
   "Return a slot index to write a NEW id into: the free-list head if any, else
-the next slot past live-count when capacity allows.  Signals when full -- Task 5
-replaces this with growth."
+the next slot past live-count, growing the segment first if capacity is
+exhausted."
   (let* ((mmap (segment-mmap segment))
          (free-head (%seg-free-head segment)))
     (if (/= free-head +no-slot+)
@@ -167,18 +232,22 @@ replaces this with growth."
           free-head)
         (let ((cap (segment-capacity segment))
               (live (segment-live-count segment)))
-          (when (>= live cap)
-            (error "segment full: capacity ~D (growth is Task 5)" cap))
-          live))))
+          (if (>= live cap)
+              (%seg-grow segment)              ; returns old-cap = first fresh slot
+              live)))))
 
 (defun segment-put (segment id vector)
   "Store VECTOR under the 16-byte ID.  Overwrites if ID is present; else takes a
-free slot (or the next free index).  Returns the slot index.  VECTOR's length
-must equal the segment's dimension, or this signals."
+free slot (or the next free index, growing the segment if necessary).  Returns
+the slot index.  VECTOR's length must equal the segment's dimension, and ID's
+first 8 bytes must not collide with the free-slot marker -- both are validated
+up front, before any slot is claimed, so a rejected put never disturbs the
+free list."
   (check-type vector (simple-array single-float (*)))
   (unless (= (length vector) (segment-dimension segment))
     (error "vector length ~D does not match segment dimension ~D"
            (length vector) (segment-dimension segment)))
+  (%seg-check-id id)
   (let ((existing (%seg-slot-of segment id)))
     (if existing
         (progn (%seg-write-vector segment existing vector) existing)
@@ -194,3 +263,20 @@ must equal the segment's dimension, or this signals."
   "The vector stored under ID as a fresh (simple-array single-float (*)), or NIL."
   (let ((slot (%seg-slot-of segment id)))
     (when slot (%seg-read-vector segment slot))))
+
+(defun segment-remove (segment id)
+  "Remove ID from the segment, pushing its slot onto the free list.  Returns T
+if ID was present, NIL otherwise.  A freed slot's id-array cell is marked with
++FREE-SLOT-MARKER+ (first 8 bytes) and the previous free-head (second 8 bytes),
+threading the free list; its vector-block bytes are left as-is (unreachable)."
+  (let ((slot (%seg-slot-of segment id)))
+    (if (null slot)
+        nil
+        (let ((mmap (segment-mmap segment))
+              (old-head (%seg-free-head segment)))
+          (serialize-uint64 mmap +free-slot-marker+ (%seg-id-offset slot))
+          (serialize-uint64 mmap old-head (+ (%seg-id-offset slot) 8))
+          (serialize-uint64 mmap slot 48)      ; free-head := slot
+          (remhash id (segment-id->slot segment))
+          (serialize-uint64 mmap (1- (segment-live-count segment)) 40)
+          t))))

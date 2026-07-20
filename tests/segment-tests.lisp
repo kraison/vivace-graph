@@ -68,7 +68,11 @@
                   (segment-put s (%id 7) (%vec 32 1.0))
                   (segment-put s (%id 7) (%vec 32 5.0))
                   (is (= 1 (segment-live-count s)))
-                  (is (every #'= (%vec 32 5.0) (segment-get s (%id 7)))))
+                  (let ((back (segment-get s (%id 7))))
+                    (is (typep back '(simple-array single-float (*)))
+                        "overwritten id must still read back a vector")
+                    (is (= 32 (length back)))
+                    (is (every #'= (%vec 32 5.0) back))))
              (close-vector-segment s)))
       (ignore-errors (delete-file path)))))
 
@@ -136,5 +140,87 @@ resurrect the removed id (the free slot is recognised, not read as an id)."
                   (progn
                     (is (null (segment-get s (%id 1))) "removed id must not resurrect")
                     (is (every #'= (%vec 16 2.0) (segment-get s (%id 2)))))
+               (close-vector-segment s))))
+      (ignore-errors (delete-file path)))))
+
+(test segment-fresh-capacity-has-no-phantom-id
+  "A segment created with spare capacity (more slots than ids put) must not
+resurrect an all-zero phantom id from the never-written tail of the id array
+after close/reopen -- create-vector-segment must pre-mark unused slots free,
+just like a real remove does, so the sweep skips them instead of reading raw
+zero bytes as a valid 16-byte id."
+  (let ((path (%seg-path)))
+    (unwind-protect
+         (progn
+           (let ((s (create-vector-segment path 8 :initial-capacity 8)))
+             (segment-put s (%id 1) (%vec 8 1.0))
+             (segment-put s (%id 2) (%vec 8 2.0))
+             (close-vector-segment s))
+           (let ((s (open-vector-segment path)))
+             (unwind-protect
+                  (let ((table (segment-id->slot s))
+                        (zero-id (make-array 16 :element-type '(unsigned-byte 8)
+                                                 :initial-element 0)))
+                    (is (= 2 (hash-table-count table))
+                        "id->slot must have exactly 2 entries, not one per phantom")
+                    (is (null (gethash zero-id table))
+                        "an all-zero phantom id must not be present after reopen"))
+               (close-vector-segment s))))
+      (ignore-errors (delete-file path)))))
+
+(test segment-remove-frees-and-reuses-slot
+  "Remove drops the id and frees its slot; the next new put reuses that slot."
+  (let ((path (%seg-path)))
+    (unwind-protect
+         (let ((s (create-vector-segment path 16 :initial-capacity 8)))
+           (unwind-protect
+                (let ((slot1 (segment-put s (%id 1) (%vec 16 1.0))))
+                  (is (eq t (segment-remove s (%id 1))))
+                  (is (null (segment-get s (%id 1))))
+                  (is (= 0 (segment-live-count s)))
+                  ;; the freed slot is reused by the next NEW id
+                  (let ((slot2 (segment-put s (%id 2) (%vec 16 2.0))))
+                    (is (= slot1 slot2)))
+                  (is (null (segment-remove s (%id 999)))))
+             (close-vector-segment s)))
+      (ignore-errors (delete-file path)))))
+
+(test segment-grows-past-initial-capacity
+  "Putting more ids than the initial capacity grows the segment; all vectors
+survive the growth bit-exactly, including ones written before it."
+  (let ((path (%seg-path)))
+    (unwind-protect
+         (let ((s (create-vector-segment path 32 :initial-capacity 4)))
+           (unwind-protect
+                (progn
+                  ;; write 4 to fill, then 12 more to force >= 2 growths
+                  (dotimes (i 16)
+                    (segment-put s (%id i) (%vec 32 (coerce i 'single-float))))
+                  (is (>= (segment-capacity s) 16))
+                  (is (= 16 (segment-live-count s)))
+                  ;; every vector, including the earliest, still reads correctly
+                  (dotimes (i 16)
+                    (is (every #'= (%vec 32 (coerce i 'single-float))
+                               (segment-get s (%id i)))
+                        "vector ~D corrupted by growth" i)))
+             (close-vector-segment s)))
+      (ignore-errors (delete-file path)))))
+
+(test segment-growth-survives-reopen
+  "A grown segment reopens with the grown capacity and all vectors intact."
+  (let ((path (%seg-path)))
+    (unwind-protect
+         (progn
+           (let ((s (create-vector-segment path 24 :initial-capacity 2)))
+             (dotimes (i 10)
+               (segment-put s (%id i) (%vec 24 (coerce i 'single-float))))
+             (close-vector-segment s))
+           (let ((s (open-vector-segment path)))
+             (unwind-protect
+                  (progn
+                    (is (>= (segment-capacity s) 10))
+                    (dotimes (i 10)
+                      (is (every #'= (%vec 24 (coerce i 'single-float))
+                                 (segment-get s (%id i))))))
                (close-vector-segment s))))
       (ignore-errors (delete-file path)))))
