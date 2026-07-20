@@ -139,7 +139,11 @@ resurrect the removed id (the free slot is recognised, not read as an id)."
              (unwind-protect
                   (progn
                     (is (null (segment-get s (%id 1))) "removed id must not resurrect")
-                    (is (every #'= (%vec 16 2.0) (segment-get s (%id 2)))))
+                    (let ((back (segment-get s (%id 2))))
+                      (is (typep back '(simple-array single-float (*)))
+                          "id 2 lost when the sweep skipped the freed hole (got ~S)" back)
+                      (is (= 16 (length back)))
+                      (is (every #'= (%vec 16 2.0) back))))
                (close-vector-segment s))))
       (ignore-errors (delete-file path)))))
 

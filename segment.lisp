@@ -73,9 +73,10 @@ of the segment.  Returns an open VECTOR-SEGMENT."
   (deserialize-uint64 (segment-mmap segment) 48))
 
 (defun open-vector-segment (path)
-  "Open an existing vector segment at PATH.  Validates magic and format, reads
-the header, and rebuilds the RAM id->slot map by sweeping the id array (the
-on-disk id array is authoritative; the map is never persisted)."
+  "Open an existing vector segment at PATH.  Validates magic, format, and
+element-type, reads the header, and rebuilds the RAM id->slot map by sweeping
+the id array (the on-disk id array is authoritative; the map is never
+persisted)."
   (let ((mmap (mmap-file path :create-p nil)))
     (let ((magic (deserialize-uint64 mmap 0))
           (format (deserialize-uint64 mmap 8)))
@@ -84,6 +85,16 @@ on-disk id array is authoritative; the map is never persisted)."
       (unless (= format +segment-format+)
         (error "vector segment ~A is format ~D, expected ~D"
                path format +segment-format+)))
+    ;; Only single-float is ever written today, and every read path
+    ;; (%seg-read-vector / %seg-write-vector) hard-assumes it; validate the
+    ;; on-disk element-type so a future double-float/int8 segment (the whole
+    ;; reason this header field exists) can't be silently misread as
+    ;; single-float instead of signaling.
+    (let ((etype (deserialize-uint64 mmap 24)))
+      (unless (= etype +fv-single-float+)
+        (error "vector segment ~A has element-type ~D, expected ~D (only ~
+                single-float is supported)"
+               path etype +fv-single-float+)))
     (let ((segment (%make-vector-segment
                     :mmap mmap
                     :dimension (deserialize-uint64 mmap 16)
