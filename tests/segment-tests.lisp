@@ -119,3 +119,22 @@ and must be rejected, not stored (else a reopen would misread it as free)."
                       (is (every #'= (%vec 48 2.0) back))))
                (close-vector-segment s))))
       (ignore-errors (delete-file path)))))
+
+(test segment-rebuild-skips-free-slots
+  "After a remove, reopening rebuilds id->slot from the id array and does NOT
+resurrect the removed id (the free slot is recognised, not read as an id)."
+  (let ((path (%seg-path)))
+    (unwind-protect
+         (progn
+           (let ((s (create-vector-segment path 16 :initial-capacity 8)))
+             (segment-put s (%id 1) (%vec 16 1.0))
+             (segment-put s (%id 2) (%vec 16 2.0))
+             (segment-remove s (%id 1))          ; Task 5 defines remove
+             (close-vector-segment s))
+           (let ((s (open-vector-segment path)))
+             (unwind-protect
+                  (progn
+                    (is (null (segment-get s (%id 1))) "removed id must not resurrect")
+                    (is (every #'= (%vec 16 2.0) (segment-get s (%id 2)))))
+               (close-vector-segment s))))
+      (ignore-errors (delete-file path)))))

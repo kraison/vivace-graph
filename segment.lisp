@@ -92,9 +92,18 @@ on-disk id array is authoritative; the map is never persisted)."
   nil)
 
 (defun %seg-rebuild-id->slot (segment)
-  ;; Filled in in a later task; the header round-trip test does not exercise it.
-  (declare (ignore segment))
-  nil)
+  "Repopulate SEGMENT's RAM id->slot hash by sweeping the on-disk id array.
+The id array is authoritative (sec 5.1).  A slot whose first 8 bytes are
++FREE-SLOT-MARKER+ is free and skipped; every other slot holds a real 16-byte id."
+  (let ((mmap (segment-mmap segment))
+        (cap (segment-capacity segment))
+        (table (segment-id->slot segment)))
+    (clrhash table)
+    (dotimes (slot cap)
+      (let ((first8 (deserialize-uint64 mmap (%seg-id-offset slot))))
+        (unless (= first8 +free-slot-marker+)
+          (let ((id (get-bytes mmap (%seg-id-offset slot) +key-bytes+)))
+            (setf (gethash id table) slot)))))))
 
 (defun %seg-id-offset (slot)
   (+ +segment-id-array-offset+ (* slot +key-bytes+)))
