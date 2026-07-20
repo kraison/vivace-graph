@@ -218,24 +218,54 @@
   (declare (type integer become))
   (map 'vector #'deserialize (extract-all-subseqs bytes)))
 
+(defun %serialize-float-vector (v)
+  "Encode V, a (simple-array single-float (*)), as one contiguous block: a type
+byte followed by DIM little-endian IEEE-754 float32s.  One allocation, versus the
+generic vector path's one allocation per element."
+  (declare (type (simple-array single-float (*)) v))
+  (let* ((dim (length v))
+         (payload-length (+ 1 (* 4 dim)))
+         (encoded-length (encode-length payload-length))
+         (l-of-l (length encoded-length))
+         (vec (make-array (+ 1 l-of-l payload-length)
+                          :element-type '(unsigned-byte 8))))
+    (setf (aref vec 0) +float-vector+)
+    (dotimes (i l-of-l)
+      (setf (aref vec (+ 1 i)) (aref encoded-length i)))
+    (let ((base (+ 1 l-of-l)))
+      (setf (aref vec base) +fv-single-float+)
+      (dotimes (i dim)
+        (let ((bits (ieee-floats:encode-float32 (aref v i)))
+              (off (+ base 1 (* 4 i))))
+          (dotimes (b 4)
+            (setf (aref vec (+ off b)) (ldb (byte 8 (* b 8)) bits))))))
+    vec))
+
 (defmethod serialize ((v vector))
-  (if (equal (array-element-type v) '(unsigned-byte 8))
-      v
-      (let* ((serialized-items (map 'list #'serialize v))
-             (total-length (reduce #'+ serialized-items :key 'length))
-             (encoded-length (encode-length total-length))
-             (length-of-encoded-length (length encoded-length))
-             (vec (make-array 0 :fill-pointer t :adjustable t
-                              :element-type '(unsigned-byte 8))))
-        (declare (type fixnum total-length length-of-encoded-length))
-        (declare (type (array (unsigned-byte 8)) encoded-length))
-        (vector-push-extend +vector+ vec)
-        (dotimes (i length-of-encoded-length)
-          (vector-push-extend (aref encoded-length i) vec))
-        (dolist (item serialized-items)
-          (dotimes (i (length item))
-            (vector-push-extend (aref item i) vec)))
-        vec)))
+  (cond
+    ((equal (array-element-type v) '(unsigned-byte 8))
+     v)
+    ;; SUBTYPEP rather than EQUAL: the upgraded element type of a single-float
+    ;; array is spelled differently across implementations, and a T-vector
+    ;; correctly fails this test.
+    ((subtypep (array-element-type v) 'single-float)
+     (%serialize-float-vector v))
+    (t
+     (let* ((serialized-items (map 'list #'serialize v))
+            (total-length (reduce #'+ serialized-items :key 'length))
+            (encoded-length (encode-length total-length))
+            (length-of-encoded-length (length encoded-length))
+            (vec (make-array 0 :fill-pointer t :adjustable t
+                             :element-type '(unsigned-byte 8))))
+       (declare (type fixnum total-length length-of-encoded-length))
+       (declare (type (array (unsigned-byte 8)) encoded-length))
+       (vector-push-extend +vector+ vec)
+       (dotimes (i length-of-encoded-length)
+         (vector-push-extend (aref encoded-length i) vec))
+       (dolist (item serialized-items)
+         (dotimes (i (length item))
+           (vector-push-extend (aref item i) vec)))
+       vec))))
 
 (defun bit-vector->integer (bit-vector)
   "Create a positive integer from a bit-vector."

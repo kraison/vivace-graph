@@ -101,3 +101,21 @@ UUID (compared by string form, since uuid objects aren't EQUAL)."
 (test serialize-returns-octet-vector
   (let ((bytes (serialize "anything")))
     (is-true (typep bytes '(vector (unsigned-byte 8))))))
+
+(defun fv (&rest floats)
+  "A (simple-array single-float (*)) built from FLOATS."
+  (make-array (length floats) :element-type 'single-float
+                              :initial-contents (mapcar (lambda (x) (coerce x 'single-float))
+                                                        floats)))
+
+(test float-vector-header
+  "A serialized float vector carries the float-vector tag and a correct payload length."
+  (let ((bytes (serialize (fv 1.0 2.0 3.0))))
+    (is (= +float-vector+ (aref bytes 0)))
+    ;; header is [tag][n][length bytes...]; payload is 1 type byte + 3*4 float bytes
+    (let* ((n (aref bytes 1))
+           (header-length (+ 2 n))
+           (payload-length (decode-length (subseq bytes 2 header-length))))
+      (is (= 13 payload-length))
+      (is (= (+ header-length 13) (length bytes)))
+      (is (= +fv-single-float+ (aref bytes header-length))))))

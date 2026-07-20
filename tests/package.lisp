@@ -18,6 +18,9 @@
                 #:serialize
                 #:deserialize
                 #:serialized-equal
+                #:decode-length
+                #:+float-vector+
+                #:+fv-single-float+
                 ;; geometry (spatial extension)
                 #:make-point
                 #:make-linestring

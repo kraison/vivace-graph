@@ -160,6 +160,12 @@ application's own config; graph-db does not read an ini file itself.")
 (alexandria:define-constant +vev-index+ 28)
 (alexandria:define-constant +bit-vector+ 29)
 (alexandria:define-constant +bignum+ 30)
+(alexandria:define-constant +float-vector+ 31)
+
+;; Element type codes for a +float-vector+ payload's first byte.  The byte exists
+;; so double-float and int8-quantised vectors can be added later without burning
+;; another type tag.
+(alexandria:define-constant +fv-single-float+ 1)
 ;; User-defined type identifiers for serializing. Start at 100
 (alexandria:define-constant +uuid+ 100)
 (alexandria:define-constant +timestamp+ 101)
