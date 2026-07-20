@@ -145,6 +145,13 @@
                 #:remove-from-index-list
                 #:index-list-head
                 #:delete-index-list
+                ;; vector segment (segment.lisp)
+                #:create-vector-segment
+                #:open-vector-segment
+                #:close-vector-segment
+                #:segment-capacity
+                #:segment-live-count
+                #:segment-dimension
                 ;; type index
                 #:make-type-index
                 #:close-type-index
