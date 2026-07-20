@@ -267,10 +267,17 @@ BYTES is the payload only: a type byte followed by DIM*4 little-endian float32s.
   (cond
     ((equal (array-element-type v) '(unsigned-byte 8))
      v)
-    ;; SUBTYPEP rather than EQUAL: the upgraded element type of a single-float
-    ;; array is spelled differently across implementations, and a T-vector
-    ;; correctly fails this test.
-    ((subtypep (array-element-type v) 'single-float)
+    ;; TYPEP against the exact (simple-array single-float (*)) shape rather
+    ;; than EQUAL or SUBTYPEP: EQUAL on the element type is spelled
+    ;; differently across implementations (so a T-vector wouldn't reliably
+    ;; fail it), but SUBTYPEP on just the element type is too permissive --
+    ;; it is also true for adjustable, displaced, and fill-pointered
+    ;; single-float vectors, which %SERIALIZE-FLOAT-VECTOR's own
+    ;; (SIMPLE-ARRAY SINGLE-FLOAT (*)) declaration forbids. TYPEP on the full
+    ;; simple-array type checks simple-ness too, so those non-simple vectors
+    ;; correctly fall through to the generic elementwise branch below instead
+    ;; of hitting a SERIALIZATION-ERROR.
+    ((typep v '(simple-array single-float (*)))
      (%serialize-float-vector v))
     (t
      (let* ((serialized-items (map 'list #'serialize v))

@@ -151,6 +151,24 @@ UUID (compared by string form, since uuid objects aren't EQUAL)."
       (is (= 1536 (length back)))
       (is (every #'= v back)))))
 
+(test non-simple-single-float-vector-uses-generic-path
+  "An adjustable or fill-pointered single-float vector is not simple, so
+%SERIALIZE-FLOAT-VECTOR's (SIMPLE-ARRAY SINGLE-FLOAT (*)) declaration would
+choke on it. SERIALIZE's dispatch must fall through to the generic elementwise
++VECTOR+ path for these instead of routing them into the float-vector fast
+path -- it round-trips correctly either way, but only the generic path is
+type-safe for a non-simple array."
+  (let ((adjustable (make-array 3 :element-type 'single-float :adjustable t
+                                  :initial-contents '(1.0 2.0 3.0)))
+        (fill-pointered (make-array 4 :element-type 'single-float :fill-pointer 3
+                                      :initial-contents '(1.0 2.0 3.0 0.0))))
+    (dolist (v (list adjustable fill-pointered))
+      (let ((bytes (serialize v)))
+        (is (= +vector+ (aref bytes 0))
+            "expected the generic +VECTOR+ tag, not +FLOAT-VECTOR+, for a non-simple array")
+        (let ((back (deserialized v)))
+          (is (equalp (coerce v 'vector) back)))))))
+
 (test float-vector-rejects-misaligned-payload
   "A corrupt payload errors rather than silently decoding to a short vector."
   (let ((bytes (serialize (fv 1.0 2.0))))
@@ -218,4 +236,12 @@ vector through the generic elementwise path instead, which still round-trips
 the values")
     #+ecl
     (is (not (eq bv (serialize bv)))
-        "ECL: unlike SBCL, this is not an identity pass-through")))
+        "ECL: unlike SBCL, this is not an identity pass-through")
+    ;; No silent pass on an implementation this test was never written against:
+    ;; without this branch, CCL/LispWorks (both supported per CLAUDE.md) would
+    ;; compile the #+sbcl/#+ecl forms above to nothing and this whole check
+    ;; would vanish rather than run -- the "form silently becomes empty"
+    ;; hazard CLAUDE.md calls out explicitly. Fail loudly instead, so a real
+    ;; assertion gets written for that implementation before it ships.
+    #-(or sbcl ecl)
+    (fail "byte-vector serialize behaviour unverified on this implementation")))

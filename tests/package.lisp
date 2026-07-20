@@ -19,6 +19,7 @@
                 #:deserialize
                 #:serialized-equal
                 #:decode-length
+                #:+vector+
                 #:+float-vector+
                 #:+fv-single-float+
                 #:serialization-error
