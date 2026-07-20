@@ -166,6 +166,23 @@ application's own config; graph-db does not read an ini file itself.")
 ;; so double-float and int8-quantised vectors can be added later without burning
 ;; another type tag.
 (alexandria:define-constant +fv-single-float+ 1)
+
+;; --- Vector segment (Phase 2) on-disk layout ---------------------------------
+;; A segment is a derived, mmap-backed index: one fixed-width single-float vector
+;; per node, addressable by node id.  See docs/superpowers/specs/
+;; 2026-07-20-vector-segments-design.md sec 5.
+(alexandria:define-constant +segment-magic+ #x5647534547 ) ; "VGSEG" as bytes
+(alexandria:define-constant +segment-format+ 1)
+(alexandria:define-constant +segment-header-bytes+ 64)
+(alexandria:define-constant +segment-id-array-offset+ 64)
+;; A free slot's id-array cell holds this marker in its first 8 bytes; its second
+;; 8 bytes hold the next free slot index.  Occupied cells hold a real 16-byte id,
+;; whose first 8 bytes are never this value (ids are uuids; see note in
+;; segment.lisp on why the marker is safe).
+(alexandria:define-constant +free-slot-marker+ #xFFFFFFFFFFFFFFFF)
+;; Sentinel "no slot" index -- terminates the free list and marks "id not found".
+(alexandria:define-constant +no-slot+ #xFFFFFFFFFFFFFFFF)
+
 ;; User-defined type identifiers for serializing. Start at 100
 (alexandria:define-constant +uuid+ 100)
 (alexandria:define-constant +timestamp+ 101)

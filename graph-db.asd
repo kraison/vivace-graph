@@ -57,6 +57,7 @@
                (:file "geohash" :depends-on ("package"))
                (:file "linear-hash" :depends-on ("serialize"))
                (:file "allocator" :depends-on ("serialize"))
+               (:file "segment" :depends-on ("allocator" "mmap"))
                (:file "graph-class" :depends-on ("globals"))
                (:file "cursors" :depends-on ("package"))
                (:file "skip-list" :depends-on ("allocator" "linear-hash"))
