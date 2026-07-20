@@ -111,12 +111,29 @@ Segments are the hedge that keeps the ANN decision deferrable and *per-segment*:
 segment that later outgrows flat scan can gain its own index without touching the
 storage layer or other segments.
 
+**Segments retire the `:cache` strategy.** The current default mirrors every chunk into
+an in-RAM `rag:memory-store`; §2.1 measures that at 8.6 GB for 1M vectors. Phase 1 halves
+it to 4.3 GB, which also does not survive the target corpus. Phase 2 makes segments the
+default backing for search, and `:cache` becomes a small-store convenience rather than the
+default path. Concretely: `:cache` stops being the default at **~250k vectors** (~1 GB of
+embeddings at 1024 dims single-float), and `make-graph-store` should warn once above that
+threshold until segments land.
+
 ### 5.2 Geography
 
 Text chunks do not carry geometry. Geography belongs to the entity a document is
 *about*. Chunks acquire location by edge traversal to a geo-located node. Some content
 has no location at all (the unlocated pool), and a map-scoped query must decide
 explicitly whether it surfaces (§7.5).
+
+**Open dependency: those edges do not exist yet.** In the current mine-action knowledge
+graph all 23,193 chunks live in a separate graph with no links to sites, hazard areas,
+surveys, or EO finds. Shapes B and C are therefore gated not only on L0–L3 but on
+**someone deciding what creates chunk→entity edges** — extraction-time entity linking,
+operator curation, or a matching pass. That is plausibly a larger and less certain piece
+of work than the storage layer, and it is a hard prerequisite for Phase 3 (§8) even
+though it is not engine work. It needs an owner and an approach before Phase 3 can be
+scheduled, even if the answer is "later".
 
 ### 5.3 Structured sources
 
@@ -148,12 +165,35 @@ the existing tags):
   with the narrowing logged once per store, not per vector.
 - Read path returns a typed view onto the mmap region without copying or boxing.
 - An optional int8-quantised companion representation for cheap pre-ranking, stored
-  alongside the full-precision block. Quantisation parameters (scale, zero-point) are
-  stored per vector.
+  alongside the full-precision block. Quantisation is **symmetric — a per-vector scale,
+  no zero-point.** A zero-point makes dot products carry cross terms needing
+  sum-of-elements corrections, which is awkward for the one job this representation has
+  (fast approximate pre-ranking). Scale-only keeps pre-ranking a clean scaled dot.
 
-Vectors are **L2-normalised at ingest**, so cosine reduces to a dot product. Note that
-today only the mock embedder normalises; provider vectors pass through `as-embedding`
-untouched. Normalisation becomes an explicit ingest step.
+Vectors are **L2-normalised at ingest**, so cosine reduces to a dot product. Today only
+the mock embedder normalises; provider vectors pass through `as-embedding` untouched.
+
+**This is a data-semantics change, not just a performance change, and it is not covered
+by "existing serialized data must still read".** Two things about already-stored
+embeddings become wrong rather than merely slow:
+
+1. **Element type.** Existing vectors were written through the generic vector path as
+   T-vectors of boxed `double-float`s. The new tag affects new writes only — old rows
+   still decode as T-vectors, so any code declaring the slot `single-float` is wrong for
+   them.
+2. **Normalisation.** Today `cosine` recomputes both norms per call, so it is correct on
+   any input. Once it is a bare dot product it is correct **only** if every stored vector
+   is unit-norm. A non-unit stored vector scales its own score and the ranking silently
+   reorders — nothing errors, nothing logs.
+
+**Policy: migrate on open.** A store detects non-conforming embeddings when it hydrates
+and rewrites them, or refuses to open under an explicit `:error` policy. There is
+deliberately no "ignore" option, because the failure mode it would permit is a wrong
+answer rather than a slow one.
+
+Empirically the current mine-action corpus is safe on point 2 — bge-m3 returns unit
+vectors (sampled norms 0.999999912, 0.999999939, 1.000000261) — but that is a property of
+one embedder, not of the design. Point 1 applies regardless of embedder.
 
 ### 7.2 L1 — vector segments
 
@@ -189,32 +229,46 @@ Composite keys are **not** required from the general index.
 VG has no temporal index today; space is a first-class indexed axis and time is a slot
 you scan and filter. For shape C, time is co-primary with space.
 
-Naive intersection of "everything within radius R" with "everything in window W"
-materialises two large id sets to keep a small overlap, and which side to drive from
-depends on selectivity not knowable statically. Instead, the spatial index gains an
-optional time dimension in its key:
+**Time ships as a refine predicate, not as part of the index key.**
 
-```
-(cell, node-id)  →  (cell, time-bucket, node-id)
-```
+The spatial index is explicitly a *filter*: it returns candidate ids whose cells meet the
+query window, and the caller refines with exact predicates
+(`spatial-index.lisp:10–14`). Time fits that contract directly — spatially anchored
+candidates carry their own timestamps, and filtering them is a refine step alongside the
+existing `geodesic-distance` / point-in-polygon refinement.
 
-A bbox or radius query already expands to N cell scans (`%bbox-cells` /
-`%geometry-cells`, `spatial-index.lisp:90–107`); each scan becomes narrowed by a time
-range. The join is then a single ordered range scan per cell.
+For shape C this is sufficient and near-free: an anchor plus a radius covers few cells
+and yields a small candidate set, so reading timestamps off those candidates costs
+approximately nothing.
 
-This belongs in the spatial index rather than the general one because two-dimensional
-space is not range-scannable on a single ordered key — geohash *is* the space-filling
-curve that makes it so, and a general composite index cannot expand a bbox into a cell
-set.
+**Consequence:** shape C requires no temporal index. Phase 3 is *not* gated on the
+general ordered index for the spatially-anchored case (§8).
 
-API, mirroring the existing `precision` knob (`spatial-index.lisp:60`):
+An earlier revision of this design put a time bucket into the index key —
+`(cell, node-id)` → `(cell, time-bucket, node-id)`. That is **deferred** (§11). An
+adversarial review found:
 
-```lisp
-(make-spatial-index heap &key (precision 7) (time-precision :day) backend)
-```
+- It pays only when the spatial filter is weak — wide area, narrow window (e.g. "all
+  shelling in this oblast in March 2022"). Those queries are real but unmeasured, and are
+  not the priority shape.
+- The key codec is `VIEW-KEY-SERIALIZE` (payload string + 16-byte id), **shared with
+  views and unique indexes** (`spatial-index.lisp:43–53`); a third key element means
+  touching shared code.
+- The workaround of folding time into the payload string is a correctness trap: prefix
+  range scans cap the upper bound with the synthetic key `"{"` (`spatial-index.lisp:28`),
+  so any separator character sorting above `#\{` (ASCII 123) — including the obvious
+  `#\|` (124) — places every timestamped entry outside its own cell's range. Queries
+  would silently return nothing, and only for timestamped nodes.
+- `spatial-index-remove (idx node-id geom)` (`spatial-index.lisp:117`) derives cells from
+  geometry; with time in the key it also needs the *old* time bucket, or a corrected
+  timestamp leaks index entries permanently. That is a maintenance API break affecting
+  every caller in the transaction hooks.
 
-Bucket granularity is a parameter, not a constant. Day buckets are the default: ACLED is
-daily and front-line movement is daily-to-weekly.
+The structural conclusion still holds and should be recorded: **if** a time dimension is
+ever added to an index key, it belongs in the spatial index rather than the general
+ordered one, because two-dimensional space is not range-scannable on a single ordered key
+— geohash *is* the space-filling curve that makes it so, and a general composite index
+cannot expand a bbox into a cell set.
 
 The join entry point:
 
@@ -224,16 +278,20 @@ The join entry point:
 
 returning candidate node ids grouped by segment.
 
-**Backward compatibility (hard requirements):**
+**Backward compatibility (hard requirements).** Deferring the key change satisfies these
+trivially — no index change, no compatibility risk. They are recorded because they bind
+any future attempt:
 
 1. **Time is optional.** Nodes with no timestamp index spatially exactly as today.
    Mine-action field data must not change.
-2. **Existing on-disk indexes still open.** An index without the time dimension reads
-   back and works; migration is via the existing `rebuild-spatial-index`
-   (`spatial-query.lisp:174`), never forced.
+2. **Existing on-disk indexes still open.** The precedent is `+spatial-index-format+`
+   with **rebuild on open** (`spatial-index.lisp:30–34`), the same path used for v1→v2 —
+   not reading old keys with new code. That costs existing graphs a one-time index
+   rebuild on upgrade, which is acceptable; a forced manual migration is not.
 3. **Existing query API unchanged.** `find-nodes-within`, `find-nodes-intersecting`,
    `find-nodes-near` and `find-nearest-k` keep their signatures. Time-aware variants are
-   additive.
+   additive. Note this covers the *query* API only — the maintenance path
+   (`spatial-index-remove`) would break, per §7.4.
 
 ### 7.5 L4 — ranking and fusion
 
@@ -272,17 +330,28 @@ schema it understands. Follows the existing spatial Prolog integration pattern.
 | phase | work | depends on |
 |---|---|---|
 | 1 | L0 dense vector storage; the §2.3 cheap wins | — |
-| 2 | general ordered index → L2 | its own design (in progress) |
+| 2 | L1 segments formalised (incl. `segment-score-subset`) | phase 1 |
 | 3 | **L3 join + L4 ranking** | phase 2 |
-| 4 | L1 segments formalised; shapes A and B | phase 1 |
+| 4 | general ordered index → L2; shapes A and B | its own design (in progress) |
 | 5 | L5 surface, cl-llm tool integration | phases 3–4 |
 
-Phase 1 is fully independent and carries standalone value: it resolves the performance
-problem that opened this investigation and unblocks every later phase. It is the right
-work to do while the general index design closes.
+Phase 1 is fully independent and unblocks every later phase. **It does not fully resolve
+the performance problem that opened this investigation**, and should not be benchmarked as
+if it does: the dominant cost named in §2.3 — `vertex->chunk` deserialising `TEXT` and
+`METADATA` for every scored candidate — needs Phase 2 segments, because a node's slots
+materialise together. Phase 1's real wins are one codec allocation instead of ~1024 per
+vector, a typed dot product, bounded top-k, and not constructing `rag:chunk` objects for
+candidates that lose.
 
-The priority deliverable (phase 3) is **gated on the general ordered index**, which is
-still in design. Phase 3 cannot start immediately regardless of priority.
+**The priority deliverable is not externally gated.** An earlier revision put the general
+ordered index ahead of the join, because time was to be an indexed axis. With time as a
+refine predicate (§7.4), shape C needs only the existing spatial index plus embedding
+scoring — so phase 3 follows directly from phases 1–2, both of which are ours to
+schedule.
+
+The general ordered index is still needed, but for shapes A and B (temporal filtering
+where there is no spatial anchor, and numeric ranking features), which moves it to phase
+4. Its design closing is no longer on the critical path.
 
 ## 9. Testing
 
@@ -294,11 +363,10 @@ Follows the existing FiveAM suites in `tests/`.
 - **L1:** `segment-scan` top-k correctness against a brute-force reference;
   `segment-score-subset` agreeing with `segment-scan` on the same id set; scoring
   touching no node payload (assert `TEXT` is never deserialised).
-- **L3:** spatiotemporal join correctness against brute-force filter; time-bucket
-  boundary conditions; **the three backward-compatibility constraints as explicit
-  regression tests** — a v1 on-disk index opening and querying unchanged, untimestamped
-  nodes indexing and querying as before, and the four existing `find-nodes-*` signatures
-  unchanged.
+- **L3:** join correctness against a brute-force spatial+temporal filter; window boundary
+  conditions (inclusive/exclusive endpoints); nodes with no timestamp excluded from
+  time-windowed results but still returned by spatial-only queries; candidate-set size
+  instrumentation asserted present, since the deferral in §7.4 depends on it.
 - **L4:** ranking determinism and tie-breaking; fusion behaviour with N > 2 lists;
   bounded backfill honouring its slot cap.
 - **Cross-impl:** SBCL and ECL, per the existing matrix.
@@ -309,16 +377,24 @@ Follows the existing FiveAM suites in `tests/`.
   the corpus is geographically clustered, wide-zoom queries degrade toward full scan.
   Mitigation: instrument candidate-set sizes from the first phase that produces them, so
   the ANN decision is forced by data rather than guessed.
-- **Time-bucket granularity is a guess.** Day buckets suit ACLED and front movement;
-  other sources may want coarser or finer. Mitigation: parameterised, and measured once
-  real query traffic exists.
-- **Spatial index key change touches live mine-action data.** Mitigation: the three hard
-  compatibility constraints in §7.4, each with an explicit regression test.
-- **Phase 3 is externally gated.** The general ordered index is not yet closed.
-  Mitigation: phase 1 is independent and worth doing regardless.
+- **Time-as-refine assumes anchored candidate sets stay small.** True for shape C (anchor
+  plus radius). If wide-area/narrow-window planner queries become common, the candidate
+  set grows and the deferred composite key comes back into scope. Mitigation: instrument
+  candidate-set size and window selectivity together, so the trigger is observed rather
+  than argued.
+- **Two reversals occurred on the index sub-problem** during design (where composite keys
+  belong, then whether they are needed at all). Both came from reasoning about index
+  structure abstractly rather than against the filter/refine contract the code states at
+  `spatial-index.lisp:10–14`. Mitigation: treat that contract as the authority for any
+  future indexing proposal here.
 
 ## 11. Deferred
 
+- **Time-bucket dimension in the spatial index key** (§7.4). Deferred behind measurement:
+  build it when instrumentation shows wide-area/narrow-window queries with candidate sets
+  large enough to matter. If built, it must clear the three compatibility constraints, the
+  shared-codec problem, the separator-ordering trap, and the `spatial-index-remove` API
+  break — all documented in §7.4.
 - HNSW / ANN indexing per segment, if any segment ever outgrows flat scan.
 - Composite keys in the general ordered index, for non-spatial multi-column cases.
 - Automatic index selection (planner rewriting scan-and-filter into range scans), already
