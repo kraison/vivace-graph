@@ -830,7 +830,11 @@ schema redefinition is not expected)."
                       when (indexed-p slot)
                         collect (slot-definition-name slot)))))))
 
-(defvar *node-vector-index-slot-cache* (make-hash-table :test 'eq))
+(defvar *node-vector-index-slot-cache*
+  #+sbcl (make-hash-table :test 'eq :synchronized t)
+  #+ccl (make-hash-table :test 'eq :shared t)
+  #+lispworks (make-hash-table :test 'eq :single-thread nil)
+  #+ecl (make-hash-table :test 'eq))
 
 (defun node-vector-index-slots (class)
   "Names of CLASS's :VECTOR-INDEX slots -- the slots that get a vector segment.
@@ -892,6 +896,59 @@ geometry); an explicit method takes precedence over the default.")
   (:method (writes graph)
     (dolist (write writes)
       (apply-tx-write-to-spatial-index write graph))))
+
+;;; Applying transaction vector-segment updates (Phase 2 step 3).
+;;;
+;;; Mirrors the spatial-index-maintenance pass immediately above: a node's
+;;; :vector-index slots (NODE-VECTOR-INDEX-SLOTS) are (re)stored into their
+;;; per-(class,slot) VECTOR-SEGMENT on create/update and removed on delete.
+;;; The segment keys on node id, so -- like the spatial index -- it is
+;;; independent of the MVCC version chains and the reaper.  A segment is
+;;; created lazily, on first conforming insert, sized to that first vector's
+;;; length.
+
+(defun %conforming-vector-p (v)
+  "True when V is a value a vector segment can store."
+  (typep v '(simple-array single-float (*))))
+
+(defun %node-segment-value (node slot-name)
+  "The conforming vector in NODE's SLOT-NAME, or NIL.  Reads via SLOT-VALUE
+directly (NOT slot-boundp) -- persistent slots read as unbound on the backing
+CLOS slot, exactly as node-geometry does."
+  (let ((v (ignore-errors (slot-value node slot-name))))
+    (when (%conforming-vector-p v) v)))
+
+(defun %segment-file (graph class-name slot-name)
+  (format nil "~A/vseg-~A-~A.dat"
+          (location graph) (string-downcase class-name) (string-downcase slot-name)))
+
+(defun %ensure-segment (graph class-name slot-name dimension)
+  "The segment for (CLASS-NAME, SLOT-NAME), created lazily if absent with
+DIMENSION (the length of the first conforming vector).  Registered in the graph's
+VECTOR-SEGMENTS table."
+  (let* ((key (cons class-name slot-name))
+         (table (vector-segments graph)))
+    (or (gethash key table)
+        (setf (gethash key table)
+              (create-vector-segment (%segment-file graph class-name slot-name)
+                                     dimension)))))
+
+(defgeneric apply-tx-write-to-vector-segments (write graph)
+  (:method (write graph) (declare (ignore write graph)) nil))
+
+(defmethod apply-tx-write-to-vector-segments ((write tx-create) graph)
+  (let ((node (node write)))
+    (when (not (deleted-p node))
+      (let ((class-name (class-name (class-of node))))
+        (dolist (slot (node-vector-index-slots (class-of node)))
+          (let ((v (%node-segment-value node slot)))
+            (when v
+              (let ((seg (%ensure-segment graph class-name slot (length v))))
+                (segment-put seg (id node) v)))))))))
+
+(defgeneric apply-tx-writes-to-vector-segments (writes graph)
+  (:method (writes graph)
+    (dolist (write writes) (apply-tx-write-to-vector-segments write graph))))
 
 ;; NB: the old free-the-prior-version GARBAGE-COLLECT-HEAP is gone.  Under MVCC
 ;; the prior version is retained (archived + chained) and reclaimed later by
@@ -1003,6 +1060,7 @@ With no FILTER, returns WRITES unchanged."
             (funcall hook)))
         (apply-tx-writes-to-views writes graph)
         (apply-tx-writes-to-spatial-index writes graph)
+        (apply-tx-writes-to-vector-segments writes graph)
         (apply-tx-writes-to-unique-indexes writes graph)   ; issue #6
         (apply-tx-writes-to-secondary-indexes writes graph) ; general ordered index
         (reap-old-versions writes graph)

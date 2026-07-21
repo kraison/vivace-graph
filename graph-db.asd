@@ -348,12 +348,20 @@
                (:file "allocator-tests")
                (:file "spatial-index-tests")
                (:file "segment-tests")
-               (:file "segment-integration-tests")
                (:file "linear-hash-tests")
                (:file "skip-list-tests")
                (:file "index-list-tests")
                (:file "type-index-tests")
                (:file "graph-tests")
+               ;; segment-integration-tests declares si-doc/si-sub under
+               ;; *integration-graph-name*; it must load AFTER graph-tests,
+               ;; whose load-time (setf (gethash *integration-graph-name*
+               ;; *schema-node-metadata*) nil) idempotent-reload guard would
+               ;; otherwise wipe si-doc/si-sub's registration if it ran later
+               ;; (segment-integration-tests used to sit above, before
+               ;; graph-tests -- discovered when CREATE-POPULATES-THE-SEGMENT
+               ;; tried to MAKE-SI-DOC and hit "NIL is not of type NODE-TYPE").
+               (:file "segment-integration-tests")
                (:file "type-mapping-tests")
                (:file "graph-spatial-tests")
                (:file "spatial-hook-tests")

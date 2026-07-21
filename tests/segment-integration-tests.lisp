@@ -48,3 +48,46 @@ option is inherited by a subclass."
              (is (= 0 (hash-table-count (graph-db::vector-segments g)))))
         (close-graph g :snapshot-p nil))
       (collect-garbage))))
+
+(defun %si-embedding (dim base)
+  (let ((v (make-array dim :element-type 'single-float)))
+    (dotimes (i dim v) (setf (aref v i) (coerce (+ base (* 0.01 i)) 'single-float)))))
+
+(defun %si-segment (graph slot)
+  (gethash (cons 'si-doc slot) (graph-db::vector-segments graph)))
+
+(test create-populates-the-segment
+  "Creating a node with a conforming :vector-index value, through a transaction,
+lazily creates the segment and stores the vector under the node id."
+  (with-temp-directory (dir)
+    (let ((g (make-graph *integration-graph-name* (namestring dir)
+                         :buffer-pool-size 1000))
+          (id nil))
+      (unwind-protect
+           (progn
+             (let ((*graph* g))
+               (with-transaction ()
+                 (setf id (id (make-si-doc :title "a" :embedding (%si-embedding 8 1.0))))))
+             (let ((seg (%si-segment g 'embedding)))
+               (is (not (null seg)) "segment was not created on insert")
+               (let ((back (graph-db::segment-get seg id)))
+                 (is (typep back '(simple-array single-float (*)))
+                     "vector not stored (got ~S)" back)
+                 (is (= 8 (length back)))
+                 (is (every #'= (%si-embedding 8 1.0) back)))))
+        (close-graph g :snapshot-p nil))
+      (collect-garbage))))
+
+(test create-without-conforming-value-makes-no-segment
+  "A node whose :vector-index slot is nil creates no segment."
+  (with-temp-directory (dir)
+    (let ((g (make-graph *integration-graph-name* (namestring dir)
+                         :buffer-pool-size 1000)))
+      (unwind-protect
+           (progn
+             (let ((*graph* g))
+               (with-transaction () (make-si-doc :title "no-vec")))
+             (is (null (%si-segment g 'embedding))
+                 "a nil embedding must not create a segment"))
+        (close-graph g :snapshot-p nil))
+      (collect-garbage))))
