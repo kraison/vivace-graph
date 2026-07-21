@@ -241,6 +241,44 @@ lazily creates the segment and stores the vector under the node id."
       (close-graph g :snapshot-p nil))
     (collect-garbage))))
 
+(test same-transaction-cross-subclass-dimension-conflict-rolls-back (with-temp-directory (dir)
+  (let ((g (make-graph *integration-graph-name* (namestring dir) :buffer-pool-size 1000)))
+    (unwind-protect
+         (progn
+           ;; fresh graph -- no prior segment for (si-doc . embedding) exists,
+           ;; so neither write can see an already-established segment.  Both
+           ;; writes are in the SAME transaction, and they span the class
+           ;; hierarchy: si-doc then si-sub.  Under Model B both map to the
+           ;; same owner key (si-doc . embedding), so this is the specific
+           ;; scenario that exercises the INTRA hash's cross-subclass
+           ;; owner-keying -- distinct from same-transaction-dimension-
+           ;; conflict-rolls-back (same class, si-doc/si-doc) and from
+           ;; cross-subclass-dimension-conflict-rolls-back (cross class, but
+           ;; against an already-COMMITTED segment, not intra-tx).
+           (signals error
+             (let ((*graph* g))
+               (with-transaction ()
+                 (make-si-doc :title "p" :embedding (%si-embedding 8 1.0))
+                 (make-si-sub :title "c" :extra "x" :embedding (%si-embedding 9 2.0)))))
+           ;; neither node may have been persisted -- the whole transaction
+           ;; rolled back, not just the second write's segment update
+           (is (= 0 (length (map-vertices #'identity g
+                                          :collect-p t :vertex-type 'si-doc)))
+               "an intra-transaction cross-subclass dimension conflict must roll back both writes")
+           ;; no owner segment may have been left with a stray entry -- either
+           ;; it's entirely absent, or (if present) empty.  The boolean is
+           ;; computed OUTSIDE the IS form: FiveAM's IS macro special-cases
+           ;; AND/OR for nicer diagnostics by evaluating every subform up
+           ;; front, which defeats short-circuiting -- (OR (NULL X) (F X))
+           ;; inside IS would call (F NIL) even when X is NIL.
+           (let* ((owner-seg (%si-segment g 'embedding))
+                  (owner-clean-p (or (null owner-seg)
+                                      (= 0 (graph-db::segment-live-count owner-seg)))))
+             (is (not (null owner-clean-p))
+                 "no owner segment entry may survive a rolled-back cross-subclass transaction")))
+      (close-graph g :snapshot-p nil))
+    (collect-garbage))))
+
 (test segment-survives-clean-reopen
   "After a clean close, reopening the graph opens the segment as-is and its
 vectors are intact."
