@@ -11,7 +11,23 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ## [Unreleased]
 
-Nothing yet.
+### Added
+- **Vector segment: a dense on-disk index for `:vector-index` slots.** A slot
+  declared `:vector-index t` in `def-vertex`/`def-edge` gets a dedicated
+  mmap vector segment, maintained automatically by the transaction apply path
+  (create/update/delete) — no parallel write path or cache to keep in sync.
+- `vector-search` (graph, class-name, slot-name, query-vector, k) — top-k
+  nodes of `class-name` (and its subclasses) by cosine similarity against
+  `slot-name`'s vector segment, as `(score . node-id)` conses. Returns `nil`
+  when no segment exists yet (declared-but-never-written slot).
+- `segment-scan` and `segment-score-subset` — lower-level segment query
+  primitives (`vector-search` is built on `segment-scan`).
+- `rebuild-vector-segment-batched` (graph, owner-name, slot-name &key
+  batch-size progress-fn) — additive, resumable, batched (re)population of a
+  `:vector-index` segment from live nodes; skips ids already present. The
+  migration path for a corpus written before the slot was declared
+  `:vector-index`, distinct from crash recovery's `rebuild-vector-segment`
+  (full drop-and-rebuild), which `restore-vector-segments` still uses.
 
 ## [2.1.1] - 2026-07-06
 

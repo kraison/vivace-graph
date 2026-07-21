@@ -510,14 +510,25 @@ sweeping on the raw, unresolved OWNER-NAME instead of the resolved owner, or
 keying on a node's exact runtime class instead of the resolved owner --
 previously produced a real LIVE-vs-REBUILT segment divergence.
 
-RESUMABLE BY CONSTRUCTION.  The segment itself records which ids it holds
-(SEGMENT-GET), so an id already present is skipped and an interrupted run
-simply leaves a partial segment for the next call to finish.  There is
-deliberately NO progress file or checkpoint record kept alongside: a marker
-that can disagree with the segment (e.g. because the write it described was
-rolled back, or the process died between the marker write and the segment
-write) is strictly worse than no marker, because it can claim work is done
-when the segment says otherwise. The segment is the only source of truth.
+RESUMABLE BY CONSTRUCTION -- OF THIS FUNCTION SPECIFICALLY, not of the
+segment's crash recovery as a whole.  The segment itself records which ids it
+holds (SEGMENT-GET), so an id already present is skipped and an interrupted
+run (an in-process abort of this call, e.g. a condition or a killed thread,
+followed by a CLEAN CLOSE-GRAPH) simply leaves a partial segment for the next
+call to finish additively -- the cheap path.  This says nothing about
+surviving a HARD crash (process killed, power loss): that is a different
+mechanism entirely, described under RESTORE-VECTOR-SEGMENTS above -- the
+segment's own dirty flag (see the file header) forces a FULL
+REBUILD-VECTOR-SEGMENT (drop and rebuild from scratch) on the next open, not
+a resume of this function.  An operator who reads \"resumable\" here and
+expects a cheap skip-scan after a hard crash will get a full re-index
+instead; both are correct, they just apply to different failure modes.
+There is deliberately NO progress file or checkpoint record kept alongside
+this function's own resumability: a marker that can disagree with the
+segment (e.g. because the write it described was rolled back, or the process
+died between the marker write and the segment write) is strictly worse than
+no marker, because it can claim work is done when the segment says
+otherwise. The segment is the only source of truth.
 
 CONCURRENCY.  The caller must not invoke this concurrently with another
 migration of the SAME segment (whether via this function or via
