@@ -15,7 +15,8 @@
                            (:predicate vector-segment-p))
   (mmap nil)                 ; a mapped-file (mmap.lisp)
   (dimension 0 :type fixnum) ; fixed at create time
-  (id->slot nil))            ; equalp hash: 16-byte id vector -> slot index
+  (id->slot nil)             ; equalp hash: 16-byte id vector -> slot index
+  (clean-at-open nil))       ; the on-disk clean flag as it was when this segment opened
 
 (defun %seg-write-header (mmap &key magic format dimension element-type
                                     capacity live-count free-head)
@@ -100,11 +101,21 @@ persisted)."
                     :dimension (deserialize-uint64 mmap 16)
                     :id->slot (make-hash-table :test 'equalp))))
       (%seg-rebuild-id->slot segment)
+      ;; Capture the persisted clean flag (the recovery decision reads THIS), then
+      ;; mark the file dirty for the new session.
+      (let ((clean (= (deserialize-uint64 mmap +segment-clean-offset+) +segment-clean+)))
+        (setf (segment-clean-at-open segment) clean)
+        (serialize-uint64 mmap +segment-dirty+ +segment-clean-offset+))
       segment)))
+
+(defun segment-clean-shutdown-p (segment)
+  "True if the segment's on-disk state at open time was cleanly closed."
+  (segment-clean-at-open segment))
 
 (defun close-vector-segment (segment)
   "Release the segment's mmap."
   (when (segment-mmap segment)
+    (serialize-uint64 (segment-mmap segment) +segment-clean+ +segment-clean-offset+)
     (munmap-file (segment-mmap segment))
     (setf (segment-mmap segment) nil))
   nil)

@@ -182,6 +182,15 @@ application's own config; graph-db does not read an ini file itself.")
 (alexandria:define-constant +free-slot-marker+ #xFFFFFFFFFFFFFFFF)
 ;; Sentinel "no slot" index -- terminates the free list and marks "id not found".
 (alexandria:define-constant +no-slot+ #xFFFFFFFFFFFFFFFF)
+;; The header's reserved uint64 (offset 56) doubles as a clean-shutdown flag:
+;; +segment-clean+ means the file was closed cleanly and can be trusted as-is;
+;; +segment-dirty+ means it is in use or was not closed (crash) and recovery
+;; (later step) should rebuild from nodes.  Consulted only at open, never at
+;; create.  No format-version bump: old segment files read this as 0 (dirty),
+;; which correctly forces one rebuild.
+(alexandria:define-constant +segment-clean-offset+ 56)
+(alexandria:define-constant +segment-clean+ 1)
+(alexandria:define-constant +segment-dirty+ 0)
 
 ;; User-defined type identifiers for serializing. Start at 100
 (alexandria:define-constant +uuid+ 100)

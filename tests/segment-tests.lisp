@@ -235,3 +235,26 @@ survive the growth bit-exactly, including ones written before it."
                             "vector ~D corrupted across reopen" i))))
                (close-vector-segment s))))
       (ignore-errors (delete-file path)))))
+
+(test segment-clean-shutdown-flag
+  "A cleanly closed segment reopens reporting clean-shutdown; a segment left open
+(simulated crash) reopens reporting NOT clean."
+  (let ((path (%seg-path)))
+    (unwind-protect
+         (progn
+           ;; clean lifecycle
+           (let ((s (create-vector-segment path 8 :initial-capacity 4)))
+             (segment-put s (%id 1) (%vec 8 1.0))
+             (close-vector-segment s))
+           (let ((s (open-vector-segment path)))
+             (is (segment-clean-shutdown-p s)
+                 "a cleanly closed segment must reopen clean")
+             ;; do NOT close -> simulate a crash: the flag was marked dirty on open
+             )
+           ;; reopen after the un-closed session
+           (let ((s (open-vector-segment path)))
+             (unwind-protect
+                  (is (not (segment-clean-shutdown-p s))
+                      "a segment left open (crash) must reopen NOT clean")
+               (close-vector-segment s))))
+      (ignore-errors (delete-file path)))))

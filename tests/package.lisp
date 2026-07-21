@@ -156,6 +156,7 @@
                 #:segment-put
                 #:segment-get
                 #:segment-remove
+                #:segment-clean-shutdown-p
                 ;; type index
                 #:make-type-index
                 #:close-type-index
