@@ -330,3 +330,63 @@ against a prefix."
                     (segment-score-subset s (%qvec 3 1.0 0.0 0.0) (list (%qid 1)))))
              (close-vector-segment s)))
       (ignore-errors (delete-file path)))))
+
+(test vector-search-finds-the-nearest-node
+  "vector-search resolves the owner segment and returns nearest node ids."
+  (with-temp-directory (dir)
+    (let ((g (make-graph *integration-graph-name* (namestring dir)
+                         :buffer-pool-size 1000))
+          (near nil))
+      (unwind-protect
+           (progn
+             (let ((*graph* g))
+               (with-transaction ()
+                 (setf near (id (make-si-doc :title "near"
+                                             :embedding (%qvec 8 1.0 0.0)))))
+               (with-transaction ()
+                 (make-si-doc :title "far" :embedding (%qvec 8 0.0 1.0))))
+             (let ((got (vector-search g 'si-doc 'embedding (%qvec 8 1.0 0.0) 2)))
+               (is (= 2 (length got)) "expected 2 hits, got ~S" got)
+               (is (equalp near (cdr (first got)))
+                   "nearest node should rank first")))
+        (close-graph g :snapshot-p nil))
+      (collect-garbage))))
+
+(test vector-search-empty-when-nothing-indexed
+  "A declared slot with no segment yet returns NIL, not an error (segments are
+created lazily on first conforming write)."
+  (with-temp-directory (dir)
+    (let ((g (make-graph *integration-graph-name* (namestring dir)
+                         :buffer-pool-size 1000)))
+      (unwind-protect
+           (is (null (vector-search g 'si-doc 'embedding (%qvec 8 1.0 0.0) 5)))
+        (close-graph g :snapshot-p nil))
+      (collect-garbage))))
+
+(test vector-search-spans-subclasses
+  "Model B: querying by the SUBCLASS name must resolve to the ANCESTOR's owner
+segment (%vector-index-slot-owner-name maps (si-sub, embedding) -> si-doc) and
+find instances of BOTH classes stored there.  This is the discriminating
+direction: a resolver that used the queried class name directly (ignoring
+inheritance) would look up a (si-sub . embedding) key that no segment is ever
+stored under -- since the write path always keys on the declaring ancestor --
+and this test would see an empty result instead of the two hits below."
+  (with-temp-directory (dir)
+    (let ((g (make-graph *integration-graph-name* (namestring dir)
+                         :buffer-pool-size 1000))
+          (sub-id nil))
+      (unwind-protect
+           (progn
+             (let ((*graph* g))
+               (with-transaction ()
+                 (make-si-doc :title "parent" :embedding (%qvec 8 0.0 1.0)))
+               (with-transaction ()
+                 (setf sub-id (id (make-si-sub :title "child" :extra "x"
+                                               :embedding (%qvec 8 1.0 0.0))))))
+             ;; query via the SUBCLASS name, not the declaring owner class
+             (let ((got (vector-search g 'si-sub 'embedding (%qvec 8 1.0 0.0) 5)))
+               (is (= 2 (length got)) "owner segment should hold both, got ~S" got)
+               (is (equalp sub-id (cdr (first got)))
+                   "the subclass instance should be found and rank first")))
+        (close-graph g :snapshot-p nil))
+      (collect-garbage))))

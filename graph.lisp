@@ -93,6 +93,22 @@ when several subclasses declare the same :VECTOR-INDEX slot."
                   (close-vector-segment seg)
                   (rebuild-vector-segment graph owner-name slot)))))))))
 
+(defun vector-search (graph class-name slot-name query-vector k)
+  "Top-K nodes of CLASS-NAME (and its subclasses) whose SLOT-NAME vector is
+nearest QUERY-VECTOR by cosine, as (score . node-id) conses, best first.
+
+Resolves the OWNER segment for (CLASS-NAME, SLOT-NAME) -- under Model B one
+segment per declaring class holds the whole hierarchy -- and scans it.  Returns
+NIL when no segment exists yet: segments are created lazily on the first
+conforming write, so a declared-but-never-written slot simply has nothing to
+search."
+  (let* ((class (find-class class-name nil))
+         (owner (and class (%vector-index-slot-owner-name class slot-name)))
+         (segment (and owner
+                       (gethash (cons owner slot-name) (vector-segments graph)))))
+    (when segment
+      (segment-scan segment query-vector k))))
+
 (defun make-graph (name location &key master-p slave-p master-host
                                    replication-port replication-key package
                                    replay-txn-dir (buffer-pool-p t)

@@ -165,6 +165,7 @@
                 #:%cosine
                 #:segment-scan
                 #:segment-score-subset
+                #:vector-search
                 ;; type index
                 #:make-type-index
                 #:close-type-index
