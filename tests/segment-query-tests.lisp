@@ -390,3 +390,216 @@ and this test would see an empty result instead of the two hits below."
                    "the subclass instance should be found and rank first")))
         (close-graph g :snapshot-p nil))
       (collect-garbage))))
+
+(test vector-search-truncates-to-k
+  "K is passed through to the scan and actually truncates: with THREE nodes
+stored, asking for k=2 must return exactly the two nearest, in order.  Every
+other vector-search test uses a k >= the stored count, so each of them would
+still pass if k were dropped on the floor or replaced by a large constant --
+this one is the assertion that pins the pass-through.  The three embeddings
+have strictly decreasing cosine against the query (1,0,...): (1,0)=1.0,
+(1,1)=0.707, (0,1)=0.0, so the expected top-2 is unambiguous and the excluded
+node is identified by id."
+  (with-temp-directory (dir)
+    (let ((g (make-graph *integration-graph-name* (namestring dir)
+                         :buffer-pool-size 1000))
+          (best nil) (mid nil) (worst nil))
+      (unwind-protect
+           (progn
+             (let ((*graph* g))
+               (with-transaction ()
+                 (setf best (id (make-si-doc :title "best"
+                                             :embedding (%qvec 8 1.0 0.0)))))
+               (with-transaction ()
+                 (setf mid (id (make-si-doc :title "mid"
+                                            :embedding (%qvec 8 1.0 1.0)))))
+               (with-transaction ()
+                 (setf worst (id (make-si-doc :title "worst"
+                                              :embedding (%qvec 8 0.0 1.0))))))
+             ;; sanity: all three really are in the segment, so a k=2 result of
+             ;; length 2 means TRUNCATION and not "only two were ever stored"
+             (let ((all (vector-search g 'si-doc 'embedding (%qvec 8 1.0 0.0) 10)))
+               (is (= 3 (length all)) "expected 3 nodes stored, got ~S" all))
+             (let ((got (vector-search g 'si-doc 'embedding (%qvec 8 1.0 0.0) 2)))
+               (is (= 2 (length got))
+                   "k=2 over 3 stored nodes must return 2, got ~D" (length got))
+               (when (= 2 (length got))
+                 (is (equalp best (cdr (first got))) "nearest should rank first")
+                 (is (equalp mid (cdr (second got))) "second-nearest should rank second")
+                 (is (null (find worst got :key #'cdr :test #'equalp))
+                     "the third-nearest node must be truncated away by k=2"))))
+        (close-graph g :snapshot-p nil))
+      (collect-garbage))))
+
+(defparameter *scan-race-rounds* 12
+  "How many independent writer/scanner rounds SCAN-IS-SAFE-AGAINST-GROWING-WRITES
+runs.  The race is timing-dependent, so one round is not evidence: each round
+is a fresh capacity-2 segment grown to 128 slots, i.e. ~6 %SEG-GROW relocations,
+so a run covers ~70 grow windows with thousands of concurrent scans across
+them.  Rounds (rather than one long round) because scan cost is O(capacity) --
+a single big segment quickly makes each scan so expensive that only a handful
+run, which is exactly how this test would have become vacuous.")
+
+(defun %scan-race-round (dim puts nscanners)
+  "One round of the growing-writes race: a fresh capacity-2 segment, PUTS
+distinct growing commits on this thread, NSCANNERS threads scanning throughout.
+
+Returns (values SCANS BAD SHORT ERRS), where BAD holds scores that were not a
+real number in [-1, 1], SHORT holds (committed-before-scan . hits-seen) pairs
+where a scan missed an already-committed id, and ERRS holds errors that killed
+a scanner thread.  Each scanner accumulates into its OWN lists and hands them
+back through JOIN-THREAD, so nothing is pushed onto a shared list from two
+threads at once (which would itself be a race, and could lose the very evidence
+this test exists to collect)."
+  (let ((path (%qpath)))
+    (unwind-protect
+         (let ((s (create-vector-segment path dim :initial-capacity 2))
+               (stop nil)
+               (committed 0))
+           (unwind-protect
+                (let* ((q (let ((v (make-array dim :element-type 'single-float
+                                                   :initial-element 0.0)))
+                            (setf (aref v 0) 1.0)
+                            v))
+                       (scanners
+                         (loop repeat nscanners
+                               collect
+                               (bordeaux-threads:make-thread
+                                (lambda ()
+                                  (let ((scans 0) (bad '()) (short '()) (err nil))
+                                    (handler-case
+                                        (loop until stop
+                                              do (let* (;; sampled BEFORE the scan:
+                                                        ;; every put counted here
+                                                        ;; completed before the scan
+                                                        ;; took the read lock, so all
+                                                        ;; of them must be visible
+                                                        (n0 committed)
+                                                        (hits (segment-scan s q (* 2 puts))))
+                                                   (incf scans)
+                                                   (when (< (length hits) n0)
+                                                     (push (cons n0 (length hits)) short))
+                                                   (dolist (hit hits)
+                                                     (let* ((score (car hit))
+                                                            ;; a NaN fails both
+                                                            ;; comparisons -- and on
+                                                            ;; SBCL merely comparing
+                                                            ;; one may trap, which is
+                                                            ;; equally a bad read
+                                                            (ok (handler-case
+                                                                    (and (realp score)
+                                                                         (<= score 1.0001)
+                                                                         (>= score -1.0001))
+                                                                  (arithmetic-error () nil))))
+                                                       (unless ok
+                                                         (push (princ-to-string score) bad))))))
+                                      ;; a torn read that blows up rather than lying:
+                                      ;; the relocated-but-capacity-not-yet-flipped
+                                      ;; window leaves all-ones free-marker bytes
+                                      ;; where vectors used to be, and those decode
+                                      ;; to a float32 overflow
+                                      (error (e) (setf err (princ-to-string e))))
+                                    (list scans bad short err)))
+                                :name "segment-scanner"))))
+                  (dotimes (i puts)
+                    (let ((v (make-array dim :element-type 'single-float
+                                             :initial-element 0.0))
+                          (id (make-array 16 :element-type '(unsigned-byte 8)
+                                             :initial-element 0)))
+                      (setf (aref v (mod i dim)) 1.0
+                            (aref id 0) (mod i 256)
+                            (aref id 1) (floor i 256))
+                      (segment-put s id v)
+                      (incf committed)))
+                  (setf stop t)
+                  (let ((scans 0) (bad '()) (short '()) (errs '()))
+                    (dolist (th scanners)
+                      (destructuring-bind (n b sh e) (bordeaux-threads:join-thread th)
+                        (incf scans n)
+                        (setf bad (append b bad)
+                              short (append sh short))
+                        (when e (push e errs))))
+                    (values scans bad short errs)))
+             (close-vector-segment s)))
+      (ignore-errors (delete-file path)))))
+
+(test scan-is-safe-against-growing-writes
+  "Scanners running continuously against a writer doing GROWING commits never
+observe a torn read.  %SEG-GROW relocates the WHOLE vector block and stores the
+new capacity LAST; without the per-segment rw-lock a scanner can see the new
+capacity against a not-yet-relocated block (or the reverse), and score bytes
+that are half one block and half another.  Three independent detectors, any of
+which fires on a torn read:
+
+  (1) no scanner thread may die -- a half-relocated block hands the scan the
+      all-ones free-slot-marker bytes as float32, which decodes to a
+      scale-float overflow, so a torn read surfaces as an arithmetic error
+      rather than a quietly wrong number;
+  (2) every score must be a real number in [-1, 1] (cosine is normalised, so
+      any value outside that came from garbage, and a NaN fails both
+      comparisons);
+  (3) no COMMITTED id may go missing -- the committed count is sampled BEFORE
+      each scan, so every put it counts completed before the scan took the
+      read lock and must therefore be visible.
+
+Deliberately NOT a single long round: scan cost is O(capacity), so one big
+segment yields only a handful of scans (measured: exactly ONE for a 400-put
+capacity-512 segment) and proves almost nothing.  ~12 short rounds instead,
+each covering ~6 grow relocations, gives thousands of scans across ~70 grow
+windows.  The check that scans actually happened is asserted, so a starved or
+dead scanner fails the test loudly instead of passing it silently.
+
+VERIFIED LOAD-BEARING: with the rw-lock removed from segment-scan/segment-put
+and the %seg-grow window widened by a sleep between the relocation and the
+capacity store, this test FAILS."
+  (let ((scans 0) (bad '()) (short '()) (errs '()))
+    (dotimes (round *scan-race-rounds*)
+      (declare (ignorable round))
+      (multiple-value-bind (n b sh e) (%scan-race-round 128 128 3)
+        (incf scans n)
+        (setf bad (append b bad)
+              short (append sh short)
+              errs (append e errs))))
+    (is (null errs)
+        "~D scanner thread(s) died on a torn read: ~S"
+        (length errs) (subseq errs 0 (min 3 (length errs))))
+    (is (plusp scans) "the scanners never ran -- test proves nothing")
+    (is (> scans (* 10 *scan-race-rounds*))
+        "only ~D scans across ~D rounds -- too few to have raced the writer"
+        scans *scan-race-rounds*)
+    (is (null bad)
+        "~D torn reads: out-of-range scores ~S"
+        (length bad) (subseq bad 0 (min 5 (length bad))))
+    (is (null short)
+        "~D scans missed already-committed ids (committed . seen): ~S"
+        (length short) (subseq short 0 (min 5 (length short))))))
+
+(test ranking-is-deterministic-across-rebuild
+  "Scanning a segment, rebuilding it from nodes, and scanning again gives an
+identical ranking -- including ties.  Slot order is meaningless under free-list
+reuse, so this only holds because the tiebreak is carried through eviction."
+  (with-temp-directory (dir)
+    (let ((g (make-graph *integration-graph-name* (namestring dir)
+                         :buffer-pool-size 1000)))
+      (unwind-protect
+           (progn
+             (let ((*graph* g))
+               ;; several nodes sharing a score with the query, to force ties
+               (dotimes (i 6)
+                 (with-transaction ()
+                   (make-si-doc :title (format nil "n~d" i)
+                                :embedding (%qvec 8 1.0 1.0)))))
+             (let* ((q (%qvec 8 1.0 1.0))
+                    (before (vector-search g 'si-doc 'embedding q 6)))
+               (is (= 6 (length before)) "expected 6 hits, got ~S" before)
+               (rebuild-vector-segment g 'si-doc 'embedding)
+               (let ((after (vector-search g 'si-doc 'embedding q 6)))
+                 (is (= (length before) (length after)))
+                 (when (= (length before) (length after))
+                   (loop for b in before for a in after
+                         do (is (equalp (cdr b) (cdr a))
+                                "ranking changed across rebuild: ~S vs ~S"
+                                (cdr b) (cdr a))
+                            (is (< (abs (- (car b) (car a))) 1e-6)))))))
+        (close-graph g :snapshot-p nil))
+      (collect-garbage))))

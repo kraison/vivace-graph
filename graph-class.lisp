@@ -47,8 +47,29 @@
    ;; A derived index maintained on the apply path; created lazily on first
    ;; conforming insert; recovered by rebuild-from-nodes on an unclean open.
    ;; See docs/superpowers/specs/2026-07-21-vector-segment-transaction-integration-design.md
+   ;;
+   ;; SYNCHRONIZED, and it has to be.  The per-segment rw-lock protects a
+   ;; segment's CONTENTS; this table is how a segment is FOUND, and the two
+   ;; sides run on different threads with no lock in common: VECTOR-SEARCH
+   ;; (graph.lisp) does an unlocked GETHASH on a query thread, while
+   ;; %ENSURE-SEGMENT (transactions.lisp) does a (SETF GETHASH) on the apply
+   ;; path when a segment is created lazily on the first conforming write.
+   ;; Writers are serialized against each other by the transaction manager
+   ;; lock, so this is a single-writer/many-reader table -- but an unsynchronized
+   ;; hash table gives no guarantee to a reader concurrent with a PUTHASH that
+   ;; grows/rehashes it (SBCL explicitly leaves that undefined: the reader can
+   ;; see a half-rebuilt vector, miss a present key, or spin).  Making the table
+   ;; itself synchronized closes it: every GETHASH/(SETF GETHASH) is under the
+   ;; table's own lock, so a reader sees either the old value (NIL -> "nothing
+   ;; indexed yet", the documented VECTOR-SEARCH answer) or the fully
+   ;; constructed segment, never a torn intermediate.  Same idiom as
+   ;; WRITE-STATS / READ-STATS below and *GRAPHS* above.
    (vector-segments :accessor vector-segments :initarg :vector-segments
-                    :initform (make-hash-table :test 'equal))
+                    :initform
+                    #+ccl (make-hash-table :test 'equal :shared t)
+                    #+lispworks (make-hash-table :test 'equal :single-thread nil)
+                    #+ecl (make-hash-table :test 'equal)
+                    #+sbcl (make-hash-table :test 'equal :synchronized t))
    ;; General ordered secondary indexes (:INDEX slot option / DEF-INDEX); keyed by
    ;; (owner-name . slot-name).  See index.lisp / docs/general-index-design.md.
    (secondary-indexes :accessor secondary-indexes :initarg :secondary-indexes :initform nil)
