@@ -461,22 +461,35 @@ scans."
     (dotimes (i (length v) (sqrt sum))
       (incf sum (* (aref v i) (aref v i))))))
 
-(defun %cosine (a b)
-  "Full cosine similarity of two equal-length single-float vectors.  Returns
-0.0 when either has zero norm (no divide error).  This does NOT assume unit
-vectors -- the segment stores whatever the caller put in it."
+(defun %cosine-with-norm (a a-norm b)
+  "Cosine similarity of A against B, where A's Euclidean norm is already known
+as A-NORM.  Lets a caller that scores many B's against the same A (e.g. a scan
+over a whole segment) hoist A's norm out of the per-candidate loop instead of
+recomputing it once per candidate.  Returns 0.0 when either norm is zero (no
+divide error).  Does NOT assume unit vectors."
   (declare (type (simple-array single-float (*)) a b)
+           (type single-float a-norm)
            (optimize (speed 3) (safety 1)))
-  (let ((dot 0f0) (na 0f0) (nb 0f0))
-    (declare (type single-float dot na nb))
+  (let ((dot 0f0) (nb 0f0))
+    (declare (type single-float dot nb))
     (dotimes (i (min (length a) (length b)))
       (let ((x (aref a i)) (y (aref b i)))
         (incf dot (* x y))
-        (incf na (* x x))
         (incf nb (* y y))))
-    (if (or (zerop na) (zerop nb))
+    (if (or (zerop a-norm) (zerop nb))
         0f0
-        (/ dot (* (sqrt na) (sqrt nb))))))
+        (/ dot (* a-norm (sqrt nb))))))
+
+(defun %cosine (a b)
+  "Full cosine similarity of two equal-length single-float vectors.  Returns
+0.0 when either has zero norm (no divide error).  This does NOT assume unit
+vectors -- the segment stores whatever the caller put in it.
+
+General two-vector entry point; implemented via %COSINE-WITH-NORM.  A caller
+scoring many B's against the same A (segment-scan) should call
+%COSINE-WITH-NORM directly with a hoisted A-norm instead of using this."
+  (declare (type (simple-array single-float (*)) a b))
+  (%cosine-with-norm a (%vector-norm a) b))
 
 (defun segment-scan (segment query-vector k)
   "Top-K by full cosine over every occupied slot, best first, as (score . id)
@@ -487,17 +500,29 @@ Touches ONLY the id array and the contiguous vector block -- it never
 materialises a node, which is the entire point of the segment.
 
 Sweeps [0, capacity) skipping free cells -- occupied slots are NOT dense
-[0, live-count) once the free list has been used."
+[0, live-count) once the free list has been used.
+
+QUERY-VECTOR's length must equal the segment's dimension -- validated up
+front, mirroring SEGMENT-PUT's write-side check, so a wrong-length query is
+rejected loudly instead of silently scored against a prefix.
+
+The query's own norm is computed ONCE here and threaded through
+%COSINE-WITH-NORM for every candidate, rather than recomputed per occupied
+slot."
   (declare (type (simple-array single-float (*)) query-vector))
-  (when (or (zerop k) (zerop (%vector-norm query-vector)))
-    (return-from segment-scan nil))
-  (with-read-lock ((segment-lock segment))
-    (let ((mmap (segment-mmap segment))
-          (cap (segment-capacity segment))
-          (collector (%make-topk k)))
-      (dotimes (slot cap)
-        (unless (= (deserialize-uint64 mmap (%seg-id-offset slot)) +free-slot-marker+)
-          (let ((id (get-bytes mmap (%seg-id-offset slot) +key-bytes+))
-                (v (%seg-read-vector segment slot)))
-            (%topk-offer collector (%cosine query-vector v) id))))
-      (%topk-results collector))))
+  (unless (= (length query-vector) (segment-dimension segment))
+    (error "query vector length ~D does not match segment dimension ~D"
+           (length query-vector) (segment-dimension segment)))
+  (let ((qnorm (%vector-norm query-vector)))
+    (when (or (zerop k) (zerop qnorm))
+      (return-from segment-scan nil))
+    (with-read-lock ((segment-lock segment))
+      (let ((mmap (segment-mmap segment))
+            (cap (segment-capacity segment))
+            (collector (%make-topk k)))
+        (dotimes (slot cap)
+          (unless (= (deserialize-uint64 mmap (%seg-id-offset slot)) +free-slot-marker+)
+            (let ((id (get-bytes mmap (%seg-id-offset slot) +key-bytes+))
+                  (v (%seg-read-vector segment slot)))
+              (%topk-offer collector (%cosine-with-norm query-vector qnorm v) id))))
+        (%topk-results collector)))))
