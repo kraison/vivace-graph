@@ -286,26 +286,24 @@ free list."
   (let ((slot (%seg-slot-of segment id)))
     (when slot (%seg-read-vector segment slot))))
 
-(defun rebuild-vector-segment (graph class-name slot-name)
-  "Rebuild the (CLASS-NAME, SLOT-NAME) segment from live nodes: drop any current
+(defun rebuild-vector-segment (graph owner-name slot-name)
+  "Rebuild the (OWNER-NAME, SLOT-NAME) segment from live nodes: drop any current
 segment/file, create a fresh one sized to the first conforming vector, and
 segment-put every live node's conforming value.  Registers and returns the fresh
 segment.  Run when quiescent (at open, before writes) -- it mutates outside the
 transaction path, like rebuild-spatial-index.
 
-Scoped to EXACT-CLASS instances (:INCLUDE-SUBCLASSES-P NIL): the live apply path
-(APPLY-TX-WRITE-TO-VECTOR-SEGMENTS) keys each node's segment on
-(CLASS-NAME (CLASS-OF NODE)) -- its exact class, not its declared type -- so a
-subclass instance's vector lives in the SUBCLASS's own segment, never the
-parent's.  MAP-VERTICES defaults to :INCLUDE-SUBCLASSES-P T, which would sweep
-subclass instances into the parent's rebuilt segment, orphaning them from
-maintenance (a delete of the subclass node only touches the subclass segment)
-and leaving the parent segment permanently drifted from the live path.  Each
-subclass with its own :VECTOR-INDEX slot gets its own call to this function
-(see RESTORE-VECTOR-SEGMENTS), so exact-class scoping here loses no coverage."
-  (let* ((key (cons class-name slot-name))
+OWNER-NAME must be the segment's OWNER -- the declaring class returned by
+%VECTOR-INDEX-SLOT-OWNER-NAME / %SEGMENT-KEY (transactions.lisp), not
+necessarily a node's exact runtime class.  One segment per owner spans its
+subclasses (the engine's :UNIQUE / :INDEX convention), so this sweeps
+MAP-VERTICES with its default :INCLUDE-SUBCLASSES-P T: every subclass
+instance's vector is swept into the OWNER's segment, matching exactly what the
+live apply path (APPLY-TX-WRITE-TO-VECTOR-SEGMENTS, via %SEGMENT-KEY) does on
+create/update/delete."
+  (let* ((key (cons owner-name slot-name))
          (table (vector-segments graph))
-         (path (%segment-file graph class-name slot-name)))
+         (path (%segment-file graph owner-name slot-name)))
     (let ((old (gethash key table)))
       (when old (close-vector-segment old)))
     (remhash key table)
@@ -320,7 +318,7 @@ subclass with its own :VECTOR-INDEX slot gets its own call to this function
                  (setf seg (create-vector-segment path (length v)))
                  (setf (gethash key table) seg))
                (segment-put seg (id node) v)))))
-       graph :vertex-type class-name :include-subclasses-p nil)
+       graph :vertex-type owner-name)
       seg)))
 
 (defun segment-remove (segment id)

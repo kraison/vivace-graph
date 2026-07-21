@@ -44,7 +44,12 @@ composite-key format (RESTORE runs after the node tables are open)."
         (init-spatial-index graph))))
 
 (defun all-node-classes-with-vector-index-slots (graph)
-  "The node classes of GRAPH that declare at least one :VECTOR-INDEX slot."
+  "The node classes of GRAPH that declare at least one :VECTOR-INDEX slot.  Note
+this can list several classes (a whole hierarchy) for the SAME segment -- a
+:VECTOR-INDEX slot's effective-slot inheritance means both the declaring class
+and its subclasses report it (node-class.lisp).  Callers that open/rebuild
+segments must dedup by owner (see ALL-VECTOR-SEGMENT-OWNER-KEYS) so one shared
+owner segment is not opened/rebuilt once per subclass."
   (loop for nt in (all-node-types graph)
         for name = (if (node-type-p nt) (node-type-name nt) nt)
         for class = (and name (find-class name nil))
@@ -52,21 +57,41 @@ composite-key format (RESTORE runs after the node tables are open)."
                   (node-vector-index-slots class))
           collect class))
 
-(defun restore-vector-segments (graph)
-  "For every class with :VECTOR-INDEX slots, open each existing segment as-is if
-it was cleanly closed, else rebuild it from nodes.  Runs at open, before the graph
-accepts writes (quiescent)."
-  (dolist (class (all-node-classes-with-vector-index-slots graph))
-    (let ((class-name (class-name class)))
+(defun all-vector-segment-owner-keys (graph)
+  "The distinct (OWNER-NAME . SLOT-NAME) segment keys across GRAPH's
+:VECTOR-INDEX slots.  Several classes in a hierarchy report the same slot
+(effective-slot inheritance -- see ALL-NODE-CLASSES-WITH-VECTOR-INDEX-SLOTS),
+but under Model B they share ONE owner segment (%VECTOR-INDEX-SLOT-OWNER-NAME),
+so each (owner, slot) pair is returned exactly once regardless of how many
+concrete classes declare it -- the open/rebuild path must open or rebuild the
+owner segment ONCE, not once per subclass."
+  (let ((seen (make-hash-table :test 'equal))
+        (keys '()))
+    (dolist (class (all-node-classes-with-vector-index-slots graph))
       (dolist (slot (node-vector-index-slots class))
-        (let ((path (%segment-file graph class-name slot)))
-          (when (probe-file path)
-            (let ((seg (open-vector-segment path)))
-              (if (segment-clean-shutdown-p seg)
-                  (setf (gethash (cons class-name slot) (vector-segments graph)) seg)
-                  (progn
-                    (close-vector-segment seg)
-                    (rebuild-vector-segment graph class-name slot))))))))))
+        (let ((key (cons (%vector-index-slot-owner-name class slot) slot)))
+          (unless (gethash key seen)
+            (setf (gethash key seen) t)
+            (push key keys)))))
+    (nreverse keys)))
+
+(defun restore-vector-segments (graph)
+  "For every distinct (OWNER, SLOT) :VECTOR-INDEX segment, open the existing
+segment as-is if it was cleanly closed, else rebuild it from nodes (a rebuild
+sweeps in every subclass instance too -- see REBUILD-VECTOR-SEGMENT).  Runs at
+open, before the graph accepts writes (quiescent).  Keyed by owner, not by
+concrete class, so a shared owner segment is opened/rebuilt exactly once even
+when several subclasses declare the same :VECTOR-INDEX slot."
+  (dolist (key (all-vector-segment-owner-keys graph))
+    (destructuring-bind (owner-name . slot) key
+      (let ((path (%segment-file graph owner-name slot)))
+        (when (probe-file path)
+          (let ((seg (open-vector-segment path)))
+            (if (segment-clean-shutdown-p seg)
+                (setf (gethash (cons owner-name slot) (vector-segments graph)) seg)
+                (progn
+                  (close-vector-segment seg)
+                  (rebuild-vector-segment graph owner-name slot)))))))))
 
 (defun make-graph (name location &key master-p slave-p master-host
                                    replication-port replication-key package

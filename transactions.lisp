@@ -850,6 +850,29 @@ done at maintenance time, not here: only a conforming (simple-array single-float
                       when (vector-index-p slot)
                         collect (slot-definition-name slot)))))))
 
+(defun %vector-index-slot-owner-name (class slot-name)
+  "The most-general node-class in CLASS's precedence list that declares SLOT-NAME
+as a :VECTOR-INDEX direct slot -- the cross-subtype segment owner (so a
+:VECTOR-INDEX slot on a parent is maintained across its subclasses through one
+shared segment, spanning subclasses -- one segment per DECLARING class).  Direct
+mirror of %UNIQUE-SLOT-OWNER-NAME (unique-constraint.lisp:61)."
+  (let ((owner (loop for c in (reverse (class-precedence-list class))
+                     when (and (typep c 'node-class)
+                               (find-if (lambda (ds)
+                                          (and (eq (slot-definition-name ds) slot-name)
+                                               (vector-index-p ds)))
+                                        (class-direct-slots c)))
+                     return c)))
+    (class-name (or owner class))))
+
+(defun %segment-key (node slot-name)
+  "The (OWNER-NAME . SLOT-NAME) key identifying NODE's vector segment for
+SLOT-NAME.  This is the ONE place the owner key is computed; every maintenance
+path (create/update/delete/validate) and rebuild goes through this so a
+subclass instance's vector always lands in the declaring ancestor's segment,
+never a per-subclass one -- mirroring :UNIQUE / :INDEX exactly."
+  (cons (%vector-index-slot-owner-name (class-of node) slot-name) slot-name))
+
 (defgeneric node-geometry (node)
   (:documentation
    "The GEOMETRY a node occupies, or NIL if it has none.  By default this is the
@@ -918,19 +941,25 @@ CLOS slot, exactly as node-geometry does."
   (let ((v (ignore-errors (slot-value node slot-name))))
     (when (%conforming-vector-p v) v)))
 
-(defun %segment-file (graph class-name slot-name)
+(defun %segment-file (graph owner-name slot-name)
+  "OWNER-NAME is the segment's OWNING class (see %VECTOR-INDEX-SLOT-OWNER-NAME /
+%SEGMENT-KEY) -- NOT necessarily a node's exact runtime class.  One file per
+owner, spanning subclasses."
   (format nil "~A/vseg-~A-~A.dat"
-          (location graph) (string-downcase class-name) (string-downcase slot-name)))
+          (location graph) (string-downcase owner-name) (string-downcase slot-name)))
 
-(defun %ensure-segment (graph class-name slot-name dimension)
-  "The segment for (CLASS-NAME, SLOT-NAME), created lazily if absent with
+(defun %ensure-segment (graph owner-name slot-name dimension)
+  "The segment for (OWNER-NAME, SLOT-NAME), created lazily if absent with
 DIMENSION (the length of the first conforming vector).  Registered in the graph's
-VECTOR-SEGMENTS table."
-  (let* ((key (cons class-name slot-name))
+VECTOR-SEGMENTS table.  OWNER-NAME must be the segment OWNER (from
+%SEGMENT-KEY), not a node's exact class -- callers pass the owner name so a
+subclass instance is created into, and thereafter maintained in, the ancestor's
+segment."
+  (let* ((key (cons owner-name slot-name))
          (table (vector-segments graph)))
     (or (gethash key table)
         (setf (gethash key table)
-              (create-vector-segment (%segment-file graph class-name slot-name)
+              (create-vector-segment (%segment-file graph owner-name slot-name)
                                      dimension)))))
 
 ;;; ---------------------------------------------------------------------------
@@ -961,25 +990,24 @@ either source) establishes the dimension."
     (dolist (write (writes tx))
       (let ((node (node write)))
         (unless (deleted-p node)
-          (let ((class-name (class-name (class-of node))))
-            (dolist (slot (node-vector-index-slots (class-of node)))
-              (let ((v (%node-segment-value node slot)))
-                (when v
-                  (let* ((key (cons class-name slot))
-                         (seg (gethash key (vector-segments graph)))
-                         (expected (if seg
-                                       (segment-dimension seg)
-                                       (gethash key intra))))
-                    (cond
-                      ((null expected)
-                       ;; first conforming write of this (class, slot) in this
-                       ;; transaction, and no committed segment yet -- this
-                       ;; write establishes the dimension for the rest of TX
-                       (setf (gethash key intra) (length v)))
-                      ((/= (length v) expected)
-                       (error "vector-index slot ~A on ~A: vector length ~D does not ~
+          (dolist (slot (node-vector-index-slots (class-of node)))
+            (let ((v (%node-segment-value node slot)))
+              (when v
+                (let* ((key (%segment-key node slot))
+                       (seg (gethash key (vector-segments graph)))
+                       (expected (if seg
+                                     (segment-dimension seg)
+                                     (gethash key intra))))
+                  (cond
+                    ((null expected)
+                     ;; first conforming write of this (owner, slot) in this
+                     ;; transaction, and no committed segment yet -- this
+                     ;; write establishes the dimension for the rest of TX
+                     (setf (gethash key intra) (length v)))
+                    ((/= (length v) expected)
+                     (error "vector-index slot ~A on ~A: vector length ~D does not ~
 match established segment dimension ~D"
-                              slot class-name (length v) expected)))))))))))))
+                            slot (car key) (length v) expected))))))))))))
 
 (defgeneric apply-tx-write-to-vector-segments (write graph)
   (:method (write graph) (declare (ignore write graph)) nil))
@@ -987,31 +1015,32 @@ match established segment dimension ~D"
 (defmethod apply-tx-write-to-vector-segments ((write tx-create) graph)
   (let ((node (node write)))
     (when (not (deleted-p node))
-      (let ((class-name (class-name (class-of node))))
-        (dolist (slot (node-vector-index-slots (class-of node)))
-          (let ((v (%node-segment-value node slot)))
-            (when v
-              (let ((seg (%ensure-segment graph class-name slot (length v))))
-                (segment-put seg (id node) v)))))))))
+      (dolist (slot (node-vector-index-slots (class-of node)))
+        (let ((v (%node-segment-value node slot)))
+          (when v
+            (let* ((key (%segment-key node slot))
+                   (seg (%ensure-segment graph (car key) slot (length v))))
+              (segment-put seg (id node) v))))))))
 
 (defmethod apply-tx-write-to-vector-segments ((write tx-update) graph)
-  (let* ((new-node (node write))
-         (class-name (class-name (class-of new-node))))
+  (let* ((new-node (node write)))
     (dolist (slot (node-vector-index-slots (class-of new-node)))
-      (let ((key (cons class-name slot))
-            (v (and (not (deleted-p new-node)) (%node-segment-value new-node slot))))
+      (let* ((key (%segment-key new-node slot))
+             (v (and (not (deleted-p new-node)) (%node-segment-value new-node slot))))
         (if v
-            (let ((seg (%ensure-segment graph class-name slot (length v))))
+            (let ((seg (%ensure-segment graph (car key) slot (length v))))
               (segment-put seg (id new-node) v))
             ;; value cleared/invalidated or node now deleted -> drop any entry
+            ;; from the OWNER's segment (gethash on the owner key, not the
+            ;; node's exact class -- a subclass's entry lives there too)
             (let ((seg (gethash key (vector-segments graph))))
               (when seg (segment-remove seg (id new-node)))))))))
 
 (defmethod apply-tx-write-to-vector-segments ((write tx-delete) graph)
-  (let* ((node (node write))
-         (class-name (class-name (class-of node))))
+  (let* ((node (node write)))
     (dolist (slot (node-vector-index-slots (class-of node)))
-      (let ((seg (gethash (cons class-name slot) (vector-segments graph))))
+      (let* ((key (%segment-key node slot))
+             (seg (gethash key (vector-segments graph))))
         (when seg (segment-remove seg (id node)))))))
 
 (defgeneric apply-tx-writes-to-vector-segments (writes graph)
