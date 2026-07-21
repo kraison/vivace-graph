@@ -946,6 +946,26 @@ VECTOR-SEGMENTS table."
               (let ((seg (%ensure-segment graph class-name slot (length v))))
                 (segment-put seg (id node) v)))))))))
 
+(defmethod apply-tx-write-to-vector-segments ((write tx-update) graph)
+  (let* ((new-node (node write))
+         (class-name (class-name (class-of new-node))))
+    (dolist (slot (node-vector-index-slots (class-of new-node)))
+      (let ((key (cons class-name slot))
+            (v (and (not (deleted-p new-node)) (%node-segment-value new-node slot))))
+        (if v
+            (let ((seg (%ensure-segment graph class-name slot (length v))))
+              (segment-put seg (id new-node) v))
+            ;; value cleared/invalidated or node now deleted -> drop any entry
+            (let ((seg (gethash key (vector-segments graph))))
+              (when seg (segment-remove seg (id new-node)))))))))
+
+(defmethod apply-tx-write-to-vector-segments ((write tx-delete) graph)
+  (let* ((node (node write))
+         (class-name (class-name (class-of node))))
+    (dolist (slot (node-vector-index-slots (class-of node)))
+      (let ((seg (gethash (cons class-name slot) (vector-segments graph))))
+        (when seg (segment-remove seg (id node)))))))
+
 (defgeneric apply-tx-writes-to-vector-segments (writes graph)
   (:method (writes graph)
     (dolist (write writes) (apply-tx-write-to-vector-segments write graph))))

@@ -91,3 +91,69 @@ lazily creates the segment and stores the vector under the node id."
                  "a nil embedding must not create a segment"))
         (close-graph g :snapshot-p nil))
       (collect-garbage))))
+
+(test update-overwrites-the-vector (with-temp-directory (dir)
+  (let ((g (make-graph *integration-graph-name* (namestring dir) :buffer-pool-size 1000))
+        (id nil))
+    (unwind-protect
+         (progn
+           (let ((*graph* g))
+             (with-transaction () (setf id (id (make-si-doc :title "a" :embedding (%si-embedding 8 1.0)))))
+             (with-transaction ()
+               (let ((v (copy (lookup-vertex id))))
+                 (setf (slot-value v 'embedding) (%si-embedding 8 5.0))
+                 (save v))))
+           (let ((back (graph-db::segment-get (%si-segment g 'embedding) id)))
+             (is (typep back '(simple-array single-float (*))))
+             (is (every #'= (%si-embedding 8 5.0) back))))
+      (close-graph g :snapshot-p nil))
+    (collect-garbage))))
+
+(test clearing-the-value-removes-the-entry (with-temp-directory (dir)
+  (let ((g (make-graph *integration-graph-name* (namestring dir) :buffer-pool-size 1000))
+        (id nil))
+    (unwind-protect
+         (progn
+           (let ((*graph* g))
+             (with-transaction () (setf id (id (make-si-doc :title "a" :embedding (%si-embedding 8 1.0)))))
+             (with-transaction ()
+               (let ((v (copy (lookup-vertex id))))
+                 (setf (slot-value v 'embedding) nil)
+                 (save v))))
+           (is (null (graph-db::segment-get (%si-segment g 'embedding) id))
+               "an update to nil must remove the segment entry"))
+      (close-graph g :snapshot-p nil))
+    (collect-garbage))))
+
+(test delete-removes-the-entry (with-temp-directory (dir)
+  (let ((g (make-graph *integration-graph-name* (namestring dir) :buffer-pool-size 1000))
+        (id nil))
+    (unwind-protect
+         (progn
+           (let ((*graph* g))
+             (with-transaction () (setf id (id (make-si-doc :title "a" :embedding (%si-embedding 8 1.0)))))
+             (with-transaction () (mark-deleted (lookup-vertex id :graph g))))
+           (is (null (graph-db::segment-get (%si-segment g 'embedding) id))
+               "deleting a node must remove its segment entry"))
+      (close-graph g :snapshot-p nil))
+    (collect-garbage))))
+
+(test wrong-dimension-signals-and-rolls-back (with-temp-directory (dir)
+  (let ((g (make-graph *integration-graph-name* (namestring dir) :buffer-pool-size 1000))
+        (id nil))
+    (unwind-protect
+         (progn
+           (let ((*graph* g))
+             (with-transaction () (setf id (id (make-si-doc :title "a" :embedding (%si-embedding 8 1.0)))))
+             ;; a 9-dim vector into an established 8-dim segment must signal
+             (signals error
+               (let ((*graph* g))
+                 (with-transaction ()
+                   (make-si-doc :title "bad" :embedding (%si-embedding 9 2.0))))))
+           ;; the good node is still there; the bad transaction rolled back
+           (is (every #'= (%si-embedding 8 1.0)
+                      (graph-db::segment-get (%si-segment g 'embedding) id)))
+           (is (= 1 (graph-db::segment-live-count (%si-segment g 'embedding)))
+               "the rolled-back insert must not have landed in the segment"))
+      (close-graph g :snapshot-p nil))
+    (collect-garbage))))
