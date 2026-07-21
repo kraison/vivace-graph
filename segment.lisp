@@ -286,6 +286,32 @@ free list."
   (let ((slot (%seg-slot-of segment id)))
     (when slot (%seg-read-vector segment slot))))
 
+(defun rebuild-vector-segment (graph class-name slot-name)
+  "Rebuild the (CLASS-NAME, SLOT-NAME) segment from live nodes: drop any current
+segment/file, create a fresh one sized to the first conforming vector, and
+segment-put every live node's conforming value.  Registers and returns the fresh
+segment.  Run when quiescent (at open, before writes) -- it mutates outside the
+transaction path, like rebuild-spatial-index."
+  (let* ((key (cons class-name slot-name))
+         (table (vector-segments graph))
+         (path (%segment-file graph class-name slot-name)))
+    (let ((old (gethash key table)))
+      (when old (close-vector-segment old)))
+    (remhash key table)
+    (ignore-errors (delete-file path))
+    (let ((seg nil))
+      (map-vertices
+       (lambda (node)
+         (unless (deleted-p node)
+           (let ((v (%node-segment-value node slot-name)))
+             (when v
+               (unless seg
+                 (setf seg (create-vector-segment path (length v)))
+                 (setf (gethash key table) seg))
+               (segment-put seg (id node) v)))))
+       graph :vertex-type class-name)
+      seg)))
+
 (defun segment-remove (segment id)
   "Remove ID from the segment, pushing its slot onto the free list.  Returns T
 if ID was present, NIL otherwise.  A freed slot's id-array cell is marked with

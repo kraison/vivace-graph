@@ -43,6 +43,31 @@ composite-key format (RESTORE runs after the node tables are open)."
               (rebuild-spatial-index graph :precision (or precision 7))))
         (init-spatial-index graph))))
 
+(defun all-node-classes-with-vector-index-slots (graph)
+  "The node classes of GRAPH that declare at least one :VECTOR-INDEX slot."
+  (loop for nt in (all-node-types graph)
+        for name = (if (node-type-p nt) (node-type-name nt) nt)
+        for class = (and name (find-class name nil))
+        when (and class (class-finalized-p class)
+                  (node-vector-index-slots class))
+          collect class))
+
+(defun restore-vector-segments (graph)
+  "For every class with :VECTOR-INDEX slots, open each existing segment as-is if
+it was cleanly closed, else rebuild it from nodes.  Runs at open, before the graph
+accepts writes (quiescent)."
+  (dolist (class (all-node-classes-with-vector-index-slots graph))
+    (let ((class-name (class-name class)))
+      (dolist (slot (node-vector-index-slots class))
+        (let ((path (%segment-file graph class-name slot)))
+          (when (probe-file path)
+            (let ((seg (open-vector-segment path)))
+              (if (segment-clean-shutdown-p seg)
+                  (setf (gethash (cons class-name slot) (vector-segments graph)) seg)
+                  (progn
+                    (close-vector-segment seg)
+                    (rebuild-vector-segment graph class-name slot))))))))))
+
 (defun make-graph (name location &key master-p slave-p master-host
                                    replication-port replication-key package
                                    replay-txn-dir (buffer-pool-p t)
@@ -315,6 +340,10 @@ Always CLOSE-GRAPH when finished."
         (when regenerate-views
           (regenerate-all-views graph))
         (restore-spatial-index graph)
+        ;; Vector segments (Phase 2 step 6): reopen-or-rebuild, same story as
+        ;; the spatial index.  Runs after UPDATE-SCHEMA so node classes are
+        ;; instantiated/finalized, and before the graph starts taking writes.
+        (restore-vector-segments graph)
         (with-open-file (out dirty-file :direction :output)
           (format out "~S" (get-universal-time)))
         (setf (gethash name *graphs*) graph)
@@ -406,6 +435,12 @@ in place, forcing recovery on the next OPEN-GRAPH."
     (when (lhash-p (edge-table graph))
       (log:info "Closing ~A" (edge-table graph))
       (close-lhash (edge-table graph)))
+    ;; Vector segments (Phase 2 step 6): close every registered segment (each
+    ;; marks itself clean on close, read back by RESTORE-VECTOR-SEGMENTS as
+    ;; the open-as-is-vs-rebuild decision on the next open).
+    (maphash (lambda (k seg) (declare (ignore k)) (close-vector-segment seg))
+             (vector-segments graph))
+    (clrhash (vector-segments graph))
     (when (memory-p (indexes graph))
       (log:info "Closing ~A" (indexes graph))
       (close-memory (indexes graph)))

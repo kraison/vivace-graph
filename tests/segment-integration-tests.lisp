@@ -209,3 +209,79 @@ lazily creates the segment and stores the vector under the node id."
                "no segment should have been established by a rolled-back transaction"))
       (close-graph g :snapshot-p nil))
     (collect-garbage))))
+
+(test segment-survives-clean-reopen
+  "After a clean close, reopening the graph opens the segment as-is and its
+vectors are intact."
+  (with-temp-directory (dir)
+    (let ((id nil))
+      (let ((g (make-graph *integration-graph-name* (namestring dir) :buffer-pool-size 1000)))
+        (let ((*graph* g))
+          (with-transaction () (setf id (id (make-si-doc :title "a" :embedding (%si-embedding 8 3.0))))))
+        (close-graph g :snapshot-p nil))
+      (let ((g (open-graph *integration-graph-name* (namestring dir))))
+        (unwind-protect
+             (let ((back (graph-db::segment-get (%si-segment g 'embedding) id)))
+               (is (typep back '(simple-array single-float (*))))
+               (is (every #'= (%si-embedding 8 3.0) back)))
+          (close-graph g :snapshot-p nil)))
+      (collect-garbage))))
+
+(test invariant-segment-matches-rebuild
+  "After an arbitrary create/update/delete sequence, the live segment equals a
+fresh rebuild-from-nodes: same id set, same vectors."
+  (with-temp-directory (dir)
+    (let ((g (make-graph *integration-graph-name* (namestring dir) :buffer-pool-size 1000))
+          (kept '()))
+      (unwind-protect
+           (progn
+             (let ((*graph* g))
+               ;; create 12
+               (dotimes (i 12)
+                 (with-transaction ()
+                   (let ((n (make-si-doc :title (format nil "n~d" i)
+                                         :embedding (%si-embedding 8 (coerce i 'single-float)))))
+                     (push (cons i (id n)) kept))))
+               ;; delete 3
+               (dolist (i '(2 5 9))
+                 (with-transaction () (mark-deleted (lookup-vertex (cdr (assoc i kept)) :graph g)))
+                 (setf kept (remove i kept :key #'car)))
+               ;; update 2 (copy-modify-save)
+               (dolist (i '(0 7))
+                 (with-transaction ()
+                   (let ((v (copy (lookup-vertex (cdr (assoc i kept)) :graph g))))
+                     (setf (slot-value v 'embedding)
+                           (%si-embedding 8 (coerce (+ 100 i) 'single-float)))
+                     (save v)))))
+             ;; snapshot the live segment's (id -> vector) map
+             (let* ((live (%si-segment g 'embedding))
+                    (live-map (make-hash-table :test 'equalp))
+                    ;; captured BEFORE rebuild-vector-segment runs: it closes
+                    ;; and replaces the currently-registered segment, so LIVE's
+                    ;; own live-count is unreadable after that call.
+                    (live-count-before (graph-db::segment-live-count live)))
+               (dolist (cell kept)
+                 (setf (gethash (cdr cell) live-map)
+                       (graph-db::segment-get live (cdr cell))))
+               ;; rebuild from nodes into a fresh segment and compare
+               (let ((rebuilt (graph-db::rebuild-vector-segment g 'si-doc 'embedding)))
+                 (is (= (hash-table-count live-map)
+                        (graph-db::segment-live-count rebuilt))
+                     "rebuild has a different id count than the live segment")
+                 ;; direct id-count invariant: the LIVE segment's own occupancy
+                 ;; must equal the rebuild's -- catches a stale/leaked entry
+                 ;; (e.g. a deleted id maintenance failed to remove) that the
+                 ;; kept-only comparison above cannot see, since KEPT already
+                 ;; excludes deleted ids by construction.
+                 (is (= live-count-before
+                        (graph-db::segment-live-count rebuilt))
+                     "live segment's live-count differs from a fresh rebuild's ~
+live-count -- the live segment likely retains an entry the rebuild does not")
+                 (loop for id being the hash-keys of live-map using (hash-value v)
+                       for r = (graph-db::segment-get rebuilt id)
+                       do (is (typep r '(simple-array single-float (*)))
+                              "id missing from rebuild")
+                          (is (and v (every #'= v r))
+                              "vector differs between live and rebuilt")))))
+        (close-graph g :snapshot-p nil))
+      (collect-garbage))))
