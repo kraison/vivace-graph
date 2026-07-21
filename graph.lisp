@@ -75,6 +75,28 @@ owner segment ONCE, not once per subclass."
             (push key keys)))))
     (nreverse keys)))
 
+(defun %vector-segment-owner-has-nodes-p (graph owner-name)
+  "True when OWNER-NAME's vertex type index holds at least one live entry,
+subclasses included -- i.e. when REBUILD-VECTOR-SEGMENT's MAP-VERTICES sweep of
+OWNER-NAME could visit anything at all.
+
+Reads the TYPE INDEX only and stops at the first id: it never calls
+LOOKUP-VERTEX, so it does not deserialize a single node, where the sweep it
+guards deserializes every one of them.  (Same non-local exit out of
+MAP-INDEX-LIST that INDEX-LIST-MEMBER-P uses.)
+
+Deliberately conservative: an index list holding only DELETED nodes still
+answers T (the memory backend keeps deleted ids indexed by design), so this can
+only ever permit a sweep that finds nothing -- never suppress one that would
+have found something."
+  (dolist (type-id (resolve-node-type-ids owner-name :vertex :graph graph) nil)
+    (let ((il (get-type-index-list (vertex-index graph) type-id)))
+      (when il
+        (map-index-list (lambda (id)
+                          (declare (ignore id))
+                          (return-from %vector-segment-owner-has-nodes-p t))
+                        il)))))
+
 (defun restore-vector-segments (graph)
   "For every distinct (OWNER, SLOT) :VECTOR-INDEX segment, open the existing
 segment as-is if it was cleanly closed, else rebuild it from nodes (a rebuild
@@ -89,26 +111,58 @@ the case REBUILD-VECTOR-SEGMENT exists for.  Skipping it -- the old behaviour --
 opened the graph clean with a permanently empty vector index, no warning and no
 error, so VECTOR-SEARCH returned nothing for a corpus that was entirely intact
 in the vertices; it also made \"delete the segment file and let it rebuild\", the
-intuitive operator recovery, a silent no-op.  A rebuild that finds no conforming
-vector creates no segment, so the ordinary case -- a graph that declares a
-:VECTOR-INDEX slot but has never stored a vector -- stays silent.  Recovering
-vectors from a file that should have existed does warn: the file did not go
-missing by itself."
+intuitive operator recovery, a silent no-op.  Recovering vectors from a file
+that should have existed does warn: the file did not go missing by itself.
+
+But an absent file is ALSO the normal state of a slot that has never been
+written -- segments are created lazily on the first conforming write -- and
+there the rebuild would sweep the whole corpus, find nothing, create nothing,
+and so leave no file for the NEXT open to find either: the same fruitless sweep
+on every open thereafter, forever.  Nothing about that state is an error, so it
+must not cost anything.  The sweep is therefore gated on
+%VECTOR-SEGMENT-OWNER-HAS-NODES-P: an owner class with no nodes in the type
+index is skipped outright, in O(1) and without deserializing a node.
+
+That gate bounds the empty-owner case exactly; it does NOT bound the other
+never-written shape, an owner class that is FULL of nodes none of which has a
+vector yet -- the migration window REBUILD-VECTOR-SEGMENT-BATCHED exists for.
+That case still pays one counting sweep per open (no segment is created, so no
+puts and no second pass), and it self-terminates the moment any vector is
+written, because that write creates the file.  Bounding it too would take a
+persisted \"nothing to index here\" marker, which is a new on-disk artifact
+whose staleness would reintroduce exactly the silent-empty-index bug above;
+deliberately not done here."
   (dolist (key (all-vector-segment-owner-keys graph))
     (destructuring-bind (owner-name . slot) key
       (let ((path (%segment-file graph owner-name slot)))
-        (if (probe-file path)
-            (let ((seg (open-vector-segment path)))
-              (if (segment-clean-shutdown-p seg)
-                  (setf (gethash (cons owner-name slot) (vector-segments graph)) seg)
-                  (progn
-                    (close-vector-segment seg)
-                    (rebuild-vector-segment graph owner-name slot))))
-            (let ((seg (rebuild-vector-segment graph owner-name slot)))
-              (when seg
-                (warn "vector segment file ~A was missing at open; rebuilt ~D ~
-                       entries from the vertices, which are authoritative."
-                      path (segment-live-count seg)))))))))
+        (cond
+          ((probe-file path)
+           (let ((seg (open-vector-segment path)))
+             (if (segment-clean-shutdown-p seg)
+                 (setf (gethash (cons owner-name slot) (vector-segments graph)) seg)
+                 (progn
+                   (close-vector-segment seg)
+                   ;; Warn BEFORE, not after: on a large corpus this rebuild is
+                   ;; the reason the open appears to hang, and an operator who
+                   ;; only learns about it once it finishes has been told
+                   ;; nothing useful.  The missing-file branch below warns after
+                   ;; instead, because there the recovered count IS the
+                   ;; diagnostic and a graph that legitimately has no vectors
+                   ;; must stay silent.
+                   (warn "vector segment ~A was not closed cleanly; rebuilding it ~
+                          from the vertices, which are authoritative.  This scans ~
+                          every ~A node and can take a while on a large corpus."
+                         path owner-name)
+                   (rebuild-vector-segment graph owner-name slot)))))
+          ((%vector-segment-owner-has-nodes-p graph owner-name)
+           (let ((seg (rebuild-vector-segment graph owner-name slot)))
+             (when seg
+               (warn "vector segment file ~A was missing at open; rebuilt ~D ~
+                      entries from the vertices, which are authoritative."
+                     path (segment-live-count seg)))))
+          ;; No file and no nodes of the owner type: nothing to index, nothing
+          ;; to warn about, and nothing to scan.
+          (t nil))))))
 
 (defun vector-search (graph class-name slot-name query-vector k)
   "Top-K nodes of CLASS-NAME (and its subclasses) whose SLOT-NAME vector is

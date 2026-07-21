@@ -423,8 +423,9 @@ against a concurrent segment-put/segment-remove."
 (defun rebuild-vector-segment (graph owner-name slot-name)
   "Rebuild the (OWNER-NAME, SLOT-NAME) segment from live nodes: drop any current
 segment/file, create a fresh one whose dimension comes from the first conforming
-vector and whose capacity is sized to the live count, and segment-put every live
-node's conforming value.  Registers and returns the fresh segment, or NIL if no
+vector and whose capacity is (MAX 1024 LIVE-COUNT) -- the corpus size, but never
+below CREATE-VECTOR-SEGMENT's own default -- and segment-put every live node's
+conforming value.  Registers and returns the fresh segment, or NIL if no
 live node has a conforming vector (in which case no segment is created at all).
 Run when quiescent (at open, before writes) -- it mutates outside the
 transaction path, like rebuild-spatial-index.
@@ -467,18 +468,43 @@ later design question, not a one-line patch."
       (when old (close-vector-segment old)))
     (remhash key table)
     (ignore-errors (delete-file path))
-    ;; Counting pre-pass, so the fresh file is sized to its corpus.  Creating at
-    ;; CREATE-VECTOR-SEGMENT's 1024 default made a fresh file ~4 MB; 8x that is
-    ;; far under the 1 GiB reservation floor, so the reservation landed on the
-    ;; floor and in-place doubling stalled at 131,072 entries.  RESTORE-VECTOR-
-    ;; SEGMENTS calls this automatically whenever the clean-shutdown flag is
-    ;; unset, i.e. after a hard crash -- so above 131,072 entries automatic
-    ;; crash recovery could not complete at all.  Sizing the create to the live
-    ;; count derives the reservation from a realistic size instead, and removes
-    ;; ~8 doubling-and-relocate passes from every rebuild as well.  The sweep is
-    ;; already O(corpus) and runs quiescent, so a second pass is cheap next to
-    ;; the relocations it deletes.  Both passes use the identical predicate, so
-    ;; the count cannot undershoot the puts.
+    ;; Counting pre-pass, so the fresh file is CREATED at its corpus size.
+    ;;
+    ;; WHY: a segment's mmap reservation is computed once, from the file's size
+    ;; AT CREATE TIME -- max(*mmap-reservation-multiplier* x size,
+    ;; *mmap-min-reservation*, size), mmap.lisp -- and the segment can never
+    ;; grow past it in place.  Creating at CREATE-VECTOR-SEGMENT's 1024 default
+    ;; made a fresh file ~4 MB, 8x of which is far under the 1 GiB floor, so the
+    ;; reservation landed on the floor and in-place doubling stalled at 131,072
+    ;; entries.  RESTORE-VECTOR-SEGMENTS calls this rebuild automatically
+    ;; whenever the clean-shutdown flag is unset, i.e. after a hard crash -- so
+    ;; above 131,072 entries automatic crash recovery could not complete at all.
+    ;; Creating at the corpus size derives the reservation from a realistic file
+    ;; instead, and removes ~8 doubling-and-relocate passes from the rebuild.
+    ;;
+    ;; SIZED EXACTLY, no growth headroom -- and note that headroom would NOT be
+    ;; merely a deferred first grow: because the reservation is a multiple of
+    ;; the created size, 2x headroom would also double the post-rebuild ceiling,
+    ;; ~8x corpus -> ~16x.  Exact sizing is chosen anyway: ~8x corpus is ample
+    ;; for recovery, below a ~128 MB file the 1 GiB floor dominates the multiple
+    ;; entirely, and the capacity a rebuild leaves behind should state what the
+    ;; corpus IS rather than guess at future growth.  Wave 2 reasons about this
+    ;; same arithmetic -- do not re-derive it from "headroom only defers a
+    ;; grow", which is false.
+    ;;
+    ;; CONSEQUENCE, accepted: a rebuild leaves live == capacity with an empty
+    ;; free list, so the very next vector write does grow and relocate at once
+    ;; -- one O(corpus) memcpy under the manager lock, per rebuild.  Safe (the
+    ;; reservation is ample), but real; it is not deferred to some later
+    ;; threshold.
+    ;;
+    ;; COST of the pre-pass itself: a second full O(corpus) MAP-VERTICES sweep,
+    ;; which deserializes every node again via LOOKUP-VERTEX -- plausibly dearer
+    ;; per node than the intra-mmap memcpys it removes, and unmeasured either
+    ;; way.  It is bought for the RESERVATION, which is what made recovery
+    ;; impossible above 131,072 entries; the relocation saving is a side effect,
+    ;; not the justification.  Both passes use the identical predicate, so the
+    ;; count cannot undershoot the puts.
     (let ((dimension nil)
           (live-count 0))
       (map-vertices

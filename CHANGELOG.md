@@ -28,8 +28,45 @@ between releases; cutting a release renames it to the new version and dates it.
   migration path for a corpus written before the slot was declared
   `:vector-index`, distinct from crash recovery's `rebuild-vector-segment`
   (full drop-and-rebuild), which `restore-vector-segments` still uses.
+- `vector-segment-capacity-exhausted` — an exported condition (readers
+  `vsce-owner`, `vsce-slot`, `vsce-required`, `vsce-reserved`,
+  `vsce-needed-bytes`) signalled when applying a transaction would have to grow
+  a vector segment past its mmap reservation. Its report says how to recover:
+  reopen the graph (the reservation is recomputed from the file's current size
+  at open), or raise `*mmap-reservation-multiplier*` / `*mmap-min-reservation*`
+  before opening.
 
 ### Fixed
+- **A vector segment could not grow past its mmap reservation without
+  corrupting the transaction.** The growth attempt failed inside the apply path,
+  after the transaction was already durable, so the segment and the nodes
+  disagreed. The capacity a transaction needs is now validated *before*
+  durability, under the segment's read lock, and an over-large transaction is
+  rejected with `vector-segment-capacity-exhausted` and rolled back cleanly —
+  nothing is journaled and the segment is untouched.
+- **Automatic crash recovery of a vector segment could not complete above
+  131,072 entries.** `rebuild-vector-segment` created the fresh segment at the
+  1024-entry default, and a segment's address-space reservation is derived from
+  its file size *at create time*, so a ~4 MB fresh file reserved only the 1 GiB
+  floor and in-place doubling ran out of reservation at 131,072 entries — while
+  `restore-vector-segments` calls exactly this rebuild whenever the segment's
+  clean-shutdown flag is unset. A rebuild is now created at the corpus size, so
+  its reservation is derived from a realistic file (and ~8 doubling-and-relocate
+  passes disappear from every rebuild).
+
+### Changed
+- **A missing vector-segment file is now rebuilt at open, not ignored.**
+  `restore-vector-segments` used to skip a segment whose file was absent, so a
+  graph whose segment file had been lost (or deleted by an operator expecting a
+  rebuild) opened clean with a permanently empty vector index, no warning and no
+  error, and `vector-search` returned nothing for a corpus that was entirely
+  intact in the vertices. The vertices are authoritative, so the segment is
+  rebuilt from them and the recovery is reported with a warning. A graph that
+  has simply never stored a vector is *not* swept: an owner class with no nodes
+  in the type index is skipped outright, so a declared-but-never-written
+  `:vector-index` slot costs nothing at open.
+- **An unclean (dirty-flag) segment rebuild at open now warns before it
+  starts**, so a multi-minute rebuild of a large segment is not silent.
 - **Snapshot/replay lost specialized vectors (issue #56).** `snapshot` → `replay`
   could not round-trip a graph whose nodes had a vector-valued slot that was not
   a byte vector: the restore readtable overrode `#(` to coerce *every* vector to

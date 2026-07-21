@@ -734,14 +734,17 @@ a separate (SI-SUB . EMBEDDING) segment would appear."
   ;; so a missing segment file meant the graph opened clean with a permanently
   ;; empty vector index and no diagnostic at all.
   (with-temp-directory (dir)
-    (let ((g (make-graph *integration-graph-name* (namestring dir) :buffer-pool-size 1000))
-          (path nil))
-      (let ((*graph* g))
-        (dotimes (i 25)
-          (with-transaction ()
-            (make-si-doc :title "n" :embedding (%si-embedding 8 (float i 1.0))))))
-      (setf path (graph-db::%segment-file g 'si-doc 'embedding))
-      (close-graph g :snapshot-p t)
+    (let* ((g (make-graph *integration-graph-name* (namestring dir) :buffer-pool-size 1000))
+           (path (graph-db::%segment-file g 'si-doc 'embedding)))
+      (unwind-protect
+           (let ((*graph* g))
+             (dotimes (i 25)
+               (with-transaction ()
+                 (make-si-doc :title "n" :embedding (%si-embedding 8 (float i 1.0))))))
+        ;; unwind-protect like every other graph in this file: a failure in the
+        ;; insert loop must not leak an open graph (and its mmaps) into the rest
+        ;; of the suite.
+        (close-graph g :snapshot-p t))
       (delete-file path)
       (let ((g2 (open-graph *integration-graph-name* (namestring dir) :buffer-pool-size 1000)))
         (unwind-protect
@@ -749,5 +752,77 @@ a separate (SI-SUB . EMBEDDING) segment would appear."
                (is (not (null seg)) "a missing segment file must not leave the index absent")
                (is (= 25 (graph-db::segment-live-count seg))
                    "the segment must be rebuilt from the vertices, which are authoritative"))
+          (close-graph g2 :snapshot-p nil)))
+      (collect-garbage))))
+
+(test clean-reopen-opens-the-segment-as-is
+  ;; TRIPWIRE for the branch nothing else asserts directly: a CLEAN reopen must
+  ;; OPEN the existing segment, never rebuild it.  The suite covered that only
+  ;; indirectly (by contents, which both branches produce), and the failure mode
+  ;; it guards against -- a full corpus sweep on every open that no test notices
+  ;; -- is exactly the shape of a bug already found once in this area.
+  ;;
+  ;; 1100 makes the two branches tell themselves apart by capacity alone: the
+  ;; live apply path creates at 1024 and grows by DOUBLING, so it lands on 2048,
+  ;; while a rebuild creates at (max 1024 live) = 1100.  The numbers can never
+  ;; coincide, so an unchanged 2048 across the reopen proves the open-as-is
+  ;; branch ran.  (close-graph writes the clean flag whether or not it
+  ;; snapshots, so :snapshot-p nil is a clean close.)
+  (with-temp-directory (dir)
+    (let ((g (make-graph *integration-graph-name* (namestring dir) :buffer-pool-size 1000))
+          (cap-before nil))
+      (unwind-protect
+           (progn
+             (let ((*graph* g))
+               (dotimes (i 1100)
+                 (with-transaction ()
+                   (make-si-doc :title "n" :embedding (%si-embedding 8 (float i 1.0))))))
+             (setf cap-before (graph-db::segment-capacity (%si-segment g 'embedding)))
+             (is (= 2048 cap-before)
+                 "the live apply path should have doubled 1024 -> 2048 for 1100 ~
+                  entries; got ~D (if this changed, pick new numbers that still ~
+                  distinguish doubling from a corpus-sized rebuild)"
+                 cap-before))
+        (close-graph g :snapshot-p nil))
+      (let ((g2 (open-graph *integration-graph-name* (namestring dir) :buffer-pool-size 1000)))
+        (unwind-protect
+             (let ((seg (%si-segment g2 'embedding)))
+               (is (= 1100 (graph-db::segment-live-count seg)))
+               (is (= cap-before (graph-db::segment-capacity seg))
+                   "a clean reopen must open the segment as-is: capacity ~D became ~
+                    ~D, which is what a rebuild (max 1024 1100) would have created"
+                   cap-before (graph-db::segment-capacity seg)))
+          (close-graph g2 :snapshot-p nil)))
+      (collect-garbage))))
+
+(test never-written-slot-is-not-swept-at-open
+  ;; A missing segment file is rebuilt (see above) -- but a slot that has never
+  ;; been written legitimately has no file either.  There the rebuild sweeps the
+  ;; whole corpus, finds nothing, creates nothing, and so leaves no file for the
+  ;; NEXT open either: the same fruitless sweep on every open, forever.  The
+  ;; sweep is therefore gated on the owner's TYPE INDEX.
+  (with-temp-directory (dir)
+    (let ((g (make-graph *integration-graph-name* (namestring dir) :buffer-pool-size 1000)))
+      (unwind-protect
+           (is (not (graph-db::%vector-segment-owner-has-nodes-p g 'si-doc))
+               "an owner class with no nodes at all must not be swept at open")
+        (close-graph g :snapshot-p nil))
+      (let ((g2 (open-graph *integration-graph-name* (namestring dir) :buffer-pool-size 1000)))
+        (unwind-protect
+             (progn
+               (is (null (%si-segment g2 'embedding))
+                   "a declared-but-never-written :vector-index slot must open with ~
+                    no segment")
+               (is (null (probe-file (graph-db::%segment-file g2 'si-doc 'embedding)))
+                   "...and no file, which is why the missing-file rebuild has to be ~
+                    gated: nothing would ever end the cycle")
+               ;; And the gate opens again the moment the owner class has nodes,
+               ;; so a genuinely LOST file is still rebuilt (that case is
+               ;; missing-segment-file-is-rebuilt-not-ignored).  A node with no
+               ;; vector is enough: the gate is deliberately conservative.
+               (let ((*graph* g2))
+                 (with-transaction () (make-si-doc :title "no-vec")))
+               (is (graph-db::%vector-segment-owner-has-nodes-p g2 'si-doc)
+                   "an owner class WITH nodes must still be swept"))
           (close-graph g2 :snapshot-p nil)))
       (collect-garbage))))
