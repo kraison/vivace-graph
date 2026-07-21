@@ -440,9 +440,76 @@ them.  Rounds (rather than one long round) because scan cost is O(capacity) --
 a single big segment quickly makes each scan so expensive that only a handful
 run, which is exactly how this test would have become vacuous.")
 
-(defun %scan-race-round (dim puts nscanners)
+(defun %race-id (i)
+  "The 16-byte node id the concurrency helpers use for index I: I little-endian
+in the first two bytes, every other byte zero.  Distinct for I < 65536, and
+never all-ones in its first 8 bytes (which %SEG-CHECK-ID rejects).
+
+Being able to run this BACKWARDS is the point -- see %RACE-ID-INDEX: a scan
+that hands back an id no writer ever stored is a torn read of the id array,
+and that is only detectable because the id encoding is checkable."
+  (let ((id (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0)))
+    (setf (aref id 0) (mod i 256)
+          (aref id 1) (floor i 256))
+    id))
+
+(defun %race-id-index (id limit)
+  "The index %RACE-ID encoded into ID, or NIL if ID is not a well-formed race
+id drawn from a universe of LIMIT ids.  A torn id read -- e.g. a scan that
+checked the free marker, then read the 16 bytes after a concurrent
+SEGMENT-REMOVE stamped +FREE-SLOT-MARKER+ over the first half -- fails the
+all-zero tail check loudly instead of decoding to a plausible index."
+  (and (typep id '(array (unsigned-byte 8) (*)))
+       (= (length id) 16)
+       (loop for k from 2 below 16 always (zerop (aref id k)))
+       (let ((n (+ (aref id 0) (* 256 (aref id 1)))))
+         (and (< n limit) n))))
+
+(defun %race-pattern (dim which)
+  "One of exactly TWO vectors, A (WHICH = 0, all +1.0) and B (WHICH = 1, all
+-1.0), used by the overwrite and churn races.
+
+They are chosen so that, against the query vector A, their cosines are exactly
++1.0 and -1.0 -- the two extreme, maximally separated legal values -- and so
+that they differ in EVERY component.  That second property is what makes a torn
+read arithmetically impossible to mistake for a legal one: splicing the first J
+components of one onto the tail of the other gives dot = J - (DIM - J) over
+norms sqrt(DIM) * sqrt(DIM), i.e. a cosine of (2J - DIM)/DIM.  That equals a
+legal +/-1.0 ONLY at J = DIM or J = 0 (i.e. no tear at all); every other splice
+point lands at least 2/DIM = 0.0156 away from both bands, 15x the 1e-3
+tolerance.  A tear in the middle of a 4-byte element is even louder: it decodes
+to an Inf/NaN pattern, which %SEG-DECODE-INTO turns into a FLOATING-POINT
+error that kills the scanner thread.
+
+This is why the bands are +/-1 rather than the more obvious 1.0 / 0.0: with an
+orthogonal B a torn read still scores inside [-1, 1] and near the middle of the
+range, where a plain range check is blind."
+  (make-array dim :element-type 'single-float
+                  :initial-element (if (zerop which) 1.0 -1.0)))
+
+(defun %race-band (score)
+  "0 if SCORE is the cosine of pattern A against the query, 1 if it is pattern
+B's, NIL if it is neither -- i.e. a torn read.  A NaN fails both comparisons,
+and merely comparing one may trap on SBCL, which is equally a bad read."
+  (handler-case
+      (cond ((not (realp score)) nil)
+            ((< (abs (- score 1.0)) 1e-3) 0)
+            ((< (abs (+ score 1.0)) 1e-3) 1)
+            (t nil))
+    (arithmetic-error () nil)))
+
+(defun %scan-race-round (dim puts nscanners &key reader)
   "One round of the growing-writes race: a fresh capacity-2 segment, PUTS
 distinct growing commits on this thread, NSCANNERS threads scanning throughout.
+
+READER, if given, is the READ OPERATION under test: a function of (SEGMENT
+QUERY-VECTOR) returning a list of (score . id) hits.  It defaults to
+SEGMENT-SCAN with k = 2*PUTS (i.e. unbounded in practice), which is what
+SCAN-IS-SAFE-AGAINST-GROWING-WRITES uses.  Parameterising it lets
+SEGMENT-SCORE-SUBSET be raced against the identical writer, with the identical
+three detectors, rather than duplicating this whole harness -- the two readers
+differ only in how they choose which slots to touch, and every torn-read
+signature is the same for both.
 
 Returns (values SCANS BAD SHORT ERRS CAPS), where BAD holds scores that were
 not a real number in [-1, 1], SHORT holds (committed-before-scan . hits-seen)
@@ -464,7 +531,10 @@ race, and could lose the very evidence this test exists to collect)."
                 (let ((q (let ((v (make-array dim :element-type 'single-float
                                                   :initial-element 0.0)))
                            (setf (aref v 0) 1.0)
-                           v)))
+                           v))
+                      (read-op (or reader
+                                   (lambda (seg query)
+                                     (segment-scan seg query (* 2 puts))))))
                   (dotimes (i nscanners)
                     (push (bordeaux-threads:make-thread
                            (lambda ()
@@ -477,7 +547,7 @@ race, and could lose the very evidence this test exists to collect)."
                                                    ;; took the read lock, so all
                                                    ;; of them must be visible
                                                    (n0 committed)
-                                                   (hits (segment-scan s q (* 2 puts))))
+                                                   (hits (funcall read-op s q)))
                                               (incf scans)
                                               ;; sampled AFTER the scan, so a capacity
                                               ;; change mid-scan is still captured --
@@ -620,6 +690,432 @@ capacity store, this test FAILS."
         "scanners only ever observed ~D distinct capacit~:@P ~S -- scans never ~
 overlapped a %seg-grow window, so this run provides no growth coverage"
         (length caps) caps)))
+
+(test score-subset-is-safe-against-growing-writes
+  "SEGMENT-SCORE-SUBSET's READ LOCK, proven the same way SEGMENT-SCAN's is.
+The identical writer (a fresh capacity-2 segment grown to 128 slots by 128
+distinct commits, ~6 %SEG-GROW relocations per round), the identical three
+detectors, but the read operation under test is SEGMENT-SCORE-SUBSET over a
+candidate set holding every id the writer will ever commit.
+
+This is a SEPARATE hazard from the scan's, not a restatement of it.
+SEGMENT-SCORE-SUBSET resolves each candidate through the RAM ID->SLOT hash and
+then reads that slot's vector at an offset derived from the CURRENT capacity
+(%SEG-VEC-OFFSET).  Both halves race a growing commit independently: the offset
+can be computed from the new capacity before the relocated bytes are visible
+(or from the old capacity after the id array has already been extended over the
+old block), and the hash itself is a plain, unsynchronized EQUALP table that
+SEGMENT-PUT is concurrently (SETF GETHASH)-ing into.  Neither is reachable
+through SEGMENT-SCAN, which never touches the hash at all.
+
+Passing the FULL committed id universe as the candidate set is what keeps
+detector (3) -- no committed id may go missing -- meaningful here: every id
+counted by the pre-scan COMMITTED sample is in the candidate list, so a legal
+result can never be shorter than that count.  Ids not yet committed are
+absent from the segment and are silently skipped, which is
+SEGMENT-SCORE-SUBSET's documented contract.
+
+VERIFIED LOAD-BEARING: with only SEGMENT-SCORE-SUBSET's read lock removed
+ (SEGMENT-SCAN's left in place), this test FAILS."
+  (let ((candidates (loop for i from 0 below 128 collect (%race-id i)))
+        (scans 0) (bad '()) (short '()) (errs '()) (caps '()))
+    (dotimes (round *scan-race-rounds*)
+      (declare (ignorable round))
+      (multiple-value-bind (n b sh e c)
+          ;; SIX scorer threads, not the growing-writes test's three: one
+          ;; SEGMENT-SCORE-SUBSET call over 128 candidates costs far more than
+          ;; one scan of the same round's (mostly small) capacity -- 128 EQUALP
+          ;; hash lookups on 16-byte keys dominate -- so at three threads a
+          ;; whole run managed only ~200 scorings, uncomfortably close to the
+          ;; 120 floor below.  Six threads take it to ~1500, a 13x margin, so a
+          ;; slower or loaded machine cannot drift the floor into flakiness.
+          (%scan-race-round 128 128 6
+                            :reader (lambda (seg query)
+                                      (segment-score-subset seg query candidates)))
+        (incf scans n)
+        (setf bad (append b bad)
+              short (append sh short)
+              errs (append e errs)
+              caps (union c caps))))
+    (is (null errs)
+        "~D scorer thread(s) died on a torn read: ~S"
+        (length errs) (subseq errs 0 (min 3 (length errs))))
+    (is (plusp scans) "the scorers never ran -- test proves nothing")
+    (is (> scans (* 10 *scan-race-rounds*))
+        "only ~D subset scorings across ~D rounds -- too few to have raced the writer"
+        scans *scan-race-rounds*)
+    (is (null bad)
+        "~D torn reads: out-of-range scores ~S"
+        (length bad) (subseq bad 0 (min 5 (length bad))))
+    (is (null short)
+        "~D scorings missed already-committed ids (committed . seen): ~S"
+        (length short) (subseq short 0 (min 5 (length short))))
+    (is (> (length caps) 1)
+        "scorers only ever observed ~D distinct capacit~:@P ~S -- they never ~
+overlapped a %seg-grow window, so this run provides no growth coverage"
+        (length caps) caps)))
+
+(defparameter *churn-race-rounds* 6
+  "Independent rounds SCAN-IS-SAFE-AGAINST-PUT-REMOVE-CHURN runs.  Rounds rather
+than one long run for the same reason the growing-writes test uses them: the
+race is timing-dependent, so a single round is an anecdote.")
+
+(defun %churn-race-round (dim nids nscanners passes)
+  "One round of the put/remove churn race: a segment prefilled with NIDS ids,
+a writer doing PASSES full passes of remove/remove/put/put on this thread, and
+NSCANNERS threads scanning throughout.
+
+The writer pairs id I with id (I + NIDS/2), removes BOTH, then re-puts them in
+the SAME order -- so the first put claims the free-list head, which is the
+SECOND id's slot, and the two ids SWAP slots.  That is deliberate: a
+remove-then-put of a single id would pop the slot it just pushed and land back
+where it started, the free list would recycle without ever moving anything, and
+the duplicate-id detector below would be dead code.  Swapping across half the
+array instead means every id migrates a long way on every pass, which is what
+makes a sweep able to see one twice.
+
+Each pass also rewrites the vectors: id I gets pattern A or B by the parity of
+ (I + PASS).  Because the writer advances one PAIR at a time, both patterns are
+present in the segment at every instant, so a correctly-locked scan always sees
+both bands -- a deterministic non-vacuity check that does not depend on winning
+any race.
+
+Returns (values SCANS BAD ILLEGAL DUPS MONO MISSES ERRS WERR CAP LIVE):
+
+  BAD      scores in neither legal band (torn vector read),
+  ILLEGAL  returned ids that no writer ever stored (torn id-array read),
+  DUPS     ids returned TWICE by one scan (a slot swap seen from both ends),
+  MONO     scans that saw only one of the two patterns,
+  MISSES   scans returning fewer than NIDS-2 hits (at most one pair is ever
+           mid-swap, so no legal scan can be shorter than that),
+  ERRS     errors that killed a scanner, WERR one that killed the writer,
+  CAP/LIVE the segment's final capacity and live count.
+
+As in %SCAN-RACE-ROUND, each scanner accumulates into its OWN lists and hands
+them back through JOIN-THREAD, and STOP plus the joins run in the CLEANUP form
+ahead of CLOSE-VECTOR-SEGMENT so a signalling writer can never unmap the
+segment out from under a live scanner."
+  (let ((path (%qpath)))
+    (unwind-protect
+         (let ((s (create-vector-segment path dim :initial-capacity nids))
+               (stop nil)
+               (scanners '())
+               (scans 0) (bad '()) (illegal '()) (dups '()) (mono 0)
+               (misses '()) (errs '()) (werr nil) (cap 0) (live 0))
+           (unwind-protect
+                (let* ((pa (%race-pattern dim 0))
+                       (pb (%race-pattern dim 1))
+                       (q pa)
+                       (half (floor nids 2)))
+                  (dotimes (i nids)
+                    (segment-put s (%race-id i) (if (evenp i) pa pb)))
+                  (dotimes (n nscanners)
+                    (declare (ignorable n))
+                    (push (bordeaux-threads:make-thread
+                           (lambda ()
+                             (let ((scans 0) (bad '()) (illegal '()) (dups '())
+                                   (mono 0) (misses '()) (err nil))
+                               (handler-case
+                                   (loop until stop
+                                         do (let ((hits (segment-scan s q (* 2 nids)))
+                                                  (seen (make-hash-table :test 'equalp))
+                                                  (band0 0) (band1 0))
+                                              (incf scans)
+                                              (dolist (hit hits)
+                                                (let ((b (%race-band (car hit)))
+                                                      (id (cdr hit)))
+                                                  (case b
+                                                    (0 (incf band0))
+                                                    (1 (incf band1))
+                                                    (t (push (princ-to-string (car hit)) bad)))
+                                                  (unless (%race-id-index id nids)
+                                                    (push (princ-to-string id) illegal))
+                                                  (if (gethash id seen)
+                                                      (push (princ-to-string id) dups)
+                                                      (setf (gethash id seen) t))))
+                                              (when (< (length hits) (- nids 2))
+                                                (push (length hits) misses))
+                                              (when (or (zerop band0) (zerop band1))
+                                                (incf mono))))
+                                 (error (e) (setf err (princ-to-string e))))
+                               (list scans bad illegal dups mono misses err)))
+                           :name "segment-churn-scanner")
+                          scanners))
+                  (handler-case
+                      (loop for p from 1 to passes
+                            do (dotimes (i half)
+                                 (let ((a (%race-id i))
+                                       (b (%race-id (+ i half))))
+                                   (segment-remove s a)
+                                   (segment-remove s b)
+                                   (segment-put s a (if (evenp (+ i p)) pa pb))
+                                   (segment-put s b (if (evenp (+ i half p)) pa pb)))))
+                    (error (e) (setf werr (princ-to-string e))))
+                  (setf cap (segment-capacity s)
+                        live (segment-live-count s))
+                  (setf stop t))
+             (progn
+               (setf stop t)
+               (dolist (th scanners)
+                 (handler-case
+                     (destructuring-bind (n b il d m ms e)
+                         (bordeaux-threads:join-thread th)
+                       (incf scans n)
+                       (incf mono m)
+                       (setf bad (append b bad)
+                             illegal (append il illegal)
+                             dups (append d dups)
+                             misses (append ms misses))
+                       (when e (push e errs)))
+                   (error (e) (push (princ-to-string e) errs))))
+               (close-vector-segment s)))
+           (values scans bad illegal dups mono misses errs werr cap live))
+      (ignore-errors (delete-file path)))))
+
+(test scan-is-safe-against-put-remove-churn
+  "SEGMENT-REMOVE's WRITE LOCK.  A writer doing continuous remove/put churn --
+so the free list is actively recycling slots and ids MIGRATE between them --
+against continuously scanning threads.
+
+The invariant the growing-writes test relies on does not survive here: with
+removes in flight an id may legitimately vanish, so \"no committed id is
+missing\" is no longer assertable.  What replaces it is strictly structural,
+and every one of these is impossible under the write lock (a scan holds the
+read lock for its WHOLE sweep, so no mutation can interleave with it):
+
+  (1) no scanner thread may die;
+  (2) every returned id must be an id the writer actually stores -- a scan that
+      checks a slot's free marker and then reads its 16 bytes after a concurrent
+      SEGMENT-REMOVE has stamped +FREE-SLOT-MARKER+ over the first half returns
+      an id with 0xFF bytes in a region %RACE-ID always leaves zero;
+  (3) no id may appear TWICE in one scan result -- only possible if an id
+      migrated from an already-swept slot to a not-yet-swept one MID-SWEEP,
+      which the read lock forbids outright;
+  (4) every score must be within 1e-3 of one of the two legal pattern cosines
+      (+1.0 / -1.0), so a torn vector read is caught as well;
+  (5) no scan may return fewer than NIDS-2 hits -- at most one PAIR is ever
+      mid-swap.
+
+Non-vacuity is asserted three ways: a floor on the scan count (a starved or
+dead scanner fails loudly rather than passing silently); the writer must not
+have died; and every scan must have observed BOTH vector patterns, which is
+deterministic rather than race-dependent because the writer advances one pair
+at a time and so leaves both patterns present at every instant.  The free list
+must also demonstrably have RECYCLED: ~6 x 400 x 16 puts against a capacity
+asserted to still be NIDS means every put after the first NIDS reused a freed
+slot rather than appending.
+
+VERIFIED LOAD-BEARING: with only SEGMENT-REMOVE's write lock removed, this
+test FAILS."
+  (let ((nids 16)
+        (scans 0) (bad '()) (illegal '()) (dups '()) (mono 0)
+        (misses '()) (errs '()) (werrs '()) (caps '()) (lives '()))
+    (dotimes (round *churn-race-rounds*)
+      (declare (ignorable round))
+      (multiple-value-bind (n b il d m ms e we cap live)
+          (%churn-race-round 128 nids 3 400)
+        (incf scans n)
+        (incf mono m)
+        (setf bad (append b bad)
+              illegal (append il illegal)
+              dups (append d dups)
+              misses (append ms misses)
+              errs (append e errs))
+        (when we (push we werrs))
+        (pushnew cap caps)
+        (pushnew live lives)))
+    (is (null errs)
+        "~D scanner thread(s) died during put/remove churn: ~S"
+        (length errs) (subseq errs 0 (min 3 (length errs))))
+    (is (null werrs)
+        "~D writer thread(s) died during put/remove churn: ~S"
+        (length werrs) (subseq werrs 0 (min 3 (length werrs))))
+    (is (plusp scans) "the scanners never ran -- test proves nothing")
+    (is (> scans (* 10 *churn-race-rounds*))
+        "only ~D scans across ~D rounds -- too few to have raced the churn"
+        scans *churn-race-rounds*)
+    (is (null illegal)
+        "~D scan hits returned an id no writer ever stored (torn id-array read): ~S"
+        (length illegal) (subseq illegal 0 (min 5 (length illegal))))
+    (is (null dups)
+        "~D ids appeared twice in a single scan (an id migrated mid-sweep): ~S"
+        (length dups) (subseq dups 0 (min 5 (length dups))))
+    (is (null bad)
+        "~D torn vector reads: scores in neither legal band ~S"
+        (length bad) (subseq bad 0 (min 5 (length bad))))
+    (is (null misses)
+        "~D scans returned fewer than ~D hits, but only one pair is ever ~
+mid-swap: ~S"
+        (length misses) (- nids 2) (subseq misses 0 (min 5 (length misses))))
+    (is (zerop mono)
+        "~D scans saw only ONE of the two vector patterns -- the writer was not ~
+actually churning under them, so this run proves nothing" mono)
+    (is (equal (list nids) caps)
+        "capacity should have stayed ~D (every put after the prefill reusing a ~
+freed slot); observed ~S -- the free list did not recycle, so removes were not ~
+exercised" nids caps)
+    (is (equal (list nids) lives)
+        "live-count should end at ~D every round, observed ~S" nids lives)))
+
+(defparameter *overwrite-race-rounds* 6
+  "Independent rounds SCAN-IS-SAFE-AGAINST-CONCURRENT-OVERWRITES runs.")
+
+(defun %overwrite-race-round (dim nids nscanners passes)
+  "One round of the CONCURRENT-OVERWRITE race (spec sec 3.1's second hazard):
+a segment prefilled with NIDS ids that are never added to or removed, and a
+writer that repeatedly REWRITES their vectors in place -- SEGMENT-PUT's
+existing-id branch, which no other test in this file ever runs under a
+concurrent reader -- while NSCANNERS threads scan.
+
+Every slot holds one of exactly two patterns (%RACE-PATTERN), flipped by the
+parity of (id-index + pass), so a correctly-locked scan may only ever see
+cosines of +1.0 and -1.0, and BOTH are present at every instant (the writer
+advances one slot at a time).
+
+Returns (values SCANS BAD DUPS MONO SHORT ERRS WERR): BAD holds scores in
+neither band -- the torn-read detector -- DUPS ids seen twice in one scan,
+MONO scans that saw only one pattern, SHORT scans that did not return exactly
+NIDS hits (nothing is ever added or removed, so any other length is a
+failure), ERRS scanner deaths and WERR a writer death.
+
+STOP and the joins are in the CLEANUP form ahead of CLOSE-VECTOR-SEGMENT, so a
+signalling writer cannot unmap the segment out from under a live scanner."
+  (let ((path (%qpath)))
+    (unwind-protect
+         (let ((s (create-vector-segment path dim :initial-capacity nids))
+               (stop nil)
+               (scanners '())
+               (scans 0) (bad '()) (dups '()) (mono 0) (short '())
+               (errs '()) (werr nil))
+           (unwind-protect
+                (let* ((pa (%race-pattern dim 0))
+                       (pb (%race-pattern dim 1))
+                       (q pa))
+                  (dotimes (i nids)
+                    (segment-put s (%race-id i) (if (evenp i) pa pb)))
+                  (dotimes (n nscanners)
+                    (declare (ignorable n))
+                    (push (bordeaux-threads:make-thread
+                           (lambda ()
+                             (let ((scans 0) (bad '()) (dups '()) (mono 0)
+                                   (short '()) (err nil))
+                               (handler-case
+                                   (loop until stop
+                                         do (let ((hits (segment-scan s q (* 2 nids)))
+                                                  (seen (make-hash-table :test 'equalp))
+                                                  (band0 0) (band1 0))
+                                              (incf scans)
+                                              (dolist (hit hits)
+                                                (let ((b (%race-band (car hit)))
+                                                      (id (cdr hit)))
+                                                  (case b
+                                                    (0 (incf band0))
+                                                    (1 (incf band1))
+                                                    (t (push (princ-to-string (car hit)) bad)))
+                                                  (if (gethash id seen)
+                                                      (push (princ-to-string id) dups)
+                                                      (setf (gethash id seen) t))))
+                                              (unless (= (length hits) nids)
+                                                (push (length hits) short))
+                                              (when (or (zerop band0) (zerop band1))
+                                                (incf mono))))
+                                 (error (e) (setf err (princ-to-string e))))
+                               (list scans bad dups mono short err)))
+                           :name "segment-overwrite-scanner")
+                          scanners))
+                  (handler-case
+                      (loop for p from 1 to passes
+                            do (dotimes (i nids)
+                                 (segment-put s (%race-id i)
+                                              (if (evenp (+ i p)) pa pb))))
+                    (error (e) (setf werr (princ-to-string e))))
+                  (setf stop t))
+             (progn
+               (setf stop t)
+               (dolist (th scanners)
+                 (handler-case
+                     (destructuring-bind (n b d m sh e)
+                         (bordeaux-threads:join-thread th)
+                       (incf scans n)
+                       (incf mono m)
+                       (setf bad (append b bad)
+                             dups (append d dups)
+                             short (append sh short))
+                       (when e (push e errs)))
+                   (error (e) (push (princ-to-string e) errs))))
+               (close-vector-segment s)))
+           (values scans bad dups mono short errs werr))
+      (ignore-errors (delete-file path)))))
+
+(test scan-is-safe-against-concurrent-overwrites
+  "SEGMENT-PUT's WRITE LOCK on the OVERWRITE path -- the hazard the design spec
+names in sec 3.1 (\"overwriting a multi-kilobyte vector with SET-BYTES is not
+atomic, so a lock-free scan could read one candidate mid-write and score
+garbage\") and that nothing else in this file exercises: every put in the
+growing-writes race uses a DISTINCT id, so SEGMENT-PUT's existing-id branch
+never once runs under a concurrent scanner.
+
+Here the id set is fixed and fully present from the start; the writer only ever
+rewrites vectors in place, and %SEG-WRITE-VECTOR's SET-BYTES of DIM*4 bytes is
+the unprotected window.
+
+THE DETECTOR IS THE POINT.  A range check on [-1, 1] is nearly useless for this
+hazard -- a half-overwritten vector almost always still scores inside the legal
+cosine range, so a test built on it would be green and prove nothing.  Instead
+every slot holds one of exactly TWO patterns whose cosines against the query
+are the two EXTREMES, +1.0 and -1.0, and which differ in every component (see
+%RACE-PATTERN).  A correctly-locked scan can therefore only ever return scores
+within 1e-3 of +1.0 or -1.0.  A torn read splices a prefix of one pattern onto
+the tail of the other and scores (2J - DIM)/DIM, which for any splice point
+other than the ends is at least 0.0156 from BOTH bands -- 15x the tolerance, so
+a tear is arithmetically incapable of masquerading as a legal read.  A tear
+inside a 4-byte element is louder still: it decodes to Inf/NaN and kills the
+scanner outright.
+
+Non-vacuity: a floor on the scan count; the writer must not have died; every
+scan must return exactly NIDS hits (nothing is added or removed); and every
+scan must have observed BOTH patterns -- deterministic, not race-dependent,
+because the writer flips one slot at a time and so leaves both present at every
+instant.
+
+VERIFIED LOAD-BEARING: with only SEGMENT-PUT's write lock removed, this test
+FAILS."
+  (let ((scans 0) (bad '()) (dups '()) (mono 0) (short '())
+        (errs '()) (werrs '()))
+    (dotimes (round *overwrite-race-rounds*)
+      (declare (ignorable round))
+      (multiple-value-bind (n b d m sh e we)
+          (%overwrite-race-round 128 16 3 600)
+        (incf scans n)
+        (incf mono m)
+        (setf bad (append b bad)
+              dups (append d dups)
+              short (append sh short)
+              errs (append e errs))
+        (when we (push we werrs))))
+    (is (null errs)
+        "~D scanner thread(s) died on a torn overwrite: ~S"
+        (length errs) (subseq errs 0 (min 3 (length errs))))
+    (is (null werrs)
+        "~D writer thread(s) died: ~S"
+        (length werrs) (subseq werrs 0 (min 3 (length werrs))))
+    (is (plusp scans) "the scanners never ran -- test proves nothing")
+    (is (> scans (* 10 *overwrite-race-rounds*))
+        "only ~D scans across ~D rounds -- too few to have raced the overwriter"
+        scans *overwrite-race-rounds*)
+    (is (null bad)
+        "~D torn overwrite reads: scores in neither legal band (+1.0/-1.0) ~S"
+        (length bad) (subseq bad 0 (min 5 (length bad))))
+    (is (null dups)
+        "~D ids appeared twice in a single scan: ~S"
+        (length dups) (subseq dups 0 (min 5 (length dups))))
+    (is (null short)
+        "~D scans did not return all 16 ids, though none is ever added or ~
+removed: ~S"
+        (length short) (subseq short 0 (min 5 (length short))))
+    (is (zerop mono)
+        "~D scans saw only ONE of the two vector patterns -- the writer was not ~
+actually overwriting under them, so this run proves nothing" mono)))
 
 (test ranking-is-deterministic-across-rebuild
   "Scanning a segment, rebuilding it from nodes, and scanning again gives an
