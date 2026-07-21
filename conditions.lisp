@@ -102,3 +102,19 @@ which is not loaded/available."
                      (or (geos-required-operation error) "(unknown)"))))
   (:documentation "Signalled when an exact-topology operation has no
 dependency-free fallback and GEOS is unavailable."))
+
+(define-condition vector-segment-capacity-exhausted (error)
+  ((owner :initarg :owner :reader vsce-owner)
+   (slot :initarg :slot :reader vsce-slot)
+   (required :initarg :required :reader vsce-required)
+   (reserved :initarg :reserved :reader vsce-reserved)
+   (needed-bytes :initarg :needed-bytes :reader vsce-needed-bytes))
+  (:report (lambda (c s)
+             (format s "vector segment ~A/~A: growing to hold ~D entries needs ~D bytes, ~
+but its mmap reservation is ~D. Reopen the graph (the reservation is recomputed ~
+from the file's current size, which grants roughly 8x more headroom), or raise ~
+GRAPH-DB::*MMAP-RESERVATION-MULTIPLIER* / GRAPH-DB::*MMAP-MIN-RESERVATION* before opening."
+                     (vsce-owner c) (vsce-slot c) (vsce-required c)
+                     (vsce-needed-bytes c) (vsce-reserved c))))
+  (:documentation "Signalled pre-durability when applying a transaction would
+require growing a vector segment past its mmap reservation."))

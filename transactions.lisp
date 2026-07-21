@@ -1009,6 +1009,48 @@ either source) establishes the dimension."
 match established segment dimension ~D"
                             slot (car key) (length v) expected))))))))))))
 
+(defun validate-vector-segment-capacity (tx graph)
+  "Signal VECTOR-SEGMENT-CAPACITY-EXHAUSTED if applying TX would require growing
+a vector segment past its mmap reservation.  Runs in the same manager-locked,
+pre-FINALIZE-TX-PERSISTENCE region as VALIDATE-VECTOR-SEGMENT-DIMENSIONS and for
+the same reason: %SEG-GROW signals from inside APPLY-TRANSACTION, by which point
+the node write is already journaled, leaving a persisted node with no segment
+entry -- invisible to VECTOR-SEARCH, with no error and no self-correction.
+
+Conservative by design: it ignores the free list, so a transaction that would in
+fact reuse freed slots may abort slightly early.  Aborting early is recoverable;
+aborting after durability is not.
+
+A (owner, slot) with no committed segment cannot exhaust -- creation sizes the
+file -- so it is skipped."
+  (let ((new-ids (make-hash-table :test 'equal)))
+    ;; Count DISTINCT new ids per segment key: an id already in the segment
+    ;; reuses its slot, and the same id written twice in one transaction still
+    ;; claims only one.
+    (dolist (write (writes tx))
+      (let ((node (node write)))
+        (unless (deleted-p node)
+          (dolist (slot (node-vector-index-slots (class-of node)))
+            (let ((v (%node-segment-value node slot)))
+              (when v
+                (let* ((key (%segment-key node slot))
+                       (seg (gethash key (vector-segments graph))))
+                  (when (and seg (null (%seg-slot-of seg (id node))))
+                    (pushnew (id node) (gethash key new-ids) :test #'equalp)))))))))
+    (maphash
+     (lambda (key ids)
+       (let* ((seg (gethash key (vector-segments graph)))
+              (required (+ (segment-live-count seg) (length ids)))
+              (cap (segment-capacity seg)))
+         (loop while (< cap required) do (setf cap (* 2 cap)))
+         (let ((needed (%seg-file-bytes cap (segment-dimension seg)))
+               (reserved (m-reserved-size (segment-mmap seg))))
+           (when (> needed reserved)
+             (error 'vector-segment-capacity-exhausted
+                    :owner (car key) :slot (cdr key)
+                    :required required :needed-bytes needed :reserved reserved)))))
+     new-ids)))
+
 (defgeneric apply-tx-write-to-vector-segments (write graph)
   (:method (write graph) (declare (ignore write graph)) nil))
 
@@ -2350,6 +2392,10 @@ See CALL-WITH-READ-SNAPSHOT."
                ;; mismatch aborts before FINALIZE-TX-PERSISTENCE, so the node write
                ;; is never journaled/applied and no node/segment drift can occur.
                (validate-vector-segment-dimensions tx (graph tx))
+               ;; Vector-segment capacity check: same region, same reason.  A
+               ;; grow past the mmap reservation would otherwise signal from
+               ;; inside APPLY-TRANSACTION, i.e. after the node write is durable.
+               (validate-vector-segment-capacity tx (graph tx))
                (setf (transaction-id tx) (tx-id-counter tm))
                (incf (tx-id-counter tm))
                (prune-committed-transactions tm)

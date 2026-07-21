@@ -12,7 +12,8 @@
              (:predicate mapped-file-p))
   path pointer fd
   ;; Length, in bytes, of the virtual-address window reserved for this mapping
-  ;; (see *mmap-reservation-size*).  POINTER is fixed at the base of that window
+  ;; (computed at open from the file's size then: see *mmap-reservation-multiplier*
+  ;; and *mmap-min-reservation*).  POINTER is fixed at the base of that window
   ;; for the life of the mapping: the file is mapped into the head, and
   ;; extend-mapped-file maps more of it into the reserved tail with MAP_FIXED.
   ;; Because POINTER never moves and the reservation is never unmapped until
@@ -253,8 +254,11 @@ times SIZE (floored at *MMAP-MIN-RESERVATION*); pass RESERVATION to override."
          (new-len (+ old-len length)))
     (when (> new-len (m-reserved-size mapped-file))
       (error "mmap reservation exhausted for ~A: need ~D bytes, reserved ~D.~%~
-Raise *mmap-reservation-size* (or MAKE-GRAPH's heap/index size) before creating ~
-the graph."
+The reservation is computed at open from the file's size then, so reopening the ~
+graph recomputes it against the now-larger file and grants fresh headroom.  To ~
+raise it up front, bind GRAPH-DB::*MMAP-RESERVATION-MULTIPLIER* or ~
+GRAPH-DB::*MMAP-MIN-RESERVATION* (or MAKE-GRAPH's heap/index size) before ~
+opening the graph."
              (m-path mapped-file) new-len (m-reserved-size mapped-file)))
     ;; Extend the backing file first so the newly mapped pages have storage.
     (%posix-lseek (m-fd mapped-file) (1- new-len) +seek-set+)

@@ -649,3 +649,44 @@ a separate (SI-SUB . EMBEDDING) segment would appear."
                  "calling with the subclass name must still not create a separate segment"))
         (close-graph g :snapshot-p nil))
       (collect-garbage))))
+
+(test capacity-exhaustion-signals-and-rolls-back
+  (with-temp-directory (dir)
+    ;; A deliberately tiny reservation, so a few vectors exhaust it.  Bound
+    ;; BEFORE make-graph: the reservation is fixed when the mapping is created.
+    (let* ((graph-db::*mmap-min-reservation* (* 64 1024))
+           (graph-db::*mmap-reservation-multiplier* 1)
+           (g (make-graph *integration-graph-name* (namestring dir) :buffer-pool-size 1000))
+           (count-before nil)
+           (live-before nil))
+      (unwind-protect
+           (progn
+             (let ((*graph* g))
+               (with-transaction ()
+                 (make-si-doc :title "seed" :embedding (%si-embedding 8 1.0))))
+             (setf count-before (length (map-vertices #'identity g
+                                                      :collect-p t :vertex-type 'si-doc))
+                   live-before (graph-db::segment-live-count (%si-segment g 'embedding)))
+             ;; Keep inserting until the segment must grow past its reservation.
+             ;; The FIRST transaction that would exceed it must signal, and must
+             ;; signal BEFORE anything is journaled.
+             (signals graph-db::vector-segment-capacity-exhausted
+               (let ((*graph* g))
+                 (dotimes (i 100000)
+                   (with-transaction ()
+                     (make-si-doc :title "fill" :embedding (%si-embedding 8 (float i 1.0))))))))
+        (close-graph g :snapshot-p nil))
+      ;; THE POINT OF THIS TEST: the aborted transaction must not have persisted
+      ;; its node.  A test that only asserts "an error was signalled" passes
+      ;; against the broken behaviour this change exists to fix.
+      (let ((g2 (open-graph *integration-graph-name* (namestring dir))))
+        (unwind-protect
+             (let ((nodes (length (map-vertices #'identity g2 :collect-p t :vertex-type 'si-doc)))
+                   (live (graph-db::segment-live-count (%si-segment g2 'embedding))))
+               (is (= nodes live)
+                   "every persisted si-doc must have a segment entry: ~D nodes vs ~D live"
+                   nodes live)
+               (is (> nodes count-before) "the fill loop should have committed something")
+               (is (> live live-before)))
+          (close-graph g2 :snapshot-p nil)))
+      (collect-garbage))))
