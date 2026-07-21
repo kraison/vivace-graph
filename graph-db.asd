@@ -362,6 +362,7 @@
                ;; graph-tests -- discovered when CREATE-POPULATES-THE-SEGMENT
                ;; tried to MAKE-SI-DOC and hit "NIL is not of type NODE-TYPE").
                (:file "segment-integration-tests")
+               (:file "segment-query-tests")
                (:file "type-mapping-tests")
                (:file "graph-spatial-tests")
                (:file "spatial-hook-tests")

@@ -162,6 +162,8 @@
                 #:%make-topk
                 #:%topk-offer
                 #:%topk-results
+                #:%cosine
+                #:segment-scan
                 ;; type index
                 #:make-type-index
                 #:close-type-index

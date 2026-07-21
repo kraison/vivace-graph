@@ -445,3 +445,59 @@ scans."
             (remhash id (segment-id->slot segment))
             (serialize-uint64 mmap (1- (segment-live-count segment)) 40)
             t)))))
+
+;;; Query layer: segment-scan is a bounded top-k full-cosine sweep.  It takes
+;;; the segment's READ lock (mutations take the write side, so a scan is safe
+;;; against a concurrent growing commit) and touches ONLY the id array and the
+;;; contiguous vector block -- it never materialises a node, which is the
+;;; entire performance premise of the segment.
+
+(defun %vector-norm (v)
+  "Euclidean norm of V."
+  (declare (type (simple-array single-float (*)) v)
+           (optimize (speed 3) (safety 1)))
+  (let ((sum 0f0))
+    (declare (type single-float sum))
+    (dotimes (i (length v) (sqrt sum))
+      (incf sum (* (aref v i) (aref v i))))))
+
+(defun %cosine (a b)
+  "Full cosine similarity of two equal-length single-float vectors.  Returns
+0.0 when either has zero norm (no divide error).  This does NOT assume unit
+vectors -- the segment stores whatever the caller put in it."
+  (declare (type (simple-array single-float (*)) a b)
+           (optimize (speed 3) (safety 1)))
+  (let ((dot 0f0) (na 0f0) (nb 0f0))
+    (declare (type single-float dot na nb))
+    (dotimes (i (min (length a) (length b)))
+      (let ((x (aref a i)) (y (aref b i)))
+        (incf dot (* x y))
+        (incf na (* x x))
+        (incf nb (* y y))))
+    (if (or (zerop na) (zerop nb))
+        0f0
+        (/ dot (* (sqrt na) (sqrt nb))))))
+
+(defun segment-scan (segment query-vector k)
+  "Top-K by full cosine over every occupied slot, best first, as (score . id)
+conses.  Takes the segment's READ lock, so it is safe against a concurrent
+growing commit (which holds the write lock).
+
+Touches ONLY the id array and the contiguous vector block -- it never
+materialises a node, which is the entire point of the segment.
+
+Sweeps [0, capacity) skipping free cells -- occupied slots are NOT dense
+[0, live-count) once the free list has been used."
+  (declare (type (simple-array single-float (*)) query-vector))
+  (when (or (zerop k) (zerop (%vector-norm query-vector)))
+    (return-from segment-scan nil))
+  (with-read-lock ((segment-lock segment))
+    (let ((mmap (segment-mmap segment))
+          (cap (segment-capacity segment))
+          (collector (%make-topk k)))
+      (dotimes (slot cap)
+        (unless (= (deserialize-uint64 mmap (%seg-id-offset slot)) +free-slot-marker+)
+          (let ((id (get-bytes mmap (%seg-id-offset slot) +key-bytes+))
+                (v (%seg-read-vector segment slot)))
+            (%topk-offer collector (%cosine query-vector v) id))))
+      (%topk-results collector))))
