@@ -480,9 +480,9 @@ later design question, not a one-line patch."
 
 (defun rebuild-vector-segment-batched (graph owner-name slot-name
                                        &key (batch-size 5000) progress-fn)
-  "ADDITIVELY fill the (OWNER-NAME, SLOT-NAME) segment from live nodes, in
-batches of BATCH-SIZE, skipping ids the segment already holds.  Returns
- (values INSERTED SKIPPED).
+  "ADDITIVELY fill the (OWNER-NAME, SLOT-NAME) segment from live nodes,
+skipping ids the segment already holds, and calling PROGRESS-FN (if given)
+roughly every BATCH-SIZE insertions.  Returns (values INSERTED SKIPPED).
 
 Distinct from REBUILD-VECTOR-SEGMENT, which DROPS the existing segment and
 rebuilds from scratch -- that is the right shape for recovery (e.g. an unclean
@@ -492,14 +492,22 @@ chunks the live apply path never touched, so the segment must be filled in
 without disturbing what a later feature (over-fetch/re-rank) may already be
 reading from it.  Both are legitimate; do not merge them.
 
-OWNER-NAME is resolved through %VECTOR-INDEX-SLOT-OWNER-NAME (same as
-REBUILD-VECTOR-SEGMENT) to the segment's true OWNER -- the declaring class --
-and MAP-VERTICES is swept from that owner with its default
+OWNER-NAME's contract is NOT the same as REBUILD-VECTOR-SEGMENT's.
+REBUILD-VECTOR-SEGMENT does no resolution at all -- it uses its argument raw
+for the segment key, the file path, and the MAP-VERTICES sweep, and its
+docstring requires the caller to already have resolved it to the true owner.
+This function DOES resolve OWNER-NAME itself, through
+%VECTOR-INDEX-SLOT-OWNER-NAME, so passing any class in the hierarchy -- the
+true declaring owner OR a subclass -- reaches the same one owner segment.
+Do not assume the two functions can be called the same way.
+
+MAP-VERTICES is swept from the RESOLVED owner with its default
 :INCLUDE-SUBCLASSES-P T, so every subclass instance is visited into the ONE
 shared owner segment.  This is Model B: one segment per declaring class spans
 its subclasses, exactly matching what APPLY-TX-WRITE-TO-VECTOR-SEGMENTS
 maintains on the live create/update/delete path.  Getting this wrong -- e.g.
-keying or sweeping on a node's exact runtime class instead of the owner --
+sweeping on the raw, unresolved OWNER-NAME instead of the resolved owner, or
+keying on a node's exact runtime class instead of the resolved owner --
 previously produced a real LIVE-vs-REBUILT segment divergence.
 
 RESUMABLE BY CONSTRUCTION.  The segment itself records which ids it holds
@@ -511,42 +519,72 @@ rolled back, or the process died between the marker write and the segment
 write) is strictly worse than no marker, because it can claim work is done
 when the segment says otherwise. The segment is the only source of truth.
 
-PROGRESS-FN, if given, is called as (funcall progress-fn done total) once per
-flushed batch -- DONE is inserted+skipped so far, TOTAL is the number of
-conforming nodes seen so far in this run (the full total is not known ahead of
-time without a separate pass).  A migration over a real corpus takes minutes,
-not seconds, and a silent one looks hung."
+CONCURRENCY.  The caller must not invoke this concurrently with another
+migration of the SAME segment (whether via this function or via
+REBUILD-VECTOR-SEGMENT) -- %ENSURE-SEGMENT's get-or-create is non-atomic, and
+two concurrent creators of the same (OWNER . SLOT-NAME) segment could each
+CREATE-VECTOR-SEGMENT the same path, with one losing the table and its
+writes. This function calls %ENSURE-SEGMENT at most ONCE per invocation
+(lazily, on the first conforming vector seen, then reused for the rest of the
+sweep), which narrows -- but does not close -- that window; serialize
+migrations of a given segment at the call site. Credit where due: the READER
+side is already safe against a concurrent migration, because SEGMENT-PUT,
+SEGMENT-GET, SEGMENT-SCAN and SEGMENT-SCORE-SUBSET all take the segment's own
+per-segment rw-lock, so a concurrent VECTOR-SEARCH sees a consistent (if
+incomplete) snapshot of the segment while this runs, never a torn read.
+Deliberately does NOT take the transaction manager lock around the whole
+migration -- a long hold would stall every commit in the database for the
+migration's entire duration (a scan holding its lock is already a noted
+commit-latency bound elsewhere in this codebase).
+
+DESTRUCTIVE CORNER, inherited from %ENSURE-SEGMENT: if a segment FILE already
+exists on disk for (OWNER . SLOT-NAME) but is not registered in
+VECTOR-SEGMENTS, %ENSURE-SEGMENT treats it as absent and calls
+CREATE-VECTOR-SEGMENT, which rewrites the header and free-marks its capacity
+-- destroying whatever was already on disk. Unreachable via the normal open
+path (RESTORE-VECTOR-SEGMENTS registers any segment file whose owner class is
+still in the schema), but reachable if a :VECTOR-INDEX declaration is removed
+and later re-added with a stale file left behind from the earlier
+declaration.
+
+BATCH-SIZE is a progress-reporting CADENCE, not a memory-bounding buffer:
+SEGMENT-PUT writes straight to the mmap outside any transaction, so nothing
+about deferring writes bounds a transaction -- each conforming vector is put
+as soon as it is encountered, with nothing queued in memory.  PROGRESS-FN, if
+given, is called as (funcall progress-fn done seen) after every BATCH-SIZE-th
+insertion (and once more at the end for any partial remainder) -- DONE is
+inserted+skipped so far, SEEN is the number of conforming nodes encountered
+so far IN THIS RUN, not the corpus's grand total (which isn't known ahead of
+time without a separate pass, and this function does not compute one).  A
+migration over a real corpus takes minutes, not seconds, and a silent one
+looks hung."
   (let* ((owner (%vector-index-slot-owner-name (find-class owner-name) slot-name))
+         (key (cons owner slot-name))
+         (seg (gethash key (vector-segments graph)))
          (inserted 0)
          (skipped 0)
-         (pending '())         ; reverse-order (id . vector) conses awaiting flush
-         (pending-count 0)
-         (total 0))
-    (flet ((flush ()
-             (when pending
-               (dolist (pair (nreverse pending))
-                 (let ((seg (%ensure-segment graph owner slot-name (length (cdr pair)))))
-                   (segment-put seg (car pair) (cdr pair))
-                   (incf inserted)))
-               (setf pending '() pending-count 0)
-               (when progress-fn
-                 (funcall progress-fn (+ inserted skipped) total)))))
-      (map-vertices
-       (lambda (node)
-         (unless (deleted-p node)
-           (let ((v (%node-segment-value node slot-name)))
-             (when v
-               (incf total)
-               (let ((seg (%ensure-segment graph owner slot-name (length v))))
-                 (if (segment-get seg (id node))
-                     (incf skipped)
-                     (progn
-                       (push (cons (id node) v) pending)
-                       (incf pending-count)
-                       (when (>= pending-count batch-size)
-                         (flush)))))))))
-       graph :vertex-type owner)
-      (flush))
+         (seen 0)
+         (since-progress 0))
+    (map-vertices
+     (lambda (node)
+       (unless (deleted-p node)
+         (let ((v (%node-segment-value node slot-name)))
+           (when v
+             (incf seen)
+             (unless seg
+               (setf seg (%ensure-segment graph owner slot-name (length v))))
+             (if (segment-get seg (id node))
+                 (incf skipped)
+                 (progn
+                   (segment-put seg (id node) v)
+                   (incf inserted)
+                   (incf since-progress)
+                   (when (and progress-fn (>= since-progress batch-size))
+                     (setf since-progress 0)
+                     (funcall progress-fn (+ inserted skipped) seen))))))))
+     graph :vertex-type owner)
+    (when (and progress-fn (plusp since-progress))
+      (funcall progress-fn (+ inserted skipped) seen))
     (values inserted skipped)))
 
 (defun %id-less-p (a b)

@@ -475,16 +475,22 @@ rebuild branch, not the open-as-is branch")
   "Additive: inserts ids the segment lacks, skips ids it already holds, and
 reports both counts.  A rebuild that dropped and recreated the segment would
 report every id as inserted, which is what distinguishes this from
-REBUILD-VECTOR-SEGMENT."
+REBUILD-VECTOR-SEGMENT.  Also verifies the CONTENT written, not just counts:
+a zero vector, or a (car pair)/(cdr pair) mispairing, would pass a counts-only
+check (k=3 over 6 entries always returns 3 hits regardless of what is stored)
+but is caught here by checking two DIFFERENT ids against two DIFFERENT
+expected vectors."
   (with-temp-directory (dir)
     (let ((g (make-graph *integration-graph-name* (namestring dir)
-                         :buffer-pool-size 1000)))
+                         :buffer-pool-size 1000))
+          (ids (make-array 6)))
       (unwind-protect
            (let ((*graph* g))
              (dotimes (i 6)
                (with-transaction ()
-                 (make-si-doc :title (format nil "n~d" i)
-                              :embedding (%si-embedding 8 (coerce (1+ i) 'single-float)))))
+                 (setf (aref ids i)
+                       (id (make-si-doc :title (format nil "n~d" i)
+                                        :embedding (%si-embedding 8 (coerce (1+ i) 'single-float)))))))
              ;; everything is already indexed by the live apply path
              (multiple-value-bind (ins skip)
                  (rebuild-vector-segment-batched g 'si-doc 'embedding :batch-size 2)
@@ -499,6 +505,18 @@ REBUILD-VECTOR-SEGMENT."
                  (rebuild-vector-segment-batched g 'si-doc 'embedding :batch-size 2)
                (is (= 6 ins) "expected 6 inserted after drop, got ~D" ins)
                (is (= 0 skip) "expected 0 skipped after drop, got ~D" skip))
+             ;; content check against the raw segment: two DIFFERENT ids must
+             ;; come back with their own DISTINCT, correct vectors
+             (let ((seg (%si-segment g 'embedding)))
+               (is (not (null seg)) "the refilled owner segment must exist")
+               (let ((back0 (graph-db::segment-get seg (aref ids 0)))
+                     (back5 (graph-db::segment-get seg (aref ids 5))))
+                 (is (and back0 (every #'= (%si-embedding 8 1.0) back0))
+                     "node 0's refilled vector must match what it was written with")
+                 (is (and back5 (every #'= (%si-embedding 8 6.0) back5))
+                     "node 5's refilled vector must match what it was written with")
+                 (is (not (every #'= back0 back5))
+                     "node 0 and node 5 have distinct embeddings -- a mispairing would smuggle one node's vector under the other's id")))
              ;; and the refilled segment answers queries
              (let ((hits (vector-search g 'si-doc 'embedding
                                         (%si-embedding 8 6.0) 3)))
@@ -508,16 +526,20 @@ REBUILD-VECTOR-SEGMENT."
 (test batched-rebuild-resumes-after-interruption
   "Resumability comes from the segment itself: interrupt a rebuild partway,
 re-run it, and the result is complete with nothing duplicated and nothing
-missing.  PROGRESS-FN throwing mid-run is the interruption."
+missing.  PROGRESS-FN throwing mid-run is the interruption.  Also verifies
+CONTENT after resume, not just counts: two ids with distinct embeddings are
+checked directly against the owner segment."
   (with-temp-directory (dir)
     (let ((g (make-graph *integration-graph-name* (namestring dir)
-                         :buffer-pool-size 1000)))
+                         :buffer-pool-size 1000))
+          (ids (make-array 10)))
       (unwind-protect
            (let ((*graph* g))
              (dotimes (i 10)
                (with-transaction ()
-                 (make-si-doc :title (format nil "n~d" i)
-                              :embedding (%si-embedding 8 (coerce (1+ i) 'single-float)))))
+                 (setf (aref ids i)
+                       (id (make-si-doc :title (format nil "n~d" i)
+                                        :embedding (%si-embedding 8 (coerce (1+ i) 'single-float)))))))
              (let ((key (cons 'si-doc 'embedding)))
                (let ((s (gethash key (graph-db::vector-segments g))))
                  (when s (graph-db::close-vector-segment s)))
@@ -549,5 +571,81 @@ below proves nothing" partial))
                (is (= 10 (length hits)) "expected all 10 ids present, got ~D" (length hits))
                (when (= 10 (length hits))
                  (is (= 10 (length (remove-duplicates (mapcar #'cdr hits) :test #'equalp)))
-                     "duplicate ids after resume: ~S" (mapcar #'cdr hits)))))
+                     "duplicate ids after resume: ~S" (mapcar #'cdr hits))))
+             ;; content check against the raw segment: two DIFFERENT ids, DISTINCT
+             ;; vectors -- a mispairing or a zero-vector bug would not be caught
+             ;; by the counts-only / hit-count assertions above
+             (let ((seg (%si-segment g 'embedding)))
+               (is (not (null seg)) "the resumed owner segment must exist")
+               (let ((back0 (graph-db::segment-get seg (aref ids 0)))
+                     (back9 (graph-db::segment-get seg (aref ids 9))))
+                 (is (and back0 (every #'= (%si-embedding 8 1.0) back0))
+                     "node 0's vector after resume must match what it was written with")
+                 (is (and back9 (every #'= (%si-embedding 8 10.0) back9))
+                     "node 9's vector after resume must match what it was written with")
+                 (is (not (every #'= back0 back9))
+                     "node 0 and node 9 have distinct embeddings -- a mispairing would smuggle one node's vector under the other's id"))))
         (close-graph g :snapshot-p nil)))))
+
+(test batched-rebuild-covers-model-b-subclasses
+  "The batched rebuild must sweep subclass instances into the DECLARING
+class's owner segment (Model B), not a separate per-subclass segment --
+exactly what REBUILD-VECTOR-SEGMENT and the live apply path do.  Mutating the
+sweep from :VERTEX-TYPE OWNER to :VERTEX-TYPE OWNER-NAME (the raw, unresolved
+argument), or the segment key to (CLASS-OF NODE), passes both of the other two
+batched-rebuild tests -- they only ever create SI-DOC instances.  This test
+creates SI-SUB instances too, so it is the one that would fail under either
+mutation: the sweep would miss (or double-report) the subclass instances, and
+a separate (SI-SUB . EMBEDDING) segment would appear."
+  (with-temp-directory (dir)
+    (let ((g (make-graph *integration-graph-name* (namestring dir)
+                         :buffer-pool-size 1000))
+          (doc-ids (make-array 6))
+          (sub-ids (make-array 4)))
+      (unwind-protect
+           (let ((*graph* g))
+             (dotimes (i 6)
+               (with-transaction ()
+                 (setf (aref doc-ids i)
+                       (id (make-si-doc :title (format nil "d~d" i)
+                                        :embedding (%si-embedding 8 (coerce (1+ i) 'single-float)))))))
+             (dotimes (i 4)
+               (with-transaction ()
+                 (setf (aref sub-ids i)
+                       (id (make-si-sub :title (format nil "s~d" i) :extra "x"
+                                        :embedding (%si-embedding 8 (coerce (+ 50 i) 'single-float)))))))
+             ;; drop the owner segment entirely, then refill via the batched rebuild
+             (let ((key (cons 'si-doc 'embedding)))
+               (let ((s (gethash key (graph-db::vector-segments g))))
+                 (when s (graph-db::close-vector-segment s)))
+               (remhash key (graph-db::vector-segments g)))
+             (multiple-value-bind (ins skip)
+                 (rebuild-vector-segment-batched g 'si-doc 'embedding :batch-size 3)
+               (is (= 10 ins)
+                   "expected 6 si-doc + 4 si-sub = 10 inserted, got ~D" ins)
+               (is (= 0 skip) "expected 0 skipped on first fill, got ~D" skip))
+             (let ((owner-seg (%si-segment g 'embedding)))
+               (is (not (null owner-seg))
+                   "the owner segment must exist after the batched rebuild")
+               (dotimes (i 6)
+                 (let ((back (graph-db::segment-get owner-seg (aref doc-ids i))))
+                   (is (and back (every #'= (%si-embedding 8 (coerce (1+ i) 'single-float)) back))
+                       "si-doc ~D must resolve via segment-get on the owner segment with its own vector" i)))
+               (dotimes (i 4)
+                 (let ((back (graph-db::segment-get owner-seg (aref sub-ids i))))
+                   (is (and back (every #'= (%si-embedding 8 (coerce (+ 50 i) 'single-float)) back))
+                       "si-sub ~D must resolve via segment-get on the OWNER segment with its own vector" i))))
+             (is (null (gethash (cons 'si-sub 'embedding) (graph-db::vector-segments g)))
+                 "there must be no separate per-subclass si-sub segment under Model B")
+             ;; calling with the SUBCLASS name must resolve to the SAME owner
+             ;; segment and report everything already present
+             (multiple-value-bind (ins2 skip2)
+                 (rebuild-vector-segment-batched g 'si-sub 'embedding :batch-size 3)
+               (is (= 0 ins2)
+                   "expected 0 inserted when called via the subclass name, got ~D" ins2)
+               (is (= 10 skip2)
+                   "expected all 10 to be reported skipped via the subclass name, got ~D" skip2))
+             (is (null (gethash (cons 'si-sub 'embedding) (graph-db::vector-segments g)))
+                 "calling with the subclass name must still not create a separate segment"))
+        (close-graph g :snapshot-p nil))
+      (collect-garbage))))
