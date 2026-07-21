@@ -210,3 +210,123 @@ rather than signalling a divide error."
                         "zero-norm vector should score 0.0, got ~A" (car (second got)))))
              (close-vector-segment s)))
       (ignore-errors (delete-file path)))))
+
+(test score-subset-agrees-with-scan
+  "Scoring a candidate set gives the same scores and order as a full scan
+restricted to those ids.  This is the ANN seam: a future index proposes
+candidates and this scores them exactly."
+  (let ((path (%qpath)))
+    (unwind-protect
+         (let ((s (create-vector-segment path 4 :initial-capacity 8)))
+           (unwind-protect
+                (progn
+                  (loop for n from 1 to 5
+                        do (segment-put s (%qid n)
+                                        (%qvec 4 (coerce n 'single-float) 1.0 0.0 0.0)))
+                  (let* ((q (%qvec 4 1.0 1.0 0.0 0.0))
+                         (subset (list (%qid 2) (%qid 4)))
+                         (got (segment-score-subset s q subset))
+                         (full (segment-scan s q 10)))
+                    (is (= 2 (length got)) "expected 2 scored, got ~S" got)
+                    ;; every subset result must match that id's score in the full scan
+                    (dolist (pair got)
+                      (let ((from-scan (find (cdr pair) full :key #'cdr :test #'equalp)))
+                        (is (not (null from-scan)) "id missing from full scan")
+                        (is (< (abs (- (car pair) (car from-scan))) 1e-6)
+                            "score differs from scan: ~A vs ~A"
+                            (car pair) (car from-scan))))
+                    ;; and they must be in best-first order
+                    (is (>= (car (first got)) (car (second got))))))
+             (close-vector-segment s)))
+      (ignore-errors (delete-file path)))))
+
+(test score-subset-skips-unknown-ids
+  "Ids absent from the segment are skipped, not errors."
+  (let ((path (%qpath)))
+    (unwind-protect
+         (let ((s (create-vector-segment path 4 :initial-capacity 8)))
+           (unwind-protect
+                (progn
+                  (segment-put s (%qid 1) (%qvec 4 1.0 0.0 0.0 0.0))
+                  (let ((got (segment-score-subset s (%qvec 4 1.0 0.0 0.0 0.0)
+                                                   (list (%qid 1) (%qid 99)))))
+                    (is (= 1 (length got)))
+                    (is (equalp (%qid 1) (cdr (first got))))))
+             (close-vector-segment s)))
+      (ignore-errors (delete-file path)))))
+
+(test score-subset-empty-inputs
+  "An empty id list, and a zero-norm query, both return NIL."
+  (let ((path (%qpath)))
+    (unwind-protect
+         (let ((s (create-vector-segment path 4 :initial-capacity 4)))
+           (unwind-protect
+                (progn
+                  (segment-put s (%qid 1) (%qvec 4 1.0 0.0 0.0 0.0))
+                  (is (null (segment-score-subset s (%qvec 4 1.0 0.0 0.0 0.0) '())))
+                  (is (null (segment-score-subset s (%qvec 4 0.0 0.0 0.0 0.0)
+                                                  (list (%qid 1))))))
+             (close-vector-segment s)))
+      (ignore-errors (delete-file path)))))
+
+(test score-subset-hand-computed-non-unit-vector
+  "Reference score is computed BY HAND, not via %cosine, so a bare
+dot-product mutation is caught even though segment-scan uses the same
+scoring path.  Stored vector (2,0,0,0) against query (1,0,0,0): true cosine
+of two parallel vectors is 1.0 regardless of magnitude, but a bare dot
+product would give 2.0."
+  (let ((path (%qpath)))
+    (unwind-protect
+         (let ((s (create-vector-segment path 4 :initial-capacity 4)))
+           (unwind-protect
+                (progn
+                  (segment-put s (%qid 1) (%qvec 4 2.0 0.0 0.0 0.0))
+                  (let ((got (segment-score-subset s (%qvec 4 1.0 0.0 0.0 0.0)
+                                                   (list (%qid 1)))))
+                    (is (= 1 (length got)) "expected 1 scored, got ~S" got)
+                    (when (= 1 (length got))
+                      (is (< (abs (- (car (first got)) 1.0)) 1e-6)
+                          "expected cosine 1.0 for parallel vectors, got ~A (a bare dot product would give 2.0)"
+                          (car (first got))))))
+             (close-vector-segment s)))
+      (ignore-errors (delete-file path)))))
+
+(test score-subset-tiebreak-orders-by-ascending-id
+  "Equal-score candidates are ordered by ascending node-id, matching
+%score-before-p's tiebreak -- mirrors segment-scan's tiebreak test but goes
+through the subset path."
+  (let ((path (%qpath)))
+    (unwind-protect
+         (let ((s (create-vector-segment path 4 :initial-capacity 8)))
+           (unwind-protect
+                (progn
+                  ;; three identical vectors -> identical scores -> id-ascending order
+                  (segment-put s (%qid 3) (%qvec 4 1.0 0.0 0.0 0.0))
+                  (segment-put s (%qid 1) (%qvec 4 1.0 0.0 0.0 0.0))
+                  (segment-put s (%qid 2) (%qvec 4 1.0 0.0 0.0 0.0))
+                  (let ((got (segment-score-subset s (%qvec 4 1.0 0.0 0.0 0.0)
+                                                   (list (%qid 3) (%qid 1) (%qid 2)))))
+                    (is (= 3 (length got)) "expected 3 scored, got ~S" got)
+                    (when (= 3 (length got))
+                      (loop for n from 1 to 3
+                            for pair in got
+                            do (is (equalp (%qid n) (cdr pair))
+                                   "expected id ~D at rank ~D under the ascending-id tiebreak, got a different id"
+                                   n n)))))
+             (close-vector-segment s)))
+      (ignore-errors (delete-file path)))))
+
+(test score-subset-wrong-length-query-errors
+  "A query vector whose length does not match the segment dimension signals
+an error, mirroring segment-scan's check, rather than silently scoring
+against a prefix."
+  (let ((path (%qpath)))
+    (unwind-protect
+         (let ((s (create-vector-segment path 4 :initial-capacity 4)))
+           (unwind-protect
+                (progn
+                  (segment-put s (%qid 1) (%qvec 4 1.0 0.0 0.0 0.0))
+                  (signals error
+                    (segment-score-subset s (%qvec 3 1.0 0.0 0.0) (list (%qid 1)))))
+             (close-vector-segment s)))
+      (ignore-errors (delete-file path)))))

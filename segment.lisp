@@ -526,3 +526,46 @@ slot."
                   (v (%seg-read-vector segment slot)))
               (%topk-offer collector (%cosine-with-norm query-vector qnorm v) id))))
         (%topk-results collector)))))
+
+(defun segment-score-subset (segment query-vector node-ids)
+  "Score only NODE-IDS against QUERY-VECTOR by full cosine, best first, as
+ (score . id) conses.  Ids absent from the segment are silently skipped --
+this is required behavior, not an error: the caller (a future ANN index or
+an int8 pre-rank) proposes a candidate set that this function is not
+expected to fully own.
+
+This is the extension seam that keeps ANN addable: nothing here assumes it
+has seen every vector in the segment, unlike SEGMENT-SCAN which sweeps
+[0, capacity).
+
+QUERY-VECTOR's length must equal the segment's dimension -- validated up
+front, mirroring SEGMENT-SCAN's check, so a wrong-length query is rejected
+loudly instead of silently scored against a prefix.
+
+The query's own norm is computed ONCE here and threaded through
+%COSINE-WITH-NORM for every candidate, rather than recomputed per id.
+
+There is no k here -- the caller already supplied the candidate set -- so
+results are sorted into the same best-first total order SEGMENT-SCAN uses
+(score DESCENDING, node-id ASCENDING) via %SCORE-BEFORE-P, without being
+bounded to any k.
+
+Takes the segment's READ lock, like SEGMENT-SCAN: mutations take the write
+side, so this is safe against a concurrent growing commit."
+  (declare (type (simple-array single-float (*)) query-vector))
+  (unless (= (length query-vector) (segment-dimension segment))
+    (error "query vector length ~D does not match segment dimension ~D"
+           (length query-vector) (segment-dimension segment)))
+  (let ((qnorm (%vector-norm query-vector)))
+    (when (or (null node-ids) (zerop qnorm))
+      (return-from segment-score-subset nil))
+    (with-read-lock ((segment-lock segment))
+      (let ((out '()))
+        (dolist (id node-ids)
+          (let ((slot (%seg-slot-of segment id)))
+            (when slot
+              (push (cons (%cosine-with-norm query-vector qnorm (%seg-read-vector segment slot))
+                          id)
+                    out))))
+        (sort out (lambda (a b)
+                    (%score-before-p (car a) (cdr a) (car b) (cdr b))))))))

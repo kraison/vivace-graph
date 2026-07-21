@@ -164,6 +164,7 @@
                 #:%topk-results
                 #:%cosine
                 #:segment-scan
+                #:segment-score-subset
                 ;; type index
                 #:make-type-index
                 #:close-type-index
