@@ -311,3 +311,29 @@ gracefully as you approach it, it falls off.
 a CPU-bound regime and told us nothing about the regime that actually matters. Scaling
 projections across a memory hierarchy boundary are not projections, they are guesses —
 measure at the target size.
+
+### 13.1 Correction: the deployment host is odm (192 GB) — ANN, not int8
+
+The §13 recommendation above was written from an 18 GB laptop and reached for int8 because
+that machine's binding constraint was page cache. **The actual deployment host is `odm`,
+with 192 GB of RAM**, which changes the conclusion (Kevin, 2026-07-21):
+
+- At dim 1024 the cliff sits at roughly `192 GB / 4 KB` = **~48M vectors**. The corpus will
+  not approach that. **Memory is not, and was never going to be, the binding constraint on
+  the real host.**
+- The constraint that DOES bind on odm is CPU: the scan is ~1.85 ms per 1k vectors when
+  fully resident, so 1M vectors is **~1.9 s per query** even with zero paging. That is too
+  slow for interactive chat, and no amount of RAM fixes it.
+- Therefore **int8 quantization is the wrong lever here** — it reduces bytes, and bytes are
+  not the problem on a 192 GB host. **ANN/HNSW is the right direction when the time comes**,
+  because it reduces the number of vectors *examined*, which is the actual bottleneck.
+- Unchanged: ANN composes with `segment-score-subset` exactly as §5 specifies — the ANN
+  index proposes candidates, the seam rescores them exactly against the float32 block.
+
+§13's measurements stand as measured; only its recommendation is superseded. The cliff
+remains a real property of the design worth knowing (it will matter for any
+memory-constrained deployment, e.g. anything Android-side), it just does not govern odm.
+
+NOT YET MEASURED ON ODM: the ~1.9 s/1M CPU-bound figure is derived from this laptop's
+CPU-bound regime, not measured on odm's hardware. Given that two projections in this
+work were already wrong by 6x and 100x, treat it as a hypothesis until measured there.
