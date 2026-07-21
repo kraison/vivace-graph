@@ -16,7 +16,21 @@
   (mmap nil)                 ; a mapped-file (mmap.lisp)
   (dimension 0 :type fixnum) ; fixed at create time
   (id->slot nil)             ; equalp hash: 16-byte id vector -> slot index
-  (clean-at-open nil))       ; the on-disk clean flag as it was when this segment opened
+  (clean-at-open nil)        ; the on-disk clean flag as it was when this segment opened
+  ;; Per-segment reader/writer lock.  All PUBLIC mutations (segment-put,
+  ;; segment-remove) take the write side; public reads (segment-get,
+  ;; segment-scan, segment-score-subset) take the read side.  Never persisted --
+  ;; created fresh by create/open.
+  ;;
+  ;; NON-RECURSIVE: lock at PUBLIC boundaries only.  The %SEG-* internals are
+  ;; lock-free and assume the caller holds the lock -- segment-put ->
+  ;; %seg-claim-slot -> %seg-grow nests, so locking inside %seg-grow would
+  ;; self-deadlock.  Same idiom as the skip list.
+  ;;
+  ;; LOCK ORDER: the write side is only ever taken INSIDE the transaction
+  ;; manager lock (mutations run on the apply path); the read side is taken
+  ;; alone.  Never take the manager lock while holding a segment lock.
+  (lock (make-rw-lock)))
 
 (defun %seg-write-header (mmap &key magic format dimension element-type
                                     capacity live-count free-head)
@@ -274,27 +288,36 @@ free slot (or the next free index, growing the segment if necessary).  Returns
 the slot index.  VECTOR's length must equal the segment's dimension, and ID's
 first 8 bytes must not collide with the free-slot marker -- both are validated
 up front, before any slot is claimed, so a rejected put never disturbs the
-free list."
-  (check-type vector (simple-array single-float (*)))
-  (unless (= (length vector) (segment-dimension segment))
-    (error "vector length ~D does not match segment dimension ~D"
-           (length vector) (segment-dimension segment)))
-  (%seg-check-id id)
-  (let ((existing (%seg-slot-of segment id)))
-    (if existing
-        (progn (%seg-write-vector segment existing vector) existing)
-        (let ((slot (%seg-claim-slot segment)))
-          (%seg-write-id segment slot id)
-          (%seg-write-vector segment slot vector)
-          (setf (gethash id (segment-id->slot segment)) slot)
-          (serialize-uint64 (segment-mmap segment)
-                            (1+ (segment-live-count segment)) 40)
-          slot))))
+free list.
+
+Takes the segment's WRITE lock: mutations are exclusive against concurrent
+scans.  The %SEG-* internals it calls (including %seg-grow) are lock-free and
+run under this lock."
+  (with-write-lock ((segment-lock segment))
+    (check-type vector (simple-array single-float (*)))
+    (unless (= (length vector) (segment-dimension segment))
+      (error "vector length ~D does not match segment dimension ~D"
+             (length vector) (segment-dimension segment)))
+    (%seg-check-id id)
+    (let ((existing (%seg-slot-of segment id)))
+      (if existing
+          (progn (%seg-write-vector segment existing vector) existing)
+          (let ((slot (%seg-claim-slot segment)))
+            (%seg-write-id segment slot id)
+            (%seg-write-vector segment slot vector)
+            (setf (gethash id (segment-id->slot segment)) slot)
+            (serialize-uint64 (segment-mmap segment)
+                              (1+ (segment-live-count segment)) 40)
+            slot)))))
 
 (defun segment-get (segment id)
-  "The vector stored under ID as a fresh (simple-array single-float (*)), or NIL."
-  (let ((slot (%seg-slot-of segment id)))
-    (when slot (%seg-read-vector segment slot))))
+  "The vector stored under ID as a fresh (simple-array single-float (*)), or NIL.
+
+Takes the segment's READ lock: shared against concurrent reads, exclusive
+against a concurrent segment-put/segment-remove."
+  (with-read-lock ((segment-lock segment))
+    (let ((slot (%seg-slot-of segment id)))
+      (when slot (%seg-read-vector segment slot)))))
 
 (defun rebuild-vector-segment (graph owner-name slot-name)
   "Rebuild the (OWNER-NAME, SLOT-NAME) segment from live nodes: drop any current
@@ -335,15 +358,19 @@ create/update/delete."
   "Remove ID from the segment, pushing its slot onto the free list.  Returns T
 if ID was present, NIL otherwise.  A freed slot's id-array cell is marked with
 +FREE-SLOT-MARKER+ (first 8 bytes) and the previous free-head (second 8 bytes),
-threading the free list; its vector-block bytes are left as-is (unreachable)."
-  (let ((slot (%seg-slot-of segment id)))
-    (if (null slot)
-        nil
-        (let ((mmap (segment-mmap segment))
-              (old-head (%seg-free-head segment)))
-          (serialize-uint64 mmap +free-slot-marker+ (%seg-id-offset slot))
-          (serialize-uint64 mmap old-head (+ (%seg-id-offset slot) 8))
-          (serialize-uint64 mmap slot 48)      ; free-head := slot
-          (remhash id (segment-id->slot segment))
-          (serialize-uint64 mmap (1- (segment-live-count segment)) 40)
-          t))))
+threading the free list; its vector-block bytes are left as-is (unreachable).
+
+Takes the segment's WRITE lock: mutations are exclusive against concurrent
+scans."
+  (with-write-lock ((segment-lock segment))
+    (let ((slot (%seg-slot-of segment id)))
+      (if (null slot)
+          nil
+          (let ((mmap (segment-mmap segment))
+                (old-head (%seg-free-head segment)))
+            (serialize-uint64 mmap +free-slot-marker+ (%seg-id-offset slot))
+            (serialize-uint64 mmap old-head (+ (%seg-id-offset slot) 8))
+            (serialize-uint64 mmap slot 48)      ; free-head := slot
+            (remhash id (segment-id->slot segment))
+            (serialize-uint64 mmap (1- (segment-live-count segment)) 40)
+            t)))))
