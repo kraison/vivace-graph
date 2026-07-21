@@ -354,6 +354,77 @@ create/update/delete."
        graph :vertex-type owner-name)
       seg)))
 
+(defun %id-less-p (a b)
+  "Lexicographic order over two 16-byte node ids.  The engine has
+UUID-ARRAY-EQUAL but no less-than, so this is it: first differing byte wins."
+  (declare (type (array (unsigned-byte 8) (*)) a b))
+  (dotimes (i +key-bytes+ nil)
+    (let ((x (aref a i)) (y (aref b i)))
+      (cond ((< x y) (return t))
+            ((> x y) (return nil))))))
+
+(defun %score-before-p (s1 id1 s2 id2)
+  "The segment ranking order: score DESCENDING, node-id ASCENDING on a tie."
+  (declare (type single-float s1 s2))
+  (cond ((> s1 s2) t)
+        ((< s1 s2) nil)
+        (t (%id-less-p id1 id2))))
+
+;;; Bounded top-k collector.  Never materialises one result per candidate: a
+;;; scan offers every occupied slot and only k are retained.  k is small, so a
+;;; linear scan of the k-element buffer beats a heap's bookkeeping.
+;;;
+;;; The tiebreak is carried through EVICTION, not applied only at the end.
+;;; Eviction happens during iteration, so a score-only comparison at the k-th
+;;; boundary would make the result depend on slot order -- which is meaningless
+;;; under free-list reuse, and would make ranking differ between an incrementally
+;;; built segment and a rebuilt one.
+(defstruct (topk (:constructor %make-topk-raw))
+  (k 0 :type fixnum)
+  (count 0 :type fixnum)
+  (scores nil :type (or null (simple-array single-float (*))))
+  (ids nil :type (or null simple-vector)))
+
+(defun %make-topk (k)
+  (%make-topk-raw :k k
+                  :scores (make-array (max k 1) :element-type 'single-float)
+                  :ids (make-array (max k 1) :initial-element nil)))
+
+(defun %topk-worst-index (c)
+  "Index of the entry that ranks LAST under %SCORE-BEFORE-P."
+  (let ((scores (topk-scores c)) (ids (topk-ids c)) (worst 0))
+    (declare (type (simple-array single-float (*)) scores))
+    (dotimes (i (topk-count c) worst)
+      (when (%score-before-p (aref scores worst) (aref ids worst)
+                             (aref scores i) (aref ids i))
+        (setf worst i)))))
+
+(defun %topk-offer (c score id)
+  "Offer SCORE/ID; keep it only if it outranks the current worst."
+  (declare (type single-float score))
+  (when (plusp (topk-k c))
+    (let ((scores (topk-scores c)) (ids (topk-ids c)))
+      (cond ((< (topk-count c) (topk-k c))
+             (setf (aref scores (topk-count c)) score
+                   (aref ids (topk-count c)) id)
+             (incf (topk-count c)))
+            (t
+             (let ((worst (%topk-worst-index c)))
+               (when (%score-before-p score id (aref scores worst) (aref ids worst))
+                 (setf (aref scores worst) score
+                       (aref ids worst) id)))))))
+  c)
+
+(defun %topk-results (c)
+  "Retained entries as (score . id) conses, best first."
+  (let ((out '()))
+    (dotimes (i (topk-count c))
+      (push (list (aref (topk-scores c) i) (aref (topk-ids c) i)) out))
+    (mapcar (lambda (row) (cons (first row) (second row)))
+            (sort out (lambda (a b)
+                        (%score-before-p (first a) (second a)
+                                         (first b) (second b)))))))
+
 (defun segment-remove (segment id)
   "Remove ID from the segment, pushing its slot onto the free list.  Returns T
 if ID was present, NIL otherwise.  A freed slot's id-array cell is marked with

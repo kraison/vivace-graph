@@ -157,6 +157,11 @@
                 #:segment-get
                 #:segment-remove
                 #:segment-clean-shutdown-p
+                #:%id-less-p
+                #:%score-before-p
+                #:%make-topk
+                #:%topk-offer
+                #:%topk-results
                 ;; type index
                 #:make-type-index
                 #:close-type-index

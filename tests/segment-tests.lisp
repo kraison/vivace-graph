@@ -236,6 +236,62 @@ survive the growth bit-exactly, including ones written before it."
                (close-vector-segment s))))
       (ignore-errors (delete-file path)))))
 
+(defun %tid (n)
+  "A 16-byte id whose first byte is N (so ids order by N)."
+  (let ((v (make-array 16 :element-type '(unsigned-byte 8) :initial-element 0)))
+    (setf (aref v 0) n)
+    v))
+
+(test id-less-p-is-lexicographic
+  "%id-less-p orders ids by the first differing byte; equal ids are not less."
+  (is (%id-less-p (%tid 1) (%tid 2)))
+  (is (not (%id-less-p (%tid 2) (%tid 1))))
+  (is (not (%id-less-p (%tid 1) (%tid 1))))
+  ;; a later differing byte decides when earlier bytes tie
+  (let ((a (%tid 5)) (b (%tid 5)))
+    (setf (aref a 3) 1 (aref b 3) 2)
+    (is (%id-less-p a b))
+    (is (not (%id-less-p b a)))))
+
+(test topk-keeps-the-best-k
+  "The collector keeps exactly the k highest scores, best first."
+  (let ((c (%make-topk 3)))
+    (dolist (row (list (list 0.1 (%tid 1)) (list 0.9 (%tid 2)) (list 0.5 (%tid 3))
+                       (list 0.7 (%tid 4)) (list 0.2 (%tid 5))))
+      (%topk-offer c (coerce (first row) 'single-float) (second row)))
+    (let ((ids (mapcar (lambda (pair) (aref (cdr pair) 0)) (%topk-results c))))
+      (is (equal '(2 4 3) ids)))))
+
+(test topk-handles-fewer-than-k
+  "Fewer offers than k returns all of them, ordered."
+  (let ((c (%make-topk 5)))
+    (%topk-offer c 0.2f0 (%tid 1))
+    (%topk-offer c 0.8f0 (%tid 2))
+    (is (equal '(2 1) (mapcar (lambda (p) (aref (cdr p) 0)) (%topk-results c))))))
+
+(test topk-tiebreak-is-order-independent
+  "A tie at the k-th boundary resolves by id ascending, NOT by arrival order.
+This is the property that makes ranking deterministic across rebuilds: slot
+iteration order is meaningless under free-list reuse, so eviction must consult
+the tiebreak, not just the final sort."
+  (flet ((collect-in (rows)
+           (let ((c (%make-topk 2)))
+             (dolist (row rows)
+               (%topk-offer c (coerce (first row) 'single-float) (second row)))
+             (mapcar (lambda (p) (aref (cdr p) 0)) (%topk-results c)))))
+    ;; id 3 clearly best; ids 1 and 2 tie at 0.5 -- the lower id must win the
+    ;; last slot regardless of which arrives first.
+    (let ((forward  (collect-in (list (list 0.9 (%tid 3)) (list 0.5 (%tid 1)) (list 0.5 (%tid 2)))))
+          (backward (collect-in (list (list 0.9 (%tid 3)) (list 0.5 (%tid 2)) (list 0.5 (%tid 1))))))
+      (is (equal '(3 1) forward))
+      (is (equal forward backward)
+          "eviction depends on arrival order: ~S vs ~S" forward backward))))
+
+(test topk-k-zero-returns-empty
+  (let ((c (%make-topk 0)))
+    (%topk-offer c 0.9f0 (%tid 1))
+    (is (null (%topk-results c)))))
+
 (test segment-clean-shutdown-flag
   "A cleanly closed segment reopens reporting clean-shutdown; a segment left open
 (simulated crash) reopens reporting NOT clean."
