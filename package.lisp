@@ -39,6 +39,14 @@
            #:rebuild-vector-segment-batched
            #:segment-scan
            #:segment-score-subset
+           ;; Signalled pre-durability when a commit would grow a segment past
+           ;; its mmap reservation.  Exported so a caller can tell "reopen the
+           ;; graph / raise the reservation and retry" apart from a genuine data
+           ;; error; the accessors go with it (as UCV-* do) so that decision can
+           ;; be made from the numbers rather than by parsing the report text.
+           #:vector-segment-capacity-exhausted
+           #:vsce-owner #:vsce-slot #:vsce-required
+           #:vsce-reserved #:vsce-needed-bytes
            #:location
            #:schema
            #:indexes

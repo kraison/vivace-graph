@@ -1017,39 +1017,76 @@ the same reason: %SEG-GROW signals from inside APPLY-TRANSACTION, by which point
 the node write is already journaled, leaving a persisted node with no segment
 entry -- invisible to VECTOR-SEARCH, with no error and no self-correction.
 
-Conservative by design: it ignores the free list, so a transaction that would in
-fact reuse freed slots may abort slightly early.  Aborting early is recoverable;
-aborting after durability is not.
+Every per-segment read here takes the segment's READ LOCK.  Holding the manager
+lock is NOT sufficient: REBUILD-VECTOR-SEGMENT-BATCHED deliberately runs WITHOUT
+the manager lock (a long hold would stall every commit) and mutates LIVE-COUNT,
+CAPACITY and the ID->SLOT table via SEGMENT-PUT while commits are in flight.
+Unlocked, ID->SLOT could be read mid-rehash (undefined behaviour), and the
+byte-wise header reads could tear -- either aborting a legitimate transaction or,
+worse, missing a real exhaustion and failing after durability, which is precisely
+what this function exists to prevent.  (REBUILD-VECTOR-SEGMENT, the non-batched
+one, IS quiescent -- it runs only from RESTORE-VECTOR-SEGMENTS during OPEN-GRAPH
+-- so it is not the reason for the lock.)  Lock order is manager -> segment, the
+existing direction, and the batched rebuild never takes the manager lock, so no
+inversion is possible.
 
-A (owner, slot) with no committed segment cannot exhaust -- creation sizes the
-file -- so it is skipped."
-  (let ((new-ids (make-hash-table :test 'equal)))
-    ;; Count DISTINCT new ids per segment key: an id already in the segment
-    ;; reuses its slot, and the same id written twice in one transaction still
-    ;; claims only one.
-    (dolist (write (writes tx))
-      (let ((node (node write)))
-        (unless (deleted-p node)
-          (dolist (slot (node-vector-index-slots (class-of node)))
-            (let ((v (%node-segment-value node slot)))
-              (when v
-                (let* ((key (%segment-key node slot))
-                       (seg (gethash key (vector-segments graph))))
-                  (when (and seg (null (%seg-slot-of seg (id node))))
-                    (pushnew (id node) (gethash key new-ids) :test #'equalp)))))))))
-    (maphash
-     (lambda (key ids)
-       (let* ((seg (gethash key (vector-segments graph)))
-              (required (+ (segment-live-count seg) (length ids)))
-              (cap (segment-capacity seg)))
-         (loop while (< cap required) do (setf cap (* 2 cap)))
-         (let ((needed (%seg-file-bytes cap (segment-dimension seg)))
-               (reserved (m-reserved-size (segment-mmap seg))))
-           (when (> needed reserved)
-             (error 'vector-segment-capacity-exhausted
-                    :owner (car key) :slot (cdr key)
-                    :required required :needed-bytes needed :reserved reserved)))))
-     new-ids)))
+The free list needs no separate accounting, and this check is already tight
+against it: SEGMENT-REMOVE decrements LIVE-COUNT while pushing the slot onto the
+free list, and SEGMENT-PUT increments LIVE-COUNT even when it pops a freed slot,
+so live + free = highwater <= capacity, and REQUIRED <= CAPACITY exactly when no
+grow is needed.  Do not \"fix\" it by crediting the free list.  The one real
+conservatism is that deletes in the SAME transaction are not credited, so a
+transaction that frees at least as many slots as it claims can still abort early.
+Aborting early is recoverable; aborting after durability is not.
+
+A (owner, slot) with no committed segment yet is skipped.  CREATE-VECTOR-SEGMENT
+sizes the file for INITIAL-CAPACITY (1024) slots and the reservation is computed
+from that, so such a segment can only exhaust if ONE transaction inserts more new
+vectors than the fresh reservation covers -- with the defaults (*MMAP-MIN-
+RESERVATION* 1 GiB) that means over a GiB of vectors in a single transaction.
+Not reachable per-document; a bulk loader committing a whole corpus at once
+could reach it."
+  ;; Overwhelmingly common case: no vector segments at all.  Cost nothing there.
+  (when (plusp (hash-table-count (vector-segments graph)))
+    (let ((new-ids (make-hash-table :test 'equal)))
+      ;; Count DISTINCT new ids per segment key: an id already in the segment
+      ;; reuses its slot, and the same id written twice in one transaction still
+      ;; claims only one.  The per-key set is a hash table, not a list: a bulk
+      ;; transaction would otherwise cost O(n^2) 16-byte EQUALP comparisons
+      ;; while holding the manager lock, blocking every other commit.
+      (dolist (write (writes tx))
+        (let ((node (node write)))
+          (unless (deleted-p node)
+            (dolist (slot (node-vector-index-slots (class-of node)))
+              (let ((v (%node-segment-value node slot)))
+                (when v
+                  (let* ((key (%segment-key node slot))
+                         (seg (gethash key (vector-segments graph))))
+                    (when (and seg
+                               (with-read-lock ((segment-lock seg))
+                                 (null (%seg-slot-of seg (id node)))))
+                      (setf (gethash (id node)
+                                     (or (gethash key new-ids)
+                                         (setf (gethash key new-ids)
+                                               (make-hash-table :test 'equalp))))
+                            t)))))))))
+      (maphash
+       (lambda (key ids)
+         (let ((seg (gethash key (vector-segments graph))))
+           (multiple-value-bind (needed reserved required)
+               (with-read-lock ((segment-lock seg))
+                 (let ((required (+ (segment-live-count seg)
+                                    (hash-table-count ids)))
+                       (cap (segment-capacity seg)))
+                   (loop while (< cap required) do (setf cap (* 2 cap)))
+                   (values (%seg-file-bytes cap (segment-dimension seg))
+                           (m-reserved-size (segment-mmap seg))
+                           required)))
+             (when (> needed reserved)
+               (error 'vector-segment-capacity-exhausted
+                      :owner (car key) :slot (cdr key)
+                      :required required :needed-bytes needed :reserved reserved)))))
+       new-ids))))
 
 (defgeneric apply-tx-write-to-vector-segments (write graph)
   (:method (write graph) (declare (ignore write graph)) nil))

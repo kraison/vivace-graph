@@ -654,6 +654,15 @@ a separate (SI-SUB . EMBEDDING) segment would appear."
   (with-temp-directory (dir)
     ;; A deliberately tiny reservation, so a few vectors exhaust it.  Bound
     ;; BEFORE make-graph: the reservation is fixed when the mapping is created.
+    ;;
+    ;; TWO THINGS TO KNOW BEFORE EXTENDING THIS TEST:
+    ;; 1. These bindings throttle EVERY mapped file in the graph, not just the
+    ;;    vector segment -- for the heap and the indexes a multiplier of 1 means
+    ;;    reserved == size, i.e. ZERO growth headroom.  That is survivable only
+    ;;    because those files are created at their full size and never extend.
+    ;;    Anything that makes them extend will fail here for unrelated reasons.
+    ;; 2. The LET* extends over the reopened G2 below, so that graph is mapped
+    ;;    with zero headroom too.
     (let* ((graph-db::*mmap-min-reservation* (* 64 1024))
            (graph-db::*mmap-reservation-multiplier* 1)
            (g (make-graph *integration-graph-name* (namestring dir) :buffer-pool-size 1000))
