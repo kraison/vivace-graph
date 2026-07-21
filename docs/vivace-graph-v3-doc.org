@@ -447,6 +447,24 @@ Each ~regenerate-*~ / ~rebuild-*~ drops the old on-disk index and rebuilds it by
 
 A logical *snapshot + replay into a fresh graph* also works and rebuilds every index on the target's backend (see Chapter 11, "Backup and Recovery"): snapshot the source, ~make-graph~ the target with ~:index-backend :bplus-tree~, adopt the source schema, and ~replay~. For a pure backend switch the in-place reindex above is simpler — one graph, node data untouched — but snapshot/replay is a sound alternative and the right tool when you also want a clean, defragmented copy.
 
+*** Vector segments (~vseg-*.dat~)
+
+One more derived index lives outside ~indexes.dat~ entirely, because it is not ordered and not a map: the *vector segment* that backs a ~:vector-index~ slot (Chapter 8, "Vector indexes and cosine kNN search"). Each segment is its own memory-mapped file in the graph directory — ~vseg-<owner>-<slot>.dat~, one per indexed slot, named for the *declaring* class that owns it.
+
+The layout is deliberately flat, so that a kNN scan reads one long run of floats:
+
+#+BEGIN_EXAMPLE
+  [ header 64 bytes ][ id array: capacity × 16 ][ vector block: capacity × dimension × 4 ]
+#+END_EXAMPLE
+
+- *Header* (64 bytes) — magic, format version, ~dimension~, element type (only ~single-float~ today; a foreign value signals rather than being misread), ~capacity~, ~live-count~, the free-list head, and a *clean-shutdown flag*.
+- *Id array* — slot /i/ holds the 16-byte node id occupying vector slot /i/. This array is the *authoritative* record of what the segment contains; the id→slot hash used for point lookups is RAM-only and is rebuilt at open by sweeping it. A free cell is marked by all-ones in its first 8 bytes, with the *next* free slot in its second 8 — the free list is threaded through the array itself, costing no extra space. (A freshly created or freshly grown region is free-marked for exactly this reason, so "never written" and "removed" are the same on-disk state.)
+- *Vector block* — ~capacity × dimension × 4~ bytes of contiguous little-endian IEEE binary32, slot /i/'s vector at offset /i/ × ~dimension~ × 4. Occupied slots are *not* dense once the free list has been used, so a scan sweeps ~[0, capacity)~ and skips free cells.
+
+*Growth is in-place doubling.* Because the vector block starts after the id array, doubling ~capacity~ moves it: the file is extended, then the existing vectors are relocated to the new block offset high slot first (so the copy never overwrites unread source bytes), and the new id cells are free-marked. The mapping's base address never moves — extension re-maps into the reserved window — so a concurrent reader never faults.
+
+The clean-shutdown flag is what makes recovery cheap: it is cleared (and synced) at open and set again at ~close-graph~. On the next open, a segment that was closed cleanly is reopened and trusted as-is; one that was not is *dropped and rebuilt from the nodes*, since a segment is derived data and always reconstructible.
+
 *** Durability and the Dirty File (~graph.lisp~)
 
 How can VivaceGraph ensure it wasn't terminated abruptly, leaving the database in an inconsistent state? It uses a simple but effective mechanism: the "dirty file."
@@ -1256,6 +1274,138 @@ Like views, unique, and spatial, an ordered index is *backend-agnostic* — skip
 
 When to reach for which: use a *view* when the index key is computed or you need map-reduce aggregation; use an *ordered index* when you simply want a slot indexed for equality and range. (Two current limitations: multi-slot/composite keys and true reverse-streaming cursors are not yet built but are designed for; and a *lazy* memory-graph does not rebuild its ordered indexes on reopen — see Chapter 3 — so use a non-lazy memory graph if you need them to survive a lazy reopen.)
 
+*** Vector indexes (~:vector-index~) and cosine kNN search
+
+Views, ~:unique~ and ~:index~ all key on values you can *order*. An embedding — the dense float vector an LLM or an image model produces — is not that kind of value: you never ask "which documents have exactly this vector," you ask "which documents are *nearest* this vector." VivaceGraph answers that with a third kind of index, the *vector segment*: a memory-mapped block of fixed-width ~single-float~ vectors, one per node, over which it runs a bounded top-k cosine k-nearest-neighbour search.
+
+Declare it with the ~:vector-index~ slot option, exactly where you would write ~:unique~ or ~:index~:
+
+#+BEGIN_SRC lisp
+  (def-vertex document ()
+    ((title     :type string)
+     (embedding :vector-index t))
+    :search-app)
+#+END_SRC
+
+That is the whole declaration. Maintenance is automatic and lives on the *transaction apply path*, alongside views, unique constraints and the spatial index — you never call an "add to index" function:
+
+#+BEGIN_SRC lisp
+  ;; EMBED is your own function; it must return a (simple-array single-float (*)).
+  (with-transaction ()
+    (make-document :title "Landmine risk survey"
+                   :embedding (embed "Landmine risk survey")))
+#+END_SRC
+
+Creating a node stores its vector; updating one overwrites it (and *removes* it if the new value is no longer a conforming vector); deleting a node removes it. The segment is created *lazily*, on the first conforming write, and is sized to that first vector's length.
+
+**** Searching
+
+#+BEGIN_SRC lisp
+  ;; (vector-search graph class-name slot-name query-vector k)
+  (vector-search *graph* 'document 'embedding (embed "buried ordnance") 10)
+  ;;=> ((0.93 . #<16-byte id>) (0.88 . #<16-byte id>) ...)
+#+END_SRC
+
+The result is a list of ~(score . node-id)~ conses, best first — a ~single-float~ cosine score in the ~car~ and the node's 16-byte id in the ~cdr~.
+
+*It returns ids, not nodes, and that is the entire point.* A scan touches only the segment's id array and its contiguous block of floats; it never deserializes a node, never touches the heap, never conses one object per candidate. Materialize only the handful you actually want:
+
+#+BEGIN_SRC lisp
+  (loop for (score . id) in (vector-search *graph* 'document 'embedding q 10)
+        collect (cons score (lookup-vertex id :graph *graph*)))
+#+END_SRC
+
+The *ranking contract* is precise and worth relying on:
+
+- *Full cosine*, not a dot product — vectors are *not* assumed to be unit-normalized; whatever you stored is what is scored. Either norm being zero yields a score of ~0.0~ rather than a division error.
+- Results are ordered by *score DESCENDING*, and ties are broken by *node id ASCENDING*.
+- That tiebreak is applied during collection, not only at the end, so the answer is *deterministic*: the same corpus and the same query give the same k in the same order, whether the segment was built incrementally or rebuilt from scratch.
+- ~k~ bounds what is retained, not what is examined: every occupied slot is scored, and only k are kept.
+
+~vector-search~ returns ~nil~ when no segment exists yet. That is deliberately ambiguous — it also covers a misspelled class or slot name, and a slot that carries no ~:vector-index~ declaration at all. If a search comes back unexpectedly empty, check the declaration before you go looking at the data.
+
+**** Ownership: one segment per *declaring* class
+
+This is the detail that trips people up. A segment is keyed by ~(owner-name . slot-name)~, where the owner is the *most general* class in the precedence list that declares the slot ~:vector-index~ — not the node's runtime class. One segment therefore spans the declaring class and *all of its subclasses*, and lives in one file per ~(owner, slot)~ pair.
+
+#+BEGIN_SRC lisp
+  (def-vertex document ()  ((embedding :vector-index t)) :search-app)
+  (def-vertex report (document) ((author :type string)) :search-app)
+
+  ;; A REPORT's embedding is stored in DOCUMENT's segment, and this search
+  ;; resolves to that same segment -- so it returns DOCUMENTs as well as REPORTs.
+  (vector-search *graph* 'report 'embedding q 10)
+#+END_SRC
+
+This mirrors ~:unique~ and ~:index~ scoping exactly. Searching a subclass does *not* give you a subclass-only result set; if you need one, filter the returned ids by type. Rebuilds follow the same rule, sweeping the owner's whole subtree into the one shared segment.
+
+**** What counts as a vector
+
+A value is indexed only if it is a ~(simple-array single-float (*))~. Anything else — a list, a ~double-float~ array, a general vector, ~nil~, an unbound slot — is *silently ignored* by the index. Nothing is signalled, and the node is simply absent from every search over that slot. This is the one sharp edge in the feature: if your embedding function returns a ~(vector single-float)~ that is not simple, or a double-float array, your corpus will index as empty and look like a bug elsewhere. Coerce at the boundary:
+
+#+BEGIN_SRC lisp
+  (defun as-embedding (list-of-numbers)
+    (make-array (length list-of-numbers)
+                :element-type 'single-float
+                :initial-contents (mapcar (lambda (x) (coerce x 'single-float))
+                                          list-of-numbers)))
+#+END_SRC
+
+*Dimension is fixed by the first vector stored* in a segment and cannot change afterwards. A write whose vector length disagrees is *rejected at the commit boundary* — the check runs inside the committing transaction, before anything durable happens, so the whole transaction aborts cleanly and no node/index drift is possible. A query vector of the wrong length signals for the same reason. Length mismatches are loud; wrong *types* are silent. Only the two behave differently.
+
+**** The lower-level entry points
+
+~vector-search~ is a thin resolver over two exported primitives that take a segment object directly. You reach a segment through the graph's internal ~vector-segments~ table, keyed by the owner cons:
+
+#+BEGIN_SRC lisp
+  (let ((seg (gethash (cons 'document 'embedding)
+                      (graph-db::vector-segments *graph*))))
+    ;; Exactly what vector-search does: bounded top-k over every occupied slot.
+    (segment-scan seg q 10)
+
+    ;; Score ONLY a candidate set, exactly, best first.  No k -- the caller
+    ;; already chose the candidates -- and the same total order as above.
+    (segment-score-subset seg q (list id-a id-b id-c)))
+#+END_SRC
+
+~segment-score-subset~ exists as an *extension seam*. It makes no assumption that it has seen every vector in the segment, and ids it does not hold are silently skipped, so an approximate index (ANN, or an int8 pre-rank) can propose a cheap candidate set and have it re-scored *exactly* against the float32 block. Note that it does not de-duplicate: an id offered twice is scored and returned twice.
+
+**** Migrating an existing corpus
+
+Because maintenance is on the apply path, nodes written *before* you added the ~:vector-index~ declaration were never indexed. Fill them in with ~rebuild-vector-segment-batched~, which sweeps live nodes and *adds* what is missing without disturbing what is already there:
+
+#+BEGIN_SRC lisp
+  ;; => (values INSERTED SKIPPED)
+  (rebuild-vector-segment-batched *graph* 'document 'embedding
+                                  :batch-size 5000
+                                  :progress-fn (lambda (done seen)
+                                                 (format t "~D/~D~%" done seen)))
+#+END_SRC
+
+It is *resumable by construction*: the segment itself records which ids it holds, so an interrupted run followed by a clean ~close-graph~ simply leaves a partial segment that the next call finishes. There is no progress file, deliberately — a marker that can disagree with the segment is worse than no marker. ~:batch-size~ is the *cadence* at which ~:progress-fn~ is called (with ~done~ = inserted+skipped and ~seen~ = conforming nodes encountered *in this run*), not a memory buffer; each vector is written as it is met. Over a real corpus this takes minutes, so pass a ~:progress-fn~ — a silent migration looks hung. You may name either the declaring class or any subclass; both resolve to the one owner segment. Serialize migrations of a given segment at the call site — do not run two at once against the same ~(owner, slot)~.
+
+**** Concurrency
+
+Each segment carries its own reader/writer lock. ~segment-scan~, ~segment-score-subset~ and reads take the read side; the apply path's inserts and removals take the write side. Concurrent searches are therefore safe against concurrent commits — including a commit that *grows* the segment — and share the segment freely with each other. Rebuilds are the exception: they run at open, before the graph accepts queries, and are not safe against a live concurrent search.
+
+**** Performance, and the ceiling
+
+Be clear-eyed about what this is: a *brute-force* exact scan over every occupied slot. There is no approximate (ANN) index yet. What you get in exchange is exactness, determinism, and a per-vector cost low enough that brute force carries you a long way.
+
+Measured on SBCL 2.5.5 / macOS arm64 (M3) at dimension 1024, the scan runs at *~1.85 ms per 1000 vectors* while the vector block fits in available page cache — about 190 ms for 100k vectors, sub-second to ~500k.
+
+Past that point it is a *cliff, not a slope*. The vector block is exactly
+
+#+BEGIN_EXAMPLE
+  live-count × dimension × 4 bytes
+#+END_EXAMPLE
+
+so at dimension 1024 each vector costs 4 KB and one million of them is 4 GB. On an 18 GB laptop, 1M vectors measured *11.3 s* per query against the ~1.9 s a linear extrapolation from 500k predicts — 6x worse, because every query now re-reads the block from disk. Repeated scans did not improve, confirming it is architectural rather than a cold cache.
+
+Use the formula to compute your own ceiling: the cliff sits where ~live × dimension × 4~ crosses the memory the machine can actually keep resident. Its *position* is hardware-dependent; its *shape* is not — performance does not degrade gracefully as you approach it, it falls off. On a large-memory host the constraint becomes CPU instead: at ~1.85 ms/1k, a resident million-vector segment is still roughly 1.9 s per query, which no amount of RAM fixes. That is the point at which an approximate index — proposing candidates for ~segment-score-subset~ to re-score exactly — becomes the answer, and it is the reason that seam exists.
+
+A note on implementations: the hot vector-decode path has an SBCL-specific fast implementation, with a portable fallback used on CCL, ECL and LispWorks. The query layer was developed and tested on SBCL.
+
 * Part IV: Advanced Topics & API
 
 This final part of the manual covers advanced features that allow VivaceGraph to integrate with a broader ecosystem of tools and services. We will explore the built-in REST API, the replication system for high availability, and the procedures for backing up and restoring your database.
@@ -1543,6 +1693,26 @@ The restoration process is as follows:
 3.  `replay` will automatically find the *most recent* snapshot file in that directory.
 4.  It reads the snapshot file one s-expression at a time and, in small, manageable transactions, recreates each vertex and edge.
 5.  *Crucially, after all nodes and edges have been restored, ~replay~ automatically regenerates all defined views.* The snapshot file contains only the raw node data, not the indexes. This final step rebuilds the high-performance view indexes from the restored data, making the new graph ready for querying.
+
+The same "indexes are derived, node data is not" principle covers *vector segments* (Chapter 8): a segment never appears in a snapshot file, and because it is maintained on the transaction apply path, it is repopulated as the restoring transactions recreate the nodes.
+
+#+BEGIN_QUOTE
+*Known limitation (issue #56).* That repopulation is currently unreachable for
+embeddings, because ~replay~ fails before it gets there. ~backup~ writes slot values
+as Lisp text, and the restore readtable coerces *every* ~#(...)~ it reads to
+~(simple-array (unsigned-byte 8) (*))~ — it has to, because node ~:ID~ values are byte
+vectors and it cannot tell an id from slot data. A ~single-float~ vector therefore
+signals a ~type-error~ on restore:
+
+: The value 1.0 is not of type (UNSIGNED-BYTE 8)
+
+So a graph holding ~:vector-index~ slots — or any slot with a non-byte vector — cannot
+currently be round-tripped through ~snapshot~ and ~replay~. It fails loudly rather than
+restoring corrupt data, but plan your backups accordingly: copy the graph *directory*
+rather than relying on snapshot/replay until #56 is fixed.
+#+END_QUOTE
+
+The same derivation is what makes crash recovery cheap outside of backup entirely — a segment that was not cleanly closed is dropped and rebuilt from the nodes on the next ~open-graph~ (Chapter 3, "Vector segments").
 
 **** Complete Example: Backup and Restore
 

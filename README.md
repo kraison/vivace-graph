@@ -15,7 +15,7 @@ To get started, please see example.lisp.
 
 ### Documentation
 
-A comprehensive developer's manual lives in [`docs/vivace-graph-v3-doc.org`](docs/vivace-graph-v3-doc.org), covering getting started, the storage engine and object model, transactions, the Prolog query language, views, the REST API, replication, backup/recovery, MVCC / versioned nodes, spatial queries, graph algorithms, the in-memory backend (eager vs. lazy), and offline-first peer replication, plus an API reference.
+A comprehensive developer's manual lives in [`docs/vivace-graph-v3-doc.org`](docs/vivace-graph-v3-doc.org), covering getting started, the storage engine and object model, transactions, the Prolog query language, views, the REST API, replication, backup/recovery, MVCC / versioned nodes, spatial queries, vector indexes and cosine kNN search, graph algorithms, the in-memory backend (eager vs. lazy), and offline-first peer replication, plus an API reference.
 
 This manual was written by [Gwang-Jin Kim (@gwangjinkim)](https://github.com/gwangjinkim) — the project's first thorough documentation, and a great piece of work. Many thanks to him. It has been adopted here and is maintained alongside the code; newer chapters (such as Chapter 12 on MVCC) are maintainer additions written in his style.
 
