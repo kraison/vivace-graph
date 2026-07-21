@@ -105,7 +105,17 @@ persisted)."
       ;; mark the file dirty for the new session.
       (let ((clean (= (deserialize-uint64 mmap +segment-clean-offset+) +segment-clean+)))
         (setf (segment-clean-at-open segment) clean)
-        (serialize-uint64 mmap +segment-dirty+ +segment-clean-offset+))
+        (serialize-uint64 mmap +segment-dirty+ +segment-clean-offset+)
+        ;; Force the dirty flag to disk NOW, so a crash after this open reliably
+        ;; leaves the segment marked dirty -> rebuild on next open.  Without this
+        ;; the flip-to-dirty is an unsynced mmap store whose writeback timing is
+        ;; the kernel's choice, so a hard crash could leave the on-disk flag still
+        ;; reading clean, and an unsanctioned recovery (one that deletes .dirty and
+        ;; reopens rather than snapshot/replay) would then TRUST a stale segment.
+        ;; Defense-in-depth: the graph's .dirty marker is the primary crash guard
+        ;; (open-graph refuses a crashed graph); this closes the residual window.
+        ;; One msync per segment at open only -- open is not a hot path.
+        (sync-region mmap :length +segment-header-bytes+))
       segment)))
 
 (defun segment-clean-shutdown-p (segment)
