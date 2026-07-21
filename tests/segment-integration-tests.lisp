@@ -227,61 +227,158 @@ vectors are intact."
           (close-graph g :snapshot-p nil)))
       (collect-garbage))))
 
-(test invariant-segment-matches-rebuild
-  "After an arbitrary create/update/delete sequence, the live segment equals a
-fresh rebuild-from-nodes: same id set, same vectors."
+(test rebuild-scopes-to-exact-class
+  "Rebuilding a parent class's segment must not sweep in subclass instances --
+the live apply path keys strictly on (CLASS-NAME (CLASS-OF NODE)), so a si-sub
+vector belongs only in the si-sub segment, never the si-doc segment."
   (with-temp-directory (dir)
     (let ((g (make-graph *integration-graph-name* (namestring dir) :buffer-pool-size 1000))
-          (kept '()))
+          (doc-id nil) (sub-id nil))
       (unwind-protect
            (progn
              (let ((*graph* g))
-               ;; create 12
+               (with-transaction ()
+                 (setf doc-id (id (make-si-doc :title "doc" :embedding (%si-embedding 8 1.0)))))
+               (with-transaction ()
+                 (setf sub-id (id (make-si-sub :title "sub" :extra "x"
+                                               :embedding (%si-embedding 8 2.0))))))
+             (let ((doc-rebuilt (graph-db::rebuild-vector-segment g 'si-doc 'embedding)))
+               (is (= 1 (graph-db::segment-live-count doc-rebuilt))
+                   "rebuilding the parent segment must not sweep in subclass instances")
+               (is (typep (graph-db::segment-get doc-rebuilt doc-id) '(simple-array single-float (*)))
+                   "the si-doc id must be present in its own rebuilt segment")
+               (is (null (graph-db::segment-get doc-rebuilt sub-id))
+                   "the si-sub id must not leak into the si-doc segment"))
+             (let ((sub-rebuilt (graph-db::rebuild-vector-segment g 'si-sub 'embedding)))
+               (is (= 1 (graph-db::segment-live-count sub-rebuilt))
+                   "rebuilding the subclass segment must contain only its own instances")
+               (is (typep (graph-db::segment-get sub-rebuilt sub-id) '(simple-array single-float (*)))
+                   "the si-sub id must be present in its own rebuilt segment")
+               (is (null (graph-db::segment-get sub-rebuilt doc-id))
+                   "the si-doc id must not appear in the si-sub segment")))
+        (close-graph g :snapshot-p nil))
+      (collect-garbage))))
+
+(test invariant-segment-matches-rebuild
+  "After an arbitrary create/update/delete sequence spanning BOTH a parent class
+and a subclass, each class's live segment equals its own fresh rebuild-from-
+nodes: same id set, same vectors, with no cross-class leakage."
+  (with-temp-directory (dir)
+    (let ((g (make-graph *integration-graph-name* (namestring dir) :buffer-pool-size 1000))
+          (kept-doc '())
+          (kept-sub '()))
+      (unwind-protect
+           (progn
+             (let ((*graph* g))
+               ;; create 12 si-doc + 6 si-sub
                (dotimes (i 12)
                  (with-transaction ()
                    (let ((n (make-si-doc :title (format nil "n~d" i)
                                          :embedding (%si-embedding 8 (coerce i 'single-float)))))
-                     (push (cons i (id n)) kept))))
-               ;; delete 3
+                     (push (cons i (id n)) kept-doc))))
+               (dotimes (i 6)
+                 (with-transaction ()
+                   (let ((n (make-si-sub :title (format nil "s~d" i) :extra "x"
+                                         :embedding (%si-embedding 8 (coerce (+ 50 i) 'single-float)))))
+                     (push (cons i (id n)) kept-sub))))
+               ;; delete 3 si-doc, 2 si-sub
                (dolist (i '(2 5 9))
-                 (with-transaction () (mark-deleted (lookup-vertex (cdr (assoc i kept)) :graph g)))
-                 (setf kept (remove i kept :key #'car)))
-               ;; update 2 (copy-modify-save)
+                 (with-transaction () (mark-deleted (lookup-vertex (cdr (assoc i kept-doc)) :graph g)))
+                 (setf kept-doc (remove i kept-doc :key #'car)))
+               (dolist (i '(1 4))
+                 (with-transaction () (mark-deleted (lookup-vertex (cdr (assoc i kept-sub)) :graph g)))
+                 (setf kept-sub (remove i kept-sub :key #'car)))
+               ;; update 2 si-doc, 1 si-sub (copy-modify-save)
                (dolist (i '(0 7))
                  (with-transaction ()
-                   (let ((v (copy (lookup-vertex (cdr (assoc i kept)) :graph g))))
+                   (let ((v (copy (lookup-vertex (cdr (assoc i kept-doc)) :graph g))))
                      (setf (slot-value v 'embedding)
                            (%si-embedding 8 (coerce (+ 100 i) 'single-float)))
+                     (save v))))
+               (dolist (i '(0))
+                 (with-transaction ()
+                   (let ((v (copy (lookup-vertex (cdr (assoc i kept-sub)) :graph g))))
+                     (setf (slot-value v 'embedding)
+                           (%si-embedding 8 (coerce (+ 200 i) 'single-float)))
                      (save v)))))
-             ;; snapshot the live segment's (id -> vector) map
-             (let* ((live (%si-segment g 'embedding))
-                    (live-map (make-hash-table :test 'equalp))
-                    ;; captured BEFORE rebuild-vector-segment runs: it closes
-                    ;; and replaces the currently-registered segment, so LIVE's
-                    ;; own live-count is unreadable after that call.
-                    (live-count-before (graph-db::segment-live-count live)))
-               (dolist (cell kept)
-                 (setf (gethash (cdr cell) live-map)
-                       (graph-db::segment-get live (cdr cell))))
-               ;; rebuild from nodes into a fresh segment and compare
-               (let ((rebuilt (graph-db::rebuild-vector-segment g 'si-doc 'embedding)))
-                 (is (= (hash-table-count live-map)
-                        (graph-db::segment-live-count rebuilt))
-                     "rebuild has a different id count than the live segment")
-                 ;; direct id-count invariant: the LIVE segment's own occupancy
-                 ;; must equal the rebuild's -- catches a stale/leaked entry
-                 ;; (e.g. a deleted id maintenance failed to remove) that the
-                 ;; kept-only comparison above cannot see, since KEPT already
-                 ;; excludes deleted ids by construction.
-                 (is (= live-count-before
-                        (graph-db::segment-live-count rebuilt))
-                     "live segment's live-count differs from a fresh rebuild's ~
-live-count -- the live segment likely retains an entry the rebuild does not")
-                 (loop for id being the hash-keys of live-map using (hash-value v)
-                       for r = (graph-db::segment-get rebuilt id)
-                       do (is (typep r '(simple-array single-float (*)))
-                              "id missing from rebuild")
-                          (is (and v (every #'= v r))
-                              "vector differs between live and rebuilt")))))
+             (flet ((check-class (class-name kept)
+                      ;; snapshot the live segment's (id -> vector) map
+                      (let* ((live (gethash (cons class-name 'embedding)
+                                            (graph-db::vector-segments g)))
+                             (live-map (make-hash-table :test 'equalp))
+                             ;; captured BEFORE rebuild-vector-segment runs: it
+                             ;; closes and replaces the currently-registered
+                             ;; segment, so LIVE's own live-count is unreadable
+                             ;; after that call.
+                             (live-count-before (graph-db::segment-live-count live)))
+                        (dolist (cell kept)
+                          (setf (gethash (cdr cell) live-map)
+                                (graph-db::segment-get live (cdr cell))))
+                        ;; rebuild from nodes into a fresh segment and compare
+                        (let ((rebuilt (graph-db::rebuild-vector-segment g class-name 'embedding)))
+                          (is (= (hash-table-count live-map)
+                                 (graph-db::segment-live-count rebuilt))
+                              "~A: rebuild has a different id count than the live segment"
+                              class-name)
+                          ;; direct id-count invariant: the LIVE segment's own
+                          ;; occupancy must equal the rebuild's -- catches a
+                          ;; stale/leaked entry (a deleted id maintenance failed
+                          ;; to remove, OR a subclass instance a mis-scoped
+                          ;; rebuild swept in) that the kept-only comparison
+                          ;; above cannot see on its own, since KEPT already
+                          ;; excludes deleted ids by construction.
+                          (is (= live-count-before (graph-db::segment-live-count rebuilt))
+                              "~A: live segment's live-count differs from a fresh ~
+rebuild's live-count -- the live segment likely retains an entry (deleted id, or ~
+cross-class leak) the rebuild does not"
+                              class-name)
+                          (loop for id being the hash-keys of live-map using (hash-value v)
+                                for r = (graph-db::segment-get rebuilt id)
+                                do (is (typep r '(simple-array single-float (*)))
+                                       "~A: id missing from rebuild" class-name)
+                                   (is (and v (every #'= v r))
+                                       "~A: vector differs between live and rebuilt" class-name))))))
+               (check-class 'si-doc kept-doc)
+               (check-class 'si-sub kept-sub)))
         (close-graph g :snapshot-p nil))
+      (collect-garbage))))
+
+(test unclean-shutdown-rebuilds-not-reopens
+  "A segment left dirty on disk (simulated crash, carrying drift a stale reopen
+would trust) causes OPEN-GRAPH -> RESTORE-VECTOR-SEGMENTS to rebuild it from
+live nodes rather than open it as-is.  Drives the real end-to-end recovery
+path (OPEN-GRAPH), not REBUILD-VECTOR-SEGMENT directly."
+  (with-temp-directory (dir)
+    (let ((id nil) (path nil) (phantom-id nil))
+      (let ((g (make-graph *integration-graph-name* (namestring dir) :buffer-pool-size 1000)))
+        (let ((*graph* g))
+          (with-transaction () (setf id (id (make-si-doc :title "a" :embedding (%si-embedding 8 4.0))))))
+        (setf path (graph-db::%segment-file g 'si-doc 'embedding))
+        ;; the graph itself closes CLEANLY -- no top-level .dirty marker, so
+        ;; OPEN-GRAPH below will succeed without requiring recovery.
+        (close-graph g :snapshot-p nil))
+      ;; Simulate an unclean shutdown of JUST the vector segment: open it
+      ;; directly (OPEN-VECTOR-SEGMENT flips the on-disk clean flag to dirty
+      ;; as a side effect of opening -- the same mechanism
+      ;; SEGMENT-CLEAN-SHUTDOWN-FLAG in segment-tests.lisp exercises) and
+      ;; inject a PHANTOM entry with no corresponding live node, standing in
+      ;; for drift a real crash could leave behind.  Deliberately never close
+      ;; it, so both the dirty flag and the phantom entry persist on disk.
+      (setf phantom-id (graph-db::gen-vertex-id))
+      (let ((raw (graph-db::open-vector-segment path)))
+        (graph-db::segment-put raw phantom-id (%si-embedding 8 999.0)))
+      (let ((g (open-graph *integration-graph-name* (namestring dir))))
+        (unwind-protect
+             (let ((seg (%si-segment g 'embedding)))
+               (is (not (null seg)) "segment must exist after open")
+               (is (null (graph-db::segment-get seg phantom-id))
+                   "a REBUILT segment must not carry a phantom entry a stale ~
+as-is reopen would have kept -- proves RESTORE-VECTOR-SEGMENTS took the ~
+rebuild branch, not the open-as-is branch")
+               (is (= 1 (graph-db::segment-live-count seg))
+                   "rebuild must contain exactly the one live node, not the phantom")
+               (let ((back (graph-db::segment-get seg id)))
+                 (is (typep back '(simple-array single-float (*))))
+                 (is (every #'= (%si-embedding 8 4.0) back))))
+          (close-graph g :snapshot-p nil)))
       (collect-garbage))))

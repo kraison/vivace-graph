@@ -291,7 +291,18 @@ free list."
 segment/file, create a fresh one sized to the first conforming vector, and
 segment-put every live node's conforming value.  Registers and returns the fresh
 segment.  Run when quiescent (at open, before writes) -- it mutates outside the
-transaction path, like rebuild-spatial-index."
+transaction path, like rebuild-spatial-index.
+
+Scoped to EXACT-CLASS instances (:INCLUDE-SUBCLASSES-P NIL): the live apply path
+(APPLY-TX-WRITE-TO-VECTOR-SEGMENTS) keys each node's segment on
+(CLASS-NAME (CLASS-OF NODE)) -- its exact class, not its declared type -- so a
+subclass instance's vector lives in the SUBCLASS's own segment, never the
+parent's.  MAP-VERTICES defaults to :INCLUDE-SUBCLASSES-P T, which would sweep
+subclass instances into the parent's rebuilt segment, orphaning them from
+maintenance (a delete of the subclass node only touches the subclass segment)
+and leaving the parent segment permanently drifted from the live path.  Each
+subclass with its own :VECTOR-INDEX slot gets its own call to this function
+(see RESTORE-VECTOR-SEGMENTS), so exact-class scoping here loses no coverage."
   (let* ((key (cons class-name slot-name))
          (table (vector-segments graph))
          (path (%segment-file graph class-name slot-name)))
@@ -309,7 +320,7 @@ transaction path, like rebuild-spatial-index."
                  (setf seg (create-vector-segment path (length v)))
                  (setf (gethash key table) seg))
                (segment-put seg (id node) v)))))
-       graph :vertex-type class-name)
+       graph :vertex-type class-name :include-subclasses-p nil)
       seg)))
 
 (defun segment-remove (segment id)
