@@ -22,10 +22,17 @@
   ;; segment-scan, segment-score-subset) take the read side.  Never persisted --
   ;; created fresh by create/open.
   ;;
-  ;; NON-RECURSIVE: lock at PUBLIC boundaries only.  The %SEG-* internals are
-  ;; lock-free and assume the caller holds the lock -- segment-put ->
-  ;; %seg-claim-slot -> %seg-grow nests, so locking inside %seg-grow would
-  ;; self-deadlock.  Same idiom as the skip list.
+  ;; LOCK AT PUBLIC BOUNDARIES ONLY.  The %SEG-* internals are lock-free and
+  ;; assume the caller already holds the lock -- segment-put -> %seg-claim-slot
+  ;; -> %seg-grow nests, so a lock inside %seg-grow would be a second acquire
+  ;; under the first.  Same idiom as the skip list.
+  ;;
+  ;; Precisely: it is the READ side that is non-recursive.  ACQUIRE-WRITE-LOCK
+  ;; (rw-lock.lisp) has an explicit same-thread re-acquire branch, so nesting
+  ;; two write acquires on one thread would in fact survive; nesting two READ
+  ;; acquires deadlocks if a writer arrives between them.  Do not rely on
+  ;; either -- the rule above is what keeps this correct, not the recursion
+  ;; behavior of any one side.
   ;;
   ;; LOCK ORDER: the write side is only ever taken INSIDE the transaction
   ;; manager lock (mutations run on the apply path); the read side is taken
@@ -178,17 +185,111 @@ never-written cell and a removed cell are the same on-disk state."
   (+ (%seg-vblock-offset (segment-capacity segment))
      (* slot (segment-dimension segment) 4)))
 
-(defun %seg-read-vector (segment slot)
-  "Read slot SLOT's vector as a fresh (simple-array single-float (*))."
-  (let* ((dim (segment-dimension segment))
-         (off (%seg-vec-offset segment slot))
-         (bytes (get-bytes (segment-mmap segment) off (* dim 4)))
-         (v (make-array dim :element-type 'single-float)))
-    (dotimes (i dim v)
+;;; Decoding the vector block is THE hot path.  segment-scan sweeps every
+;;; occupied slot and decodes its whole vector, so at 20k x 1024 the decode ran
+;;; ~21M times per scan and measured 1613 ms of a 1633 ms scan -- 98.8% of the
+;;; time, against a 17 ms pure-scoring floor.  The scan's entire justification is
+;;; that scoring contiguous float32s beats materialising nodes; a byte-at-a-time
+;;; decoder threw that away.  Hence the SBCL fast path below.
+;;;
+;;; ON-DISK FORMAT (unchanged): each element is 4 bytes, LITTLE-ENDIAN, holding
+;;; the IEEE-754 binary32 bit pattern that IEEE-FLOATS:ENCODE-FLOAT32 produces
+;;; (%SEG-WRITE-VECTOR assembles it with LDB byte 0 first).  Reading it with
+;;; SB-SYS:SIGNED-SAP-REF-32 + SB-KERNEL:MAKE-SINGLE-FLOAT is therefore
+;;; equivalent ONLY on a little-endian host with IEEE binary32 single-floats.
+;;; That is stated as an explicit assumption rather than left implicit: SBCL
+;;; targets here are arm64 and x86_64, both little-endian, and the guard below
+;;; makes the assumption fail loudly rather than silently on anything else.
+
+#+sbcl
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (unless (= (sb-kernel:single-float-bits 1.0f0) #x3F800000)
+    (error "segment.lisp's SBCL fast decode assumes IEEE binary32 single-floats"))
+  #+big-endian
+  (error "segment.lisp's SBCL fast vector decode assumes a little-endian host; ~
+          this build is big-endian.  Remove the #+sbcl fast path (the portable ~
+          #-sbcl decoder below is byte-order explicit) before running here."))
+
+#+sbcl
+(defun %seg-decode-into (mmap off dim buffer)
+  "Decode DIM little-endian float32s starting at byte offset OFF of MMAP into
+BUFFER.  Bit-identical to the portable DPB + IEEE-FLOATS:DECODE-FLOAT32 loop:
+for every finite pattern MAKE-SINGLE-FLOAT reproduces DECODE-FLOAT32 exactly
+ (same sign, exponent and significand bits), and for the non-finite patterns
+ (exponent = 255, i.e. Inf/NaN) -- which SEGMENT-PUT can never write, since
+IEEE-FLOATS:ENCODE-FLOAT32 refuses them, and which therefore only ever appear
+as CORRUPT or TORN bytes -- it defers to DECODE-FLOAT32 itself, so those still
+signal the very same FLOATING-POINT-OVERFLOW they always did.  That matters:
+the concurrency regression test relies on a torn read blowing up rather than
+quietly yielding a NaN, and a bare SAP-REF-SINGLE would have silently
+downgraded that detector.
+
+SEGV GUARD.  MMAP.LISP wraps GET-BYTE/GET-BYTES in :AROUND handlers that catch
+SB-KERNEL::MEMORY-FAULT-ERROR and retry; reading through the SAP bypasses them,
+so the guard is re-established HERE at whole-vector granularity (one handler
+frame per vector instead of one per byte -- strictly cheaper, and the retry unit
+is the same idempotent read).  It is a backstop, not a correctness requirement:
+since the stable-address mapping landed (mmap-file reserves the window and
+extend-mapped-file re-maps into it with MAP_FIXED) the base pointer never moves
+and no remap can unmap a live address, which is exactly why *MMAP-SEGV-RETRIES*
+is asserted to stay 0 under concurrency.  Keeping the handler costs nothing
+measurable and preserves the existing contract rather than silently dropping it."
+  (declare (type fixnum off dim)
+           (type (simple-array single-float (*)) buffer)
+           (optimize (speed 3) (safety 0)))
+  (handler-case
+      (let ((sap (m-pointer mmap)))
+        (declare (type sb-sys:system-area-pointer sap))
+        (dotimes (i dim buffer)
+          (declare (type fixnum i))
+          (let ((word (sb-sys:signed-sap-ref-32 sap (the fixnum (+ off (* i 4))))))
+            (declare (type (signed-byte 32) word))
+            (setf (aref buffer i)
+                  (if (= #xff (logand (ash word -23) #xff))
+                      ;; Inf/NaN pattern: never legitimately stored.  Route it
+                      ;; through the original decoder so the error is identical.
+                      (ieee-floats:decode-float32 (ldb (byte 32 0) word))
+                      (sb-kernel:make-single-float word))))))
+    (sb-kernel::memory-fault-error (c)
+      (incf *mmap-segv-retries*)
+      (log:error "SEGV: GOT ~A in ~A; retrying." c mmap)
+      (%seg-decode-into mmap off dim buffer))))
+
+#-sbcl
+(defun %seg-decode-into (mmap off dim buffer)
+  "Portable decoder: byte-order-explicit little-endian assembly through the
+mmap accessors (which carry their own SEGV-retry :AROUND methods).  This is the
+original implementation, retained verbatim as the fallback for CCL, ECL and
+LispWorks so every implementation produces identical results."
+  (let ((bytes (get-bytes mmap off (* dim 4))))
+    (dotimes (i dim buffer)
       (let ((bits 0) (b (* i 4)))
         (dotimes (k 4)
           (setf bits (dpb (aref bytes (+ b k)) (byte 8 (* k 8)) bits)))
-        (setf (aref v i) (ieee-floats:decode-float32 bits))))))
+        (setf (aref buffer i) (ieee-floats:decode-float32 bits))))))
+
+(defun %seg-read-vector-into (segment slot buffer)
+  "Decode slot SLOT's vector into BUFFER, a (simple-array single-float (*)) of
+the segment's dimension.  Returns BUFFER.  Lets a scan reuse one buffer for
+every candidate instead of consing a fresh vector per slot.
+
+The length check is NOT redundant: the SBCL decoder runs at (safety 0), so a
+short buffer would scribble past the array rather than signal.  One check per
+vector (not per element) is unmeasurable next to the decode it guards."
+  (declare (type (simple-array single-float (*)) buffer))
+  (unless (>= (length buffer) (segment-dimension segment))
+    (error "decode buffer of length ~D is shorter than segment dimension ~D"
+           (length buffer) (segment-dimension segment)))
+  (%seg-decode-into (segment-mmap segment)
+                    (%seg-vec-offset segment slot)
+                    (segment-dimension segment)
+                    buffer))
+
+(defun %seg-read-vector (segment slot)
+  "Read slot SLOT's vector as a fresh (simple-array single-float (*))."
+  (%seg-read-vector-into
+   segment slot
+   (make-array (segment-dimension segment) :element-type 'single-float)))
 
 (defun %seg-write-vector (segment slot vector)
   "Write VECTOR into slot SLOT's vector-block region."
@@ -540,13 +641,19 @@ slot."
     (when (or (zerop k) (zerop qnorm))
       (return-from segment-scan nil))
     (with-read-lock ((segment-lock segment))
-      (let ((mmap (segment-mmap segment))
-            (cap (segment-capacity segment))
-            (collector (%make-topk k)))
+      (let* ((mmap (segment-mmap segment))
+             (cap (segment-capacity segment))
+             (collector (%make-topk k))
+             ;; ONE scratch vector for the whole sweep instead of a fresh
+             ;; dim-wide array per candidate: %cosine-with-norm consumes it
+             ;; immediately and never retains it, and the buffer is local to
+             ;; this call, so no other thread can see it.
+             (v (make-array (segment-dimension segment)
+                            :element-type 'single-float)))
         (dotimes (slot cap)
           (unless (= (deserialize-uint64 mmap (%seg-id-offset slot)) +free-slot-marker+)
-            (let ((id (get-bytes mmap (%seg-id-offset slot) +key-bytes+))
-                  (v (%seg-read-vector segment slot)))
+            (let ((id (get-bytes mmap (%seg-id-offset slot) +key-bytes+)))
+              (%seg-read-vector-into segment slot v)
               (%topk-offer collector (%cosine-with-norm query-vector qnorm v) id))))
         (%topk-results collector)))))
 
@@ -573,6 +680,12 @@ results are sorted into the same best-first total order SEGMENT-SCAN uses
 (score DESCENDING, node-id ASCENDING) via %SCORE-BEFORE-P, without being
 bounded to any k.
 
+NODE-IDS is NOT de-duplicated: an id appearing twice is scored twice and
+appears twice in the result, adjacently (equal score and equal id tie under
+%SCORE-BEFORE-P).  This matters for the ANN seam -- a candidate generator that
+unions several probe lists can easily emit duplicates -- so de-duplicate on
+the caller's side if that is not what you want.
+
 Takes the segment's READ lock, like SEGMENT-SCAN: mutations take the write
 side, so this is safe against a concurrent growing commit."
   (declare (type (simple-array single-float (*)) query-vector))
@@ -583,12 +696,14 @@ side, so this is safe against a concurrent growing commit."
     (when (or (null node-ids) (zerop qnorm))
       (return-from segment-score-subset nil))
     (with-read-lock ((segment-lock segment))
-      (let ((out '()))
+      (let ((out '())
+            ;; One reusable scratch vector, as in SEGMENT-SCAN.
+            (v (make-array (segment-dimension segment)
+                           :element-type 'single-float)))
         (dolist (id node-ids)
           (let ((slot (%seg-slot-of segment id)))
             (when slot
-              (push (cons (%cosine-with-norm query-vector qnorm (%seg-read-vector segment slot))
-                          id)
-                    out))))
+              (%seg-read-vector-into segment slot v)
+              (push (cons (%cosine-with-norm query-vector qnorm v) id) out))))
         (sort out (lambda (a b)
                     (%score-before-p (car a) (cdr a) (car b) (cdr b))))))))

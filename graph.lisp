@@ -101,7 +101,15 @@ Resolves the OWNER segment for (CLASS-NAME, SLOT-NAME) -- under Model B one
 segment per declaring class holds the whole hierarchy -- and scans it.  Returns
 NIL when no segment exists yet: segments are created lazily on the first
 conforming write, so a declared-but-never-written slot simply has nothing to
-search."
+search.
+
+NIL is AMBIGUOUS, deliberately.  It means any of: (a) the legitimate lazy case
+above; (b) CLASS-NAME names no class; (c) SLOT-NAME is not a :VECTOR-INDEX slot
+on CLASS-NAME or any ancestor -- in which case %VECTOR-INDEX-SLOT-OWNER-NAME
+falls back to the queried class itself and the lookup misses a key nothing was
+ever stored under.  So a typo in either name is indistinguishable from an empty
+index and reports \"nothing indexed\" rather than signalling.  If you are
+debugging an unexpectedly empty result, check the declaration before the data."
   (let* ((class (find-class class-name nil))
          (owner (and class (%vector-index-slot-owner-name class slot-name)))
          (segment (and owner

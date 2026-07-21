@@ -34,6 +34,10 @@
            #:snapshot
            #:replay
            #:restore
+           ;; Vector segments (dense-vector index + cosine kNN query layer).
+           #:vector-search
+           #:segment-scan
+           #:segment-score-subset
            #:location
            #:schema
            #:indexes

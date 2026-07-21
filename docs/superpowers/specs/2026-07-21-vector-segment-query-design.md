@@ -211,3 +211,51 @@ break the mechanism, confirm the test fails, restore.
   vectors into one owner segment would surface as a mid-apply error (not reachable today;
   no peer config uses `:vector-index`). Noted for when peer replication and vector search
   meet.
+
+## 12. Addendum (as-built, 2026-07-21): the decode tax
+
+The step shipped as designed, but the first end-to-end measurement of the delivered
+`segment-scan` found it **~100x slower than the contiguous-float scan this whole phase was
+justified by**. Recorded here because the omission — not the code — is the reusable lesson.
+
+Measured on this tree, SBCL 2.5.5 / macOS arm64 (M3), 20,000 vectors x 1024 dims:
+
+| | as first delivered | after the fix |
+| --- | --- | --- |
+| full `segment-scan` | 1632.7 ms | **35.3 ms** |
+| of which `%seg-read-vector` x20000 | 1613.5 ms (98.8%) | 21.1 ms |
+| pure scoring x20000 | 17.4 ms | 17.6 ms |
+
+Step 1's attribution measured the reference contiguous scan at 14.8 ms at this shape, and
+the "pure scoring" line reproduces it — so the scoring code was always correct and always
+fast, and §4's "scoring is ~2% of scan cost" was never wrong. The 1613 ms was **decode**,
+a cost the attribution benchmark never measured because it scanned a Lisp array rather
+than the mmap.
+
+Root cause: `%seg-read-vector` was written in Step 2 as a correctness-oriented unit
+operation — per candidate it read the vector one byte at a time through the mmap layer's
+SEGV-retry `:around`, allocated two fresh arrays, and called `ieee-floats:decode-float32`
+per element. Step 4 reused it verbatim inside the hot loop. Every task-scoped review saw
+"the existing accessor, used correctly" and was right to; **no task brief carried Step 1's
+numbers**, so nothing in the per-task process could have caught it. It took reading all
+eight commits against the original premise.
+
+The fix (SBCL fast path, original decoder retained as the `#-sbcl` fallback) reads
+float32s directly off the stable base pointer, proved bit-identical over 20,000 real
+vectors and a 1,024,288-pattern sweep including every exponent and both signs. Two details
+worth preserving:
+
+- **The SEGV-retry guard was kept, at one `handler-case` per vector instead of per byte.**
+  The stable-address mapping (reserved window + `MAP_FIXED`) is why `*mmap-segv-retries*`
+  stays 0, which makes the guard a backstop — not a licence to delete it.
+- **Exponent-255 words are still routed through `ieee-floats:decode-float32`.** A bare
+  `sap-ref-single` would turn the all-ones free-marker bytes that `%seg-grow` writes into a
+  quiet NaN, silently downgrading the concurrency test's primary torn-read detector from an
+  error to a plausible-looking score. Such patterns can never be legitimately stored
+  (`encode-float32` refuses them), so the branch never fires on real data.
+
+**Process lesson:** an attribution benchmark that measures a *proxy* for the hot path
+(a Lisp array standing in for the mmap) establishes an upper bound on the win, not the win.
+When a later step reuses an existing accessor inside that hot path, the benchmark must be
+re-run end-to-end against the real implementation before the premise is treated as
+delivered.
