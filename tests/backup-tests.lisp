@@ -15,6 +15,287 @@
 
 (in-suite backup-suite)
 
+;;; ---------------------------------------------------------------------------
+;;; Issue #56: specialized (non-byte) vector slots must survive snapshot/replay.
+;;;
+;;; The snapshot file is text, so a vector's ELEMENT TYPE has to be written down:
+;;; BACKUP emits #V(<element-type> ...) and the restore readtable reads it back.
+;;; Before the fix, the restore reader coerced every #(...) to (unsigned-byte 8)
+;;; -- correct for ids, fatal for a SINGLE-FLOAT embedding.
+;;; ---------------------------------------------------------------------------
+
+(def-vertex bk-vec ()
+  ((label :type string)
+   (fvec))                              ; a (simple-array single-float (*))
+  :graph-db-integration-test)
+
+(def-edge bk-link ()
+  ((payload))                           ; a specialized vector on an EDGE
+  :graph-db-integration-test)
+
+(defun %bk-floats (&rest values)
+  "A (simple-array single-float (*)) holding VALUES."
+  (make-array (length values) :element-type 'single-float
+                              :initial-contents (mapcar (lambda (x)
+                                                          (coerce x 'single-float))
+                                                        values)))
+
+(defun %bk-bytes (&rest values)
+  (coerce values '(simple-array (unsigned-byte 8) (*))))
+
+(test snapshot-replay-preserves-single-float-vector-slot
+  "REGRESSION for issue #56.  A node slot holding a (simple-array single-float
+(*)) round-trips through snapshot + replay with both its CONTENTS and its
+ELEMENT TYPE intact.  Before the fix the replay signalled
+  The value 1.0 is not of type (UNSIGNED-BYTE 8)."
+  (with-temp-directory (dir1)
+    (with-temp-directory (dir2)
+      (let* ((p1 (namestring dir1)) (p2 (namestring dir2))
+             (original (%bk-floats 1.0 1.25 1.5 -2.75))
+             (id nil))
+        (let ((g (make-graph *integration-graph-name* p1 :buffer-pool-size 1000)))
+          (let ((*graph* g))
+            (with-transaction ()
+              (setq id (id (make-bk-vec :label "floats" :fvec original))))
+            (is (= 1 (graph-db:snapshot g))
+                "expected exactly 1 node snapshotted"))
+          (close-graph g :snapshot-p nil))
+        (let ((g2 (make-graph *integration-graph-name* p2 :buffer-pool-size 1000)))
+          (unwind-protect
+               (let ((*graph* g2))
+                 (graph-db:replay g2 (merge-pathnames "txn-log/" dir1) :graph-db/test)
+                 (let ((v (lookup-vertex id)))
+                   (is-true v "the float-vector vertex ~A was not restored at all" id)
+                   (when v
+                     (is (equalp id (id v)) "restored vertex id differs from ~S" id)
+                     (is (typep (id v) '(simple-array (unsigned-byte 8) (*)))
+                         "restored vertex id is not an id byte vector: ~S" (type-of (id v)))
+                     (let ((back (slot-value v 'fvec)))
+                       (is (vectorp back)
+                           "restored fvec should be a vector, got ~S" back)
+                       (is (= 4 (length back))
+                           "restored fvec should have 4 elements, got ~S" back)
+                       (is (equalp original back)
+                           "restored fvec ~S differs from the original ~S" back original)
+                       (is (equal 'single-float (array-element-type back))
+                           "restored fvec lost its element type: ~S (type-of ~S)"
+                           (array-element-type back) (type-of back))
+                       (is (typep back '(simple-array single-float (*)))
+                           "restored fvec is not a specialized single-float vector: ~S"
+                           (type-of back))
+                       ;; element-by-element, so an all-zero or truncated vector
+                       ;; cannot slip past the assertions above
+                       (is (and (= 1.0 (aref back 0)) (= 1.25 (aref back 1))
+                                (= 1.5 (aref back 2)) (= -2.75 (aref back 3)))
+                           "restored fvec has the wrong values: ~S" back)))))
+            (close-graph g2 :snapshot-p nil)
+            (collect-garbage)))))))
+
+(defun %backup-text-round-trip (plist)
+  "Print PLIST with the real snapshot writer, read it back with the real restore
+readtable, and return what came out."
+  (let ((text (with-output-to-string (out)
+                (graph-db::write-backup-plist plist out))))
+    (let ((*readtable* graph-db::*restore-readtable*)
+          (*package* (find-package :graph-db/test)))
+      (values (read-from-string text) text))))
+
+(test snapshot-text-preserves-byte-vector-data
+  "The case the old blanket #(...) coercion existed to serve: UNSIGNED-BYTE 8
+data still comes back as a byte vector, not as a simple-vector of integers.
+
+This is exercised at the snapshot TEXT layer (real writer + real restore
+readtable) rather than through a node slot, because a raw byte vector is not a
+storable slot value in the first place: SERIALIZE treats an (unsigned-byte 8)
+vector as ALREADY-serialized bytes and splices it in raw, so the surrounding
+alist no longer deserializes.  That is a pre-existing property of the binary
+codec, unrelated to the snapshot format.  Byte vectors reach a snapshot as node
+IDS and as an edge's FROM / TO, and those paths are covered end to end by the
+other tests here."
+  (let* ((bytes (%bk-bytes 0 1 127 128 255))
+         (plist (list :v 'g-person (list (cons :name "b") (cons :blob bytes))
+                      :id bytes :revision 0 :deleted-p nil)))
+    (multiple-value-bind (back text) (%backup-text-round-trip plist)
+      (is (search "#V((UNSIGNED-BYTE 8) 0 1 127 128 255)" text)
+          "writer should emit an element-typed #V literal; wrote: ~A" text)
+      (let ((blob (cdr (assoc :blob (third back))))
+            (id (getf (nthcdr 3 back) :id)))
+        (is-true blob "the :BLOB entry did not survive the round trip: ~S" back)
+        (is (equalp bytes blob) "round-tripped blob ~S differs from ~S" blob bytes)
+        (is (typep blob '(simple-array (unsigned-byte 8) (*)))
+            "round-tripped blob is no longer a byte vector: ~S" (type-of blob))
+        (is (= 255 (aref blob 4)) "round-tripped blob has wrong values: ~S" blob)
+        (is (typep id '(simple-array (unsigned-byte 8) (*)))
+            "round-tripped :ID is no longer an id byte vector: ~S" (type-of id))
+        (is (equalp bytes id) "round-tripped :ID ~S differs from ~S" id bytes)))))
+
+(test snapshot-replay-preserves-edge-endpoints-and-vector-payload
+  "Edges carry TWO bare id byte vectors positionally (FROM and TO) plus their own
+data, so they are the case most likely to break.  Round-trip an edge with a
+single-float payload: endpoints, weight, payload and traversability all survive."
+  (with-temp-directory (dir1)
+    (with-temp-directory (dir2)
+      (let* ((p1 (namestring dir1)) (p2 (namestring dir2))
+             (payload (%bk-floats 0.5 -0.25 4.0))
+             (aid nil) (bid nil) (eid nil))
+        (let ((g (make-graph *integration-graph-name* p1 :buffer-pool-size 1000)))
+          (let ((*graph* g))
+            (with-transaction ()
+              (let* ((a (make-bk-vec :label "from"))
+                     (b (make-bk-vec :label "to"))
+                     (e (make-bk-link :from a :to b :weight 3.25 :payload payload)))
+                (setq aid (id a) bid (id b) eid (id e))))
+            (is (= 3 (graph-db:snapshot g))
+                "expected 3 nodes snapshotted (2 vertices + 1 edge)"))
+          (close-graph g :snapshot-p nil))
+        (let ((g2 (make-graph *integration-graph-name* p2 :buffer-pool-size 1000)))
+          (unwind-protect
+               (let ((*graph* g2))
+                 (graph-db:replay g2 (merge-pathnames "txn-log/" dir1) :graph-db/test)
+                 (let ((a (lookup-vertex aid)))
+                   (is-true a "source vertex ~A was not restored" aid)
+                   (is-true (lookup-vertex bid) "target vertex ~A was not restored" bid)
+                   (when a
+                     (let ((outs (outgoing-edges a)))
+                       (is (= 1 (length outs))
+                           "expected exactly 1 restored outgoing edge, got ~S" outs)
+                       (when (= 1 (length outs))
+                         (let ((e (first outs)))
+                           (is (equalp eid (id e)) "restored edge lost its id")
+                           (is (equalp aid (from e))
+                               "restored edge FROM is ~S, expected ~S" (from e) aid)
+                           (is (equalp bid (to e))
+                               "restored edge TO is ~S, expected ~S" (to e) bid)
+                           (is (typep (from e) '(simple-array (unsigned-byte 8) (*)))
+                               "restored edge FROM is not an id byte vector: ~S"
+                               (type-of (from e)))
+                           (is (typep (to e) '(simple-array (unsigned-byte 8) (*)))
+                               "restored edge TO is not an id byte vector: ~S"
+                               (type-of (to e)))
+                           (is (= 3.25 (weight e))
+                               "restored edge weight is ~S, expected 3.25" (weight e))
+                           (let ((back (slot-value e 'payload)))
+                             (is (equalp payload back)
+                                 "restored edge payload ~S differs from ~S" back payload)
+                             (is (equal 'single-float (array-element-type back))
+                                 "restored edge payload lost its element type: ~S"
+                                 (type-of back))
+                             (is (= 4.0 (aref back 2))
+                                 "restored edge payload has the wrong values: ~S" back))))))))
+            (close-graph g2 :snapshot-p nil)
+            (collect-garbage)))))))
+
+(test snapshot-replay-repopulates-vector-index-segment
+  "End-to-end for a :VECTOR-INDEX slot (SI-DOC/EMBEDDING, from
+segment-integration-tests): after snapshot + replay into a fresh graph, the
+restoring transactions repopulate the vector segment, so VECTOR-SEARCH on the
+NEW graph finds the node.  This is #56 at the feature level -- an embedding is a
+single-float vector, so before the fix the replay could not even parse it."
+  (with-temp-directory (dir1)
+    (with-temp-directory (dir2)
+      (let* ((p1 (namestring dir1)) (p2 (namestring dir2))
+             (near-vec (%si-embedding 8 1.0))
+             (far-vec (%si-embedding 8 50.0))
+             (near nil) (far nil))
+        (let ((g (make-graph *integration-graph-name* p1 :buffer-pool-size 1000)))
+          (let ((*graph* g))
+            (with-transaction ()
+              (setq near (id (make-si-doc :title "near" :embedding near-vec)))
+              (setq far (id (make-si-doc :title "far" :embedding far-vec))))
+            (graph-db:snapshot g))
+          (close-graph g :snapshot-p nil))
+        (let ((g2 (make-graph *integration-graph-name* p2 :buffer-pool-size 1000)))
+          (unwind-protect
+               (let ((*graph* g2))
+                 ;; the fresh graph has no segment at all before replay
+                 (is (null (vector-search g2 'si-doc 'embedding near-vec 5))
+                     "fresh graph must have nothing indexed before replay")
+                 (graph-db:replay g2 (merge-pathnames "txn-log/" dir1) :graph-db/test)
+                 ;; the slot value itself came back with its element type
+                 (let ((v (lookup-vertex near)))
+                   (is-true v "the embedded vertex ~A was not restored" near)
+                   (when v
+                     (let ((back (slot-value v 'embedding)))
+                       (is (equalp near-vec back)
+                           "restored embedding ~S differs from ~S" back near-vec)
+                       (is (equal 'single-float (array-element-type back))
+                           "restored embedding lost its element type: ~S" (type-of back)))))
+                 ;; and the segment was repopulated by the restoring transactions
+                 (let ((hits (vector-search g2 'si-doc 'embedding near-vec 5)))
+                   (is (= 2 (length hits))
+                       "expected both restored docs in the rebuilt segment, got ~S" hits)
+                   (when hits
+                     (is (equalp near (cdr (first hits)))
+                         "the nearest restored doc should rank first; got ~S"
+                         (mapcar #'cdr hits))
+                     (is (member far (mapcar #'cdr hits) :test #'equalp)
+                         "the far doc ~A is missing from the rebuilt segment" far))))
+            (close-graph g2 :snapshot-p nil)
+            (collect-garbage)))))))
+
+(defun %write-old-format-snapshot (path a-id b-id e-id)
+  "Hand-write a snapshot in the PRE-#V format: every vector, including the ids
+and an edge's FROM / TO, printed as a bare #(...).  This is exactly what
+graph-db wrote before the issue-#56 fix, and it must still restore."
+  (flet ((bare (id) (format nil "#(~{~D~^ ~})" (coerce id 'list))))
+    (ensure-directories-exist path)
+    (with-open-file (out path :direction :output :if-exists :supersede
+                              :if-does-not-exist :create)
+      (format out "(:V G-PERSON ((:NAME . \"Old\") (:AGE . 51)) :ID ~A :REVISION 0 :DELETED-P NIL)~%"
+              (bare a-id))
+      (format out "(:V G-PERSON ((:NAME . \"Format\") (:AGE . 8)) :ID ~A :REVISION 0 :DELETED-P NIL)~%"
+              (bare b-id))
+      (format out "(:E G-KNOWS ~A ~A 1.5 ((:SINCE . 1999)) :ID ~A :REVISION 0 :DELETED-P NIL)~%"
+              (bare a-id) (bare b-id) (bare e-id)))))
+
+(test old-format-snapshot-still-replays
+  "BACKWARD COMPATIBILITY GATE.  A snapshot written by a pre-fix graph-db --
+bare #(...) for the vertex ids and for the edge's FROM / TO -- still replays:
+those values are repaired back into id byte vectors at the consumption site.
+Without that repair the ids come back as SIMPLE-VECTORs and nothing resolves."
+  (with-temp-directory (snapdir)
+    (let ((a-id (graph-db::gen-vertex-id))
+          (b-id (graph-db::gen-vertex-id))
+          (e-id (graph-db::gen-edge-id)))
+      (%write-old-format-snapshot (merge-pathnames "snap-1" snapdir) a-id b-id e-id)
+      (with-temp-directory (dir2)
+        (let ((g2 (make-graph *integration-graph-name* (namestring dir2)
+                              :buffer-pool-size 1000)))
+          (unwind-protect
+               (let ((*graph* g2))
+                 (graph-db:replay g2 snapdir :graph-db/test)
+                 (let ((a (lookup-vertex a-id))
+                       (b (lookup-vertex b-id)))
+                   (is-true a "old-format vertex ~A did not restore" a-id)
+                   (is-true b "old-format vertex ~A did not restore" b-id)
+                   (when (and a b)
+                     (is (typep (id a) '(simple-array (unsigned-byte 8) (*)))
+                         "old-format id restored as ~S, not an id byte vector"
+                         (type-of (id a)))
+                     (is (string= "Old" (slot-value a 'name))
+                         "old-format slot value lost: ~S" (slot-value a 'name))
+                     (is (= 51 (slot-value a 'age)))
+                     (is (string= "Format" (slot-value b 'name)))
+                     (let ((outs (outgoing-edges a)))
+                       (is (= 1 (length outs))
+                           "old-format edge did not restore into the adjacency index: ~S"
+                           outs)
+                       (when (= 1 (length outs))
+                         (let ((e (first outs)))
+                           (is (equalp e-id (id e)) "old-format edge id lost")
+                           (is (equalp a-id (from e))
+                               "old-format edge FROM is ~S, expected ~S" (from e) a-id)
+                           (is (equalp b-id (to e))
+                               "old-format edge TO is ~S, expected ~S" (to e) b-id)
+                           (is (typep (from e) '(simple-array (unsigned-byte 8) (*)))
+                               "old-format edge FROM restored as ~S, not an id byte vector"
+                               (type-of (from e)))
+                           (is (= 1.5 (weight e))
+                               "old-format edge weight is ~S, expected 1.5" (weight e))
+                           (is (= 1999 (slot-value e 'since))))))))
+            (close-graph g2 :snapshot-p nil)
+            (collect-garbage))))))))
+
 (test snapshot-and-replay-round-trip
   "Snapshot a populated graph, then replay it into a fresh empty graph in a new
 directory: vertex count, slot values, edge endpoints/weight and node ids all

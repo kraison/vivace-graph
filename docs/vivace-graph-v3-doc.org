@@ -1669,10 +1669,12 @@ When you call ~snapshot~, it performs several important steps to ensure a high-q
 The resulting file contains a series of Lisp s-expressions, one for each node in the graph. This format is not only easy to inspect but is also crucial for the restore process.
 
 #+BEGIN_EXAMPLE
-  ;; A snapshot file looks like this:
-  (:V USER ((:USERNAME . "alice")) :ID #<"uuid-bytes"> :REVISION 2 :DELETED-P NIL)
-  (:V USER ((:USERNAME . "bob")) :ID #<"uuid-bytes"> :REVISION 1 :DELETED-P NIL)
-  (:E FOLLOWS ("<bob's-id>") ("<alice's-id>") 1.0 NIL :ID #<"uuid-bytes"> ...)
+  ;; A snapshot file looks like this (ids abbreviated):
+  (:V USER ((:USERNAME . "alice")) :ID #V((UNSIGNED-BYTE 8) 37 22 12 ...) :REVISION 2 :DELETED-P NIL)
+  (:V USER ((:USERNAME . "bob")) :ID #V((UNSIGNED-BYTE 8) 91 4 200 ...) :REVISION 1 :DELETED-P NIL)
+  (:E FOLLOWS #V((UNSIGNED-BYTE 8) 91 4 200 ...) #V((UNSIGNED-BYTE 8) 37 22 12 ...) 1.0 NIL :ID ... )
+  ;; a vector-valued slot carries its element type too:
+  (:V DOC ((:EMBEDDING . #V(SINGLE-FLOAT 1.0 1.25 1.5))) :ID ... :REVISION 0 :DELETED-P NIL)
   ...
 #+END_EXAMPLE
 
@@ -1697,19 +1699,31 @@ The restoration process is as follows:
 The same "indexes are derived, node data is not" principle covers *vector segments* (Chapter 8): a segment never appears in a snapshot file, and because it is maintained on the transaction apply path, it is repopulated as the restoring transactions recreate the nodes.
 
 #+BEGIN_QUOTE
-*Known limitation (issue #56).* That repopulation is currently unreachable for
-embeddings, because ~replay~ fails before it gets there. ~backup~ writes slot values
-as Lisp text, and the restore readtable coerces *every* ~#(...)~ it reads to
-~(simple-array (unsigned-byte 8) (*))~ — it has to, because node ~:ID~ values are byte
-vectors and it cannot tell an id from slot data. A ~single-float~ vector therefore
-signals a ~type-error~ on restore:
+*Vector-valued slots in the snapshot text (issue #56, fixed).* A snapshot file is Lisp
+text, and standard ~#(...)~ syntax throws a vector's element type away — it always reads
+back as a ~simple-vector~. graph-db used to paper over that by coercing *every* ~#(...)~
+in a snapshot to ~(simple-array (unsigned-byte 8) (*))~, because node ~:ID~ values (and an
+edge's ~from~ / ~to~) are byte vectors and the reader could not tell an id from slot data.
+That made any non-byte vector slot — a ~single-float~ embedding, say — a hard restore
+failure: /The value 1.0 is not of type (UNSIGNED-BYTE 8)/.
 
-: The value 1.0 is not of type (UNSIGNED-BYTE 8)
+The snapshot format now writes the element type down. ~backup~ prints any vector whose
+element type is not ~T~ as ~#V(<element-type> e1 e2 ...)~ — for example
+~#V(SINGLE-FLOAT 1.0 1.25 1.5)~ or ~#V((UNSIGNED-BYTE 8) 37 22 12)~ — and ~replay~ rebuilds
+the array with exactly that element type. Plain ~#(...)~ now reads as an ordinary
+~simple-vector~, and strings are untouched. (~*print-readably*~ is deliberately not used:
+SBCL's ~#A((3) SINGLE-FLOAT ...)~ is an SBCL extension, and a snapshot taken on one
+implementation must restore on SBCL, CCL, ECL and LispWorks alike.) So a graph holding
+~:vector-index~ slots now round-trips through ~snapshot~ and ~replay~ with its embeddings
+intact, and the segment repopulation described above happens as advertised.
 
-So a graph holding ~:vector-index~ slots — or any slot with a non-byte vector — cannot
-currently be round-tripped through ~snapshot~ and ~replay~. It fails loudly rather than
-restoring corrupt data, but plan your backups accordingly: copy the graph *directory*
-rather than relying on snapshot/replay until #56 is fixed.
+*Compatibility is one-way.* A snapshot written by this version is *not* readable by an
+older graph-db, which does not know ~#V~. A snapshot written by an older graph-db *is*
+readable by this one: its bare-~#(...)~ ids, and an edge's ~from~ / ~to~, are coerced back
+into id byte vectors during the replay. The one thing an old file cannot give back is
+the element type of a node's own vector-valued *slots* — that was never recorded — so
+such a slot restores as a plain ~simple-vector~; take a fresh snapshot afterwards to
+capture the types. The on-disk graph format is unchanged by all of this.
 #+END_QUOTE
 
 The same derivation is what makes crash recovery cheap outside of backup entirely — a segment that was not cleanly closed is dropped and rebuilt from the nodes on the next ~open-graph~ (Chapter 3, "Vector segments").

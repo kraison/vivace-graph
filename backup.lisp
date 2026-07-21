@@ -2,6 +2,63 @@
 
 (defgeneric backup (object location &key include-deleted-p))
 
+;;; ---------------------------------------------------------------------------
+;;; Printing specialized vectors readably (issue #56).
+;;;
+;;; BACKUP prints a node as one s-expression with (FORMAT ... "~S"), so the
+;;; standard printer decides how vectors look -- and it prints EVERY vector as
+;;; #(...), throwing the element type away.  The restore reader then cannot tell
+;;; an id (a byte vector) from a SINGLE-FLOAT embedding.
+;;;
+;;; The fix is an explicit, portable encoding we control both ends of: a vector
+;;; whose element type is not T is wrapped, just before printing, in a
+;;; BACKUP-VECTOR-LITERAL whose PRINT-OBJECT emits #V(<element-type> e1 e2 ...).
+;;; RESTORE-SHARP-V-READER (transaction-restore.lisp) reads it back.
+;;;
+;;; Wrapping is done by a pre-pass rather than a PPRINT-DISPATCH entry because
+;;; BACKUP binds *PRINT-PRETTY* to NIL, which disables pprint dispatch entirely.
+;;; PRINT-OBJECT is honoured either way, including inside nested alists.
+;;; ---------------------------------------------------------------------------
+
+(defstruct (backup-vector-literal (:constructor make-backup-vector-literal (vector))
+                                  (:copier nil))
+  "Print-time wrapper: prints its VECTOR as #V(<element-type> e1 e2 ...)."
+  (vector #() :read-only t))
+
+(defmethod print-object ((object backup-vector-literal) stream)
+  (let ((vector (backup-vector-literal-vector object)))
+    (write-string "#V(" stream)
+    (prin1 (array-element-type vector) stream)
+    (loop for element across vector
+          do (write-char #\Space stream)
+             (prin1 element stream))
+    (write-char #\) stream)))
+
+(defun backup-literalize (object)
+  "Recursively copy OBJECT, wrapping every specialized vector for printing.
+
+A vector whose ARRAY-ELEMENT-TYPE is not T loses that type through the standard
+#(...) printer, so it is wrapped in a BACKUP-VECTOR-LITERAL.  Strings are left
+alone: they already print and read back correctly.  Conses and general (element
+type T) vectors are walked so that specialized vectors nested inside a node's
+data alist are wrapped too."
+  (typecase object
+    (cons (cons (backup-literalize (car object))
+                (backup-literalize (cdr object))))
+    (string object)
+    (vector
+     (if (eq (array-element-type object) t)
+         (let ((copy (make-array (length object))))
+           (dotimes (i (length object) copy)
+             (setf (aref copy i) (backup-literalize (aref object i)))))
+         (make-backup-vector-literal object)))
+    (t object)))
+
+(defun write-backup-plist (plist stream)
+  "Print PLIST as one readable snapshot line on STREAM."
+  (let ((*print-pretty* nil))
+    (format stream "~S~%" (backup-literalize plist))))
+
 (defmethod backup :around ((node node) location &key include-deleted-p)
   (when (or include-deleted-p (not (deleted-p node)))
     (call-next-method)))
@@ -16,8 +73,7 @@
                :id (id v)
                :revision (revision v)
                :deleted-p (deleted-p v))))
-    (let ((*print-pretty* nil))
-      (format stream "~S~%" plist))))
+    (write-backup-plist plist stream)))
 
 (defmethod backup ((e edge) (stream stream) &key include-deleted-p)
   (declare (ignore include-deleted-p))
@@ -32,8 +88,7 @@
                :id (id e)
                :revision (revision e)
                :deleted-p (deleted-p e))))
-    (let ((*print-pretty* nil))
-      (format stream "~S~%" plist))))
+    (write-backup-plist plist stream)))
 
 (defmethod backup ((graph graph) location &key include-deleted-p)
   (ensure-directories-exist location)

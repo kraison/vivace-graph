@@ -29,6 +29,32 @@ between releases; cutting a release renames it to the new version and dates it.
   `:vector-index`, distinct from crash recovery's `rebuild-vector-segment`
   (full drop-and-rebuild), which `restore-vector-segments` still uses.
 
+### Fixed
+- **Snapshot/replay lost specialized vectors (issue #56).** `snapshot` → `replay`
+  could not round-trip a graph whose nodes had a vector-valued slot that was not
+  a byte vector: the restore readtable overrode `#(` to coerce *every* vector to
+  `(unsigned-byte 8)` — necessary because node ids are byte vectors, fatal for
+  anything else — so a `single-float` slot (e.g. a `:vector-index` embedding)
+  aborted the restore with `The value 1.0 is not of type (UNSIGNED-BYTE 8)`.
+  The snapshot text format now records a vector's element type explicitly:
+  `backup` writes any vector whose element type is not `T` as
+  `#V(<element-type> e1 e2 ...)` (e.g. `#V(SINGLE-FLOAT 1.0 1.25)`,
+  `#V((UNSIGNED-BYTE 8) 37 22)`), and `#(...)` now reads back as a plain
+  `simple-vector`. Strings are unaffected. `*print-readably*` was deliberately
+  *not* used: SBCL's `#A((3) SINGLE-FLOAT ...)` is an SBCL extension, and a
+  snapshot must restore on SBCL, CCL, ECL and LispWorks alike.
+
+### Changed
+- **The snapshot text format changed, one-way compatibly.** Snapshots written by
+  this version are **not** readable by older graph-db versions (they contain
+  `#V` literals older readers do not know). Snapshots written by older versions
+  **are** readable by this one: ids, and an edge's `from`/`to`, are coerced back
+  to id byte vectors at the consumption site in `recreate-graph`. One thing old
+  files cannot give back is the *element type* of a node's own vector-valued
+  slots — that was never written down — so such a slot restores from an old
+  snapshot as a plain `simple-vector`; re-snapshot afterwards to record the
+  types. Nothing about the on-disk graph format changed.
+
 ## [2.1.1] - 2026-07-06
 
 A bug-fix release.
