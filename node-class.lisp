@@ -19,6 +19,8 @@
    ;; docs/unique-constraint-design.md.
    (unique :accessor unique-spec :initarg :unique :initform nil :allocation :instance)
    (unique-scope :accessor unique-scope :initarg :scope :initform :local
+                 :allocation :instance)
+   (vector-index :accessor vector-index-p :initarg :vector-index :initform nil
                  :allocation :instance)))
 
 (defmethod persistent-p (slot-def)
@@ -32,6 +34,9 @@
 
 (defmethod unique-scope (slot-def)
   :local)
+
+(defmethod vector-index-p (slot-def)
+  nil)
 
 (defmethod ephemeral-p (slot-def)
   nil)
@@ -125,6 +130,13 @@
         (setf (slot-value slot 'unique) (or (unique-spec slot) (unique-spec u))
               (slot-value slot 'unique-scope) (or (and u (unique-scope u))
                                                   (unique-scope slot)))))
+    ;; Inherit the :VECTOR-INDEX flag from the declaring direct slot, so a
+    ;; :VECTOR-INDEX slot on a parent is indexed across its subclasses (like
+    ;; :INDEX / :UNIQUE above).
+    (let ((vi (find-if #'vector-index-p direct-slots)))
+      (when (or (vector-index-p slot) vi)
+        (setf (slot-value slot 'vector-index) (or (vector-index-p slot)
+                                                  (and vi (vector-index-p vi))))))
     slot))
 
 (defmethod find-all-subclasses ((class class))

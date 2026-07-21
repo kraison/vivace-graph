@@ -348,6 +348,7 @@
                (:file "allocator-tests")
                (:file "spatial-index-tests")
                (:file "segment-tests")
+               (:file "segment-integration-tests")
                (:file "linear-hash-tests")
                (:file "skip-list-tests")
                (:file "index-list-tests")
