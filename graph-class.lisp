@@ -43,6 +43,12 @@
    ;; A derived structure (v1: rebuilt on open); enforcement is at the commit
    ;; boundary.  See unique-constraint.lisp / docs/unique-constraint-design.md.
    (unique-indexes :accessor unique-indexes :initarg :unique-indexes :initform nil)
+   ;; Vector segments (Phase 2): (class-name . slot-name) -> VECTOR-SEGMENT.
+   ;; A derived index maintained on the apply path; created lazily on first
+   ;; conforming insert; recovered by rebuild-from-nodes on an unclean open.
+   ;; See docs/superpowers/specs/2026-07-21-vector-segment-transaction-integration-design.md
+   (vector-segments :accessor vector-segments :initarg :vector-segments
+                    :initform (make-hash-table :test 'equal))
    ;; General ordered secondary indexes (:INDEX slot option / DEF-INDEX); keyed by
    ;; (owner-name . slot-name).  See index.lisp / docs/general-index-design.md.
    (secondary-indexes :accessor secondary-indexes :initarg :secondary-indexes :initform nil)

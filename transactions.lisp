@@ -830,6 +830,22 @@ schema redefinition is not expected)."
                       when (indexed-p slot)
                         collect (slot-definition-name slot)))))))
 
+(defvar *node-vector-index-slot-cache* (make-hash-table :test 'eq))
+
+(defun node-vector-index-slots (class)
+  "Names of CLASS's :VECTOR-INDEX slots -- the slots that get a vector segment.
+Cached per class (runtime schema redefinition is not expected).  Value gating is
+done at maintenance time, not here: only a conforming (simple-array single-float
+(*)) value is actually indexed."
+  (multiple-value-bind (val present) (gethash class *node-vector-index-slot-cache*)
+    (if present
+        val
+        (setf (gethash class *node-vector-index-slot-cache*)
+              (when (class-finalized-p class)
+                (loop for slot in (class-slots class)
+                      when (vector-index-p slot)
+                        collect (slot-definition-name slot)))))))
+
 (defgeneric node-geometry (node)
   (:documentation
    "The GEOMETRY a node occupies, or NIL if it has none.  By default this is the
