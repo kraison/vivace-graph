@@ -333,7 +333,30 @@ subclasses (the engine's :UNIQUE / :INDEX convention), so this sweeps
 MAP-VERTICES with its default :INCLUDE-SUBCLASSES-P T: every subclass
 instance's vector is swept into the OWNER's segment, matching exactly what the
 live apply path (APPLY-TX-WRITE-TO-VECTOR-SEGMENTS, via %SEGMENT-KEY) does on
-create/update/delete."
+create/update/delete.
+
+NOT SAFE against a concurrent reader of the OLD segment -- latent, not live.
+Making VECTOR-SEGMENTS a :SYNCHRONIZED hash table only guarantees that every
+individual GETHASH/(SETF GETHASH) on the table is atomic; it says nothing
+about a query thread that already holds the OLD segment object (fetched from
+the table before this function ran) and is scanning it via SEGMENT-SCAN when
+CLOSE-VECTOR-SEGMENT below unmaps it underneath that scan, nor about the NIL
+window between REMHASH and the final (SETF GETHASH) -- during which a
+concurrent VECTOR-SEARCH legitimately (if misleadingly, mid-rebuild) reports
+\"nothing indexed\" rather than either the old or the new results. Both are
+real gaps in a table-synchronization-only story.
+
+This is safe TODAY only because of the caller discipline documented above:
+REBUILD-VECTOR-SEGMENT runs from OPEN-GRAPH (before any query traffic exists)
+or from tests, and never while VECTOR-SEARCH could be running concurrently.
+If a future caller ever invokes this against a live graph, that invariant
+must be re-examined -- e.g. by having VECTOR-SEARCH hold a strong reference to
+the segment it looked up for the duration of its own scan (so a rebuild's
+CLOSE-VECTOR-SEGMENT can't unmap out from under it) plus a defined answer for
+the NIL window, rather than assuming quiescence.  Deliberately NOT fixed here:
+out of scope for this task, and the right design (reference-counted segment
+handles? RCU-style swap? a rebuild that queues behind in-flight scans?) is a
+later design question, not a one-line patch."
   (let* ((key (cons owner-name slot-name))
          (table (vector-segments graph))
          (path (%segment-file graph owner-name slot-name)))

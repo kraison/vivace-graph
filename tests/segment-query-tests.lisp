@@ -444,63 +444,72 @@ run, which is exactly how this test would have become vacuous.")
   "One round of the growing-writes race: a fresh capacity-2 segment, PUTS
 distinct growing commits on this thread, NSCANNERS threads scanning throughout.
 
-Returns (values SCANS BAD SHORT ERRS), where BAD holds scores that were not a
-real number in [-1, 1], SHORT holds (committed-before-scan . hits-seen) pairs
-where a scan missed an already-committed id, and ERRS holds errors that killed
-a scanner thread.  Each scanner accumulates into its OWN lists and hands them
-back through JOIN-THREAD, so nothing is pushed onto a shared list from two
-threads at once (which would itself be a race, and could lose the very evidence
-this test exists to collect)."
+Returns (values SCANS BAD SHORT ERRS CAPS), where BAD holds scores that were
+not a real number in [-1, 1], SHORT holds (committed-before-scan . hits-seen)
+pairs where a scan missed an already-committed id, ERRS holds errors that
+killed a scanner thread, and CAPS holds the distinct SEGMENT-CAPACITY values
+observed by scanners across the round -- evidence that scans actually landed
+inside growth, not just that enough of them ran.  Each scanner accumulates
+into its OWN lists and hands them back through JOIN-THREAD, so nothing is
+pushed onto a shared list from two threads at once (which would itself be a
+race, and could lose the very evidence this test exists to collect)."
   (let ((path (%qpath)))
     (unwind-protect
          (let ((s (create-vector-segment path dim :initial-capacity 2))
                (stop nil)
-               (committed 0))
+               (committed 0)
+               (scanners '())
+               (scans 0) (bad '()) (short '()) (errs '()) (caps '()))
            (unwind-protect
-                (let* ((q (let ((v (make-array dim :element-type 'single-float
-                                                   :initial-element 0.0)))
-                            (setf (aref v 0) 1.0)
-                            v))
-                       (scanners
-                         (loop repeat nscanners
-                               collect
-                               (bordeaux-threads:make-thread
-                                (lambda ()
-                                  (let ((scans 0) (bad '()) (short '()) (err nil))
-                                    (handler-case
-                                        (loop until stop
-                                              do (let* (;; sampled BEFORE the scan:
-                                                        ;; every put counted here
-                                                        ;; completed before the scan
-                                                        ;; took the read lock, so all
-                                                        ;; of them must be visible
-                                                        (n0 committed)
-                                                        (hits (segment-scan s q (* 2 puts))))
-                                                   (incf scans)
-                                                   (when (< (length hits) n0)
-                                                     (push (cons n0 (length hits)) short))
-                                                   (dolist (hit hits)
-                                                     (let* ((score (car hit))
-                                                            ;; a NaN fails both
-                                                            ;; comparisons -- and on
-                                                            ;; SBCL merely comparing
-                                                            ;; one may trap, which is
-                                                            ;; equally a bad read
-                                                            (ok (handler-case
-                                                                    (and (realp score)
-                                                                         (<= score 1.0001)
-                                                                         (>= score -1.0001))
-                                                                  (arithmetic-error () nil))))
-                                                       (unless ok
-                                                         (push (princ-to-string score) bad))))))
-                                      ;; a torn read that blows up rather than lying:
-                                      ;; the relocated-but-capacity-not-yet-flipped
-                                      ;; window leaves all-ones free-marker bytes
-                                      ;; where vectors used to be, and those decode
-                                      ;; to a float32 overflow
-                                      (error (e) (setf err (princ-to-string e))))
-                                    (list scans bad short err)))
-                                :name "segment-scanner"))))
+                (let ((q (let ((v (make-array dim :element-type 'single-float
+                                                  :initial-element 0.0)))
+                           (setf (aref v 0) 1.0)
+                           v)))
+                  (dotimes (i nscanners)
+                    (push (bordeaux-threads:make-thread
+                           (lambda ()
+                             (let ((scans 0) (bad '()) (short '()) (err nil) (caps '()))
+                               (handler-case
+                                   (loop until stop
+                                         do (let* (;; sampled BEFORE the scan:
+                                                   ;; every put counted here
+                                                   ;; completed before the scan
+                                                   ;; took the read lock, so all
+                                                   ;; of them must be visible
+                                                   (n0 committed)
+                                                   (hits (segment-scan s q (* 2 puts))))
+                                              (incf scans)
+                                              ;; sampled AFTER the scan, so a capacity
+                                              ;; change mid-scan is still captured --
+                                              ;; this is evidence scans overlapped
+                                              ;; %seg-grow, not just that enough of
+                                              ;; them ran
+                                              (pushnew (segment-capacity s) caps)
+                                              (when (< (length hits) n0)
+                                                (push (cons n0 (length hits)) short))
+                                              (dolist (hit hits)
+                                                (let* ((score (car hit))
+                                                       ;; a NaN fails both
+                                                       ;; comparisons -- and on
+                                                       ;; SBCL merely comparing
+                                                       ;; one may trap, which is
+                                                       ;; equally a bad read
+                                                       (ok (handler-case
+                                                               (and (realp score)
+                                                                    (<= score 1.0001)
+                                                                    (>= score -1.0001))
+                                                             (arithmetic-error () nil))))
+                                                  (unless ok
+                                                    (push (princ-to-string score) bad))))))
+                                 ;; a torn read that blows up rather than lying:
+                                 ;; the relocated-but-capacity-not-yet-flipped
+                                 ;; window leaves all-ones free-marker bytes
+                                 ;; where vectors used to be, and those decode
+                                 ;; to a float32 overflow
+                                 (error (e) (setf err (princ-to-string e))))
+                               (list scans bad short err caps)))
+                           :name "segment-scanner")
+                          scanners))
                   (dotimes (i puts)
                     (let ((v (make-array dim :element-type 'single-float
                                              :initial-element 0.0))
@@ -511,16 +520,39 @@ this test exists to collect)."
                             (aref id 1) (floor i 256))
                       (segment-put s id v)
                       (incf committed)))
-                  (setf stop t)
-                  (let ((scans 0) (bad '()) (short '()) (errs '()))
-                    (dolist (th scanners)
-                      (destructuring-bind (n b sh e) (bordeaux-threads:join-thread th)
-                        (incf scans n)
-                        (setf bad (append b bad)
-                              short (append sh short))
-                        (when e (push e errs))))
-                    (values scans bad short errs)))
-             (close-vector-segment s)))
+                  (setf stop t))
+             ;; Cleanup runs on EVERY exit path from the protected form above --
+             ;; including one where the writer loop (segment-put, above) itself
+             ;; signals, which is exactly what a real regression would do.  STOP
+             ;; and the joins used to live in the body, after the writer loop:
+             ;; if the writer loop signalled, STOP was never set, the scanner
+             ;; threads were never joined, and this cleanup form went straight
+             ;; to CLOSE-VECTOR-SEGMENT while three threads were still actively
+             ;; reading the mapping -- SIGSEGV / hard image death, or scanner
+             ;; threads orphaned to walk freed memory for the rest of the suite,
+             ;; instead of a readable FiveAM failure.  Setting STOP and joining
+             ;; here, unconditionally, before CLOSE-VECTOR-SEGMENT, guarantees no
+             ;; thread can still be touching the mapping when it is unmapped.
+             ;;
+             ;; Each JOIN-THREAD is wrapped in HANDLER-CASE: the scanner lambda
+             ;; already catches everything internally and returns a plain list,
+             ;; so JOIN-THREAD should never signal here, but this is the last
+             ;; line of defense between a misbehaving thread and the unmap --
+             ;; a join failure is folded into ERRS (a real test failure) rather
+             ;; than propagating past CLOSE-VECTOR-SEGMENT below.
+             (progn
+               (setf stop t)
+               (dolist (th scanners)
+                 (handler-case
+                     (destructuring-bind (n b sh e c) (bordeaux-threads:join-thread th)
+                       (incf scans n)
+                       (setf bad (append b bad)
+                             short (append sh short)
+                             caps (union c caps))
+                       (when e (push e errs)))
+                   (error (e) (push (princ-to-string e) errs))))
+               (close-vector-segment s)))
+           (values scans bad short errs caps))
       (ignore-errors (delete-file path)))))
 
 (test scan-is-safe-against-growing-writes
@@ -549,17 +581,28 @@ each covering ~6 grow relocations, gives thousands of scans across ~70 grow
 windows.  The check that scans actually happened is asserted, so a starved or
 dead scanner fails the test loudly instead of passing it silently.
 
+The scan-count floor (10x *SCAN-RACE-ROUNDS*) only rules out total starvation
+-- it says nothing about WHERE those scans landed, and ignores NSCANNERS and
+PUTS entirely.  A later tweak to :initial-capacity or the round shape could
+quietly collapse coverage to a single small capacity while staying above the
+floor.  So each scanner also samples SEGMENT-CAPACITY on every iteration; the
+distinct values collected across all rounds are asserted to span more than
+one capacity, which is only possible if scans actually ran while %SEG-GROW
+was relocating the block -- i.e. structural evidence that scans overlapped
+growth, not just that enough of them happened.
+
 VERIFIED LOAD-BEARING: with the rw-lock removed from segment-scan/segment-put
 and the %seg-grow window widened by a sleep between the relocation and the
 capacity store, this test FAILS."
-  (let ((scans 0) (bad '()) (short '()) (errs '()))
+  (let ((scans 0) (bad '()) (short '()) (errs '()) (caps '()))
     (dotimes (round *scan-race-rounds*)
       (declare (ignorable round))
-      (multiple-value-bind (n b sh e) (%scan-race-round 128 128 3)
+      (multiple-value-bind (n b sh e c) (%scan-race-round 128 128 3)
         (incf scans n)
         (setf bad (append b bad)
               short (append sh short)
-              errs (append e errs))))
+              errs (append e errs)
+              caps (union c caps))))
     (is (null errs)
         "~D scanner thread(s) died on a torn read: ~S"
         (length errs) (subseq errs 0 (min 3 (length errs))))
@@ -572,29 +615,56 @@ capacity store, this test FAILS."
         (length bad) (subseq bad 0 (min 5 (length bad))))
     (is (null short)
         "~D scans missed already-committed ids (committed . seen): ~S"
-        (length short) (subseq short 0 (min 5 (length short))))))
+        (length short) (subseq short 0 (min 5 (length short))))
+    (is (> (length caps) 1)
+        "scanners only ever observed ~D distinct capacit~:@P ~S -- scans never ~
+overlapped a %seg-grow window, so this run provides no growth coverage"
+        (length caps) caps)))
 
 (test ranking-is-deterministic-across-rebuild
   "Scanning a segment, rebuilding it from nodes, and scanning again gives an
 identical ranking -- including ties.  Slot order is meaningless under free-list
-reuse, so this only holds because the tiebreak is carried through eviction."
+reuse, so this only holds because the tiebreak is carried through eviction.
+
+All six embeddings tie exactly, so the ranking is entirely the node-id
+tiebreak %SCORE-BEFORE-P documents (score DESC, node-id ASC).  Comparing
+BEFORE to AFTER alone would only pin the ranking to ITSELF: since MAP-VERTICES'
+sweep order happens to differ from creation order for ~719/720 random UUID
+sets, that comparison catches a tiebreak regression by luck, not by structure
+-- a rebuild that silently dropped the tiebreak and fell back to slot/sweep
+order would still pass it whenever before and after happened to sweep the
+same way.  So this also asserts BEFORE and AFTER independently equal the six
+ids sorted by %ID-LESS-P -- the actual documented order -- which no amount of
+sweep-order luck can satisfy by accident."
   (with-temp-directory (dir)
     (let ((g (make-graph *integration-graph-name* (namestring dir)
-                         :buffer-pool-size 1000)))
+                         :buffer-pool-size 1000))
+          (ids '()))
       (unwind-protect
            (progn
              (let ((*graph* g))
                ;; several nodes sharing a score with the query, to force ties
                (dotimes (i 6)
                  (with-transaction ()
-                   (make-si-doc :title (format nil "n~d" i)
-                                :embedding (%qvec 8 1.0 1.0)))))
+                   (push (id (make-si-doc :title (format nil "n~d" i)
+                                          :embedding (%qvec 8 1.0 1.0)))
+                         ids))))
              (let* ((q (%qvec 8 1.0 1.0))
+                    (expected (sort (copy-list ids) #'%id-less-p))
                     (before (vector-search g 'si-doc 'embedding q 6)))
+               (is (= 6 (length ids)) "expected 6 created ids, got ~S" ids)
                (is (= 6 (length before)) "expected 6 hits, got ~S" before)
+               (is (equalp expected (mapcar #'cdr before))
+                   "BEFORE ranking does not match the documented (score DESC, ~
+node-id ASC) tiebreak order: expected ~S, got ~S"
+                   expected (mapcar #'cdr before))
                (rebuild-vector-segment g 'si-doc 'embedding)
                (let ((after (vector-search g 'si-doc 'embedding q 6)))
                  (is (= (length before) (length after)))
+                 (is (equalp expected (mapcar #'cdr after))
+                     "AFTER ranking does not match the documented (score DESC, ~
+node-id ASC) tiebreak order: expected ~S, got ~S"
+                     expected (mapcar #'cdr after))
                  (when (= (length before) (length after))
                    (loop for b in before for a in after
                          do (is (equalp (cdr b) (cdr a))
