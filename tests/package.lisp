@@ -158,6 +158,7 @@
                 #:segment-remove
                 #:segment-clean-shutdown-p
                 #:rebuild-vector-segment
+                #:rebuild-vector-segment-batched
                 #:%id-less-p
                 #:%score-before-p
                 #:%make-topk

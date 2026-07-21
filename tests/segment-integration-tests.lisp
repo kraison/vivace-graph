@@ -470,3 +470,84 @@ rebuild branch, not the open-as-is branch")
                  (is (every #'= (%si-embedding 8 4.0) back))))
           (close-graph g :snapshot-p nil)))
       (collect-garbage))))
+
+(test batched-rebuild-fills-missing-and-skips-present
+  "Additive: inserts ids the segment lacks, skips ids it already holds, and
+reports both counts.  A rebuild that dropped and recreated the segment would
+report every id as inserted, which is what distinguishes this from
+REBUILD-VECTOR-SEGMENT."
+  (with-temp-directory (dir)
+    (let ((g (make-graph *integration-graph-name* (namestring dir)
+                         :buffer-pool-size 1000)))
+      (unwind-protect
+           (let ((*graph* g))
+             (dotimes (i 6)
+               (with-transaction ()
+                 (make-si-doc :title (format nil "n~d" i)
+                              :embedding (%si-embedding 8 (coerce (1+ i) 'single-float)))))
+             ;; everything is already indexed by the live apply path
+             (multiple-value-bind (ins skip)
+                 (rebuild-vector-segment-batched g 'si-doc 'embedding :batch-size 2)
+               (is (= 0 ins) "expected 0 inserted, got ~D" ins)
+               (is (= 6 skip) "expected 6 skipped, got ~D" skip))
+             ;; drop the segment entirely, then refill it
+             (let ((key (cons 'si-doc 'embedding)))
+               (let ((s (gethash key (graph-db::vector-segments g))))
+                 (when s (graph-db::close-vector-segment s)))
+               (remhash key (graph-db::vector-segments g)))
+             (multiple-value-bind (ins skip)
+                 (rebuild-vector-segment-batched g 'si-doc 'embedding :batch-size 2)
+               (is (= 6 ins) "expected 6 inserted after drop, got ~D" ins)
+               (is (= 0 skip) "expected 0 skipped after drop, got ~D" skip))
+             ;; and the refilled segment answers queries
+             (let ((hits (vector-search g 'si-doc 'embedding
+                                        (%si-embedding 8 6.0) 3)))
+               (is (= 3 (length hits)) "expected 3 hits, got ~S" hits)))
+        (close-graph g :snapshot-p nil)))))
+
+(test batched-rebuild-resumes-after-interruption
+  "Resumability comes from the segment itself: interrupt a rebuild partway,
+re-run it, and the result is complete with nothing duplicated and nothing
+missing.  PROGRESS-FN throwing mid-run is the interruption."
+  (with-temp-directory (dir)
+    (let ((g (make-graph *integration-graph-name* (namestring dir)
+                         :buffer-pool-size 1000)))
+      (unwind-protect
+           (let ((*graph* g))
+             (dotimes (i 10)
+               (with-transaction ()
+                 (make-si-doc :title (format nil "n~d" i)
+                              :embedding (%si-embedding 8 (coerce (1+ i) 'single-float)))))
+             (let ((key (cons 'si-doc 'embedding)))
+               (let ((s (gethash key (graph-db::vector-segments g))))
+                 (when s (graph-db::close-vector-segment s)))
+               (remhash key (graph-db::vector-segments g)))
+             ;; interrupt after the first batch
+             (let ((batches 0))
+               (ignore-errors
+                (rebuild-vector-segment-batched
+                 g 'si-doc 'embedding :batch-size 3
+                 :progress-fn (lambda (done total)
+                                (declare (ignore total))
+                                (incf batches)
+                                (when (>= batches 1)
+                                  (error "simulated interruption after ~D" done))))))
+             ;; partial state: some in, some not
+             (let ((partial (graph-db::segment-live-count
+                             (gethash (cons 'si-doc 'embedding)
+                                      (graph-db::vector-segments g)))))
+               (is (< 0 partial 10)
+                   "expected a PARTIAL segment after interruption, got ~D of 10 ~
+-- if this is 0 or 10 the interruption did not land mid-run and the resume ~
+below proves nothing" partial))
+             ;; re-run completes it
+             (multiple-value-bind (ins skip)
+                 (rebuild-vector-segment-batched g 'si-doc 'embedding :batch-size 3)
+               (is (plusp skip) "expected the resume to SKIP already-done ids, got ~D" skip)
+               (is (= 10 (+ ins skip)) "expected 10 total, got ~D + ~D" ins skip))
+             (let ((hits (vector-search g 'si-doc 'embedding (%si-embedding 8 10.0) 10)))
+               (is (= 10 (length hits)) "expected all 10 ids present, got ~D" (length hits))
+               (when (= 10 (length hits))
+                 (is (= 10 (length (remove-duplicates (mapcar #'cdr hits) :test #'equalp)))
+                     "duplicate ids after resume: ~S" (mapcar #'cdr hits)))))
+        (close-graph g :snapshot-p nil)))))

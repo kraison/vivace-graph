@@ -36,6 +36,7 @@
            #:restore
            ;; Vector segments (dense-vector index + cosine kNN query layer).
            #:vector-search
+           #:rebuild-vector-segment-batched
            #:segment-scan
            #:segment-score-subset
            #:location

@@ -478,6 +478,77 @@ later design question, not a one-line patch."
        graph :vertex-type owner-name)
       seg)))
 
+(defun rebuild-vector-segment-batched (graph owner-name slot-name
+                                       &key (batch-size 5000) progress-fn)
+  "ADDITIVELY fill the (OWNER-NAME, SLOT-NAME) segment from live nodes, in
+batches of BATCH-SIZE, skipping ids the segment already holds.  Returns
+ (values INSERTED SKIPPED).
+
+Distinct from REBUILD-VECTOR-SEGMENT, which DROPS the existing segment and
+rebuilds from scratch -- that is the right shape for recovery (e.g. an unclean
+shutdown, see RESTORE-VECTOR-SEGMENTS), this is the right shape for migration:
+an existing deployment upgrading into a newly-declared :VECTOR-INDEX slot has
+chunks the live apply path never touched, so the segment must be filled in
+without disturbing what a later feature (over-fetch/re-rank) may already be
+reading from it.  Both are legitimate; do not merge them.
+
+OWNER-NAME is resolved through %VECTOR-INDEX-SLOT-OWNER-NAME (same as
+REBUILD-VECTOR-SEGMENT) to the segment's true OWNER -- the declaring class --
+and MAP-VERTICES is swept from that owner with its default
+:INCLUDE-SUBCLASSES-P T, so every subclass instance is visited into the ONE
+shared owner segment.  This is Model B: one segment per declaring class spans
+its subclasses, exactly matching what APPLY-TX-WRITE-TO-VECTOR-SEGMENTS
+maintains on the live create/update/delete path.  Getting this wrong -- e.g.
+keying or sweeping on a node's exact runtime class instead of the owner --
+previously produced a real LIVE-vs-REBUILT segment divergence.
+
+RESUMABLE BY CONSTRUCTION.  The segment itself records which ids it holds
+(SEGMENT-GET), so an id already present is skipped and an interrupted run
+simply leaves a partial segment for the next call to finish.  There is
+deliberately NO progress file or checkpoint record kept alongside: a marker
+that can disagree with the segment (e.g. because the write it described was
+rolled back, or the process died between the marker write and the segment
+write) is strictly worse than no marker, because it can claim work is done
+when the segment says otherwise. The segment is the only source of truth.
+
+PROGRESS-FN, if given, is called as (funcall progress-fn done total) once per
+flushed batch -- DONE is inserted+skipped so far, TOTAL is the number of
+conforming nodes seen so far in this run (the full total is not known ahead of
+time without a separate pass).  A migration over a real corpus takes minutes,
+not seconds, and a silent one looks hung."
+  (let* ((owner (%vector-index-slot-owner-name (find-class owner-name) slot-name))
+         (inserted 0)
+         (skipped 0)
+         (pending '())         ; reverse-order (id . vector) conses awaiting flush
+         (pending-count 0)
+         (total 0))
+    (flet ((flush ()
+             (when pending
+               (dolist (pair (nreverse pending))
+                 (let ((seg (%ensure-segment graph owner slot-name (length (cdr pair)))))
+                   (segment-put seg (car pair) (cdr pair))
+                   (incf inserted)))
+               (setf pending '() pending-count 0)
+               (when progress-fn
+                 (funcall progress-fn (+ inserted skipped) total)))))
+      (map-vertices
+       (lambda (node)
+         (unless (deleted-p node)
+           (let ((v (%node-segment-value node slot-name)))
+             (when v
+               (incf total)
+               (let ((seg (%ensure-segment graph owner slot-name (length v))))
+                 (if (segment-get seg (id node))
+                     (incf skipped)
+                     (progn
+                       (push (cons (id node) v) pending)
+                       (incf pending-count)
+                       (when (>= pending-count batch-size)
+                         (flush)))))))))
+       graph :vertex-type owner)
+      (flush))
+    (values inserted skipped)))
+
 (defun %id-less-p (a b)
   "Lexicographic order over two 16-byte node ids.  The engine has
 UUID-ARRAY-EQUAL but no less-than, so this is it: first differing byte wins."
