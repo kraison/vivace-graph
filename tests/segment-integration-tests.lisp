@@ -140,20 +140,49 @@ lazily creates the segment and stores the vector under the node id."
 
 (test wrong-dimension-signals-and-rolls-back (with-temp-directory (dir)
   (let ((g (make-graph *integration-graph-name* (namestring dir) :buffer-pool-size 1000))
-        (id nil))
+        (id nil)
+        (count-before nil))
     (unwind-protect
          (progn
            (let ((*graph* g))
              (with-transaction () (setf id (id (make-si-doc :title "a" :embedding (%si-embedding 8 1.0)))))
+             (setf count-before (length (map-vertices #'identity g
+                                                       :collect-p t :vertex-type 'si-doc)))
              ;; a 9-dim vector into an established 8-dim segment must signal
              (signals error
                (let ((*graph* g))
                  (with-transaction ()
                    (make-si-doc :title "bad" :embedding (%si-embedding 9 2.0))))))
+           ;; the bad NODE must not have been persisted -- the whole transaction
+           ;; (node write included, not just the segment write) rolled back
+           (is (= count-before (length (map-vertices #'identity g
+                                                      :collect-p t :vertex-type 'si-doc)))
+               "the rolled-back transaction must not have persisted the bad node")
            ;; the good node is still there; the bad transaction rolled back
-           (is (every #'= (%si-embedding 8 1.0)
-                      (graph-db::segment-get (%si-segment g 'embedding) id)))
+           (let ((back (graph-db::segment-get (%si-segment g 'embedding) id)))
+             (is (typep back '(simple-array single-float (*))))
+             (is (= 8 (length back)))
+             (is (every #'= (%si-embedding 8 1.0) back)))
            (is (= 1 (graph-db::segment-live-count (%si-segment g 'embedding)))
                "the rolled-back insert must not have landed in the segment"))
+      (close-graph g :snapshot-p nil))
+    (collect-garbage))))
+
+(test delete-with-no-established-segment-is-a-safe-no-op (with-temp-directory (dir)
+  (let ((g (make-graph *integration-graph-name* (namestring dir) :buffer-pool-size 1000))
+        (id nil))
+    (unwind-protect
+         (progn
+           (let ((*graph* g))
+             ;; embedding nil at create -> no segment for (si-doc . embedding) is
+             ;; ever established
+             (with-transaction () (setf id (id (make-si-doc :title "no-vec"))))
+             (is (null (%si-segment g 'embedding)))
+             ;; deleting must not error even though there is no segment to
+             ;; look up -- the (WHEN SEG ...) guard in TX-DELETE must hold
+             (finishes
+               (with-transaction () (mark-deleted (lookup-vertex id :graph g))))
+             (is (null (%si-segment g 'embedding))
+                 "deleting a node with no vector value must not create a segment")))
       (close-graph g :snapshot-p nil))
     (collect-garbage))))

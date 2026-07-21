@@ -933,6 +933,39 @@ VECTOR-SEGMENTS table."
               (create-vector-segment (%segment-file graph class-name slot-name)
                                      dimension)))))
 
+;;; ---------------------------------------------------------------------------
+;;; Enforcement (VALIDATE, pre-durability)
+;;; ---------------------------------------------------------------------------
+;;;
+;;; Mirrors VALIDATE-UNIQUE-CONSTRAINTS: a dimension mismatch must abort the
+;;; transaction BEFORE FINALIZE-TX-PERSISTENCE / APPLY-TRANSACTION, not during
+;;; the apply path.  SEGMENT-PUT's own dimension check (inside
+;;; APPLY-TX-WRITE-TO-VECTOR-SEGMENTS) fires too late to prevent drift: by the
+;;; time apply-transaction runs, the node write has already been journaled and
+;;; applied to the heap, so a SEGMENT-PUT error there leaves a persisted node
+;;; with no corresponding segment entry.  Checking here, under the same
+;;; manager lock as VALIDATE-UNIQUE-CONSTRAINTS and before anything is
+;;; journaled, makes the whole transaction -- node write included -- roll
+;;; back cleanly on a mismatch.
+
+(defun validate-vector-segment-dimensions (tx graph)
+  "Signal an error if any write in TX would store a :vector-index value whose
+length disagrees with an already-established segment's dimension for that
+(class, slot).  A slot with no established segment yet cannot mismatch --
+its first conforming vector is what establishes the dimension."
+  (dolist (write (writes tx))
+    (let ((node (node write)))
+      (unless (deleted-p node)
+        (let ((class-name (class-name (class-of node))))
+          (dolist (slot (node-vector-index-slots (class-of node)))
+            (let ((v (%node-segment-value node slot)))
+              (when v
+                (let ((seg (gethash (cons class-name slot) (vector-segments graph))))
+                  (when (and seg (/= (length v) (segment-dimension seg)))
+                    (error "vector-index slot ~A on ~A: vector length ~D does not ~
+match established segment dimension ~D"
+                           slot class-name (length v) (segment-dimension seg))))))))))))
+
 (defgeneric apply-tx-write-to-vector-segments (write graph)
   (:method (write graph) (declare (ignore write graph)) nil))
 
@@ -2268,6 +2301,11 @@ See CALL-WITH-READ-SNAPSHOT."
                ;; manager lock -- a violation aborts before FINALIZE-TX-PERSISTENCE, so
                ;; nothing is journaled (the UNWIND-PROTECT below drops the temp file).
                (validate-unique-constraints tx (graph tx))
+               ;; Vector-segment dimension check (Task 4 fix): same pre-durability,
+               ;; manager-locked region as the unique-constraint check above -- a
+               ;; mismatch aborts before FINALIZE-TX-PERSISTENCE, so the node write
+               ;; is never journaled/applied and no node/segment drift can occur.
+               (validate-vector-segment-dimensions tx (graph tx))
                (setf (transaction-id tx) (tx-id-counter tm))
                (incf (tx-id-counter tm))
                (prune-committed-transactions tm)
