@@ -64,14 +64,42 @@ Therefore the segment's contract is:
 
 ## 4. Segment ownership on the graph
 
-Segments are per-`(class, slot)` — a graph can have several, unlike the single spatial
-index. The graph gains a `vector-segments` slot on `graph-class` (accessor
-`vector-segments`, initform an `equal` hash table), keyed by `(class-name . slot-name)`,
-value a `vector-segment`.
+Segments are per-`(owner-class, slot)` — a graph can have several, unlike the single
+spatial index. The graph gains a `vector-segments` slot on `graph-class` (accessor
+`vector-segments`, initform an `equal` hash table), keyed by `(owner-class-name .
+slot-name)`, value a `vector-segment`.
+
+**One segment per *declaring* class, spanning subclasses (the engine convention).** A
+`:vector-index` slot is declared on some class; the segment is owned by that declaring
+class and holds every instance of it **and its subclasses**. This mirrors `:unique` and
+`:index` exactly — a `:unique` slot on a parent enforces across subclasses, keyed by
+`(owner . slot)` (`unique-constraint.lisp:61` `%unique-slot-owner-name`); the general
+ordered index likewise keys on the declaring ancestor. The `:vector-index` inheritance
+rule in `node-class.lisp` already states this ("indexed across its subclasses, like
+`:index` / `:unique`").
+
+The **owner** of a `(class, slot)` is the highest ancestor in the class-precedence-list
+whose *direct* slots declare that slot with `:vector-index` — resolved by
+`%vector-index-slot-owner-name`, a mirror of `%unique-slot-owner-name`. So a subclass
+instance's vector lands in the *ancestor's* segment, not a per-subclass one. Every
+maintenance path (create/update/delete/validate) and rebuild keys through a single
+`%segment-key (node slot)` → `(owner-name . slot)` helper, so the model is applied in
+exactly one place.
+
+Consequences of one-segment-per-owner: all instances of the hierarchy share one
+**dimension** (one logical index, one embedding model). A subclass instance whose
+embedding has a different dimension hits the dimension-mismatch rollback (§6) — which is
+correct: you cannot mix dimensions in one kNN index.
 
 The keying is by class *name* and slot *name* (symbols), not the class object, so it
 survives schema reload and matches how the rest of the schema layer keys per-graph
 metadata.
+
+**Not offered: per-subclass (exact-class) segments.** An alternative model — one segment
+per concrete class, so a subclass indexes separately from its parent — was considered and
+rejected. It fragments one logical index across N segments, forces a hierarchy query to
+fan out and merge, and contradicts the engine's own convention for `:unique`/`:index`. No
+use case wanted it. `:vector-index` is a plain boolean; there is no scope option.
 
 ## 5. Declaration: the `:vector-index` slot option
 
