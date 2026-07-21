@@ -81,17 +81,34 @@ segment as-is if it was cleanly closed, else rebuild it from nodes (a rebuild
 sweeps in every subclass instance too -- see REBUILD-VECTOR-SEGMENT).  Runs at
 open, before the graph accepts writes (quiescent).  Keyed by owner, not by
 concrete class, so a shared owner segment is opened/rebuilt exactly once even
-when several subclasses declare the same :VECTOR-INDEX slot."
+when several subclasses declare the same :VECTOR-INDEX slot.
+
+A MISSING segment file is REBUILT, not skipped.  The vertices are present and
+authoritative and the segment is derived from them, so an absent file is exactly
+the case REBUILD-VECTOR-SEGMENT exists for.  Skipping it -- the old behaviour --
+opened the graph clean with a permanently empty vector index, no warning and no
+error, so VECTOR-SEARCH returned nothing for a corpus that was entirely intact
+in the vertices; it also made \"delete the segment file and let it rebuild\", the
+intuitive operator recovery, a silent no-op.  A rebuild that finds no conforming
+vector creates no segment, so the ordinary case -- a graph that declares a
+:VECTOR-INDEX slot but has never stored a vector -- stays silent.  Recovering
+vectors from a file that should have existed does warn: the file did not go
+missing by itself."
   (dolist (key (all-vector-segment-owner-keys graph))
     (destructuring-bind (owner-name . slot) key
       (let ((path (%segment-file graph owner-name slot)))
-        (when (probe-file path)
-          (let ((seg (open-vector-segment path)))
-            (if (segment-clean-shutdown-p seg)
-                (setf (gethash (cons owner-name slot) (vector-segments graph)) seg)
-                (progn
-                  (close-vector-segment seg)
-                  (rebuild-vector-segment graph owner-name slot)))))))))
+        (if (probe-file path)
+            (let ((seg (open-vector-segment path)))
+              (if (segment-clean-shutdown-p seg)
+                  (setf (gethash (cons owner-name slot) (vector-segments graph)) seg)
+                  (progn
+                    (close-vector-segment seg)
+                    (rebuild-vector-segment graph owner-name slot))))
+            (let ((seg (rebuild-vector-segment graph owner-name slot)))
+              (when seg
+                (warn "vector segment file ~A was missing at open; rebuilt ~D ~
+                       entries from the vertices, which are authoritative."
+                      path (segment-live-count seg)))))))))
 
 (defun vector-search (graph class-name slot-name query-vector k)
   "Top-K nodes of CLASS-NAME (and its subclasses) whose SLOT-NAME vector is

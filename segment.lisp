@@ -422,9 +422,11 @@ against a concurrent segment-put/segment-remove."
 
 (defun rebuild-vector-segment (graph owner-name slot-name)
   "Rebuild the (OWNER-NAME, SLOT-NAME) segment from live nodes: drop any current
-segment/file, create a fresh one sized to the first conforming vector, and
-segment-put every live node's conforming value.  Registers and returns the fresh
-segment.  Run when quiescent (at open, before writes) -- it mutates outside the
+segment/file, create a fresh one whose dimension comes from the first conforming
+vector and whose capacity is sized to the live count, and segment-put every live
+node's conforming value.  Registers and returns the fresh segment, or NIL if no
+live node has a conforming vector (in which case no segment is created at all).
+Run when quiescent (at open, before writes) -- it mutates outside the
 transaction path, like rebuild-spatial-index.
 
 OWNER-NAME must be the segment's OWNER -- the declaring class returned by
@@ -465,18 +467,45 @@ later design question, not a one-line patch."
       (when old (close-vector-segment old)))
     (remhash key table)
     (ignore-errors (delete-file path))
-    (let ((seg nil))
+    ;; Counting pre-pass, so the fresh file is sized to its corpus.  Creating at
+    ;; CREATE-VECTOR-SEGMENT's 1024 default made a fresh file ~4 MB; 8x that is
+    ;; far under the 1 GiB reservation floor, so the reservation landed on the
+    ;; floor and in-place doubling stalled at 131,072 entries.  RESTORE-VECTOR-
+    ;; SEGMENTS calls this automatically whenever the clean-shutdown flag is
+    ;; unset, i.e. after a hard crash -- so above 131,072 entries automatic
+    ;; crash recovery could not complete at all.  Sizing the create to the live
+    ;; count derives the reservation from a realistic size instead, and removes
+    ;; ~8 doubling-and-relocate passes from every rebuild as well.  The sweep is
+    ;; already O(corpus) and runs quiescent, so a second pass is cheap next to
+    ;; the relocations it deletes.  Both passes use the identical predicate, so
+    ;; the count cannot undershoot the puts.
+    (let ((dimension nil)
+          (live-count 0))
       (map-vertices
        (lambda (node)
          (unless (deleted-p node)
            (let ((v (%node-segment-value node slot-name)))
              (when v
-               (unless seg
-                 (setf seg (create-vector-segment path (length v)))
-                 (setf (gethash key table) seg))
-               (segment-put seg (id node) v)))))
+               (unless dimension (setf dimension (length v)))
+               (incf live-count)))))
        graph :vertex-type owner-name)
-      seg)))
+      ;; No conforming vector anywhere: create no segment at all, as before.
+      (when dimension
+        (let ((seg (create-vector-segment
+                    path dimension
+                    ;; Never below CREATE-VECTOR-SEGMENT's own default: a small
+                    ;; corpus gains nothing from a hair-tight file, and this
+                    ;; keeps the small-graph shape exactly as it was.
+                    :initial-capacity (max 1024 live-count))))
+          (setf (gethash key table) seg)
+          (map-vertices
+           (lambda (node)
+             (unless (deleted-p node)
+               (let ((v (%node-segment-value node slot-name)))
+                 (when v
+                   (segment-put seg (id node) v)))))
+           graph :vertex-type owner-name)
+          seg)))))
 
 (defun rebuild-vector-segment-batched (graph owner-name slot-name
                                        &key (batch-size 5000) progress-fn)

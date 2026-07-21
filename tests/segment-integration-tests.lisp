@@ -699,3 +699,55 @@ a separate (SI-SUB . EMBEDDING) segment would appear."
                (is (> live live-before)))
           (close-graph g2 :snapshot-p nil)))
       (collect-garbage))))
+
+(test rebuild-sizes-the-segment-to-the-corpus
+  ;; rebuild-vector-segment created at the 1024 default, so a fresh file was
+  ;; ~4 MB, its reservation fell to the 1 GiB floor, and doubling stalled at
+  ;; 131,072 entries -- meaning automatic crash recovery (restore-vector-segments
+  ;; rebuilds whenever the clean flag is unset) could not complete above that.
+  ;; Testing the real 131k threshold would be far too slow, so this asserts the
+  ;; mechanism instead: the rebuild must CREATE the file at the corpus size
+  ;; rather than start at 1024 and double into it.
+  ;;
+  ;; 2000 is chosen so the two behaviours are distinguishable: doubling out of
+  ;; the 1024 default can only ever land on 2048, never on 2000.  An assertion
+  ;; of merely ">= 2000" would pass against the broken code.
+  (with-temp-directory (dir)
+    (let ((g (make-graph *integration-graph-name* (namestring dir) :buffer-pool-size 1000)))
+      (unwind-protect
+           (progn
+             (let ((*graph* g))
+               (dotimes (i 2000)
+                 (with-transaction ()
+                   (make-si-doc :title "n" :embedding (%si-embedding 8 (float i 1.0))))))
+             (let ((seg (graph-db::rebuild-vector-segment g 'si-doc 'embedding)))
+               (is (= 2000 (graph-db::segment-live-count seg)))
+               (is (= 2000 (graph-db::segment-capacity seg))
+                   "a rebuild must size capacity to the corpus (2000), not grow ~
+                    into it from the 1024 default (2048); got ~D"
+                   (graph-db::segment-capacity seg))))
+        (close-graph g :snapshot-p nil))
+      (collect-garbage))))
+
+(test missing-segment-file-is-rebuilt-not-ignored
+  ;; restore-vector-segments guarded everything with (when (probe-file path) ...),
+  ;; so a missing segment file meant the graph opened clean with a permanently
+  ;; empty vector index and no diagnostic at all.
+  (with-temp-directory (dir)
+    (let ((g (make-graph *integration-graph-name* (namestring dir) :buffer-pool-size 1000))
+          (path nil))
+      (let ((*graph* g))
+        (dotimes (i 25)
+          (with-transaction ()
+            (make-si-doc :title "n" :embedding (%si-embedding 8 (float i 1.0))))))
+      (setf path (graph-db::%segment-file g 'si-doc 'embedding))
+      (close-graph g :snapshot-p t)
+      (delete-file path)
+      (let ((g2 (open-graph *integration-graph-name* (namestring dir) :buffer-pool-size 1000)))
+        (unwind-protect
+             (let ((seg (%si-segment g2 'embedding)))
+               (is (not (null seg)) "a missing segment file must not leave the index absent")
+               (is (= 25 (graph-db::segment-live-count seg))
+                   "the segment must be rebuilt from the vertices, which are authoritative"))
+          (close-graph g2 :snapshot-p nil)))
+      (collect-garbage))))
