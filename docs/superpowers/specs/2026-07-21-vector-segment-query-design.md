@@ -259,3 +259,55 @@ worth preserving:
 When a later step reuses an existing accessor inside that hot path, the benchmark must be
 re-run end-to-end against the real implementation before the premise is treated as
 delivered.
+
+## 13. Addendum (2026-07-21): the 1M measurement — scan cost is a CLIFF, not a slope
+
+Measured on the delivered (post-§12) scan. dim 1024, capacity preallocated to 2^20 so no
+`%seg-grow` relocation runs; the same segment scanned at each checkpoint, so live count is
+the only variable. SBCL 2.5.5, macOS arm64 (M3), **18 GB RAM**.
+
+| live vectors | scan (median of 5) | ms per 1k | note |
+| --- | --- | --- | --- |
+| 100,000 | 192.4 ms | 1.92 | CPU-bound |
+| 250,000 | 452.7 ms | 1.81 | CPU-bound |
+| 500,000 | 939.7 ms | 1.88 | CPU-bound, spread widening (880-1185) |
+| **1,000,000** | **11,298 ms** | **11.30** | **I/O-bound** |
+
+Linear extrapolation from 500k predicts ~1.9 s at 1M. **The actual is 11.3 s — 6x worse.**
+
+Confirmed architectural, not a benchmark artifact: re-measured in a FRESH process against a
+pre-built, closed segment (no dirty-page writeback competing), six consecutive scans gave
+8938 / 9295 / 7917 / 9371 / 9702 / 9747 ms — **flat, not improving with repetition**. Cache
+warming would show a descending curve. Write pressure accounted for only ~2 s of the
+original 11.3 s.
+
+The mechanism: at dim 1024 the vector block is `n * 4 KB`, so 1M vectors = **4 GB**. Below
+the machine's available page cache the scan is CPU-bound at a stable ~1.85 ms/1k; above it,
+every query re-reads the block from disk (~445 MB/s observed, i.e. disk throughput). The
+free-cell sweep is a function of capacity, not live count, and stays ~25-35 ms throughout —
+never a factor.
+
+**The cliff position is hardware-dependent, but its SHAPE is not.** It sits where
+`live * dim * 4` crosses available page cache. A 64 GB hub keeps 4 GB resident and would
+still see ~1.9 s at 1M; this 18 GB laptop does not. So "how many vectors can we scan" has
+no fixed answer — it is `available_cache / (dim * 4)`, and performance does not degrade
+gracefully as you approach it, it falls off.
+
+**Consequences for what comes next:**
+
+- Brute-force scan is comfortably interactive to ~500k on this hardware (sub-second) and is
+  the right answer there. It is not the right answer at 1M on a memory-constrained host.
+- **int8 quantization is now the highest-leverage next move, ahead of ANN.** It is a 4x
+  size reduction (1M x 1024 int8 = 1 GB, resident on any of these machines), which moves the
+  cliff out 4x and returns the scan to CPU-bound — and it is far simpler than an ANN index.
+- It composes with what Step 4 already built: scan the int8 block for candidates, then
+  rescore them exactly against the float32 block through `segment-score-subset` — the
+  two-stage design the §5 extension seam was specified for. That seam is already
+  implemented and lock-proven.
+- Step 5 (the cl-llm `:segment` store) should record which side of the cliff the deployment
+  target sits on rather than assuming a single latency number.
+
+**Process lesson, the same one as §12 in a different costume:** a benchmark at 20k measured
+a CPU-bound regime and told us nothing about the regime that actually matters. Scaling
+projections across a memory hierarchy boundary are not projections, they are guesses —
+measure at the target size.
