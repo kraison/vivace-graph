@@ -950,21 +950,36 @@ VECTOR-SEGMENTS table."
 
 (defun validate-vector-segment-dimensions (tx graph)
   "Signal an error if any write in TX would store a :vector-index value whose
-length disagrees with an already-established segment's dimension for that
-(class, slot).  A slot with no established segment yet cannot mismatch --
-its first conforming vector is what establishes the dimension."
-  (dolist (write (writes tx))
-    (let ((node (node write)))
-      (unless (deleted-p node)
-        (let ((class-name (class-name (class-of node))))
-          (dolist (slot (node-vector-index-slots (class-of node)))
-            (let ((v (%node-segment-value node slot)))
-              (when v
-                (let ((seg (gethash (cons class-name slot) (vector-segments graph))))
-                  (when (and seg (/= (length v) (segment-dimension seg)))
-                    (error "vector-index slot ~A on ~A: vector length ~D does not ~
+length disagrees with the established dimension for that (class, slot) --
+established either by an already-committed segment, or by an earlier write
+of the SAME (class, slot) within this same transaction (an INTRA hash,
+mirroring VALIDATE-UNIQUE-CONSTRAINTS's intra-transaction check).  A
+(class, slot) with no established segment and no prior write in this
+transaction cannot mismatch -- the first conforming vector seen (from
+either source) establishes the dimension."
+  (let ((intra (make-hash-table :test 'equal)))
+    (dolist (write (writes tx))
+      (let ((node (node write)))
+        (unless (deleted-p node)
+          (let ((class-name (class-name (class-of node))))
+            (dolist (slot (node-vector-index-slots (class-of node)))
+              (let ((v (%node-segment-value node slot)))
+                (when v
+                  (let* ((key (cons class-name slot))
+                         (seg (gethash key (vector-segments graph)))
+                         (expected (if seg
+                                       (segment-dimension seg)
+                                       (gethash key intra))))
+                    (cond
+                      ((null expected)
+                       ;; first conforming write of this (class, slot) in this
+                       ;; transaction, and no committed segment yet -- this
+                       ;; write establishes the dimension for the rest of TX
+                       (setf (gethash key intra) (length v)))
+                      ((/= (length v) expected)
+                       (error "vector-index slot ~A on ~A: vector length ~D does not ~
 match established segment dimension ~D"
-                           slot class-name (length v) (segment-dimension seg))))))))))))
+                              slot class-name (length v) expected)))))))))))))
 
 (defgeneric apply-tx-write-to-vector-segments (write graph)
   (:method (write graph) (declare (ignore write graph)) nil))

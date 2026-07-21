@@ -186,3 +186,26 @@ lazily creates the segment and stores the vector under the node id."
                  "deleting a node with no vector value must not create a segment")))
       (close-graph g :snapshot-p nil))
     (collect-garbage))))
+
+(test same-transaction-dimension-conflict-rolls-back (with-temp-directory (dir)
+  (let ((g (make-graph *integration-graph-name* (namestring dir) :buffer-pool-size 1000)))
+    (unwind-protect
+         (progn
+           ;; fresh graph -- no prior segment for (si-doc . embedding) exists,
+           ;; so neither write can see an already-established segment.  Both
+           ;; writes are in the SAME transaction: the first would establish
+           ;; the dimension, the second conflicts with it.
+           (signals error
+             (let ((*graph* g))
+               (with-transaction ()
+                 (make-si-doc :title "a" :embedding (%si-embedding 8 1.0))
+                 (make-si-doc :title "b" :embedding (%si-embedding 9 2.0)))))
+           ;; neither node may have been persisted -- the whole transaction
+           ;; rolled back, not just the second write's segment update
+           (is (= 0 (length (map-vertices #'identity g
+                                          :collect-p t :vertex-type 'si-doc)))
+               "an intra-transaction dimension conflict must roll back both writes")
+           (is (null (%si-segment g 'embedding))
+               "no segment should have been established by a rolled-back transaction"))
+      (close-graph g :snapshot-p nil))
+    (collect-garbage))))
