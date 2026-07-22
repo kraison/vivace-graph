@@ -675,9 +675,17 @@ a separate (SI-SUB . EMBEDDING) segment would appear."
     ;;    reservation is a ceiling, nothing ever signals, and this test would
     ;;    silently degrade into a slow insert loop asserting nothing.  Switching
     ;;    relocation off is not a contrivance: it is the supported kill-switch,
-    ;;    and it selects exactly the code path that still runs in production
-    ;;    when relocation FAILS (address space exhausted) -- which is the
-    ;;    failure this test's invariant is about.
+    ;;    and it is a real production configuration.
+    ;;    ⚠ WHAT IT IS NOT: the same code path production takes when relocation
+    ;;    FAILS.  An earlier version of this comment claimed that.  The
+    ;;    kill-switch takes the branch of %SEG-ENSURE-RESERVATION that signals
+    ;;    BEFORE any syscall; a failing relocation takes the branch that calls
+    ;;    RELOCATE-VECTOR-SEGMENT-MAPPING, has it fail, and rolls back.  They
+    ;;    share only what is downstream of the signal.  The failing-relocation
+    ;;    path is covered separately -- at the transaction level by
+    ;;    CAPACITY-EXHAUSTION-UNDER-A-FAILING-RELOCATION-ROLLS-BACK below, and
+    ;;    at the segment level by the two fault-injection tests in
+    ;;    tests/segment-tests.lisp.
     ;; Re-proven to discriminate, both times, by disabling the
     ;; ENSURE-VECTOR-SEGMENT-CAPACITY call site with #+(or) and confirming it
     ;; fails.
@@ -715,6 +723,91 @@ a separate (SI-SUB . EMBEDDING) segment would appear."
                (is (= nodes live)
                    "every persisted si-doc must have a segment entry: ~D nodes vs ~D live"
                    nodes live)
+               (is (> nodes count-before) "the fill loop should have committed something")
+               (is (> live live-before)))
+          (close-graph g2 :snapshot-p nil)))
+      (collect-garbage))))
+
+(test capacity-exhaustion-under-a-failing-relocation-rolls-back
+  "Wave 1's invariant -- NEVER a persisted node without a segment entry -- must
+hold when relocation is ENABLED and FAILS, which is the way this actually breaks
+in production (RLIMIT_AS / address-space exhaustion), and which
+CAPACITY-EXHAUSTION-SIGNALS-AND-ROLLS-BACK above does NOT cover: that test
+switches relocation off, taking the branch of %SEG-ENSURE-RESERVATION that
+signals before any syscall.  Here the relocation is attempted and refused, and
+the transaction must still abort pre-durability having changed nothing.
+
+RELOCATE-VECTOR-SEGMENT-MAPPING is what gets fault-injected, rather than
+%POSIX-MMAP as in the segment-level tests: a live graph maps a dozen files, and
+failing anonymous reservations indiscriminately across a whole graph would break
+things unrelated to the segment.  The primitive's OWN failure and rollback are
+covered at that level, in tests/segment-tests.lisp.
+
+It also asserts the diagnostic survives: the condition must name the segment's
+OWNER, not merely a path.  Getting that right is why
+ENSURE-VECTOR-SEGMENT-CAPACITY pre-flights the reservation itself, once, for the
+full target capacity, instead of letting individual doublings signal."
+  (with-temp-directory (dir)
+    ;; Same degenerate reservations as the test above, and the same three
+    ;; caveats apply (they throttle every mapped file; the LET* covers G2).
+    ;; *SEGMENT-RELOCATE-ON-EXHAUSTION* is deliberately left at its default T.
+    (let* ((graph-db::*mmap-min-reservation* (* 64 1024))
+           (graph-db::*mmap-reservation-multiplier* 1)
+           (graph-db::*segment-min-reservation* (* 64 1024))
+           (g (make-graph *integration-graph-name* (namestring dir) :buffer-pool-size 1000))
+           (orig (fdefinition 'graph-db::relocate-vector-segment-mapping))
+           (attempts 0)
+           (caught nil)
+           (count-before nil)
+           (live-before nil))
+      (unwind-protect
+           (progn
+             (let ((*graph* g))
+               (with-transaction ()
+                 (make-si-doc :title "seed" :embedding (%si-embedding 8 1.0))))
+             (setf count-before (length (map-vertices #'identity g
+                                                      :collect-p t :vertex-type 'si-doc))
+                   live-before (graph-db::segment-live-count (%si-segment g 'embedding)))
+             (setf (fdefinition 'graph-db::relocate-vector-segment-mapping)
+                   (lambda (mapped-file new-reservation)
+                     (declare (ignore mapped-file new-reservation))
+                     (incf attempts)
+                     (error "injected relocation failure for the test")))
+             (setf caught
+                   (handler-case
+                       (let ((*graph* g))
+                         (dotimes (i 100000)
+                           (with-transaction ()
+                             (make-si-doc :title "fill"
+                                          :embedding (%si-embedding 8 (float i 1.0)))))
+                         nil)
+                     (graph-db:vector-segment-capacity-exhausted (e) e))))
+        (progn
+          (setf (fdefinition 'graph-db::relocate-vector-segment-mapping) orig)
+          (close-graph g :snapshot-p nil)))
+      (is (plusp attempts)
+          "relocation was never attempted -- the fill loop never reached the ~
+           reservation, so this test proved nothing")
+      (is (typep caught 'graph-db:vector-segment-capacity-exhausted)
+          "a failing relocation must signal VECTOR-SEGMENT-CAPACITY-EXHAUSTED; ~
+           got ~S" caught)
+      (when caught
+        (is (graph-db::vsce-owner caught)
+            "the abort must name the segment's OWNER, not just a path -- that is ~
+             the whole point of pre-flighting the reservation on the transaction ~
+             path")
+        (is (and (graph-db::vsce-reason caught)
+                 (search "re-reserving" (graph-db::vsce-reason caught)))
+            "the reason must say the relocation FAILED, not that it was ~
+             disabled: ~S" (graph-db::vsce-reason caught)))
+      ;; THE POINT, exactly as in the test above: nothing half-persisted.
+      (let ((g2 (open-graph *integration-graph-name* (namestring dir))))
+        (unwind-protect
+             (let ((nodes (length (map-vertices #'identity g2 :collect-p t :vertex-type 'si-doc)))
+                   (live (graph-db::segment-live-count (%si-segment g2 'embedding))))
+               (is (= nodes live)
+                   "every persisted si-doc must have a segment entry after a ~
+                    FAILED relocation: ~D nodes vs ~D live" nodes live)
                (is (> nodes count-before) "the fill loop should have committed something")
                (is (> live live-before)))
           (close-graph g2 :snapshot-p nil)))

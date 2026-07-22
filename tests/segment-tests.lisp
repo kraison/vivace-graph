@@ -571,6 +571,260 @@ fault."
       (ignore-errors (delete-file path)))))
 
 ;;; ---------------------------------------------------------------------------
+;;; Relocation that FAILS.  This is the path that actually fires in production:
+;;; RLIMIT_AS or virtual-address exhaustion refusing the new reservation, with
+;;; relocation switched ON.  It is NOT the same path as
+;;; *SEGMENT-RELOCATE-ON-EXHAUSTION* = NIL, which signals before issuing any
+;;; syscall; the two share only what is downstream of the signal, so the
+;;; kill-switch test does not cover this and never did.
+;;;
+;;; Made deterministic by fault-injecting the anonymous PROT_NONE reservation
+;;; mmap -- the same FDEFINITION-swap technique as
+;;; MMAP-FILE-CLOSES-FD-ON-FAILED-FILE-MAP below -- rather than by trying to
+;;; genuinely exhaust the address space of the test process.
+;;; ---------------------------------------------------------------------------
+
+(defmacro with-failing-segment-reservation ((counter-place &key (fail-on 1)
+                                                             (stage :reservation))
+                                            &body body)
+  "Run BODY with RELOCATE-VECTOR-SEGMENT-MAPPING's FAIL-ON'th relocation made to
+fail deterministically, at STAGE.  Restores the real %POSIX-MMAP on the way out,
+so a test can go on to prove the segment is still usable once the injected
+pressure is gone.
+
+STAGE :RESERVATION (the default) fails the anonymous PROT_NONE window — the
+first of the two mmaps, and the one address-space exhaustion really refuses.
+STAGE :FILE-MAP lets that window be reserved and fails the MAP_FIXED file map
+that follows, which is the ONLY way to reach the primitive's rollback arm (the
+one that has a window to release).
+
+COUNTER-PLACE is INCF'd on every relocation attempt (failed or not), so a test
+can assert the injection actually fired instead of silently proving nothing.
+The caller establishes it; it survives the macro.
+
+HOW THE TWO MMAPS ARE TOLD APART: the reservation has a NULL address and fd -1;
+the file map is whatever call comes immediately after it.  EXTEND-MAPPED-FILE's
+re-map passes a non-null address and is not preceded by a reservation, so it is
+never touched.  MMAP-FILE's own reservation has the same shape as a relocation's,
+so create/open the segment OUTSIDE this macro."
+  (let ((orig (gensym "ORIG"))
+        (pending (gensym "PENDING")))
+    `(let ((,orig (fdefinition 'graph-db::%posix-mmap))
+           (,pending nil))
+       (unwind-protect
+            (progn
+              (setf (fdefinition 'graph-db::%posix-mmap)
+                    (lambda (addr length prot flags fd offset)
+                      (cond
+                        ((and (cffi:null-pointer-p addr) (= fd -1))
+                         (if (= (incf ,counter-place) ,fail-on)
+                             (ecase ,stage
+                               (:reservation
+                                (error "injected reservation failure for the test"))
+                               (:file-map
+                                (setf ,pending t)
+                                (funcall ,orig addr length prot flags fd offset)))
+                             (funcall ,orig addr length prot flags fd offset)))
+                        (,pending
+                         (setf ,pending nil)
+                         (error "injected file-map failure for the test"))
+                        (t
+                         (funcall ,orig addr length prot flags fd offset)))))
+              ,@body)
+         (setf (fdefinition 'graph-db::%posix-mmap) ,orig)))))
+
+(test segment-relocation-failure-leaves-the-segment-consistent
+  "A relocation that GENUINELY FAILS must signal
+VECTOR-SEGMENT-CAPACITY-EXHAUSTED and leave the segment byte-for-byte as it
+was: OLD MAPPING STILL LIVE (M-POINTER unchanged -- the primitive publishes the
+new base only after both mmaps succeed, and rolls the reservation back
+otherwise), reservation unchanged, FILE LENGTH unchanged (%SEG-GROW re-reserves
+BEFORE it extends), capacity and live-count unchanged, no slot claimed, and
+every stored vector still readable through that still-live mapping.
+
+Then, with the injected pressure removed, the same put must SUCCEED -- a
+segment that survives the failure but is wedged afterwards would satisfy every
+assertion above and still be broken."
+  (let ((path (%seg-path)))
+    (unwind-protect
+         (with-tiny-segment-reservation
+           (let ((s (create-vector-segment path 64 :initial-capacity 32))
+                 (reservations 0))
+             (unwind-protect
+                  (progn
+                    ;; Exactly fills the initial capacity; the NEXT put grows.
+                    (dotimes (i 32)
+                      (segment-put s (%id i) (%vec 64 (float i 1.0))))
+                    (let* ((mmap (graph-db::segment-mmap s))
+                           (base-before (%seg-base-address s))
+                           (reserved-before (graph-db::m-reserved-size mmap))
+                           (file-before (graph-db::mapped-file-length mmap)))
+                      (is (= reserved-before file-before)
+                          "test setup is broken: the segment must start with ZERO ~
+                           growth headroom, or the failing grow would not relocate")
+                      (with-failing-segment-reservation (reservations :fail-on 1)
+                        (signals graph-db::vector-segment-capacity-exhausted
+                          (segment-put s (%id 32) (%vec 64 32.0))))
+                      (is (= 1 reservations)
+                          "fault injection never fired -- the test setup is ~
+                           broken, not the code under test")
+                      (is (= base-before (%seg-base-address s))
+                          "a FAILED relocation must not move M-POINTER; the old ~
+                           window is what readers are still using")
+                      (is (= reserved-before (graph-db::m-reserved-size mmap))
+                          "a failed relocation must not change the reservation")
+                      (is (= file-before (graph-db::mapped-file-length mmap))
+                          "the reservation is checked BEFORE the file is ~
+                           extended, so a failed relocation must not have grown ~
+                           the file")
+                      (is (= 32 (segment-live-count s))
+                          "a failed grow must not have claimed a slot")
+                      (is (= 32 (segment-capacity s))
+                          "a failed grow must not have changed capacity")
+                      (is (null (segment-get s (%id 32))))
+                      (let ((bad 0))
+                        (dotimes (i 32)
+                          (let ((back (segment-get s (%id i))))
+                            (unless (and back (every #'= (%vec 64 (float i 1.0)) back))
+                              (incf bad))))
+                        (is (zerop bad)
+                            "~D vectors unreadable after a failed relocation -- ~
+                             the old mapping should still be live" bad))
+                      ;; Usable, not merely undamaged.
+                      (segment-put s (%id 32) (%vec 64 32.0))
+                      (is (= 33 (segment-live-count s))
+                          "the segment must still be usable once the address ~
+                           space pressure is gone")
+                      (is (every #'= (%vec 64 32.0) (segment-get s (%id 32))))
+                      (is (/= base-before (%seg-base-address s))
+                          "the retried grow should have relocated for real")))
+               (close-vector-segment s))))
+      (ignore-errors (delete-file path)))))
+
+(test segment-relocation-failure-on-a-later-grow-leaves-the-segment-consistent
+  "The same, but failing on the SECOND relocation rather than the first, i.e.
+after an earlier doubling has already relocated the mapping and extended the
+file.  That is the shape the transaction path's multi-doubling grow loop takes,
+and the state a failure has to be consistent against is the state the FIRST
+relocation left behind -- not the pristine one the previous test starts from.
+
+Deliberately runs the whole body inside WITH-TINY-SEGMENT-RESERVATION so the
+reservation policy stays \"exactly the file size\" at GROW time too: every
+doubling then relocates, which is what makes a second relocation reachable at
+all."
+  (let ((path (%seg-path)))
+    (unwind-protect
+         (with-tiny-segment-reservation
+           (let ((s (create-vector-segment path 64 :initial-capacity 32))
+                 (reservations 0))
+             (unwind-protect
+                  (let ((base-at-create (%seg-base-address s))
+                        (mmap (graph-db::segment-mmap s))
+                        (base-after-first nil)
+                        (reserved-after-first nil)
+                        (file-after-first nil))
+                    (dotimes (i 32)
+                      (segment-put s (%id i) (%vec 64 (float i 1.0))))
+                    (with-failing-segment-reservation (reservations :fail-on 2)
+                      ;; Grow #1 (32 -> 64): relocation SUCCEEDS.
+                      (dotimes (i 32)
+                        (segment-put s (%id (+ 32 i)) (%vec 64 (float (+ 32 i) 1.0))))
+                      (is (= 1 reservations)
+                          "the first grow should have relocated exactly once (~D)"
+                          reservations)
+                      (is (= 64 (segment-capacity s)))
+                      (setf base-after-first (%seg-base-address s)
+                            reserved-after-first (graph-db::m-reserved-size mmap)
+                            file-after-first (graph-db::mapped-file-length mmap))
+                      (is (/= base-at-create base-after-first)
+                          "the first relocation did not happen; the test proves ~
+                           nothing about a SECOND one")
+                      ;; Grow #2 (64 -> 128): relocation FAILS.
+                      (signals graph-db::vector-segment-capacity-exhausted
+                        (segment-put s (%id 64) (%vec 64 64.0))))
+                    (is (= 2 reservations)
+                        "the second relocation was never attempted -- test setup ~
+                         is broken, not the code under test")
+                    (is (= base-after-first (%seg-base-address s))
+                        "the failed second relocation must leave the mapping the ~
+                         FIRST one published")
+                    (is (= reserved-after-first (graph-db::m-reserved-size mmap)))
+                    (is (= file-after-first (graph-db::mapped-file-length mmap)))
+                    (is (= 64 (segment-live-count s)))
+                    (is (= 64 (segment-capacity s)))
+                    (is (null (segment-get s (%id 64))))
+                    (let ((bad 0))
+                      (dotimes (i 64)
+                        (let ((back (segment-get s (%id i))))
+                          (unless (and back (every #'= (%vec 64 (float i 1.0)) back))
+                            (incf bad))))
+                      (is (zerop bad)
+                          "~D of 64 vectors -- including the 32 that were copied ~
+                           by the FIRST relocation -- did not survive the failed ~
+                           second one" bad))
+                    ;; Usable again.
+                    (segment-put s (%id 64) (%vec 64 64.0))
+                    (is (= 65 (segment-live-count s)))
+                    (is (= 128 (segment-capacity s)))
+                    (is (every #'= (%vec 64 64.0) (segment-get s (%id 64)))))
+               (close-vector-segment s))))
+      (ignore-errors (delete-file path)))))
+
+(test segment-relocation-failure-at-the-file-map-rolls-the-reservation-back
+  "The other half of the relocation primitive's failure surface: the anonymous
+window IS reserved and the MAP_FIXED file map into it fails.  This is the only
+case that reaches the rollback arm, which must release the window it just took
+-- on the one path whose failure mode is address-space pressure, a rollback that
+silently leaked its own reservation would make things worse, so the munmap's
+return code is checked and a failure WARNs.  The test asserts no such warning
+was signalled, alongside the same leave-it-consistent-and-usable checks."
+  (let ((path (%seg-path)))
+    (unwind-protect
+         (with-tiny-segment-reservation
+           (let ((s (create-vector-segment path 64 :initial-capacity 32))
+                 (reservations 0)
+                 (warnings '()))
+             (unwind-protect
+                  (progn
+                    (dotimes (i 32)
+                      (segment-put s (%id i) (%vec 64 (float i 1.0))))
+                    (let* ((mmap (graph-db::segment-mmap s))
+                           (base-before (%seg-base-address s))
+                           (reserved-before (graph-db::m-reserved-size mmap))
+                           (file-before (graph-db::mapped-file-length mmap)))
+                      (with-failing-segment-reservation (reservations :fail-on 1
+                                                                      :stage :file-map)
+                        (handler-bind ((warning (lambda (w)
+                                                  (push w warnings)
+                                                  (muffle-warning w))))
+                          (signals graph-db::vector-segment-capacity-exhausted
+                            (segment-put s (%id 32) (%vec 64 32.0)))))
+                      (is (= 1 reservations)
+                          "fault injection never fired -- test setup is broken")
+                      (is (null warnings)
+                          "the rollback munmap failed (~{~A~^; ~}) -- the ~
+                           reservation it had just taken is leaked" warnings)
+                      (is (= base-before (%seg-base-address s))
+                          "M-POINTER is published only after BOTH mmaps succeed")
+                      (is (= reserved-before (graph-db::m-reserved-size mmap))
+                          "the reservation size is published only after both ~
+                           mmaps succeed")
+                      (is (= file-before (graph-db::mapped-file-length mmap)))
+                      (is (= 32 (segment-live-count s)))
+                      (is (= 32 (segment-capacity s)))
+                      (let ((bad 0))
+                        (dotimes (i 32)
+                          (let ((back (segment-get s (%id i))))
+                            (unless (and back (every #'= (%vec 64 (float i 1.0)) back))
+                              (incf bad))))
+                        (is (zerop bad) "~D vectors damaged by the failed map" bad))
+                      (segment-put s (%id 32) (%vec 64 32.0))
+                      (is (= 33 (segment-live-count s)))
+                      (is (every #'= (%vec 64 32.0) (segment-get s (%id 32))))))
+               (close-vector-segment s))))
+      (ignore-errors (delete-file path)))))
+
+;;; ---------------------------------------------------------------------------
 ;;; MMAP-FILE cleanup on a failed file-map (mmap.lisp).  Not segment-specific,
 ;;; but it lives here because this change is what amplified the leak: a failed
 ;;; open used to leak the whole reservation window -- *MMAP-MIN-RESERVATION*

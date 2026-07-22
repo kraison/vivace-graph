@@ -253,16 +253,35 @@ the concurrency regression test relies on a torn read blowing up rather than
 quietly yielding a NaN, and a bare SAP-REF-SINGLE would have silently
 downgraded that detector.
 
+⚠ THIS CACHES (M-POINTER MMAP) ONCE AND DEREFERENCES IT FOR THE WHOLE VECTOR, AT
+ (SAFETY 0).  THE ONLY THING THAT MAKES THAT SAFE IS THE SEGMENT'S READ LOCK.
+Say it plainly, because the reason USED to be a property of the mapping itself
+and no longer is: it was true that \"the base pointer never moves\" -- MMAP-FILE
+reserves the window and EXTEND-MAPPED-FILE re-maps into it with MAP_FIXED, so
+growth kept the address.  RELOCATE-VECTOR-SEGMENT-MAPPING (added when the
+reservation stopped being a growth ceiling) MOVES IT: %SEG-GROW re-reserves a
+larger window, republishes M-POINTER, and MUNMAPS THE OLD ONE.  A SAP captured
+before that call points into freed address space afterwards -- a SIGSEGV if we
+are lucky, a read of some unrelated later mapping if we are not.
+
+What holds the line is that every caller of this function reaches it through a
+public segment entry point holding the segment's READ lock (SEGMENT-GET,
+SEGMENT-SCAN, SEGMENT-SCORE-SUBSET), and relocation only ever happens under the
+same segment's WRITE lock.  So no relocation can begin while this SAP is live.
+DO NOT introduce a caller that reads a segment without that lock, and do not
+\"optimise away\" the read lock on a scan: it is not there for the id table, it
+is there for this pointer.
+
 SEGV GUARD.  MMAP.LISP wraps GET-BYTE/GET-BYTES in :AROUND handlers that catch
 SB-KERNEL::MEMORY-FAULT-ERROR and retry; reading through the SAP bypasses them,
 so the guard is re-established HERE at whole-vector granularity (one handler
 frame per vector instead of one per byte -- strictly cheaper, and the retry unit
-is the same idempotent read).  It is a backstop, not a correctness requirement:
-since the stable-address mapping landed (mmap-file reserves the window and
-extend-mapped-file re-maps into it with MAP_FIXED) the base pointer never moves
-and no remap can unmap a live address, which is exactly why *MMAP-SEGV-RETRIES*
-is asserted to stay 0 under concurrency.  Keeping the handler costs nothing
-measurable and preserves the existing contract rather than silently dropping it."
+is the same idempotent read).  It is a backstop, not the correctness argument --
+the read lock above is.  *MMAP-SEGV-RETRIES* is asserted to stay 0 under
+concurrency, including across relocations, and if it ever moves off 0 the
+conclusion is that some reader reached a mapping without the lock, NOT that the
+retry saved us.  Keeping the handler costs nothing measurable and preserves the
+existing contract rather than silently dropping it."
   (declare (type fixnum off dim)
            (type (simple-array single-float (*)) buffer)
            (optimize (speed 3) (safety 0)))
@@ -383,9 +402,17 @@ TLB-visible remap, so doing it once per several doublings matters.
 
 Signals VECTOR-SEGMENT-CAPACITY-EXHAUSTED when relocation is switched off
  (*SEGMENT-RELOCATE-ON-EXHAUSTION*) or when it fails outright (address space
-exhausted / RLIMIT_AS).  On the transaction path that signal happens
-pre-durability -- see ENSURE-VECTOR-SEGMENT-CAPACITY, which pre-flights this
-exact condition so the abort carries the owner and slot.
+exhausted / RLIMIT_AS).  Either way NOTHING HAS BEEN MUTATED when it signals:
+the disabled branch runs before any syscall, and RELOCATE-VECTOR-SEGMENT-MAPPING
+rolls its own failure back, so the segment is left at its current reservation,
+fully consistent and usable.  Note the two branches are NOT the same code path
+-- they share only what is downstream of the signal -- so a test that exercises
+the kill-switch has NOT thereby exercised a failing relocation.
+
+ENSURE-VECTOR-SEGMENT-CAPACITY calls this DIRECTLY, once, for the FULL capacity
+a transaction will need, before it grows anything; that is what makes a
+transaction-path abort atomic (no doubling has run yet) and lets it re-signal
+with the owner and slot, which this function does not know.
 
 CAPACITY is the slot count NEEDED bytes corresponds to -- carried purely so the
 signalled condition reports entries and bytes, rather than reporting the byte
@@ -397,7 +424,7 @@ entries needs 98,368 bytes\")."
         (error 'vector-segment-capacity-exhausted
                :path (m-path mmap)
                :required capacity :needed-bytes needed :reserved reserved
-               :reason "relocation is disabled (GRAPH-DB::*SEGMENT-RELOCATE-ON-EXHAUSTION* is NIL)"))
+               :reason "relocation is disabled (GRAPH-DB:*SEGMENT-RELOCATE-ON-EXHAUSTION* is NIL)"))
       (handler-case
           (relocate-vector-segment-mapping mmap (%seg-reservation-for needed))
         (error (e)

@@ -170,11 +170,20 @@
 
 Reserves a virtual-address window (PROT_NONE, anonymous, MAP_NORESERVE — address
 space only) and maps the file into the head of it with MAP_FIXED.  The returned
-mapped-file's POINTER is the base of that window and is stable for the life of
-the mapping; EXTEND-MAPPED-FILE grows by re-mapping the file into the reserved
-window, so the pointer never moves and concurrent readers never fault.  The file
-may grow up to the reservation, which defaults to *MMAP-RESERVATION-MULTIPLIER*
-times SIZE (floored at *MMAP-MIN-RESERVATION*); pass RESERVATION to override."
+mapped-file's POINTER is the base of that window, and GROWTH NEVER MOVES IT:
+EXTEND-MAPPED-FILE grows by re-mapping the file into the reserved window, so
+concurrent readers never fault.  The file may grow up to the reservation, which
+defaults to *MMAP-RESERVATION-MULTIPLIER* times SIZE (floored at
+*MMAP-MIN-RESERVATION*); pass RESERVATION to override.
+
+ONE THING CAN MOVE POINTER, and it is not growth:
+RELOCATE-VECTOR-SEGMENT-MAPPING re-reserves a larger window and re-maps the
+file into it, which is how a VECTOR SEGMENT grows past its reservation.  It is
+callable ONLY by a subsystem that can exclude every reader of the mapping for
+the duration (today: the vector segment, under its own rw-lock) — read that
+function's contract before assuming a base pointer you cached is still valid.
+For every other mapped file in this system the reservation is a hard ceiling
+and POINTER is stable for the life of the mapping."
   (log:debug "Opening mmap ~A" file)
   (when (and (not create-p) (not (probe-file file)))
     (error "mmap-file: ~A does not exist and create-p is not true." file))
@@ -282,7 +291,7 @@ graph recomputes it against the now-larger file and grants fresh headroom.  To ~
 raise it up front, bind GRAPH-DB::*MMAP-RESERVATION-MULTIPLIER* or ~
 GRAPH-DB::*MMAP-MIN-RESERVATION* (or MAKE-GRAPH's heap/index size) before ~
 opening the graph.  Exception: a VECTOR SEGMENT never reaches this error at ~
-all -- its floor is GRAPH-DB::*SEGMENT-MIN-RESERVATION*, and %SEG-GROW ~
+all -- its floor is GRAPH-DB:*SEGMENT-MIN-RESERVATION*, and %SEG-GROW ~
 re-reserves and relocates its mapping (under the segment's write lock) before ~
 calling this, so for segments the reservation is not a ceiling.  Only if that ~
 relocation is disabled or fails does a segment signal, and it signals ~
@@ -307,6 +316,33 @@ VECTOR-SEGMENT-CAPACITY-EXHAUSTED, not this."
 ;;; ---------------------------------------------------------------------------
 ;;; Relocation.  READ THE CONTRACT BEFORE ADDING A SECOND CALLER.
 ;;; ---------------------------------------------------------------------------
+
+(defun %munmap-or-warn (addr length what)
+  "munmap(2) LENGTH bytes at ADDR, reporting rather than ignoring a failure.
+Returns munmap's return code (0 on success, -1 on error).
+
+WHY THIS IS NOT `(ignore-errors (%posix-munmap ...))'.  Both callers are on the
+RELOCATION path, whose characteristic failure mode is address-space pressure
+ (RLIMIT_AS, VA exhaustion) inside a process that stays up for months.  A munmap
+that the kernel refuses there leaks an ENTIRE reservation -- up to
+*SEGMENT-MIN-RESERVATION* (16 GiB by default) of address space per occurrence --
+which compounds precisely the condition that provoked the relocation, and would
+otherwise do so with no trace at all.  It must be loud.
+
+It must also not SIGNAL: one caller runs in an UNWIND-PROTECT cleanup form while
+a real failure is already unwinding, where an error here would replace the
+diagnosis with itself.  Hence log + WARN, never ERROR."
+  (let ((rc (handler-case (%posix-munmap addr length)
+              (error (e)
+                (log:error "munmap of the ~A raised ~A" what e)
+                -1))))
+    (unless (eql rc 0)
+      (log:error "munmap of the ~A (~D bytes at ~A) FAILED (rc ~A): that address ~
+space is leaked for the life of the process."
+                 what length addr rc)
+      (warn "munmap of the ~A failed (rc ~A); ~D bytes of address space leaked."
+            what rc length))
+    rc))
 
 (defun relocate-vector-segment-mapping (mapped-file new-reservation)
   "Move MAPPED-FILE's mapping into a fresh, larger reserved window: reserve
@@ -387,8 +423,9 @@ usable at its current reservation."
                      ok t)))
         (unless ok
           ;; Roll the reservation back; leave M-POINTER as it was.
-          (when new-base (ignore-errors (%posix-munmap new-base reserved)))))
-      (%posix-munmap old-base old-reserved)
+          (when new-base
+            (%munmap-or-warn new-base reserved "rolled-back new reservation"))))
+      (%munmap-or-warn old-base old-reserved "released old segment window")
       mapped-file)))
 
 (defmethod serialize-uint64 ((mf mapped-file) int offset)

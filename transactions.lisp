@@ -1025,12 +1025,32 @@ within its mmap reservation.  Once %SEG-GROW could recover from exhaustion by
 re-reserving and relocating (%SEG-ENSURE-RESERVATION), a pure check became
 over-eager -- it would abort transactions that would now succeed -- and merely
 raising its bound would have replaced a guarantee with a guess about what
-relocation might achieve.  Performing the grow HERE keeps the guarantee: this
-function and APPLY-TRANSACTION both run under the manager lock, in that order,
-within one commit, so nothing can consume the capacity in between.  After this
-returns, capacity >= live-count + the distinct new ids TX writes, and
-%SEG-CLAIM-SLOT therefore takes either a free-list slot or the LIVE index with
-live < capacity -- it cannot reach its %SEG-GROW branch.
+relocation might achieve.  Performing the grow HERE keeps the guarantee.
+
+EXACTLY WHAT IS GUARANTEED -- stated carefully, because the obvious phrasing
+ (\"validation and apply are serialised under the manager lock, so nothing can
+consume the capacity in between\") IS NOT TRUE, and contradicts the paragraph
+below about REBUILD-VECTOR-SEGMENT-BATCHED in this very docstring.  The manager
+lock serialises COMMITS against each other, and nothing else.  So:
+
+  APPLY-TRANSACTION cannot need to grow ABSENT A CONCURRENT LOCK-FREE MUTATOR.
+  After this returns, capacity >= live-count + the distinct new ids TX writes,
+  and %SEG-CLAIM-SLOT therefore takes either a free-list slot or the LIVE index
+  with live < capacity -- it cannot reach its %SEG-GROW branch.  No other
+  COMMIT can invalidate that, because commits are serialised here.
+
+  REBUILD-VECTOR-SEGMENT-BATCHED can.  It deliberately runs WITHOUT the manager
+  lock (see below) and raises LIVE-COUNT via SEGMENT-PUT.  If it interleaves
+  between this function and apply, apply's %SEG-CLAIM-SLOT can find
+  live >= capacity and reach %SEG-GROW after all -- inside apply, POST-DURABILITY.
+  That is not a regression: wave 1's validate-only version had the identical
+  hole.  And it is BENIGN while relocation is on, because that grow relocates
+  and succeeds.  The wave-1 failure mode -- a persisted node with no segment
+  entry -- returns only if *SEGMENT-RELOCATE-ON-EXHAUSTION* is NIL or relocation
+  genuinely fails (out of address space) at that exact moment.
+  Do not paper over this by claiming a serialisation that does not exist; if it
+  ever needs closing, the fix is to make the batched rebuild's SEGMENT-PUTs
+  visible to the pre-flight, not to reword the guarantee.
 
 TWO ACCEPTED CONSEQUENCES, stated here rather than left implied:
 
@@ -1118,28 +1138,35 @@ process is out of address space."
              (let ((required (+ (segment-live-count seg)
                                 (hash-table-count ids))))
                (when (> required (segment-capacity seg))
-                 ;; PRE-FLIGHT.  %SEG-GROW would signal this itself, but only
-                 ;; from the doubling that actually overruns, i.e. possibly
-                 ;; after earlier doublings have already been performed, and
-                 ;; without knowing the owner and slot.  Deciding it up front,
-                 ;; for the FULL target capacity, means an unrecoverable
-                 ;; transaction aborts having changed nothing at all, with a
-                 ;; diagnostic that names the segment.
+                 ;; PRE-FLIGHT THE RESERVATION ONCE, FOR THE FULL TARGET.
+                 ;; %SEG-GROW would re-reserve per doubling, and would signal
+                 ;; from whichever doubling actually overruns -- i.e. possibly
+                 ;; after earlier doublings have already extended the file and
+                 ;; bumped CAPACITY, and carrying PATH instead of the OWNER and
+                 ;; SLOT this pre-flight exists to add.  Obtaining a reservation
+                 ;; that covers the FINAL capacity up front makes the abort
+                 ;; genuinely atomic -- nothing changed at all -- whether
+                 ;; relocation is switched off or attempted and failed.  It also
+                 ;; costs at most one relocation for the whole grow instead of
+                 ;; one per doubling.  The loop below then finds every
+                 ;; intermediate %SEG-ENSURE-RESERVATION a no-op.
                  (let ((cap (segment-capacity seg)))
                    (loop while (< cap required) do (setf cap (* 2 cap)))
-                   (let ((needed (%seg-file-bytes cap (segment-dimension seg)))
-                         (reserved (m-reserved-size (segment-mmap seg))))
-                     (when (and (> needed reserved)
-                                (not *segment-relocate-on-exhaustion*))
-                       (error 'vector-segment-capacity-exhausted
-                              :owner (car key) :slot (cdr key)
-                              :required required :needed-bytes needed
-                              :reserved reserved
-                              :reason "relocation is disabled (GRAPH-DB::*SEGMENT-RELOCATE-ON-EXHAUSTION* is NIL)"))))
+                   (let ((needed (%seg-file-bytes cap (segment-dimension seg))))
+                     (handler-case
+                         (%seg-ensure-reservation (segment-mmap seg) needed cap)
+                       (vector-segment-capacity-exhausted (e)
+                         ;; Re-signal naming the segment.  %SEG-ENSURE-RESERVATION
+                         ;; knows only the path; REQUIRED is the transaction's
+                         ;; own figure, which is the one an operator wants.
+                         (error 'vector-segment-capacity-exhausted
+                                :owner (car key) :slot (cdr key)
+                                :required required :needed-bytes needed
+                                :reserved (vsce-reserved e)
+                                :reason (vsce-reason e))))))
                  ;; Now actually grow, so APPLY-TRANSACTION cannot need to.
-                 ;; %SEG-GROW re-reserves and relocates if a doubling would
-                 ;; pass the reservation; if that fails (out of address space)
-                 ;; it signals here, still pre-durability.
+                 ;; The reservation is already large enough, so no doubling
+                 ;; below can signal.
                  (loop while (> required (segment-capacity seg))
                        do (%seg-grow seg)))))))
        new-ids))))
@@ -2487,10 +2514,14 @@ See CALL-WITH-READ-SNAPSHOT."
                (validate-vector-segment-dimensions tx (graph tx))
                ;; Vector-segment capacity: same region, same reason.  This one
                ;; does not merely check -- it GROWS each segment to the capacity
-               ;; this transaction needs, so APPLY-TRANSACTION provably cannot
-               ;; need to grow (and cannot fail a grow after the node write is
-               ;; durable).  Both run under the manager lock, in this order, so
-               ;; nothing can consume the capacity in between.
+               ;; this transaction needs, so APPLY-TRANSACTION does not need to
+               ;; grow (and cannot fail a grow after the node write is durable).
+               ;; The manager lock serialises COMMITS, so no other commit can
+               ;; consume the capacity in between.  It does NOT exclude
+               ;; REBUILD-VECTOR-SEGMENT-BATCHED, which runs lock-free by
+               ;; design; read ENSURE-VECTOR-SEGMENT-CAPACITY's docstring for
+               ;; exactly what that leaves reachable and why it is benign while
+               ;; relocation is on.
                (ensure-vector-segment-capacity tx (graph tx))
                (setf (transaction-id tx) (tx-id-counter tm))
                (incf (tx-id-counter tm))

@@ -71,16 +71,30 @@ between releases; cutting a release renames it to the new version and dates it.
   `vector-segment-capacity-exhausted` now fires only when relocation is
   disabled or fails (address space exhausted), and carries two new slots —
   `vsce-path` (for the direct `segment-put` path, which has no owner/slot) and
-  `vsce-reason` — with a report that says which of the two happened.
+  `vsce-reason` — with a report that says which of the two happened. Both
+  `munmap`s on the relocation path (the rollback and the old-window release)
+  check their return code and warn: a refused `munmap` leaks an entire
+  reservation, in a long-lived process, on the one path whose failure mode *is*
+  address-space pressure.
 - **The pre-durability capacity check now *grows* the segment instead of
   rejecting the transaction** (`validate-vector-segment-capacity` →
   `ensure-vector-segment-capacity`). Once exhaustion became recoverable, a check
   that refused any transaction needing more than the current reservation was
   over-eager. Growing in the same manager-locked region, before
   `finalize-tx-persistence`, keeps wave 1's guarantee rather than weakening it
-  to a heuristic: validation and apply are serialised under the manager lock, so
-  nothing can consume the capacity in between, and `apply-transaction`
-  *provably* cannot need to grow. Two accepted consequences, documented at the
+  to a heuristic: since commits are serialised under the manager lock, no other
+  *commit* can consume the capacity in between, so `apply-transaction` cannot
+  need to grow **absent a concurrent lock-free mutator**. One exists:
+  `rebuild-vector-segment-batched` deliberately runs *without* the manager lock
+  and raises `live-count` via `segment-put`. If it interleaves, apply's grow
+  branch is reachable after all — but it then *relocates* and succeeds, so the
+  wave-1 failure mode (a persisted node with no segment entry) returns only if
+  relocation is switched off or genuinely fails at that moment. This is not a
+  regression: wave 1's validate-only version had the identical hole. The
+  reservation for the full target capacity is now pre-flighted **once**, before
+  any doubling runs, so an unrecoverable transaction aborts having changed
+  nothing at all and the diagnostic still names the owner and slot.
+  Two accepted consequences, documented at the
   function: a transaction that fails later leaves an over-sized segment (harmless
   — capacity is not semantic, `live-count` and the id array are untouched), and a
   crash mid-grow leaves the segment dirty so `restore-vector-segments` rebuilds
@@ -106,8 +120,10 @@ between releases; cutting a release renames it to the new version and dates it.
   advances by doubling, so the largest power-of-two capacity whose file still
   fits under the 16 GiB floor is 2,097,152 slots, not the byte-exact
   4,177,983 (the next doubling, 4,194,304, needs 17,246,978,112 bytes, over
-  the 17,179,869,184-byte floor). `vector-segment-capacity-exhausted` is
-  unchanged and still fires (pre-durability) if the floor is ever reached.
+  the 17,179,869,184-byte floor). (When this landed, reaching the floor still
+  meant `vector-segment-capacity-exhausted`; the *relocation* entry above then
+  removed the ceiling outright, so today the floor is only the point at which a
+  segment starts relocating.)
   `*segment-min-reservation*` is exported — it is the one knob that actually
   raises this ceiling, unlike `*mmap-min-reservation*`, which segment files
   no longer consult.

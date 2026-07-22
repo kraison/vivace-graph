@@ -121,11 +121,11 @@ but its mmap reservation is ~D, and the mapping could not be re-reserved and ~
 relocated into a larger window (~A). Normally a segment grows past its ~
 reservation by relocating -- under its own write lock -- so this is not the ~
 ordinary ceiling it used to be. If relocation is switched off, re-enable ~
-GRAPH-DB::*SEGMENT-RELOCATE-ON-EXHAUSTION*; if it FAILED, the process is out of ~
+GRAPH-DB:*SEGMENT-RELOCATE-ON-EXHAUSTION*; if it FAILED, the process is out of ~
 address space (check RLIMIT_AS / `ulimit -v`, which counts reserved address ~
 space even though it is PROT_NONE and MAP_NORESERVE). Reopening the graph also ~
 recomputes the reservation from the file's current size, giving it the larger ~
-of GRAPH-DB::*SEGMENT-MIN-RESERVATION* (16 GiB by default, and the floor that ~
+of GRAPH-DB:*SEGMENT-MIN-RESERVATION* (16 GiB by default, and the floor that ~
 actually applies to vector segment files) and ~
 GRAPH-DB::*MMAP-RESERVATION-MULTIPLIER* times that size (8x by default). ~
 GRAPH-DB::*MMAP-MIN-RESERVATION* is NOT consulted for segment files, so raising ~
@@ -137,6 +137,29 @@ it alone does nothing here."
                      (vsce-needed-bytes c) (vsce-reserved c)
                      (or (vsce-reason c) "no reason recorded"))))
   (:documentation "Signalled when a vector segment must grow past its mmap
-reservation and cannot relocate to a larger one.  On the transaction path it is
-signalled PRE-DURABILITY, so the whole transaction -- node write included --
-rolls back cleanly and no node is left without a segment entry."))
+reservation and cannot relocate to a larger one -- either because relocation is
+switched off (*SEGMENT-RELOCATE-ON-EXHAUSTION*) or because it failed outright
+ (address space exhausted / RLIMIT_AS).
+
+WHERE IT IS SIGNALLED FROM, precisely -- the blanket \"pre-durability on the
+transaction path\" this used to claim is not true of every case:
+
+  * ENSURE-VECTOR-SEGMENT-CAPACITY (the normal transaction path) signals it
+    PRE-DURABILITY, in the manager-locked region before
+    FINALIZE-TX-PERSISTENCE, having changed nothing -- so the whole transaction,
+    node write included, rolls back cleanly and no node is left without a
+    segment entry.  That is the case this condition exists to make safe.
+  * %SEG-GROW signals it directly for a NON-transactional writer -- a bare
+    SEGMENT-PUT, REBUILD-VECTOR-SEGMENT-BATCHED -- where there is no transaction
+    and \"pre-durability\" means nothing.  Such a signal carries PATH, not
+    OWNER/SLOT.
+  * It can also escape from INSIDE APPLY-TRANSACTION, i.e. POST-DURABILITY, in
+    two residual cases the pre-flight cannot cover: a segment that does not
+    exist yet (it is created inside apply, and one transaction inserting more
+    vectors than the fresh reservation covers can exhaust it), and a segment
+    whose capacity was consumed after the pre-flight by a concurrent lock-free
+    mutator -- REBUILD-VECTOR-SEGMENT-BATCHED, which deliberately runs without
+    the manager lock.  Both are narrow, both require relocation to be off or to
+    fail, and both are documented at ENSURE-VECTOR-SEGMENT-CAPACITY.  Seeing
+    this condition escape a commit rather than abort one means you are in one of
+    them."))
