@@ -241,8 +241,20 @@ mmap(base + reserved, additional, PROT_NONE,
 ```
 
 If it returns the requested address, the window simply got bigger: `m-pointer` never moved, no
-reader is affected, no lock is needed beyond what the caller already holds. On a sparse 64-bit
-address space this usually succeeds.
+reader is affected, no lock is needed beyond what the caller already holds.
+
+⚠ **Correction (2026-07-22, measured — this section previously claimed "on a sparse 64-bit
+address space this usually succeeds", which is false for the shape that matters.)** With a 16 GiB
+segment reservation, adjacent claims of 1 page, 1 MiB, 1 GiB and 8 GiB were **all refused** — on
+Linux 5.15 *and* 4.15. The reason is that top-down `mmap` allocation packs each new window flush
+against existing mappings: on both hosts `libssl.so.3` began at the reservation's exact end.
+Legacy bottom-up layout and Darwin behave the same way. A large reservation is precisely the case
+where there is nothing adjacent to claim.
+
+So **Part 3 is an opportunistic saving, not the mechanism.** Part 4's relocation remains the
+workhorse, and the lever that actually prevents relocation is Part 2's reservation floor — making
+exhaustion rare — not Part 3. Part 3 is still worth having: a miss costs one extra `mmap` on an
+already-rare path, and it wins whenever a segment happens to sit at the top of the layout.
 
 **Correction (2026-07-22, measured — an earlier revision of this section was wrong).**
 
