@@ -360,14 +360,73 @@ validated ID via %SEG-CHECK-ID."
   "Slot index storing ID, or NIL."
   (gethash id (segment-id->slot segment)))
 
+(defun %seg-ensure-reservation (mmap needed capacity)
+  "Make MMAP's virtual-address reservation cover NEEDED bytes, RELOCATING the
+mapping into a larger window if it does not (Part 4 of the segment-reservation
+design; the unimplemented final sentence of docs/mmap-remap-race-plan.md Phase
+3).  A no-op in the overwhelmingly common case where the reservation already
+covers NEEDED.
+
+CALLER MUST HOLD THE SEGMENT'S WRITE LOCK.  Relocation moves M-POINTER, and the
+segment's rw-lock is the ONLY thing excluding readers from the old address --
+see RELOCATE-VECTOR-SEGMENT-MAPPING's docstring, which spells out why the heap
+and the linear hash can never do this.  %SEG-GROW, the sole caller, runs under
+that lock (SEGMENT-PUT / SEGMENT-REMOVE take it; the %SEG-* internals are
+lock-free by convention).
+
+The new reservation goes through %SEG-RESERVATION-FOR, so a relocated segment
+lands on the same policy a freshly opened one would: max(floor, multiplier x
+size).  Since the multiplier is > 1, the new window is strictly larger than
+NEEDED, i.e. relocation also buys the NEXT few doublings rather than only the
+current one -- relocation copies nothing but does cost two syscalls and a
+TLB-visible remap, so doing it once per several doublings matters.
+
+Signals VECTOR-SEGMENT-CAPACITY-EXHAUSTED when relocation is switched off
+ (*SEGMENT-RELOCATE-ON-EXHAUSTION*) or when it fails outright (address space
+exhausted / RLIMIT_AS).  On the transaction path that signal happens
+pre-durability -- see ENSURE-VECTOR-SEGMENT-CAPACITY, which pre-flights this
+exact condition so the abort carries the owner and slot.
+
+CAPACITY is the slot count NEEDED bytes corresponds to -- carried purely so the
+signalled condition reports entries and bytes, rather than reporting the byte
+count in the entry field (which read as a nonsense \"growing to hold 98,368
+entries needs 98,368 bytes\")."
+  (let ((reserved (m-reserved-size mmap)))
+    (when (> needed reserved)
+      (unless *segment-relocate-on-exhaustion*
+        (error 'vector-segment-capacity-exhausted
+               :path (m-path mmap)
+               :required capacity :needed-bytes needed :reserved reserved
+               :reason "relocation is disabled (GRAPH-DB::*SEGMENT-RELOCATE-ON-EXHAUSTION* is NIL)"))
+      (handler-case
+          (relocate-vector-segment-mapping mmap (%seg-reservation-for needed))
+        (error (e)
+          ;; Nothing was mutated (the primitive rolls back), so the segment is
+          ;; still usable at its current reservation -- report rather than
+          ;; resignal the raw mmap error, so callers can still discriminate
+          ;; this from a data error by condition type.
+          (error 'vector-segment-capacity-exhausted
+                 :path (m-path mmap)
+                 :required capacity :needed-bytes needed :reserved reserved
+                 :reason (format nil "re-reserving ~D bytes failed: ~A"
+                                 (%seg-reservation-for needed) e))))))
+  mmap)
+
 (defun %seg-grow (segment)
   "Double the segment's capacity in place.  Because the vector block starts
 after the id array and the id array's size is capacity*16, growing capacity
 moves the vector block: extend the file, then relocate the existing vectors
 from the OLD block offset to the NEW one, high slot first so the copy never
-overwrites unread source bytes.  The base pointer never moves (extend-mapped-
-file remaps into the reserved window), so a concurrent read never faults.
-Returns OLD-CAP, the first fresh (unclaimed) slot index."
+overwrites unread source bytes.  The base pointer normally never moves
+ (extend-mapped-file remaps into the reserved window), so a concurrent read
+never faults.  Returns OLD-CAP, the first fresh (unclaimed) slot index.
+
+If the doubling would pass the mmap reservation, %SEG-ENSURE-RESERVATION first
+re-reserves a larger window and RELOCATES the mapping into it -- the one case
+where the base pointer does move.  That is safe here and nowhere else: this runs
+under the segment's write lock (SEGMENT-PUT / SEGMENT-REMOVE), which excludes
+every reader of this mapping.  The reservation is therefore no longer a ceiling
+for segments."
   (let* ((mmap (segment-mmap segment))
          (dim (segment-dimension segment))
          (old-cap (segment-capacity segment))
@@ -377,6 +436,10 @@ Returns OLD-CAP, the first fresh (unclaimed) slot index."
          (needed (%seg-file-bytes new-cap dim))
          (have (mapped-file-length mmap)))
     (when (> needed have)
+      ;; Relocate to a larger reservation if this doubling would not fit; a
+      ;; no-op otherwise.  Must precede the extend, which treats the
+      ;; reservation as hard (it has no read lock to relocate under).
+      (%seg-ensure-reservation mmap needed new-cap)
       (extend-mapped-file mmap (- needed have)))
     ;; Relocate vectors, HIGH slot first: new-vblock > old-vblock, so copying
     ;; slot i from old+i*w to new+i*w with i descending never overwrites a

@@ -104,21 +104,39 @@ which is not loaded/available."
 dependency-free fallback and GEOS is unavailable."))
 
 (define-condition vector-segment-capacity-exhausted (error)
-  ((owner :initarg :owner :reader vsce-owner)
-   (slot :initarg :slot :reader vsce-slot)
+  ;; OWNER/SLOT identify the segment on the transaction path, which knows them;
+  ;; PATH identifies it on the direct SEGMENT-PUT path (%SEG-GROW), which does
+  ;; not.  Exactly one pair is populated, hence the initforms -- an unbound slot
+  ;; here would make the report itself error, in the middle of an incident.
+  ((owner :initarg :owner :initform nil :reader vsce-owner)
+   (slot :initarg :slot :initform nil :reader vsce-slot)
+   (path :initarg :path :initform nil :reader vsce-path)
    (required :initarg :required :reader vsce-required)
    (reserved :initarg :reserved :reader vsce-reserved)
-   (needed-bytes :initarg :needed-bytes :reader vsce-needed-bytes))
+   (needed-bytes :initarg :needed-bytes :reader vsce-needed-bytes)
+   (reason :initarg :reason :initform nil :reader vsce-reason))
   (:report (lambda (c s)
-             (format s "vector segment ~A/~A: growing to hold ~D entries needs ~D bytes, ~
-but its mmap reservation is ~D. Reopen the graph (the reservation is recomputed ~
-from the file's current size at open, giving it the larger of ~
-GRAPH-DB::*SEGMENT-MIN-RESERVATION* -- 16 GiB by default, and the floor that ~
-actually applies to vector segment files -- and ~
-GRAPH-DB::*MMAP-RESERVATION-MULTIPLIER* times that size -- 8x by default), or ~
-raise one of those two before opening. GRAPH-DB::*MMAP-MIN-RESERVATION* is NOT ~
-consulted for segment files, so raising it alone does nothing here."
-                     (vsce-owner c) (vsce-slot c) (vsce-required c)
-                     (vsce-needed-bytes c) (vsce-reserved c))))
-  (:documentation "Signalled pre-durability when applying a transaction would
-require growing a vector segment past its mmap reservation."))
+             (format s "vector segment ~A: growing to hold ~D entries needs ~D bytes, ~
+but its mmap reservation is ~D, and the mapping could not be re-reserved and ~
+relocated into a larger window (~A). Normally a segment grows past its ~
+reservation by relocating -- under its own write lock -- so this is not the ~
+ordinary ceiling it used to be. If relocation is switched off, re-enable ~
+GRAPH-DB::*SEGMENT-RELOCATE-ON-EXHAUSTION*; if it FAILED, the process is out of ~
+address space (check RLIMIT_AS / `ulimit -v`, which counts reserved address ~
+space even though it is PROT_NONE and MAP_NORESERVE). Reopening the graph also ~
+recomputes the reservation from the file's current size, giving it the larger ~
+of GRAPH-DB::*SEGMENT-MIN-RESERVATION* (16 GiB by default, and the floor that ~
+actually applies to vector segment files) and ~
+GRAPH-DB::*MMAP-RESERVATION-MULTIPLIER* times that size (8x by default). ~
+GRAPH-DB::*MMAP-MIN-RESERVATION* is NOT consulted for segment files, so raising ~
+it alone does nothing here."
+                     (if (vsce-owner c)
+                         (format nil "~A/~A" (vsce-owner c) (vsce-slot c))
+                         (or (vsce-path c) "(unknown)"))
+                     (vsce-required c)
+                     (vsce-needed-bytes c) (vsce-reserved c)
+                     (or (vsce-reason c) "no reason recorded"))))
+  (:documentation "Signalled when a vector segment must grow past its mmap
+reservation and cannot relocate to a larger one.  On the transaction path it is
+signalled PRE-DURABILITY, so the whole transaction -- node write included --
+rolls back cleanly and no node is left without a segment entry."))

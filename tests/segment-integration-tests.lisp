@@ -667,12 +667,24 @@ a separate (SI-SUB . EMBEDDING) segment would appear."
     ;;    their own floor (16 GiB by default, %SEG-RESERVATION-FOR), which
     ;;    overrides *MMAP-MIN-RESERVATION* for segment files only.  Leave it at
     ;;    the default and this segment can never exhaust -- the test would still
-    ;;    PASS while verifying nothing at all.  Re-proven to discriminate by
-    ;;    disabling the VALIDATE-VECTOR-SEGMENT-CAPACITY call site with #+(or)
-    ;;    and confirming it fails.
+    ;;    PASS while verifying nothing at all.
+    ;; 4. *SEGMENT-RELOCATE-ON-EXHAUSTION* MUST be bound NIL, for the SAME
+    ;;    reason and by an even wider margin.  A segment now recovers from
+    ;;    exhaustion by re-reserving a larger window and relocating its mapping
+    ;;    into it (%SEG-ENSURE-RESERVATION), so with it left at the default T no
+    ;;    reservation is a ceiling, nothing ever signals, and this test would
+    ;;    silently degrade into a slow insert loop asserting nothing.  Switching
+    ;;    relocation off is not a contrivance: it is the supported kill-switch,
+    ;;    and it selects exactly the code path that still runs in production
+    ;;    when relocation FAILS (address space exhausted) -- which is the
+    ;;    failure this test's invariant is about.
+    ;; Re-proven to discriminate, both times, by disabling the
+    ;; ENSURE-VECTOR-SEGMENT-CAPACITY call site with #+(or) and confirming it
+    ;; fails.
     (let* ((graph-db::*mmap-min-reservation* (* 64 1024))
            (graph-db::*mmap-reservation-multiplier* 1)
            (graph-db::*segment-min-reservation* (* 64 1024))
+           (graph-db::*segment-relocate-on-exhaustion* nil)
            (g (make-graph *integration-graph-name* (namestring dir) :buffer-pool-size 1000))
            (count-before nil)
            (live-before nil))
@@ -706,6 +718,55 @@ a separate (SI-SUB . EMBEDDING) segment would appear."
                (is (> nodes count-before) "the fill loop should have committed something")
                (is (> live live-before)))
           (close-graph g2 :snapshot-p nil)))
+      (collect-garbage))))
+
+(test growth-past-the-reservation-succeeds-through-a-transaction
+  ;; The direct inverse of CAPACITY-EXHAUSTION-SIGNALS-AND-ROLLS-BACK, with the
+  ;; SAME degenerate reservations and only *SEGMENT-RELOCATE-ON-EXHAUSTION* left
+  ;; at its default: what aborts there must now succeed here.  Two things are
+  ;; asserted, not one -- that the commits succeed, and that the segment's
+  ;; reservation actually GREW.  Without the second, a test that merely inserted
+  ;; without erroring would pass even if the reservation had silently been large
+  ;; enough all along, proving nothing about relocation.
+  ;;
+  ;; 1100 docs is chosen against the arithmetic: at dimension 8 a slot costs 48
+  ;; bytes, so the 64 KiB reservation covers capacity 1024 but not the doubling
+  ;; to 2048 (98,368 bytes).  Crossing 1024 live entries therefore forces
+  ;; exactly the grow that used to signal.  It also stays inside the insert
+  ;; count the exhaustion test above already demonstrates the (headroom-free)
+  ;; heap and indexes survive.
+  (with-temp-directory (dir)
+    (let* ((graph-db::*mmap-min-reservation* (* 64 1024))
+           (graph-db::*mmap-reservation-multiplier* 1)
+           (graph-db::*segment-min-reservation* (* 64 1024))
+           (g (make-graph *integration-graph-name* (namestring dir) :buffer-pool-size 1000))
+           (reserved-before nil))
+      (unwind-protect
+           (let ((*graph* g))
+             (with-transaction ()
+               (make-si-doc :title "seed" :embedding (%si-embedding 8 1.0)))
+             (setf reserved-before
+                   (graph-db::m-reserved-size
+                    (graph-db::segment-mmap (%si-segment g 'embedding))))
+             (dotimes (i 1100)
+               (with-transaction ()
+                 (make-si-doc :title "fill" :embedding (%si-embedding 8 (float i 1.0)))))
+             (let ((nodes (length (map-vertices #'identity g :collect-p t :vertex-type 'si-doc)))
+                   (seg (%si-segment g 'embedding)))
+               (is (= 1101 nodes))
+               (is (= nodes (graph-db::segment-live-count seg))
+                   "~D nodes vs ~D segment entries after growing past the reservation"
+                   nodes (graph-db::segment-live-count seg))
+               (is (> (graph-db::segment-capacity seg) 1024)
+                   "the segment should have grown past capacity 1024; it is ~D"
+                   (graph-db::segment-capacity seg))
+               (is (> (graph-db::m-reserved-size (graph-db::segment-mmap seg))
+                      reserved-before)
+                   "the reservation should have been enlarged by relocation; it ~
+                    is still ~D, so no relocation happened and this test proved ~
+                    nothing"
+                   reserved-before)))
+        (close-graph g :snapshot-p nil))
       (collect-garbage))))
 
 (test rebuild-sizes-the-segment-to-the-corpus

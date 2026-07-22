@@ -19,6 +19,12 @@
   ;; Because POINTER never moves and the reservation is never unmapped until
   ;; close, concurrent readers never fault and need no lock.  See
   ;; docs/mmap-remap-race-plan.md.
+  ;;
+  ;; ONE EXCEPTION, and it is not a general one:
+  ;; RELOCATE-VECTOR-SEGMENT-MAPPING (below) does move POINTER, for a vector
+  ;; segment only, because a segment -- unlike the heap and the linear hash --
+  ;; holds an rw-lock over every one of its readers.  Read its docstring before
+  ;; calling it from anywhere else; the short version is: don't.
   (reserved-size 0 :type integer))
 
 ;;; Diagnostic: count SEGV-retries in the accessor :around methods.  With the
@@ -275,10 +281,12 @@ The reservation is computed at open from the file's size then, so reopening the 
 graph recomputes it against the now-larger file and grants fresh headroom.  To ~
 raise it up front, bind GRAPH-DB::*MMAP-RESERVATION-MULTIPLIER* or ~
 GRAPH-DB::*MMAP-MIN-RESERVATION* (or MAKE-GRAPH's heap/index size) before ~
-opening the graph.  Exception: a VECTOR SEGMENT file's floor is ~
-GRAPH-DB::*SEGMENT-MIN-RESERVATION*, not *MMAP-MIN-RESERVATION* -- see ~
-VECTOR-SEGMENT-CAPACITY-EXHAUSTED, which is what normally signals for those ~
-before growth ever reaches this generic path."
+opening the graph.  Exception: a VECTOR SEGMENT never reaches this error at ~
+all -- its floor is GRAPH-DB::*SEGMENT-MIN-RESERVATION*, and %SEG-GROW ~
+re-reserves and relocates its mapping (under the segment's write lock) before ~
+calling this, so for segments the reservation is not a ceiling.  Only if that ~
+relocation is disabled or fails does a segment signal, and it signals ~
+VECTOR-SEGMENT-CAPACITY-EXHAUSTED, not this."
              (m-path mapped-file) new-len (m-reserved-size mapped-file)))
     ;; Extend the backing file first so the newly mapped pages have storage.
     (%posix-lseek (m-fd mapped-file) (1- new-len) +seek-set+)
@@ -295,6 +303,93 @@ before growth ever reaches this generic path."
                  (m-fd mapped-file)
                  0)
     mapped-file))
+
+;;; ---------------------------------------------------------------------------
+;;; Relocation.  READ THE CONTRACT BEFORE ADDING A SECOND CALLER.
+;;; ---------------------------------------------------------------------------
+
+(defun relocate-vector-segment-mapping (mapped-file new-reservation)
+  "Move MAPPED-FILE's mapping into a fresh, larger reserved window: reserve
+NEW-RESERVATION bytes of PROT_NONE anonymous address space, MAP_FIXED the file
+into its head, publish the new base in M-POINTER, then munmap the old window.
+Returns MAPPED-FILE.  A no-op (and not an error) if the current reservation
+already covers NEW-RESERVATION.
+
+⚠ THIS MOVES M-POINTER, WHICH THE WHOLE LOCK-FREE READ PATH ASSUMES NEVER
+MOVES.  Everything else in this file exists to guarantee the opposite: MMAP-FILE
+reserves a window once and EXTEND-MAPPED-FILE grows strictly INSIDE it, so
+GET-BYTE/SET-BYTE and segment.lisp's SAP-based decoder can dereference the base
+pointer with no lock and never fault (see the MAPPED-FILE docstring and
+docs/mmap-remap-race-plan.md).  This function breaks that guarantee for the
+duration of the call and then re-establishes it at a different address.
+
+THE CALLER MUST HOLD WRITE-EXCLUSIVE ACCESS AGAINST *EVERY* READER OF THIS
+MAPPING.  Not \"should\"; there is no other protection.  A reader that loaded
+the old base before the swap dereferences unmapped memory after the munmap
+below, which is a SIGSEGV at best and a read of some later, unrelated mapping
+at worst.
+
+WHO QUALIFIES: the vector segment, and nothing else in this codebase today --
+hence the name.  Every public segment entry point takes the segment's own
+rw-lock (SEGMENT-PUT/SEGMENT-REMOVE write; SEGMENT-GET/SEGMENT-SCAN/
+SEGMENT-SCORE-SUBSET read), so %SEG-GROW, which runs under the write side, has
+genuine exclusion over the segment's readers.
+
+WHO DOES NOT QUALIFY -- THE HEAP (allocator.lisp) AND THE LINEAR HASH
+(linear-hash.lisp).  Both call EXTEND-MAPPED-FILE, so both look like plausible
+callers, and both would be CATASTROPHIC ones: the MAPPED-FILE layer has NO read
+lock, and removing that lock is precisely what the stable-address design bought
+(Phase 1's per-file read lock serialised every reader; Phase 3 removed it by
+pinning the address).  If you are here from allocator.lisp or linear-hash.lisp,
+the answer is not to relax this contract or to generalise the name -- it is that
+those subsystems cannot relocate at all, and their reservation is a hard
+ceiling.  See the spec's Part 4 and its \"Out of scope\".
+
+On failure (either mmap) nothing is mutated: the old window is still mapped and
+M-POINTER still points at it, so the caller may signal and the segment remains
+usable at its current reservation."
+  (let ((len (mapped-file-length mapped-file))
+        (old-base (m-pointer mapped-file))
+        (old-reserved (m-reserved-size mapped-file)))
+    (let ((reserved (max new-reservation len))
+          (new-base nil)
+          (ok nil))
+      (when (<= reserved old-reserved)
+        (return-from relocate-vector-segment-mapping mapped-file))
+      (unwind-protect
+           (progn
+             ;; Reserve the new window first.  If this fails (VA exhaustion,
+             ;; RLIMIT_AS), the old mapping is untouched.
+             (setq new-base (%posix-mmap
+                             (cffi:null-pointer)
+                             reserved
+                             +prot-none+
+                             (logior +map-private+
+                                     +map-anonymous+
+                                     +map-noreserve+)
+                             -1
+                             0))
+             ;; Map the file over the head of the new window.  MAP_SHARED, so
+             ;; while both windows are live they are views of the same pages --
+             ;; there is no copy and no coherency window.
+             (let ((pointer (%posix-mmap
+                             new-base
+                             len
+                             (logior +prot-read+ +prot-write+)
+                             (logior +map-shared+ +map-fixed+)
+                             (m-fd mapped-file)
+                             0)))
+               ;; Publish, then release.  In this order: a stray reader that
+               ;; sneaks past the caller's lock is far better off reading the
+               ;; still-mapped old window than faulting on a freed one.
+               (setf (m-pointer mapped-file) pointer
+                     (m-reserved-size mapped-file) reserved
+                     ok t)))
+        (unless ok
+          ;; Roll the reservation back; leave M-POINTER as it was.
+          (when new-base (ignore-errors (%posix-munmap new-base reserved)))))
+      (%posix-munmap old-base old-reserved)
+      mapped-file)))
 
 (defmethod serialize-uint64 ((mf mapped-file) int offset)
   (declare (type word int offset))

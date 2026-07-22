@@ -1009,15 +1009,48 @@ either source) establishes the dimension."
 match established segment dimension ~D"
                             slot (car key) (length v) expected))))))))))))
 
-(defun validate-vector-segment-capacity (tx graph)
-  "Signal VECTOR-SEGMENT-CAPACITY-EXHAUSTED if applying TX would require growing
-a vector segment past its mmap reservation.  Runs in the same manager-locked,
-pre-FINALIZE-TX-PERSISTENCE region as VALIDATE-VECTOR-SEGMENT-DIMENSIONS and for
-the same reason: %SEG-GROW signals from inside APPLY-TRANSACTION, by which point
-the node write is already journaled, leaving a persisted node with no segment
-entry -- invisible to VECTOR-SEARCH, with no error and no self-correction.
+(defun ensure-vector-segment-capacity (tx graph)
+  "Grow every vector segment TX writes to until it can hold what TX will put in
+it, so APPLY-TRANSACTION provably never has to grow.  Runs in the same
+manager-locked, pre-FINALIZE-TX-PERSISTENCE region as
+VALIDATE-VECTOR-SEGMENT-DIMENSIONS and for the same reason: %SEG-GROW can signal
+ (if it cannot relocate to a larger reservation), and from inside
+APPLY-TRANSACTION that signal lands after the node write is journaled, leaving a
+persisted node with no segment entry -- invisible to VECTOR-SEARCH, with no error
+and no self-correction.
 
-Every per-segment read here takes the segment's READ LOCK.  Holding the manager
+WHY IT GROWS RATHER THAN MERELY VALIDATING.  It used to only validate: it
+computed the capacity TX needed and signalled if the segment could not reach it
+within its mmap reservation.  Once %SEG-GROW could recover from exhaustion by
+re-reserving and relocating (%SEG-ENSURE-RESERVATION), a pure check became
+over-eager -- it would abort transactions that would now succeed -- and merely
+raising its bound would have replaced a guarantee with a guess about what
+relocation might achieve.  Performing the grow HERE keeps the guarantee: this
+function and APPLY-TRANSACTION both run under the manager lock, in that order,
+within one commit, so nothing can consume the capacity in between.  After this
+returns, capacity >= live-count + the distinct new ids TX writes, and
+%SEG-CLAIM-SLOT therefore takes either a free-list slot or the LIVE index with
+live < capacity -- it cannot reach its %SEG-GROW branch.
+
+TWO ACCEPTED CONSEQUENCES, stated here rather than left implied:
+
+  1. A transaction that fails LATER leaves an over-sized segment.  Only
+     FINALIZE-TX-PERSISTENCE and APPLY-TRANSACTION remain after this point, so
+     the window is small, but it is real.  It is harmless: capacity is not
+     semantic.  LIVE-COUNT is untouched, no id-array cell is claimed, and the
+     freshly added cells are free-marked exactly as %SEG-GROW always marks them,
+     so the segment stays fully consistent -- the file is merely larger than it
+     needed to be, and the next transaction uses the space.
+
+  2. A crash MID-GROW leaves the segment dirty, so RESTORE-VECTOR-SEGMENTS
+     rebuilds it at the next open.  That is the pre-existing recovery path and
+     this does not make it worse -- but note it leans on wave 1: before rebuilds
+     were created at the corpus size, that automatic rebuild could not complete
+     above 131,072 entries.
+
+Every per-segment access here takes the segment's OWN LOCK -- the read side while
+counting new ids, the WRITE side around the grow (which mutates the segment and
+may relocate its mapping).  Holding the manager
 lock is NOT sufficient: REBUILD-VECTOR-SEGMENT-BATCHED deliberately runs WITHOUT
 the manager lock (a long hold would stall every commit) and mutates LIVE-COUNT,
 CAPACITY and the ID->SLOT table via SEGMENT-PUT while commits are in flight.
@@ -1030,22 +1063,26 @@ one, IS quiescent -- it runs only from RESTORE-VECTOR-SEGMENTS during OPEN-GRAPH
 existing direction, and the batched rebuild never takes the manager lock, so no
 inversion is possible.
 
-The free list needs no separate accounting, and this check is already tight
-against it: SEGMENT-REMOVE decrements LIVE-COUNT while pushing the slot onto the
-free list, and SEGMENT-PUT increments LIVE-COUNT even when it pops a freed slot,
-so live + free = highwater <= capacity, and REQUIRED <= CAPACITY exactly when no
+The free list needs no separate accounting, and this is already tight against
+it: SEGMENT-REMOVE decrements LIVE-COUNT while pushing the slot onto the free
+list, and SEGMENT-PUT increments LIVE-COUNT even when it pops a freed slot, so
+live + free = highwater <= capacity, and REQUIRED <= CAPACITY exactly when no
 grow is needed.  Do not \"fix\" it by crediting the free list.  The one real
 conservatism is that deletes in the SAME transaction are not credited, so a
-transaction that frees at least as many slots as it claims can still abort early.
-Aborting early is recoverable; aborting after durability is not.
+transaction that frees at least as many slots as it claims can still grow the
+segment it did not have to.  That wastes space, which is recoverable; failing
+after durability is not.
 
-A (owner, slot) with no committed segment yet is skipped.  CREATE-VECTOR-SEGMENT
-sizes the file for INITIAL-CAPACITY (1024) slots and the reservation is computed
-from that, so such a segment can only exhaust if ONE transaction inserts more new
-vectors than the fresh reservation covers -- with the defaults (*MMAP-MIN-
-RESERVATION* 1 GiB) that means over a GiB of vectors in a single transaction.
-Not reachable per-document; a bulk loader committing a whole corpus at once
-could reach it."
+A (owner, slot) with no committed segment yet is skipped -- there is nothing to
+grow, since the segment does not exist until APPLY-TRANSACTION creates it, and
+CREATE-VECTOR-SEGMENT sizes both the file and its reservation for
+INITIAL-CAPACITY (1024) slots.  Such a segment can still need to grow inside
+APPLY-TRANSACTION, if ONE transaction inserts more new vectors than the fresh
+reservation covers (over a GiB of vectors in a single transaction, with the
+defaults) -- not reachable per-document, but reachable by a bulk loader
+committing a whole corpus at once.  That residual gap is now much narrower than
+it was: %SEG-GROW relocates rather than signalling, so it fails only if the
+process is out of address space."
   ;; Overwhelmingly common case: no vector segments at all.  Cost nothing there.
   (when (plusp (hash-table-count (vector-segments graph)))
     (let ((new-ids (make-hash-table :test 'equal)))
@@ -1073,19 +1110,38 @@ could reach it."
       (maphash
        (lambda (key ids)
          (let ((seg (gethash key (vector-segments graph))))
-           (multiple-value-bind (needed reserved required)
-               (with-read-lock ((segment-lock seg))
-                 (let ((required (+ (segment-live-count seg)
-                                    (hash-table-count ids)))
-                       (cap (segment-capacity seg)))
+           ;; WRITE lock, not the read lock this used to take: the grow below
+           ;; mutates the segment (and may relocate its mapping), which is
+           ;; exactly what the segment's write side exists to make exclusive.
+           ;; Lock order is unchanged -- manager -> segment.
+           (with-write-lock ((segment-lock seg))
+             (let ((required (+ (segment-live-count seg)
+                                (hash-table-count ids))))
+               (when (> required (segment-capacity seg))
+                 ;; PRE-FLIGHT.  %SEG-GROW would signal this itself, but only
+                 ;; from the doubling that actually overruns, i.e. possibly
+                 ;; after earlier doublings have already been performed, and
+                 ;; without knowing the owner and slot.  Deciding it up front,
+                 ;; for the FULL target capacity, means an unrecoverable
+                 ;; transaction aborts having changed nothing at all, with a
+                 ;; diagnostic that names the segment.
+                 (let ((cap (segment-capacity seg)))
                    (loop while (< cap required) do (setf cap (* 2 cap)))
-                   (values (%seg-file-bytes cap (segment-dimension seg))
-                           (m-reserved-size (segment-mmap seg))
-                           required)))
-             (when (> needed reserved)
-               (error 'vector-segment-capacity-exhausted
-                      :owner (car key) :slot (cdr key)
-                      :required required :needed-bytes needed :reserved reserved)))))
+                   (let ((needed (%seg-file-bytes cap (segment-dimension seg)))
+                         (reserved (m-reserved-size (segment-mmap seg))))
+                     (when (and (> needed reserved)
+                                (not *segment-relocate-on-exhaustion*))
+                       (error 'vector-segment-capacity-exhausted
+                              :owner (car key) :slot (cdr key)
+                              :required required :needed-bytes needed
+                              :reserved reserved
+                              :reason "relocation is disabled (GRAPH-DB::*SEGMENT-RELOCATE-ON-EXHAUSTION* is NIL)"))))
+                 ;; Now actually grow, so APPLY-TRANSACTION cannot need to.
+                 ;; %SEG-GROW re-reserves and relocates if a doubling would
+                 ;; pass the reservation; if that fails (out of address space)
+                 ;; it signals here, still pre-durability.
+                 (loop while (> required (segment-capacity seg))
+                       do (%seg-grow seg)))))))
        new-ids))))
 
 (defgeneric apply-tx-write-to-vector-segments (write graph)
@@ -2429,10 +2485,13 @@ See CALL-WITH-READ-SNAPSHOT."
                ;; mismatch aborts before FINALIZE-TX-PERSISTENCE, so the node write
                ;; is never journaled/applied and no node/segment drift can occur.
                (validate-vector-segment-dimensions tx (graph tx))
-               ;; Vector-segment capacity check: same region, same reason.  A
-               ;; grow past the mmap reservation would otherwise signal from
-               ;; inside APPLY-TRANSACTION, i.e. after the node write is durable.
-               (validate-vector-segment-capacity tx (graph tx))
+               ;; Vector-segment capacity: same region, same reason.  This one
+               ;; does not merely check -- it GROWS each segment to the capacity
+               ;; this transaction needs, so APPLY-TRANSACTION provably cannot
+               ;; need to grow (and cannot fail a grow after the node write is
+               ;; durable).  Both run under the manager lock, in this order, so
+               ;; nothing can consume the capacity in between.
+               (ensure-vector-segment-capacity tx (graph tx))
                (setf (transaction-id tx) (tx-id-counter tm))
                (incf (tx-id-counter tm))
                (prune-committed-transactions tm)

@@ -123,6 +123,30 @@ Overrides *MMAP-MIN-RESERVATION* for segment files only; the multiplier still
 applies, so a segment already larger than this floor divided by
 *MMAP-RESERVATION-MULTIPLIER* still gets proportional headroom.")
 
+;; The floor above makes exhaustion rare; this makes it recoverable.  When a
+;; segment's growth would pass its reservation, %SEG-GROW re-reserves a larger
+;; window and RELOCATES the mapping into it (RELOCATE-VECTOR-SEGMENT-MAPPING,
+;; mmap.lisp) instead of signalling.  That moves M-POINTER, which is only ever
+;; safe for a subsystem that can exclude its own readers -- the segment can
+;; (every public entry point takes its rw-lock), the heap and linear hash
+;; cannot.  See docs/mmap-remap-race-plan.md Phase 3.
+;;
+;; Two reasons this is a knob rather than unconditional:
+;;   1. an operator kill-switch: if relocation ever misbehaves on some platform,
+;;      binding this to NIL restores the previous behaviour exactly -- a clean
+;;      PRE-DURABILITY abort with VECTOR-SEGMENT-CAPACITY-EXHAUSTED, which is
+;;      strictly safe (it just caps growth at the reservation again);
+;;   2. it is the only way left to exercise that abort path in a test.  With
+;;      relocation enabled, exhaustion no longer happens, so the regression test
+;;      that proves a capacity failure never leaves a persisted node without a
+;;      segment entry would otherwise silently stop testing anything.
+(defparameter *segment-relocate-on-exhaustion* t
+  "When true (the default), a vector segment whose growth would exceed its
+virtual-address reservation re-reserves a larger window and relocates its
+mapping into it, under the segment's own write lock.  When NIL, such a grow
+signals VECTOR-SEGMENT-CAPACITY-EXHAUSTED instead -- pre-durability on the
+transaction path, so the transaction rolls back cleanly.")
+
 ;; Key namespaces
 (defvar *vertex-namespace* (uuid:uuid-to-byte-array
                             (uuid:make-uuid-from-string "2140DCE1-3208-4354-8696-5DF3076D1CEB")))

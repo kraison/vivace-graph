@@ -47,6 +47,7 @@
            #:vector-segment-capacity-exhausted
            #:vsce-owner #:vsce-slot #:vsce-required
            #:vsce-reserved #:vsce-needed-bytes
+           #:vsce-path #:vsce-reason
            ;; The one knob that actually raises a segment's mmap reservation
            ;; ceiling (see VECTOR-SEGMENT-CAPACITY-EXHAUSTED's report and
            ;; %SEG-RESERVATION-FOR).  Exported so raising it before OPEN-GRAPH
@@ -57,6 +58,11 @@
            ;; in the graph (heap, indexes, linear hashes), not just segments,
            ;; so exporting them is a broader API decision than this fix.
            #:*segment-min-reservation*
+           ;; The kill-switch for growth-by-relocation.  Exported for the same
+           ;; reason as the floor above: turning relocation off is a supported
+           ;; operational decision (it restores the old, strictly-safe
+           ;; pre-durability abort), not internal-symbol surgery.
+           #:*segment-relocate-on-exhaustion*
            #:location
            #:schema
            #:indexes

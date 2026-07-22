@@ -29,13 +29,11 @@ between releases; cutting a release renames it to the new version and dates it.
   `:vector-index`, distinct from crash recovery's `rebuild-vector-segment`
   (full drop-and-rebuild), which `restore-vector-segments` still uses.
 - `vector-segment-capacity-exhausted` — an exported condition (readers
-  `vsce-owner`, `vsce-slot`, `vsce-required`, `vsce-reserved`,
-  `vsce-needed-bytes`) signalled when applying a transaction would have to grow
-  a vector segment past its mmap reservation. Its report says how to recover:
-  reopen the graph (the reservation is recomputed from the file's current size
-  at open), or raise `*mmap-reservation-multiplier*` / `*segment-min-reservation*`
-  before opening (`*mmap-min-reservation*` does not apply to segment files —
-  see the "Changed" entry below).
+  `vsce-owner`, `vsce-slot`, `vsce-path`, `vsce-required`, `vsce-reserved`,
+  `vsce-needed-bytes`, `vsce-reason`) signalled when a vector segment must grow
+  past its mmap reservation and cannot relocate to a larger one — see the
+  "Changed" entries below for when that can still happen and what its report
+  now advises.
 
 ### Fixed
 - **A vector segment could not grow past its mmap reservation without
@@ -56,6 +54,37 @@ between releases; cutting a release renames it to the new version and dates it.
   passes disappear from every rebuild).
 
 ### Changed
+- **A vector segment's mmap reservation is no longer a growth ceiling.** When a
+  doubling would pass the reservation, the segment now reserves a larger
+  address window, re-maps its file into it, and releases the old window —
+  completing the "re-reserve + relocate under the write lock" step
+  `docs/mmap-remap-race-plan.md` Phase 3 planned but never implemented. This
+  moves `m-pointer`, which the lock-free read path otherwise depends on never
+  moving, and is therefore **segment-only**: every public segment entry point
+  takes the segment's own rw-lock, so `%seg-grow` has real exclusion over its
+  readers. The heap (`allocator.lisp`) and linear hash (`linear-hash.lisp`) have
+  no such lock — for them the reservation remains a hard ceiling, and the
+  primitive is named `relocate-vector-segment-mapping` so calling it from either
+  reads as wrong at the call site.
+  `*segment-relocate-on-exhaustion*` (exported, default `t`) switches the
+  behaviour off, restoring the previous strictly-safe pre-durability abort.
+  `vector-segment-capacity-exhausted` now fires only when relocation is
+  disabled or fails (address space exhausted), and carries two new slots —
+  `vsce-path` (for the direct `segment-put` path, which has no owner/slot) and
+  `vsce-reason` — with a report that says which of the two happened.
+- **The pre-durability capacity check now *grows* the segment instead of
+  rejecting the transaction** (`validate-vector-segment-capacity` →
+  `ensure-vector-segment-capacity`). Once exhaustion became recoverable, a check
+  that refused any transaction needing more than the current reservation was
+  over-eager. Growing in the same manager-locked region, before
+  `finalize-tx-persistence`, keeps wave 1's guarantee rather than weakening it
+  to a heuristic: validation and apply are serialised under the manager lock, so
+  nothing can consume the capacity in between, and `apply-transaction`
+  *provably* cannot need to grow. Two accepted consequences, documented at the
+  function: a transaction that fails later leaves an over-sized segment (harmless
+  — capacity is not semantic, `live-count` and the id array are untouched), and a
+  crash mid-grow leaves the segment dirty so `restore-vector-segments` rebuilds
+  it (the existing path, made survivable above 131k entries by wave 1).
 - **Vector segments now get their own address-space reservation floor,
   `*segment-min-reservation*` (16 GiB), instead of inheriting the general
   `*mmap-min-reservation*` (1 GiB).** The general rule — 8× the file's size at
