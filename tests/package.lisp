@@ -182,6 +182,7 @@
                 #:with-transaction
                 #:lookup-vertex
                 #:lookup-edge
+                #:vertex-history
                 #:outgoing-edges
                 #:incoming-edges
                 #:traverse

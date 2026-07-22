@@ -467,6 +467,73 @@ live head is newer than EPOCH."
                 (progn (ensure-node-bytes ver graph) (return ver))
                 (setf p (prev-pointer ver))))))))
 
+;;; --- Public read path over the retained version chain -----------------------
+;;; The walk above exists for snapshot isolation: it stops at the first version
+;;; old enough for the reader.  VERTEX-HISTORY is the same walk run to the end
+;;; (or to :LIMIT) and handed to a caller -- the supported way to read what
+;;; KEEP-REVISIONS retains.
+
+(defun vertex-history (graph id &key limit)
+  "Return the retained versions of the vertex ID in GRAPH as a list of
+\(VERSION . COMMIT-EPOCH) conses, NEWEST FIRST.  The live version is included
+and is always the first entry.  ID is a 16-byte id array or its string form.
+Returns NIL if GRAPH holds no vertex with that id.  LIMIT, when given, caps the
+result at the LIMIT newest versions.
+
+Each VERSION is a fully materialized VERTEX (bytes and data read while this
+call held its read pin), so it stays valid after the call and outside any
+*GRAPH* binding.  Treat them as READ-ONLY: only the first entry is the node the
+graph will hand out again, and archived versions are not saveable.  To modify a
+vertex, COPY the live one inside a transaction as usual.
+
+The chain starts from the committed LIVE head, deliberately independent of any
+enclosing transaction's snapshot: an audit read wants everything committed, not
+the subset visible at some reader's start epoch.  Uncommitted writes in the
+calling transaction are therefore not shown, and a soft-deleted vertex still
+reports its history (the deletion is itself a version, with DELETED-P set on
+the live head).
+
+⚠ THE DEPTH AVAILABLE IS BOUNDED BY KEEP-REVISIONS -- the node type's if it
+sets one, otherwise the graph's (default 0, i.e. NO history beyond the live
+version).  REAP-OLD-VERSIONS discards versions past that window as soon as no
+active reader could still observe them.  So a SHORT HISTORY DOES NOT MEAN THE
+VERTEX WAS EDITED FEW TIMES: it may equally mean the reaper did its job and the
+older versions are gone for good.  Anyone reading this as an audit trail must
+not read absence of history as absence of change; if the full trail matters,
+the graph must be created with a KEEP-REVISIONS window wide enough to hold it,
+and a vertex reaching that window is a signal to surface, not a case to absorb.
+
+Concurrency: the walk holds a read pin, which bounds the reaper's floor and so
+protects every version an active reader could observe.  Versions already older
+than that floor remain reclaimable, so a history walk that races a concurrent
+UPDATE of the SAME vertex may see its deep tail cut short -- the same
+truncation KEEP-REVISIONS can cause, and indistinguishable from it.  Quiescent
+vertices (the normal case for ingested source records) are unaffected."
+  (when (and limit (<= limit 0))
+    (return-from vertex-history nil))
+  (let ((*graph* graph)   ; DESERIALIZE-VERTEX-HEAD resolves the node type
+                          ; through *GRAPH*, not through an argument.
+        (key (if (stringp id) (read-id-array-from-string id) id)))
+    (with-read-pin (graph)
+      (let ((live (lookup-node (vertex-table graph) key graph)))
+        (when (node-p live)
+          (ensure-node-bytes live graph)
+          (maybe-init-node-data live :graph graph)
+          (let ((history (list (cons live (commit-epoch live))))
+                (count 1)
+                (p (prev-pointer live)))
+            (loop
+              (when (or (zerop p) (and limit (>= count limit)))
+                (return))
+              (let ((version (deserialize-vertex-head (heap graph) p)))
+                (setf (id version) key)
+                (ensure-node-bytes version graph)
+                (maybe-init-node-data version :graph graph)
+                (push (cons version (commit-epoch version)) history)
+                (incf count)
+                (setf p (prev-pointer version))))
+            (nreverse history)))))))
+
 ;;; Read-epoch pins (non-transactional reads).  A reader records the current
 ;;; epoch BEFORE it reads a node head and holds the pin until it has finished
 ;;; dereferencing that node's data.  While pinned, the reaper's floor is bounded

@@ -140,6 +140,8 @@
            #:make-edge
            #:lookup-vertex
            #:lookup-edge
+           ;; MVCC: public read path over the versions KEEP-REVISIONS retains
+           #:vertex-history
            #:to
            #:from
            #:weight

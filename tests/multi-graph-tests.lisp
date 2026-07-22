@@ -362,3 +362,90 @@ keep-revisions=0 control's ~,4Fms mean over ~D updates (observed ratio ~,3Fx)"
           (ignore-errors (close-graph gctl :snapshot-p nil))
           (ignore-errors (close-graph gbnd :snapshot-p nil))
           (collect-garbage))))))
+
+;;; ---------------------------------------------------------------------------
+;;; VERTEX-HISTORY: the public read path over the retained MVCC chain
+;;;
+;;; Retention (above) without a read path is storage we pay for and cannot use.
+;;; mine-action's forensics graph adopts KEEP-REVISIONS=100 specifically to keep
+;;; an audit trail -- what a source told us about an event, and when -- so the
+;;; chain-walk that until now existed only as an internal snapshot-isolation
+;;; mechanism (RESOLVE-VERSION-AT-EPOCH) needs a supported public form.
+;;; ---------------------------------------------------------------------------
+
+(def-vertex mg-hist-note () ((note :type string)) :mg-zeta)
+
+(defparameter *mg-history-update-count* 5
+  "Number of in-place updates applied to the single vertex in
+VERTEX-HISTORY-WALKS-THE-MVCC-CHAIN.  The expected history length is this plus
+one, for the original create.")
+
+(test vertex-history-walks-the-mvcc-chain
+  "VERTEX-HISTORY (GRAPH ID &KEY LIMIT) returns the retained MVCC versions of a
+vertex as (VERSION . COMMIT-EPOCH) pairs, newest first, the live version
+included and first.
+
+Create one vertex and update it *MG-HISTORY-UPDATE-COUNT* (5) times with
+distinguishable NOTE values in a KEEP-REVISIONS=100 graph -- a window far wider
+than the 6 versions produced, so the reaper cannot truncate what we assert on.
+Then check every property a consumer reading this as an audit trail depends on:
+the entry count, newest-first ordering, STRICTLY decreasing commit-epochs, the
+right slot value at every position (not merely at the ends -- a walk that
+returned the live version six times, or that skipped a link, would satisfy a
+count-and-endpoints test), that the head of the list really is the live version
+(same commit-epoch and revision as a plain LOOKUP-VERTEX returns), and that
+:LIMIT truncates from the NEW end rather than the old.
+
+The version objects are also read back with *GRAPH* bound to NIL, deliberately:
+each returned version must be self-contained (bytes and data materialized while
+the read pin was held), because an audit consumer will hold these objects well
+past the call and often outside any *GRAPH* binding."
+  (with-temp-directory (dir)
+    (let (g id)
+      (unwind-protect
+           (progn
+             (setf g (make-graph :mg-zeta (namestring dir)
+                                 :buffer-pool-size 1000 :keep-revisions 100))
+             (let ((*graph* g))
+               (with-transaction () (setf id (id (make-mg-hist-note :note "v0"))))
+               (dotimes (i *mg-history-update-count*)
+                 (with-transaction ()
+                   (let ((v (copy (lookup-vertex id))))
+                     (setf (slot-value v 'note) (format nil "v~D" (1+ i)))
+                     (save v)))))
+             (let* ((expected-length (1+ *mg-history-update-count*))
+                    (expected-notes (loop for i from *mg-history-update-count* downto 0
+                                          collect (format nil "v~D" i)))
+                    (history (vertex-history g id)))
+               (is (= expected-length (length history))
+                   "expected ~D history entries (1 create + ~D updates), got ~D"
+                   expected-length *mg-history-update-count* (length history))
+               (when (= expected-length (length history))
+                 (let ((notes (let ((*graph* nil))
+                                (mapcar (lambda (entry) (slot-value (car entry) 'note))
+                                        history)))
+                       (epochs (mapcar #'cdr history)))
+                   (is (equal expected-notes notes)
+                       "expected notes newest-first ~S, got ~S" expected-notes notes)
+                   (is (every #'> epochs (rest epochs))
+                       "commit-epochs must be STRICTLY decreasing newest-first, got ~S" epochs)))
+               ;; The head of the list must be the live version, not merely the
+               ;; newest archived one.
+               (let ((live (let ((*graph* g)) (lookup-vertex id))))
+                 (is (= (graph-db::commit-epoch live) (cdr (first history)))
+                     "the first entry's commit-epoch ~D must be the LIVE version's ~D"
+                     (cdr (first history)) (graph-db::commit-epoch live))
+                 (is (= (graph-db:revision live) (graph-db:revision (car (first history))))
+                     "the first entry's revision ~D must be the LIVE version's ~D"
+                     (graph-db:revision (car (first history))) (graph-db:revision live)))
+               ;; :LIMIT truncates from the old end -- it returns the N NEWEST.
+               (let* ((limited (vertex-history g id :limit 3))
+                      (limited-notes (let ((*graph* nil))
+                                       (mapcar (lambda (entry) (slot-value (car entry) 'note))
+                                               limited))))
+                 (is (= 3 (length limited))
+                     ":limit 3 must return exactly 3 entries, got ~D" (length limited))
+                 (is (equal '("v5" "v4" "v3") limited-notes)
+                     ":limit 3 must return the three NEWEST versions, got ~S" limited-notes))))
+        (ignore-errors (close-graph g :snapshot-p nil))
+        (collect-garbage)))))
