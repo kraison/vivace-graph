@@ -236,3 +236,129 @@ established vector segments (mg-beta's and mg-gamma's)."
               (ignore-errors (close-graph gb2 :snapshot-p nil))
               (ignore-errors (close-graph gc2 :snapshot-p nil)))))
         (collect-garbage)))))
+
+;;; ---------------------------------------------------------------------------
+;;; keep-revisions retention-cost bound
+;;;
+;;; mine-action's forensics graph adopts KEEP-REVISIONS = 100 on the strength of
+;;; a single measurement (spec 2026-07-22-forensics-graph-design.md, S5):
+;;; REAP-OLD-VERSIONS runs inside the transaction-manager lock, so its cost is
+;;; paid by every commit in the graph, not only commits touching a deep version
+;;; chain.  Without a guard, a future engine change could make retention
+;;; expensive again -- linear in total chain length rather than in
+;;; KEEP-REVISIONS -- and nothing would notice; the failure mode is a slow
+;;; ingest, not a failing test.  Two more graph names/classes (distinct from
+;;; MG-ALPHA/BETA/GAMMA above; a vertex type is bound to one graph name for its
+;;; life in this image) stand in for a control graph and a bounded-retention
+;;; graph.
+;;; ---------------------------------------------------------------------------
+
+(def-vertex mg-ctl-counter () ((counter :type integer)) :mg-delta)
+(def-vertex mg-bnd-counter () ((counter :type integer)) :mg-epsilon)
+
+(defparameter *mg-retain-update-count* 2000
+  "Number of update commits timed against each of the control and bounded
+graphs in KEEP-REVISIONS-BOUNDS-COMMIT-LATENCY.  2,000 matches the measurement
+recorded in the spec and in this file's docstrings, and is large enough that
+the bounded graph's chain (capped at its KEEP-REVISIONS window) reaches and
+holds steady state for the great majority of the run.")
+
+(defparameter *mg-epsilon-keep-revisions* 100
+  "KEEP-REVISIONS for the bounded graph in the test below -- mine-action's
+chosen forensics-graph policy.  Left as a DEFPARAMETER, not inlined, because
+proving the test discriminates (see the task report) means temporarily setting
+this to 4,000,000,000 -- effectively unbounded within the run -- and confirming
+the assertion fails, then restoring it to 100 before committing.")
+
+(defun %mg-commit-latencies-ms (graph vertex-id n)
+  "Update the vertex at VERTEX-ID in GRAPH N times, using the mine-action
+update idiom -- (COPY -> SETF -> SAVE) inside its own WITH-TRANSACTION -- and
+return a list of N per-commit wall-clock latencies in milliseconds.  Uses
+LOOKUP-VERTEX and SLOT-VALUE rather than a type-specific accessor, so this one
+helper drives both MG-CTL-COUNTER and MG-BND-COUNTER."
+  (let ((*graph* graph))
+    (loop repeat n
+          collect (let ((start (get-internal-real-time)))
+                    (with-transaction ()
+                      (let ((v (copy (lookup-vertex vertex-id))))
+                        (setf (slot-value v 'counter) (random 1000000))
+                        (save v)))
+                    (/ (* 1000d0 (- (get-internal-real-time) start))
+                       internal-time-units-per-second)))))
+
+(defun %mg-mean (numbers)
+  (/ (reduce #'+ numbers) (float (length numbers) 1.0d0)))
+
+(test keep-revisions-bounds-commit-latency
+  "KEEP-REVISIONS retention cost is paid by every commit in the graph, not only
+commits touching a deep version chain: REAP-OLD-VERSIONS runs inside the
+transaction-manager lock (see APPLY-TRANSACTION, transactions.lisp).
+
+Measured 2026-07-22 (the number this bound and mine-action's policy both rest
+on): with KEEP-REVISIONS at 4,000,000,000 -- i.e. effectively never reaping --
+2,000 updates to one vertex degraded mean commit latency 0.378ms -> 1.378ms,
+approximately 3.65x, roughly linearly in chain length (about +0.0005ms per
+retained revision), against a flat ~0.31ms/commit control at KEEP-REVISIONS=0.
+
+mine-action's forensics graph adopts KEEP-REVISIONS=100: the degradation is
+linear in chain length, and its chains are short (FIRMS detections are written
+once; ACLED events see a handful of corrections), so a window of 100 gives
+complete audit history at negligible cost. This test pins that a *bounded*
+window of 100 stays cheap relative to a KEEP-REVISIONS=0 control over the same
+number of updates to a single vertex -- so a future regression that made the
+reaper cost scale with total chain length again, rather than with
+KEEP-REVISIONS, would fail this test rather than silently slow every commit in
+production.
+
+Bound chosen: mean commit latency at KEEP-REVISIONS=100 must stay within 2x of
+the KEEP-REVISIONS=0 control's mean, both measured over *MG-RETAIN-UPDATE-COUNT*
+(2,000) updates to a single vertex -- the plan's original suggestion, kept as
+is. Six consecutive runs at KEEP-REVISIONS=100 on this shared machine measured
+ratios of 0.989x, 1.021x, 0.980x, 0.980x, 0.976x and 0.953x: an ~7-point spread
+(0.953x-1.021x) clustered tightly around 1.0x, nowhere near flaky against a 2x
+bound, so no widening was needed. Discrimination was proved (see the task
+report) by temporarily setting *MG-EPSILON-KEEP-REVISIONS* to 4,000,000,000 --
+effectively never reaping within the run -- and re-running with everything
+else unchanged: two such runs measured ratios of 2.504x and 2.557x, both
+failing the assertion by a wide margin on either side (six-run control high of
+1.021x vs. perturbed low of 2.504x). Note this mean-over-the-whole-run ratio
+(~2.5x) is smaller than the 3.65x the spec quotes for KEEP-REVISIONS=4e9 at
+update 2,000: the spec's figure compares the first and the very last commit of
+the ramp, while this test averages every commit across it, including the
+cheap early ones before the chain has grown -- both are real measurements of
+the same degradation, taken differently."
+  (with-temp-directory (dir-ctl)
+    (with-temp-directory (dir-bnd)
+      (let (gctl gbnd id-ctl id-bnd)
+        (unwind-protect
+             (progn
+               (setf gctl (make-graph :mg-delta (namestring dir-ctl)
+                                       :buffer-pool-size 1000 :keep-revisions 0))
+               (setf gbnd (make-graph :mg-epsilon (namestring dir-bnd)
+                                       :buffer-pool-size 1000
+                                       :keep-revisions *mg-epsilon-keep-revisions*))
+               (let ((*graph* gctl))
+                 (with-transaction () (setf id-ctl (id (make-mg-ctl-counter :counter 0)))))
+               (let ((*graph* gbnd))
+                 (with-transaction () (setf id-bnd (id (make-mg-bnd-counter :counter 0)))))
+               ;; Warm both graphs identically before timing, so JIT/file-cache
+               ;; warm-up is not mistaken for retention cost.
+               (%mg-commit-latencies-ms gctl id-ctl 20)
+               (%mg-commit-latencies-ms gbnd id-bnd 20)
+               (let* ((n *mg-retain-update-count*)
+                      (ctl-latencies (%mg-commit-latencies-ms gctl id-ctl n))
+                      (bnd-latencies (%mg-commit-latencies-ms gbnd id-bnd n))
+                      (ctl-mean (%mg-mean ctl-latencies))
+                      (bnd-mean (%mg-mean bnd-latencies))
+                      (ratio (/ bnd-mean ctl-mean)))
+                 (format t "~&;; keep-revisions=0 control mean commit latency over ~D updates: ~,4Fms~%"
+                         n ctl-mean)
+                 (format t "~&;; keep-revisions=~D bounded mean commit latency over ~D updates: ~,4Fms (ratio ~,3Fx)~%"
+                         *mg-epsilon-keep-revisions* n bnd-mean ratio)
+                 (is (<= bnd-mean (* 2.0d0 ctl-mean))
+                     "keep-revisions=~D mean commit latency ~,4Fms must stay within 2x the ~
+keep-revisions=0 control's ~,4Fms mean over ~D updates (observed ratio ~,3Fx)"
+                     *mg-epsilon-keep-revisions* bnd-mean ctl-mean n ratio)))
+          (ignore-errors (close-graph gctl :snapshot-p nil))
+          (ignore-errors (close-graph gbnd :snapshot-p nil))
+          (collect-garbage))))))
