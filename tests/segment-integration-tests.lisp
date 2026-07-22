@@ -663,8 +663,16 @@ a separate (SI-SUB . EMBEDDING) segment would appear."
     ;;    Anything that makes them extend will fail here for unrelated reasons.
     ;; 2. The LET* extends over the reopened G2 below, so that graph is mapped
     ;;    with zero headroom too.
+    ;; 3. *SEGMENT-MIN-RESERVATION* MUST be bound low as well.  Segments consult
+    ;;    their own floor (16 GiB by default, %SEG-RESERVATION-FOR), which
+    ;;    overrides *MMAP-MIN-RESERVATION* for segment files only.  Leave it at
+    ;;    the default and this segment can never exhaust -- the test would still
+    ;;    PASS while verifying nothing at all.  Re-proven to discriminate by
+    ;;    disabling the VALIDATE-VECTOR-SEGMENT-CAPACITY call site with #+(or)
+    ;;    and confirming it fails.
     (let* ((graph-db::*mmap-min-reservation* (* 64 1024))
            (graph-db::*mmap-reservation-multiplier* 1)
+           (graph-db::*segment-min-reservation* (* 64 1024))
            (g (make-graph *integration-graph-name* (namestring dir) :buffer-pool-size 1000))
            (count-before nil)
            (live-before nil))

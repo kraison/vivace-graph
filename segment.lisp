@@ -58,6 +58,23 @@
   "Total bytes a segment file needs for CAPACITY slots of DIMENSION."
   (+ (%seg-vblock-offset capacity) (* capacity dimension 4)))
 
+(defun %seg-reservation-for (size)
+  "The virtual-address reservation, in bytes, a segment file of SIZE should get.
+
+MMAP-FILE's general default -- *MMAP-RESERVATION-MULTIPLIER* x size, floored at
+*MMAP-MIN-RESERVATION* -- was aimed at schema-sized heap and index files.  A
+segment's size tracks the corpus, so it exhausts that headroom far sooner, and
+the failure lands inside APPLY-TRANSACTION.  Segments therefore get their own,
+much larger floor (*SEGMENT-MIN-RESERVATION*).
+
+MAX, not the bare floor: a segment that is ALREADY larger than
+floor / multiplier must still get proportional headroom rather than being capped
+at the floor -- passing the floor alone would make the reservation SHRINK
+relative to today's behaviour for exactly the large segments that need it most.
+Both call sites (create and open) must use this; the open path is the one that
+originally had no reservation at all."
+  (max *segment-min-reservation* (* *mmap-reservation-multiplier* size)))
+
 (defun create-vector-segment (path dimension &key (initial-capacity 1024))
   "Create a new vector segment at PATH holding DIMENSION-wide single-float
 vectors, with room for INITIAL-CAPACITY slots.  DIMENSION is fixed for the life
@@ -65,7 +82,8 @@ of the segment.  Returns an open VECTOR-SEGMENT."
   (check-type dimension (integer 1))
   (check-type initial-capacity (integer 1))
   (let* ((bytes (%seg-file-bytes initial-capacity dimension))
-         (mmap (mmap-file path :create-p t :size bytes)))
+         (mmap (mmap-file path :create-p t :size bytes
+                               :reservation (%seg-reservation-for bytes))))
     (%seg-write-header mmap
                        :magic +segment-magic+
                        :format +segment-format+
@@ -99,7 +117,14 @@ of the segment.  Returns an open VECTOR-SEGMENT."
 element-type, reads the header, and rebuilds the RAM id->slot map by sweeping
 the id array (the on-disk id array is authoritative; the map is never
 persisted)."
-  (let ((mmap (mmap-file path :create-p nil)))
+  ;; Size the reservation from the file as it is NOW.  PROBE-FILE first so a
+  ;; missing file still produces MMAP-FILE's own diagnostic rather than a raw
+  ;; CL file-error out of %FILE-SIZE; the 0 is never used in that case.
+  (let ((mmap (mmap-file path :create-p nil
+                              :reservation (%seg-reservation-for
+                                            (if (probe-file path)
+                                                (%file-size path)
+                                                0)))))
     (let ((magic (deserialize-uint64 mmap 0))
           (format (deserialize-uint64 mmap 8)))
       (unless (= magic +segment-magic+)

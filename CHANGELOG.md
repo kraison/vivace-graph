@@ -55,6 +55,23 @@ between releases; cutting a release renames it to the new version and dates it.
   passes disappear from every rebuild).
 
 ### Changed
+- **Vector segments now get their own address-space reservation floor,
+  `*segment-min-reservation*` (16 GiB), instead of inheriting the general
+  `*mmap-min-reservation*` (1 GiB).** The general rule — 8× the file's size at
+  open, floored — was written for heap and index files, whose size is set by the
+  schema and the workload, and of which a graph has 15–20. A vector segment is
+  the first mapped file whose size tracks the *corpus*, so it reached that
+  ceiling far sooner (roughly once per 8× of growth), and hitting it aborts a
+  transaction. Both call sites now pass a reservation —
+  `create-vector-segment` and, the one that previously passed none at all,
+  `open-vector-segment` — computed as
+  `max(*segment-min-reservation*, *mmap-reservation-multiplier* × size)`, so a
+  segment already larger than `floor ÷ multiplier` still gets proportional
+  headroom rather than being capped at the floor. A reservation is `PROT_NONE`
+  `MAP_NORESERVE` anonymous address space: no RAM, no disk, no commit charge, so
+  on 64-bit the larger floor costs nothing real. At dimension 1024 it buys
+  ~4.18M slots per segment. `vector-segment-capacity-exhausted` is unchanged and
+  still fires (pre-durability) if the floor is ever reached.
 - **A missing vector-segment file is now rebuilt at open, not ignored.**
   `restore-vector-segments` used to skip a segment whose file was absent, so a
   graph whose segment file had been lost (or deleted by an operator expecting a

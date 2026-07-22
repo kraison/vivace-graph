@@ -94,6 +94,24 @@ application's own config; graph-db does not read an ini file itself.")
 (defparameter *mmap-min-reservation* (* 1024 1024 1024)
   "Floor, in bytes, for a mapped file's virtual-address reservation.")
 
+;; Vector segments need their own, much larger floor.  The general 8x rule above
+;; was sized for the files it was written for: heap and index files, whose size
+;; is set by the schema and the workload and which a graph has ~15-20 of.  A
+;; vector segment is the first mapped file whose size tracks the CORPUS, so it
+;; reaches 8x of whatever it happened to be at open far sooner -- and when it
+;; does, the grow fails from inside APPLY-TRANSACTION.  There is at most one
+;; segment per (vertex-type, slot), not 15-20 of them.
+;;
+;; The floor costs nothing real: a reservation is PROT_NONE + MAP_NORESERVE
+;; anonymous address space -- no RAM, no disk, no commit charge -- and on 64-bit
+;; the address space it consumes is irrelevant.  At dimension 1024 (4,112 bytes
+;; per slot) a 16 GiB floor buys 4,177,983 slots.
+(defparameter *segment-min-reservation* (* 16 1024 1024 1024)
+  "Floor, in bytes, for a VECTOR SEGMENT's virtual-address reservation.
+Overrides *MMAP-MIN-RESERVATION* for segment files only; the multiplier still
+applies, so a segment already larger than this floor divided by
+*MMAP-RESERVATION-MULTIPLIER* still gets proportional headroom.")
+
 ;; Key namespaces
 (defvar *vertex-namespace* (uuid:uuid-to-byte-array
                             (uuid:make-uuid-from-string "2140DCE1-3208-4354-8696-5DF3076D1CEB")))

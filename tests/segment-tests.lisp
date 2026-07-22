@@ -314,3 +314,75 @@ the tiebreak, not just the final sort."
                       "a segment left open (crash) must reopen NOT clean")
                (close-vector-segment s))))
       (ignore-errors (delete-file path)))))
+
+;;; ---------------------------------------------------------------------------
+;;; The segment reservation floor (%SEG-RESERVATION-FOR).
+;;; ---------------------------------------------------------------------------
+
+(test segment-reservation-floor-on-create
+  "A freshly created segment reserves at least *SEGMENT-MIN-RESERVATION*.
+Without its own floor a default 1024-slot file is a few MB, 8x of which is far
+under *MMAP-MIN-RESERVATION*, so the reservation landed on the general 1 GiB
+floor and in-place growth stalled a few doublings later."
+  (let ((path (%seg-path)))
+    (unwind-protect
+         (let ((s (create-vector-segment path 64 :initial-capacity 16)))
+           (unwind-protect
+                (is (>= (graph-db::m-reserved-size (graph-db::segment-mmap s))
+                        graph-db::*segment-min-reservation*)
+                    "a created segment reserved ~D bytes; the floor is ~D"
+                    (graph-db::m-reserved-size (graph-db::segment-mmap s))
+                    graph-db::*segment-min-reservation*)
+             (close-vector-segment s)))
+      (ignore-errors (delete-file path)))))
+
+(test segment-reservation-floor-on-reopen
+  "A REOPENED segment gets the floor too.  OPEN-VECTOR-SEGMENT is a separate
+MMAP-FILE call site from CREATE-VECTOR-SEGMENT and is the one that originally
+passed no :RESERVATION at all -- which is the call site that matters, since a
+long-lived graph runs on reopened segments, not freshly created ones."
+  (let ((path (%seg-path)))
+    (unwind-protect
+         (progn
+           (let ((s (create-vector-segment path 64 :initial-capacity 16)))
+             (segment-put s (%id 1) (%vec 64 1.0))
+             (close-vector-segment s))
+           (let ((s (open-vector-segment path)))
+             (unwind-protect
+                  (is (>= (graph-db::m-reserved-size (graph-db::segment-mmap s))
+                          graph-db::*segment-min-reservation*)
+                      "a reopened segment reserved ~D bytes; the floor is ~D"
+                      (graph-db::m-reserved-size (graph-db::segment-mmap s))
+                      graph-db::*segment-min-reservation*)
+               (close-vector-segment s))))
+      (ignore-errors (delete-file path)))))
+
+(test segment-reservation-takes-the-larger-of-floor-and-multiple
+  "When multiplier x size exceeds the floor, the MULTIPLE wins -- the floor is a
+floor, not a cap.  A segment already larger than floor/multiplier must keep
+proportional headroom; passing the bare floor would SHRINK the reservation for
+exactly the largest segments.  Constructed by binding the floor small and the
+multiplier large, so the MAX in %SEG-RESERVATION-FOR is genuinely exercised
+rather than assumed.  *MMAP-MIN-RESERVATION* is bound down as well: otherwise
+MMAP-FILE's own 1 GiB floor would dominate and mask the result."
+  (let ((path (%seg-path)))
+    (unwind-protect
+         (let* ((graph-db::*mmap-min-reservation* 4096)
+                (graph-db::*mmap-reservation-multiplier* 64)
+                (graph-db::*segment-min-reservation* (* 64 1024))
+                (bytes (graph-db::%seg-file-bytes 1024 64))
+                (s (create-vector-segment path 64 :initial-capacity 1024)))
+           (unwind-protect
+                (progn
+                  (is (> (* 64 bytes) graph-db::*segment-min-reservation*)
+                      "test setup is broken: multiplier x size (~D) must exceed ~
+                       the floor (~D) for this to test anything"
+                      (* 64 bytes) graph-db::*segment-min-reservation*)
+                  (is (= (* 64 bytes)
+                         (graph-db::m-reserved-size (graph-db::segment-mmap s)))
+                      "expected the multiple ~D to win over the floor ~D; ~
+                       reserved ~D"
+                      (* 64 bytes) graph-db::*segment-min-reservation*
+                      (graph-db::m-reserved-size (graph-db::segment-mmap s))))
+             (close-vector-segment s)))
+      (ignore-errors (delete-file path)))))
