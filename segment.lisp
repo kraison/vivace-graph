@@ -380,11 +380,29 @@ validated ID via %SEG-CHECK-ID."
   (gethash id (segment-id->slot segment)))
 
 (defun %seg-ensure-reservation (mmap needed capacity)
-  "Make MMAP's virtual-address reservation cover NEEDED bytes, RELOCATING the
-mapping into a larger window if it does not (Part 4 of the segment-reservation
-design; the unimplemented final sentence of docs/mmap-remap-race-plan.md Phase
-3).  A no-op in the overwhelmingly common case where the reservation already
-covers NEEDED.
+  "Make MMAP's virtual-address reservation cover NEEDED bytes.  A no-op in the
+overwhelmingly common case where the reservation already covers NEEDED.
+Otherwise, two mechanisms in order:
+
+  1. EXTEND IT IN PLACE (Part 3) -- claim the address range immediately after
+     the current window (EXTEND-RESERVATION-IN-PLACE).  One mmap; M-POINTER
+     does not move; nothing is copied or remapped; no reader can observe it at
+     all.  Measured, this fires LESS often than the design assumed -- Linux
+     packs a new mmap(NULL) window flush under the existing mappings, so the
+     range above it is usually taken; see that function's docstring.
+  2. RELOCATE (Part 4) -- move the mapping into a fresh larger window
+     (RELOCATE-VECTOR-SEGMENT-MAPPING).  Nominally the fallback, but in practice
+     still the path production takes most of the time.  This one MOVES
+     M-POINTER.
+
+The two ask for different amounts, deliberately.  The adjacent claim asks for
+exactly NEEDED, because it costs one syscall and nothing else -- paying it once
+per doubling is cheaper than reserving speculative address space that
+RLIMIT_AS still charges for.  Relocation asks %SEG-RESERVATION-FOR for the full
+policy size (max(floor, multiplier x size)), because it costs two syscalls and a
+TLB-visible remap, so it should buy the NEXT several doublings as well.  A
+relocated segment therefore lands on exactly the policy a freshly opened one
+would.
 
 CALLER MUST HOLD THE SEGMENT'S WRITE LOCK.  Relocation moves M-POINTER, and the
 segment's rw-lock is the ONLY thing excluding readers from the old address --
@@ -393,21 +411,19 @@ and the linear hash can never do this.  %SEG-GROW, the sole caller, runs under
 that lock (SEGMENT-PUT / SEGMENT-REMOVE take it; the %SEG-* internals are
 lock-free by convention).
 
-The new reservation goes through %SEG-RESERVATION-FOR, so a relocated segment
-lands on the same policy a freshly opened one would: max(floor, multiplier x
-size).  Since the multiplier is > 1, the new window is strictly larger than
-NEEDED, i.e. relocation also buys the NEXT few doublings rather than only the
-current one -- relocation copies nothing but does cost two syscalls and a
-TLB-visible remap, so doing it once per several doublings matters.
-
-Signals VECTOR-SEGMENT-CAPACITY-EXHAUSTED when relocation is switched off
- (*SEGMENT-RELOCATE-ON-EXHAUSTION*) or when it fails outright (address space
-exhausted / RLIMIT_AS).  Either way NOTHING HAS BEEN MUTATED when it signals:
-the disabled branch runs before any syscall, and RELOCATE-VECTOR-SEGMENT-MAPPING
-rolls its own failure back, so the segment is left at its current reservation,
-fully consistent and usable.  Note the two branches are NOT the same code path
--- they share only what is downstream of the signal -- so a test that exercises
-the kill-switch has NOT thereby exercised a failing relocation.
+Signals VECTOR-SEGMENT-CAPACITY-EXHAUSTED only when BOTH mechanisms are
+unavailable: the adjacent claim failed or is switched off
+ (*SEGMENT-EXTEND-ADJACENT-ON-EXHAUSTION*), AND relocation is switched off
+ (*SEGMENT-RELOCATE-ON-EXHAUSTION*) or failed outright (address space exhausted
+/ RLIMIT_AS).  Either way NOTHING HAS BEEN MUTATED when it signals: a failed
+adjacent claim unmaps whatever it got, the disabled branch runs before any
+syscall, and RELOCATE-VECTOR-SEGMENT-MAPPING rolls its own failure back, so the
+segment is left at its current reservation, fully consistent and usable.  Note
+the branches are NOT the same code path -- they share only what is downstream of
+the signal -- so a test that exercises the kill-switch has NOT thereby exercised
+a failing relocation, and a test that exercises the adjacent claim has NOT
+thereby exercised relocation AT ALL.  That last one is the whole reason
+*SEGMENT-EXTEND-ADJACENT-ON-EXHAUSTION* exists.
 
 ENSURE-VECTOR-SEGMENT-CAPACITY calls this DIRECTLY, once, for the FULL capacity
 a transaction will need, before it grows anything; that is what makes a
@@ -420,11 +436,19 @@ count in the entry field (which read as a nonsense \"growing to hold 98,368
 entries needs 98,368 bytes\")."
   (let ((reserved (m-reserved-size mmap)))
     (when (> needed reserved)
+      ;; Cheap path first: grow the window rather than move it.  Returns NIL
+      ;; without mutating anything if the adjacent range is not free.
+      (when (and *segment-extend-adjacent-on-exhaustion*
+                 (extend-reservation-in-place mmap needed))
+        (return-from %seg-ensure-reservation mmap))
       (unless *segment-relocate-on-exhaustion*
         (error 'vector-segment-capacity-exhausted
                :path (m-path mmap)
                :required capacity :needed-bytes needed :reserved reserved
-               :reason "relocation is disabled (GRAPH-DB:*SEGMENT-RELOCATE-ON-EXHAUSTION* is NIL)"))
+               :reason (format nil "the adjacent address range could not be claimed ~
+(~:[it is occupied~;GRAPH-DB:*SEGMENT-EXTEND-ADJACENT-ON-EXHAUSTION* is NIL~]) ~
+and relocation is disabled (GRAPH-DB:*SEGMENT-RELOCATE-ON-EXHAUSTION* is NIL)"
+                               (not *segment-extend-adjacent-on-exhaustion*))))
       (handler-case
           (relocate-vector-segment-mapping mmap (%seg-reservation-for needed))
         (error (e)

@@ -54,6 +54,36 @@ between releases; cutting a release renames it to the new version and dates it.
   passes disappear from every rebuild).
 
 ### Changed
+- **A vector segment now grows its reservation *in place* before falling back to
+  relocating.** On exhaustion `%seg-ensure-reservation` first tries to claim the
+  address range immediately after the current window
+  (`extend-reservation-in-place`, `mmap.lisp`): one `mmap`, `m-pointer` never
+  moves, nothing is copied or re-mapped, and no reader can observe anything at
+  all.
+  **How often it actually fires: less than the design assumed.** Measured with a
+  production-sized (16 GiB) reservation on Linux 5.15 and 4.15, the claim failed
+  at every size tried, because the default top-down `mmap` allocator places a
+  `mmap(NULL, …)` window flush against the bottom of the existing mappings —
+  `libssl.so.3` sat at the window's exact end on both hosts — so the range
+  immediately *above* a newly created window is occupied by construction. The
+  legacy bottom-up layout behaved identically, and Darwin likewise. It succeeds
+  only for a window that happens to sit below a hole. Relocation (the entry
+  below) therefore remains the workhorse; this is an opportunistic saving that
+  costs one `mmap` on an already-rare path when it misses.
+  The claim passes `MAP_FIXED_NOREPLACE` where the constant exists (Linux
+  4.17+), which makes the kernel reject cleanly instead of placing the mapping
+  somewhere useless. **The safety property is not that flag**, which older Linux
+  and Darwin simply ignore, leaving the address an advisory hint: it is the
+  unconditional post-hoc check that the address returned is exactly the address
+  requested, with a `munmap` and a fallback when it is not. Plain `MAP_FIXED` is
+  never passed and must never be added — it would evict whatever occupies the
+  range. (Measured, since an earlier revision of the design asserted the
+  opposite: Linux 5.15 honours the flag and returns `EEXIST`; Linux 4.15 ignores
+  it and places the mapping elsewhere; in neither case is the occupant touched.)
+  `*segment-extend-adjacent-on-exhaustion*` (exported, default `t`) switches it
+  off, which is also what keeps the relocation tests genuinely exercising
+  relocation. `*segment-adjacent-extensions*` and `*segment-relocations*` count
+  which path ran.
 - **A vector segment's mmap reservation is no longer a growth ceiling.** When a
   doubling would pass the reservation, the segment now reserves a larger
   address window, re-maps its file into it, and releases the old window —

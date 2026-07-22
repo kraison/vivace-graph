@@ -401,62 +401,91 @@ MMAP-FILE's own 1 GiB floor would dominate and mask the result."
 (defmacro with-tiny-segment-reservation (&body body)
   "Run BODY with a segment's reservation policy set to \"exactly the file size\":
 floors below any real file, multiplier 1.  The FIRST %SEG-GROW then has nowhere
-to grow in place, so the relocation path is entered deterministically instead of
-after however many doublings the real 16 GiB floor affords."
+to grow in place, so the exhaustion path is entered deterministically instead of
+after however many doublings the real 16 GiB floor affords.
+
+Note this says NOTHING about WHICH exhaustion path is taken -- since wave 3 that
+is the adjacent claim by default, and relocation only as its fallback.  A test
+that means to exercise relocation must ALSO wrap itself in
+WITH-ADJACENT-EXTENSION-DISABLED."
   `(let ((graph-db::*mmap-min-reservation* 4096)
          (graph-db::*mmap-reservation-multiplier* 1)
          (graph-db::*segment-min-reservation* 4096))
      ,@body))
 
+(defmacro with-adjacent-extension-disabled (&body body)
+  "Run BODY with *SEGMENT-EXTEND-ADJACENT-ON-EXHAUSTION* NIL, so that growth
+past the reservation goes STRAIGHT TO RELOCATION.
+
+⚠ WHY EVERY RELOCATION TEST BELOW IS WRAPPED IN THIS.  Wave 3 made
+%SEG-ENSURE-RESERVATION try to claim the adjacent address range first, and on a
+sparse 64-bit address space that normally SUCCEEDS.  Left alone, every test in
+this section would quietly stop exercising relocation and start exercising the
+adjacent claim instead -- and most of them would keep PASSING, because they
+mostly assert consistency properties that hold on both paths.  (The couple that
+assert M-POINTER moved would fail, which is the lucky case; the rest would go
+green and cover nothing.)  This binding is what keeps them honest.  It must NOT
+be folded into WITH-TINY-SEGMENT-RESERVATION: several tests use that macro only
+around the CREATE, while the grow -- the thing that needs the binding in
+effect -- happens outside it."
+  `(let ((graph-db::*segment-extend-adjacent-on-exhaustion* nil))
+     ,@body))
+
 (test segment-growth-past-the-reservation-relocates
-  "Growing past the mmap reservation now MOVES the mapping instead of signalling.
-The base pointer must change (that is the whole point -- and what makes this
-unsafe for the heap, which has no read lock), the reservation must be larger
-afterwards, and every vector written before the move must read back bit-exactly
-from the new address.  Also asserts no SEGV-retry fired: relocation happens
-under the write lock, so no access should ever touch the old window."
-  (let ((path (%seg-path)))
-    (unwind-protect
-         (let* ((n 200)
-                (retries-before graph-db::*mmap-segv-retries*)
-                (s (with-tiny-segment-reservation
-                     (create-vector-segment path 64 :initial-capacity 32))))
-           (unwind-protect
-                (let ((base-before (%seg-base-address s))
-                      (reserved-before
-                        (graph-db::m-reserved-size (graph-db::segment-mmap s))))
-                  (is (= reserved-before
-                         (graph-db::mapped-file-length (graph-db::segment-mmap s)))
-                      "test setup is broken: the segment must start with ZERO ~
-                       growth headroom (reserved ~D vs file ~D), or the first ~
-                       grow would not relocate"
-                      reserved-before
-                      (graph-db::mapped-file-length (graph-db::segment-mmap s)))
-                  (dotimes (i n)
-                    (segment-put s (%id i) (%vec 64 (float i 1.0))))
-                  (is (= n (segment-live-count s)))
-                  (is (/= base-before (%seg-base-address s))
-                      "the mapping should have relocated; base address is still ~D"
-                      base-before)
-                  (is (> (graph-db::m-reserved-size (graph-db::segment-mmap s))
-                         reserved-before)
-                      "the reservation should have grown past ~D; it is ~D"
-                      reserved-before
-                      (graph-db::m-reserved-size (graph-db::segment-mmap s)))
-                  ;; Every vector, including the ones written before the move.
-                  (let ((bad 0))
+  "Growing past the mmap reservation, WITH THE ADJACENT CLAIM DISABLED, MOVES
+the mapping instead of signalling.  The base pointer must change (that is the
+whole point -- and what makes this unsafe for the heap, which has no read lock),
+the reservation must be larger afterwards, and every vector written before the
+move must read back bit-exactly from the new address.  Also asserts no
+SEGV-retry fired: relocation happens under the write lock, so no access should
+ever touch the old window."
+  (with-adjacent-extension-disabled
+    (let ((path (%seg-path)))
+      (unwind-protect
+           (let* ((n 200)
+                  (retries-before graph-db::*mmap-segv-retries*)
+                  (relocations-before graph-db::*segment-relocations*)
+                  (s (with-tiny-segment-reservation
+                       (create-vector-segment path 64 :initial-capacity 32))))
+             (unwind-protect
+                  (let ((base-before (%seg-base-address s))
+                        (reserved-before
+                          (graph-db::m-reserved-size (graph-db::segment-mmap s))))
+                    (is (= reserved-before
+                           (graph-db::mapped-file-length (graph-db::segment-mmap s)))
+                        "test setup is broken: the segment must start with ZERO ~
+                         growth headroom (reserved ~D vs file ~D), or the first ~
+                         grow would not relocate"
+                        reserved-before
+                        (graph-db::mapped-file-length (graph-db::segment-mmap s)))
                     (dotimes (i n)
-                      (let ((back (segment-get s (%id i)))
-                            (want (%vec 64 (float i 1.0))))
-                        (unless (and back (every #'= want back)) (incf bad))))
-                    (is (zerop bad)
-                        "~D of ~D vectors did not survive the relocation intact"
-                        bad n))
-                  (is (= retries-before graph-db::*mmap-segv-retries*)
-                      "relocation must not produce SEGV-retries (~D new)"
-                      (- graph-db::*mmap-segv-retries* retries-before)))
-             (close-vector-segment s)))
-      (ignore-errors (delete-file path)))))
+                      (segment-put s (%id i) (%vec 64 (float i 1.0))))
+                    (is (= n (segment-live-count s)))
+                    (is (> graph-db::*segment-relocations* relocations-before)
+                        "no RELOCATION ran; this test must exercise relocation, ~
+                         not the adjacent claim")
+                    (is (/= base-before (%seg-base-address s))
+                        "the mapping should have relocated; base address is still ~D"
+                        base-before)
+                    (is (> (graph-db::m-reserved-size (graph-db::segment-mmap s))
+                           reserved-before)
+                        "the reservation should have grown past ~D; it is ~D"
+                        reserved-before
+                        (graph-db::m-reserved-size (graph-db::segment-mmap s)))
+                    ;; Every vector, including the ones written before the move.
+                    (let ((bad 0))
+                      (dotimes (i n)
+                        (let ((back (segment-get s (%id i)))
+                              (want (%vec 64 (float i 1.0))))
+                          (unless (and back (every #'= want back)) (incf bad))))
+                      (is (zerop bad)
+                          "~D of ~D vectors did not survive the relocation intact"
+                          bad n))
+                    (is (= retries-before graph-db::*mmap-segv-retries*)
+                        "relocation must not produce SEGV-retries (~D new)"
+                        (- graph-db::*mmap-segv-retries* retries-before)))
+               (close-vector-segment s)))
+        (ignore-errors (delete-file path))))))
 
 (test segment-relocation-survives-a-reopen
   "A relocated segment is still a valid file: the move is purely a
@@ -464,61 +493,71 @@ virtual-address change (same fd, same bytes), so closing and reopening must find
 the grown capacity and every vector.  Guards against the relocation quietly
 mapping the wrong length or the wrong offset, which an in-process read could
 mask."
-  (let ((path (%seg-path)))
-    (unwind-protect
-         (progn
+  (with-adjacent-extension-disabled
+    (let ((path (%seg-path))
+          (relocations-before graph-db::*segment-relocations*))
+      (unwind-protect
+           (progn
+             (let ((s (with-tiny-segment-reservation
+                        (create-vector-segment path 64 :initial-capacity 32))))
+               (dotimes (i 100)
+                 (segment-put s (%id i) (%vec 64 (float i 1.0))))
+               (close-vector-segment s))
+             (is (> graph-db::*segment-relocations* relocations-before)
+                 "no RELOCATION ran; there is no relocated segment to reopen and ~
+                  this test proved nothing")
+             (let ((s (open-vector-segment path)))
+               (unwind-protect
+                    (progn
+                      (is (= 100 (segment-live-count s)))
+                      (is (>= (segment-capacity s) 100))
+                      (let ((bad 0))
+                        (dotimes (i 100)
+                          (let ((back (segment-get s (%id i))))
+                            (unless (and back (every #'= (%vec 64 (float i 1.0)) back))
+                              (incf bad))))
+                        (is (zerop bad)
+                            "~D vectors were wrong after reopening a relocated segment"
+                            bad)))
+                 (close-vector-segment s))))
+        (ignore-errors (delete-file path))))))
+
+(test segment-relocation-can-be-switched-off
+  "With BOTH growth mechanisms switched off -- *SEGMENT-EXTEND-ADJACENT-ON-
+EXHAUSTION* and *SEGMENT-RELOCATE-ON-EXHAUSTION* NIL -- growth past the
+reservation signals VECTOR-SEGMENT-CAPACITY-EXHAUSTED again: the pre-wave-2
+behaviour, kept as an operator kill-switch.  Both are needed, and that is not a
+weakening of the test: they are independent knobs over independent mechanisms,
+and turning off only the fallback while leaving the cheap path on is not a
+kill-switch at all.  The failed grow must leave the segment intact and usable:
+nothing claimed, LIVE-COUNT unchanged, earlier vectors still readable.  This is
+also the mechanism the transaction-level rollback test uses to reach the abort
+path at all."
+  (with-adjacent-extension-disabled
+    (let ((path (%seg-path)))
+      (unwind-protect
            (let ((s (with-tiny-segment-reservation
                       (create-vector-segment path 64 :initial-capacity 32))))
-             (dotimes (i 100)
-               (segment-put s (%id i) (%vec 64 (float i 1.0))))
-             (close-vector-segment s))
-           (let ((s (open-vector-segment path)))
              (unwind-protect
-                  (progn
-                    (is (= 100 (segment-live-count s)))
-                    (is (>= (segment-capacity s) 100))
+                  (let ((graph-db::*segment-relocate-on-exhaustion* nil))
+                    (dotimes (i 32)
+                      (segment-put s (%id i) (%vec 64 (float i 1.0))))
+                    (is (= 32 (segment-live-count s)))
+                    (signals graph-db::vector-segment-capacity-exhausted
+                      (segment-put s (%id 32) (%vec 64 32.0)))
+                    (is (= 32 (segment-live-count s))
+                        "a refused grow must not have claimed a slot")
+                    (is (= 32 (segment-capacity s))
+                        "a refused grow must not have changed capacity")
+                    (is (null (segment-get s (%id 32))))
                     (let ((bad 0))
-                      (dotimes (i 100)
+                      (dotimes (i 32)
                         (let ((back (segment-get s (%id i))))
                           (unless (and back (every #'= (%vec 64 (float i 1.0)) back))
                             (incf bad))))
-                      (is (zerop bad)
-                          "~D vectors were wrong after reopening a relocated segment"
-                          bad)))
-               (close-vector-segment s))))
-      (ignore-errors (delete-file path)))))
-
-(test segment-relocation-can-be-switched-off
-  "With *SEGMENT-RELOCATE-ON-EXHAUSTION* NIL, growth past the reservation
-signals VECTOR-SEGMENT-CAPACITY-EXHAUSTED again -- the pre-wave-2 behaviour,
-kept as an operator kill-switch.  The failed grow must leave the segment intact
-and usable: nothing claimed, LIVE-COUNT unchanged, earlier vectors still
-readable.  This is also the mechanism the transaction-level rollback test uses
-to reach the abort path at all."
-  (let ((path (%seg-path)))
-    (unwind-protect
-         (let ((s (with-tiny-segment-reservation
-                    (create-vector-segment path 64 :initial-capacity 32))))
-           (unwind-protect
-                (let ((graph-db::*segment-relocate-on-exhaustion* nil))
-                  (dotimes (i 32)
-                    (segment-put s (%id i) (%vec 64 (float i 1.0))))
-                  (is (= 32 (segment-live-count s)))
-                  (signals graph-db::vector-segment-capacity-exhausted
-                    (segment-put s (%id 32) (%vec 64 32.0)))
-                  (is (= 32 (segment-live-count s))
-                      "a refused grow must not have claimed a slot")
-                  (is (= 32 (segment-capacity s))
-                      "a refused grow must not have changed capacity")
-                  (is (null (segment-get s (%id 32))))
-                  (let ((bad 0))
-                    (dotimes (i 32)
-                      (let ((back (segment-get s (%id i))))
-                        (unless (and back (every #'= (%vec 64 (float i 1.0)) back))
-                          (incf bad))))
-                    (is (zerop bad) "~D vectors damaged by the refused grow" bad)))
-             (close-vector-segment s)))
-      (ignore-errors (delete-file path)))))
+                      (is (zerop bad) "~D vectors damaged by the refused grow" bad)))
+               (close-vector-segment s)))
+        (ignore-errors (delete-file path))))))
 
 (test segment-reader-blocked-during-relocation-sees-consistent-data
   "A concurrent reader must never observe the move.  SEGMENT-GET takes the read
@@ -528,47 +567,48 @@ no such lock -- see RELOCATE-VECTOR-SEGMENT-MAPPING).  A reader thread hammers a
 slot written before the first relocation while the main thread grows the segment
 through several of them; every read must return the same bytes, and no read may
 fault."
-  (let ((path (%seg-path)))
-    (unwind-protect
-         (let* ((retries-before graph-db::*mmap-segv-retries*)
-                (s (with-tiny-segment-reservation
-                     (create-vector-segment path 64 :initial-capacity 32)))
-                (want (%vec 64 7.0))
-                (done nil)
-                (reads 0)
-                (bad 0)
-                (err nil))
-           (unwind-protect
-                (let ((base-before nil) (reader nil))
-                  (segment-put s (%id 0) want)
-                  (setf base-before (%seg-base-address s))
-                  (setf reader
-                        (bordeaux-threads:make-thread
-                         (lambda ()
-                           (handler-case
-                               (loop until done
-                                     do (let ((back (segment-get s (%id 0))))
-                                          (incf reads)
-                                          (unless (and back (every #'= want back))
-                                            (incf bad))))
-                             (error (e) (setf err e))))
-                         :name "segment-relocation-reader"))
-                  (dotimes (i 400)
-                    (segment-put s (%id (1+ i)) (%vec 64 (float i 1.0))))
-                  (setf done t)
-                  (bordeaux-threads:join-thread reader)
-                  (is (null err) "the reader thread failed: ~A" err)
-                  (is (plusp reads) "the reader never ran; the test proved nothing")
-                  (is (zerop bad) "~D of ~D concurrent reads were torn or wrong"
-                      bad reads)
-                  (is (/= base-before (%seg-base-address s))
-                      "no relocation happened during the run; the test proved nothing")
-                  (is (= retries-before graph-db::*mmap-segv-retries*)
-                      "~D SEGV-retries fired during relocation; a reader touched ~
-                       the old window"
-                      (- graph-db::*mmap-segv-retries* retries-before)))
-             (progn (setf done t) (close-vector-segment s))))
-      (ignore-errors (delete-file path)))))
+  (with-adjacent-extension-disabled
+    (let ((path (%seg-path)))
+      (unwind-protect
+           (let* ((retries-before graph-db::*mmap-segv-retries*)
+                  (s (with-tiny-segment-reservation
+                       (create-vector-segment path 64 :initial-capacity 32)))
+                  (want (%vec 64 7.0))
+                  (done nil)
+                  (reads 0)
+                  (bad 0)
+                  (err nil))
+             (unwind-protect
+                  (let ((base-before nil) (reader nil))
+                    (segment-put s (%id 0) want)
+                    (setf base-before (%seg-base-address s))
+                    (setf reader
+                          (bordeaux-threads:make-thread
+                           (lambda ()
+                             (handler-case
+                                 (loop until done
+                                       do (let ((back (segment-get s (%id 0))))
+                                            (incf reads)
+                                            (unless (and back (every #'= want back))
+                                              (incf bad))))
+                               (error (e) (setf err e))))
+                           :name "segment-relocation-reader"))
+                    (dotimes (i 400)
+                      (segment-put s (%id (1+ i)) (%vec 64 (float i 1.0))))
+                    (setf done t)
+                    (bordeaux-threads:join-thread reader)
+                    (is (null err) "the reader thread failed: ~A" err)
+                    (is (plusp reads) "the reader never ran; the test proved nothing")
+                    (is (zerop bad) "~D of ~D concurrent reads were torn or wrong"
+                        bad reads)
+                    (is (/= base-before (%seg-base-address s))
+                        "no relocation happened during the run; the test proved nothing")
+                    (is (= retries-before graph-db::*mmap-segv-retries*)
+                        "~D SEGV-retries fired during relocation; a reader touched ~
+                         the old window"
+                        (- graph-db::*mmap-segv-retries* retries-before)))
+               (progn (setf done t) (close-vector-segment s))))
+        (ignore-errors (delete-file path))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Relocation that FAILS.  This is the path that actually fires in production:
@@ -645,61 +685,62 @@ every stored vector still readable through that still-live mapping.
 Then, with the injected pressure removed, the same put must SUCCEED -- a
 segment that survives the failure but is wedged afterwards would satisfy every
 assertion above and still be broken."
-  (let ((path (%seg-path)))
-    (unwind-protect
-         (with-tiny-segment-reservation
-           (let ((s (create-vector-segment path 64 :initial-capacity 32))
-                 (reservations 0))
-             (unwind-protect
-                  (progn
-                    ;; Exactly fills the initial capacity; the NEXT put grows.
-                    (dotimes (i 32)
-                      (segment-put s (%id i) (%vec 64 (float i 1.0))))
-                    (let* ((mmap (graph-db::segment-mmap s))
-                           (base-before (%seg-base-address s))
-                           (reserved-before (graph-db::m-reserved-size mmap))
-                           (file-before (graph-db::mapped-file-length mmap)))
-                      (is (= reserved-before file-before)
-                          "test setup is broken: the segment must start with ZERO ~
-                           growth headroom, or the failing grow would not relocate")
-                      (with-failing-segment-reservation (reservations :fail-on 1)
-                        (signals graph-db::vector-segment-capacity-exhausted
-                          (segment-put s (%id 32) (%vec 64 32.0))))
-                      (is (= 1 reservations)
-                          "fault injection never fired -- the test setup is ~
-                           broken, not the code under test")
-                      (is (= base-before (%seg-base-address s))
-                          "a FAILED relocation must not move M-POINTER; the old ~
-                           window is what readers are still using")
-                      (is (= reserved-before (graph-db::m-reserved-size mmap))
-                          "a failed relocation must not change the reservation")
-                      (is (= file-before (graph-db::mapped-file-length mmap))
-                          "the reservation is checked BEFORE the file is ~
-                           extended, so a failed relocation must not have grown ~
-                           the file")
-                      (is (= 32 (segment-live-count s))
-                          "a failed grow must not have claimed a slot")
-                      (is (= 32 (segment-capacity s))
-                          "a failed grow must not have changed capacity")
-                      (is (null (segment-get s (%id 32))))
-                      (let ((bad 0))
-                        (dotimes (i 32)
-                          (let ((back (segment-get s (%id i))))
-                            (unless (and back (every #'= (%vec 64 (float i 1.0)) back))
-                              (incf bad))))
-                        (is (zerop bad)
-                            "~D vectors unreadable after a failed relocation -- ~
-                             the old mapping should still be live" bad))
-                      ;; Usable, not merely undamaged.
-                      (segment-put s (%id 32) (%vec 64 32.0))
-                      (is (= 33 (segment-live-count s))
-                          "the segment must still be usable once the address ~
-                           space pressure is gone")
-                      (is (every #'= (%vec 64 32.0) (segment-get s (%id 32))))
-                      (is (/= base-before (%seg-base-address s))
-                          "the retried grow should have relocated for real")))
-               (close-vector-segment s))))
-      (ignore-errors (delete-file path)))))
+  (with-adjacent-extension-disabled
+    (let ((path (%seg-path)))
+      (unwind-protect
+           (with-tiny-segment-reservation
+             (let ((s (create-vector-segment path 64 :initial-capacity 32))
+                   (reservations 0))
+               (unwind-protect
+                    (progn
+                      ;; Exactly fills the initial capacity; the NEXT put grows.
+                      (dotimes (i 32)
+                        (segment-put s (%id i) (%vec 64 (float i 1.0))))
+                      (let* ((mmap (graph-db::segment-mmap s))
+                             (base-before (%seg-base-address s))
+                             (reserved-before (graph-db::m-reserved-size mmap))
+                             (file-before (graph-db::mapped-file-length mmap)))
+                        (is (= reserved-before file-before)
+                            "test setup is broken: the segment must start with ZERO ~
+                             growth headroom, or the failing grow would not relocate")
+                        (with-failing-segment-reservation (reservations :fail-on 1)
+                          (signals graph-db::vector-segment-capacity-exhausted
+                            (segment-put s (%id 32) (%vec 64 32.0))))
+                        (is (= 1 reservations)
+                            "fault injection never fired -- the test setup is ~
+                             broken, not the code under test")
+                        (is (= base-before (%seg-base-address s))
+                            "a FAILED relocation must not move M-POINTER; the old ~
+                             window is what readers are still using")
+                        (is (= reserved-before (graph-db::m-reserved-size mmap))
+                            "a failed relocation must not change the reservation")
+                        (is (= file-before (graph-db::mapped-file-length mmap))
+                            "the reservation is checked BEFORE the file is ~
+                             extended, so a failed relocation must not have grown ~
+                             the file")
+                        (is (= 32 (segment-live-count s))
+                            "a failed grow must not have claimed a slot")
+                        (is (= 32 (segment-capacity s))
+                            "a failed grow must not have changed capacity")
+                        (is (null (segment-get s (%id 32))))
+                        (let ((bad 0))
+                          (dotimes (i 32)
+                            (let ((back (segment-get s (%id i))))
+                              (unless (and back (every #'= (%vec 64 (float i 1.0)) back))
+                                (incf bad))))
+                          (is (zerop bad)
+                              "~D vectors unreadable after a failed relocation -- ~
+                               the old mapping should still be live" bad))
+                        ;; Usable, not merely undamaged.
+                        (segment-put s (%id 32) (%vec 64 32.0))
+                        (is (= 33 (segment-live-count s))
+                            "the segment must still be usable once the address ~
+                             space pressure is gone")
+                        (is (every #'= (%vec 64 32.0) (segment-get s (%id 32))))
+                        (is (/= base-before (%seg-base-address s))
+                            "the retried grow should have relocated for real")))
+                 (close-vector-segment s))))
+        (ignore-errors (delete-file path))))))
 
 (test segment-relocation-failure-on-a-later-grow-leaves-the-segment-consistent
   "The same, but failing on the SECOND relocation rather than the first, i.e.
@@ -712,63 +753,64 @@ Deliberately runs the whole body inside WITH-TINY-SEGMENT-RESERVATION so the
 reservation policy stays \"exactly the file size\" at GROW time too: every
 doubling then relocates, which is what makes a second relocation reachable at
 all."
-  (let ((path (%seg-path)))
-    (unwind-protect
-         (with-tiny-segment-reservation
-           (let ((s (create-vector-segment path 64 :initial-capacity 32))
-                 (reservations 0))
-             (unwind-protect
-                  (let ((base-at-create (%seg-base-address s))
-                        (mmap (graph-db::segment-mmap s))
-                        (base-after-first nil)
-                        (reserved-after-first nil)
-                        (file-after-first nil))
-                    (dotimes (i 32)
-                      (segment-put s (%id i) (%vec 64 (float i 1.0))))
-                    (with-failing-segment-reservation (reservations :fail-on 2)
-                      ;; Grow #1 (32 -> 64): relocation SUCCEEDS.
+  (with-adjacent-extension-disabled
+    (let ((path (%seg-path)))
+      (unwind-protect
+           (with-tiny-segment-reservation
+             (let ((s (create-vector-segment path 64 :initial-capacity 32))
+                   (reservations 0))
+               (unwind-protect
+                    (let ((base-at-create (%seg-base-address s))
+                          (mmap (graph-db::segment-mmap s))
+                          (base-after-first nil)
+                          (reserved-after-first nil)
+                          (file-after-first nil))
                       (dotimes (i 32)
-                        (segment-put s (%id (+ 32 i)) (%vec 64 (float (+ 32 i) 1.0))))
-                      (is (= 1 reservations)
-                          "the first grow should have relocated exactly once (~D)"
-                          reservations)
+                        (segment-put s (%id i) (%vec 64 (float i 1.0))))
+                      (with-failing-segment-reservation (reservations :fail-on 2)
+                        ;; Grow #1 (32 -> 64): relocation SUCCEEDS.
+                        (dotimes (i 32)
+                          (segment-put s (%id (+ 32 i)) (%vec 64 (float (+ 32 i) 1.0))))
+                        (is (= 1 reservations)
+                            "the first grow should have relocated exactly once (~D)"
+                            reservations)
+                        (is (= 64 (segment-capacity s)))
+                        (setf base-after-first (%seg-base-address s)
+                              reserved-after-first (graph-db::m-reserved-size mmap)
+                              file-after-first (graph-db::mapped-file-length mmap))
+                        (is (/= base-at-create base-after-first)
+                            "the first relocation did not happen; the test proves ~
+                             nothing about a SECOND one")
+                        ;; Grow #2 (64 -> 128): relocation FAILS.
+                        (signals graph-db::vector-segment-capacity-exhausted
+                          (segment-put s (%id 64) (%vec 64 64.0))))
+                      (is (= 2 reservations)
+                          "the second relocation was never attempted -- test setup ~
+                           is broken, not the code under test")
+                      (is (= base-after-first (%seg-base-address s))
+                          "the failed second relocation must leave the mapping the ~
+                           FIRST one published")
+                      (is (= reserved-after-first (graph-db::m-reserved-size mmap)))
+                      (is (= file-after-first (graph-db::mapped-file-length mmap)))
+                      (is (= 64 (segment-live-count s)))
                       (is (= 64 (segment-capacity s)))
-                      (setf base-after-first (%seg-base-address s)
-                            reserved-after-first (graph-db::m-reserved-size mmap)
-                            file-after-first (graph-db::mapped-file-length mmap))
-                      (is (/= base-at-create base-after-first)
-                          "the first relocation did not happen; the test proves ~
-                           nothing about a SECOND one")
-                      ;; Grow #2 (64 -> 128): relocation FAILS.
-                      (signals graph-db::vector-segment-capacity-exhausted
-                        (segment-put s (%id 64) (%vec 64 64.0))))
-                    (is (= 2 reservations)
-                        "the second relocation was never attempted -- test setup ~
-                         is broken, not the code under test")
-                    (is (= base-after-first (%seg-base-address s))
-                        "the failed second relocation must leave the mapping the ~
-                         FIRST one published")
-                    (is (= reserved-after-first (graph-db::m-reserved-size mmap)))
-                    (is (= file-after-first (graph-db::mapped-file-length mmap)))
-                    (is (= 64 (segment-live-count s)))
-                    (is (= 64 (segment-capacity s)))
-                    (is (null (segment-get s (%id 64))))
-                    (let ((bad 0))
-                      (dotimes (i 64)
-                        (let ((back (segment-get s (%id i))))
-                          (unless (and back (every #'= (%vec 64 (float i 1.0)) back))
-                            (incf bad))))
-                      (is (zerop bad)
-                          "~D of 64 vectors -- including the 32 that were copied ~
-                           by the FIRST relocation -- did not survive the failed ~
-                           second one" bad))
-                    ;; Usable again.
-                    (segment-put s (%id 64) (%vec 64 64.0))
-                    (is (= 65 (segment-live-count s)))
-                    (is (= 128 (segment-capacity s)))
-                    (is (every #'= (%vec 64 64.0) (segment-get s (%id 64)))))
-               (close-vector-segment s))))
-      (ignore-errors (delete-file path)))))
+                      (is (null (segment-get s (%id 64))))
+                      (let ((bad 0))
+                        (dotimes (i 64)
+                          (let ((back (segment-get s (%id i))))
+                            (unless (and back (every #'= (%vec 64 (float i 1.0)) back))
+                              (incf bad))))
+                        (is (zerop bad)
+                            "~D of 64 vectors -- including the 32 that were copied ~
+                             by the FIRST relocation -- did not survive the failed ~
+                             second one" bad))
+                      ;; Usable again.
+                      (segment-put s (%id 64) (%vec 64 64.0))
+                      (is (= 65 (segment-live-count s)))
+                      (is (= 128 (segment-capacity s)))
+                      (is (every #'= (%vec 64 64.0) (segment-get s (%id 64)))))
+                 (close-vector-segment s))))
+        (ignore-errors (delete-file path))))))
 
 (test segment-relocation-failure-at-the-file-map-rolls-the-reservation-back
   "The other half of the relocation primitive's failure surface: the anonymous
@@ -778,51 +820,379 @@ case that reaches the rollback arm, which must release the window it just took
 silently leaked its own reservation would make things worse, so the munmap's
 return code is checked and a failure WARNs.  The test asserts no such warning
 was signalled, alongside the same leave-it-consistent-and-usable checks."
-  (let ((path (%seg-path)))
-    (unwind-protect
-         (with-tiny-segment-reservation
-           (let ((s (create-vector-segment path 64 :initial-capacity 32))
-                 (reservations 0)
-                 (warnings '()))
+  (with-adjacent-extension-disabled
+    (let ((path (%seg-path)))
+      (unwind-protect
+           (with-tiny-segment-reservation
+             (let ((s (create-vector-segment path 64 :initial-capacity 32))
+                   (reservations 0)
+                   (warnings '()))
+               (unwind-protect
+                    (progn
+                      (dotimes (i 32)
+                        (segment-put s (%id i) (%vec 64 (float i 1.0))))
+                      (let* ((mmap (graph-db::segment-mmap s))
+                             (base-before (%seg-base-address s))
+                             (reserved-before (graph-db::m-reserved-size mmap))
+                             (file-before (graph-db::mapped-file-length mmap)))
+                        (with-failing-segment-reservation (reservations :fail-on 1
+                                                                        :stage :file-map)
+                          (handler-bind ((warning (lambda (w)
+                                                    (push w warnings)
+                                                    (muffle-warning w))))
+                            (signals graph-db::vector-segment-capacity-exhausted
+                              (segment-put s (%id 32) (%vec 64 32.0)))))
+                        (is (= 1 reservations)
+                            "fault injection never fired -- test setup is broken")
+                        (is (null warnings)
+                            "the rollback munmap failed (~{~A~^; ~}) -- the ~
+                             reservation it had just taken is leaked" warnings)
+                        (is (= base-before (%seg-base-address s))
+                            "M-POINTER is published only after BOTH mmaps succeed")
+                        (is (= reserved-before (graph-db::m-reserved-size mmap))
+                            "the reservation size is published only after both ~
+                             mmaps succeed")
+                        (is (= file-before (graph-db::mapped-file-length mmap)))
+                        (is (= 32 (segment-live-count s)))
+                        (is (= 32 (segment-capacity s)))
+                        (let ((bad 0))
+                          (dotimes (i 32)
+                            (let ((back (segment-get s (%id i))))
+                              (unless (and back (every #'= (%vec 64 (float i 1.0)) back))
+                                (incf bad))))
+                          (is (zerop bad) "~D vectors damaged by the failed map" bad))
+                        (segment-put s (%id 32) (%vec 64 32.0))
+                        (is (= 33 (segment-live-count s)))
+                        (is (every #'= (%vec 64 32.0) (segment-get s (%id 32))))))
+                 (close-vector-segment s))))
+        (ignore-errors (delete-file path))))))
+
+;;; ---------------------------------------------------------------------------
+;;; Growth by ADJACENT RE-RESERVATION (EXTEND-RESERVATION-IN-PLACE), the cheap
+;;; path %SEG-ENSURE-RESERVATION tries BEFORE relocating.  Everything above this
+;;; point runs with it switched off; these three are the tests that switch it
+;;; back on.
+;;; ---------------------------------------------------------------------------
+
+(defun %seg-adjacent-address (s)
+  "The address EXTEND-RESERVATION-IN-PLACE will try to claim for S: the end of
+the current window, rounded up to a page."
+  (let ((mmap (graph-db::segment-mmap s)))
+    (+ (%seg-base-address s)
+       (graph-db::%round-up (graph-db::m-reserved-size mmap)
+                            (graph-db::%posix-page-size)))))
+
+(defmacro with-adjacent-extension-enabled (&body body)
+  "The inverse of WITH-ADJACENT-EXTENSION-DISABLED.  T is the default, so this
+is belt-and-braces -- but it states the intent, and it means these tests keep
+testing the adjacent path even if the default is ever flipped."
+  `(let ((graph-db::*segment-extend-adjacent-on-exhaustion* t))
+     ,@body))
+
+(defparameter *adjacent-room* (* 64 1024 1024)
+  "Size of the window the adjacent-claim tests reserve and then mostly hand
+back, so the range after the segment is KNOWN free.")
+
+(defmacro with-adjacent-room (&body body)
+  "Reservation policy for the adjacent-claim tests: multiplier 1 and a
+*ADJACENT-ROOM*-sized floor, so a created segment holds one big contiguous
+window that %SEG-CARVE-ADJACENT-ROOM can then give most of back."
+  `(let ((graph-db::*mmap-min-reservation* 4096)
+         (graph-db::*mmap-reservation-multiplier* 1)
+         (graph-db::*segment-min-reservation* *adjacent-room*))
+     ,@body))
+
+(defun %seg-carve-adjacent-room (s)
+  "Put S into the exact state the adjacent-claim path is for: ZERO growth
+headroom, with the address range immediately after its window GENUINELY FREE.
+
+Unmaps everything in S's window above the (page-rounded) file, then records the
+smaller reservation.  The next grow therefore exhausts the reservation, and the
+range the claim asks for is one we just handed back to the kernel a few
+microseconds earlier.
+
+WHY NOT JUST USE A TINY RESERVATION AND HOPE.  Because that is what the first
+draft did, and on Darwin it does not work: with a one-page window the kernel put
+the next mapping 25 pages further on, so the claim was refused, the test fell
+back to relocation, and the assertions failed.  An address HINT is only honoured
+if the range is free, and 'probably free' is not a test.  Nothing about this
+setup fakes the mechanism -- the claim below is a real mmap judged by the real
+kernel; it just guarantees there is something to claim.
+
+Returns the address the claim will ask for."
+  (let* ((mmap (graph-db::segment-mmap s))
+         (page (graph-db::%posix-page-size))
+         (base (%seg-base-address s))
+         (held (graph-db::%round-up (graph-db::m-reserved-size mmap) page))
+         (keep (graph-db::%round-up (graph-db::mapped-file-length mmap) page)))
+    (assert (< keep held))
+    (graph-db::%posix-munmap (cffi:make-pointer (+ base keep)) (- held keep))
+    (setf (graph-db::m-reserved-size mmap) keep)
+    (+ base keep)))
+
+(test segment-growth-past-the-reservation-extends-in-place
+  "The direct INVERSE of SEGMENT-GROWTH-PAST-THE-RESERVATION-RELOCATES: when the
+range after the window is free, growing past the reservation must claim it and
+leave M-POINTER exactly where it was.  Nothing is copied, nothing is remapped,
+and no reader could observe anything, which is the entire point of the
+mechanism.  Asserts the reservation grew, the base did NOT move, the adjacent
+counter fired, NO relocation ran at all, and every vector still reads back."
+  (with-adjacent-extension-enabled
+    (let ((path (%seg-path)))
+      (unwind-protect
+           (let* ((n 200)
+                  (retries-before graph-db::*mmap-segv-retries*)
+                  (extensions-before graph-db::*segment-adjacent-extensions*)
+                  (relocations-before graph-db::*segment-relocations*)
+                  (s (with-adjacent-room
+                       (create-vector-segment path 64 :initial-capacity 32))))
              (unwind-protect
-                  (progn
+                  (let* ((ignore (%seg-carve-adjacent-room s))
+                         (base-before (%seg-base-address s))
+                         (reserved-before
+                           (graph-db::m-reserved-size (graph-db::segment-mmap s))))
+                    (declare (ignore ignore))
+                    (is (> (graph-db::%seg-file-bytes 64 64) reserved-before)
+                        "test setup is broken: the segment must start with ZERO ~
+                         growth headroom (the first doubling needs ~D bytes and ~
+                         ~D are reserved), or nothing would be extended"
+                        (graph-db::%seg-file-bytes 64 64) reserved-before)
+                    (dotimes (i n)
+                      (segment-put s (%id i) (%vec 64 (float i 1.0))))
+                    (is (= n (segment-live-count s)))
+                    (is (> graph-db::*segment-adjacent-extensions* extensions-before)
+                        "the adjacent range was never claimed; either the kernel ~
+                         refused a free range or the path is not wired in")
+                    (is (= relocations-before graph-db::*segment-relocations*)
+                        "~D relocation(s) ran; with the adjacent range free the ~
+                         mapping must never move"
+                        (- graph-db::*segment-relocations* relocations-before))
+                    (is (= base-before (%seg-base-address s))
+                        "an in-place extension MUST NOT move M-POINTER; it was ~
+                         ~D and is now ~D"
+                        base-before (%seg-base-address s))
+                    (is (> (graph-db::m-reserved-size (graph-db::segment-mmap s))
+                           reserved-before)
+                        "the reservation should have grown past ~D; it is ~D"
+                        reserved-before
+                        (graph-db::m-reserved-size (graph-db::segment-mmap s)))
+                    (let ((bad 0))
+                      (dotimes (i n)
+                        (let ((back (segment-get s (%id i)))
+                              (want (%vec 64 (float i 1.0))))
+                          (unless (and back (every #'= want back)) (incf bad))))
+                      (is (zerop bad)
+                          "~D of ~D vectors did not survive the in-place extension"
+                          bad n))
+                    (is (= retries-before graph-db::*mmap-segv-retries*)
+                        "an in-place extension must not produce SEGV-retries (~D new)"
+                        (- graph-db::*mmap-segv-retries* retries-before)))
+               (close-vector-segment s)))
+        (ignore-errors (delete-file path))))))
+
+(test segment-adjacent-claim-over-an-occupied-range-does-not-clobber-it
+  "THE SAFETY TEST.  Map a real, private, writable page at exactly the address
+the adjacent claim will ask for, put a SENTINEL in it, then force a grow.
+Afterwards: the segment must have fallen back to RELOCATION, the segment's own
+data must be intact, and -- the point -- THE OCCUPANT'S SENTINEL MUST STILL BE
+THERE, byte for byte.
+
+An earlier revision of the design claimed that a kernel which does not know
+MAP_FIXED_NOREPLACE degrades to plain MAP_FIXED and REPLACES the occupant.  That
+was asserted, never measured, and it is wrong: an unknown flag is ignored, which
+leaves the address an advisory hint.  A C probe on two kernels confirmed it
+(5.15: EEXIST; 4.15: placed elsewhere, sentinel intact).  This test exists
+anyway, because that probe tested THE KERNEL and this tests OUR CODE -- the
+thing that must never be written here is a MAP_FIXED fallback, and a test is the
+only thing that will notice if someone adds one."
+  (with-adjacent-extension-enabled
+    (let ((path (%seg-path))
+          (occupied nil)
+          (page (graph-db::%posix-page-size))
+          (sentinel #xFEEDFACECAFEBEEF))
+      (unwind-protect
+           (let* ((extensions-before graph-db::*segment-adjacent-extensions*)
+                  (relocations-before graph-db::*segment-relocations*)
+                  (s (with-adjacent-room
+                       (create-vector-segment path 64 :initial-capacity 32))))
+             (unwind-protect
+                  (let* ((base-before (%seg-base-address s))
+                         (want (progn (dotimes (i 32)
+                                        (segment-put s (%id i)
+                                                     (%vec 64 (float i 1.0))))
+                                      (%seg-carve-adjacent-room s))))
+                    (is (= want (%seg-adjacent-address s))
+                        "test setup is broken: the carve and the claim disagree ~
+                         about where the adjacent range starts (~D vs ~D)"
+                        want (%seg-adjacent-address s))
+                    ;; Take the range the claim will want.  A HINT, never
+                    ;; MAP_FIXED: the test must not itself clobber anything.  The
+                    ;; carve above just freed this range, so the hint lands.
+                    (setf occupied (graph-db::%posix-mmap
+                                    (cffi:make-pointer want)
+                                    page
+                                    (logior graph-db::+prot-read+
+                                            graph-db::+prot-write+)
+                                    (logior graph-db::+map-private+
+                                            graph-db::+map-anonymous+)
+                                    -1 0))
+                    (is (= want (cffi:pointer-address occupied))
+                        "test setup is broken: could not place the occupant at ~D ~
+                         (landed at ~D), so the adjacent claim would not collide ~
+                         and this test would prove nothing"
+                        want (cffi:pointer-address occupied))
+                    (setf (cffi:mem-ref occupied :uint64) sentinel)
+                    ;; This put grows, finds the range taken, and must relocate.
+                    (segment-put s (%id 32) (%vec 64 32.0))
+                    (is (= sentinel (cffi:mem-ref occupied :uint64))
+                        "THE OCCUPANT WAS CLOBBERED: sentinel was ~X, is now ~X. ~
+                         Something on the adjacent-claim path is passing MAP_FIXED."
+                        sentinel (cffi:mem-ref occupied :uint64))
+                    (is (= extensions-before graph-db::*segment-adjacent-extensions*)
+                        "the adjacent claim reported SUCCESS over an occupied ~
+                         range; the address check did not do its job")
+                    (is (> graph-db::*segment-relocations* relocations-before)
+                        "the fallback relocation never ran")
+                    (is (/= base-before (%seg-base-address s))
+                        "the mapping should have relocated; base is still ~D"
+                        base-before)
+                    (is (= 33 (segment-live-count s)))
+                    (let ((bad 0))
+                      (dotimes (i 33)
+                        (let ((back (segment-get s (%id i)))
+                              (expect (%vec 64 (float i 1.0))))
+                          (unless (and back (every #'= expect back)) (incf bad))))
+                      (is (zerop bad)
+                          "~D of 33 vectors did not survive the fallback" bad))
+                    ;; And once more, after everything, from the occupant's side.
+                    (is (= sentinel (cffi:mem-ref occupied :uint64))
+                        "the occupant's sentinel did not survive the relocation's ~
+                         munmap of the old window"))
+               (close-vector-segment s)))
+        (when occupied
+          (graph-db::%posix-munmap occupied page))
+        (ignore-errors (delete-file path))))))
+
+(test segment-adjacent-claim-at-the-wrong-address-is-unmapped-and-falls-back
+  "THE SAFETY PROPERTY ITSELF, in isolation.  On Darwin and on Linux before
+4.17 there is no MAP_FIXED_NOREPLACE, so a claim over a taken range comes back
+as a perfectly good mapping AT SOME OTHER ADDRESS.  The only thing that makes
+that safe is the post-hoc comparison of the address we got with the address we
+asked for.
+
+Fault-injects %POSIX-MMAP -- the same FDEFINITION-swap idiom as
+WITH-FAILING-SEGMENT-RESERVATION above -- so the adjacent claim ALWAYS comes
+back misplaced, on every platform including the one where the kernel would
+otherwise have honoured it.  Asserts we (a) gave the misplaced mapping back with
+the right length, (b) did NOT count it as a successful extension, and (c) fell
+through to relocation.
+
+The adjacent claim is told apart from every other mmap in the system by ADDR
+non-null AND FD -1: MMAP-FILE's and the relocation's reservations pass a NULL
+addr, and both file maps pass a real fd.
+
+The release is observed at %MUNMAP-OR-WARN rather than at %POSIX-MUNMAP because
+%POSIX-MUNMAP is DECLAIMED INLINE -- an FDEFINITION swap on it would compile
+away and silently observe nothing, which is exactly the kind of test that passes
+without testing."
+  (with-adjacent-extension-enabled
+    (let* ((path (%seg-path))
+           (orig-mmap (fdefinition 'graph-db::%posix-mmap))
+           (orig-munmap (fdefinition 'graph-db::%munmap-or-warn))
+           (claims 0)
+           (blocker nil)
+           (blocked-length nil)
+           (misplaced nil)
+           (asked-length nil)
+           (munmaps '()))
+      (unwind-protect
+           (let* ((extensions-before graph-db::*segment-adjacent-extensions*)
+                  (relocations-before graph-db::*segment-relocations*)
+                  (s (with-adjacent-room
+                       (create-vector-segment path 64 :initial-capacity 32))))
+             (unwind-protect
+                  (let ((base-before (%seg-base-address s))
+                        (want nil))
                     (dotimes (i 32)
                       (segment-put s (%id i) (%vec 64 (float i 1.0))))
-                    (let* ((mmap (graph-db::segment-mmap s))
-                           (base-before (%seg-base-address s))
-                           (reserved-before (graph-db::m-reserved-size mmap))
-                           (file-before (graph-db::mapped-file-length mmap)))
-                      (with-failing-segment-reservation (reservations :fail-on 1
-                                                                      :stage :file-map)
-                        (handler-bind ((warning (lambda (w)
-                                                  (push w warnings)
-                                                  (muffle-warning w))))
-                          (signals graph-db::vector-segment-capacity-exhausted
-                            (segment-put s (%id 32) (%vec 64 32.0)))))
-                      (is (= 1 reservations)
-                          "fault injection never fired -- test setup is broken")
-                      (is (null warnings)
-                          "the rollback munmap failed (~{~A~^; ~}) -- the ~
-                           reservation it had just taken is leaked" warnings)
-                      (is (= base-before (%seg-base-address s))
-                          "M-POINTER is published only after BOTH mmaps succeed")
-                      (is (= reserved-before (graph-db::m-reserved-size mmap))
-                          "the reservation size is published only after both ~
-                           mmaps succeed")
-                      (is (= file-before (graph-db::mapped-file-length mmap)))
-                      (is (= 32 (segment-live-count s)))
-                      (is (= 32 (segment-capacity s)))
-                      (let ((bad 0))
-                        (dotimes (i 32)
-                          (let ((back (segment-get s (%id i))))
-                            (unless (and back (every #'= (%vec 64 (float i 1.0)) back))
-                              (incf bad))))
-                        (is (zerop bad) "~D vectors damaged by the failed map" bad))
-                      (segment-put s (%id 32) (%vec 64 32.0))
-                      (is (= 33 (segment-live-count s)))
-                      (is (every #'= (%vec 64 32.0) (segment-get s (%id 32))))))
-               (close-vector-segment s))))
-      (ignore-errors (delete-file path)))))
+                    (setf want (%seg-carve-adjacent-room s))
+                    (unwind-protect
+                         (progn
+                           (setf (fdefinition 'graph-db::%posix-mmap)
+                                 (lambda (addr length prot flags fd offset)
+                                   (if (and (not (cffi:null-pointer-p addr))
+                                            (= fd -1))
+                                       (let ((plain (logandc2
+                                                     flags
+                                                     graph-db::+map-fixed-noreplace+)))
+                                         (incf claims)
+                                         (setf asked-length length
+                                               blocked-length length)
+                                         ;; Take the requested range ourselves
+                                         ;; FIRST, so the kernel is forced to put
+                                         ;; the claim somewhere else.  Without
+                                         ;; this the kernel happily hands back the
+                                         ;; very address asked for (the carve just
+                                         ;; freed it), the claim is NOT misplaced,
+                                         ;; and the test proves nothing.
+                                         (setf blocker
+                                               (funcall orig-mmap addr length prot
+                                                        plain fd offset))
+                                         (setf misplaced
+                                               (funcall orig-mmap
+                                                        (cffi:null-pointer)
+                                                        length prot plain
+                                                        fd offset)))
+                                       (funcall orig-mmap addr length prot flags
+                                                fd offset))))
+                           (setf (fdefinition 'graph-db::%munmap-or-warn)
+                                 (lambda (addr length what)
+                                   (push (cons (cffi:pointer-address addr) length)
+                                         munmaps)
+                                   (funcall orig-munmap addr length what)))
+                           (segment-put s (%id 32) (%vec 64 32.0)))
+                      (setf (fdefinition 'graph-db::%posix-mmap) orig-mmap
+                            (fdefinition 'graph-db::%munmap-or-warn) orig-munmap))
+                    (is (= 1 claims)
+                        "fault injection never reached the adjacent claim (~D ~
+                         calls) -- the test setup is broken, not the code under ~
+                         test" claims)
+                    (is (and blocker (= want (cffi:pointer-address blocker)))
+                        "test setup is broken: could not block the requested ~
+                         address ~D (got ~S)" want blocker)
+                    (is (and misplaced
+                             (/= want (cffi:pointer-address misplaced)))
+                        "test setup is broken: the injected claim landed at the ~
+                         address it asked for (~D), so it was not misplaced at all"
+                        want)
+                    (is (equal (cons (cffi:pointer-address misplaced) asked-length)
+                               (find (cffi:pointer-address misplaced) munmaps
+                                     :key #'car))
+                        "the misplaced mapping at ~D (~D bytes) was not unmapped; ~
+                         munmaps seen: ~S"
+                        (cffi:pointer-address misplaced) asked-length munmaps)
+                    (is (= extensions-before graph-db::*segment-adjacent-extensions*)
+                        "a claim that landed at the WRONG address was counted as ~
+                         a successful extension")
+                    (is (> graph-db::*segment-relocations* relocations-before)
+                        "the fallback relocation never ran after the misplaced ~
+                         claim")
+                    (is (/= base-before (%seg-base-address s))
+                        "the mapping should have relocated; base is still ~D"
+                        base-before)
+                    (is (= 33 (segment-live-count s)))
+                    (let ((bad 0))
+                      (dotimes (i 33)
+                        (let ((back (segment-get s (%id i)))
+                              (expect (%vec 64 (float i 1.0))))
+                          (unless (and back (every #'= expect back)) (incf bad))))
+                      (is (zerop bad)
+                          "~D of 33 vectors did not survive the fallback" bad)))
+               (close-vector-segment s)))
+        (setf (fdefinition 'graph-db::%posix-mmap) orig-mmap
+              (fdefinition 'graph-db::%munmap-or-warn) orig-munmap)
+        (when blocker (graph-db::%posix-munmap blocker blocked-length))
+        (ignore-errors (delete-file path))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; MMAP-FILE cleanup on a failed file-map (mmap.lisp).  Not segment-specific,

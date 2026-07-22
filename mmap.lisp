@@ -20,11 +20,18 @@
   ;; close, concurrent readers never fault and need no lock.  See
   ;; docs/mmap-remap-race-plan.md.
   ;;
-  ;; ONE EXCEPTION, and it is not a general one:
+  ;; RESERVED-SIZE can GROW without POINTER moving:
+  ;; EXTEND-RESERVATION-IN-PLACE (below) claims the address range immediately
+  ;; after the window, which is the cheap way a vector segment grows past its
+  ;; reservation.  Readers are unaffected -- there is nothing for them to
+  ;; observe.
+  ;;
+  ;; ONE EXCEPTION MOVES POINTER, and it is not a general one:
   ;; RELOCATE-VECTOR-SEGMENT-MAPPING (below) does move POINTER, for a vector
   ;; segment only, because a segment -- unlike the heap and the linear hash --
-  ;; holds an rw-lock over every one of its readers.  Read its docstring before
-  ;; calling it from anywhere else; the short version is: don't.
+  ;; holds an rw-lock over every one of its readers.  It is the FALLBACK for
+  ;; when the adjacent range above cannot be claimed.  Read its docstring
+  ;; before calling it from anywhere else; the short version is: don't.
   (reserved-size 0 :type integer))
 
 ;;; Diagnostic: count SEGV-retries in the accessor :around methods.  With the
@@ -314,8 +321,26 @@ VECTOR-SEGMENT-CAPACITY-EXHAUSTED, not this."
     mapped-file))
 
 ;;; ---------------------------------------------------------------------------
-;;; Relocation.  READ THE CONTRACT BEFORE ADDING A SECOND CALLER.
+;;; Growing a reservation.  Two mechanisms, tried in this order by
+;;; %SEG-ENSURE-RESERVATION:
+;;;
+;;;   1. EXTEND-RESERVATION-IN-PLACE -- claim the address range immediately
+;;;      AFTER the window.  One syscall, M-POINTER does not move, no reader is
+;;;      affected.  Works only when that range is free, which is RARER than the
+;;;      design assumed -- see its docstring's "HOW OFTEN THIS WORKS".
+;;;   2. RELOCATE-VECTOR-SEGMENT-MAPPING -- move the whole window elsewhere.
+;;;      MOVES M-POINTER, so it is safe ONLY for a subsystem that can exclude
+;;;      every one of its own readers.  READ THE CONTRACT BEFORE ADDING A
+;;;      SECOND CALLER.
 ;;; ---------------------------------------------------------------------------
+
+;;; Diagnostics: which of the two actually ran.  An operator (or a test) can
+;;; otherwise not tell a free extension from a relocation, and they have very
+;;; different costs and very different risk.  Plain INCF; a racy count is fine.
+(defparameter *segment-adjacent-extensions* 0
+  "Count of reservations grown IN PLACE by claiming the adjacent range.")
+(defparameter *segment-relocations* 0
+  "Count of reservations grown by RELOCATING the mapping (M-POINTER moved).")
 
 (defun %munmap-or-warn (addr length what)
   "munmap(2) LENGTH bytes at ADDR, reporting rather than ignoring a failure.
@@ -343,6 +368,102 @@ space is leaked for the life of the process."
       (warn "munmap of the ~A failed (rc ~A); ~D bytes of address space leaked."
             what rc length))
     rc))
+
+(defun %round-up (n multiple)
+  (* multiple (ceiling n multiple)))
+
+(defun extend-reservation-in-place (mapped-file new-reservation)
+  "Try to grow MAPPED-FILE's virtual-address reservation to at least
+NEW-RESERVATION bytes by claiming the range IMMEDIATELY AFTER the current
+window.  Returns T on success and NIL on failure.
+
+On success M-RESERVED-SIZE is larger and M-POINTER IS UNCHANGED: the window
+simply got bigger, no byte moved, no reader was disturbed, and none of
+RELOCATE-VECTOR-SEGMENT-MAPPING's cost or risk was paid.  On failure NOTHING is
+mutated -- not M-POINTER, not M-RESERVED-SIZE, and no mapping is left behind --
+so the caller can fall straight through to relocation.
+
+HOW OFTEN THIS WORKS -- LESS THAN THE DESIGN ASSUMED, AND THAT IS MEASURED.  The
+premise was that a sparse 64-bit address space leaves the adjacent range free
+most of the time.  It does not.  Linux's default TOP-DOWN mmap allocator places a
+mmap(NULL, ...) window flush against the BOTTOM of the existing mappings, so the
+range immediately ABOVE a newly created window is occupied by construction.  With
+a production-sized 16 GiB reservation on Linux 5.15 and on Linux 4.15 the window
+ended at exactly the first byte of libssl.so.3, and claims of 1 page, 1 MiB,
+1 GiB and 8 GiB were ALL refused.  The legacy bottom-up layout (ulimit -s
+unlimited) behaved identically, and Darwin declines a hint the same way.  It
+succeeds where the window happens to sit below a hole -- which does happen, but
+is not something to plan around.  The reason to keep it is that a miss costs one
+mmap on a path that is already rare; the reason not to rely on it is above.
+
+WHY THIS IS SAFE ON EVERY PLATFORM, INCLUDING THE ONES WITHOUT THE FLAG.  The
+claim asks for +MAP-FIXED-NOREPLACE+ where that constant exists (Linux 4.17+),
+which makes the kernel REJECT rather than place the mapping elsewhere.  Where it
+does not exist -- Darwin, and Linux before 4.17, which ignores the unknown bit
+-- the address argument is merely an advisory HINT, so the mapping can land
+somewhere other than where we asked.  It does NOT degrade to MAP_FIXED and it
+does NOT evict the occupant; that was measured, see +MAP-FIXED-NOREPLACE+'s
+comment in posix.lisp.  PLAIN MAP_FIXED IS NEVER PASSED HERE and must never be
+added: it would silently replace whatever mapping already occupies the range --
+another mmapped graph file, the Lisp heap, a shared library -- and the corruption
+would be invisible until something read from it.
+
+The safety property is therefore the POST-HOC ADDRESS COMPARISON below, not the
+flag: if what came back is not exactly what was asked for, it is somebody else's
+neighbourhood, so unmap it and fail.  That check is unconditional, which is why
+this needs no kernel-version gate and no platform gate.
+
+PAGE ALIGNMENT.  A reservation is whatever byte count the policy computed, so
+the true end of the window is the current size rounded UP to a page.  Claiming
+from anywhere else would either overlap the window's own last page or leave a
+hole, and an unaligned ADDR is an outright EINVAL under MAP_FIXED_NOREPLACE.
+The new size is recorded as (rounded-up old + rounded-up claim), which is what
+MUNMAP-FILE and RELOCATE-VECTOR-SEGMENT-MAPPING must later release: a single
+munmap spans both mappings, since they are adjacent by construction."
+  (let* ((reserved (m-reserved-size mapped-file))
+         (base (m-pointer mapped-file)))
+    (cond
+      ((null base) nil)
+      ((<= new-reservation reserved) t)          ; already covered; nothing to do
+      (t
+       (let* ((page (%posix-page-size))
+              (aligned-reserved (%round-up reserved page))
+              (want (+ (cffi:pointer-address base) aligned-reserved))
+              (length (%round-up (- new-reservation reserved) page))
+              (got (handler-case
+                       (%posix-mmap (cffi:make-pointer want)
+                                    length
+                                    +prot-none+
+                                    (logior +map-private+
+                                            +map-anonymous+
+                                            +map-noreserve+
+                                            +map-fixed-noreplace+)
+                                    -1
+                                    0)
+                     ;; EEXIST where the flag is honoured, ENOMEM / RLIMIT_AS
+                     ;; anywhere.  Either way: no mapping was made, fall back.
+                     (error (e)
+                       (log:debug "adjacent reservation claim for ~A refused: ~A"
+                                  (m-path mapped-file) e)
+                       nil))))
+         (cond
+           ((null got) nil)
+           ((/= (cffi:pointer-address got) want)
+            ;; Hint placement on a kernel without the flag: we were given a
+            ;; perfectly good mapping somewhere useless.  Give it back.
+            (log:debug "adjacent reservation claim for ~A landed at ~D, not ~D; ~
+releasing it and falling back to relocation"
+                       (m-path mapped-file) (cffi:pointer-address got) want)
+            (%munmap-or-warn got length "misplaced adjacent reservation claim")
+            nil)
+           (t
+            (setf (m-reserved-size mapped-file) (+ aligned-reserved length))
+            (incf *segment-adjacent-extensions*)
+            (log:debug "extended ~A's reservation in place to ~D bytes (base ~D ~
+unchanged)"
+                       (m-path mapped-file) (m-reserved-size mapped-file)
+                       (cffi:pointer-address base))
+            t)))))))
 
 (defun relocate-vector-segment-mapping (mapped-file new-reservation)
   "Move MAPPED-FILE's mapping into a fresh, larger reserved window: reserve
@@ -420,7 +541,8 @@ usable at its current reservation."
                ;; still-mapped old window than faulting on a freed one.
                (setf (m-pointer mapped-file) pointer
                      (m-reserved-size mapped-file) reserved
-                     ok t)))
+                     ok t)
+               (incf *segment-relocations*)))
         (unless ok
           ;; Roll the reservation back; leave M-POINTER as it was.
           (when new-base

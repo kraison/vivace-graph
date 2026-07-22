@@ -123,6 +123,41 @@ Overrides *MMAP-MIN-RESERVATION* for segment files only; the multiplier still
 applies, so a segment already larger than this floor divided by
 *MMAP-RESERVATION-MULTIPLIER* still gets proportional headroom.")
 
+;; The CHEAP way out of exhaustion, tried before relocation: claim the address
+;; range immediately AFTER the segment's window (EXTEND-RESERVATION-IN-PLACE,
+;; mmap.lisp) so the window simply grows.  M-POINTER never moves, nothing is
+;; remapped, and no reader is disturbed.  When it cannot,
+;; *SEGMENT-RELOCATE-ON-EXHAUSTION* below takes over.
+;;
+;; DO NOT EXPECT THIS TO FIRE OFTEN.  The design assumed a sparse 64-bit address
+;; space means the adjacent range is usually free.  Measured, it usually is NOT:
+;; Linux's default top-down mmap allocator places a mmap(NULL, ...) window flush
+;; against the bottom of the existing mappings, so the range immediately ABOVE a
+;; freshly created window is occupied by construction -- on both test hosts a
+;; 16 GiB reservation ended exactly where libssl.so.3 begins, and claims of one
+;; page through 8 GiB were all refused.  Darwin behaves the same way, and so does
+;; Linux's legacy bottom-up layout.  It succeeds only where the window happens to
+;; sit below a hole.  Keep it because a miss costs one mmap on an already-rare
+;; path; do not plan capacity around it.  The lever that actually keeps a segment
+;; from relocating is *SEGMENT-MIN-RESERVATION* above -- reserve more up front.
+;;
+;; Two reasons this is a knob rather than unconditional, exactly mirroring the
+;; relocation switch below:
+;;   1. an operator kill-switch, if claiming adjacent address space ever
+;;      misbehaves on some platform: with this NIL the behaviour is precisely
+;;      wave 2's -- straight to relocation;
+;;   2. it is the only way left to exercise the RELOCATION path in a test.
+;;      Once the adjacent claim usually succeeds, every pre-existing relocation
+;;      test would quietly stop testing relocation and start testing this
+;;      instead -- while still passing green.  The relocation tests therefore
+;;      bind this to NIL, deliberately and visibly.
+(defparameter *segment-extend-adjacent-on-exhaustion* t
+  "When true (the default), a vector segment whose growth would exceed its
+virtual-address reservation first tries to claim the range immediately after
+its current window, growing the reservation IN PLACE without moving the
+mapping.  When NIL, or when the range is not free, it falls back to
+*SEGMENT-RELOCATE-ON-EXHAUSTION*.")
+
 ;; The floor above makes exhaustion rare; this makes it recoverable.  When a
 ;; segment's growth would pass its reservation, %SEG-GROW re-reserves a larger
 ;; window and RELOCATES the mapping into it (RELOCATE-VECTOR-SEGMENT-MAPPING,

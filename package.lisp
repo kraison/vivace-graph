@@ -63,6 +63,10 @@
            ;; operational decision (it restores the old, strictly-safe
            ;; pre-durability abort), not internal-symbol surgery.
            #:*segment-relocate-on-exhaustion*
+           ;; The kill-switch for the CHEAP half of the same mechanism: growth
+           ;; by claiming the adjacent address range, which relocation is only
+           ;; the fallback for.  Exported alongside it for the same reason.
+           #:*segment-extend-adjacent-on-exhaustion*
            #:location
            #:schema
            #:indexes
