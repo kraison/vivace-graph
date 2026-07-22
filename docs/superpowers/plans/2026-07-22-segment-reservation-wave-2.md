@@ -15,11 +15,18 @@
 The spec ordered Parts 2 → 3 → 4 by ambition. Part 3 (adjacent re-reservation) requires
 `MAP_FIXED_NOREPLACE`, which is Linux-only, so it was deferred as untestable on macOS.
 
-**Checking odm settled it: Part 3 is dead there too.** odm runs kernel **4.15.0-213**, and
-`MAP_FIXED_NOREPLACE` needs **4.17+**. On 4.15 the flag is not rejected — it is **silently
-ignored**, so the mapping degrades to plain `MAP_FIXED` and *replaces* whatever occupies the
-target address. That is the clobber hazard the spec warned about, and it would be live on the one
-Linux host available. **Do not attempt Part 3 on odm.**
+**odm cannot exercise Part 3**: it runs kernel **4.15.0-213**, and `MAP_FIXED_NOREPLACE` needs
+**4.17+**, so the flag is ignored there.
+
+⚠ **Correction (2026-07-22, measured).** An earlier revision of this paragraph said the ignored
+flag "degrades to plain `MAP_FIXED` and *replaces* whatever occupies the target address" — a
+clobber hazard. **That was wrong, and it was asserted rather than tested.** A C probe on odm
+shows the ignored flag falls back to *advisory hint* placement: the mapping landed at a
+different address and the sentinel in the occupied page was **intact**. An unknown mmap flag is
+ignored, which leaves the address as a hint; it does not imply `MAP_FIXED`.
+
+So Part 3 on a pre-4.17 kernel is **useless, not dangerous** — the claim usually lands elsewhere
+and is unwound by a post-hoc address check. See the spec's Part 3 for the corrected analysis.
 
 Part 4 is plain POSIX, testable on both hosts, and **on its own removes the ceiling**. Part 3 was
 only ever an optimisation that avoids the relocation cost. It stays deferred until a host with a

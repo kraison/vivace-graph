@@ -244,20 +244,38 @@ If it returns the requested address, the window simply got bigger: `m-pointer` n
 reader is affected, no lock is needed beyond what the caller already holds. On a sparse 64-bit
 address space this usually succeeds.
 
-⚠ **The footgun that must not be got wrong.** `posix.lisp` currently defines only
-`+map-fixed+ #x10`. Plain `MAP_FIXED` over an already-occupied range **silently replaces it** —
-that would corrupt whatever lived there, which is a far worse bug than the one being fixed.
-This requires:
+**Correction (2026-07-22, measured — an earlier revision of this section was wrong).**
 
-- Linux: `MAP_FIXED_NOREPLACE` (`#x100000`, kernel 4.17+). Verify the kernel supports it; on
-  older kernels the flag is ignored and the mapping silently succeeds by replacing — so a
-  version check or a post-hoc address comparison is mandatory, not optional.
-- macOS: no `MAP_FIXED_NOREPLACE`. Either probe first (racy) or skip Part 3 and fall through to
-  Part 4.
+This section previously claimed that a kernel ignoring `MAP_FIXED_NOREPLACE` would "silently
+succeed by replacing" the occupied range, making Part 3 dangerous on old kernels. **That is not
+what happens**, and it was asserted rather than tested.
 
-**Recommendation:** implement Part 3 for Linux only, and let other platforms fall through. odm
-(Linux) is where corpora large enough to matter will live; the macOS dev hub is a development
-box, adequately served by Parts 1, 2 and 4.
+Measured with a C probe on two hosts (map a page, write a sentinel, try to reclaim the same
+address with the flag, inspect the sentinel):
+
+| host | kernel | result |
+| --- | --- | --- |
+| hypnos | 5.15.0-179 | **honoured** — rejected with `EEXIST`, sentinel intact |
+| odm | 4.15.0-213 | **ignored → advisory hint placement**: mapping landed at a *different* address, sentinel **intact** |
+
+An unknown mmap flag is ignored, which leaves the address argument as a *hint* — it does **not**
+imply `MAP_FIXED`. Nothing is clobbered. So:
+
+- **The safety property is a post-hoc address comparison**, and it is complete on every kernel:
+  claim the range, and if the returned address is not exactly the one requested, `munmap` it and
+  fall back. No kernel-version gate is required.
+- Never pass plain `MAP_FIXED` as a fallback. *That* would clobber — but nothing requires it.
+- On a kernel without the flag Part 3 is merely **useless** (the claim usually lands elsewhere and
+  is unwound), not dangerous. That is why odm cannot exercise it, and why the flag is still worth
+  passing where available: it turns a wasted map-then-unmap into a clean rejection.
+- macOS has no `MAP_FIXED_NOREPLACE`; the address check alone still makes the attempt safe there,
+  just less efficient.
+
+**Recommendation:** implement Part 3 unconditionally, guarded by the address check rather than by
+platform or kernel version. Pass `MAP_FIXED_NOREPLACE` where the constant is available so the
+kernel rejects cleanly instead of placing elsewhere; where it is not, the address check still
+makes the attempt safe. Part 4 remains the fallback whenever the adjacent range cannot be
+claimed.
 
 ### Part 4 — Re-reserve and relocate, under the segment's write lock
 
