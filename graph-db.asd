@@ -363,6 +363,15 @@
                ;; tried to MAKE-SI-DOC and hit "NIL is not of type NODE-TYPE").
                (:file "segment-integration-tests")
                (:file "segment-query-tests")
+               ;; multi-graph-tests declares its own graph names (:mg-alpha /
+               ;; :mg-beta / :mg-gamma), distinct from *integration-graph-name*,
+               ;; so it is not exposed to the graph-tests reload hazard noted
+               ;; above.  Appended here anyway, after every file in this run's
+               ;; segment-integration lineage, rather than inserted earlier --
+               ;; the same "append, don't insert" discipline that hazard was a
+               ;; regression test for, so a future file with a colliding graph
+               ;; name can't rediscover it the hard way.
+               (:file "multi-graph-tests")
                (:file "type-mapping-tests")
                (:file "graph-spatial-tests")
                (:file "spatial-hook-tests")
