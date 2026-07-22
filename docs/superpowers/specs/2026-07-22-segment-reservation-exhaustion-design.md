@@ -230,7 +230,7 @@ reservation policy that is free on a 192 GB server is not obviously free everywh
 no longer a constrained in-process consumer to design around: the only live consumers are 64-bit
 hosts (see §6), so a generous default is appropriate.
 
-### Part 3 — Adjacent re-reservation (the real fix, no relocation)
+### Part 3 — Adjacent re-reservation (an opportunistic saving, not the fix)
 
 On exhaustion, before giving up, try to claim the address range **immediately after** the current
 window:
@@ -380,8 +380,12 @@ agree.** That is what is currently violated.
    on servers, and replaces the undocumented `setf graph-db::*mmap-reservation-multiplier*` lever
    of §1.8. Consider exporting the knobs, or documenting the restart remedy, so §1.8 stops being
    folklore.
-3. **Part 3** — the real fix. Linux first. Budget the platform work honestly; the `MAP_FIXED`
-   hazard is the whole difficulty.
+3. **Part 3** — an opportunistic saving, not the fix; land alongside Part 4. Both premises this
+   item originally rested on turned out false: there is no `MAP_FIXED` clobber hazard to budget
+   for (an ignored `MAP_FIXED_NOREPLACE` falls back to hint placement, never eviction — the
+   address check alone makes the attempt safe on every platform), and adjacent space is usually
+   NOT available, so this is not "the real fix" — Part 2's reservation floor is what actually keeps
+   exhaustion rare, and Part 4's relocation is the workhorse that catches what Part 3 misses.
 4. **Part 4** — fallback, and the completion of the Phase-3 plan.
 
 Parts 1, 2 and 6 are worth landing on their own even if 3 and 4 never happen. **Part 6 is

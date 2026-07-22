@@ -438,17 +438,26 @@ entries needs 98,368 bytes\")."
     (when (> needed reserved)
       ;; Cheap path first: grow the window rather than move it.  Returns NIL
       ;; without mutating anything if the adjacent range is not free.
-      (when (and *segment-extend-adjacent-on-exhaustion*
-                 (extend-reservation-in-place mmap needed))
-        (return-from %seg-ensure-reservation mmap))
-      (unless *segment-relocate-on-exhaustion*
-        (error 'vector-segment-capacity-exhausted
-               :path (m-path mmap)
-               :required capacity :needed-bytes needed :reserved reserved
-               :reason (format nil "the adjacent address range could not be claimed ~
-(~:[it is occupied~;GRAPH-DB:*SEGMENT-EXTEND-ADJACENT-ON-EXHAUSTION* is NIL~]) ~
-and relocation is disabled (GRAPH-DB:*SEGMENT-RELOCATE-ON-EXHAUSTION* is NIL)"
-                               (not *segment-extend-adjacent-on-exhaustion*))))
+      (let (extended adjacent-reason)
+        (when *segment-extend-adjacent-on-exhaustion*
+          (multiple-value-setq (extended adjacent-reason)
+            (extend-reservation-in-place mmap needed)))
+        (when extended
+          (return-from %seg-ensure-reservation mmap))
+        (unless *segment-relocate-on-exhaustion*
+          (error 'vector-segment-capacity-exhausted
+                 :path (m-path mmap)
+                 :required capacity :needed-bytes needed :reserved reserved
+                 :reason (format nil "the adjacent address range could not be claimed ~
+(~A) and relocation is disabled (GRAPH-DB:*SEGMENT-RELOCATE-ON-EXHAUSTION* is NIL)"
+                                 (cond
+                                   ((not *segment-extend-adjacent-on-exhaustion*)
+                                    "GRAPH-DB:*SEGMENT-EXTEND-ADJACENT-ON-EXHAUSTION* is NIL")
+                                   ((eq adjacent-reason :occupied) "it is occupied")
+                                   ((eq adjacent-reason :no-base)
+                                    "the segment has no established mapping yet")
+                                   (t (format nil "the mapping attempt failed: ~A"
+                                              adjacent-reason)))))))
       (handler-case
           (relocate-vector-segment-mapping mmap (%seg-reservation-for needed))
         (error (e)
@@ -473,10 +482,14 @@ overwrites unread source bytes.  The base pointer normally never moves
 never faults.  Returns OLD-CAP, the first fresh (unclaimed) slot index.
 
 If the doubling would pass the mmap reservation, %SEG-ENSURE-RESERVATION first
-re-reserves a larger window and RELOCATES the mapping into it -- the one case
-where the base pointer does move.  That is safe here and nowhere else: this runs
-under the segment's write lock (SEGMENT-PUT / SEGMENT-REMOVE), which excludes
-every reader of this mapping.  The reservation is therefore no longer a ceiling
+tries to EXTEND the reservation in place -- claiming the address range
+immediately after the current window -- in which case the base pointer does
+NOT move, nothing is copied, and no reader can observe it.  Only when that
+adjacent range is unavailable does it fall back to RE-RESERVING a larger window
+and RELOCATING the mapping into it -- the one case where the base pointer does
+move.  That relocation is safe here and nowhere else: this runs under the
+segment's write lock (SEGMENT-PUT / SEGMENT-REMOVE), which excludes every
+reader of this mapping.  The reservation is therefore no longer a ceiling
 for segments."
   (let* ((mmap (segment-mmap segment))
          (dim (segment-dimension segment))

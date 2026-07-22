@@ -156,7 +156,10 @@ applies, so a segment already larger than this floor divided by
 virtual-address reservation first tries to claim the range immediately after
 its current window, growing the reservation IN PLACE without moving the
 mapping.  When NIL, or when the range is not free, it falls back to
-*SEGMENT-RELOCATE-ON-EXHAUSTION*.")
+*SEGMENT-RELOCATE-ON-EXHAUSTION*.  Binding this to NIL by itself does not force
+a hard abort on exhaustion -- *SEGMENT-RELOCATE-ON-EXHAUSTION* is still T by
+default and will grow the segment by relocating it.  Both must be NIL to
+disable growth past the reservation entirely.")
 
 ;; The floor above makes exhaustion rare; this makes it recoverable.  When a
 ;; segment's growth would pass its reservation, %SEG-GROW re-reserves a larger
@@ -168,9 +171,13 @@ mapping.  When NIL, or when the range is not free, it falls back to
 ;;
 ;; Two reasons this is a knob rather than unconditional:
 ;;   1. an operator kill-switch: if relocation ever misbehaves on some platform,
-;;      binding this to NIL restores the previous behaviour exactly -- a clean
-;;      PRE-DURABILITY abort with VECTOR-SEGMENT-CAPACITY-EXHAUSTED, which is
-;;      strictly safe (it just caps growth at the reservation again);
+;;      binding this to NIL used to restore the previous behaviour exactly --
+;;      a clean PRE-DURABILITY abort with VECTOR-SEGMENT-CAPACITY-EXHAUSTED.
+;;      Since wave 3 that is no longer true of THIS knob alone:
+;;      *SEGMENT-EXTEND-ADJACENT-ON-EXHAUSTION* (above) runs FIRST, and left at
+;;      its default T it can still grow the segment in place without ever
+;;      reaching this knob.  Getting the strictly-safe abort back requires
+;;      BOTH knobs bound to NIL;
 ;;   2. it is the only way left to exercise that abort path in a test.  With
 ;;      relocation enabled, exhaustion no longer happens, so the regression test
 ;;      that proves a capacity failure never leaves a persisted node without a
@@ -180,7 +187,11 @@ mapping.  When NIL, or when the range is not free, it falls back to
 virtual-address reservation re-reserves a larger window and relocates its
 mapping into it, under the segment's own write lock.  When NIL, such a grow
 signals VECTOR-SEGMENT-CAPACITY-EXHAUSTED instead -- pre-durability on the
-transaction path, so the transaction rolls back cleanly.")
+transaction path, so the transaction rolls back cleanly -- PROVIDED
+*SEGMENT-EXTEND-ADJACENT-ON-EXHAUSTION* is ALSO NIL.  Left at its default T,
+the adjacent claim it controls runs first and can still grow the segment in
+place, bypassing this knob entirely; only binding BOTH to NIL restores the
+strictly-safe pre-durability abort.")
 
 ;; Key namespaces
 (defvar *vertex-namespace* (uuid:uuid-to-byte-array

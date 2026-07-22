@@ -83,7 +83,11 @@ between releases; cutting a release renames it to the new version and dates it.
   `*segment-extend-adjacent-on-exhaustion*` (exported, default `t`) switches it
   off, which is also what keeps the relocation tests genuinely exercising
   relocation. `*segment-adjacent-extensions*` and `*segment-relocations*` count
-  which path ran.
+  which path ran. **Binding this knob to NIL by itself does not stop a segment
+  from growing past its reservation** — it only removes the adjacent shortcut,
+  leaving `*segment-relocate-on-exhaustion*` (below) to grow it by relocating
+  instead. Getting the hard, pre-durability abort back requires BOTH knobs NIL;
+  see the correction to that entry's description below.
 - **A vector segment's mmap reservation is no longer a growth ceiling.** When a
   doubling would pass the reservation, the segment now reserves a larger
   address window, re-maps its file into it, and releases the old window —
@@ -96,8 +100,13 @@ between releases; cutting a release renames it to the new version and dates it.
   no such lock — for them the reservation remains a hard ceiling, and the
   primitive is named `relocate-vector-segment-mapping` so calling it from either
   reads as wrong at the call site.
-  `*segment-relocate-on-exhaustion*` (exported, default `t`) switches the
-  behaviour off, restoring the previous strictly-safe pre-durability abort.
+  `*segment-relocate-on-exhaustion*` (exported, default `t`) switches this
+  behaviour off — but, since the adjacent re-reservation entry above shares the
+  same exhaustion path and runs FIRST, this knob alone no longer restores the
+  previous strictly-safe pre-durability abort: left at its default,
+  `*segment-extend-adjacent-on-exhaustion*` can still grow the segment in place
+  without ever reaching this one. **Both knobs must be bound to NIL** to get
+  that abort back.
   `vector-segment-capacity-exhausted` now fires only when relocation is
   disabled or fails (address space exhausted), and carries two new slots —
   `vsce-path` (for the direct `segment-put` path, which has no owner/slot) and

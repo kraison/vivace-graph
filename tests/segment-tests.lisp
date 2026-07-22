@@ -427,7 +427,17 @@ assert M-POINTER moved would fail, which is the lucky case; the rest would go
 green and cover nothing.)  This binding is what keeps them honest.  It must NOT
 be folded into WITH-TINY-SEGMENT-RESERVATION: several tests use that macro only
 around the CREATE, while the grow -- the thing that needs the binding in
-effect -- happens outside it."
+effect -- happens outside it.
+
+⚠ THIS IS A DYNAMIC BINDING, SO IT DOES NOT REACH A SPAWNED THREAD.  A LET over
+a special variable is only in effect on the thread that establishes it; a grow
+that happens on a thread spawned from inside BODY (e.g. via BT:MAKE-THREAD)
+would see the variable's GLOBAL value, not this binding, and would silently
+take the adjacent path this macro means to suppress.  No current test grows a
+segment from a spawned thread -- and *SEGMENT-RELOCATIONS* not advancing would
+catch it if one started to without also being fixed -- but this is exactly the
+shape of trap the exhaustion design doc warns about: a control that reads as
+governing a whole operation but only governs the thread that set it."
   `(let ((graph-db::*segment-extend-adjacent-on-exhaustion* nil))
      ,@body))
 

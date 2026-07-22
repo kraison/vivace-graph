@@ -375,13 +375,33 @@ space is leaked for the life of the process."
 (defun extend-reservation-in-place (mapped-file new-reservation)
   "Try to grow MAPPED-FILE's virtual-address reservation to at least
 NEW-RESERVATION bytes by claiming the range IMMEDIATELY AFTER the current
-window.  Returns T on success and NIL on failure.
+window.  Returns TWO values, (SUCCESS-P REASON):
 
-On success M-RESERVED-SIZE is larger and M-POINTER IS UNCHANGED: the window
-simply got bigger, no byte moved, no reader was disturbed, and none of
-RELOCATE-VECTOR-SEGMENT-MAPPING's cost or risk was paid.  On failure NOTHING is
-mutated -- not M-POINTER, not M-RESERVED-SIZE, and no mapping is left behind --
-so the caller can fall straight through to relocation.
+  (values T :ALREADY-COVERED) -- NEW-RESERVATION already fit inside the
+    current reservation.  NOTHING was claimed, M-RESERVED-SIZE did not change,
+    and *SEGMENT-ADJACENT-EXTENSIONS* was NOT incremented.  A caller that
+    treats the primary value alone as \"an extension happened\" would be
+    wrong here -- check REASON, not just SUCCESS-P, if that distinction
+    matters to it.
+  (values T :CLAIMED)         -- the adjacent range was actually claimed; see
+    below.
+  (values NIL :OCCUPIED)      -- the requested address is occupied by
+    something else: either the kernel refused it outright (EEXIST under
+    +MAP-FIXED-NOREPLACE+), or -- on a platform that ignores the flag -- the
+    call silently placed the mapping elsewhere, which was then unmapped.
+    Either way the diagnosis is address CONTENTION, not a mapping failure.
+  (values NIL <condition>)    -- the mmap(2) call itself signalled, for a
+    reason that is NOT specifically about that one address (e.g. ENOMEM /
+    RLIMIT_AS).  The raw condition is returned so a caller can report the
+    actual cause instead of assuming occupancy.
+  (values NIL :NO-BASE)       -- MAPPED-FILE has no established mapping yet;
+    there is nothing to extend adjacent to.
+
+On a :CLAIMED success M-RESERVED-SIZE is larger and M-POINTER IS UNCHANGED: the
+window simply got bigger, no byte moved, no reader was disturbed, and none of
+RELOCATE-VECTOR-SEGMENT-MAPPING's cost or risk was paid.  On any NIL outcome
+NOTHING is mutated -- not M-POINTER, not M-RESERVED-SIZE, and no mapping is
+left behind -- so the caller can fall straight through to relocation.
 
 HOW OFTEN THIS WORKS -- LESS THAN THE DESIGN ASSUMED, AND THAT IS MEASURED.  The
 premise was that a sparse 64-bit address space leaves the adjacent range free
@@ -423,13 +443,14 @@ munmap spans both mappings, since they are adjacent by construction."
   (let* ((reserved (m-reserved-size mapped-file))
          (base (m-pointer mapped-file)))
     (cond
-      ((null base) nil)
-      ((<= new-reservation reserved) t)          ; already covered; nothing to do
+      ((null base) (values nil :no-base))
+      ((<= new-reservation reserved) (values t :already-covered)) ; nothing to do
       (t
        (let* ((page (%posix-page-size))
               (aligned-reserved (%round-up reserved page))
               (want (+ (cffi:pointer-address base) aligned-reserved))
               (length (%round-up (- new-reservation reserved) page))
+              (mmap-error nil)
               (got (handler-case
                        (%posix-mmap (cffi:make-pointer want)
                                     length
@@ -441,21 +462,26 @@ munmap spans both mappings, since they are adjacent by construction."
                                     -1
                                     0)
                      ;; EEXIST where the flag is honoured, ENOMEM / RLIMIT_AS
-                     ;; anywhere.  Either way: no mapping was made, fall back.
+                     ;; anywhere.  Either way: no mapping was made, fall back --
+                     ;; but keep the condition so the caller can distinguish an
+                     ;; actual mapping failure from mere address contention.
                      (error (e)
                        (log:debug "adjacent reservation claim for ~A refused: ~A"
                                   (m-path mapped-file) e)
+                       (setf mmap-error e)
                        nil))))
          (cond
-           ((null got) nil)
+           ((null got) (values nil mmap-error))
            ((/= (cffi:pointer-address got) want)
             ;; Hint placement on a kernel without the flag: we were given a
-            ;; perfectly good mapping somewhere useless.  Give it back.
+            ;; perfectly good mapping somewhere useless.  Give it back.  This IS
+            ;; occupancy -- the kernel could not honour the hint precisely
+            ;; because something else already lives at WANT.
             (log:debug "adjacent reservation claim for ~A landed at ~D, not ~D; ~
 releasing it and falling back to relocation"
                        (m-path mapped-file) (cffi:pointer-address got) want)
             (%munmap-or-warn got length "misplaced adjacent reservation claim")
-            nil)
+            (values nil :occupied))
            (t
             (setf (m-reserved-size mapped-file) (+ aligned-reserved length))
             (incf *segment-adjacent-extensions*)
@@ -463,7 +489,7 @@ releasing it and falling back to relocation"
 unchanged)"
                        (m-path mapped-file) (m-reserved-size mapped-file)
                        (cffi:pointer-address base))
-            t)))))))
+            (values t :claimed))))))))
 
 (defun relocate-vector-segment-mapping (mapped-file new-reservation)
   "Move MAPPED-FILE's mapping into a fresh, larger reserved window: reserve
