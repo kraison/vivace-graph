@@ -10,13 +10,20 @@
 
 **Wave 1 is done** (`20200c9`): capacity is validated pre-durability, and rebuilds are corpus-sized. Suite baseline **2559 checks, 0 fail**.
 
-## Why Part 3 is deferred
+## Why Part 3 is deferred — now confirmed, not just assumed
 
 The spec ordered Parts 2 → 3 → 4 by ambition. Part 3 (adjacent re-reservation) requires
-`MAP_FIXED_NOREPLACE`, which is Linux-only; this work is happening on macOS, so it could be
-written but not exercised — and its entire difficulty is a clobber hazard that only manifests at
-runtime. Part 4 is plain POSIX, testable here, and **on its own removes the ceiling**. Part 3 is
-an optimisation that avoids the relocation cost, not a prerequisite. Revisit it on Linux.
+`MAP_FIXED_NOREPLACE`, which is Linux-only, so it was deferred as untestable on macOS.
+
+**Checking odm settled it: Part 3 is dead there too.** odm runs kernel **4.15.0-213**, and
+`MAP_FIXED_NOREPLACE` needs **4.17+**. On 4.15 the flag is not rejected — it is **silently
+ignored**, so the mapping degrades to plain `MAP_FIXED` and *replaces* whatever occupies the
+target address. That is the clobber hazard the spec warned about, and it would be live on the one
+Linux host available. **Do not attempt Part 3 on odm.**
+
+Part 4 is plain POSIX, testable on both hosts, and **on its own removes the ceiling**. Part 3 was
+only ever an optimisation that avoids the relocation cost. It stays deferred until a host with a
+4.17+ kernel exists.
 
 ## Global Constraints
 
@@ -148,19 +155,29 @@ itself fails (VA exhaustion / ENOMEM).
 *current* reservation. Once Step 2 makes that recoverable, the check becomes over-eager: it would
 roll back transactions that would now succeed.
 
-Two defensible resolutions — pick one, and justify it in your report:
+Two candidates. **I recommend (a); take (b) only if you find a defect in the reasoning.**
 
-- **(a) Grow during validation.** Perform the grow/relocate in the pre-durability region, so
-  `apply-transaction` cannot fail. Trade-off: a transaction that later aborts for an unrelated
-  reason leaves an over-sized segment. Capacity is not semantic, so that is harmless — but say so
-  explicitly rather than leaving it implied.
+- **(a) Grow during validation — recommended.** Perform the grow (including relocation) in the
+  pre-durability region, so `apply-transaction` provably cannot need to grow. This is airtight
+  rather than probabilistic: validation and apply both run under the manager lock and are
+  serialised, so nothing can consume the capacity in between.
+
+  Trade-offs, both acceptable, but state them in the code rather than leaving them implied:
+  - A transaction that later fails (only `finalize-tx-persistence` remains after this point)
+    leaves an over-sized segment. Capacity is not semantic and `live-count` is untouched, so the
+    segment stays consistent; the file is merely larger than it needed to be.
+  - A crash mid-grow leaves the segment dirty, so `restore-vector-segments` rebuilds it at open.
+    That is the existing recovery path and is not made worse — but note wave 1 is what made that
+    rebuild survivable above 131k, so (a) leans on wave 1 having landed.
+
 - **(b) Keep the check, raise its bound.** Validate against what relocation could plausibly
-  achieve rather than the current reservation. Trade-off: "plausibly" is not knowable, so this
-  weakens the guarantee that apply cannot fail.
+  achieve. Rejected unless (a) proves unworkable: "plausibly" is not knowable, so it trades a
+  guarantee for a heuristic — and the guarantee is the entire point of wave 1.
 
 **Whichever you choose, the wave-1 invariant must survive: a failure must never leave a persisted
 node with no segment entry.** There is a test for exactly that; it must still pass, and must still
-discriminate.
+**discriminate** — re-prove it, because making exhaustion recoverable is precisely the kind of
+change that silently neuters an exhaustion test. That has already happened twice in this work.
 
 - [ ] **Step 4: Tests**
 
@@ -173,6 +190,19 @@ discriminate.
 
 Run the concurrency suite (`graph-db/concurrency-test`) as well as the main one; this changes
 memory mapping under a lock.
+
+**Run on both hosts.** A change that moves `m-pointer` deserves two platforms. An isolated
+sandbox exists on odm (Linux, SBCL 2.1.11 — vs the dev hub's macOS, SBCL 2.5.5):
+
+- `~/part4-test/vivace-graph-v3` on `raison@odm.chatsubo.net`, branch `part4`
+- run with `~/part4-test/run-suite.sh`, which fences `CL_SOURCE_REGISTRY`,
+  `ql:*local-project-directories*`, `ASDF_OUTPUT_TRANSLATIONS` and `TMPDIR`, and **asserts the
+  loaded `graph-db` is the sandbox copy**, exiting 9 otherwise
+- move code there by `git bundle` — **never push to origin**, never touch
+  `~/work/vivace-graph-v3`, `~/quicklisp/local-projects/`, `/var/tmp/mine-action`, or `systemctl`
+
+Record the sandbox's own baseline before changing anything: odm's older SBCL could have a
+pre-existing failure that would otherwise be mistaken for this change's.
 
 - [ ] **Step 5: Full suite + concurrency suite, then commit**
 
