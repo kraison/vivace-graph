@@ -112,10 +112,12 @@ dependency-free fallback and GEOS is unavailable."))
   (:report (lambda (c s)
              (format s "vector segment ~A/~A: growing to hold ~D entries needs ~D bytes, ~
 but its mmap reservation is ~D. Reopen the graph (the reservation is recomputed ~
-from the file's current size at open, giving it GRAPH-DB::*MMAP-RESERVATION-~
-MULTIPLIER* times that size -- 8x by default -- or ~
-GRAPH-DB::*MMAP-MIN-RESERVATION*, whichever is larger), or raise either of those ~
-before opening."
+from the file's current size at open, giving it the larger of ~
+GRAPH-DB::*SEGMENT-MIN-RESERVATION* -- 16 GiB by default, and the floor that ~
+actually applies to vector segment files -- and ~
+GRAPH-DB::*MMAP-RESERVATION-MULTIPLIER* times that size -- 8x by default), or ~
+raise one of those two before opening. GRAPH-DB::*MMAP-MIN-RESERVATION* is NOT ~
+consulted for segment files, so raising it alone does nothing here."
                      (vsce-owner c) (vsce-slot c) (vsce-required c)
                      (vsce-needed-bytes c) (vsce-reserved c))))
   (:documentation "Signalled pre-durability when applying a transaction would

@@ -172,51 +172,68 @@ times SIZE (floored at *MMAP-MIN-RESERVATION*); pass RESERVATION to override."
   (log:debug "Opening mmap ~A" file)
   (when (and (not create-p) (not (probe-file file)))
     (error "mmap-file: ~A does not exist and create-p is not true." file))
-  (let* ((fd (%posix-open
-              file
-              (if create-p
-                  (logior +o-creat+ +o-rdwr+)
-                  +o-rdwr+))))
-    (when create-p
-      (%posix-lseek fd (1- size) +seek-set+)
-      (cffi:with-foreign-string (null (format nil "~A" (code-char 0)))
-        (cffi:foreign-funcall "write"
-                              :int fd
-                              :pointer null
-                              size 1))
-      ;; Belt-and-suspenders: set the mode explicitly to #o640 (owner rw, group
-      ;; r) so database files are reopenable without being world-accessible,
-      ;; even if the open() mode argument is not honored on some platform.
-      (%posix-fchmod fd #o640))
-    ;; Make sure the file size is set right!
-    (setq size (%posix-file-size-fd fd))
-    (let* ((reserved (max (or reservation
-                              (* *mmap-reservation-multiplier* size))
-                          *mmap-min-reservation*
-                          size))
-           ;; Reserve the address window with no access and no backing.
-           (base (%posix-mmap
-                  (cffi:null-pointer)
-                  reserved
-                  +prot-none+
-                  (logior +map-private+
-                          +map-anonymous+
-                          +map-noreserve+)
-                  -1
-                  0))
-           ;; Map the file over the head of the reservation (replaces the
-           ;; PROT_NONE pages for [base, base+size); MAP_FIXED keeps the addr).
-           (pointer (%posix-mmap
-                     base
-                     size
-                     (logior +prot-read+ +prot-write+)
-                     (logior +map-shared+ +map-fixed+)
-                     fd
-                     0)))
-      (make-mapped-file :path (truename file)
-                        :fd fd
-                        :pointer pointer
-                        :reserved-size reserved))))
+  (let ((fd (%posix-open
+             file
+             (if create-p
+                 (logior +o-creat+ +o-rdwr+)
+                 +o-rdwr+)))
+        (base nil)
+        (reserved nil)
+        (ok nil))
+    ;; Unwind cleanly on any failure once FD is open: an interrupted create
+    ;; step, or a MAP_FAILED file-map (the second %POSIX-MMAP below) after the
+    ;; anonymous window was already reserved, must not leak the fd or the VA
+    ;; window.  Before this, a failed file-map left both open -- ordinarily a
+    ;; ~1 GiB leak per retry, now up to *SEGMENT-MIN-RESERVATION* (16 GiB) for
+    ;; a vector segment, so a retry loop against a nearly-full filesystem or
+    ;; address space could exhaust it far faster than before.
+    (unwind-protect
+        (progn
+          (when create-p
+            (%posix-lseek fd (1- size) +seek-set+)
+            (cffi:with-foreign-string (null (format nil "~A" (code-char 0)))
+              (cffi:foreign-funcall "write"
+                                    :int fd
+                                    :pointer null
+                                    size 1))
+            ;; Belt-and-suspenders: set the mode explicitly to #o640 (owner rw,
+            ;; group r) so database files are reopenable without being
+            ;; world-accessible, even if the open() mode argument is not
+            ;; honored on some platform.
+            (%posix-fchmod fd #o640))
+          ;; Make sure the file size is set right!
+          (setq size (%posix-file-size-fd fd))
+          (setq reserved (max (or reservation
+                                  (* *mmap-reservation-multiplier* size))
+                              *mmap-min-reservation*
+                              size))
+          ;; Reserve the address window with no access and no backing.
+          (setq base (%posix-mmap
+                      (cffi:null-pointer)
+                      reserved
+                      +prot-none+
+                      (logior +map-private+
+                              +map-anonymous+
+                              +map-noreserve+)
+                      -1
+                      0))
+          ;; Map the file over the head of the reservation (replaces the
+          ;; PROT_NONE pages for [base, base+size); MAP_FIXED keeps the addr).
+          (let ((pointer (%posix-mmap
+                          base
+                          size
+                          (logior +prot-read+ +prot-write+)
+                          (logior +map-shared+ +map-fixed+)
+                          fd
+                          0)))
+            (setf ok t)
+            (make-mapped-file :path (truename file)
+                              :fd fd
+                              :pointer pointer
+                              :reserved-size reserved)))
+      (unless ok
+        (when base (ignore-errors (%posix-munmap base reserved)))
+        (ignore-errors (%posix-close fd))))))
 
 (defmethod sync-region ((mapped-file mapped-file) &key addr length
                         (sync +ms-sync+))
@@ -258,7 +275,10 @@ The reservation is computed at open from the file's size then, so reopening the 
 graph recomputes it against the now-larger file and grants fresh headroom.  To ~
 raise it up front, bind GRAPH-DB::*MMAP-RESERVATION-MULTIPLIER* or ~
 GRAPH-DB::*MMAP-MIN-RESERVATION* (or MAKE-GRAPH's heap/index size) before ~
-opening the graph."
+opening the graph.  Exception: a VECTOR SEGMENT file's floor is ~
+GRAPH-DB::*SEGMENT-MIN-RESERVATION*, not *MMAP-MIN-RESERVATION* -- see ~
+VECTOR-SEGMENT-CAPACITY-EXHAUSTED, which is what normally signals for those ~
+before growth ever reaches this generic path."
              (m-path mapped-file) new-len (m-reserved-size mapped-file)))
     ;; Extend the backing file first so the newly mapped pages have storage.
     (%posix-lseek (m-fd mapped-file) (1- new-len) +seek-set+)

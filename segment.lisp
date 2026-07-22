@@ -71,8 +71,12 @@ MAX, not the bare floor: a segment that is ALREADY larger than
 floor / multiplier must still get proportional headroom rather than being capped
 at the floor -- passing the floor alone would make the reservation SHRINK
 relative to today's behaviour for exactly the large segments that need it most.
-Both call sites (create and open) must use this; the open path is the one that
-originally had no reservation at all."
+Both call sites (create and open) must use this.  Before this floor existed,
+NEITHER passed MMAP-FILE an explicit :RESERVATION at all -- both simply took
+its general default (*MMAP-RESERVATION-MULTIPLIER* x size, floored at
+*MMAP-MIN-RESERVATION*), which is exactly the floor that was too small for a
+segment.  The open path is the one that matters most in practice, since a
+long-lived graph runs on reopened segments, not freshly created ones."
   (max *segment-min-reservation* (* *mmap-reservation-multiplier* size)))
 
 (defun create-vector-segment (path dimension &key (initial-capacity 1024))
@@ -496,26 +500,37 @@ later design question, not a one-line patch."
     ;; Counting pre-pass, so the fresh file is CREATED at its corpus size.
     ;;
     ;; WHY: a segment's mmap reservation is computed once, from the file's size
-    ;; AT CREATE TIME -- max(*mmap-reservation-multiplier* x size,
-    ;; *mmap-min-reservation*, size), mmap.lisp -- and the segment can never
-    ;; grow past it in place.  Creating at CREATE-VECTOR-SEGMENT's 1024 default
-    ;; made a fresh file ~4 MB, 8x of which is far under the 1 GiB floor, so the
-    ;; reservation landed on the floor and in-place doubling stalled at 131,072
-    ;; entries.  RESTORE-VECTOR-SEGMENTS calls this rebuild automatically
-    ;; whenever the clean-shutdown flag is unset, i.e. after a hard crash -- so
-    ;; above 131,072 entries automatic crash recovery could not complete at all.
-    ;; Creating at the corpus size derives the reservation from a realistic file
-    ;; instead, and removes ~8 doubling-and-relocate passes from the rebuild.
+    ;; AT CREATE TIME -- today, %SEG-RESERVATION-FOR: max(*segment-min-
+    ;; reservation* [16 GiB], *mmap-reservation-multiplier* x size) -- and the
+    ;; segment can never grow past it in place.  Before *segment-min-reservation*
+    ;; existed, creating at CREATE-VECTOR-SEGMENT's 1024 default made a fresh
+    ;; file ~4 MB, 8x of which was far under the then-general *mmap-min-
+    ;; reservation* (1 GiB) floor, so the reservation landed on that floor and
+    ;; in-place doubling stalled at 131,072 entries.  RESTORE-VECTOR-SEGMENTS
+    ;; calls this rebuild automatically whenever the clean-shutdown flag is
+    ;; unset, i.e. after a hard crash -- so above 131,072 entries automatic
+    ;; crash recovery could not complete at all.  Creating at the corpus size
+    ;; derives the reservation from a realistic file instead, and removes ~8
+    ;; doubling-and-relocate passes from the rebuild; the later 16 GiB segment
+    ;; floor pushes the stall point far out regardless, but corpus-sized
+    ;; creation is still what removes the relocate passes.
     ;;
-    ;; SIZED EXACTLY, no growth headroom -- and note that headroom would NOT be
-    ;; merely a deferred first grow: because the reservation is a multiple of
-    ;; the created size, 2x headroom would also double the post-rebuild ceiling,
-    ;; ~8x corpus -> ~16x.  Exact sizing is chosen anyway: ~8x corpus is ample
-    ;; for recovery, below a ~128 MB file the 1 GiB floor dominates the multiple
-    ;; entirely, and the capacity a rebuild leaves behind should state what the
-    ;; corpus IS rather than guess at future growth.  Wave 2 reasons about this
-    ;; same arithmetic -- do not re-derive it from "headroom only defers a
-    ;; grow", which is false.
+    ;; SIZED EXACTLY, no growth headroom.  Whether that costs anything depends
+    ;; on which side of the segment floor (currently 16 GiB; see %SEG-
+    ;; RESERVATION-FOR) the rebuilt file lands on:
+    ;;   - Below floor / multiplier (currently ~2 GiB of rebuilt file, i.e. an
+    ;;     already-large corpus) the floor alone dominates the reservation
+    ;;     regardless of any headroom multiple, so sizing exactly costs
+    ;;     nothing there -- 2x headroom would NOT move the post-rebuild
+    ;;     ceiling at all.
+    ;;   - Above that threshold the reservation is proportional to the created
+    ;;     size, so headroom is not merely a deferred first grow: 2x headroom
+    ;;     would double the post-rebuild ceiling too, ~8x corpus -> ~16x.
+    ;; Exact sizing is chosen either way: ~8x corpus is ample for recovery, and
+    ;; the capacity a rebuild leaves behind should state what the corpus IS
+    ;; rather than guess at future growth.  This is the one place that reasons
+    ;; about rebuild headroom against the reservation formula -- keep it in
+    ;; sync with %SEG-RESERVATION-FOR if the floor or multiplier ever change.
     ;;
     ;; CONSEQUENCE, accepted: a rebuild leaves live == capacity with an empty
     ;; free list, so the very next vector write does grow and relocate at once

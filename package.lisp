@@ -47,6 +47,16 @@
            #:vector-segment-capacity-exhausted
            #:vsce-owner #:vsce-slot #:vsce-required
            #:vsce-reserved #:vsce-needed-bytes
+           ;; The one knob that actually raises a segment's mmap reservation
+           ;; ceiling (see VECTOR-SEGMENT-CAPACITY-EXHAUSTED's report and
+           ;; %SEG-RESERVATION-FOR).  Exported so raising it before OPEN-GRAPH
+           ;; is a supported call, not the internal-symbol surgery
+           ;; (GRAPH-DB::*SEGMENT-MIN-RESERVATION*) it used to require;
+           ;; *MMAP-RESERVATION-MULTIPLIER* and *MMAP-MIN-RESERVATION*
+           ;; deliberately stay internal here -- they reach every mapped file
+           ;; in the graph (heap, indexes, linear hashes), not just segments,
+           ;; so exporting them is a broader API decision than this fix.
+           #:*segment-min-reservation*
            #:location
            #:schema
            #:indexes

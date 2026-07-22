@@ -338,9 +338,11 @@ floor and in-place growth stalled a few doublings later."
 
 (test segment-reservation-floor-on-reopen
   "A REOPENED segment gets the floor too.  OPEN-VECTOR-SEGMENT is a separate
-MMAP-FILE call site from CREATE-VECTOR-SEGMENT and is the one that originally
-passed no :RESERVATION at all -- which is the call site that matters, since a
-long-lived graph runs on reopened segments, not freshly created ones."
+MMAP-FILE call site from CREATE-VECTOR-SEGMENT; before *SEGMENT-MIN-RESERVATION*
+existed neither call site passed an explicit :RESERVATION at all (both just
+took MMAP-FILE's general default).  OPEN-VECTOR-SEGMENT is the call site that
+matters most in practice, since a long-lived graph runs on reopened segments,
+not freshly created ones."
   (let ((path (%seg-path)))
     (unwind-protect
          (progn
@@ -385,4 +387,47 @@ MMAP-FILE's own 1 GiB floor would dominate and mask the result."
                       (* 64 bytes) graph-db::*segment-min-reservation*
                       (graph-db::m-reserved-size (graph-db::segment-mmap s))))
              (close-vector-segment s)))
+      (ignore-errors (delete-file path)))))
+
+;;; ---------------------------------------------------------------------------
+;;; MMAP-FILE cleanup on a failed file-map (mmap.lisp).  Not segment-specific,
+;;; but it lives here because this change is what amplified the leak: a failed
+;;; open used to leak the whole reservation window -- *MMAP-MIN-RESERVATION*
+;;; (1 GiB) before this feature, now *SEGMENT-MIN-RESERVATION* (16 GiB, 16x
+;;; more) for a vector segment -- plus its fd, on every retry.
+;;; ---------------------------------------------------------------------------
+
+(test mmap-file-closes-fd-on-failed-file-map
+  "MMAP-FILE reserves the anonymous VA window, then maps the file over its
+head.  If that second mmap fails, the fd opened for the file must not be left
+open -- previously it was, on top of the anonymous window itself never being
+released.  Fault-injects the SECOND %POSIX-MMAP call (the file map; the first
+is the anonymous reservation) via an FDEFINITION swap -- same technique as
+tests/unique-constraint-tests.lisp -- so the failure is deterministic instead
+of relying on actually exhausting address space.  Verified directly: capture
+the exact fd MMAP-FILE was using when the injected failure hit, then try to
+close it again ourselves -- a second close on an fd MMAP-FILE already closed
+must fail (EBADF); succeeding would mean MMAP-FILE leaked it."
+  (let* ((path (%seg-path))
+         (call-count 0)
+         (captured-fd nil)
+         (orig (fdefinition 'graph-db::%posix-mmap)))
+    (unwind-protect
+         (progn
+           (setf (fdefinition 'graph-db::%posix-mmap)
+                 (lambda (addr length prot flags fd offset)
+                   (incf call-count)
+                   (if (= call-count 2)
+                       (progn (setf captured-fd fd)
+                              (error "injected file-map failure for the test"))
+                       (funcall orig addr length prot flags fd offset))))
+           (signals error (graph-db::mmap-file path :create-p t :size 4096))
+           (is (integerp captured-fd)
+               "fault injection never reached the file-map call -- test setup ~
+                is broken, not the code under test")
+           (is (minusp (graph-db::%posix-close captured-fd))
+               "MMAP-FILE leaked fd ~D on a failed file-map: closing it again ~
+                afterward succeeded, meaning MMAP-FILE never closed it"
+               captured-fd))
+      (setf (fdefinition 'graph-db::%posix-mmap) orig)
       (ignore-errors (delete-file path)))))

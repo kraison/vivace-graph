@@ -102,10 +102,21 @@ application's own config; graph-db does not read an ini file itself.")
 ;; does, the grow fails from inside APPLY-TRANSACTION.  There is at most one
 ;; segment per (vertex-type, slot), not 15-20 of them.
 ;;
-;; The floor costs nothing real: a reservation is PROT_NONE + MAP_NORESERVE
-;; anonymous address space -- no RAM, no disk, no commit charge -- and on 64-bit
-;; the address space it consumes is irrelevant.  At dimension 1024 (4,112 bytes
-;; per slot) a 16 GiB floor buys 4,177,983 slots.
+;; The floor costs nothing real to RAM, disk, or Linux commit charge: a
+;; reservation is PROT_NONE + MAP_NORESERVE anonymous address space, and on
+;; 64-bit the address space it consumes is irrelevant.  Exception: RLIMIT_AS /
+;; `ulimit -v` counts reserved address space regardless of MAP_NORESERVE, so a
+;; process capped by one (e.g. a systemd unit's LimitAS=, as on odm) can fail
+;; to open a graph outright even though nothing here is actually resident.
+;;
+;; At dimension 1024 (4,112 bytes per slot), capacity only ever advances by
+;; doubling (%SEG-GROW) from CREATE-VECTOR-SEGMENT's 1024 default, so real
+;; capacities are powers of two -- NOT the byte-exact 16 GiB / 4,112 =
+;; 4,177,983.  The largest power-of-two capacity whose file still fits under a
+;; 16 GiB floor is 2,097,152 (2^21, ~8.03 GiB of file): the next doubling,
+;; 4,194,304 (2^22), needs 17,246,978,112 bytes, over the 17,179,869,184-byte
+;; (16 GiB) floor.  A capacity-planning estimate must use the power-of-two
+;; number, not the byte-exact one.
 (defparameter *segment-min-reservation* (* 16 1024 1024 1024)
   "Floor, in bytes, for a VECTOR SEGMENT's virtual-address reservation.
 Overrides *MMAP-MIN-RESERVATION* for segment files only; the multiplier still

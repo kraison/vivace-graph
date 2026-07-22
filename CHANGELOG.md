@@ -33,8 +33,9 @@ between releases; cutting a release renames it to the new version and dates it.
   `vsce-needed-bytes`) signalled when applying a transaction would have to grow
   a vector segment past its mmap reservation. Its report says how to recover:
   reopen the graph (the reservation is recomputed from the file's current size
-  at open), or raise `*mmap-reservation-multiplier*` / `*mmap-min-reservation*`
-  before opening.
+  at open), or raise `*mmap-reservation-multiplier*` / `*segment-min-reservation*`
+  before opening (`*mmap-min-reservation*` does not apply to segment files —
+  see the "Changed" entry below).
 
 ### Fixed
 - **A vector segment could not grow past its mmap reservation without
@@ -62,16 +63,25 @@ between releases; cutting a release renames it to the new version and dates it.
   schema and the workload, and of which a graph has 15–20. A vector segment is
   the first mapped file whose size tracks the *corpus*, so it reached that
   ceiling far sooner (roughly once per 8× of growth), and hitting it aborts a
-  transaction. Both call sites now pass a reservation —
-  `create-vector-segment` and, the one that previously passed none at all,
-  `open-vector-segment` — computed as
+  transaction. Both call sites now pass an explicit reservation —
+  `create-vector-segment` and `open-vector-segment`, neither of which passed
+  one before (both simply took `mmap-file`'s general default) — computed as
   `max(*segment-min-reservation*, *mmap-reservation-multiplier* × size)`, so a
   segment already larger than `floor ÷ multiplier` still gets proportional
   headroom rather than being capped at the floor. A reservation is `PROT_NONE`
-  `MAP_NORESERVE` anonymous address space: no RAM, no disk, no commit charge, so
-  on 64-bit the larger floor costs nothing real. At dimension 1024 it buys
-  ~4.18M slots per segment. `vector-segment-capacity-exhausted` is unchanged and
-  still fires (pre-durability) if the floor is ever reached.
+  `MAP_NORESERVE` anonymous address space: no RAM, no disk, no Linux commit
+  charge, so on 64-bit the larger floor costs nothing real — except `RLIMIT_AS`
+  / `ulimit -v`, which counts reserved address space regardless of
+  `MAP_NORESERVE` and can make a graph fail to open under a capped process
+  (e.g. a systemd unit's `LimitAS=`). At dimension 1024, capacity only ever
+  advances by doubling, so the largest power-of-two capacity whose file still
+  fits under the 16 GiB floor is 2,097,152 slots, not the byte-exact
+  4,177,983 (the next doubling, 4,194,304, needs 17,246,978,112 bytes, over
+  the 17,179,869,184-byte floor). `vector-segment-capacity-exhausted` is
+  unchanged and still fires (pre-durability) if the floor is ever reached.
+  `*segment-min-reservation*` is exported — it is the one knob that actually
+  raises this ceiling, unlike `*mmap-min-reservation*`, which segment files
+  no longer consult.
 - **A missing vector-segment file is now rebuilt at open, not ignored.**
   `restore-vector-segments` used to skip a segment whose file was absent, so a
   graph whose segment file had been lost (or deleted by an operator expecting a
