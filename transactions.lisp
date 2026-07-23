@@ -199,10 +199,19 @@
     ;; covered by the transaction's own start-tx-id.
     (let ((standalone (not *read-pinned-p*)))
       (with-read-pin (graph)
-        (let ((node (lookup-node table id graph)))
-          (when (and standalone (node-p node))
-            (ensure-node-bytes node graph))
-          node))))
+        ;; Bind *GRAPH* to GRAPH so the vertex/edge value-deserializer
+        ;; (DESERIALIZE-VERTEX-HEAD / -EDGE-HEAD) resolves the stored type-id ->
+        ;; CLASS against THIS graph's schema, and the escape-materialization below
+        ;; reads THIS graph's heap -- even when LOOKUP-VERTEX is called with an
+        ;; explicit :GRAPH while ambient *GRAPH* is a different graph.  type-ids
+        ;; are per-graph, so without this a cross-graph read materializes the wrong
+        ;; class.  MAP-VERTICES / MAP-EDGES already bind *GRAPH* around their scans
+        ;; for exactly this reason; LOOKUP-OBJECT was the gap (issue #53, reachable).
+        (let ((*graph* graph))
+          (let ((node (lookup-node table id graph)))
+            (when (and standalone (node-p node))
+              (ensure-node-bytes node graph))
+            node)))))
   (:method (id table transaction (graph t))
     (let ((local-cache (local-cache transaction))
           (graph-cache (graph-cache transaction)))
@@ -210,7 +219,11 @@
         (if local
             local
             (let ((value (or (gethash id graph-cache)
-                             (lookup-node table id (graph transaction)))))
+                             ;; Same per-graph type-id resolution as the null-txn
+                             ;; method: bind *GRAPH* to the graph LOOKUP-NODE reads
+                             ;; so the value-deserializer picks the right schema.
+                             (let ((*graph* (graph transaction)))
+                               (lookup-node table id (graph transaction))))))
               (when value
                 ;; P4: resolve the version visible at this transaction's snapshot
                 ;; (commit-epoch < start-tx-id).  The resolved (possibly archived)
