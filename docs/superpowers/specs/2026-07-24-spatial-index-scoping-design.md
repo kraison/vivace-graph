@@ -2,7 +2,7 @@
 
 **Date:** 2026-07-24
 **Branch:** `experiment`
-**Status:** design approved, not yet implemented
+**Status:** IMPLEMENTED on `experiment` (8-task SDD run, commits `f77ed21`..`1396b2a`, unpushed/untagged as of 2026-07-24); awaiting the 3.0.0 release cut. Plan: `docs/superpowers/plans/2026-07-24-spatial-index-scoping.md`
 **Responds to:** `mine-action/docs/superpowers/specs/2026-07-24-vg-spatial-index-change-request.md`
 **Release impact:** **MAJOR** — breaking public API plus an on-disk format bump (3.0.0)
 
