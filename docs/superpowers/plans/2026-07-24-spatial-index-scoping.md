@@ -1543,7 +1543,8 @@ empty index returns NIL, which is a legitimate empty result and not a fault.
 
 Prolog gains find-within/3, find-intersects/3, find-near/5 and find-nearest/5.
 The old /2 and /4 arities are removed rather than left to signal, so a stale
-query fails at query-compile time with unknown-functor."
+query fails at goal entry with unknown-functor rather than binding against the wrong arity.
+(Not compile time: prologc.lisp emits the functor lookup as runtime code in the clause body.)"
 ```
 
 ---

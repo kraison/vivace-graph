@@ -269,7 +269,13 @@ That outer dedup is what lets the deferred CR-3.2 drop in unchanged.
 ```
 
 The old `/2` and `/4` forms are **removed** rather than left to signal, so a stale query fails at
-query-compile time with unknown-functor instead of at runtime inside a solution loop. The scope
+**goal entry** with unknown-functor, rather than binding against the wrong arity. Note this is
+*not* compile time: `prologc.lisp:198-212` emits the functor lookup as runtime code inside the
+clause body, so a stale query macroexpands and compiles cleanly and fails when the goal is first
+entered. (An earlier draft of this document claimed query-compile time; that was wrong, and it was
+a stated reason for removing the arities rather than leaving them to signal. Removal is still
+preferred — an unknown functor names the problem, where a surviving `/2` would silently bind a
+scope-shaped argument as an area.) The scope
 argument accepts the same three shapes; a test pins whether a literal list survives the Prolog
 compiler's argument handling. If it does not, Prolog scope is documented as symbol-or-`:all` and
 multi-class queries use a disjunction.
