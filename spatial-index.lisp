@@ -77,9 +77,11 @@ rebuild.  The rescan is 12 iterations and runs only on that transition."
 
 ;; On-disk sidecar format version.  v1 (unversioned) keyed the skip list by a bare
 ;; geohash string with the node-id as the value (DUPLICATE keys -> O(n) remove); v2
-;; keys by the composite (cell . node-id), duplicate-free.  RESTORE-SPATIAL-INDEX
-;; rebuilds a v1 index into v2 on open (a re-scan of node geometries).
-(alexandria:define-constant +spatial-index-format+ 2 :test '=)
+;; keys by the composite (cell . node-id), duplicate-free, one index per GRAPH; v3
+;; is one index per (declaring-class . geometry-slot), each with its own precision,
+;; insert cap and precision histogram.  A v1/v2 sidecar triggers an index-only
+;; re-derivation from live node geometries at open (RESTORE-SPATIAL-INDEX-ROOTS).
+(alexandria:define-constant +spatial-index-format+ 3 :test '=)
 
 ;; A bbox query covers its window with at most this many (coarse) cells, each of
 ;; which becomes ONE prefix range scan.  Bounding the covering set is what keeps a
@@ -120,13 +122,14 @@ it is fixed for the life of the index (see +SPATIAL-INSERT-MAX-CELLS+)."
                                              precision-counts)
   "Reopen the spatial index whose ordered map is rooted at ADDRESS in HEAP, with
 BACKEND's opener.  The caller must supply PRECISION and MAX-CELLS matching the
-values used at creation -- only the ordered map's format/address/precision/
-backend are persisted today (see GRAPH.LISP), so this constructor cannot check
-or recover them itself.  PRECISION-COUNTS is the histogram, if the caller has
-one to hand back in (a future sidecar format is expected to persist it
-alongside precision/max-cells); omitting it (the default) starts from an empty
-histogram, which leaves the coarsest-precision clamp unrestricted until enough
-inserts have run to populate it."
+values used at creation; this constructor cannot check or recover them itself.
+The v3 sidecar (SAVE-SPATIAL-INDEX-ROOTS in GRAPH.LISP) persists all four
+alongside the address, so OPEN-GRAPH always has them to hand.  PRECISION-COUNTS
+is the persisted histogram; omitting it (the default) starts from an empty one,
+which sets the coarsest-precision clamp to PRECISION -- the FINEST clamp, so a
+capped coarse entry already in the store would be silently unreachable.  That is
+why the histogram is persisted, and re-persisted whenever the coarsest occupied
+precision DROPS."
   (let ((idx (%make-spatial-index
               :skip-list (open-heap-index backend :address address :heap heap
                                           :comparison 'reduce-comp-lessp)

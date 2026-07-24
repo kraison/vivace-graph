@@ -327,6 +327,8 @@
            #:spatial-index-query-radius
            #:delete-spatial-index
            #:rebuild-spatial-indexes
+           #:regenerate-spatial-index
+           #:regenerate-spatial-indexes
            ;; write-path protocol (applications specialize this)
            #:node-geometry
            ;; subset replication (field devices)

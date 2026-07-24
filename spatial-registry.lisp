@@ -52,13 +52,22 @@ index.  The same seam MAKE-VIEW-SKIP-LIST provides for views -- it is what lets
 (defun %spatial-index-for (graph owner-name slot-name)
   "Get-or-create GRAPH's spatial index for (OWNER-NAME . SLOT-NAME).  This is the
 ONE place an index is created, so every maintenance path and every rebuild agree on
-its precision and cap."
+its precision and cap.
+
+A newly created index is persisted to the sidecar IMMEDIATELY, not just at close:
+its root address is stable for the life of the index, so recording it at creation
+costs one small write and means a crash before CLOSE-GRAPH still reopens the index
+by address rather than orphaning it (SAVE-SPATIAL-INDEX-ROOTS is a no-op on a
+memory-graph, whose in-RAM indexes have no address to record)."
   (let ((reg (spatial-indexes graph))
         (key (cons owner-name slot-name)))
     (or (gethash key reg)
-        (setf (gethash key reg)
-              (make-graph-spatial-index
-               graph :precision (%spatial-precision-for graph owner-name slot-name))))))
+        (let ((idx (make-graph-spatial-index
+                    graph
+                    :precision (%spatial-precision-for graph owner-name slot-name))))
+          (setf (gethash key reg) idx)
+          (save-spatial-index-roots graph)
+          idx))))
 
 (defun all-spatial-indexes (graph)
   "Every spatial index GRAPH currently holds."

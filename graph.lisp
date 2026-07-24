@@ -7,12 +7,95 @@
                 rebuild-secondary-indexes save-secondary-index-roots
                 restore-secondary-index-roots install-secondary-indexes
                 ;; spatial-query.lisp / spatial-registry.lisp (both load later)
-                rebuild-spatial-indexes))
+                rebuild-spatial-indexes report-degraded-spatial-indexes))
 
-;; NB: there is no spatial sidecar in this increment.  The graph's single spatial
-;; index became a per-(owner . slot) REGISTRY (spatial-registry.lisp), and both
-;; MAKE-GRAPH and OPEN-GRAPH populate it with REBUILD-SPATIAL-INDEXES.  Per-index
-;; persistence (spatial-indexes.dat + migration) lands in the next increment.
+;;; ---------------------------------------------------------------------------
+;;; Spatial index persistence -- the v3 sidecar.
+;;;
+;;; One index per (declaring-class . geometry-slot) (spatial-registry.lisp), each
+;;; a heap-backed ordered map in the graph's INDEXES memory.  Their root addresses
+;;; are persisted to spatial-indexes.dat, exactly as views, :unique and the general
+;;; ordered indexes persist theirs, so OPEN-GRAPH REOPENS them by address instead
+;;; of allocating fresh ones.
+;;;
+;;; This is not merely a speed-up.  GC-HEAP sweeps heap.dat only; nothing ever
+;;; reclaims indexes.dat.  An open that allocated fresh ordered maps ORPHANED the
+;;; previous run's with no root address left to free them by, so the indexes region
+;;; grew without bound -- a megabyte per open on a few hundred polygons -- until it
+;;; was exhausted.  Reopening by address is what closes that.
+;;; ---------------------------------------------------------------------------
+
+(defun spatial-indexes-root-file (location)
+  (format nil "~A/spatial-indexes.dat" location))
+
+(defun spatial-index-root-file (location)
+  "The PRE-v3 single-index sidecar.  Its presence with no spatial-indexes.dat is
+the migration signal; it is never written any more, and is left in place rather
+than renamed -- the old RESTORE-SPATIAL-INDEX treats a missing file as an EMPTY
+index rather than a rebuild, so renaming would make a downgrade fail silently.
+Downgrade after migration is unsupported either way."
+  (format nil "~A/spatial-index.root" location))
+
+(defun save-spatial-index-roots (graph)
+  "Persist every spatial index's root, precision, backend, insert cap and precision
+histogram.  Called at CLOSE-GRAPH, at index creation, and whenever an index's
+COARSEST-PRECISION decreases (§7.2: losing that decrease would reopen with a
+too-fine clamp and silently miss; losing an increase merely over-covers).
+
+No-op on a graph with no INDEXES heap -- a memory-graph, whose indexes are in-RAM
+mem-skip-lists with no heap address to persist.  Its spatial registry rides the
+checkpoint image instead."
+  (when (and (indexes graph) (spatial-indexes graph))
+    (let ((roots '()))
+      (maphash (lambda (key idx)
+                 ;; Only a heap-backed ordered map has an address; skip anything
+                 ;; else rather than signalling, so a hybrid graph still closes.
+                 (when (view-index-p (spatial-index-skip-list idx))
+                   (push (list (car key) (cdr key)
+                               (spatial-index-address idx)
+                               (spatial-index-precision idx)
+                               (spatial-index-backend idx)
+                               (spatial-index-max-cells idx)
+                               (copy-seq (spatial-index-precision-counts idx)))
+                         roots)))
+               (spatial-indexes graph))
+      (cl-store:store (list :format +spatial-index-format+ :indexes roots)
+                      (spatial-indexes-root-file (location graph)))))
+  nil)
+
+(defun restore-spatial-index-roots (graph)
+  "Reopen the spatial indexes from the v3 sidecar -- no node scan.  Returns T when
+one was present and current, NIL to fall back to REBUILD-SPATIAL-INDEXES (a fresh
+graph, a pre-v3 graph, a crash before any root was written, or a sidecar too
+damaged to read).  No-op returning NIL on a graph with no INDEXES heap.
+
+An UNREADABLE sidecar falls back rather than propagating.  Unlike the unique and
+secondary sidecars -- written only at CLOSE-GRAPH -- this one is also written at
+index creation and on a coarsening, i.e. from inside a commit, so a crash CAN tear
+it; and the nodes remain authoritative, so a rebuild always reconstructs the truth.
+Refusing to open a graph whose node data is entirely intact would be the wrong
+trade.  Only the read is guarded: a well-formed sidecar whose RECORDS are
+malformed still signals, because that is a code defect, not a torn write."
+  (let ((file (and (indexes graph) (spatial-indexes-root-file (location graph)))))
+    (when (and file (probe-file file))
+      (destructuring-bind (&key format indexes &allow-other-keys)
+          (handler-case (cl-store:restore file)
+            (error (e)
+              (warn "Spatial index sidecar ~A is unreadable (~A); re-deriving the ~
+                     indexes from live node geometries, which are authoritative."
+                    file e)
+              nil))
+        (when (eql format +spatial-index-format+)
+          (dolist (r indexes)
+            (destructuring-bind (owner slot address precision backend max-cells
+                                 &optional counts)
+                r
+              (setf (gethash (cons owner slot) (spatial-indexes graph))
+                    (open-spatial-index (indexes graph) address
+                                        :precision precision :backend backend
+                                        :max-cells max-cells
+                                        :precision-counts counts))))
+          t)))))
 
 (defun all-node-classes-with-vector-index-slots (graph)
   "The node classes of GRAPH that declare at least one :VECTOR-INDEX slot.  Note
@@ -193,9 +276,11 @@ Keyword arguments:
                           initial sizes (bytes) of the heap and indexes regions
                           (default *DEFAULT-HEAP-SIZE* / *DEFAULT-INDEX-SIZE*).
                           Both grow on demand, so these are only starting sizes.
-  :SPATIAL-PRECISION      geohash precision of the spatial index grid (default 7,
-                          ~150 m cells; 9 ~ 5 m).  Persisted with the index and
-                          read back on OPEN-GRAPH.  See Chapter 13.
+  :SPATIAL-PRECISION      default geohash precision of the spatial index grids
+                          (default 7, ~150 m cells; 9 ~ 5 m).  Each index persists
+                          its own precision in spatial-indexes.dat and reopens at
+                          it, so this is the value NEW indexes are created with.
+                          See Chapter 13.
   :INDEX-BACKEND          ordered-map engine for this graph's heap-backed indexes
                           (views, :unique, spatial): :SKIP-LIST (default) or
                           :BPLUS-TREE (mmap B+ tree -- better cold-cache locality,
@@ -286,6 +371,7 @@ to disk and remove it."
         (update-schema graph)
         (setf (graph-default-spatial-precision graph) (or spatial-precision 7))
         (rebuild-spatial-indexes graph)
+        (save-spatial-index-roots graph)
         (with-open-file (out dirty-file :direction :output)
           (format out "~S" (get-universal-time)))
         (setf (gethash name *graphs*) graph))
@@ -339,11 +425,11 @@ to disk and remove it."
                    export-predicate device-registry merge-policy
                    reference-classes (peer-schema-version '(1 0))
                    (index-backend *index-backend*)
-                   ;; Geohash precision for the spatial indexes this open rebuilds.
-                   ;; MAKE-GRAPH takes the same keyword; until the per-index sidecar
-                   ;; lands (next increment) the precision is not persisted, so a
-                   ;; graph created with a non-default precision must be reopened
-                   ;; with the same value.
+                   ;; Default geohash precision for spatial indexes CREATED on this
+                   ;; graph (MAKE-GRAPH takes the same keyword).  Existing indexes
+                   ;; reopen at their own persisted precision from the v3 sidecar,
+                   ;; so this governs only indexes created after the open -- and,
+                   ;; for a pre-v3 graph, the ones its migration re-derives.
                    (spatial-precision 7))
   "Open the existing graph named NAME whose files live under directory
 LOCATION, register it, and return it.  Use this to reopen a graph created
@@ -438,7 +524,20 @@ Always CLOSE-GRAPH when finished."
         (when regenerate-views
           (regenerate-all-views graph))
         (setf (graph-default-spatial-precision graph) (or spatial-precision 7))
-        (rebuild-spatial-indexes graph)
+        ;; Spatial indexes: reopen from the v3 sidecar by root address (no node
+        ;; scan, and -- critically -- no fresh allocation orphaning last run's
+        ;; ordered maps in a region GC-HEAP never sweeps).
+        (if (restore-spatial-index-roots graph)
+            (report-degraded-spatial-indexes graph)
+            (progn
+              ;; No current sidecar: a fresh graph, or a pre-v3 one whose single
+              ;; index must be re-derived per (owner . slot).  Index only -- node
+              ;; data is untouched and nothing is re-fetched.
+              (when (probe-file (spatial-index-root-file (location graph)))
+                (log:info "Spatial index sidecar is pre-v3; re-deriving per-class ~
+                           indexes from live node geometries (index only)."))
+              (rebuild-spatial-indexes graph)
+              (save-spatial-index-roots graph)))
         ;; Vector segments (Phase 2 step 6): reopen-or-rebuild, same story as
         ;; the spatial index.  Runs after UPDATE-SCHEMA so node classes are
         ;; instantiated/finalized, and before the graph starts taking writes.
@@ -510,6 +609,10 @@ in place, forcing recovery on the next OPEN-GRAPH."
     ;; heap is still open, so OPEN can reopen them without a scan.  No-op on memory.
     (save-unique-index-roots graph)
     (save-secondary-index-roots graph)
+    ;; Spatial indexes (v3 sidecar): the addresses are already durable from
+    ;; creation, but the precision histogram is only in RAM, so this close is
+    ;; what makes the coarsest-precision clamp survive the reopen intact.
+    (save-spatial-index-roots graph)
     (when snapshot-p
       (log:info "Snapshotting ~A" graph)
       (snapshot graph))

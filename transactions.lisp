@@ -982,6 +982,8 @@ declarative :INDEX slot when you want scoping.")
 ;; MOP helpers and the memory-graph backend).  Same idiom as graph.lisp's
 ;; declaim for the unique/secondary index functions.
 (declaim (ftype (function (t t t) t) %spatial-index-for spatial-index-for))
+;; SAVE-SPATIAL-INDEX-ROOTS is in graph.lisp; declared for the same reason.
+(declaim (ftype (function (t) t) save-spatial-index-roots))
 
 (defun %spatial-index-node (graph node)
   "Insert NODE into the index its geometry slot selects.  No-op without geometry.
@@ -1003,13 +1005,26 @@ class-scopeable."
         ;; itself sees a bare node-id -- so the warning is emitted here.
         (let ((after (spatial-index-coarsest-precision idx)))
           (when (< after before)
+            ;; §7.2: persist the DECREASE immediately.  The histogram lives in RAM
+            ;; between closes, and losing a decrease to a crash would reopen the
+            ;; index with a clamp FINER than cells it actually holds -- a silent
+            ;; miss.  (Losing an increase merely over-covers, so only the decrease
+            ;; is worth a write.)
+            (save-spatial-index-roots graph)
             (multiple-value-bind (mnl mnt mxl mxt) (geometry-bbox geom)
-              (warn "Spatial index ~S.~S coarsened to precision ~D (was ~D) for ~
-                     node ~S, bbox (~,4F ~,4F ~,4F ~,4F).  Queries on this index ~
-                     now cover more coarsely.  Removing every node stored at that ~
-                     precision restores it automatically (a per-index regenerate ~
-                     lands with spatial index persistence -- Task 3)."
-                    owner slot after before (id node) mnl mnt mxl mxt))))))))
+              ;; Report REQUESTED vs GRANTED (§7.4): naming only the previous
+              ;; coarsest would tell an operator "coarsened to 4 (was 5)" on a
+              ;; second coarsening and never reveal that the index was CONFIGURED
+              ;; at 7 -- the number they need to judge how far selectivity has
+              ;; fallen and what a regenerate would restore.
+              (warn "Spatial index ~S.~S coarsened to precision ~D (configured ~D; ~
+                     previously ~D) for node ~S, bbox (~,4F ~,4F ~,4F ~,4F).  ~
+                     Queries on this index now cover at precision ~D.  Removing ~
+                     every node stored at that precision restores it automatically ~
+                     (the clamp is self-healing), or call ~
+                     (REGENERATE-SPATIAL-INDEX graph '~S '~S)."
+                    owner slot after (spatial-index-precision idx) before
+                    (id node) mnl mnt mxl mxt after owner slot))))))))
 
 (defun %spatial-unindex-node (graph node)
   "Remove NODE from the index its geometry slot selects.  No-op without geometry,

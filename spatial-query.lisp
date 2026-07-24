@@ -20,6 +20,10 @@
 (declaim (ftype (function (t t) t) %resolve-spatial-scope %scope-admits-p))
 (declaim (ftype (function (t) t) all-spatial-indexes))
 (declaim (ftype (function (t t t) t) %spatial-index-for))
+;; Forward reference: SAVE-SPATIAL-INDEX-ROOTS lives in graph.lisp, which loads
+;; before this file but does not depend on it (and vice versa) -- declared for the
+;; same reason graph.lisp declares REBUILD-SPATIAL-INDEXES.
+(declaim (ftype (function (t) t) save-spatial-index-roots))
 
 (defun %node-by-id (id graph)
   "Resolve a spatial-index id (uuid bytes) to its live node, or NIL."
@@ -205,6 +209,31 @@ area of operations, plus all non-spatial nodes."
           (multiple-value-bind (lat lon) (%geometry-rep-point geom)
             (geometry-contains-point-p area lon lat))))))
 
+(defun report-degraded-spatial-indexes (graph)
+  "Warn ONCE PER INDEX whose coarsest occupied precision is below the precision it
+was configured with -- i.e. an oversized geometry has capped its insert cover and
+widened every query's covering clamp (§7.2).
+
+%SPATIAL-INDEX-NODE warns at the moment of the coarsening, but that warning fires
+on the transition only, and no rebuild path routes through it.  Without this, an
+index that comes back up still degraded -- through a reopen from the sidecar, or a
+rebuild -- would be silent forever after that one original warning.  Emitted per
+INDEX, never per node: a rebuild must not produce a warning storm."
+  (when (spatial-indexes graph)
+    (maphash (lambda (key idx)
+               (let ((configured (spatial-index-precision idx))
+                     (coarsest (spatial-index-coarsest-precision idx)))
+                 (when (< coarsest configured)
+                   (warn "Spatial index ~S.~S is DEGRADED: configured precision ~D, ~
+                          but cells are stored as coarsely as ~D, so every query on ~
+                          it covers at precision ~D.  Delete the oversized ~
+                          geometries (the clamp is self-healing) or call ~
+                          (REGENERATE-SPATIAL-INDEX graph '~S '~S)."
+                         (car key) (cdr key) configured coarsest coarsest
+                         (car key) (cdr key)))))
+             (spatial-indexes graph)))
+  nil)
+
 (defun rebuild-spatial-indexes (graph)
   "Rebuild GRAPH's spatial indexes from scratch: drop every current index, then
 re-index each live node into the (owner . slot) index its geometry slot selects.
@@ -237,4 +266,54 @@ graph is quiescent -- analogous to REGENERATE-VIEW."
                      (incf count))))))
         (map-vertices #'reindex graph)
         (map-edges #'reindex graph))
+      (report-degraded-spatial-indexes graph)
       count)))
+
+(defun regenerate-spatial-index (graph owner-name slot-name)
+  "Drop and rebuild ONE spatial index, re-deriving its precision histogram from
+live nodes.  This is the manual recovery for an index whose selectivity was
+degraded by an oversized insert (§7.2) -- reach for this rather than
+REGENERATE-SPATIAL-INDEXES, which rebuilds every index in the graph.  Returns the
+number of nodes indexed."
+  (with-recursive-lock-held ((txn-lock graph))
+    ;; Bind *GRAPH*: NODE-GEOMETRY reads slots, and a node read that falls back to
+    ;; the dynamic current graph must resolve in GRAPH (the wrong-graph bug class).
+    (let ((*graph* graph)
+          (key (cons owner-name slot-name)))
+      (let ((old (gethash key (spatial-indexes graph))))
+        ;; Only a heap-backed ordered map owns storage that must be freed; a
+        ;; memory-graph's in-RAM index is simply dropped with the registry entry.
+        (when (and old (view-index-p (spatial-index-skip-list old)))
+          (delete-spatial-index old)))
+      (remhash key (spatial-indexes graph))
+      (let ((count 0))
+        (flet ((reindex (node)
+                 (unless (deleted-p node)
+                   (multiple-value-bind (geom slot) (node-geometry node)
+                     (when (and geom (eq slot slot-name)
+                                (eq (%indexed-slot-owner-name (class-of node) slot)
+                                    owner-name))
+                       (spatial-index-insert
+                        (%spatial-index-for graph owner-name slot-name)
+                        (id node) geom)
+                       (incf count))))))
+          ;; OWNER-NAME is the DECLARING class, and its subclasses share the index,
+          ;; so the typed scan must include them -- MAP-VERTICES/MAP-EDGES do by
+          ;; default.  FIND-CLASS guards SUBTYPEP against a name that no longer
+          ;; designates a class (a sidecar entry whose class was never redefined in
+          ;; this image); the vertex scan then simply finds nothing.
+          (let ((class (find-class owner-name nil)))
+            (if (and class (subtypep class 'edge))
+                (map-edges #'reindex graph :edge-type owner-name)
+                (map-vertices #'reindex graph :vertex-type owner-name))))
+        (save-spatial-index-roots graph)
+        (report-degraded-spatial-indexes graph)
+        count))))
+
+(defun regenerate-spatial-indexes (graph)
+  "Drop every spatial index and rebuild it on GRAPH's CURRENT :INDEX-BACKEND,
+persisting the new roots.  The parallel of REGENERATE-ALL-VIEWS /
+REGENERATE-SECONDARY-INDEXES for an in-place backend switch."
+  (rebuild-spatial-indexes graph)
+  (save-spatial-index-roots graph)
+  graph)

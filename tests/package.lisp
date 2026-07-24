@@ -71,6 +71,8 @@
                 #:spatial-index-query-radius
                 #:delete-spatial-index
                 #:rebuild-spatial-indexes
+                #:regenerate-spatial-index
+                #:regenerate-spatial-indexes
                 ;; index-backed spatial queries (spatial extension)
                 #:find-nodes-within
                 #:find-nodes-intersecting
