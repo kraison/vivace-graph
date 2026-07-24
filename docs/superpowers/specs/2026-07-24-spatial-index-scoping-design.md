@@ -234,6 +234,14 @@ matches `index-lookup` and `map-index`. A required positional argument makes eve
 - class `C` → for each of `C`'s geometry-index slot names (MOP `:index` slots plus any applicable
   `def-spatial-index` spec), resolve the owner with `%indexed-slot-owner-name`, collect
   `(owner . slot)`
+- class `C` with an **application-supplied `node-geometry` method** → `(method-owner . NIL)`.
+  Overriding `node-geometry` is a documented extension point (`example.lisp`), and such a method
+  returns a computed geometry with no slot name, so there is no `(owner . slot)` key to derive.
+  These classes are indexed under a NIL slot and are **scopeable by name like any other** — leaving
+  them reachable only through `:all` would push a documented feature onto exactly the unscoped
+  query this design forbids. The method owner is resolved most-general-first, mirroring
+  `%indexed-slot-owner-name`, so a method on a parent gives its subclasses one shared index rather
+  than scattering them per-subclass
 - a list → the union of each element's keys
 - `:all` → every key in the registry
 
@@ -248,8 +256,8 @@ That outer dedup is what lets the deferred CR-3.2 drop in unchanged.
 
 **Error contract**, reusing `%require-index`'s shape (`index.lisp:471`):
 
-- scope names a class with **no** geometry-index slot declared → **signal**. A programming error,
-  and the reason the scope is required
+- scope names a class with **no geometry at all** — neither an `:index`-marked geometry slot nor a
+  `node-geometry` method → **signal**. A programming error, and the reason the scope is required
 - declared, but the index holds no entries yet → return `NIL`. A legitimately empty result must not
   look like a bug
 

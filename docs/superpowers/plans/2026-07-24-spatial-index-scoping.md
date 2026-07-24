@@ -1204,17 +1204,37 @@ every A point, and scoping to B returns no A nodes."
       (is (= 2 (length (find-nodes-within '(scope-probe scope-zone) window :graph g))))
       (is (= 2 (length (find-nodes-within :all window :graph g)))))))
 
+;; A vertex with no geometry of any kind -- neither an :INDEX-marked geometry
+;; slot nor a NODE-GEOMETRY method.  This, not GEO-PLACE, is what "not a spatial
+;; class" means: GEO-PLACE overrides NODE-GEOMETRY and IS scopeable.
+(def-vertex scope-aspatial ()
+  ((label :type string))
+  :graph-db-integration-test)
+
 (test unscoped-class-signals-declared-empty-returns-nil
-  "A class with no geometry-index slot signals; a declared-but-empty one is NIL."
+  "A class with no geometry at all signals; a declared-but-empty one is NIL."
   (with-test-graph (g)
     (with-transaction ()
       (make-scope-probe :geom (make-point 37.1724d0 49.2020d0)))
     (let ((window (scope-rect 22.0d0 44.0d0 41.0d0 53.0d0)))
-      ;; GEO-PLACE (spatial-hook-tests) has a hand-written NODE-GEOMETRY method
-      ;; and NO :index-marked geometry slot -- not scopeable.
-      (signals error (find-nodes-within 'geo-place window :graph g))
+      (signals error (find-nodes-within 'scope-aspatial window :graph g))
       ;; SCOPE-ZONE is declared but nothing was written: empty, not an error.
       (is (null (find-nodes-within 'scope-zone window :graph g))))))
+
+(test custom-node-geometry-classes-are-scopeable
+  "Overriding NODE-GEOMETRY is a documented extension point, so such a class is
+scopeable by name -- not reachable only through :ALL.  GEO-PLACE (defined in
+spatial-hook-tests.lisp) has a hand-written method and no :INDEX-marked slot."
+  (with-test-graph (g)
+    (with-transaction ()
+      (make-geo-place :loc (make-point 37.1724d0 49.2020d0))
+      (make-scope-probe :geom (make-point 37.1730d0 49.2025d0)))
+    (let ((window (scope-rect 37.0d0 49.0d0 37.5d0 49.5d0)))
+      (let ((places (find-nodes-within 'geo-place window :graph g)))
+        (is (= 1 (length places)))
+        (is (every #'geo-place-p places)))
+      ;; ...and scoping to the slot-declared class still excludes it.
+      (is (every #'scope-probe-p (find-nodes-within 'scope-probe window :graph g))))))
 ```
 
 - [ ] **Step 2: Run to verify failure**
@@ -1230,13 +1250,43 @@ Expected: FAIL — `invalid number of arguments` from `find-nodes-within`.
 `%do-scoped-candidates` and `%scope-admits-p` already exist from Task 2 and do **not** change. Add `%class-geometry-slots-declared-p` to `spatial-registry.lisp`, and **replace** Task 2's `:ALL`-only `%resolve-spatial-scope` stub with the full version:
 
 ```lisp
+(defun %node-geometry-method-owner-name (class)
+  "The most general class carrying an applicable application-supplied
+NODE-GEOMETRY method, or NIL when the class relies on the default method.
+
+Overriding NODE-GEOMETRY is a documented extension point (see example.lisp): the
+method returns a computed geometry and NO slot name, so such a class is indexed
+under the key (OWNER . NIL).  This resolves OWNER the same way
+%INDEXED-SLOT-OWNER-NAME resolves a slot's -- most general first -- so a method
+defined on a parent gives its subclasses ONE shared index, exactly as an :INDEX
+slot on a parent does.  Keying on each node's own class instead would scatter a
+hierarchy across per-subclass indexes and make a scope on the parent miss them.
+
+Use the repo's existing MOP idiom for GENERIC-FUNCTION-METHODS /
+METHOD-SPECIALIZERS and verify it on SBCL, ECL and CCL.  The two built-in methods
+specialize on T and on NODE; only something more specific counts as custom."
+  (let ((owner nil))
+    (dolist (m (generic-function-methods #'node-geometry) owner)
+      (let ((spec (first (method-specializers m))))
+        (when (and (typep spec 'class)
+                   (not (member (class-name spec) '(t node)))
+                   (subtypep (class-name class) (class-name spec))
+                   (or (null owner) (subtypep owner (class-name spec))))
+          (setf owner (class-name spec)))))))
+
 (defun %class-geometry-slots-declared-p (class-name)
-  "True when CLASS-NAME declares at least one :INDEX-marked slot -- i.e. it is a
-scopeable spatial class.  Distinguishes a declared-but-empty index (a legitimate
-empty result) from a class that is not spatially indexed at all (an error)."
+  "True when CLASS-NAME is a scopeable spatial class: it declares at least one
+:INDEX-marked slot, OR it carries an application-supplied NODE-GEOMETRY method.
+
+Both are first-class ways to be spatially indexed, so both must be scopeable --
+otherwise overriding NODE-GEOMETRY would leave a class reachable only through
+:ALL, which is the unscoped query this task exists to forbid.  Distinguishes a
+declared-but-empty index (a legitimate empty result) from a class that is not
+spatially indexed at all (an error)."
   (let ((class (ignore-errors (find-class class-name nil))))
     (and class (class-finalized-p class)
-         (node-geometry-index-slots class)
+         (or (node-geometry-index-slots class)
+             (%node-geometry-method-owner-name class))
          t)))
 
 (defun %resolve-spatial-scope (scope graph)
@@ -1268,6 +1318,38 @@ programming error, and catching it is the reason the scope is required."
                 (when idx (push idx indexes))))))
         (values indexes names))))
 ```
+
+- [ ] **Step 3b: Route the NIL-slot (custom `node-geometry`) case through the method owner**
+
+Task 2 keys a custom-`node-geometry` node as `(%indexed-slot-owner-name (class-of node) NIL . NIL)`, which resolves to the node's **own** class — so a hierarchy scatters across per-subclass indexes and a scope on the parent misses its subclasses' nodes. Now that such classes are scopeable, the owner must mirror the slot rule. In `transactions.lisp`, in both `%spatial-index-node` and `%spatial-unindex-node`, resolve the owner as:
+
+```lisp
+(if slot
+    (%indexed-slot-owner-name (class-of node) slot)
+    (%node-geometry-method-owner-name (class-of node)))
+```
+
+and in `spatial-registry.lisp`, make `class-spatial-index-keys` return the `(owner . NIL)` key for a class with a custom method:
+
+```lisp
+(defun class-spatial-index-keys (class graph)
+  "The (OWNER-NAME . SLOT-NAME) keys covering CLASS's geometry.  Each :INDEX-marked
+slot resolves to the most general node-class declaring it, so a slot on a mixin
+yields ONE key shared by every subclass.  A class with an application-supplied
+NODE-GEOMETRY method instead yields (METHOD-OWNER . NIL), resolved by the same
+most-general rule."
+  (declare (ignorable graph))
+  (when (class-finalized-p class)
+    (let ((slot-keys (loop for slot-name in (node-geometry-index-slots class)
+                           collect (cons (%indexed-slot-owner-name class slot-name)
+                                         slot-name)))
+          (method-owner (%node-geometry-method-owner-name class)))
+      (if method-owner
+          (cons (cons method-owner nil) slot-keys)
+          slot-keys))))
+```
+
+There is no persistence before Task 3 and every open rebuilds, so re-keying costs nothing here.
 
 - [ ] **Step 4: Add the scope parameter to the entry points**
 
