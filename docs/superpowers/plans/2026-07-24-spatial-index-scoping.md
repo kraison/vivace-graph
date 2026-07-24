@@ -289,8 +289,11 @@ value is unused (NIL)."
     (dolist (cell (%geometry-cells geom (spatial-index-precision idx)
                                    (spatial-index-max-cells idx))
                   node-id)
-      (add-to-skip-list sl (list cell node-id) nil)
-      (%count-cell idx cell))))
+      ;; Count what the STORE actually gained, not what we attempted: every
+      ;; backend returns NIL for a duplicate-key no-op.  The histogram must track
+      ;; physical entries or it drifts out of step with the store.
+      (when (add-to-skip-list sl (list cell node-id) nil)
+        (%count-cell idx cell)))))
 
 (defun spatial-index-remove (idx node-id geom)
   "Remove NODE-ID's entries for GEOM (using the same cells INSERT produced).
@@ -299,8 +302,16 @@ duplicate-free path."
   (let ((sl (spatial-index-skip-list idx)))
     (dolist (cell (%geometry-cells geom (spatial-index-precision idx)
                                    (spatial-index-max-cells idx)))
-      (remove-from-skip-list sl (list cell node-id))
-      (%uncount-cell idx cell))))
+      ;; Gate on the actual removal.  Removing an entry that is not there is a
+      ;; supported no-op in this engine (apply-peer-purge is documented idempotent;
+      ;; recover-transactions re-applies unmarked .txn files after a crash), and an
+      ;; unconditional decrement on such a call drives the histogram BELOW the
+      ;; store.  That reports COARSEST-PRECISION finer than reality, which makes
+      ;; every query cover past the coarse keys still physically present -- nodes
+      ;; vanish silently and the self-heal rescan cannot recover, because it reads
+      ;; the same corrupted histogram.
+      (when (remove-from-skip-list sl (list cell node-id))
+        (%uncount-cell idx cell)))))
 ```
 
 - [ ] **Step 6: Clamp the query**
