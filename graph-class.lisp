@@ -31,7 +31,24 @@
    (vev-index :accessor vev-index :initarg :vev-index)
    (vertex-index :accessor vertex-index :initarg :vertex-index)
    (edge-index :accessor edge-index :initarg :edge-index)
-   (spatial-index :accessor spatial-index :initarg :spatial-index :initform nil)
+   ;; Spatial indexes: (owner-class-name . slot-name) -> SPATIAL-INDEX.  One index
+   ;; per DECLARING class per geometry slot, exactly like SECONDARY-INDEXES and
+   ;; VECTOR-SEGMENTS below.  Created LAZILY on first geometry-valued insert (an
+   ;; :INDEX slot that never holds a geometry creates nothing), so a declared-but-
+   ;; unpopulated slot costs nothing.  SYNCHRONIZED for the same reason
+   ;; VECTOR-SEGMENTS is: query threads GETHASH here while the apply path may be
+   ;; creating an index.
+   (spatial-indexes :accessor spatial-indexes :initarg :spatial-indexes
+                    :initform
+                    #+ccl (make-hash-table :test 'equal :shared t)
+                    #+lispworks (make-hash-table :test 'equal :single-thread nil)
+                    #+ecl (make-hash-table :test 'equal)
+                    #+sbcl (make-hash-table :test 'equal :synchronized t))
+   ;; Default geohash precision for spatial indexes created on this graph
+   ;; (MAKE-GRAPH / OPEN-GRAPH :spatial-precision).  Per-index overrides are
+   ;; layered on top; see spatial-registry.lisp.
+   (default-spatial-precision :accessor graph-default-spatial-precision
+                              :initarg :default-spatial-precision :initform 7)
    ;; Which ordered-map backend NEW heap-backed indexes (views, :unique, spatial)
    ;; on THIS graph are built with: :SKIP-LIST or :BPLUS-TREE.  Defaults to the
    ;; global *INDEX-BACKEND* at creation; overridable per graph via MAKE-GRAPH /

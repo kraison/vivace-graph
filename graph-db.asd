@@ -98,7 +98,13 @@
                (:file "traverse" :depends-on ("interface"))
                (:file "memory-graph" :depends-on ("traverse" "transactions" "graph" "mem-skip-list"))
                (:file "unique-constraint" :depends-on ("traverse" "transactions" "graph" "memory-graph" "node-class" "schema"))
-               (:file "index" :depends-on ("unique-constraint" "spatial-query" "interface"))))
+               (:file "index" :depends-on ("unique-constraint" "spatial-query" "interface"))
+               ;; The per-(owner . slot) spatial index registry.  Loaded LAST so it
+               ;; can see the MOP helpers (node-class), the graph, the memory-graph
+               ;; backend and the ordered-index factory; TRANSACTIONS.LISP,
+               ;; GRAPH.LISP and SPATIAL-QUERY.LISP reach it through DECLAIM FTYPE
+               ;; forward declarations.
+               (:file "spatial-registry" :depends-on ("index"))))
 
 ;; REPLICATION: core + the usocket network transport, but NO HTTP server.  This is
 ;; the master/slave + hub/peer replication layer -- transaction-streaming (usocket
@@ -377,6 +383,7 @@
                (:file "spatial-hook-tests")
                (:file "spatial-query-tests")
                (:file "spatial-intersect-tests")
+               (:file "spatial-scope-tests")
                (:file "subset-replication-tests")
                (:file "peer-lamport-tests")
                (:file "peer-merge-tests")

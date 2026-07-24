@@ -365,13 +365,13 @@ from spatial-hook-tests.)"
         (let ((g2 (make-graph *integration-graph-name* p2 :buffer-pool-size 1000)))
           (unwind-protect
                (let ((*graph* g2))
-                 ;; the fresh graph's index is empty before replay
-                 (is (null (spatial-index-query-bbox (spatial-index g2)
-                                                     37.16d0 49.19d0 37.19d0 49.21d0))
-                     "fresh graph has an empty spatial index")
+                 ;; the fresh graph has no spatial index at all before replay
+                 ;; (indexes are created lazily, on the first geometry write)
+                 (is (null (all-spatial-indexes g2))
+                     "fresh graph has no spatial index yet")
                  (graph-db:replay g2 (merge-pathnames "txn-log/" dir1) :graph-db/test)
                  ;; after replay the Kharkiv place is spatially indexed; Lviv is elsewhere
-                 (let ((cands (spatial-index-query-bbox (spatial-index g2)
+                 (let ((cands (spatial-index-query-bbox (spatial-index-for g2 'geo-place nil)
                                                         37.16d0 49.19d0 37.19d0 49.21d0)))
                    (is (member kh-id cands :test 'equalp) "Kharkiv place re-indexed by replay")
                    (is (not (member lv-id cands :test 'equalp)) "Lviv place outside the window"))

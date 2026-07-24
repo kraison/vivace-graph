@@ -64,7 +64,7 @@
                 #:mark-deleted
                 #:map-vertices
                 #:node-geometry
-                #:spatial-index
+                #:all-spatial-indexes
                 #:find-nodes-intersecting
                 #:find-nodes-within
                 #:find-nodes-near

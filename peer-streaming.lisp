@@ -1029,10 +1029,7 @@ the existence/id of purged (undisclosed) work (design §7)."
      (remove-from-views graph node)
      (lhash-remove (edge-table graph) (id node)))
     (vertex
-     (let ((idx (spatial-index graph)))
-       (when idx
-         (let ((geom (node-geometry node)))
-           (when geom (spatial-index-remove idx (id node) geom)))))
+     (%spatial-unindex-node graph node)
      (remove-from-type-index node graph)
      (remove-from-views graph node)
      (lhash-remove (vertex-table graph) (id node))))

@@ -51,7 +51,11 @@
                 #:geohash-neighbor
                 #:geohash-neighbors
                 ;; spatial index (spatial extension)
-                #:spatial-index            ; graph slot accessor
+                #:spatial-indexes          ; graph registry: (owner . slot) -> index
+                #:spatial-index-for        ; one index, or NIL if not created yet
+                #:all-spatial-indexes
+                #:class-spatial-index-keys
+                #:graph-default-spatial-precision
                 #:node-geometry            ; write-path indexing protocol
                 #:make-spatial-index
                 #:open-spatial-index
@@ -66,9 +70,7 @@
                 #:spatial-index-query-bbox
                 #:spatial-index-query-radius
                 #:delete-spatial-index
-                #:rebuild-spatial-index
-                ;; index lifecycle helpers (graph.lisp) for rebuild tests
-                #:init-spatial-index
+                #:rebuild-spatial-indexes
                 ;; index-backed spatial queries (spatial extension)
                 #:find-nodes-within
                 #:find-nodes-intersecting

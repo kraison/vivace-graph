@@ -308,7 +308,11 @@
            #:geohash-neighbor
            #:geohash-neighbors
            ;; spatial index
-           #:spatial-index
+           #:spatial-indexes
+           #:spatial-index-for
+           #:all-spatial-indexes
+           #:class-spatial-index-keys
+           #:graph-default-spatial-precision
            #:spatial-index-p
            #:make-spatial-index
            #:open-spatial-index
@@ -322,7 +326,7 @@
            #:spatial-index-query-bbox
            #:spatial-index-query-radius
            #:delete-spatial-index
-           #:rebuild-spatial-index
+           #:rebuild-spatial-indexes
            ;; write-path protocol (applications specialize this)
            #:node-geometry
            ;; subset replication (field devices)

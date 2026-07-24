@@ -39,18 +39,8 @@ hash-test (the ordered map keys by LESS-THAN, not a hash)."
 ;;; Per-class descriptors (MOP introspection over the :INDEX slot option)
 ;;; ---------------------------------------------------------------------------
 
-(defun %indexed-slot-owner-name (class slot-name)
-  "The most-general node-class in CLASS's precedence list that declares SLOT-NAME as
-an :INDEX direct slot -- the cross-subtype index owner (an :INDEX slot on a parent is
-one shared index across its subclasses)."
-  (let ((owner (loop for c in (reverse (class-precedence-list class))
-                     when (and (typep c 'node-class)
-                               (find-if (lambda (ds)
-                                          (and (eq (slot-definition-name ds) slot-name)
-                                               (indexed-p ds)))
-                                        (class-direct-slots c)))
-                     return c)))
-    (class-name (or owner class))))
+;; %INDEXED-SLOT-OWNER-NAME lives in node-class.lisp (it is shared with the
+;; spatial maintenance path in transactions.lisp, which loads before this file).
 
 (defun class-indexed-slots (class)
   "List of (SLOT-NAME OWNER-NAME SPEC) for CLASS's :INDEX effective slots; NIL for a

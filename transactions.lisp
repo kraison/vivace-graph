@@ -955,45 +955,91 @@ never a per-subclass one -- mirroring :UNIQUE / :INDEX exactly."
 
 (defgeneric node-geometry (node)
   (:documentation
-   "The GEOMETRY a node occupies, or NIL if it has none.  By default this is the
-value of the node's :INDEX-marked geometry slot (see NODE-GEOMETRY-INDEX-SLOTS);
-declaring (slot :type geometry :index t) is enough to make a node type spatially
-indexed.  Applications may instead specialize this method (e.g. for a computed
-geometry); an explicit method takes precedence over the default.")
+   "The GEOMETRY a node occupies and the slot it came from, as (values geometry
+slot-name), or (values nil nil).  By default the geometry is the value of the
+node's :INDEX-marked geometry slot (see NODE-GEOMETRY-INDEX-SLOTS); declaring
+ (slot :type geometry :index t) is enough to make a node type spatially indexed.
+Applications may instead specialize this method (e.g. for a computed geometry);
+an explicit method takes precedence over the default.  A specializing method that
+returns only ONE value reports no slot: such a node is still indexed (under its
+own class, slot NIL) but is not reachable by a class-scoped query -- prefer the
+declarative :INDEX slot when you want scoping.")
   (:method (node) (declare (ignore node)) nil)
   (:method ((node node))
     ;; NB: do NOT gate on SLOT-BOUNDP -- node-class persistent slots are read
     ;; through SLOT-VALUE-USING-CLASS from the serialized buffer, and
     ;; SLOT-BOUNDP reports the (always-unbound) backing CLOS slot, so it would
     ;; skip every persistent slot.  Read the value and test it directly.
+    ;; Returns (values GEOMETRY SLOT-NAME): the slot is what selects the node's
+    ;; spatial index, and it is chosen PER NODE, so two instances of one class
+    ;; can legitimately land in different indexes when different slots are bound.
     (loop for slot in (node-geometry-index-slots (class-of node))
           for v = (ignore-errors (slot-value node slot))
-          when (geometryp v) return v)))
+          when (geometryp v) return (values v slot))))
+
+;; Forward reference: %SPATIAL-INDEX-FOR / SPATIAL-INDEX-FOR live in
+;; spatial-registry.lisp, which loads after this file (it needs the graph, the
+;; MOP helpers and the memory-graph backend).  Same idiom as graph.lisp's
+;; declaim for the unique/secondary index functions.
+(declaim (ftype (function (t t t) t) %spatial-index-for spatial-index-for))
+
+(defun %spatial-index-node (graph node)
+  "Insert NODE into the index its geometry slot selects.  No-op without geometry.
+
+A node whose geometry came from a declared :INDEX slot is keyed by (OWNER . SLOT);
+one reported by an application's own NODE-GEOMETRY method has no slot, and
+%INDEXED-SLOT-OWNER-NAME then falls back to the node's own class, so it is keyed
+by (CLASS . NIL) -- still indexed and still symmetrically removable, just not
+class-scopeable."
+  (multiple-value-bind (geom slot) (node-geometry node)
+    (when (and geom (not (deleted-p node)))
+      (let* ((owner (%indexed-slot-owner-name (class-of node) slot))
+             (idx (%spatial-index-for graph owner slot))
+             (before (spatial-index-coarsest-precision idx)))
+        (spatial-index-insert idx (id node) geom)
+        ;; §7.4: an insert whose cover was capped can LOWER the index's coarsest
+        ;; occupied precision, which widens every subsequent query's covering
+        ;; clamp.  Only this layer can name the node responsible -- the index
+        ;; itself sees a bare node-id -- so the warning is emitted here.
+        (let ((after (spatial-index-coarsest-precision idx)))
+          (when (< after before)
+            (multiple-value-bind (mnl mnt mxl mxt) (geometry-bbox geom)
+              (warn "Spatial index ~S.~S coarsened to precision ~D (was ~D) for ~
+                     node ~S, bbox (~,4F ~,4F ~,4F ~,4F).  Queries on this index ~
+                     now cover more coarsely.  Removing every node stored at that ~
+                     precision restores it automatically (a per-index regenerate ~
+                     lands with spatial index persistence -- Task 3)."
+                    owner slot after before (id node) mnl mnt mxl mxt))))))))
+
+(defun %spatial-unindex-node (graph node)
+  "Remove NODE from the index its geometry slot selects.  No-op without geometry,
+and no-op when that index does not exist (nothing was ever written)."
+  (multiple-value-bind (geom slot) (node-geometry node)
+    (when geom
+      (let* ((owner (%indexed-slot-owner-name (class-of node) slot))
+             (idx (spatial-index-for graph owner slot)))
+        (when idx
+          (let ((before (spatial-index-coarsest-precision idx)))
+            (spatial-index-remove idx (id node) geom)
+            ;; Symmetric to the warning above: the clamp is self-healing, so note
+            ;; when removing this node gave the index its selectivity back.
+            (let ((after (spatial-index-coarsest-precision idx)))
+              (when (> after before)
+                (log:info "Spatial index ~S.~S recovered to precision ~D (was ~D) ~
+after removing node ~S." owner slot after before (id node))))))))))
 
 (defgeneric apply-tx-write-to-spatial-index (write graph)
   (:method (write graph) (declare (ignore write graph)) nil))
 
 (defmethod apply-tx-write-to-spatial-index ((write tx-create) graph)
-  (let ((node (node write)) (idx (spatial-index graph)))
-    (when idx
-      (let ((geom (node-geometry node)))
-        (when (and geom (not (deleted-p node)))
-          (spatial-index-insert idx (id node) geom))))))
+  (%spatial-index-node graph (node write)))
 
 (defmethod apply-tx-write-to-spatial-index ((write tx-update) graph)
-  (let ((new-node (node write)) (old-node (old-node write)) (idx (spatial-index graph)))
-    (when idx
-      (let ((old-geom (node-geometry old-node))
-            (new-geom (node-geometry new-node)))
-        (when old-geom (spatial-index-remove idx (id old-node) old-geom))
-        (when (and new-geom (not (deleted-p new-node)))
-          (spatial-index-insert idx (id new-node) new-geom))))))
+  (%spatial-unindex-node graph (old-node write))
+  (%spatial-index-node graph (node write)))
 
 (defmethod apply-tx-write-to-spatial-index ((write tx-delete) graph)
-  (let ((node (node write)) (idx (spatial-index graph)))
-    (when idx
-      (let ((geom (node-geometry node)))
-        (when geom (spatial-index-remove idx (id node) geom))))))
+  (%spatial-unindex-node graph (node write)))
 
 (defgeneric apply-tx-writes-to-spatial-index (writes graph)
   (:method (writes graph)

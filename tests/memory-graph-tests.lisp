@@ -176,13 +176,13 @@ is rebuilt on reopen."
             (make-m-place :label "lviv"    :geom (graph-db::make-point 24.0d0 49.8d0))
             (make-m-place :label "london"  :geom (graph-db::make-point -0.1d0 51.5d0)))
           (let ((hits (graph-db::spatial-index-query-bbox
-                       (graph-db::spatial-index g) 22.0d0 48.0d0 40.0d0 51.0d0)))
+                       (graph-db::spatial-index-for g 'm-place 'geom) 22.0d0 48.0d0 40.0d0 51.0d0)))
             (is (= 2 (length hits)))))
         (close-graph g :snapshot-p t))
       (let ((g2 (graph-db::open-memory-graph *mem-test-graph-name* loc)))
         (unwind-protect
              (let ((hits (graph-db::spatial-index-query-bbox
-                          (graph-db::spatial-index g2) 22.0d0 48.0d0 40.0d0 51.0d0)))
+                          (graph-db::spatial-index-for g2 'm-place 'geom) 22.0d0 48.0d0 40.0d0 51.0d0)))
                (is (= 2 (length hits))))
           (ignore-errors (close-graph g2 :snapshot-p nil))
           (collect-garbage))))))
@@ -456,7 +456,7 @@ access."
                (is (= 1 (length (incoming-edges (lookup-vertex b)))))
                ;; spatial bbox (restored structurally; hit id -> materialize)
                (is (= 1 (length (graph-db::spatial-index-query-bbox
-                                 (graph-db::spatial-index g2) 22.0d0 48.0d0 40.0d0 51.0d0))))
+                                 (graph-db::spatial-index-for g2 'm-place 'geom) 22.0d0 48.0d0 40.0d0 51.0d0))))
                ;; reduce view (decade 3 = Ann + Bo = 2), no node materialization
                (is (equal '((3 . 2))
                           (map-reduced-view (lambda (k id v) (declare (ignore id)) (cons k v))

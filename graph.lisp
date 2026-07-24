@@ -5,43 +5,14 @@
 (declaim (ftype (function (t) t)
                 rebuild-unique-indexes save-unique-index-roots restore-unique-index-roots
                 rebuild-secondary-indexes save-secondary-index-roots
-                restore-secondary-index-roots install-secondary-indexes))
+                restore-secondary-index-roots install-secondary-indexes
+                ;; spatial-query.lisp / spatial-registry.lisp (both load later)
+                rebuild-spatial-indexes))
 
-(defun spatial-index-root-file (location)
-  (format nil "~A/spatial-index.root" location))
-
-(defun init-spatial-index (graph &key (precision 7))
-  "Create GRAPH's spatial index (at geohash PRECISION) in its indexes heap and
-persist the skip-list root pointer + precision to a sidecar file (mirrors how
-views persist their pointer).  PRECISION is read back by RESTORE-SPATIAL-INDEX."
-  (let ((idx (make-spatial-index (indexes graph) :precision precision
-                                 :backend (graph-index-backend graph))))
-    (setf (spatial-index graph) idx)
-    (cl-store:store (list :format +spatial-index-format+
-                          :address (spatial-index-address idx)
-                          :precision (spatial-index-precision idx)
-                          ;; backend tag -> RESTORE reopens with the right opener
-                          :backend (spatial-index-backend idx))
-                    (spatial-index-root-file (location graph)))
-    idx))
-
-(defun restore-spatial-index (graph)
-  "Reopen GRAPH's spatial index from its root sidecar.  A sidecar written in the
-older on-disk format (v1: bare-string keys, duplicate cells), or a graph that
-predates the spatial index, is rebuilt from live node geometries into the current
-composite-key format (RESTORE runs after the node tables are open)."
-  (let ((file (spatial-index-root-file (location graph))))
-    (if (probe-file file)
-        (destructuring-bind (&key address precision format (backend :skip-list)
-                             &allow-other-keys)
-            (cl-store:restore file)
-          (if (eql format +spatial-index-format+)
-              (setf (spatial-index graph)
-                    (open-spatial-index (indexes graph) address :precision (or precision 7)
-                                        :backend backend))
-              ;; v1 / unversioned on disk -> rebuild into v2 (drops old, re-scans nodes).
-              (rebuild-spatial-index graph :precision (or precision 7))))
-        (init-spatial-index graph))))
+;; NB: there is no spatial sidecar in this increment.  The graph's single spatial
+;; index became a per-(owner . slot) REGISTRY (spatial-registry.lisp), and both
+;; MAKE-GRAPH and OPEN-GRAPH populate it with REBUILD-SPATIAL-INDEXES.  Per-index
+;; persistence (spatial-indexes.dat + migration) lands in the next increment.
 
 (defun all-node-classes-with-vector-index-slots (graph)
   "The node classes of GRAPH that declare at least one :VECTOR-INDEX slot.  Note
@@ -313,7 +284,8 @@ to disk and remove it."
         ;; def-vertex/def-edge :keep-revisions).  Set before update-schema persists.
         (setf (schema-keep-revisions (schema graph)) keep-revisions)
         (update-schema graph)
-        (init-spatial-index graph :precision spatial-precision)
+        (setf (graph-default-spatial-precision graph) (or spatial-precision 7))
+        (rebuild-spatial-indexes graph)
         (with-open-file (out dirty-file :direction :output)
           (format out "~S" (get-universal-time)))
         (setf (gethash name *graphs*) graph))
@@ -366,7 +338,13 @@ to disk and remove it."
                    peer-role origin-id peer-host
                    export-predicate device-registry merge-policy
                    reference-classes (peer-schema-version '(1 0))
-                   (index-backend *index-backend*))
+                   (index-backend *index-backend*)
+                   ;; Geohash precision for the spatial indexes this open rebuilds.
+                   ;; MAKE-GRAPH takes the same keyword; until the per-index sidecar
+                   ;; lands (next increment) the precision is not persisted, so a
+                   ;; graph created with a non-default precision must be reopened
+                   ;; with the same value.
+                   (spatial-precision 7))
   "Open the existing graph named NAME whose files live under directory
 LOCATION, register it, and return it.  Use this to reopen a graph created
 earlier with MAKE-GRAPH; the keyword arguments mirror MAKE-GRAPH's.
@@ -459,7 +437,8 @@ Always CLOSE-GRAPH when finished."
         (install-views graph)
         (when regenerate-views
           (regenerate-all-views graph))
-        (restore-spatial-index graph)
+        (setf (graph-default-spatial-precision graph) (or spatial-precision 7))
+        (rebuild-spatial-indexes graph)
         ;; Vector segments (Phase 2 step 6): reopen-or-rebuild, same story as
         ;; the spatial index.  Runs after UPDATE-SCHEMA so node classes are
         ;; instantiated/finalized, and before the graph starts taking writes.

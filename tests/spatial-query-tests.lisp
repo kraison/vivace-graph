@@ -124,17 +124,22 @@ must likewise survive a continent-sized window."
       (is (member idb ids :test 'equalp))
       (is (not (member idfar ids :test 'equalp))))))
 
-;;; ---- rebuild-spatial-index ---------------------------------------------
+;;; ---- rebuild-spatial-indexes -------------------------------------------
+
+;; GEO-PLACE has a hand-written NODE-GEOMETRY method and no :INDEX slot, so its
+;; nodes are keyed by (GEO-PLACE . NIL) -- see %SPATIAL-INDEX-NODE.
+(defun q-place-index (g)
+  (spatial-index-for g 'geo-place nil))
 
 (test rebuild-repopulates-after-index-loss
-  "Wiping the index then rebuilding from the nodes restores query results."
+  "Wiping the registry then rebuilding from the nodes restores query results."
   (with-three-places (g ida idb idfar)
-    ;; simulate a lost/empty index: drop it and create a fresh empty one
-    (delete-spatial-index (spatial-index g))
-    (init-spatial-index g)
+    ;; simulate a lost/empty index: drop every index and clear the registry
+    (dolist (idx (all-spatial-indexes g)) (delete-spatial-index idx))
+    (clrhash (spatial-indexes g))
     (is (null (find-nodes-near (second *q-a*) (first *q-a*) 600d0 :graph g))
         "index is empty after the wipe")
-    (let ((n (rebuild-spatial-index g)))
+    (let ((n (rebuild-spatial-indexes g)))
       (is (= n 3) "all three geometry-bearing nodes re-indexed")
       (let ((nodes (mapcar #'car (find-nodes-near (second *q-a*) (first *q-a*) 600d0 :graph g))))
         (is (has-id-p ida nodes))
@@ -142,12 +147,14 @@ must likewise survive a continent-sized window."
         (is (not (has-id-p idfar nodes)))))))
 
 (test rebuild-changes-precision
-  "rebuild-spatial-index :precision changes the grid and keeps results correct."
+  "Changing the graph's default precision and rebuilding changes the grid and
+keeps results correct."
   (with-three-places (g ida idb idfar)
     (declare (ignore idb idfar))
-    (is (= 7 (spatial-index-precision (spatial-index g))))
-    (rebuild-spatial-index g :precision 9)
-    (is (= 9 (spatial-index-precision (spatial-index g))))
+    (is (= 7 (spatial-index-precision (q-place-index g))))
+    (setf (graph-default-spatial-precision g) 9)
+    (rebuild-spatial-indexes g)
+    (is (= 9 (spatial-index-precision (q-place-index g))))
     (is (has-id-p ida (mapcar #'car (find-nodes-near (second *q-a*) (first *q-a*) 600d0 :graph g))))))
 
 ;;; ---- kNN (find-nearest-k) ----------------------------------------------

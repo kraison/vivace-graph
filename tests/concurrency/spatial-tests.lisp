@@ -48,7 +48,8 @@
 (defun idx-count (g box)
   "Number of DISTINCT node ids the spatial index returns for BOX."
   (length (remove-duplicates
-           (apply #'spatial-index-query-bbox (spatial-index g) box)
+           (loop for idx in (all-spatial-indexes g)
+                 append (apply #'spatial-index-query-bbox idx box))
            :test 'equalp)))
 
 (defun live-place-count (g)

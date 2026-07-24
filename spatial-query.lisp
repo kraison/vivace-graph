@@ -13,6 +13,14 @@
 ;;; so they compose with graph traversal in a query, e.g.:
 ;;;   (select-flat (?f) (is-a ?f eo-find) (find-near ?f 49.20 37.17 500.0))
 
+;; Forward references: the (owner . slot) registry lives in spatial-registry.lisp,
+;; which loads after this file (it needs the MOP helpers, the graph and the
+;; memory-graph backend).  Same idiom graph.lisp uses for the unique/secondary
+;; index functions.
+(declaim (ftype (function (t t) t) %resolve-spatial-scope %scope-admits-p))
+(declaim (ftype (function (t) t) all-spatial-indexes))
+(declaim (ftype (function (t t t) t) %spatial-index-for))
+
 (defun %node-by-id (id graph)
   "Resolve a spatial-index id (uuid bytes) to its live node, or NIL."
   (or (lookup-vertex id :graph graph)
@@ -38,51 +46,72 @@ historical behaviour), so results are unchanged when the add-on is absent."
           (multiple-value-bind (lat lon) (%geometry-rep-point geom)
             (geometry-contains-point-p area lon lat)))))
 
+(defmacro %do-scoped-candidates ((node-var scope graph &key bbox radius) &body body)
+  "Run BODY with NODE-VAR bound to each live, scope-admitted node whose id came
+back from every index in SCOPE.  Dedups by node id across indexes, so a node
+reachable through two of its own slot-indexes is visited once."
+  (let ((indexes (gensym "IX")) (types (gensym "TY")) (seen (gensym "SEEN"))
+        (idx (gensym "I")) (id (gensym "ID")))
+    `(multiple-value-bind (,indexes ,types) (%resolve-spatial-scope ,scope ,graph)
+       (let ((,seen (make-hash-table :test 'equalp)))
+         (dolist (,idx ,indexes)
+           (dolist (,id ,(if bbox
+                             `(destructuring-bind (mnl mnt mxl mxt) ,bbox
+                                (spatial-index-query-bbox ,idx mnl mnt mxl mxt))
+                             `(destructuring-bind (lat lon r) ,radius
+                                (spatial-index-query-radius ,idx lat lon r))))
+             (unless (gethash ,id ,seen)
+               (setf (gethash ,id ,seen) t)
+               (let ((,node-var (%node-by-id ,id ,graph)))
+                 (when (and ,node-var (not (deleted-p ,node-var))
+                            (%scope-admits-p ,node-var ,types))
+                   ,@body)))))))))
+
 (defun find-nodes-within (area &key (graph *graph*))
   "List of live nodes whose geometry lies within AREA (a :POLYGON or
 :MULTIPOLYGON geometry).  A :POINT node is judged exactly; an extended-geometry
 node is judged exactly when graph-db/geos is loaded, otherwise by its
-representative point (bbox centre)."
-  (let ((idx (spatial-index graph)) (result '()))
-    (when (and idx (geometryp area))
+representative point (bbox centre).
+
+TRANSITIONAL: scoped to :ALL, which reproduces the single-index behaviour this
+replaced.  A required scope argument lands in the next increment, and changes only
+this lambda list and %RESOLVE-SPATIAL-SCOPE -- not the loop below."
+  (let ((result '()))
+    (when (geometryp area)
       (multiple-value-bind (min-lon min-lat max-lon max-lat) (geometry-bbox area)
-        (dolist (id (spatial-index-query-bbox idx min-lon min-lat max-lon max-lat))
-          (let ((node (%node-by-id id graph)))
-            (when (and node (not (deleted-p node)))
-              (let ((geom (node-geometry node)))
-                (when (and geom (%node-within-area-p area geom))
-                  (push node result))))))))
+        (%do-scoped-candidates (node :all graph
+                                :bbox (list min-lon min-lat max-lon max-lat))
+          (let ((geom (node-geometry node)))
+            (when (and geom (%node-within-area-p area geom))
+              (push node result))))))
     (nreverse result)))
 
 (defun find-nodes-intersecting (area &key (graph *graph*))
   "List of live nodes whose geometry INTERSECTS AREA (any geometry kind).  Exact
 with the graph-db/geos add-on; without it, extended-geometry candidates use a
 COARSE bounding-box overlap test (point candidates are always exact)."
-  (let ((idx (spatial-index graph)) (result '()))
-    (when (and idx (geometryp area))
+  (let ((result '()))
+    (when (geometryp area)
       (multiple-value-bind (min-lon min-lat max-lon max-lat) (geometry-bbox area)
-        (dolist (id (spatial-index-query-bbox idx min-lon min-lat max-lon max-lat))
-          (let ((node (%node-by-id id graph)))
-            (when (and node (not (deleted-p node)))
-              (let ((geom (node-geometry node)))
-                (when (and geom (geometry-intersects-p area geom))
-                  (push node result))))))))
+        (%do-scoped-candidates (node :all graph
+                                :bbox (list min-lon min-lat max-lon max-lat))
+          (let ((geom (node-geometry node)))
+            (when (and geom (geometry-intersects-p area geom))
+              (push node result))))))
     (nreverse result)))
 
 (defun find-nodes-near (lat lon radius &key (graph *graph*))
   "List of (NODE . DISTANCE-METRES) for live nodes within RADIUS of (LAT, LON),
 nearest first."
-  (let ((idx (spatial-index graph)) (result '()))
-    (when (and idx (numberp lat) (numberp lon) (numberp radius))
-      (dolist (id (spatial-index-query-radius idx lat lon radius))
-        (let ((node (%node-by-id id graph)))
-          (when (and node (not (deleted-p node)))
-            (let ((geom (node-geometry node)))
-              (when geom
-                (multiple-value-bind (nlat nlon) (%geometry-rep-point geom)
-                  (let ((d (geodesic-distance lat lon nlat nlon)))
-                    (when (<= d radius)
-                      (push (cons node d) result))))))))))
+  (let ((result '()))
+    (when (and (numberp lat) (numberp lon) (numberp radius))
+      (%do-scoped-candidates (node :all graph :radius (list lat lon radius))
+        (let ((geom (node-geometry node)))
+          (when geom
+            (multiple-value-bind (nlat nlon) (%geometry-rep-point geom)
+              (let ((d (geodesic-distance lat lon nlat nlon)))
+                (when (<= d radius)
+                  (push (cons node d) result))))))))
     (sort result #'< :key #'cdr)))
 
 (def-global-prolog-functor find-within/2 (?node ?area cont)
@@ -134,9 +163,14 @@ MAX-RADIUS\".  Each widening re-runs the window query, whose cost grows with the
 number of indexed nodes the window encloses (the bbox query covers a window with
 a bounded set of coarse cells and range-scans them, so empty space is free);
 widen MAX-RADIUS only if you accept scanning the larger candidate set."
-  (let ((idx (spatial-index graph)))
-    (when (and idx (numberp lat) (numberp lon) (integerp k) (plusp k))
-      (let* ((prec (spatial-index-precision idx))
+  (let ((indexes (%resolve-spatial-scope :all graph)))
+    (when (and indexes (numberp lat) (numberp lon) (integerp k) (plusp k))
+      ;; Seed off the FINEST precision in scope: seeding from a coarse index would
+      ;; make the very first widening an enormous sweep.
+      ;; (LOOP MAXIMIZE, not REDUCE :KEY -- ANSI leaves it unspecified whether
+      ;; REDUCE applies :KEY to a one-element sequence, and one index is the
+      ;; common case.)
+      (let* ((prec (loop for i in indexes maximize (spatial-index-precision i)))
              ;; seed radius: the index cell's latitude extent in metres
              (r (max 1d0 (* (nth-value 1 (geohash-cell-size prec)) 111320d0)))
              (found '()))
@@ -171,30 +205,36 @@ area of operations, plus all non-spatial nodes."
           (multiple-value-bind (lat lon) (%geometry-rep-point geom)
             (geometry-contains-point-p area lon lat))))))
 
-(defun rebuild-spatial-index (graph &key precision)
-  "Rebuild GRAPH's spatial index from scratch: drop the current index, create a
-fresh one, and re-index every live node that has a NODE-GEOMETRY.  Returns the
-number of nodes indexed.
+(defun rebuild-spatial-indexes (graph)
+  "Rebuild GRAPH's spatial indexes from scratch: drop every current index, then
+re-index each live node into the (owner . slot) index its geometry slot selects.
+Returns the number of nodes indexed.
 
-Use this to change the grid PRECISION (otherwise the current precision is kept),
-to adopt the index on a graph that predates the spatial extension, or to repair
-it.  It mutates the index directly (outside the transaction write path), so run
-it when the graph is quiescent -- analogous to REGENERATE-VIEW."
-  (let ((prec (or precision
-                  (and (spatial-index-p (spatial-index graph))
-                       (spatial-index-precision (spatial-index graph)))
-                  7)))
-    (with-recursive-lock-held ((txn-lock graph))
-      (when (spatial-index-p (spatial-index graph))
-        (delete-spatial-index (spatial-index graph)))
-      (init-spatial-index graph :precision prec)   ; fresh index + persisted sidecar
-      (let ((idx (spatial-index graph)) (count 0))
-        (flet ((reindex (node)
-                 (unless (deleted-p node)
-                   (let ((geom (node-geometry node)))
-                     (when geom
-                       (spatial-index-insert idx (id node) geom)
-                       (incf count))))))
-          (map-vertices (lambda (v) (reindex v)) graph)
-          (map-edges (lambda (e) (reindex e)) graph))
-        count))))
+Use this to adopt the per-class scheme on a graph that predates it, to change grid
+precision (set GRAPH-DEFAULT-SPATIAL-PRECISION first), or to repair.  It mutates
+the indexes directly (outside the transaction write path), so run it when the
+graph is quiescent -- analogous to REGENERATE-VIEW."
+  (with-recursive-lock-held ((txn-lock graph))
+    ;; Bind *GRAPH*: NODE-GEOMETRY reads slots, and a node read that falls back to
+    ;; the dynamic current graph must resolve in GRAPH, not in whatever the caller
+    ;; happened to have current (the wrong-graph bug class).
+    (let ((*graph* graph)
+          (count 0))
+      (dolist (idx (all-spatial-indexes graph))
+        ;; Only a heap-backed ordered map owns storage that must be freed; a
+        ;; memory-graph's in-RAM index is simply dropped with the registry entry.
+        (when (view-index-p (spatial-index-skip-list idx))
+          (delete-spatial-index idx)))
+      (clrhash (spatial-indexes graph))
+      (flet ((reindex (node)
+               (unless (deleted-p node)
+                 (multiple-value-bind (geom slot) (node-geometry node)
+                   (when geom
+                     (spatial-index-insert
+                      (%spatial-index-for
+                       graph (%indexed-slot-owner-name (class-of node) slot) slot)
+                      (id node) geom)
+                     (incf count))))))
+        (map-vertices #'reindex graph)
+        (map-edges #'reindex graph))
+      count)))

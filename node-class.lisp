@@ -139,6 +139,21 @@
                                                   (and vi (vector-index-p vi))))))
     slot))
 
+(defun %indexed-slot-owner-name (class slot-name)
+  "The most-general node-class in CLASS's precedence list that declares SLOT-NAME as
+an :INDEX direct slot -- the cross-subtype index owner (an :INDEX slot on a parent is
+one shared index across its subclasses).  Lives here rather than in index.lisp so both
+the general ordered index and the spatial index can reach it: index.lisp loads after
+transactions.lisp, which needs this on the spatial maintenance path."
+  (let ((owner (loop for c in (reverse (class-precedence-list class))
+                     when (and (typep c 'node-class)
+                               (find-if (lambda (ds)
+                                          (and (eq (slot-definition-name ds) slot-name)
+                                               (indexed-p ds)))
+                                        (class-direct-slots c)))
+                     return c)))
+    (class-name (or owner class))))
+
 (defmethod find-all-subclasses ((class class))
   ;;(log:debug "Finding subclasses for ~A" class)
   (let ((result nil))

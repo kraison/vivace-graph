@@ -30,7 +30,9 @@
 (defparameter *lviv-box*    '(23.70d0 50.00d0 23.75d0 50.05d0))
 
 (defun in-box-p (g id box)
-  (member id (apply #'spatial-index-query-bbox (spatial-index g) box) :test 'equalp))
+  (member id (loop for idx in (all-spatial-indexes g)
+                   append (apply #'spatial-index-query-bbox idx box))
+          :test 'equalp))
 
 (test create-indexes-node
   "Committing a geometry-bearing node indexes it automatically."
