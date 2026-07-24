@@ -58,7 +58,15 @@ A newly created index is persisted to the sidecar IMMEDIATELY, not just at close
 its root address is stable for the life of the index, so recording it at creation
 costs one small write and means a crash before CLOSE-GRAPH still reopens the index
 by address rather than orphaning it (SAVE-SPATIAL-INDEX-ROOTS is a no-op on a
-memory-graph, whose in-RAM indexes have no address to record)."
+memory-graph, whose in-RAM indexes have no address to record).
+
+Exception: while *SPATIAL-REBUILD-IN-PROGRESS* is bound (REBUILD-SPATIAL-INDEXES /
+REGENERATE-SPATIAL-INDEX), this per-creation save is a no-op -- the caller is
+already bracketing the whole multi-index operation with its own :COMPLETE NIL /
+:COMPLETE T saves, and a save here would both be redundant (K extra sidecar writes
+for K indexes recreated) and wrong: an intermediate :COMPLETE T write partway
+through the rebuild would defeat the very bracket that makes a crash safe to
+re-derive from."
   (let ((reg (spatial-indexes graph))
         (key (cons owner-name slot-name)))
     (or (gethash key reg)
@@ -66,7 +74,8 @@ memory-graph, whose in-RAM indexes have no address to record)."
                     graph
                     :precision (%spatial-precision-for graph owner-name slot-name))))
           (setf (gethash key reg) idx)
-          (save-spatial-index-roots graph)
+          (unless *spatial-rebuild-in-progress*
+            (save-spatial-index-roots graph))
           idx))))
 
 (defun all-spatial-indexes (graph)

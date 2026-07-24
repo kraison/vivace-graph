@@ -344,3 +344,110 @@ resolves to no registered type at all should."
         (is (= 0 count))
         (is (null warnings)
             "SCOPE-ZONE is a registered type; no live nodes is not a diagnostic")))))
+
+;;; ---------------------------------------------------------------------------
+;;; Fix round 2: an incomplete v3 sidecar (a rebuild that crashed partway
+;;; through) must not be trusted.  6e1462b closed the freed-root window by
+;;; having REBUILD-SPATIAL-INDEXES persist the now-empty registry immediately
+;;; after CLRHASH -- correct for that purpose, but it means a rebuild that
+;;; crashes BEFORE recreating every index now leaves a readable, well-formed,
+;;; INCOMPLETE sidecar: the next open trusted it, returned T, and left whichever
+;;; index the crash never reached silently unindexed forever.
+;;; ---------------------------------------------------------------------------
+
+(test crash-mid-rebuild-forces-a-full-rederive
+  "REBUILD-SPATIAL-INDEXES marks the sidecar :COMPLETE NIL before reindexing and
+:COMPLETE T only once every index is back in place.  A crash in between -- here,
+after index A (SCOPE-PROBE/GEOM) has been recreated and repopulated but before
+index B (SCOPE-ZONE/EXTENT) is ever touched -- must leave a sidecar that
+RESTORE-SPATIAL-INDEX-ROOTS refuses to trust, even though it reads back cleanly
+and is internally well-formed.  Before the fix nothing marked it incomplete: the
+next open would have seen a readable format-3 file, returned T, and B would have
+stayed silently unindexed forever -- indistinguishable from a legitimate
+declared-but-empty index."
+  (with-test-graph (g)
+    (let (probe-id zone-id)
+      (with-transaction ()
+        (setq probe-id (id (make-scope-probe
+                            :geom (make-point 37.1724d0 49.2020d0))))
+        (setq zone-id (id (make-scope-zone
+                           :extent (scope-rect 22.1d0 44.4d0 40.2d0 52.4d0)))))
+      ;; Both indexes are live and queryable before the simulated crash.
+      (is (spatial-index-p (spatial-index-for g 'scope-probe 'geom)))
+      (is (spatial-index-p (spatial-index-for g 'scope-zone 'extent)))
+      ;; Reproduce REBUILD-SPATIAL-INDEXES's own opening moves by hand: drop
+      ;; every current index, clear the registry, mark the sidecar INCOMPLETE --
+      ;; exactly what the function does immediately after CLRHASH.
+      (dolist (idx (all-spatial-indexes g))
+        (when (graph-db::view-index-p (graph-db::spatial-index-skip-list idx))
+          (delete-spatial-index idx)))
+      (clrhash (spatial-indexes g))
+      (graph-db::save-spatial-index-roots g :complete nil)
+      ;; Now reproduce the reindexing loop, but ONLY for A -- this IS the crash:
+      ;; B is never recreated.  *SPATIAL-REBUILD-IN-PROGRESS*, bound exactly as
+      ;; REBUILD-SPATIAL-INDEXES binds it, suppresses %SPATIAL-INDEX-FOR's
+      ;; ordinary per-creation save, so nothing overwrites the incomplete marker
+      ;; with a premature :COMPLETE T either.
+      (let ((graph-db::*spatial-rebuild-in-progress* t))
+        (spatial-index-insert
+         (graph-db::%spatial-index-for g 'scope-probe 'geom)
+         probe-id (make-point 37.1724d0 49.2020d0)))
+      ;; -- crash here; the closing COMPLETE save at the end of REBUILD-SPATIAL-
+      ;; INDEXES never runs. --
+      ;; Simulate the reopen WITHOUT going through CLOSE-GRAPH (which would
+      ;; re-save from RAM and mask the very bug under test): reset the in-RAM
+      ;; registry and ask RESTORE-SPATIAL-INDEX-ROOTS to repopulate it against
+      ;; the same heap, exactly as OPEN-GRAPH does.
+      (clrhash (spatial-indexes g))
+      (is (null (graph-db::restore-spatial-index-roots g))
+          "an INCOMPLETE sidecar must not be trusted, even though it reads back ~
+           cleanly and is internally well-formed")
+      (is (= 0 (hash-table-count (spatial-indexes g)))
+          "RESTORE-SPATIAL-INDEX-ROOTS must not partially populate the registry ~
+           from an incomplete sidecar")
+      ;; OPEN-GRAPH's own fallback when RESTORE-SPATIAL-INDEX-ROOTS returns NIL:
+      ;; rebuild from the live nodes, which remain authoritative.
+      (rebuild-spatial-indexes g)
+      (let ((probe-ix (spatial-index-for g 'scope-probe 'geom))
+            (zone-ix (spatial-index-for g 'scope-zone 'extent)))
+        (is (spatial-index-p probe-ix))
+        (is (spatial-index-p zone-ix)
+            "index B must come back after the fallback rebuild, not stay ~
+             silently unindexed forever")
+        (is (has-p probe-id
+                   (spatial-index-query-bbox probe-ix 37.16d0 49.19d0
+                                             37.19d0 49.21d0)))
+        (is (has-p zone-id
+                   (spatial-index-query-bbox zone-ix 22d0 44d0 41d0 53d0))
+            "B's node must actually be findable, not merely present as a struct")))))
+
+(test sidecar-without-complete-key-restores-normally
+  "A sidecar plist with no :COMPLETE key at all -- the exact shape SAVE-SPATIAL-
+INDEX-ROOTS wrote before this marker existed -- must still restore normally: the
+DESTRUCTURING-BIND (COMPLETE T) default is what keeps a graph already on the v3
+format from being forced into a needless rebuild by this change."
+  (with-test-graph (g)
+    (let (probe-id)
+      (with-transaction ()
+        (setq probe-id (id (make-scope-probe
+                            :geom (make-point 37.1724d0 49.2020d0)))))
+      ;; %SPATIAL-INDEX-FOR already wrote a (now :COMPLETE T) sidecar the moment
+      ;; the index was created; rewrite it in the PRE-MARKER shape, with no
+      ;; :COMPLETE key in the plist at all.
+      (let* ((file (graph-db::spatial-indexes-root-file (namestring (graph-db:location g))))
+             (plist (cl-store:restore file)))
+        (is (getf plist :complete)
+            "sanity check: the current SAVE-SPATIAL-INDEX-ROOTS does write ~
+             :COMPLETE T here")
+        (cl-store:store (list :format (getf plist :format)
+                              :indexes (getf plist :indexes))
+                        file))
+      (clrhash (spatial-indexes g))
+      (is (graph-db::restore-spatial-index-roots g)
+          "a sidecar with no :COMPLETE key must restore as complete, not fall ~
+           back to a rebuild")
+      (let ((idx (spatial-index-for g 'scope-probe 'geom)))
+        (is (spatial-index-p idx))
+        (is (has-p probe-id
+                   (spatial-index-query-bbox idx 37.16d0 49.19d0
+                                             37.19d0 49.21d0)))))))

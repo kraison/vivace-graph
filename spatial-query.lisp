@@ -22,8 +22,17 @@
 (declaim (ftype (function (t t t) t) %spatial-index-for))
 ;; Forward reference: SAVE-SPATIAL-INDEX-ROOTS lives in graph.lisp, which loads
 ;; before this file but does not depend on it (and vice versa) -- declared for the
-;; same reason graph.lisp declares REBUILD-SPATIAL-INDEXES.
-(declaim (ftype (function (t) t) save-spatial-index-roots))
+;; same reason graph.lisp declares REBUILD-SPATIAL-INDEXES.  (&REST, not &KEY: its
+;; single :COMPLETE keyword doesn't need spelling out here.)
+(declaim (ftype (function (t &rest t) t) save-spatial-index-roots))
+
+(defvar *spatial-rebuild-in-progress* nil
+  "Bound to T for the duration of a multi-index spatial rebuild (REBUILD-SPATIAL-
+INDEXES, REGENERATE-SPATIAL-INDEX).  While bound, %SPATIAL-INDEX-FOR's ordinary
+per-creation sidecar save (spatial-registry.lisp) is a no-op: the rebuild brackets
+the whole operation with its own :COMPLETE NIL / :COMPLETE T saves instead, so a
+crash anywhere in between is caught by the completeness marker rather than by
+trusting whichever per-index saves happened to land first.")
 
 (defun %node-by-id (id graph)
   "Resolve a spatial-index id (uuid bytes) to its live node, or NIL."
@@ -242,7 +251,22 @@ Returns the number of nodes indexed.
 Use this to adopt the per-class scheme on a graph that predates it, to change grid
 precision (set GRAPH-DEFAULT-SPATIAL-PRECISION first), or to repair.  It mutates
 the indexes directly (outside the transaction write path), so run it when the
-graph is quiescent -- analogous to REGENERATE-VIEW."
+graph is quiescent -- analogous to REGENERATE-VIEW.
+
+The sidecar is bracketed :COMPLETE NIL / :COMPLETE T around the ENTIRE rebuild,
+not saved once per index as it is created along the way: *SPATIAL-REBUILD-IN-
+PROGRESS* suppresses %SPATIAL-INDEX-FOR's ordinary per-creation save for the
+duration, so a crash anywhere between the two brackets -- including before the
+first index is even recreated, or on a graph whose geometry-bearing nodes are all
+deleted, so nothing gets recreated at all -- leaves a sidecar that reads back
+:COMPLETE NIL, and RESTORE-SPATIAL-INDEX-ROOTS re-derives on the next open rather
+than trusting a file naming a freed address or missing an index the crash never
+reached.
+
+The closing save lives HERE, inside the function, not left to callers as it once
+was: this function is exported, and a bare external call that relied on a caller's
+after-the-fact save would strand the sidecar on :COMPLETE NIL, forcing a needless
+full rebuild on every subsequent open until something happened to save it complete."
   (with-recursive-lock-held ((txn-lock graph))
     ;; Bind *GRAPH*: NODE-GEOMETRY reads slots, and a node read that falls back to
     ;; the dynamic current graph must resolve in GRAPH, not in whatever the caller
@@ -255,27 +279,29 @@ graph is quiescent -- analogous to REGENERATE-VIEW."
         (when (view-index-p (spatial-index-skip-list idx))
           (delete-spatial-index idx)))
       (clrhash (spatial-indexes graph))
-      ;; Persist the now-empty registry IMMEDIATELY, before any reindexing below.
-      ;; Otherwise, on a graph whose geometry-bearing nodes are all deleted, no
-      ;; %SPATIAL-INDEX-FOR call follows to rewrite the sidecar, and it is left
-      ;; naming the address DELETE-SPATIAL-INDEX just freed above -- readable, so
-      ;; the unreadable-sidecar fallback in RESTORE-SPATIAL-INDEX-ROOTS never
-      ;; fires, and a crash before the next clean CLOSE-GRAPH has OPEN-SPATIAL-INDEX
-      ;; map freed pages on the next open.  This also shrinks that window in the
-      ;; ordinary case, where reindexing goes on to save it again anyway.
-      (save-spatial-index-roots graph)
-      (flet ((reindex (node)
-               (unless (deleted-p node)
-                 (multiple-value-bind (geom slot) (node-geometry node)
-                   (when geom
-                     (spatial-index-insert
-                      (%spatial-index-for
-                       graph (%indexed-slot-owner-name (class-of node) slot) slot)
-                      (id node) geom)
-                     (incf count))))))
-        (map-vertices #'reindex graph)
-        (map-edges #'reindex graph))
+      ;; Mark the sidecar INCOMPLETE before any reindexing below.  It now names
+      ;; zero indexes -- momentarily true, and, if a crash intervenes before the
+      ;; closing save below runs, the last thing a reopen will read back.  The
+      ;; :COMPLETE NIL marker (not the emptiness of :INDEXES) is what makes
+      ;; RESTORE-SPATIAL-INDEX-ROOTS refuse to trust it.
+      (save-spatial-index-roots graph :complete nil)
+      (let ((*spatial-rebuild-in-progress* t))
+        (flet ((reindex (node)
+                 (unless (deleted-p node)
+                   (multiple-value-bind (geom slot) (node-geometry node)
+                     (when geom
+                       (spatial-index-insert
+                        (%spatial-index-for
+                         graph (%indexed-slot-owner-name (class-of node) slot) slot)
+                        (id node) geom)
+                       (incf count))))))
+          (map-vertices #'reindex graph)
+          (map-edges #'reindex graph)))
       (report-degraded-spatial-indexes graph)
+      ;; Every index named above is back in place; mark the sidecar COMPLETE
+      ;; again.  A crash before this point re-derives from scratch on the next
+      ;; open; a crash after it (or none at all) reopens by address, as usual.
+      (save-spatial-index-roots graph)
       count)))
 
 (defun regenerate-spatial-index (graph owner-name slot-name)
@@ -290,12 +316,25 @@ vertex or edge type registered in GRAPH: RESOLVE-NODE-TYPE-IDS silently skips an
 unresolvable designator, so the scan below would otherwise just find nothing --
 a return value indistinguishable from a real index whose nodes were all deleted.
 That is a plausible mistake, since a shared index may be declared on an ancestor
-class with several subclasses (§4)."
+class with several subclasses (§4).
+
+The sidecar is bracketed :COMPLETE NIL / :COMPLETE T the same way REBUILD-SPATIAL-
+INDEXES is: this function deletes and remhashes the OLD index before recreating
+it, so a crash in between would otherwise leave the sidecar naming an address
+DELETE-SPATIAL-INDEX just freed.  Marking the WHOLE sidecar incomplete for a
+single-index regenerate is heavier than strictly necessary -- it forces every
+OTHER index to re-derive too, on the next open after a crash, since the v3 format
+has no per-index completeness granularity -- but it is the safe direction."
   (with-recursive-lock-held ((txn-lock graph))
     ;; Bind *GRAPH*: NODE-GEOMETRY reads slots, and a node read that falls back to
     ;; the dynamic current graph must resolve in GRAPH (the wrong-graph bug class).
     (let ((*graph* graph)
           (key (cons owner-name slot-name)))
+      ;; Mark the sidecar INCOMPLETE before touching the old index's storage: a
+      ;; crash between here and the closing save below would otherwise leave the
+      ;; sidecar naming a freed address, exactly the freed-root window §7.2 and
+      ;; the fix in 6e1462b closed for REBUILD-SPATIAL-INDEXES.
+      (save-spatial-index-roots graph :complete nil)
       (unless (or (resolve-node-type-ids owner-name :vertex :graph graph)
                   (resolve-node-type-ids owner-name :edge :graph graph))
         (warn "REGENERATE-SPATIAL-INDEX: ~S is not a registered vertex or edge ~
@@ -311,25 +350,29 @@ class with several subclasses (§4)."
           (delete-spatial-index old)))
       (remhash key (spatial-indexes graph))
       (let ((count 0))
-        (flet ((reindex (node)
-                 (unless (deleted-p node)
-                   (multiple-value-bind (geom slot) (node-geometry node)
-                     (when (and geom (eq slot slot-name)
-                                (eq (%indexed-slot-owner-name (class-of node) slot)
-                                    owner-name))
-                       (spatial-index-insert
-                        (%spatial-index-for graph owner-name slot-name)
-                        (id node) geom)
-                       (incf count))))))
-          ;; OWNER-NAME is the DECLARING class, and its subclasses share the index,
-          ;; so the typed scan must include them -- MAP-VERTICES/MAP-EDGES do by
-          ;; default.  FIND-CLASS guards SUBTYPEP against a name that no longer
-          ;; designates a class (a sidecar entry whose class was never redefined in
-          ;; this image); the vertex scan then simply finds nothing.
-          (let ((class (find-class owner-name nil)))
-            (if (and class (subtypep class 'edge))
-                (map-edges #'reindex graph :edge-type owner-name)
-                (map-vertices #'reindex graph :vertex-type owner-name))))
+        (let ((*spatial-rebuild-in-progress* t))
+          (flet ((reindex (node)
+                   (unless (deleted-p node)
+                     (multiple-value-bind (geom slot) (node-geometry node)
+                       (when (and geom (eq slot slot-name)
+                                  (eq (%indexed-slot-owner-name (class-of node) slot)
+                                      owner-name))
+                         (spatial-index-insert
+                          (%spatial-index-for graph owner-name slot-name)
+                          (id node) geom)
+                         (incf count))))))
+            ;; OWNER-NAME is the DECLARING class, and its subclasses share the
+            ;; index, so the typed scan must include them -- MAP-VERTICES/MAP-EDGES
+            ;; do by default.  FIND-CLASS guards SUBTYPEP against a name that no
+            ;; longer designates a class (a sidecar entry whose class was never
+            ;; redefined in this image); the vertex scan then simply finds nothing.
+            (let ((class (find-class owner-name nil)))
+              (if (and class (subtypep class 'edge))
+                  (map-edges #'reindex graph :edge-type owner-name)
+                  (map-vertices #'reindex graph :vertex-type owner-name)))))
+        ;; The (owner . slot) index is back in place; mark the sidecar COMPLETE
+        ;; again.  A crash before this point re-derives EVERY index from scratch
+        ;; on the next open; a crash after it (or none at all) reopens by address.
         (save-spatial-index-roots graph)
         (report-degraded-spatial-indexes graph)
         count))))
@@ -337,7 +380,9 @@ class with several subclasses (§4)."
 (defun regenerate-spatial-indexes (graph)
   "Drop every spatial index and rebuild it on GRAPH's CURRENT :INDEX-BACKEND,
 persisting the new roots.  The parallel of REGENERATE-ALL-VIEWS /
-REGENERATE-SECONDARY-INDEXES for an in-place backend switch."
+REGENERATE-SECONDARY-INDEXES for an in-place backend switch.
+
+REBUILD-SPATIAL-INDEXES persists the completed sidecar itself; no trailing save
+is needed here."
   (rebuild-spatial-indexes graph)
-  (save-spatial-index-roots graph)
   graph)

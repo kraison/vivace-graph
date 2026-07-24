@@ -36,11 +36,21 @@ index rather than a rebuild, so renaming would make a downgrade fail silently.
 Downgrade after migration is unsupported either way."
   (format nil "~A/spatial-index.root" location))
 
-(defun save-spatial-index-roots (graph)
+(defun save-spatial-index-roots (graph &key (complete t))
   "Persist every spatial index's root, precision, backend, insert cap and precision
-histogram.  Called at CLOSE-GRAPH, at index creation, and whenever an index's
-COARSEST-PRECISION decreases (§7.2: losing that decrease would reopen with a
-too-fine clamp and silently miss; losing an increase merely over-covers).
+histogram, plus a COMPLETE marker.  Called at CLOSE-GRAPH, at index creation, and
+whenever an index's COARSEST-PRECISION decreases (§7.2: losing that decrease would
+reopen with a too-fine clamp and silently miss; losing an increase merely
+over-covers).
+
+:COMPLETE distinguishes a sidecar that names every index the registry is supposed
+to hold from one written partway through a multi-index operation
+(REBUILD-SPATIAL-INDEXES, REGENERATE-SPATIAL-INDEX): those bracket their own work
+with an immediate :COMPLETE NIL save and a closing :COMPLETE T save once every
+index is back in place, so a crash in between leaves a sidecar that is perfectly
+readable and internally well-formed, but RESTORE-SPATIAL-INDEX-ROOTS must still
+refuse to trust it -- the alternative is a reopen that silently treats an index the
+crash never got to recreate as legitimately empty, forever.
 
 No-op on a graph with no INDEXES heap -- a memory-graph, whose indexes are in-RAM
 mem-skip-lists with no heap address to persist.  Its spatial registry rides the
@@ -59,15 +69,18 @@ checkpoint image instead."
                                (copy-seq (spatial-index-precision-counts idx)))
                          roots)))
                (spatial-indexes graph))
-      (cl-store:store (list :format +spatial-index-format+ :indexes roots)
+      (cl-store:store (list :format +spatial-index-format+
+                            :complete complete
+                            :indexes roots)
                       (spatial-indexes-root-file (location graph)))))
   nil)
 
 (defun restore-spatial-index-roots (graph)
   "Reopen the spatial indexes from the v3 sidecar -- no node scan.  Returns T when
-one was present and current, NIL to fall back to REBUILD-SPATIAL-INDEXES (a fresh
-graph, a pre-v3 graph, a crash before any root was written, or a sidecar too
-damaged to read).  No-op returning NIL on a graph with no INDEXES heap.
+one was present, current, and COMPLETE; NIL to fall back to REBUILD-SPATIAL-INDEXES
+(a fresh graph, a pre-v3 graph, a crash before any root was written, a sidecar too
+damaged to read, or one a crashed rebuild left marked :COMPLETE NIL).  No-op
+returning NIL on a graph with no INDEXES heap.
 
 An UNREADABLE sidecar falls back rather than propagating.  Unlike the unique and
 secondary sidecars -- written only at CLOSE-GRAPH -- this one is also written at
@@ -75,17 +88,25 @@ index creation and on a coarsening, i.e. from inside a commit, so a crash CAN te
 it; and the nodes remain authoritative, so a rebuild always reconstructs the truth.
 Refusing to open a graph whose node data is entirely intact would be the wrong
 trade.  Only the read is guarded: a well-formed sidecar whose RECORDS are
-malformed still signals, because that is a code defect, not a torn write."
+malformed still signals, because that is a code defect, not a torn write.
+
+A well-formed but INCOMPLETE sidecar is the second, independent reason to fall
+back: readable and internally consistent, but naming fewer indexes than the
+registry is supposed to hold because the rebuild that wrote it never reached its
+closing save (see SAVE-SPATIAL-INDEX-ROOTS).  A sidecar with no :COMPLETE key at
+all -- the shape written before this marker existed -- reads as complete via the
+DESTRUCTURING-BIND default below, not as a special case, so a graph already on the
+v3 format is never forced into a needless rebuild by this change."
   (let ((file (and (indexes graph) (spatial-indexes-root-file (location graph)))))
     (when (and file (probe-file file))
-      (destructuring-bind (&key format indexes &allow-other-keys)
+      (destructuring-bind (&key format indexes (complete t) &allow-other-keys)
           (handler-case (cl-store:restore file)
             (error (e)
               (warn "Spatial index sidecar ~A is unreadable (~A); re-deriving the ~
                      indexes from live node geometries, which are authoritative."
                     file e)
               nil))
-        (when (eql format +spatial-index-format+)
+        (when (and (eql format +spatial-index-format+) complete)
           (dolist (r indexes)
             (destructuring-bind (owner slot address precision backend max-cells
                                  &optional counts)
@@ -370,8 +391,10 @@ to disk and remove it."
         (setf (schema-keep-revisions (schema graph)) keep-revisions)
         (update-schema graph)
         (setf (graph-default-spatial-precision graph) (or spatial-precision 7))
+        ;; REBUILD-SPATIAL-INDEXES persists the (empty, on a fresh graph) sidecar
+        ;; itself once it finishes; a trailing save here would just be a redundant
+        ;; duplicate of the exact same state.
         (rebuild-spatial-indexes graph)
-        (save-spatial-index-roots graph)
         (with-open-file (out dirty-file :direction :output)
           (format out "~S" (get-universal-time)))
         (setf (gethash name *graphs*) graph))
@@ -536,8 +559,13 @@ Always CLOSE-GRAPH when finished."
               (when (probe-file (spatial-index-root-file (location graph)))
                 (log:info "Spatial index sidecar is pre-v3; re-deriving per-class ~
                            indexes from live node geometries (index only)."))
-              (rebuild-spatial-indexes graph)
-              (save-spatial-index-roots graph)))
+              ;; REBUILD-SPATIAL-INDEXES persists the completed sidecar itself; a
+              ;; trailing save here would just be a redundant duplicate.  This
+              ;; matters more than usual on THIS path: it is the automatic pre-v3
+              ;; migration that runs before .DIRTY is written below, so a crash
+              ;; here must leave the sidecar readable as INCOMPLETE, not as a
+              ;; complete-looking empty one -- see SAVE-SPATIAL-INDEX-ROOTS.
+              (rebuild-spatial-indexes graph)))
         ;; Vector segments (Phase 2 step 6): reopen-or-rebuild, same story as
         ;; the spatial index.  Runs after UPDATE-SCHEMA so node classes are
         ;; instantiated/finalized, and before the graph starts taking writes.
