@@ -329,9 +329,8 @@
            #:rebuild-spatial-indexes
            #:regenerate-spatial-index
            #:regenerate-spatial-indexes
-           ;; declaring a spatial index's grid precision: the out-of-band macro,
-           ;; and the reader for the (slot :spatial-precision N) slot option
-           #:def-spatial-index
+           ;; declaring a spatial index's grid precision: the reader for the
+           ;; (slot :spatial-precision N) slot option, its one declaration surface
            #:spatial-precision-spec
            #:install-spatial-indexes
            ;; write-path protocol (applications specialize this)

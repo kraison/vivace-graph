@@ -615,7 +615,7 @@ the narrow-radius symbol case above cannot distinguish."
           "a literal list scope survives the Prolog compiler and unions both classes")
       (is (= 1 (length (select-flat (?n) (find-near ?n (scope-probe)
                                                     49.2020d0 37.1724d0 1.0d6))))
-          "a one-element literal list is a list, not the symbol inside it")
+          "a one-element literal list still resolves to a valid scope")
       (is (<= 1 (length (select-flat (?n) (find-near ?n :all
                                                      49.2020d0 37.1724d0 500.0d0))))))))
 
@@ -645,13 +645,9 @@ SCOPEABLE class is still an empty result, not an error."
     (is (null (find-nearest-k 'scope-probe nil nil nil :graph g)))))
 
 ;;; ---------------------------------------------------------------------------
-;;; §5: the two declaration surfaces -- the :SPATIAL-PRECISION slot option and
-;;; DEF-SPATIAL-INDEX -- and the MOP-first precedence between them.
-;;;
-;;; Every test that registers a DEF-SPATIAL-INDEX rebinds *SCHEMA-SPATIAL-METADATA*:
-;;; the registry is global and keyed by graph NAME, so a leaked spec would change
-;;; the precision another test's index is built at and make the suite
-;;; order-dependent.
+;;; §5: the ONE declaration surface -- the :SPATIAL-PRECISION slot option -- its
+;;; inheritance, its range check, and the open-time reconcile that adopts a
+;;; changed declaration.
 ;;; ---------------------------------------------------------------------------
 
 (def-vertex scope-coarse ()
@@ -698,36 +694,45 @@ same-class test went on passing everywhere."
         "no per-subclass index was created")
     (is (= 3 (spatial-index-precision (spatial-index-for g 'scope-coarse 'extent))))))
 
-(test slot-option-beats-def-spatial-index
-  "MOP-first, matching CLASS-SECONDARY-INDEX-DESCRIPTORS: the slot option wins
-and the losing declaration warns rather than silently doing nothing.  Asserted
-through the public surface -- declare, write a node, inspect the index that was
-actually built -- not by calling the conflict predicate directly.
+;; An out-of-range precision on a class that is NOT a graph node type: the range
+;; check lives in the RESOLVER, and this pins its message without putting a class
+;; the write path would choke on into the integration graph's schema.
+(defclass scope-bad-precision ()
+  ((extent :initarg :extent :index t :spatial-precision 15))
+  (:metaclass graph-db::node-class))
 
-*SCHEMA-SPATIAL-METADATA* is rebound so the DEF-SPATIAL-INDEX registered here
-does not leak into later tests and make them order-dependent."
-  (let ((graph-db::*schema-spatial-metadata* (make-hash-table)))
-    (with-test-graph (g)
-      (signals warning
-        (def-spatial-index scope-coarse extent :graph-db-integration-test
-          :precision 5))
-      (handler-bind ((warning #'muffle-warning))
-        (with-transaction ()
-          (make-scope-coarse :extent (scope-rect 22.1d0 44.4d0 40.2d0 52.4d0))))
-      ;; The slot option's 3 is what the index was actually built with, not 5.
-      (is (= 3 (spatial-index-precision
-                (spatial-index-for g 'scope-coarse 'extent)))))))
+(defclass scope-float-precision ()
+  ((extent :initarg :extent :index t :spatial-precision 5.0))
+  (:metaclass graph-db::node-class))
 
-(test def-spatial-index-sets-precision-for-an-unannotated-slot
-  "A slot with no :SPATIAL-PRECISION takes the macro's value, with no warning --
-the two surfaces are complementary when only one of them declares."
-  (let ((graph-db::*schema-spatial-metadata* (make-hash-table)))
-    (with-test-graph (g)
-      (def-spatial-index scope-zone extent :graph-db-integration-test :precision 4)
-      (with-transaction ()
-        (make-scope-zone :extent (scope-rect 22.1d0 44.4d0 40.2d0 52.4d0)))
-      (is (= 4 (spatial-index-precision
-                (spatial-index-for g 'scope-zone 'extent)))))))
+(test out-of-range-precision-is-rejected-by-name
+  "%MAKE-SPATIAL-INDEX's slot type is (INTEGER 1 12), but reaching it means a raw
+structure type error at the first geometry-valued write -- and at low safety on
+ECL, possibly no error at all.  The resolver checks instead, because it is the
+last point that still knows WHICH class and slot declared the bad value.
+
+Both an out-of-range integer and a non-integer are rejected, and the report names
+the class and the slot: 15 and 5.0 are typos a schema author makes, and 'the value
+15 is not of type (INTEGER 1 12)' does not say where to go and fix it."
+  (graph-db::finalize-inheritance (find-class 'scope-bad-precision))
+  (graph-db::finalize-inheritance (find-class 'scope-float-precision))
+  (let ((err (handler-case
+                 (progn (graph-db::%declared-spatial-precision
+                         'scope-bad-precision 'extent)
+                        nil)
+               (error (e) (princ-to-string e)))))
+    (is (and err (search "SCOPE-BAD-PRECISION" (string-upcase err))
+             (search "EXTENT" (string-upcase err)))
+        "an out-of-range integer is refused, naming the class and the slot"))
+  (signals error (graph-db::%declared-spatial-precision
+                  'scope-float-precision 'extent)))
+
+;; The staleness fixture, kept OFF the classes other tests assert on: the test
+;; redefines it mid-run and puts it back, and a failure between the two would
+;; otherwise poison whatever else read that precision.
+(def-vertex scope-restale ()
+  ((extent :type geometry :index t :spatial-precision 6))
+  :graph-db-integration-test)
 
 (test declared-precision-change-rebuilds-that-index-at-open
   "A declared precision that no longer matches the PERSISTED one rebuilds that ONE
@@ -735,57 +740,65 @@ index at open, rather than waiting to be asked.  An index holding cells at two
 precisions reintroduces the covering-precision miss the clamp exists to prevent,
 so adopting the change lazily would be silently wrong.
 
+With the slot option as the only declaration surface, changing a declaration means
+REDEFINING THE CLASS -- so that is what this does, between the close and the
+reopen, and it puts the definition back in an UNWIND-PROTECT.  SCOPE-RESTALE
+exists only for this: it is redefined twice per run, and no other test reads it.
+
 The untouched index is the control: it comes back from the sidecar at its own
 persisted precision, so the rebuild really is bounded to the one that changed.
 
-Warnings are muffled throughout: a country-scale polygon at precision 5 or 6 is
-far past +SPATIAL-INSERT-MAX-CELLS+, so the EXPECTED coarsening warning fires on
-every insert and on every rebuild.  That degradation is orthogonal to what is
-under test here -- SPATIAL-INDEX-PRECISION reports the CONFIGURED precision, which
-the clamp never moves."
-  (let ((graph-db::*schema-spatial-metadata* (make-hash-table)))
-    (handler-bind ((warning #'muffle-warning))
-      (with-temp-directory (dir)
-        (let ((path (namestring dir)) zone-id)
-          (def-spatial-index scope-zone extent :graph-db-integration-test
-            :precision 6)
-          (let ((g (make-graph *integration-graph-name* path :buffer-pool-size 1000)))
-            (let ((*graph* g))
-              (with-transaction ()
-                (setq zone-id (id (make-scope-zone
-                                   :extent (scope-rect 22.1d0 44.4d0 40.2d0 52.4d0))))
-                (make-scope-probe :geom (make-point 37.1724d0 49.2020d0)))
-              (is (= 6 (spatial-index-precision
-                        (spatial-index-for g 'scope-zone 'extent))))
-              (is (= 7 (spatial-index-precision
-                        (spatial-index-for g 'scope-probe 'geom))))
-              (close-graph g :snapshot-p nil)))
-          ;; Re-declare at a DIFFERENT precision, as editing the schema would.
-          (setf (gethash :graph-db-integration-test
-                         graph-db::*schema-spatial-metadata*)
-                nil)
-          (def-spatial-index scope-zone extent :graph-db-integration-test
-            :precision 5)
-          (let ((g (open-graph *integration-graph-name* path)))
-            (unwind-protect
-                 (let ((zone-ix (spatial-index-for g 'scope-zone 'extent)))
-                   (is (= 5 (spatial-index-precision zone-ix))
-                       "the index adopted the newly declared precision at open")
-                   (is (has-p zone-id
-                              (spatial-index-query-bbox zone-ix 30d0 48d0 31d0 49d0))
-                       "and was repopulated from the live nodes, not left empty")
-                   (is (= 7 (spatial-index-precision
-                             (spatial-index-for g 'scope-probe 'geom)))
-                       "the index nobody redeclared was not rebuilt"))
-              (close-graph g :snapshot-p nil)
-              (collect-garbage))))))))
+Warnings are muffled throughout, for two reasons.  A country-scale polygon at
+precision 5 or 6 is far past +SPATIAL-INSERT-MAX-CELLS+, so the EXPECTED coarsening
+warning fires on every insert and on every rebuild; and redefining a class at
+runtime redefines its generated constructor, which is a STYLE-WARNING on some
+implementations.  Neither bears on what is under test -- SPATIAL-INDEX-PRECISION
+reports the CONFIGURED precision, which the clamp never moves."
+  (handler-bind ((warning #'muffle-warning))
+    (with-temp-directory (dir)
+      (let ((path (namestring dir)) zone-id)
+        (let ((g (make-graph *integration-graph-name* path :buffer-pool-size 1000)))
+          (let ((*graph* g))
+            (with-transaction ()
+              (setq zone-id (id (make-scope-restale
+                                 :extent (scope-rect 22.1d0 44.4d0 40.2d0 52.4d0))))
+              (make-scope-probe :geom (make-point 37.1724d0 49.2020d0)))
+            (is (= 6 (spatial-index-precision
+                      (spatial-index-for g 'scope-restale 'extent))))
+            (is (= 7 (spatial-index-precision
+                      (spatial-index-for g 'scope-probe 'geom))))
+            (close-graph g :snapshot-p nil)))
+        (unwind-protect
+             (progn
+               ;; Edit the schema: the same slot, at a different precision.
+               (def-vertex scope-restale ()
+                 ((extent :type geometry :index t :spatial-precision 5))
+                 :graph-db-integration-test)
+               (let ((g (open-graph *integration-graph-name* path)))
+                 (unwind-protect
+                      (let ((zone-ix (spatial-index-for g 'scope-restale 'extent)))
+                        (is (= 5 (spatial-index-precision zone-ix))
+                            "the index adopted the newly declared precision at open")
+                        (is (has-p zone-id
+                                   (spatial-index-query-bbox zone-ix
+                                                             30d0 48d0 31d0 49d0))
+                            "and was repopulated from the live nodes, not left empty")
+                        (is (= 7 (spatial-index-precision
+                                  (spatial-index-for g 'scope-probe 'geom)))
+                            "the index nobody redeclared was not rebuilt"))
+                   (close-graph g :snapshot-p nil)
+                   (collect-garbage))))
+          ;; Back to 6, whatever happened above.
+          (def-vertex scope-restale ()
+            ((extent :type geometry :index t :spatial-precision 6))
+            :graph-db-integration-test))))))
 
 (test graph-default-precision-does-not-rebuild-a-persisted-index
   "The graph default is the precision for indexes CREATED after the open, not a
 declaration ABOUT the existing ones: reopening without :SPATIAL-PRECISION (so, at
 the 7 default) must NOT silently rebuild an index the graph was created at 5.
 
-Only an explicit declaration -- the slot option or DEF-SPATIAL-INDEX -- is a
+Only an explicit declaration -- the :SPATIAL-PRECISION slot option -- is a
 statement about a particular index, and only that triggers the rebuild.  Treating
 the fallback default as a declaration would make OPEN-GRAPH's documented
 \"existing indexes reopen at their own persisted precision\" false, and would

@@ -73,8 +73,7 @@
                 #:rebuild-spatial-indexes
                 #:regenerate-spatial-index
                 #:regenerate-spatial-indexes
-                ;; declaration surfaces for a spatial index's grid precision
-                #:def-spatial-index
+                ;; the declaration surface for a spatial index's grid precision
                 #:spatial-precision-spec
                 ;; index-backed spatial queries (spatial extension)
                 #:find-nodes-within
