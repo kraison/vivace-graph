@@ -479,9 +479,50 @@ for.
 
 ## 10. Memory-graph
 
-`%rebuild-derived-from-nodes` and the image dump's `:spatial` key (`memory-graph.lisp:604`) both
-assume one index; both become a map keyed `(owner . slot)`, with a memory-image version bump so an
-old image re-derives. Each index gets its own `mem-skip-list`, as views do.
+The image's `:spatial` payload becomes one record per `(owner . slot)` — carrying that index's
+precision, insert cap and precision histogram, exactly like the on-disk sidecar — and each index
+restores **structurally** into its own `mem-skip-list`, as views do.
+
+There are **two** memory image formats, and both had to move: the cl-store image (version bumped so
+an old single-index payload routes to the nodes-only rebuild rather than being destructured as a
+record list) and the **native/lazy format the ECL device actually uses** (also bumped). The native
+one was the path still rebuilding-from-nodes on open, which is what made this more than a cl-store
+edit — see §10.1.
+
+`%rebuild-derived-from-nodes` remains as the v1 (pre-registry image) fallback, keying each node
+through `%node-spatial-owner-name` so its owner rule matches the write path (§6). The histogram
+reloads into a fresh `(simple-array fixnum (13))` and `coarsest` is re-derived from it, identical to
+the on-disk `open-spatial-index` — so a coarsely-stored geometry survives a memory reopen and the
+§7.2 clamp is not defeated.
+
+### 10.1 Why this removed a cost rather than adding a feature
+
+Between Task 2 and this point, a memory-graph rebuilt its spatial index from live nodes on every
+open, gated by a filter over `node-geometry-index-slots`. That function returns **every** `:index`
+slot, scalars included, so the filter faulted in every node of any class with any indexed slot —
+materializing the lazy node blobs that issue #50's `:lazy` mode exists to keep on disk. For an
+Android field device whose finds carry an indexed scalar (`sku`, `ordnance-class`), that was most of
+the corpus, on every open.
+
+Structural restore reloads the skip-lists directly and touches no node blob: measured at **0 of 11**
+nodes materialized on reopen, against 11 of 11 before. The three workaround helpers Task 2 added
+(`%mem-lznode-may-be-spatial-p`, `%rebuild-memory-spatial-indexes`, `%custom-node-geometry-classes`)
+are deleted. There is no sound *narrower* filter — declared-type matching is exactly what the engine
+refuses to do — so removing the rebuild is the only real fix, and this is where it lands.
+
+### 10.2 Known limitation: precision re-declaration on a memory reopen
+
+The on-disk backend adopts a changed `:spatial-precision` declaration at open, because
+`install-spatial-indexes` rebuilds the affected index. The memory backend does **not** call
+`install-spatial-indexes` — doing so would re-materialize the very lazy nodes §10.1 stopped
+materializing — so a memory index reopens at its *persisted* precision and a changed declaration is
+not adopted until a forced rebuild.
+
+This is a resolution limitation, not a correctness one: the histogram and its clamp round-trip
+faithfully, so the index over-covers at the old grid (correct, slightly slower) rather than missing
+anything. Closing it properly needs a lazy-aware regenerate, deferred with CR-3.2 and
+multi-resolution (§13). **The requesting application must be told: changing a `:spatial-precision`
+declaration will not re-grid a memory-graph index on reopen.**
 
 ---
 
