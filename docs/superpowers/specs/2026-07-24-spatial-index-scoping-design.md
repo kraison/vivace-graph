@@ -92,9 +92,9 @@ spatially *queryable*, just not mixed with ACLED — which is CR-1 option 1.
 | Scope values | class symbol, list of class symbols, or `:all` |
 | API shape | Required **positional** first argument |
 | Insert slot choice | **Per-node** (preserves today's semantics) |
-| Precision declaration | **Both** a slot option and a `def-spatial-index` macro |
-| Precision precedence | slot option > macro > graph default (MOP-first, matching `index.lisp`), with a warning on conflict |
-| Index creation | Lazy, on first geometry-valued insert (explicit `def-spatial-index` builds eagerly) |
+| Precision declaration | The `:spatial-precision` slot option only — no macro (§5.1) |
+| Precision precedence | slot option > graph default; one surface, so no conflict exists |
+| Index creation | Lazy, on first geometry-valued insert — unconditionally (§4.1) |
 | Insert-cover clamp | Per-precision histogram, so degradation self-heals when the oversized node leaves |
 | Migration | Automatic on format mismatch; index-only re-derivation |
 
@@ -145,10 +145,11 @@ never holds a geometry therefore never creates a spatial index at all. This matt
 deferred CR-3.2, where a class may declare several geometry slots and populate only some: the
 unpopulated ones cost nothing, because they do not exist.
 
-The one exception is an explicit declaration. A `def-spatial-index` — and, once §5's install pass
-runs, any index whose precision is declared — is built **eagerly at open**, even when empty, because
-the user asked for it: same contract as `def-index`. So "created lazily on first write" is precise
-only for *undeclared* indexes, which is the common case but not the whole story.
+This holds **universally**: nothing is created at open. An earlier revision of this document carved
+out an exception for explicitly declared indexes, which were built eagerly by an install pass; that
+pass went away with the `def-spatial-index` macro (§5.1), so the lazy rule is unconditional again.
+`install-spatial-indexes` survives, but it only *rebuilds* an index whose declared precision no
+longer matches its persisted one — it never creates one.
 
 **Nearly free.** A spatial index is built by `make-heap-index` into the graph's **shared
 `indexes.dat` heap** (`spatial-index.lisp:60`, `graph.lisp:17`), not as a separately-mmap'd file. It
@@ -167,45 +168,55 @@ normal state of a declared-but-unpopulated slot, not a fault.
 
 ## 5. Declaration and precision resolution
 
-Two surfaces:
+**One surface: the slot option.**
 
 ```lisp
-;; slot option
 (def-vertex deepstate-zone ()
   ((extent :type geometry :index t :spatial-precision 3))
   :mine-action-forensics)
-
-;; macro
-(def-spatial-index deepstate-zone extent :mine-action-forensics :precision 3)
 ```
 
-`def-spatial-index` mirrors `def-index`: it registers a spec, builds immediately if the graph is
-open, and otherwise is built at open by an install pass. Like `def-index`, it can also declare a
-spatial index on a slot *not* marked `:index`.
+Precision resolves as **slot option > graph default (7)**. There is no second surface and therefore
+no precedence rule, no conflict, and nothing to warn about.
 
-**Precedence: slot option > `def-spatial-index` > graph default (7).**
+### 5.1 Why there is no `def-spatial-index` macro
 
-This is **MOP-first**, matching `class-secondary-index-descriptors` (`index.lisp:110`) exactly. One
-rule across both halves of `:index`: a reader who learns how the ordered secondary index resolves a
-conflict does not have to remember that spatial goes the other way. The point of this document is
-not to create the next asymmetry.
+An earlier draft of this document specified one, mirroring `def-index`, and it was built and then
+removed. The reasoning is worth keeping, because "add a declarative macro" will look like an obvious
+improvement to the next reader.
 
-When both surfaces are present and disagree, **warn once at install**. This matters more than the
-direction of the rule: the losing declaration is loud either way, so a `def-spatial-index` that is
-overridden by a slot option is never a silent no-op.
+Spatial is one of four slot-based index kinds in this engine, and the surfaces are not uniform:
 
-**Usage guideline — the two surfaces are complementary, not competing.** Use the slot option for
-what the schema declares, and `def-spatial-index` for what it does not. A slot with no
-`:spatial-precision` can be tuned freely out-of-band; a slot that declares one is stating its
-precision as part of the schema, and changing it is a schema edit. Declaring the same thing twice is
-what the warning exists to discourage.
+| | Slot option | Macro | Maintenance reads |
+| --- | --- | --- | --- |
+| `:unique` | yes | none | `class-unique-slots` — MOP only |
+| `:vector-index` | yes | none | `node-vector-index-slots` — MOP only |
+| `:index` (ordered) | yes | `def-index` | `class-secondary-index-descriptors` — MOP ∪ registry |
+| spatial | yes | **none** | `node-geometry` — MOP only |
 
-An inversion (macro wins) was considered and rejected. It would buy out-of-band retuning of a slot
-that already declares a precision, and per-graph divergence — the CLOS class and its slot option are
-global, while `def-spatial-index` is graph-scoped like `def-index` and `def-view`, since
-`def-node-type` registers metadata per graph name (`schema.lisp:422`). Neither is a demonstrated
-need here, and both are outweighed by having one resolution rule. Revisit on evidence if a class is
-ever genuinely registered into two graphs wanting different grids.
+Two of the three have no macro at all. Only `:index` does, and the reason `def-index` can genuinely
+index a slot *not* marked `:index` is that its maintenance is **descriptor-driven**: `%ix-claim`
+iterates the union and reads `(slot-value node (first d))` by name.
+
+Spatial maintenance is `node-geometry`-driven, and that function scans `:index`-marked slots only.
+So a spatial macro could set an index's precision but could never reach an unmarked slot — while
+its docstring, copied from `def-index`, claimed it could. Declaring on an unmarked slot eagerly
+created and persisted an index that no node was ever written into, and a query scoped to that class
+then signalled "not a spatially indexed class": a completely silent no-op, which is precisely the
+CR-3 failure class this whole change request exists to eliminate.
+
+Making the claim true would mean giving `%spatial-index-node` a descriptor loop over declared slots
+alongside the `node-geometry` path. That widens the commit hot path, and it delivers a slice of
+CR-3.2 (a node indexed under more than one geometry slot) through a side door, in a release where
+CR-3.2 is deliberately deferred and versioned — including the refine-path problem CR-3.2 has to
+solve, which a declared slot would inherit unsolved.
+
+The macro also had a second defect with no good answer at this scope: naming a *subclass* rather
+than the declaring owner built an orphan index that the write path never used and no scope ever
+scanned, silently.
+
+So the macro is gone and spatial matches `:unique` and `:vector-index`. Revisit only together with
+CR-3.2, where the refine question gets answered once for both.
 
 **Precision change on an existing index.** The *persisted* precision is authoritative for reopening.
 If the declared precision differs, that one index is **rebuilt automatically at open** — bounded by
@@ -234,7 +245,7 @@ matches `index-lookup` and `map-index`. A required positional argument makes eve
 **Resolution.** A scope resolves to a set of `(owner . slot)` keys, then to live indexes:
 
 - class `C` → for each of `C`'s geometry-index slot names (MOP `:index` slots plus any applicable
-  `def-spatial-index` spec), resolve the owner with `%indexed-slot-owner-name`, collect
+  slots), resolve the owner with `%indexed-slot-owner-name`, collect
   `(owner . slot)`
 - class `C` with an **application-supplied `node-geometry` method** → `(method-owner . NIL)`.
   Overriding `node-geometry` is a documented extension point (`example.lisp`), and such a method
@@ -497,9 +508,10 @@ Added here:
    nothing else catches it.
 8. **High-water durability** — coarse insert, unclean close, reopen, small query still finds it.
 9. **Precision-change auto-rebuild** — declared ≠ persisted, reopen, identical results.
-10. **Both-surfaces precedence** — slot option and `def-spatial-index` disagree; the slot option
-    wins and a warning is emitted. Also the non-conflicting case: a slot with no
-    `:spatial-precision` takes the macro's value.
+10. **Precision declaration** — a `:spatial-precision` slot option sets the index's grid, inherits
+    to a subclass that declares no slots of its own, and is range-checked by name; the graph
+    default is *not* treated as a declaration, so reopening a graph without repeating
+    `:spatial-precision` must not re-grid it.
 11. **Scope error contract** — undeclared class signals; declared-but-empty returns `NIL`.
 12. **Dedup** — a node reachable through two of its own slot-indexes is returned once.
 13. **Prolog scope shapes** — symbol, list, `:all` through the query compiler.
@@ -510,8 +522,7 @@ Added here:
     emptied a level) reopens correct-but-coarse and still returns every node; a *decrease* survives
     an unclean close (this is test 8, re-stated as the unsafe direction).
 16. **Lazy creation** — a slot marked `:index` that never holds a geometry creates no index at all;
-    a scope naming it returns `NIL` rather than signalling; an explicit `def-spatial-index` on the
-    same slot *does* create one, empty.
+    a scope naming it returns `NIL` rather than signalling.
 17. **`audit-spatial-slots`** — finds a class the 64-node sampler missed, by populating the second
     geometry slot only on a node beyond the sampling window.
 
@@ -602,7 +613,7 @@ both API and on-disk format, so the paperwork is not optional.
   `tests/spatial-intersect-tests.lisp`, `tests/geos/`, `tests/replication/slave.lisp`,
   `tests/backup-tests.lisp`, plus the `tests/package.lisp` and `tests/concurrency/package.lisp`
   import lists.
-- **`package.lisp`** — export `spatial-indexes`, `spatial-index-for`, `def-spatial-index`,
+- **`package.lisp`** — export `spatial-indexes`, `spatial-index-for`, `install-spatial-indexes`,
   `rebuild-spatial-indexes`, `regenerate-spatial-index` (per-index, §7.4),
   `regenerate-spatial-indexes` (all), `audit-spatial-slots` (§8), the new Prolog functors; remove
   `spatial-index` and `rebuild-spatial-index`.
