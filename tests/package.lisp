@@ -78,10 +78,10 @@
                 #:find-nodes-intersecting
                 #:find-nodes-near
                 #:find-nearest-k
-                #:find-within/2
-                #:find-intersects/2
-                #:find-near/4
-                #:find-nearest/4
+                #:find-within/3
+                #:find-intersects/3
+                #:find-near/5
+                #:find-nearest/5
                 ;; topology seam (exact only with graph-db/geos; fallback here)
                 #:geometry-intersects-p
                 #:geometry-contains-geometry-p

@@ -451,3 +451,157 @@ format from being forced into a needless rebuild by this change."
         (is (has-p probe-id
                    (spatial-index-query-bbox idx 37.16d0 49.19d0
                                              37.19d0 49.21d0)))))))
+
+;;; ---------------------------------------------------------------------------
+;;; The required query scope (§6).  A scope both SELECTS the indexes scanned and
+;;; FILTERS the results by type -- both halves are needed, because a geometry
+;;; slot declared on a mixin gives its subclasses ONE shared index.
+;;; ---------------------------------------------------------------------------
+
+(test scope-excludes-the-other-class-both-directions
+  "A query scoped to A returns no B nodes even though B's polygon contains
+every A point, and scoping to B returns no A nodes."
+  (with-test-graph (g)
+    (with-transaction ()
+      (make-scope-probe :geom (make-point 37.1724d0 49.2020d0))
+      (make-scope-zone :extent (scope-rect 22.1d0 44.4d0 40.2d0 52.4d0)))
+    (let ((window (scope-rect 22.0d0 44.0d0 41.0d0 53.0d0)))
+      (let ((probes (find-nodes-within 'scope-probe window :graph g))
+            (zones  (find-nodes-within 'scope-zone window :graph g)))
+        (is (= 1 (length probes)))
+        (is (every #'scope-probe-p probes))
+        (is (= 1 (length zones)))
+        (is (every #'scope-zone-p zones))))))
+
+(test scope-accepts-a-class-list-and-dedups
+  "A list scope unions the named classes; :ALL unions everything."
+  (with-test-graph (g)
+    (with-transaction ()
+      (make-scope-probe :geom (make-point 37.1724d0 49.2020d0))
+      (make-scope-zone :extent (scope-rect 22.1d0 44.4d0 40.2d0 52.4d0)))
+    (let ((window (scope-rect 22.0d0 44.0d0 41.0d0 53.0d0)))
+      (is (= 2 (length (find-nodes-within '(scope-probe scope-zone) window :graph g))))
+      (is (= 2 (length (find-nodes-within :all window :graph g)))))))
+
+;; A vertex with no geometry of any kind -- neither an :INDEX-marked geometry
+;; slot nor a NODE-GEOMETRY method.  This, not GEO-PLACE, is what "not a spatial
+;; class" means: GEO-PLACE overrides NODE-GEOMETRY and IS scopeable.
+(def-vertex scope-aspatial ()
+  ((label :type string))
+  :graph-db-integration-test)
+
+(test unscoped-class-signals-declared-empty-returns-nil
+  "A class with no geometry at all signals; a declared-but-empty one is NIL."
+  (with-test-graph (g)
+    (with-transaction ()
+      (make-scope-probe :geom (make-point 37.1724d0 49.2020d0)))
+    (let ((window (scope-rect 22.0d0 44.0d0 41.0d0 53.0d0)))
+      (signals error (find-nodes-within 'scope-aspatial window :graph g))
+      ;; SCOPE-ZONE is declared but nothing was written: empty, not an error.
+      (is (null (find-nodes-within 'scope-zone window :graph g))))))
+
+(test custom-node-geometry-classes-are-scopeable
+  "Overriding NODE-GEOMETRY is a documented extension point, so such a class is
+scopeable by name -- not reachable only through :ALL.  GEO-PLACE (defined in
+spatial-hook-tests.lisp) has a hand-written method and no :INDEX-marked slot."
+  (with-test-graph (g)
+    (with-transaction ()
+      (make-geo-place :loc (make-point 37.1724d0 49.2020d0))
+      (make-scope-probe :geom (make-point 37.1730d0 49.2025d0)))
+    (let ((window (scope-rect 37.0d0 49.0d0 37.5d0 49.5d0)))
+      (let ((places (find-nodes-within 'geo-place window :graph g)))
+        (is (= 1 (length places)))
+        (is (every #'geo-place-p places)))
+      ;; ...and scoping to the slot-declared class still excludes it.
+      (is (every #'scope-probe-p (find-nodes-within 'scope-probe window :graph g))))))
+
+;;; A geometry-bearing PARENT whose geometry comes from a hand-written
+;;; NODE-GEOMETRY method, plus a subclass that inherits that method.  The method
+;;; is the only geometry declaration either class has, so both are keyed
+;;; (SCOPE-SITE . NIL) -- the METHOD OWNER, resolved most-general-first, exactly
+;;; as an :INDEX slot declared on a parent is.
+(def-vertex scope-site ()
+  ((where))
+  :graph-db-integration-test)
+
+(def-vertex scope-outpost (scope-site)
+  ()
+  :graph-db-integration-test)
+
+(defmethod node-geometry ((s scope-site))
+  (slot-value s 'where))
+
+(test method-owner-shares-one-index-across-a-hierarchy
+  "A NODE-GEOMETRY method on a PARENT gives its subclasses ONE shared index, and a
+scope on the parent finds the subclass's nodes.
+
+Keying such a node by its OWN class -- which is what falling back to
+%INDEXED-SLOT-OWNER-NAME with a NIL slot does -- would scatter the hierarchy
+across per-subclass indexes and make this parent scope miss the outpost entirely."
+  (with-test-graph (g)
+    (with-transaction ()
+      (make-scope-site :where (make-point 37.1724d0 49.2020d0))
+      (make-scope-outpost :where (make-point 37.1730d0 49.2025d0)))
+    (is (spatial-index-p (spatial-index-for g 'scope-site nil))
+        "the shared index is keyed by the METHOD OWNER")
+    (is (null (spatial-index-for g 'scope-outpost nil))
+        "no per-subclass index was created")
+    (let ((window (scope-rect 37.0d0 49.0d0 37.5d0 49.5d0)))
+      (let ((both (find-nodes-within 'scope-site window :graph g)))
+        (is (= 2 (length both)) "the parent scope spans the subclass")
+        (is (some #'scope-outpost-p both)))
+      ;; ...and the type filter is still what discriminates within that one index.
+      (let ((subs (find-nodes-within 'scope-outpost window :graph g)))
+        (is (= 1 (length subs)))
+        (is (every #'scope-outpost-p subs))))))
+
+(test method-owner-unindex-is-symmetric
+  "Deleting a subclass node removes it from the METHOD OWNER's index -- the key its
+insert used.  An insert and a remove that disagreed about the owner would leave
+the entry behind forever, un-removable, since nothing else ever visits that key."
+  (with-test-graph (g)
+    (let (outpost)
+      (with-transaction ()
+        (make-scope-site :where (make-point 37.1724d0 49.2020d0))
+        (setq outpost (make-scope-outpost :where (make-point 37.1730d0 49.2025d0))))
+      (let ((window (scope-rect 37.0d0 49.0d0 37.5d0 49.5d0)))
+        (is (= 2 (length (find-nodes-within 'scope-site window :graph g))))
+        (with-transaction () (mark-deleted (lookup-vertex (id outpost))))
+        (is (= 1 (length (find-nodes-within 'scope-site window :graph g)))
+            "the deleted subclass node is gone from the shared index")
+        ;; The index entry itself must be gone, not merely filtered out by the
+        ;; liveness check the query applies on top of the candidate ids.
+        (is (not (has-p (id outpost)
+                        (spatial-index-query-bbox
+                         (spatial-index-for g 'scope-site nil)
+                         37.0d0 49.0d0 37.5d0 49.5d0)))
+            "the raw index entry was removed, not just filtered by deleted-p")))))
+
+(test method-owner-survives-a-rebuild
+  "REBUILD-SPATIAL-INDEXES re-derives the same (METHOD-OWNER . NIL) key the write
+path used.  A rebuild that resolved the owner differently would quietly move every
+such node into a different index than queries and removes look in."
+  (with-test-graph (g)
+    (with-transaction ()
+      (make-scope-site :where (make-point 37.1724d0 49.2020d0))
+      (make-scope-outpost :where (make-point 37.1730d0 49.2025d0)))
+    (is (= 2 (rebuild-spatial-indexes g)))
+    (is (spatial-index-p (spatial-index-for g 'scope-site nil)))
+    (is (null (spatial-index-for g 'scope-outpost nil)))
+    (is (= 2 (length (find-nodes-within 'scope-site
+                                        (scope-rect 37.0d0 49.0d0 37.5d0 49.5d0)
+                                        :graph g))))))
+
+(test prolog-scope-shapes
+  "The Prolog functors accept a symbol scope and :ALL.  A literal list scope is
+pinned here: if the query compiler mangles it, restrict the documented Prolog
+scope to symbol-or-:ALL and route multi-class queries through a disjunction."
+  (with-test-graph (g)
+    (let ((*graph* g))
+      (with-transaction ()
+        (make-scope-probe :geom (make-point 37.1724d0 49.2020d0))
+        (make-scope-zone :extent (scope-rect 22.1d0 44.4d0 40.2d0 52.4d0)))
+      (is (= 1 (length (select-flat (?n) (find-near ?n scope-probe
+                                                    49.2020d0 37.1724d0 500.0d0)))))
+      (is (<= 1 (length (select-flat (?n) (find-near ?n :all
+                                                     49.2020d0 37.1724d0 500.0d0))))))))

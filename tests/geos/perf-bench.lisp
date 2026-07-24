@@ -59,15 +59,15 @@ of timings (ms) and prints a short report."
                           (getf results :n-nodes) (+ n-points n-polygons)))
                   ;; --- queries (timed) ---
                   (let ((s (get-internal-real-time)))
-                    (setf (getf results :within-exact-n) (length (find-nodes-within aoi :graph g))
+                    (setf (getf results :within-exact-n) (length (find-nodes-within 'geos-place aoi :graph g))
                           (getf results :within-exact-ms) (%ms-since s)))
                   (let ((s (get-internal-real-time)))
                     (setf (getf results :intersecting-exact-n)
-                          (length (find-nodes-intersecting aoi :graph g))
+                          (length (find-nodes-intersecting 'geos-place aoi :graph g))
                           (getf results :intersecting-exact-ms) (%ms-since s)))
                   (without-geos
                     (let ((s (get-internal-real-time)))
-                      (setf (getf results :within-fallback-n) (length (find-nodes-within aoi :graph g))
+                      (setf (getf results :within-fallback-n) (length (find-nodes-within 'geos-place aoi :graph g))
                             (getf results :within-fallback-ms) (%ms-since s))))
                   (format t "~&=== graph-db/geos perf (~D points + ~D polygons) ===~%"
                           n-points n-polygons)

@@ -573,7 +573,7 @@ Returns the number of nodes indexed."
                   (when geom
                     (spatial-index-insert
                      (%spatial-index-for
-                      graph (%indexed-slot-owner-name (class-of node) slot) slot)
+                      graph (%node-spatial-owner-name (class-of node) slot) slot)
                      (id node) geom)
                     (incf count)))))))))))
 
@@ -696,7 +696,7 @@ mem-index-list is a set, deleted nodes stay indexed and scans filter them)."
                  (when geom
                    (spatial-index-insert
                     (%spatial-index-for
-                     graph (%indexed-slot-owner-name (class-of n) slot) slot)
+                     graph (%node-spatial-owner-name (class-of n) slot) slot)
                     (id n) geom))))))
       (dolist (v vertices) (reindex v))
       (dolist (e edges)    (reindex e)))))

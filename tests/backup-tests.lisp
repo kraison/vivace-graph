@@ -376,7 +376,7 @@ from spatial-hook-tests.)"
                    (is (member kh-id cands :test 'equalp) "Kharkiv place re-indexed by replay")
                    (is (not (member lv-id cands :test 'equalp)) "Lviv place outside the window"))
                  ;; and through the high-level query
-                 (is (= 1 (length (find-nodes-near 49.2020d0 37.1724d0 500d0 :graph g2)))))
+                 (is (= 1 (length (find-nodes-near 'geo-place 49.2020d0 37.1724d0 500d0 :graph g2)))))
             (close-graph g2 :snapshot-p nil)
             (collect-garbage)))))))
 

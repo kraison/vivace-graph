@@ -8,10 +8,12 @@
 ;;; point itself for a :POINT geometry, the bounding-box centre otherwise (so
 ;;; the EO-find-in-task-area case is exact; extended geometries are approximate).
 ;;;
-;;; Both a Lisp API (FIND-NODES-WITHIN / FIND-NODES-NEAR) and Prolog functors
-;;; (FIND-WITHIN/2, FIND-NEAR/4) are provided; the functors yield matching nodes
-;;; so they compose with graph traversal in a query, e.g.:
-;;;   (select-flat (?f) (is-a ?f eo-find) (find-near ?f 49.20 37.17 500.0))
+;;; Every query takes a required SCOPE as its first argument -- a node-class name,
+;;; a list of them, or :ALL -- which both selects the indexes scanned and filters
+;;; the results by type.  Both a Lisp API (FIND-NODES-WITHIN / FIND-NODES-NEAR) and
+;;; Prolog functors (FIND-WITHIN/3, FIND-NEAR/5) are provided; the functors yield
+;;; matching nodes so they compose with graph traversal in a query, e.g.:
+;;;   (select-flat (?f) (find-near ?f eo-find 49.20 37.17 500.0))
 
 ;; Forward references: the (owner . slot) registry lives in spatial-registry.lisp,
 ;; which loads after this file (it needs the MOP helpers, the graph and the
@@ -80,45 +82,45 @@ reachable through two of its own slot-indexes is visited once."
                             (%scope-admits-p ,node-var ,types))
                    ,@body)))))))))
 
-(defun find-nodes-within (area &key (graph *graph*))
-  "List of live nodes whose geometry lies within AREA (a :POLYGON or
-:MULTIPOLYGON geometry).  A :POINT node is judged exactly; an extended-geometry
-node is judged exactly when graph-db/geos is loaded, otherwise by its
-representative point (bbox centre).
+(defun find-nodes-within (scope area &key (graph *graph*))
+  "Live nodes in SCOPE whose geometry lies within AREA (a :POLYGON or
+:MULTIPOLYGON).  SCOPE is a node-class name, a list of them, or :ALL; it selects
+which spatial indexes are scanned AND filters the results by type.  Signals when
+SCOPE names a class that is not spatially indexed.
 
-TRANSITIONAL: scoped to :ALL, which reproduces the single-index behaviour this
-replaced.  A required scope argument lands in the next increment, and changes only
-this lambda list and %RESOLVE-SPATIAL-SCOPE -- not the loop below."
+A :POINT node is judged exactly; an extended-geometry node is judged exactly when
+graph-db/geos is loaded, otherwise by its representative point (bbox centre)."
   (let ((result '()))
     (when (geometryp area)
       (multiple-value-bind (min-lon min-lat max-lon max-lat) (geometry-bbox area)
-        (%do-scoped-candidates (node :all graph
+        (%do-scoped-candidates (node scope graph
                                 :bbox (list min-lon min-lat max-lon max-lat))
           (let ((geom (node-geometry node)))
             (when (and geom (%node-within-area-p area geom))
               (push node result))))))
     (nreverse result)))
 
-(defun find-nodes-intersecting (area &key (graph *graph*))
-  "List of live nodes whose geometry INTERSECTS AREA (any geometry kind).  Exact
+(defun find-nodes-intersecting (scope area &key (graph *graph*))
+  "Live nodes in SCOPE whose geometry INTERSECTS AREA (any geometry kind).  Exact
 with the graph-db/geos add-on; without it, extended-geometry candidates use a
-COARSE bounding-box overlap test (point candidates are always exact)."
+COARSE bounding-box overlap test (point candidates are always exact).  SCOPE is as
+for FIND-NODES-WITHIN."
   (let ((result '()))
     (when (geometryp area)
       (multiple-value-bind (min-lon min-lat max-lon max-lat) (geometry-bbox area)
-        (%do-scoped-candidates (node :all graph
+        (%do-scoped-candidates (node scope graph
                                 :bbox (list min-lon min-lat max-lon max-lat))
           (let ((geom (node-geometry node)))
             (when (and geom (geometry-intersects-p area geom))
               (push node result))))))
     (nreverse result)))
 
-(defun find-nodes-near (lat lon radius &key (graph *graph*))
-  "List of (NODE . DISTANCE-METRES) for live nodes within RADIUS of (LAT, LON),
-nearest first."
+(defun find-nodes-near (scope lat lon radius &key (graph *graph*))
+  "(NODE . DISTANCE-METRES) for live nodes in SCOPE within RADIUS of (LAT, LON),
+nearest first.  SCOPE is as for FIND-NODES-WITHIN."
   (let ((result '()))
     (when (and (numberp lat) (numberp lon) (numberp radius))
-      (%do-scoped-candidates (node :all graph :radius (list lat lon radius))
+      (%do-scoped-candidates (node scope graph :radius (list lat lon radius))
         (let ((geom (node-geometry node)))
           (when geom
             (multiple-value-bind (nlat nlon) (%geometry-rep-point geom)
@@ -127,79 +129,84 @@ nearest first."
                   (push (cons node d) result))))))))
     (sort result #'< :key #'cdr)))
 
-(def-global-prolog-functor find-within/2 (?node ?area cont)
-  "Yield each indexed node whose geometry lies within the bound :POLYGON or
-:MULTIPOLYGON ?AREA."
+(def-global-prolog-functor find-within/3 (?node ?scope ?area cont)
+  "Yield each node in ?SCOPE whose geometry lies within the bound :POLYGON or
+:MULTIPOLYGON ?AREA.  ?SCOPE is a node-class name or :ALL."
   (let ((node-var (var-deref ?node))
+        (scope (var-deref ?scope))
         (area (var-deref ?area)))
     (when (geometryp area)
-      (dolist (node (find-nodes-within area :graph *graph*))
+      (dolist (node (find-nodes-within scope area :graph *graph*))
         (let ((old-trail (fill-pointer *trail*)))
           (when (unify node-var node)
             (funcall cont))
           (undo-bindings old-trail))))))
 
-(def-global-prolog-functor find-intersects/2 (?node ?area cont)
-  "Yield each indexed node whose geometry intersects the bound ?AREA geometry."
+(def-global-prolog-functor find-intersects/3 (?node ?scope ?area cont)
+  "Yield each node in ?SCOPE whose geometry intersects the bound ?AREA geometry."
   (let ((node-var (var-deref ?node))
+        (scope (var-deref ?scope))
         (area (var-deref ?area)))
     (when (geometryp area)
-      (dolist (node (find-nodes-intersecting area :graph *graph*))
+      (dolist (node (find-nodes-intersecting scope area :graph *graph*))
         (let ((old-trail (fill-pointer *trail*)))
           (when (unify node-var node)
             (funcall cont))
           (undo-bindings old-trail))))))
 
-(def-global-prolog-functor find-near/4 (?node ?lat ?lon ?radius cont)
-  "Yield each indexed node within ?RADIUS metres of (?LAT, ?LON)."
+(def-global-prolog-functor find-near/5 (?node ?scope ?lat ?lon ?radius cont)
+  "Yield each node in ?SCOPE within ?RADIUS metres of (?LAT, ?LON)."
   (let ((node-var (var-deref ?node))
+        (scope (var-deref ?scope))
         (lat (var-deref ?lat)) (lon (var-deref ?lon)) (radius (var-deref ?radius)))
     (when (and (numberp lat) (numberp lon) (numberp radius))
-      (dolist (nd (find-nodes-near lat lon radius :graph *graph*))
+      (dolist (nd (find-nodes-near scope lat lon radius :graph *graph*))
         (let ((old-trail (fill-pointer *trail*)))
           (when (unify node-var (car nd))
             (funcall cont))
           (undo-bindings old-trail))))))
 
-(defun find-nearest-k (lat lon k &key (graph *graph*) (max-radius 2.5d4))
-  "List of (NODE . DISTANCE-METRES) for the K nodes nearest (LAT, LON), nearest
-first (fewer than K if the graph holds fewer indexed nodes within MAX-RADIUS).
+(defun find-nearest-k (scope lat lon k &key (graph *graph*) (max-radius 2.5d4))
+  "The K nodes in SCOPE nearest (LAT, LON) as (NODE . DISTANCE-METRES), nearest
+first (fewer than K if SCOPE holds fewer within MAX-RADIUS).  SCOPE is as for
+FIND-NODES-WITHIN.
 
-Correctness: FIND-NODES-NEAR returns every node within a given radius sorted by
-distance, so once a radius encloses at least K nodes, those K are the global K
-nearest -- anything outside the radius is farther than everything inside it.  We
-start from one grid cell's size and double the radius until K are enclosed (or
-MAX-RADIUS is reached), then keep the K closest.
+Correctness: FIND-NODES-NEAR returns every node within a radius sorted by distance,
+so once a radius encloses at least K nodes, those K are the global K nearest --
+anything outside the radius is farther than everything inside it.  The seed radius
+comes from the FINEST precision in scope and doubles until K are enclosed or
+MAX-RADIUS is reached.
 
 MAX-RADIUS is a deliberate bound (default 25 km): kNN is \"K nearest within
 MAX-RADIUS\".  Each widening re-runs the window query, whose cost grows with the
 number of indexed nodes the window encloses (the bbox query covers a window with
 a bounded set of coarse cells and range-scans them, so empty space is free);
 widen MAX-RADIUS only if you accept scanning the larger candidate set."
-  (let ((indexes (%resolve-spatial-scope :all graph)))
+  (let ((indexes (%resolve-spatial-scope scope graph)))
     (when (and indexes (numberp lat) (numberp lon) (integerp k) (plusp k))
-      ;; Seed off the FINEST precision in scope: seeding from a coarse index would
-      ;; make the very first widening an enormous sweep.
-      ;; (LOOP MAXIMIZE, not REDUCE :KEY -- ANSI leaves it unspecified whether
-      ;; REDUCE applies :KEY to a one-element sequence, and one index is the
-      ;; common case.)
+      ;; Seed off the FINEST precision in scope: with a mixed-precision scope,
+      ;; seeding from a coarse index would make the very first query an enormous
+      ;; sweep.  (LOOP MAXIMIZE, not REDUCE :KEY -- ANSI leaves it unspecified
+      ;; whether REDUCE applies :KEY to a one-element sequence, and one index is
+      ;; the common case.)
       (let* ((prec (loop for i in indexes maximize (spatial-index-precision i)))
              ;; seed radius: the index cell's latitude extent in metres
              (r (max 1d0 (* (nth-value 1 (geohash-cell-size prec)) 111320d0)))
              (found '()))
         (loop
-          (setf found (find-nodes-near lat lon r :graph graph))
+          (setf found (find-nodes-near scope lat lon r :graph graph))
           (when (or (>= (length found) k) (>= r max-radius))
             (return))
           (setf r (min max-radius (* r 2d0))))
         (subseq found 0 (min k (length found)))))))
 
-(def-global-prolog-functor find-nearest/4 (?node ?lat ?lon ?k cont)
-  "Yield each of the ?K nodes nearest (?LAT, ?LON), nearest first."
+(def-global-prolog-functor find-nearest/5 (?node ?scope ?lat ?lon ?k cont)
+  "Yield each of the ?K nodes in ?SCOPE nearest (?LAT, ?LON), nearest first."
   (let ((node-var (var-deref ?node))
+        (scope (var-deref ?scope))
         (lat (var-deref ?lat)) (lon (var-deref ?lon)) (k (var-deref ?k)))
     (when (and (numberp lat) (numberp lon) (integerp k))
-      (dolist (nd (find-nearest-k lat lon k :graph *graph*))
+      (dolist (nd (find-nearest-k scope lat lon k :graph *graph*))
         (let ((old-trail (fill-pointer *trail*)))
           (when (unify node-var (car nd))
             (funcall cont))
@@ -292,7 +299,7 @@ full rebuild on every subsequent open until something happened to save it comple
                      (when geom
                        (spatial-index-insert
                         (%spatial-index-for
-                         graph (%indexed-slot-owner-name (class-of node) slot) slot)
+                         graph (%node-spatial-owner-name (class-of node) slot) slot)
                         (id node) geom)
                        (incf count))))))
           (map-vertices #'reindex graph)
@@ -355,7 +362,7 @@ has no per-index completeness granularity -- but it is the safe direction."
                    (unless (deleted-p node)
                      (multiple-value-bind (geom slot) (node-geometry node)
                        (when (and geom (eq slot slot-name)
-                                  (eq (%indexed-slot-owner-name (class-of node) slot)
+                                  (eq (%node-spatial-owner-name (class-of node) slot)
                                       owner-name))
                          (spatial-index-insert
                           (%spatial-index-for graph owner-name slot-name)

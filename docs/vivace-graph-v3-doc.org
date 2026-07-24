@@ -1920,17 +1920,24 @@ The index itself lives inside the graph's index region (~indexes.dat~), is creat
 
 Two read styles are provided, both refining the index's candidates with exact geometry math.
 
+Every query takes a *scope* as its first argument: a node-class name, a list of names, or ~:all~. The scope both /selects/ which per-class indexes are scanned and /filters/ the results by type. Both halves matter — a geometry slot declared on a mixin gives its subclasses one *shared* index, so storage separation alone would not keep a sibling subclass's nodes out of the answer. Naming a class that is not spatially indexed signals an error; a class whose index simply holds nothing yet returns ~nil~, which is a legitimate empty result.
+
 *Lisp API:*
 
 #+BEGIN_SRC lisp
-  ;; Nodes within RADIUS metres of a point, nearest first, as (node . distance):
-  (find-nodes-near 49.20 37.17 500.0)
+  ;; Observations within RADIUS metres of a point, nearest first, as (node . distance):
+  (find-nodes-near 'observation 49.20 37.17 500.0)
 
-  ;; The K nodes nearest a point, nearest first (also (node . distance) pairs):
-  (find-nearest-k 49.20 37.17 5)
+  ;; The K observations nearest a point, nearest first (also (node . distance) pairs):
+  (find-nearest-k 'observation 49.20 37.17 5)
 
-  ;; Nodes whose location falls inside a :POLYGON / :MULTIPOLYGON area:
-  (find-nodes-within my-task-area)
+  ;; Observations whose location falls inside a :POLYGON / :MULTIPOLYGON area:
+  (find-nodes-within 'observation my-task-area)
+
+  ;; A list scope unions the named classes (here OBSERVATION plus some other
+  ;; spatially indexed type); :all scans every index in the graph.
+  (find-nodes-within '(observation sensor) my-task-area)
+  (find-nodes-within :all my-task-area)
 #+END_SRC
 
 ~find-nearest-k~ is bounded by ~:max-radius~ (default 25 km): the geohash index answers a window by enumerating its grid cells, so an unbounded nearest-neighbour search is not supported — it returns the K nearest /within max-radius/ (widen it only if you accept the per-query cost, which grows with the square of the radius).
@@ -1940,21 +1947,18 @@ Two read styles are provided, both refining the index's candidates with exact ge
 #+BEGIN_SRC lisp
   ;; All observations within 500 m of (49.20, 37.17):
   (select-flat (?o)
-    (is-a ?o observation)
-    (find-near ?o 49.20 37.17 500.0))
+    (find-near ?o observation 49.20 37.17 500.0))
 
   ;; The 5 observations nearest (49.20, 37.17):
   (select-flat (?o)
-    (is-a ?o observation)
-    (find-nearest ?o 49.20 37.17 5))
+    (find-nearest ?o observation 49.20 37.17 5))
 
   ;; All observations inside a task-area geometry bound to ?area:
   (select-flat (?o)
-    (is-a ?o observation)
-    (find-within ?o ?area))
+    (find-within ?o observation ?area))
 #+END_SRC
 
-~find-near/4~ takes ~?node lat lon radius-metres~; ~find-nearest/4~ takes ~?node lat lon k~; ~find-within/2~ takes ~?node area~.
+~find-near/5~ takes ~?node scope lat lon radius-metres~; ~find-nearest/5~ takes ~?node scope lat lon k~; ~find-within/3~ and ~find-intersects/3~ take ~?node scope area~. The scope is written as a bare class-name atom (or ~:all~); it already restricts the answer by type, so the ~is-a~ goal these examples once needed is no longer required.
 
 *** Under the hood, and a few caveats
 
@@ -1991,14 +1995,14 @@ Core ~graph-db~ never depends on libgeos. Loading the add-on binds the library i
 The add-on /upgrades/ a set of generic functions in place (no API change). When it is loaded:
 
 - ~find-nodes-within~ judges extended-geometry nodes by **exact containment**, not their bbox centre.
-- ~find-nodes-intersecting~ / ~find-intersects/2~ become **exact** (without GEOS they fall back to a coarse bounding-box overlap).
+- ~find-nodes-intersecting~ / ~find-intersects/3~ become **exact** (without GEOS they fall back to a coarse bounding-box overlap).
 - ~geometry-intersects-p~, ~geometry-contains-geometry-p~ answer exactly for all geometry kinds.
 - ~geometry-make-valid~ repairs an invalid geometry (e.g. a self-intersecting polygon from a messy KML); ~geometry-valid-p~ tests validity. (~make-valid~ needs GEOS >= 3.8.)
 - ~geometry-distance-exact~ gives planar distance — note this is in *coordinate units* (degrees for lon/lat), not metres; use ~geodesic-distance~ / ~geometry-distance~ for metric distance between points.
 
 #+BEGIN_SRC lisp
   ;; nodes whose footprint actually overlaps the area (exact with GEOS):
-  (find-nodes-intersecting my-task-area)
+  (find-nodes-intersecting 'observation my-task-area)
 
   ;; repair a self-intersecting polygon before indexing it:
   (let ((clean (geometry-make-valid messy-polygon)))
@@ -2540,18 +2544,21 @@ This chapter provides a categorized reference for the most important exported sy
   Construct WGS84 ~geometry~ values ((lon lat) order). Accessors: ~geometry-kind~, ~geometry-coordinates~, ~geometry-lon~, ~geometry-lat~, ~geometry-bbox~.
 
 - ~node-geometry (node)~ ::
-  Generic function (default ~nil~) returning the geometry a node occupies. Marking a geometry slot ~:index t~ wires its default up automatically; specialize it explicitly only for a *computed* geometry. Geometry-bearing nodes are then maintained automatically in the spatial index.
+  Generic function (default ~nil~) returning the geometry a node occupies /and/ the slot it came from, as ~(values geometry slot-name)~. Marking a geometry slot ~:index t~ wires its default up automatically; specialize it explicitly only for a *computed* geometry (such a method reports no slot, and its class is indexed — and scoped — under the most general class carrying the method). Geometry-bearing nodes are then maintained automatically in the spatial index.
 
-- ~find-nodes-near (lat lon radius &key graph)~ ::
-  Live nodes within ~radius~ metres of ~(lat lon)~, nearest first, as ~(node . distance)~.
+- *scope* (first argument to every query below) ::
+  A node-class name, a list of node-class names, or ~:all~. Selects which per-class spatial indexes are scanned /and/ filters the results by type. Signals when it names a class that is not spatially indexed; returns ~nil~ for a class whose index is simply empty.
 
-- ~find-nearest-k (lat lon k &key graph max-radius)~ ::
-  The ~k~ nearest live nodes to ~(lat lon)~, nearest first, as ~(node . distance)~. Bounded by ~max-radius~ (default 25 km); returns fewer than ~k~ if fewer nodes lie within it.
+- ~find-nodes-near (scope lat lon radius &key graph)~ ::
+  Live nodes in ~scope~ within ~radius~ metres of ~(lat lon)~, nearest first, as ~(node . distance)~.
 
-- ~find-nodes-within (area &key graph)~ ::
-  Live nodes whose location lies inside the ~:polygon~ / ~:multipolygon~ ~area~ geometry.
+- ~find-nearest-k (scope lat lon k &key graph max-radius)~ ::
+  The ~k~ nearest live nodes in ~scope~ to ~(lat lon)~, nearest first, as ~(node . distance)~. Bounded by ~max-radius~ (default 25 km); returns fewer than ~k~ if fewer nodes lie within it.
 
-- ~(find-near ?node lat lon radius)~ / ~(find-nearest ?node lat lon k)~ / ~(find-within ?node area)~ ::
+- ~find-nodes-within (scope area &key graph)~ / ~find-nodes-intersecting (scope area &key graph)~ ::
+  Live nodes in ~scope~ whose location lies inside — respectively, overlaps — the ~area~ geometry.
+
+- ~(find-near ?node scope lat lon radius)~ / ~(find-nearest ?node scope lat lon k)~ / ~(find-within ?node scope area)~ / ~(find-intersects ?node scope area)~ ::
   Prolog functors that yield matching nodes, composable with the rest of a query.
 
 - ~geohash-neighbor (cell dlon dlat)~ / ~geohash-neighbors (cell)~ ::

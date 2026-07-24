@@ -339,10 +339,10 @@
            #:find-nodes-intersecting
            #:find-nodes-near
            #:find-nearest-k
-           #:find-within/2
-           #:find-intersects/2
-           #:find-near/4
-           #:find-nearest/4
+           #:find-within/3
+           #:find-intersects/3
+           #:find-near/5
+           #:find-nearest/5
            #:geo-distance/5
            #:geo-near/5
            #:geo-within/3

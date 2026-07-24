@@ -97,8 +97,8 @@
             ;; The in-AO places (Kharkiv site + Crosser-out) replicated and are in
             ;; the slave's spatial index; the out-of-AO places (Lviv site +
             ;; Crosser-in) were filtered out entirely.
-            (let ((kh (find-nodes-near 49.2020d0 37.1724d0 2000d0 :graph g))
-                  (lv (find-nodes-near 50.0263d0 23.7183d0 2000d0 :graph g)))
+            (let ((kh (find-nodes-near 'r-place 49.2020d0 37.1724d0 2000d0 :graph g))
+                  (lv (find-nodes-near 'r-place 50.0263d0 23.7183d0 2000d0 :graph g)))
               (check (= 2 (length kh))
                      "catch-up subset: 2 in-AO places replicated + indexed (got ~D)"
                      (length kh))
@@ -149,7 +149,7 @@
             ;; After the live phase the Kharkiv area holds: Kharkiv site (catch-up),
             ;; Kharkiv live, and Crosser-in (entered the AO).  Crosser-out LEFT the
             ;; AO and was deleted on the slave -> 3 in-AO places near Kharkiv.
-            (let ((kh (find-nodes-near 49.2020d0 37.1724d0 2000d0 :graph g)))
+            (let ((kh (find-nodes-near 'r-place 49.2020d0 37.1724d0 2000d0 :graph g)))
               (check (= 3 (length kh))
                      "live: 3 in-AO places indexed after live replication (got ~D)"
                      (length kh)))

@@ -961,9 +961,10 @@ node's :INDEX-marked geometry slot (see NODE-GEOMETRY-INDEX-SLOTS); declaring
  (slot :type geometry :index t) is enough to make a node type spatially indexed.
 Applications may instead specialize this method (e.g. for a computed geometry);
 an explicit method takes precedence over the default.  A specializing method that
-returns only ONE value reports no slot: such a node is still indexed (under its
-own class, slot NIL) but is not reachable by a class-scoped query -- prefer the
-declarative :INDEX slot when you want scoping.")
+returns only ONE value reports no slot: such a node is indexed under
+ (METHOD-OWNER . NIL), where METHOD-OWNER is the most general class carrying an
+applicable method (see %NODE-GEOMETRY-METHOD-OWNER-NAME), so the class is still
+scopeable by name exactly as a declared :INDEX slot is.")
   (:method (node) (declare (ignore node)) nil)
   (:method ((node node))
     ;; NB: do NOT gate on SLOT-BOUNDP -- node-class persistent slots are read
@@ -977,6 +978,51 @@ declarative :INDEX slot when you want scoping.")
           for v = (ignore-errors (slot-value node slot))
           when (geometryp v) return (values v slot))))
 
+(defun %node-geometry-method-owner-name (class)
+  "The most general class carrying an applicable application-supplied
+NODE-GEOMETRY method, or NIL when CLASS relies on the engine's default method.
+
+Overriding NODE-GEOMETRY is a documented extension point (see example.lisp): the
+method returns a computed geometry and NO slot name, so such a node is indexed
+under the key (OWNER . NIL).  This resolves OWNER the same way
+%INDEXED-SLOT-OWNER-NAME resolves a slot's -- most general first -- so a method
+defined on a parent gives its subclasses ONE shared index, exactly as an :INDEX
+slot on a parent does.  Keying on each node's own class instead would scatter a
+hierarchy across per-subclass indexes and make a scope on the parent miss them.
+
+The MOP idiom is the one %CUSTOM-NODE-GEOMETRY-CLASSES already uses (memory-
+graph.lisp): GENERIC-FUNCTION-METHODS / METHOD-SPECIALIZERS come from the MOP
+package this package USEs per implementation (sb-mop, closer-mop, clos).  The two
+built-in methods specialize on T and on NODE; only something more specific counts
+as custom.  The TYPEP guard keeps an EQL specializer -- which is not a type
+specifier -- away from SUBTYPEP."
+  (let ((owner nil))
+    (dolist (m (generic-function-methods #'node-geometry) owner)
+      (let ((spec (first (method-specializers m))))
+        (when (and (typep spec 'class)
+                   (not (member (class-name spec) '(t node)))
+                   (subtypep (class-name class) (class-name spec))
+                   (or (null owner) (subtypep owner (class-name spec))))
+          (setf owner (class-name spec)))))))
+
+(defun %node-spatial-owner-name (class slot-name)
+  "The owner half of the (OWNER . SLOT) key CLASS's geometry is indexed under.
+
+This is the ONE place the spatial owner is computed.  Every path that touches a
+spatial index -- insert, remove, whole-graph rebuild, per-index regenerate, the
+memory-graph rebuilds, and the scope resolver -- goes through it, because an
+insert and its matching remove that disagreed about the owner would orphan the
+index entry permanently.
+
+A declared :INDEX slot resolves to the most general class DECLARING that slot; a
+geometry from an application's own NODE-GEOMETRY method has no slot and resolves
+to the most general class carrying that method.  The CLASS-NAME fallback covers
+the pathological case of a slotless geometry with no class-specialized method
+ (e.g. an EQL-specialized one): still indexed, still symmetrically removable."
+  (if slot-name
+      (%indexed-slot-owner-name class slot-name)
+      (or (%node-geometry-method-owner-name class) (class-name class))))
+
 ;; Forward reference: %SPATIAL-INDEX-FOR / SPATIAL-INDEX-FOR live in
 ;; spatial-registry.lisp, which loads after this file (it needs the graph, the
 ;; MOP helpers and the memory-graph backend).  Same idiom as graph.lisp's
@@ -989,13 +1035,13 @@ declarative :INDEX slot when you want scoping.")
   "Insert NODE into the index its geometry slot selects.  No-op without geometry.
 
 A node whose geometry came from a declared :INDEX slot is keyed by (OWNER . SLOT);
-one reported by an application's own NODE-GEOMETRY method has no slot, and
-%INDEXED-SLOT-OWNER-NAME then falls back to the node's own class, so it is keyed
-by (CLASS . NIL) -- still indexed and still symmetrically removable, just not
-class-scopeable."
+one reported by an application's own NODE-GEOMETRY method has no slot and is keyed
+by (METHOD-OWNER . NIL).  Both go through %NODE-SPATIAL-OWNER-NAME, which is also
+what %SPATIAL-UNINDEX-NODE uses -- the two must agree exactly or a remove would
+miss the entry the insert wrote."
   (multiple-value-bind (geom slot) (node-geometry node)
     (when (and geom (not (deleted-p node)))
-      (let* ((owner (%indexed-slot-owner-name (class-of node) slot))
+      (let* ((owner (%node-spatial-owner-name (class-of node) slot))
              (idx (%spatial-index-for graph owner slot))
              (before (spatial-index-coarsest-precision idx)))
         (spatial-index-insert idx (id node) geom)
@@ -1028,10 +1074,11 @@ class-scopeable."
 
 (defun %spatial-unindex-node (graph node)
   "Remove NODE from the index its geometry slot selects.  No-op without geometry,
-and no-op when that index does not exist (nothing was ever written)."
+and no-op when that index does not exist (nothing was ever written).  Resolves the
+owner through %NODE-SPATIAL-OWNER-NAME, exactly as %SPATIAL-INDEX-NODE does."
   (multiple-value-bind (geom slot) (node-geometry node)
     (when geom
-      (let* ((owner (%indexed-slot-owner-name (class-of node) slot))
+      (let* ((owner (%node-spatial-owner-name (class-of node) slot))
              (idx (spatial-index-for graph owner slot)))
         (when idx
           (let ((before (spatial-index-coarsest-precision idx)))

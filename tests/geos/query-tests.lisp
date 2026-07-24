@@ -38,8 +38,8 @@
                (id (make-geos-place :geom (poly 0.010d0 0.010d0 0.012d0 0.012d0))))) ; far
        ,@body)))
 
-(defun within-ids (g) (mapcar #'id (find-nodes-within *q-aoi* :graph g)))
-(defun intersect-ids (g) (mapcar #'id (find-nodes-intersecting *q-aoi* :graph g)))
+(defun within-ids (g) (mapcar #'id (find-nodes-within 'geos-place *q-aoi* :graph g)))
+(defun intersect-ids (g) (mapcar #'id (find-nodes-intersecting 'geos-place *q-aoi* :graph g)))
 (defun has (id ids) (member id ids :test 'equalp))
 
 (test exact-within-excludes-uncontained-polygon

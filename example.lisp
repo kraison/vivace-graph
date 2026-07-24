@@ -165,27 +165,32 @@
 ;;; merchant was placed in the graph's spatial index on commit.  No extra
 ;;; bookkeeping is needed -- the transaction write-path maintains it.
 
+;; Every spatial query takes a SCOPE first: a node-class name, a list of them,
+;; or :ALL.  The scope picks which per-class index is scanned AND filters the
+;; results by type, so a query for merchants can never return anything else.
+
 ;; Merchants within 2 km of a downtown point (lat, lon, radius-metres).
 ;; Returns (merchant . distance-metres) pairs, nearest first.
-(find-nodes-near 49.2020d0 37.1724d0 2000d0)
+(find-nodes-near 'merchant 49.2020d0 37.1724d0 2000d0)
 ;; => Snake Oil, Inc. (~0 m) and Elixir Emporium (~1.5 km); Faraway Tonics
 ;;    (another city) is excluded.
 
 ;; The two nearest merchants to that same point, nearest first.
-(find-nearest-k 49.2020d0 37.1724d0 2)
+(find-nearest-k 'merchant 49.2020d0 37.1724d0 2)
 
 ;; Merchants whose location falls inside an area of interest (a polygon, given
 ;; as rings of (lon lat) -- the first ring is the outer boundary).
 (find-nodes-within
+ 'merchant
  (make-polygon '(((37.165d0 49.196d0) (37.195d0 49.196d0)
                   (37.195d0 49.212d0) (37.165d0 49.212d0)
                   (37.165d0 49.196d0)))))
 
-;; The same proximity query, composed in Prolog with a type test: bind ?m to
-;; every merchant within 2 km of the point.  find-near/4 yields nodes, so it
-;; cooperates with is-a and the rest of the query language.
+;; The same proximity query, composed in Prolog.  find-near/5 takes the scope as
+;; its second argument and yields nodes, so it cooperates with the rest of the
+;; query language.  (The scope already restricts the answer to merchants, so the
+;; is-a goal the pre-scope API needed is no longer required.)
 (select-flat (?m)
-  (is-a ?m merchant)
-  (find-near ?m 49.2020d0 37.1724d0 2000d0))
+  (find-near ?m merchant 49.2020d0 37.1724d0 2000d0))
 
 (close-graph *graph*)

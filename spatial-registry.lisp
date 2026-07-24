@@ -13,15 +13,24 @@
 ;;;; index functions.
 
 (defun class-spatial-index-keys (class graph)
-  "The (OWNER-NAME . SLOT-NAME) keys covering CLASS's geometry-index slots.  Each
-:INDEX-marked slot resolves to the most general node-class declaring it, so a slot
-on a mixin yields ONE key shared by every subclass.  GRAPH is accepted for symmetry
-with CLASS-SECONDARY-INDEX-DESCRIPTORS and for the DEF-SPATIAL-INDEX registry added
-in a later task."
+  "The (OWNER-NAME . SLOT-NAME) keys covering CLASS's geometry.  Each :INDEX-marked
+slot resolves to the most general node-class declaring it, so a slot on a mixin
+yields ONE key shared by every subclass.  A class with an application-supplied
+NODE-GEOMETRY method instead yields (METHOD-OWNER . NIL), resolved by the same
+most-general rule -- the same key %NODE-SPATIAL-OWNER-NAME hands the write path, so
+a scope on such a class finds exactly what the write path wrote.
+
+GRAPH is accepted for symmetry with CLASS-SECONDARY-INDEX-DESCRIPTORS and for the
+DEF-SPATIAL-INDEX registry added in a later task."
   (declare (ignorable graph))
   (when (class-finalized-p class)
-    (loop for slot-name in (node-geometry-index-slots class)
-          collect (cons (%indexed-slot-owner-name class slot-name) slot-name))))
+    (let ((slot-keys (loop for slot-name in (node-geometry-index-slots class)
+                           collect (cons (%indexed-slot-owner-name class slot-name)
+                                         slot-name)))
+          (method-owner (%node-geometry-method-owner-name class)))
+      (if method-owner
+          (cons (cons method-owner nil) slot-keys)
+          slot-keys))))
 
 (defun spatial-index-for (graph owner-name slot-name)
   "GRAPH's spatial index for (OWNER-NAME . SLOT-NAME), or NIL if none has been
@@ -87,18 +96,61 @@ re-derive from."
     result))
 
 (defun node-spatial-index (graph node slot-name)
-  "The index NODE's SLOT-NAME geometry belongs in, created if absent."
+  "The index NODE's SLOT-NAME geometry belongs in, created if absent.  Resolves the
+owner through %NODE-SPATIAL-OWNER-NAME, so a NIL SLOT-NAME (a custom NODE-GEOMETRY
+method) lands in the method owner's index, not a per-subclass one."
   (%spatial-index-for graph
-                      (%indexed-slot-owner-name (class-of node) slot-name)
+                      (%node-spatial-owner-name (class-of node) slot-name)
                       slot-name))
 
-(defun %resolve-spatial-scope (scope graph)
-  "Resolve SCOPE to (values INDEXES TYPE-NAMES): the spatial indexes to scan, and
-the class list results must satisfy (NIL = no filtering).
+(defun %class-geometry-slots-declared-p (class-name)
+  "True when CLASS-NAME is a scopeable spatial class: it declares at least one
+:INDEX-marked slot, OR it carries an application-supplied NODE-GEOMETRY method.
 
-Task 2 handles only :ALL; class-name and class-list scopes arrive in Task 4."
-  (ecase scope
-    (:all (values (all-spatial-indexes graph) nil))))
+Both are first-class ways to be spatially indexed, so both must be scopeable --
+otherwise overriding NODE-GEOMETRY would leave a class reachable only through
+:ALL, which is the unscoped query this API exists to forbid.  Distinguishes a
+declared-but-empty index (a legitimate empty result) from a class that is not
+spatially indexed at all (an error).  Direct mirror of %SLOT-INDEX-DECLARED-P."
+  (let ((class (ignore-errors (find-class class-name nil))))
+    (and class (class-finalized-p class)
+         (or (node-geometry-index-slots class)
+             (%node-geometry-method-owner-name class))
+         t)))
+
+(defun %resolve-spatial-scope (scope graph)
+  "Resolve SCOPE -- a class name, a list of class names, or :ALL -- to
+ (values INDEXES TYPE-NAMES).
+
+INDEXES is the set of live spatial indexes to scan; TYPE-NAMES is the class list
+results must satisfy, or NIL for :ALL (no filtering).  A named class contributes
+every (owner . slot) index covering its geometry, so a slot declared on a mixin
+resolves to the ancestor's shared index -- and the type filter is what then keeps
+a sibling subclass's nodes out of the answer.  Indexes are deduped by KEY, not by
+struct identity, so two classes sharing an ancestor's index scan it once.
+
+An index that does not exist yet contributes nothing: indexes are created lazily on
+the first geometry-valued write, so a declared-but-empty index is a legitimate
+empty result, not a fault.
+
+Signals when a named class is not spatially indexed at all: that is a programming
+error, and catching it is the reason the scope is required."
+  (if (eq scope :all)
+      (values (all-spatial-indexes graph) nil)
+      (let* ((names (if (listp scope) scope (list scope)))
+             (keys (make-hash-table :test 'equalp))
+             (indexes '()))
+        (dolist (name names)
+          (unless (%class-geometry-slots-declared-p name)
+            (error "~S is not a spatially indexed class in ~S: it declares no ~
+                    :INDEX-marked geometry slot and has no NODE-GEOMETRY method."
+                   name (graph-name graph)))
+          (dolist (key (class-spatial-index-keys (find-class name) graph))
+            (unless (gethash key keys)
+              (setf (gethash key keys) t)
+              (let ((idx (spatial-index-for graph (car key) (cdr key))))
+                (when idx (push idx indexes))))))
+        (values indexes names))))
 
 (defun %scope-admits-p (node type-names)
   "True when NODE satisfies the scope's type filter (always, for :ALL)."
