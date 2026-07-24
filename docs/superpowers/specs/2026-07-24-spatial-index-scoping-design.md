@@ -13,9 +13,9 @@
 The graph's single spatial index becomes a **registry of per-`(owner-class . slot)` indexes**,
 mirroring `secondary-indexes`, `unique-indexes` and `vector-segments`. Spatial queries gain a
 **required scope** argument. Geohash precision becomes **per index**. The insert-side cell cover
-gains a **bounded, persisted cap** and a **query-side clamp** that keeps the bound from silently
-losing nodes. A **value-based warning** reports node classes whose second indexed geometry slot is
-inert.
+gains a **bounded, persisted cap** and a **self-healing query-side clamp** that keeps the bound from
+silently losing nodes. A **value-based warning** reports node classes whose second indexed geometry
+slot is inert.
 
 Deferred to a follow-on (§13): indexing a node under *every* indexed geometry slot (the change
 request's CR-3.2), and multi-resolution query probing.
@@ -44,7 +44,7 @@ Coarsening the insert inverts that. Store a polygon as `"u8k"` (precision 3); qu
 inside it, get `cover-prec` 7 and covering cell `"u8kabcd"`, range `["u8kabcd", "u8kabcd{")`.
 `"u8k"` sorts *before* the range start and the node is invisible. The change request's own test
 property 3 — "the cap must not lose the node" — is exactly what the naive fix fails. §7 fixes this
-with a persisted high-water clamp.
+with a persisted, self-healing clamp on the query's covering precision.
 
 **(b) CR-3.1 cannot be implemented as specified.** It asks for a finalization-time warning on
 classes declaring more than one `:index` slot "whose type is geometry." The engine deliberately
@@ -94,6 +94,8 @@ spatially *queryable*, just not mixed with ACLED — which is CR-1 option 1.
 | Insert slot choice | **Per-node** (preserves today's semantics) |
 | Precision declaration | **Both** a slot option and a `def-spatial-index` macro |
 | Precision precedence | slot option > macro > graph default (MOP-first, matching `index.lisp`), with a warning on conflict |
+| Index creation | Lazy, on first geometry-valued insert (explicit `def-spatial-index` builds eagerly) |
+| Insert-cover clamp | Per-precision histogram, so degradation self-heals when the oversized node leaves |
 | Migration | Automatic on format mismatch; index-only re-derivation |
 
 Keying on `(owner . slot)` rather than owner alone is deliberate. Today a class has at most one
@@ -127,12 +129,37 @@ mirroring `secondary-indexes.dat`:
 
 ```lisp
 (:format 3
- :indexes ((owner-name slot-name address precision backend max-cells coarsest-precision) …))
+ :indexes ((owner-name slot-name address precision backend max-cells precision-counts) …))
 ```
 
 Written on every index creation **and** at `close-graph`. Secondary indexes write only at close, so
 a crash costs them a full rebuild; spatial addresses are stable (`%bpt-address` is a header address
 and root splits sync into it — verified), so writing at creation is strictly better and free.
+
+### 4.1 Indexes are created lazily, and an empty one is nearly free
+
+**Lazily.** An index is created on the **first geometry-valued insert** for its `(owner . slot)`,
+mirroring `%ix-claim`'s gate-before-create (`index.lisp:236`, whose comment reads "Gate BEFORE
+%SLOT-INDEX-FOR so a geometry slot never creates an ordered index"). A slot marked `:index` that
+never holds a geometry therefore never creates a spatial index at all. This matters under the
+deferred CR-3.2, where a class may declare several geometry slots and populate only some: the
+unpopulated ones cost nothing, because they do not exist.
+
+The one exception is an explicit `def-spatial-index`, which builds at open even when empty — the
+user asked for it, same contract as `def-index`.
+
+**Nearly free.** A spatial index is built by `make-heap-index` into the graph's **shared
+`indexes.dat` heap** (`spatial-index.lisp:60`, `graph.lisp:17`), not as a separately-mmap'd file. It
+has **no address-space reservation of any kind**. An empty one is a skip-list head/tail sentinel
+pair, or a B+ tree header plus one 4 KiB page (`+bplus-default-page-size+`).
+
+This is worth stating explicitly because the neighbouring vector-segment subsystem *does* reserve —
+`max(8 × size, *mmap-min-reservation*, size)`, a **1 GiB floor** per segment
+(`docs/superpowers/specs/2026-07-22-segment-reservation-exhaustion-design.md` §1). Spatial indexes
+do nothing analogous, and nothing here should be reasoned about by analogy to segments.
+
+§6's declared-but-empty error contract depends on this rule: an index that does not exist yet is the
+normal state of a declared-but-unpopulated slot, not a fault.
 
 ---
 
@@ -279,8 +306,17 @@ deliberate, since insert is paid once per write and finer storage is strictly be
 
 ### 7.2 The clamp
 
-Each index carries `coarsest-precision`: the minimum precision ever used for a stored cell,
-initialized to the index precision and monotonically decreasing. The query becomes:
+Each index carries `precision-counts`: a 12-element vector counting how many stored cell entries
+exist at each geohash precision. `coarsest-precision` is **derived** from it — the lowest occupied
+level — and cached, recomputed only when a counter crosses zero:
+
+```lisp
+(loop for p from 1 to 12 when (plusp (aref counts p)) return p)
+```
+
+`spatial-index-insert` increments `counts[p]` per cell written; `spatial-index-remove` decrements.
+Because §7.1's persisted `max-cells` makes insert and remove compute identical cell sets, the
+counters stay balanced by construction. The query becomes:
 
 ```lisp
 (min (spatial-index-precision idx)
@@ -291,10 +327,26 @@ initialized to the index precision and monotonically decreasing. The query becom
 The third term is the correctness fix. It guarantees every stored cell is at or finer than the
 covering cell, so the prefix range scan still reaches it — closing the hole in §2.1(a).
 
-**Durability.** Crashing after a coarse insert but before persisting the new high-water would reopen
-with a too-fine `coarsest-precision` and silently miss. The sidecar is therefore rewritten
-**whenever the high-water decreases** — a small `cl-store` write on a genuinely exceptional path,
-not per insert.
+**Self-healing.** A histogram rather than a monotonic high-water means the clamp *recovers*: delete
+the oversized polygon, its cells decrement, that level empties, and `coarsest-precision` rises back
+on its own. No rebuild, no operator action. An index degraded by one bad insert un-degrades when the
+bad node leaves — which is what anyone would expect and what a high-water mark would not have
+delivered.
+
+**Durability, and why the asymmetry is safe.** Drift in the two directions has opposite
+consequences, and only one of them needs a synchronous write:
+
+- Losing a **decrease** (a newly-occupied coarser level) reopens with a too-*fine* clamp → the query
+  covers finer than a stored coarse cell → **misses**. Unsafe.
+- Losing an **increase** (a level emptied) reopens with a too-*coarse* clamp → the query
+  over-covers → more candidates, exact refine unchanged → **correct, merely slower**. Safe.
+
+So the sidecar is rewritten synchronously **only when `coarsest-precision` decreases** — the rare,
+exceptional path, exactly as before. Increases ride the ordinary close-time write. Any residual
+drift is corrected by any rebuild, which recomputes the histogram from scratch.
+
+Test 7 (insert/remove symmetry) is what keeps this honest: an imbalance in the counters is the one
+thing that could push the clamp in the unsafe direction, and a residual-entry assertion catches it.
 
 ### 7.3 What this means in practice
 
@@ -317,9 +369,22 @@ exactly the cost the deferred multi-resolution work removes.
 
 ### 7.4 Observability
 
-`warn` on every *decrease* of the high-water mark, naming node id, class, slot, bbox, and requested
+`warn` on every *decrease* of `coarsest-precision`, naming node id, class, slot, bbox, and requested
 vs granted precision; `log:info` per coarsened insert. Warning per node would mean thousands of
 warnings on a bulk ingest; warning per decrease is loud, rare, and still names a specific node.
+
+**The warning must state the recovery path**, or an operator reads "selectivity degraded", removes
+the offending node, and cannot tell whether anything improved. Two routes, and the text names both:
+
+- **Automatic** — removing every node stored at that precision raises `coarsest-precision` back on
+  its own (§7.2). This is the normal path and needs no intervention.
+- **Manual** — `regenerate-spatial-index` (graph, owner, slot) rebuilds that **one** index and
+  recomputes its histogram from live nodes. Note the singular: regenerating every spatial index in
+  the graph to clear one degraded index is a bad trade, so the per-index form is the one to reach
+  for. `regenerate-spatial-indexes` (plural) remains, for a backend switch.
+
+A symmetric `log:info` fires when `coarsest-precision` rises, so the recovery is as visible in the
+log as the degradation was.
 
 ---
 
@@ -327,18 +392,32 @@ warnings on a bulk ingest; warning per decrease is loud, rare, and still names a
 
 Value-based, since the declared-type version is not buildable (§2.1(b)).
 
-The first node of a class to reach spatial maintenance runs the geometry loop *without* the early
-return, counts geometry-valued indexed slots, and if there are ≥2, warns naming the class, every
-geometry slot found, and which one wins. A per-class flag on `*node-geometry-slot-cache*` makes it
-once-ever; every subsequent write takes today's early-return path. Zero steady-state cost.
+A node reaching spatial maintenance runs the geometry loop *without* the early return, counts
+geometry-valued indexed slots, and if there are ≥2, warns naming the class, every geometry slot
+found, and which one wins.
 
-Two honest caveats:
+**Sampled over a class's first 64 nodes, not just its first.** The full loop runs while a per-class
+counter on `*node-geometry-slot-cache*` is under 64, and stops early the moment it fires; after that
+every write takes today's early-return path. Checking only the first node would miss any class whose
+first node happens to be unrepresentative — the common case for a schema where `centroid` is
+populated at creation and `extent` is filled in later. Checking *always* is the wrong trade in the
+other direction: `node-geometry-index-slots` returns **all** `:index` slots, scalars included, so
+dropping the early return permanently would cost a slot read per indexed slot on every spatial
+write. 64 is bounded, negligible, and covers the realistic case.
 
-1. It samples one node. A class whose first node has only `centroid` bound will not warn even if a
-   later node has both.
-2. **The migration sweep of §9 is the real audit.** It visits every node, so it surfaces all four
-   of mine-action's affected classes (`admin-area`, `site`, `survey`, `hazard-area`) on first open —
-   precisely when they want to know.
+**`audit-spatial-slots` (graph)** does the §9 migration sweep *without* rebuilding: it visits every
+live node, reports every class with more than one geometry-valued indexed slot, and names the winner
+for each. Available on demand and in CI — the answer for classes added long after migration, and the
+thing to wire into a schema test suite.
+
+Two honest caveats remain:
+
+1. Sampling is bounded, not exhaustive. A class where fewer than 1 in 64 nodes binds two geometry
+   slots still slips past the sampler. `audit-spatial-slots` is what closes that, for anyone who
+   runs it.
+2. **The migration sweep of §9 is a free audit of everything present at that moment.** It visits
+   every node, so it surfaces all four of mine-action's affected classes (`admin-area`, `site`,
+   `survey`, `hazard-area`) on first open — precisely when they want to know.
 
 This warning is scoped to the present semantics. When CR-3.2 lands, multiple indexed geometry slots
 become the *intended* configuration and this warning is **removed**, not suppressed.
@@ -406,6 +485,17 @@ Added here:
 11. **Scope error contract** — undeclared class signals; declared-but-empty returns `NIL`.
 12. **Dedup** — a node reachable through two of its own slot-indexes is returned once.
 13. **Prolog scope shapes** — symbol, list, `:all` through the query compiler.
+14. **Clamp self-heals** — insert an oversized geometry (clamp drops), delete it, assert
+    `coarsest-precision` returns to the index precision and a fine query regains its old
+    selectivity, **with no rebuild**. The property the histogram exists for.
+15. **Histogram durability asymmetry** — a lost *increase* (unclean close after a delete that
+    emptied a level) reopens correct-but-coarse and still returns every node; a *decrease* survives
+    an unclean close (this is test 8, re-stated as the unsafe direction).
+16. **Lazy creation** — a slot marked `:index` that never holds a geometry creates no index at all;
+    a scope naming it returns `NIL` rather than signalling; an explicit `def-spatial-index` on the
+    same slot *does* create one, empty.
+17. **`audit-spatial-slots`** — finds a class the 64-node sampler missed, by populating the second
+    geometry slot only on a node beyond the sampling window.
 
 Matrix: both backends (skip-list, B+ tree), memory-graph, SBCL + ECL (CCL on Linux).
 
@@ -495,7 +585,8 @@ both API and on-disk format, so the paperwork is not optional.
   `tests/backup-tests.lisp`, plus the `tests/package.lisp` and `tests/concurrency/package.lisp`
   import lists.
 - **`package.lisp`** — export `spatial-indexes`, `spatial-index-for`, `def-spatial-index`,
-  `rebuild-spatial-indexes`, `regenerate-spatial-indexes`, the new Prolog functors; remove
+  `rebuild-spatial-indexes`, `regenerate-spatial-index` (per-index, §7.4),
+  `regenerate-spatial-indexes` (all), `audit-spatial-slots` (§8), the new Prolog functors; remove
   `spatial-index` and `rebuild-spatial-index`.
 
 ### 14.2 GitHub project documentation
