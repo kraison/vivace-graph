@@ -439,7 +439,7 @@ The recommended path is an *in-place reindex*: reopen the graph on the new backe
     (regenerate-all-views g)          ; map/reduce views
     (regenerate-unique-indexes g)     ; :unique constraints
     (regenerate-secondary-indexes g)  ; general ordered indexes (:index / def-index)
-    (rebuild-spatial-index g)         ; spatial index
+    (regenerate-spatial-indexes g)    ; spatial indexes
     (close-graph g))                  ; persists the new backend tags
 #+END_SRC
 
@@ -1892,7 +1892,7 @@ A ~geometry~ is a normal serializable value, so you store one in a node slot jus
 
 *** Making a node type spatial
 
-To put a node type on the map, give it a geometry slot and mark that slot ~:index t~. That is all it takes: every create/update/delete of such a node then automatically maintains the graph's spatial index — there is no separate "add to index" call.
+To put a node type on the map, give it a geometry slot and mark that slot ~:index t~. That is all it takes: every create/update/delete of such a node then automatically maintains that class's spatial index — there is no separate "add to index" call.
 
 #+BEGIN_SRC lisp
   (def-vertex observation ()
@@ -1914,7 +1914,29 @@ Under the hood, indexing goes through the ~node-geometry~ generic function, whic
     (slot-value o 'location))
 #+END_SRC
 
-The index itself lives inside the graph's index region (~indexes.dat~), is created by ~make-graph~, and is reopened automatically by ~open-graph~ — you do not manage it directly.
+*One index per declaring class per geometry slot.* Spatial indexes form a registry keyed ~(owner-class . slot)~, exactly like ~:unique~, ~:vector-index~ and ~:index~. Each spatially indexed class+slot gets its /own/ index, which is what lets a query be scoped to just one class (see /Querying/ below). Two consequences are worth stating:
+
+- A geometry slot declared on a *mixin* gives all of that mixin's subclasses /one shared/ index — the index is owned by the class that /declares/ the slot, not by each subclass. Sibling subclasses are then kept apart at query time by the scope's type filter, not by storage. A class that declares its own geometry slot (no mixin) gets an index to itself.
+- Indexes are created *lazily*, on the first geometry-valued write for that class+slot — not by ~make-graph~. A slot marked ~:index t~ that never actually holds a geometry creates no index at all, and a query scoped to it simply returns ~nil~. Each index lives in the graph's index region (~indexes.dat~) and is reopened automatically by ~open-graph~; you never manage it directly.
+
+Here is a second spatial type, so the query examples below have two classes to scope across. Because ~sensor~ declares its own geometry slot, it gets its own index, independent of ~observation~'s:
+
+#+BEGIN_SRC lisp
+  (def-vertex sensor ()
+    ((location :type geometry :index t)
+     (kind     :type string))
+    :survey-app)
+#+END_SRC
+
+*Per-index grid precision.* A geometry slot may set its index's geohash precision with the ~:spatial-precision~ slot option; without it the index uses the graph default (7, ≈150 m cells — set the graph-wide default with ~make-graph~'s ~:spatial-precision~ keyword). Coarser grids suit large areas (country-scale zone polygons), finer grids suit dense points. This slot option is the /only/ precision-declaration surface — there is no separate per-index declaration macro. Changing a declared precision re-grids that one index automatically the next time the graph is opened (a mixed-precision index would otherwise miss on query); the rebuild is bounded to that class's nodes.
+
+#+BEGIN_SRC lisp
+  (def-vertex zone ()
+    ((extent :type geometry :index t :spatial-precision 3))  ; coarse grid for big polygons
+    :survey-app)
+#+END_SRC
+
+*One geometry slot per node is indexed.* A node is indexed by the /first/ geometry-valued indexed slot ~node-geometry~ finds; a second geometry-valued indexed slot on the same class is silently /inert/. Because the effective geometry is decided by value at write time (the ~:type geometry~ declaration cannot be compared reliably across application packages), VivaceGraph reports this by value rather than by declaration: a class whose nodes bind two geometry slots triggers a ~warn~ on the write path — naming the class, the geometry slots found, and which one wins — sampled over the class's first 64 nodes, so it costs nothing steady-state. ~audit-spatial-slots~ (graph) is the exhaustive, read-only counterpart: it sweeps every live node and reports every such class with its winning and inert slots — the thing to run after a migration or wire into a schema test suite.
 
 *** Querying
 
@@ -1934,8 +1956,8 @@ Every query takes a *scope* as its first argument: a node-class name, a list of 
   ;; Observations whose location falls inside a :POLYGON / :MULTIPOLYGON area:
   (find-nodes-within 'observation my-task-area)
 
-  ;; A list scope unions the named classes (here OBSERVATION plus some other
-  ;; spatially indexed type); :all scans every index in the graph.
+  ;; A list scope unions the named classes (here OBSERVATION and SENSOR);
+  ;; :all scans every index in the graph.
   (find-nodes-within '(observation sensor) my-task-area)
   (find-nodes-within :all my-task-area)
 #+END_SRC
@@ -1962,7 +1984,8 @@ Every query takes a *scope* as its first argument: a node-class name, a list of 
 
 *** Under the hood, and a few caveats
 
-- *The index* is an ordered index (in the graph's index region, ~indexes.dat~) — a skip list by default, or a B+ tree if the graph's ~:index-backend~ selects one (see Chapter 3) — keyed by the composite ~(geohash-cell . node-id)~: a node's id is entered under every fixed-precision grid cell its geometry occupies. Folding the id into the key keeps the index *duplicate-free*, so insert and — especially — *remove* are O(log n) (an older duplicate-cell layout made removal O(n)). A query covers its window with as few, possibly coarser, cells as it can and does one *prefix range scan* per covering cell — geohash keys are prefix-nested, so every finer cell within a coarse one sorts inside its range — touching only the cells in view. The grid precision is set with ~make-graph~'s ~:spatial-precision~ keyword (default 7, ≈150 m cells; 9 ≈ 5 m); it is persisted with the index and read back by ~open-graph~, which rebuilds an index written in the older format from node geometries on first open.
+- *The indexes* are ordered indexes (in the graph's index region, ~indexes.dat~) — a skip list by default, or a B+ tree if the graph's ~:index-backend~ selects one (see Chapter 3) — one per spatially indexed ~(class . slot)~, each keyed by the composite ~(geohash-cell . node-id)~: a node's id is entered under every grid cell its geometry occupies, at that index's precision. Folding the id into the key keeps the index *duplicate-free*, so insert and — especially — *remove* are O(log n) (an older duplicate-cell layout made removal O(n)). A query covers its window with as few, possibly coarser, cells as it can and does one *prefix range scan* per covering cell — geohash keys are prefix-nested, so every finer cell within a coarse one sorts inside its range — touching only the cells in view. Each index carries its own precision: the ~:spatial-precision~ slot option if the geometry slot declares one, else the graph default (~make-graph~'s ~:spatial-precision~ keyword, default 7 ≈150 m cells; 9 ≈ 5 m). A precision is persisted with its index and read back by ~open-graph~. A graph written before the per-class scheme (the spatial sidecar is now ~spatial-indexes.dat~, format v3) re-derives /all/ its spatial indexes from the live node geometries on first open — index only, node data untouched, nothing re-fetched.
+- *A bounded insert, self-healed at query time.* To stop a huge polygon from covering an astronomical number of fine cells, an insert caps its cover (16384 cells per index) and, when it must, stores that geometry more coarsely. The coarsening is made safe by the same /filter then refine/ contract: each index remembers the coarsest precision it actually holds and a query never covers finer than that, so a coarsely-stored country-scale polygon is still found (then refined exactly). Deleting the oversized geometry lets the finer selectivity return on its own, with no rebuild. Per-index precision (above) is the real control; the cap and clamp are a safety net for data that does not match the grid.
 - *Matching uses a representative point*: a ~:point~ matches exactly; an extended geometry (line, polygon) is matched by the centre of its bounding box, so radius/containment results for extended geometries are approximate. Point-in-polygon refinement honours holes.
 - *Distance* is the haversine great-circle distance — accurate to roughly half a percent, ample for most uses; a more precise geodesic can replace it later without changing the API.
 - *Heavier topology* (intersection, union, validity repair) is intentionally out of this dependency-free core and is left to an optional GEOS-backed module.
@@ -2475,7 +2498,7 @@ This chapter provides a categorized reference for the most important exported sy
   Force-rebuilds every view in the graph.  ~open-graph~ (and ~open-memory-graph~) accept ~:regenerate-views t~ to run this at open time.  Also the views half of an index-backend migration: after reopening with a new ~:index-backend~, this rebuilds every view on the current backend (see Chapter 3).
 
 - ~regenerate-unique-indexes (graph)~ ::
-  Drops and rebuilds every ~:unique~ constraint index on the graph's *current* index backend, re-persisting each index's backend tag.  The unique-index half of an in-place skip-list→B+ tree migration (paired with ~regenerate-all-views~ and ~rebuild-spatial-index~; see Chapter 3).
+  Drops and rebuilds every ~:unique~ constraint index on the graph's *current* index backend, re-persisting each index's backend tag.  The unique-index half of an in-place skip-list→B+ tree migration (paired with ~regenerate-all-views~ and ~regenerate-spatial-indexes~; see Chapter 3).
 
 **** General ordered indexes (~:index~ / ~def-index~; see Chapter 8)
 - ~def-index (owner-class slot graph-name &key canonicalize)~ ::
@@ -2485,7 +2508,7 @@ This chapter provides a categorized reference for the most important exported sy
 - ~index-range (graph class slot &key start end)~ / ~map-index (function graph class slot &key start end)~ ::
   The nodes whose ~slot~ is in ~[start,end]~ (inclusive; open-ended when ~nil~), in ascending value order — collected, or streamed to ~function~.
 - ~regenerate-secondary-indexes (graph)~ ::
-  Drops and rebuilds every ordered index on the graph's *current* index backend — the ~:index~/~def-index~ half of an in-place backend migration (paired with ~regenerate-all-views~, ~regenerate-unique-indexes~, ~rebuild-spatial-index~; see Chapter 3).
+  Drops and rebuilds every ordered index on the graph's *current* index backend — the ~:index~/~def-index~ half of an in-place backend migration (paired with ~regenerate-all-views~, ~regenerate-unique-indexes~, ~regenerate-spatial-indexes~; see Chapter 3).
 
 **** Graph Traversal & Mapping
 - ~map-vertices (function graph &key vertex-type include-vertex-types exclude-vertex-types include-subclasses-p ... )~ ::
@@ -2546,6 +2569,13 @@ This chapter provides a categorized reference for the most important exported sy
 - ~node-geometry (node)~ ::
   Generic function (default ~nil~) returning the geometry a node occupies /and/ the slot it came from, as ~(values geometry slot-name)~. Marking a geometry slot ~:index t~ wires its default up automatically; specialize it explicitly only for a *computed* geometry (such a method reports no slot, and its class is indexed — and scoped — under the most general class carrying the method). Geometry-bearing nodes are then maintained automatically in the spatial index.
 
+- ~(slot :type geometry :index t :spatial-precision N)~ (slot options) ::
+  ~:index t~ opts a geometry slot into spatial indexing; the optional
+  ~:spatial-precision N~ sets /that/ index's geohash grid precision (else the
+  graph default — ~make-graph~'s ~:spatial-precision~, default 7). This is the
+  only precision-declaration surface; there is no separate declaration macro.
+  Changing a declared precision re-grids that one index at the next ~open-graph~.
+
 - *scope* (first argument to every query below) ::
   A node-class name, a list of node-class names, or ~:all~. Selects which per-class spatial indexes are scanned /and/ filters the results by type. Signals when it names a class that is not spatially indexed; returns ~nil~ for a class whose index is simply empty.
 
@@ -2564,11 +2594,41 @@ This chapter provides a categorized reference for the most important exported sy
 - ~geohash-neighbor (cell dlon dlat)~ / ~geohash-neighbors (cell)~ ::
   Grid helpers: the cell ~dlon~/~dlat~ steps away (wraps the antimeridian, ~nil~ off a pole), and the 8 same-precision cells surrounding ~cell~.
 
-- ~rebuild-spatial-index (graph &key precision)~ ::
-  Rebuild the index from scratch by scanning every live node with a
-  ~node-geometry~. Use to change the grid ~precision~, adopt the index on a
-  graph that predates the spatial extension, or repair it. Run when the graph is
-  quiescent (like ~regenerate-view~). Returns the number of nodes indexed.
+- ~spatial-indexes (graph)~ / ~spatial-index-for (graph owner-class slot)~ ::
+  The per-~(owner-class . slot)~ spatial-index registry, and the one index for a
+  given owner class and geometry slot. Per-index introspection:
+  ~spatial-index-precision~, ~spatial-index-max-cells~,
+  ~spatial-index-precision-counts~, ~spatial-index-coarsest-precision~.
+
+- ~rebuild-spatial-indexes (graph)~ ::
+  Rebuild /every/ spatial index from scratch by scanning every live node with a
+  ~node-geometry~ and routing it into the ~(owner . slot)~ index its geometry slot
+  selects. Adopts the per-class scheme on a graph that predates it, or repairs.
+  Run when the graph is quiescent (like ~regenerate-view~). Returns the number of
+  nodes indexed.
+
+- ~regenerate-spatial-index (graph owner-class slot)~ ::
+  Drop and rebuild /one/ ~(owner . slot)~ index, re-deriving its precision
+  histogram from live nodes. The manual recovery for an index whose selectivity a
+  single oversized insert degraded — prefer this to rebuilding every index.
+
+- ~regenerate-spatial-indexes (graph)~ ::
+  Rebuild every spatial index on the graph's *current* index backend — the
+  spatial half of an in-place skip-list→B+ tree migration (paired with
+  ~regenerate-all-views~, ~regenerate-unique-indexes~,
+  ~regenerate-secondary-indexes~; see Chapter 3).
+
+- ~install-spatial-indexes (graph)~ ::
+  Called at open (the mirror of ~install-views~ / ~install-secondary-indexes~):
+  rebuilds any spatial index whose /persisted/ precision no longer matches the
+  ~:spatial-precision~ its slot option now declares. Creates nothing — indexes are
+  still created lazily, at the first geometry-valued write.
+
+- ~audit-spatial-slots (graph)~ ::
+  Read-only exhaustive sweep: reports each class carrying more than one
+  geometry-valued indexed slot — as ~(class winning-slot . inert-slots)~. The
+  counterpart to the write-path inert-slot warning (see "Making a node type
+  spatial"); wire it into a schema test suite or run it after a migration.
 
 - ~make-spatial-replication-filter (area)~ ::
   Build a slave-graph ~:replication-filter~ predicate from ~area~ (a ~:polygon~ /

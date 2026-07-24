@@ -19,6 +19,22 @@ A comprehensive developer's manual lives in [`docs/vivace-graph-v3-doc.org`](doc
 
 This manual was written by [Gwang-Jin Kim (@gwangjinkim)](https://github.com/gwangjinkim) — the project's first thorough documentation, and a great piece of work. Many thanks to him. It has been adopted here and is maintained alongside the code; newer chapters (such as Chapter 12 on MVCC) are maintainer additions written in his style.
 
+### Announcement, 2026-07-24 — VivaceGraph 3.0.0, per-class spatial indexes (breaking)
+
+The spatial extension is reworked from a single graph-wide index into a registry of **per-`(owner-class . slot)` indexes**, and this is a breaking release on both the public API and the on-disk format.
+
+**What breaks (API):**
+
+- **Every spatial query now takes a required scope as its first argument** — a node-class name, a list of names, or `:all`. `(find-nodes-within area)` becomes `(find-nodes-within 'my-class area)`; likewise `find-nodes-intersecting`, `find-nodes-near`, and `find-nearest-k`. The scope both selects which per-class indexes are scanned and type-filters the results. Stale call sites are a compile-time warning on SBCL and ECL.
+- **The single graph-wide spatial-index accessor and the old singular whole-graph rebuild function are gone.** There is no longer one index to name or rebuild: use `spatial-indexes` / `spatial-index-for`, and `rebuild-spatial-indexes` (all) / `regenerate-spatial-index` (one).
+- **The old unscoped Prolog arities are gone** — `find-within`/`find-intersects` at arity 2 and `find-near`/`find-nearest` at arity 4 — replaced by the scoped `find-within/3`, `find-intersects/3`, `find-near/5`, `find-nearest/5` (the scope rides in second position). A stale query fails at goal entry with an unknown-functor error.
+
+**What migrates automatically:** the on-disk spatial sidecar goes to format v3 (`spatial-indexes.dat`). An existing graph **re-derives its spatial indexes from the live node geometries at first open** — index only, node data untouched, nothing re-fetched — so you open in place with no separate migration step. Grid precision is now per index, declared with a `:spatial-precision` slot option on the geometry slot (the graph-wide `make-graph :spatial-precision` remains the default).
+
+**Downgrade after migration is unsupported:** an older build reopens the stale `spatial-index.root` as a silently empty or out-of-date index. Snapshot first if you need a fallback.
+
+See Chapter 13 of the developer's manual and [`CHANGELOG.md`](CHANGELOG.md) for the full story.
+
 ### Announcement, 2026-07-06 — VivaceGraph 2.1.1 (bug fix)
 
 A bug-fix release. Fixes an **ECL-only** bug where `edge-exists-p` (and a generated `make-<type>`'s type resolution) could fail when operating on a graph other than the current `*graph*`: a ve/vev index read deserialized its index-list against the wrong heap. No API or on-disk format change; upgrade in place. See [`CHANGELOG.md`](CHANGELOG.md).
@@ -37,7 +53,7 @@ git remote set-url origin git@github.com:kraison/vivace-graph.git
 
 A large, **backward-compatible** feature release. Highlights:
 
-- **Pluggable ordered-index backend.** Views, `:unique` constraints and the spatial index can now run on a page-oriented **B+ tree** instead of the skip list — selected per graph with `:index-backend :bplus-tree` on `make-graph` / `open-graph` (default stays `:skip-list`). On disk the B+ tree wins on every operation once warm. Each index remembers its own backend, and an existing graph is migrated in place with `regenerate-all-views` / `regenerate-unique-indexes` / `rebuild-spatial-index`. (Manual Chapter 3.)
+- **Pluggable ordered-index backend.** Views, `:unique` constraints and the spatial index can now run on a page-oriented **B+ tree** instead of the skip list — selected per graph with `:index-backend :bplus-tree` on `make-graph` / `open-graph` (default stays `:skip-list`). On disk the B+ tree wins on every operation once warm. Each index remembers its own backend, and an existing graph is migrated in place with `regenerate-all-views` / `regenerate-unique-indexes` / `regenerate-spatial-indexes`. (Manual Chapter 3.)
 - **`:unique` slot constraints (issue #6).** Declare `(slot … :unique t | equal | equalp | <canonicalizer>)`; enforced atomically at the commit boundary, NULL-exempt, backed by a durable per-graph index. (Chapter 8.)
 - **Offline-first peer replication (Chapter 16).** A bidirectional hub-and-spoke *peer* mode for mobile/edge fleets: each device syncs only the authorized subset it may see, authors locally while disconnected, and reconciles on reconnect.
 - **In-memory backend — `make-memory-graph` (issue #50, Chapter 15).** The whole graph as live Lisp objects for lowest-latency reads, with the same API; eager or lazy open.

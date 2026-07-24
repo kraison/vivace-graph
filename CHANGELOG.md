@@ -11,6 +11,12 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ## [Unreleased]
 
+> The next release is **3.0.0** (MAJOR). Per this file's SemVer preamble, MAJOR is
+> mandatory here on two independent grounds: the spatial-index changes below are a
+> breaking public-API change *and* an on-disk format bump (the spatial sidecar goes to
+> format v3). Existing on-disk graphs still open — the spatial index re-derives itself
+> automatically at first open — but stale call sites and old Prolog arities do not.
+
 ### Added
 - **Vector segment: a dense on-disk index for `:vector-index` slots.** A slot
   declared `:vector-index t` in `def-vertex`/`def-edge` gets a dedicated
@@ -34,6 +40,54 @@ between releases; cutting a release renames it to the new version and dates it.
   past its mmap reservation and cannot relocate to a larger one — see the
   "Changed" entries below for when that can still happen and what its report
   now advises.
+- **Spatial index — a per-`(owner . slot)` index registry.** The graph's single
+  spatial index becomes a registry of per-declaring-class, per-geometry-slot
+  indexes, mirroring `:unique` / `:vector-index` / `:index`. `spatial-indexes`
+  (graph accessor) is the registry keyed `(owner-name . slot-name)`, and
+  `spatial-index-for` (graph, owner, slot) reaches one index. One spatial index
+  is created per declaring class per geometry slot, lazily, on the first
+  geometry-valued insert. A geometry slot on a *mixin* gives its subclasses ONE
+  shared index — separated at query time by the required type filter, not by
+  storage — which is narrower than "per class"; a class that overrides
+  `node-geometry` is indexed under `(owner . NIL)` and is still scopeable by name.
+  Motivated by the mine-action team's spatial-index change request (CR-1).
+- **`:spatial-precision` slot option — per-index geohash precision.** A geometry
+  slot may declare `(slot :type geometry :index t :spatial-precision N)`; that
+  index is built on an `N`-level geohash grid instead of the graph default (7).
+  This is the *only* precision-declaration surface (there is deliberately no
+  separate per-index declaration macro). Changing a declared precision rebuilds
+  that one index automatically at open (bounded to the owner's nodes), because a
+  mixed-precision index would silently miss on query.
+- **`audit-spatial-slots` (graph)** — a read-only, exhaustive sweep that reports
+  every class carrying more than one geometry-valued indexed slot and names the
+  winning slot, for wiring into a schema test suite (see the inert-slot warning
+  under Fixed).
+- **New spatial maintenance and query entry points.** `rebuild-spatial-indexes`
+  (all indexes, the migration/repair sweep), `regenerate-spatial-index`
+  (one `(owner slot)` index — the manual recovery for a degraded index),
+  `regenerate-spatial-indexes` (all — the spatial half of an index-backend
+  switch), and `install-spatial-indexes` (adopts a changed declared precision at
+  open; creates nothing). Per-index introspection: `spatial-index-max-cells`,
+  `spatial-index-precision-counts`, `spatial-index-coarsest-precision`.
+- **Prolog: scoped spatial functors `find-within/3`, `find-intersects/3`,
+  `find-near/5`, `find-nearest/5`.** The scope rides in second position
+  (`(find-near ?node scope lat lon radius)`); it accepts a class symbol, a list
+  of class symbols, or `:all`, and type-filters the yielded nodes, so the `is-a`
+  goal these queries once needed is gone.
+
+### Removed
+- **BREAKING: `spatial-index` (the single whole-graph spatial-index accessor).**
+  There is no longer one index for it to name; use `spatial-indexes` /
+  `spatial-index-for`.
+- **BREAKING: the old singular, whole-graph spatial rebuild function.** There is
+  no longer one index to rebuild; replaced by `rebuild-spatial-indexes` (rebuild
+  every index) and `regenerate-spatial-index` (rebuild one `(owner slot)` index).
+- **BREAKING: the previous unscoped Prolog spatial arities** — `find-within` and
+  `find-intersects` at arity 2, `find-near` and `find-nearest` at arity 4.
+  Replaced by the scoped `/3` and `/5` forms above. The old arities are removed
+  rather than left to signal, so a stale query fails at goal entry with an
+  unknown-functor error that names the problem, instead of binding a scope-shaped
+  argument as an area.
 
 ### Fixed
 - **A vector segment could not grow past its mmap reservation without
@@ -52,6 +106,32 @@ between releases; cutting a release renames it to the new version and dates it.
   clean-shutdown flag is unset. A rebuild is now created at the corpus size, so
   its reservation is derived from a realistic file (and ~8 doubling-and-relocate
   passes disappear from every rebuild).
+- **Spatial insert could blow up on a country-scale geometry, and coarsening it
+  naively would silently lose nodes (CR-2).** An insert now caps its geohash cover
+  at 16384 cells — a per-index, *persisted* bound, so insert and remove always
+  compute the identical cell set and no entry is ever orphaned. Coarsening the
+  stored cover is unsafe on its own, because geohash prefixes nest one way: a query
+  covering a small box at a fine precision would sort *past* a coarsely-stored
+  polygon and miss it. The query therefore clamps its covering precision to the
+  coarsest precision actually stored, tracked by a per-index histogram
+  (`spatial-index-precision-counts` / `spatial-index-coarsest-precision`). The
+  clamp is **self-healing**: delete the oversized node and its cells decrement,
+  the coarse level empties, and selectivity returns on its own with no rebuild. A
+  `warn` fires on each *decrease* of an index's coarsest precision (rare, loud,
+  and names the node, class, slot, bbox, and the recovery path); a `log:info`
+  marks the recovery. The histogram is rewritten synchronously only when the
+  coarsest precision decreases (the unsafe direction); an emptied level rides the
+  ordinary close-time write, because reopening too-coarse merely over-covers.
+- **A class with two geometry-valued indexed slots silently indexed only one
+  (CR-3.1).** A node reaches spatial maintenance, is indexed by its first
+  geometry-valued indexed slot, and every other geometry slot was inert with no
+  signal. A value-based warning now fires on the write path — sampled over a
+  class's first 64 nodes, so it costs nothing steady-state — naming the class,
+  every geometry slot found, and which one wins. `audit-spatial-slots` (above) is
+  the exhaustive read-only counterpart for classes whose two-geometry nodes lie
+  beyond the sampling window. (The declared-`:type geometry` form the request
+  first asked for is not buildable: the engine cannot compare the type symbol
+  reliably across application packages, so the check is value-based.)
 
 ### Changed
 - **A vector segment now grows its reservation *in place* before falling back to
@@ -202,6 +282,41 @@ between releases; cutting a release renames it to the new version and dates it.
   slots — that was never written down — so such a slot restores from an old
   snapshot as a plain `simple-vector`; re-snapshot afterwards to record the
   types. Nothing about the on-disk graph format changed.
+- **BREAKING: every spatial query now takes a required scope as its first
+  positional argument.** `find-nodes-within`, `find-nodes-intersecting`,
+  `find-nodes-near`, and `find-nearest-k` gain a mandatory first argument — a
+  node-class name, a list of class names, or `:all` — that both *selects* which
+  per-`(owner . slot)` indexes are scanned and *type-filters* the results. The
+  filter is what makes a scoped query correct when sibling subclasses share a
+  mixin-owned index. A required positional argument makes every stale call site a
+  compile-time warning on SBCL and ECL, which is the safest way to land a
+  deliberate break. Requested by the mine-action team (CR-1): they needed to
+  query one class's geometry without dredging up another's.
+- **BREAKING: the spatial sidecar is now `spatial-indexes.dat`, format v3**
+  (was `spatial-index.root`, a single plist). It records one entry per
+  `(owner . slot)` index — address, precision, backend, insert cap, and precision
+  histogram — and is written on every index creation and at `close-graph`. A
+  pre-v3 graph (the old file present, or `:format` ≠ 3) **re-derives its spatial
+  indexes automatically at first open**: one `map-vertices` + `map-edges` sweep
+  routes each node into the `(owner . slot)` index its geometry slot selects, so
+  the contents come out identical to what the single index held, merely
+  partitioned. **Index only — node data is untouched and nothing is re-fetched.**
+  The old `spatial-index.root` is left in place, but **downgrade after migration
+  is unsupported**: an older build would reopen it as a silently stale (or empty)
+  index.
+- **The memory-graph image bumped, and lost a per-open cost.** Both in-memory
+  formats moved — the cl-store image (v4) and the native/lazy image the ECL
+  device uses (v6) — so the spatial payload is now one structural record per
+  `(owner . slot)`, carrying that index's precision, insert cap, and histogram,
+  restored directly into its own `mem-skip-list` the way views are. This
+  **removes** the rebuild-from-nodes that a memory-graph previously ran on every
+  open: that pass filtered over *all* `:index` slots and so faulted in every lazy
+  node blob of any class with any indexed slot — most of the corpus on a field
+  device (issue #50 `:lazy` mode). Measured 0 of 11 nodes materialized on reopen,
+  against 11 of 11 before. Known limitation: a changed `:spatial-precision`
+  declaration is **not** adopted on a memory reopen (doing so would re-materialize
+  exactly those lazy nodes); a memory index reopens at its persisted precision
+  until a forced rebuild — correct, only over-covering, never missing.
 
 ## [2.1.1] - 2026-07-06
 
@@ -240,7 +355,7 @@ v2 graphs open without migration.
   operation once warm (page-packed keys → far fewer cache-line and page misses,
   sequential in-leaf range scans, less space), with in-place cell edits and
   merge-on-delete rebalancing. Existing graphs migrate in place via
-  `regenerate-all-views` / `regenerate-unique-indexes` / `rebuild-spatial-index`
+  `regenerate-all-views` / `regenerate-unique-indexes` / `regenerate-spatial-indexes`
   (or snapshot + replay). (Manual Chapter 3.)
 - **`:unique` slot constraints (issue #6).** `def-vertex` / `def-edge` slots may
   carry `:unique t | equal | equalp | <canonicalizer>` (the value is the uniqueness

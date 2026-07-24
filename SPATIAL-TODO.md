@@ -19,7 +19,7 @@ maintenance, queries). Merged into `experiment`; full suite green on SBCL
   create/update/delete via the `node-geometry` protocol.
 - Pure Prolog predicates — `geo-distance/5`, `geo-near/5`, `geo-within/3`.
 - Index-backed queries — `find-nodes-within` / `find-nodes-near` (Lisp);
-  `find-within/2`, `find-near/4` (Prolog, yield nodes).
+  `find-within/3`, `find-near/5` (Prolog, yield nodes; scoped as of 3.0.0).
 - Public API exported from the `graph-db` package.
 - Manual Chapter 13 + README (see "Doc fixes" below for two corrections).
 
@@ -35,10 +35,11 @@ maintenance, queries). Merged into `experiment`; full suite green on SBCL
 - **Distance is haversine** (~0.5% vs ellipsoid); `geometry-distance-exact` (GEOS)
   is PLANAR in coordinate units (degrees for lon/lat), not metres — use it for
   ordering, not real distance.
-- **Single grid precision per graph** — set with `make-graph :spatial-precision`
-  (default 7, ~150 m cells); geohash (Z-order), not Hilbert.
+- **Grid precision** — geohash (Z-order), not Hilbert. *(As of 3.0.0 precision is
+  per-index via the `:spatial-precision` slot option; `make-graph :spatial-precision`
+  remains the graph-wide default, 7 ≈ 150 m cells.)*
 - **No regenerate/rebuild** of the index (views have `regenerate-view`). *(Done —
-  see `rebuild-spatial-index`.)*
+  see `rebuild-spatial-indexes` / `regenerate-spatial-index`.)*
 
 ## TODO
 
@@ -53,11 +54,13 @@ maintenance, queries). Merged into `experiment`; full suite green on SBCL
       AO-boundary-crossing *updates* (a node moving in/out of the AO) are not yet
       reconciled.
 - [x] **`find-intersects` query** — DONE (`graph-db/geos`): `find-nodes-intersecting`
-      (Lisp) + `find-intersects/2` (Prolog), index bbox candidates refined by the
+      (Lisp) + `find-intersects/3` (Prolog, scoped as of 3.0.0), index bbox candidates refined by the
       `geometry-intersects-p` seam (exact with GEOS, coarse bbox fallback without).
-- [x] **`rebuild-spatial-index`** — DONE (`spatial-query.lisp`): drop + recreate the
-      index, re-index every live node with a `node-geometry`; optional `:precision`
-      change; returns the count. Mirrors `regenerate-view`.
+- [x] **`rebuild-spatial-indexes`** — DONE (`spatial-query.lisp`): drop + recreate the
+      per-`(owner . slot)` indexes, re-index every live node with a `node-geometry`;
+      returns the count. Mirrors `regenerate-view`. Per-index recovery is
+      `regenerate-spatial-index` (owner, slot); the whole-graph backend-switch form is
+      `regenerate-spatial-indexes`. *(Superseded the 2.0 singular whole-graph rebuild function in 3.0.0.)*
 - [x] **Exact extended-geometry containment** — DONE (`graph-db/geos`):
       `find-nodes-within` routes non-point candidates through the exact
       `geometry-contains-geometry-p` (GEOS) seam, dropping the centroid
@@ -84,7 +87,7 @@ maintenance, queries). Merged into `experiment`; full suite green on SBCL
       (correct because everything inside radius r is nearer than anything outside
       it). Bounded by `:max-radius` (default 25 km) since the fixed-precision
       geohash index enumerates cells per window — unbounded kNN is not supported.
-      Prolog `find-nearest/4`. Covered by `spatial-query-suite`.
+      Prolog `find-nearest/5` (scoped as of 3.0.0). Covered by `spatial-query-suite`.
 - [x] **Snapshot → restore → spatial-query test** — DONE (backup-suite): replay
       into a fresh graph re-applies nodes through the write-path hook, repopulating
       the spatial index (verified queryable; empty before replay).
