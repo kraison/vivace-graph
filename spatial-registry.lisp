@@ -39,12 +39,115 @@ NIL here does NOT mean the slot is unindexed."
   (let ((reg (spatial-indexes graph)))
     (and reg (gethash (cons owner-name slot-name) reg))))
 
+;;; ---------------------------------------------------------------------------
+;;; DEF-SPATIAL-INDEX: the out-of-band declaration surface (mirrors DEF-INDEX)
+;;; ---------------------------------------------------------------------------
+
+(defvar *schema-spatial-metadata* (make-hash-table)
+  "graph-name (symbol) -> list of SPATIAL-INDEX-SPECs (newest first).")
+
+(defstruct (spatial-index-spec (:constructor make-spatial-index-spec))
+  owner-name slot-name graph-name precision)
+
+(defvar *spatial-precision-conflicts-warned* nil
+  "NIL, or a hash-table INSTALL-SPATIAL-INDEXES binds for the duration of one
+install.  While bound, %WARN-ON-PRECISION-CONFLICT reports each conflicting
+ (owner . slot) at most ONCE, so an open that both CREATES a declared index and
+then re-checks it for staleness -- two independent resolutions of the same
+precision -- does not report the same conflict twice.")
+
+(defun %registered-spatial-specs (graph)
+  "DEF-SPATIAL-INDEX specs for GRAPH, de-duped by (owner . slot), newest-wins."
+  (let ((seen (make-hash-table :test 'equal)) (result '()))
+    (dolist (spec (gethash (graph-name graph) *schema-spatial-metadata*))
+      (let ((k (cons (spatial-index-spec-owner-name spec)
+                     (spatial-index-spec-slot-name spec))))
+        (unless (gethash k seen)
+          (setf (gethash k seen) t)
+          (push spec result))))
+    (nreverse result)))
+
+(defun %slot-option-precision (owner-name slot-name)
+  "The :SPATIAL-PRECISION declared on OWNER-NAME's SLOT-NAME, or NIL."
+  (let ((class (ignore-errors (find-class owner-name nil))))
+    (when (and class (class-finalized-p class))
+      (let ((slot (find slot-name (class-slots class) :key #'slot-definition-name)))
+        (and slot (spatial-precision-spec slot))))))
+
+(defun %def-spatial-precision (graph owner-name slot-name)
+  "The precision a DEF-SPATIAL-INDEX declares for (OWNER-NAME . SLOT-NAME), or NIL."
+  (let ((spec (find-if (lambda (s)
+                         (and (eq (spatial-index-spec-owner-name s) owner-name)
+                              (eq (spatial-index-spec-slot-name s) slot-name)))
+                       (%registered-spatial-specs graph))))
+    (and spec (spatial-index-spec-precision spec))))
+
+(defun %precision-conflict-unreported-p (owner-name slot-name)
+  "True when (OWNER-NAME . SLOT-NAME)'s precision conflict has not been reported
+yet in the current INSTALL-SPATIAL-INDEXES pass -- always true outside one, where
+each resolution stands on its own.  Marks it reported as a side effect."
+  (let ((seen *spatial-precision-conflicts-warned*))
+    (or (null seen)
+        (let ((key (cons owner-name slot-name)))
+          (unless (gethash key seen)
+            (setf (gethash key seen) t))))))
+
+(defun %warn-on-precision-conflict (graph owner-name slot-name macro-precision)
+  "Warn when a DEF-SPATIAL-INDEX precision is overridden by a slot option.  The
+slot option wins -- MOP-first, matching CLASS-SECONDARY-INDEX-DESCRIPTORS -- and
+this warning is what keeps the losing declaration from being a silent no-op.
+Returns the slot option's precision (NIL when it declares none), i.e. the winner
+of the two, so callers resolve and warn in one pass."
+  (let ((slot-precision (%slot-option-precision owner-name slot-name)))
+    (when (and slot-precision macro-precision
+               (/= slot-precision macro-precision)
+               (%precision-conflict-unreported-p owner-name slot-name))
+      (warn "Spatial precision conflict on ~S.~S in ~S: the :SPATIAL-PRECISION ~
+             slot option (~D) wins over DEF-SPATIAL-INDEX (~D).  Declare it in ~
+             one place: the slot option for what the schema states, ~
+             DEF-SPATIAL-INDEX for what it does not."
+            owner-name slot-name (graph-name graph)
+            slot-precision macro-precision))
+    slot-precision))
+
+(defmacro def-spatial-index (owner-class slot graph-name &key precision)
+  "Declare a spatial index on OWNER-CLASS.SLOT in GRAPH-NAME (spanning
+OWNER-CLASS's subclasses), optionally at a specific geohash :PRECISION.
+Declarative and idempotent like DEF-INDEX and DEF-VIEW.
+
+Use the (slot :spatial-precision N) slot option for what the schema declares and
+this macro for what it does not: this can also index a slot NOT marked :INDEX,
+and needs no change to an already-persisted class definition.  When both declare
+a precision the SLOT OPTION wins and a warning is signalled -- do not declare it
+twice.  To adopt a changed precision, the index is rebuilt automatically at the
+next open."
+  `(let ((spec (make-spatial-index-spec
+                :owner-name ',owner-class :slot-name ',slot
+                :graph-name ',graph-name :precision ,precision)))
+     (push spec (gethash ',graph-name *schema-spatial-metadata*))
+     (let ((g (lookup-graph ',graph-name)))
+       (when g (%spatial-index-for g ',owner-class ',slot)))
+     spec))
+
+(defun %declared-spatial-precision (graph owner-name slot-name)
+  "The precision EXPLICITLY declared for (OWNER-NAME . SLOT-NAME), or NIL when
+neither declaration surface names one.  Precedence: slot option > DEF-SPATIAL-INDEX.
+MOP-first, matching CLASS-SECONDARY-INDEX-DESCRIPTORS, so one rule covers both
+halves of :INDEX; the conflict warning is what makes the losing declaration audible.
+
+Distinct from %SPATIAL-PRECISION-FOR, which falls back to the graph default: the
+NIL here is what tells INSTALL-SPATIAL-INDEXES that nothing has been DECLARED about
+this index, so its persisted precision must be left alone."
+  (let ((macro-precision (%def-spatial-precision graph owner-name slot-name)))
+    (or (%warn-on-precision-conflict graph owner-name slot-name macro-precision)
+        macro-precision)))
+
 (defun %spatial-precision-for (graph owner-name slot-name)
-  "The geohash precision (OWNER-NAME . SLOT-NAME)'s index is created with.  For now
-the graph default; the slot option and DEF-SPATIAL-INDEX surfaces are layered on in
-a later task."
-  (declare (ignorable owner-name slot-name))
-  (or (graph-default-spatial-precision graph) 7))
+  "The geohash precision (OWNER-NAME . SLOT-NAME)'s index is created with.
+Precedence: slot option > DEF-SPATIAL-INDEX > the graph default."
+  (or (%declared-spatial-precision graph owner-name slot-name)
+      (graph-default-spatial-precision graph)
+      7))
 
 (defgeneric make-graph-spatial-index (graph &key precision)
   (:documentation "Create ONE spatial index for GRAPH at PRECISION.  A normal graph
@@ -156,3 +259,55 @@ error, and catching it is the reason the scope is required."
   "True when NODE satisfies the scope's type filter (always, for :ALL)."
   (or (null type-names)
       (some (lambda (n) (typep node n)) type-names)))
+
+;;; ---------------------------------------------------------------------------
+;;; Reconciling the declarations against what is actually on disk (called at open)
+;;; ---------------------------------------------------------------------------
+
+(defun install-spatial-indexes (graph)
+  "Build any DEF-SPATIAL-INDEX registered for GRAPH that is missing from its
+registry, and rebuild any index whose PERSISTED precision no longer matches an
+EXPLICITLY DECLARED one.  The mirror of INSTALL-SECONDARY-INDEXES / INSTALL-VIEWS,
+called at open right after the restore-or-rebuild.
+
+The rebuild is not optional and is not deferred to the user, unlike DEF-INDEX's
+changed-canonicalizer contract: an index holding cells at two precisions
+reintroduces the covering-precision miss the clamp exists to prevent, so leaving
+it would be silently wrong.  It is bounded to the one owner's nodes.
+
+Only an EXPLICIT declaration -- the :SPATIAL-PRECISION slot option or
+DEF-SPATIAL-INDEX -- triggers that rebuild.  The graph default deliberately does
+not: it is the precision new indexes are CREATED at, not a statement about the
+existing ones, and OPEN-GRAPH documents that they reopen at their own persisted
+precision.  Were the default to count, reopening a graph created with
+:SPATIAL-PRECISION 5 and merely forgetting the keyword would silently re-grid
+every index in it."
+  (let ((*spatial-precision-conflicts-warned* (make-hash-table :test 'equal)))
+    ;; 1. Declared but never created -- a DEF-SPATIAL-INDEX evaluated before this
+    ;;    graph existed, or added since the last close.  %SPATIAL-INDEX-FOR is the
+    ;;    one creation site, so it picks up the declared precision itself.
+    (dolist (spec (%registered-spatial-specs graph))
+      (let ((owner (spatial-index-spec-owner-name spec))
+            (slot (spatial-index-spec-slot-name spec)))
+        (unless (spatial-index-for graph owner slot)
+          (%spatial-index-for graph owner slot))))
+    ;; 2. Created earlier at a precision the declarations have since changed.  The
+    ;;    stale set is collected FIRST and regenerated after: REGENERATE-SPATIAL-
+    ;;    INDEX remhashes and re-adds its key, and mutating a hash-table under
+    ;;    MAPHASH is undefined.
+    (let ((stale '()))
+      (maphash (lambda (key idx)
+                 (let ((declared (%declared-spatial-precision graph (car key)
+                                                              (cdr key))))
+                   (when (and declared
+                              (not (eql declared (spatial-index-precision idx))))
+                     (push (list (car key) (cdr key)
+                                 (spatial-index-precision idx) declared)
+                           stale))))
+               (spatial-indexes graph))
+      (dolist (s stale)
+        (destructuring-bind (owner slot was now) s
+          (log:info "Spatial index ~S.~S declared precision ~D but was written at ~
+                     ~D; rebuilding that index." owner slot now was)
+          (regenerate-spatial-index graph owner slot)))))
+  nil)

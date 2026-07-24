@@ -1007,8 +1007,9 @@ PUSH-ACK below it, so the device re-streams it next time (re-deduped by op-id)."
     high))
 
 (defun peer-purge-node (graph node)
-  "Hard-remove NODE from the device: drop it from every index/view (and the
-spatial index for a geometry vertex), then from its lhash table and the cache.
+  "Hard-remove NODE from the device: drop it from every index/view (including the
+spatial index, for a geometry-bearing vertex OR edge), then from its lhash table
+and the cache.
 Unlike a tombstone this leaves NO trace -- a captured device must not even reveal
 the existence/id of purged (undisclosed) work (design §7)."
   ;; #6: release the node's unique keys BEFORE removal (reads its :ORIGIN partition,
@@ -1021,6 +1022,13 @@ the existence/id of purged (undisclosed) work (design §7)."
   ;; a graph with no secondary indexes pays nothing).
   (when (secondary-indexes graph)
     (%ix-release node graph))
+  ;; Spatial index: an EDGE can carry geometry exactly as a vertex can (the write
+  ;; path, REBUILD-SPATIAL-INDEXES and REGENERATE-SPATIAL-INDEX all have an edge
+  ;; path), so this is released for both kinds, before the etypecase rather than
+  ;; inside one of its branches.  A purge leaves no tombstone and no node, so
+  ;; nothing ever visits that index key again: a missed unindex orphans the entry
+  ;; permanently, and the id it still names now resolves to nothing.
+  (%spatial-unindex-node graph node)
   (etypecase node
     (edge
      (remove-from-ve-index node graph)
@@ -1029,7 +1037,6 @@ the existence/id of purged (undisclosed) work (design §7)."
      (remove-from-views graph node)
      (lhash-remove (edge-table graph) (id node)))
     (vertex
-     (%spatial-unindex-node graph node)
      (remove-from-type-index node graph)
      (remove-from-views graph node)
      (lhash-remove (vertex-table graph) (id node))))

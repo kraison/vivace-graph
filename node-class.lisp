@@ -21,7 +21,13 @@
    (unique-scope :accessor unique-scope :initarg :scope :initform :local
                  :allocation :instance)
    (vector-index :accessor vector-index-p :initarg :vector-index :initform nil
-                 :allocation :instance)))
+                 :allocation :instance)
+   ;; Geohash grid precision for this geometry slot's spatial index, or NIL for
+   ;; the graph default.  A type-as-hint option: it means nothing on a slot that
+   ;; never holds a geometry.  See spatial-registry.lisp for resolution against
+   ;; DEF-SPATIAL-INDEX.
+   (spatial-precision :accessor spatial-precision-spec :initarg :spatial-precision
+                      :initform nil :allocation :instance)))
 
 (defmethod persistent-p (slot-def)
   nil)
@@ -36,6 +42,9 @@
   :local)
 
 (defmethod vector-index-p (slot-def)
+  nil)
+
+(defmethod spatial-precision-spec (slot-def)
   nil)
 
 (defmethod ephemeral-p (slot-def)
@@ -137,6 +146,14 @@
       (when (or (vector-index-p slot) vi)
         (setf (slot-value slot 'vector-index) (or (vector-index-p slot)
                                                   (and vi (vector-index-p vi))))))
+    ;; Inherit :SPATIAL-PRECISION from the declaring direct slot, so a geometry
+    ;; slot on a parent carries one grid precision across its subclasses -- the
+    ;; same shared-index semantics as :INDEX / :UNIQUE / :VECTOR-INDEX above.
+    (let ((sp (find-if #'spatial-precision-spec direct-slots)))
+      (when (or (spatial-precision-spec slot) sp)
+        (setf (slot-value slot 'spatial-precision)
+              (or (spatial-precision-spec slot)
+                  (and sp (spatial-precision-spec sp))))))
     slot))
 
 (defun %indexed-slot-owner-name (class slot-name)

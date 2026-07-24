@@ -61,26 +61,39 @@ historical behaviour), so results are unchanged when the add-on is absent."
           (multiple-value-bind (lat lon) (%geometry-rep-point geom)
             (geometry-contains-point-p area lon lat)))))
 
-(defmacro %do-scoped-candidates ((node-var scope graph &key bbox radius) &body body)
+(defmacro %do-scoped-candidates ((node-var scope graph &key bbox radius (guard t))
+                                 &body body)
   "Run BODY with NODE-VAR bound to each live, scope-admitted node whose id came
 back from every index in SCOPE.  Dedups by node id across indexes, so a node
-reachable through two of its own slot-indexes is visited once."
+reachable through two of its own slot-indexes is visited once.
+
+SCOPE is resolved -- and therefore VALIDATED -- BEFORE GUARD is evaluated, so a
+query naming a class that is not spatially indexed signals even when its payload
+argument is junk too.  Signalling on an unscopeable class is the entire point of
+the required scope, and a payload-first guard made it reachable only when the
+payload happened to be well formed.
+
+GUARD is the payload-validity test; BBOX / RADIUS are evaluated once, after it
+passes, so they may assume a well-formed payload."
   (let ((indexes (gensym "IX")) (types (gensym "TY")) (seen (gensym "SEEN"))
-        (idx (gensym "I")) (id (gensym "ID")))
+        (idx (gensym "I")) (id (gensym "ID")) (win (gensym "WINDOW"))
+        (a (gensym "A")) (b (gensym "B")) (c (gensym "C")) (d (gensym "D")))
     `(multiple-value-bind (,indexes ,types) (%resolve-spatial-scope ,scope ,graph)
-       (let ((,seen (make-hash-table :test 'equalp)))
-         (dolist (,idx ,indexes)
-           (dolist (,id ,(if bbox
-                             `(destructuring-bind (mnl mnt mxl mxt) ,bbox
-                                (spatial-index-query-bbox ,idx mnl mnt mxl mxt))
-                             `(destructuring-bind (lat lon r) ,radius
-                                (spatial-index-query-radius ,idx lat lon r))))
-             (unless (gethash ,id ,seen)
-               (setf (gethash ,id ,seen) t)
-               (let ((,node-var (%node-by-id ,id ,graph)))
-                 (when (and ,node-var (not (deleted-p ,node-var))
-                            (%scope-admits-p ,node-var ,types))
-                   ,@body)))))))))
+       (when ,guard
+         (let ((,seen (make-hash-table :test 'equalp))
+               (,win ,(or bbox radius)))
+           (dolist (,idx ,indexes)
+             (dolist (,id ,(if bbox
+                               `(destructuring-bind (,a ,b ,c ,d) ,win
+                                  (spatial-index-query-bbox ,idx ,a ,b ,c ,d))
+                               `(destructuring-bind (,a ,b ,c) ,win
+                                  (spatial-index-query-radius ,idx ,a ,b ,c))))
+               (unless (gethash ,id ,seen)
+                 (setf (gethash ,id ,seen) t)
+                 (let ((,node-var (%node-by-id ,id ,graph)))
+                   (when (and ,node-var (not (deleted-p ,node-var))
+                              (%scope-admits-p ,node-var ,types))
+                     ,@body))))))))))
 
 (defun find-nodes-within (scope area &key (graph *graph*))
   "Live nodes in SCOPE whose geometry lies within AREA (a :POLYGON or
@@ -91,13 +104,14 @@ SCOPE names a class that is not spatially indexed.
 A :POINT node is judged exactly; an extended-geometry node is judged exactly when
 graph-db/geos is loaded, otherwise by its representative point (bbox centre)."
   (let ((result '()))
-    (when (geometryp area)
-      (multiple-value-bind (min-lon min-lat max-lon max-lat) (geometry-bbox area)
-        (%do-scoped-candidates (node scope graph
-                                :bbox (list min-lon min-lat max-lon max-lat))
-          (let ((geom (node-geometry node)))
-            (when (and geom (%node-within-area-p area geom))
-              (push node result))))))
+    (%do-scoped-candidates (node scope graph
+                            :guard (geometryp area)
+                            :bbox (multiple-value-bind (mnl mnt mxl mxt)
+                                      (geometry-bbox area)
+                                    (list mnl mnt mxl mxt)))
+      (let ((geom (node-geometry node)))
+        (when (and geom (%node-within-area-p area geom))
+          (push node result))))
     (nreverse result)))
 
 (defun find-nodes-intersecting (scope area &key (graph *graph*))
@@ -106,27 +120,30 @@ with the graph-db/geos add-on; without it, extended-geometry candidates use a
 COARSE bounding-box overlap test (point candidates are always exact).  SCOPE is as
 for FIND-NODES-WITHIN."
   (let ((result '()))
-    (when (geometryp area)
-      (multiple-value-bind (min-lon min-lat max-lon max-lat) (geometry-bbox area)
-        (%do-scoped-candidates (node scope graph
-                                :bbox (list min-lon min-lat max-lon max-lat))
-          (let ((geom (node-geometry node)))
-            (when (and geom (geometry-intersects-p area geom))
-              (push node result))))))
+    (%do-scoped-candidates (node scope graph
+                            :guard (geometryp area)
+                            :bbox (multiple-value-bind (mnl mnt mxl mxt)
+                                      (geometry-bbox area)
+                                    (list mnl mnt mxl mxt)))
+      (let ((geom (node-geometry node)))
+        (when (and geom (geometry-intersects-p area geom))
+          (push node result))))
     (nreverse result)))
 
 (defun find-nodes-near (scope lat lon radius &key (graph *graph*))
   "(NODE . DISTANCE-METRES) for live nodes in SCOPE within RADIUS of (LAT, LON),
 nearest first.  SCOPE is as for FIND-NODES-WITHIN."
   (let ((result '()))
-    (when (and (numberp lat) (numberp lon) (numberp radius))
-      (%do-scoped-candidates (node scope graph :radius (list lat lon radius))
-        (let ((geom (node-geometry node)))
-          (when geom
-            (multiple-value-bind (nlat nlon) (%geometry-rep-point geom)
-              (let ((d (geodesic-distance lat lon nlat nlon)))
-                (when (<= d radius)
-                  (push (cons node d) result))))))))
+    (%do-scoped-candidates (node scope graph
+                            :guard (and (numberp lat) (numberp lon)
+                                        (numberp radius))
+                            :radius (list lat lon radius))
+      (let ((geom (node-geometry node)))
+        (when geom
+          (multiple-value-bind (nlat nlon) (%geometry-rep-point geom)
+            (let ((d (geodesic-distance lat lon nlat nlon)))
+              (when (<= d radius)
+                (push (cons node d) result)))))))
     (sort result #'< :key #'cdr)))
 
 (def-global-prolog-functor find-within/3 (?node ?scope ?area cont)

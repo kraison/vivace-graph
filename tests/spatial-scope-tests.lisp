@@ -593,9 +593,16 @@ such node into a different index than queries and removes look in."
                                         :graph g))))))
 
 (test prolog-scope-shapes
-  "The Prolog functors accept a symbol scope and :ALL.  A literal list scope is
-pinned here: if the query compiler mangles it, restrict the documented Prolog
-scope to symbol-or-:ALL and route multi-class queries through a disjunction."
+  "The Prolog functors accept a symbol scope, a LITERAL LIST of class names, and
+:ALL.  The list is the shape that needed pinning: if the query compiler mangled it
+-- into its first element, or into a term that never resolves to class names --
+the documented Prolog scope would have to be restricted to symbol-or-:ALL, with
+multi-class queries routed through a disjunction instead.
+
+The wide radius on the list case is deliberate.  It encloses BOTH nodes (the zone
+polygon's centre is ~480 km from the probe point), so a list scope that had
+silently collapsed to its first element would return 1 here rather than 2 -- which
+the narrow-radius symbol case above cannot distinguish."
   (with-test-graph (g)
     (let ((*graph* g))
       (with-transaction ()
@@ -603,5 +610,245 @@ scope to symbol-or-:ALL and route multi-class queries through a disjunction."
         (make-scope-zone :extent (scope-rect 22.1d0 44.4d0 40.2d0 52.4d0)))
       (is (= 1 (length (select-flat (?n) (find-near ?n scope-probe
                                                     49.2020d0 37.1724d0 500.0d0)))))
+      (is (= 2 (length (select-flat (?n) (find-near ?n (scope-probe scope-zone)
+                                                    49.2020d0 37.1724d0 1.0d6))))
+          "a literal list scope survives the Prolog compiler and unions both classes")
+      (is (= 1 (length (select-flat (?n) (find-near ?n (scope-probe)
+                                                    49.2020d0 37.1724d0 1.0d6))))
+          "a one-element literal list is a list, not the symbol inside it")
       (is (<= 1 (length (select-flat (?n) (find-near ?n :all
                                                      49.2020d0 37.1724d0 500.0d0))))))))
+
+;;; ---------------------------------------------------------------------------
+;;; Eager scope validation (§6).  Signalling on an unscopeable class is the whole
+;;; point of a required scope, so it must not be reachable only when the payload
+;;; argument happens to be well-formed.
+;;; ---------------------------------------------------------------------------
+
+(test bad-scope-signals-even-with-a-bad-payload
+  "Every entry point resolves -- and therefore VALIDATES -- the scope BEFORE its
+payload guard.  Guarding on the payload first made (FIND-NODES-WITHIN 'BOGUS NIL)
+quietly return NIL, so a call that was wrong in BOTH arguments reported neither.
+
+The second half pins the other side of the line: a payload that is junk on a
+SCOPEABLE class is still an empty result, not an error."
+  (with-test-graph (g)
+    (with-transaction ()
+      (make-scope-probe :geom (make-point 37.1724d0 49.2020d0)))
+    (signals error (find-nodes-within 'scope-aspatial nil :graph g))
+    (signals error (find-nodes-intersecting 'scope-aspatial nil :graph g))
+    (signals error (find-nodes-near 'scope-aspatial nil nil nil :graph g))
+    (signals error (find-nearest-k 'scope-aspatial nil nil nil :graph g))
+    (is (null (find-nodes-within 'scope-probe nil :graph g)))
+    (is (null (find-nodes-intersecting 'scope-probe nil :graph g)))
+    (is (null (find-nodes-near 'scope-probe nil nil nil :graph g)))
+    (is (null (find-nearest-k 'scope-probe nil nil nil :graph g)))))
+
+;;; ---------------------------------------------------------------------------
+;;; §5: the two declaration surfaces -- the :SPATIAL-PRECISION slot option and
+;;; DEF-SPATIAL-INDEX -- and the MOP-first precedence between them.
+;;;
+;;; Every test that registers a DEF-SPATIAL-INDEX rebinds *SCHEMA-SPATIAL-METADATA*:
+;;; the registry is global and keyed by graph NAME, so a leaked spec would change
+;;; the precision another test's index is built at and make the suite
+;;; order-dependent.
+;;; ---------------------------------------------------------------------------
+
+(def-vertex scope-coarse ()
+  ((extent :type geometry :index t :spatial-precision 3))
+  :graph-db-integration-test)
+
+;; Adds nothing of its own: the geometry slot AND its declared precision have to
+;; arrive by effective-slot inheritance.
+(def-vertex scope-coarse-sub (scope-coarse)
+  ()
+  :graph-db-integration-test)
+
+(test slot-option-sets-index-precision
+  "A :SPATIAL-PRECISION slot option is the index's grid precision."
+  (with-test-graph (g)
+    (with-transaction ()
+      (make-scope-coarse :extent (scope-rect 22.1d0 44.4d0 40.2d0 52.4d0)))
+    (let ((idx (spatial-index-for g 'scope-coarse 'extent)))
+      (is (= 3 (spatial-index-precision idx)))
+      ;; At p=3 a country-scale polygon is ~98 cells, so the cap never fires and
+      ;; the clamp stays at the index's own precision.
+      (is (= 3 (spatial-index-coarsest-precision idx))))))
+
+(test slot-option-inherits-to-a-subclass
+  "The :SPATIAL-PRECISION option inherits through COMPUTE-EFFECTIVE-SLOT-DEFINITION,
+exactly as :INDEX / :UNIQUE / :VECTOR-INDEX do -- so a geometry slot declared on a
+parent carries ONE grid precision across every subclass sharing its index.
+
+Asserted on the SUBCLASS's own effective slot, not only through the shared index.
+That inheritance is what a per-implementation reader conditional missing a branch
+would silently drop, leaving the option NIL on that implementation while a
+same-class test went on passing everywhere."
+  (let ((slot (find 'extent (graph-db::class-slots (find-class 'scope-coarse-sub))
+                    :key #'graph-db::slot-definition-name)))
+    (is (not (null slot)) "the subclass really does have the inherited slot")
+    (is (eql 3 (spatial-precision-spec slot))
+        "the effective slot carries the parent's declared precision"))
+  ;; ...and the write path puts a subclass node in the PARENT's index, at that
+  ;; precision -- the behaviour the inheritance exists for.
+  (with-test-graph (g)
+    (with-transaction ()
+      (make-scope-coarse-sub :extent (scope-rect 22.1d0 44.4d0 40.2d0 52.4d0)))
+    (is (null (spatial-index-for g 'scope-coarse-sub 'extent))
+        "no per-subclass index was created")
+    (is (= 3 (spatial-index-precision (spatial-index-for g 'scope-coarse 'extent))))))
+
+(test slot-option-beats-def-spatial-index
+  "MOP-first, matching CLASS-SECONDARY-INDEX-DESCRIPTORS: the slot option wins
+and the losing declaration warns rather than silently doing nothing.  Asserted
+through the public surface -- declare, write a node, inspect the index that was
+actually built -- not by calling the conflict predicate directly.
+
+*SCHEMA-SPATIAL-METADATA* is rebound so the DEF-SPATIAL-INDEX registered here
+does not leak into later tests and make them order-dependent."
+  (let ((graph-db::*schema-spatial-metadata* (make-hash-table)))
+    (with-test-graph (g)
+      (signals warning
+        (def-spatial-index scope-coarse extent :graph-db-integration-test
+          :precision 5))
+      (handler-bind ((warning #'muffle-warning))
+        (with-transaction ()
+          (make-scope-coarse :extent (scope-rect 22.1d0 44.4d0 40.2d0 52.4d0))))
+      ;; The slot option's 3 is what the index was actually built with, not 5.
+      (is (= 3 (spatial-index-precision
+                (spatial-index-for g 'scope-coarse 'extent)))))))
+
+(test def-spatial-index-sets-precision-for-an-unannotated-slot
+  "A slot with no :SPATIAL-PRECISION takes the macro's value, with no warning --
+the two surfaces are complementary when only one of them declares."
+  (let ((graph-db::*schema-spatial-metadata* (make-hash-table)))
+    (with-test-graph (g)
+      (def-spatial-index scope-zone extent :graph-db-integration-test :precision 4)
+      (with-transaction ()
+        (make-scope-zone :extent (scope-rect 22.1d0 44.4d0 40.2d0 52.4d0)))
+      (is (= 4 (spatial-index-precision
+                (spatial-index-for g 'scope-zone 'extent)))))))
+
+(test declared-precision-change-rebuilds-that-index-at-open
+  "A declared precision that no longer matches the PERSISTED one rebuilds that ONE
+index at open, rather than waiting to be asked.  An index holding cells at two
+precisions reintroduces the covering-precision miss the clamp exists to prevent,
+so adopting the change lazily would be silently wrong.
+
+The untouched index is the control: it comes back from the sidecar at its own
+persisted precision, so the rebuild really is bounded to the one that changed.
+
+Warnings are muffled throughout: a country-scale polygon at precision 5 or 6 is
+far past +SPATIAL-INSERT-MAX-CELLS+, so the EXPECTED coarsening warning fires on
+every insert and on every rebuild.  That degradation is orthogonal to what is
+under test here -- SPATIAL-INDEX-PRECISION reports the CONFIGURED precision, which
+the clamp never moves."
+  (let ((graph-db::*schema-spatial-metadata* (make-hash-table)))
+    (handler-bind ((warning #'muffle-warning))
+      (with-temp-directory (dir)
+        (let ((path (namestring dir)) zone-id)
+          (def-spatial-index scope-zone extent :graph-db-integration-test
+            :precision 6)
+          (let ((g (make-graph *integration-graph-name* path :buffer-pool-size 1000)))
+            (let ((*graph* g))
+              (with-transaction ()
+                (setq zone-id (id (make-scope-zone
+                                   :extent (scope-rect 22.1d0 44.4d0 40.2d0 52.4d0))))
+                (make-scope-probe :geom (make-point 37.1724d0 49.2020d0)))
+              (is (= 6 (spatial-index-precision
+                        (spatial-index-for g 'scope-zone 'extent))))
+              (is (= 7 (spatial-index-precision
+                        (spatial-index-for g 'scope-probe 'geom))))
+              (close-graph g :snapshot-p nil)))
+          ;; Re-declare at a DIFFERENT precision, as editing the schema would.
+          (setf (gethash :graph-db-integration-test
+                         graph-db::*schema-spatial-metadata*)
+                nil)
+          (def-spatial-index scope-zone extent :graph-db-integration-test
+            :precision 5)
+          (let ((g (open-graph *integration-graph-name* path)))
+            (unwind-protect
+                 (let ((zone-ix (spatial-index-for g 'scope-zone 'extent)))
+                   (is (= 5 (spatial-index-precision zone-ix))
+                       "the index adopted the newly declared precision at open")
+                   (is (has-p zone-id
+                              (spatial-index-query-bbox zone-ix 30d0 48d0 31d0 49d0))
+                       "and was repopulated from the live nodes, not left empty")
+                   (is (= 7 (spatial-index-precision
+                             (spatial-index-for g 'scope-probe 'geom)))
+                       "the index nobody redeclared was not rebuilt"))
+              (close-graph g :snapshot-p nil)
+              (collect-garbage))))))))
+
+(test graph-default-precision-does-not-rebuild-a-persisted-index
+  "The graph default is the precision for indexes CREATED after the open, not a
+declaration ABOUT the existing ones: reopening without :SPATIAL-PRECISION (so, at
+the 7 default) must NOT silently rebuild an index the graph was created at 5.
+
+Only an explicit declaration -- the slot option or DEF-SPATIAL-INDEX -- is a
+statement about a particular index, and only that triggers the rebuild.  Treating
+the fallback default as a declaration would make OPEN-GRAPH's documented
+\"existing indexes reopen at their own persisted precision\" false, and would
+silently re-grid a graph whose owner merely forgot the keyword.
+
+Warnings are muffled for the same reason as the test above: at precision 5 this
+polygon coarsens, and that is expected and beside the point here."
+  (handler-bind ((warning #'muffle-warning))
+    (with-temp-directory (dir)
+      (let ((path (namestring dir)) zone-id)
+        (let ((g (make-graph *integration-graph-name* path :buffer-pool-size 1000
+                                                           :spatial-precision 5)))
+          (let ((*graph* g))
+            (with-transaction ()
+              (setq zone-id (id (make-scope-zone
+                                 :extent (scope-rect 22.1d0 44.4d0 40.2d0 52.4d0)))))
+            (is (= 5 (spatial-index-precision
+                      (spatial-index-for g 'scope-zone 'extent))))
+            (close-graph g :snapshot-p nil)))
+        (let ((g (open-graph *integration-graph-name* path)))
+          (unwind-protect
+               (let ((idx (spatial-index-for g 'scope-zone 'extent)))
+                 (is (= 5 (spatial-index-precision idx))
+                     "the persisted precision survived a reopen at the default")
+                 (is (has-p zone-id
+                            (spatial-index-query-bbox idx 30d0 48d0 31d0 49d0))))
+            (close-graph g :snapshot-p nil)
+            (collect-garbage)))))))
+
+;;; ---------------------------------------------------------------------------
+;;; A geometry-bearing EDGE.  Edges are spatially indexed exactly as vertices are
+;;; -- REBUILD-SPATIAL-INDEXES maps both, and REGENERATE-SPATIAL-INDEX has an edge
+;;; path -- so every teardown path has to release them symmetrically.
+;;; ---------------------------------------------------------------------------
+
+(def-edge scope-route ()
+  ((path :type geometry :index t))
+  :graph-db-integration-test)
+
+(test peer-purge-releases-a-geometry-edge
+  "PEER-PURGE-NODE's EDGE branch must unindex the edge's geometry, exactly as its
+VERTEX branch does and as it already does for the unique index, the general
+ordered index and the views in BOTH branches.
+
+A purge leaves no tombstone and no node, so nothing ever visits that index key
+again: a missed unindex orphans the entry permanently, and the id it names now
+resolves to nothing -- a device that purged an undisclosed geometry-bearing edge
+would keep answering spatial queries with its ghost."
+  (with-test-graph (g)
+    (let (edge-id)
+      (with-transaction ()
+        (let ((a (make-scope-probe :geom (make-point 37.1724d0 49.2020d0)))
+              (b (make-scope-probe :geom (make-point 37.1730d0 49.2025d0))))
+          (setq edge-id (id (make-scope-route
+                             :from a :to b :weight 1.0
+                             :path (make-point 37.1727d0 49.2022d0))))))
+      (let ((idx (spatial-index-for g 'scope-route 'path)))
+        (is (spatial-index-p idx) "the edge's geometry was indexed on create")
+        (is (has-p edge-id
+                   (spatial-index-query-bbox idx 37.17d0 49.20d0 37.18d0 49.21d0))))
+      (graph-db::peer-purge-node g (lookup-edge edge-id))
+      (let ((idx (spatial-index-for g 'scope-route 'path)))
+        (is (not (has-p edge-id
+                        (spatial-index-query-bbox idx 37.17d0 49.20d0
+                                                  37.18d0 49.21d0)))
+            "the purged edge's spatial entry must be gone from the index itself")))))

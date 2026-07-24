@@ -995,7 +995,21 @@ graph.lisp): GENERIC-FUNCTION-METHODS / METHOD-SPECIALIZERS come from the MOP
 package this package USEs per implementation (sb-mop, closer-mop, clos).  The two
 built-in methods specialize on T and on NODE; only something more specific counts
 as custom.  The TYPEP guard keeps an EQL specializer -- which is not a type
-specifier -- away from SUBTYPEP."
+specifier -- away from SUBTYPEP.
+
+CAVEAT.  GENERIC-FUNCTION-METHODS returns the methods in an implementation-defined
+ORDER, unlike %INDEXED-SLOT-OWNER-NAME's deterministic reversed-CPL walk.  The
+SUBTYPEP most-general test above makes the RESULT order-independent for any fixed
+set of methods, so this is not a portability hazard in itself.
+
+The exposure is temporal, and it is real: defining a NODE-GEOMETRY method on a MORE
+GENERAL class at runtime, after nodes of a subclass are already indexed, relocates
+the owner.  Every entry written under the old key then orphans -- the remove looks
+in the new owner's index, and nothing ever visits the old key again.  Declare the
+NODE-GEOMETRY methods for a hierarchy before writing its nodes; if one is added
+later, REBUILD-SPATIAL-INDEXES re-derives every key from scratch.  This is the same
+exposure an :INDEX slot has under class redefinition -- consistent with existing
+engine behaviour, not a new risk introduced by the method-owner key."
   (let ((owner nil))
     (dolist (m (generic-function-methods #'node-geometry) owner)
       (let ((spec (first (method-specializers m))))

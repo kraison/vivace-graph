@@ -7,7 +7,8 @@
                 rebuild-secondary-indexes save-secondary-index-roots
                 restore-secondary-index-roots install-secondary-indexes
                 ;; spatial-query.lisp / spatial-registry.lisp (both load later)
-                rebuild-spatial-indexes report-degraded-spatial-indexes))
+                rebuild-spatial-indexes report-degraded-spatial-indexes
+                install-spatial-indexes))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Spatial index persistence -- the v3 sidecar.
@@ -566,6 +567,12 @@ Always CLOSE-GRAPH when finished."
               ;; here must leave the sidecar readable as INCOMPLETE, not as a
               ;; complete-looking empty one -- see SAVE-SPATIAL-INDEX-ROOTS.
               (rebuild-spatial-indexes graph)))
+        ;; Reconcile the DECLARATIONS against what just came back: create any
+        ;; DEF-SPATIAL-INDEX the sidecar does not name, and rebuild any index whose
+        ;; declared grid precision no longer matches the persisted one.  The mirror
+        ;; of INSTALL-VIEWS / INSTALL-SECONDARY-INDEXES, and for the same reason --
+        ;; a declaration made while the graph was closed has to take effect.
+        (install-spatial-indexes graph)
         ;; Vector segments (Phase 2 step 6): reopen-or-rebuild, same story as
         ;; the spatial index.  Runs after UPDATE-SCHEMA so node classes are
         ;; instantiated/finalized, and before the graph starts taking writes.
