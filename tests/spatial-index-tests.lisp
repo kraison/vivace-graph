@@ -167,3 +167,58 @@ middle same-cell remove used to no-op).  Runs on BOTH backends."
                  (is (has-p (bid 1) cands))
                  (is (not (has-p (bid 2) cands)))))
           (close-memory heap))))))
+
+;;; --- §7: bounded insert cover + self-healing clamp -------------------------
+
+(defun big-poly (min-lon min-lat max-lon max-lat)
+  "An axis-aligned rectangle polygon, as one exterior ring (lon lat pairs)."
+  (graph-db::%make-geometry
+   :kind :polygon
+   :coordinates (list (list (list min-lon min-lat) (list max-lon min-lat)
+                            (list max-lon max-lat) (list min-lon max-lat)
+                            (list min-lon min-lat)))))
+
+(test insert-caps-oversized-cover
+  "A ~18 x 8 degree polygon indexes in bounded time and space at p=7."
+  (with-temp-memory (heap)
+    (let ((idx (make-spatial-index heap :precision 7)))
+      (spatial-index-insert idx (bid 1) (big-poly 22.1d0 44.4d0 40.2d0 52.4d0))
+      ;; Uncapped this would enumerate ~7.7e7 cells and exhaust the heap.
+      (is (<= (loop for p from 1 to 12
+                    sum (aref (spatial-index-precision-counts idx) p))
+              (spatial-index-max-cells idx)))
+      ;; The cover was coarsened, so the clamp dropped below storage precision.
+      (is (< (spatial-index-coarsest-precision idx) 7)))))
+
+(test clamp-finds-coarse-and-fine-together
+  "A small query inside a coarsely-stored polygon returns BOTH it and a
+finely-stored point in the same index -- the mixed case a single-node test
+would pass by accident."
+  (with-temp-memory (heap)
+    (let ((idx (make-spatial-index heap :precision 7)))
+      (spatial-index-insert idx (bid 1) (big-poly 22.1d0 44.4d0 40.2d0 52.4d0))
+      (spatial-index-insert idx (bid 2) (pt *eo-a*))
+      (let ((cands (spatial-index-query-bbox idx 37.16d0 49.19d0 37.19d0 49.21d0)))
+        (is (has-p (bid 1) cands))
+        (is (has-p (bid 2) cands))))))
+
+(test clamp-self-heals-on-remove
+  "Deleting the oversized geometry restores the clamp with no rebuild."
+  (with-temp-memory (heap)
+    (let ((idx (make-spatial-index heap :precision 7))
+          (poly (big-poly 22.1d0 44.4d0 40.2d0 52.4d0)))
+      (spatial-index-insert idx (bid 1) poly)
+      (is (< (spatial-index-coarsest-precision idx) 7))
+      (spatial-index-remove idx (bid 1) poly)
+      (is (= (spatial-index-coarsest-precision idx) 7)))))
+
+(test insert-remove-symmetry-under-coarsening
+  "Remove computes the same cell set insert did, so nothing is orphaned."
+  (with-temp-memory (heap)
+    (let ((idx (make-spatial-index heap :precision 7))
+          (poly (big-poly 22.1d0 44.4d0 40.2d0 52.4d0)))
+      (spatial-index-insert idx (bid 1) poly)
+      (spatial-index-remove idx (bid 1) poly)
+      (is (zerop (loop for p from 1 to 12
+                       sum (aref (spatial-index-precision-counts idx) p))))
+      (is (null (spatial-index-query-bbox idx 22.1d0 44.4d0 40.2d0 52.4d0))))))

@@ -313,6 +313,9 @@
            #:make-spatial-index
            #:open-spatial-index
            #:spatial-index-precision
+           #:spatial-index-max-cells
+           #:spatial-index-precision-counts
+           #:spatial-index-coarsest-precision
            #:spatial-index-address
            #:spatial-index-insert
            #:spatial-index-remove

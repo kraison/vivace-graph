@@ -58,6 +58,9 @@
                 #:spatial-index-p
                 #:spatial-index-address
                 #:spatial-index-precision
+                #:spatial-index-max-cells
+                #:spatial-index-precision-counts
+                #:spatial-index-coarsest-precision
                 #:spatial-index-insert
                 #:spatial-index-remove
                 #:spatial-index-query-bbox
