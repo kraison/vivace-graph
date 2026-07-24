@@ -268,3 +268,79 @@ reopen sees the NEW roots rather than the freed ones."
                                                     37.19d0 49.21d0))))
           (close-graph g :snapshot-p nil)
           (collect-garbage))))))
+
+;;; ---------------------------------------------------------------------------
+;;; Fix round 1: REBUILD-SPATIAL-INDEXES stranding a freed root; REGENERATE-
+;;; SPATIAL-INDEX unable to tell "no such index" from "no live nodes".
+;;; ---------------------------------------------------------------------------
+
+(test rebuild-with-no-live-nodes-does-not-strand-a-freed-root
+  "REBUILD-SPATIAL-INDEXES on a graph whose geometry-bearing nodes are all deleted
+must persist the resulting EMPTY registry immediately.  Before the fix, the
+sidecar was only ever rewritten as a side effect of %SPATIAL-INDEX-FOR creating a
+replacement index -- so with nothing left to reindex, it kept naming the address
+DELETE-SPATIAL-INDEX had just freed.  That sidecar is perfectly READABLE, so the
+unreadable-sidecar fallback in RESTORE-SPATIAL-INDEX-ROOTS never gets a chance to
+catch it: a crash before the next clean CLOSE-GRAPH would have OPEN-SPATIAL-INDEX
+map freed pages on the next open."
+  (with-test-graph (g)
+    (let (zone)
+      (with-transaction ()
+        (setq zone (make-scope-zone
+                    :extent (scope-rect 22.1d0 44.4d0 40.2d0 52.4d0))))
+      ;; %SPATIAL-INDEX-FOR persisted this index's root the moment it was
+      ;; created, so the sidecar is already up to date and names a live address.
+      (is (spatial-index-p (spatial-index-for g 'scope-zone 'extent)))
+      (mark-deleted zone)
+      (is (= 0 (rebuild-spatial-indexes g))
+          "no live geometry-bearing node is left to reindex")
+      ;; Simulate the crash-then-reopen WITHOUT going through CLOSE-GRAPH -- which
+      ;; itself re-saves the roots from whatever is currently in RAM and would mask
+      ;; exactly the bug under test.  RESTORE-SPATIAL-INDEX-ROOTS is what OPEN-GRAPH
+      ;; calls to repopulate the registry from the sidecar against an
+      ;; already-mapped INDEXES heap, so resetting the in-RAM registry and rerunning
+      ;; it against the SAME heap is a faithful reopen of just the sidecar contract.
+      (clrhash (spatial-indexes g))
+      (is (graph-db::restore-spatial-index-roots g)
+          "the sidecar is well-formed and readable -- exactly the crash path the ~
+           unreadable-sidecar fallback cannot cover")
+      (is (= 0 (hash-table-count (spatial-indexes g)))
+          "the sidecar must not still name the index REBUILD-SPATIAL-INDEXES just ~
+           freed -- the registry must come back correctly EMPTY, not mapping a ~
+           freed heap address")
+      (is (null (spatial-index-for g 'scope-zone 'extent))))))
+
+(test regenerate-unregistered-owner-warns
+  "REGENERATE-SPATIAL-INDEX warns when OWNER-NAME does not name any vertex or edge
+type registered on the graph.  Without the warning, the 0 it (correctly) returns
+is indistinguishable from a real index whose nodes were all deleted -- a plausible
+operator mistake, since a shared index may be declared on an ancestor class."
+  (with-test-graph (g)
+    (let ((warnings '()) count)
+      (handler-bind ((warning (lambda (w) (push w warnings) (muffle-warning w))))
+        (setq count (regenerate-spatial-index g 'no-such-spatial-owner 'extent)))
+      (is (= 0 count) "still a diagnostic, not an error -- 0 is still returned")
+      (is (= 1 (length warnings))
+          "expected exactly one warning about the unregistered owner, got ~D"
+          (length warnings))
+      (let ((msg (princ-to-string (first warnings))))
+        (is (search "NO-SUCH-SPATIAL-OWNER" msg)
+            "the warning must name the owner: ~S" msg)
+        (is (search "EXTENT" msg) "the warning must name the slot: ~S" msg)))))
+
+(test regenerate-registered-owner-with-no-live-nodes-does-not-warn
+  "The new warning is precise: a REAL index whose owner class IS registered, just
+with no live geometry-bearing nodes left, must NOT warn -- only an owner that
+resolves to no registered type at all should."
+  (with-test-graph (g)
+    (let (zone warnings)
+      (with-transaction ()
+        (setq zone (make-scope-zone
+                    :extent (scope-rect 22.1d0 44.4d0 40.2d0 52.4d0))))
+      (mark-deleted zone)
+      (let (count)
+        (handler-bind ((warning (lambda (w) (push w warnings) (muffle-warning w))))
+          (setq count (regenerate-spatial-index g 'scope-zone 'extent)))
+        (is (= 0 count))
+        (is (null warnings)
+            "SCOPE-ZONE is a registered type; no live nodes is not a diagnostic")))))

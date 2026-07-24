@@ -255,6 +255,15 @@ graph is quiescent -- analogous to REGENERATE-VIEW."
         (when (view-index-p (spatial-index-skip-list idx))
           (delete-spatial-index idx)))
       (clrhash (spatial-indexes graph))
+      ;; Persist the now-empty registry IMMEDIATELY, before any reindexing below.
+      ;; Otherwise, on a graph whose geometry-bearing nodes are all deleted, no
+      ;; %SPATIAL-INDEX-FOR call follows to rewrite the sidecar, and it is left
+      ;; naming the address DELETE-SPATIAL-INDEX just freed above -- readable, so
+      ;; the unreadable-sidecar fallback in RESTORE-SPATIAL-INDEX-ROOTS never
+      ;; fires, and a crash before the next clean CLOSE-GRAPH has OPEN-SPATIAL-INDEX
+      ;; map freed pages on the next open.  This also shrinks that window in the
+      ;; ordinary case, where reindexing goes on to save it again anyway.
+      (save-spatial-index-roots graph)
       (flet ((reindex (node)
                (unless (deleted-p node)
                  (multiple-value-bind (geom slot) (node-geometry node)
@@ -274,12 +283,27 @@ graph is quiescent -- analogous to REGENERATE-VIEW."
 live nodes.  This is the manual recovery for an index whose selectivity was
 degraded by an oversized insert (§7.2) -- reach for this rather than
 REGENERATE-SPATIAL-INDEXES, which rebuilds every index in the graph.  Returns the
-number of nodes indexed."
+number of nodes indexed.
+
+WARNS (but still returns 0, not an error) when OWNER-NAME does not name any
+vertex or edge type registered in GRAPH: RESOLVE-NODE-TYPE-IDS silently skips an
+unresolvable designator, so the scan below would otherwise just find nothing --
+a return value indistinguishable from a real index whose nodes were all deleted.
+That is a plausible mistake, since a shared index may be declared on an ancestor
+class with several subclasses (§4)."
   (with-recursive-lock-held ((txn-lock graph))
     ;; Bind *GRAPH*: NODE-GEOMETRY reads slots, and a node read that falls back to
     ;; the dynamic current graph must resolve in GRAPH (the wrong-graph bug class).
     (let ((*graph* graph)
           (key (cons owner-name slot-name)))
+      (unless (or (resolve-node-type-ids owner-name :vertex :graph graph)
+                  (resolve-node-type-ids owner-name :edge :graph graph))
+        (warn "REGENERATE-SPATIAL-INDEX: ~S is not a registered vertex or edge ~
+               type in ~S, so the (~S . ~S) index will be rebuilt from ZERO ~
+               nodes -- indistinguishable from a real index whose nodes were all ~
+               deleted.  Check the class name and that it is declared on this ~
+               graph."
+              owner-name graph owner-name slot-name))
       (let ((old (gethash key (spatial-indexes graph))))
         ;; Only a heap-backed ordered map owns storage that must be freed; a
         ;; memory-graph's in-RAM index is simply dropped with the registry entry.
