@@ -24,8 +24,9 @@
                  :allocation :instance)
    ;; Geohash grid precision for this geometry slot's spatial index, or NIL for
    ;; the graph default.  A type-as-hint option: it means nothing on a slot that
-   ;; never holds a geometry.  See spatial-registry.lisp for resolution against
-   ;; DEF-SPATIAL-INDEX.
+   ;; never holds a geometry.  It is the ONLY precision-declaration surface (there
+   ;; is deliberately no per-index macro); see %SPATIAL-PRECISION-FOR /
+   ;; %DECLARED-SPATIAL-PRECISION in spatial-registry.lisp for how it resolves.
    (spatial-precision :accessor spatial-precision-spec :initarg :spatial-precision
                       :initform nil :allocation :instance)))
 
