@@ -910,6 +910,58 @@ schema redefinition is not expected)."
                       when (indexed-p slot)
                         collect (slot-definition-name slot)))))))
 
+(defparameter *node-geometry-multi-sample-limit* 64
+  "How many nodes of a class are checked for a SECOND geometry-valued indexed
+slot before the check is retired for that class.  Checking only the first node
+would miss a schema where a centroid is populated at creation and an extent is
+filled in later; checking always would cost a slot read per :INDEX slot -- scalars
+included, since NODE-GEOMETRY-INDEX-SLOTS returns them all -- on every spatial
+write forever.  AUDIT-SPATIAL-SLOTS is the exhaustive sweep.")
+
+(defvar *node-geometry-multi-sample-counts*
+  #+sbcl (make-hash-table :test 'eq :synchronized t)
+  #+ccl (make-hash-table :test 'eq :shared t)
+  #+lispworks (make-hash-table :test 'eq :single-thread nil)
+  #+ecl (make-hash-table :test 'eq)
+  "CLASS -> nodes sampled so far, or :DONE once the check has fired or expired.")
+
+(defun node-geometry-slots-with-values (node)
+  "Every indexed slot of NODE that actually holds a geometry, in effective-slot
+order.  The first is the one NODE-GEOMETRY selects; any others are INERT."
+  (loop for slot in (node-geometry-index-slots (class-of node))
+        when (geometryp (ignore-errors (slot-value node slot)))
+          collect slot))
+
+(defun %maybe-warn-inert-geometry-slots (node)
+  "Warn once per class when a node carries more than one geometry-valued indexed
+slot: only the first is indexed, and the rest are silently inert.
+
+Deliberately NOT a finalization-time check.  NODE-GEOMETRY-INDEX-SLOTS refuses to
+compare the declared `:type geometry' symbol -- it is read in the *application's*
+package and is not reliably EQ to GRAPH-DB:GEOMETRY, and a user need not declare a
+type at all -- so which slots will hold geometry is unknowable until a node exists.
+Hence a value-based check, here on the maintenance path.
+
+Bounded, not permanent: *NODE-GEOMETRY-MULTI-SAMPLE-LIMIT* nodes per class, then
+the class is retired.  A class with ONE geometry slot and several indexed scalars
+is the ordinary case and stays silent -- :INDEX is also the general ordered-index
+option, so most of the slots this walks are not geometry at all."
+  (let* ((class (class-of node))
+         (seen (gethash class *node-geometry-multi-sample-counts* 0)))
+    (unless (eq seen :done)
+      (let ((slots (node-geometry-slots-with-values node)))
+        (cond ((rest slots)
+               (setf (gethash class *node-geometry-multi-sample-counts*) :done)
+               (warn "~S declares ~D geometry-valued indexed slots ~S; only ~S is ~
+                      indexed and the rest are INERT.  Index under one slot, or ~
+                      run AUDIT-SPATIAL-SLOTS to review the whole graph."
+                     (class-name class) (length slots) slots (first slots)))
+              ((>= (1+ seen) *node-geometry-multi-sample-limit*)
+               (setf (gethash class *node-geometry-multi-sample-counts*) :done))
+              (t
+               (setf (gethash class *node-geometry-multi-sample-counts*)
+                     (1+ seen))))))))
+
 (defvar *node-vector-index-slot-cache*
   #+sbcl (make-hash-table :test 'eq :synchronized t)
   #+ccl (make-hash-table :test 'eq :shared t)
@@ -1055,6 +1107,12 @@ what %SPATIAL-UNINDEX-NODE uses -- the two must agree exactly or a remove would
 miss the entry the insert wrote."
   (multiple-value-bind (geom slot) (node-geometry node)
     (when (and geom (not (deleted-p node)))
+      ;; §8: a class declaring two geometry slots indexes only the first, and the
+      ;; rest are silently inert.  Sampled here, on the one path every geometry
+      ;; write goes through; bounded per class, so it costs nothing after a class
+      ;; has been seen.  Before the insert, so the diagnostic still reaches an
+      ;; operator whose insert then fails.
+      (%maybe-warn-inert-geometry-slots node)
       (let* ((owner (%node-spatial-owner-name (class-of node) slot))
              (idx (%spatial-index-for graph owner slot))
              (before (spatial-index-coarsest-precision idx)))

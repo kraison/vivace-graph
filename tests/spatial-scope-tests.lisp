@@ -745,18 +745,41 @@ REDEFINING THE CLASS -- so that is what this does, between the close and the
 reopen, and it puts the definition back in an UNWIND-PROTECT.  SCOPE-RESTALE
 exists only for this: it is redefined twice per run, and no other test reads it.
 
-The untouched index is the control: it comes back from the sidecar at its own
-persisted precision, so the rebuild really is bounded to the one that changed.
+The untouched index is the control, and it is pinned by a CANARY: an entry under
+an id no live node has, written straight into the index before the close.  A
+restore brings the persisted ordered map back with the canary in it; a rebuild
+repopulates from live nodes only, so the canary cannot survive one.
+
+Two weaker pins were tried and rejected, both of which PASS even under a
+whole-graph rebuild and so assert nothing:
+
+  - The index's PRECISION.  %SPATIAL-PRECISION-FOR yields the 7 default for a slot
+    with no declaration whether the index was restored or rebuilt from scratch.
+    (Kept below as a sanity check, no longer as the claim.)
+  - The index's ROOT ADDRESS.  REBUILD-SPATIAL-INDEXES frees the old ordered map
+    and immediately allocates a new one, and the binned allocator hands back the
+    block it just freed -- measured, same address before and after, for both
+    REGENERATE-SPATIAL-INDEX and REBUILD-SPATIAL-INDEXES.  Address identity is
+    not index identity here.
 
 Warnings are muffled throughout, for two reasons.  A country-scale polygon at
 precision 5 or 6 is far past +SPATIAL-INSERT-MAX-CELLS+, so the EXPECTED coarsening
 warning fires on every insert and on every rebuild; and redefining a class at
 runtime redefines its generated constructor, which is a STYLE-WARNING on some
 implementations.  Neither bears on what is under test -- SPATIAL-INDEX-PRECISION
-reports the CONFIGURED precision, which the clamp never moves."
+reports the CONFIGURED precision, which the clamp never moves.
+
+TEST HYGIENE.  The UNWIND-PROTECT below restores the CLASS, not global schema
+state: each run pushes two more SCOPE-RESTALE metas onto *SCHEMA-NODE-METADATA*,
+and nothing prunes them, so every later UPDATE-SCHEMA iterates a slightly longer
+list.  It is bounded (two per run) and benign (newest-wins on resolution, and the
+type-id is preserved across the redefinition), but do not read the UNWIND-PROTECT
+as putting the schema registry back the way it was."
   (handler-bind ((warning #'muffle-warning))
     (with-temp-directory (dir)
-      (let ((path (namestring dir)) zone-id)
+      (let ((path (namestring dir))
+            (canary (graph-db::gen-vertex-id))
+            zone-id)
         (let ((g (make-graph *integration-graph-name* path :buffer-pool-size 1000)))
           (let ((*graph* g))
             (with-transaction ()
@@ -767,6 +790,10 @@ reports the CONFIGURED precision, which the clamp never moves."
                       (spatial-index-for g 'scope-restale 'extent))))
             (is (= 7 (spatial-index-precision
                       (spatial-index-for g 'scope-probe 'geom))))
+            ;; The canary: an id no node has, in a corner of the world nothing
+            ;; else occupies, so a rebuild of this index cannot reproduce it.
+            (spatial-index-insert (spatial-index-for g 'scope-probe 'geom)
+                                  canary (make-point 10d0 10d0))
             (close-graph g :snapshot-p nil)))
         (unwind-protect
              (progn
@@ -783,9 +810,15 @@ reports the CONFIGURED precision, which the clamp never moves."
                                    (spatial-index-query-bbox zone-ix
                                                              30d0 48d0 31d0 49d0))
                             "and was repopulated from the live nodes, not left empty")
+                        (is (has-p canary
+                                   (spatial-index-query-bbox
+                                    (spatial-index-for g 'scope-probe 'geom)
+                                    9d0 9d0 11d0 11d0))
+                            "the index nobody redeclared still holds its canary --
+it was RESTORED from the sidecar, not repopulated from live nodes")
                         (is (= 7 (spatial-index-precision
                                   (spatial-index-for g 'scope-probe 'geom)))
-                            "the index nobody redeclared was not rebuilt"))
+                            "and still reports its own precision"))
                    (close-graph g :snapshot-p nil)
                    (collect-garbage))))
           ;; Back to 6, whatever happened above.
@@ -865,3 +898,205 @@ would keep answering spatial queries with its ghost."
                         (spatial-index-query-bbox idx 37.17d0 49.20d0
                                                   37.18d0 49.21d0)))
             "the purged edge's spatial entry must be gone from the index itself")))))
+
+;;; ---------------------------------------------------------------------------
+;;; §8: the inert second geometry slot.
+;;;
+;;; NODE-GEOMETRY picks the FIRST indexed slot whose runtime value is a geometry,
+;;; so a class declaring two of them silently indexes one and drops the other.
+;;; This cannot be caught at finalization (the ':type geometry' symbol is read in
+;;; the application's package and is not reliably EQ to GRAPH-DB:GEOMETRY, and a
+;;; user need not declare a type at all), so the check is value-based, on the
+;;; maintenance path -- bounded per class -- with AUDIT-SPATIAL-SLOTS as the
+;;; exhaustive sweep.
+;;; ---------------------------------------------------------------------------
+
+(def-vertex scope-two-geoms ()
+  ((centroid :type geometry :index t)
+   (outline :type geometry :index t))
+  :graph-db-integration-test)
+
+;; The sampler retires a class for the LIFE OF THE IMAGE once it has warned or
+;; spent its budget, so both tests below reset SCOPE-TWO-GEOMS's counter first.
+;; Without it the pair is order-dependent -- whichever ran first would consume
+;; the budget and leave the other asserting against a retired class -- and
+;; FiveAM does not promise a run order.  Resetting one class's counter does not
+;; weaken either check: each test then exercises the state it names.
+(defun reset-two-geoms-sampler ()
+  (remhash (find-class 'scope-two-geoms)
+           graph-db::*node-geometry-multi-sample-counts*))
+
+(test warns-on-a-second-inert-geometry-slot
+  "A node with two geometry-valued indexed slots warns and names the winner.
+
+The warning TEXT is checked, not merely that some warning was signaled: this
+same write path also warns when an oversized insert coarsens an index, so a bare
+SIGNALS WARNING here could pass on the wrong condition entirely."
+  (with-test-graph (g)
+    (declare (ignore g))
+    (reset-two-geoms-sampler)
+    (let ((text nil))
+      (signals warning
+        (handler-bind ((warning (lambda (c)
+                                  (unless text (setf text (princ-to-string c))))))
+          (with-transaction ()
+            (make-scope-two-geoms :centroid (make-point 30d0 50d0)
+                                  :outline (scope-rect 35d0 55d0 36d0 56d0)))))
+      (let ((up (string-upcase (or text ""))))
+        (is (search "INERT" up) "the warning is the inert-slot one, not the clamp's")
+        (is (search "SCOPE-TWO-GEOMS" up) "and it names the class")
+        (is (search "CENTROID" up) "and the winning slot")
+        (is (search "OUTLINE" up) "and the slot that is being dropped")))))
+
+(test warns-once-per-class-not-once-per-node
+  "The sampler retires a class the moment it fires, so a bulk load of a
+mis-declared class does not emit one warning per node."
+  (with-test-graph (g)
+    (declare (ignore g))
+    (reset-two-geoms-sampler)
+    (let ((count 0))
+      (handler-bind ((warning (lambda (c)
+                                (when (search "INERT" (string-upcase
+                                                       (princ-to-string c)))
+                                  (incf count))
+                                (muffle-warning c))))
+        (with-transaction ()
+          (dotimes (i 5)
+            (make-scope-two-geoms
+             :centroid (make-point (+ 30d0 (* i 0.001d0)) 50d0)
+             :outline (scope-rect 35d0 55d0 36d0 56d0)))))
+      (is (= 1 count) "exactly one inert-slot warning for five bad nodes"))))
+
+;; One geometry slot, two indexed SCALARS.  This is the shape the check must stay
+;; silent on, and it is the common one: :INDEX is the general ordered-index option
+;; as well as the spatial opt-in, so NODE-GEOMETRY-INDEX-SLOTS hands back LABEL and
+;; RANK here alongside GEOM.  Without a class of this shape in the fixture, both
+;; the silence test and the read-only test below would assert nothing.
+(def-vertex scope-mixed-index ()
+  ((geom :type geometry :index t)
+   (label :type string :index t)
+   (rank :type integer :index t))
+  :graph-db-integration-test)
+
+(test one-geometry-slot-and-indexed-scalars-stay-silent
+  "The check must not cry wolf on a class that is working as intended.
+NODE-GEOMETRY-INDEX-SLOTS returns EVERY :INDEX-marked slot -- :INDEX is also the
+general ordered-index option -- so a class with one geometry slot and several
+indexed scalars is the ordinary case and must stay silent.
+
+This is the shape four classes in the requesting team's schema have, minus the
+second geometry; getting it wrong would bury the real finding in noise."
+  (with-test-graph (g)
+    (remhash (find-class 'scope-mixed-index)
+             graph-db::*node-geometry-multi-sample-counts*)
+    (let ((warned nil))
+      (handler-bind ((warning (lambda (c)
+                                (when (search "INERT" (string-upcase
+                                                       (princ-to-string c)))
+                                  (setf warned (princ-to-string c)))
+                                (muffle-warning c))))
+        (with-transaction ()
+          (make-scope-mixed-index :geom (make-point 37.1724d0 49.2020d0)
+                                  :label "alpha" :rank 3)))
+      (is (null warned)
+          "one geometry slot plus two indexed scalars never warns")
+      (is (equal '(geom)
+                 (graph-db::node-geometry-slots-with-values
+                  (first (map-vertices #'identity g :vertex-type 'scope-mixed-index
+                                                    :collect-p t))))
+          "and only the geometry slot is reported as geometry-valued"))))
+
+(test audit-finds-what-the-sampler-missed
+  "AUDIT-SPATIAL-SLOTS sweeps every node, so it reports a class whose only
+two-geometry node lies beyond the sampling window.
+
+The premise is asserted, not assumed: the load below spends the class's whole
+sampling budget on single-geometry nodes, and the two-geometry node that follows
+must draw NO warning.  Muffling alone would hide a sampler that had in fact
+caught it, and the test would then pass without the audit doing any work.
+
+Note that the window is a CREATION-order one.  MAP-VERTICES walks the vertex
+table in linear-hash order, so the two-geometry node -- created 66th of 66 --
+comes back around the middle of the sweep (measured: 36th).  That is why the
+sampler's silence is asserted directly rather than inferred from position."
+  (with-test-graph (g)
+    (reset-two-geoms-sampler)
+    (with-transaction ()
+      (dotimes (i (1+ graph-db::*node-geometry-multi-sample-limit*))
+        (make-scope-two-geoms :centroid (make-point (+ 30d0 (* i 0.001d0)) 50d0))))
+    (let ((warned 0))
+      (handler-bind ((warning (lambda (c)
+                                (when (search "INERT" (string-upcase
+                                                       (princ-to-string c)))
+                                  (incf warned))
+                                (muffle-warning c))))
+        (with-transaction ()
+          (make-scope-two-geoms :centroid (make-point 30d0 50d0)
+                                :outline (scope-rect 35d0 55d0 36d0 56d0))))
+      (is (zerop warned)
+          "the sampler is retired by now, so this node really is beyond its window"))
+    (let ((report (audit-spatial-slots g)))
+      (is (assoc 'scope-two-geoms report))
+      (is (eq 'centroid (second (assoc 'scope-two-geoms report))))
+      (is (equal '(outline) (cddr (assoc 'scope-two-geoms report)))
+          "the inert slots follow the winner in the report"))))
+
+(test audit-reports-nothing-on-a-healthy-graph
+  "The audit is a diagnostic, not a lint that always finds something: a graph
+whose classes each carry ONE geometry slot reports the empty list."
+  (with-test-graph (g)
+    (with-transaction ()
+      (make-scope-probe :geom (make-point 37.1724d0 49.2020d0))
+      (make-scope-zone :extent (scope-rect 22.1d0 44.4d0 40.2d0 52.4d0)))
+    (is (null (audit-spatial-slots g)))))
+
+(test audit-is-read-only
+  "AUDIT-SPATIAL-SLOTS must not create, mutate or persist anything -- it is safe
+to call on a production graph.  It reads slots, and a slot read must never be
+what brings an index into existence.
+
+SCOPE-MIXED-INDEX is what gives this teeth.  %SPATIAL-INDEX-FOR CREATES a missing
+index as a side effect, so an audit that resolved an index per indexed slot -- the
+natural way to write it wrong -- would mint (SCOPE-MIXED-INDEX . LABEL) and
+ (SCOPE-MIXED-INDEX . RANK) spatial indexes over scalar slots.  Those keys do not
+exist beforehand, so the key-set comparison below catches it.  A fixture of
+geometry-only classes would not: every key it could resolve already exists."
+  (with-test-graph (g)
+    (with-transaction ()
+      (make-scope-probe :geom (make-point 37.1724d0 49.2020d0))
+      (make-scope-mixed-index :geom (make-point 37.1730d0 49.2025d0)
+                              :label "beta" :rank 7))
+    (flet ((keys (graph)
+             (sort (loop for k being the hash-keys of (spatial-indexes graph)
+                         collect (princ-to-string k))
+                   #'string<)))
+      (let ((keys-before (keys g))
+            (addr-before (spatial-index-address
+                          (spatial-index-for g 'scope-probe 'geom))))
+        (audit-spatial-slots g)
+        (is (equal keys-before (keys g)) "no index was created or dropped")
+        (is (= addr-before (spatial-index-address
+                            (spatial-index-for g 'scope-probe 'geom)))
+            "and the surviving index is the same one, at the same root")))))
+
+;; A geometry-bearing EDGE with a second geometry slot: the audit maps edges as
+;; well as vertices, and a mis-declared edge class is exactly as inert.
+(def-edge scope-two-geom-route ()
+  ((track :type geometry :index t)
+   (corridor :type geometry :index t))
+  :graph-db-integration-test)
+
+(test audit-covers-edges-too
+  "AUDIT-SPATIAL-SLOTS maps edges as well as vertices."
+  (with-test-graph (g)
+    (handler-bind ((warning #'muffle-warning))
+      (with-transaction ()
+        (let ((a (make-scope-probe :geom (make-point 37.1724d0 49.2020d0)))
+              (b (make-scope-probe :geom (make-point 37.1730d0 49.2025d0))))
+          (make-scope-two-geom-route
+           :from a :to b :weight 1.0
+           :track (make-point 37.1727d0 49.2022d0)
+           :corridor (scope-rect 37.17d0 49.20d0 37.18d0 49.21d0)))))
+    (let ((entry (assoc 'scope-two-geom-route (audit-spatial-slots g))))
+      (is (not (null entry)) "the mis-declared edge class is reported")
+      (is (equal '(track corridor) (rest entry))))))

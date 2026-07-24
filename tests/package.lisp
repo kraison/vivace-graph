@@ -73,6 +73,9 @@
                 #:rebuild-spatial-indexes
                 #:regenerate-spatial-index
                 #:regenerate-spatial-indexes
+                ;; §8: the inert second geometry slot (exhaustive read-only sweep)
+                #:audit-spatial-slots
+                #:node-geometry-slots-with-values
                 ;; the declaration surface for a spatial index's grid precision
                 #:spatial-precision-spec
                 ;; index-backed spatial queries (spatial extension)

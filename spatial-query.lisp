@@ -401,6 +401,46 @@ has no per-index completeness granularity -- but it is the safe direction."
         (report-degraded-spatial-indexes graph)
         count))))
 
+(defun audit-spatial-slots (graph)
+  "Sweep every live node in GRAPH and report each class carrying more than one
+geometry-valued indexed slot, as a list of (CLASS-NAME WINNING-SLOT . INERT-SLOTS).
+
+The exhaustive counterpart to the bounded per-class sampler on the write path
+ (%MAYBE-WARN-INERT-GEOMETRY-SLOTS): it catches a class whose two-geometry nodes
+all lie beyond the sampling window, and a class added long after the graph's
+migration.  Read-only -- wire it into a schema test suite.
+
+READ-ONLY is a contract, not a description.  This visits every node in the graph,
+so it is a thing an operator may reasonably run against production: it creates no
+index, writes no sidecar, mutates no node and takes no transaction.  Note in
+particular that it resolves nothing through %SPATIAL-INDEX-FOR, which CREATES a
+missing index as a side effect -- the audit never needs an index, only slot values.
+
+Binds *GRAPH* for the duration: NODE-GEOMETRY-SLOTS-WITH-VALUES reads slots, and a
+node read that falls back to the dynamic current graph must resolve in GRAPH rather
+than in whatever the caller happened to have current (the wrong-graph bug class).
+
+One node per class settles it -- the first node found carrying two geometries -- so
+this is O(nodes) with an early exit per class, not O(nodes x slots) throughout.  A
+class whose FIRST such node is the last node in the graph still costs a full sweep;
+that is the price of the guarantee the sampler cannot give."
+  (let ((found (make-hash-table :test 'eq))
+        (*graph* graph))
+    (flet ((check (node)
+             (unless (deleted-p node)
+               (let ((class (class-of node)))
+                 (unless (gethash class found)
+                   (let ((slots (node-geometry-slots-with-values node)))
+                     (when (rest slots)
+                       (setf (gethash class found) slots))))))))
+      (map-vertices #'check graph)
+      (map-edges #'check graph))
+    (let ((result '()))
+      (maphash (lambda (class slots)
+                 (push (cons (class-name class) slots) result))
+               found)
+      result)))
+
 (defun regenerate-spatial-indexes (graph)
   "Drop every spatial index and rebuild it on GRAPH's CURRENT :INDEX-BACKEND,
 persisting the new roots.  The parallel of REGENERATE-ALL-VIEWS /
