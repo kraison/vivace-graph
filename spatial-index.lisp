@@ -119,9 +119,14 @@ it is fixed for the life of the index (see +SPATIAL-INSERT-MAX-CELLS+)."
                                              (max-cells +spatial-insert-max-cells+)
                                              precision-counts)
   "Reopen the spatial index whose ordered map is rooted at ADDRESS in HEAP, with
-BACKEND's opener.  PRECISION and MAX-CELLS must match the values used at creation
-(both are persisted in the sidecar).  PRECISION-COUNTS is the persisted histogram;
-NIL means an empty one, which leaves the clamp unrestricted."
+BACKEND's opener.  The caller must supply PRECISION and MAX-CELLS matching the
+values used at creation -- only the ordered map's format/address/precision/
+backend are persisted today (see GRAPH.LISP), so this constructor cannot check
+or recover them itself.  PRECISION-COUNTS is the histogram, if the caller has
+one to hand back in (a future sidecar format is expected to persist it
+alongside precision/max-cells); omitting it (the default) starts from an empty
+histogram, which leaves the coarsest-precision clamp unrestricted until enough
+inserts have run to populate it."
   (let ((idx (%make-spatial-index
               :skip-list (open-heap-index backend :address address :heap heap
                                           :comparison 'reduce-comp-lessp)
@@ -182,23 +187,34 @@ MAX-CELLS so one huge part cannot starve the rest."
 (defun spatial-index-insert (idx node-id geom)
   "Index NODE-ID under every cell GEOM occupies.  NODE-ID is a node's 16-byte
 uuid; it is folded into the composite key (cell . node-id) and the skip-node
-value is unused (NIL)."
+value is unused (NIL).  ADD-TO-SKIP-LIST is a duplicate-key no-op (returns NIL)
+when this exact (cell . node-id) is already stored -- e.g. a replayed or
+double-applied insert -- and PRECISION-COUNTS is only bumped when an entry was
+actually added, so the histogram tracks what the store physically holds."
   (let ((sl (spatial-index-skip-list idx)))
     (dolist (cell (%geometry-cells geom (spatial-index-precision idx)
                                    (spatial-index-max-cells idx))
                   node-id)
-      (add-to-skip-list sl (list cell node-id) nil)
-      (%count-cell idx cell))))
+      (when (add-to-skip-list sl (list cell node-id) nil)
+        (%count-cell idx cell)))))
 
 (defun spatial-index-remove (idx node-id geom)
   "Remove NODE-ID's entries for GEOM (using the same cells INSERT produced).
 Each (cell . node-id) is a unique composite key, so REMOVE takes the O(log n)
-duplicate-free path."
+duplicate-free path.  REMOVE-FROM-SKIP-LIST is a supported no-op (returns NIL)
+when the (cell . node-id) is not present -- e.g. a double-applied remove from
+transaction replay or an idempotent peer purge -- and PRECISION-COUNTS is only
+decremented when an entry was actually removed.  Decrementing unconditionally
+would drift the histogram below what the store really holds, and because
+%UNCOUNT-CELL floors at zero the corruption is silent: the coarsest-precision
+clamp can end up finer than a level that is still physically populated, and
+SPATIAL-INDEX-QUERY-BBOX's prefix range scan then misses it -- see
+SPATIAL-INDEX-COARSEST-PRECISION."
   (let ((sl (spatial-index-skip-list idx)))
     (dolist (cell (%geometry-cells geom (spatial-index-precision idx)
                                    (spatial-index-max-cells idx)))
-      (remove-from-skip-list sl (list cell node-id))
-      (%uncount-cell idx cell))))
+      (when (remove-from-skip-list sl (list cell node-id))
+        (%uncount-cell idx cell)))))
 
 (defun spatial-index-query-bbox (idx min-lon min-lat max-lon max-lat)
   "Candidate node-ids whose indexed cells meet the query bounding box.  A

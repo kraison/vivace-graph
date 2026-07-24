@@ -222,3 +222,50 @@ would pass by accident."
       (is (zerop (loop for p from 1 to 12
                        sum (aref (spatial-index-precision-counts idx) p))))
       (is (null (spatial-index-query-bbox idx 22.1d0 44.4d0 40.2d0 52.4d0))))))
+
+(test double-remove-does-not-orphan-a-surviving-node
+  "REGRESSION: removing an already-absent entry is a SUPPORTED no-op elsewhere in
+this engine (APPLY-PEER-PURGE documents idempotent purge; RECOVER-TRANSACTIONS
+re-applies every unmarked .txn on crash recovery even when the heap already
+reflects it), so SPATIAL-INDEX-REMOVE must tolerate it too.  Before the fix, it
+called %UNCOUNT-CELL unconditionally, so a double-remove decremented a
+precision-counts bin regardless of whether anything was actually removed from
+the store.
+
+Two nodes are inserted under the IDENTICAL oversized polygon, so their entries
+land in the exact same (coarsely-covered) precision bin with EXACTLY equal
+counts -- both cover exactly the same cells, by construction.  Removing one of
+them once is legitimate and must not disturb the other.  Removing it a SECOND
+time touches nothing in the store, but a histogram that decrements anyway
+drives that shared bin to zero -- exactly cancelling out the surviving node's
+share -- and the coarsest-precision clamp self-heals to a level that is too
+FINE for the surviving node's coarsely-stored cells.  SPATIAL-INDEX-QUERY-BBOX's
+prefix range scan then walks past them: a small window well inside the
+surviving node's footprint (same window and geometry as
+CLAMP-FINDS-COARSE-AND-FINE-TOGETHER, which establishes that the clamp is what
+makes this window find the oversized geometry at all) silently returns
+nothing for it.  The existing INSERT-REMOVE-SYMMETRY-UNDER-COARSENING test
+cannot catch this: %UNCOUNT-CELL floors its counts at zero, so
+`(zerop (sum counts))` looks identical whether the counts are exactly right or
+were driven to zero early by a spurious extra decrement.  Only a query-level
+assertion -- can a node inserted earlier still be found -- exposes the bug.
+Runs on BOTH backends."
+  (labels ((exercise (idx)
+             (let ((poly (big-poly 22.1d0 44.4d0 40.2d0 52.4d0)))
+               (spatial-index-insert idx (bid 1) poly)  ; A -- must survive throughout
+               (spatial-index-insert idx (bid 2) poly)  ; B -- identical geometry/cells
+               (is (< (spatial-index-coarsest-precision idx) 7)
+                   "the shared geometry is coarsely covered, not at full precision")
+               (flet ((a-found-p ()
+                        (has-p (bid 1)
+                               (spatial-index-query-bbox idx 37.16d0 49.19d0 37.19d0 49.21d0))))
+                 (is (a-found-p) "A is findable before B is touched at all")
+                 (spatial-index-remove idx (bid 2) poly)   ; legitimate remove of B
+                 (is (a-found-p) "A survives B's real removal")
+                 (spatial-index-remove idx (bid 2) poly)   ; DOUBLE remove of B: a no-op
+                 (is (a-found-p)
+                     "A must still be findable after B's double-remove -- A's own entries
+were never touched by either call")))))
+    (with-temp-memory (heap)                 ; on-disk backend
+      (exercise (make-spatial-index heap :precision 7)))
+    (exercise (graph-db::make-mem-spatial-index :precision 7))))
