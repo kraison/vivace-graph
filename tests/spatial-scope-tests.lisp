@@ -1069,6 +1069,54 @@ the engine's own documented workaround."
     (is (null (assoc 'scope-two-geoms-combined (audit-spatial-slots g)))
         "a method-supplied geometry is not the 'first slot wins' shape the audit checks for")))
 
+;; A custom NODE-GEOMETRY method that reports a SLOT name -- the two-value case
+;; the generic's own docstring documents -- is NOT the "combine into one and hide"
+;; workaround SCOPE-TWO-GEOMS-COMBINED stands in for.  Such a node IS keyed
+;; (CLASS . SLOT) by %NODE-SPATIAL-OWNER-NAME, "first indexed slot wins" DOES
+;; apply to it, and a second geometry-valued indexed slot on it IS genuinely
+;; inert -- exactly as it would be under the default method.  This is the shape
+;; finding 1 named: gating the audit on "does the class carry ANY custom method"
+;; (rather than on NODE-GEOMETRY's own per-node SLOT return, the sampler's actual
+;; condition) would silently exempt this class from the audit forever, with no
+;; sampler backstop reaching it either once its two-geometry node falls outside
+;; the sampling window.
+(def-vertex scope-two-geoms-reporting ()
+  ((centroid :type geometry :index t)
+   (outline :type geometry :index t))
+  :graph-db-integration-test)
+
+(defmethod node-geometry ((s scope-two-geoms-reporting))
+  ;; Two values: a geometry AND a slot name, unlike SCOPE-TWO-GEOMS-COMBINED's
+  ;; one-value return.  The slot named here need not be the class's actual
+  ;; winning slot in general, but making it CENTROID lets this test assert the
+  ;; warning names the same winner the default method would have chosen.
+  (values (or (slot-value s 'centroid) (slot-value s 'outline)) 'centroid))
+
+(test custom-two-value-node-geometry-method-is-still-audited
+  "A custom NODE-GEOMETRY method returning (VALUES GEOM SLOT-NAME) opts INTO the
+'first slot wins' rule, not out of it -- AUDIT-SPATIAL-SLOTS must report a class
+shaped this way exactly as it would a default-method class with the same two
+geometry-valued indexed slots.  This is the discriminating case for finding 1:
+before the fix, the audit's gate asked only whether the class carried a custom
+NODE-GEOMETRY method at all, which wrongly exempted this shape along with the
+genuine SCOPE-TWO-GEOMS-COMBINED workaround.
+
+This class also has a real SLOT name, so -- unlike SCOPE-TWO-GEOMS-COMBINED --
+the WRITE-path sampler fires its own inert-slot warning on creation, exactly as
+it would for a default-method class shaped this way; that warning is muffled
+here since it is not what this test is checking."
+  (with-test-graph (g)
+    (handler-bind ((warning #'muffle-warning))
+      (with-transaction ()
+        (make-scope-two-geoms-reporting
+         :centroid (make-point 30d0 50d0)
+         :outline (scope-rect 35d0 55d0 36d0 56d0))))
+    (let ((entry (assoc 'scope-two-geoms-reporting (audit-spatial-slots g))))
+      (is (not (null entry))
+          "a two-value custom method does not exempt its class from the audit")
+      (is (eq 'centroid (second entry)) "and the winner is the slot the method named")
+      (is (equal '(outline) (cddr entry)) "with the other geometry slot reported inert"))))
+
 (test audit-finds-what-the-sampler-missed
   "AUDIT-SPATIAL-SLOTS sweeps every node, so it reports a class whose only
 two-geometry node lies beyond the sampling window.
@@ -1135,11 +1183,29 @@ geometry-only classes would not: every key it could resolve already exists.
 
 The key-set and root-address checks only see the in-memory registry, though, and
 SAVE-SPATIAL-INDEX-ROOTS (a call the audit must never make) writes to the v3
-sidecar file, not to any in-memory structure the checks above would notice.  So
-this also snapshots the sidecar's FILE-WRITE-DATE and length across the call --
-a direct SAVE-SPATIAL-INDEX-ROOTS call, or any other unexpected mutation that
-happens to persist, would change one or the other even if the registry itself
-came out looking untouched."
+sidecar file, not to any in-memory structure the checks above would notice.  A
+prior version of this test tried to catch that by snapshotting the sidecar
+file's FILE-WRITE-DATE and length across the call -- but FILE-WRITE-DATE is
+integer universal time (one-second granularity), this whole test runs well
+inside one second, and SAVE-SPATIAL-INDEX-ROOTS re-serializes the SAME roots to
+the SAME file, so an unchanged registry produces identical length AND identical
+write-date whether or not the call happened.  Confirmed directly, not assumed:
+inserting a bare (SAVE-SPATIAL-INDEX-ROOTS GRAPH) as the first form of
+AUDIT-SPATIAL-SLOTS and re-running this test left all four of its assertions
+passing.  A check that cannot fail on the exact bug it names is not a check.
+
+So instead of inspecting the file, this counts calls to SAVE-SPATIAL-INDEX-ROOTS
+itself, via the FDEFINITION-swap idiom this suite already uses for %POSIX-MMAP
+and REBUILD-UNIQUE-INDEXES: zero calls is the only correct count for a read-only
+sweep, at any timer resolution, on any backend.
+
+The same idiom also proves the audit commits no write, full stop, rather than
+merely that it happens not to touch the two things this test otherwise inspects:
+every node create, update and delete in this engine funnels through
+APPLY-TRANSACTION, the shared apply path transaction commit, replay and
+replication all go through, so a zero count on it during the audit is direct
+evidence no node was mutated -- not an inference from the absence of symptoms
+in an unrelated registry and a file stat."
   (with-test-graph (g)
     (with-transaction ()
       (make-scope-probe :geom (make-point 37.1724d0 49.2020d0))
@@ -1148,27 +1214,35 @@ came out looking untouched."
     (flet ((keys (graph)
              (sort (loop for k being the hash-keys of (spatial-indexes graph)
                          collect (princ-to-string k))
-                   #'string<))
-           (sidecar-stat (graph)
-             (let ((file (graph-db::spatial-indexes-root-file
-                          (namestring (graph-db:location graph)))))
-               (values (file-write-date file)
-                       (with-open-file (in file :element-type '(unsigned-byte 8))
-                         (file-length in))))))
+                   #'string<)))
       (let ((keys-before (keys g))
             (addr-before (spatial-index-address
-                          (spatial-index-for g 'scope-probe 'geom))))
-        (multiple-value-bind (date-before length-before) (sidecar-stat g)
-          (audit-spatial-slots g)
-          (is (equal keys-before (keys g)) "no index was created or dropped")
-          (is (= addr-before (spatial-index-address
-                              (spatial-index-for g 'scope-probe 'geom)))
-              "and the surviving index is the same one, at the same root")
-          (multiple-value-bind (date-after length-after) (sidecar-stat g)
-            (is (= date-before date-after)
-                "and the sidecar file's write date did not change")
-            (is (= length-before length-after)
-                "and neither did its length")))))))
+                          (spatial-index-for g 'scope-probe 'geom)))
+            (save-calls 0)
+            (apply-calls 0)
+            (orig-save (fdefinition 'graph-db::save-spatial-index-roots))
+            (orig-apply (fdefinition 'graph-db::apply-transaction)))
+        (unwind-protect
+             (progn
+               (setf (fdefinition 'graph-db::save-spatial-index-roots)
+                     (lambda (&rest args)
+                       (incf save-calls)
+                       (apply orig-save args)))
+               (setf (fdefinition 'graph-db::apply-transaction)
+                     (lambda (&rest args)
+                       (incf apply-calls)
+                       (apply orig-apply args)))
+               (audit-spatial-slots g)
+               (is (equal keys-before (keys g)) "no index was created or dropped")
+               (is (= addr-before (spatial-index-address
+                                   (spatial-index-for g 'scope-probe 'geom)))
+                   "and the surviving index is the same one, at the same root")
+               (is (zerop save-calls)
+                   "and the sidecar was never re-saved")
+               (is (zerop apply-calls)
+                   "and no transaction was ever applied -- the audit commits no write"))
+          (setf (fdefinition 'graph-db::save-spatial-index-roots) orig-save)
+          (setf (fdefinition 'graph-db::apply-transaction) orig-apply))))))
 
 ;; A geometry-bearing EDGE with a second geometry slot: the audit maps edges as
 ;; well as vertices, and a mis-declared edge class is exactly as inert.

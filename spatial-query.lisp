@@ -410,15 +410,23 @@ The exhaustive counterpart to the bounded per-class sampler on the write path
 all lie beyond the sampling window, and a class added long after the graph's
 migration.  Read-only -- wire it into a schema test suite.
 
-A class carrying an application-supplied NODE-GEOMETRY method (see the
-NODE-GEOMETRY generic's docstring) is skipped entirely, exactly as the sampler
-skips it (%SPATIAL-INDEX-NODE only samples when NODE-GEOMETRY returned a slot
-name).  The 'first indexed slot wins' rule this audit is checking for is a
-property of the DEFAULT method only; a class that overrides NODE-GEOMETRY -- the
-documented way to combine more than one geometry-valued slot into one indexed
-geometry -- has already opted out of that rule, and reporting it as though the
-default applied would be a false positive against the very workaround the
-sampler's own warning text recommends.
+A class is skipped for a node exactly when %SPATIAL-INDEX-NODE would have
+skipped the sampler's check for that SAME node: NODE-GEOMETRY returned a
+geometry but no slot name.  This is not approximated by asking whether the
+class carries an application-supplied NODE-GEOMETRY method -- that question is
+too coarse, because a method is free to return a slot name of its own (see the
+two-value case in the NODE-GEOMETRY generic's docstring), and such a node IS the
+'first indexed slot wins' shape this audit checks for, exactly as if the
+default method had produced it.  The gate below calls NODE-GEOMETRY itself and
+branches on its SECOND value, so a method that reports a slot is audited like
+any other slotted node, and only a method that reports NIL -- the documented
+one-value workaround for combining more than one geometry-valued slot -- opts
+its class out, matching the sampler exactly by construction rather than by a
+separate rule that can drift from it.  A node with no geometry at all (NODE-
+GEOMETRY returning NIL NIL, the common case for an optional geometry slot that
+is simply unset on this node) decides nothing either way: it is not evidence
+that the class's method reports no slot, only that this one node has no
+geometry yet, so the class is left open for a later node to settle.
 
 READ-ONLY is a contract about mutation, not about cost.  This creates no index,
 writes no sidecar, mutates no node and takes no transaction; in particular it
@@ -437,10 +445,17 @@ Binds *GRAPH* for the duration: NODE-GEOMETRY-SLOTS-WITH-VALUES reads slots, and
 node read that falls back to the dynamic current graph must resolve in GRAPH rather
 than in whatever the caller happened to have current (the wrong-graph bug class).
 
-One node per class settles it -- the first node found carrying two geometries -- so
-this is O(nodes) with an early exit per class, not O(nodes x slots) throughout.  A
-class whose FIRST such node is the last node in the graph still costs a full sweep;
-that is the price of the guarantee the sampler cannot give."
+A class is SETTLED -- no longer probed -- as soon as one geometry-bearing node
+is DECISIVE: carrying two geometry-valued slots (FOUND) or reporting no slot at
+all (SKIP).  Settling never costs O(nodes x methods): the gate below calls
+NODE-GEOMETRY once per node, one ordinary generic-function dispatch, never
+GENERIC-FUNCTION-METHODS or SUBTYPEP.  The ordinary case -- a healthy class,
+one geometry-valued slot, default method -- is never decisive and so never
+settles; each of its nodes still costs one dispatch plus one slot-value scan,
+same as MAP-VERTICES already pays walking the raw table, for the life of the
+sweep.  A class whose FIRST decisive node is the last node in the graph still
+costs a full sweep; that is the price of the guarantee the sampler cannot
+give."
   (let ((found (make-hash-table :test 'eq))
         (skip (make-hash-table :test 'eq))
         (*graph* graph))
@@ -448,11 +463,13 @@ that is the price of the guarantee the sampler cannot give."
              (unless (deleted-p node)
                (let ((class (class-of node)))
                  (unless (or (gethash class found) (gethash class skip))
-                   (if (%node-geometry-method-owner-name class)
-                       (setf (gethash class skip) t)
-                       (let ((slots (node-geometry-slots-with-values node)))
-                         (when (rest slots)
-                           (setf (gethash class found) slots)))))))))
+                   (multiple-value-bind (geom slot) (node-geometry node)
+                     (when geom
+                       (if (null slot)
+                           (setf (gethash class skip) t)
+                           (let ((slots (node-geometry-slots-with-values node)))
+                             (when (rest slots)
+                               (setf (gethash class found) slots)))))))))))
       (map-vertices #'check graph)
       (map-edges #'check graph))
     (let ((result '()))

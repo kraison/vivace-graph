@@ -950,13 +950,25 @@ option, so most of the slots this walks are not geometry at all.
 No lock: this runs on the spatial write path, and a diagnostic does not justify
 serializing it.  Two threads can both read SEEN before either writes, so the
 final store below re-reads the hash-table entry rather than trusting SEEN, and
-only ever writes something at least as large as what is already there and never
-overwrites :DONE.  Without that re-check, a descheduled thread could clobber a
-concurrently-set :DONE with a plain integer (un-retiring an already-decided
-class) or move the count backwards -- either way the 64-sample bound would be
-merely probabilistic rather than guaranteed.  The count can still under-count
-(two threads both reading SEEN=N and each computing N+1) but it can never go
-backwards or lose :DONE, which is all this diagnostic needs."
+only ever writes something at least as large as what that re-read saw, never
+blindly SEEN.  Without that re-check, a descheduled thread could clobber a
+concurrently-set :DONE with a plain integer, or move the count backwards, on
+the strength of a SEEN it read long before it finally stored -- an arbitrarily
+wide window.  The re-read narrows that window to the gap between the re-read
+and the SETF a few lines below, which is real and worth having, but it does NOT
+close it: those two forms are still separate operations, not a single atomic
+compare-and-swap, so a thread can still be preempted between them.  Losing
+:DONE is still possible (A re-reads CUR=5, computes 6, is preempted; B warns
+and sets :DONE; A resumes and stores 6, un-retiring the class) and so is going
+backwards (A re-reads CUR=5, computes (MAX 4 5)=5, is preempted; B stores 6; A
+resumes and stores 5).  Both windows are now two hash-table operations wide
+instead of spanning the whole slot walk, which is the improvement this re-read
+actually buys; the count can also still under-count (two threads both reading
+SEEN=N and each computing N+1).  No lock or CAS closes the remaining window --
+there is no portable compare-and-swap on a hash-table entry across
+SBCL/CCL/ECL/LispWorks, and a diagnostic does not justify inventing one; the
+64-sample bound and the single warning are therefore best-effort, not
+guaranteed, under concurrent writers to the same class."
   (let* ((class (class-of node))
          (seen (gethash class *node-geometry-multi-sample-counts* 0)))
     (unless (eq seen :done)
