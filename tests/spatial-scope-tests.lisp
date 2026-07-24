@@ -945,8 +945,12 @@ SIGNALS WARNING here could pass on the wrong condition entirely."
       (let ((up (string-upcase (or text ""))))
         (is (search "INERT" up) "the warning is the inert-slot one, not the clamp's")
         (is (search "SCOPE-TWO-GEOMS" up) "and it names the class")
-        (is (search "CENTROID" up) "and the winning slot")
-        (is (search "OUTLINE" up) "and the slot that is being dropped")))))
+        ;; Both CENTROID and OUTLINE appear in the ~S-printed slot list regardless
+        ;; of which one wins, so checking for either symbol alone proves nothing
+        ;; about which slot the warning names as the winner.  "ONLY ~S" is the
+        ;; format string's own words around the winning slot specifically, so this
+        ;; is the assertion that actually discriminates first-wins from second-wins.
+        (is (search "ONLY CENTROID" up) "and CENTROID -- the first slot -- is named as the winner")))))
 
 (test warns-once-per-class-not-once-per-node
   "The sampler retires a class the moment it fires, so a bulk load of a
@@ -1006,6 +1010,65 @@ second geometry; getting it wrong would bury the real finding in noise."
                                                     :collect-p t))))
           "and only the geometry slot is reported as geometry-valued"))))
 
+;; Two :INDEX geometry slots PLUS an application-supplied NODE-GEOMETRY method --
+;; the engine's own documented workaround for wanting more than one geometry-
+;; valued input (see NODE-GEOMETRY's docstring): combine them into one geometry
+;; and return it alone, with no second (slot-name) value.  Such a node is indexed
+;; under (METHOD-OWNER . NIL) -- the "first indexed slot wins" default resolution
+;; never runs at all -- so this is NOT the inert-slot shape, even though
+;; NODE-GEOMETRY-SLOTS-WITH-VALUES (a raw slot-value walk, blind to NODE-GEOMETRY
+;; methods) still finds both CENTROID and OUTLINE holding geometries.  Both the
+;; sampler and the audit must recognize that and stay silent.
+(def-vertex scope-two-geoms-combined ()
+  ((centroid :type geometry :index t)
+   (outline :type geometry :index t))
+  :graph-db-integration-test)
+
+(defmethod node-geometry ((s scope-two-geoms-combined))
+  ;; Stand-in for a real combinator (e.g. a bounding union): what the check under
+  ;; test cares about is only that this returns ONE value, not which geometry.
+  (or (slot-value s 'centroid) (slot-value s 'outline)))
+
+(defun reset-two-geoms-combined-sampler ()
+  (remhash (find-class 'scope-two-geoms-combined)
+           graph-db::*node-geometry-multi-sample-counts*))
+
+(test custom-node-geometry-method-silences-the-sampler
+  "The documented single-method workaround must not trip the inert-slot warning.
+
+Without the guard at %SPATIAL-INDEX-NODE (only sample when NODE-GEOMETRY handed
+back a SLOT name), this class would warn on every node: NODE-GEOMETRY-SLOTS-WITH-
+VALUES finds CENTROID and OUTLINE both holding geometries regardless of the
+method, exactly as it does for SCOPE-TWO-GEOMS."
+  (with-test-graph (g)
+    (declare (ignore g))
+    (reset-two-geoms-combined-sampler)
+    (let ((warned nil))
+      (handler-bind ((warning (lambda (c)
+                                (when (search "INERT" (string-upcase
+                                                       (princ-to-string c)))
+                                  (setf warned (princ-to-string c)))
+                                (muffle-warning c))))
+        (with-transaction ()
+          (make-scope-two-geoms-combined
+           :centroid (make-point 30d0 50d0)
+           :outline (scope-rect 35d0 55d0 36d0 56d0))))
+      (is (null warned)
+          "a custom NODE-GEOMETRY method opts the class out of the sampler's check"))))
+
+(test custom-node-geometry-method-silences-the-audit
+  "AUDIT-SPATIAL-SLOTS must skip a class with a custom NODE-GEOMETRY method too,
+independent of the sampler ever having run -- an operator who wires the audit
+into a schema test suite must not get a permanent false failure for following
+the engine's own documented workaround."
+  (with-test-graph (g)
+    (with-transaction ()
+      (make-scope-two-geoms-combined
+       :centroid (make-point 30d0 50d0)
+       :outline (scope-rect 35d0 55d0 36d0 56d0)))
+    (is (null (assoc 'scope-two-geoms-combined (audit-spatial-slots g)))
+        "a method-supplied geometry is not the 'first slot wins' shape the audit checks for")))
+
 (test audit-finds-what-the-sampler-missed
   "AUDIT-SPATIAL-SLOTS sweeps every node, so it reports a class whose only
 two-geometry node lies beyond the sampling window.
@@ -1043,11 +1106,19 @@ sampler's silence is asserted directly rather than inferred from position."
 
 (test audit-reports-nothing-on-a-healthy-graph
   "The audit is a diagnostic, not a lint that always finds something: a graph
-whose classes each carry ONE geometry slot reports the empty list."
+whose classes each carry ONE geometry slot reports the empty list.
+
+SCOPE-MIXED-INDEX (one geometry slot, two indexed SCALARS) is in the fixture on
+purpose: SCOPE-PROBE and SCOPE-ZONE alone each have exactly one indexed slot
+period, so neither could catch the audit wrongly walking non-geometry :INDEX
+slots into its notion of 'more than one geometry-valued slot' -- that noise is
+the actual risk an all-geometry fixture can't defend against."
   (with-test-graph (g)
     (with-transaction ()
       (make-scope-probe :geom (make-point 37.1724d0 49.2020d0))
-      (make-scope-zone :extent (scope-rect 22.1d0 44.4d0 40.2d0 52.4d0)))
+      (make-scope-zone :extent (scope-rect 22.1d0 44.4d0 40.2d0 52.4d0))
+      (make-scope-mixed-index :geom (make-point 37.1730d0 49.2025d0)
+                              :label "delta" :rank 2))
     (is (null (audit-spatial-slots g)))))
 
 (test audit-is-read-only
@@ -1060,7 +1131,15 @@ index as a side effect, so an audit that resolved an index per indexed slot -- t
 natural way to write it wrong -- would mint (SCOPE-MIXED-INDEX . LABEL) and
  (SCOPE-MIXED-INDEX . RANK) spatial indexes over scalar slots.  Those keys do not
 exist beforehand, so the key-set comparison below catches it.  A fixture of
-geometry-only classes would not: every key it could resolve already exists."
+geometry-only classes would not: every key it could resolve already exists.
+
+The key-set and root-address checks only see the in-memory registry, though, and
+SAVE-SPATIAL-INDEX-ROOTS (a call the audit must never make) writes to the v3
+sidecar file, not to any in-memory structure the checks above would notice.  So
+this also snapshots the sidecar's FILE-WRITE-DATE and length across the call --
+a direct SAVE-SPATIAL-INDEX-ROOTS call, or any other unexpected mutation that
+happens to persist, would change one or the other even if the registry itself
+came out looking untouched."
   (with-test-graph (g)
     (with-transaction ()
       (make-scope-probe :geom (make-point 37.1724d0 49.2020d0))
@@ -1069,15 +1148,27 @@ geometry-only classes would not: every key it could resolve already exists."
     (flet ((keys (graph)
              (sort (loop for k being the hash-keys of (spatial-indexes graph)
                          collect (princ-to-string k))
-                   #'string<)))
+                   #'string<))
+           (sidecar-stat (graph)
+             (let ((file (graph-db::spatial-indexes-root-file
+                          (namestring (graph-db:location graph)))))
+               (values (file-write-date file)
+                       (with-open-file (in file :element-type '(unsigned-byte 8))
+                         (file-length in))))))
       (let ((keys-before (keys g))
             (addr-before (spatial-index-address
                           (spatial-index-for g 'scope-probe 'geom))))
-        (audit-spatial-slots g)
-        (is (equal keys-before (keys g)) "no index was created or dropped")
-        (is (= addr-before (spatial-index-address
-                            (spatial-index-for g 'scope-probe 'geom)))
-            "and the surviving index is the same one, at the same root")))))
+        (multiple-value-bind (date-before length-before) (sidecar-stat g)
+          (audit-spatial-slots g)
+          (is (equal keys-before (keys g)) "no index was created or dropped")
+          (is (= addr-before (spatial-index-address
+                              (spatial-index-for g 'scope-probe 'geom)))
+              "and the surviving index is the same one, at the same root")
+          (multiple-value-bind (date-after length-after) (sidecar-stat g)
+            (is (= date-before date-after)
+                "and the sidecar file's write date did not change")
+            (is (= length-before length-after)
+                "and neither did its length")))))))
 
 ;; A geometry-bearing EDGE with a second geometry slot: the audit maps edges as
 ;; well as vertices, and a mis-declared edge class is exactly as inert.

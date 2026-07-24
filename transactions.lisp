@@ -945,7 +945,18 @@ Hence a value-based check, here on the maintenance path.
 Bounded, not permanent: *NODE-GEOMETRY-MULTI-SAMPLE-LIMIT* nodes per class, then
 the class is retired.  A class with ONE geometry slot and several indexed scalars
 is the ordinary case and stays silent -- :INDEX is also the general ordered-index
-option, so most of the slots this walks are not geometry at all."
+option, so most of the slots this walks are not geometry at all.
+
+No lock: this runs on the spatial write path, and a diagnostic does not justify
+serializing it.  Two threads can both read SEEN before either writes, so the
+final store below re-reads the hash-table entry rather than trusting SEEN, and
+only ever writes something at least as large as what is already there and never
+overwrites :DONE.  Without that re-check, a descheduled thread could clobber a
+concurrently-set :DONE with a plain integer (un-retiring an already-decided
+class) or move the count backwards -- either way the 64-sample bound would be
+merely probabilistic rather than guaranteed.  The count can still under-count
+(two threads both reading SEEN=N and each computing N+1) but it can never go
+backwards or lose :DONE, which is all this diagnostic needs."
   (let* ((class (class-of node))
          (seen (gethash class *node-geometry-multi-sample-counts* 0)))
     (unless (eq seen :done)
@@ -959,8 +970,10 @@ option, so most of the slots this walks are not geometry at all."
               ((>= (1+ seen) *node-geometry-multi-sample-limit*)
                (setf (gethash class *node-geometry-multi-sample-counts*) :done))
               (t
-               (setf (gethash class *node-geometry-multi-sample-counts*)
-                     (1+ seen))))))))
+               (let ((cur (gethash class *node-geometry-multi-sample-counts* 0)))
+                 (unless (eq cur :done)
+                   (setf (gethash class *node-geometry-multi-sample-counts*)
+                         (max (1+ seen) (if (integerp cur) cur 0)))))))))))
 
 (defvar *node-vector-index-slot-cache*
   #+sbcl (make-hash-table :test 'eq :synchronized t)
@@ -1112,7 +1125,15 @@ miss the entry the insert wrote."
       ;; write goes through; bounded per class, so it costs nothing after a class
       ;; has been seen.  Before the insert, so the diagnostic still reaches an
       ;; operator whose insert then fails.
-      (%maybe-warn-inert-geometry-slots node)
+      ;;
+      ;; Only when SLOT is non-NIL: a NIL slot means this geometry came from an
+      ;; application's own NODE-GEOMETRY method (the documented workaround for
+      ;; wanting more than one geometry-valued input -- e.g. combining two
+      ;; indexed slots into one geometry), not from the "first indexed slot
+      ;; wins" default.  The multi-slot rule does not apply there at all, so
+      ;; warning would be a false positive against the very workaround the
+      ;; warning's own message recommends.
+      (when slot (%maybe-warn-inert-geometry-slots node))
       (let* ((owner (%node-spatial-owner-name (class-of node) slot))
              (idx (%spatial-index-for graph owner slot))
              (before (spatial-index-coarsest-precision idx)))

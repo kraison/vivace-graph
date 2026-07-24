@@ -410,11 +410,28 @@ The exhaustive counterpart to the bounded per-class sampler on the write path
 all lie beyond the sampling window, and a class added long after the graph's
 migration.  Read-only -- wire it into a schema test suite.
 
-READ-ONLY is a contract, not a description.  This visits every node in the graph,
-so it is a thing an operator may reasonably run against production: it creates no
-index, writes no sidecar, mutates no node and takes no transaction.  Note in
-particular that it resolves nothing through %SPATIAL-INDEX-FOR, which CREATES a
-missing index as a side effect -- the audit never needs an index, only slot values.
+A class carrying an application-supplied NODE-GEOMETRY method (see the
+NODE-GEOMETRY generic's docstring) is skipped entirely, exactly as the sampler
+skips it (%SPATIAL-INDEX-NODE only samples when NODE-GEOMETRY returned a slot
+name).  The 'first indexed slot wins' rule this audit is checking for is a
+property of the DEFAULT method only; a class that overrides NODE-GEOMETRY -- the
+documented way to combine more than one geometry-valued slot into one indexed
+geometry -- has already opted out of that rule, and reporting it as though the
+default applied would be a false positive against the very workaround the
+sampler's own warning text recommends.
+
+READ-ONLY is a contract about mutation, not about cost.  This creates no index,
+writes no sidecar, mutates no node and takes no transaction; in particular it
+resolves nothing through %SPATIAL-INDEX-FOR, which CREATES a missing index as a
+side effect, so the audit never needs an index, only slot values.  But the sweep
+itself is not free to run concurrently with live traffic: it goes through the
+fully-untyped MAP-VERTICES / MAP-EDGES scan (no :VERTEX-TYPE / :EDGE-TYPE given),
+which walks the raw vertex/edge table rather than the type index and so BYPASSES
+MVCC snapshot isolation -- see MAP-VERTICES's docstring, which calls that scan
+shape an admin pass meant for a quiescent graph.  Each scan also holds a
+WITH-READ-PIN for its entire duration, pinning a read epoch and blocking version
+reaping until it returns.  Safe to point at production data; budget for it like
+any other full-graph admin sweep, not like a query.
 
 Binds *GRAPH* for the duration: NODE-GEOMETRY-SLOTS-WITH-VALUES reads slots, and a
 node read that falls back to the dynamic current graph must resolve in GRAPH rather
@@ -425,14 +442,17 @@ this is O(nodes) with an early exit per class, not O(nodes x slots) throughout. 
 class whose FIRST such node is the last node in the graph still costs a full sweep;
 that is the price of the guarantee the sampler cannot give."
   (let ((found (make-hash-table :test 'eq))
+        (skip (make-hash-table :test 'eq))
         (*graph* graph))
     (flet ((check (node)
              (unless (deleted-p node)
                (let ((class (class-of node)))
-                 (unless (gethash class found)
-                   (let ((slots (node-geometry-slots-with-values node)))
-                     (when (rest slots)
-                       (setf (gethash class found) slots))))))))
+                 (unless (or (gethash class found) (gethash class skip))
+                   (if (%node-geometry-method-owner-name class)
+                       (setf (gethash class skip) t)
+                       (let ((slots (node-geometry-slots-with-values node)))
+                         (when (rest slots)
+                           (setf (gethash class found) slots)))))))))
       (map-vertices #'check graph)
       (map-edges #'check graph))
     (let ((result '()))
