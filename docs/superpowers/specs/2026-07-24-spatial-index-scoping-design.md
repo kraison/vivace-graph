@@ -145,8 +145,10 @@ never holds a geometry therefore never creates a spatial index at all. This matt
 deferred CR-3.2, where a class may declare several geometry slots and populate only some: the
 unpopulated ones cost nothing, because they do not exist.
 
-The one exception is an explicit `def-spatial-index`, which builds at open even when empty — the
-user asked for it, same contract as `def-index`.
+The one exception is an explicit declaration. A `def-spatial-index` — and, once §5's install pass
+runs, any index whose precision is declared — is built **eagerly at open**, even when empty, because
+the user asked for it: same contract as `def-index`. So "created lazily on first write" is precise
+only for *undeclared* indexes, which is the common case but not the whole story.
 
 **Nearly free.** A spatial index is built by `make-heap-index` into the graph's **shared
 `indexes.dat` heap** (`spatial-index.lisp:60`, `graph.lisp:17`), not as a separately-mmap'd file. It
@@ -276,9 +278,11 @@ entered. (An earlier draft of this document claimed query-compile time; that was
 a stated reason for removing the arities rather than leaving them to signal. Removal is still
 preferred — an unknown functor names the problem, where a surviving `/2` would silently bind a
 scope-shaped argument as an area.) The scope
-argument accepts the same three shapes; a test pins whether a literal list survives the Prolog
-compiler's argument handling. If it does not, Prolog scope is documented as symbol-or-`:all` and
-multi-class queries use a disjunction.
+argument accepts the same three shapes, **including a literal list** — confirmed, not assumed: a
+test passes `(scope-probe scope-zone)` through the query compiler with a radius wide enough that a
+collapse-to-first-element would show in the results. The contingency this document previously
+carried (restrict Prolog scope to symbol-or-`:all` and use a disjunction for multiple classes) is
+therefore not needed.
 
 **Unchanged.** `make-spatial-replication-filter` reads `node-geometry` directly and never touches
 the index. Each index computes its own `cover-prec` as `min(own precision, adaptive)`, so a scope
