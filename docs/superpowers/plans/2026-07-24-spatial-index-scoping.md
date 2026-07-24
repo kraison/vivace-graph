@@ -707,37 +707,99 @@ write path), so run it when the graph is quiescent -- analogous to REGENERATE-VI
       count)))
 ```
 
-In the same file, replace the three `(let ((idx (spatial-index graph)) …)` query bodies with a union over all indexes. `find-nodes-within` becomes:
+The three window/radius queries share one candidate loop, so factor it out **now** rather than writing it three times and collapsing it in Task 4. Add to `spatial-registry.lisp`:
 
 ```lisp
+(defun %resolve-spatial-scope (scope graph)
+  "Resolve SCOPE to (values INDEXES TYPE-NAMES): the spatial indexes to scan, and
+the class list results must satisfy (NIL = no filtering).
+
+Task 2 handles only :ALL; class-name and class-list scopes arrive in Task 4."
+  (ecase scope
+    (:all (values (all-spatial-indexes graph) nil))))
+
+(defun %scope-admits-p (node type-names)
+  "True when NODE satisfies the scope's type filter (always, for :ALL)."
+  (or (null type-names)
+      (some (lambda (n) (typep node n)) type-names)))
+```
+
+Then in `spatial-query.lisp`, define the shared driver once and express all three queries through it:
+
+```lisp
+(defmacro %do-scoped-candidates ((node-var scope graph &key bbox radius) &body body)
+  "Run BODY with NODE-VAR bound to each live, scope-admitted node whose id came
+back from every index in SCOPE.  Dedups by node id across indexes, so a node
+reachable through two of its own slot-indexes is visited once."
+  (let ((indexes (gensym "IX")) (types (gensym "TY")) (seen (gensym "SEEN"))
+        (idx (gensym "I")) (id (gensym "ID")))
+    `(multiple-value-bind (,indexes ,types) (%resolve-spatial-scope ,scope ,graph)
+       (let ((,seen (make-hash-table :test 'equalp)))
+         (dolist (,idx ,indexes)
+           (dolist (,id ,(if bbox
+                             `(destructuring-bind (mnl mnt mxl mxt) ,bbox
+                                (spatial-index-query-bbox ,idx mnl mnt mxl mxt))
+                             `(destructuring-bind (lat lon r) ,radius
+                                (spatial-index-query-radius ,idx lat lon r))))
+             (unless (gethash ,id ,seen)
+               (setf (gethash ,id ,seen) t)
+               (let ((,node-var (%node-by-id ,id ,graph)))
+                 (when (and ,node-var (not (deleted-p ,node-var))
+                            (%scope-admits-p ,node-var ,types))
+                   ,@body)))))))))
+
 (defun find-nodes-within (area &key (graph *graph*))
   "List of live nodes whose geometry lies within AREA (a :POLYGON or
 :MULTIPOLYGON geometry).  A :POINT node is judged exactly; an extended-geometry
 node is judged exactly when graph-db/geos is loaded, otherwise by its
 representative point (bbox centre).
 
-TRANSITIONAL: queries the union of every spatial index, reproducing the
-single-index behaviour this replaced.  A required scope argument lands next."
-  (let ((seen (make-hash-table :test 'equalp))
-        (result '()))
+TRANSITIONAL: scoped to :ALL, which reproduces the single-index behaviour this
+replaced.  A required scope argument lands in Task 4, and changes only this
+lambda list and %RESOLVE-SPATIAL-SCOPE -- not the loop below."
+  (let ((result '()))
     (when (geometryp area)
       (multiple-value-bind (min-lon min-lat max-lon max-lat) (geometry-bbox area)
-        (dolist (idx (all-spatial-indexes graph))
-          (dolist (id (spatial-index-query-bbox idx min-lon min-lat max-lon max-lat))
-            (unless (gethash id seen)
-              (setf (gethash id seen) t)
-              (let ((node (%node-by-id id graph)))
-                (when (and node (not (deleted-p node)))
-                  (let ((geom (node-geometry node)))
-                    (when (and geom (%node-within-area-p area geom))
-                      (push node result))))))))))
+        (%do-scoped-candidates (node :all graph
+                                :bbox (list min-lon min-lat max-lon max-lat))
+          (let ((geom (node-geometry node)))
+            (when (and geom (%node-within-area-p area geom))
+              (push node result))))))
     (nreverse result)))
+
+(defun find-nodes-intersecting (area &key (graph *graph*))
+  "List of live nodes whose geometry INTERSECTS AREA (any geometry kind).  Exact
+with the graph-db/geos add-on; without it, extended-geometry candidates use a
+COARSE bounding-box overlap test (point candidates are always exact)."
+  (let ((result '()))
+    (when (geometryp area)
+      (multiple-value-bind (min-lon min-lat max-lon max-lat) (geometry-bbox area)
+        (%do-scoped-candidates (node :all graph
+                                :bbox (list min-lon min-lat max-lon max-lat))
+          (let ((geom (node-geometry node)))
+            (when (and geom (geometry-intersects-p area geom))
+              (push node result))))))
+    (nreverse result)))
+
+(defun find-nodes-near (lat lon radius &key (graph *graph*))
+  "List of (NODE . DISTANCE-METRES) for live nodes within RADIUS of (LAT, LON),
+nearest first."
+  (let ((result '()))
+    (when (and (numberp lat) (numberp lon) (numberp radius))
+      (%do-scoped-candidates (node :all graph :radius (list lat lon radius))
+        (let ((geom (node-geometry node)))
+          (when geom
+            (multiple-value-bind (nlat nlon) (%geometry-rep-point geom)
+              (let ((d (geodesic-distance lat lon nlat nlon)))
+                (when (<= d radius)
+                  (push (cons node d) result))))))))
+    (sort result #'< :key #'cdr)))
 ```
 
-Apply the identical shape to `find-nodes-intersecting` (swap the predicate for `geometry-intersects-p`) and `find-nodes-near` (use `spatial-index-query-radius idx lat lon radius`, keep the `%geometry-rep-point` / `geodesic-distance` refine and the final `sort`). In `find-nearest-k`, replace the seed-radius computation with the finest precision in scope:
+In `find-nearest-k`, replace the seed-radius computation with the finest precision in scope — seeding off a coarse index would make the very first query an enormous sweep:
 
 ```lisp
-  (let ((indexes (all-spatial-indexes graph)))
+  (let ((indexes (%resolve-spatial-scope :all graph)))
     (when (and indexes (numberp lat) (numberp lon) (integerp k) (plusp k))
       (let* ((prec (reduce #'max indexes :key #'spatial-index-precision))
              (r (max 1d0 (* (nth-value 1 (geohash-cell-size prec)) 111320d0)))
@@ -1152,9 +1214,9 @@ sbcl --non-interactive --eval '(ql:quickload :graph-db/test)' --eval '(fiveam:ru
 
 Expected: FAIL — `invalid number of arguments` from `find-nodes-within`.
 
-- [ ] **Step 3: Add scope resolution**
+- [ ] **Step 3: Widen scope resolution**
 
-Append to `spatial-registry.lisp`:
+`%do-scoped-candidates` and `%scope-admits-p` already exist from Task 2 and do **not** change. Add `%class-geometry-slots-declared-p` to `spatial-registry.lisp`, and **replace** Task 2's `:ALL`-only `%resolve-spatial-scope` stub with the full version:
 
 ```lisp
 (defun %class-geometry-slots-declared-p (class-name)
@@ -1194,39 +1256,13 @@ programming error, and catching it is the reason the scope is required."
               (let ((idx (spatial-index-for graph (car key) (cdr key))))
                 (when idx (push idx indexes))))))
         (values indexes names))))
-
-(defun %scope-admits-p (node type-names)
-  "True when NODE satisfies the scope's type filter (always, for :ALL)."
-  (or (null type-names)
-      (some (lambda (n) (typep node n)) type-names)))
 ```
 
-- [ ] **Step 4: Rewrite the query entry points**
+- [ ] **Step 4: Add the scope parameter to the entry points**
 
-In `spatial-query.lisp`, replace `find-nodes-within`, `find-nodes-intersecting`, `find-nodes-near` and `find-nearest-k` with:
+`%do-scoped-candidates` is unchanged from Task 2 — the only edits are the lambda lists and the `:all` literal moving to the caller's `scope` variable. In `spatial-query.lisp`, replace the four entry points with:
 
 ```lisp
-(defmacro %do-scoped-candidates ((node-var scope graph &key bbox radius) &body body)
-  "Run BODY with NODE-VAR bound to each live, scope-admitted node whose id came
-back from every index in SCOPE.  Dedups by node id across indexes, so a node
-reachable through two of its own slot-indexes is visited once."
-  (let ((indexes (gensym "IX")) (types (gensym "TY")) (seen (gensym "SEEN"))
-        (idx (gensym "I")) (id (gensym "ID")))
-    `(multiple-value-bind (,indexes ,types) (%resolve-spatial-scope ,scope ,graph)
-       (let ((,seen (make-hash-table :test 'equalp)))
-         (dolist (,idx ,indexes)
-           (dolist (,id ,(if bbox
-                             `(destructuring-bind (mnl mnt mxl mxt) ,bbox
-                                (spatial-index-query-bbox ,idx mnl mnt mxl mxt))
-                             `(destructuring-bind (lat lon r) ,radius
-                                (spatial-index-query-radius ,idx lat lon r))))
-             (unless (gethash ,id ,seen)
-               (setf (gethash ,id ,seen) t)
-               (let ((,node-var (%node-by-id ,id ,graph)))
-                 (when (and ,node-var (not (deleted-p ,node-var))
-                            (%scope-admits-p ,node-var ,types))
-                   ,@body)))))))))
-
 (defun find-nodes-within (scope area &key (graph *graph*))
   "Live nodes in SCOPE whose geometry lies within AREA (a :POLYGON or
 :MULTIPOLYGON).  SCOPE is a node-class name, a list of them, or :ALL; it selects
@@ -1457,19 +1493,34 @@ Append to `tests/spatial-scope-tests.lisp`:
 
 (test slot-option-beats-def-spatial-index
   "MOP-first, matching CLASS-SECONDARY-INDEX-DESCRIPTORS: the slot option wins
-and the losing declaration warns rather than silently doing nothing."
-  (with-test-graph (g)
-    (is (eql 3 (graph-db::%spatial-precision-for g 'scope-coarse 'extent)))
-    (signals warning
-      (graph-db::%warn-on-precision-conflict g 'scope-coarse 'extent 5))))
+and the losing declaration warns rather than silently doing nothing.  Asserted
+through the public surface -- declare, write a node, inspect the index that was
+actually built -- not by calling the conflict predicate directly.
+
+*SCHEMA-SPATIAL-METADATA* is rebound so the DEF-SPATIAL-INDEX registered here
+does not leak into later tests and make them order-dependent."
+  (let ((graph-db::*schema-spatial-metadata* (make-hash-table)))
+    (with-test-graph (g)
+      (signals warning
+        (def-spatial-index scope-coarse extent :graph-db-integration-test
+          :precision 5))
+      (handler-bind ((warning #'muffle-warning))
+        (with-transaction ()
+          (make-scope-coarse :extent (scope-rect 22.1d0 44.4d0 40.2d0 52.4d0))))
+      ;; The slot option's 3 is what the index was actually built with, not 5.
+      (is (= 3 (spatial-index-precision
+                (spatial-index-for g 'scope-coarse 'extent)))))))
 
 (test def-spatial-index-sets-precision-for-an-unannotated-slot
-  "A slot with no :SPATIAL-PRECISION takes the macro's value."
-  (with-test-graph (g)
-    (def-spatial-index scope-zone extent :graph-db-integration-test :precision 4)
-    (with-transaction ()
-      (make-scope-zone :extent (scope-rect 22.1d0 44.4d0 40.2d0 52.4d0)))
-    (is (= 4 (spatial-index-precision (spatial-index-for g 'scope-zone 'extent))))))
+  "A slot with no :SPATIAL-PRECISION takes the macro's value, with no warning --
+the two surfaces are complementary when only one of them declares."
+  (let ((graph-db::*schema-spatial-metadata* (make-hash-table)))
+    (with-test-graph (g)
+      (def-spatial-index scope-zone extent :graph-db-integration-test :precision 4)
+      (with-transaction ()
+        (make-scope-zone :extent (scope-rect 22.1d0 44.4d0 40.2d0 52.4d0)))
+      (is (= 4 (spatial-index-precision
+                (spatial-index-for g 'scope-zone 'extent)))))))
 ```
 
 - [ ] **Step 2: Run to verify failure**
