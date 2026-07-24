@@ -37,6 +37,22 @@ fault-on-access invariant.  Call at the start of any test that reopens a graph."
    (geom :index t))
   :graph-db-memory-test)
 
+;; A SECOND geometry-bearing type declaring its OWN geometry slot, so it lands in
+;; a DISTINCT (owner . slot) spatial index from M-PLACE -- the per-index image
+;; round-trip needs two indexes to prove it keeps them apart.
+(def-vertex m-region ()
+  ((label)
+   (extent :type geometry :index t))
+  :graph-db-memory-test)
+
+;; A geometry-LESS type with an indexed SCALAR slot.  NODE-GEOMETRY returns NIL for
+;; it (a string is not a geometry), so it is never spatially indexed -- yet its
+;; :INDEX slot is exactly what the old lazy-open spatial REBUILD over-approximated
+;; as "may be spatial", faulting every such node in and defeating :LAZY.
+(def-vertex m-tag ()
+  ((label :type string :index t))
+  :graph-db-memory-test)
+
 (defmacro with-test-memory-graph ((g) &body body)
   "Fresh memory-graph in a temp dir; closed (no checkpoint) + GC'd afterward."
   (let ((dir (gensym "DIR")))
@@ -186,6 +202,137 @@ is rebuilt on reopen."
                (is (= 2 (length hits))))
           (ignore-errors (close-graph g2 :snapshot-p nil))
           (collect-garbage))))))
+
+(test memory-image-round-trips-per-class-spatial-indexes
+  "The image carries one spatial record per (owner . slot): a memory graph with TWO
+distinct geometry classes reopens with BOTH indexes restored STRUCTURALLY.  The
+canary -- a raw index entry under an id no live node has -- is what proves it: a
+rebuild-from-nodes could not reproduce it, so its survival across the reopen means
+the indexes were loaded from the image, not re-derived by scanning the nodes."
+  (reset-mem-view-registry)
+  (with-temp-directory (dir)
+    (let ((loc (namestring dir))
+          (canary (graph-db::gen-vertex-id))
+          place-id region-id)
+      (let ((g (graph-db::make-memory-graph *mem-test-graph-name* loc)))
+        (let ((*graph* g))
+          (with-transaction ()
+            (setq place-id (id (make-m-place :label "kharkiv"
+                                             :geom (graph-db::make-point 36.3d0 50.0d0))))
+            (setq region-id (id (make-m-region
+                                 :label "east"
+                                 :extent (scope-rect 22.1d0 44.4d0 40.2d0 52.4d0)))))
+          ;; Canary straight into M-PLACE's index at a corner nothing else occupies.
+          (graph-db::spatial-index-insert
+           (graph-db::spatial-index-for g 'm-place 'geom)
+           canary (graph-db::make-point 10d0 10d0)))
+        (close-graph g :snapshot-p t))
+      (let ((g2 (graph-db::open-memory-graph *mem-test-graph-name* loc)))
+        (unwind-protect
+             (let ((place-ix  (graph-db::spatial-index-for g2 'm-place 'geom))
+                   (region-ix (graph-db::spatial-index-for g2 'm-region 'extent)))
+               (is (graph-db::spatial-index-p place-ix))
+               (is (graph-db::spatial-index-p region-ix))
+               (is (not (eq place-ix region-ix))
+                   "the two classes keep their own indexes across a reopen")
+               (is (has-p place-id
+                          (graph-db::spatial-index-query-bbox
+                           place-ix 36.0d0 49.9d0 36.5d0 50.1d0)))
+               (is (has-p region-id
+                          (graph-db::spatial-index-query-bbox
+                           region-ix 30.0d0 48.0d0 31.0d0 49.0d0)))
+               (is (has-p canary
+                          (graph-db::spatial-index-query-bbox
+                           place-ix 9.0d0 9.0d0 11.0d0 11.0d0))
+                   "the canary survived -- the index was RESTORED structurally, not ~
+                    rebuilt from the live nodes"))
+          (ignore-errors (close-graph g2 :snapshot-p nil))
+          (collect-garbage))))))
+
+(test memory-coarse-geometry-survives-a-reopen
+  "The image carries each index's PRECISION HISTOGRAM, not just its cells.  A
+geometry too large to cover within +SPATIAL-INSERT-MAX-CELLS+ is stored coarsely
+and the query clamp is lowered to match; that clamp is derived from the histogram,
+which lives only in RAM between closes.  An image that dropped it would reopen with
+the clamp back at the configured precision, and a prefix range scan would sort PAST
+the coarser stored key -- a silent miss on an index that is physically intact."
+  (reset-mem-view-registry)
+  (handler-bind ((warning #'muffle-warning))    ; coarsening is EXPECTED here
+    (with-temp-directory (dir)
+      (let ((loc (namestring dir)) big-id)
+        (let ((g (graph-db::make-memory-graph *mem-test-graph-name* loc)))
+          (let ((*graph* g))
+            (with-transaction ()
+              ;; ~1 degree square: far more than 16384 cells at precision 7, so the
+              ;; insert cover is capped and the entry stored coarsely.
+              (setq big-id (id (make-m-region
+                                :label "big"
+                                :extent (scope-rect 10d0 40d0 11d0 41d0)))))
+            (let ((idx (graph-db::spatial-index-for g 'm-region 'extent)))
+              (is (< (graph-db::spatial-index-coarsest-precision idx)
+                     (graph-db::spatial-index-precision idx))
+                  "the oversized polygon really did coarsen the index")))
+          (close-graph g :snapshot-p t))
+        (let ((g2 (graph-db::open-memory-graph *mem-test-graph-name* loc)))
+          (unwind-protect
+               (let ((idx (graph-db::spatial-index-for g2 'm-region 'extent)))
+                 (is (< (graph-db::spatial-index-coarsest-precision idx)
+                        (graph-db::spatial-index-precision idx))
+                     "the clamp came back from the image, not reset to the ~
+                      configured precision")
+                 (is (has-p big-id
+                            (graph-db::spatial-index-query-bbox
+                             idx 10.4d0 40.4d0 10.6d0 40.6d0))
+                     "a small window inside the coarsely-stored polygon still finds ~
+                      it after the reopen"))
+            (ignore-errors (close-graph g2 :snapshot-p nil))
+            (collect-garbage)))))))
+
+(test lazy-reopen-keeps-geometryless-indexed-scalars-lazy
+  "Restoring spatial STRUCTURALLY removes the lazy-open REBUILD that used to fault in
+every node of any class with ANY :INDEX slot.  A class with an indexed SCALAR slot
+and no geometry now reopens with its nodes STILL LZNODE blobs -- the fault-on-access
+property the Android field device depends on -- while a geometry class's index is
+still restored and queryable without a scan."
+  (reset-mem-view-registry)
+  (flet ((n-materialized (g)
+           (loop for v being the hash-values of
+                 (graph-db::mem-table-data (graph-db::vertex-table g))
+                 count (graph-db::node-p v)))
+         (n-lznodes (g)
+           (loop for v being the hash-values of
+                 (graph-db::mem-table-data (graph-db::vertex-table g))
+                 count (graph-db::lznode-p v))))
+    (with-temp-directory (dir)
+      (let ((loc (namestring dir)))
+        (let ((g (graph-db::make-memory-graph *mem-test-graph-name* loc :lazy t)))
+          (let ((*graph* g))
+            (with-transaction ()
+              (dotimes (i 10) (make-m-tag :label (format nil "t~D" i)))
+              (make-m-place :label "site" :geom (graph-db::make-point 36.3d0 50.0d0))))
+          (close-graph g :snapshot-p t))
+        (let ((g2 (graph-db::open-memory-graph *mem-test-graph-name* loc :lazy t)))
+          (unwind-protect
+               (let ((*graph* g2))
+                 (is (= 11 (graph-db::mem-table-count (graph-db::vertex-table g2))))
+                 ;; The whole point: open faulted in NONE of them.  Before this task,
+                 ;; the spatial rebuild materialized all 11 (10 indexed-scalar + 1
+                 ;; geometry) because NODE-GEOMETRY-INDEX-SLOTS returns scalar :INDEX
+                 ;; slots too.
+                 (is (= 0 (n-materialized g2))
+                     "no node was materialized on lazy open")
+                 (is (= 11 (n-lznodes g2))
+                     "every node is still a deferred LZNODE blob")
+                 ;; ...and the geometry index came back structurally, queryable.
+                 (is (= 1 (length (graph-db::spatial-index-query-bbox
+                                   (graph-db::spatial-index-for g2 'm-place 'geom)
+                                   22.0d0 48.0d0 40.0d0 51.0d0)))
+                     "the geometry index restored structurally, still findable")
+                 ;; And the query did not have to materialize any node either.
+                 (is (= 0 (n-materialized g2))
+                     "a spatial bbox query returns ids without materializing nodes"))
+            (ignore-errors (close-graph g2 :snapshot-p nil))
+            (collect-garbage)))))))
 
 ;;; --- views -------------------------------------------------------------------
 

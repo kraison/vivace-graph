@@ -1067,11 +1067,10 @@ defined on a parent gives its subclasses ONE shared index, exactly as an :INDEX
 slot on a parent does.  Keying on each node's own class instead would scatter a
 hierarchy across per-subclass indexes and make a scope on the parent miss them.
 
-The MOP idiom is the one %CUSTOM-NODE-GEOMETRY-CLASSES already uses (memory-
-graph.lisp): GENERIC-FUNCTION-METHODS / METHOD-SPECIALIZERS come from the MOP
-package this package USEs per implementation (sb-mop, closer-mop, clos).  The two
-built-in methods specialize on T and on NODE; only something more specific counts
-as custom.  The TYPEP guard keeps an EQL specializer -- which is not a type
+The MOP idiom -- GENERIC-FUNCTION-METHODS / METHOD-SPECIALIZERS -- comes from the
+MOP package this package USEs per implementation (sb-mop, closer-mop, clos).  The
+two built-in methods specialize on T and on NODE; only something more specific
+counts as custom.  The TYPEP guard keeps an EQL specializer -- which is not a type
 specifier -- away from SUBTYPEP.
 
 CAVEAT.  GENERIC-FUNCTION-METHODS returns the methods in an implementation-defined
