@@ -28,16 +28,6 @@
 ;; single :COMPLETE keyword doesn't need spelling out here.)
 (declaim (ftype (function (t &rest t) t) save-spatial-index-roots))
 
-(defvar *spatial-rebuild-in-progress* nil
-  "Bound to T for the duration of a multi-index spatial rebuild (REBUILD-SPATIAL-
-INDEXES, REGENERATE-SPATIAL-INDEX).  It once gated %SPATIAL-INDEX-FOR's per-creation
-sidecar save (so a rebuild's index creations did not each write an intermediate
-:COMPLETE T sidecar and defeat the rebuild's own :COMPLETE NIL / :COMPLETE T
-bracket).  That per-creation save has since been removed entirely -- the sidecar is
-written only at CLOSE-GRAPH and by these rebuild/regenerate ops, never on the commit
-path -- so nothing reads this flag today.  It is retained as the explicit
-\"inside a bulk rebuild\" marker: the bindings document that intent and re-arm
-cleanly if a creation-time write is ever reintroduced.")
 
 (defun %node-by-id (id graph)
   "Resolve a spatial-index id (uuid bytes) to its live node, or NIL."
@@ -312,18 +302,17 @@ full rebuild on every subsequent open until something happened to save it comple
       ;; :COMPLETE NIL marker (not the emptiness of :INDEXES) is what makes
       ;; RESTORE-SPATIAL-INDEX-ROOTS refuse to trust it.
       (save-spatial-index-roots graph :complete nil)
-      (let ((*spatial-rebuild-in-progress* t))
-        (flet ((reindex (node)
-                 (unless (deleted-p node)
-                   (multiple-value-bind (geom slot) (node-geometry node)
-                     (when geom
-                       (spatial-index-insert
-                        (%spatial-index-for
-                         graph (%node-spatial-owner-name (class-of node) slot) slot)
-                        (id node) geom)
-                       (incf count))))))
-          (map-vertices #'reindex graph)
-          (map-edges #'reindex graph)))
+      (flet ((reindex (node)
+               (unless (deleted-p node)
+                 (multiple-value-bind (geom slot) (node-geometry node)
+                   (when geom
+                     (spatial-index-insert
+                      (%spatial-index-for
+                       graph (%node-spatial-owner-name (class-of node) slot) slot)
+                      (id node) geom)
+                     (incf count))))))
+        (map-vertices #'reindex graph)
+        (map-edges #'reindex graph))
       (report-degraded-spatial-indexes graph)
       ;; Every index named above is back in place; mark the sidecar COMPLETE
       ;; again.  A crash before this point re-derives from scratch on the next
@@ -377,26 +366,25 @@ has no per-index completeness granularity -- but it is the safe direction."
           (delete-spatial-index old)))
       (remhash key (spatial-indexes graph))
       (let ((count 0))
-        (let ((*spatial-rebuild-in-progress* t))
-          (flet ((reindex (node)
-                   (unless (deleted-p node)
-                     (multiple-value-bind (geom slot) (node-geometry node)
-                       (when (and geom (eq slot slot-name)
-                                  (eq (%node-spatial-owner-name (class-of node) slot)
-                                      owner-name))
-                         (spatial-index-insert
-                          (%spatial-index-for graph owner-name slot-name)
-                          (id node) geom)
-                         (incf count))))))
-            ;; OWNER-NAME is the DECLARING class, and its subclasses share the
-            ;; index, so the typed scan must include them -- MAP-VERTICES/MAP-EDGES
-            ;; do by default.  FIND-CLASS guards SUBTYPEP against a name that no
-            ;; longer designates a class (a sidecar entry whose class was never
-            ;; redefined in this image); the vertex scan then simply finds nothing.
-            (let ((class (find-class owner-name nil)))
-              (if (and class (subtypep class 'edge))
-                  (map-edges #'reindex graph :edge-type owner-name)
-                  (map-vertices #'reindex graph :vertex-type owner-name)))))
+        (flet ((reindex (node)
+                 (unless (deleted-p node)
+                   (multiple-value-bind (geom slot) (node-geometry node)
+                     (when (and geom (eq slot slot-name)
+                                (eq (%node-spatial-owner-name (class-of node) slot)
+                                    owner-name))
+                       (spatial-index-insert
+                        (%spatial-index-for graph owner-name slot-name)
+                        (id node) geom)
+                       (incf count))))))
+          ;; OWNER-NAME is the DECLARING class, and its subclasses share the
+          ;; index, so the typed scan must include them -- MAP-VERTICES/MAP-EDGES
+          ;; do by default.  FIND-CLASS guards SUBTYPEP against a name that no
+          ;; longer designates a class (a sidecar entry whose class was never
+          ;; redefined in this image); the vertex scan then simply finds nothing.
+          (let ((class (find-class owner-name nil)))
+            (if (and class (subtypep class 'edge))
+                (map-edges #'reindex graph :edge-type owner-name)
+                (map-vertices #'reindex graph :vertex-type owner-name))))
         ;; The (owner . slot) index is back in place; mark the sidecar COMPLETE
         ;; again.  A crash before this point re-derives EVERY index from scratch
         ;; on the next open; a crash after it (or none at all) reopens by address.

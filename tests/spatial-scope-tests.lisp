@@ -384,14 +384,12 @@ declared-but-empty index."
       (clrhash (spatial-indexes g))
       (graph-db::save-spatial-index-roots g :complete nil)
       ;; Now reproduce the reindexing loop, but ONLY for A -- this IS the crash:
-      ;; B is never recreated.  *SPATIAL-REBUILD-IN-PROGRESS*, bound exactly as
-      ;; REBUILD-SPATIAL-INDEXES binds it, suppresses %SPATIAL-INDEX-FOR's
-      ;; ordinary per-creation save, so nothing overwrites the incomplete marker
-      ;; with a premature :COMPLETE T either.
-      (let ((graph-db::*spatial-rebuild-in-progress* t))
-        (spatial-index-insert
-         (graph-db::%spatial-index-for g 'scope-probe 'geom)
-         probe-id (make-point 37.1724d0 49.2020d0)))
+      ;; B is never recreated.  (%SPATIAL-INDEX-FOR no longer writes a sidecar on
+      ;; index creation, so nothing overwrites the incomplete marker set above
+      ;; with a premature :COMPLETE T.)
+      (spatial-index-insert
+       (graph-db::%spatial-index-for g 'scope-probe 'geom)
+       probe-id (make-point 37.1724d0 49.2020d0))
       ;; -- crash here; the closing COMPLETE save at the end of REBUILD-SPATIAL-
       ;; INDEXES never runs. --
       ;; Simulate the reopen WITHOUT going through CLOSE-GRAPH (which would
@@ -1300,12 +1298,24 @@ to force a synchronous SAVE-SPATIAL-INDEX-ROOTS under the transaction-manager lo
         (setf (fdefinition 'graph-db::save-spatial-index-roots) orig)))))
 
 (test coarse-geometry-survives-crash-recovery
-  "A country-scale geometry whose index was COARSENED is still findable after a
-crash + recovery, though the commit path no longer persists the histogram.  Phase 1
-crashes after the lhash write but before spatial maintenance (durable WAL entry, not
-yet indexed); Phase 2 reopens, and OPEN-GRAPH replays the WAL and then re-derives
-the spatial indexes from the recovered node, reconstructing the clamp from
-authoritative geometry."
+  "PROPERTY (not a mutation-discriminator): a country-scale geometry whose index
+would be COARSENED is still findable after a crash + recovery, even though the
+commit path no longer persists the histogram.  Phase 1 crashes after the lhash
+write but before spatial maintenance (via *AFTER-APPLY-TX-WRITES-HOOK*), leaving a
+durable-but-unindexed WAL entry; Phase 2 reopens, OPEN-GRAPH replays the WAL and --
+because the WAL tail is non-empty -- re-derives the spatial indexes from the
+recovered node.
+
+Scope of what this pins: in THIS injectable scenario the index did not exist
+pre-crash, so the WAL replay alone reconstructs the histogram (its inserts are all
+fresh, so %COUNT-CELL runs), and the recovery rebuild is exercised but not strictly
+necessary.  The rebuild's necessity is the narrower case where a coarse cell
+reached disk before the crash, so replay's idempotent re-insert is a dup no-op that
+skips %COUNT-CELL and leaves a stale-restored clamp too fine -- a state that needs
+a post-spatial-apply crash hook (which the engine deliberately does not expose) or
+file surgery to construct, so it is covered by reasoning about the mmap durability
+model rather than by an in-process mutation test.  What this test guarantees is the
+user-visible property: the recovery path yields a correct, queryable spatial index."
   (with-temp-directory (dir)
     (let ((path (namestring dir))
           zone-id)
