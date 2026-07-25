@@ -39,10 +39,14 @@ Downgrade after migration is unsupported either way."
 
 (defun save-spatial-index-roots (graph &key (complete t))
   "Persist every spatial index's root, precision, backend, insert cap and precision
-histogram, plus a COMPLETE marker.  Called at CLOSE-GRAPH, at index creation, and
-whenever an index's COARSEST-PRECISION decreases (§7.2: losing that decrease would
-reopen with a too-fine clamp and silently miss; losing an increase merely
-over-covers).
+histogram, plus a COMPLETE marker.  Called at CLOSE-GRAPH and by the rebuild/
+regenerate admin ops -- NOT on the commit path.  It deliberately never runs while a
+transaction holds the manager lock: it once fired on an index creation and on a
+coarsest-precision decrease, but that put CL-STORE file I/O on the post-durability
+commit path under that lock (a convoy point and a failure-injection point after the
+data is already durable).  Crash-correctness of the histogram now comes from
+OPEN-GRAPH re-deriving the spatial indexes from the recovered nodes after WAL
+replay, not from an incremental write here.
 
 :COMPLETE distinguishes a sidecar that names every index the registry is supposed
 to hold from one written partway through a multi-index operation
@@ -583,7 +587,25 @@ Always CLOSE-GRAPH when finished."
         (setf (gethash name *graphs*) graph)
         (when gc-heap-p
           (gc-heap graph))
-        (recover-transactions graph)
+        ;; A non-empty WAL tail means this open is a CRASH RECOVERY: the .txn files
+        ;; RECOVER-TRANSACTIONS is about to replay were durable but never cleanly
+        ;; applied.  Capture that BEFORE the replay marks/consumes them.
+        (let ((crash-recovery-p (and (recovery-transaction-files graph) t)))
+          (recover-transactions graph)
+          ;; The spatial index restored above came from a sidecar written at the
+          ;; last CLEAN close -- it predates the writes just replayed, and its
+          ;; histogram cannot be repaired by replay, because replay's idempotent
+          ;; (add-unless-present) inserts hit cells that may already be on disk and
+          ;; so skip %COUNT-CELL.  A too-fine clamp would then silently miss a
+          ;; coarsely-stored geometry.  Re-derive every spatial index from the now-
+          ;; authoritative (replayed) nodes; this reconstructs the histogram exactly
+          ;; and re-persists the sidecar.  Only on recovery -- a clean open has no
+          ;; WAL tail, so the fast sidecar restore above stands untouched.  (This is
+          ;; why the commit path no longer writes the sidecar on a coarsening or an
+          ;; index creation: crash-correctness comes from this rebuild, not from
+          ;; CL-STORE I/O under the transaction-manager lock.)
+          (when crash-recovery-p
+            (rebuild-spatial-indexes graph)))
         ;; Unique constraints (issue #6): reopen the persistent unique skip-lists from
         ;; the sidecar (durable, no scan); only rebuild from nodes if there is no
         ;; sidecar -- a fresh graph, or a crash before CLOSE-GRAPH saved the roots.

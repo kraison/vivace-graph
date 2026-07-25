@@ -127,6 +127,15 @@ between releases; cutting a release renames it to the new version and dates it.
   full precision and only a genuinely large one is coarsened — an equal 1/N split
   coarsened small parts needlessly and, past 16384 parts, collapsed the whole
   index's query clamp to precision 1.
+  The spatial sidecar is no longer written on the commit path. It used to be
+  written on an index creation and on a coarsest-precision decrease, which put
+  `cl-store` file I/O under the transaction-manager lock, on the post-durability
+  side of the commit — a commit-convoy point and a failure-injection point after
+  the data was already durable. It is now written only at `close-graph` and by the
+  rebuild/regenerate admin ops; a crash forces recovery, and `open-graph`
+  re-derives every spatial index from the recovered nodes after the WAL replay, so
+  the histogram/clamp is reconstructed from authoritative geometry rather than from
+  an incremental write.
 - **A class with two geometry-valued indexed slots silently indexed only one
   (CR-3.1).** A node reaches spatial maintenance, is indexed by its first
   geometry-valued indexed slot, and every other geometry slot was inert with no

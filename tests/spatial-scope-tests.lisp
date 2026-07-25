@@ -431,9 +431,10 @@ format from being forced into a needless rebuild by this change."
       (with-transaction ()
         (setq probe-id (id (make-scope-probe
                             :geom (make-point 37.1724d0 49.2020d0)))))
-      ;; %SPATIAL-INDEX-FOR already wrote a (now :COMPLETE T) sidecar the moment
-      ;; the index was created; rewrite it in the PRE-MARKER shape, with no
-      ;; :COMPLETE key in the plist at all.
+      ;; The commit path no longer writes the sidecar (it is written at CLOSE-GRAPH
+      ;; and by the rebuild/regenerate ops); write it explicitly here, then rewrite
+      ;; it in the PRE-MARKER shape, with no :COMPLETE key in the plist at all.
+      (graph-db::save-spatial-index-roots g)
       (let* ((file (graph-db::spatial-indexes-root-file (namestring (graph-db:location g))))
              (plist (cl-store:restore file)))
         (is (getf plist :complete)
@@ -1265,3 +1266,72 @@ in an unrelated registry and a file stat."
     (let ((entry (assoc 'scope-two-geom-route (audit-spatial-slots g))))
       (is (not (null entry)) "the mis-declared edge class is reported")
       (is (equal '(track corridor) (rest entry))))))
+
+;;; ---------------------------------------------------------------------------
+;;; The spatial sidecar is written at CLOSE-GRAPH and by the rebuild/regenerate
+;;; admin ops -- NEVER on the commit path.  It used to fire on an index creation
+;;; and on a coarsest-precision decrease, which put CL-STORE file I/O under the
+;;; transaction-manager lock, on the post-durability side of the commit.  Crash-
+;;; correctness of the histogram now comes from OPEN-GRAPH re-deriving the spatial
+;;; indexes from the recovered nodes after WAL replay, so the commit path is free
+;;; of it.
+;;; ---------------------------------------------------------------------------
+
+(test commit-path-does-not-write-the-spatial-sidecar
+  "Committing a node whose geometry COARSENS its index -- the exact case that used
+to force a synchronous SAVE-SPATIAL-INDEX-ROOTS under the transaction-manager lock
+-- must not write the sidecar at all.  No CL-STORE runs on the commit path."
+  (with-test-graph (g)
+    (let ((saves 0)
+          (orig (fdefinition 'graph-db::save-spatial-index-roots)))
+      (unwind-protect
+           (progn
+             (setf (fdefinition 'graph-db::save-spatial-index-roots)
+                   (lambda (&rest args) (incf saves) (apply orig args)))
+             (with-transaction ()
+               ;; a country-scale extent: capped and coarsened at the default p7
+               (make-scope-zone :extent (scope-rect 22.1d0 44.4d0 40.2d0 52.4d0)))
+             (is (< (spatial-index-coarsest-precision
+                     (spatial-index-for g 'scope-zone 'extent))
+                    7)
+                 "precondition: the big extent coarsened its index below p7")
+             (is (zerop saves)
+                 "no SAVE-SPATIAL-INDEX-ROOTS on the commit path"))
+        (setf (fdefinition 'graph-db::save-spatial-index-roots) orig)))))
+
+(test coarse-geometry-survives-crash-recovery
+  "A country-scale geometry whose index was COARSENED is still findable after a
+crash + recovery, though the commit path no longer persists the histogram.  Phase 1
+crashes after the lhash write but before spatial maintenance (durable WAL entry, not
+yet indexed); Phase 2 reopens, and OPEN-GRAPH replays the WAL and then re-derives
+the spatial indexes from the recovered node, reconstructing the clamp from
+authoritative geometry."
+  (with-temp-directory (dir)
+    (let ((path (namestring dir))
+          zone-id)
+      (let ((g (make-graph *integration-graph-name* path :buffer-pool-size 1000)))
+        (unwind-protect
+             (let ((*graph* g))
+               (setf graph-db::*after-apply-tx-writes-hook*
+                     (lambda () (error "simulated crash before spatial apply")))
+               (handler-case
+                   (with-transaction ()
+                     (setq zone-id (id (make-scope-zone
+                                        :extent (scope-rect 22.1d0 44.4d0
+                                                            40.2d0 52.4d0)))))
+                 (error () nil)))
+          (setf graph-db::*after-apply-tx-writes-hook* nil)
+          (ignore-errors (close-graph g :snapshot-p nil))))
+      (let ((g2 (open-graph *integration-graph-name* path)))
+        (unwind-protect
+             (let ((*graph* g2))
+               (let ((idx (spatial-index-for g2 'scope-zone 'extent)))
+                 (is (spatial-index-p idx)
+                     "the zone index exists after recovery")
+                 (is (< (spatial-index-coarsest-precision idx) 7)
+                     "recovery reconstructed the coarsened histogram")
+                 (is (has-p zone-id
+                            (spatial-index-query-bbox idx 30d0 48d0 30.1d0 48.1d0))
+                     "the coarse geometry is findable after recovery")))
+          (ignore-errors (close-graph g2 :snapshot-p nil))
+          (collect-garbage))))))

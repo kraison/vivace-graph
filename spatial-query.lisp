@@ -30,11 +30,14 @@
 
 (defvar *spatial-rebuild-in-progress* nil
   "Bound to T for the duration of a multi-index spatial rebuild (REBUILD-SPATIAL-
-INDEXES, REGENERATE-SPATIAL-INDEX).  While bound, %SPATIAL-INDEX-FOR's ordinary
-per-creation sidecar save (spatial-registry.lisp) is a no-op: the rebuild brackets
-the whole operation with its own :COMPLETE NIL / :COMPLETE T saves instead, so a
-crash anywhere in between is caught by the completeness marker rather than by
-trusting whichever per-index saves happened to land first.")
+INDEXES, REGENERATE-SPATIAL-INDEX).  It once gated %SPATIAL-INDEX-FOR's per-creation
+sidecar save (so a rebuild's index creations did not each write an intermediate
+:COMPLETE T sidecar and defeat the rebuild's own :COMPLETE NIL / :COMPLETE T
+bracket).  That per-creation save has since been removed entirely -- the sidecar is
+written only at CLOSE-GRAPH and by these rebuild/regenerate ops, never on the commit
+path -- so nothing reads this flag today.  It is retained as the explicit
+\"inside a bulk rebuild\" marker: the bindings document that intent and re-arm
+cleanly if a creation-time write is ever reintroduced.")
 
 (defun %node-by-id (id graph)
   "Resolve a spatial-index id (uuid bytes) to its live node, or NIL."

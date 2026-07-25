@@ -1162,12 +1162,14 @@ miss the entry the insert wrote."
         ;; itself sees a bare node-id -- so the warning is emitted here.
         (let ((after (spatial-index-coarsest-precision idx)))
           (when (< after before)
-            ;; §7.2: persist the DECREASE immediately.  The histogram lives in RAM
-            ;; between closes, and losing a decrease to a crash would reopen the
-            ;; index with a clamp FINER than cells it actually holds -- a silent
-            ;; miss.  (Losing an increase merely over-covers, so only the decrease
-            ;; is worth a write.)
-            (save-spatial-index-roots graph)
+            ;; NO sidecar save here.  The histogram lives in RAM between closes and
+            ;; is persisted at CLOSE-GRAPH; a crash (which loses the RAM copy) forces
+            ;; recovery, and OPEN-GRAPH re-derives every spatial index from the
+            ;; recovered node geometries after replaying the WAL (see the crash-
+            ;; recovery rebuild there), so a lost decrease is reconstructed from
+            ;; authoritative data rather than from a file written on the hot commit
+            ;; path under the transaction-manager lock.  §7.2's silent-miss concern
+            ;; is met by that rebuild, not by an incremental write.
             (multiple-value-bind (mnl mnt mxl mxt) (geometry-bbox geom)
               ;; Report REQUESTED vs GRANTED (§7.4): naming only the previous
               ;; coarsest would tell an operator "coarsened to 4 (was 5)" on a
