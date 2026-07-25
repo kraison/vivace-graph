@@ -1041,7 +1041,14 @@ an explicit method takes precedence over the default.  A specializing method tha
 returns only ONE value reports no slot: such a node is indexed under
  (METHOD-OWNER . NIL), where METHOD-OWNER is the most general class carrying an
 applicable method (see %NODE-GEOMETRY-METHOD-OWNER-NAME), so the class is still
-scopeable by name exactly as a declared :INDEX slot is.")
+scopeable by name exactly as a declared :INDEX slot is.
+
+CAVEAT for a two-value method: if a specializing method returns (values geom
+slot-name), the node is indexed under (CLASS . SLOT-NAME) -- but a class scope
+resolves through NODE-GEOMETRY-INDEX-SLOTS, i.e. the :INDEX-marked slots only, so
+if SLOT-NAME names a slot that is NOT declared :INDEX, no class scope will
+enumerate that key and the node is reachable ONLY via the :ALL scope.  Return the
+declared :INDEX slot's name (or one value) to keep the node scopeable by class.")
   (:method (node) (declare (ignore node)) nil)
   (:method ((node node))
     ;; NB: do NOT gate on SLOT-BOUNDP -- node-class persistent slots are read

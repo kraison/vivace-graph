@@ -223,6 +223,55 @@ would pass by accident."
                        sum (aref (spatial-index-precision-counts idx) p))))
       (is (null (spatial-index-query-bbox idx 22.1d0 44.4d0 40.2d0 52.4d0))))))
 
+(defun %speck-parts (n)
+  "N tiny (0.001-degree) polygon parts, well separated, for a multipolygon whose
+area is dominated by some other big part."
+  (loop for i from 0 below n
+        for x = (+ 20d0 (* i 0.5d0))
+        collect (list (list (list x 50d0) (list (+ x 0.001d0) 50d0)
+                            (list (+ x 0.001d0) 50.001d0) (list x 50.001d0)
+                            (list x 50d0)))))
+
+(test multipolygon-budget-is-size-proportional
+  "A multipolygon's cell budget is split by part AREA, not equally: one 8x8-degree
+part plus nine 0.001-degree specks.  The big part keeps the fine grid its size
+warrants; an equal 1/N split would coarsen it to max-cells/N regardless of the
+specks needing almost nothing."
+  (let* ((max-cells 4096)
+         (big '(((0d0 0d0) (8d0 0d0) (8d0 8d0) (0d0 8d0) (0d0 0d0))))
+         (mp (make-multipolygon (cons big (%speck-parts 9))))
+         (parts (graph-db::geometry-coordinates mp))
+         (big-geom (graph-db::%make-geometry :kind :polygon :coordinates (first parts)))
+         ;; recompute the big part's budget exactly as %GEOMETRY-CELLS does, so the
+         ;; subset check does not depend on the floor arithmetic landing just so
+         (areas (mapcar #'graph-db::%polygon-bbox-area parts))
+         (total (reduce #'+ areas :initial-value 0d0))
+         (big-budget (max 1 (floor (* max-cells (first areas)) total)))
+         (proportional (graph-db::%bbox-cells big-geom 9 big-budget))
+         (equal-split  (graph-db::%bbox-cells big-geom 9 (floor max-cells (length parts))))
+         (cells (graph-db::%geometry-cells mp 9 max-cells)))
+    ;; the big part was actually stored at its area-proportional (fine) grid...
+    (is (subsetp proportional cells :test #'string=)
+        "the large part is covered at its area-proportional precision")
+    ;; ...which is strictly finer than the equal 1/N split it used to get
+    (is (> (length proportional) (length equal-split))
+        "proportional gives the large part more cells than an equal split would")))
+
+(test multipolygon-insert-remove-symmetry
+  "REMOVE recomputes exactly the cells INSERT wrote for a multipolygon, so the
+area-proportional per-part budget must be a pure deterministic function of the
+geometry -- no residual entries after removal."
+  (with-temp-memory (heap)
+    (let* ((idx (make-spatial-index heap :precision 7))
+           (big '(((0d0 0d0) (8d0 0d0) (8d0 8d0) (0d0 8d0) (0d0 0d0))))
+           (mp (make-multipolygon (cons big (%speck-parts 9)))))
+      (spatial-index-insert idx (bid 8) mp)
+      (spatial-index-remove idx (bid 8) mp)
+      (is (zerop (loop for p from 1 to 12
+                       sum (aref (spatial-index-precision-counts idx) p)))
+          "no orphaned cell entries after removing the multipolygon")
+      (is (null (spatial-index-query-bbox idx 0d0 0d0 8d0 8d0))))))
+
 (test double-remove-does-not-orphan-a-surviving-node
   "REGRESSION: removing an already-absent entry is a SUPPORTED no-op elsewhere in
 this engine (APPLY-PEER-PURGE documents idempotent purge; RECOVER-TRANSACTIONS

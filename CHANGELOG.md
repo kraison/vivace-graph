@@ -122,6 +122,11 @@ between releases; cutting a release renames it to the new version and dates it.
   marks the recovery. The histogram is rewritten synchronously only when the
   coarsest precision decreases (the unsafe direction); an emptied level rides the
   ordinary close-time write, because reopening too-coarse merely over-covers.
+  A multipolygon splits the cap across its parts in proportion to each part's
+  bounding-box *area* (with a floor of one cell per part), so a small part keeps
+  full precision and only a genuinely large one is coarsened — an equal 1/N split
+  coarsened small parts needlessly and, past 16384 parts, collapsed the whole
+  index's query clamp to precision 1.
 - **A class with two geometry-valued indexed slots silently indexed only one
   (CR-3.1).** A node reaches spatial maintenance, is indexed by its first
   geometry-valued indexed slot, and every other geometry slot was inert with no
@@ -292,6 +297,11 @@ between releases; cutting a release renames it to the new version and dates it.
   compile-time warning on SBCL and ECL, which is the safest way to land a
   deliberate break. Requested by the mine-action team (CR-1): they needed to
   query one class's geometry without dredging up another's.
+  *Known limitation:* a scope resolves the named class's own geometry slots, so
+  scoping to a parent does not reach an index a *subclass* declares on an extra
+  geometry slot of its own (a node stored there is still a `parent` by type, but
+  the parent scope will not scan it). Scope to the subclass or use `:all`; the
+  general fix rides with GitHub #60.
 - **BREAKING: the spatial sidecar is now `spatial-indexes.dat`, format v3**
   (was `spatial-index.root`, a single plist). It records one entry per
   `(owner . slot)` index — address, precision, backend, insert cap, and precision

@@ -11,9 +11,9 @@ maintenance, queries). Merged into `experiment`; full suite green on SBCL
 - `geohash.lisp` — encode/decode/bbox/cell-size/covering/prefix-range.
 - `geometry-ops.lisp` — haversine distance, point-in-polygon (+holes),
   multipolygon containment, bbox overlap.
-- `spatial-index.lisp` — heap-backed geohash skip-list index, fixed precision
-  (default 7), insert/remove/query-bbox/query-radius, persisted via a
-  `spatial-index.root` sidecar.
+- `spatial-index.lisp` — heap-backed geohash index, per-index precision
+  (default 7), insert/remove/query-bbox/query-radius, persisted via the
+  `spatial-indexes.dat` sidecar (v3; one record per `(owner . slot)` index).
 - Graph lifecycle — `make-graph`/`open-graph`/`close-graph` create/reopen the index.
 - Write-path hook (`transactions.lisp`) — auto-maintains the index on
   create/update/delete via the `node-geometry` protocol.

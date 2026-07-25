@@ -168,23 +168,52 @@ SPATIAL-INDEX-INSERT wrote."
                                        max-cells))))
       (geohash-covering min-lon min-lat max-lon max-lat :precision p))))
 
+(defun %polygon-bbox-area (poly)
+  "Bounding-box area (square degrees) of one multipolygon part POLY (a polygon
+coordinate list) -- the weight used to split a multipolygon's cell budget.
+Derived from GEOMETRY-BBOX, so it is identical on the insert and the remove of the
+same geometry."
+  (multiple-value-bind (min-lon min-lat max-lon max-lat)
+      (geometry-bbox (%make-geometry :kind :polygon :coordinates poly))
+    (* (max 0d0 (- max-lon min-lon))
+       (max 0d0 (- max-lat min-lat)))))
+
 (defun %geometry-cells (geom precision max-cells)
   "The geohash cells (strings) GEOM occupies.  A point yields one cell; a
 polygon/linestring yields the capped grid over its bbox.  A multipolygon is
-covered PART BY PART (not by one overall bbox) so the empty gaps between
-separated parts are not indexed, each part drawing on an equal share of
-MAX-CELLS so one huge part cannot starve the rest."
+covered PART BY PART (not by one overall bbox) so the empty gaps between separated
+parts are not indexed.  MAX-CELLS is split across the parts in proportion to each
+part's bounding-box AREA (with a floor of 1 cell per part), so a small part keeps
+full precision and only a genuinely large part is coarsened -- an equal 1/N split
+would drag every part down to the same budget, coarsening small parts needlessly
+and, past MAX-CELLS parts, collapsing the whole index's query clamp to precision 1.
+
+The area weights come from GEOMETRY-BBOX in GEOMETRY-COORDINATES order and the
+per-part budget is (floor (* max-cells area) total), so %GEOMETRY-CELLS stays a
+pure deterministic function of (geom, precision, max-cells) and SPATIAL-INDEX-
+REMOVE recomputes exactly the cells SPATIAL-INDEX-INSERT wrote."
   (if (eq (geometry-kind geom) :multipolygon)
       (let* ((parts (geometry-coordinates geom))
-             (budget (max 1 (floor max-cells (max 1 (length parts)))))
+             (n (max 1 (length parts)))
+             (areas (mapcar #'%polygon-bbox-area parts))
+             (total (reduce #'+ areas :initial-value 0d0))
              (seen (make-hash-table :test 'equal))
              (cells '()))
-        (dolist (poly parts cells)
-          (dolist (c (%bbox-cells (%make-geometry :kind :polygon :coordinates poly)
-                                  precision budget))
-            (unless (gethash c seen)
-              (setf (gethash c seen) t)
-              (push c cells)))))
+        (loop for poly in parts
+              for area in areas
+              ;; Proportional share, floored at 1.  When every part is degenerate
+              ;; (zero total area) there is no proportion to take, so fall back to
+              ;; the equal split -- still deterministic.
+              for budget = (if (plusp total)
+                               (max 1 (floor (* max-cells area) total))
+                               (max 1 (floor max-cells n)))
+              do (dolist (c (%bbox-cells (%make-geometry :kind :polygon
+                                                         :coordinates poly)
+                                         precision budget))
+                   (unless (gethash c seen)
+                     (setf (gethash c seen) t)
+                     (push c cells))))
+        cells)
       (%bbox-cells geom precision max-cells)))
 
 (defun spatial-index-insert (idx node-id geom)

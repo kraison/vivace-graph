@@ -584,7 +584,7 @@ below CREATE-VECTOR-SEGMENT's own default -- and segment-put every live node's
 conforming value.  Registers and returns the fresh segment, or NIL if no
 live node has a conforming vector (in which case no segment is created at all).
 Run when quiescent (at open, before writes) -- it mutates outside the
-transaction path, like rebuild-spatial-index.
+transaction path, like rebuild-spatial-indexes.
 
 OWNER-NAME must be the segment's OWNER -- the declaring class returned by
 %VECTOR-INDEX-SLOT-OWNER-NAME / %SEGMENT-KEY (transactions.lisp), not
