@@ -628,7 +628,7 @@ usable at its current reservation."
   (dotimes (i 4)
     (set-byte mf offset (ldb (byte 8 (* i 8)) int))
     (incf offset))
-  (incf offset))
+  offset)
 
 (defmethod deserialize-uint32 ((mf mapped-file) offset)
   (declare (type word offset))
@@ -644,7 +644,7 @@ usable at its current reservation."
   (dotimes (i 5)
     (set-byte mf offset (ldb (byte 8 (* i 8)) int))
     (incf offset))
-  (incf offset))
+  offset)
 
 (defmethod deserialize-uint40 ((mf mapped-file) offset)
   (declare (type word offset))
