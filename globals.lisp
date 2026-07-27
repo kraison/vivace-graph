@@ -265,6 +265,8 @@ strictly-safe pre-durability abort.")
 ;; so double-float and int8-quantised vectors can be added later without burning
 ;; another type tag.
 (alexandria:define-constant +fv-single-float+ 1)
+(alexandria:define-constant +fv-double-float+ 2)
+
 
 ;; --- Vector segment (Phase 2) on-disk layout ---------------------------------
 ;; A segment is a derived, mmap-backed index: one fixed-width single-float vector

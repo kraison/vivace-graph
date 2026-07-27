@@ -134,6 +134,36 @@ UUID (compared by string form, since uuid objects aren't EQUAL)."
         (is (= (aref v i) (aref back i))
             "element ~A differs: ~A vs ~A" i (aref v i) (aref back i))))))
 
+(defun dfv (&rest floats)
+  "A (simple-array double-float (*)) built from FLOATS."
+  (make-array (length floats) :element-type 'double-float
+                              :initial-contents (mapcar (lambda (x) (coerce x 'double-float))
+                                                        floats)))
+
+(test double-float-vector-round-trip
+  "Double-float vectors round-trip exactly, preserving element type and dimension."
+  (dolist (v (list (dfv)
+                   (dfv 0.0d0)
+                   (dfv 1.0d0 -1.0d0 0.5d0 -0.5d0)
+                   (dfv 3.141592653589793d0 -2.718281828459045d0 1.0d20 -1.0d-20)))
+    (let ((back (deserialized v)))
+      (is (typep back '(simple-array double-float (*)))
+          "expected simple-array double-float (*), got ~S" (type-of back))
+      (is (equalp v back)))))
+
+(test extract-all-subseqs-linear-scaling
+  "Deserializing a large vector does not exhibit quadratic memory allocation (Issue #81)."
+  (let* ((n 4000)
+         (v (make-array n :initial-contents (loop for i from 0 below n collect (mod i 100))))
+         (bytes (serialize v))
+         (before #+sbcl (sb-ext:get-bytes-consed) #-sbcl 0)
+         (back (deserialize bytes))
+         (after #+sbcl (sb-ext:get-bytes-consed) #-sbcl 0)
+         (consed (- after before)))
+    (is (equalp v back))
+    #+sbcl
+    (is (< consed 1000000) "4,000 element vector deserialization consed ~:D bytes (expected <1MB, was >24MB when O(N^2))" consed)))
+
 (test float-vector-extremes
   "Boundary float32 values survive the round trip bit-exactly."
   (let ((v (fv most-positive-single-float most-negative-single-float

@@ -22,6 +22,8 @@
                 #:+vector+
                 #:+float-vector+
                 #:+fv-single-float+
+                #:+fv-double-float+
+
                 #:serialization-error
                 ;; geometry (spatial extension)
                 #:make-point
