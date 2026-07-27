@@ -102,7 +102,32 @@
   (cffi:foreign-funcall "close" :int fd :int))
 
 (defun %posix-lseek (fd offset whence)
-  (cffi:foreign-funcall "lseek" :int fd :long offset :int whence :long))
+  (let ((r (cffi:foreign-funcall "lseek" :int fd :long offset :int whence :long)))
+    (when (minusp r)
+      (error "posix lseek failed for fd ~D (offset ~D, whence ~D)" fd offset whence))
+    r))
+
+(defun %posix-write (fd ptr count)
+  "write(2). FD is an open file descriptor, PTR is a foreign pointer, COUNT is size_t.
+Returns the number of bytes written, or signals an error on failure."
+  (let ((r (cffi:foreign-funcall "write"
+                                 :int fd
+                                 :pointer ptr
+                                 :unsigned-long count
+                                 :long)))
+    (when (minusp r)
+      (error "posix write failed for fd ~D (count ~D)" fd count))
+    r))
+
+(defun %posix-extend-file-backing (fd new-length)
+  "Extends the file backed by FD to NEW-LENGTH bytes by seeking to (1- NEW-LENGTH) and writing a zero byte.
+Signals an error if lseek or write fails (e.g. ENOSPC)."
+  (%posix-lseek fd (1- new-length) +seek-set+)
+  (cffi:with-foreign-string (null-buf (string (code-char 0)))
+    (let ((written (%posix-write fd null-buf 1)))
+      (unless (= written 1)
+        (error "posix write failed to extend file fd ~D to ~D bytes (wrote ~D bytes)"
+               fd new-length written)))))
 
 (defun %posix-fchmod (fd mode)
   (cffi:foreign-funcall "fchmod" :int fd :unsigned-int mode :int))

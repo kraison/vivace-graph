@@ -1246,3 +1246,11 @@ must fail (EBADF); succeeding would mean MMAP-FILE leaked it."
                captured-fd))
       (setf (fdefinition 'graph-db::%posix-mmap) orig)
       (ignore-errors (delete-file path)))))
+
+(test posix-write-and-extend-file-backing-signals-on-error
+  "%POSIX-WRITE and %POSIX-EXTEND-FILE-BACKING signal a Lisp error when write or lseek fails on an invalid fd."
+  (cffi:with-foreign-string (buf "x")
+    (signals error (graph-db::%posix-write -1 buf 1)))
+  (signals error (graph-db::%posix-extend-file-backing -1 4096)))
+
+

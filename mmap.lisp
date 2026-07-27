@@ -212,12 +212,7 @@ and POINTER is stable for the life of the mapping."
     (unwind-protect
         (progn
           (when create-p
-            (%posix-lseek fd (1- size) +seek-set+)
-            (cffi:with-foreign-string (null (format nil "~A" (code-char 0)))
-              (cffi:foreign-funcall "write"
-                                    :int fd
-                                    :pointer null
-                                    size 1))
+            (%posix-extend-file-backing fd size)
             ;; Belt-and-suspenders: set the mode explicitly to #o640 (owner rw,
             ;; group r) so database files are reopenable without being
             ;; world-accessible, even if the open() mode argument is not
@@ -305,12 +300,7 @@ relocation is disabled or fails does a segment signal, and it signals ~
 VECTOR-SEGMENT-CAPACITY-EXHAUSTED, not this."
              (m-path mapped-file) new-len (m-reserved-size mapped-file)))
     ;; Extend the backing file first so the newly mapped pages have storage.
-    (%posix-lseek (m-fd mapped-file) (1- new-len) +seek-set+)
-    (cffi:with-foreign-string (null (format nil "~A" (code-char 0)))
-      (cffi:foreign-funcall "write"
-                            :int (m-fd mapped-file)
-                            :pointer null
-                            size 1))
+    (%posix-extend-file-backing (m-fd mapped-file) new-len)
     ;; Re-map [0, new-len) over the reserved window at the same base.
     (%posix-mmap (m-pointer mapped-file)
                  new-len
