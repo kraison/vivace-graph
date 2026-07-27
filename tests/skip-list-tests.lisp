@@ -96,13 +96,13 @@ chain correctly, and %SL-LENGTH is the maintained counter."
       (is (= 60 (sl-find-value sl 6)))
       (is (equal '(0 1 2 3 4 6 7 8 9) (mapcar #'car (skip-list-to-list sl)))))))
 
-(test duplicate-add-ignored-without-duplicates
+(test skip-list-disallows-duplicates
   "With duplicates disallowed, re-adding an existing key is a no-op: the
-count and the original value are unchanged."
+count and the original value are unchanged, and add-to-skip-list returns NIL."
   (with-temp-memory (heap)
     (let ((sl (make-integer-skip-list heap)))
-      (add-to-skip-list sl 7 "first")
-      (add-to-skip-list sl 7 "second")
+      (is-true (add-to-skip-list sl 7 "first"))
+      (is (null (add-to-skip-list sl 7 "second")))
       (is (= 1 (sl-live-count sl)))
       (is (= 1 (%sl-length sl)))
       (is (string= "first" (sl-find-value sl 7))))))

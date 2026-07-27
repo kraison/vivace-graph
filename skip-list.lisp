@@ -580,7 +580,7 @@ L1: 50%, L2: 25%, L3: 12.5%, ..."
                  ;;(error 'skip-list-duplicate-error
                  ;;:skip-list skip-list :key key :value value)
                  (let ((*print-pretty* nil))
-                   (log:error "ATTEMPT TO INSERT DUP KV '~A/~A' IN ~A" key value skip-list))
+                   (log:debug "ATTEMPT TO INSERT DUP KV '~A/~A' IN ~A" key value skip-list))
                  (return-from add-to-skip-list nil)))))
          (log:debug "~S / ~S:~%  ~S~%  ~S~%" key value (elt preds 0) (elt succs 0))
          (let ((locks nil) pred succ prev-pred (valid-p t))
