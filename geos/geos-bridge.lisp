@@ -152,9 +152,120 @@ unsupported type."
     (unwind-protect (cffi:foreign-string-to-lisp cstr)
       (%geos-free (geos-ctx-handle ctx) cstr))))
 
+(defun %coords->geos-coordseq (ctx coords &key closed-p)
+  "Convert a list of (lon lat) pairs into a GEOSCoordSeq pointer."
+  (let* ((handle (geos-ctx-handle ctx))
+         (n (length coords))
+         (need-close (and closed-p
+                          (> n 0)
+                          (let ((f (first coords)) (l (car (last coords))))
+                            (or (/= (first f) (first l)) (/= (second f) (second l))))))
+         (len (+ n (if need-close 1 0)))
+         (seq (%geos-coordseq-create handle len 2)))
+    (when (cffi:null-pointer-p seq)
+      (error 'geos-error :message "GEOSCoordSeq_create_r failed"))
+    (loop for c in coords
+          for idx from 0
+          do (%geos-coordseq-setx handle seq idx (coerce (first c) 'double-float))
+             (%geos-coordseq-sety handle seq idx (coerce (second c) 'double-float)))
+    (when need-close
+      (let ((f (first coords)))
+        (%geos-coordseq-setx handle seq n (coerce (first f) 'double-float))
+        (%geos-coordseq-sety handle seq n (coerce (second f) 'double-float))))
+    seq))
+
+(defun %ring->geos-linear-ring (ctx ring)
+  "Convert a list of (lon lat) ring vertices into a GEOS LinearRing geometry pointer."
+  (let ((handle (geos-ctx-handle ctx))
+        (seq (%coords->geos-coordseq ctx ring :closed-p t)))
+    (let ((geom (%geos-create-linear-ring handle seq)))
+      (when (cffi:null-pointer-p geom)
+        (%geos-coordseq-destroy handle seq)
+        (error 'geos-error :message "GEOSGeom_createLinearRing_r failed"))
+      geom)))
+
+(defun %polygon-body->geos-polygon (ctx rings)
+  "RINGS = (exterior . holes).  Returns a GEOS Polygon geometry pointer."
+  (let* ((handle (geos-ctx-handle ctx))
+         (shell (%ring->geos-linear-ring ctx (first rings)))
+         (holes (rest rings))
+         (nholes (length holes)))
+    (if (zerop nholes)
+        (let ((poly (%geos-create-polygon handle shell (cffi:null-pointer) 0)))
+          (when (cffi:null-pointer-p poly)
+            (%geos-geom-destroy handle shell)
+            (error 'geos-error :message "GEOSGeom_createPolygon_r failed"))
+          poly)
+        (cffi:with-foreign-object (h-arr :pointer nholes)
+          (let ((created-holes '()))
+            (unwind-protect
+                 (progn
+                   (loop for h in holes
+                         for idx from 0
+                         for h-geom = (%ring->geos-linear-ring ctx h)
+                         do (push h-geom created-holes)
+                            (setf (cffi:mem-aref h-arr :pointer idx) h-geom))
+                   (let ((poly (%geos-create-polygon handle shell h-arr nholes)))
+                     (when (cffi:null-pointer-p poly)
+                       (error 'geos-error :message "GEOSGeom_createPolygon_r failed"))
+                     (setf shell nil created-holes nil)
+                     poly))
+              (when shell (%geos-geom-destroy handle shell))
+              (dolist (h created-holes) (%geos-geom-destroy handle h))))))))
+
 (defun geometry->geos (ctx g)
-  "Build a GEOS geometry pointer from VG geometry G (caller destroys it)."
-  (%read-wkt ctx (geometry->wkt g)))
+  "Build a GEOS geometry pointer directly from VG geometry G (caller destroys it)."
+  (let ((handle (geos-ctx-handle ctx)))
+    (ecase (geometry-kind g)
+      (:point
+       (let ((c (geometry-coordinates g)))
+         (if c
+             (let ((seq (%coords->geos-coordseq ctx (list c))))
+               (let ((geom (%geos-create-point handle seq)))
+                 (when (cffi:null-pointer-p geom)
+                   (%geos-coordseq-destroy handle seq)
+                   (error 'geos-error :message "GEOSGeom_createPoint_r failed"))
+                 geom))
+             (let ((seq (%geos-coordseq-create handle 0 2)))
+               (%geos-create-point handle seq)))))
+      (:linestring
+       (let ((cs (geometry-coordinates g)))
+         (if cs
+             (let ((seq (%coords->geos-coordseq ctx cs)))
+               (let ((geom (%geos-create-linestring handle seq)))
+                 (when (cffi:null-pointer-p geom)
+                   (%geos-coordseq-destroy handle seq)
+                   (error 'geos-error :message "GEOSGeom_createLineString_r failed"))
+                 geom))
+             (let ((seq (%geos-coordseq-create handle 0 2)))
+               (%geos-create-linestring handle seq)))))
+      (:polygon
+       (let ((rings (geometry-coordinates g)))
+         (if rings
+             (%polygon-body->geos-polygon ctx rings)
+             (let ((shell (%geos-create-linear-ring handle (%geos-coordseq-create handle 0 2))))
+               (%geos-create-polygon handle shell (cffi:null-pointer) 0)))))
+      (:multipolygon
+       (let* ((polys (geometry-coordinates g))
+              (npolys (length polys)))
+         (if (zerop npolys)
+             (%geos-create-collection handle 6 (cffi:null-pointer) 0) ; GEOS_MULTIPOLYGON = 6
+             (cffi:with-foreign-object (p-arr :pointer npolys)
+               (let ((created-polys '()))
+                 (unwind-protect
+                      (progn
+                        (loop for p in polys
+                              for idx from 0
+                              for p-geom = (%polygon-body->geos-polygon ctx p)
+                              do (push p-geom created-polys)
+                                 (setf (cffi:mem-aref p-arr :pointer idx) p-geom))
+                        (let ((mpoly (%geos-create-collection handle 6 p-arr npolys)))
+                          (when (cffi:null-pointer-p mpoly)
+                            (error 'geos-error :message "GEOSGeom_createCollection_r failed"))
+                          (setf created-polys nil)
+                          mpoly))
+                   (dolist (p created-polys) (%geos-geom-destroy handle p)))))))))))
+
 
 (defun geos->geometry (ctx geom)
   "Convert a GEOS geometry pointer back into a VG geometry."
