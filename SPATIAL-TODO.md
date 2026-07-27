@@ -133,7 +133,7 @@ maintenance, queries). Merged into `experiment`; full suite green on SBCL
 
 ### Done (this pass)
 - [x] `make-graph :spatial-precision` and `:spatial-max-cells` keywords (persisted; read back by `open-graph`).
-- [x] `+spatial-insert-max-cells+` default changed from 16384 to 256 (27x faster inserts, 16x faster queries; issue #80).
+- [x] Per-index `:spatial-max-cells` slot option and `make-graph :spatial-max-cells` keyword added (issue #80). Global `+spatial-insert-max-cells+` default retained at 16384 for backwards compatibility.
 - [x] Per-index `:spatial-max-cells` slot option added to `def-vertex` slot specs.
 - [x] Chapter 13 caveat fixes: corrected the "prefix range scans" description
       (queries do same-precision exact-cell lookups) and the precision/max-cells config claims.

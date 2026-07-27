@@ -1929,7 +1929,8 @@ Here is a second spatial type, so the query examples below have two classes to s
     :survey-app)
 #+END_SRC
 
-*Per-index grid precision and max-cells cap.* A geometry slot may set its index's geohash precision with the ~:spatial-precision~ slot option (default 7, ≈150 m cells — set graph default via ~make-graph~'s ~:spatial-precision~) and its max-cells cap with the ~:spatial-max-cells~ slot option (default 256 — set graph default via ~make-graph~'s ~:spatial-max-cells~). Coarser grids and lower cell caps suit large area geometries, while finer grids suit dense point data. Changing a declared precision re-grids that one index automatically the next time the graph is opened.
+*Per-index grid precision and max-cells cap.* A geometry slot may set its index's geohash precision with the ~:spatial-precision~ slot option (default 7, ≈150 m cells — set graph default via ~make-graph~'s ~:spatial-precision~) and its max-cells cap with the ~:spatial-max-cells~ slot option (default 16384 — set graph default via ~make-graph~'s ~:spatial-max-cells~). Coarser grids and lower cell caps suit large area geometries, while finer grids suit dense point data. Changing a declared precision re-grids that one index automatically the next time the graph is opened.
+
 
 #+BEGIN_SRC lisp
   (def-vertex zone ()
@@ -2574,7 +2575,8 @@ This chapter provides a categorized reference for the most important exported sy
 - ~(slot :type geometry :index t :spatial-precision N :spatial-max-cells M)~ (slot options) ::
   ~:index t~ opts a geometry slot into spatial indexing; optional
   ~:spatial-precision N~ sets that index's geohash grid precision (default 7);
-  optional ~:spatial-max-cells M~ sets that index's max-cells cap (default 256).
+  optional ~:spatial-max-cells M~ sets that index's max-cells cap (default 16384).
+
   Graph-wide defaults are set via ~make-graph~'s ~:spatial-precision~ and ~:spatial-max-cells~.
 
 

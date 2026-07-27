@@ -1351,8 +1351,9 @@ user-visible property: the recovery path yields a correct, queryable spatial ind
   :graph-db-integration-test)
 
 (test spatial-max-cells-slot-option-and-graph-default
-  "Tests +spatial-insert-max-cells+ default of 256, the :spatial-max-cells slot option, and make-graph :spatial-max-cells keyword."
-  (is (= 256 graph-db::+spatial-insert-max-cells+))
+  "Tests +spatial-insert-max-cells+ default of 16384, the :spatial-max-cells slot option, and make-graph :spatial-max-cells keyword."
+  (is (= 16384 graph-db::+spatial-insert-max-cells+))
+
   (with-temp-directory (dir)
     (ensure-directories-exist dir)
     (let ((g (make-graph *integration-graph-name* (namestring dir)
