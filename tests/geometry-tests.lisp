@@ -67,3 +67,31 @@
     (let ((r (geo-roundtrip (make-point (first pt) (second pt)))))
       (is (= (first pt) (geometry-lon r)))
       (is (= (second pt) (geometry-lat r))))))
+
+(test geometry-coordinate-pairs-all-kinds
+  "geometry-coordinate-pairs returns pre-6e5e368 (lon lat) double-float nested lists for all four kinds (Issue #84)."
+  (let ((pt (make-point 37.1d0 49.2d0))
+        (ls (make-linestring '((10 20) (30 40))))
+        (poly (make-polygon '(((0 0) (4 0) (4 4) (0 4) (0 0))
+                              ((1 1) (2 1) (2 2) (1 2) (1 1)))))
+        (mp (make-multipolygon '((((0 0) (1 0) (1 1) (0 0)))
+                                 (((5 5) (6 5) (6 6) (5 5)))))))
+    (is (equalp '(37.1d0 49.2d0) (geometry-coordinate-pairs pt)))
+    (is (equalp '((10.0d0 20.0d0) (30.0d0 40.0d0)) (geometry-coordinate-pairs ls)))
+    (is (equalp '(((0.0d0 0.0d0) (4.0d0 0.0d0) (4.0d0 4.0d0) (0.0d0 4.0d0) (0.0d0 0.0d0))
+                  ((1.0d0 1.0d0) (2.0d0 1.0d0) (2.0d0 2.0d0) (1.0d0 2.0d0) (1.0d0 1.0d0)))
+                (geometry-coordinate-pairs poly)))
+    (is (equalp '((((0.0d0 0.0d0) (1.0d0 0.0d0) (1.0d0 1.0d0) (0.0d0 0.0d0)))
+                  (((5.0d0 5.0d0) (6.0d0 5.0d0) (6.0d0 6.0d0) (5.0d0 5.0d0))))
+                (geometry-coordinate-pairs mp)))))
+
+
+(test map-geometry-coordinates-traversal
+  "map-geometry-coordinates visits all (lon lat) vertices with zero allocations."
+  (let ((poly (make-polygon '(((0 0) (4 0) (4 3) (0 3) (0 0)))))
+        (collected '()))
+    (map-geometry-coordinates (lambda (lon lat) (push (list lon lat) collected)) poly)
+    (is (equalp '((0.0d0 0.0d0) (4.0d0 0.0d0) (4.0d0 3.0d0) (0.0d0 3.0d0) (0.0d0 0.0d0))
+                (nreverse collected)))))
+
+

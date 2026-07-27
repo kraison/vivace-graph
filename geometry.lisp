@@ -5,23 +5,30 @@
 ;;; Part of VivaceGraph's public, general-purpose spatial layer (no domain
 ;;; knowledge lives here).  Coordinates are WGS84 and stored in (LON LAT) order
 ;;; -- GIS x,y / GeoJSON convention -- as DOUBLE-FLOATs.  KIND is one of :POINT
-;;; :LINESTRING :POLYGON :MULTIPOLYGON, with COORDINATES shaped accordingly:
-;;;   :point         -> (lon lat)
-;;;   :linestring    -> ((lon lat) (lon lat) ...)
-;;;   :polygon       -> (ring ...) where ring = ((lon lat) ...); the first ring
-;;;                     is the exterior boundary, any others are holes
+;;; :LINESTRING :POLYGON :MULTIPOLYGON.
+;;;
+;;; Internal coordinate storage in the COORDINATES slot uses packed
+;;; (simple-array double-float (*)) vectors for rings (3-4x memory reduction,
+;;; zero-consing spatial operations):
+;;;   :point         -> #(lon lat)
+;;;   :linestring    -> #(lon0 lat0 lon1 lat1 ...)
+;;;   :polygon       -> (ring ...) where ring = #(lon0 lat0 ...)
 ;;;   :multipolygon  -> (polygon ...) where polygon = (ring ...)
+;;;
+;;; Public coordinate accessors:
+;;;   (geometry-coordinates g)      -> packed array representation (in-memory & serialization)
+;;;   (geometry-coordinate-pairs g) -> classic nested list of (lon lat) pairs
+;;;   (map-geometry-coordinates fn g) -> zero-allocation vertex traversal: (funcall fn lon lat)
 ;;;
 ;;; The wire format reuses the generic byte protocol:
 ;;;   [+geometry+][len-header][serialized kind-code][serialized coordinates]
-;;; built with SERIALIZE-MULTIPLE, so EXTRACT-LENGTH's variable-length branch
-;;; decodes it with no change to the serialization dispatch core.  The payload
-;;; encoding may later be compacted (e.g. a flat double-float array) WITHOUT
-;;; changing the type tag, the struct, or this public API.
+;;; built with SERIALIZE-MULTIPLE.  The payload uses the fast float-vector codec
+;;; (+fv-double-float+).
 
 (defstruct (geometry (:constructor %make-geometry) (:predicate geometryp))
   (kind :point :type symbol)
   coordinates)
+
 
 (defparameter +geometry-kinds+ '(:point :linestring :polygon :multipolygon)
   "Ordered list; a geometry's KIND is serialized as its position here.")
@@ -148,6 +155,60 @@
                 (dolist (item coords) (walk-ring item))
                 (walk-ring coords))))
       (values min-lon min-lat max-lon max-lat))))
+
+(defun map-geometry-coordinates (fn g)
+  "Call FN with (LON LAT) double-floats for every vertex in geometry G.
+Zero allocations over packed float array storage."
+  (declare (type function fn))
+  (labels ((visit-vec (v)
+             (declare (type (simple-array double-float (*)) v))
+             (loop for i from 0 below (length v) by 2
+                   do (funcall fn (aref v i) (aref v (1+ i)))))
+           (visit-ring (r)
+             (cond
+               ((typep r '(simple-array double-float (*)))
+                (visit-vec r))
+               ((consp r)
+                (dolist (c r)
+                  (if (and (consp c) (numberp (first c)))
+                      (funcall fn (%df (first c)) (%df (second c)))
+                      (visit-ring c)))))))
+    (ecase (geometry-kind g)
+      (:point
+       (funcall fn (geometry-lon g) (geometry-lat g)))
+      (:linestring
+       (let ((c (geometry-coordinates g)))
+         (visit-ring c)))
+      (:polygon
+       (let ((rings (geometry-coordinates g)))
+         (dolist (r rings) (visit-ring r))))
+      (:multipolygon
+       (let ((polys (geometry-coordinates g)))
+         (dolist (p polys)
+           (dolist (r p) (visit-ring r))))))))
+
+(defun %vec->pairs (vec)
+  "Convert a 1D double-float vector #(lon0 lat0 lon1 lat1 ...) to a list of (lon lat) double-float pairs."
+  (if (typep vec '(simple-array double-float (*)))
+      (loop for i from 0 below (length vec) by 2
+            collect (list (aref vec i) (aref vec (1+ i))))
+      (if (consp vec)
+          (mapcar (lambda (c) (if (consp c) (list (%df (first c)) (%df (second c))) c)) vec)
+          vec)))
+
+(defun geometry-coordinate-pairs (g)
+  "Return the coordinates of G as nested lists of (lon lat) double-float pairs.
+Restores the classic pre-6e5e368 list-of-pairs structure for callers and exporters."
+  (ecase (geometry-kind g)
+    (:point
+     (list (geometry-lon g) (geometry-lat g)))
+    (:linestring
+     (%vec->pairs (geometry-coordinates g)))
+    (:polygon
+     (mapcar #'%vec->pairs (geometry-coordinates g)))
+    (:multipolygon
+     (mapcar (lambda (p) (mapcar #'%vec->pairs p)) (geometry-coordinates g)))))
+
 
 ;;; -------------------------------------------------------------------------
 ;;; Serialization (reuses the generic byte protocol; no core dispatch changes)

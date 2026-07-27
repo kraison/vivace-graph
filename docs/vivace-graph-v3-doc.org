@@ -1887,7 +1887,8 @@ Locations are represented by the ~geometry~ value type. Coordinates are WGS84 an
   (make-multipolygon '(polygon ...))   ; polygon = (ring ...)
 #+END_SRC
 
-A ~geometry~ is a normal serializable value, so you store one in a node slot just like a string or number. Legacy nested list serializations are transparently upgraded to packed arrays upon deserialization. When optional GEOS integration is loaded, foreign geometries are built directly via GEOS C API FFI calls without WKT text round-trips (~27x faster predicate execution). Useful accessors include ~geometry-kind~, ~geometry-coordinates~, ~geometry-lon~ / ~geometry-lat~ (for points), and ~geometry-bbox~ (axis-aligned bounding box as ~(values min-lon min-lat max-lon max-lat)~).
+A ~geometry~ is a normal serializable value, so you store one in a node slot just like a string or number. Legacy nested list serializations are transparently upgraded to packed arrays upon deserialization. When optional GEOS integration is loaded, foreign geometries are built directly via GEOS C API FFI calls without WKT text round-trips (~27x faster predicate execution). Useful accessors include ~geometry-kind~, ~geometry-coordinates~ (packed array representation), ~geometry-coordinate-pairs~ (classic nested list of ~(lon lat)~ pairs for exporters and GeoJSON), ~map-geometry-coordinates~ (zero-allocation vertex iterator), ~geometry-lon~ / ~geometry-lat~ (for points), and ~geometry-bbox~ (axis-aligned bounding box as ~(values min-lon min-lat max-lon max-lat)~).
+
 
 
 *** Making a node type spatial

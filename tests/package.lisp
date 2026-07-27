@@ -33,7 +33,10 @@
                 #:geometryp
                 #:geometry-kind
                 #:geometry-coordinates
+                #:geometry-coordinate-pairs
+                #:map-geometry-coordinates
                 #:geometry-lon
+
                 #:geometry-lat
                 #:geometry-bbox
                 ;; geometry refine ops (spatial extension)
