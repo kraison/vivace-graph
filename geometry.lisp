@@ -16,9 +16,10 @@
 ;;;   :multipolygon  -> (polygon ...) where polygon = (ring ...)
 ;;;
 ;;; Public coordinate accessors:
-;;;   (geometry-coordinates g)      -> packed array representation (in-memory & serialization)
-;;;   (geometry-coordinate-pairs g) -> classic nested list of (lon lat) pairs
-;;;   (map-geometry-coordinates fn g) -> zero-allocation vertex traversal: (funcall fn lon lat)
+;;;   (geometry-coordinates g)        -> packed array representation (in-memory & serialization)
+;;;   (geometry-coordinate-pairs g)   -> classic nested list of (lon lat) pairs
+;;;   (do-geometry-coordinates (lon lat) g &body body) -> zero-allocation vertex iteration macro
+;;;   (map-geometry-coordinates fn g) -> functional vertex traversal (~32 B/vertex due to funcall boxing)
 ;;;
 ;;; The wire format reuses the generic byte protocol:
 ;;;   [+geometry+][len-header][serialized kind-code][serialized coordinates]
@@ -28,6 +29,7 @@
 (defstruct (geometry (:constructor %make-geometry) (:predicate geometryp))
   (kind :point :type symbol)
   coordinates)
+
 
 
 (defparameter +geometry-kinds+ '(:point :linestring :polygon :multipolygon)
@@ -156,36 +158,64 @@
                 (walk-ring coords))))
       (values min-lon min-lat max-lon max-lat))))
 
+(defmacro do-geometry-coordinates ((lon lat) geometry &body body)
+  "Iterate over every (LON LAT) double-float vertex in GEOMETRY, binding LON and LAT.
+This macro form inlines the traversal loops and operates directly on packed float arrays
+with zero memory allocations (0 bytes/vertex)."
+  (let ((g-var (gensym "GEOM"))
+        (c-var (gensym "COORDS"))
+        (ring-var (gensym "RING"))
+        (poly-var (gensym "POLY"))
+        (v-var (gensym "VEC"))
+        (i-var (gensym "I"))
+        (fn-var (gensym "FN"))
+        (visit-vec-var (gensym "VISIT-VEC"))
+        (visit-ring-var (gensym "VISIT-RING")))
+    `(let ((,g-var ,geometry))
+       (flet ((,fn-var (,lon ,lat)
+                (declare (type double-float ,lon ,lat))
+                ,@body))
+         (declare (inline ,fn-var)
+                  (dynamic-extent #',fn-var))
+         (labels ((,visit-vec-var (,v-var)
+                    (declare (type (simple-array double-float (*)) ,v-var))
+                    (loop for ,i-var from 0 below (length ,v-var) by 2
+                          do (,fn-var (aref ,v-var ,i-var) (aref ,v-var (1+ ,i-var)))))
+                  (,visit-ring-var (,ring-var)
+                    (cond
+                      ((typep ,ring-var '(simple-array double-float (*)))
+                       (,visit-vec-var ,ring-var))
+                      ((consp ,ring-var)
+                       (dolist (c ,ring-var)
+                         (if (and (consp c) (numberp (first c)))
+                             (,fn-var (%df (first c)) (%df (second c)))
+                             (,visit-ring-var c)))))))
+           (ecase (geometry-kind ,g-var)
+             (:point
+              (,fn-var (geometry-lon ,g-var) (geometry-lat ,g-var)))
+             (:linestring
+              (let ((,c-var (geometry-coordinates ,g-var)))
+                (,visit-ring-var ,c-var)))
+             (:polygon
+              (let ((,c-var (geometry-coordinates ,g-var)))
+                (dolist (,ring-var ,c-var)
+                  (,visit-ring-var ,ring-var))))
+             (:multipolygon
+              (let ((,c-var (geometry-coordinates ,g-var)))
+                (dolist (,poly-var ,c-var)
+                  (dolist (,ring-var ,poly-var)
+                    (,visit-ring-var ,ring-var)))))))))))
+
+
+(declaim (inline map-geometry-coordinates))
 (defun map-geometry-coordinates (fn g)
   "Call FN with (LON LAT) double-floats for every vertex in geometry G.
-Zero allocations over packed float array storage."
-  (declare (type function fn))
-  (labels ((visit-vec (v)
-             (declare (type (simple-array double-float (*)) v))
-             (loop for i from 0 below (length v) by 2
-                   do (funcall fn (aref v i) (aref v (1+ i)))))
-           (visit-ring (r)
-             (cond
-               ((typep r '(simple-array double-float (*)))
-                (visit-vec r))
-               ((consp r)
-                (dolist (c r)
-                  (if (and (consp c) (numberp (first c)))
-                      (funcall fn (%df (first c)) (%df (second c)))
-                      (visit-ring c)))))))
-    (ecase (geometry-kind g)
-      (:point
-       (funcall fn (geometry-lon g) (geometry-lat g)))
-      (:linestring
-       (let ((c (geometry-coordinates g)))
-         (visit-ring c)))
-      (:polygon
-       (let ((rings (geometry-coordinates g)))
-         (dolist (r rings) (visit-ring r))))
-      (:multipolygon
-       (let ((polys (geometry-coordinates g)))
-         (dolist (p polys)
-           (dolist (r p) (visit-ring r))))))))
+Note: Passing coordinates across a dynamic funcall boundary boxes double-floats (~32 bytes/vertex).
+For zero-allocation vertex iteration, use DO-GEOMETRY-COORDINATES."
+  (declare (type (or function symbol) fn))
+  (do-geometry-coordinates (lon lat) g
+    (funcall fn lon lat)))
+
 
 (defun %vec->pairs (vec)
   "Convert a 1D double-float vector #(lon0 lat0 lon1 lat1 ...) to a list of (lon lat) double-float pairs."

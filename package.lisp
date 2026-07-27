@@ -270,6 +270,7 @@
            #:geometry-kind
            #:geometry-coordinates
            #:geometry-coordinate-pairs
+           #:do-geometry-coordinates
            #:map-geometry-coordinates
            #:geometry-lon
            #:geometry-lat

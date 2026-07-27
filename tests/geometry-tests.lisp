@@ -87,11 +87,42 @@
 
 
 (test map-geometry-coordinates-traversal
-  "map-geometry-coordinates visits all (lon lat) vertices with zero allocations."
+  "map-geometry-coordinates visits all (lon lat) vertices."
   (let ((poly (make-polygon '(((0 0) (4 0) (4 3) (0 3) (0 0)))))
         (collected '()))
     (map-geometry-coordinates (lambda (lon lat) (push (list lon lat) collected)) poly)
     (is (equalp '((0.0d0 0.0d0) (4.0d0 0.0d0) (4.0d0 3.0d0) (0.0d0 3.0d0) (0.0d0 0.0d0))
                 (nreverse collected)))))
+
+(test do-geometry-coordinates-macro
+  "do-geometry-coordinates inlines traversal with zero memory allocations (Issue #85)."
+  (let ((poly (make-polygon '(((0 0) (4 0) (4 3) (0 3) (0 0)))))
+        (collected '()))
+    (do-geometry-coordinates (lon lat) poly
+      (push (list lon lat) collected))
+    (is (equalp '((0.0d0 0.0d0) (4.0d0 0.0d0) (4.0d0 3.0d0) (0.0d0 3.0d0) (0.0d0 0.0d0))
+                (nreverse collected)))))
+
+(test do-geometry-coordinates-zero-allocation
+  "do-geometry-coordinates performs zero memory allocations over 2,261 vertices (Issue #85)."
+  (let* ((n 2261)
+         (ring (loop for i from 0 below n
+                     collect (list (+ 37d0 (* 0.5d0 (cos (* 2 pi (/ i n)))))
+                                   (+ 48d0 (* 0.5d0 (sin (* 2 pi (/ i n))))))))
+         (poly (make-polygon (list (append ring (list (first ring)))))))
+    (let ((c 0))
+      (declare (fixnum c))
+      (let ((before #+sbcl (sb-ext:get-bytes-consed) #-sbcl 0))
+        (dotimes (rep 10)
+          (do-geometry-coordinates (lon lat) poly
+            (declare (ignore lon lat))
+            (incf c)))
+        (let ((after #+sbcl (sb-ext:get-bytes-consed) #-sbcl 0))
+          (is (= (* 10 (1+ n)) c))
+          (is (= 0 (- after before)) "Expected 0 bytes consed, but consed ~:D bytes" (- after before)))))))
+
+
+
+
 
 
