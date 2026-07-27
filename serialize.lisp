@@ -265,7 +265,7 @@ BYTES is the payload only: a type byte followed by DIM*4 little-endian float32s.
 
 (defmethod serialize ((v vector))
   (cond
-    ((equal (array-element-type v) '(unsigned-byte 8))
+    ((typep v '(vector (unsigned-byte 8)))
      v)
     ;; TYPEP against the exact (simple-array single-float (*)) shape rather
     ;; than EQUAL or SUBTYPEP: EQUAL on the element type is spelled

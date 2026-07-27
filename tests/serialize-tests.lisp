@@ -226,22 +226,23 @@ not silently corrupt non-finite data: it refuses to store it at all."
   ;; does rather than picking one and failing the other.
   (let ((bv (make-array 3 :element-type '(unsigned-byte 8)
                           :initial-contents '(1 2 3))))
-    #+sbcl
     (is (eq bv (serialize bv))
-        "SBCL: (UNSIGNED-BYTE 8) blob pass-through returns the identical vector")
-    #+ecl
-    (is (equalp bv (deserialize (serialize bv)))
-        "ECL: EXT:BYTE8 vs (UNSIGNED-BYTE 8) under EQUAL (issue #52) sends the
-vector through the generic elementwise path instead, which still round-trips
-the values")
-    #+ecl
-    (is (not (eq bv (serialize bv)))
-        "ECL: unlike SBCL, this is not an identity pass-through")
-    ;; No silent pass on an implementation this test was never written against:
-    ;; without this branch, CCL/LispWorks (both supported per CLAUDE.md) would
-    ;; compile the #+sbcl/#+ecl forms above to nothing and this whole check
-    ;; would vanish rather than run -- the "form silently becomes empty"
-    ;; hazard CLAUDE.md calls out explicitly. Fail loudly instead, so a real
-    ;; assertion gets written for that implementation before it ships.
-    #-(or sbcl ecl)
-    (fail "byte-vector serialize behaviour unverified on this implementation")))
+        "(UNSIGNED-BYTE 8) blob pass-through returns the identical vector portably")))
+
+(test octet-vector-pass-through-caller-contracts
+  "Tests caller requirements for octet vector serialization across gen-vertex-id, gen-edge-id, and memory-graph."
+  (let ((v-id (graph-db::gen-vertex-id))
+        (e-id (graph-db::gen-edge-id))
+        (raw-blob (make-array 32 :element-type '(unsigned-byte 8) :initial-element 255)))
+    ;; Check vertex ID serialization returns identity byte vector
+    (is (typep (serialize v-id) '(vector (unsigned-byte 8))))
+    (is (eq v-id (serialize v-id)))
+    ;; Check edge ID serialization returns identity byte vector
+    (is (typep (serialize e-id) '(vector (unsigned-byte 8))))
+    (is (eq e-id (serialize e-id)))
+    ;; Check raw blob serialization returns identity byte vector
+    (is (typep (serialize raw-blob) '(vector (unsigned-byte 8))))
+    (is (eq raw-blob (serialize raw-blob)))))
+
+
+
