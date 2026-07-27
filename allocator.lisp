@@ -147,12 +147,13 @@
   (assert (typep data-size 'allocation-data-size))
   (let ((int (logior (ash data-size 1) (if active-p 1 0))))
     (serialize-uint64 mmap int allocation-offset)
-    ;; Zero out the next and previous offsets
-    (serialize-pointer mmap 0 (+ +allocation-header-size+
-                                 allocation-offset))
-    (serialize-pointer mmap 0 (+ +allocation-header-size+
-                                 +allocation-pointer-size+
-                                 allocation-offset)))
+    (unless active-p
+      ;; Zero out the next and previous offsets for free blocks
+      (serialize-pointer mmap 0 (+ +allocation-header-size+
+                                   allocation-offset))
+      (serialize-pointer mmap 0 (+ +allocation-header-size+
+                                   +allocation-pointer-size+
+                                   allocation-offset))))
   (+ +allocation-header-size+ allocation-offset))
 
 (defun allocation-free-p (memory allocation-offset)
