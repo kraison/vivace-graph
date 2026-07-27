@@ -368,3 +368,27 @@ close/reopen cycle."
                (is (every #'= v back)))
           (close-graph g :snapshot-p nil)))
       (collect-garbage))))
+
+(test octet-vector-slot-survives-close-and-reopen
+  "An (unsigned-byte 8) octet vector stored in a vertex slot reads back bit-exactly after a close/reopen cycle (issue #68)."
+  (with-temp-directory (dir)
+    (let ((bytes (make-array 6 :element-type '(unsigned-byte 8)
+                               :initial-contents '(#x41 #x42 #x43 #x44 #x45 #x46)))
+          (id nil))
+      (let ((g (make-graph *integration-graph-name* (namestring dir)
+                           :buffer-pool-size 1000)))
+        (let ((*graph* g))
+          (with-transaction ()
+            (setf id (id (make-g-embedded :payload bytes)))))
+        (close-graph g :snapshot-p nil))
+      (let ((g (open-graph *integration-graph-name* (namestring dir))))
+        (unwind-protect
+             (let* ((*graph* g)
+                    (back (slot-value (lookup-vertex id :graph g) 'payload)))
+               (is (typep back '(vector (unsigned-byte 8)))
+                   "reopened slot has type ~S" (type-of back))
+               (is (= 6 (length back)))
+               (is (equalp bytes back)))
+          (close-graph g :snapshot-p nil)))
+      (collect-garbage))))
+

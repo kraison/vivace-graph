@@ -3,6 +3,16 @@
 ;;(declaim (optimize (speed 3)))
 
 (defgeneric serialize (object))
+(defgeneric serialize-raw-bytes (object))
+
+(defmethod serialize-raw-bytes (object)
+  (serialize object))
+
+(defmethod serialize-raw-bytes ((v vector))
+  (if (typep v '(vector (unsigned-byte 8)))
+      v
+      (serialize v)))
+
 (defgeneric deserialize-help (become object))
 (defgeneric deserialize-help-mmap (become object length header-length))
 (defgeneric make-serialized-key (object))
@@ -184,7 +194,7 @@
 
 (defmethod make-slot-key (id slot-name)
   (if (symbolp slot-name) (setq slot-name (symbol-name slot-name)))
-  (let* ((serialized-id (serialize id))
+  (let* ((serialized-id (serialize-raw-bytes id))
          (serialized-slot-name (serialize slot-name))
          (total-length (+ (length serialized-id) (length serialized-slot-name))))
     (declare (type fixnum total-length))
@@ -263,10 +273,33 @@ BYTES is the payload only: a type byte followed by DIM*4 little-endian float32s.
             (setf bits (dpb (aref bytes (+ off b)) (byte 8 (* b 8)) bits)))
           (setf (aref v i) (ieee-floats:decode-float32 bits)))))))
 
+(defun %serialize-octet-vector (v)
+  "Encode V, a (vector (unsigned-byte 8)), as a tagged +blob+ object:
+tag byte (+blob+ = 13), encoded length, followed by the octet payload."
+  (declare (type (vector (unsigned-byte 8)) v))
+  (let* ((payload-length (length v))
+         (encoded-length (encode-length payload-length))
+         (l-of-l (length encoded-length))
+         (vec (make-array (+ 1 l-of-l payload-length)
+                          :element-type '(unsigned-byte 8))))
+    (setf (aref vec 0) +blob+)
+    (dotimes (i l-of-l)
+      (setf (aref vec (1+ i)) (aref encoded-length i)))
+    (dotimes (i payload-length)
+      (setf (aref vec (+ 1 l-of-l i)) (aref v i)))
+    vec))
+
+(defmethod deserialize-help ((become (eql +blob+)) (bytes array))
+  "Decode uninterpreted octets (+blob+)."
+  (declare (type (array (unsigned-byte 8)) bytes))
+  (let ((copy (make-array (length bytes) :element-type '(unsigned-byte 8))))
+    (replace copy bytes)
+    copy))
+
 (defmethod serialize ((v vector))
   (cond
     ((typep v '(vector (unsigned-byte 8)))
-     v)
+     (%serialize-octet-vector v))
     ;; TYPEP against the exact (simple-array single-float (*)) shape rather
     ;; than EQUAL or SUBTYPEP: EQUAL on the element type is spelled
     ;; differently across implementations (so a T-vector wouldn't reliably

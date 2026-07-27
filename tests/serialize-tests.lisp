@@ -198,51 +198,28 @@ not silently corrupt non-finite data: it refuses to store it at all."
   "Non-single-float vectors still take their existing paths."
   (let ((tv (vector 1 "two" :three)))
     (is (equalp tv (deserialized tv))))
-  ;; A (unsigned-byte 8) vector is intended to be a pass-through blob rather
-  ;; than round-tripped through SERIALIZE/DESERIALIZE: SERIALIZE's dispatch
-  ;; tests (EQUAL (ARRAY-ELEMENT-TYPE v) '(UNSIGNED-BYTE 8)) and, on a match,
-  ;; returns the vector unchanged (EQ, not a copy) -- it has no tag/length
-  ;; header of its own, so DESERIALIZE cannot be called on it directly. Two
-  ;; call sites depend on this identity behaviour on SBCL: memory-graph.lisp:
-  ;; 472-485 (NI-VAL/RI-VAL) stores byte arrays raw under its own tag rather
-  ;; than routing them through SERIALIZE's header format, and edge.lisp:225
-  ;; serializes already-byte data and writes the (identical) result straight
-  ;; to the heap. There is no wrapped-blob codec to round-trip against:
-  ;; +blob+ (globals.lisp) has no encoder or decoder anywhere in the codebase.
-  ;;
-  ;; This dispatch is implementation-divergent, tracked as
-  ;; https://github.com/kraison/vivace-graph/issues/52 and NOT fixed here
-  ;; (fixing it means changing SERIALIZE's semantics, out of scope for this
-  ;; plan). On SBCL, (ARRAY-ELEMENT-TYPE bv) is the list (UNSIGNED-BYTE 8),
-  ;; so EQUAL matches and the pass-through fires. On ECL, the upgraded
-  ;; element type of a (UNSIGNED-BYTE 8) array is the symbol EXT:BYTE8, which
-  ;; is not EQUAL to the list '(UNSIGNED-BYTE 8) -- the pass-through branch
-  ;; never fires, and the vector instead falls through to the generic
-  ;; elementwise branch (the same one that handles the T-vector above). That
-  ;; branch does tag/frame its output, so on ECL the byte vector DOES survive
-  ;; a SERIALIZE/DESERIALIZE round trip (as a generic vector, not EQ and not
-  ;; the original (UNSIGNED-BYTE 8) array type) -- the opposite contract from
-  ;; SBCL for the identical input. Assert what each implementation actually
-  ;; does rather than picking one and failing the other.
+  ;; An octet vector serializes as a tagged +blob+ object, round-tripping through
+  ;; SERIALIZE/DESERIALIZE to an equivalent (vector (unsigned-byte 8)).
   (let ((bv (make-array 3 :element-type '(unsigned-byte 8)
                           :initial-contents '(1 2 3))))
-    (is (eq bv (serialize bv))
-        "(UNSIGNED-BYTE 8) blob pass-through returns the identical vector portably")))
+    (is (equalp bv (deserialized bv))
+        "(UNSIGNED-BYTE 8) octet vector round-trips through serialize/deserialize")))
 
-(test octet-vector-pass-through-caller-contracts
-  "Tests caller requirements for octet vector serialization across gen-vertex-id, gen-edge-id, and memory-graph."
+(test octet-vector-raw-bytes-and-node-slot-contracts
+  "Tests caller requirements for octet vector serialization across gen-vertex-id, gen-edge-id, and raw bytes pass-through."
   (let ((v-id (graph-db::gen-vertex-id))
         (e-id (graph-db::gen-edge-id))
         (raw-blob (make-array 32 :element-type '(unsigned-byte 8) :initial-element 255)))
-    ;; Check vertex ID serialization returns identity byte vector
-    (is (typep (serialize v-id) '(vector (unsigned-byte 8))))
-    (is (eq v-id (serialize v-id)))
-    ;; Check edge ID serialization returns identity byte vector
-    (is (typep (serialize e-id) '(vector (unsigned-byte 8))))
-    (is (eq e-id (serialize e-id)))
-    ;; Check raw blob serialization returns identity byte vector
-    (is (typep (serialize raw-blob) '(vector (unsigned-byte 8))))
-    (is (eq raw-blob (serialize raw-blob)))))
+    ;; Check vertex ID raw bytes serialization returns identity byte vector
+    (is (typep (graph-db::serialize-raw-bytes v-id) '(vector (unsigned-byte 8))))
+    (is (eq v-id (graph-db::serialize-raw-bytes v-id)))
+    ;; Check edge ID raw bytes serialization returns identity byte vector
+    (is (typep (graph-db::serialize-raw-bytes e-id) '(vector (unsigned-byte 8))))
+    (is (eq e-id (graph-db::serialize-raw-bytes e-id)))
+    ;; Check raw blob serialization returns identity byte vector via serialize-raw-bytes
+    (is (typep (graph-db::serialize-raw-bytes raw-blob) '(vector (unsigned-byte 8))))
+    (is (eq raw-blob (graph-db::serialize-raw-bytes raw-blob)))))
+
 
 
 
