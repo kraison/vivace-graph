@@ -1345,3 +1345,35 @@ user-visible property: the recovery path yields a correct, queryable spatial ind
                      "the coarse geometry is findable after recovery")))
           (ignore-errors (close-graph g2 :snapshot-p nil))
           (collect-garbage))))))
+
+(def-vertex scope-custom-cap ()
+  ((extent :type geometry :index t :spatial-max-cells 64))
+  :graph-db-integration-test)
+
+(test spatial-max-cells-slot-option-and-graph-default
+  "Tests +spatial-insert-max-cells+ default of 256, the :spatial-max-cells slot option, and make-graph :spatial-max-cells keyword."
+  (is (= 256 graph-db::+spatial-insert-max-cells+))
+  (with-temp-directory (dir)
+    (ensure-directories-exist dir)
+    (let ((g (make-graph *integration-graph-name* (namestring dir)
+                         :spatial-max-cells 512
+                         :buffer-pool-size 1000)))
+      (unwind-protect
+           (let ((*graph* g))
+             (is (= 512 (graph-default-spatial-max-cells g)))
+             (with-transaction ()
+               (make-scope-site :where (make-point 37.1724d0 49.2020d0))
+               (make-scope-custom-cap :extent (make-point 37.1730d0 49.2025d0)))
+             (let ((site-idx (spatial-index-for g 'scope-site nil))
+                   (cap-idx (spatial-index-for g 'scope-custom-cap 'extent)))
+
+               (is (spatial-index-p site-idx))
+               (is (spatial-index-p cap-idx))
+               (is (= 512 (spatial-index-max-cells site-idx))
+                   "un-declared slot gets graph default max-cells")
+               (is (= 64 (spatial-index-max-cells cap-idx))
+                   "declared slot gets :spatial-max-cells slot option")))
+        (close-graph g :snapshot-p nil))
+      (collect-garbage))))
+
+

@@ -24,7 +24,7 @@
 ;; index and PERSISTED (graph.lisp), never a mutable global: SPATIAL-INDEX-REMOVE
 ;; recomputes cells from the geometry, so a cap that drifted between an insert and
 ;; its matching remove would orphan entries permanently.
-(alexandria:define-constant +spatial-insert-max-cells+ 16384 :test '=)
+(alexandria:define-constant +spatial-insert-max-cells+ 256 :test '=)
 
 (defstruct (spatial-index (:constructor %make-spatial-index) (:predicate spatial-index-p))
   skip-list

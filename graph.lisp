@@ -278,6 +278,7 @@ debugging an unexpectedly empty result, check the declaration before the data."
                                    (index-size *default-index-size*)
                                    (keep-revisions 0)
                                    (spatial-precision 7)
+                                   (spatial-max-cells +spatial-insert-max-cells+)
                                    replication-filter
                                    peer-role origin-id peer-host
                                    export-predicate device-registry merge-policy
@@ -396,6 +397,7 @@ to disk and remove it."
         (setf (schema-keep-revisions (schema graph)) keep-revisions)
         (update-schema graph)
         (setf (graph-default-spatial-precision graph) (or spatial-precision 7))
+        (setf (graph-default-spatial-max-cells graph) (or spatial-max-cells +spatial-insert-max-cells+))
         ;; REBUILD-SPATIAL-INDEXES persists the (empty, on a fresh graph) sidecar
         ;; itself once it finishes; a trailing save here would just be a redundant
         ;; duplicate of the exact same state.
@@ -458,7 +460,8 @@ to disk and remove it."
                    ;; reopen at their own persisted precision from the v3 sidecar,
                    ;; so this governs only indexes created after the open -- and,
                    ;; for a pre-v3 graph, the ones its migration re-derives.
-                   (spatial-precision 7))
+                   (spatial-precision 7)
+                   (spatial-max-cells +spatial-insert-max-cells+))
   "Open the existing graph named NAME whose files live under directory
 LOCATION, register it, and return it.  Use this to reopen a graph created
 earlier with MAKE-GRAPH; the keyword arguments mirror MAKE-GRAPH's.
@@ -552,6 +555,7 @@ Always CLOSE-GRAPH when finished."
         (when regenerate-views
           (regenerate-all-views graph))
         (setf (graph-default-spatial-precision graph) (or spatial-precision 7))
+        (setf (graph-default-spatial-max-cells graph) (or spatial-max-cells +spatial-insert-max-cells+))
         ;; Spatial indexes: reopen from the v3 sidecar by root address (no node
         ;; scan, and -- critically -- no fresh allocation orphaning last run's
         ;; ordered maps in a region GC-HEAP never sweeps).

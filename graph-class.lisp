@@ -49,6 +49,10 @@
    ;; layered on top; see spatial-registry.lisp.
    (default-spatial-precision :accessor graph-default-spatial-precision
                               :initarg :default-spatial-precision :initform 7)
+   ;; Default max cells cap for spatial indexes created on this graph
+   ;; (MAKE-GRAPH / OPEN-GRAPH :spatial-max-cells).
+   (default-spatial-max-cells :accessor graph-default-spatial-max-cells
+                              :initarg :default-spatial-max-cells :initform +spatial-insert-max-cells+)
    ;; Which ordered-map backend NEW heap-backed indexes (views, :unique, spatial)
    ;; on THIS graph are built with: :SKIP-LIST or :BPLUS-TREE.  Defaults to the
    ;; global *INDEX-BACKEND* at creation; overridable per graph via MAKE-GRAPH /

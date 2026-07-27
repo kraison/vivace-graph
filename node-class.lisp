@@ -28,6 +28,10 @@
    ;; is deliberately no per-index macro); see %SPATIAL-PRECISION-FOR /
    ;; %DECLARED-SPATIAL-PRECISION in spatial-registry.lisp for how it resolves.
    (spatial-precision :accessor spatial-precision-spec :initarg :spatial-precision
+                      :initform nil :allocation :instance)
+   ;; Max cells cap for this geometry slot's spatial index, or NIL for the graph
+   ;; default.  Declared via the :SPATIAL-MAX-CELLS slot option.
+   (spatial-max-cells :accessor spatial-max-cells-spec :initarg :spatial-max-cells
                       :initform nil :allocation :instance)))
 
 (defmethod persistent-p (slot-def)
@@ -46,6 +50,9 @@
   nil)
 
 (defmethod spatial-precision-spec (slot-def)
+  nil)
+
+(defmethod spatial-max-cells-spec (slot-def)
   nil)
 
 (defmethod ephemeral-p (slot-def)
@@ -155,6 +162,12 @@
         (setf (slot-value slot 'spatial-precision)
               (or (spatial-precision-spec slot)
                   (and sp (spatial-precision-spec sp))))))
+    ;; Inherit :SPATIAL-MAX-CELLS from the declaring direct slot.
+    (let ((smc (find-if #'spatial-max-cells-spec direct-slots)))
+      (when (or (spatial-max-cells-spec slot) smc)
+        (setf (slot-value slot 'spatial-max-cells)
+              (or (spatial-max-cells-spec slot)
+                  (and smc (spatial-max-cells-spec smc))))))
     slot))
 
 (defun %indexed-slot-owner-name (class slot-name)

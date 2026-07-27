@@ -56,6 +56,7 @@
                 #:all-spatial-indexes
                 #:class-spatial-index-keys
                 #:graph-default-spatial-precision
+                #:graph-default-spatial-max-cells
                 #:node-geometry            ; write-path indexing protocol
                 #:make-spatial-index
                 #:open-spatial-index
@@ -76,8 +77,10 @@
                 ;; §8: the inert second geometry slot (exhaustive read-only sweep)
                 #:audit-spatial-slots
                 #:node-geometry-slots-with-values
-                ;; the declaration surface for a spatial index's grid precision
+                ;; the declaration surface for a spatial index's grid precision and max-cells
                 #:spatial-precision-spec
+                #:spatial-max-cells-spec
+
                 ;; index-backed spatial queries (spatial extension)
                 #:find-nodes-within
                 #:find-nodes-intersecting

@@ -313,6 +313,9 @@
            #:all-spatial-indexes
            #:class-spatial-index-keys
            #:graph-default-spatial-precision
+           #:graph-default-spatial-max-cells
+           #:spatial-precision-spec
+           #:spatial-max-cells-spec
            #:spatial-index-p
            #:make-spatial-index
            #:open-spatial-index

@@ -91,17 +91,41 @@ Precedence: the :SPATIAL-PRECISION slot option, then GRAPH's default, then 7."
       (graph-default-spatial-precision graph)
       7))
 
-(defgeneric make-graph-spatial-index (graph &key precision)
-  (:documentation "Create ONE spatial index for GRAPH at PRECISION.  A normal graph
+(defun %check-spatial-max-cells (max-cells owner-name slot-name)
+  (unless (and (integerp max-cells) (>= max-cells 1))
+    (error "Invalid :spatial-max-cells ~S declared for ~A . ~A: must be a positive integer"
+           max-cells owner-name slot-name))
+  max-cells)
+
+(defun %declared-spatial-max-cells (owner-name slot-name)
+  "The max-cells cap EXPLICITLY declared for (OWNER-NAME . SLOT-NAME) by the
+:SPATIAL-MAX-CELLS slot option, or NIL when the slot declares none."
+  (let ((class (ignore-errors (find-class owner-name nil))))
+    (when (and class (class-finalized-p class))
+      (let* ((slot (find slot-name (class-slots class) :key #'slot-definition-name))
+             (max-cells (and slot (spatial-max-cells-spec slot))))
+        (when max-cells
+          (%check-spatial-max-cells max-cells owner-name slot-name))))))
+
+(defun %spatial-max-cells-for (graph owner-name slot-name)
+  "The max-cells cap (OWNER-NAME . SLOT-NAME)'s index is created with.
+Precedence: the :SPATIAL-MAX-CELLS slot option, then GRAPH's default, then +spatial-insert-max-cells+ (256)."
+  (or (%declared-spatial-max-cells owner-name slot-name)
+      (graph-default-spatial-max-cells graph)
+      +spatial-insert-max-cells+))
+
+(defgeneric make-graph-spatial-index (graph &key precision max-cells)
+  (:documentation "Create ONE spatial index for GRAPH at PRECISION and MAX-CELLS.  A normal graph
 gets a heap-backed ordered map in its INDEXES memory, following the graph's chosen
 :INDEX-BACKEND; a memory-graph overrides this to return an in-RAM mem-skip-list
 index.  The same seam MAKE-VIEW-SKIP-LIST provides for views -- it is what lets
 %SPATIAL-INDEX-FOR be the ONE creation site for both backends.")
-  (:method ((graph graph) &key (precision 7))
+  (:method ((graph graph) &key (precision 7) (max-cells +spatial-insert-max-cells+))
     (make-spatial-index (indexes graph) :precision precision
+                                        :max-cells max-cells
                                         :backend (graph-index-backend graph)))
-  (:method ((graph memory-graph-mixin) &key (precision 7))
-    (make-mem-spatial-index :precision precision)))
+  (:method ((graph memory-graph-mixin) &key (precision 7) (max-cells +spatial-insert-max-cells+))
+    (make-mem-spatial-index :precision precision :max-cells max-cells)))
 
 (defun %spatial-index-for (graph owner-name slot-name)
   "Get-or-create GRAPH's spatial index for (OWNER-NAME . SLOT-NAME).  This is the
@@ -123,9 +147,11 @@ sidecar naming fewer indexes than exist)."
     (or (gethash key reg)
         (let ((idx (make-graph-spatial-index
                     graph
-                    :precision (%spatial-precision-for graph owner-name slot-name))))
+                    :precision (%spatial-precision-for graph owner-name slot-name)
+                    :max-cells (%spatial-max-cells-for graph owner-name slot-name))))
           (setf (gethash key reg) idx)
           idx))))
+
 
 (defun all-spatial-indexes (graph)
   "Every spatial index GRAPH currently holds."

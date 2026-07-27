@@ -467,6 +467,8 @@ Example:
 
 (defmethod instantiate-node-type ((meta node-type) (graph graph))
   (with-recursive-lock-held ((schema-lock (schema graph)))
+    (let ((cl (find-class (node-type-name meta) nil)))
+      (when cl (remhash cl *node-geometry-slot-cache*)))
     ;; Check if this type exists and if it differs from old spec
     (log:debug "Looking up ~A: ~A ~A" meta (node-type-name meta) (node-type-parent-type meta))
     (let ((old-meta (lookup-node-type-by-name (node-type-name meta)
@@ -493,6 +495,7 @@ Example:
                   (get-next-type-id (schema graph)
                                     (node-type-parent-type meta)))
             (update-node-type meta graph))))))
+
 
 (defmethod update-schema ((graph-name symbol))
   (let ((graph (lookup-graph graph-name)))

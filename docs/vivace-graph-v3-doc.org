@@ -1929,13 +1929,14 @@ Here is a second spatial type, so the query examples below have two classes to s
     :survey-app)
 #+END_SRC
 
-*Per-index grid precision.* A geometry slot may set its index's geohash precision with the ~:spatial-precision~ slot option; without it the index uses the graph default (7, ≈150 m cells — set the graph-wide default with ~make-graph~'s ~:spatial-precision~ keyword). Coarser grids suit large areas (country-scale zone polygons), finer grids suit dense points. This slot option is the /only/ precision-declaration surface — there is no separate per-index declaration macro. Changing a declared precision re-grids that one index automatically the next time the graph is opened (a mixed-precision index would otherwise miss on query); the rebuild is bounded to that class's nodes.
+*Per-index grid precision and max-cells cap.* A geometry slot may set its index's geohash precision with the ~:spatial-precision~ slot option (default 7, ≈150 m cells — set graph default via ~make-graph~'s ~:spatial-precision~) and its max-cells cap with the ~:spatial-max-cells~ slot option (default 256 — set graph default via ~make-graph~'s ~:spatial-max-cells~). Coarser grids and lower cell caps suit large area geometries, while finer grids suit dense point data. Changing a declared precision re-grids that one index automatically the next time the graph is opened.
 
 #+BEGIN_SRC lisp
   (def-vertex zone ()
-    ((extent :type geometry :index t :spatial-precision 3))  ; coarse grid for big polygons
+    ((extent :type geometry :index t :spatial-precision 3 :spatial-max-cells 64))  ; coarse grid for big polygons
     :survey-app)
 #+END_SRC
+
 
 *One geometry slot per node is indexed.* A node is indexed by the /first/ geometry-valued indexed slot ~node-geometry~ finds; a second geometry-valued indexed slot on the same class is silently /inert/. Because the effective geometry is decided by value at write time (the ~:type geometry~ declaration cannot be compared reliably across application packages), VivaceGraph reports this by value rather than by declaration: a class whose nodes bind two geometry slots triggers a ~warn~ on the write path — naming the class, the geometry slots found, and which one wins — sampled over the class's first 64 nodes, so it costs nothing steady-state. ~audit-spatial-slots~ (graph) is the exhaustive, read-only counterpart: it sweeps every live node and reports every such class with its winning and inert slots — the thing to run after a migration or wire into a schema test suite.
 
@@ -2570,12 +2571,12 @@ This chapter provides a categorized reference for the most important exported sy
 - ~node-geometry (node)~ ::
   Generic function (default ~nil~) returning the geometry a node occupies /and/ the slot it came from, as ~(values geometry slot-name)~. Marking a geometry slot ~:index t~ wires its default up automatically; specialize it explicitly only for a *computed* geometry (such a method reports no slot, and its class is indexed — and scoped — under the most general class carrying the method). Geometry-bearing nodes are then maintained automatically in the spatial index.
 
-- ~(slot :type geometry :index t :spatial-precision N)~ (slot options) ::
-  ~:index t~ opts a geometry slot into spatial indexing; the optional
-  ~:spatial-precision N~ sets /that/ index's geohash grid precision (else the
-  graph default — ~make-graph~'s ~:spatial-precision~, default 7). This is the
-  only precision-declaration surface; there is no separate declaration macro.
-  Changing a declared precision re-grids that one index at the next ~open-graph~.
+- ~(slot :type geometry :index t :spatial-precision N :spatial-max-cells M)~ (slot options) ::
+  ~:index t~ opts a geometry slot into spatial indexing; optional
+  ~:spatial-precision N~ sets that index's geohash grid precision (default 7);
+  optional ~:spatial-max-cells M~ sets that index's max-cells cap (default 256).
+  Graph-wide defaults are set via ~make-graph~'s ~:spatial-precision~ and ~:spatial-max-cells~.
+
 
 - *scope* (first argument to every query below) ::
   A node-class name, a list of node-class names, or ~:all~. Selects which per-class spatial indexes are scanned /and/ filters the results by type. Signals when it names a class that is not spatially indexed; returns ~nil~ for a class whose index is simply empty.
