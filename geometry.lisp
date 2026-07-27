@@ -21,7 +21,7 @@
 
 (defstruct (geometry (:constructor %make-geometry) (:predicate geometryp))
   (kind :point :type symbol)
-  (coordinates nil :type list))
+  coordinates)
 
 (defparameter +geometry-kinds+ '(:point :linestring :polygon :multipolygon)
   "Ordered list; a geometry's KIND is serialized as its position here.")
@@ -39,33 +39,71 @@
   "Coerce X to DOUBLE-FLOAT (all stored coordinates are double-floats)."
   (coerce x 'double-float))
 
-(defun %coord (c)
-  "Normalize a single (lon lat) coordinate to a list of two double-floats."
-  (list (%df (first c)) (%df (second c))))
+(defun %coord-vec (coords)
+  "Convert COORDS (a list of (lon lat) pairs, or a packed double-float array) into a packed (simple-array double-float (*)) array."
+  (cond
+    ((typep coords '(simple-array double-float (*)))
+     coords)
+    ((consp coords)
+     (let* ((n (length coords))
+            (vec (make-array (* 2 n) :element-type 'double-float)))
+       (loop for c in coords
+             for idx from 0 by 2
+             do (setf (aref vec idx) (%df (first c))
+                      (aref vec (1+ idx)) (%df (second c))))
+       vec))
+    ((vectorp coords)
+     (let* ((len (length coords))
+            (vec (make-array len :element-type 'double-float)))
+       (dotimes (i len)
+         (setf (aref vec i) (%df (aref coords i))))
+       vec))
+    (t (make-array 0 :element-type 'double-float))))
 
-(defun %ring (ring)
-  (mapcar #'%coord ring))
+(defun %normalize-coordinates (kind coordinates)
+  "Ensure COORDINATES for KIND use packed double-float arrays."
+  (ecase kind
+    (:point
+     (cond
+       ((typep coordinates '(simple-array double-float (*)))
+        coordinates)
+       ((consp coordinates)
+        (make-array 2 :element-type 'double-float
+                      :initial-contents (list (%df (first coordinates)) (%df (second coordinates)))))
+       (t coordinates)))
+    (:linestring
+     (%coord-vec coordinates))
+    (:polygon
+     (if (consp coordinates)
+         (mapcar #'%coord-vec coordinates)
+         coordinates))
+    (:multipolygon
+     (if (consp coordinates)
+         (mapcar (lambda (p) (if (consp p) (mapcar #'%coord-vec p) p)) coordinates)
+         coordinates))))
 
 ;;; -------------------------------------------------------------------------
 ;;; Constructors
 ;;; -------------------------------------------------------------------------
 
 (defun make-point (lon lat)
-  (%make-geometry :kind :point :coordinates (list (%df lon) (%df lat))))
+  (let ((vec (make-array 2 :element-type 'double-float)))
+    (setf (aref vec 0) (%df lon)
+          (aref vec 1) (%df lat))
+    (%make-geometry :kind :point :coordinates vec)))
 
 (defun make-linestring (coords)
-  "COORDS: a list of (lon lat)."
-  (%make-geometry :kind :linestring :coordinates (mapcar #'%coord coords)))
+  "COORDS: a list of (lon lat) or a packed double-float array."
+  (%make-geometry :kind :linestring :coordinates (%coord-vec coords)))
 
 (defun make-polygon (rings)
-  "RINGS: a list of rings, each a list of (lon lat).  First ring is the exterior
-boundary; subsequent rings are holes."
-  (%make-geometry :kind :polygon :coordinates (mapcar #'%ring rings)))
+  "RINGS: a list of rings, each a list of (lon lat) or a packed double-float array."
+  (%make-geometry :kind :polygon :coordinates (mapcar #'%coord-vec rings)))
 
 (defun make-multipolygon (polygons)
   "POLYGONS: a list of polygons, each a list of rings."
   (%make-geometry :kind :multipolygon
-                  :coordinates (mapcar (lambda (p) (mapcar #'%ring p)) polygons)))
+                  :coordinates (mapcar (lambda (p) (mapcar #'%coord-vec p)) polygons)))
 
 ;;; -------------------------------------------------------------------------
 ;;; Accessors
@@ -73,11 +111,17 @@ boundary; subsequent rings are holes."
 
 (defun geometry-lon (g)
   "Longitude of a :POINT geometry."
-  (first (geometry-coordinates g)))
+  (let ((c (geometry-coordinates g)))
+    (if (arrayp c)
+        (aref c 0)
+        (%df (first c)))))
 
 (defun geometry-lat (g)
   "Latitude of a :POINT geometry."
-  (second (geometry-coordinates g)))
+  (let ((c (geometry-coordinates g)))
+    (if (arrayp c)
+        (aref c 1)
+        (%df (second c)))))
 
 (defun geometry-bbox (g)
   "Axis-aligned bounding box of G as (values min-lon min-lat max-lon max-lat)."
@@ -87,15 +131,22 @@ boundary; subsequent rings are holes."
                (when (or (null max-lon) (> lon max-lon)) (setf max-lon lon))
                (when (or (null min-lat) (< lat min-lat)) (setf min-lat lat))
                (when (or (null max-lat) (> lat max-lat)) (setf max-lat lat)))
-             (walk (x)
-               ;; X is either a (lon lat) pair or a nesting of such.
-               (if (and (consp x) (numberp (first x)) (numberp (second x))
-                        (not (consp (first x))))
-                   (visit (first x) (second x))
-                   (mapc #'walk x))))
+             (walk-ring (r)
+               (cond
+                 ((typep r '(simple-array double-float (*)))
+                  (loop for i from 0 below (length r) by 2
+                        do (visit (aref r i) (aref r (1+ i)))))
+                 ((consp r)
+                  (dolist (c r)
+                    (if (and (consp c) (numberp (first c)))
+                        (visit (%df (first c)) (%df (second c)))
+                        (walk-ring c)))))))
       (if (eq (geometry-kind g) :point)
           (visit (geometry-lon g) (geometry-lat g))
-          (walk (geometry-coordinates g)))
+          (let ((coords (geometry-coordinates g)))
+            (if (consp coords)
+                (dolist (item coords) (walk-ring item))
+                (walk-ring coords))))
       (values min-lon min-lat max-lon max-lat))))
 
 ;;; -------------------------------------------------------------------------
@@ -109,9 +160,12 @@ boundary; subsequent rings are holes."
 
 (defmethod deserialize-help ((become (eql +geometry+)) (bytes array))
   (declare (type (array (unsigned-byte 8)) bytes))
-  (let ((parts (extract-all-subseqs bytes)))
-    (%make-geometry :kind (geometry-code-kind (deserialize (first parts)))
-                    :coordinates (deserialize (second parts)))))
+  (let* ((parts (extract-all-subseqs bytes))
+         (kind (geometry-code-kind (deserialize (first parts))))
+         (raw-coords (deserialize (second parts))))
+    (%make-geometry :kind kind
+                    :coordinates (%normalize-coordinates kind raw-coords))))
+
 
 (defmethod deserialize-help-mmap ((become (eql +geometry+)) (p mpointer)
                                   n-bytes header-length)

@@ -135,6 +135,9 @@ maintenance, queries). Merged into `experiment`; full suite green on SBCL
 - [x] `make-graph :spatial-precision` and `:spatial-max-cells` keywords (persisted; read back by `open-graph`).
 - [x] Per-index `:spatial-max-cells` slot option and `make-graph :spatial-max-cells` keyword added (issue #80). Global `+spatial-insert-max-cells+` default retained at 16384 for backwards compatibility.
 - [x] Per-index `:spatial-max-cells` slot option added to `def-vertex` slot specs.
+- [x] Issue #79 Fix #1: Direct GEOS C API geometry construction without WKT text round-trip (~27x speedup, predicate time reduced from 4.64ms to 0.17ms on 2.2k vertex geometries).
+- [x] Issue #79 Fix #2: Packed coordinate array storage (`simple-array double-float (*)`). Reduces memory footprint by 3-4x and enables zero-consing bounding box and point-in-polygon operations. Full backward compatibility preserved for reading legacy nested list serializations from disk.
 - [x] Chapter 13 caveat fixes: corrected the "prefix range scans" description
       (queries do same-precision exact-cell lookups) and the precision/max-cells config claims.
+
 

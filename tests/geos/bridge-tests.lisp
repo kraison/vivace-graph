@@ -11,10 +11,21 @@
 ;;; ---- coordinate comparison ---------------------------------------------
 
 (defun coords-approx-equal (a b &optional (eps 1d-9))
-  "Recursively compare two coordinate structures (numbers or nested lists)."
+  "Recursively compare two coordinate structures (numbers, vectors, or nested lists)."
   (cond ((and (numberp a) (numberp b)) (<= (abs (- a b)) eps))
+        ((and (typep a '(simple-array double-float (*))) (consp b))
+         (let ((n (/ (length a) 2)))
+           (and (= n (length b))
+                (loop for i from 0 below n
+                      for c in b
+                      always (and (<= (abs (- (aref a (* 2 i)) (first c))) eps)
+                                  (<= (abs (- (aref a (1+ (* 2 i))) (second c))) eps))))))
+        ((and (consp a) (typep b '(simple-array double-float (*))))
+         (coords-approx-equal b a eps))
+        ((and (typep a 'sequence) (typep b 'sequence) (= (length a) (length b)))
+         (every (lambda (x y) (coords-approx-equal x y eps)) a b))
         ((and (listp a) (listp b) (= (length a) (length b)))
-         (every #'coords-approx-equal a b))
+         (every (lambda (x y) (coords-approx-equal x y eps)) a b))
         (t nil)))
 
 (defun geom-approx-equal (a b)
@@ -57,9 +68,15 @@ inverses), independent of GEOS."
   (let* ((open (make-polygon '(((0d0 0d0) (4d0 0d0) (4d0 4d0) (0d0 4d0)))))  ; not closed
          (parsed (wkt->geometry (geometry->wkt open)))
          (ring (first (geometry-coordinates parsed))))
-    (is (coords-approx-equal (first ring) (car (last ring)))
-        "ring not closed: ~A" ring)
-    (is (= 5 (length ring)) "expected 5 vertices after closure, got ~D" (length ring))))
+    (let ((n-verts (if (arrayp ring) (/ (length ring) 2) (length ring)))
+          (first-x (if (arrayp ring) (aref ring 0) (first (first ring))))
+          (first-y (if (arrayp ring) (aref ring 1) (second (first ring))))
+          (last-x (if (arrayp ring) (aref ring (- (length ring) 2)) (first (car (last ring)))))
+          (last-y (if (arrayp ring) (aref ring (- (length ring) 1)) (second (car (last ring))))))
+      (is (and (= first-x last-x) (= first-y last-y)) "ring not closed: ~A" ring)
+      (is (= 5 n-verts) "expected 5 vertices after closure, got ~D" n-verts))))
+
+
 
 ;;; ---- GEOS round-trip (writer/reader through libgeos) -------------------
 

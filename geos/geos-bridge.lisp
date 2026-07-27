@@ -26,20 +26,52 @@ string back yields the same double; trailing zeros are trimmed for tidiness."
         (setf s (concatenate 'string s "0"))))
     s))
 
+(defun %coord-x (c)
+  (if (arrayp c) (aref c 0) (coerce (first c) 'double-float)))
+
+(defun %coord-y (c)
+  (if (arrayp c) (aref c 1) (coerce (second c) 'double-float)))
+
 (defun %coord->wkt (c)
-  "C is a (lon lat) pair -> \"lon lat\"."
-  (concatenate 'string (%wkt-num (first c)) " " (%wkt-num (second c))))
+  "C is a (lon lat) pair or 2-element array -> \"lon lat\"."
+  (concatenate 'string (%wkt-num (%coord-x c)) " " (%wkt-num (%coord-y c))))
 
 (defun %close-ring (ring)
   "Ensure RING's first and last vertices coincide (WKT requires closed rings)."
-  (if (and ring (rest ring)
-           (let ((f (first ring)) (l (car (last ring))))
-             (and (= (first f) (first l)) (= (second f) (second l)))))
+  (if (typep ring '(simple-array double-float (*)))
       ring
-      (append ring (list (first ring)))))
+      (if (and ring (rest ring)
+               (let ((f (first ring)) (l (car (last ring))))
+                 (and (= (first f) (first l)) (= (second f) (second l)))))
+          ring
+          (append ring (list (first ring))))))
 
 (defun %ring->wkt (ring)
-  (format nil "(~{~A~^, ~})" (mapcar #'%coord->wkt (%close-ring ring))))
+  (if (typep ring '(simple-array double-float (*)))
+      (let* ((len2 (length ring))
+             (n (/ len2 2))
+             (need-close (and (> n 0)
+                              (or (/= (aref ring 0) (aref ring (- len2 2)))
+                                  (/= (aref ring 1) (aref ring (- len2 1))))))
+             (parts '()))
+        (loop for i from 0 below n
+              for idx2 = (* 2 i)
+              do (push (concatenate 'string (%wkt-num (aref ring idx2)) " " (%wkt-num (aref ring (1+ idx2)))) parts))
+        (when need-close
+          (push (concatenate 'string (%wkt-num (aref ring 0)) " " (%wkt-num (aref ring 1))) parts))
+        (format nil "(~{~A~^, ~})" (nreverse parts)))
+      (format nil "(~{~A~^, ~})" (mapcar #'%coord->wkt (%close-ring ring)))))
+
+(defun %linestring->wkt (cs)
+  (if (typep cs '(simple-array double-float (*)))
+      (let* ((len2 (length cs))
+             (n (/ len2 2))
+             (parts '()))
+        (loop for i from 0 below n
+              for idx2 = (* 2 i)
+              do (push (concatenate 'string (%wkt-num (aref cs idx2)) " " (%wkt-num (aref cs (1+ idx2)))) parts))
+        (format nil "(~{~A~^, ~})" (nreverse parts)))
+      (format nil "(~{~A~^, ~})" (mapcar #'%coord->wkt cs))))
 
 (defun %polygon-body->wkt (rings)
   "RINGS = exterior + holes -> \"((ext), (hole), ...)\"."
@@ -50,10 +82,13 @@ string back yields the same double; trailing zeros are trimmed for tidiness."
   (ecase (geometry-kind g)
     (:point
      (let ((c (geometry-coordinates g)))
-       (if c (format nil "POINT (~A)" (%coord->wkt c)) "POINT EMPTY")))
+       (if (and c (or (consp c) (and (arrayp c) (plusp (length c)))))
+           (format nil "POINT (~A)" (%coord->wkt c))
+           "POINT EMPTY")))
     (:linestring
      (let ((cs (geometry-coordinates g)))
-       (if cs (format nil "LINESTRING (~{~A~^, ~})" (mapcar #'%coord->wkt cs))
+       (if (and cs (or (consp cs) (and (arrayp cs) (plusp (length cs)))))
+           (format nil "LINESTRING ~A" (%linestring->wkt cs))
            "LINESTRING EMPTY")))
     (:polygon
      (let ((rings (geometry-coordinates g)))
@@ -65,6 +100,8 @@ string back yields the same double; trailing zeros are trimmed for tidiness."
            (format nil "MULTIPOLYGON (~{~A~^, ~})"
                    (mapcar #'%polygon-body->wkt polys))
            "MULTIPOLYGON EMPTY")))))
+
+
 
 ;;; --------------------------------------------------------------------------
 ;;; WKT -> geometry  (pure, minimal parser)
@@ -153,26 +190,48 @@ unsupported type."
       (%geos-free (geos-ctx-handle ctx) cstr))))
 
 (defun %coords->geos-coordseq (ctx coords &key closed-p)
-  "Convert a list of (lon lat) pairs into a GEOSCoordSeq pointer."
-  (let* ((handle (geos-ctx-handle ctx))
-         (n (length coords))
-         (need-close (and closed-p
-                          (> n 0)
-                          (let ((f (first coords)) (l (car (last coords))))
-                            (or (/= (first f) (first l)) (/= (second f) (second l))))))
-         (len (+ n (if need-close 1 0)))
-         (seq (%geos-coordseq-create handle len 2)))
-    (when (cffi:null-pointer-p seq)
-      (error 'geos-error :message "GEOSCoordSeq_create_r failed"))
-    (loop for c in coords
-          for idx from 0
-          do (%geos-coordseq-setx handle seq idx (coerce (first c) 'double-float))
-             (%geos-coordseq-sety handle seq idx (coerce (second c) 'double-float)))
-    (when need-close
-      (let ((f (first coords)))
-        (%geos-coordseq-setx handle seq n (coerce (first f) 'double-float))
-        (%geos-coordseq-sety handle seq n (coerce (second f) 'double-float))))
-    seq))
+  "Convert coords (a list of (lon lat) or a packed double-float array) into a GEOSCoordSeq pointer."
+  (let ((handle (geos-ctx-handle ctx)))
+    (if (typep coords '(simple-array double-float (*)))
+        (let* ((len2 (length coords))
+               (n (floor len2 2))
+               (need-close (and closed-p
+                                (> n 0)
+                                (or (/= (aref coords 0) (aref coords (- len2 2)))
+                                    (/= (aref coords 1) (aref coords (- len2 1))))))
+               (seq-len (+ n (if need-close 1 0)))
+               (seq (%geos-coordseq-create handle seq-len 2)))
+          (when (cffi:null-pointer-p seq)
+            (error 'geos-error :message "GEOSCoordSeq_create_r failed"))
+          (loop for i from 0 below n
+                for idx2 = (* 2 i)
+                do (%geos-coordseq-setx handle seq i (aref coords idx2))
+                   (%geos-coordseq-sety handle seq i (aref coords (1+ idx2))))
+          (when need-close
+            (%geos-coordseq-setx handle seq n (aref coords 0))
+            (%geos-coordseq-sety handle seq n (aref coords 1)))
+          seq)
+        (let* ((n (length coords))
+               (need-close (and closed-p
+                                (> n 0)
+                                (let ((f (first coords)) (l (car (last coords))))
+                                  (or (/= (%coord-x f) (%coord-x l))
+                                      (/= (%coord-y f) (%coord-y l))))))
+               (seq-len (+ n (if need-close 1 0)))
+               (seq (%geos-coordseq-create handle seq-len 2)))
+          (when (cffi:null-pointer-p seq)
+            (error 'geos-error :message "GEOSCoordSeq_create_r failed"))
+          (loop for c in coords
+                for idx from 0
+                do (%geos-coordseq-setx handle seq idx (%coord-x c))
+                   (%geos-coordseq-sety handle seq idx (%coord-y c)))
+          (when need-close
+            (let ((f (first coords)))
+              (%geos-coordseq-setx handle seq n (%coord-x f))
+              (%geos-coordseq-sety handle seq n (%coord-y f))))
+          seq))))
+
+
 
 (defun %ring->geos-linear-ring (ctx ring)
   "Convert a list of (lon lat) ring vertices into a GEOS LinearRing geometry pointer."
@@ -219,8 +278,8 @@ unsupported type."
     (ecase (geometry-kind g)
       (:point
        (let ((c (geometry-coordinates g)))
-         (if c
-             (let ((seq (%coords->geos-coordseq ctx (list c))))
+         (if (and c (or (consp c) (and (arrayp c) (plusp (length c)))))
+             (let ((seq (%coords->geos-coordseq ctx (if (arrayp c) c (list c)))))
                (let ((geom (%geos-create-point handle seq)))
                  (when (cffi:null-pointer-p geom)
                    (%geos-coordseq-destroy handle seq)
@@ -228,6 +287,7 @@ unsupported type."
                  geom))
              (let ((seq (%geos-coordseq-create handle 0 2)))
                (%geos-create-point handle seq)))))
+
       (:linestring
        (let ((cs (geometry-coordinates g)))
          (if cs
