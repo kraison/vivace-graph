@@ -236,18 +236,20 @@ and POINTER is stable for the life of the mapping."
                       0))
           ;; Map the file over the head of the reservation (replaces the
           ;; PROT_NONE pages for [base, base+size); MAP_FIXED keeps the addr).
-          (let ((pointer (%posix-mmap
-                          base
-                          size
-                          (logior +prot-read+ +prot-write+)
-                          (logior +map-shared+ +map-fixed+)
-                          fd
-                          0)))
+          (let* ((pointer (%posix-mmap
+                           base
+                           size
+                           (logior +prot-read+ +prot-write+)
+                           (logior +map-shared+ +map-fixed+)
+                           fd
+                           0))
+                 (path (truename file))
+                 (mf (make-mapped-file :path path
+                                       :fd fd
+                                       :pointer pointer
+                                       :reserved-size reserved)))
             (setf ok t)
-            (make-mapped-file :path (truename file)
-                              :fd fd
-                              :pointer pointer
-                              :reserved-size reserved)))
+            mf))
       (unless ok
         (when base (ignore-errors (%posix-munmap base reserved)))
         (ignore-errors (%posix-close fd))))))

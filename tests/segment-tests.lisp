@@ -1253,4 +1253,60 @@ must fail (EBADF); succeeding would mean MMAP-FILE leaked it."
     (signals error (graph-db::%posix-write -1 buf 1)))
   (signals error (graph-db::%posix-extend-file-backing -1 4096)))
 
+(test mmap-file-cleans-up-when-truename-fails
+  "MMAP-FILE unmaps reservation and closes fd if TRUENAME fails after mapping."
+  (let* ((path (%seg-path))
+         (captured-fd nil)
+         (orig-mmap (fdefinition 'graph-db::%posix-mmap))
+         (orig-truename (fdefinition 'truename)))
+    (unwind-protect
+         (progn
+           (setf (fdefinition 'graph-db::%posix-mmap)
+                 (lambda (addr length prot flags fd offset)
+                   (when (and fd (not (minusp fd)))
+                     (setf captured-fd fd))
+                   (funcall orig-mmap addr length prot flags fd offset)))
+           #+sbcl
+           (sb-ext:without-package-locks
+             (setf (fdefinition 'truename)
+                   (lambda (p)
+                     (if (and (stringp (namestring p))
+                              (search "vgseg" (namestring p)))
+                         (error "injected truename failure for test")
+                         (funcall orig-truename p)))))
+           #+ecl
+           (progn
+             (si:package-lock (find-package "COMMON-LISP") nil)
+             (setf (fdefinition 'truename)
+                   (lambda (p)
+                     (if (and (stringp (namestring p))
+                              (search "vgseg" (namestring p)))
+                         (error "injected truename failure for test")
+                         (funcall orig-truename p)))))
+           #-(or sbcl ecl)
+           (setf (fdefinition 'truename)
+                 (lambda (p)
+                   (if (and (stringp (namestring p))
+                            (search "vgseg" (namestring p)))
+                       (error "injected truename failure for test")
+                       (funcall orig-truename p))))
+           (signals error (graph-db::mmap-file path :create-p t :size 4096))
+           (is (integerp captured-fd)
+               "fault injection reached mmap-file with open fd")
+           (is (minusp (graph-db::%posix-close captured-fd))
+               "MMAP-FILE leaked fd on truename failure: closing it again succeeded"))
+      (setf (fdefinition 'graph-db::%posix-mmap) orig-mmap)
+      #+sbcl
+      (sb-ext:without-package-locks
+        (setf (fdefinition 'truename) orig-truename))
+      #+ecl
+      (progn
+        (setf (fdefinition 'truename) orig-truename)
+        (si:package-lock (find-package "COMMON-LISP") t))
+      #-(or sbcl ecl)
+      (setf (fdefinition 'truename) orig-truename)
+      (ignore-errors (delete-file path)))))
+
+
+
 
