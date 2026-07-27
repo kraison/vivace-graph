@@ -217,3 +217,101 @@
                          (with-write-lock (lock)
                            (bt:thread-yield))))))
     (pass)))
+
+(defun %join-thread-with-timeout (thread &key (timeout-seconds 2.0))
+  (let ((end-time (+ (get-internal-real-time) (* timeout-seconds internal-time-units-per-second))))
+    (loop
+       (unless (bt:thread-alive-p thread)
+         (return (bt:join-thread thread)))
+       (when (> (get-internal-real-time) end-time)
+         (ignore-errors (bt:destroy-thread thread))
+         (error "Thread ~A timed out (deadlock detected)" thread))
+       (sleep 0.05))))
+
+#+(or sbcl lispworks ecl)
+(test rw-lock-aborted-writer-cleans-queue
+  "An aborted writer in the queue unwinds cleanly without deadlocking subsequent writers/readers."
+  (let ((lock (make-rw-lock))
+        (held (bt:make-semaphore))
+        (release (bt:make-semaphore))
+        (holder nil)
+        (waiter nil))
+    ;; Holder thread acquires write lock and stays parked
+    (setf holder (bt:make-thread
+                  (lambda ()
+                    (with-write-lock (lock)
+                      (bt:signal-semaphore held)
+                      (bt:wait-on-semaphore release)))))
+    (bt:wait-on-semaphore held)
+    ;; Waiter thread enqueues for write lock
+    (setf waiter (bt:make-thread
+                  (lambda ()
+                    (acquire-write-lock lock :wait-p t))))
+    (sleep 0.1) ; Ensure waiter enqueues
+    ;; Abort waiter thread while it is queued
+    (bt:destroy-thread waiter)
+    (sleep 0.1)
+    ;; Release holder
+    (bt:signal-semaphore release)
+    (%join-thread-with-timeout holder)
+    ;; Check if lock is usable by a new writer and reader
+    (is (rw-lock-p (acquire-write-lock lock :wait-p nil)))
+    (release-write-lock lock)
+    (is (rw-lock-p (acquire-read-lock lock)))
+    (release-read-lock lock)))
+
+#+(or sbcl lispworks ecl)
+(test rw-lock-concurrent-read-to-write-upgrades
+  "Two concurrent readers upgrading to write locks via :reading-p do not deadlock."
+  (let ((lock (make-rw-lock))
+        (start-sem (bt:make-semaphore))
+        (done-count 0)
+        (count-lock (bt:make-lock "count"))
+        (t1 nil) (t2 nil))
+    (setf t1 (bt:make-thread
+              (lambda ()
+                (with-read-lock (lock)
+                  (bt:wait-on-semaphore start-sem)
+                  (with-write-lock (lock :reading-p t)
+                    (bt:with-lock-held (count-lock)
+                      (incf done-count)))))))
+    (setf t2 (bt:make-thread
+              (lambda ()
+                (with-read-lock (lock)
+                  (bt:wait-on-semaphore start-sem)
+                  (with-write-lock (lock :reading-p t)
+                    (bt:with-lock-held (count-lock)
+                      (incf done-count)))))))
+    (sleep 0.1)
+    (bt:signal-semaphore start-sem)
+    (bt:signal-semaphore start-sem)
+    (%join-thread-with-timeout t1)
+    (%join-thread-with-timeout t2)
+    (is (= 2 done-count) "Both read-to-write upgrades completed without deadlock")))
+
+#+(or sbcl lispworks ecl)
+(test rw-lock-macro-does-not-release-unacquired-lock
+  "with-read-lock and with-write-lock do not release the lock if acquisition failed."
+  (let ((lock (make-rw-lock))
+        (held (bt:make-semaphore))
+        (release (bt:make-semaphore))
+        (holder nil))
+    (setf holder (bt:make-thread
+                  (lambda ()
+                    (with-write-lock (lock)
+                      (bt:signal-semaphore held)
+                      (bt:wait-on-semaphore release)))))
+    (bt:wait-on-semaphore held)
+    ;; Attempting non-blocking write lock when another thread holds it:
+    ;; acquire-write-lock returns NIL. with-write-lock should signal "Unable to get rw-lock"
+    ;; without calling release-write-lock (which would raise "Cannot release lock I don't own!").
+    (handler-case
+        (acquire-write-lock lock :wait-p nil)
+      (error (c)
+        (is (typep c 'error))))
+    (bt:signal-semaphore release)
+    (%join-thread-with-timeout holder)
+    (is (null (lock-writer lock)))))
+
+
+
