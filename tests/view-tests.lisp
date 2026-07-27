@@ -528,3 +528,13 @@ lazily on the next add-to-view."
                      "the kept view indexes the new node (decade 2 now 11)"))
             (ignore-errors (close-graph g2 :snapshot-p nil))
             (collect-garbage)))))))
+
+(test lookup-view-group-and-invoke-view-with-nil-or-unknown-graph-signals
+  "LOOKUP-VIEW-GROUP returns NIL and INVOKE-GRAPH-VIEW signals INVALID-VIEW-ERROR when graph is NIL or an unknown symbol."
+  (is (null (graph-db::lookup-view-group 'g-person nil)))
+  (is (null (graph-db::lookup-view-group 'g-person 'non-existent-graph-name)))
+  (signals graph-db::invalid-view-error
+    (graph-db::invoke-graph-view 'g-person 'people-by-name :graph nil))
+  (signals graph-db::invalid-view-error
+    (graph-db::invoke-graph-view 'g-person 'people-by-name :graph 'non-existent-graph-name)))
+

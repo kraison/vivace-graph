@@ -58,8 +58,14 @@ once per entry you want the node to contribute (zero, one, or many times)."
 (defmethod lookup-view-group ((group-name symbol) (graph graph))
   (gethash group-name (views graph)))
 
+(defmethod lookup-view-group (group-name (graph null))
+  (declare (ignore group-name graph))
+  nil)
+
 (defmethod lookup-view-group ((group-name symbol) (graph-name symbol))
-  (lookup-view-group group-name (lookup-graph graph-name)))
+  (let ((g (lookup-graph graph-name)))
+    (when g
+      (lookup-view-group group-name g))))
 
 (defmethod lookup-view-group ((node node) graph)
   (lookup-view-group (class-name (class-of node)) graph))
