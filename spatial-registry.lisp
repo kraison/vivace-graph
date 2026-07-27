@@ -109,7 +109,8 @@ Precedence: the :SPATIAL-PRECISION slot option, then GRAPH's default, then 7."
 
 (defun %spatial-max-cells-for (graph owner-name slot-name)
   "The max-cells cap (OWNER-NAME . SLOT-NAME)'s index is created with.
-Precedence: the :SPATIAL-MAX-CELLS slot option, then GRAPH's default, then +spatial-insert-max-cells+ (256)."
+Precedence: the :SPATIAL-MAX-CELLS slot option, then GRAPH's default, then +spatial-insert-max-cells+ (16384)."
+
   (or (%declared-spatial-max-cells owner-name slot-name)
       (graph-default-spatial-max-cells graph)
       +spatial-insert-max-cells+))
