@@ -246,6 +246,19 @@
   :perform (test-op (op c)
                     (uiop:symbol-call :graph-db/perf-test :run-perf)))
 
+(defsystem graph-db/profiler
+  :name "VivaceGraph Profiler"
+  :description "Reusable SBCL-focused performance profiling tool (sb-sprof + sb-profile) for VivaceGraph."
+  :depends-on (:graph-db :cl-ppcre :alexandria :parse-float)
+  :pathname "profiling/"
+  :serial t
+  :components ((:file "package")
+               (:file "registry")
+               (:file "sprof")
+               (:file "profile")
+               (:file "harness")))
+
+
 ;; OPTIONAL graph-algorithms add-on: analysis algorithms (shortest path,
 ;; ranking, components, flow, ...) ported from the standalone graph-utils
 ;; library onto VivaceGraph's persistent MVCC model.  Depends only on the
