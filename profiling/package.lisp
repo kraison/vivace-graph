@@ -79,5 +79,10 @@
    #:profiling-suite-result-timestamp
    #:profiling-suite-result-runs
    #:run-full-profiling-suite
-   #:print-profiling-suite-summary))
+   #:print-profiling-suite-summary
+
+   ;; Stage 3 PDF & Visual Reporting Suite
+   #:generate-pdf-report
+   #:profile-and-generate-pdf))
+
 

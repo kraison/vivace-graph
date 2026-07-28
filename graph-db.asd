@@ -249,7 +249,7 @@
 (defsystem graph-db/profiler
   :name "VivaceGraph Profiler"
   :description "Reusable SBCL-focused performance profiling tool (sb-sprof + sb-profile) for VivaceGraph."
-  :depends-on (:graph-db :cl-ppcre :alexandria :parse-float)
+  :depends-on (:graph-db :cl-ppcre :alexandria :parse-float :cl-typesetting :cl-pdf :cl-pdf-parser)
   :pathname "profiling/"
   :serial t
   :components ((:file "package")
@@ -266,7 +266,10 @@
                              (:file "views")
                              (:file "spatial")
                              (:file "prolog")
-                             (:file "suite")))))
+                             (:file "suite")))
+               (:module "reporting"
+                :components ((:file "pdf")))))
+
 
 
 
