@@ -117,3 +117,51 @@
                          (save item)))))
       (is (= 2 (slot-value (lookup-vertex vid) 'value))
           "Final counter must be 2 (initial 0 + 2 successful increments)"))))
+
+;;; ---------------------------------------------------------------------------
+;;; Test 4: read-write conflict (stale read) forces validation failure / retry
+;;;
+;;; T1 reads Node X and writes Node Y.
+;;; T2 concurrently modifies Node X and commits.
+;;; T1's read-set (containing Node X) conflicts with T2's write-set (containing Node X).
+;;; OCC validation for T1 MUST fail because T1 read a stale version of Node X.
+;;; ---------------------------------------------------------------------------
+
+(test read-write-conflict-forces-retry
+  "T1 reads X and writes Y while T2 modifies X and commits: T1 validation fails / retries."
+  (with-acid-graph (g)
+    (let (x-id y-id)
+      (with-transaction ()
+        (setq x-id (id (make-ac-item :value 10 :label "X"))
+              y-id (id (make-ac-item :value 100 :label "Y"))))
+      (let ((t1-read-x (make-semaphore))
+            (t2-committed-x (make-semaphore))
+            (first-pass t))
+        (make-thread
+         (lambda ()
+           (let ((*graph* g))
+             (wait-on-semaphore t1-read-x)
+             (with-transaction ()
+               (let ((x (copy (lookup-vertex x-id))))
+                 (setf (slot-value x 'value) 20)
+                 (save x)))
+             (signal-semaphore t2-committed-x)))
+         :name "acid-read-write-t2")
+        (with-transaction ()
+          ;; T1 reads X
+          (let ((x-val (slot-value (lookup-vertex x-id) 'value)))
+            (when first-pass
+              (setq first-pass nil)
+              (signal-semaphore t1-read-x)
+              (wait-on-semaphore t2-committed-x))
+            ;; T1 writes Y based on its read of X
+            (let ((y (copy (lookup-vertex y-id))))
+              (setf (slot-value y 'value) (+ (slot-value y 'value) x-val))
+              (save y))))
+        ;; After T1 retries, it sees T2's updated X=20, so Y becomes 100 + 20 = 120 (not 100 + 10 = 110)
+        (is (= 20 (slot-value (lookup-vertex x-id) 'value)))
+        (is (= 120 (slot-value (lookup-vertex y-id) 'value))
+            "T1 must re-read updated X (20) on retry, making Y = 100 + 20 = 120; got ~D"
+            (slot-value (lookup-vertex y-id) 'value))))))
+
+

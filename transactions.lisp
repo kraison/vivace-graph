@@ -254,7 +254,8 @@
 
 (defgeneric validate (transaction)
   (:method (transaction)
-    (let ((write-set (write-set transaction)))
+    (let ((write-set (write-set transaction))
+          (read-set (read-set transaction)))
       (or (zerop (object-set-count write-set))
           (loop for other-transaction in (overlapping-transactions
                                           transaction
@@ -262,7 +263,10 @@
              never (object-sets-intersect-p write-set
                                             (read-set other-transaction))
              never (object-sets-intersect-p write-set
+                                            (write-set other-transaction))
+             never (object-sets-intersect-p read-set
                                             (write-set other-transaction)))))))
+
 
 (defgeneric %commit (transaction))
 (defgeneric %rollback (transaction))
