@@ -59,6 +59,17 @@
    #:profile-entry-bytes
    #:profile-entry-bytes-per-call
 
+   #:*sb-profile-call-overhead-seconds*
+   #:*overhead-warn-fraction*
+   #:measure-sb-profile-overhead
+   #:profile-entry-overhead-ms
+   #:profile-entry-overhead-fraction
+   #:profile-entry-overhead-suspect-p
+   #:profile-result-overhead-warnings
+   #:profile-entry-usec-per-call
+   #:profile-entry-total-ms
+   #:format-usec
+   #:format-bytes
    #:profile-result
    #:make-profile-result
    #:profile-result-p

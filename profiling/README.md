@@ -91,6 +91,37 @@ it. Reading the counters directly (a tick *is* a microsecond, since
 a full suite run from **807 down to 7**. Text parsing remains as a fallback if a
 future SBCL stops exposing the internals.
 
+## The profiler warns when it is measuring itself
+
+`sb-profile` encapsulates every function it traces, so a function called a
+million times pays a million encapsulations. Past some call volume the reported
+time is mostly the profiler observing itself.
+
+This is not theoretical — it produced a wrong bug report. Tracing the
+slot-access path (`persistent-p`/`meta-p`/`ephemeral-p`, ~1M calls each)
+attributed **3,214 ms across a workload that takes 887 ms uninstrumented**: more
+measured time than real time.
+
+So every run now measures its own encapsulation cost (~0.49 µs/call on the dev
+host — note SBCL's own `sb-profile::*overhead*` reports the *timer* cost of
+~0.006 µs and understates this by ~80×), estimates each row's instrumentation
+share, and flags the rows it cannot vouch for:
+
+```
+     Calls |  Total ms |  us/call |   Consed | Bytes/Call | ! | Symbol
+   342,000 |     77.50 |    0.227 |      0 B |          0 | ! | GRAPH-DB::PERSISTENT-P
+```
+
+`!` means the estimated overhead is ≥ `*overhead-warn-fraction*` (25%) of the
+reported time. A share over 100% — common for million-call functions — means the
+estimate exceeds the whole reported time. **Call counts remain exact; only the
+times are compromised.** A run whose attributed time exceeds its own wall clock
+is called out explicitly.
+
+The warnings appear in the console tables and in the PDF. To measure something
+in this class, use `sb-sprof` sampling or a before/after wall-clock comparison
+against a `:subsystems '(:nothing)` baseline, which traces nothing.
+
 ## Real-world workloads
 
 `modules/real_world.lisp` models **measured** mine-action production shape (ma

@@ -178,6 +178,111 @@ discards the counters."
        tbl)
       (sort entries #'> :key #'profile-entry-seconds))))
 
+;;; ---------------------------------------------------------------------------
+;;; Instrumentation-overhead accounting
+;;;
+;;; SB-PROFILE encapsulates every function it traces, so a function called a
+;;; million times pays a million encapsulations.  Past some call volume the
+;;; measurement costs more than the thing measured, and the reported time is
+;;; mostly the profiler observing itself.
+;;;
+;;; This is not hypothetical.  Profiling vivace-graph's slot-access path
+;;; (persistent-p / meta-p / ephemeral-p, ~1M calls each) attributed 3,214 ms
+;;; across the traced functions in a workload that takes 887 ms uninstrumented
+;;; -- i.e. more "measured" time than real time, which is impossible as cost and
+;;; briefly produced a wrong bug report.  A profiler that can mislead this way
+;;; must say so itself rather than relying on the reader to notice.
+;;;
+;;; SB-PROFILE's own SB-PROFILE::*OVERHEAD* is not usable for this: its :CALL
+;;; slot (~6e-9 s) measures the TIMER read, not the encapsulation, and
+;;; understates real per-call cost by roughly two orders of magnitude.  So we
+;;; measure encapsulation empirically instead.
+;;; ---------------------------------------------------------------------------
+
+(defvar *sb-profile-call-overhead-seconds* nil
+  "Measured per-call cost of SB-PROFILE encapsulation, in seconds.
+NIL until MEASURE-SB-PROFILE-OVERHEAD has run; it is measured once and cached.")
+
+(defparameter *overhead-warn-fraction* 0.25d0
+  "Flag a profile entry when estimated instrumentation overhead reaches this
+fraction of the time attributed to it.")
+
+(defun %overhead-probe (x) (1+ x))
+
+(defun measure-sb-profile-overhead (&key (iterations 200000) (force nil))
+  "Measure and cache per-call SB-PROFILE encapsulation overhead, in seconds.
+
+Times a trivial function with and without instrumentation and attributes the
+difference to encapsulation.  Deliberately measured in THIS image, since the
+cost depends on the host and the SBCL build."
+  #+sbcl
+  (when (or force (null *sb-profile-call-overhead-seconds*))
+    (ignore-errors
+     (let ((f #'%overhead-probe))
+       ;; Unprofiled baseline.
+       (ignore-errors (sb-profile:unprofile %overhead-probe))
+       (let ((t0 (get-internal-real-time)))
+         (dotimes (i iterations) (funcall f i))
+         (let* ((bare (- (get-internal-real-time) t0)))
+           (eval '(sb-profile:profile %overhead-probe))
+           (let ((g (fdefinition '%overhead-probe))
+                 (t1 (get-internal-real-time)))
+             (dotimes (i iterations) (funcall g i))
+             (let ((wrapped (- (get-internal-real-time) t1)))
+               (ignore-errors (sb-profile:unprofile %overhead-probe))
+               (ignore-errors (sb-profile:reset))
+               (setf *sb-profile-call-overhead-seconds*
+                     (max 0.0d0
+                          (/ (- (float wrapped 1.0d0) (float bare 1.0d0))
+                             internal-time-units-per-second
+                             iterations))))))))))
+  *sb-profile-call-overhead-seconds*)
+
+(defun profile-entry-overhead-ms (entry)
+  "Estimated milliseconds of ENTRY's reported time that is instrumentation."
+  (let ((per-call (or *sb-profile-call-overhead-seconds* 0.0d0)))
+    (* 1.0d3 per-call (profile-entry-calls entry))))
+
+(defun profile-entry-overhead-fraction (entry)
+  "Estimated instrumentation share of ENTRY's reported time, 0.0-1.0+.
+Returns 0 when overhead has not been measured."
+  (let ((total (profile-entry-total-ms entry)))
+    (if (or (null *sb-profile-call-overhead-seconds*) (<= total 0.0d0))
+        0.0d0
+        (/ (profile-entry-overhead-ms entry) total))))
+
+(defun profile-entry-overhead-suspect-p (entry)
+  "True when ENTRY's reported time is materially instrumentation, not workload.
+Such a row's TIME must not be quoted as a cost; its CALL COUNT is still exact."
+  (>= (profile-entry-overhead-fraction entry) *overhead-warn-fraction*))
+
+(defun profile-result-overhead-warnings (result &optional wall-clock-ms)
+  "Human-readable warnings about instrumentation distortion in RESULT.
+Returns a list of strings, empty when the run looks trustworthy."
+  (let* ((entries (profile-result-entries result))
+         (suspects (remove-if-not #'profile-entry-overhead-suspect-p entries))
+         (attributed (reduce #'+ entries :key #'profile-entry-total-ms :initial-value 0.0d0))
+         (warnings '()))
+    (when suspects
+      (push (format nil
+                    "~D of ~D traced function(s) have an estimated instrumentation share >= ~D%~
+~%    (highest: ~{~A~^, ~}).  Their CALL COUNTS are exact; their TIMES are not a cost."
+                    (length suspects) (length entries)
+                    (round (* 100 *overhead-warn-fraction*))
+                    (mapcar #'profile-entry-name
+                            (subseq (sort (copy-list suspects) #'>
+                                          :key #'profile-entry-overhead-fraction)
+                                    0 (min 3 (length suspects)))))
+            warnings))
+    (when (and wall-clock-ms (plusp wall-clock-ms) (> attributed wall-clock-ms))
+      (push (format nil
+                    "Attributed time (~,1F ms) EXCEEDS this run's wall clock (~,1F ms).  That is ~
+impossible as real cost:~%    the run is dominated by instrumentation.  Re-run with a narrower ~
+:SUBSYSTEMS set, or use sb-sprof."
+                    attributed wall-clock-ms)
+            warnings))
+    (nreverse warnings)))
+
 (defun parse-integer-clean (str)
   "Parse integer after removing commas or spaces."
   (let ((clean (ppcre:regex-replace-all "[,\\s]" str "")))
@@ -217,6 +322,10 @@ Generic functions are included.  Returns (values RESULT PROFILE-RESULT)."
           (raw-entries nil)
           (body-result nil))
      (ignore-errors (sb-profile:unprofile))
+     ;; Measure encapsulation overhead BEFORE installing our own trace set --
+     ;; the probe profiles and unprofiles a function of its own, so it must not
+     ;; run while the real set is installed.  Cached after the first call.
+     (ignore-errors (measure-sb-profile-overhead))
      (%install-sb-profile valid-syms)
      (when ,reset
        (ignore-errors (sb-profile:reset)))

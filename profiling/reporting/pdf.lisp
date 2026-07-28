@@ -317,6 +317,14 @@ blow a fixed-width column out of alignment."
                          (when (and profile (profile-result-entries profile))
                            (typeset:paragraph (:font "Helvetica-Bold" :font-size 8 :color '(0.3 0.3 0.3) :bottom-margin 2)
                              "Function Call & Memory Tracing Data (SB-PROFILE):")
+                           ;; Instrumentation-distortion warnings, before the
+                           ;; table rather than after it.
+                           (dolist (w (profile-result-overhead-warnings
+                                       profile (profiler-run-result-real-time-ms run)))
+                             (typeset:paragraph (:font "Helvetica-Bold" :font-size 7.2 :color +pdf-warn+
+                                                 :leading 10 :bottom-margin 3)
+                               (typeset:put-string
+                                (ppcre:regex-replace-all "\\s+" (format nil "WARNING: ~A" w) " "))))
                            (typeset:table (:border 0.4 :border-color +pdf-rule+ :cell-padding 3
                                            :col-widths '(148 46 50 52 56 52 78))
                              (typeset:header-row (:background-color +pdf-head-bg-2+)
@@ -344,8 +352,13 @@ blow a fixed-width column out of alignment."
                                                            (typeset:put-string (format-bytes (profile-entry-bytes entry)))))
                                         (typeset:cell () (typeset:paragraph (:font "Courier" :font-size 6.8 :h-align :right)
                                                            (typeset:put-string (format nil "~:D" (round (profile-entry-bytes-per-call entry))))))
-                                        (typeset:cell () (typeset:paragraph (:font "Helvetica" :font-size 6.8 :color +pdf-muted+)
-                                                           (typeset:put-string (symbol-subsystem-rationale (profile-entry-name entry))))))))
+                                        (typeset:cell () (typeset:paragraph (:font "Helvetica" :font-size 6.8
+                                                                            :color (if (profile-entry-overhead-suspect-p entry)
+                                                                                       +pdf-warn+ +pdf-muted+))
+                                                           (typeset:put-string
+                                                            (if (profile-entry-overhead-suspect-p entry)
+                                                                "! mostly overhead"
+                                                                (symbol-subsystem-rationale (profile-entry-name entry)))))))))
                            (typeset:vspace 6))
 
                          (typeset:paragraph (:h-align :justified :font "Helvetica-Oblique" :font-size 8 :leading 11.5 :bottom-margin 8)
@@ -544,6 +557,14 @@ otherwise abort report generation with a type error."
                          (when (and profile (profile-result-entries profile))
                            (typeset:paragraph (:font "Helvetica-Bold" :font-size 8 :color '(0.3 0.3 0.3) :bottom-margin 2)
                              "Function Call & Memory Tracing Data (SB-PROFILE):")
+                           ;; Instrumentation-distortion warnings, before the
+                           ;; table rather than after it.
+                           (dolist (w (profile-result-overhead-warnings
+                                       profile (profiler-run-result-real-time-ms run)))
+                             (typeset:paragraph (:font "Helvetica-Bold" :font-size 7.2 :color +pdf-warn+
+                                                 :leading 10 :bottom-margin 3)
+                               (typeset:put-string
+                                (ppcre:regex-replace-all "\\s+" (format nil "WARNING: ~A" w) " "))))
                            (typeset:table (:border 0.4 :border-color +pdf-rule+ :cell-padding 3
                                            :col-widths '(148 46 50 52 56 52 78))
                              (typeset:header-row (:background-color +pdf-head-bg-2+)
@@ -571,8 +592,13 @@ otherwise abort report generation with a type error."
                                                            (typeset:put-string (format-bytes (profile-entry-bytes entry)))))
                                         (typeset:cell () (typeset:paragraph (:font "Courier" :font-size 6.8 :h-align :right)
                                                            (typeset:put-string (format nil "~:D" (round (profile-entry-bytes-per-call entry))))))
-                                        (typeset:cell () (typeset:paragraph (:font "Helvetica" :font-size 6.8 :color +pdf-muted+)
-                                                           (typeset:put-string (symbol-subsystem-rationale (profile-entry-name entry))))))))
+                                        (typeset:cell () (typeset:paragraph (:font "Helvetica" :font-size 6.8
+                                                                            :color (if (profile-entry-overhead-suspect-p entry)
+                                                                                       +pdf-warn+ +pdf-muted+))
+                                                           (typeset:put-string
+                                                            (if (profile-entry-overhead-suspect-p entry)
+                                                                "! mostly overhead"
+                                                                (symbol-subsystem-rationale (profile-entry-name entry)))))))))
                            (typeset:vspace 6))
 
                          ;; Cross-Subsystem Bottleneck Analysis Text

@@ -915,16 +915,25 @@ REALWORLD-WORKLOAD-RESULT objects."
                 (format t "--- [SB-PROFILE] Primitive Function Call & Allocation Tracing ---~%")
                 (if p-entries
                     (progn
-                      (format t "     Calls |  Total ms |     us/call |      Consed | Bytes/Call | Primitive Symbol~%")
+                      ;; Surface instrumentation distortion BEFORE the table, so
+                      ;; nobody quotes a number the profiler already knows is
+                      ;; mostly its own overhead.
+                      (dolist (w (profile-result-overhead-warnings
+                                  prof (profiler-run-result-real-time-ms r)))
+                        (format t "  !! ~A~%" w))
+                      (format t "     Calls |  Total ms |     us/call |      Consed | Bytes/Call | ! | Primitive Symbol~%")
                       (format t "----------------------------------------------------------------------------------------~%")
                       (dolist (e p-entries)
-                        (format t "  ~8:D | ~9,3F | ~11@A | ~11@A | ~10:D | ~A~%"
+                        (format t "  ~8:D | ~9,3F | ~11@A | ~11@A | ~10:D | ~A | ~A~%"
                                 (profile-entry-calls e)
                                 (profile-entry-total-ms e)
                                 (format-usec (profile-entry-usec-per-call e))
                                 (format-bytes (profile-entry-bytes e))
                                 (round (profile-entry-bytes-per-call e))
-                                (profile-entry-name e))))
+                                (if (profile-entry-overhead-suspect-p e) "!" " ")
+                                (profile-entry-name e)))
+                      (when (some #'profile-entry-overhead-suspect-p p-entries)
+                        (format t "  ! = time is materially instrumentation overhead; trust the call count, not the time.~%")))
                     (format t "  No primitive tracing entries recorded.~%"))
 
                 ;; SB-SPROF Unfiltered Stack Table
