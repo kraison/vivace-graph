@@ -210,7 +210,13 @@ Includes generic functions; excludes macros and special operators."
     ;; geometry / spatial
     "GEOMETRY-COORDINATE-PAIRS" "MAP-GEOMETRY-COORDINATES" "NODE-GEOMETRY"
     "MAKE-POINT" "MAKE-POLYGON" "SPATIAL-INDEX-INSERT" "SPATIAL-INDEX-QUERY-BBOX"
-    "FIND-NODES-INTERSECTING"
+    "FIND-NODES-INTERSECTING" "POINT-IN-RING-P" "POINT-IN-POLYGON-RINGS-P"
+    "GEOMETRY-CONTAINS-POINT-P"
+    ;; slot-access bookkeeping -- genuinely hot: primitive-node.lisp consults
+    ;; these on EVERY slot read and write, so they sit under every
+    ;; materialization.  See vivace-graph #87.
+    "PERSISTENT-SLOT-NAMES" "EPHEMERAL-SLOT-NAMES" "META-SLOT-NAMES"
+    "PERSISTENT-P" "EPHEMERAL-P" "META-P"
     ;; transactions
     "WITH-TRANSACTION" "COMMIT-TRANSACTION" "VALIDATE-TRANSACTION")
   "A small, curated set of the engine's genuinely hot entry points.

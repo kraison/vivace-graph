@@ -320,7 +320,7 @@ FINDS-PER-SURVEY point finds.  Returns the list of survey vertices."
     (nreverse surveys)))
 
 ;;; --- Workload 1: Survey + Find Bulk Ingestion Pipeline ---
-(defun profile-realworld-ingestion-workload (&key (scale 1.0) (sprof-mode :cpu))
+(defun profile-realworld-ingestion-workload (&key (scale 1.0) (sprof-mode :cpu) subsystems)
   "Profile end-to-end bulk ingestion at mine-action's measured survey:find ratio."
   (let* ((count (max 1 (floor (* scale 200))))
          (run-res nil)
@@ -338,8 +338,8 @@ FINDS-PER-SURVEY point finds.  Returns the list of survey vertices."
       (setf run-res
             (profile-block (:name (format nil "Real-World Workload 1: Survey/Find Bulk Ingestion Pipeline (~:D surveys, ~:D finds)"
                                           count (* count *rw-finds-per-survey*))
-                            :subsystems '(:mmap-storage :graph-storage :transactions
-                                          :spatial :views :serialization)
+                            :subsystems (or subsystems '(:mmap-storage :graph-storage :transactions
+                                          :spatial :views :serialization))
                             :sprof-mode sprof-mode
                             :top-n 30)
               (%rw-populate-surveys graph count))))
@@ -351,7 +351,7 @@ FINDS-PER-SURVEY point finds.  Returns the list of survey vertices."
      :run-result run-res)))
 
 ;;; --- Workload 2: Map Viewport Query (the app's hottest read path) ---
-(defun profile-realworld-spatial-traversal-workload (&key (scale 1.0) (sprof-mode :cpu))
+(defun profile-realworld-spatial-traversal-workload (&key (scale 1.0) (sprof-mode :cpu) subsystems)
   "Profile the map viewport read path: bbox spatial query -> node materialization
 -> polygon coordinate walk for GeoJSON emission.
 
@@ -378,8 +378,8 @@ point-only corpus could never exercise."
                                    (list 35.9d0 48.9d0))))))
         (setf run-res
               (profile-block (:name (format nil "Real-World Workload 2: Spatial Map Viewport Query (~:D viewport queries)" query-iters)
-                              :subsystems '(:spatial :graph-storage :index-backends
-                                            :serialization :mmap-storage)
+                              :subsystems (or subsystems '(:spatial :graph-storage :index-backends
+                                            :serialization :mmap-storage))
                               :sprof-mode sprof-mode
                               :top-n 30)
                 (let ((graph-db:*graph* graph)
@@ -405,7 +405,7 @@ point-only corpus could never exercise."
      :run-result run-res)))
 
 ;;; --- Workload 3: Analytical View Rollup ---
-(defun profile-realworld-view-rollup-workload (&key (scale 1.0) (sprof-mode :cpu))
+(defun profile-realworld-view-rollup-workload (&key (scale 1.0) (sprof-mode :cpu) subsystems)
   "Profile secondary-index view materialization and map/reduce analytical rollups.
 mine-action declares 27 views; rollups back the site//survey summary panels."
   (let* ((count (max 1 (floor (* scale 500))))
@@ -424,7 +424,7 @@ mine-action declares 27 views; rollups back the site//survey summary panels."
                           :geom (%rw-find-point (mod i 50) i)))))
       (setf run-res
             (profile-block (:name (format nil "Real-World Workload 3: Analytical View Rollup (~:D finds)" count)
-                            :subsystems '(:views :serialization :index-backends :mmap-storage)
+                            :subsystems (or subsystems '(:views :serialization :index-backends :mmap-storage))
                             :sprof-mode sprof-mode
                             :top-n 30)
               (let ((graph-db:*graph* graph))
@@ -443,7 +443,7 @@ mine-action declares 27 views; rollups back the site//survey summary panels."
      :run-result run-res)))
 
 ;;; --- Workload 4: Prolog engine (SYNTHETIC -- not a mine-action workload) ---
-(defun profile-realworld-prolog-inference-workload (&key (scale 1.0) (sprof-mode :cpu))
+(defun profile-realworld-prolog-inference-workload (&key (scale 1.0) (sprof-mode :cpu) subsystems)
   "Profile Prolog rule compilation, unification and term dereferencing.
 
 NOT a mine-action workload: mine-action does not use the Prolog engine at all
@@ -460,7 +460,7 @@ subsystem, but do not read its numbers as application-representative."
           (make-rw-node :find-key (format nil "sp-~D|find-1" i))))
       (setf run-res
             (profile-block (:name (format nil "Real-World Workload 4: Prolog Engine, synthetic (~:D queries)" count)
-                            :subsystems '(:prolog :graph-storage :index-backends)
+                            :subsystems (or subsystems '(:prolog :graph-storage :index-backends))
                             :sprof-mode sprof-mode
                             :top-n 30)
               (let ((graph-db:*graph* graph))
@@ -479,7 +479,7 @@ subsystem, but do not read its numbers as application-representative."
      :run-result run-res)))
 
 ;;; --- Workload 5: Concurrent Field-Operator Transactions ---
-(defun profile-realworld-concurrent-transactions-workload (&key (scale 1.0) (sprof-mode :cpu))
+(defun profile-realworld-concurrent-transactions-workload (&key (scale 1.0) (sprof-mode :cpu) subsystems)
   "Profile many small write transactions and OCC validation.
 Models field operators claiming surveys and editing site records: many short
 transactions rather than one bulk load."
@@ -493,8 +493,8 @@ transactions rather than one bulk load."
     (with-rw-graph (graph #P"/tmp/vg-profiler-rw-tx/")
       (setf run-res
             (profile-block (:name (format nil "Real-World Workload 5: Concurrent Field-Operator Transactions (~:D txns)" tx-count)
-                            :subsystems '(:transactions :mmap-storage :graph-storage
-                                          :index-backends :spatial)
+                            :subsystems (or subsystems '(:transactions :mmap-storage :graph-storage
+                                          :index-backends :spatial))
                             :sprof-mode sprof-mode
                             :top-n 30)
               (let ((graph-db:*graph* graph))
@@ -514,7 +514,7 @@ transactions rather than one bulk load."
      :run-result run-res)))
 
 ;;; --- Workload 6: Complex Node Serialization & Deserialization ---
-(defun profile-realworld-complex-serialization-workload (&key (scale 1.0) (sprof-mode :cpu))
+(defun profile-realworld-complex-serialization-workload (&key (scale 1.0) (sprof-mode :cpu) subsystems)
   "Profile large complex node creation, binary serialization, mmap writing, and
 cache-bypassed deserialization.  Models a survey report record: long narrative
 text plus an embedding vector plus geometry."
@@ -539,7 +539,7 @@ text plus an embedding vector plus geometry."
     (with-rw-graph (graph #P"/tmp/vg-profiler-rw-complex/")
       (setf run-res
             (profile-block (:name (format nil "Real-World Workload 6: Complex Node Serialization & Deserialization (~:D nodes, 25KB text, 512 floats, ~D passes)" count read-passes)
-                            :subsystems '(:serialization :graph-core :mmap-storage :transactions)
+                            :subsystems (or subsystems '(:serialization :graph-core :mmap-storage :transactions))
                             :sprof-mode sprof-mode
                             :top-n 30)
               (let ((graph-db:*graph* graph))
@@ -570,7 +570,7 @@ text plus an embedding vector plus geometry."
      :run-result run-res)))
 
 ;;; --- Workload 7: GEOS Land-Release Coverage (NEW) ---
-(defun profile-realworld-geos-coverage-workload (&key (scale 1.0) (sprof-mode :cpu))
+(defun profile-realworld-geos-coverage-workload (&key (scale 1.0) (sprof-mode :cpu) subsystems)
   "Profile the GEOS topology path behind coverage and land release.
 
 mine-action calls GEOMETRY-MAKE-VALID, -UNION, -INTERSECTION, -DIFFERENCE and
@@ -588,7 +588,7 @@ computation.  None of it had any profiler coverage before."
             (extent (graph-db:make-polygon (list (%rw-ring 36.5d0 49.5d0 1.2d0 64)))))
         (setf run-res
               (profile-block (:name (format nil "Real-World Workload 7: GEOS Land-Release Coverage (~:D polygons)" count)
-                              :subsystems '(:geos :spatial :graph-core)
+                              :subsystems (or subsystems '(:geos :spatial :graph-core))
                               :sprof-mode sprof-mode
                               :top-n 30)
                 (let* ((valid (mapcar (lambda (p)
@@ -622,7 +622,7 @@ computation.  None of it had any profiler coverage before."
 
 ;;; --- Workload 8: Large-Polygon Whole-Record Materialization (NEW) ---
 (defun profile-realworld-large-polygon-materialization-workload
-    (&key (scale 1.0) (sprof-mode :cpu))
+    (&key (scale 1.0) (sprof-mode :cpu) subsystems)
   "Profile the documented worst case: materializing a node that carries a
 country-scale polygon in order to read one small scalar slot.
 
@@ -652,7 +652,7 @@ the read-path optimisation in #83, and nothing in the profiler exercised it."
       (setf run-res
             (profile-block (:name (format nil "Real-World Workload 8: Large-Polygon Whole-Record Materialization (~:D zones x ~:D vertices, ~:D passes)"
                                           zones *rw-large-zone-vertices* passes)
-                            :subsystems '(:serialization :mmap-storage :graph-core :spatial)
+                            :subsystems (or subsystems '(:serialization :mmap-storage :graph-core :spatial))
                             :sprof-mode sprof-mode
                             :top-n 30)
               (let ((graph-db:*graph* graph)
@@ -673,7 +673,7 @@ the read-path optimisation in #83, and nothing in the profiler exercised it."
      :run-result run-res)))
 
 ;;; --- Workload 9: DeepState Ground Control History (NEW) ---
-(defun profile-realworld-control-history-workload (&key (scale 1.0) (sprof-mode :cpu))
+(defun profile-realworld-control-history-workload (&key (scale 1.0) (sprof-mode :cpu) subsystems)
   "Profile ground-control-history generation -- the slowest path in the application.
 
 Mirrors mine-action's DEEPSTATE-CONTROL-PROFILE: for every day in the window,
@@ -715,8 +715,8 @@ number of point-in-polygon tests."
       (setf run-res
             (profile-block (:name (format nil "Real-World Workload 9: DeepState Ground Control History (~:D days walked, ~:D zones x ~:D vertices)"
                                           walk (* days per-day) *rw-deepstate-zone-vertices*)
-                            :subsystems '(:serialization :mmap-storage :graph-core
-                                          :spatial :geos)
+                            :subsystems (or subsystems '(:serialization :mmap-storage :graph-core
+                                          :spatial :geos))
                             :sprof-mode sprof-mode
                             :top-n 30)
               (let ((graph-db:*graph* graph)
@@ -744,7 +744,7 @@ number of point-in-polygon tests."
      :run-result run-res)))
 
 ;;; --- Workload 10: ACLED Dropped-Pin Radius Query (NEW) ---
-(defun profile-realworld-acled-pin-workload (&key (scale 1.0) (sprof-mode :cpu))
+(defun profile-realworld-acled-pin-workload (&key (scale 1.0) (sprof-mode :cpu) subsystems)
   "Profile the ACLED dropped-pin query: a 10 km diameter circle over a large
 point corpus.
 
@@ -779,8 +779,8 @@ returning 462 events."
             (profile-block (:name (format nil "Real-World Workload 10: ACLED Dropped-Pin Radius Query (~:D events, ~:D pins @ ~,1F km diameter)"
                                           events queries
                                           (/ (* 2 *rw-acled-pin-radius-m*) 1000.0))
-                            :subsystems '(:spatial :graph-storage :index-backends
-                                          :serialization :mmap-storage)
+                            :subsystems (or subsystems '(:spatial :graph-storage :index-backends
+                                          :serialization :mmap-storage))
                             :sprof-mode sprof-mode
                             :top-n 30)
               (let ((graph-db:*graph* graph)
@@ -807,7 +807,7 @@ returning 462 events."
      :run-result run-res)))
 
 ;;; --- Workload 11: Knowledge-Base Vector Retrieval (NEW) ---
-(defun profile-realworld-kb-vector-search-workload (&key (scale 1.0) (sprof-mode :cpu))
+(defun profile-realworld-kb-vector-search-workload (&key (scale 1.0) (sprof-mode :cpu) subsystems)
   "Profile knowledge-base retrieval: cosine top-K over the chunk vector segment.
 
 The production knowledge graph holds 23,193 chunk embeddings of dimension 1,024
@@ -831,7 +831,7 @@ embedding, which is a network call to an embedding model, not engine work."
       (setf run-res
             (profile-block (:name (format nil "Real-World Workload 11: Knowledge-Base Vector Retrieval (~:D chunks x ~:D dims, ~:D queries, top-~D)"
                                           chunks dim queries k)
-                            :subsystems '(:graph-core :mmap-storage :serialization)
+                            :subsystems (or subsystems '(:graph-core :mmap-storage :serialization))
                             :sprof-mode sprof-mode
                             :top-n 30)
               (let ((graph-db:*graph* graph)
@@ -850,7 +850,7 @@ embedding, which is a network call to an embedding model, not engine work."
      :run-result run-res)))
 
 ;;; --- Master Real-World Suite Runner ---
-(defun run-real-world-profiling-suite (&key (scale 1.0) (sprof-mode :cpu))
+(defun run-real-world-profiling-suite (&key (scale 1.0) (sprof-mode :cpu) subsystems)
   "Execute all real-world cross-subsystem workloads and return a list of
 REALWORLD-WORKLOAD-RESULT objects."
   (format t "~%========================================================================~%")
@@ -860,23 +860,24 @@ REALWORLD-WORKLOAD-RESULT objects."
   (format t "           Prolog (synthetic), Concurrent Txns, Complex Serialization,~%")
   (format t "           GEOS Land-Release Coverage, Large-Polygon Materialization,~%")
   (format t "           DeepState Control History, ACLED Dropped-Pin, KB Vector Retrieval~%")
-  (format t "Scale: ~,1F | SPROF Mode: ~A~%" scale sprof-mode)
+  (format t "Scale: ~,1F | SPROF Mode: ~A | Subsystems: ~A~%" scale sprof-mode
+          (or subsystems "per-workload defaults"))
   (format t "Data shape from measured mine-action production (2026-07-28).~%")
   (format t "========================================================================~%")
 
   (let ((results '()))
-    (push (profile-realworld-ingestion-workload :scale scale :sprof-mode sprof-mode) results)
-    (push (profile-realworld-spatial-traversal-workload :scale scale :sprof-mode sprof-mode) results)
-    (push (profile-realworld-view-rollup-workload :scale scale :sprof-mode sprof-mode) results)
-    (push (profile-realworld-prolog-inference-workload :scale scale :sprof-mode sprof-mode) results)
-    (push (profile-realworld-concurrent-transactions-workload :scale scale :sprof-mode sprof-mode) results)
-    (push (profile-realworld-complex-serialization-workload :scale scale :sprof-mode sprof-mode) results)
-    (push (profile-realworld-geos-coverage-workload :scale scale :sprof-mode sprof-mode) results)
+    (push (profile-realworld-ingestion-workload :scale scale :sprof-mode sprof-mode :subsystems subsystems) results)
+    (push (profile-realworld-spatial-traversal-workload :scale scale :sprof-mode sprof-mode :subsystems subsystems) results)
+    (push (profile-realworld-view-rollup-workload :scale scale :sprof-mode sprof-mode :subsystems subsystems) results)
+    (push (profile-realworld-prolog-inference-workload :scale scale :sprof-mode sprof-mode :subsystems subsystems) results)
+    (push (profile-realworld-concurrent-transactions-workload :scale scale :sprof-mode sprof-mode :subsystems subsystems) results)
+    (push (profile-realworld-complex-serialization-workload :scale scale :sprof-mode sprof-mode :subsystems subsystems) results)
+    (push (profile-realworld-geos-coverage-workload :scale scale :sprof-mode sprof-mode :subsystems subsystems) results)
     (push (profile-realworld-large-polygon-materialization-workload
-           :scale scale :sprof-mode sprof-mode) results)
-    (push (profile-realworld-control-history-workload :scale scale :sprof-mode sprof-mode) results)
-    (push (profile-realworld-acled-pin-workload :scale scale :sprof-mode sprof-mode) results)
-    (push (profile-realworld-kb-vector-search-workload :scale scale :sprof-mode sprof-mode) results)
+           :scale scale :sprof-mode sprof-mode :subsystems subsystems) results)
+    (push (profile-realworld-control-history-workload :scale scale :sprof-mode sprof-mode :subsystems subsystems) results)
+    (push (profile-realworld-acled-pin-workload :scale scale :sprof-mode sprof-mode :subsystems subsystems) results)
+    (push (profile-realworld-kb-vector-search-workload :scale scale :sprof-mode sprof-mode :subsystems subsystems) results)
 
     (let ((final-list (nreverse results)))
       (format t "~%========================================================================~%")
