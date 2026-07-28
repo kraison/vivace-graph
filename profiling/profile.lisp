@@ -49,13 +49,18 @@
   "Profile the specified FUNCTION-SYMBOLS with SB-PROFILE during BODY execution.
 Returns (values RESULT PROFILE-RESULT)."
   #+sbcl
-  `(let* ((valid-syms (remove-if-not (lambda (s) (and (symbolp s) (fboundp s)))
-                                    ,function-symbols))
+  `(let* ((valid-syms (remove-if-not (lambda (s)
+                                     (and (symbolp s)
+                                          (fboundp s)
+                                          (not (typep (fdefinition s) 'generic-function))))
+                                   ,function-symbols))
           (report-str nil)
           (body-result nil))
      (ignore-errors (sb-profile:unprofile))
-     (when valid-syms
-       (eval `(sb-profile:profile ,@valid-syms)))
+     (dolist (sym valid-syms)
+       (ignore-errors (eval `(sb-profile:profile ,sym))))
+
+
      (when ,reset
        (sb-profile:reset))
      (unwind-protect

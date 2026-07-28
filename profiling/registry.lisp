@@ -31,7 +31,27 @@
   "Return all registered subsystem keys."
   (list-subsystems))
 
+;; Initialize default subsystem function bindings across all vivace-graph layers
+(graph-db:def-vertex prof-node ()
+  ((value)
+   (label))
+  :prof-graph)
+
+(graph-db:def-edge prof-link ()
+  ((label))
+  :prof-graph)
+
+(graph-db:def-view prof-view :lessp (prof-node :prof-graph)
+  (:map (lambda (node)
+          (let ((lbl (slot-value node 'label)))
+            (when lbl (graph-db::yield lbl 1))))))
+
+
+
 (defun init-default-subsystem-registry ()
+
+
+
   "Populate default subsystem function bindings across all vivace-graph layers."
   (clrhash *subsystem-registry*)
   
@@ -44,10 +64,11 @@
      graph-db::set-bytes
      graph-db::%get-byte
      graph-db::%set-byte
-     graph-db::allocate-memory
-     graph-db::free-memory
+     graph-db::allocate
+     graph-db::free
      graph-db::read-uint64-from-seq
      graph-db::write-uint64-to-seq))
+
 
   ;; 2. Serialization & Encoding
   (register-subsystem-functions
@@ -151,10 +172,12 @@
   ;; 10. Prolog Query Solver
   (register-subsystem-functions
    :prolog
-   '(graph-db::prolog-compile-query
-     graph-db::run-prolog-query
-     graph-db::resolve-functor
-     graph-db::deref-var))
+   '(graph-db::unify
+     graph-db::deref-exp
+     graph-db::var-deref
+     graph-db::make-functor-symbol
+     graph-db::prolog-compile))
+
 
   ;; 11. Replication Transport
   (register-subsystem-functions

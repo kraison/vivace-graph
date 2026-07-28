@@ -60,4 +60,24 @@
    #:with-sb-profile-tracing
    #:profile-block
    #:profile-subsystem
-   #:print-profiler-run-summary))
+   #:print-profiler-run-summary
+
+   ;; Subsystem Profiling Modules
+   #:profile-mmap-subsystem
+   #:profile-serialization-subsystem
+   #:profile-index-subsystem
+   #:profile-graph-subsystem
+   #:profile-transactions-subsystem
+   #:profile-views-subsystem
+   #:profile-spatial-subsystem
+   #:profile-prolog-subsystem
+
+   ;; Suite Execution & Results
+   #:profiling-suite-result
+   #:make-profiling-suite-result
+   #:profiling-suite-result-p
+   #:profiling-suite-result-timestamp
+   #:profiling-suite-result-runs
+   #:run-full-profiling-suite
+   #:print-profiling-suite-summary))
+

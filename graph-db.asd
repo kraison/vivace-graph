@@ -256,7 +256,18 @@
                (:file "registry")
                (:file "sprof")
                (:file "profile")
-               (:file "harness")))
+               (:file "harness")
+               (:module "modules"
+                :components ((:file "mmap")
+                             (:file "serialization")
+                             (:file "index")
+                             (:file "graph")
+                             (:file "transactions")
+                             (:file "views")
+                             (:file "spatial")
+                             (:file "prolog")
+                             (:file "suite")))))
+
 
 
 ;; OPTIONAL graph-algorithms add-on: analysis algorithms (shortest path,
