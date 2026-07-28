@@ -31,9 +31,14 @@ sampling, and SB-PROFILE deterministic function tracing across SUBSYSTEMS."
         (prof-var (gensym "PROF"))
         (res-var (gensym "RES")))
     `(let* ((,subsys-var (if (listp ,subsystems) ,subsystems (list ,subsystems)))
-            (,syms-var (let ((acc '()))
-                         (dolist (s ,subsys-var acc)
-                           (setf acc (union acc (get-subsystem-functions s))))))
+            ;; Refresh first: the registry is otherwise a snapshot taken when
+            ;; registry.lisp loaded, so any optional system loaded afterwards
+            ;; (GRAPH-DB/GEOS in particular) would be silently untraceable.
+            (,syms-var (progn
+                         (when *auto-refresh-registry* (refresh-subsystem-registry))
+                         (let ((acc '()))
+                           (dolist (s ,subsys-var acc)
+                             (setf acc (union acc (get-subsystem-functions s)))))))
             (,sprof-var nil)
             (,prof-var nil)
             (,res-var nil)
@@ -48,11 +53,14 @@ sampling, and SB-PROFILE deterministic function tracing across SUBSYSTEMS."
        (let ((b-start #+sbcl (sb-ext:get-bytes-consed) #-sbcl 0))
          (setf (values ,res-var ,prof-var)
                (with-sb-profile-tracing (,syms-var :reset t)
-                 (setf ,sprof-var
-                       (with-sprof-profiling (:mode ,sprof-mode
-                                              :max-samples ,sprof-samples
-                                              :top-n ,top-n)
-                         (progn ,@body)))))
+                 (if (eq ,sprof-mode :none)
+                     (progn ,@body)
+                     (let ((sprof-res (with-sprof-profiling (:mode ,sprof-mode
+                                                             :max-samples ,sprof-samples
+                                                             :top-n ,top-n)
+                                        (progn ,@body))))
+                       (setf ,sprof-var sprof-res)
+                       ,res-var))))
          
          (setf ,t-end (get-internal-real-time)
                ,c-end (get-internal-run-time)
@@ -73,10 +81,6 @@ sampling, and SB-PROFILE deterministic function tracing across SUBSYSTEMS."
             :gc-time-ms gc-ms
             :sprof ,sprof-var
             :profile ,prof-var))))))
-
-
-
-
 
 (defun profile-subsystem (subsystem-key workload-fn &key (name nil) (sprof-mode :cpu) (iterations 1))
   "Helper function to profile a specific SUBSYSTEM-KEY running WORKLOAD-FN for ITERATIONS."
@@ -104,6 +108,10 @@ sampling, and SB-PROFILE deterministic function tracing across SUBSYSTEMS."
     (when (and sprof (sprof-result-entries sprof))
       (format stream "~%--- Top Functions by Statistical Sampling (sb-sprof :mode ~A) ---~%"
               (sprof-result-mode sprof))
+      (when (plusp (sprof-result-filtered-rows sprof))
+        (format stream "NOTE: ~:D row(s) carrying ~:D self-sample(s) are not shown.~%"
+                (sprof-result-filtered-rows sprof)
+                (sprof-result-filtered-samples sprof)))
       (format stream "  Self %  |  Tot %   |  Self Smp  | Function Name~%")
       (format stream "------------------------------------------------------------------------~%")
       (dolist (e (sprof-result-entries sprof))
@@ -116,15 +124,16 @@ sampling, and SB-PROFILE deterministic function tracing across SUBSYSTEMS."
   ;; SB-PROFILE deterministic tracing results
   (let ((prof (profiler-run-result-profile res)))
     (when (and prof (profile-result-entries prof))
-      (format stream "~%--- Function Call Tracing (sb-profile) ---~%")
-      (format stream "  Calls   |  Total Sec  |  Sec/Call   | Bytes Consed | Function Name~%")
-      (format stream "------------------------------------------------------------------------~%")
+      (format stream "~%--- Primitive Function Call & Allocation Tracing (sb-profile) ---~%")
+      (format stream "     Calls |  Total ms |     us/call |      Consed | Bytes/Call | Function Symbol~%")
+      (format stream "----------------------------------------------------------------------------------------~%")
       (dolist (e (profile-result-entries prof))
-        (format stream "  ~7D | ~10,4F  | ~10,6F  | ~11D  | ~A~%"
+        (format stream "  ~8:D | ~9,3F | ~11@A | ~11@A | ~10:D | ~A~%"
                 (profile-entry-calls e)
-                (profile-entry-seconds e)
-                (profile-entry-sec-per-call e)
-                (profile-entry-bytes e)
+                (profile-entry-total-ms e)
+                (format-usec (profile-entry-usec-per-call e))
+                (format-bytes (profile-entry-bytes e))
+                (round (profile-entry-bytes-per-call e))
                 (profile-entry-name e)))))
   (format stream "========================================================================~%~%")
   res)

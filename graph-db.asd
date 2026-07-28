@@ -249,7 +249,12 @@
 (defsystem graph-db/profiler
   :name "VivaceGraph Profiler"
   :description "Reusable SBCL-focused performance profiling tool (sb-sprof + sb-profile) for VivaceGraph."
-  :depends-on (:graph-db :cl-ppcre :alexandria :parse-float :cl-typesetting :cl-pdf :cl-pdf-parser)
+  ;; GRAPH-DB/GEOS is required, not optional: without it the entire GEOS
+  ;; topology layer (union/intersection/difference/make-valid/area) is not
+  ;; fbound, so the profiler registered a single :GEOS function and the
+  ;; real-world coverage workload could not run at all.
+  :depends-on (:graph-db :graph-db/geos :cl-ppcre :alexandria :parse-float
+               :cl-typesetting :cl-pdf :cl-pdf-parser)
   :pathname "profiling/"
   :serial t
   :components ((:file "package")
@@ -266,6 +271,7 @@
                              (:file "views")
                              (:file "spatial")
                              (:file "prolog")
+                             (:file "real_world")
                              (:file "suite")))
                (:module "reporting"
                 :components ((:file "pdf")))))

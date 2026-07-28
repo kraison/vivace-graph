@@ -6,10 +6,27 @@
   (:export
    ;; Registry & Subsystem Selection
    #:*subsystem-registry*
+   #:*subsystem-aliases*
+   #:*profiled-packages*
+   #:*auto-refresh-registry*
+   #:*hot-path-function-names*
    #:register-subsystem-functions
    #:get-subsystem-functions
+   #:resolve-subsystem-key
    #:list-subsystems
    #:all-subsystems
+   #:profileable-symbol-p
+   #:classify-symbol-subsystem
+   #:populate-all-graph-db-functions
+   #:populate-hot-path-subsystem
+   #:init-default-subsystem-registry
+   #:refresh-subsystem-registry
+   #:subsystem-coverage-report
+
+   ;; SB-PROFILE instrumentation controls
+   #:*profile-excluded-packages*
+   #:*profile-excluded-names*
+   #:profile-candidate-p
 
    ;; Result Data Structures
    #:sprof-sample-entry
@@ -27,6 +44,10 @@
    #:sprof-result-mode
    #:sprof-result-total-samples
    #:sprof-result-entries
+   #:sprof-result-filtered-rows
+   #:sprof-result-filtered-samples
+   #:*sprof-harness-frames*
+   #:internal-symbol-p
 
    #:profile-entry
    #:make-profile-entry
@@ -83,6 +104,29 @@
 
    ;; Stage 3 PDF & Visual Reporting Suite
    #:generate-pdf-report
-   #:profile-and-generate-pdf))
+   #:profile-and-generate-pdf
+
+   ;; Real-World Cross-Subsystem Workload Profiling
+   #:realworld-workload-result
+   #:make-realworld-workload-result
+   #:realworld-workload-result-p
+   #:realworld-workload-result-name
+   #:realworld-workload-result-description
+   #:realworld-workload-result-target-subsystems
+   #:realworld-workload-result-code-sample
+   #:realworld-workload-result-run-result
+   #:profile-realworld-ingestion-workload
+   #:profile-realworld-spatial-traversal-workload
+   #:profile-realworld-view-rollup-workload
+   #:profile-realworld-prolog-inference-workload
+   #:profile-realworld-concurrent-transactions-workload
+   #:profile-realworld-complex-serialization-workload
+   #:profile-realworld-geos-coverage-workload
+   #:profile-realworld-large-polygon-materialization-workload
+   #:profile-realworld-control-history-workload
+   #:profile-realworld-acled-pin-workload
+   #:profile-realworld-kb-vector-search-workload
+   #:run-real-world-profiling-suite
+   #:profile-and-generate-realworld-pdf))
 
 
