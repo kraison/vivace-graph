@@ -484,10 +484,28 @@ to match the layout extract-length / deserialize-help expect for +uuid+."
       (setf (aref vec (+ 2 i)) (ldb (byte 8 (* i 8)) code)))
     vec))
 
+(defun %octets-to-string-fast (bytes &key (start 0) (end (length bytes)))
+  (declare (type (array (unsigned-byte 8)) bytes)
+           (type fixnum start end))
+  (let ((len (- end start)))
+    (declare (type fixnum len))
+    (let ((ascii-p t))
+      (loop for i from start below end do
+        (when (>= (aref bytes i) 128)
+          (setf ascii-p nil)
+          (return)))
+      (if ascii-p
+          (let ((str (make-string len :element-type 'character)))
+            (loop for i from 0 below len do
+              (setf (schar str i) (code-char (aref bytes (+ start i)))))
+            str)
+          (babel:octets-to-string bytes :start start :end end)))))
+
 (defmethod deserialize-help ((become (eql +string+)) (bytes array))
   (declare (type (array (unsigned-byte 8)) bytes))
   (declare (type (integer 0 255) become))
-  (babel:octets-to-string bytes))
+  (%octets-to-string-fast bytes))
+
 
 (defmethod serialize ((string string))
   "Unicode aware string encoding. Not as efficient as it could be: creates 2

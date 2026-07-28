@@ -139,10 +139,16 @@ once per entry you want the node to contribute (zero, one, or many times)."
       d)))
 
 (defun view-key-deserialize (array)
-  (multiple-value-bind (payload length)
-      (deserialize (subseq array 16))
-    (let ((d (list payload (subseq array 0 16))))
-      (values d (+ length 16)))))
+  (declare (type (array (unsigned-byte 8)) array))
+  (let ((node-id (make-array 16 :element-type '(unsigned-byte 8))))
+    (dotimes (i 16) (setf (aref node-id i) (aref array i)))
+    (if (and (> (length array) 16) (= (aref array 16) +string+))
+        (multiple-value-bind (data-len header-len) (extract-length array :start 16)
+          (let ((str (%octets-to-string-fast array :start (+ 16 header-len) :end (+ 16 header-len data-len))))
+            (values (list str node-id) (+ 16 header-len data-len))))
+        (multiple-value-bind (payload length) (deserialize (subseq array 16))
+          (values (list payload node-id) (+ length 16))))))
+
 
 (defmethod restore-views ((graph graph))
   (let ((views-file (format nil "~A/views.dat" (location graph)))

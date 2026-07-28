@@ -236,40 +236,42 @@ L1: 50%, L2: 25%, L3: 12.5%, ..."
       (values bytes size))))
 
 (defun read-skip-node (skip-list addr)
+  (declare (type word addr))
   (if (= addr 0)
       nil
-      (or (and *cache-enabled*
-               (with-sl-cache-lock (skip-list)
-                 (gethash addr (%sl-node-cache skip-list))))
-          (let ((node (get-skip-node-buffer)) (pointer 8))
-            (setf (%sn-addr node) addr)
-            ;;(log:debug "READING SKIP NODE BYTES AT ~S" addr)
-            (multiple-value-bind (bytes size)
-                (read-skip-node-bytes skip-list addr)
-              ;;(log:debug "READ ~S: ~S" size bytes)
-              (setf (%sn-size node) size
-                    (%sn-level node) (aref bytes pointer)
-                    (%sn-flags node) (aref bytes (incf pointer))
-                    (%sn-pointers node) (make-array (%sn-level node)
-                                                    :element-type 'word))
-              (incf pointer)
-              (dotimes (i (%sn-level node))
-                (let ((p (read-uint64-from-seq (subseq bytes pointer))))
-                  ;;(log:debug "READING POINTER (~S OF ~S) => ~S"
-                  ;;i (1- (%sn-level node)) p)
-                  (setf (aref (%sn-pointers node) i) p)
-                  (incf pointer 8)))
-              ;;(log:debug "READ POINTERS, OFFSET IS ~S" pointer)
-              (multiple-value-bind (key length)
-                  (funcall (%sl-key-deserializer skip-list) (subseq bytes pointer))
-                ;;(log:debug "GOT KEY ~S OF LEN ~S" key length)
-                (let ((value (funcall (%sl-value-deserializer skip-list)
-                                      (subseq bytes (+ pointer length)))))
-                  (setf (%sn-key node) key
-                        (%sn-value node) value)
-                  (with-sl-cache-lock (skip-list)
-                    (setf (gethash addr (%sl-node-cache skip-list))
-                          node)))))))))
+      (let* ((cache (%sl-node-cache-vec skip-list))
+             (idx (logand (ash addr -6) 2047))
+             (cached (aref cache idx)))
+        (if (and cached (= (%sn-addr cached) addr))
+            cached
+            (or (and *cache-enabled*
+                     (with-sl-cache-lock (skip-list)
+                       (gethash addr (%sl-node-cache skip-list))))
+                (let ((node (get-skip-node-buffer)) (pointer 8))
+                  (setf (%sn-addr node) addr)
+                  (multiple-value-bind (bytes size)
+                      (read-skip-node-bytes skip-list addr)
+                    (setf (%sn-size node) size
+                          (%sn-level node) (aref bytes pointer)
+                          (%sn-flags node) (aref bytes (incf pointer))
+                          (%sn-pointers node) (make-array (%sn-level node)
+                                                          :element-type 'word))
+                    (incf pointer)
+                    (dotimes (i (%sn-level node))
+                      (let ((p (read-uint64-from-seq (subseq bytes pointer))))
+                        (setf (aref (%sn-pointers node) i) p)
+                        (incf pointer 8)))
+                    (multiple-value-bind (key length)
+                        (funcall (%sl-key-deserializer skip-list) (subseq bytes pointer))
+                      (let ((value (funcall (%sl-value-deserializer skip-list)
+                                            (subseq bytes (+ pointer length)))))
+                        (setf (%sn-key node) key
+                              (%sn-value node) value)
+                        (setf (aref cache idx) node)
+                        (with-sl-cache-lock (skip-list)
+                          (setf (gethash addr (%sl-node-cache skip-list))
+                                node)))))))))))
+
 
 (defstruct
     (skip-list
@@ -299,11 +301,13 @@ L1: 50%, L2: 25%, L3: 12.5%, ..."
   (key-deserializer 'deserialize)
   (value-serializer 'identity)
   (value-deserializer 'identity)
+  (node-cache-vec (make-array 2048 :element-type 't :initial-element nil))
   (node-cache
    #+sbcl (make-hash-table :test 'eq :weakness :value :synchronized t)
    #+lispworks (make-hash-table :test 'eq :weak-kind :value :single-thread nil)
    #+ccl (make-hash-table :test 'eq :weak :value :shared t)
    #+ecl (make-hash-table :test 'eq :weakness :value))
+
   ;; ECL hash tables aren't thread-safe and have no :synchronized option, so the
   ;; node-cache above needs an explicit lock (see WITH-SL-CACHE-LOCK).
   #+ecl (cache-lock (mp:make-lock))

@@ -83,25 +83,6 @@
   ;; Lock-free: the pointer is stable (see mmap-file / extend-mapped-file).
   (%set-byte mapped-file offset byte))
 
-(defmethod get-byte :around (mf offset)
-  (handler-case
-      (call-next-method)
-    #+sbcl
-    (sb-kernel::memory-fault-error (c)
-      (incf *mmap-segv-retries*)
-      (log:error "SEGV: GOT ~A in ~A; retrying." c mf)
-      (get-byte mf offset))
-    #+ccl
-    (CCL::INVALID-MEMORY-ACCESS (c)
-      (incf *mmap-segv-retries*)
-      (log:error "SEGV: GOT ~A in ~A; retrying." c mf)
-      (get-byte mf offset))
-    #+ecl
-    (ext:segmentation-violation (c)
-      (incf *mmap-segv-retries*)
-      (log:error "SEGV: GOT ~A in ~A; retrying." c mf)
-      (get-byte mf offset))))
-
 ;; Raw read.  Safe lock-free because the mapping's base pointer is stable.
 (declaim (inline %get-byte))
 (defun %get-byte (mapped-file offset)
@@ -118,24 +99,6 @@
   ;; Lock-free: the pointer is stable (see mmap-file / extend-mapped-file).
   (%get-byte mapped-file offset))
 
-(defmethod get-bytes :around (mf offset length)
-  (handler-case
-      (call-next-method)
-    #+sbcl
-    (sb-kernel::memory-fault-error (c)
-      (incf *mmap-segv-retries*)
-      (log:error "SEGV: GOT ~A in ~A; retrying." c mf)
-      (get-bytes mf offset length))
-    #+ccl
-    (CCL::INVALID-MEMORY-ACCESS (c)
-      (incf *mmap-segv-retries*)
-      (log:error "SEGV: GOT ~A in ~A; retrying." c mf)
-      (get-bytes mf offset length))
-    #+ecl
-    (ext:segmentation-violation (c)
-      (incf *mmap-segv-retries*)
-      (log:error "SEGV: GOT ~A in ~A; retrying." c mf)
-      (get-bytes mf offset length))))
 
 (defmethod get-bytes ((mapped-file mapped-file) offset length)
   (declare (type word offset length))

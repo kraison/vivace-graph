@@ -137,9 +137,17 @@ maintenance, queries). Merged into `experiment`; full suite green on SBCL
 - [x] Per-index `:spatial-max-cells` slot option added to `def-vertex` slot specs.
 - [x] Issue #79 Fix #1: Direct GEOS C API geometry construction without WKT text round-trip (~27x speedup, predicate time reduced from 4.64ms to 0.17ms on 2.2k vertex geometries).
 - [x] Issue #79 Fix #2: Packed coordinate array storage (`simple-array double-float (*)`). Reduces memory footprint by 3-4x and enables zero-consing bounding box and point-in-polygon operations. Full backward compatibility preserved for reading legacy nested list serializations from disk.
-- [x] Issue #84: Exported `geometry-coordinate-pairs` (pair-shaped nested list accessor restoring classic `(lon lat)` structure for exporters/callers) and `map-geometry-coordinates` (zero-allocation vertex iterator). Corrected header documentation.
+- [x] Issue #84: Exported `geometry-coordinate-pairs` (pair-shaped nested list accessor restoring classic `(lon lat)` structure for exporters/callers) and `map-geometry-coordinates` (vertex iterator). Corrected header documentation.
+- [x] Issue #85: Added and exported `do-geometry-coordinates ((lon lat) geometry &body body)` macro form for zero-allocation unboxed double-float register iteration over geometry vertices (25x faster than `geometry-coordinate-pairs`).
+- [x] Issue #83: Substrate performance optimizations for index read path:
+  - Removed `:around` CLOS method dispatch from `get-byte` / `get-bytes`.
+  - Added fast direct-mapped array node cache to `skip-list` (eliminating weak hash table lock contention and GC overhead).
+  - Implemented lazy leaf page entry decoding for `bplus-tree` (`bplus-cursor`), eliminating wholesale decoding of leaf entries.
+  - Added ASCII string decoding fast path `%octets-to-string-fast` in `serialize.lisp` and zero-allocation slice decoding in `view-key-deserialize`.
+  - Benchmark results: B+ tree spatial query latency dropped from 2.608 ms to 0.744 ms (**3.5x speedup**, 58% less consing). Skip-list latency dropped from 1.329 ms to 1.116 ms.
 - [x] Chapter 13 caveat fixes: corrected the "prefix range scans" description
       (queries do same-precision exact-cell lookups) and the precision/max-cells config claims.
+
 
 
 
