@@ -381,6 +381,10 @@
   :components ((:file "package")
                (:file "suite")
                (:file "serialize-tests")
+               ;; node-class-tests defines only bare NODE-CLASS metaobjects (no
+               ;; graph, no schema registration), so it has no ordering
+               ;; constraint against the graph-level files below.
+               (:file "node-class-tests")
                (:file "geometry-tests")
                (:file "geometry-ops-tests")
                (:file "geohash-tests")

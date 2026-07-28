@@ -310,23 +310,47 @@ reaper cost scale with total chain length again, rather than with
 KEEP-REVISIONS, would fail this test rather than silently slow every commit in
 production.
 
-Bound chosen: mean commit latency at KEEP-REVISIONS=100 must stay within 2x of
+Bound chosen: mean commit latency at KEEP-REVISIONS=100 must stay within 3x of
 the KEEP-REVISIONS=0 control's mean, both measured over *MG-RETAIN-UPDATE-COUNT*
-(2,000) updates to a single vertex -- the plan's original suggestion, kept as
-is. Six consecutive runs at KEEP-REVISIONS=100 on this shared machine measured
-ratios of 0.989x, 1.021x, 0.980x, 0.980x, 0.976x and 0.953x: an ~7-point spread
-(0.953x-1.021x) clustered tightly around 1.0x, nowhere near flaky against a 2x
-bound, so no widening was needed. Discrimination was proved (see the task
-report) by temporarily setting *MG-EPSILON-KEEP-REVISIONS* to 4,000,000,000 --
-effectively never reaping within the run -- and re-running with everything
-else unchanged: two such runs measured ratios of 2.504x and 2.557x, both
-failing the assertion by a wide margin on either side (six-run control high of
-1.021x vs. perturbed low of 2.504x). Note this mean-over-the-whole-run ratio
-(~2.5x) is smaller than the 3.65x the spec quotes for KEEP-REVISIONS=4e9 at
-update 2,000: the spec's figure compares the first and the very last commit of
-the ramp, while this test averages every commit across it, including the
-cheap early ones before the chain has grown -- both are real measurements of
-the same degradation, taken differently."
+(2,000) updates to a single vertex.
+
+RECALIBRATED 2026-07-29 (GH #87), from 2x to 3x.  This is a ratio, so it moves
+when the DENOMINATOR moves: #87 removed the per-slot-access rebuilding of the
+persistent/ephemeral/meta name lists, which sped ordinary commits up far more
+than it sped up reaping.  The reaper's ABSOLUTE cost -- the thing this test
+exists to protect -- did not change:
+
+                     control    bounded    ratio    reap overhead
+    SBCL  before     0.4805ms   0.5395ms   1.123x   0.059ms
+    SBCL  after      0.1810ms   0.2360ms   1.304x   0.055ms
+    ECL   before     5.6066ms   7.1893ms   1.282x   1.583ms
+    ECL   after      1.3497ms   3.0719ms   2.276x   1.722ms
+
+so the ECL ratio crossed 2x purely because its baseline got 4.15x cheaper while
+a fixed ~1.6ms of reaping stayed put.  (ECL's reaping is ~27x more expensive in
+absolute terms than SBCL's, which is why ECL is the implementation that trips
+this and SBCL is not.)
+
+Discrimination is re-proved at the new bound, and is in fact WIDER than before:
+setting *MG-EPSILON-KEEP-REVISIONS* to 4,000,000,000 -- effectively never
+reaping within the run -- now measures 4.506x on SBCL and 12.119x on ECL,
+against healthy ratios of 1.304x (SBCL) and 2.17x-2.28x over five runs (ECL).
+A 3x bound sits with ~1.3x margin above the worst healthy observation and ~1.5x
+below the closest pathological one.
+
+Note that no single ratio ever separated healthy from pathological across BOTH
+implementations before #87: the pre-#87 SBCL pathological case measured 2.342x
+while the post-#87 ECL healthy case measures 2.28x.  The original 2x was
+calibrated on SBCL alone (six runs, 0.953x-1.021x) and was already marginal on
+ECL.  If this test trips again, check the reap OVERHEAD column above before
+touching the bound -- a real regression moves that number, a baseline
+improvement does not.
+
+Note also that this mean-over-the-whole-run ratio is smaller than the 3.65x the
+spec quotes for KEEP-REVISIONS=4e9 at update 2,000: the spec's figure compares
+the first and the very last commit of the ramp, while this test averages every
+commit across it, including the cheap early ones before the chain has grown --
+both are real measurements of the same degradation, taken differently."
   (with-temp-directory (dir-ctl)
     (with-temp-directory (dir-bnd)
       (let (gctl gbnd id-ctl id-bnd)
@@ -355,8 +379,8 @@ the same degradation, taken differently."
                          n ctl-mean)
                  (format t "~&;; keep-revisions=~D bounded mean commit latency over ~D updates: ~,4Fms (ratio ~,3Fx)~%"
                          *mg-epsilon-keep-revisions* n bnd-mean ratio)
-                 (is (<= bnd-mean (* 2.0d0 ctl-mean))
-                     "keep-revisions=~D mean commit latency ~,4Fms must stay within 2x the ~
+                 (is (<= bnd-mean (* 3.0d0 ctl-mean))
+                     "keep-revisions=~D mean commit latency ~,4Fms must stay within 3x the ~
 keep-revisions=0 control's ~,4Fms mean over ~D updates (observed ratio ~,3Fx)"
                      *mg-epsilon-keep-revisions* bnd-mean ctl-mean n ratio)))
           (ignore-errors (close-graph gctl :snapshot-p nil))

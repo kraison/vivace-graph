@@ -1,7 +1,11 @@
 (in-package :graph-db)
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
-(defclass node-class (standard-class) nil)
+(defclass node-class (standard-class)
+  ;; Cached slot categorization; see %NODE-SLOT-INFO below.  NIL means "not
+  ;; computed yet"; it is never written with anything but a complete,
+  ;; freshly-built NODE-SLOT-INFO or NIL.
+  ((slot-info :initform nil :accessor %node-class-slot-info)))
 
 (defmethod validate-superclass ((class node-class) (super standard-class))
   "Node classes may inherit from ordinary classes."
@@ -69,46 +73,109 @@
     (standard-effective-slot-definition node-slot-definition)
   ())
 
+;;; ---------------------------------------------------------------------------
+;;; Per-class slot categorization, computed once (GH #87)
+;;;
+;;; PERSISTENT-P / EPHEMERAL-P / META-P are generic functions, and the four
+;;; SLOT-*-USING-CLASS :AROUND methods in primitive-node.lisp consult them on
+;;; EVERY slot access.  Walking CLASS-SLOTS and consing a fresh name list per
+;;; access cost ~28 list rebuilds and ~532 predicate dispatches per node
+;;; materialized -- about 59% of one profiler workload -- to recompute answers
+;;; that cannot change once the class is finalized.
+;;;
+;;; So compute the breakdown once and cache it on the class.  The correctness
+;;; obligation is invalidation: see %INVALIDATE-NODE-SLOT-INFO below for the two
+;;; places a class definition can change out from under the cache.
+;;; ---------------------------------------------------------------------------
+
+(defstruct (node-slot-info (:conc-name %nsi-))
+  ;; slot-name -> the keyword naming its entry in a node's DATA alist.  Holds
+  ;; ONLY persistent slots, so GETHASH answers "is this persistent?" and "what
+  ;; keyword?" in one lookup -- which is all the hot path needs, because every
+  ;; non-persistent branch of those :AROUND methods just calls the next method.
+  (persistent-keywords (make-hash-table :test 'eq) :type hash-table)
+  (persistent-names nil :type list)
+  (ephemeral-names nil :type list)
+  (meta-names nil :type list)
+  (data-names nil :type list))
+
+(defun %compute-node-slot-info (class)
+  "Build CLASS's NODE-SLOT-INFO.  Each list is filtered independently, exactly
+as the separate walks it replaces did, so a slot carrying more than one flag
+still appears in each list it qualifies for."
+  (let ((keywords (make-hash-table :test 'eq))
+        (persistent '()) (ephemeral '()) (meta '()) (data '()))
+    (dolist (slot (class-slots class))
+      (let ((name (slot-definition-name slot))
+            (persistentp (persistent-p slot))
+            (ephemeralp (ephemeral-p slot)))
+        (when persistentp
+          (push name persistent)
+          (setf (gethash name keywords) (intern (symbol-name name) :keyword)))
+        (when ephemeralp (push name ephemeral))
+        (when (meta-p slot) (push name meta))
+        (when (or persistentp ephemeralp) (push name data))))
+    (make-node-slot-info :persistent-keywords keywords
+                         :persistent-names (nreverse persistent)
+                         :ephemeral-names (nreverse ephemeral)
+                         :meta-names (nreverse meta)
+                         :data-names (nreverse data))))
+
+(defun %node-slot-info (class)
+  "CLASS's cached slot categorization, computing it on first use.
+Deliberately unlocked: two threads racing here build equal structures and one
+SETF wins, which is harmless.  What must never happen is publishing a partially
+filled structure, so the SETF stores an already-complete one."
+  (or (%node-class-slot-info class)
+      (setf (%node-class-slot-info class) (%compute-node-slot-info class))))
+
+(defun %invalidate-node-slot-info (class)
+  "Drop CLASS's cached categorization, and its subclasses' -- a subclass's
+effective slots are recomputed when a superclass changes, so their caches are
+stale too."
+  (setf (%node-class-slot-info class) nil)
+  (dolist (sub (class-direct-subclasses class))
+    (when (typep sub 'node-class)
+      (%invalidate-node-slot-info sub))))
+
+(defmethod finalize-inheritance :after ((class node-class))
+  "Effective slots have just been recomputed, so any cached view of them is stale."
+  (%invalidate-node-slot-info class))
+
+(defmethod reinitialize-instance :after ((class node-class) &rest initargs
+                                         &key &allow-other-keys)
+  "Class redefinition (a re-evaluated DEF-VERTEX / DEF-EDGE / DEFCLASS)."
+  (declare (ignore initargs))
+  (%invalidate-node-slot-info class))
+
+(defun %persistent-slot-keyword (class slot-name)
+  "The keyword naming SLOT-NAME's entry in a node's DATA alist, or NIL when
+SLOT-NAME is not a persistent slot of CLASS.  This is the whole question the
+SLOT-*-USING-CLASS :AROUND methods need to ask."
+  (values (gethash slot-name (%nsi-persistent-keywords (%node-slot-info class)))))
+
+;;; The four readers below return the CACHED lists, not fresh copies as they did
+;;; before #87.  Treat them as read-only: SORT / NREVERSE / DELETE on a returned
+;;; list corrupts the class's cache.  COPY-LIST first if you need to mutate.
+
 (defmethod data-slots ((instance node-class))
   "Return a list of managed slot names for an instance."
-  (map 'list 'slot-definition-name
-       (remove-if-not #'(lambda (i)
-                          (or (persistent-p i) (ephemeral-p i)))
-                      (class-slots instance))))
+  (%nsi-data-names (%node-slot-info instance)))
 
 (defmethod meta-slot-names ((instance node-class))
   "Return a list of metadata slot names for an instance."
-  ;;(log:debug "meta-slot-names(~A)" instance)
-  (let ((names
-         (map 'list 'slot-definition-name
-              (remove-if-not #'(lambda (i)
-                                 (meta-p i))
-
-               (class-slots instance)))))
-    ;;(log:debug "meta-slot-names(~A): ~A" instance names)
-    names))
+  (%nsi-meta-names (%node-slot-info instance)))
 
 (defmethod persistent-slot-names ((instance node-class))
   "Return a list of persistent slot names for an instance."
-  ;;(log:debug "persistent-slot-names(~A)" instance)
-  (let ((names
-         (map 'list 'slot-definition-name
-              (remove-if-not #'(lambda (i)
-                                 (persistent-p i))
-                             (class-slots instance)))))
-    ;;(log:debug "persistent-slot-names(~A): ~A" instance names)
-    names))
+  (%nsi-persistent-names (%node-slot-info instance)))
 
 (defmethod ephemeral-slot-names ((instance node-class))
-  "Return a list of persistent slot names for an instance."
-  ;;(log:debug "ephemeral-slot-names(~A)" instance)
-  (let ((names
-         (map 'list 'slot-definition-name
-              (remove-if-not #'(lambda (i)
-                                 (ephemeral-p i))
-                             (class-slots instance)))))
-    ;;(log:debug "ephemeral-slot-names(~A): ~A" instance names)
-    names))
+  "Return a list of ephemeral slot names for an instance.
+Note that this is empty for every node class as things stand -- :EPHEMERAL never
+reaches the effective slot; see the EPHEMERAL-DECLARATION-IS-CURRENTLY-INERT
+test in tests/node-class-tests.lisp."
+  (%nsi-ephemeral-names (%node-slot-info instance)))
 
 (defmethod direct-slot-definition-class ((class node-class) &rest initargs)
   (declare (ignore initargs))

@@ -366,17 +366,11 @@ to NIL is bound.  Materializes the data first (mirrors NODE-SLOT-VALUE)."
   (log:trace "slot-value-using-class~%  '~A'~%  '~A'" class (slot-definition-name slot))
   (let* (#+lispworks(slot (closer-mop::find-slot slot class))
          (slot-name (slot-definition-name slot))
-         (slot-keyword-name (intern (symbol-name slot-name) :keyword)))
-    (cond ((member slot-name (persistent-slot-names class))
-           ;; FIXME: Check for txn and give current revision's value
-           (node-slot-value instance slot-keyword-name))
-          ((member slot-name (ephemeral-slot-names class))
-           ;; FIXME: Check for txn and give current revision's value
-           (call-next-method))
-          ((member slot-name (meta-slot-names class))
-           (call-next-method))
-          (t
-           (call-next-method)))))
+         (slot-keyword-name (%persistent-slot-keyword class slot-name)))
+    (if slot-keyword-name
+        ;; FIXME: Check for txn and give current revision's value
+        (node-slot-value instance slot-keyword-name)
+        (call-next-method))))
 
 (defmethod (setf slot-value-using-class) :around
     (new-value (class node-class) instance slot)
@@ -386,17 +380,11 @@ to NIL is bound.  Materializes the data first (mirrors NODE-SLOT-VALUE)."
   ;;(sb-pcl:slot-definition-name slot))
   (let* (#+lispworks(slot (closer-mop::find-slot slot class))
          (slot-name (slot-definition-name slot))
-         (slot-keyword-name (intern (symbol-name slot-name) :keyword)))
-    (cond ((member slot-name (persistent-slot-names class))
-           ;; FIXME: Check for txn and handle
-           (setf (node-slot-value instance slot-keyword-name) new-value))
-          ((member slot-name (ephemeral-slot-names class))
-           ;; FIXME: Check for txn and handle
-           (call-next-method))
-          ((member slot-name (meta-slot-names class))
-           (call-next-method))
-          (t
-           (call-next-method)))))
+         (slot-keyword-name (%persistent-slot-keyword class slot-name)))
+    (if slot-keyword-name
+        ;; FIXME: Check for txn and handle
+        (setf (node-slot-value instance slot-keyword-name) new-value)
+        (call-next-method))))
 
 ;; *INITIALIZING-NODE* is defvar'd above MAYBE-INIT-NODE-DATA (it guards that
 ;; function too); see there for the full rationale.
@@ -414,15 +402,10 @@ slot (which is always unbound), so SLOT-BOUNDP must consult the alist for them.
 Ephemeral and meta slots ARE real CLOS slots -- defer to the standard method."
   (let* (#+lispworks(slot (closer-mop::find-slot slot class))
          (slot-name (slot-definition-name slot))
-         (slot-keyword-name (intern (symbol-name slot-name) :keyword)))
-    (cond ((member slot-name (persistent-slot-names class))
-           (node-slot-boundp instance slot-keyword-name))
-          ((member slot-name (ephemeral-slot-names class))
-           (call-next-method))
-          ((member slot-name (meta-slot-names class))
-           (call-next-method))
-          (t
-           (call-next-method)))))
+         (slot-keyword-name (%persistent-slot-keyword class slot-name)))
+    (if slot-keyword-name
+        (node-slot-boundp instance slot-keyword-name)
+        (call-next-method))))
 
 (defmethod slot-makunbound-using-class :around ((class node-class) instance slot)
   "Unbind a persistent slot by dropping its DATA-alist entry (the real CLOS slot
@@ -433,19 +416,14 @@ re-initialization CHANGE-CLASS performs does not clear the alist-backed slot
 values we just set."
   (let* (#+lispworks(slot (closer-mop::find-slot slot class))
          (slot-name (slot-definition-name slot))
-         (slot-keyword-name (intern (symbol-name slot-name) :keyword)))
-    (cond ((and (member slot-name (persistent-slot-names class))
-                (not *initializing-node*))
-           (maybe-init-node-data instance)
-           (setf (data instance)
-                 (delete slot-keyword-name (data instance) :key #'car))
-           instance)
-          ((member slot-name (ephemeral-slot-names class))
-           (call-next-method))
-          ((member slot-name (meta-slot-names class))
-           (call-next-method))
-          (t
-           (call-next-method)))))
+         (slot-keyword-name (%persistent-slot-keyword class slot-name)))
+    (if (and slot-keyword-name (not *initializing-node*))
+        (progn
+          (maybe-init-node-data instance)
+          (setf (data instance)
+                (delete slot-keyword-name (data instance) :key #'car))
+          instance)
+        (call-next-method))))
 
 (defgeneric node-equal (x y)
   (:method ((x node) (y node))
