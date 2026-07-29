@@ -115,6 +115,7 @@
            #:rollback
            #:*transaction*
            #:*read-snapshots*
+           #:read-transaction
            #:no-transaction-in-progress
 
            #:def-node-type

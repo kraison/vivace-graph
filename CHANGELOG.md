@@ -94,6 +94,22 @@ between releases; cutting a release renames it to the new version and dates it.
   of class symbols, or `:all`, and type-filters the yielded nodes, so the `is-a`
   goal these queries once needed is gone.
 
+### Changed
+- **`*TRANSACTION*` is `NIL` inside a read-only snapshot** (`with-read-snapshot`,
+  and `select`/`do-query` with `:snapshot t`). A snapshot now populates the new,
+  exported `*read-snapshots*` instead of binding `*transaction*`, so code that
+  read `*transaction*` to detect "am I inside a query" sees `NIL` there. Call
+  the new exported `read-transaction` (&optional graph) to ask which transaction
+  a read of a given graph actually resolves through — the read-write
+  `*transaction*` when it covers that graph, else that graph's read snapshot,
+  else `NIL`. Second-order effects of the same change: inside a snapshot,
+  `copy` now signals `no-transaction-in-progress-warning` instead of silently
+  joining the snapshot, `commit`/`rollback` now signal
+  `no-transaction-in-progress` instead of no-op'ing, and `make-<type>` /
+  `mark-deleted` now auto-wrap their own real, committing transaction instead of
+  joining a snapshot that was never going to commit — a correctness fix, but a
+  visible behavior change for any code relying on the old silent join.
+
 ### Removed
 - **BREAKING: `spatial-index` (the single whole-graph spatial-index accessor).**
   There is no longer one index for it to name; use `spatial-indexes` /

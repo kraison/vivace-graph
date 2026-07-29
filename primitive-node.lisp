@@ -173,7 +173,8 @@ block, so the bytes are captured before the pin is released and the node can
 escape self-contained.  Deserialize stays lazy (MAYBE-INIT-NODE-DATA).  This
 replaced the lhash value-finalizer (which copied under the bucket lock)."
   (when (node-p node)
-    (setf (node-graph node) graph)
+    (unless (eq (node-graph node) graph)
+      (setf (node-graph node) graph))
     (let ((dp (data-pointer node)))
       (when (and (> dp 0)
                  (or (eq (bytes node) :init) (null (bytes node))))
@@ -246,7 +247,8 @@ explicitly afterward (the transaction-node path) or materialized lazily later
       (let ((node (lhash-get table key)))
         (when (node-p node)
           (setf (id node) key)
-          (setf (node-graph node) graph)
+          (unless (eq (node-graph node) graph)
+            (setf (node-graph node) graph))
           ;; we should wait to do this until we need the data.
           ;;(maybe-init-node-data node :graph graph)
           (when *cache-enabled*

@@ -19,10 +19,13 @@
    (node-graph :initarg :node-graph))
   (:report (lambda (error stream)
              (with-slots (node transaction-graph node-graph) error
+               ;; NODE is a full node object on the write path but a raw id
+               ;; byte vector on the read path (GH #53); STRING-ID has a
+               ;; method for both, so use it rather than printing the array.
                (format stream "Cross-graph access in a read-write transaction: ~
 node ~A belongs to ~A but the transaction is on ~A. A read-write transaction ~
 is single-graph; use one transaction per graph."
-                       node (and node-graph (graph-name node-graph))
+                       (string-id node) (and node-graph (graph-name node-graph))
                        (and transaction-graph (graph-name transaction-graph)))))))
 
 (define-condition serialization-error (error)

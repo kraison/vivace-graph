@@ -266,6 +266,29 @@ identity, not on presence (GH #53)."
   (is (member 'beta (mapcar #'graph-db::slot-definition-name
                             (graph-db::class-slots (find-class 'samechk-thing))))))
 
+(test same-graph-redefinition-with-string-graph-name-still-allowed
+  "GRAPH-NAME need not be a keyword -- *SCHEMA-NODE-METADATA* is EQUAL-keyed, so
+a string name is a legal key too. The uniqueness check must compare with EQUAL,
+not EQ: two distinct string objects with the same contents are not EQ, so an EQ
+check would misidentify a same-graph redefinition as a cross-graph collision and
+wrongly signal DUPLICATE-NODE-CLASS-ERROR (GH #53).
+The two graph-name strings are built at RUNTIME via COPY-SEQ, spliced in with
+backquote rather than written as quoted literals: two literal \"strchk-one\"
+strings in source are similar literals, which a compiler is free to (and SBCL
+does) coalesce into one EQ object in the fasl -- silently defeating this test's
+whole premise."
+  (let ((gn1 (copy-seq "strchk-one"))
+        (gn2 (copy-seq "strchk-one")))
+    (is (not (eq gn1 gn2))
+        "test setup is broken: the two graph-name objects must not be EQ")
+    (eval `(def-vertex strchk-thing ()
+            ((alpha :type string)) ,gn1))
+    (finishes
+      (eval `(def-vertex strchk-thing ()
+              ((alpha :type string) (beta)) ,gn2))))
+  (is (member 'beta (mapcar #'graph-db::slot-definition-name
+                            (graph-db::class-slots (find-class 'strchk-thing))))))
+
 (test redefinition-replaces-its-registry-entry
   "UPDATE-SCHEMA replays every meta in the list on graph open, so accumulating
 duplicates costs an instantiation per historical version, forever (GH #53)."

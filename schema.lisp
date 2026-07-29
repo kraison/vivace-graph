@@ -226,7 +226,7 @@ replication for a quick schema compatibility check."
 graph-name identity, not presence: a same-graph redefinition legitimately
 re-registers under the same key (GH #53)."
   (maphash (lambda (gname metas)
-             (unless (eq gname graph-name)
+             (unless (equal gname graph-name)
                (when (find name metas :key #'node-type-name)
                  (error 'duplicate-node-class-error
                         :name name :existing-graph gname :new-graph graph-name))))

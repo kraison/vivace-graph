@@ -2577,11 +2577,12 @@ needed): records a deletion of a copy with its deleted flag set, so the node
 stops appearing in queries.  MARK-DELETED is the usual entry point.")
   (:method (node graph)
     ;; A read-write transaction is single-graph (GH #53).  A NIL home is
-    ;; unknown, not foreign.  DELETE-NODE bypasses UPDATE-NODE, so it needs
-    ;; its own check; guard on *TRANSACTION* since the :AROUND auto-wraps one.
+    ;; unknown, not foreign.  DELETE-NODE bypasses UPDATE-NODE, so it needs its
+    ;; own check.  The :AROUND guarantees *TRANSACTION* is bound here, so no
+    ;; guard on it -- a foreign delete must error, never pass silently.
     (let ((home (node-home-graph node nil))
-          (txn-graph (and *transaction* (graph *transaction*))))
-      (when (and home txn-graph (not (eq home txn-graph)))
+          (txn-graph (graph *transaction*)))
+      (when (and home (not (eq home txn-graph)))
         (error 'cross-graph-transaction-error
                :node node :transaction-graph txn-graph :node-graph home)))
     (let ((old-node node)

@@ -907,8 +907,11 @@ as deferred blobs and materialize on first touch (needs a VG-native image)."
   (let ((v (mem-table-get table key)))
     (let ((node (if (lznode-p v) (mem-materialize table key v) v)))
       ;; Nodes reach the mem-table unstamped (peer apply, image restore), so
-      ;; every node this hands out is stamped here (GH #53).
-      (when (node-p node) (setf (node-graph node) graph))
+      ;; every node this hands out is stamped here (GH #53) -- but only when
+      ;; wrong, so this hot read path stays a pure read (no cache-line write
+      ;; on every lookup, matching the on-disk lookup-node above).
+      (when (and (node-p node) (not (eq (node-graph node) graph)))
+        (setf (node-graph node) graph))
       node)))
 
 ;; Create: publish the live node into the mem-table.  No heap write, no index

@@ -2445,6 +2445,23 @@ legal — that is ordinary schema evolution and works at runtime.
 Previously a second definition silently replaced the first class's slots, leaving the
 first graph's stored data unreachable through the API while still on disk.
 
+*** ~*transaction*~ is NIL inside a read-only snapshot
+
+~with-read-snapshot~ (and ~select~/~do-query~ with ~:snapshot t~) records its snapshot per
+graph in ~*read-snapshots*~ rather than binding ~*transaction*~, so code that reads
+~*transaction*~ to tell whether it is inside a query sees ~NIL~ there. Call
+~(read-transaction &optional graph)~ instead: it returns the read-write ~*transaction*~ when
+one is active and covers ~graph~, else ~graph~'s read snapshot from ~*read-snapshots*~, else
+~NIL~. This has second-order effects inside a snapshot: ~copy~ now signals
+~no-transaction-in-progress-warning~, ~commit~/~rollback~ now signal
+~no-transaction-in-progress~, and ~make-<type>~/~mark-deleted~ now auto-wrap their own real,
+committing transaction instead of silently joining a snapshot that was never going to
+commit.
+
+Also note: ~graph~ is now a *reserved* slot name on node classes — it backs the ~:META~
+home-graph tracking slot described above. A user-defined slot named ~graph~ shadows it and
+silently disables home-graph tracking for that class; do not use it as a slot name.
+
 ** API Reference
 
 This chapter provides a categorized reference for the most important exported symbols from the ~graph-db~ package. It is not an exhaustive list of every internal function but focuses on the public API you will use most often when building applications.

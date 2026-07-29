@@ -1047,6 +1047,25 @@ this test isolated to the write check it is about."
           "the foreign delete must not have landed")
       gc)))
 
+(test cross-graph-error-report-is-readable-on-the-read-path
+  "The read path stores a raw id byte vector in the NODE slot, not a node
+object (see the TRANSACTION method of LOOKUP-OBJECT); the report must print it
+via STRING-ID like the write path does, not the raw vector (GH #53)."
+  (with-three-graphs (ga gb gc)
+    (let (a-id)
+      (let ((*graph* ga))
+        (with-transaction () (setq a-id (id (make-mg-plain :label "in-a")))))
+      (let ((condition
+              (handler-case
+                  (let ((*graph* gb))
+                    (with-transaction () (lookup-vertex a-id :graph ga)))
+                (graph-db:cross-graph-transaction-error (e) e))))
+        (is (typep condition 'graph-db:cross-graph-transaction-error))
+        (let ((report (format nil "~A" condition)))
+          (is (search (string-id a-id) report)
+              "report must contain the readable hex id, got ~A" report)))
+      gc)))
+
 ;;; --- read-only snapshots are per graph and compose (GH #53) -----------------
 
 (defun %mg-count (graph type)
