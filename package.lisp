@@ -113,6 +113,7 @@
            #:commit
            #:rollback
            #:*transaction*
+           #:*read-snapshots*
            #:no-transaction-in-progress
 
            #:def-node-type

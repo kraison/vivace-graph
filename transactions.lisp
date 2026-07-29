@@ -7,6 +7,9 @@
                 apply-tx-writes-to-secondary-indexes))
 
 (defvar *transaction* nil)
+(defvar *read-snapshots* nil
+  "Graph -> read-only snapshot transaction, or NIL.  Read-only snapshots are
+per graph and may compose; read-write transactions are not (GH #53).")
 (defvar *end-of-transaction-action* '%commit)
 (defparameter *maximum-transaction-attempts* 8
   "The number of times a transaction is retried after failing
@@ -190,6 +193,11 @@
 
 (defgeneric lookup-object (id table transaction graph)
   (:method (id table (transaction null) graph)
+    ;; No read-write transaction: a read-only snapshot of GRAPH, if one is
+    ;; active, resolves the read (GH #53).
+    (let ((snapshot (and *read-snapshots* (gethash graph *read-snapshots*))))
+      (when snapshot
+        (return-from lookup-object (lookup-object id table snapshot graph))))
     ;; Non-transactional read: pin the read epoch so the reaper retains whatever
     ;; version we observe.  If this is a STANDALONE lookup (no enclosing pin), the
     ;; node escapes our pin, so materialize its bytes now (the lhash value-
@@ -2804,28 +2812,61 @@ stops appearing in queries.  MARK-DELETED is the usual entry point.")
       (setf (state tx) :active)
       tx)))
 
+(defun %transaction-covers-graph-p (transaction graph)
+  "True when TRANSACTION governs reads of GRAPH.  RECOVERY-TRANSACTION and its
+subclasses carry no graph at all, and covered everything before (GH #53)."
+  (let ((tg (and (slot-exists-p transaction 'graph)
+                 (slot-boundp transaction 'graph)
+                 (slot-value transaction 'graph))))
+    (or (null tg) (eq tg graph))))
+
+(defun read-transaction (&optional (graph *graph*))
+  "The transaction a read of GRAPH resolves through: the read-write
+*TRANSACTION* when it is on GRAPH, otherwise GRAPH's read-only snapshot from
+*READ-SNAPSHOTS*, otherwise NIL (read non-transactionally).  Enforcement of the
+cross-graph rule lives at the read/write sites themselves, not here (GH #53)."
+  (if (and *transaction* (%transaction-covers-graph-p *transaction* graph))
+      *transaction*
+      (and *read-snapshots* (gethash graph *read-snapshots*))))
+
 (defun call-with-read-snapshot (thunk &optional (graph *graph*))
-  "Run THUNK with *TRANSACTION* bound to a fresh, read-only MVCC snapshot of
-GRAPH, so every read THUNK performs resolves at one consistent epoch (a node
+  "Run THUNK with reads of GRAPH resolving through a fresh, read-only MVCC
+snapshot of GRAPH, so every such read resolves at one consistent epoch (a node
 committed after the snapshot started is invisible).  The snapshot transaction is
 registered active for THUNK's dynamic extent -- which holds the reaper's floor
 so the observed versions are retained -- and is simply discarded on exit, never
-validated or committed (a query writes nothing).  If a transaction is already
-active, THUNK runs under it unchanged so an enclosing snapshot is inherited.  A
-no-op (THUNK runs directly) when GRAPH has no transaction manager yet."
+validated or committed (a query writes nothing).
+
+The snapshot is recorded in *READ-SNAPSHOTS* under GRAPH rather than bound to
+*TRANSACTION*, so snapshots on several graphs COMPOSE: a cross-graph query holds
+one snapshot per participating graph, each internally consistent, with
+deliberately no single instant across them (GH #53).  An enclosing snapshot of
+the SAME graph is inherited, as is a read-write transaction on it.  A no-op
+(THUNK runs directly) when GRAPH has no transaction manager yet."
   (let ((tm (and graph
                  (slot-boundp graph 'transaction-manager)
                  (transaction-manager graph))))
-    (if (or *transaction* (null tm))
-        (funcall thunk)
-        (let ((txn (create-transaction tm)))
-          (unwind-protect
-               (let ((*transaction* txn))
-                 (funcall thunk))
-            (remove-transaction txn tm))))))
+    (cond
+      ((null tm) (funcall thunk))
+      ;; a read-write transaction on this graph already provides a snapshot
+      ((and *transaction* (%transaction-covers-graph-p *transaction* graph))
+       (funcall thunk))
+      ;; already snapshotted this graph -> inherit
+      ((and *read-snapshots* (gethash graph *read-snapshots*)) (funcall thunk))
+      (t
+       (let ((txn (create-transaction tm))
+             (table (or *read-snapshots* (make-hash-table :test 'eq))))
+         (unwind-protect
+              (let ((*read-snapshots* table))
+                (setf (gethash graph table) txn)
+                (funcall thunk))
+           ;; the entry must not outlive the extent: a stale snapshot pins the
+           ;; reaper's floor and retains versions forever (GH #53)
+           (remhash graph table)
+           (remove-transaction txn tm)))))))
 
 (defmacro with-read-snapshot ((&optional (graph '*graph*)) &body body)
-  "Evaluate BODY with reads pinned to a single consistent MVCC snapshot of GRAPH.
+  "Evaluate BODY with reads of GRAPH pinned to a single consistent MVCC snapshot.
 See CALL-WITH-READ-SNAPSHOT."
   `(call-with-read-snapshot (lambda () ,@body) ,graph))
 

@@ -987,3 +987,104 @@ isolates this test to the write check it is about."
                 (setf (slot-value copy 'label) "nope")
                 (save copy :graph gb))))))
       gc)))
+
+;;; --- read-only snapshots are per graph and compose (GH #53) -----------------
+
+(defun %mg-count (graph type)
+  (length (map-vertices #'identity graph :collect-p t :vertex-type type)))
+
+(test read-only-snapshots-compose-across-graphs
+  "A read-only snapshot may span graphs; each graph is internally consistent,
+with no single instant across graphs (GH #53)."
+  (with-three-graphs (ga gb gc)
+    (let (a-id b-id)
+      (let ((*graph* ga))
+        (with-transaction () (setq a-id (id (make-mg-plain :label "a1")))))
+      (let ((*graph* gb))
+        (with-transaction () (setq b-id (id (make-mg-text :label "b1")))))
+      (graph-db:with-read-snapshot (ga)
+        (graph-db:with-read-snapshot (gb)
+          (is (string= "a1" (slot-value (lookup-vertex a-id :graph ga) 'label)))
+          (is (string= "b1" (slot-value (lookup-vertex b-id :graph gb) 'label)))))
+      gc)))
+
+(test composed-snapshots-each-hide-their-own-graphs-later-commits
+  "THE discriminating test for the registry.  Reading the right value under two
+composed snapshots (above) proves nothing on its own: LOOKUP-OBJECT's
+NON-transactional method binds *GRAPH* to the requested graph, so a cross-graph
+read returns the right value even with no snapshot in force at all.  What only a
+per-graph registry can do is make BOTH reads resolve through their OWN graph's
+snapshot -- so a commit made to either graph after the snapshots were taken is
+invisible in that graph, while both remain visible outside.  If either graph's
+entry were missing (or a single snapshot covered only one of them), that graph's
+read would fall through to a live non-transactional read and see 2 (GH #53)."
+  (with-three-graphs (ga gb gc)
+    (let ((a-inside 0) (b-inside 0))
+      (let ((*graph* ga)) (with-transaction () (make-mg-plain :label "a1")))
+      (let ((*graph* gb)) (with-transaction () (make-mg-text :label "b1")))
+      (graph-db:with-read-snapshot (ga)
+        (graph-db:with-read-snapshot (gb)
+          ;; commit into BOTH graphs after both snapshots were taken
+          (let ((*graph* ga)) (with-transaction () (make-mg-plain :label "a2")))
+          (let ((*graph* gb)) (with-transaction () (make-mg-text :label "b2")))
+          (setq a-inside (%mg-count ga 'mg-plain)
+                b-inside (%mg-count gb 'mg-text))))
+      (is (= 1 a-inside)
+          "ga's snapshot must hide the mg-plain committed after it started, saw ~D" a-inside)
+      (is (= 1 b-inside)
+          "gb's snapshot must hide the mg-text committed after it started, saw ~D" b-inside)
+      (is (= 2 (%mg-count ga 'mg-plain)) "outside the snapshot ga has both vertices")
+      (is (= 2 (%mg-count gb 'mg-text)) "outside the snapshot gb has both vertices")
+      gc)))
+
+(test read-write-transaction-blocks-a-foreign-read-even-under-a-snapshot
+  "Step 1 of the read-resolution rule is exhaustive: an active read-write
+transaction forbids cross-graph access outright and does NOT fall through to
+*READ-SNAPSHOTS*, even when a snapshot for the other graph is active.  Answering
+such a read from a different consistency domain is exactly the works-until-it-
+doesn't behaviour the contract removes (GH #53)."
+  (with-three-graphs (ga gb gc)
+    (let (b-id)
+      (let ((*graph* gb))
+        (with-transaction () (setq b-id (id (make-mg-text :label "b1")))))
+      (graph-db:with-read-snapshot (gb)
+        ;; a snapshot of GB is active, and the read below still must signal
+        (is (not (null (lookup-vertex b-id :graph gb)))
+            "the gb snapshot really is in force outside the rw transaction")
+        (signals graph-db:cross-graph-transaction-error
+          (with-transaction ((graph-db::transaction-manager ga))
+            (lookup-vertex b-id :graph gb))))
+      gc)))
+
+(test read-snapshots-do-not-outlive-their-dynamic-extent
+  "A snapshot left registered pins the MVCC reaper's floor and retains versions
+forever, so both the registry entry and the transaction-manager registration
+must be undone on unwind -- including a non-local exit (GH #53)."
+  (with-three-graphs (ga gb gc)
+    (let (ta tb)
+      (ignore-errors
+        (graph-db:with-read-snapshot (ga)
+          (graph-db:with-read-snapshot (gb)
+            (setq ta (gethash ga graph-db:*read-snapshots*)
+                  tb (gethash gb graph-db:*read-snapshots*))
+            (error "unwind"))))
+      (is (not (null ta)) "ga's snapshot must be registered under ga while active")
+      (is (not (null tb)) "gb's snapshot must be registered under gb while active")
+      (is (null graph-db:*read-snapshots*)
+          "the registry must not outlive the snapshots' extent")
+      (is (null (gethash (graph-db::sequence-number ta)
+                         (graph-db::transactions (graph-db::transaction-manager ga))))
+          "ga's snapshot transaction must be deregistered from its manager")
+      (is (null (gethash (graph-db::sequence-number tb)
+                         (graph-db::transactions (graph-db::transaction-manager gb))))
+          "gb's snapshot transaction must be deregistered from its manager")
+      ;; nested snapshots share one table, so an inner entry must be gone while
+      ;; the OUTER extent is still running -- otherwise later reads of gb inside
+      ;; it would resolve through a snapshot that has already been discarded
+      (graph-db:with-read-snapshot (ga)
+        (graph-db:with-read-snapshot (gb) nil)
+        (is (null (gethash gb graph-db:*read-snapshots*))
+            "the inner snapshot's entry must be removed from the shared table")
+        (is (not (null (gethash ga graph-db:*read-snapshots*)))
+            "the outer snapshot's own entry must survive its inner one"))
+      gc)))

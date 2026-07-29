@@ -602,8 +602,9 @@ replayed onto the device."
   (let ((frontier 0))
     (with-read-snapshot (graph)
       ;; A reader with start-tx-id S sees commits with commit-epoch < S; so the
-      ;; snapshot's frontier -- the highest tx-id it reflects -- is S-1.
-      (setf frontier (1- (start-tx-id *transaction*)))
+      ;; snapshot's frontier -- the highest tx-id it reflects -- is S-1.  The
+      ;; snapshot lives in *READ-SNAPSHOTS*, not *TRANSACTION* (GH #53).
+      (setf frontier (1- (start-tx-id (read-transaction graph))))
       (multiple-value-bind (vset eset)
           (scope-node-set graph (peer-device-roots device) (peer-device-scope device)
                           :edge-types (peer-device-edge-types device))

@@ -381,15 +381,21 @@ did a single untyped lhash scan that read live versions and leaked the phantom."
 
 (test snapshot-option-establishes-a-read-transaction
   "SELECT :snapshot t runs the query inside a read transaction (so reads resolve
-at one epoch); a plain query has no transaction bound."
+at one epoch); a plain query has no transaction bound.  The snapshot lives in
+*READ-SNAPSHOTS* keyed by graph, not in *TRANSACTION* (GH #53), so the escape
+asks READ-TRANSACTION -- which answers for either."
   (with-test-graph (g)
     (declare (ignore g))
     ;; the lisp escape reports whether a transaction is active during the query
     (is (equal '(:yes)
                (select (:flat t :snapshot t) (?b)
-                       (lisp ?b (if graph-db:*transaction* :yes :no)))))
+                       (lisp ?b (if (graph-db::read-transaction *graph*) :yes :no)))))
     (is (equal '(:no)
                (select (:flat t) (?b)
+                       (lisp ?b (if (graph-db::read-transaction *graph*) :yes :no)))))
+    ;; and it is specifically NOT the read-write *TRANSACTION*
+    (is (equal '(:no)
+               (select (:flat t :snapshot t) (?b)
                        (lisp ?b (if graph-db:*transaction* :yes :no)))))))
 
 (test snapshot-query-is-stable-across-a-concurrent-commit
