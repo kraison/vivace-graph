@@ -1032,6 +1032,21 @@ this test isolated to the write check it is about."
                 (save copy :graph gb))))))
       gc)))
 
+(test read-write-transaction-rejects-a-foreign-delete
+  "DELETE-NODE bypasses UPDATE-NODE, so it needs its own check (GH #53)."
+  (with-three-graphs (ga gb gc)
+    (let (a-id)
+      (let ((*graph* ga))
+        (with-transaction () (setq a-id (id (make-mg-plain :label "doomed")))))
+      (let ((node (let ((*graph* gb)) (lookup-vertex a-id :graph ga))))
+        (signals graph-db:cross-graph-transaction-error
+          (let ((*graph* gb))
+            (with-transaction () (mark-deleted node)))))
+      ;; and it must still be there
+      (is (not (null (lookup-vertex a-id :graph ga)))
+          "the foreign delete must not have landed")
+      gc)))
+
 ;;; --- read-only snapshots are per graph and compose (GH #53) -----------------
 
 (defun %mg-count (graph type)
