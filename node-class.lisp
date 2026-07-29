@@ -129,24 +129,42 @@ filled structure, so the SETF stores an already-complete one."
   (or (%node-class-slot-info class)
       (setf (%node-class-slot-info class) (%compute-node-slot-info class))))
 
-(defun %invalidate-node-slot-info (class)
-  "Drop CLASS's cached categorization, and its subclasses' -- a subclass's
-effective slots are recomputed when a superclass changes, so their caches are
-stale too."
+(defvar *node-class-cache-invalidators* '()
+  "Functions of one NODE-CLASS, run whenever its effective slots may have changed.
+
+VG supports RUNTIME SCHEMA MUTATION -- DEF-VERTEX / DEF-EDGE can be evaluated
+against a live image to add or redefine a type -- so anything that memoizes a
+CLASS-SLOTS-derived answer must be dropped when that happens.  Register the
+dropper here rather than adding another FINALIZE-INHERITANCE :AFTER method:
+a second :AFTER with the same specializer would REPLACE this file's, silently
+disabling the invalidation it was meant to add.
+
+Each function is called for the changed class AND for every node-class subclass
+of it -- the walk is done by %INVALIDATE-NODE-CLASS-CACHES -- so an invalidator
+only has to handle the one class it is given.")
+
+(defun %invalidate-node-class-caches (class)
+  "Drop every memoized view of CLASS's effective slots, and its subclasses'.
+
+The subclass walk is the part that is easy to miss: a subclass's effective slots
+are recomputed when a SUPERCLASS is redefined, so invalidating only the class
+that was redefined leaves subclasses serving stale answers."
   (setf (%node-class-slot-info class) nil)
+  (dolist (fn *node-class-cache-invalidators*)
+    (funcall fn class))
   (dolist (sub (class-direct-subclasses class))
     (when (typep sub 'node-class)
-      (%invalidate-node-slot-info sub))))
+      (%invalidate-node-class-caches sub))))
 
 (defmethod finalize-inheritance :after ((class node-class))
   "Effective slots have just been recomputed, so any cached view of them is stale."
-  (%invalidate-node-slot-info class))
+  (%invalidate-node-class-caches class))
 
 (defmethod reinitialize-instance :after ((class node-class) &rest initargs
                                          &key &allow-other-keys)
   "Class redefinition (a re-evaluated DEF-VERTEX / DEF-EDGE / DEFCLASS)."
   (declare (ignore initargs))
-  (%invalidate-node-slot-info class))
+  (%invalidate-node-class-caches class))
 
 (defun %persistent-slot-keyword (class slot-name)
   "The keyword naming SLOT-NAME's entry in a node's DATA alist, or NIL when

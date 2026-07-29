@@ -163,3 +163,82 @@ redefined."
       (is (null (graph-db::%persistent-slot-keyword sub 's))
           "subclass cache survived a superclass redefinition")
       (is (eq :own (graph-db::%persistent-slot-keyword sub 'own))))))
+
+;;; ---- runtime schema mutation vs. MOP-derived caches ---------------------
+;;;
+;;; VG supports evaluating DEF-VERTEX / DEF-EDGE against a live image to add or
+;;; redefine a type.  Several places memoize a CLASS-SLOTS-derived answer for
+;;; speed, and each is only sound if it dies when the schema changes.  These
+;;; pin the three ways that went wrong.
+
+(defun %nc-fresh-name (stem)
+  (intern (format nil "~:@(~a~)-~36R" stem (random (expt 36 8))) :graph-db/test))
+
+(test runtime-redefinition-reaches-subclasses
+  "A subclass's effective slots change when its SUPERCLASS is redefined, so every
+per-class cache must be dropped for the subclass too.  Invalidating only the
+class that was redefined left NODE-GEOMETRY-INDEX-SLOTS on the subclass stale,
+which means a geometry slot added to a parent was silently never spatially
+indexed for subclass instances."
+  (let ((parent (%nc-fresh-name "rt-parent"))
+        (child (%nc-fresh-name "rt-child")))
+    (eval `(defclass ,parent () ((pgeom :index t)) (:metaclass graph-db::node-class)))
+    (eval `(defclass ,child (,parent) ((cname)) (:metaclass graph-db::node-class)))
+    (graph-db::finalize-inheritance (find-class child))
+    (is (equal '(pgeom)
+               (graph-db::node-geometry-index-slots (find-class child)))
+        "baseline: subclass inherits the parent's indexed slot")
+    ;; add a SECOND indexed slot to the PARENT
+    (eval `(defclass ,parent () ((pgeom :index t) (pgeom2 :index t))
+             (:metaclass graph-db::node-class)))
+    (graph-db::finalize-inheritance (find-class parent))
+    (graph-db::finalize-inheritance (find-class child))
+    (is (equal '(pgeom pgeom2)
+               (graph-db::node-geometry-index-slots (find-class parent)))
+        "the redefined class itself must see the new slot")
+    (is (equal '(pgeom pgeom2)
+               (graph-db::node-geometry-index-slots (find-class child)))
+        "the SUBCLASS must see the parent's new indexed slot, got ~a"
+        (graph-db::node-geometry-index-slots (find-class child)))))
+
+(test runtime-redefinition-reaches-vector-index-slots
+  ":VECTOR-INDEX slots are memoized the same way and were never invalidated at
+all, so a slot added at runtime never got a vector segment."
+  (let ((name (%nc-fresh-name "rt-vi")))
+    (eval `(defclass ,name () ((other)) (:metaclass graph-db::node-class)))
+    (graph-db::finalize-inheritance (find-class name))
+    (is (null (graph-db::node-vector-index-slots (find-class name)))
+        "baseline: no vector-index slots")
+    (eval `(defclass ,name () ((other) (emb :vector-index t))
+             (:metaclass graph-db::node-class)))
+    (graph-db::finalize-inheritance (find-class name))
+    (is (equal '(emb) (graph-db::node-vector-index-slots (find-class name)))
+        "a :VECTOR-INDEX slot added at runtime must be seen, got ~a"
+        (graph-db::node-vector-index-slots (find-class name)))))
+
+(test unfinalized-class-does-not-poison-the-slot-caches
+  "Asking before the class is finalized must not CACHE the empty answer.
+CLASS-SLOTS is unavailable then, and storing the resulting NIL made it permanent
+-- the class could never be spatially indexed again for the life of the image.
+
+NOTE the implementation difference: SBCL leaves a window between DEFCLASS and
+finalization in which the premature call can happen, and that window is what
+this test exploits.  ECL finalizes eagerly, so there is usually no window to
+exploit there and this degenerates to checking the answers are right.  The
+assertions below therefore do not require the window to exist -- requiring it
+made this test fail on ECL against perfectly correct code."
+  (let ((name (%nc-fresh-name "rt-unfin")))
+    (eval `(defclass ,name () ((g :index t) (emb :vector-index t))
+             (:metaclass graph-db::node-class)))
+    ;; Ask too early WHERE THAT IS POSSIBLE -- this is what used to poison the
+    ;; cache.  Harmless (and simply a warm read) where the class is already
+    ;; finalized.
+    (graph-db::node-geometry-index-slots (find-class name))
+    (graph-db::node-vector-index-slots (find-class name))
+    (graph-db::finalize-inheritance (find-class name))
+    (is (equal '(g) (graph-db::node-geometry-index-slots (find-class name)))
+        "geometry slots after finalizing, got ~a"
+        (graph-db::node-geometry-index-slots (find-class name)))
+    (is (equal '(emb) (graph-db::node-vector-index-slots (find-class name)))
+        "vector-index slots after finalizing, got ~a"
+        (graph-db::node-vector-index-slots (find-class name)))))

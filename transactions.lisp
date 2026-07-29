@@ -903,13 +903,20 @@ symbol is read in the *application's* package, which is not necessarily EQ to
 GRAPH-DB:GEOMETRY (and a user need not even declare a type).  Instead we return
 every indexed slot, and NODE-GEOMETRY picks the one whose runtime value is an
 actual GEOMETRY (via GEOMETRYP) -- robust across packages and to mixed
-geometry/non-geometry indexed slots on the same type.  Cached per class (runtime
-schema redefinition is not expected)."
+geometry/non-geometry indexed slots on the same type.
+
+Cached per class, and INVALIDATED on class redefinition via
+*NODE-CLASS-CACHE-INVALIDATORS* -- VG supports runtime schema mutation, and a
+subclass must be dropped too when a SUPERCLASS gains or loses an :INDEX slot."
   (multiple-value-bind (val present) (gethash class *node-geometry-slot-cache*)
     (if present
         val
-        (setf (gethash class *node-geometry-slot-cache*)
-              (when (class-finalized-p class)
+        ;; Do NOT cache before finalization.  CLASS-SLOTS is unavailable then, and
+        ;; storing the resulting NIL would make that negative answer PERMANENT --
+        ;; the class could never be spatially indexed again for the life of the
+        ;; image, even after it finalized.
+        (when (class-finalized-p class)
+          (setf (gethash class *node-geometry-slot-cache*)
                 (loop for slot in (class-slots class)
                       when (indexed-p slot)
                         collect (slot-definition-name slot)))))))
@@ -999,17 +1006,31 @@ guaranteed, under concurrent writers to the same class."
 
 (defun node-vector-index-slots (class)
   "Names of CLASS's :VECTOR-INDEX slots -- the slots that get a vector segment.
-Cached per class (runtime schema redefinition is not expected).  Value gating is
-done at maintenance time, not here: only a conforming (simple-array single-float
-(*)) value is actually indexed."
+Cached per class, and INVALIDATED on class redefinition via
+*NODE-CLASS-CACHE-INVALIDATORS*.  Value gating is done at maintenance time, not
+here: only a conforming (simple-array single-float (*)) value is actually
+indexed."
   (multiple-value-bind (val present) (gethash class *node-vector-index-slot-cache*)
     (if present
         val
-        (setf (gethash class *node-vector-index-slot-cache*)
-              (when (class-finalized-p class)
+        ;; Not cached before finalization -- see NODE-GEOMETRY-INDEX-SLOTS for why
+        ;; caching that NIL would be permanent.
+        (when (class-finalized-p class)
+          (setf (gethash class *node-vector-index-slot-cache*)
                 (loop for slot in (class-slots class)
                       when (vector-index-p slot)
                         collect (slot-definition-name slot)))))))
+
+(defun %invalidate-node-class-slot-caches (class)
+  "Drop CLASS's memoized CLASS-SLOTS-derived answers.  Registered on
+*NODE-CLASS-CACHE-INVALIDATORS*, which handles the subclass walk."
+  (remhash class *node-geometry-slot-cache*)
+  (remhash class *node-vector-index-slot-cache*)
+  ;; Also the multi-geometry sampling state: its :DONE marker retires a class
+  ;; from sampling, and a redefined class deserves to be looked at afresh.
+  (remhash class *node-geometry-multi-sample-counts*))
+
+(pushnew '%invalidate-node-class-slot-caches *node-class-cache-invalidators*)
 
 (defun %vector-index-slot-owner-name (class slot-name)
   "The most-general node-class in CLASS's precedence list that declares SLOT-NAME

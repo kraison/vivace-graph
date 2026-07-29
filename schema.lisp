@@ -468,7 +468,12 @@ Example:
 (defmethod instantiate-node-type ((meta node-type) (graph graph))
   (with-recursive-lock-held ((schema-lock (schema graph)))
     (let ((cl (find-class (node-type-name meta) nil)))
-      (when cl (remhash cl *node-geometry-slot-cache*)))
+      ;; Drop EVERY memoized CLASS-SLOTS-derived answer for this class and its
+      ;; subclasses, not just the geometry one for this class: re-instantiating a
+      ;; node type is a schema mutation, and a subclass's effective slots change
+      ;; with its superclass.  (FINALIZE-INHERITANCE :AFTER normally covers this;
+      ;; this keeps the guarantee on any path that reaches here without it.)
+      (when (typep cl 'node-class) (%invalidate-node-class-caches cl)))
     ;; Check if this type exists and if it differs from old spec
     (log:debug "Looking up ~A: ~A ~A" meta (node-type-name meta) (node-type-parent-type meta))
     (let ((old-meta (lookup-node-type-by-name (node-type-name meta)
