@@ -1930,7 +1930,7 @@ Here is a second spatial type, so the query examples below have two classes to s
     :survey-app)
 #+END_SRC
 
-*Per-index grid precision and max-cells cap.* A geometry slot may set its index's geohash precision with the ~:spatial-precision~ slot option (default 7, ≈150 m cells — set graph default via ~make-graph~'s ~:spatial-precision~) and its max-cells cap with the ~:spatial-max-cells~ slot option (default 16384 — set graph default via ~make-graph~'s ~:spatial-max-cells~). Coarser grids and lower cell caps suit large area geometries, while finer grids suit dense point data. Changing a declared precision re-grids that one index automatically the next time the graph is opened.
+*Per-index grid precision and max-cells cap.* A geometry slot may set its index's geohash precision with the ~:spatial-precision~ slot option (default 7, ≈150 m cells — set graph default via ~make-graph~'s ~:spatial-precision~) and its max-cells cap with the ~:spatial-max-cells~ slot option (default 16384 — set graph default via ~make-graph~'s ~:spatial-max-cells~). Coarser grids and lower cell caps suit large area geometries, while finer grids suit dense point data. Changing a declared precision re-grids that one index automatically the next time the graph is opened — on the *on-disk* backend. A ~memory-graph~ reopens its index at the *persisted* precision and does not adopt a changed declaration until you rebuild explicitly; it over-covers at the old grid, so results stay correct but a stale precision costs selectivity rather than accuracy (see #66).
 
 
 #+BEGIN_SRC lisp
