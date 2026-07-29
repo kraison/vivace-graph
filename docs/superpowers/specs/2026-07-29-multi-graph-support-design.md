@@ -220,10 +220,14 @@ is "is this name registered under a graph-name *other than* this one".
 Vertex-vs-edge is irrelevant — they share the CL class namespace, so the same name as a
 vertex in A and an edge in B is the same collision.
 
-**Feasibility:** all 114 `DEF-VERTEX`/`DEF-EDGE` names in the repo were scanned. Exactly
-one name appears under two graph names and neither occurrence is real — `schema.lisp:435`
-is a docstring example, and `xach-test.lisp` is an ad-hoc file not in the ASD. That file
-would now error if loaded; it is not worth protecting.
+**Feasibility — CORRECTED 2026-07-30 by the whole-branch review.** The original scan
+excluded `demo/` and under-counted. There are **three real collisions**: `example.lisp`
+(`:test-graph`) and `demo/schema.lisp` (`:social-shopping`) both define `customer`,
+`merchant` and `product`. Neither file is in the ASD, so no suite breaks — but
+`example.lisp` is the canonical walkthrough named in CLAUDE.md, and loading it alongside the
+demo now hard-errors. That is a real user-facing consequence, not the "nothing breaks" the
+first scan claimed. The two harmless cases also stand: a docstring example in
+`schema.lisp`, and `xach-test.lisp`, which is not in the ASD.
 
 ## 8. Schema registry: replace, don't accumulate
 
