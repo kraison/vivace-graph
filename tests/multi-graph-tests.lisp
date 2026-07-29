@@ -531,3 +531,18 @@ cached with its correct class, so only a from-disk read exercises the deserializ
           (ignore-errors (close-graph ga :snapshot-p nil))
           (ignore-errors (close-graph gb :snapshot-p nil))
           (collect-garbage))))))
+
+(test nodes-record-their-home-graph
+  "Node buffers are pooled and reused on SBCL/CCL/LispWorks, so an unstamped
+node inherits the previous occupant's graph (GH #53)."
+  (with-three-graphs (ga gb gc)
+    (let (a-id b-id)
+      (let ((*graph* ga))
+        (with-transaction () (setq a-id (id (make-mg-plain :label "in-a")))))
+      (let ((*graph* gb))
+        (with-transaction () (setq b-id (id (make-mg-text :label "in-b")))))
+      (let ((*graph* gc))
+        (is (eq ga (graph-db::node-graph (lookup-vertex a-id :graph ga)))
+            "home graph must come from the lookup, not *GRAPH*")
+        (is (eq gb (graph-db::node-graph (lookup-vertex b-id :graph gb)))
+            "home graph must come from the lookup, not *GRAPH*")))))

@@ -2507,6 +2507,7 @@ and it reads these patched bytes, never the .txn files)."
                                    :deleted-p (slot-value node 'deleted-p)
                                    :written-p (slot-value node 'written-p)
                                    :data-pointer (slot-value node 'data-pointer))))
+      (setf (node-graph new-node) (node-graph node))
       (setf (data new-node) (copy-tree (slot-value node 'data)))
       ;; Copy bytes so maybe-init-node-data on the copy does not try to
       ;; re-read from data-pointer (which may be freed by a concurrent commit).

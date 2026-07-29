@@ -389,5 +389,14 @@ is preserved."
    (deleted-p :accessor deleted-p :initform nil :initarg :deleted-p :type boolean
               :meta t :persistent nil)
    (data :accessor data :initarg :data :initform nil :meta t :persistent nil)
-   (bytes :accessor bytes :initform :init :initarg :bytes :meta t :persistent nil))
+   (bytes :accessor bytes :initform :init :initarg :bytes :meta t :persistent nil)
+   ;; Home graph. :META so it is a real CLOS slot, :PERSISTENT NIL so it is never
+   ;; serialized. NIL = unknown -> callers fall back to *GRAPH* (GH #53).
+   (graph :accessor node-graph :initform nil :initarg :graph
+          :meta t :persistent nil))
   (:metaclass node-class))
+
+(defun node-home-graph (node &optional (default *graph*))
+  "NODE's graph, or DEFAULT when unknown. Use instead of a bare *GRAPH* when
+resolving a node's heap, tables or schema (GH #53)."
+  (or (node-graph node) default))
