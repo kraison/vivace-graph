@@ -25,10 +25,37 @@
   "Print-time wrapper: prints its VECTOR as #V(<element-type> e1 e2 ...)."
   (vector #() :read-only t))
 
+(defparameter *backup-element-types*
+  '((unsigned-byte 8) (signed-byte 8)
+    (unsigned-byte 16) (signed-byte 16)
+    (unsigned-byte 32) (signed-byte 32)
+    (unsigned-byte 64) (signed-byte 64)
+    single-float double-float bit character base-char)
+  "Standard element-type specifiers tried, narrowest first, when canonicalizing
+a vector's element type for a snapshot.  See %BACKUP-ELEMENT-TYPE-SPEC.")
+
+(defun %backup-element-type-spec (vector)
+  "A PORTABLE type specifier for VECTOR's element type.
+
+ARRAY-ELEMENT-TYPE returns the implementation's OWN name for the upgraded type,
+and printing that into a snapshot makes the snapshot implementation-specific:
+ECL says EXT:BYTE8 where SBCL says (UNSIGNED-BYTE 8), and an ECL-written
+snapshot then fails to READ on SBCL with \"Package EXT does not exist\" -- which
+breaks snapshot+replay, the documented path for moving a graph between
+implementations (an ECL field device backing up to an SBCL hub, say).
+
+So map the upgraded type back to the standard specifier that upgrades to it and
+print that instead.  Falls back to the raw ARRAY-ELEMENT-TYPE if nothing
+matches, which is no worse than the old behaviour."
+  (let ((et (array-element-type vector)))
+    (or (find-if (lambda (spec) (equal (upgraded-array-element-type spec) et))
+                 *backup-element-types*)
+        et)))
+
 (defmethod print-object ((object backup-vector-literal) stream)
   (let ((vector (backup-vector-literal-vector object)))
     (write-string "#V(" stream)
-    (prin1 (array-element-type vector) stream)
+    (prin1 (%backup-element-type-spec vector) stream)
     (loop for element across vector
           do (write-char #\Space stream)
              (prin1 element stream))

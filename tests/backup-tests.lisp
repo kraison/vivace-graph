@@ -129,6 +129,47 @@ other tests here."
             "round-tripped :ID is no longer an id byte vector: ~S" (type-of id))
         (is (equalp bytes id) "round-tripped :ID ~S differs from ~S" id bytes)))))
 
+(test snapshot-vector-element-types-are-implementation-independent
+  "A snapshot must be readable by an implementation OTHER than the one that
+wrote it -- snapshot+replay is the documented way to move a graph between
+implementations, and the ECL field devices back up to an SBCL hub.
+
+ARRAY-ELEMENT-TYPE returns the implementation's own name for the upgraded type,
+so printing it directly made snapshots implementation-specific: ECL emitted
+#V(EXT:BYTE8 ...), which SBCL cannot even READ (\"Package EXT does not exist\"),
+so an ECL-written snapshot could not be restored on SBCL at all.
+
+Asserts the printed specifier is the STANDARD one for each element type
+graph-db actually stores -- byte vectors (ids, blobs), single-float embeddings
+and double-float packed coordinates -- and, as the property that really
+matters, that it carries no package-qualified symbol."
+  (flet ((spec-of (vector)
+           (graph-db::%backup-element-type-spec vector))
+         (printed (vector)
+           (with-output-to-string (s)
+             (let ((*print-pretty* nil))
+               (princ (graph-db::make-backup-vector-literal vector) s)))))
+    (let ((bytes   (make-array 3 :element-type (quote (unsigned-byte 8))
+                                 :initial-contents (list 0 1 255)))
+          (singles (make-array 2 :element-type (quote single-float)
+                                 :initial-contents (list 1.0 2.0)))
+          (doubles (make-array 2 :element-type (quote double-float)
+                                 :initial-contents (list 1d0 2d0))))
+      (is (equal (quote (unsigned-byte 8)) (spec-of bytes))
+          "byte vector element type printed as ~S, not the standard specifier"
+          (spec-of bytes))
+      (is (equal (quote single-float) (spec-of singles))
+          "single-float element type printed as ~S" (spec-of singles))
+      (is (equal (quote double-float) (spec-of doubles))
+          "double-float element type printed as ~S" (spec-of doubles))
+      ;; THE portability property: no symbol in the literal may be
+      ;; package-qualified, or another implementation cannot read it.
+      (dolist (v (list bytes singles doubles))
+        (let ((text (printed v)))
+          (is (not (find #\: text))
+              "printed #V literal ~S contains a package marker, so another ~
+implementation cannot read this snapshot" text))))))
+
 (test snapshot-replay-preserves-edge-endpoints-and-vector-payload
   "Edges carry TWO bare id byte vectors positionally (FROM and TO) plus their own
 data, so they are the case most likely to break.  Round-trip an edge with a
