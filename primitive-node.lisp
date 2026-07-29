@@ -215,10 +215,15 @@ explicitly afterward (the transaction-node path) or materialized lazily later
     ;; the transaction's start-tx-id, so for nodes obtained through those paths
     ;; this bare read is a no-op (bytes already present).  It remains only as a
     ;; fallback for nodes materialized off those paths.
+    ;;
+    ;; DATA-POINTER is an address in the node's OWN heap; GRAPH (ultimately
+    ;; *GRAPH*) is only a fallback for an unstamped node (GH #53).  Resolved HERE
+    ;; rather than around the whole body because this is the only use of it and
+    ;; this branch runs once per node, while the body runs on every slot access.
     (when (or (eq (bytes node) :init) (null (bytes node)))
       (setf (bytes node)
             (read-bytes (make-mpointer
-                         :mmap (memory-mmap (heap graph))
+                         :mmap (memory-mmap (heap (node-home-graph node graph)))
                          :loc (data-pointer node)))))
     ;; Deserialize lazily from the in-memory bytes (safe; *graph* is bound here).
     (when (and (null (data node))

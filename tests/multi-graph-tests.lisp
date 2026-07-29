@@ -920,6 +920,54 @@ a phantom graph (GH #53)."
         (is (string= "beta-value"
                      (slot-value (lookup-vertex b-id :graph gb) 'label)))))))
 
+(test lazy-slot-reads-resolve-through-the-nodes-own-graph
+  "A node whose data is still LAZY, read with *GRAPH* bound elsewhere, must
+materialize from its OWN heap (GH #53).
+
+The test above does not cover this: LOOKUP-OBJECT's standalone branch binds
+*GRAPH* to the requested graph AND calls ENSURE-NODE-BYTES, so by the time the
+slot is read the bytes are already in the image and no heap is touched.  A
+side-effect MAP-VERTICES scan is the opposite: it runs FN inside the read pin,
+so the nodes it hands out keep BYTES = :INIT.  Stash one, let the scan return
+-- dropping its *GRAPH* binding -- and read the slot under a foreign *GRAPH*."
+  (with-three-graphs (ga gb gc)
+    (let (loc-a)
+      (let ((*graph* ga))
+        (with-transaction () (make-mg-plain :label "lazy-alpha"))
+        (with-transaction () (make-mg-plain :label "lazy-beta")))
+      (setq loc-a (graph-db:location ga))
+      (close-graph ga :snapshot-p t)
+      (setq ga (open-graph :mg-alpha loc-a))
+      ;; Two lazy nodes: SLOT-VALUE and SLOT-BOUNDP each need one that has not
+      ;; already been materialized by the other's read.
+      (let (nodes)
+        (map-vertices (lambda (v) (push v nodes)) ga :vertex-type 'mg-plain)
+        (is (= 2 (length nodes))
+            "precondition: the scan must have yielded 2 vertices, got ~D" (length nodes))
+        (dolist (n nodes)
+          (is (or (eq :init (graph-db::bytes n)) (null (graph-db::bytes n)))
+              "precondition: the node's bytes must still be lazy, got ~S"
+              (graph-db::bytes n))
+          (is (null (graph-db::data n))
+              "precondition: the node's data must still be lazy, got ~S"
+              (graph-db::data n))
+          (is (plusp (graph-db::data-pointer n))
+              "precondition: the node must have a heap data-pointer to resolve"))
+        (when (= 2 (length nodes))
+          (let ((value (let ((*graph* gb))
+                         (handler-case (slot-value (first nodes) 'label)
+                           (error (e) (format nil "<error: ~A>" (type-of e))))))
+                (bound (let ((*graph* gb))
+                         (handler-case (slot-boundp (second nodes) 'label)
+                           (error (e) (format nil "<error: ~A>" (type-of e)))))))
+            (is (member value '("lazy-alpha" "lazy-beta") :test #'equal)
+                "a lazy slot must materialize from GA's heap, not *GRAPH*'s; got ~S"
+                value)
+            (is (eq t bound)
+                "SLOT-BOUNDP must resolve through the node's own graph too; got ~S"
+                bound))))
+      gc)))
+
 (test node-to-alist-resolves-through-the-nodes-own-graph
   "NODE-TO-ALIST omits :GRAPH and fell back to *GRAPH* (GH #53)."
   (with-three-graphs (ga gb gc)
@@ -969,12 +1017,8 @@ rather than silently returning NIL (GH #53)."
 
 (test read-write-transaction-rejects-a-foreign-write
   "Saving a node whose home is another graph signals (GH #53).  The transaction
-is opened on GB's manager directly rather than by rebinding *GRAPH*: COPY of a
-foreign node under a foreign *GRAPH* trips a SEPARATE, pre-existing defect --
-SLOT-VALUE-USING-CLASS resolves a lazy slot's heap through *GRAPH* instead of
-the node's home, which on ECL fires inside COPY's own MAKE-INSTANCE and errors
-before the write path is ever reached.  Keeping *GRAPH* on the node's own graph
-isolates this test to the write check it is about."
+is opened on GB's manager directly rather than by rebinding *GRAPH*, which keeps
+this test isolated to the write check it is about."
   (with-three-graphs (ga gb gc)
     (let (a-id)
       (let ((*graph* ga))
