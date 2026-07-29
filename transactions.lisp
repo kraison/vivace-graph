@@ -260,12 +260,36 @@
           (loop for other-transaction in (overlapping-transactions
                                           transaction
                                           (transaction-manager transaction))
-             never (object-sets-intersect-p write-set
-                                            (read-set other-transaction))
+             ;; BACKWARD validation, against transactions that COMMITTED during
+             ;; this one's lifetime -- the only population OVERLAPPING-TRANSACTIONS
+             ;; returns.  Two conflicts matter:
+             ;;   write/write -- a lost update;
+             ;;   read/write  -- this transaction read a value the other has since
+             ;;                  overwritten, so its reads are stale (#73).
              never (object-sets-intersect-p write-set
                                             (write-set other-transaction))
              never (object-sets-intersect-p read-set
                                             (write-set other-transaction)))))))
+
+;;; NOTE on a clause that used to live in VALIDATE and was removed (GH #92):
+;;;
+;;;   never (object-sets-intersect-p write-set (read-set other-transaction))
+;;;
+;;; That is FORWARD validation -- "am I about to invalidate someone?" -- and
+;;; forward validation is only meaningful against transactions that are still
+;;; ACTIVE and can therefore still be invalidated.  OVERLAPPING-TRANSACTIONS
+;;; returns COMMITTED transactions only, and a committed transaction is finished
+;;; and immutable: nothing written now can invalidate it, and its own reads were
+;;; validated at its commit.  Since it committed first the serial order is
+;;; other < this, so `other read the old value, this writes the new one' is an
+;;; ordinary read-then-write dependency and is serializable.
+;;;
+;;; So it never prevented an anomaly; it only caused retries.  Demonstrated: T2
+;;; reads X and writes Y and commits; T1, started earlier, then writes X -- a
+;;; node T2 only READ.  T1 needed 2 attempts with the clause and 1 without.
+;;; Retries are not free here -- *MAXIMUM-TRANSACTION-ATTEMPTS* is 8 and the
+;;; fallback is a GLOBAL transaction-manager lock -- so the spurious aborts push
+;;; contended workloads toward full serialization.
 
 
 (defgeneric %commit (transaction))
