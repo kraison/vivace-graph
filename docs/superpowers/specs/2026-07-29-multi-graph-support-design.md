@@ -1,0 +1,257 @@
+# Multi-graph support in one image — design
+
+**Date:** 2026-07-29
+**Status:** approved, not yet implemented
+**Target:** 3.0.0
+
+## 1. Why
+
+VivaceGraph already lets an application open several graphs in one Lisp image, and
+mine-action does exactly that (ops / knowledge / forensics). What it does not have is a
+*contract* for what that means. The behaviour today is a mix of things that work, things
+that silently do the wrong thing, and things that were fixed on one code path but not its
+twin.
+
+This spec defines the contract, and the mechanisms that enforce it, so multi-graph use is
+a supported configuration rather than a configuration that happens to mostly work.
+
+## 2. What was measured first
+
+Every claim below was reproduced before being designed against. This section is the
+evidence, not background.
+
+**Cross-graph reads work outside a transaction and silently fail inside one.** With node
+`A` in graph `ga` and `*graph*` bound to `gb`:
+
+| context | `(lookup-vertex a-id :graph ga)` |
+|---|---|
+| outside a transaction | `:FOUND` |
+| **inside a transaction on `gb`** | **`NIL`** |
+| inside a transaction on `ga` | `:FOUND` |
+
+`LOOKUP-OBJECT` has two methods. The `(transaction null)` one binds `*GRAPH*` to the
+requested graph and carries a comment citing #53 ("type-ids are per-graph, so without this
+a cross-graph read materializes the wrong class"). The transactional method does
+`(lookup-node table id (graph transaction))`, discarding the caller's `:GRAPH`. The fix
+landed on one path and not the other. The failure is a `NIL` for a node that exists —
+indistinguishable from "no such node".
+
+**Two graphs defining a class with the same name silently clobber each other.**
+Defining `dup-thing` under `:dg-one` with slot `alpha`, then under `:dg-two` with `beta`
+and `gamma`:
+
+```
+*** NO ERROR SIGNALLED ***
+slots now:            ... BETA GAMMA
+is ALPHA still a slot? NIL
+one class object shared by both graphs? T
+```
+
+Graph one's nodes still carry `(:ALPHA . …)` in their stored data alists, but the class no
+longer declares the slot, so that data is on disk and unreachable through the API.
+
+**Same-graph redefinition works correctly and must keep working.**
+
+```
+before: slots=(ALPHA)       registry-entries=1  alpha="one"
+after:  slots=(ALPHA BETA)  registry-entries=2  alpha="one"  beta="two"
+```
+
+Note `registry-entries` going 1 → 2: `DEF-VERTEX` does `(push meta (gethash graph-name
+*schema-node-metadata*))`, so a redefinition **accumulates** rather than replaces.
+
+**Node instances are pooled.** On SBCL/CCL/LispWorks a node comes from
+`GET-VERTEX-BUFFER` and is `CHANGE-CLASS`ed; only ECL builds fresh instances (it does so
+to avoid the #47 leak). Any per-node ownership field must therefore be stamped on *every*
+materialization path — an unstamped node inherits the previous occupant's value, which is
+worse than carrying none.
+
+## 3. Contract: transaction scope
+
+**A read-write transaction belongs to exactly one graph** — the one whose transaction
+manager it was created against. Touching a node whose home graph differs, read or write,
+signals `CROSS-GRAPH-TRANSACTION-ERROR`.
+
+This is not a limitation chosen for convenience; it is what the current implementation
+*means*. The transaction manager is a slot on `GRAPH`. `WITH-TRANSACTION` defaults to
+`(transaction-manager *graph*)`. The `TX` object has a single `graph` slot. Each graph has
+its own tx-id counter, its own committed-transaction set that `OVERLAPPING-TRANSACTIONS`
+validates against, and its own WAL. A transaction spanning two graphs would need a global
+ordering across independent counters and two-phase commit across two WALs; without 2PC a
+crash between the two commits leaves one committed and the other not. Atomicity and
+durability are defined per graph, and this spec keeps that definition rather than
+weakening it.
+
+Applications needing to write to several graphs use one transaction per graph and own the
+sequencing. That coordination is explicitly **not** atomic, and the manual must say so.
+
+## 4. Contract: read consistency
+
+**A read-only snapshot is per graph, and several may be active at once.** A cross-graph
+query holds one snapshot per participating graph. Each graph is internally consistent and
+repeatable for the duration; there is deliberately **no single instant across graphs**.
+Two graphs may be observed at different logical moments.
+
+That limit is a documented property, not a defect to be worked around. A single
+cross-graph instant needs a global epoch shared by every transaction manager — the same
+class of work as multi-graph transactions, and out of scope here (§11).
+
+Prolog queries need no transaction to read across graphs: `SELECT` runs
+`(funcall func #'prolog-ignore)` with no transaction, and that path already honours an
+explicit `:GRAPH`. Only `:SNAPSHOT T` wraps the query in `CALL-WITH-READ-SNAPSHOT`. So
+`:SNAPSHOT T` does not merely fail to help a cross-graph query — it is what *breaks* it
+today, by binding a single-graph transaction that then swallows the requested graph.
+
+**The rule is that the kind of transaction decides**, because the two contracts above
+give different answers for the same call:
+
+- a **read-only snapshot** on A may read B — resolving through B's own snapshot if one is
+  active, otherwise reading non-transactionally;
+- a **read-write transaction** on A may not touch B at all — error, read or write.
+
+A rule keyed on "is there a transaction" cannot express this. It must key on *which kind*.
+
+## 5. Node ownership
+
+Nodes carry their home graph in `NODE-GRAPH`: a `:META T :PERSISTENT NIL` slot on the root
+`NODE` class, so it is a real CLOS slot rather than an alist entry and is never
+serialized. A graph is not a value that can be written to disk, and a node's home is
+re-established on every materialization.
+
+`NIL` means **unknown** and falls back to `*GRAPH*`, preserving today's behaviour for any
+path not yet stamped. `NODE-HOME-GRAPH` is the accessor to use wherever a node's heap,
+tables or schema are resolved.
+
+Ownership is needed regardless of the read paths: it is how cross-graph misuse is
+*detected* for the error in §3.
+
+**Because node buffers are pooled, the slot must be stamped on every materialization
+path.** Stamping points: `FINALIZE-NODE` and `ENSURE-NODE-BYTES` (both already receive the
+graph), `LOOKUP-NODE`, and `COPY-NODE` — which enumerates the slots it copies, so an
+omission there silently produces a copy that resolves through `*GRAPH*`. The pooling
+hazard gets a test of its own.
+
+## 6. Read resolution and enforcement
+
+`*TRANSACTION*` keeps its present meaning: **the** read-write transaction, necessarily
+single-graph, still exported, still bound in the same three places
+(`CALL-WITH-TRANSACTION`, `CALL-WITH-READ-SNAPSHOT`, the restore path). Rather than
+replace it with a registry, add `*READ-SNAPSHOTS*`, mapping graph → read-only snapshot.
+`CALL-WITH-READ-SNAPSHOT` populates an entry instead of rebinding `*TRANSACTION*`; nesting
+on the same graph inherits, exactly as its docstring already promises.
+
+Resolution for a read of graph `G`:
+
+1. If a read-write `*TRANSACTION*` is active:
+   - on **G** — use it;
+   - on any **other** graph — signal `CROSS-GRAPH-TRANSACTION-ERROR`.
+2. Otherwise `G`'s entry in `*READ-SNAPSHOTS*` — use it.
+3. Otherwise read non-transactionally.
+
+Step 1 is deliberately exhaustive: **an active read-write transaction forbids cross-graph
+access outright, even when a read-only snapshot for `G` happens to be in
+`*READ-SNAPSHOTS*`.** It does not fall through to step 2. Reading another graph from
+inside a read-write transaction is a programming error under §3 regardless of whether a
+snapshot makes it technically answerable, and silently satisfying it from a different
+consistency domain is exactly the kind of "works until it doesn't" behaviour this spec
+exists to remove.
+
+Cross-graph reads are therefore available from a read-only snapshot or from no
+transaction at all — never from inside a read-write transaction.
+
+That is the enforcement point, and it is the exact site that returns `NIL` today.
+
+Write enforcement sits at `SAVE` / `UPDATE-NODE` / `DELETE-NODE` / `MARK-DELETED`,
+comparing `(node-graph node)` against the transaction's graph.
+
+## 7. Class names are globally unique across graphs
+
+`DEF-VERTEX` / `DEF-EDGE` signal `DUPLICATE-NODE-CLASS-ERROR` when the class name is
+already registered under a **different** graph name. Plain error, no restart: silently
+sharing a class across schemas is the thing that corrupts reads, and a restart in a
+non-interactive load is just something a `HANDLER-BIND` swallows. Re-homing a class means
+removing the old definition first.
+
+Two details that decide whether the implementation is correct:
+
+**The guard must be emitted before the `DEFCLASS` form.** The macro currently expands to
+`DEFCLASS` first and registration after, so a check placed later fires only once the class
+has already been clobbered.
+
+**The check is on graph-name identity, not presence.** "Is this name already registered?"
+is the natural phrasing and is wrong: a same-graph redefinition adds a second entry under
+the same key (§2), so a presence test rejects exactly the case §7 must preserve. The check
+is "is this name registered under a graph-name *other than* this one".
+
+Vertex-vs-edge is irrelevant — they share the CL class namespace, so the same name as a
+vertex in A and an edge in B is the same collision.
+
+**Feasibility:** all 114 `DEF-VERTEX`/`DEF-EDGE` names in the repo were scanned. Exactly
+one name appears under two graph names and neither occurrence is real — `schema.lisp:435`
+is a docstring example, and `xach-test.lisp` is an ad-hoc file not in the ASD. That file
+would now error if loaded; it is not worth protecting.
+
+## 8. Schema registry: replace, don't accumulate
+
+`DEF-VERTEX` pushes a new meta onto `(gethash graph-name *schema-node-metadata*)` on every
+evaluation, so redefining a type accumulates metas without bound. This is not cosmetic:
+`UPDATE-SCHEMA` does `(dolist (meta (reverse node-metadata)) (instantiate-node-type meta
+graph))`, replaying **every historical version of every type** on graph open. N
+redefinitions cost N instantiations of that type at every open, forever.
+
+Fix: replace the existing meta for that node-type name **in place**, preserving its
+position in the list.
+
+Position matters. `UPDATE-SCHEMA` applies oldest → newest, and `INSTANTIATE-NODE-TYPE`
+assigns type-ids in application order. Replacing in place keeps a redefined type's type-id
+assignment order stable; remove-then-push would move it to the front and could hand it a
+different type-id on a fresh graph. Since §7 makes names unique within a graph, keying the
+replacement on the node-type name is sufficient.
+
+## 9. What does not change
+
+Validation, `OVERLAPPING-TRANSACTIONS`, the retry and exclusive-lock fallback, the WAL,
+MVCC epochs, and nested-transaction independence are all untouched. No on-disk format
+change. A single-graph application sees no behavioural difference except that a
+previously-silent `NIL` becomes an error, and a previously-silent class clobber becomes an
+error.
+
+## 10. Testing
+
+- **Ownership under pooling** — nodes materialized from a recycled buffer must report the
+  correct graph. This is the test that fails if a stamping point is missed.
+- **Cross-graph reads under a wrong `*GRAPH*`** — slot reads, `NODE-TO-ALIST`, `COPY`, and
+  writes landing in the right graph, each with `*GRAPH*` deliberately bound elsewhere.
+- **The enforcement error** — a read-write transaction touching a foreign node signals;
+  a read-only snapshot on A reading B does not.
+- **Composed snapshots** — two snapshots active at once, each internally consistent.
+- **Class-name uniqueness** — a second graph reusing a name errors; same-graph
+  redefinition still succeeds, with existing node data readable and the new slot usable.
+- **Registry replacement** — repeated redefinition leaves one meta, and type-ids stay
+  stable across a redefinition on a fresh graph.
+
+Every test must be shown to fail without its corresponding change.
+
+Suites: full graph-db suite, plus acid and concurrency, on **both SBCL and ECL**. ECL
+matters specifically here because it is the implementation that does *not* pool nodes, so
+it exercises the opposite branch of §5.
+
+## 11. Out of scope — file as issues
+
+- **Multi-graph transactions** with two-phase commit across per-graph WALs and a global
+  tx-id ordering. The future target.
+- **A global cross-graph epoch**, giving cross-graph queries a single instant.
+- Whether any consumer actually needs atomic cross-graph writes is unconfirmed; worth
+  grepping mine-action for sequential writes to two graphs before treating §3 as free.
+
+## 12. Risks
+
+- **Missed stamping point.** A materialization path that does not set `NODE-GRAPH` yields a
+  node carrying a *stale* graph on the pooling implementations. The `NIL`-means-unknown
+  fallback does not save that case, because the slot is not `NIL` — it holds the previous
+  occupant's graph. Mitigated by the pooling test, but the risk is real and the reason the
+  stamping points are enumerated in §5 rather than left to judgement.
+- **`*READ-SNAPSHOTS*` lifetime.** Entries must be removed on unwind, or a snapshot
+  outlives its dynamic extent and pins the reaper's floor.
+- **Enforcement in the wrong place** could reject legitimate single-graph work. The error
+  must fire only when a node's home is known *and* differs.
