@@ -681,6 +681,163 @@ Refs #53"
 
 ---
 
+### Task 7a: Slot access resolves through the node's own graph
+
+**Added after Task 4 review.** Tasks 1-2 stamp `NODE-GRAPH` at 16 sites but nothing
+READS it on the slot-access path, so the stamps are currently decoration. This is the
+core of #53.
+
+**Files:**
+- Modify: `primitive-node.lisp` — the four `SLOT-*-USING-CLASS :AROUND` methods (~371-450)
+  and `MAYBE-INIT-NODE-DATA` (~207)
+- Test: `tests/multi-graph-tests.lisp`
+
+**Interfaces:**
+- Consumes: `NODE-HOME-GRAPH` (Task 1).
+
+- [ ] **Step 1: Write the failing test**
+
+A node whose lazy data has not yet been materialized, read under a foreign `*GRAPH*`,
+must return its own data. This is the case that currently dies on ECL inside `COPY` with
+a `DESERIALIZATION-ERROR`, because `MAYBE-INIT-NODE-DATA` dereferences the foreign
+`DATA-POINTER` into `*GRAPH*`'s heap.
+
+```lisp
+(test lazy-slot-reads-resolve-through-the-nodes-own-graph
+  "MAYBE-INIT-NODE-DATA resolved the heap via *GRAPH*, so a node whose data was
+still lazy deserialized from the wrong file (GH #53)."
+  (with-three-graphs (ga gb gc)
+    (let (a-id loc-a)
+      (let ((*graph* ga))
+        (with-transaction () (setq a-id (id (make-mg-plain :label "lazy-alpha")))))
+      (setq loc-a (graph-db:location ga))
+      (close-graph ga :snapshot-p t)
+      (setq ga (open-graph :mg-alpha loc-a))
+      ;; reopened: the node's data is lazy, not yet materialized
+      (let ((*graph* gb))
+        (let ((node (lookup-vertex a-id :graph ga)))
+          (is (string= "lazy-alpha" (slot-value node 'label))
+              "a lazy slot must materialize from GA's heap, not *GRAPH*'s")))
+      gc)))
+```
+
+- [ ] **Step 2: Run it and confirm it fails**
+
+Run `multi-graph-suite` on **both** SBCL and ECL. ECL is expected to fail with a
+`DESERIALIZATION-ERROR`; SBCL may pass by luck of heap layout, which is itself the
+argument for the fix — a wrong-heap read that happens to decode is worse than one that
+errors.
+
+- [ ] **Step 3: Resolve through the node's own graph**
+
+`MAYBE-INIT-NODE-DATA` already takes `:GRAPH` defaulting to `*GRAPH*`. Prefer the node's
+own:
+
+```lisp
+(defun maybe-init-node-data (node &key (graph *graph*))
+  ;; Resolve the heap through the NODE's own graph (GH #53).
+  (let ((graph (node-home-graph node graph)))
+    ...existing body unchanged...))
+```
+
+Note the existing body must be wrapped in the new `LET`; keep the trailing `node` return
+value outside it exactly as now.
+
+- [ ] **Step 4: Thread the graph through the slot-access methods**
+
+The four `SLOT-*-USING-CLASS :AROUND` methods in `primitive-node.lisp` call
+`NODE-SLOT-VALUE` / `NODE-SLOT-BOUNDP` with no `:GRAPH`. Pass the node's own:
+
+```lisp
+(node-slot-value instance slot-keyword-name :graph (node-home-graph instance))
+```
+
+and the same for the `setf` and `slot-boundp` paths. `NODE-SLOT-VALUE` and
+`NODE-SLOT-BOUNDP` already accept `:GRAPH`.
+
+- [ ] **Step 5: Run the test, then the full suite on both lisps**
+
+This touches the hottest read path in the engine. Run the full suite plus
+`graph-db/acid-test` and `graph-db/concurrency-test` on both SBCL and ECL, redirecting
+each to a log file.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add primitive-node.lisp tests/multi-graph-tests.lisp
+git commit -m "fix(node): resolve a node's heap through its own graph
+
+Refs #53"
+```
+
+---
+
+### Task 7b: Enforce single-graph on the delete path
+
+**Added after Task 4 review.** `DELETE-NODE` / `MARK-DELETED` bypass `UPDATE-NODE`, so
+Task 4's write enforcement does not cover them and a cross-graph delete is still silent.
+Spec §6 names them.
+
+**Files:**
+- Modify: `transactions.lisp` — `DELETE-NODE` (~2549)
+- Test: `tests/multi-graph-tests.lisp`
+
+**Interfaces:**
+- Consumes: `NODE-HOME-GRAPH` (Task 1), `CROSS-GRAPH-TRANSACTION-ERROR` (Task 3).
+
+- [ ] **Step 1: Write the failing test**
+
+```lisp
+(test read-write-transaction-rejects-a-foreign-delete
+  "DELETE-NODE bypasses UPDATE-NODE, so it needs its own check (GH #53)."
+  (with-three-graphs (ga gb gc)
+    (let (a-id)
+      (let ((*graph* ga))
+        (with-transaction () (setq a-id (id (make-mg-plain :label "doomed")))))
+      (let ((node (let ((*graph* gb)) (lookup-vertex a-id :graph ga))))
+        (signals graph-db:cross-graph-transaction-error
+          (let ((*graph* gb))
+            (with-transaction () (mark-deleted node)))))
+      ;; and it must still be there
+      (is (not (null (lookup-vertex a-id :graph ga)))
+          "the foreign delete must not have landed")
+      gc)))
+```
+
+- [ ] **Step 2: Run it and confirm it fails**
+
+Expected: no error signalled, and the node is deleted from GA.
+
+- [ ] **Step 3: Add the check**
+
+In `DELETE-NODE`'s default method, mirroring `UPDATE-NODE`:
+
+```lisp
+    ;; A read-write transaction is single-graph (GH #53).  A NIL home is
+    ;; unknown, not foreign.
+    (let ((home (node-home-graph node nil))
+          (txn-graph (and *transaction* (graph *transaction*))))
+      (when (and home txn-graph (not (eq home txn-graph)))
+        (error 'cross-graph-transaction-error
+               :node node :transaction-graph txn-graph :node-graph home)))
+```
+
+Guard on `*transaction*` being non-NIL: `DELETE-NODE` auto-wraps a transaction in some
+paths, so it can be reached outside one.
+
+- [ ] **Step 4: Run the test, then the full suite on both lisps**
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add transactions.lisp tests/multi-graph-tests.lisp
+git commit -m "feat(transactions): enforce single-graph on the delete path
+
+Refs #53"
+```
+
+---
+
 ### Task 8: Documentation and issues
 
 **Files:**
