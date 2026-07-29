@@ -76,6 +76,7 @@
            #:transaction-p
            #:graph-name
            #:transaction-error
+           #:cross-graph-transaction-error
            #:master-host
            #:replication-port
            #:slave-socket

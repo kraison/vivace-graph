@@ -13,6 +13,18 @@
              (with-slots (reason) error
                (format stream "Transaction error: ~A." reason)))))
 
+(define-condition cross-graph-transaction-error (error)
+  ((node :initarg :node)
+   (transaction-graph :initarg :transaction-graph)
+   (node-graph :initarg :node-graph))
+  (:report (lambda (error stream)
+             (with-slots (node transaction-graph node-graph) error
+               (format stream "Cross-graph access in a read-write transaction: ~
+node ~A belongs to ~A but the transaction is on ~A. A read-write transaction ~
+is single-graph; use one transaction per graph."
+                       node (and node-graph (graph-name node-graph))
+                       (and transaction-graph (graph-name transaction-graph)))))))
+
 (define-condition serialization-error (error)
   ((instance :initarg :instance)
    (reason :initarg :reason))
