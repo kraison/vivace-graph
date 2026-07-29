@@ -193,10 +193,26 @@ Expected: PASS.
 
 - [ ] **Step 3: Confirm they fail without Task 1**
 
+Do **not** use `git stash` — a pre-design stash already exists and popping the wrong
+entry would be destructive. Back the files up, remove only the stamping lines, retest,
+restore:
+
 ```bash
-cd ~/vg-repo && git stash push node-class.lisp primitive-node.lisp transactions.lisp && touch node-class.lisp primitive-node.lisp transactions.lisp
-# rerun; expect failures on the assertions
-git stash pop && touch node-class.lisp primitive-node.lisp transactions.lisp
+cd ~/vg-repo
+cp primitive-node.lisp /tmp/pn.bak && cp transactions.lisp /tmp/tx.bak
+# delete the four `(setf (node-graph ...))` stamping lines added in Task 1 step 4,
+# leaving the slot and NODE-HOME-GRAPH in place so the failure is the ASSERTION and
+# not an undefined function
+python3 - <<'EOF'
+for f in ("primitive-node.lisp", "transactions.lisp"):
+    s = open(f).read()
+    s = "\n".join(l for l in s.split("\n") if "(setf (node-graph" not in l)
+    open(f, "w").write(s)
+EOF
+touch primitive-node.lisp transactions.lisp
+# rerun the suite; expect the assertions to fail, not an error
+cp /tmp/pn.bak primitive-node.lisp && cp /tmp/tx.bak transactions.lisp
+touch primitive-node.lisp transactions.lisp
 ```
 
 - [ ] **Step 4: Commit**
@@ -246,15 +262,22 @@ In `package.lisp`, beside the other condition exports:
 
 - [ ] **Step 3: Verify it loads and reports**
 
-```bash
-ssh ma 'cd ~/vg-repo && VG_ROOT=$HOME/vg-repo sbcl --dynamic-space-size 8192 --noinform --disable-debugger --eval "(require :asdf)" --load ~/run-suite-system.lisp' SYS=graph-db FN=identity 2>/dev/null || true
-```
-Simpler check — load `:graph-db` and evaluate:
+Write `/tmp/cond-check.lisp`:
 ```lisp
-(princ-to-string (make-condition 'graph-db:cross-graph-transaction-error
-                                 :node :n :transaction-graph nil :node-graph nil))
+(require :asdf)
+(load (merge-pathnames "quicklisp/setup.lisp" (user-homedir-pathname)))
+(push (pathname (concatenate 'string (uiop:getenv "VG_ROOT") "/")) asdf:*central-registry*)
+(handler-bind ((warning #'muffle-warning)) (ql:quickload :graph-db :silent t))
+(format t "~&REPORT: ~a~%"
+        (princ-to-string (make-condition 'graph-db:cross-graph-transaction-error
+                                         :node :n :transaction-graph nil :node-graph nil)))
+(uiop:quit 0)
 ```
-Expected: a readable sentence, no error.
+Run:
+```bash
+scp /tmp/cond-check.lisp ma:~/ && ssh ma 'VG_ROOT=$HOME/vg-repo sbcl --dynamic-space-size 8192 --noinform --disable-debugger --load ~/cond-check.lisp 2>&1 | grep REPORT'
+```
+Expected: one `REPORT:` line containing a readable sentence, no error.
 
 - [ ] **Step 4: Commit**
 
@@ -439,7 +462,10 @@ In `lookup-object`'s `(transaction null)` method, before the existing body:
         (return-from lookup-object (lookup-object id table snap graph))))
 ```
 
-(Convert the method to a named block if needed so `return-from` works.)
+`DEFMETHOD` bodies are already implicit blocks named for the generic function, so
+`(return-from lookup-object ...)` works as written — no restructuring needed. Verify by
+compiling; if the compiler objects, wrap the body in an explicit
+`(block lookup-object ...)` instead.
 
 - [ ] **Step 6: Run the test, then the full suite on both lisps**
 
@@ -601,8 +627,22 @@ In `schema.lisp`, swap the `push` for:
                        (append metas (list ,meta)))))
 ```
 
-Note this makes the list oldest-first, so `UPDATE-SCHEMA`'s `(reverse ...)` must be
-dropped in the same commit — verify the ordering end to end.
+This makes the list **oldest-first**, so `UPDATE-SCHEMA`'s `reverse` must go in the same
+commit or the replay order silently inverts. In `schema.lisp`, `update-schema`:
+
+```lisp
+(defmethod update-schema ((graph graph))
+  (with-recursive-lock-held ((schema-lock (schema graph)))
+    (let ((node-metadata (gethash (graph-name graph) *schema-node-metadata*)))
+      ;; The list is maintained oldest-first (GH #53); apply in order.
+      (dolist (meta node-metadata)
+        (instantiate-node-type meta graph)))
+    (save-schema (schema graph) graph)))
+```
+
+Every test helper that resets the registry with
+`(setf (gethash <name> *schema-node-metadata*) nil)` stays valid — NIL is still the empty
+list.
 
 - [ ] **Step 4: Verify type-id stability**
 
