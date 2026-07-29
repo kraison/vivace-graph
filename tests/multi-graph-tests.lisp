@@ -868,3 +868,84 @@ a phantom graph (GH #53)."
                      "a restored node must be stamped with the graph that reopened it")))
           (ignore-errors (close-graph g2 :snapshot-p nil))
           (collect-garbage))))))
+
+;;; --- cross-graph reads under a foreign *GRAPH* (GH #53) ---------------------
+;;;
+;;; The stamps above are load-bearing, not decorative: these three tests pin
+;;; the actual consumer-visible behaviour they enable -- reading a node found
+;;; via an explicit :GRAPH stays correct no matter what *GRAPH* is ambiently
+;;; bound to.  Lookups are deliberately OUTSIDE any transaction (reading a
+;;; foreign graph inside a read-write transaction becomes an error in Task 4).
+
+;; Both tests below close and reopen GA/GB before the cross-graph reads.
+;; Without that, A-ID/B-ID are still the live, correctly-classed objects
+;; CACHE-HIT hands back from their own creation moments earlier -- the read
+;; never touches the deserializer, and passes no matter what *GRAPH* is bound
+;; to.  Reopening forces a genuine disk materialization through
+;; DESERIALIZE-VERTEX-HEAD's per-graph type-id -> class resolution, the actual
+;; cross-graph hazard (MG-PLAIN and MG-TEXT collide on type-id 1; see
+;; CROSS-GRAPH-LOOKUP-MATERIALIZES-THE-OWNING-GRAPHS-CLASS above).  TYPE-OF is
+;; asserted alongside the slot value because MG-PLAIN and MG-TEXT both declare
+;; a slot named LABEL -- a wrongly-classed node would still return the right
+;; string, so the slot check alone does not discriminate.
+
+(test slot-reads-resolve-through-the-nodes-own-graph
+  "Read a node's slots with *GRAPH* bound to a different graph (GH #53)."
+  (with-three-graphs (ga gb gc)
+    (let (a-id b-id loc-a loc-b)
+      (let ((*graph* ga))
+        (with-transaction () (setq a-id (id (make-mg-plain :label "alpha-value")))))
+      (let ((*graph* gb))
+        (with-transaction () (setq b-id (id (make-mg-text :label "beta-value")))))
+      (setq loc-a (graph-db:location ga) loc-b (graph-db:location gb))
+      (close-graph ga :snapshot-p t)
+      (close-graph gb :snapshot-p t)
+      (setq ga (open-graph :mg-alpha loc-a))
+      (setq gb (open-graph :mg-beta loc-b))
+      (let ((*graph* gb))
+        (let ((node (lookup-vertex a-id :graph ga)))
+          (is (eq 'mg-plain (type-of node))
+              "a-id must materialize as MG-PLAIN with *GRAPH* bound to gb, got ~S"
+              (type-of node))
+          (is (string= "alpha-value" (slot-value node 'label)))))
+      (let ((*graph* ga))
+        (let ((node (lookup-vertex b-id :graph gb)))
+          (is (eq 'mg-text (type-of node))
+              "b-id must materialize as MG-TEXT with *GRAPH* bound to ga, got ~S"
+              (type-of node))
+          (is (string= "beta-value" (slot-value node 'label)))))
+      (let ((*graph* gc))
+        (is (string= "alpha-value"
+                     (slot-value (lookup-vertex a-id :graph ga) 'label)))
+        (is (string= "beta-value"
+                     (slot-value (lookup-vertex b-id :graph gb) 'label)))))))
+
+(test node-to-alist-resolves-through-the-nodes-own-graph
+  "NODE-TO-ALIST omits :GRAPH and fell back to *GRAPH* (GH #53)."
+  (with-three-graphs (ga gb gc)
+    (let (a-id loc-a)
+      (let ((*graph* ga))
+        (with-transaction () (setq a-id (id (make-mg-plain :label "alist-alpha")))))
+      (setq loc-a (graph-db:location ga))
+      (close-graph ga :snapshot-p t)
+      (setq ga (open-graph :mg-alpha loc-a))
+      (let ((*graph* gb))
+        (is (string= "alist-alpha"
+                     (cdr (assoc :label
+                                 (graph-db::node-to-alist
+                                  (lookup-vertex a-id :graph ga)))))))
+      gc)))
+
+(test copies-carry-the-home-graph
+  "COPY-NODE enumerates the slots it copies (GH #53)."
+  (with-three-graphs (ga gb gc)
+    (let (a-id)
+      (let ((*graph* ga))
+        (with-transaction () (setq a-id (id (make-mg-plain :label "orig")))))
+      (let ((node (let ((*graph* gb)) (lookup-vertex a-id :graph ga))))
+        (let ((*graph* ga))
+          (with-transaction ()
+            (let ((copy (copy node)))
+              (is (eq ga (graph-db::node-graph copy)))
+              (is (string= "orig" (slot-value copy 'label)))))))
+      gc)))
