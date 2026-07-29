@@ -129,23 +129,35 @@ re-established on every materialization.
 path not yet stamped. `NODE-HOME-GRAPH` is the accessor to use wherever a node's heap,
 tables or schema are resolved.
 
+There is a **third state**: because the slot is excluded from cl-store (below), a restored
+node has it UNBOUND, and an unbound read signals rather than falling back.
+`NODE-HOME-GRAPH` must therefore treat unbound as unknown too, so the documented
+graph-or-fallback contract is actually true rather than true-by-luck of a stamp two lines
+downstream.
+
 Ownership is needed regardless of the read paths: it is how cross-graph misuse is
 *detected* for the error in §3.
 
 **The slot must be stamped on every materialization path**, because a missed site leaves
 `NIL` and silently falls back to `*GRAPH*` — the very bug this removes.
 
-Stamp at the FUNNELS, not the leaves. Sites that have `graph` in hand: `MAKE-VERTEX` /
-`MAKE-EDGE` (creation — a node is otherwise unstamped for the whole body of the
-transaction that creates it), `FINALIZE-NODE`, `ENSURE-NODE-BYTES`, `LOOKUP-NODE`
-(**both** the cache-hit and miss branches), and `COPY-NODE`, which enumerates the slots it
-copies.
+Stamp at the FUNNELS, not the leaves. This list is the complete enumeration — §12 depends
+on it being complete, so anything added later belongs here too.
+
+On-disk backend: `MAKE-VERTEX` / `MAKE-EDGE` (creation — a node is otherwise unstamped for
+the whole body of the transaction that creates it), `FINALIZE-NODE`, `ENSURE-NODE-BYTES`,
+`LOOKUP-NODE` (**both** the cache-hit and miss branches), `COPY-NODE` (which enumerates the
+slots it copies), the untyped `MAP-VERTICES` and `MAP-EDGES` scans (their nodes come
+straight from the deserializer and a side-effect scan never reaches `ENSURE-NODE-BYTES`),
+and `APPLY-TX-WRITE` for `TX-UPDATE` — the update/delete funnel, which unlike its
+`TX-CREATE` sibling never reaches `FINALIZE-NODE`.
 
 The **memory backend needs its own stamps** and is the higher-value case, being the
-Android/mine-action consumer: `LOOKUP-NODE ((table mem-table) key graph)` currently
-declares `graph` ignored; `APPLY-TX-WRITE` for `MEMORY-GRAPH-MIXIN` is a full override so
-`FINALIZE-NODE` never runs there; and `%LZNODE->NODE` builds a node with `graph` already
-bound. Without these the feature is structurally inert for memory graphs.
+Android/mine-action consumer: `LOOKUP-NODE ((table mem-table) key graph)` (which declared
+`graph` ignored), `APPLY-TX-WRITE` for both `TX-CREATE` and `TX-UPDATE` on
+`MEMORY-GRAPH-MIXIN` (full overrides, so `FINALIZE-NODE` never runs there), `%LZNODE->NODE`,
+and `RESTORE-MEMORY-IMAGE` — see below for why restore needs one. Without these the
+feature is structurally inert for memory graphs.
 
 **`NODE-GRAPH` must be excluded from cl-store.** `WRITE-MEMORY-IMAGE`'s non-lazy branch
 cl-stores the node CLOS objects themselves, and cl-store walks every slot regardless of
