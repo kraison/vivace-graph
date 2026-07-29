@@ -124,7 +124,12 @@ index.  The same seam MAKE-VIEW-SKIP-LIST provides for views -- it is what lets
   (:method ((graph graph) &key (precision 7) (max-cells +spatial-insert-max-cells+))
     (make-spatial-index (indexes graph) :precision precision
                                         :max-cells max-cells
-                                        :backend (graph-index-backend graph)))
+                                        ;; :SPATIAL-INDEX-BACKEND wins when set;
+                                        ;; NIL (the default) follows the graph's
+                                        ;; general :INDEX-BACKEND.  See GH #91 for
+                                        ;; why a graph may want these to differ.
+                                        :backend (or (graph-spatial-index-backend graph)
+                                                     (graph-index-backend graph))))
   (:method ((graph memory-graph-mixin) &key (precision 7) (max-cells +spatial-insert-max-cells+))
     (make-mem-spatial-index :precision precision :max-cells max-cells)))
 

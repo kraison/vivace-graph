@@ -26,6 +26,7 @@
            #:*default-index-size*
            #:*index-backend*
            #:graph-index-backend
+           #:graph-spatial-index-backend
            #:open-graph
            #:close-graph
            #:lookup-graph

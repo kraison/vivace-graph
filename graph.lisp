@@ -283,7 +283,8 @@ debugging an unexpectedly empty result, check the declaration before the data."
                                    peer-role origin-id peer-host
                                    export-predicate device-registry merge-policy
                                    reference-classes (peer-schema-version '(1 0))
-                                   (index-backend *index-backend*))
+                                   (index-backend *index-backend*)
+                                   spatial-index-backend)
   "Create a brand-new graph named NAME with its on-disk files under the
 directory LOCATION, register it (so LOOKUP-GRAPH and *GRAPH* can find it), and
 return it.  The directory is created if necessary and must not already contain
@@ -318,6 +319,18 @@ Keyword arguments:
                           value here governs indexes CREATED on this graph.  Wire
                           it from your app's own config.  See
                           docs/bplus-tree-experiment.md.
+  :SPATIAL-INDEX-BACKEND  engine for SPATIAL indexes specifically, overriding
+                          :INDEX-BACKEND for them alone.  NIL (default) means
+                          follow :INDEX-BACKEND.  Use it to keep B+ trees for
+                          views and :UNIQUE while spatial indexes use the skip
+                          list: a spatial query is a handful of SHORT prefix
+                          range scans (one per covering geohash cell, most
+                          returning nothing), and the B+ tree's range-scan
+                          advantage is per ENTRY, so it does not survive that
+                          shape -- measured ~600 KB consed for a zero-row query
+                          vs ~115 KB on the skip list, and slower at every corpus
+                          size (GH #91).  Governs only NEWLY created spatial
+                          indexes; existing ones reopen on their persisted tag.
   :REPLICATION-FILTER     (slaves only) a predicate (NODE) -> boolean; the slave
                           applies only replicated writes whose node it accepts,
                           so it holds just a subset (e.g. its area of operations).
@@ -357,6 +370,7 @@ to disk and remove it."
              :graph-name name
              :location path
              :index-backend index-backend
+             :spatial-index-backend spatial-index-backend
              :views
              #+sbcl (make-hash-table :synchronized t)
              #+ccl (make-hash-table :shared t)
@@ -455,6 +469,7 @@ to disk and remove it."
                    export-predicate device-registry merge-policy
                    reference-classes (peer-schema-version '(1 0))
                    (index-backend *index-backend*)
+                   spatial-index-backend
                    ;; Default geohash precision for spatial indexes CREATED on this
                    ;; graph (MAKE-GRAPH takes the same keyword).  Existing indexes
                    ;; reopen at their own persisted precision from the v3 sidecar,
@@ -502,6 +517,7 @@ Always CLOSE-GRAPH when finished."
              :graph-name name
              :location path
              :index-backend index-backend
+             :spatial-index-backend spatial-index-backend
              :views
              #+sbcl (make-hash-table :synchronized t)
              #+ccl (make-hash-table :shared t)

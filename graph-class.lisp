@@ -60,6 +60,18 @@
    ;; index carries its own persisted backend tag); this only governs new ones.
    (index-backend :accessor graph-index-backend :initarg :index-backend
                   :initform *index-backend*)
+   ;; Backend for SPATIAL indexes specifically, or NIL to follow INDEX-BACKEND.
+   ;; Spatial queries have a different access pattern from views and :UNIQUE --
+   ;; a handful of SHORT prefix range scans, one per covering geohash cell, most
+   ;; returning nothing -- and the B+ tree's range-scan advantage is per ENTRY,
+   ;; so it does not survive that shape: measured ~600 KB consed for a
+   ;; zero-row query vs ~115 KB on the skip list, and slower at every corpus
+   ;; size (GH #91).  This lets a graph keep B+ trees everywhere else and use
+   ;; the skip list where it actually wins.  Like INDEX-BACKEND, it governs only
+   ;; NEWLY created indexes; existing ones reopen on their own persisted tag.
+   (spatial-index-backend :accessor graph-spatial-index-backend
+                          :initarg :spatial-index-backend
+                          :initform nil)
    ;; Unique constraints (issue #6): (owner-class . slot-name) -> UNIQUE-INDEX.
    ;; A derived structure (v1: rebuilt on open); enforcement is at the commit
    ;; boundary.  See unique-constraint.lisp / docs/unique-constraint-design.md.

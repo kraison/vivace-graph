@@ -8,6 +8,7 @@
   ((geom :type geometry :index t))
   :graph-db-integration-test)
 
+
 (def-suite graph-spatial-suite
   :description "A graph owns a registry of spatial indexes, repopulated on reopen."
   :in graph-db-suite)
@@ -51,3 +52,77 @@ after OPEN-GRAPH: the registry is repopulated by REBUILD-SPATIAL-INDEXES."
                        "Lviv point is outside the query window"))))
           (close-graph g2 :snapshot-p nil)
           (collect-garbage))))))
+
+;;; ---- per-index-type backend selection (GH #91) -------------------------
+;;;
+;;; These use their OWN graph name and types rather than the shared integration
+;;; schema: DEF-VERTEX registration is per graph name and assigns type-ids in
+;;; evaluation order, and *INTEGRATION-GRAPH-NAME* is shared with the
+;;; thread-heavy segment-query tests.  Adding a type there to serve these tests
+;;; would perturb an unrelated suite for no reason.
+
+(defparameter *spatial-backend-graph-name* :graph-db-spatial-backend-test)
+
+(eval-when (:load-toplevel :execute)
+  (setf (gethash *spatial-backend-graph-name* *schema-node-metadata*) nil))
+
+(def-vertex sb-first  () ((geom :type geometry :index t))
+  :graph-db-spatial-backend-test)
+;; A SECOND spatial owner: its index is created lazily at a LATER moment, which
+;; is precisely where the naive workaround (flipping GRAPH-INDEX-BACKEND around
+;; the first geometry write) silently produced one backend of each.
+(def-vertex sb-second () ((geom :type geometry :index t))
+  :graph-db-spatial-backend-test)
+
+(test spatial-index-backend-overrides-the-graph-default
+  "A graph can keep B+ trees for views and :UNIQUE while its SPATIAL indexes use
+the skip list.  Spatial queries are a handful of SHORT prefix range scans (one
+per covering geohash cell, most returning nothing), and the B+ tree's
+range-scan advantage is per ENTRY, so it loses badly on that shape -- hence
+wanting to differ from the graph default at all.
+
+Also pins the property the naive workaround FAILS: spatial indexes are created
+lazily per (OWNER . SLOT), so a SECOND geometry-bearing type written later must
+get the same backend as the first.  Flipping GRAPH-INDEX-BACKEND around the
+first write silently produced one of each."
+  (with-temp-directory (dir)
+    (let ((g (make-graph *spatial-backend-graph-name* (namestring dir)
+                         :index-backend :bplus-tree
+                         :spatial-index-backend :skip-list)))
+      (unwind-protect
+           (let ((*graph* g))
+             (with-transaction ()
+               (make-sb-first :geom (make-point 37.1724d0 49.2020d0)))
+             (with-transaction ()
+               (make-sb-second :geom (make-point 37.1800d0 49.2100d0)))
+             (let ((backends (mapcar #'graph-db::spatial-index-backend
+                                     (mapcar (lambda (x) (if (consp x) (cdr x) x))
+                                             (all-spatial-indexes g)))))
+               (is (= 2 (length backends))
+                   "expected two spatial indexes (two owner.slot pairs), got ~a"
+                   (length backends))
+               (is (every (lambda (b) (eq :skip-list b)) backends)
+                   "every spatial index must follow :SPATIAL-INDEX-BACKEND, got ~a"
+                   backends))
+             (is (eq :bplus-tree (graph-db::graph-index-backend g))
+                 "the graph's general backend must be untouched"))
+        (ignore-errors (close-graph g :snapshot-p nil))))))
+
+(test spatial-index-backend-nil-follows-the-graph-default
+  "NIL (the default) means 'follow :INDEX-BACKEND' -- so existing callers, which
+pass only :INDEX-BACKEND, are completely unaffected."
+  (with-temp-directory (dir)
+    (let ((g (make-graph *spatial-backend-graph-name* (namestring dir)
+                         :index-backend :bplus-tree)))
+      (unwind-protect
+           (let ((*graph* g))
+             (is (null (graph-db::graph-spatial-index-backend g))
+                 "the new slot must default to NIL")
+             (with-transaction ()
+               (make-sb-first :geom (make-point 37.1724d0 49.2020d0)))
+             (let ((idx (first (all-spatial-indexes g))))
+               (is (eq :bplus-tree
+                       (graph-db::spatial-index-backend
+                        (if (consp idx) (cdr idx) idx)))
+                   "with no override the spatial index must follow :INDEX-BACKEND")))
+        (ignore-errors (close-graph g :snapshot-p nil))))))
