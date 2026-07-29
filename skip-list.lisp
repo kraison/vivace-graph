@@ -235,13 +235,36 @@ L1: 50%, L2: 25%, L3: 12.5%, ..."
     (let ((bytes (get-bytes (%sl-heap skip-list) addr size)))
       (values bytes size))))
 
+(declaim (inline %node-cache-vec-index))
+(defun %node-cache-vec-index (addr)
+  "Slot ADDR maps to in the direct-mapped NODE-CACHE-VEC."
+  (logand (ash addr -6) 2047))
+
+(defun invalidate-cached-skip-node (skip-list addr)
+  "Evict ADDR from BOTH node caches.
+
+Must be called wherever ADDR is freed.  NODE-CACHE-VEC is direct-mapped and
+validated by ADDRESS, so once ADDR goes back to the allocator a later node
+handed the same address would match a stale entry's (%SN-ADDR CACHED) guard and
+READ-SKIP-NODE would return the previous node's key, value and POINTERS --
+silently wrong reads, and cyclic traversals where the stale pointers form a
+loop.  The weak hash cache does not have this problem (a freed node becomes
+garbage), but is cleared here too so both caches are dropped in one place."
+  (let* ((vec (%sl-node-cache-vec skip-list))
+         (idx (%node-cache-vec-index addr))
+         (cached (aref vec idx)))
+    (when (and cached (= (%sn-addr cached) addr))
+      (setf (aref vec idx) nil)))
+  (with-sl-cache-lock (skip-list)
+    (remhash addr (%sl-node-cache skip-list))))
+
 (defun read-skip-node (skip-list addr)
   (declare (type word addr))
   (if (= addr 0)
       nil
       (let* ((cache (%sl-node-cache-vec skip-list))
-             (idx (logand (ash addr -6) 2047))
-             (cached (aref cache idx)))
+             (idx (%node-cache-vec-index addr))
+             (cached (and *cache-enabled* (aref cache idx))))
         (if (and cached (= (%sn-addr cached) addr))
             cached
             (or (and *cache-enabled*
@@ -267,10 +290,16 @@ L1: 50%, L2: 25%, L3: 12.5%, ..."
                                             (subseq bytes (+ pointer length)))))
                         (setf (%sn-key node) key
                               (%sn-value node) value)
-                        (setf (aref cache idx) node)
-                        (with-sl-cache-lock (skip-list)
-                          (setf (gethash addr (%sl-node-cache skip-list))
-                                node)))))))))))
+                        ;; Both caches are populated only when caching is on, so
+                        ;; binding *CACHE-ENABLED* to NIL really does force a
+                        ;; fresh read (the profiler's cold-read workloads and
+                        ;; any correctness-sensitive bypass depend on that).
+                        (when *cache-enabled*
+                          (setf (aref cache idx) node)
+                          (with-sl-cache-lock (skip-list)
+                            (setf (gethash addr (%sl-node-cache skip-list))
+                                  node)))
+                        node)))))))))
 
 
 (defstruct
@@ -434,6 +463,9 @@ L1: 50%, L2: 25%, L3: 12.5%, ..."
             (%sl-heap skip-list) nil
             (%sl-mmap skip-list) nil
             (%sl-locks skip-list) #())
+      ;; Every address above has just been freed, so the direct-mapped cache
+      ;; must be dropped along with the hash one (INVALIDATE-CACHED-SKIP-NODE).
+      (fill (%sl-node-cache-vec skip-list) nil)
       (with-sl-cache-lock (skip-list)
         (clrhash (%sl-node-cache skip-list)))
       nil)))
@@ -754,9 +786,11 @@ none matched."
                                    level
                                    (aref (%sn-pointers node-to-delete) level)))
                              (decf-skip-list-count skip-list)
-                             (with-sl-cache-lock (skip-list)
-                               (remhash (%sn-addr node-to-delete)
-                                        (%sl-node-cache skip-list)))
+                             ;; Evict from BOTH caches BEFORE handing the address
+                             ;; back to the allocator -- see
+                             ;; INVALIDATE-CACHED-SKIP-NODE.
+                             (invalidate-cached-skip-node
+                              skip-list (%sn-addr node-to-delete))
                              (free (%sl-heap skip-list) (%sn-addr node-to-delete))
                              (unlock-skip-node skip-list lock)
                              (setq lock nil)
