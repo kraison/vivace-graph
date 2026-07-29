@@ -297,6 +297,14 @@ VECTOR-SEGMENT-CAPACITY-EXHAUSTED, not this."
 (defparameter *segment-relocations* 0
   "Count of reservations grown by RELOCATING the mapping (M-POINTER moved).")
 
+;; NOTINLINE so a test can intercept this with an FDEFINITION swap.  ECL
+;; compiles a same-file call into a direct C call, bypassing the symbol
+;; entirely, so without this the fault injection in
+;; SEGMENT-ADJACENT-CLAIM-AT-THE-WRONG-ADDRESS-IS-UNMAPPED-AND-FALLS-BACK
+;; silently observed nothing on ECL and the test failed against correct code.
+;; (%POSIX-MUNMAP is declaimed INLINE and cannot be hooked at all; this wrapper
+;; is the supported observation point.)  Costs nothing: an error/teardown path.
+(declaim (notinline %munmap-or-warn))
 (defun %munmap-or-warn (addr length what)
   "munmap(2) LENGTH bytes at ADDR, reporting rather than ignoring a failure.
 Returns munmap's return code (0 on success, -1 on error).
