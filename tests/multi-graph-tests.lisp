@@ -949,3 +949,41 @@ a phantom graph (GH #53)."
               (is (eq ga (graph-db::node-graph copy)))
               (is (string= "orig" (slot-value copy 'label)))))))
       gc)))
+
+;;; --- read-write transactions are single-graph (GH #53) ----------------------
+
+(test read-write-transaction-rejects-a-foreign-read
+  "A read-write transaction is single-graph; reading another graph signals
+rather than silently returning NIL (GH #53)."
+  (with-three-graphs (ga gb gc)
+    (let (a-id)
+      (let ((*graph* ga))
+        (with-transaction () (setq a-id (id (make-mg-plain :label "in-a")))))
+      (signals graph-db:cross-graph-transaction-error
+        (let ((*graph* gb))
+          (with-transaction () (lookup-vertex a-id :graph ga))))
+      (is (not (null (let ((*graph* ga))
+                       (with-transaction () (lookup-vertex a-id :graph ga)))))
+          "a same-graph transactional read is unaffected")
+      gc)))
+
+(test read-write-transaction-rejects-a-foreign-write
+  "Saving a node whose home is another graph signals (GH #53).  The transaction
+is opened on GB's manager directly rather than by rebinding *GRAPH*: COPY of a
+foreign node under a foreign *GRAPH* trips a SEPARATE, pre-existing defect --
+SLOT-VALUE-USING-CLASS resolves a lazy slot's heap through *GRAPH* instead of
+the node's home, which on ECL fires inside COPY's own MAKE-INSTANCE and errors
+before the write path is ever reached.  Keeping *GRAPH* on the node's own graph
+isolates this test to the write check it is about."
+  (with-three-graphs (ga gb gc)
+    (let (a-id)
+      (let ((*graph* ga))
+        (with-transaction () (setq a-id (id (make-mg-plain :label "orig")))))
+      (let ((*graph* ga))
+        (let ((node (lookup-vertex a-id :graph ga)))
+          (signals graph-db:cross-graph-transaction-error
+            (with-transaction ((graph-db::transaction-manager gb))
+              (let ((copy (copy node)))
+                (setf (slot-value copy 'label) "nope")
+                (save copy :graph gb))))))
+      gc)))

@@ -213,6 +213,11 @@
               (ensure-node-bytes node graph))
             node)))))
   (:method (id table transaction (graph t))
+    ;; A read-write transaction is single-graph (GH #53).
+    (let ((txn-graph (graph transaction)))
+      (unless (eq graph txn-graph)
+        (error 'cross-graph-transaction-error
+               :node id :transaction-graph txn-graph :node-graph graph)))
     (let ((local-cache (local-cache transaction))
           (graph-cache (graph-cache transaction)))
       (let ((local (gethash id local-cache)))
@@ -2537,6 +2542,13 @@ NEW-NODE was not produced by COPY.")
       (unless old-node
         (error 'modifying-non-copy
                :node new-node))
+      ;; A read-write transaction is single-graph (GH #53).  A NIL home is
+      ;; unknown, not foreign.
+      (let ((home (node-home-graph new-node nil))
+            (txn-graph (graph *transaction*)))
+        (when (and home (not (eq home txn-graph)))
+          (error 'cross-graph-transaction-error
+                 :node new-node :transaction-graph txn-graph :node-graph home)))
       ;; Refresh the serialized bytes from the (modified) data: NEW-NODE is a
       ;; COPY that still carries the ORIGINAL node's bytes, and mutating a slot
       ;; updates DATA but not BYTES.  The write is serialized from BYTES into
