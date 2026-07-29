@@ -242,3 +242,26 @@ made this test fail on ECL against perfectly correct code."
     (is (equal '(emb) (graph-db::node-vector-index-slots (find-class name)))
         "vector-index slots after finalizing, got ~a"
         (graph-db::node-vector-index-slots (find-class name)))))
+
+;;; One CL class namespace, per-graph schemas (GH #53): DEF-VERTEX/DEF-EDGE
+;;; share the CL class namespace across graphs, so a second graph reusing a
+;;; name used to silently clobber the first class's slots.
+
+(test duplicate-class-name-across-graphs-errors
+  "One CL class namespace, per-graph schemas: a second graph reusing a name
+silently clobbered the first class's slots (GH #53)."
+  (eval '(def-vertex dupchk-thing () ((alpha :type string)) :dupchk-one))
+  (signals duplicate-node-class-error
+    (eval '(def-vertex dupchk-thing () ((beta)) :dupchk-two)))
+  (is (member 'alpha (mapcar #'graph-db::slot-definition-name
+                             (graph-db::class-slots (find-class 'dupchk-thing))))
+      "the original class must be untouched -- the guard runs before DEFCLASS"))
+
+(test same-graph-redefinition-still-allowed
+  "Runtime schema evolution must keep working; the check is on graph-name
+identity, not on presence (GH #53)."
+  (eval '(def-vertex samechk-thing () ((alpha :type string)) :samechk-one))
+  (finishes (eval '(def-vertex samechk-thing () ((alpha :type string) (beta))
+                    :samechk-one)))
+  (is (member 'beta (mapcar #'graph-db::slot-definition-name
+                            (graph-db::class-slots (find-class 'samechk-thing))))))

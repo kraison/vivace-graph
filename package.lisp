@@ -77,6 +77,7 @@
            #:graph-name
            #:transaction-error
            #:cross-graph-transaction-error
+           #:duplicate-node-class-error
            #:master-host
            #:replication-port
            #:slave-socket

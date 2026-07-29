@@ -221,6 +221,17 @@ replication for a quick schema compatibility check."
   (finalize-inheritance (find-class (node-type-name meta)))
   (save-schema (schema graph) graph))
 
+(defun %check-node-class-graph-unique (name graph-name)
+  "Signal if NAME is registered under a graph other than GRAPH-NAME. Keys on
+graph-name identity, not presence: a same-graph redefinition legitimately adds
+a second entry under the same key (GH #53)."
+  (maphash (lambda (gname metas)
+             (unless (eq gname graph-name)
+               (when (find name metas :key #'node-type-name)
+                 (error 'duplicate-node-class-error
+                        :name name :existing-graph gname :new-graph graph-name))))
+           *schema-node-metadata*))
+
 (defmacro def-node-type (name parent-types slot-specs graph-name &key keep-revisions)
   "Define a persistent node type NAME for the graph named GRAPH-NAME.  This is
 the machinery behind DEF-VERTEX and DEF-EDGE; you normally use those instead.
@@ -252,6 +263,7 @@ be defined before or after the graph is created."
                             (append s1 (list :initarg (intern (symbol-name (first s1)) :keyword))))))
                     slot-specs))
       `(progn
+         (%check-node-class-graph-unique ',name ',graph-name)
          (defclass ,name (,@parent-types)
            (,@slot-specs)
            (:metaclass node-class))

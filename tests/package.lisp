@@ -228,6 +228,7 @@
                 #:def-edge
                 #:node-slot-value
                 #:*schema-node-metadata*
+                #:duplicate-node-class-error
                 ;; views
                 #:def-view
                 #:invoke-graph-view

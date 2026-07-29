@@ -41,6 +41,17 @@ is single-graph; use one transaction per graph."
                (format stream "Deserialization failed for ~a because of ~a."
                        instance reason)))))
 
+(define-condition duplicate-node-class-error (error)
+  ;; One CL class namespace, per-graph schemas: a second graph reusing a name
+  ;; would silently clobber the first class's slots (GH #53).
+  ((name :initarg :name) (existing-graph :initarg :existing-graph)
+   (new-graph :initarg :new-graph))
+  (:report (lambda (error stream)
+             (with-slots (name existing-graph new-graph) error
+               (format stream "Node class ~A is already defined for graph ~A; ~
+cannot redefine it for ~A. Class names are global; remove the old definition ~
+to re-home it." name existing-graph new-graph)))))
+
 (define-condition stale-revision-error (error)
   ((instance :initarg :instance)
    (current-revision :initarg :current-revision))
