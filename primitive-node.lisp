@@ -231,6 +231,9 @@ explicitly afterward (the transaction-node path) or materialized lazily later
   (or (and *cache-enabled*
            (let ((node (gethash key (cache graph))))
              (when node
+               ;; Nodes also enter the cache unstamped (APPLY-TX-WRITE :AFTER),
+               ;; so stamp on the hit too (GH #53).
+               (setf (node-graph node) graph)
                (record-graph-read graph)
                node)))
       (let ((node (lhash-get table key)))

@@ -238,6 +238,9 @@ regenerates the id on a duplicate-key collision."
                    :bytes bytes
                    :data data)))
           (setf (bytes e) bytes)
+          ;; Stamped from birth: the edge is live for the whole creating
+          ;; transaction, long before commit stamps it (GH #53).
+          (setf (node-graph e) graph)
           (handler-case
               (create-node e graph)
             (duplicate-key-error (c)
@@ -405,6 +408,9 @@ typed/adjacency scans skip the 0 sentinel, as they always have.)"
                              (or include-deleted-p (active-edge-p edge))
                              (not (member (type-id edge) excluded)))
                     (setf (id edge) (car pair))
+                    ;; The deserializer builds these; a side-effect scan never
+                    ;; sees ENSURE-NODE-BYTES (GH #53).
+                    (setf (node-graph edge) graph)
                     (if collect-p (push (funcall fn edge) result) (funcall fn edge)))))
             (edge-table graph))))))
     (when collect-p (nreverse result))))

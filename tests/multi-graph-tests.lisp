@@ -532,9 +532,54 @@ cached with its correct class, so only a from-disk read exercises the deserializ
           (ignore-errors (close-graph gb :snapshot-p nil))
           (collect-garbage))))))
 
+;;;; ---------------------------------------------------------------------------
+;;;; GH #53: every node carries its home graph.
+;;;;
+;;;; An unstamped node leaves NODE-GRAPH NIL, and NIL silently falls back to
+;;;; *GRAPH* -- reintroducing the cross-graph read the slot exists to stop.  So
+;;;; each materialization path gets its own test, and each test is written to
+;;;; fail if ITS stamp alone is removed: where two paths would otherwise cover
+;;;; each other, the test clears the slot first to model the real path that
+;;;; delivers an unstamped node there (peer apply, journal replay, image
+;;;; restore -- all of which build nodes off the wire/disk, not via MAKE-<type>).
+;;;; ---------------------------------------------------------------------------
+
+;; An edge type on :MG-ALPHA, so the on-disk stamps can be asserted for edges
+;; as well as vertices.
+(def-edge mg-link () () :mg-alpha)
+
+;; An in-memory graph for the memory-backend stamps.  Its own name, so the
+;; on-disk :MG-* schemas stay untouched.
+(def-vertex mg-mem-note () ((note :type string)) :mg-mem)
+(def-edge mg-mem-link () () :mg-mem)
+
+(defmacro with-alpha-graph ((g) &body body)
+  "Fresh on-disk graph named :MG-ALPHA in a scratch dir, *GRAPH* bound to it."
+  (let ((d (gensym "DIR")))
+    `(with-temp-directory (,d)
+       (let ((,g (make-graph :mg-alpha (namestring ,d) :buffer-pool-size 1000)))
+         (unwind-protect (let ((*graph* ,g)) ,@body)
+           (ignore-errors (close-graph ,g :snapshot-p nil))
+           (collect-garbage))))))
+
+(defmacro with-mem-graph ((g) &body body)
+  "Fresh in-memory graph named :MG-MEM in a scratch dir; closed afterward."
+  (let ((d (gensym "DIR")))
+    `(with-temp-directory (,d)
+       (let ((,g (graph-db::make-memory-graph :mg-mem (namestring ,d))))
+         (unwind-protect (let ((*graph* ,g)) ,@body)
+           (ignore-errors (close-graph ,g :snapshot-p nil))
+           (collect-garbage))))))
+
+(defun %unstamp (node)
+  "Clear NODE's home graph, modelling a node that arrived off the wire / off
+disk rather than through MAKE-<type>.  Returns NODE."
+  (setf (graph-db::node-graph node) nil)
+  node)
+
 (test nodes-record-their-home-graph
-  "Node buffers are pooled and reused on SBCL/CCL/LispWorks, so an unstamped
-node inherits the previous occupant's graph (GH #53)."
+  "A node read out of its own graph reports THAT graph, whatever *GRAPH* is
+bound to at the time (GH #53)."
   (with-three-graphs (ga gb gc)
     (let (a-id b-id)
       (let ((*graph* ga))
@@ -546,3 +591,224 @@ node inherits the previous occupant's graph (GH #53)."
             "home graph must come from the lookup, not *GRAPH*")
         (is (eq gb (graph-db::node-graph (lookup-vertex b-id :graph gb)))
             "home graph must come from the lookup, not *GRAPH*")))))
+
+(test node-graph-stamped-at-creation
+  "MAKE-VERTEX / MAKE-EDGE stamp the node they build, so it is stamped for the
+WHOLE body of the creating transaction -- not just from commit (GH #53).
+Asserted INSIDE the transaction, the only place COMMIT's stamp cannot have run
+yet."
+  (with-alpha-graph (g)
+    (with-transaction ()
+      (let* ((v1 (make-mg-plain :label "v1"))
+             (v2 (make-mg-plain :label "v2"))
+             (e (make-mg-link :from v1 :to v2)))
+        (is (eq g (graph-db::node-graph v1))
+            "a vertex must be stamped before its transaction commits")
+        (is (eq g (graph-db::node-graph e))
+            "an edge must be stamped before its transaction commits")))))
+
+(test node-graph-stamped-at-commit
+  "FINALIZE-NODE stamps the node it writes.  Load-bearing for nodes that enter
+APPLY-TX-WRITE without ever passing through MAKE-<type> -- peer apply and
+journal replay build them off the wire; the UNSTAMP models that (GH #53)."
+  (with-alpha-graph (g)
+    (let ((v nil))
+      (with-transaction ()
+        (setq v (%unstamp (make-mg-plain :label "off-the-wire"))))
+      (is (eq g (graph-db::node-graph v))
+          "commit must stamp the node it writes, even when it arrived unstamped"))))
+
+(test node-graph-stamped-on-cache-hit
+  "LOOKUP-NODE stamps on the CACHE-HIT branch too, so \"every node LOOKUP-NODE
+returns is stamped\" holds unconditionally.  Nodes reach the cache unstamped via
+APPLY-TX-WRITE :AFTER, which the UNSTAMP models.  Read through a TYPED
+side-effect scan: inside its read pin LOOKUP-OBJECT skips ENSURE-NODE-BYTES, so
+the cache-hit branch is the only stamp on that path (GH #53)."
+  (with-alpha-graph (g)
+    (let (id (seen '()))
+      (with-transaction () (setq id (id (make-mg-plain :label "cached"))))
+      (let ((cached (gethash id (graph-db::cache g))))
+        (is (not (null cached))
+            "precondition: the node must be in the graph cache, or this tests nothing")
+        (when cached (%unstamp cached)))
+      (map-vertices (lambda (v) (push (graph-db::node-graph v) seen)) g
+                    :vertex-type 'mg-plain)
+      (is (equal (list g) seen)
+          "a cache HIT must stamp the node it returns, got ~S" seen))))
+
+(test node-graph-stamped-on-cold-read
+  "LOOKUP-NODE's miss branch stamps the node the deserializer just built.  Read
+inside a transaction with the caches cleared: that path never calls
+ENSURE-NODE-BYTES, so the miss branch is the only stamp (GH #53)."
+  (with-alpha-graph (g)
+    (let (id)
+      (with-transaction () (setq id (id (make-mg-plain :label "cold"))))
+      (clrhash (graph-db::cache g))
+      (let ((graph-db::*cache-enabled* nil))
+        (with-transaction ()
+          (let ((v (lookup-vertex id :graph g)))
+            (is (eq g (graph-db::node-graph v))
+                "a cold transactional read must stamp the node it materializes")))))))
+
+(test node-graph-stamped-on-untyped-scan
+  "The fully-untyped MAP-VERTICES / MAP-EDGES scans hand out nodes straight from
+the lhash deserializer, and a SIDE-EFFECT scan (no :COLLECT-P) never runs
+ENSURE-NODE-BYTES -- so backup, GC, COMPACT-VERTICES and reindex would all see
+NIL without this stamp (GH #53)."
+  (with-alpha-graph (g)
+    (let ((seen '()) (n 0))
+      (with-transaction ()
+        (let ((v1 (make-mg-plain :label "s1"))
+              (v2 (make-mg-plain :label "s2")))
+          (make-mg-link :from v1 :to v2)))
+      (clrhash (graph-db::cache g))
+      (map-vertices (lambda (v) (incf n) (pushnew (graph-db::node-graph v) seen)) g)
+      (map-edges (lambda (e) (incf n) (pushnew (graph-db::node-graph e) seen)) g)
+      (is (= 3 n) "precondition: the untyped scans must have visited 3 nodes, got ~D" n)
+      (is (equal (list g) seen)
+          "every node an untyped side-effect scan yields must be stamped with its ~
+graph, got ~S" seen))))
+
+(test node-graph-survives-copy
+  "COPY builds a fresh instance for the update path; it must carry the original's
+home graph (GH #53)."
+  (with-alpha-graph (g)
+    (let (id)
+      (with-transaction () (setq id (id (make-mg-plain :label "orig"))))
+      (with-transaction ()
+        (let ((c (copy (lookup-vertex id :graph g))))
+          (is (eq g (graph-db::node-graph c))
+              "a COPY must inherit the original's home graph"))))))
+
+(test node-graph-stamped-on-archived-versions
+  "ENSURE-NODE-BYTES stamps the versions it materializes.  The ARCHIVED entries
+VERTEX-HISTORY returns come straight off the heap and reach the caller through
+no other stamping path (GH #53)."
+  (with-temp-directory (dir)
+    (let (g id)
+      (unwind-protect
+           (progn
+             (setf g (make-graph :mg-zeta (namestring dir)
+                                 :buffer-pool-size 1000 :keep-revisions 100))
+             (let ((*graph* g))
+               (with-transaction () (setf id (id (make-mg-hist-note :note "v0"))))
+               (dotimes (i 3)
+                 (with-transaction ()
+                   (let ((v (copy (lookup-vertex id))))
+                     (setf (slot-value v 'note) (format nil "v~D" (1+ i)))
+                     (save v)))))
+             (let* ((history (vertex-history g id))
+                    (archived (rest history))
+                    (graphs (mapcar (lambda (e) (graph-db::node-graph (car e))) archived)))
+               (is (= 3 (length archived))
+                   "precondition: expected 3 archived versions, got ~D" (length archived))
+               (is (equal (list g g g) graphs)
+                   "every archived version must be stamped with its graph, got ~S" graphs)))
+        (ignore-errors (close-graph g :snapshot-p nil))
+        (collect-garbage)))))
+
+;;; --- the memory backend ------------------------------------------------------
+
+(test memory-node-graph-stamped-at-commit
+  "The memory backend overrides APPLY-TX-WRITE for TX-CREATE, so FINALIZE-NODE
+never runs for it; the override must stamp instead.  The UNSTAMP models a node
+applied from a peer pull rather than built by MAKE-<type> (GH #53)."
+  (with-mem-graph (g)
+    (let ((v nil))
+      (with-transaction () (setq v (%unstamp (make-mg-mem-note :note "off-the-wire"))))
+      (is (eq g (graph-db::node-graph v))
+          "a memory-graph commit must stamp the node it publishes"))))
+
+(test memory-node-graph-stamped-on-lookup
+  "LOOKUP-NODE on a MEM-TABLE stamps what it returns.  Nodes land in a mem-table
+unstamped via peer apply and image restore, which the UNSTAMP models.  Read
+through a TYPED side-effect scan, whose read pin makes LOOKUP-OBJECT skip
+ENSURE-NODE-BYTES, leaving the mem-table lookup as the only stamp (GH #53)."
+  (with-mem-graph (g)
+    (let (id (seen '()))
+      (with-transaction () (setq id (id (make-mg-mem-note :note "in-ram"))))
+      (%unstamp (graph-db::mem-table-get (graph-db::vertex-table g) id))
+      (map-vertices (lambda (v) (push (graph-db::node-graph v) seen)) g
+                    :vertex-type 'mg-mem-note)
+      (is (equal (list g) seen)
+          "a mem-table lookup must stamp the node it returns, got ~S" seen))))
+
+(test memory-lazy-materialization-stamps-the-node
+  "%LZNODE->NODE builds a live node from a deferred blob on first touch; it must
+stamp it (GH #53).  Called directly, because LOOKUP-NODE would otherwise stamp
+the materialized node on its way out and hide a missing stamp here."
+  (with-temp-directory (dir)
+    (let ((loc (namestring dir)) id)
+      (let ((g (graph-db::make-memory-graph :mg-mem loc :lazy t)))
+        (let ((*graph* g))
+          (with-transaction () (setq id (id (make-mg-mem-note :note "lazy")))))
+        (close-graph g :snapshot-p t))
+      (let ((g2 (graph-db::open-memory-graph :mg-mem loc :lazy t)))
+        (unwind-protect
+             (let* ((table (graph-db::vertex-table g2))
+                    (lz (graph-db::mem-table-get table id)))
+               (is-true (graph-db::lznode-p lz)
+                        "precondition: a lazy reopen must hold the node as an LZNODE")
+               (when (graph-db::lznode-p lz)
+                 (let ((node (graph-db::%lznode->node table id lz)))
+                   (is (eq g2 (graph-db::node-graph node))
+                       "fault-in materialization must stamp the node it builds"))))
+          (ignore-errors (close-graph g2 :snapshot-p nil))
+          (collect-garbage))))))
+
+(test memory-image-never-stores-the-node-graph-slot
+  "The cl-store memory image stores the node CLOS objects themselves, and
+cl-store does not honour :PERSISTENT NIL -- so without an explicit exclusion the
+GRAPH slot would drag the live graph (schema, mem-tables and hence every node,
+transaction-manager, locks, threads) into the image, and restore would hand back
+a phantom graph (GH #53)."
+  (with-temp-directory (dir)
+    (let ((loc (namestring dir)) id)
+      (let ((g (graph-db::make-memory-graph :mg-mem loc)))
+        (unwind-protect
+             (let ((*graph* g))
+               (with-transaction ()
+                 (let ((a (make-mg-mem-note :note "a"))
+                       (b (make-mg-mem-note :note "b")))
+                   (setq id (id a))
+                   (make-mg-mem-link :from a :to b)))
+               ;; The slot must not even be offered to cl-store.
+               (let ((slots (mapcar #'graph-db::slot-definition-name
+                                    (cl-store:serializable-slots (lookup-vertex id :graph g)))))
+                 (is (null (member 'graph-db::graph slots))
+                     "cl-store must not see a node's GRAPH slot; serializable slots were ~S"
+                     slots))
+               (graph-db::checkpoint-memory-graph g))
+          (ignore-errors (close-graph g :snapshot-p nil))
+          (collect-garbage)))
+      ;; ... and nothing graph-shaped may come back out of the image file.
+      (let* ((image (graph-db::memory-image-file (pathname loc)))
+             (blob (cl-store:restore image))
+             (stored (append (getf blob :vertices) (getf blob :edges))))
+        (is (= 3 (length stored))
+            "precondition: the image must hold the 2 vertices + 1 edge, got ~D"
+            (length stored))
+        (is (every (lambda (n) (not (and (slot-boundp n 'graph-db::graph)
+                                         (slot-value n 'graph-db::graph))))
+                   stored)
+            "no node restored straight from the image file may carry a graph"))
+      ;; ... and the restored nodes are usable, stamped with the REOPENED graph.
+      (let ((g2 (graph-db::open-memory-graph :mg-mem loc)))
+        (unwind-protect
+             (progn
+               ;; Straight out of the mem-table, before anything looks it up:
+               ;; restore must leave the slot BOUND and right, or NODE-GRAPH
+               ;; signals instead of falling back.
+               (let ((raw (graph-db::mem-table-get (graph-db::vertex-table g2) id)))
+                 ;; IS-TRUE, not IS: FiveAM's IS evaluates a two-argument form's
+                 ;; arguments eagerly, which would defeat the boundp guard.
+                 (is-true (and (slot-boundp raw 'graph-db::graph)
+                               (eq g2 (slot-value raw 'graph-db::graph)))
+                          "restore must stamp the nodes it puts in the mem-table"))
+               (let ((v (lookup-vertex id :graph g2)))
+                 (is (string= "a" (slot-value v 'note))
+                     "a restored node must still carry its data")
+                 (is (eq g2 (graph-db::node-graph v))
+                     "a restored node must be stamped with the graph that reopened it")))
+          (ignore-errors (close-graph g2 :snapshot-p nil))
+          (collect-garbage))))))

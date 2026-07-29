@@ -481,15 +481,19 @@ cells loaded straight from PAIRS -- no node scan, no geohash recompute."
          (class (node-type-name
                  (lookup-node-type-by-id type-id (if edge-p :edge :vertex) :graph graph)))
          (blob (lznode-data-blob lz))
-         (data (when blob (deserialize blob))))
-    (if edge-p
-        (%make-edge :id id :type-id type-id :revision (lznode-revision lz)
-                    :commit-epoch (lznode-commit-epoch lz) :deleted-p (lznode-deleted-p lz)
-                    :from (lznode-from lz) :to (lznode-to lz) :weight (lznode-weight lz)
-                    :data data :bytes blob :written-p t :data-pointer 0 :class class)
-        (%make-vertex :id id :type-id type-id :revision (lznode-revision lz)
-                      :commit-epoch (lznode-commit-epoch lz) :deleted-p (lznode-deleted-p lz)
-                      :data data :bytes blob :written-p t :data-pointer 0 :class class))))
+         (data (when blob (deserialize blob)))
+         (node
+          (if edge-p
+              (%make-edge :id id :type-id type-id :revision (lznode-revision lz)
+                          :commit-epoch (lznode-commit-epoch lz) :deleted-p (lznode-deleted-p lz)
+                          :from (lznode-from lz) :to (lznode-to lz) :weight (lznode-weight lz)
+                          :data data :bytes blob :written-p t :data-pointer 0 :class class)
+              (%make-vertex :id id :type-id type-id :revision (lznode-revision lz)
+                            :commit-epoch (lznode-commit-epoch lz) :deleted-p (lznode-deleted-p lz)
+                            :data data :bytes blob :written-p t :data-pointer 0 :class class))))
+    ;; Fault-in builds the node from a blob; stamp it here (GH #53).
+    (setf (node-graph node) graph)
+    node))
 
 (defun mem-materialize (table id lz)
   "Build the live node from LZ and atomically swap it into TABLE under ID (so later
@@ -739,8 +743,14 @@ per-view dump is stashed in *MEMORY-IMAGE-VIEW-DUMP* for RESTORE-VIEWS."
                            &allow-other-keys)
           (cl-store:restore file)
         (declare (ignore highest-tx-id))
-        (dolist (v vertices) (mem-table-put (vertex-table graph) (id v) v))
-        (dolist (e edges)     (mem-table-put (edge-table graph) (id e) e))
+        ;; The image never carries a node's graph, so stamp on the way in --
+        ;; the rebuild below uses these nodes before any lookup (GH #53).
+        (dolist (v vertices)
+          (setf (node-graph v) graph)
+          (mem-table-put (vertex-table graph) (id v) v))
+        (dolist (e edges)
+          (setf (node-graph e) graph)
+          (mem-table-put (edge-table graph) (id e) e))
         (cond
           ((and (eql version 4) type-vertex)
            ;; Structural restore -- direct index/skip-list inserts, no map/reduce/
@@ -894,9 +904,12 @@ as deferred blobs and materialize on first touch (needs a VG-native image)."
 ;; LAZY table an untouched node is an LZNODE blob; materialize it on first touch
 ;; (fault-on-access) and swap the live node in, so subsequent lookups are direct.
 (defmethod lookup-node ((table mem-table) key graph)
-  (declare (ignore graph))
   (let ((v (mem-table-get table key)))
-    (if (lznode-p v) (mem-materialize table key v) v)))
+    (let ((node (if (lznode-p v) (mem-materialize table key v) v)))
+      ;; Nodes reach the mem-table unstamped (peer apply, image restore), so
+      ;; every node this hands out is stamped here (GH #53).
+      (when (node-p node) (setf (node-graph node) graph))
+      node)))
 
 ;; Create: publish the live node into the mem-table.  No heap write, no index
 ;; update yet (Step 3), no version chain (MVCC dropped).  Mirrors the on-disk
@@ -914,7 +927,10 @@ as deferred blobs and materialize on first touch (needs a VG-native image)."
           (written-p node) t
           (commit-epoch node) *commit-epoch*
           (prev-pointer node) 0
-          (data-pointer node) 0)
+          (data-pointer node) 0
+          ;; This override replaces FINALIZE-NODE, which stamps on the
+          ;; on-disk path (GH #53).
+          (node-graph node) graph)
     (mem-table-put table (id node) node)
     ;; Index maintenance mirrors the on-disk tx-create: type-index for every node,
     ;; plus ve/vev adjacency for edges (add-node-to-indexes dispatches).  Update /
