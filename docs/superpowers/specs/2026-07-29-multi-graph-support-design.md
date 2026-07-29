@@ -60,11 +60,18 @@ after:  slots=(ALPHA BETA)  registry-entries=2  alpha="one"  beta="two"
 Note `registry-entries` going 1 → 2: `DEF-VERTEX` does `(push meta (gethash graph-name
 *schema-node-metadata*))`, so a redefinition **accumulates** rather than replaces.
 
-**Node instances are pooled.** On SBCL/CCL/LispWorks a node comes from
-`GET-VERTEX-BUFFER` and is `CHANGE-CLASS`ed; only ECL builds fresh instances (it does so
-to avoid the #47 leak). Any per-node ownership field must therefore be stamped on *every*
-materialization path — an unstamped node inherits the previous occupant's value, which is
-worse than carrying none.
+**Node instances are pooled but never recycled** — CORRECTED 2026-07-29 after review.
+On SBCL/CCL/LispWorks a node comes from `GET-VERTEX-BUFFER` and is `CHANGE-CLASS`ed; ECL
+builds fresh instances (avoiding the #47 leak). But `RELEASE-BUFFER` handles byte vectors
+only, keyed by length — there is **no return path for node instances**. The `:VERTEX` /
+`:EDGE` pools are only ever filled with fresh `MAKE-INSTANCE` results by
+`MAKE-VERTEX-BUFFER` / `MAKE-EDGE-BUFFER`, so each pooled instance is used once.
+
+An earlier draft of this spec claimed a missed stamp would leave the *previous occupant's*
+graph. That is wrong: it leaves `NIL`. The consequence is still a defect — `NIL` silently
+re-arms the `*GRAPH*` fallback this design exists to remove, so a missed site quietly
+reintroduces the original bug rather than announcing itself — but it is a silent
+regression, not a confidently wrong answer.
 
 ## 3. Contract: transaction scope
 
@@ -125,11 +132,26 @@ tables or schema are resolved.
 Ownership is needed regardless of the read paths: it is how cross-graph misuse is
 *detected* for the error in §3.
 
-**Because node buffers are pooled, the slot must be stamped on every materialization
-path.** Stamping points: `FINALIZE-NODE` and `ENSURE-NODE-BYTES` (both already receive the
-graph), `LOOKUP-NODE`, and `COPY-NODE` — which enumerates the slots it copies, so an
-omission there silently produces a copy that resolves through `*GRAPH*`. The pooling
-hazard gets a test of its own.
+**The slot must be stamped on every materialization path**, because a missed site leaves
+`NIL` and silently falls back to `*GRAPH*` — the very bug this removes.
+
+Stamp at the FUNNELS, not the leaves. Sites that have `graph` in hand: `MAKE-VERTEX` /
+`MAKE-EDGE` (creation — a node is otherwise unstamped for the whole body of the
+transaction that creates it), `FINALIZE-NODE`, `ENSURE-NODE-BYTES`, `LOOKUP-NODE`
+(**both** the cache-hit and miss branches), and `COPY-NODE`, which enumerates the slots it
+copies.
+
+The **memory backend needs its own stamps** and is the higher-value case, being the
+Android/mine-action consumer: `LOOKUP-NODE ((table mem-table) key graph)` currently
+declares `graph` ignored; `APPLY-TX-WRITE` for `MEMORY-GRAPH-MIXIN` is a full override so
+`FINALIZE-NODE` never runs there; and `%LZNODE->NODE` builds a node with `graph` already
+bound. Without these the feature is structurally inert for memory graphs.
+
+**`NODE-GRAPH` must be excluded from cl-store.** `WRITE-MEMORY-IMAGE`'s non-lazy branch
+cl-stores the node CLOS objects themselves, and cl-store walks every slot regardless of
+`:PERSISTENT NIL` — so the slot would drag the live graph, its schema, its tables, locks
+and threads into the image, and restore would hand back a phantom graph. `:PERSISTENT NIL`
+governs only VG's own binary codec; the second serializer needs an explicit exclusion.
 
 ## 6. Read resolution and enforcement
 
@@ -246,11 +268,11 @@ it exercises the opposite branch of §5.
 
 ## 12. Risks
 
-- **Missed stamping point.** A materialization path that does not set `NODE-GRAPH` yields a
-  node carrying a *stale* graph on the pooling implementations. The `NIL`-means-unknown
-  fallback does not save that case, because the slot is not `NIL` — it holds the previous
-  occupant's graph. Mitigated by the pooling test, but the risk is real and the reason the
-  stamping points are enumerated in §5 rather than left to judgement.
+- **Missed stamping point.** A path that does not set `NODE-GRAPH` leaves `NIL`, which
+  silently falls back to `*GRAPH*` — reintroducing the original bug without any signal.
+  This is why §5 enumerates the sites rather than leaving them to judgement, and why the
+  test must be shown to fail with *each* stamp removed, not just one: a test satisfied by
+  the `FINALIZE-NODE` stamp alone passes with the others deleted.
 - **`*READ-SNAPSHOTS*` lifetime.** Entries must be removed on unwind, or a snapshot
   outlives its dynamic extent and pins the reaper's floor.
 - **Enforcement in the wrong place** could reject legitimate single-graph work. The error
