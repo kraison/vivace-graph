@@ -404,4 +404,6 @@ is preserved."
 (defun node-home-graph (node &optional (default *graph*))
   "NODE's graph, or DEFAULT when unknown. Use instead of a bare *GRAPH* when
 resolving a node's heap, tables or schema (GH #53)."
-  (or (node-graph node) default))
+  (if (slot-boundp node 'graph)
+      (or (node-graph node) default)
+      default))

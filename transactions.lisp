@@ -797,6 +797,9 @@ APPLY-TRANSACTION)."
           (ldb (byte 32 0) (1+ (revision old-node))))
     (setf (bytes new-node)
           (serialize (data new-node)))
+    ;; Stamp home graph, symmetric with the create path's FINALIZE-NODE (GH #53).
+    (setf (node-graph new-node) graph
+          (node-graph old-node) graph)
     (maybe-write-to-heap new-node graph)
     ;; MVCC: archive the prior version's head (it still points at the retained
     ;; old data block) and chain the new live head to it.  The old data block is

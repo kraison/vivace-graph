@@ -618,6 +618,41 @@ journal replay build them off the wire; the UNSTAMP models that (GH #53)."
       (is (eq g (graph-db::node-graph v))
           "commit must stamp the node it writes, even when it arrived unstamped"))))
 
+(test node-home-graph-defaults-on-unbound-slot
+  "NODE-HOME-GRAPH must fall back to DEFAULT when the GRAPH slot is UNBOUND, not
+just when it is NIL.  CL-STORE excludes the slot from serialization, so a node
+fresh out of CL-STORE:RESTORE (before any downstream stamp runs) has it UNBOUND
+-- and a bare NODE-GRAPH read on an unbound slot SIGNALS rather than falling
+back (GH #53).  Built directly via ALLOCATE-INSTANCE so the slot is never
+touched, rather than routing through CL-STORE."
+  (with-alpha-graph (g)
+    (let ((n (allocate-instance (find-class 'mg-plain))))
+      (is (not (slot-boundp n 'graph-db::graph))
+          "precondition: a freshly allocated instance must have an unbound GRAPH slot")
+      (is (eq g (graph-db::node-home-graph n g))
+          "node-home-graph must fall back to DEFAULT on an unbound slot, not signal"))))
+
+(test node-graph-stamped-on-update
+  "APPLY-TX-WRITE for TX-UPDATE stamps both the new node it writes and the
+archived OLD-NODE, symmetric with TX-CREATE's FINALIZE-NODE call above.  Journal
+replay, replication apply and peer push all build TX-UPDATE via
+DESERIALIZE-TRANSACTION-NODE-VECTOR, which never runs COPY-NODE's own stamp --
+the UNSTAMP models that on both sides here (GH #53)."
+  (with-alpha-graph (g)
+    (let (id)
+      (with-transaction () (setq id (id (make-mg-plain :label "before"))))
+      (with-transaction ()
+        (let* ((old (%unstamp (copy (lookup-vertex id :graph g))))
+               (new (%unstamp (copy (lookup-vertex id :graph g)))))
+          (setf (slot-value new 'label) "after")
+          (graph-db::apply-tx-write
+           (make-instance 'graph-db::tx-update :node new :old-node old)
+           g)
+          (is (eq g (graph-db::node-graph new))
+              "tx-update must stamp the new node it writes")
+          (is (eq g (graph-db::node-graph old))
+              "tx-update must stamp the archived old node too"))))))
+
 (test node-graph-stamped-on-cache-hit
   "LOOKUP-NODE stamps on the CACHE-HIT branch too, so \"every node LOOKUP-NODE
 returns is stamped\" holds unconditionally.  Nodes reach the cache unstamped via
@@ -718,6 +753,27 @@ applied from a peer pull rather than built by MAKE-<type> (GH #53)."
       (with-transaction () (setq v (%unstamp (make-mg-mem-note :note "off-the-wire"))))
       (is (eq g (graph-db::node-graph v))
           "a memory-graph commit must stamp the node it publishes"))))
+
+(test memory-node-graph-stamped-on-update
+  "The memory backend overrides APPLY-TX-WRITE for TX-UPDATE too; the override
+must stamp both the published new node and the archived OLD-NODE, symmetric with
+TX-CREATE's override above.  Peer apply and journal replay build TX-UPDATE off
+the wire, never through COPY-NODE's own stamp -- the UNSTAMP models that on both
+sides (GH #53)."
+  (with-mem-graph (g)
+    (let (id)
+      (with-transaction () (setq id (id (make-mg-mem-note :note "before"))))
+      (with-transaction ()
+        (let* ((old (%unstamp (copy (lookup-vertex id :graph g))))
+               (new (%unstamp (copy (lookup-vertex id :graph g)))))
+          (setf (slot-value new 'note) "after")
+          (graph-db::apply-tx-write
+           (make-instance 'graph-db::tx-update :node new :old-node old)
+           g)
+          (is (eq g (graph-db::node-graph new))
+              "a memory-graph tx-update must stamp the new node it publishes")
+          (is (eq g (graph-db::node-graph old))
+              "a memory-graph tx-update must stamp the old node too"))))))
 
 (test memory-node-graph-stamped-on-lookup
   "LOOKUP-NODE on a MEM-TABLE stamps what it returns.  Nodes land in a mem-table

@@ -950,7 +950,10 @@ as deferred blobs and materialize on first touch (needs a VG-native image)."
     (setf (revision new-node) (ldb (byte 32 0) (1+ (revision old-node)))
           (commit-epoch new-node) *commit-epoch*
           (prev-pointer new-node) 0
-          (data-pointer new-node) 0)      ; never a heap address (see tx-create)
+          (data-pointer new-node) 0      ; never a heap address (see tx-create)
+          ;; Stamp home graph, symmetric with tx-create above (GH #53).
+          (node-graph new-node) graph
+          (node-graph old-node) graph)
     (mem-table-put table (id new-node) new-node))
   write)
 
