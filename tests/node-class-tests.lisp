@@ -265,3 +265,84 @@ identity, not on presence (GH #53)."
                     :samechk-one)))
   (is (member 'beta (mapcar #'graph-db::slot-definition-name
                             (graph-db::class-slots (find-class 'samechk-thing))))))
+
+(test redefinition-replaces-its-registry-entry
+  "UPDATE-SCHEMA replays every meta in the list on graph open, so accumulating
+duplicates costs an instantiation per historical version, forever (GH #53)."
+  (setf (gethash :regchk-one *schema-node-metadata*) nil)
+  (eval '(def-vertex regchk-thing () ((alpha :type string)) :regchk-one))
+  (eval '(def-vertex regchk-thing () ((alpha :type string) (beta)) :regchk-one))
+  (eval '(def-vertex regchk-thing () ((alpha :type string) (beta) (gamma))
+          :regchk-one))
+  (is (= 1 (count 'regchk-thing
+                  (gethash :regchk-one graph-db::*schema-node-metadata*)
+                  :key #'graph-db::node-type-name))
+      "three definitions must leave exactly one registry entry")
+  (is (member 'gamma (mapcar #'graph-db::slot-definition-name
+                             (graph-db::class-slots (find-class 'regchk-thing))))
+      "and the surviving entry must be the NEWEST definition"))
+
+(test redefinition-keeps-type-id-stable
+  "Registry position drives type-id assignment: UPDATE-SCHEMA replays the list in
+order on graph open and INSTANTIATE-NODE-TYPE hands out ids in that order, so a
+redefined type that moved would get a DIFFERENT type-id on a fresh graph -- and
+type-ids travel on the peer wire (GH #53)."
+  (setf (gethash :tidchk-graph *schema-node-metadata*) nil)
+  (eval '(def-vertex tidchk-a () ((x)) :tidchk-graph))
+  (eval '(def-vertex tidchk-b () ((y)) :tidchk-graph))
+  ;; Redefine the FIRST-declared type last; it must not drift to the end.
+  (eval '(def-vertex tidchk-a () ((x) (z)) :tidchk-graph))
+  (with-temp-directory (dir)
+    (let ((g (make-graph :tidchk-graph (namestring dir) :buffer-pool-size 1000)))
+      (unwind-protect
+           (let ((id-a (graph-db::node-type-id
+                        (graph-db::lookup-node-type-by-name 'tidchk-a :vertex
+                                                            :graph g)))
+                 (id-b (graph-db::node-type-id
+                        (graph-db::lookup-node-type-by-name 'tidchk-b :vertex
+                                                            :graph g))))
+             (is (= 1 id-a)
+                 "the first-declared type keeps type-id 1 across a redefinition, got ~a"
+                 id-a)
+             (is (= 2 id-b) "the second-declared type keeps type-id 2, got ~a" id-b))
+        (ignore-errors (close-graph g :snapshot-p nil))
+        (collect-garbage)))))
+
+(test registry-replay-order-survives-reopen
+  "OPEN-GRAPH runs UPDATE-SCHEMA again over the same registry list; an inverted
+replay order would only surface here (GH #53)."
+  (setf (gethash :ropenchk-graph *schema-node-metadata*) nil)
+  (eval '(def-vertex ropenchk-a () ((x)) :ropenchk-graph))
+  (eval '(def-vertex ropenchk-b () ((y)) :ropenchk-graph))
+  (eval '(def-vertex ropenchk-a () ((x) (z)) :ropenchk-graph))
+  (with-temp-directory (dir)
+    (let (id-a id-b tid-a tid-b)
+      (let ((g (make-graph :ropenchk-graph (namestring dir)
+                           :buffer-pool-size 1000)))
+        (unwind-protect
+             (let ((*graph* g))
+               (with-transaction ()
+                 (setq id-a (id (eval '(make-ropenchk-a :x "a")))
+                       id-b (id (eval '(make-ropenchk-b :y "b")))))
+               (setq tid-a (graph-db::node-type-id
+                            (graph-db::lookup-node-type-by-name 'ropenchk-a
+                                                                :vertex :graph g))
+                     tid-b (graph-db::node-type-id
+                            (graph-db::lookup-node-type-by-name 'ropenchk-b
+                                                                :vertex :graph g))))
+          (close-graph g :snapshot-p nil)))
+      (let ((g (open-graph :ropenchk-graph (namestring dir))))
+        (unwind-protect
+             (let ((*graph* g))
+               (is (= tid-a (graph-db::node-type-id
+                             (graph-db::lookup-node-type-by-name 'ropenchk-a
+                                                                 :vertex :graph g)))
+                   "type-id of the redefined type is unchanged by reopen")
+               (is (= tid-b (graph-db::node-type-id
+                             (graph-db::lookup-node-type-by-name 'ropenchk-b
+                                                                 :vertex :graph g))))
+               (is (typep (lookup-vertex id-a) 'ropenchk-a)
+                   "a stored node still resolves to its own class after reopen")
+               (is (typep (lookup-vertex id-b) 'ropenchk-b)))
+          (close-graph g :snapshot-p nil)
+          (collect-garbage))))))
