@@ -2387,6 +2387,64 @@ The storage backend is orthogonal to the replication role: ~make-memory-graph~ a
 - ~docs/peer-replication-proposal.md~ — the originally approved proposal.
 
 
+** Chapter 17: Multiple Graphs in One Image
+
+VivaceGraph supports opening several graphs in one Lisp image. This chapter states
+the contract; it is enforced, not advisory.
+
+*** A read-write transaction belongs to exactly one graph
+
+The transaction manager is per graph. ~with-transaction~ defaults to
+~(transaction-manager *graph*)~, each graph has its own transaction-id counter, its own
+committed-transaction set for validation, and its own write-ahead log. Touching a node
+whose home graph differs from the transaction's — reading it *or* writing it — signals
+~cross-graph-transaction-error~.
+
+This is not a restriction added for convenience; it is what atomicity and durability
+already mean here. A transaction spanning two graphs would need a global ordering across
+independent counters and two-phase commit across two logs. Without 2PC, a crash between
+the two commits leaves one graph committed and the other not.
+
+To write to several graphs, use one transaction per graph and sequence them yourself.
+*That coordination is not atomic.* If the second transaction fails, the first has already
+committed, and nothing rolls it back. Design for that, or keep the invariant inside one
+graph.
+
+*** Read-only snapshots are per graph and compose
+
+~with-read-snapshot~ records its snapshot per graph, so several may be active at once. A
+query may hold one snapshot per participating graph, each internally consistent and
+repeatable.
+
+There is deliberately *no single instant across graphs*: two graphs may be observed at
+different logical moments. A cross-graph instant would need an epoch shared by every
+transaction manager, which is not implemented.
+
+A read-write transaction takes precedence and does *not* fall through to a snapshot. If a
+read-write transaction on graph A is active, reading graph B signals — even if a snapshot
+of B exists. Satisfying that read from a different consistency domain would be worse than
+refusing it.
+
+*** Nodes know which graph they came from
+
+Every node carries its home graph. A node's heap, tables and schema resolve through that
+rather than through the ambient ~*graph*~, so a node found via an explicit ~:graph~ reads
+correctly whatever ~*graph*~ happens to be bound to. The value is never serialized.
+
+One consequence worth knowing: a node retained past its graph's ~close-graph~ now
+dereferences an unmapped heap rather than silently decoding whatever lies at that offset
+in another graph's file. Do not hold nodes across a close.
+
+*** Class names are global
+
+Common Lisp has one class namespace, so a node class name must be unique across *all*
+graph schemas. Defining the same name for a second graph signals
+~duplicate-node-class-error~. Redefining a type under the *same* graph name remains
+legal — that is ordinary schema evolution and works at runtime.
+
+Previously a second definition silently replaced the first class's slots, leaving the
+first graph's stored data unreachable through the API while still on disk.
+
 ** API Reference
 
 This chapter provides a categorized reference for the most important exported symbols from the ~graph-db~ package. It is not an exhaustive list of every internal function but focuses on the public API you will use most often when building applications.

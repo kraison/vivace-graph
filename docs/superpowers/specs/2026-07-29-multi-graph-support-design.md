@@ -275,8 +275,10 @@ it exercises the opposite branch of §5.
 - **Multi-graph transactions** with two-phase commit across per-graph WALs and a global
   tx-id ordering. The future target.
 - **A global cross-graph epoch**, giving cross-graph queries a single instant.
-- Whether any consumer actually needs atomic cross-graph writes is unconfirmed; worth
-  grepping mine-action for sequential writes to two graphs before treating §3 as free.
+- **Answered 2026-07-30:** no consumer needs atomic cross-graph writes. mine-action uses
+  two graph names (`:mine-action`, 7 sites; `:mine-action-forensics`, 1) and has no code
+  writing to two graphs in one operation — no `save`/`update-node` call passes an explicit
+  `:graph` at all. The single-graph contract in §3 costs it nothing.
 
 ## 12. Risks
 

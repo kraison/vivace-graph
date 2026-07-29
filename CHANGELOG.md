@@ -18,6 +18,25 @@ between releases; cutting a release renames it to the new version and dates it.
 > automatically at first open — but stale call sites and old Prolog arities do not.
 
 ### Added
+
+- **Multi-graph support is now a defined, enforced contract** (#53). Running several
+  graphs in one image was previously a configuration that mostly worked; it now has
+  stated semantics and tests. See the manual, "Multiple Graphs in One Image".
+  - A read-write transaction belongs to exactly one graph. Touching a node whose home
+    graph differs — read or write — signals the new `cross-graph-transaction-error`.
+    Previously a cross-graph read inside a transaction silently returned `NIL` for a node
+    that exists, indistinguishable from "no such node".
+  - Read-only snapshots are per graph and compose, so a cross-graph query holds one
+    snapshot per participating graph. There is deliberately no single instant across
+    graphs.
+  - Nodes carry their home graph, so a node's heap resolves through its own graph rather
+    than the ambient `*graph*`. A node read from another graph previously dereferenced its
+    offset in the *wrong* memory-mapped file.
+  - Node class names must be unique across all graph schemas; a collision signals the new
+    `duplicate-node-class-error`. Previously the second definition silently replaced the
+    first class's slots, leaving the first graph's stored data unreachable through the API.
+    Redefining a type under the same graph name is unaffected.
+
 - **Vector segment: a dense on-disk index for `:vector-index` slots.** A slot
   declared `:vector-index t` in `def-vertex`/`def-edge` gets a dedicated
   mmap vector segment, maintained automatically by the transaction apply path
