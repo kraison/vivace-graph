@@ -26,6 +26,17 @@
 ;;; was exhausted.  Reopening by address is what closes that.
 ;;; ---------------------------------------------------------------------------
 
+(defun %atomic-cl-store (object path)
+  "CL-STORE OBJECT to PATH torn-write-safe (GH #63): write to PATH.tmp in the
+same directory, then rename(2) (%POSIX-RENAME) into place.  A crash mid-write
+leaves only the .tmp file behind; PATH itself is always either the previous
+complete sidecar or the new one, never a partial write.  Shared by the
+spatial/unique/secondary index sidecar writers -- the only three that
+CL-STORE:STORE a live index sidecar in place."
+  (let ((tmp (format nil "~A.tmp" (namestring path))))
+    (cl-store:store object tmp)
+    (%posix-rename tmp path)))
+
 (defun spatial-indexes-root-file (location)
   (format nil "~A/spatial-indexes.dat" location))
 
@@ -74,10 +85,10 @@ checkpoint image instead."
                                (copy-seq (spatial-index-precision-counts idx)))
                          roots)))
                (spatial-indexes graph))
-      (cl-store:store (list :format +spatial-index-format+
-                            :complete complete
-                            :indexes roots)
-                      (spatial-indexes-root-file (location graph)))))
+      (%atomic-cl-store (list :format +spatial-index-format+
+                              :complete complete
+                              :indexes roots)
+                        (spatial-indexes-root-file (location graph)))))
   nil)
 
 (defun restore-spatial-index-roots (graph)

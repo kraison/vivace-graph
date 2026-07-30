@@ -182,6 +182,39 @@ its :canonicalize (string-downcase) makes it case-insensitive."
         (ignore-errors (close-graph g))
         (collect-garbage)))))
 
+(test secondary-sidecar-torn-write-falls-back-to-rebuild
+  "GH #63: a truncated secondary-index sidecar must not prevent the graph from
+opening.  Before the fix, CL-STORE:RESTORE's error propagated straight out of
+OPEN-GRAPH (via RESTORE-SECONDARY-INDEX-ROOTS) and the open itself failed; now
+it falls back to REBUILD-SECONDARY-INDEXES, exactly as the spatial sidecar
+already does."
+  (with-temp-directory (dir)
+    (let ((path (namestring dir)))
+      (let ((g (make-graph *ix-graph-name* path :buffer-pool-size 1000)))
+        (unwind-protect
+             (let ((*graph* g))
+               (with-transaction ()
+                 (make-ix-person :name "a" :age 30)
+                 (make-ix-person :name "b" :age 30)))
+          (close-graph g)))
+      ;; Truncate the sidecar mid-record, as an interrupted write would.
+      (let* ((file (graph-db::secondary-index-root-file path))
+             (bytes (with-open-file (in file :element-type '(unsigned-byte 8))
+                      (let ((b (make-array (file-length in)
+                                           :element-type '(unsigned-byte 8))))
+                        (read-sequence b in)
+                        b))))
+        (with-open-file (out file :direction :output :element-type '(unsigned-byte 8)
+                                  :if-exists :supersede)
+          (write-sequence bytes out :end (floor (length bytes) 2))))
+      (handler-bind ((warning #'muffle-warning))    ; the torn-sidecar warning
+        (let ((g (open-graph *ix-graph-name* path :buffer-pool-size 1000)))
+          (unwind-protect
+               (is (equal '("a" "b") (ix-names (index-lookup g 'ix-person 'age 30)))
+                   "the index was rebuilt from the still-intact nodes")
+            (ignore-errors (close-graph g))
+            (collect-garbage)))))))
+
 ;;; --- dual backend -----------------------------------------------------------
 
 (test bplus-backend-equality-and-range

@@ -143,6 +143,42 @@ enforces."
                    (collect-garbage))))
           (setf (fdefinition 'graph-db::rebuild-unique-indexes) orig))))))
 
+(test unique-sidecar-torn-write-falls-back-to-rebuild
+  "GH #63: a truncated unique-index sidecar must not prevent the graph from
+opening.  Before the fix, CL-STORE:RESTORE's error propagated straight out of
+OPEN-GRAPH (via RESTORE-UNIQUE-INDEX-ROOTS) and the open itself failed; now it
+falls back to REBUILD-UNIQUE-INDEXES, exactly as the spatial sidecar already
+does."
+  (with-temp-directory (dir)
+    (let ((path (namestring dir)))
+      (let ((g (make-graph *uq-graph-name* path :buffer-pool-size 1000)))
+        (let ((*graph* g))
+          (with-transaction ()
+            (make-uq-user :uname "alice" :email "a@x.com")
+            (make-uq-user :uname "bob"   :email "b@x.com")))
+        (close-graph g))
+      ;; Truncate the sidecar mid-record, as an interrupted write would.
+      (let* ((file (graph-db::unique-index-root-file path))
+             (bytes (with-open-file (in file :element-type '(unsigned-byte 8))
+                      (let ((b (make-array (file-length in)
+                                           :element-type '(unsigned-byte 8))))
+                        (read-sequence b in)
+                        b))))
+        (with-open-file (out file :direction :output :element-type '(unsigned-byte 8)
+                                  :if-exists :supersede)
+          (write-sequence bytes out :end (floor (length bytes) 2))))
+      (handler-bind ((warning #'muffle-warning))    ; the torn-sidecar warning
+        (let ((g2 (open-graph *uq-graph-name* path :buffer-pool-size 1000)))
+          (unwind-protect
+               (let ((*graph* g2))
+                 (is (= 2 (uq-index-size g2 'uq-user 'uname))
+                     "the index was rebuilt from the still-intact nodes")
+                 (signals graph-db:unique-constraint-violation
+                   (with-transaction () (make-uq-user :uname "alice" :email "c@x.com")))
+                 (finishes (with-transaction () (make-uq-user :uname "carol" :email "c@x.com"))))
+            (ignore-errors (close-graph g2))
+            (collect-garbage)))))))
+
 (test concurrent-race-exactly-one-wins
   "The phantom the commit lock defeats: N threads racing to create the same unique
 value -- exactly one commits, the rest get UNIQUE-CONSTRAINT-VIOLATION."

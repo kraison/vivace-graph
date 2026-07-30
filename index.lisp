@@ -311,7 +311,7 @@ the ordered map."
                                (view-index-backend-tag (slot-index-skip-list six)))
                          roots)))
                (secondary-indexes graph))
-      (cl-store:store roots (secondary-index-root-file (location graph))))))
+      (%atomic-cl-store roots (secondary-index-root-file (location graph))))))
 
 (defun %owner-slot-canonicalizer (owner-name slot-name graph)
   "Resolve the canonicalizer for (OWNER-NAME . SLOT-NAME) from the owner class's live
@@ -331,23 +331,37 @@ canonicalizer is a function, not serializable, so it is re-resolved, not stored)
 (defun restore-secondary-index-roots (graph)
   "Reopen the on-disk secondary indexes from the sidecar -- no node scan.  Returns T
 if a sidecar was present (caller skips REBUILD-SECONDARY-INDEXES); NIL to fall back
-to rebuild.  The canonicalizer is re-resolved from the owner class's live :INDEX
-spec."
+to rebuild (a fresh graph, or an unreadable sidecar).  The canonicalizer is
+re-resolved from the owner class's live :INDEX spec.
+
+An UNREADABLE sidecar falls back to rebuild rather than failing the open (GH #63),
+mirroring RESTORE-SPATIAL-INDEX-ROOTS -- nodes remain authoritative, so
+REBUILD-SECONDARY-INDEXES reconstructs the truth.  :UNREADABLE is a sentinel
+distinct from NIL: a graph with no secondary indexes declared saves an empty
+list, which must still count as a successfully-restored (if empty) sidecar,
+not trigger a spurious rebuild."
   (let ((file (secondary-index-root-file (location graph))))
     (when (probe-file file)
-      (let ((reg (or (secondary-indexes graph)
-                     (setf (secondary-indexes graph)
-                           (make-hash-table :test 'equal
-                                            #+sbcl :synchronized #+sbcl t
-                                            #+ccl :shared #+ccl t)))))
-        (dolist (r (cl-store:restore file))
-          (destructuring-bind (owner slot address &optional (backend :skip-list)) r
-            (setf (gethash (cons owner slot) reg)
-                  (%make-slot-index :owner-name owner :slot-name slot
-                                    :canonicalizer (%owner-slot-canonicalizer owner slot graph)
-                                    :skip-list (%open-secondary-skip-list
-                                                graph address backend))))))
-      t)))
+      (let ((records (handler-case (cl-store:restore file)
+                        (error (e)
+                          (warn "Secondary index sidecar ~A is unreadable (~A); rebuilding ~
+                                 from live nodes, which are authoritative."
+                                file e)
+                          :unreadable))))
+        (unless (eq records :unreadable)
+          (let ((reg (or (secondary-indexes graph)
+                         (setf (secondary-indexes graph)
+                               (make-hash-table :test 'equal
+                                                #+sbcl :synchronized #+sbcl t
+                                                #+ccl :shared #+ccl t)))))
+            (dolist (r records)
+              (destructuring-bind (owner slot address &optional (backend :skip-list)) r
+                (setf (gethash (cons owner slot) reg)
+                      (%make-slot-index :owner-name owner :slot-name slot
+                                        :canonicalizer (%owner-slot-canonicalizer owner slot graph)
+                                        :skip-list (%open-secondary-skip-list
+                                                    graph address backend))))))
+          t)))))
 
 (defun regenerate-secondary-indexes (graph)
   "Drop every on-disk secondary index and rebuild it on GRAPH's CURRENT :INDEX-BACKEND,

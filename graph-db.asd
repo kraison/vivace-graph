@@ -75,7 +75,7 @@
                (:file "type-index" :depends-on ("vev-index"))
                (:file "graph" :depends-on
                       ("ve-index" "vev-index" "type-index" "linear-hash" "allocator"
-                       "spatial-index"))
+                       "spatial-index" "posix"))
                (:file "stats" :depends-on ("graph"))
                (:file "schema" :depends-on ("stats"))
                (:file "node-class" :depends-on ("schema"))
