@@ -650,6 +650,93 @@ a separate (SI-SUB . EMBEDDING) segment would appear."
         (close-graph g :snapshot-p nil))
       (collect-garbage))))
 
+;;; ---------------------------------------------------------------------------
+;;; :vector-index on an EDGE owner (GH #57).  Live maintenance
+;;; (APPLY-TX-WRITE-TO-VECTOR-SEGMENTS) is node-generic over CLASS-OF, so an
+;;; edge's :vector-index slot is filled exactly like a vertex's; both rebuild
+;;; paths swept MAP-VERTICES unconditionally, so an edge-owned segment came
+;;; back empty after RESTORE-VECTOR-SEGMENTS' drop-and-rebuild on an unclean
+;;; shutdown (or an explicit REBUILD-VECTOR-SEGMENT-BATCHED migration).
+;;; ---------------------------------------------------------------------------
+
+(def-edge si-rel ()
+  ((embedding :vector-index t))
+  :graph-db-integration-test)
+
+(defun %si-edge-segment (graph slot)
+  (gethash (cons 'si-rel slot) (graph-db::vector-segments graph)))
+
+(defun %make-si-rel (base)
+  "Create two bare si-doc endpoints and a si-rel edge between them carrying a
+conforming embedding (BASE feeds %SI-EMBEDDING); returns the edge's id. Must
+be called inside a transaction, like the SI-DOC constructors it shares with
+the vertex-side fixtures above."
+  (let ((a (make-si-doc :title "a"))
+        (b (make-si-doc :title "b")))
+    (id (make-si-rel :from a :to b :embedding (%si-embedding 8 base)))))
+
+(test rebuild-vector-segment-sweeps-edges
+  "REBUILD-VECTOR-SEGMENT must dispatch to MAP-EDGES when OWNER-NAME is an
+edge class (GH #57).  Before the fix this swept MAP-VERTICES regardless,
+which resolves an edge type name to no vertex type at all -- so live-count
+would come back 0 and REBUILD-VECTOR-SEGMENT would report no segment, even
+though the live apply path had already filled one correctly."
+  (with-temp-directory (dir)
+    (let ((g (make-graph *integration-graph-name* (namestring dir) :buffer-pool-size 1000))
+          (eid nil))
+      (unwind-protect
+           (progn
+             (let ((*graph* g))
+               (with-transaction () (setf eid (%make-si-rel 3.0))))
+             ;; sanity: the live apply path already filled the segment
+             (is (not (null (%si-edge-segment g 'embedding)))
+                 "the live path must maintain an edge-owned vector-index segment")
+             (let ((rebuilt (graph-db::rebuild-vector-segment g 'si-rel 'embedding)))
+               (is (not (null rebuilt))
+                   "rebuild must produce a segment for an edge owner, not silently skip it")
+               (is (= 1 (graph-db::segment-live-count rebuilt)))
+               (let ((back (graph-db::segment-get rebuilt eid)))
+                 (is (typep back '(simple-array single-float (*)))
+                     "the edge's vector must survive the rebuild")
+                 (is (every #'= (%si-embedding 8 3.0) back)))))
+        (close-graph g :snapshot-p nil))
+      (collect-garbage))))
+
+(test batched-rebuild-sweeps-edges
+  "REBUILD-VECTOR-SEGMENT-BATCHED must dispatch to MAP-EDGES for an edge
+owner too (GH #57) -- a separate code path and sweep from
+REBUILD-VECTOR-SEGMENT, so fixing one does not fix the other. Mirrors
+BATCHED-REBUILD-FILLS-MISSING-AND-SKIPS-PRESENT's skip-then-drop-and-refill
+shape, scaled to a single edge."
+  (with-temp-directory (dir)
+    (let ((g (make-graph *integration-graph-name* (namestring dir) :buffer-pool-size 1000))
+          (eid nil))
+      (unwind-protect
+           (progn
+             (let ((*graph* g))
+               (with-transaction () (setf eid (%make-si-rel 5.0))))
+             ;; already indexed by the live apply path -> additive skip
+             (multiple-value-bind (ins skip)
+                 (rebuild-vector-segment-batched g 'si-rel 'embedding)
+               (is (= 0 ins) "expected 0 inserted, got ~D" ins)
+               (is (= 1 skip) "expected 1 skipped, got ~D" skip))
+             ;; drop the segment entirely, then refill it
+             (let ((key (cons 'si-rel 'embedding)))
+               (let ((s (gethash key (graph-db::vector-segments g))))
+                 (when s (graph-db::close-vector-segment s)))
+               (remhash key (graph-db::vector-segments g)))
+             (multiple-value-bind (ins skip)
+                 (rebuild-vector-segment-batched g 'si-rel 'embedding)
+               (is (= 1 ins) "expected 1 inserted after drop, got ~D" ins)
+               (is (= 0 skip) "expected 0 skipped after drop, got ~D" skip))
+             (let ((seg (%si-edge-segment g 'embedding)))
+               (is (not (null seg)) "the refilled edge-owner segment must exist")
+               (let ((back (graph-db::segment-get seg eid)))
+                 (is (and back (every #'= (%si-embedding 8 5.0) back))
+                     "refilled vector must match what the edge was created with"))))
+        (close-graph g :snapshot-p nil))
+      (collect-garbage))))
+
 (test capacity-exhaustion-signals-and-rolls-back
   (with-temp-directory (dir)
     ;; A deliberately tiny reservation, so a few vectors exhaust it.  Bound

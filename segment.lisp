@@ -576,6 +576,16 @@ against a concurrent segment-put/segment-remove."
     (let ((slot (%seg-slot-of segment id)))
       (when slot (%seg-read-vector segment slot)))))
 
+(defun %sweep-vector-index-owner (fn graph owner-name)
+  "Call FN on every live node of OWNER-NAME (and its subclasses), whether OWNER-
+NAME is a vertex or an edge class.  Live maintenance (APPLY-TX-WRITE-TO-VECTOR-
+SEGMENTS) is node-generic over CLASS-OF, so a :VECTOR-INDEX slot on an edge is
+filled exactly like one on a vertex; rebuild must sweep the matching kind or
+an edge-owned segment always rebuilds empty (GH #57)."
+  (if (subtypep owner-name 'edge)
+      (map-edges fn graph :edge-type owner-name)
+      (map-vertices fn graph :vertex-type owner-name)))
+
 (defun rebuild-vector-segment (graph owner-name slot-name)
   "Rebuild the (OWNER-NAME, SLOT-NAME) segment from live nodes: drop any current
 segment/file, create a fresh one whose dimension comes from the first conforming
@@ -589,9 +599,10 @@ transaction path, like rebuild-spatial-indexes.
 OWNER-NAME must be the segment's OWNER -- the declaring class returned by
 %VECTOR-INDEX-SLOT-OWNER-NAME / %SEGMENT-KEY (transactions.lisp), not
 necessarily a node's exact runtime class.  One segment per owner spans its
-subclasses (the engine's :UNIQUE / :INDEX convention), so this sweeps
-MAP-VERTICES with its default :INCLUDE-SUBCLASSES-P T: every subclass
-instance's vector is swept into the OWNER's segment, matching exactly what the
+subclasses (the engine's :UNIQUE / :INDEX convention), so this sweeps via
+%SWEEP-VECTOR-INDEX-OWNER (MAP-VERTICES or MAP-EDGES, whichever OWNER-NAME is;
+GH #57) with its default :INCLUDE-SUBCLASSES-P T: every subclass instance's
+vector is swept into the OWNER's segment, matching exactly what the
 live apply path (APPLY-TX-WRITE-TO-VECTOR-SEGMENTS, via %SEGMENT-KEY) does on
 create/update/delete.
 
@@ -674,14 +685,14 @@ later design question, not a one-line patch."
     ;; count cannot undershoot the puts.
     (let ((dimension nil)
           (live-count 0))
-      (map-vertices
+      (%sweep-vector-index-owner
        (lambda (node)
          (unless (deleted-p node)
            (let ((v (%node-segment-value node slot-name)))
              (when v
                (unless dimension (setf dimension (length v)))
                (incf live-count)))))
-       graph :vertex-type owner-name)
+       graph owner-name)
       ;; No conforming vector anywhere: create no segment at all, as before.
       (when dimension
         (let ((seg (create-vector-segment
@@ -691,13 +702,13 @@ later design question, not a one-line patch."
                     ;; keeps the small-graph shape exactly as it was.
                     :initial-capacity (max 1024 live-count))))
           (setf (gethash key table) seg)
-          (map-vertices
+          (%sweep-vector-index-owner
            (lambda (node)
              (unless (deleted-p node)
                (let ((v (%node-segment-value node slot-name)))
                  (when v
                    (segment-put seg (id node) v)))))
-           graph :vertex-type owner-name)
+           graph owner-name)
           seg)))))
 
 (defun rebuild-vector-segment-batched (graph owner-name slot-name
@@ -716,17 +727,18 @@ reading from it.  Both are legitimate; do not merge them.
 
 OWNER-NAME's contract is NOT the same as REBUILD-VECTOR-SEGMENT's.
 REBUILD-VECTOR-SEGMENT does no resolution at all -- it uses its argument raw
-for the segment key, the file path, and the MAP-VERTICES sweep, and its
-docstring requires the caller to already have resolved it to the true owner.
-This function DOES resolve OWNER-NAME itself, through
+for the segment key, the file path, and the %SWEEP-VECTOR-INDEX-OWNER sweep,
+and its docstring requires the caller to already have resolved it to the true
+owner. This function DOES resolve OWNER-NAME itself, through
 %VECTOR-INDEX-SLOT-OWNER-NAME, so passing any class in the hierarchy -- the
 true declaring owner OR a subclass -- reaches the same one owner segment.
 Do not assume the two functions can be called the same way.
 
-MAP-VERTICES is swept from the RESOLVED owner with its default
-:INCLUDE-SUBCLASSES-P T, so every subclass instance is visited into the ONE
-shared owner segment.  This is Model B: one segment per declaring class spans
-its subclasses, exactly matching what APPLY-TX-WRITE-TO-VECTOR-SEGMENTS
+%SWEEP-VECTOR-INDEX-OWNER (MAP-VERTICES or MAP-EDGES, whichever OWNER is; GH
+#57) is swept from the RESOLVED owner with its default :INCLUDE-SUBCLASSES-P
+T, so every subclass instance is visited into the ONE shared owner segment.
+This is Model B: one segment per declaring class spans its subclasses,
+exactly matching what APPLY-TX-WRITE-TO-VECTOR-SEGMENTS
 maintains on the live create/update/delete path.  Getting this wrong -- e.g.
 sweeping on the raw, unresolved OWNER-NAME instead of the resolved owner, or
 keying on a node's exact runtime class instead of the resolved owner --
@@ -798,7 +810,7 @@ looks hung."
          (skipped 0)
          (seen 0)
          (since-progress 0))
-    (map-vertices
+    (%sweep-vector-index-owner
      (lambda (node)
        (unless (deleted-p node)
          (let ((v (%node-segment-value node slot-name)))
@@ -815,7 +827,7 @@ looks hung."
                    (when (and progress-fn (>= since-progress batch-size))
                      (setf since-progress 0)
                      (funcall progress-fn (+ inserted skipped) seen))))))))
-     graph :vertex-type owner)
+     graph owner)
     (when (and progress-fn (plusp since-progress))
       (funcall progress-fn (+ inserted skipped) seen))
     (values inserted skipped)))
