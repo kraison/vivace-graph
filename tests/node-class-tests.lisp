@@ -107,18 +107,29 @@ rebuilding up to three lists per access (~28 rebuilds per node materialized,
     (graph-db::ephemeral-slot-names class)
     (graph-db::meta-slot-names class)
     (graph-db::%persistent-slot-keyword class 'p1)
-    (sb-ext:gc :full t)
-    (let ((before (sb-ext:get-bytes-consed))
-          (n 2000))
-      (dotimes (i n)
-        (graph-db::persistent-slot-names class)
-        (graph-db::ephemeral-slot-names class)
-        (graph-db::meta-slot-names class)
-        (graph-db::%persistent-slot-keyword class 'p1))
-      (let ((per-iteration (/ (- (sb-ext:get-bytes-consed) before) n)))
-        (is (< per-iteration 16)
-            "one round of the three slot-name lookups consed ~a bytes"
-            per-iteration)))))
+    ;; GET-BYTES-CONSED is process-wide, so a background thread allocating inside
+    ;; the window inflates the reading.  Take the MINIMUM over several rounds:
+    ;; interference can only ADD, so the min converges on the true cost.  A single
+    ;; round against a budget of 16 measured 16.384 on a loaded host -- a false
+    ;; failure 2.4% over, from ~768 stray bytes across the whole loop.
+    (let* ((n 2000)
+           (per-iteration
+             (loop repeat 5
+                   minimize (progn
+                              (sb-ext:gc :full t)
+                              (let ((before (sb-ext:get-bytes-consed)))
+                                (dotimes (i n)
+                                  (graph-db::persistent-slot-names class)
+                                  (graph-db::ephemeral-slot-names class)
+                                  (graph-db::meta-slot-names class)
+                                  (graph-db::%persistent-slot-keyword class 'p1))
+                                (/ (- (sb-ext:get-bytes-consed) before) n))))))
+      ;; Headroom over the ~16 B/iteration steady state.  The regression this
+      ;; guards rebuilt up to three lists per call (hundreds of bytes), so 64
+      ;; still fails decisively on it while not sitting on the true value.
+      (is (< per-iteration 64)
+          "one round of the three slot-name lookups consed ~a bytes (~,1F)"
+          per-iteration (float per-iteration)))))
 
 (test slot-categorization-follows-class-redefinition
   "The cache is only sound if it dies when the class definition changes.
