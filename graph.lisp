@@ -386,7 +386,8 @@ to disk and remove it."
              #+sbcl (make-hash-table :synchronized t)
              #+ccl (make-hash-table :shared t)
              #+lispworks (make-hash-table :single-thread nil)
-             #+ecl (make-hash-table)
+             #+ecl (make-hash-table #+graph-db-ecl-sync-hash :synchronized
+                                     #+graph-db-ecl-sync-hash t)
              :cache
              (make-id-table :synchronized t :weakness :value)
              :replication-key replication-key
@@ -533,7 +534,8 @@ Always CLOSE-GRAPH when finished."
              #+sbcl (make-hash-table :synchronized t)
              #+ccl (make-hash-table :shared t)
              #+lispworks (make-hash-table :single-thread nil)
-             #+ecl (make-hash-table)
+             #+ecl (make-hash-table #+graph-db-ecl-sync-hash :synchronized
+                                     #+graph-db-ecl-sync-hash t)
              :cache
              (make-id-table :synchronized t :weakness :value)
              :replication-key replication-key

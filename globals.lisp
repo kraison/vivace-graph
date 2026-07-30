@@ -26,6 +26,31 @@
                                       (and (= minor 9) (>= patch 9)))))
         (pushnew :graph-db-ecl-modern-mp *features*)))))
 
+;;; ECL synchronized-hash-table capability gate (GH #101).
+;;;
+;;; SBCL and CCL mark every concurrently-accessed table :SYNCHRONIZED / :SHARED.
+;;; ECL arms were written without an equivalent because ECL once had none -- see
+;;; the note in skip-list.lisp, which found rehash races and SIGSEGVs and guarded
+;;; that table with an explicit lock instead.  Modern ECL does support it:
+;;; measured on 26.5.5, eight threads x 20k inserts over a deliberately
+;;; undersized table complete losslessly with :SYNCHRONIZED T and LIVELOCK
+;;; without it.
+;;;
+;;; PROBED, not version-gated: the version at which ECL gained this is not
+;;; documented anywhere we can check, and the oldest supported ECL (21.2.1) is
+;;; not installed on any host here, so a threshold would be a guess.  Constructing
+;;; a table is the direct question.  Default-to-safe: if the keyword is rejected
+;;; the feature stays absent and those tables are exactly as they are today.
+;;;
+;;; LIMITATION: this proves the keyword is ACCEPTED, not that it is HONOURED.  An
+;;; ECL that accepted and ignored it would probe true and stay racy -- no worse
+;;; than today, but not fixed either.  26.5.5 is verified honoured by the test
+;;; above; re-run it when raising the floor to a version between 21.2.1 and 26.5.5.
+#+ecl
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (when (ignore-errors (hash-table-p (make-hash-table :test 'eql :synchronized t)))
+    (pushnew :graph-db-ecl-sync-hash *features*)))
+
 (defvar *cache-enabled* t)
 
 (defparameter *index-backend* :skip-list
@@ -339,9 +364,14 @@ strictly-safe pre-durability abort.")
 (defvar *user-functors* (make-hash-table :shared t :test 'eql))
 
 #+ecl
-(defvar *prolog-global-functors* (make-hash-table))
+(defvar *prolog-global-functors*
+  (make-hash-table #+graph-db-ecl-sync-hash :synchronized
+                   #+graph-db-ecl-sync-hash t))
 #+ecl
-(defvar *user-functors* (make-hash-table :test 'eql))
+(defvar *user-functors*
+  (make-hash-table :test 'eql
+                   #+graph-db-ecl-sync-hash :synchronized
+                   #+graph-db-ecl-sync-hash t))
 
 (defparameter *prolog-trace* nil)
 (alexandria:define-constant +unbound+ :unbound)

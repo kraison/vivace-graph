@@ -6,12 +6,16 @@
    #+sbcl (make-hash-table :test 'eql :synchronized t)
    #+ccl (make-hash-table :test 'eql :shared t)
    #+lispworks (make-hash-table :test 'eql :single-thread nil)
-   #+ecl (make-hash-table :test 'eql))
+   #+ecl (make-hash-table :test 'eql
+                          #+graph-db-ecl-sync-hash :synchronized
+                          #+graph-db-ecl-sync-hash t))
   (class-locks
    #+sbcl (make-hash-table :test 'eql :synchronized t)
    #+ccl (make-hash-table :test 'eql :shared t)
    #+lispworks (make-hash-table :test 'eql :single-thread nil)
-   #+ecl (make-hash-table :test 'eql))
+   #+ecl (make-hash-table :test 'eql
+                          #+graph-db-ecl-sync-hash :synchronized
+                          #+graph-db-ecl-sync-hash t))
   (next-edge-id 1 :type (unsigned-byte 16))
   (next-vertex-id 1 :type (unsigned-byte 16))
   ;; MVCC: graph-wide default number of prior node versions the reaper retains
@@ -83,12 +87,16 @@
           #+sbcl (make-hash-table :test 'eql :synchronized t)
           #+ccl (make-hash-table :test 'eql :shared t)
           #+lispworks (make-hash-table :test 'eql :single-thread nil)
-          #+ecl (make-hash-table :test 'eql))
+          #+ecl (make-hash-table :test 'eql
+                          #+graph-db-ecl-sync-hash :synchronized
+                          #+graph-db-ecl-sync-hash t))
     (setf (gethash :vertex (schema-type-table (schema graph)))
           #+sbcl (make-hash-table :test 'eql :synchronized t)
           #+ccl (make-hash-table :test 'eql :shared t)
           #+lispworks (make-hash-table :test 'eql :single-thread nil)
-          #+ecl (make-hash-table :test 'eql))
+          #+ecl (make-hash-table :test 'eql
+                          #+graph-db-ecl-sync-hash :synchronized
+                          #+graph-db-ecl-sync-hash t))
     (setf (gethash 'edge (schema-class-locks schema))
           (make-rw-lock))
     (setf (gethash 'vertex (schema-class-locks schema))
@@ -118,7 +126,9 @@ persisted type-ids (unlike re-running INIT-SCHEMA from scratch)."
   (let ((locks #+sbcl (make-hash-table :test 'eql :synchronized t)
                #+ccl (make-hash-table :test 'eql :shared t)
                #+lispworks (make-hash-table :test 'eql :single-thread nil)
-               #+ecl (make-hash-table :test 'eql)))
+               #+ecl (make-hash-table :test 'eql
+                          #+graph-db-ecl-sync-hash :synchronized
+                          #+graph-db-ecl-sync-hash t)))
     (setf (gethash 'vertex locks) (make-rw-lock)
           (gethash 'edge locks) (make-rw-lock))
     ;; The type-table nests sub-tables (by parent type) whose VALUES include the

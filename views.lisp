@@ -8,7 +8,9 @@
   (table #+sbcl (make-hash-table :test 'eql :synchronized t)
          #+lispworks (make-hash-table :test 'eql :single-thread nil)
          #+ccl (make-hash-table :test 'eql :shared t)
-         #+ecl (make-hash-table :test 'eql))
+         #+ecl (make-hash-table :test 'eql
+                                #+graph-db-ecl-sync-hash :synchronized
+                                #+graph-db-ecl-sync-hash t))
   (lock (make-rw-lock)))
 
 (defstruct (view
@@ -155,7 +157,9 @@ once per entry you want the node to contribute (zero, one, or many times)."
         (view-table (make-hash-table
                      #+sbcl :synchronized #+sbcl t
                      #+ccl :shared #+ccl t
-                     #+lispworks :single-thread #+lispworks nil)))
+                     #+lispworks :single-thread #+lispworks nil
+                     #+graph-db-ecl-sync-hash :synchronized
+                     #+graph-db-ecl-sync-hash t)))
     (when (probe-file views-file)
       (let ((blob (cl-store:restore views-file)))
         (dolist (view-data blob)

@@ -4,7 +4,8 @@
   #+sbcl (make-hash-table :test 'eq :synchronized t)
   #+lispworks (make-hash-table :test 'eq :single-thread nil)
   #+ccl (make-hash-table :test 'eq :shared t)
-  #+ecl (make-hash-table :test 'eq))
+  #+ecl (make-hash-table :test 'eq #+graph-db-ecl-sync-hash :synchronized
+                          #+graph-db-ecl-sync-hash t))
 (defvar *buffer-pool-stats* nil)
 (defvar *buffer-pool-thread* nil)
 (defvar *stop-buffer-pool* nil)
@@ -290,7 +291,8 @@
         #+sbcl (make-hash-table :test 'eq :synchronized t)
         #+lispworks (make-hash-table :test 'eq :single-thread nil)
         #+ccl (make-hash-table :test 'eq :shared t)
-        #+ecl (make-hash-table :test 'eq))
+        #+ecl (make-hash-table :test 'eq #+graph-db-ecl-sync-hash :synchronized
+                               #+graph-db-ecl-sync-hash t))
   (setf (gethash :vertex *buffer-pool*)
         (list nil)
         (gethash :edge *buffer-pool*)

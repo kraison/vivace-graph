@@ -4,7 +4,9 @@
   #+sbcl (make-hash-table :synchronized t :test 'equalp)
   #+ccl (make-hash-table :shared t :test 'equalp)
   #+lispworks (make-hash-table :single-thread nil :test 'equalp)
-  #+ecl (make-hash-table :test 'equalp))
+  #+ecl (make-hash-table :test 'equalp
+                         #+graph-db-ecl-sync-hash :synchronized
+                         #+graph-db-ecl-sync-hash t))
 
 (defmacro def-global-prolog-functor (name lambda-list &body body)
   "Define a global Prolog functor (query predicate) NAME, which must be of the

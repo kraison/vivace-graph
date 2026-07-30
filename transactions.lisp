@@ -79,8 +79,10 @@ per graph and may compose; read-write transactions are not (GH #53).")
 
 (defclass object-set ()
   ((table
-    ;; Validation reads object-sets from other threads; CCL requires :shared t.
-    :initform (make-id-table #+ccl :synchronized #+ccl t)
+    ;; Validation reads object-sets from other threads; CCL requires :shared t,
+    ;; and ECL needs the same guard where it supports it (GH #101).
+    :initform (make-id-table #+ccl :synchronized #+ccl t
+                              #+ecl :synchronized #+ecl t)
     :reader table)))
 
 (defmethod object-set-list ((set object-set))
@@ -931,7 +933,7 @@ APPLY-TRANSACTION)."
   #+sbcl (make-hash-table :test 'eq :synchronized t)
   #+ccl (make-hash-table :test 'eq :shared t)
   #+lispworks (make-hash-table :test 'eq :single-thread nil)
-  #+ecl (make-hash-table :test 'eq)
+  #+ecl (make-hash-table :test 'eq #+graph-db-ecl-sync-hash :synchronized #+graph-db-ecl-sync-hash t)
   "Cache CLASS -> list of its :INDEX-marked slot names (candidate geometry slots).")
 
 (defun node-geometry-index-slots (class)
@@ -973,7 +975,7 @@ write forever.  AUDIT-SPATIAL-SLOTS is the exhaustive sweep.")
   #+sbcl (make-hash-table :test 'eq :synchronized t)
   #+ccl (make-hash-table :test 'eq :shared t)
   #+lispworks (make-hash-table :test 'eq :single-thread nil)
-  #+ecl (make-hash-table :test 'eq)
+  #+ecl (make-hash-table :test 'eq #+graph-db-ecl-sync-hash :synchronized #+graph-db-ecl-sync-hash t)
   "CLASS -> nodes sampled so far, or :DONE once the check has fired or expired.")
 
 (defun node-geometry-slots-with-values (node)
@@ -1042,7 +1044,7 @@ guaranteed, under concurrent writers to the same class."
   #+sbcl (make-hash-table :test 'eq :synchronized t)
   #+ccl (make-hash-table :test 'eq :shared t)
   #+lispworks (make-hash-table :test 'eq :single-thread nil)
-  #+ecl (make-hash-table :test 'eq))
+  #+ecl (make-hash-table :test 'eq #+graph-db-ecl-sync-hash :synchronized #+graph-db-ecl-sync-hash t))
 
 (defun node-vector-index-slots (class)
   "Names of CLASS's :VECTOR-INDEX slots -- the slots that get a vector segment.

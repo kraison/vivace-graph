@@ -3,9 +3,11 @@
 ;;; The skip list's node-cache is read/written lock-free by every concurrent
 ;;; reader and writer (READ-SKIP-NODE etc.).  On SBCL/CCL/LispWorks the cache is
 ;;; a per-op thread-safe hash table (:synchronized / :shared / :single-thread
-;;; nil).  ECL hash tables have no such option, so concurrent access corrupts the
-;;; table internally (rehash races) and crashes (SIGSEGV) under real concurrency.
-;;; Guard the ECL node-cache with its own lock; a no-op everywhere else.
+;;; nil).  ECL 26.5.5 does support :synchronized (GH #101), but this explicit
+;;; lock predates that and also covers older ECLs that don't, so it stays --
+;;; adding :synchronized to the table too would just double-lock the hottest
+;;; read path in the engine.  Guard the ECL node-cache with its own lock; a
+;;; no-op everywhere else.
 (defmacro with-sl-cache-lock ((skip-list) &body body)
   #+ecl `(mp:with-lock ((%sl-cache-lock ,skip-list)) ,@body)
   #-ecl `(progn ,@body))
@@ -337,8 +339,9 @@ garbage), but is cleared here too so both caches are dropped in one place."
    #+ccl (make-hash-table :test 'eq :weak :value :shared t)
    #+ecl (make-hash-table :test 'eq :weakness :value))
 
-  ;; ECL hash tables aren't thread-safe and have no :synchronized option, so the
-  ;; node-cache above needs an explicit lock (see WITH-SL-CACHE-LOCK).
+  ;; Explicit lock retained instead of :synchronized on NODE-CACHE itself: it
+  ;; also covers ECLs predating that option, and :synchronized would be
+  ;; redundant given this lock (GH #101).  See WITH-SL-CACHE-LOCK.
   #+ecl (cache-lock (mp:make-lock))
   ;; ECL-only: a per-skip-list reader/writer lock (see WITH-SL-READ-LOCK /
   ;; WITH-SL-WRITE-LOCK).  Shared among concurrent readers, exclusive for writers.

@@ -22,7 +22,8 @@
 (let ((length-table #+sbcl (make-hash-table :synchronized t)
                     #+lispworks (make-hash-table :single-thread nil)
                     #+ccl (make-hash-table :shared t)
-                    #+ecl (make-hash-table)))
+                    #+ecl (make-hash-table #+graph-db-ecl-sync-hash :synchronized
+                                            #+graph-db-ecl-sync-hash t)))
   (defun encode-length (int)
     (declare (type integer int))
     (or (gethash int length-table)

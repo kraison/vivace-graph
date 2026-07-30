@@ -33,7 +33,9 @@
   (data (make-hash-table :test 'equalp
                          #+sbcl :synchronized #+sbcl t
                          #+ccl :shared #+ccl t
-                         #+lispworks :single-thread #+lispworks nil))
+                         #+lispworks :single-thread #+lispworks nil
+                         #+graph-db-ecl-sync-hash :synchronized
+                         #+graph-db-ecl-sync-hash t))
   ;; Writes are single-threaded (the transaction-manager lock serializes commit
   ;; apply), so this lock only guards the rare non-commit mutation; reads are
   ;; lock-free and see a whole node via atomic slot replacement.
@@ -172,7 +174,8 @@ MEMORY-PEER-GRAPH.  With LAZY, the node tables materialize on first touch."
                               #+sbcl (make-hash-table :synchronized t)
                               #+ccl (make-hash-table :shared t)
                               #+lispworks (make-hash-table :single-thread nil)
-                              #+ecl (make-hash-table)
+                              #+ecl (make-hash-table #+graph-db-ecl-sync-hash :synchronized
+                                                      #+graph-db-ecl-sync-hash t)
                               :cache (make-id-table :synchronized t :weakness :value)
                               :vertex-table (make-mem-table)
                               :edge-table (make-mem-table)
@@ -1118,7 +1121,9 @@ as deferred blobs and materialize on first touch (needs a VG-native image)."
   (data (make-hash-table :test 'eql
                          #+sbcl :synchronized #+sbcl t
                          #+ccl :shared #+ccl t
-                         #+lispworks :single-thread #+lispworks nil)))
+                         #+lispworks :single-thread #+lispworks nil
+                         #+graph-db-ecl-sync-hash :synchronized
+                         #+graph-db-ecl-sync-hash t)))
 (defun make-mem-type-index () (%make-mem-type-index))
 
 (defun %mem-ti-list (idx type-id &optional create)
@@ -1146,7 +1151,9 @@ as deferred blobs and materialize on first touch (needs a VG-native image)."
   (data (make-hash-table :test 'equalp
                          #+sbcl :synchronized #+sbcl t
                          #+ccl :shared #+ccl t
-                         #+lispworks :single-thread #+lispworks nil)))
+                         #+lispworks :single-thread #+lispworks nil
+                         #+graph-db-ecl-sync-hash :synchronized
+                         #+graph-db-ecl-sync-hash t)))
 (defun make-mem-ve-index () (%make-mem-ve-index))
 
 (defmethod ve-index-push ((idx mem-ve-index) (key ve-key) (id array)
@@ -1175,7 +1182,9 @@ as deferred blobs and materialize on first touch (needs a VG-native image)."
   (data (make-hash-table :test 'equalp
                          #+sbcl :synchronized #+sbcl t
                          #+ccl :shared #+ccl t
-                         #+lispworks :single-thread #+lispworks nil)))
+                         #+lispworks :single-thread #+lispworks nil
+                         #+graph-db-ecl-sync-hash :synchronized
+                         #+graph-db-ecl-sync-hash t)))
 (defun make-mem-vev-index () (%make-mem-vev-index))
 
 (defmethod add-to-vev-index ((edge edge) (graph memory-graph-mixin) &key unless-present)

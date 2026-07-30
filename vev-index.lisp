@@ -80,7 +80,9 @@
   ;; out-id + equalp in-id), so ECL's native EQUALP tables are an exact
   ;; substitute (no custom hash-table test support on ECL).
   #+ecl
-  (make-hash-table :test 'equalp :weakness :value))
+  (make-hash-table :test 'equalp :weakness :value
+                    #+graph-db-ecl-sync-hash :synchronized
+                    #+graph-db-ecl-sync-hash t))
 
 (defstruct (vev-index
              (:constructor %make-vev-index))

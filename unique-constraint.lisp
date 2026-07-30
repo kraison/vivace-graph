@@ -195,7 +195,9 @@ from SPEC on creation."
                     (setf (unique-indexes graph)
                           (make-hash-table :test 'equal
                                            #+sbcl :synchronized #+sbcl t
-                                           #+ccl :shared #+ccl t))))
+                                           #+ccl :shared #+ccl t
+                                           #+graph-db-ecl-sync-hash :synchronized
+                                           #+graph-db-ecl-sync-hash t))))
            (key (cons owner-name slot-name)))
       (or (gethash key reg)
           (multiple-value-bind (test canon) (%resolve-unique-canonicalizer spec)
@@ -208,7 +210,9 @@ from SPEC on creation."
                   (setf (unique-index-table uix)
                         (make-hash-table :test test
                                          #+sbcl :synchronized #+sbcl t
-                                         #+ccl :shared #+ccl t)))
+                                         #+ccl :shared #+ccl t
+                                         #+graph-db-ecl-sync-hash :synchronized
+                                         #+graph-db-ecl-sync-hash t)))
               (setf (gethash key reg) uix)))))))
 
 ;;; ---------------------------------------------------------------------------
@@ -438,7 +442,9 @@ not trigger a spurious rebuild."
                          (setf (unique-indexes graph)
                                (make-hash-table :test 'equal
                                                 #+sbcl :synchronized #+sbcl t
-                                                #+ccl :shared #+ccl t)))))
+                                                #+ccl :shared #+ccl t
+                                                #+graph-db-ecl-sync-hash :synchronized
+                                                #+graph-db-ecl-sync-hash t)))))
             (dolist (r records)
               ;; BACKEND is absent in pre-B+-tree sidecars (5-tuples) -> defaults to
               ;; :skip-list, so an existing graph reopens exactly as before.

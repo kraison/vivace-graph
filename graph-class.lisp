@@ -8,7 +8,8 @@
   #+ccl
   (make-hash-table :test 'equal :shared t)
   #+ecl
-  (make-hash-table :test 'equal))
+  (make-hash-table :test 'equal #+graph-db-ecl-sync-hash :synchronized
+                    #+graph-db-ecl-sync-hash t))
 
 (defclass graph ()
   ((graph-name :accessor graph-name :initarg :graph-name)
@@ -42,7 +43,9 @@
                     :initform
                     #+ccl (make-hash-table :test 'equal :shared t)
                     #+lispworks (make-hash-table :test 'equal :single-thread nil)
-                    #+ecl (make-hash-table :test 'equal)
+                    #+ecl (make-hash-table :test 'equal
+                                            #+graph-db-ecl-sync-hash :synchronized
+                                            #+graph-db-ecl-sync-hash t)
                     #+sbcl (make-hash-table :test 'equal :synchronized t))
    ;; Default geohash precision for spatial indexes created on this graph
    ;; (MAKE-GRAPH / OPEN-GRAPH :spatial-precision).  Per-index overrides are
@@ -101,7 +104,9 @@
                     :initform
                     #+ccl (make-hash-table :test 'equal :shared t)
                     #+lispworks (make-hash-table :test 'equal :single-thread nil)
-                    #+ecl (make-hash-table :test 'equal)
+                    #+ecl (make-hash-table :test 'equal
+                                            #+graph-db-ecl-sync-hash :synchronized
+                                            #+graph-db-ecl-sync-hash t)
                     #+sbcl (make-hash-table :test 'equal :synchronized t))
    ;; General ordered secondary indexes (:INDEX slot option / DEF-INDEX); keyed by
    ;; (owner-name . slot-name).  See index.lisp / docs/general-index-design.md.
@@ -113,13 +118,17 @@
                 :initform
                 #+ccl (make-hash-table :test 'eq :shared t)
                 #+lispworks (make-hash-table :test 'eq :single-thread nil)
-                #+ecl (make-hash-table :test 'eq)
+                #+ecl (make-hash-table :test 'eq
+                                        #+graph-db-ecl-sync-hash :synchronized
+                                        #+graph-db-ecl-sync-hash t)
                 #+sbcl (make-hash-table :test 'eq :synchronized t))
    (read-stats :accessor read-stats :initarg :read-stats
                :initform
                #+ccl (make-hash-table :test 'eq :shared t)
                #+lispworks (make-hash-table :test 'eq :single-thread nil)
-               #+ecl (make-hash-table :test 'eq)
+               #+ecl (make-hash-table :test 'eq
+                                       #+graph-db-ecl-sync-hash :synchronized
+                                       #+graph-db-ecl-sync-hash t)
                #+sbcl (make-hash-table :test 'eq :synchronized t))))
 
 (defmethod print-object ((graph graph) stream)

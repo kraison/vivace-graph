@@ -477,7 +477,9 @@ values we just set."
   ;; so this table is keyed by node-id (a byte vector) under EQUALP instead of
   ;; by the node object.  Callers must key by (id node) on ECL (see UNIQUE/1).
   #+ecl
-  (make-hash-table :test 'equalp :weakness weakness))
+  (make-hash-table :test 'equalp :weakness weakness
+                   #+graph-db-ecl-sync-hash :synchronized
+                   #+graph-db-ecl-sync-hash synchronized))
 
 (defun id-equal (x y) (equalp x y))
 (defun sxhash-id-array (id) (sxhash (%hash id)))
@@ -501,4 +503,6 @@ values we just set."
   ;; ID-EQUAL is just EQUALP, and ECL's native EQUALP tables compare byte
   ;; vectors by content, so EQUALP is an exact substitute here.
   #+ecl
-  (make-hash-table :test 'equalp :weakness weakness))
+  (make-hash-table :test 'equalp :weakness weakness
+                   #+graph-db-ecl-sync-hash :synchronized
+                   #+graph-db-ecl-sync-hash synchronized))

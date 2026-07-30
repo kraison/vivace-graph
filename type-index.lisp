@@ -22,7 +22,8 @@
    #+ecl (make-hash-table :test 'eq))
   ;; ECL only: the cache is populated LAZILY (see %TI-LIST / #46) rather than
   ;; eagerly for all +MAX-NODE-TYPES+ types at open, so it is written at runtime
-  ;; on first touch.  ECL hash tables aren't synchronized, so guard it.
+  ;; on first touch.  Guarded by an explicit lock rather than :synchronized on
+  ;; CACHE itself, so it also covers ECLs predating that option (GH #101).
   #+ecl (cache-lock (mp:make-lock)))
 
 (defun make-type-index (location heap)
@@ -62,9 +63,9 @@
 
 (defun %ti-list (idx type-id)
   "The index-list for TYPE-ID in IDX.  On ECL the cache is lazy (#46): return the
-cached list or deserialize-and-cache it on first touch, guarding the
-unsynchronized ECL cache table.  On other impls the cache is fully populated at
-make/open, so this is a plain lookup."
+cached list or deserialize-and-cache it on first touch, guarding the cache
+table with an explicit lock (GH #101).  On other impls the cache is fully
+populated at make/open, so this is a plain lookup."
   #+ecl
   (with-lock ((type-index-cache-lock idx))
     (or (gethash type-id (type-index-cache idx))

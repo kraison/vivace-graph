@@ -204,7 +204,9 @@ creation and builds the ordered map on the graph's backend."
                     (setf (secondary-indexes graph)
                           (make-hash-table :test 'equal
                                            #+sbcl :synchronized #+sbcl t
-                                           #+ccl :shared #+ccl t))))
+                                           #+ccl :shared #+ccl t
+                                           #+graph-db-ecl-sync-hash :synchronized
+                                           #+graph-db-ecl-sync-hash t))))
            (key (cons owner-name slot-name)))
       (or (gethash key reg)
           (let ((six (%make-slot-index
@@ -353,7 +355,9 @@ not trigger a spurious rebuild."
                          (setf (secondary-indexes graph)
                                (make-hash-table :test 'equal
                                                 #+sbcl :synchronized #+sbcl t
-                                                #+ccl :shared #+ccl t)))))
+                                                #+ccl :shared #+ccl t
+                                                #+graph-db-ecl-sync-hash :synchronized
+                                                #+graph-db-ecl-sync-hash t)))))
             (dolist (r records)
               (destructuring-bind (owner slot address &optional (backend :skip-list)) r
                 (setf (gethash (cons owner slot) reg)
