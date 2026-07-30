@@ -101,6 +101,7 @@
                 #:geometry-intersects-p
                 #:geometry-contains-geometry-p
                 #:geos-available-p
+                #:geometry-valid-p
                 ;; subset replication
                 #:replication-filter
                 #:make-spatial-replication-filter
