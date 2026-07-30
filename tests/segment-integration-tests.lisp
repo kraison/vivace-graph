@@ -500,7 +500,13 @@ expected vectors."
              (let ((key (cons 'si-doc 'embedding)))
                (let ((s (gethash key (graph-db::vector-segments g))))
                  (when s (graph-db::close-vector-segment s)))
-               (remhash key (graph-db::vector-segments g)))
+               (remhash key (graph-db::vector-segments g))
+               ;; Delete the FILE too.  REBUILD-VECTOR-SEGMENT's real drop does
+               ;; (close / remhash / delete-file); dropping only the registration
+               ;; now means "unregistered but present", which %ENSURE-SEGMENT
+               ;; ADOPTS rather than overwrites (GH #55).
+               (ignore-errors
+                (delete-file (graph-db::%segment-file g 'si-doc 'embedding))))
              (multiple-value-bind (ins skip)
                  (rebuild-vector-segment-batched g 'si-doc 'embedding :batch-size 2)
                (is (= 6 ins) "expected 6 inserted after drop, got ~D" ins)
@@ -543,7 +549,13 @@ checked directly against the owner segment."
              (let ((key (cons 'si-doc 'embedding)))
                (let ((s (gethash key (graph-db::vector-segments g))))
                  (when s (graph-db::close-vector-segment s)))
-               (remhash key (graph-db::vector-segments g)))
+               (remhash key (graph-db::vector-segments g))
+               ;; Delete the FILE too.  REBUILD-VECTOR-SEGMENT's real drop does
+               ;; (close / remhash / delete-file); dropping only the registration
+               ;; now means "unregistered but present", which %ENSURE-SEGMENT
+               ;; ADOPTS rather than overwrites (GH #55).
+               (ignore-errors
+                (delete-file (graph-db::%segment-file g 'si-doc 'embedding))))
              ;; interrupt after the first batch
              (let ((batches 0))
                (ignore-errors
@@ -618,7 +630,13 @@ a separate (SI-SUB . EMBEDDING) segment would appear."
              (let ((key (cons 'si-doc 'embedding)))
                (let ((s (gethash key (graph-db::vector-segments g))))
                  (when s (graph-db::close-vector-segment s)))
-               (remhash key (graph-db::vector-segments g)))
+               (remhash key (graph-db::vector-segments g))
+               ;; Delete the FILE too.  REBUILD-VECTOR-SEGMENT's real drop does
+               ;; (close / remhash / delete-file); dropping only the registration
+               ;; now means "unregistered but present", which %ENSURE-SEGMENT
+               ;; ADOPTS rather than overwrites (GH #55).
+               (ignore-errors
+                (delete-file (graph-db::%segment-file g 'si-doc 'embedding))))
              (multiple-value-bind (ins skip)
                  (rebuild-vector-segment-batched g 'si-doc 'embedding :batch-size 3)
                (is (= 10 ins)
@@ -724,7 +742,13 @@ shape, scaled to a single edge."
              (let ((key (cons 'si-rel 'embedding)))
                (let ((s (gethash key (graph-db::vector-segments g))))
                  (when s (graph-db::close-vector-segment s)))
-               (remhash key (graph-db::vector-segments g)))
+               (remhash key (graph-db::vector-segments g))
+               ;; Delete the FILE too.  REBUILD-VECTOR-SEGMENT's real drop does
+               ;; (close / remhash / delete-file); dropping only the registration
+               ;; now means "unregistered but present", which %ENSURE-SEGMENT
+               ;; ADOPTS rather than overwrites (GH #55).
+               (ignore-errors
+                (delete-file (graph-db::%segment-file g 'si-rel 'embedding))))
              (multiple-value-bind (ins skip)
                  (rebuild-vector-segment-batched g 'si-rel 'embedding)
                (is (= 1 ins) "expected 1 inserted after drop, got ~D" ins)
@@ -1075,3 +1099,63 @@ full target capacity, instead of letting individual doublings signal."
                    "an owner class WITH nodes must still be swept"))
           (close-graph g2 :snapshot-p nil)))
       (collect-garbage))))
+
+;;; ---------------------------------------------------------------------------
+;;; GH #55: %ENSURE-SEGMENT must not create over an existing segment file
+;;; ---------------------------------------------------------------------------
+
+(test ensure-segment-adopts-an-unregistered-file
+  "GH #55: %ENSURE-SEGMENT was a get-or-create keyed on TABLE REGISTRATION only.
+If a segment FILE existed but was not in the graph's VECTOR-SEGMENTS table, it
+called CREATE-VECTOR-SEGMENT, which rewrites the header and free-marks the
+capacity -- destroying the file's contents with no error and no warning.  The
+next scan simply returned fewer results.
+
+Filed as latent, but it was reachable: every memory-graph reopen left every
+segment file unregistered until GH #58, and it is still reachable whenever
+RESTORE-VECTOR-SEGMENTS cannot register a file at open (owner class not yet
+finalized, a re-added :VECTOR-INDEX leaving a stale file, a generated node type).
+
+Reproduces that state directly: write a vector, drop the registration while
+leaving the file on disk, then write again through the normal commit path."
+  (with-temp-directory (dir)
+    (let ((g (make-graph *integration-graph-name* (namestring dir) :buffer-pool-size 1000))
+          (first-id nil)
+          (second-id nil)
+          (key (cons 'si-doc 'embedding)))
+      (unwind-protect
+           (let ((*graph* g))
+             (with-transaction ()
+               (setf first-id (id (make-si-doc :title "first"
+                                               :embedding (%si-embedding 8 1.0)))))
+             ;; Sanity: the live path stored it.
+             (let ((seg (gethash key (graph-db::vector-segments g))))
+               (is (not (null seg)) "the live path must have created the segment")
+               (is (not (null (graph-db::segment-get seg first-id)))
+                   "the first vector must be in the segment before we start"))
+             ;; Drop the REGISTRATION but leave the FILE -- the hazard's state.
+             (let ((seg (gethash key (graph-db::vector-segments g))))
+               (graph-db::close-vector-segment seg))
+             (remhash key (graph-db::vector-segments g))
+             (is (probe-file (graph-db::%segment-file g 'si-doc 'embedding))
+                 "the segment file must still be on disk for this test to mean anything")
+             ;; Now write through the normal path: %ENSURE-SEGMENT runs and finds
+             ;; no table entry.  It must ADOPT the file, not create over it.
+             (handler-bind ((warning #'muffle-warning))   ; the adoption warning
+               (let ((*graph* g))
+                 (with-transaction ()
+                   (setf second-id (id (make-si-doc :title "second"
+                                                    :embedding (%si-embedding 8 2.0)))))))
+             (let ((seg (gethash key (graph-db::vector-segments g))))
+               (is (not (null seg)) "a segment must be registered again")
+               (let ((back (graph-db::segment-get seg first-id)))
+                 (is (not (null back))
+                     "THE BUG: the pre-existing vector was destroyed by creating ~
+                      over its file")
+                 (when back
+                   (is (every #'= (%si-embedding 8 1.0) back)
+                       "the pre-existing vector's CONTENTS were corrupted")))
+               (is (not (null (graph-db::segment-get seg second-id)))
+                   "the newly written vector must also be present")))
+        (ignore-errors (close-graph g :snapshot-p nil))
+        (collect-garbage)))))

@@ -1326,9 +1326,26 @@ segment."
   (let* ((key (cons owner-name slot-name))
          (table (vector-segments graph)))
     (or (gethash key table)
-        (setf (gethash key table)
-              (create-vector-segment (%segment-file graph owner-name slot-name)
-                                     dimension)))))
+        (let ((path (%segment-file graph owner-name slot-name)))
+          (setf (gethash key table)
+                ;; Keyed on the FILE, not only on table registration (GH #55).
+                ;; CREATE-VECTOR-SEGMENT rewrites the header and free-marks the
+                ;; capacity, so creating over an existing file destroys it
+                ;; silently -- and an unregistered file is reachable: whenever
+                ;; RESTORE-VECTOR-SEGMENTS could not register it at open (owner
+                ;; class not yet finalized, a re-added :VECTOR-INDEX leaving a
+                ;; stale file, a lazily generated node type), or on a memory
+                ;; graph before GH #58 made it restore segments at all.
+                (if (probe-file path)
+                    (progn
+                      (warn "Vector segment ~A exists on disk but was not ~
+                             registered at open; adopting it rather than ~
+                             overwriting.  Expect this only if its owner class ~
+                             was undefined or unfinalized when the graph was ~
+                             opened (GH #55)."
+                            path)
+                      (open-vector-segment path))
+                    (create-vector-segment path dimension)))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Enforcement (VALIDATE, pre-durability)
