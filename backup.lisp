@@ -120,6 +120,10 @@ data alist are wrapped too."
 (defmethod backup ((graph graph) location &key include-deleted-p)
   (ensure-directories-exist location)
   (let ((count 0))
+    ;; NOTE: :IF-EXISTS is deliberately left at the implementation default, which
+    ;; DIVERGES -- SBCL errors, ECL silently overwrites.  Pinning it to :ERROR
+    ;; unmasks the constant txn-log snapshot filename ECL's default has been
+    ;; hiding; fix that first (GH #100), then make this explicit.
     (with-open-file (out location :direction :output)
       (map-vertices (lambda (v)
                       (maybe-init-node-data v :graph graph)
@@ -172,15 +176,24 @@ data alist are wrapped too."
 ;;; pre-58f87d6 UUID/hash change was migrated the same way (snapshot + replay).
 ;;; ---------------------------------------------------------------------------
 
+(defun %migration-snapshot-file (name)
+  "A per-run path for MIGRATE-GRAPH's intermediate snapshot.  A name-only path is
+constant across runs, users and processes on a host, so one aborted migration left
+a file that made every later migration of that name die with a bare FILE-EXISTS
+naming a path the caller never chose (GH #98).
+
+Uniqueness comes from a v4 UUID, not from the clock: GETTIMEOFDAY has no #+ecl
+branch and returns NIL there, which would make every ECL path identical -- the
+failure mode this function exists to prevent.  See GH #100."
+  (format nil "~Amigrate-~A-~A.snapshot"
+          (or #+sbcl (sb-ext:native-namestring (uiop:temporary-directory))
+              "/tmp/")
+          name (uuid:make-v4-uuid)))
+
 (defun migrate-graph (name old-location new-location
                       &key (package :graph-db) include-deleted-p
                            (delete-snapshot-p t)
-                           (snapshot-file
-                            (format nil "~A/migrate-~A.snapshot"
-                                    (or #+sbcl (sb-ext:native-namestring
-                                                (uiop:temporary-directory))
-                                        "/tmp/")
-                                    name)))
+                           (snapshot-file (%migration-snapshot-file name)))
   "Migrate a pre-MVCC (v1) graph at OLD-LOCATION to the current (v2) on-disk
 format at NEW-LOCATION, returning the new, open graph.
 
@@ -194,40 +207,51 @@ OLD-LOCATION is left byte-for-byte untouched; NEW-LOCATION must not already hold
 a graph.  The CLOS classes for the graph's node types must already be defined in
 this image (load your DEF-VERTEX / DEF-EDGE forms first).  :INCLUDE-DELETED-P
 carries tombstoned nodes across too; :DELETE-SNAPSHOT-P (default T) removes the
-intermediate snapshot file when done."
+intermediate snapshot file on every exit, including a failed migration.
+
+:SNAPSHOT-FILE defaults to a PER-RUN path under the temporary directory.  It is
+deliberately not keyed on NAME alone: such a path is constant across runs, users
+and processes on a host, so an aborted migration left a file behind that made
+every later migration of that name fail with a bare FILE-EXISTS (GH #98).  Pass
+an explicit path if you want a predictable one."
   (when (equal (namestring (truename (ensure-directories-exist
                                       (merge-pathnames "" old-location))))
                (ignore-errors
                 (namestring (truename (merge-pathnames "" new-location)))))
     (error "MIGRATE-GRAPH: old and new locations must differ (~A)" old-location))
   (let ((old-schema nil))
-    ;; 1. Open the v1 graph read-only (15-byte heads) and snapshot it logically.
-    (let ((*node-head-reader* 'deserialize-node-head-v1))
-      (let ((old (open-graph name old-location
-                             ;; tolerate v1 AND v2 so a re-run is harmless
-                             :accept-versions (list 1 +storage-version+)
-                             :gc-heap-p nil :buffer-pool-p t)))
-        (unwind-protect
-             (let ((*graph* old)) ;; map-vertices' all-types branch reads *graph*
-               (setq old-schema (schema old))
-               (log:info "MIGRATE-GRAPH: snapshotting v1 graph ~A -> ~A"
-                         old-location snapshot-file)
-               (backup old snapshot-file :include-deleted-p include-deleted-p))
-          (close-graph old :snapshot-p nil))))
-    ;; 2. Create the v2 graph, adopt the v1 schema (preserving type-ids), replay.
-    (let ((new (make-graph name new-location)))
-      (handler-case
-          (progn
-            (setf (schema new) old-schema)
-            (restore-schema-locks (schema new))
-            (setf (schema-lock (schema new)) (make-recursive-lock))
-            (save-schema (schema new) new)
-            (log:info "MIGRATE-GRAPH: replaying snapshot into v2 graph ~A"
-                      new-location)
-            (recreate-graph new snapshot-file :package-name package)
-            (when delete-snapshot-p
-              (ignore-errors (delete-file snapshot-file)))
-            new)
-        (error (c)
-          (close-graph new)
-          (error c))))))
+    ;; The snapshot is removed on EVERY exit, not just the success path (GH #98):
+    ;; an abort anywhere below used to leak it, and with the old name-only default
+    ;; path that leaked file then broke the retry the user reaches for next.
+    (unwind-protect
+         (progn
+           ;; 1. Open the v1 graph read-only (15-byte heads) and snapshot it logically.
+           (let ((*node-head-reader* 'deserialize-node-head-v1))
+             (let ((old (open-graph name old-location
+                                    ;; tolerate v1 AND v2 so a re-run is harmless
+                                    :accept-versions (list 1 +storage-version+)
+                                    :gc-heap-p nil :buffer-pool-p t)))
+               (unwind-protect
+                    (let ((*graph* old)) ;; map-vertices' all-types branch reads *graph*
+                      (setq old-schema (schema old))
+                      (log:info "MIGRATE-GRAPH: snapshotting v1 graph ~A -> ~A"
+                                old-location snapshot-file)
+                      (backup old snapshot-file :include-deleted-p include-deleted-p))
+                 (close-graph old :snapshot-p nil))))
+           ;; 2. Create the v2 graph, adopt the v1 schema (preserving type-ids), replay.
+           (let ((new (make-graph name new-location)))
+             (handler-case
+                 (progn
+                   (setf (schema new) old-schema)
+                   (restore-schema-locks (schema new))
+                   (setf (schema-lock (schema new)) (make-recursive-lock))
+                   (save-schema (schema new) new)
+                   (log:info "MIGRATE-GRAPH: replaying snapshot into v2 graph ~A"
+                             new-location)
+                   (recreate-graph new snapshot-file :package-name package)
+                   new)
+               (error (c)
+                 (close-graph new)
+                 (error c)))))
+      (when delete-snapshot-p
+        (ignore-errors (delete-file snapshot-file))))))
