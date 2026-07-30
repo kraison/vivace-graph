@@ -31,6 +31,11 @@
   skip-list
   (lock (make-rw-lock))
   lookup-fn
+  ;; The (map-code . reduce-code) the cached MAP-FN/REDUCE-FN were built from, so
+  ;; COMPILE-VIEW-CODE can skip a recompile that would produce identical functions
+  ;; (GH #89).  Transient: SAVE-VIEWS persists an explicit field alist, not the
+  ;; struct, so this never reaches disk.
+  compiled-from
   (sort-order :lessp))
 
 (defun yield (key value)
@@ -316,11 +321,31 @@ once per entry you want the node to contribute (zero, one, or many times)."
 |#
 
 (defmethod compile-view-code ((view view))
-  (setf (view-map-fn view)
-        (eval (read-from-string (view-map-code view))))
-  (when (view-reduce-code view)
-    (setf (view-reduce-fn view)
-          (eval (read-from-string (view-reduce-code view))))))
+  "Compile the view's map/reduce source into functions, memoized on the SOURCE.
+
+ADD-TO-VIEW calls this on EVERY node addition, and it used to READ-FROM-STRING
+and EVAL unconditionally -- invoking the reader and the compiler once per view
+per node to rebuild functions that had not changed.  That was ~77% of with-view
+write time and ~193 KB/node of pure garbage (GH #89).
+
+Keyed on the source rather than on (FUNCTIONP MAP-FN), so a redefined view still
+recompiles: the bare functionp guard would cache the first compile forever.
+
+Deliberately unlocked, like %NODE-SLOT-INFO's cache: two threads racing here
+compile equal functions and one wins, which is harmless.  What must not happen is
+publishing COMPILED-FROM before the functions it describes, so it is set LAST --
+otherwise another thread could skip the compile while the functions are stale."
+  (let ((key (cons (view-map-code view) (view-reduce-code view))))
+    (unless (and (functionp (view-map-fn view))
+                 (equal key (view-compiled-from view)))
+      (setf (view-map-fn view)
+            (eval (read-from-string (view-map-code view))))
+      ;; Assigned unconditionally so dropping a view's :REDUCE clears the stale
+      ;; function rather than leaving the old one bound.
+      (setf (view-reduce-fn view)
+            (when (view-reduce-code view)
+              (eval (read-from-string (view-reduce-code view)))))
+      (setf (view-compiled-from view) key))))
 
 (defun reduce-equal (key1 key2)
   ;;(log:debug "REDUCE-EQUAL ~S < ~S" key1 key2)
