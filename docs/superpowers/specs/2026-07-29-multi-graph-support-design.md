@@ -193,6 +193,21 @@ exists to remove.
 Cross-graph reads are therefore available from a read-only snapshot or from no
 transaction at all — never from inside a read-write transaction.
 
+**Scope of "a read" here: through the transactional path, not literally every read.**
+§3's "touching a node ... read or write, signals" means every access that funnels through
+`LOOKUP-OBJECT` (so `LOOKUP-VERTEX`/`LOOKUP-EDGE` and typed scans) or through a mutation
+entry point (`CREATE-NODE`, `SAVE`/`UPDATE-NODE`, `DELETE-NODE`/`MARK-DELETED`). Two paths
+read a node's storage without going through that check and are accepted carve-outs, not
+gaps to close: `COPY-NODE`'s `MAYBE-INIT-NODE-DATA`, which resolves through the node's own
+home graph and so can fault in bytes from a graph other than the active transaction's (the
+misuse is still caught one step later, at the following `SAVE`); and the fully untyped
+`MAP-VERTICES`/`MAP-EDGES` scan (no `:VERTEX-TYPE`), which walks the lhash directly and
+never reaches `LOOKUP-OBJECT` — consistent with the already-documented, pre-existing
+carve-out that untyped scans bypass MVCC entirely and are meant for quiescent, read-only
+passes (manual, Chapter 12, "A note on scans"). Scanning a foreign graph that way from inside a
+read-write transaction reads without a pin; that is the caller's responsibility, not
+something the engine checks (tracked as GH #96, disposition: document, not close).
+
 That is the enforcement point, and it is the exact site that returns `NIL` today.
 
 Write enforcement sits at `SAVE` / `UPDATE-NODE` / `DELETE-NODE` / `MARK-DELETED`,

@@ -1047,6 +1047,16 @@ this test isolated to the write check it is about."
           "the foreign delete must not have landed")
       gc)))
 
+(test read-write-transaction-rejects-a-foreign-create
+  "CREATE-NODE ignored its GRAPH argument and ENSURE-TRANSACTION reused the
+ambient *TRANSACTION*, so a node stamped :GRAPH GA inside a transaction opened
+on GB was written into GB silently -- the create-path hole closed by GH #96."
+  (with-three-graphs (ga gb gc)
+    (signals graph-db:cross-graph-transaction-error
+      (with-transaction ((graph-db::transaction-manager gb))
+        (make-mg-plain :label "misrouted" :graph ga)))
+    gc))
+
 (test cross-graph-error-report-is-readable-on-the-read-path
   "The read path stores a raw id byte vector in the NODE slot, not a node
 object (see the TRANSACTION method of LOOKUP-OBJECT); the report must print it

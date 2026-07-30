@@ -2507,6 +2507,25 @@ and it reads these patched bytes, never the .txn files)."
 
 (defgeneric create-node (node graph)
   (:method (node graph)
+    ;; A read-write transaction is single-graph (GH #53).  ENSURE-TRANSACTION
+    ;; reuses the ambient *TRANSACTION* rather than one scoped to GRAPH, so
+    ;; without this check a node stamped :GRAPH GA inside a transaction on GB
+    ;; is created and silently written into GB (GH #96).  The :AROUND
+    ;; guarantees *TRANSACTION* is bound here, so no guard on it.
+    ;;
+    ;; Only a user-level TX carries a graph.  RECOVERY-TRANSACTION does not
+    ;; (only its REPLICATED-TRANSACTION subclass does), and logical-snapshot
+    ;; replay re-creates nodes through this same public constructor path under
+    ;; a RESTORE-TRANSACTION -- so the test is load-bearing, not defensive:
+    ;; reading GRAPH unconditionally is a NO-APPLICABLE-METHOD on every replay.
+    ;; Replay targets GRAPH by construction and has no second graph to disagree
+    ;; with.  Tested positively on TX because RECOVERY-TRANSACTION is defined
+    ;; further down this file.
+    (when (typep *transaction* 'tx)
+      (let ((txn-graph (graph *transaction*)))
+        (unless (eq graph txn-graph)
+          (error 'cross-graph-transaction-error
+                 :node node :transaction-graph txn-graph :node-graph graph))))
     (%create-node node graph *transaction*)))
 
 (defmethod create-node :around (node graph)

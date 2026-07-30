@@ -2410,6 +2410,21 @@ To write to several graphs, use one transaction per graph and sequence them your
 committed, and nothing rolls it back. Design for that, or keep the invariant inside one
 graph.
 
+*** The rule covers the transactional path, not literally every read
+
+"Touching a node ... signals" means every read that resolves through ~lookup-object~
+(~lookup-vertex~, ~lookup-edge~, and any typed scan built on them) and every mutation entry
+point — ~create-node~, ~save~/~update-node~, ~delete-node~/~mark-deleted~. Two call paths
+read a node's storage without going through that check. ~copy~'s ~maybe-init-node-data~ may
+fault a node's bytes in from its own home graph's heap while a read-write transaction on a
+*different* graph is active; the misuse is still caught one step later, at the following
+~save~. And a fully untyped ~map-vertices~/~map-edges~ scan (no ~:vertex-type~) walks the
+lhash directly and never reaches ~lookup-object~ — consistent with "A note on scans" in
+Chapter 12, which documents that untyped scans bypass MVCC entirely and are meant for
+quiescent, read-only passes. Scanning a foreign graph that way from inside a read-write
+transaction reads without a pin; the result is correct only if the other graph is quiescent,
+and that is the caller's responsibility, not something the engine checks.
+
 *** Read-only snapshots are per graph and compose
 
 ~with-read-snapshot~ records its snapshot per graph, so several may be active at once. A
