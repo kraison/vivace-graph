@@ -9,7 +9,9 @@
 (in-suite io-suite)
 
 (defun write-temp-file (content ext)
-  (let ((path (merge-pathnames (format nil "gda-io-~36R.~A" (random (expt 36 10)) ext)
+  ;; SCRATCH-TAG, not a bare (RANDOM ...): SBCL's default *RANDOM-STATE* is
+  ;; constant, so concurrent runs would pick the same name.
+  (let ((path (merge-pathnames (format nil "gda-io-~A.~A" (scratch-tag) ext)
                                (uiop:temporary-directory))))
     (with-open-file (out path :direction :output :if-exists :supersede
                               :if-does-not-exist :create)

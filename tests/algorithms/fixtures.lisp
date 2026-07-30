@@ -23,10 +23,25 @@
 
 ;;; ---- scratch graph lifecycle -------------------------------------
 
+;; SBCL's initial *RANDOM-STATE* is a fixed constant, so an unseeded (RANDOM ...)
+;; produces the SAME name sequence in every image: two concurrent suite runs on a
+;; shared host would share -- and delete -- each other's scratch dirs.  Seed from
+;; entropy, lazily so a dumped image reseeds in each new process, and add a
+;; counter so one image can never repeat a name either.
+(defvar *scratch-random-state* nil)
+(defvar *scratch-counter* 0)
+
+(defun scratch-tag ()
+  "A name fragment unique across concurrent processes and across calls."
+  (unless *scratch-random-state*
+    (setf *scratch-random-state* (make-random-state t)))
+  (format nil "~36R-~36R"
+          (random (expt 36 12) *scratch-random-state*)
+          (incf *scratch-counter*)))
+
 (defun make-temp-directory ()
-  (let ((dir (merge-pathnames
-              (format nil "gda-test-~36R/" (random (expt 36 12)))
-              (uiop:temporary-directory))))
+  (let ((dir (merge-pathnames (format nil "gda-test-~A/" (scratch-tag))
+                              (uiop:temporary-directory))))
     (ensure-directories-exist dir)
     dir))
 

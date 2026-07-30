@@ -109,9 +109,15 @@ node, its slot data, the subclass, and the edge topology."
       ;; v2 code refuses to open the v1 graph directly (the format gate).
       (signals error (graph-db:open-graph :mvcc-mig-guard old-dir
                                           :buffer-pool-p nil :gc-heap-p nil))
-      ;; ...but MIGRATE-GRAPH brings it forward to v2.
+      ;; ...but MIGRATE-GRAPH brings it forward to v2.  Its default snapshot-file
+      ;; is a FIXED path (<tmp>/migrate-<name>.snapshot) and BACKUP opens it with
+      ;; :if-exists :error, so one aborted run poisons every later run on a shared
+      ;; host with FILE-EXISTS.  Keep the snapshot inside our per-run temp tree.
       (let ((g (graph-db::migrate-graph :graph-db-mvcc-migration old-dir new-dir
-                                        :package :graph-db/test)))
+                                        :package :graph-db/test
+                                        :snapshot-file
+                                        (namestring
+                                         (merge-pathnames "migrate.snapshot" root)))))
         (unwind-protect
              (let ((*graph* g))
                (is (= 2 graph-db::+storage-version+)

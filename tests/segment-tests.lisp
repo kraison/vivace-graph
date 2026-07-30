@@ -8,8 +8,11 @@
 
 (in-suite segment-suite)
 
+;; GET-INTERNAL-REAL-TIME is measured from image start on SBCL/ECL, so it is NOT
+;; unique across processes -- and CREATE-VECTOR-SEGMENT maps an existing file
+;; rather than truncating it, so a collision is silent corruption, not an error.
 (defun %seg-path ()
-  (format nil "/var/tmp/vgseg-~a.dat" (get-internal-real-time)))
+  (namestring (make-temp-file-name "vgseg" "dat")))
 
 (test segment-create-and-reopen-header
   "A created segment's header (dimension, capacity, live-count) survives close and reopen."

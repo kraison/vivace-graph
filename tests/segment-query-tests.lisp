@@ -9,8 +9,9 @@
 
 (in-suite segment-query-suite)
 
+;; Unique per process, not per image-relative clock -- see %SEG-PATH.
 (defun %qpath ()
-  (format nil "/var/tmp/vgquery-~a.dat" (get-internal-real-time)))
+  (namestring (make-temp-file-name "vgquery" "dat")))
 
 (defun %qvec (dim &rest floats)
   "A DIM-long single-float vector from FLOATS, zero-padded."
