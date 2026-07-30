@@ -833,17 +833,32 @@ as deferred blobs and materialize on first touch (needs a VG-native image)."
       ;; Restore the checkpoint, then replay the journal tail committed after it.
       ;; Recovery runs BEFORE the transaction-manager is installed (the reaper
       ;; tolerates the unbound slot); the retain hook keeps the journal.
-      (if (eq (restore-memory-image graph) :structural)
-          ;; v2 image: views/indexes/spatial were restored structurally.  Create +
-          ;; populate the views from the image dump, THEN replay the journal tail so
-          ;; its authored ops update the already-restored derived structures
-          ;; incrementally (fast open -- no map/reduce regen; #50).
-          (progn (restore-views graph)
-                 (recover-transactions graph))
-          ;; v1 / no image: load the journal tail into the tables first, then
-          ;; rebuild views in-RAM from ALL restored nodes (rebuild-on-open fallback).
-          (progn (recover-transactions graph)
-                 (restore-views graph)))
+      (let ((image-restore-result (restore-memory-image graph)))
+        ;; Vector segments (GH #58): reopen-or-rebuild BEFORE any journal
+        ;; replay, mirroring OPEN-GRAPH.  RECOVER-TRANSACTIONS replays through
+        ;; the shared APPLY-TRANSACTION, which maintains segments via
+        ;; %ENSURE-SEGMENT -- and an unregistered (owner . slot) there
+        ;; unconditionally CREATE-VECTOR-SEGMENTs over any same-named file
+        ;; already on disk, destroying it.  RESTORE-MEMORY-IMAGE above has
+        ;; already populated the type index (structurally, or via the v1
+        ;; rebuild-from-nodes fallback) for either branch below, so a rebuild
+        ;; here sweeps the right checkpoint-time corpus; replay then updates
+        ;; the segment(s) incrementally, same story as the spatial index.
+        ;; Skipped on a LAZY graph, same reason RESTORE-SECONDARY-INDEXES is
+        ;; skipped below: a rebuild sweep would materialize every LZNODE blob.
+        (unless (lazy-p graph)
+          (restore-vector-segments graph))
+        (if (eq image-restore-result :structural)
+            ;; v2 image: views/indexes/spatial were restored structurally.  Create +
+            ;; populate the views from the image dump, THEN replay the journal tail so
+            ;; its authored ops update the already-restored derived structures
+            ;; incrementally (fast open -- no map/reduce regen; #50).
+            (progn (restore-views graph)
+                   (recover-transactions graph))
+            ;; v1 / no image: load the journal tail into the tables first, then
+            ;; rebuild views in-RAM from ALL restored nodes (rebuild-on-open fallback).
+            (progn (recover-transactions graph)
+                   (restore-views graph))))
       ;; Reconcile the declarative view registry (issue #49) after views are
       ;; restored AND the journal tail is replayed, so any regenerate sees all nodes.
       (install-views graph)

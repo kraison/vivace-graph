@@ -53,6 +53,12 @@ fault-on-access invariant.  Call at the start of any test that reopens a graph."
   ((label :type string :index t))
   :graph-db-memory-test)
 
+;; A :vector-index slot, for the vector-segment reopen test below (GH #58).
+(def-vertex m-doc ()
+  ((title :type string)
+   (embedding :vector-index t))
+  :graph-db-memory-test)
+
 (defmacro with-test-memory-graph ((g) &body body)
   "Fresh memory-graph in a temp dir; closed (no checkpoint) + GC'd afterward."
   (let ((dir (gensym "DIR")))
@@ -200,6 +206,43 @@ is rebuilt on reopen."
              (let ((hits (graph-db::spatial-index-query-bbox
                           (graph-db::spatial-index-for g2 'm-place 'geom) 22.0d0 48.0d0 40.0d0 51.0d0)))
                (is (= 2 (length hits))))
+          (ignore-errors (close-graph g2 :snapshot-p nil))
+          (collect-garbage))))))
+
+;;; --- vector segments -----------------------------------------------------
+
+(defun %m-embedding (dim base)
+  (let ((v (make-array dim :element-type 'single-float)))
+    (dotimes (i dim v) (setf (aref v i) (coerce (+ base (* 0.01 i)) 'single-float)))))
+
+(test vector-segment-survives-reopen
+  "GH #58: a :vector-index slot's segment must survive a clean close/reopen of a
+memory graph, not just live while the image is up.  OPEN-MEMORY-GRAPH did not
+call RESTORE-VECTOR-SEGMENTS at all, so before the fix VECTOR-SEARCH returns
+nothing on the reopened graph even though the segment file (written by ordinary
+live maintenance, same as the on-disk backend) is sitting right there on disk."
+  (with-temp-directory (dir)
+    (let ((loc (namestring dir)) near far)
+      (let ((g (graph-db::make-memory-graph *mem-test-graph-name* loc)))
+        (let ((*graph* g))
+          (with-transaction ()
+            (setq near (id (make-m-doc :title "near" :embedding (%m-embedding 8 1.0))))
+            (setq far (id (make-m-doc :title "far" :embedding (%m-embedding 8 50.0)))))
+          ;; Confirm the segment is live and correct BEFORE the reopen, so a
+          ;; later empty result can only be the reopen's fault.
+          (let ((hits (vector-search g 'm-doc 'embedding (%m-embedding 8 1.0) 5)))
+            (is (= 2 (length hits)))))
+        (close-graph g :snapshot-p t))
+      (let ((g2 (graph-db::open-memory-graph *mem-test-graph-name* loc)))
+        (unwind-protect
+             (let ((hits (vector-search g2 'm-doc 'embedding (%m-embedding 8 1.0) 5)))
+               (is (= 2 (length hits))
+                   "vector segment did not survive the reopen -- got ~S" hits)
+               (is (member far (mapcar #'cdr hits) :test #'equalp)
+                   "the far doc ~A is missing from the reopened segment" far)
+               (when hits
+                 (is (equalp near (cdr (first hits)))
+                     "the nearest doc should rank first; got ~S" hits)))
           (ignore-errors (close-graph g2 :snapshot-p nil))
           (collect-garbage))))))
 
