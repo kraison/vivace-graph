@@ -17,12 +17,18 @@
                 (values :data-integrity-issues
                         problems)))
             (progn
-              (multiple-value-bind (sec msec) #+sbcl(sb-ext:get-time-of-day) #-sbcl(gettimeofday)
-                (let ((snap-file (format nil "~A/txn-log/snap-~D.~6,'0D"
-                                         (location graph) sec msec)))
-                  (setq count (backup graph
-                                      snap-file
-                                      :include-deleted-p include-deleted-p))))
+              ;; Uniqueness comes from the UUID, never the clock (GH #100): the
+              ;; old sec.usec name was NIL.NIL on ECL -- one constant filename
+              ;; whose snapshots silently overwrote each other -- and even where
+              ;; the clock works, two closes inside one microsecond collide.
+              ;; FIND-NEWEST-SNAPSHOT orders by FILE-WRITE-DATE, not by name, so
+              ;; the timestamp here is only for humans reading the directory.
+              (let ((snap-file (format nil "~A/txn-log/snap-~D-~A"
+                                       (location graph) (get-universal-time)
+                                       (uuid:make-v4-uuid))))
+                (setq count (backup graph
+                                    snap-file
+                                    :include-deleted-p include-deleted-p)))
               count))))))
 
 (defun find-newest-snapshot (dir)

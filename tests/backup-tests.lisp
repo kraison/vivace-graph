@@ -486,3 +486,42 @@ restores only the live nodes."
                      "deleted vertex should not have been restored"))
             (close-graph g2 :snapshot-p nil)
             (collect-garbage)))))))
+
+;;; ---------------------------------------------------------------------------
+;;; GH #100: snapshot filenames must not come from the clock
+;;; ---------------------------------------------------------------------------
+
+(test gettimeofday-returns-two-integer-values
+  "GH #100: every branch must return (VALUES SECONDS MICROSECONDS).  ECL had no
+branch at all, so the whole body was empty and the call returned NIL -- which
+then formatted into a snapshot filename as the literal \"NIL\"."
+  (multiple-value-bind (sec usec) (graph-db::gettimeofday)
+    (is (integerp sec) "seconds must be an integer, got ~S" sec)
+    (is (integerp usec) "microseconds must be an integer, got ~S" usec)
+    ;; Sanity: seconds since the epoch, not a fraction and not a nanosecond count.
+    (is (> sec 1700000000) "seconds looks wrong for a Unix epoch time: ~S" sec)
+    (is (<= 0 usec 999999) "microseconds out of range: ~S" usec)))
+
+(test repeated-snapshots-do-not-overwrite-each-other
+  "GH #100: the txn-log snapshot name was built from GETTIMEOFDAY, which returns
+NIL on ECL -- so every snapshot of a graph wrote to ONE constant filename and
+silently replaced its predecessor (ECL's :IF-EXISTS default overwrites).  Two
+snapshots must leave two files."
+  (with-temp-directory (dir)
+    (let ((g (make-graph *integration-graph-name* (namestring dir)
+                         :buffer-pool-size 1000)))
+      (unwind-protect
+           (let ((*graph* g))
+             (with-transaction () (make-bk-vec :label "a"))
+             (graph-db::snapshot g :check-data-integrity-p nil)
+             (with-transaction () (make-bk-vec :label "b"))
+             (graph-db::snapshot g :check-data-integrity-p nil)
+             (let ((snaps (directory
+                           (merge-pathnames "txn-log/snap-*"
+                                            (uiop:ensure-directory-pathname
+                                             (namestring dir))))))
+               (is (= 2 (length snaps))
+                   "expected 2 distinct snapshot files, got ~D: ~S"
+                   (length snaps) (mapcar #'file-namestring snaps))))
+        (ignore-errors (close-graph g :snapshot-p nil))
+        (collect-garbage)))))

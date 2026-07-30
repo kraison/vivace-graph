@@ -120,11 +120,12 @@ data alist are wrapped too."
 (defmethod backup ((graph graph) location &key include-deleted-p)
   (ensure-directories-exist location)
   (let ((count 0))
-    ;; NOTE: :IF-EXISTS is deliberately left at the implementation default, which
-    ;; DIVERGES -- SBCL errors, ECL silently overwrites.  Pinning it to :ERROR
-    ;; unmasks the constant txn-log snapshot filename ECL's default has been
-    ;; hiding; fix that first (GH #100), then make this explicit.
-    (with-open-file (out location :direction :output)
+    ;; The implementation default DIVERGES -- SBCL errors, ECL silently
+    ;; overwrites -- so a user's backup was destroyed on one and protected on the
+    ;; other.  Pinned to :ERROR (GH #100).  Safe only now that no caller derives a
+    ;; backup path from the clock; ECL's permissive default was what hid the
+    ;; constant txn-log snapshot name.
+    (with-open-file (out location :direction :output :if-exists :error)
       (map-vertices (lambda (v)
                       (maybe-init-node-data v :graph graph)
                       (incf count)

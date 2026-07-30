@@ -33,9 +33,16 @@
                 (tz :pointer))
              :result-type :int)
 (defun gettimeofday ()
+  "Wall-clock time since the Unix epoch as (VALUES SECONDS MICROSECONDS).
+EVERY branch returns those two values, in those units (GH #100).  It previously
+returned a single rational on SBCL and two values on CCL, and multiplied the
+microseconds by 1000 on LispWorks, so no caller could be correct everywhere; ECL
+had no branch at all, making the whole body empty and the result NIL.
+
+The final branch is the portable CFFI implementation, so an implementation with
+no native arm gets a correct answer rather than silently falling through to NIL."
   #+sbcl
-  (multiple-value-bind (sec msec) (sb-ext:get-time-of-day)
-    (+ sec (/ msec 1000000)))
+  (sb-ext:get-time-of-day)
   #+(and ccl (not windows))
   (ccl:rlet ((tv :timeval))
             (let ((err (ccl:external-call "gettimeofday" :address tv :address (ccl:%null-ptr) :int)))
@@ -54,7 +61,11 @@
               (fli:foreign-slot-value tv 'tv-usec
                                       :type 'suseconds-t
                                       :object-type '(:struct timeval))))
-        (values secs (* 1000 usecs))))))
+        ;; tv_usec is MICROseconds; the old (* 1000 usecs) returned nanoseconds
+        ;; and disagreed with every other branch.  Untested -- no LispWorks here.
+        (values secs usecs))))
+  #-(or sbcl (and ccl (not windows)) lispworks)
+  (%posix-gettimeofday))
 
 (defvar *unix-epoch-difference*
   (encode-universal-time 0 0 0 1 1 1970 0))

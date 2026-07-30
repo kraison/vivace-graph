@@ -42,7 +42,9 @@
                (:file "globals" :depends-on ("package"))
                (:file "conditions" :depends-on ("package"))
                (:file "posix" :depends-on ("package"))
-               (:file "utilities" :depends-on ("globals"))
+               ;; "posix" for %POSIX-GETTIMEOFDAY, the portable fallback arm of
+               ;; GETTIMEOFDAY (GH #100).
+               (:file "utilities" :depends-on ("globals" "posix"))
                (:file "queue" :depends-on ("utilities"))
                (:file "mailbox" :depends-on ("queue"))
                #+(or sbcl lispworks ecl) (:file "rw-lock" :depends-on ("queue"))
