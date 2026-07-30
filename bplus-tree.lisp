@@ -397,13 +397,17 @@ EXACT-P is true when key[IDX] = DKEY."
     (buf-u64 buf (+ slot 2 (buf-u16 buf slot)))))
 
 (defun %bpt-descend-leaf-addr (tree dkey)
-  "Return the address of the leaf that would hold DKEY, binary-searching each
-internal node without decoding it wholesale."
+  "Return (values LEAF-ADDR LEAF-BUF), binary-searching each internal node
+without decoding it wholesale.  Returning the leaf's already-read BUF (not just
+its address) matters: every caller used to immediately re-issue %BPT-READ-PAGE
+on this same address, paying a second full-page memcpy + fresh allocation for a
+page this function had just read -- one wasted ~page-size cons on every point
+lookup, insert/delete descent, and range-cursor open (GH #97 localization)."
   (let ((addr (%bpt-root tree)))
     (loop
       (let ((buf (%bpt-read-page tree addr)))
         (if (%bpt-leaf-p buf)
-            (return addr)
+            (return (values addr buf))
             (let ((n (buf-u16 buf +bpt-p-count-offset+)))
               (multiple-value-bind (idx exact) (%bpt-page-bsearch tree buf n dkey)
                 (declare (ignore exact))
@@ -419,8 +423,7 @@ internal node without decoding it wholesale."
   "Return (values LEAF-ADDR LEAF-BUF LEAF-LINK LEAF-ENTRIES) for the leaf that
 would hold DKEY.  Internal nodes are binary-searched (not decoded); only the
 final leaf is decoded into entries (its caller needs them)."
-  (let* ((addr (%bpt-descend-leaf-addr tree dkey))
-         (buf (%bpt-read-page tree addr)))
+  (multiple-value-bind (addr buf) (%bpt-descend-leaf-addr tree dkey)
     (multiple-value-bind (leaf-p link entries) (%bpt-decode-page tree buf)
       (declare (ignore leaf-p))
       (values addr buf link entries))))
@@ -432,9 +435,9 @@ final leaf is decoded into entries (its caller needs them)."
 (defun %bpt-find (tree dkey)
   "Return (values SVAL FOUND-P) for DKEY -- SVAL is the raw serialized value.
 Fully lean: binary-search all the way down, decode only the one matching cell."
-  (let ((addr (%bpt-descend-leaf-addr tree dkey)))
-    (let* ((buf (%bpt-read-page tree addr))
-           (n (buf-u16 buf +bpt-p-count-offset+)))
+  (multiple-value-bind (addr buf) (%bpt-descend-leaf-addr tree dkey)
+    (declare (ignore addr))
+    (let ((n (buf-u16 buf +bpt-p-count-offset+)))
       (multiple-value-bind (idx exact) (%bpt-page-bsearch tree buf n dkey)
         (if exact
             (let* ((slot (buf-u16 buf (+ +bpt-p-slots-offset+ (* idx 2))))
@@ -856,9 +859,9 @@ Merges underfull pages on the way up and collapses a degenerate root."
 (defun %bpt-leaf-at (tree dkey)
   "Return (values BUF COUNT NEXT-ADDR START-INDEX) positioned at the first
 entry with key >= DKEY in the leaf that would hold DKEY."
-  (let ((addr (%bpt-descend-leaf-addr tree dkey)))
-    (let* ((buf (%bpt-read-page tree addr))
-           (count (buf-u16 buf +bpt-p-count-offset+))
+  (multiple-value-bind (addr buf) (%bpt-descend-leaf-addr tree dkey)
+    (declare (ignore addr))
+    (let* ((count (buf-u16 buf +bpt-p-count-offset+))
            (link (buf-u64 buf +bpt-p-link-offset+)))
       (multiple-value-bind (idx exact) (%bpt-page-bsearch tree buf count dkey)
         (declare (ignore exact))
