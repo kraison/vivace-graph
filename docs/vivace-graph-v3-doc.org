@@ -1020,11 +1020,18 @@ Let's assume we have a helper Lisp function, `(haversine-distance lat1 lon1 lat2
 In this advanced pattern, the custom functor acts as an efficient, domain-specific index. It bridges the gap between the declarative query language and the high-performance, procedural code needed to implement custom access paths, giving you the best of both worlds.
 
 
-** Chapter 8: Indexing with Views
+** Chapter 8: Indexing (Views, Ordered, Unique and Vector Indexes)
 
 You've seen how to create nodes and query them using the Prolog engine. But what happens when your graph grows to millions of nodes? Searching for a user by their username by iterating through every single user in the database, as we did in the last chapter, will become unacceptably slow.
 
-This is the exact problem that indexes solve in a traditional relational database. In VivaceGraph, the equivalent and more powerful concept is the *view*. This chapter will teach you how to use views to make your queries fast and to perform powerful data aggregations.
+This is the exact problem that indexes solve in a traditional relational database. VivaceGraph offers four kinds of secondary index, and this chapter covers all of them:
+
+- *Views* (~def-view~) — the most general: an arbitrary ~:map~ function decides what a node contributes, and an optional ~:reduce~ aggregates. Reach for these when the index key is computed rather than simply stored.
+- *General ordered indexes* (~:index~ / ~def-index~) — the simplest: index a slot by its value, for equality and range lookups, with no map function to write.
+- *Unique constraints* (~:unique~) — an ordered index that additionally *enforces* uniqueness at the commit boundary.
+- *Vector indexes* (~:vector-index~) — dense embeddings with cosine kNN search.
+
+If you just want "find the user whose email is X", the general ordered index is what you want, and it is a one-word slot annotation; see "General ordered indexes" below. Views are the more powerful tool for when that is not enough.
 
 *** The "Why": Avoiding Full Graph Scans
 

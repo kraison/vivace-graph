@@ -94,7 +94,70 @@ between releases; cutting a release renames it to the new version and dates it.
   of class symbols, or `:all`, and type-filters the yielded nodes, so the `is-a`
   goal these queries once needed is gone.
 
+- **General ordered indexes — index a slot by its value (`:index` / `def-index`).**
+  The non-unique counterpart to `:unique`, built on the same machinery. Annotate a
+  slot with `(slot :index t)`, or `(slot :index string-downcase)` to index a
+  canonicalized value; or declare it away from the class with
+  `(def-index user email :social-app :canonicalize string-downcase)`, which is
+  declarative and idempotent like `def-view` and may even be evaluated before its
+  graph exists. Query with `index-lookup` (equality), `index-range` and `map-index`
+  (ordered ranges). An index on a class covers that class *and its subclasses*,
+  rooted where it is declared. Maintained on the commit path and durable — its root
+  is persisted in a sidecar and reopened by address, not rebuilt by scanning every
+  node at open — on either ordered-map backend. Admin entry points:
+  `rebuild-secondary-indexes`, `regenerate-secondary-indexes`. Manual: Chapter 8,
+  "General ordered indexes".
+  - *Not yet reachable from Prolog* — there is no index-backed generator predicate,
+    so a Prolog query still generates candidates by type and filters them. Tracked
+    in #102.
+
+- **`:spatial-index-backend` — choose the ordered-map backend for spatial indexes
+  independently of the rest of the graph.** A graph can keep `:index-backend
+  :bplus-tree` for views and `:unique` while running spatial on the skip list,
+  which measurements favour for spatial workloads (#91).
+
+- **`:ephemeral` slot option now works** (#90). A slot declared `:ephemeral t` is
+  per-instance state that is never written to disk — ordinary CLOS storage, absent
+  from everything the node serializes. It had no effect at all previously: such
+  slots were categorized persistent and stored like any other, and
+  `ephemeral-slot-names` returned `NIL` for every node class. Nothing declared
+  `:ephemeral` anywhere, so no existing graph changes. Give ephemeral slots an
+  `:initform`: an unset persistent slot reads back as `NIL`, but an unset ephemeral
+  slot is an unbound CLOS slot and signals. Manual: "Persistent, ephemeral and meta
+  slots".
+
 ### Changed
+
+#### Performance
+
+- **A view's map/reduce source is compiled once, not once per node** (#89).
+  `add-to-view` called `compile-view-code` on every node addition, and that
+  read-from-string'd and eval'd the source unconditionally — invoking the reader and
+  the compiler once per view per node to rebuild functions that had not changed.
+  Measured on 2,000 vertices with one map-reduce view: **~3.6x faster writes and ~85%
+  less allocation** (0.90 -> 0.25 ms/node, 227 KB -> 34 KB per node), on the write path
+  every ingest pays. Memoized on the source, so a redefined view still recompiles.
+
+- **Point-in-polygon no longer boxes every coordinate** (#86). The packed
+  double-float path was allocating a fresh boxed float per coordinate; type
+  declarations on a private kernel, with coercion at the public boundary, removed it.
+  47 KB per call -> 0, and one profiler workload went from 300.6 MB to 33.1 MB.
+
+- **Slot categorization is computed once per class, not per slot access** (#87).
+  `persistent-p` / `ephemeral-p` / `meta-p` answers are fixed once a class is
+  finalized, but the name lists were walked and freshly consed on every access —
+  roughly 28 rebuilds per node materialized, 26.4 MB of throwaway lists in one
+  profiler workload. Now cached per class, invalidated on redefinition.
+
+- **The B+ tree stops re-reading the leaf page its descent just read** (#97).
+  `%bpt-descend-leaf-addr` read the leaf to test its flag and discarded the buffer, so
+  every caller immediately re-read the same page — one wasted full-page copy per point
+  lookup, insert descent, delete descent and range-cursor open. Saves ~10 KB per
+  spatial query at the measured shape. The larger cause — no page cache across a
+  query's covering cells — remains open in #97.
+
+#### Other
+
 - **`*TRANSACTION*` is `NIL` inside a read-only snapshot** (`with-read-snapshot`,
   and `select`/`do-query` with `:snapshot t`). A snapshot now populates the new,
   exported `*read-snapshots*` instead of binding `*transaction*`, so code that
@@ -110,79 +173,8 @@ between releases; cutting a release renames it to the new version and dates it.
   joining a snapshot that was never going to commit — a correctness fix, but a
   visible behavior change for any code relying on the old silent join.
 
-### Removed
-- **BREAKING: `spatial-index` (the single whole-graph spatial-index accessor).**
-  There is no longer one index for it to name; use `spatial-indexes` /
-  `spatial-index-for`.
-- **BREAKING: the old singular, whole-graph spatial rebuild function.** There is
-  no longer one index to rebuild; replaced by `rebuild-spatial-indexes` (rebuild
-  every index) and `regenerate-spatial-index` (rebuild one `(owner slot)` index).
-- **BREAKING: the previous unscoped Prolog spatial arities** — `find-within` and
-  `find-intersects` at arity 2, `find-near` and `find-nearest` at arity 4.
-  Replaced by the scoped `/3` and `/5` forms above. The old arities are removed
-  rather than left to signal, so a stale query fails at goal entry with an
-  unknown-functor error that names the problem, instead of binding a scope-shaped
-  argument as an area.
+#### Storage growth and segment behaviour
 
-### Fixed
-- **A vector segment could not grow past its mmap reservation without
-  corrupting the transaction.** The growth attempt failed inside the apply path,
-  after the transaction was already durable, so the segment and the nodes
-  disagreed. The capacity a transaction needs is now validated *before*
-  durability, under the segment's read lock, and an over-large transaction is
-  rejected with `vector-segment-capacity-exhausted` and rolled back cleanly —
-  nothing is journaled and the segment is untouched.
-- **Automatic crash recovery of a vector segment could not complete above
-  131,072 entries.** `rebuild-vector-segment` created the fresh segment at the
-  1024-entry default, and a segment's address-space reservation is derived from
-  its file size *at create time*, so a ~4 MB fresh file reserved only the 1 GiB
-  floor and in-place doubling ran out of reservation at 131,072 entries — while
-  `restore-vector-segments` calls exactly this rebuild whenever the segment's
-  clean-shutdown flag is unset. A rebuild is now created at the corpus size, so
-  its reservation is derived from a realistic file (and ~8 doubling-and-relocate
-  passes disappear from every rebuild).
-- **Spatial insert could blow up on a country-scale geometry, and coarsening it
-  naively would silently lose nodes (CR-2).** An insert now caps its geohash cover
-  at 16384 cells — a per-index, *persisted* bound, so insert and remove always
-  compute the identical cell set and no entry is ever orphaned. Coarsening the
-  stored cover is unsafe on its own, because geohash prefixes nest one way: a query
-  covering a small box at a fine precision would sort *past* a coarsely-stored
-  polygon and miss it. The query therefore clamps its covering precision to the
-  coarsest precision actually stored, tracked by a per-index histogram
-  (`spatial-index-precision-counts` / `spatial-index-coarsest-precision`). The
-  clamp is **self-healing**: delete the oversized node and its cells decrement,
-  the coarse level empties, and selectivity returns on its own with no rebuild. A
-  `warn` fires on each *decrease* of an index's coarsest precision (rare, loud,
-  and names the node, class, slot, bbox, and the recovery path); a `log:info`
-  marks the recovery. The histogram is rewritten synchronously only when the
-  coarsest precision decreases (the unsafe direction); an emptied level rides the
-  ordinary close-time write, because reopening too-coarse merely over-covers.
-  A multipolygon splits the cap across its parts in proportion to each part's
-  bounding-box *area* (with a floor of one cell per part), so a small part keeps
-  full precision and only a genuinely large one is coarsened — an equal 1/N split
-  coarsened small parts needlessly and, past 16384 parts, collapsed the whole
-  index's query clamp to precision 1.
-  The spatial sidecar is no longer written on the commit path. It used to be
-  written on an index creation and on a coarsest-precision decrease, which put
-  `cl-store` file I/O under the transaction-manager lock, on the post-durability
-  side of the commit — a commit-convoy point and a failure-injection point after
-  the data was already durable. It is now written only at `close-graph` and by the
-  rebuild/regenerate admin ops; a crash forces recovery, and `open-graph`
-  re-derives every spatial index from the recovered nodes after the WAL replay, so
-  the histogram/clamp is reconstructed from authoritative geometry rather than from
-  an incremental write.
-- **A class with two geometry-valued indexed slots silently indexed only one
-  (CR-3.1).** A node reaches spatial maintenance, is indexed by its first
-  geometry-valued indexed slot, and every other geometry slot was inert with no
-  signal. A value-based warning now fires on the write path — sampled over a
-  class's first 64 nodes, so it costs nothing steady-state — naming the class,
-  every geometry slot found, and which one wins. `audit-spatial-slots` (above) is
-  the exhaustive read-only counterpart for classes whose two-geometry nodes lie
-  beyond the sampling window. (The declared-`:type geometry` form the request
-  first asked for is not buildable: the engine cannot compare the type symbol
-  reliably across application packages, so the check is value-based.)
-
-### Changed
 - **A vector segment now grows its reservation *in place* before falling back to
   relocating.** On exhaustion `%seg-ensure-reservation` first tries to claim the
   address range immediately after the current window
@@ -321,7 +313,8 @@ between releases; cutting a release renames it to the new version and dates it.
   *not* used: SBCL's `#A((3) SINGLE-FLOAT ...)` is an SBCL extension, and a
   snapshot must restore on SBCL, CCL, ECL and LispWorks alike.
 
-### Changed
+#### On-disk and wire formats
+
 - **The snapshot text format changed, one-way compatibly.** Snapshots written by
   this version are **not** readable by older graph-db versions (they contain
   `#V` literals older readers do not know). Snapshots written by older versions
@@ -371,6 +364,168 @@ between releases; cutting a release renames it to the new version and dates it.
   declaration is **not** adopted on a memory reopen (doing so would re-materialize
   exactly those lazy nodes); a memory index reopens at its persisted precision
   until a forced rebuild — correct, only over-covering, never missing.
+
+### Removed
+- **BREAKING: `spatial-index` (the single whole-graph spatial-index accessor).**
+  There is no longer one index for it to name; use `spatial-indexes` /
+  `spatial-index-for`.
+- **BREAKING: the old singular, whole-graph spatial rebuild function.** There is
+  no longer one index to rebuild; replaced by `rebuild-spatial-indexes` (rebuild
+  every index) and `regenerate-spatial-index` (rebuild one `(owner slot)` index).
+- **BREAKING: the previous unscoped Prolog spatial arities** — `find-within` and
+  `find-intersects` at arity 2, `find-near` and `find-nearest` at arity 4.
+  Replaced by the scoped `/3` and `/5` forms above. The old arities are removed
+  rather than left to signal, so a stale query fails at goal entry with an
+  unknown-functor error that names the problem, instead of binding a scope-shaped
+  argument as an area.
+
+### Fixed
+
+- **A skip-list read could return a freed node's data, or loop forever** (#88). The
+  direct-mapped node cache is validated by *address*, so anything that frees a node had
+  to evict it first and did not. Wrong reads and unbounded traversal cycles, in any
+  skip-list-backed structure.
+
+- **A node created with an explicit `:graph` was written into the ambient
+  transaction's graph instead** (#96). `create-node` reused the ambient
+  `*transaction*` and ignored its `graph` argument, so the node was stamped with one
+  graph and stored in another, silently — the mirror image of the read-side bug the
+  multi-graph work exists to fix. Now signals `cross-graph-transaction-error`.
+
+- **A `:vector-index` slot on an *edge* class was maintained but never rebuilt** (#57).
+  Both rebuild paths swept `map-vertices` with the owner as `:vertex-type`, which
+  matches nothing for an edge class, so the segment came back empty after any rebuild —
+  invisible while the process stayed up, because the live path had already built it
+  correctly in RAM.
+
+- **A memory graph lost its vector segments on reopen** (#58). `open-memory-graph`
+  never called `restore-vector-segments`, so the segment files were written by ordinary
+  maintenance and then orphaned; `vector-search` returned nothing. (Still skipped for
+  `:lazy` graphs, where a rebuild sweep would materialize every deferred node.)
+
+- **An existing segment file could be silently destroyed** (#55). `%ensure-segment`
+  keyed on table registration alone, so an unregistered-but-present segment file was
+  *created over* — header rewritten, capacity free-marked, contents gone, no error and
+  no warning. Reachable in practice: before #58, every memory-graph reopen left every
+  segment file unregistered. It is now adopted rather than overwritten.
+
+- **Index sidecars were written in place, and a torn one failed the whole open**
+  (#63). The spatial, unique and secondary sidecars now write to a temporary file and
+  rename into place. More seriously, only spatial could survive *reading* a damaged
+  one — unique and secondary let the error propagate out of `open-graph`, despite both
+  documenting a "fall back to rebuild" contract that nothing could reach. The nodes are
+  authoritative, so they now warn and rebuild.
+
+- **A stale memory-graph image could not be recovered, and the error advised
+  destroying the data** (#65). The message told the operator to delete the image and
+  reopen "to rebuild from the journal" — but a clean-close checkpoint clears the
+  journal, and the memory backend has no heap, so `graph.img` is the *only* durable
+  record and deleting it discards the graph. The message is corrected and v5 images now
+  migrate on read (including `:lazy` graphs, materializing only geometry-bearing nodes).
+
+- **A retried migration failed with a bare `FILE-EXISTS`** (#98). `migrate-graph`'s
+  default snapshot path was keyed on the graph name alone — constant across runs, users
+  and processes — and cleanup only ran on success. One aborted migration therefore broke
+  every later migration of that name. The path is now per-run and cleanup is on every
+  exit.
+
+- **ECL: `gettimeofday` returned `NIL`, silently collapsing every snapshot name**
+  (#100). It had arms for SBCL, CCL and LispWorks and none for ECL, so the whole body
+  was empty. `txn-log` built its snapshot filename from it, so on ECL every snapshot of
+  a graph formatted to one constant name — and ECL's permissive `:if-exists` default
+  overwrote rather than erroring, so each snapshot silently replaced its predecessor.
+  It also returned a single rational on SBCL against two values on CCL, so no caller
+  could be correct everywhere.
+
+- **ECL: hash tables the engine treats as shared were not synchronized** (#101). Every
+  concurrently-accessed table is created `:synchronized` on SBCL and `:shared` on CCL;
+  the ECL arms had no equivalent, because ECL once had none. Modern ECL does, gated
+  here on a runtime probe. The reachable case was the secondary-index registry, read
+  unlocked from the public query API while a commit could be inserting into it.
+
+- **A vector segment could not grow past its mmap reservation without
+  corrupting the transaction.** The growth attempt failed inside the apply path,
+  after the transaction was already durable, so the segment and the nodes
+  disagreed. The capacity a transaction needs is now validated *before*
+  durability, under the segment's read lock, and an over-large transaction is
+  rejected with `vector-segment-capacity-exhausted` and rolled back cleanly —
+  nothing is journaled and the segment is untouched.
+- **Automatic crash recovery of a vector segment could not complete above
+  131,072 entries.** `rebuild-vector-segment` created the fresh segment at the
+  1024-entry default, and a segment's address-space reservation is derived from
+  its file size *at create time*, so a ~4 MB fresh file reserved only the 1 GiB
+  floor and in-place doubling ran out of reservation at 131,072 entries — while
+  `restore-vector-segments` calls exactly this rebuild whenever the segment's
+  clean-shutdown flag is unset. A rebuild is now created at the corpus size, so
+  its reservation is derived from a realistic file (and ~8 doubling-and-relocate
+  passes disappear from every rebuild).
+- **Spatial insert could blow up on a country-scale geometry, and coarsening it
+  naively would silently lose nodes (CR-2).** An insert now caps its geohash cover
+  at 16384 cells — a per-index, *persisted* bound, so insert and remove always
+  compute the identical cell set and no entry is ever orphaned. Coarsening the
+  stored cover is unsafe on its own, because geohash prefixes nest one way: a query
+  covering a small box at a fine precision would sort *past* a coarsely-stored
+  polygon and miss it. The query therefore clamps its covering precision to the
+  coarsest precision actually stored, tracked by a per-index histogram
+  (`spatial-index-precision-counts` / `spatial-index-coarsest-precision`). The
+  clamp is **self-healing**: delete the oversized node and its cells decrement,
+  the coarse level empties, and selectivity returns on its own with no rebuild. A
+  `warn` fires on each *decrease* of an index's coarsest precision (rare, loud,
+  and names the node, class, slot, bbox, and the recovery path); a `log:info`
+  marks the recovery. The histogram is rewritten synchronously only when the
+  coarsest precision decreases (the unsafe direction); an emptied level rides the
+  ordinary close-time write, because reopening too-coarse merely over-covers.
+  A multipolygon splits the cap across its parts in proportion to each part's
+  bounding-box *area* (with a floor of one cell per part), so a small part keeps
+  full precision and only a genuinely large one is coarsened — an equal 1/N split
+  coarsened small parts needlessly and, past 16384 parts, collapsed the whole
+  index's query clamp to precision 1.
+  The spatial sidecar is no longer written on the commit path. It used to be
+  written on an index creation and on a coarsest-precision decrease, which put
+  `cl-store` file I/O under the transaction-manager lock, on the post-durability
+  side of the commit — a commit-convoy point and a failure-injection point after
+  the data was already durable. It is now written only at `close-graph` and by the
+  rebuild/regenerate admin ops; a crash forces recovery, and `open-graph`
+  re-derives every spatial index from the recovered nodes after the WAL replay, so
+  the histogram/clamp is reconstructed from authoritative geometry rather than from
+  an incremental write.
+- **A class with two geometry-valued indexed slots silently indexed only one
+  (CR-3.1).** A node reaches spatial maintenance, is indexed by its first
+  geometry-valued indexed slot, and every other geometry slot was inert with no
+  signal. A value-based warning now fires on the write path — sampled over a
+  class's first 64 nodes, so it costs nothing steady-state — naming the class,
+  every geometry slot found, and which one wins. `audit-spatial-slots` (above) is
+  the exhaustive read-only counterpart for classes whose two-geometry nodes lie
+  beyond the sampling window. (The declared-`:type geometry` form the request
+  first asked for is not buildable: the engine cannot compare the type symbol
+  reliably across application packages, so the check is value-based.)
+
+### Known limitations
+
+Shipping with 3.0.0, tracked rather than hidden:
+
+- **The general ordered index is not reachable from Prolog** (#102). `index-lookup` and
+  friends work from Lisp; a Prolog query still generates candidates by type and filters
+  them, because no index-backed generator predicate exists yet.
+- **A scan-then-write transaction serializes the graph** (#92). Every node a typed scan
+  visits joins the read-set, so a scanning transaction conflicts with any concurrent
+  writer touching anything it scanned; measured at the retry ceiling, meaning every such
+  commit completes under the global lock. Correct, but it does not scale. Deliberately
+  deferred to 3.1: the fix changes isolation semantics and did not belong in a release
+  that already carries a format bump. Note that backoff and a higher retry cap do *not*
+  help — the collision is deterministic, not probabilistic.
+- **A `:lazy` memory graph still reopens without vector segments** (#58 covers the
+  non-lazy case). A rebuild sweep would materialize every deferred node, defeating
+  fault-on-access.
+- **Two ECL growing-writes concurrency tests are intermittent** (#95). They pass in
+  isolation (20/20) and fail only under a loaded multi-suite run; four attempts to
+  reproduce them deliberately failed. Instrumented so the next natural occurrence
+  identifies the cause rather than raising the question again.
+- **`geometry-contains-point-p` uses a different point-in-polygon implementation from
+  every other spatial predicate** (#99). Characterized against GEOS across 45 systematic
+  cases plus generative sweeps: they agree everywhere away from a boundary, and differ
+  only in boundary *convention* (half-open ray-cast versus DE-9IM). No defect, but the
+  inconsistency is deliberate to revisit rather than accidental.
 
 ## [2.1.1] - 2026-07-06
 
