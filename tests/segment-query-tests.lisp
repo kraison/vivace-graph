@@ -557,7 +557,15 @@ race, and could lose the very evidence this test exists to collect)."
                                               ;; them ran
                                               (pushnew (segment-capacity s) caps)
                                               (when (< (length hits) n0)
-                                                (push (cons n0 (length hits)) short))
+                                                ;; The short scan IS the failure; the
+                                                ;; immediate RE-SCAN is what makes the
+                                                ;; next occurrence self-diagnosing
+                                                ;; (GH #95).  Costs nothing on the
+                                                ;; passing path -- it runs only here.
+                                                (push (list :n0 n0 :first (length hits)
+                                                            :rescan (length (funcall read-op s q))
+                                                            :cap (segment-capacity s))
+                                                      short))
                                               (dolist (hit hits)
                                                 (let* ((score (car hit))
                                                        ;; a NaN fails both
@@ -645,6 +653,19 @@ which fires on a torn read:
       each scan, so every put it counts completed before the scan took the
       read lock and must therefore be visible.
 
+      GH #95: detector (3) is the ONLY one that has ever fired in the wild, and
+      it fires with clean scores and no dead thread -- a consistent but STALE
+      view, not the torn read this test was built to catch.  Investigation could
+      not reproduce it: 20/20 passes running this suite alone on ECL at load
+      2-5, and a full suite passes under induced CPU load of 8-10.  The three
+      observed failures all happened with two or three FULL SUITES running
+      concurrently, which adds GC and I/O pressure that CPU load does not (ECL
+      is GC-bound late in the suite, #43).  So each short scan now records an
+      immediate re-scan; see the assertion message for how to read it.  Do not
+      relax this detector to silence the flake -- it is load-bearing (removing
+      the rw-lock makes it fail), and the capture is what will identify the
+      cause the next time it fires naturally.
+
 Deliberately NOT a single long round: scan cost is O(capacity), so one big
 segment yields only a handful of scans (measured: exactly ONE for a 400-put
 capacity-512 segment) and proves almost nothing.  ~12 short rounds instead,
@@ -685,7 +706,11 @@ capacity store, this test FAILS."
         "~D torn reads: out-of-range scores ~S"
         (length bad) (subseq bad 0 (min 5 (length bad))))
     (is (null short)
-        "~D scans missed already-committed ids (committed . seen): ~S"
+        "~D scans missed already-committed ids: ~S~@
+         Read RESCAN (GH #95): >= :N0 means the data WAS present and the first ~
+         scan missed it -- a real read-visibility race.  < :N0 means the ids ~
+         were not in the segment yet, so COMMITTED over-counts and detector ~
+         (3)'s premise is wrong (a test bug, not an engine bug)."
         (length short) (subseq short 0 (min 5 (length short))))
     (is (> (length caps) 1)
         "scanners only ever observed ~D distinct capacit~:@P ~S -- scans never ~
@@ -749,7 +774,11 @@ VERIFIED LOAD-BEARING: with only SEGMENT-SCORE-SUBSET's read lock removed
         "~D torn reads: out-of-range scores ~S"
         (length bad) (subseq bad 0 (min 5 (length bad))))
     (is (null short)
-        "~D scorings missed already-committed ids (committed . seen): ~S"
+        "~D scorings missed already-committed ids: ~S~@
+         Read RESCAN (GH #95): >= :N0 means the data WAS present and the first ~
+         scoring missed it -- a real read-visibility race.  < :N0 means the ids ~
+         were not in the segment yet, so COMMITTED over-counts and detector ~
+         (3)'s premise is wrong (a test bug, not an engine bug)."
         (length short) (subseq short 0 (min 5 (length short))))
     (is (> (length caps) 1)
         "scorers only ever observed ~D distinct capacit~:@P ~S -- they never ~
