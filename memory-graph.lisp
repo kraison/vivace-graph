@@ -634,30 +634,109 @@ the same structural derived dumps.  Untouched LZNODEs pass their blob through."
                        :if-does-not-exist :create)
       (write-sequence buf s))))
 
+(defun %signal-unsupported-memory-image-version (ver file)
+  "The image is the ONLY durable copy of a cleanly-closed memory graph -- the
+journal is cleared on checkpoint (GH #65) -- so the old advice to delete it and
+recover from the journal was actively wrong (it discards the graph and 'succeeds'
+onto an empty one).  Say what remedies actually exist instead."
+  (error "Unsupported memory-image format v~D at ~A (this build reads v5 and v6, ~
+writing v6).  This image is the ONLY durable record of a cleanly-closed memory ~
+graph -- the journal is cleared after every checkpoint, so deleting the image ~
+discards the graph, it does not recover it.  Open it with a build that reads v~D, ~
+or migrate it to v6 first."
+         ver file ver))
+
+(defun %custom-node-geometry-classes ()
+  "The classes carrying an application-supplied NODE-GEOMETRY method -- i.e. every
+method specializer other than the engine's own T and NODE defaults.  Such a node
+has a geometry that no slot declaration reveals, so it cannot be skipped when
+deciding whether an LZNODE is worth materializing during a v5 spatial migration
+(GH #65)."
+  (let ((defaults (list (find-class t) (find-class 'node))))
+    (loop for m in (generic-function-methods #'node-geometry)
+          for spec = (first (method-specializers m))
+          ;; TYPEP guard: an EQL specializer is not a type specifier, so it must
+          ;; never reach the SUBTYPEP test below.
+          when (and (typep spec 'class) (not (member spec defaults)))
+            collect spec)))
+
+(defun %mem-lznode-may-be-spatial-p (graph lz edge-p custom-classes)
+  "True when the class of the unmaterialized LZ could carry a geometry, so it is
+worth the MAKE-INSTANCE cost while migrating a v5 image's spatial index (GH #65)."
+  (let* ((meta (ignore-errors
+                (lookup-node-type-by-id (lznode-type-id lz)
+                                        (if edge-p :edge :vertex) :graph graph)))
+         (class (and meta (find-class (node-type-name meta) nil))))
+    (and class
+         (or (node-geometry-index-slots class)
+             (some (lambda (c) (subtypep class c)) custom-classes))
+         t)))
+
+(defun %rebuild-memory-spatial-indexes-from-nodes (graph)
+  "Rebuild GRAPH's per-(owner . slot) spatial indexes by visiting every node --
+the v5 migration path (GH #65).  v5's writer emitted its spatial section EMPTY
+BY DESIGN (see WRITE-MEMORY-IMAGE-NATIVE's v5 comment in history) -- restore was
+always meant to rederive it from the nodes, so this is not a lossy compromise,
+it is what v5 specified.  Recovers the logic 714eb3b deleted (pre-per-(owner .
+slot) registry) and re-targets it at today's registry.
+
+Lazy-safe -- and this is why it serves BOTH lazy and non-lazy graphs, not just a
+non-lazy fallback: an LZNODE is materialized ONLY when its class could carry a
+geometry (NODE-GEOMETRY-INDEX-SLOTS, or a class a NODE-GEOMETRY method
+specializes on), so a graph with one geometry-bearing class among many touches
+only that fraction -- fault-on-access survives for everything else."
+  (clrhash (spatial-indexes graph))            ; in-RAM indexes own no heap storage
+  (let ((*graph* graph)                        ; node reads must resolve in GRAPH
+        (customs (%custom-node-geometry-classes))
+        (count 0))
+    (dolist (edge-p (list nil t) count)
+      (let ((table (if edge-p (edge-table graph) (vertex-table graph)))
+            (entries '()))
+        (when table
+          (maphash (lambda (id x) (push (cons id x) entries))
+                   (mem-table-data table))
+          (dolist (e entries)
+            (let* ((raw (cdr e))
+                   (node (if (lznode-p raw)
+                             (when (%mem-lznode-may-be-spatial-p graph raw edge-p customs)
+                               (mem-materialize table (car e) raw))
+                             raw)))
+              (when (and node (not (deleted-p node)))
+                (multiple-value-bind (geom slot) (node-geometry node)
+                  (when geom
+                    (spatial-index-insert
+                     (%spatial-index-for
+                      graph (%node-spatial-owner-name (class-of node) slot) slot)
+                     (id node) geom)
+                    (incf count)))))))))))
+
 (defun restore-memory-image-native (graph file)
-  "Restore a VG-native (v6) image.  When GRAPH is LAZY, node tables receive LZNODE
-blobs (no MAKE-INSTANCE -- fault-on-access); otherwise each node is materialized
-now.  The ve/vev/type indexes, the per-(owner . slot) spatial indexes AND the views
-are all restored STRUCTURALLY either way -- the spatial records carry their own
-cells, precision, cap and histogram, so nothing rebuilds from (or materializes) the
-nodes.  Returns :STRUCTURAL and stashes the view dump in *MEMORY-IMAGE-VIEW-DUMP*."
+  "Restore a VG-native image, v5 or v6.  When GRAPH is LAZY, node tables receive
+LZNODE blobs (no MAKE-INSTANCE -- fault-on-access); otherwise each node is
+materialized now.  The ve/vev/type indexes and the views are restored
+STRUCTURALLY either way.  v6's per-(owner . slot) spatial records are also
+restored structurally; v5 (whose spatial section is one flat, always-empty
+(cell . node-id) pair list -- empty BY DESIGN, not truncated) has that section
+discarded and its spatial index rebuilt from the just-restored nodes instead
+(GH #65), via %REBUILD-MEMORY-SPATIAL-INDEXES-FROM-NODES -- lazy-safe, so this
+runs on a LAZY graph too (the Android field device's config, and the case #65
+was filed for).  Returns :STRUCTURAL and stashes the view dump in
+*MEMORY-IMAGE-VIEW-DUMP*."
   (let* ((bytes (with-open-file (s file :element-type '(unsigned-byte 8))
                   (let ((a (make-array (file-length s) :element-type '(unsigned-byte 8))))
                     (read-sequence a s) a)))
          (rc (ni-ric bytes))
          (lazy (lazy-p graph))
          (vtable (vertex-table graph))
-         (etable (edge-table graph)))
+         (etable (edge-table graph))
+         (ver nil))
     (ri-bytes rc 4)                                ; magic
-    (let ((ver (ri-uint rc 4)))                    ; format version
-      ;; Each format bump is a mid-stream layout change that cannot be read
-      ;; positionally by a parser expecting a different one.  Reject a stale image
-      ;; loudly rather than misparse it; the memory graph then rebuilds from its
-      ;; transaction journal.  v6 made the spatial section per-(owner . slot).
-      (unless (= ver 6)
-        (error "Unsupported memory-image format v~D (this build writes/reads v6). ~
-Delete the stale image at ~A and reopen to rebuild from the journal."
-               ver file)))
+    (setf ver (ri-uint rc 4))                       ; format version
+    ;; Each format bump is a mid-stream layout change that cannot be read
+    ;; positionally by a parser expecting a different one, so anything but the two
+    ;; known versions is rejected loudly rather than misparsed (GH #65).  v6 made
+    ;; the spatial section per-(owner . slot); v5 is migrated below.
+    (unless (member ver '(5 6)) (%signal-unsupported-memory-image-version ver file))
     (ri-uint rc 8)                                 ; highest-tx-id
     (let ((nv (ri-uint rc 4)))
       (dotimes (i nv)
@@ -672,15 +751,20 @@ Delete the stale image at ~A and reopen to rebuild from the journal."
     (%load-mem-index (mem-ve-index-data (ve-index-in graph))    (ri-index rc #'ri-key-ve))
     (%load-mem-index (mem-ve-index-data (ve-index-out graph))   (ri-index rc #'ri-key-ve))
     (%load-mem-index (mem-vev-index-data (vev-index graph))     (ri-index rc #'ri-key-vev))
-    ;; Spatial: recreate each (owner . slot) index structurally from its record.
-    (dolist (rec (ri-spatial rc))
-      (destructuring-bind (owner slot pairs precision max-cells counts) rec
-        (%restore-mem-spatial-index graph owner slot pairs precision max-cells counts)))
+    (if (= ver 5)
+        (ri-pairs rc)         ; v5's flat spatial pairs: always empty, discard (GH #65)
+        (dolist (rec (ri-spatial rc))
+          (destructuring-bind (owner slot pairs precision max-cells counts) rec
+            (%restore-mem-spatial-index graph owner slot pairs precision max-cells counts))))
     (setf *memory-image-view-dump* (or (ri-views rc) '()))
-    ;; unique constraints (#6): v6 always writes the section -- guard on remaining
-    ;; bytes anyway, harmlessly, so a truncated tail cannot signal here.
+    ;; unique constraints (#6): both v5 and v6 always write the section -- guard on
+    ;; remaining bytes anyway, harmlessly, so a truncated tail cannot signal here.
     (when (< (ric-i rc) (length (ric-bytes rc)))
       (%load-unique-indexes graph (ri-val rc)))
+    ;; v5 migration (GH #65): rederive the spatial index from the nodes -- the one
+    ;; thing v5's image didn't carry.  Lazy-safe (see the function docstring), so
+    ;; this runs unconditionally, not just on a materialized (non-lazy) graph.
+    (when (= ver 5) (%rebuild-memory-spatial-indexes-from-nodes graph))
     :structural))
 
 (defun write-memory-image (graph)
