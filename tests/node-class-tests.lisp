@@ -47,34 +47,39 @@
         "uncategorized slots: ~a" (set-difference all (append p e m)))))
 
 (test slot-categories-match-declarations
-  "Persistent is the default: a slot is persistent unless declared :META T.
-See EPHEMERAL-DECLARATION-IS-CURRENTLY-INERT for why E1 is in the list."
-  (is (equal '(e1 p1 p2 plain) (%nc-names #'graph-db::persistent-slot-names 'nc-probe)))
+  "Persistent is the default: a slot is persistent unless declared :META T or
+:EPHEMERAL T."
+  (is (equal '(p1 p2 plain) (%nc-names #'graph-db::persistent-slot-names 'nc-probe)))
+  (is (equal '(e1) (%nc-names #'graph-db::ephemeral-slot-names 'nc-probe)))
   (is (equal '(m1) (%nc-names #'graph-db::meta-slot-names 'nc-probe)))
   ;; DATA-SLOTS is persistent + ephemeral, and excludes meta.
   (is (equal '(e1 p1 p2 plain) (%nc-names #'graph-db::data-slots 'nc-probe))))
 
-(test ephemeral-declaration-is-currently-inert
-  "CHARACTERIZATION, not endorsement: :EPHEMERAL T on a direct slot has no
-effect on the effective slot, so EPHEMERAL-SLOT-NAMES is empty for every node
-class and an :EPHEMERAL slot is in fact stored persistently.
-
-NODE-SLOT-DEFINITION declares PERSISTENT with :INITFORM T, and
-COMPUTE-EFFECTIVE-SLOT-DEFINITION does not propagate :EPHEMERAL from the direct
-slots the way it propagates :INDEX / :UNIQUE / :VECTOR-INDEX / :SPATIAL-*.  So
-by the time its COND runs (PERSISTENT-P SLOT) is always true, the second branch
-always wins, and the third branch -- the only one that ever sets EPHEMERAL -- is
-unreachable.
-
-Recorded here so the behaviour is known rather than rediscovered, and so that
-deliberately fixing it fails loudly at this test instead of silently changing
-what gets written to disk."
+(test ephemeral-slots-are-not-persisted
+  "GH #90: :EPHEMERAL T on a direct slot had no effect -- EPHEMERAL-SLOT-NAMES
+was empty for every node class and such a slot was written to disk like any
+other.  CALL-NEXT-METHOD builds a fresh effective slot without carrying custom
+slot-definition slots over, so PERSISTENT-P was always true there and the clause
+that set EPHEMERAL was unreachable; the propagation now reads the DIRECT slots,
+as :INDEX / :UNIQUE / :VECTOR-INDEX / :SPATIAL-* already did."
   (let ((class (find-class 'nc-probe)))
-    (is (null (graph-db::ephemeral-slot-names class))
-        "ephemeral-slot-names is no longer empty: ~a"
+    (is (equal '(e1) (graph-db::ephemeral-slot-names class))
+        "the :EPHEMERAL slot is not categorized as ephemeral: ~a"
         (graph-db::ephemeral-slot-names class))
-    (is (member 'e1 (graph-db::persistent-slot-names class))
-        "an :EPHEMERAL slot is no longer persistent -- storage behaviour changed")))
+    (is (not (member 'e1 (graph-db::persistent-slot-names class)))
+        "an :EPHEMERAL slot is still persistent, so it is still written to disk")
+    ;; The gate the write path actually consults: NIL routes the access to the
+    ;; standard method, i.e. ordinary CLOS storage rather than the DATA alist.
+    (is (null (graph-db::%persistent-slot-keyword class 'e1))
+        "e1 still has a DATA-alist keyword, so it would still be serialized")
+    (is (eq :p1 (graph-db::%persistent-slot-keyword class 'p1))
+        "a normal slot must be unaffected")
+    ;; Ephemeral is NOT meta: it still holds a value in the instance.  Losing
+    ;; that would turn the option from inert into actively broken.
+    (is (not (member 'e1 (graph-db::meta-slot-names class)))
+        "an :EPHEMERAL slot must not be categorized as meta")
+    (is (member 'e1 (graph-db::data-slots class))
+        "an :EPHEMERAL slot is still a data slot (persistent + ephemeral)")))
 
 (test persistent-slot-keyword-agrees-with-persistent-slot-names
   "The hot path asks for a slot's DATA-alist keyword; NIL means \"not

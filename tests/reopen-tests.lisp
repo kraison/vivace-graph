@@ -91,3 +91,53 @@ not persisted; restore-schema-locks recreates them from the restored types."
                (is-true (lookup-vertex id) "pre-existing data intact"))
           (ignore-errors (close-graph g2 :snapshot-p nil))
           (collect-garbage))))))
+
+;;; ---------------------------------------------------------------------------
+;;; GH #90: :EPHEMERAL slots are live in memory and are NOT persisted
+;;; ---------------------------------------------------------------------------
+
+(def-vertex eph-node ()
+  ((label :type string)
+   (scratch :ephemeral t :initform nil))
+  :graph-db-integration-test)
+
+(test ephemeral-slot-is-live-but-not-persisted
+  "GH #90: :EPHEMERAL T had no effect -- such a slot was categorized persistent
+and written to disk like any other, because COMPUTE-EFFECTIVE-SLOT-DEFINITION
+tested the freshly-built EFFECTIVE slot (whose PERSISTENT is always T from its
+initform) instead of the DIRECT slots.
+
+The user-visible contract, which is what this pins: the slot behaves like an
+ordinary CLOS slot while the node is live, and its value is absent after a
+reopen because it was never written."
+  (with-temp-directory (dir)
+    (let ((path (namestring dir))
+          (nid nil))
+      (let ((g (make-graph *integration-graph-name* path :buffer-pool-size 1000)))
+        (let ((*graph* g))
+          (with-transaction ()
+            (let ((n (make-eph-node :label "keep")))
+              (setq nid (id n))
+              ;; Live: ordinary CLOS storage, read back exactly.
+              (setf (slot-value n 'scratch) :in-memory-only)
+              (is (eq :in-memory-only (slot-value n 'scratch))
+                  "an ephemeral slot must hold its value while the node is live")))
+          ;; Still live after the transaction, via a fresh lookup in this session.
+          (let ((n (lookup-vertex nid)))
+            (is (string= "keep" (slot-value n 'label))
+                "the persistent slot must be unaffected"))
+          (close-graph g :snapshot-p nil)))
+      (let ((g2 (open-graph *integration-graph-name* path)))
+        (unwind-protect
+             (let ((*graph* g2))
+               (let ((n (lookup-vertex nid)))
+                 (is-true n)
+                 (is (string= "keep" (slot-value n 'label))
+                     "the persistent slot must survive the reopen")
+                 ;; The whole point: nothing was written, so it comes back at
+                 ;; its initform rather than :IN-MEMORY-ONLY.
+                 (is (null (slot-value n 'scratch))
+                     "the ephemeral slot was PERSISTED -- it came back as ~S"
+                     (slot-value n 'scratch))))
+          (close-graph g2 :snapshot-p nil)
+          (collect-garbage))))))

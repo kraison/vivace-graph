@@ -184,6 +184,27 @@ We define these using the ~def-vertex~ and ~def-edge~ macros. Notice that each d
 
 These macros automatically generate constructor functions (~make-user~, ~make-post~, etc.) and accessor methods for the slots you define.
 
+**** Persistent, ephemeral and meta slots
+
+A slot is *persistent* by default: its value lives in the node's ~data~ alist and is written to disk with the node. Two slot options change that.
+
+- ~:ephemeral t~ ::
+  Per-instance state that is *never written to disk*. The slot becomes an ordinary CLOS slot — read and written with ~slot-value~ as usual, and simply absent from everything the node serializes. Use it for a cache or a derived value you want to hang off a node without paying to store it.
+
+  Give an ephemeral slot an ~:initform~. An unset *persistent* slot reads back as ~nil~ (it resolves through the ~data~ alist), but an unset *ephemeral* slot is an unbound CLOS slot and signals ~unbound-slot~ — standard CLOS behaviour, and a sharp edge if you expect the persistent slot's forgiving ~nil~.
+
+  Ephemeral values do not survive a reopen, are not replicated, and are not visible to another process holding the same graph.
+
+- ~:meta t~ ::
+  Engine-managed metadata (id, revision, type-id and friends). Not part of a node's user data. You will rarely declare this yourself.
+
+#+BEGIN_SRC lisp
+  (def-vertex sensor ()
+    ((serial      :type string)          ; persistent, the default
+     (last-report :ephemeral t :initform nil))  ; live only, never stored
+    :social-app)
+#+END_SRC
+
 *** Connecting to the Database (~make-graph~, ~open-graph~, ~close-graph~)
 
 With our schema defined, we can connect to the database. We will store our graph's files in a directory, for example, ~"/var/tmp/social-app/"~.

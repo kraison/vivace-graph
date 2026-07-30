@@ -212,14 +212,19 @@ test in tests/node-class-tests.lisp."
   (log:trace "compute-effective-slot-definition for ~A / ~A: ~A" class slot-name direct-slots)
   (let ((slot (call-next-method)))
     ;;(log:debug "  SLOT: ~A" slot)
+    ;; Test :EPHEMERAL against the DIRECT slots only.  CALL-NEXT-METHOD returns a
+    ;; freshly built effective slot and the standard method does not carry custom
+    ;; slot-definition slots across, so the effective slot always arrives with
+    ;; EPHEMERAL NIL and PERSISTENT T (their initforms).  The old middle clause
+    ;; therefore always matched and :EPHEMERAL never took effect (GH #90).
     (cond ((or (meta-p slot) (some 'meta-p direct-slots))
            (setf (slot-value slot 'meta) t)
            (setf (slot-value slot 'persistent) nil))
-          ((or (persistent-p slot) (some 'persistent-p direct-slots))
-           (setf (slot-value slot 'persistent) t))
+          ((some 'ephemeral-p direct-slots)
+           (setf (slot-value slot 'ephemeral) t)
+           (setf (slot-value slot 'persistent) nil))
           (t
-           (setf (slot-value slot 'persistent) nil)
-           (setf (slot-value slot 'ephemeral) t)))
+           (setf (slot-value slot 'persistent) t)))
     ;; Inherit the :INDEX spec (T or a canonicalizer) from the declaring direct slot,
     ;; so an :INDEX slot on a parent indexes across its subclasses (general index).
     (let ((i (find-if #'indexed-p direct-slots)))
