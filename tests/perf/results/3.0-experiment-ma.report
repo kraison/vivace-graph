@@ -1,0 +1,52 @@
+;;;; graph-db perf report
+;;;; tag=3.0-experiment impl=SBCL 2.6.6 scale=NORMAL
+
+;; insert-vertices                        OPS 20000  SECONDS 1.58  OPS/S 12658  
+;; lookup-by-id                           OPS 20000  SECONDS 0.097  OPS/S 206181  
+;; scan-vertices                          OPS 20000  SECONDS 0.21  OPS/S 95236  
+;; update-vertices                        OPS 20000  SECONDS 1.95  OPS/S 10256  
+;; delete-vertices                        OPS 10000  SECONDS 0.596  OPS/S 16778  
+;; insert-edges                           OPS 20000  SECONDS 2.273  OPS/S 8799  
+;; scan-edges                             OPS 20000  SECONDS 0.236  OPS/S 84744  
+;; view-lookup                            OPS 20000  SECONDS 0.585  OPS/S 34187  
+;; unique-insert                          OPS 20000  SECONDS 1.891  OPS/S 10576  
+;; unique-baseline-plain-insert           OPS 20000  SECONDS 1.184  OPS/S 16892  
+;; indexed-insert                         OPS 20000  SECONDS 1.626  OPS/S 12300  
+;; index-lookup-eq                        OPS 20000  SECONDS 0.353  OPS/S 56656  
+;; index-range-1pct                       OPS 2000  SECONDS 1.088  OPS/S 1838  
+;; index-fullscan-eq                      OPS 200  SECONDS 10.101  OPS/S 20  
+;; prolog-is-a-scan                       OPS 10000  SECONDS 0.027  OPS/S 370370  
+;; prolog-edge-join                       OPS 5000  SECONDS 0.036  OPS/S 138889  
+;; commit-batched-1txn                    OPS 5000  SECONDS 0.276  OPS/S 18116  
+;; commit-per-op-Ntxn                     OPS 5000  SECONDS 1.036  OPS/S 4826  
+;; concurrent-rw                          OPS 32000  SECONDS 4.115  OPS/S 7776  
+;; heap-used-after-inserts                BYTES 1601034  PER-OP 80  
+;; heap-used-after-updates                BYTES 3201034  PER-OP 160  
+;; snapshot                               SECONDS 0.734  
+;; restore-replay                         SECONDS 1.496  
+;; reopen                                 SECONDS 10.547  
+
+(:PERF-REPORT :TAG "3.0-experiment" :IMPL "SBCL 2.6.6" :SCALE :NORMAL :ENTRIES
+ (("insert-vertices" :OPS 20000 :SECONDS 1.58 :OPS/S 12658)
+  ("lookup-by-id" :OPS 20000 :SECONDS 0.097 :OPS/S 206181)
+  ("scan-vertices" :OPS 20000 :SECONDS 0.21 :OPS/S 95236)
+  ("update-vertices" :OPS 20000 :SECONDS 1.95 :OPS/S 10256)
+  ("delete-vertices" :OPS 10000 :SECONDS 0.596 :OPS/S 16778)
+  ("insert-edges" :OPS 20000 :SECONDS 2.273 :OPS/S 8799)
+  ("scan-edges" :OPS 20000 :SECONDS 0.236 :OPS/S 84744)
+  ("view-lookup" :OPS 20000 :SECONDS 0.585 :OPS/S 34187)
+  ("unique-insert" :OPS 20000 :SECONDS 1.891 :OPS/S 10576)
+  ("unique-baseline-plain-insert" :OPS 20000 :SECONDS 1.184 :OPS/S 16892)
+  ("indexed-insert" :OPS 20000 :SECONDS 1.626 :OPS/S 12300)
+  ("index-lookup-eq" :OPS 20000 :SECONDS 0.353 :OPS/S 56656)
+  ("index-range-1pct" :OPS 2000 :SECONDS 1.088 :OPS/S 1838)
+  ("index-fullscan-eq" :OPS 200 :SECONDS 10.101 :OPS/S 20)
+  ("prolog-is-a-scan" :OPS 10000 :SECONDS 0.027 :OPS/S 370370)
+  ("prolog-edge-join" :OPS 5000 :SECONDS 0.036 :OPS/S 138889)
+  ("commit-batched-1txn" :OPS 5000 :SECONDS 0.276 :OPS/S 18116)
+  ("commit-per-op-Ntxn" :OPS 5000 :SECONDS 1.036 :OPS/S 4826)
+  ("concurrent-rw" :OPS 32000 :SECONDS 4.115 :OPS/S 7776)
+  ("heap-used-after-inserts" :BYTES 1601034 :PER-OP 80)
+  ("heap-used-after-updates" :BYTES 3201034 :PER-OP 160)
+  ("snapshot" :SECONDS 0.734) ("restore-replay" :SECONDS 1.496)
+  ("reopen" :SECONDS 10.547)))
