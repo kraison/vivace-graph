@@ -79,9 +79,13 @@ rebuild.  The rescan is 12 iterations and runs only on that transition."
 ;; geohash string with the node-id as the value (DUPLICATE keys -> O(n) remove); v2
 ;; keys by the composite (cell . node-id), duplicate-free, one index per GRAPH; v3
 ;; is one index per (declaring-class . geometry-slot), each with its own precision,
-;; insert cap and precision histogram.  A v1/v2 sidecar triggers an index-only
-;; re-derivation from live node geometries at open (RESTORE-SPATIAL-INDEX-ROOTS).
-(alexandria:define-constant +spatial-index-format+ 3 :test '=)
+;; insert cap and precision histogram.  v4 is v3's LAYOUT exactly; it bumps only
+;; because %GEOMETRY-CELLS changed which cells a multipolygon occupies (GH #103)
+;; and a remove derives its cells from the geometry -- cells the old budget
+;; wrote would be orphaned by a new remove.  Any older sidecar triggers an
+;; index-only re-derivation from live node geometries at open (RESTORE-SPATIAL-
+;; INDEX-ROOTS).
+(alexandria:define-constant +spatial-index-format+ 4 :test '=)
 
 ;; A bbox query covers its window with at most this many (coarse) cells, each of
 ;; which becomes ONE prefix range scan.  Bounding the covering set is what keeps a
@@ -168,53 +172,65 @@ SPATIAL-INDEX-INSERT wrote."
                                        max-cells))))
       (geohash-covering min-lon min-lat max-lon max-lat :precision p))))
 
-(defun %polygon-bbox-area (poly)
-  "Bounding-box area (square degrees) of one multipolygon part POLY (a polygon
-coordinate list) -- the weight used to split a multipolygon's cell budget.
-Derived from GEOMETRY-BBOX, so it is identical on the insert and the remove of the
-same geometry."
-  (multiple-value-bind (min-lon min-lat max-lon max-lat)
-      (geometry-bbox (%make-geometry :kind :polygon :coordinates poly))
-    (* (max 0d0 (- max-lon min-lon))
-       (max 0d0 (- max-lat min-lat)))))
+(defun %geometry-part-bboxes (geom)
+  "GEOM's bounding boxes as (MIN-LON MIN-LAT MAX-LON MAX-LAT): one PER PART for
+a multipolygon -- covering part by part keeps the gaps between separated parts
+out of the index -- and one overall otherwise.  In GEOMETRY-COORDINATES order,
+so an insert and its matching remove see identical numbers."
+  (flet ((bbox (g) (multiple-value-list (geometry-bbox g))))
+    (if (eq (geometry-kind geom) :multipolygon)
+        (loop for poly in (geometry-coordinates geom)
+              collect (bbox (%make-geometry :kind :polygon :coordinates poly)))
+        (list (bbox geom)))))
+
+(defun %total-cover-cells (bboxes precision cap)
+  "Cells BBOXES need in total at PRECISION, stopping once past CAP -- the figure
+beyond it is never used and the uncapped count can be astronomical."
+  (let ((total 0))
+    (dolist (b bboxes total)
+      (incf total (%covering-cell-count (max 0d0 (- (third b) (first b)))
+                                        (max 0d0 (- (fourth b) (second b)))
+                                        precision))
+      (when (> total cap) (return (1+ cap))))))
+
+(defun %cover-precision-for (bboxes precision max-cells)
+  "Finest precision, at most PRECISION, covering ALL of BBOXES in at most
+MAX-CELLS cells; NIL when not even precision 1 does.
+
+ONE precision for every part, chosen from the TOTAL (GH #103).  A per-part
+budget floors a sliver at one cell, one cell means precision 1, and one
+precision-1 cell collapses the index's query clamp (SPATIAL-INDEX-QUERY-BBOX).
+A part costs cells in proportion to its own size, so a small one is cheap at
+full precision and coarsening it buys nothing."
+  (loop for p from precision downto 1
+        when (<= (%total-cover-cells bboxes p max-cells) max-cells)
+          return p))
 
 (defun %geometry-cells (geom precision max-cells)
-  "The geohash cells (strings) GEOM occupies.  A point yields one cell; a
-polygon/linestring yields the capped grid over its bbox.  A multipolygon is
-covered PART BY PART (not by one overall bbox) so the empty gaps between separated
-parts are not indexed.  MAX-CELLS is split across the parts in proportion to each
-part's bounding-box AREA (with a floor of 1 cell per part), so a small part keeps
-full precision and only a genuinely large part is coarsened -- an equal 1/N split
-would drag every part down to the same budget, coarsening small parts needlessly
-and, past MAX-CELLS parts, collapsing the whole index's query clamp to precision 1.
+  "The geohash cells (strings) GEOM occupies: one for a point, the grid over its
+bbox for a polygon/linestring, the grid over each PART for a multipolygon.
+MAX-CELLS bounds the TOTAL across the parts, never each part separately -- see
+%COVER-PRECISION-FOR (GH #103).
 
-The area weights come from GEOMETRY-BBOX in GEOMETRY-COORDINATES order and the
-per-part budget is (floor (* max-cells area) total), so %GEOMETRY-CELLS stays a
-pure deterministic function of (geom, precision, max-cells) and SPATIAL-INDEX-
-REMOVE recomputes exactly the cells SPATIAL-INDEX-INSERT wrote."
-  (if (eq (geometry-kind geom) :multipolygon)
-      (let* ((parts (geometry-coordinates geom))
-             (n (max 1 (length parts)))
-             (areas (mapcar #'%polygon-bbox-area parts))
-             (total (reduce #'+ areas :initial-value 0d0))
-             (seen (make-hash-table :test 'equal))
-             (cells '()))
-        (loop for poly in parts
-              for area in areas
-              ;; Proportional share, floored at 1.  When every part is degenerate
-              ;; (zero total area) there is no proportion to take, so fall back to
-              ;; the equal split -- still deterministic.
-              for budget = (if (plusp total)
-                               (max 1 (floor (* max-cells area) total))
-                               (max 1 (floor max-cells n)))
-              do (dolist (c (%bbox-cells (%make-geometry :kind :polygon
-                                                         :coordinates poly)
-                                         precision budget))
-                   (unless (gethash c seen)
-                     (setf (gethash c seen) t)
-                     (push c cells))))
-        cells)
-      (%bbox-cells geom precision max-cells)))
+A pure function of (geom, precision, max-cells), which is what makes
+SPATIAL-INDEX-REMOVE recompute exactly the set SPATIAL-INDEX-INSERT wrote."
+  (let* ((bboxes (%geometry-part-bboxes geom))
+         (p (%cover-precision-for bboxes precision max-cells)))
+    (if (null p)
+        ;; More parts than MAX-CELLS holds at ANY precision (a shredded
+        ;; coastline): each part costs a cell however coarse the grid, so
+        ;; coarsening cannot help.  One cover of the whole envelope IS bounded;
+        ;; it indexes the gaps, which the caller's exact predicate refines away.
+        (%bbox-cells geom precision max-cells)
+        (let ((seen (make-hash-table :test 'equal))
+              (cells '()))
+          (dolist (b bboxes cells)
+            (destructuring-bind (min-lon min-lat max-lon max-lat) b
+              (dolist (c (geohash-covering min-lon min-lat max-lon max-lat
+                                           :precision p))
+                (unless (gethash c seen)
+                  (setf (gethash c seen) t)
+                  (push c cells)))))))))
 
 (defun spatial-index-insert (idx node-id geom)
   "Index NODE-ID under every cell GEOM occupies.  NODE-ID is a node's 16-byte

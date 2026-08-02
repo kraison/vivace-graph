@@ -14,7 +14,7 @@ between releases; cutting a release renames it to the new version and dates it.
 > The next release is **3.0.0** (MAJOR). Per this file's SemVer preamble, MAJOR is
 > mandatory here on two independent grounds: the spatial-index changes below are a
 > breaking public-API change *and* an on-disk format bump (the spatial sidecar goes to
-> format v3). Existing on-disk graphs still open — the spatial index re-derives itself
+> format v4). Existing on-disk graphs still open — the spatial index re-derives itself
 > automatically at first open — but stale call sites and old Prolog arities do not.
 
 ### Added
@@ -339,11 +339,11 @@ between releases; cutting a release renames it to the new version and dates it.
   geometry slot of its own (a node stored there is still a `parent` by type, but
   the parent scope will not scan it). Scope to the subclass or use `:all`; the
   general fix rides with GitHub #60.
-- **BREAKING: the spatial sidecar is now `spatial-indexes.dat`, format v3**
+- **BREAKING: the spatial sidecar is now `spatial-indexes.dat`, format v4**
   (was `spatial-index.root`, a single plist). It records one entry per
   `(owner . slot)` index — address, precision, backend, insert cap, and precision
   histogram — and is written on every index creation and at `close-graph`. A
-  pre-v3 graph (the old file present, or `:format` ≠ 3) **re-derives its spatial
+  pre-v4 graph (the old file present, or a stale `:format`) **re-derives its spatial
   indexes automatically at first open**: one `map-vertices` + `map-edges` sweep
   routes each node into the `(owner . slot)` index its geometry slot selects, so
   the contents come out identical to what the single index held, merely
@@ -380,6 +380,29 @@ between releases; cutting a release renames it to the new version and dates it.
   argument as an area.
 
 ### Fixed
+
+- **One sliver part in a multipolygon collapsed the whole spatial index's query
+  precision to 1** (#103). A multipolygon's cell budget was split across its parts in
+  proportion to each part's bounding-box *area*, floored at one cell. A part under
+  `1/max-cells` of the total floored to a one-cell budget — and covering any real
+  geometry in one cell means precision 1. Because a query never covers more finely
+  than the coarsest cell stored (the clamp that keeps a capped insert findable), one
+  small island in one admin boundary widened *every* query on that index. Measured on
+  a real graph: 6 sliver parts across 5 of 1,780 places held the whole index at
+  precision 1 while 100,253 of 100,265 cells sat correctly at precision 5.
+  The budget is now a bound on a geometry's **total** cover, not a per-part
+  allowance: every part is covered at one precision, the finest whose total fits, so
+  a small part stays fine *because* it is cheap and only a genuinely oversized
+  geometry coarsens anything. A geometry with more parts than the cap can hold at any
+  precision — coarsening cannot help there, since each part costs a cell however
+  coarse the grid — falls back to a single bounded cover of its envelope instead of
+  collapsing to precision 1.
+  *Migration:* a heap-backed graph re-derives its spatial indexes automatically at
+  first open (this is what the sidecar's v4 bump is for). A **memory-graph restores
+  its spatial grid structurally from the image**, so it keeps the cells the old
+  budget wrote until you call `regenerate-spatial-indexes` once; the image format
+  is deliberately not bumped, since the image is a memory graph's only durable
+  record. Cells covering a single-part geometry are byte-identical either way.
 
 - **A skip-list read could return a freed node's data, or loop forever** (#88). The
   direct-mapped node cache is validated by *address*, so anything that frees a node had

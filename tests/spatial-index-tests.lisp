@@ -232,35 +232,90 @@ area is dominated by some other big part."
                             (list (+ x 0.001d0) 50.001d0) (list x 50.001d0)
                             (list x 50d0)))))
 
-(test multipolygon-budget-is-size-proportional
-  "A multipolygon's cell budget is split by part AREA, not equally: one 8x8-degree
-part plus nine 0.001-degree specks.  The big part keeps the fine grid its size
-warrants; an equal 1/N split would coarsen it to max-cells/N regardless of the
-specks needing almost nothing."
+(defun %speck-cluster (n)
+  "N tiny parts packed into a ~0.1-degree cluster -- an archipelago whose part
+COUNT, not its extent, is what overruns a cell budget."
+  (loop for i from 0 below n
+        for x = (+ 37d0 (* i 0.001d0))
+        collect (list (list (list x 49d0) (list (+ x 0.0005d0) 49d0)
+                            (list (+ x 0.0005d0) 49.0005d0) (list x 49.0005d0)
+                            (list x 49d0)))))
+
+(test gh-103-sliver-part-keeps-the-index-precision
+  "REGRESSION (GH #103): one sliver part in one multipolygon used to collapse
+the WHOLE index's query precision to 1.  The old per-part budget was MAX-CELLS
+split by bbox area and floored at 1, so a part under 1/MAX-CELLS of the total
+floored to a one-cell budget -- and one cell for a real geometry means precision
+1, which clamps every query on the index (SPATIAL-INDEX-QUERY-BBOX).  A mainland
+plus an island is the shape that did it in the field, and nothing here is near
+the cap: ~1,000 cells against 16,384."
+  (with-temp-memory (heap)
+    (let* ((idx (make-spatial-index heap :precision 5))
+           (mainland '(((36d0 49d0) (37.3d0 49d0) (37.3d0 50.3d0)
+                        (36d0 50.3d0) (36d0 49d0))))
+           (island '(((37.5d0 49.5d0) (37.51d0 49.5d0) (37.51d0 49.51d0)
+                      (37.5d0 49.51d0) (37.5d0 49.5d0))))
+           (mp (make-multipolygon (list mainland island))))
+      (spatial-index-insert idx (bid 1) mp)
+      (is (zerop (aref (spatial-index-precision-counts idx) 1))
+          "no cell was stored at precision 1")
+      (is (= 5 (spatial-index-coarsest-precision idx))
+          "queries still cover at the configured precision")
+      ;; both parts remain reachable -- the sliver is indexed, just not coarsely
+      (is (has-p (bid 1) (spatial-index-query-bbox
+                          idx 36.5d0 49.5d0 36.6d0 49.6d0)))
+      (is (has-p (bid 1) (spatial-index-query-bbox
+                          idx 37.5d0 49.5d0 37.51d0 49.51d0))))))
+
+(test multipolygon-coarsens-on-the-total-not-per-part
+  "MAX-CELLS bounds a multipolygon's TOTAL cover, not each part's share: one
+8x8-degree part plus nine 0.001-degree specks are covered at ONE precision, the
+finest whose total fits.  The specks cost 4 cells each at any precision, so
+they neither coarsen the big part nor get coarsened by it -- the big part gets
+exactly the grid it would get alone."
   (let* ((max-cells 4096)
          (big '(((0d0 0d0) (8d0 0d0) (8d0 8d0) (0d0 8d0) (0d0 0d0))))
          (mp (make-multipolygon (cons big (%speck-parts 9))))
-         (parts (graph-db::geometry-coordinates mp))
-         (big-geom (graph-db::%make-geometry :kind :polygon :coordinates (first parts)))
-         ;; recompute the big part's budget exactly as %GEOMETRY-CELLS does, so the
-         ;; subset check does not depend on the floor arithmetic landing just so
-         (areas (mapcar #'graph-db::%polygon-bbox-area parts))
-         (total (reduce #'+ areas :initial-value 0d0))
-         (big-budget (max 1 (floor (* max-cells (first areas)) total)))
-         (proportional (graph-db::%bbox-cells big-geom 9 big-budget))
-         (equal-split  (graph-db::%bbox-cells big-geom 9 (floor max-cells (length parts))))
-         (cells (graph-db::%geometry-cells mp 9 max-cells)))
-    ;; the big part was actually stored at its area-proportional (fine) grid...
-    (is (subsetp proportional cells :test #'string=)
-        "the large part is covered at its area-proportional precision")
-    ;; ...which is strictly finer than the equal 1/N split it used to get
-    (is (> (length proportional) (length equal-split))
-        "proportional gives the large part more cells than an equal split would")))
+         (alone (make-multipolygon (list big)))
+         (cells (graph-db::%geometry-cells mp 9 max-cells))
+         (big-cells (graph-db::%geometry-cells alone 9 max-cells)))
+    (is (= 1 (length (remove-duplicates (mapcar #'length cells))))
+        "one precision across every part")
+    (is (subsetp big-cells cells :test #'string=)
+        "the specks did not coarsen the large part")
+    (is (> (length (first cells)) 1) "not collapsed to precision 1")))
+
+(test multipolygon-past-any-budget-covers-its-envelope-once
+  "A multipolygon with more parts than MAX-CELLS can hold at ANY precision --
+each part costs at least one cell however coarse the grid -- covers its whole
+envelope ONCE rather than collapsing to precision 1.  Bounded by construction
+and still far more selective than the coarsest grid; the price is that the gaps
+between the parts are indexed, which the caller's exact predicate refines away."
+  (let* ((max-cells 64)
+         (mp (make-multipolygon (%speck-cluster 100)))
+         (cells (graph-db::%geometry-cells mp 7 max-cells)))
+    (is (<= (length cells) max-cells) "the cover is still bounded")
+    (is (> (length (first cells)) 1) "not collapsed to precision 1")
+    (is (null (set-exclusive-or cells (graph-db::%bbox-cells mp 7 max-cells)
+                                :test #'string=))
+        "the fall-back is exactly the single-envelope cover")))
+
+(test single-part-geometry-cells-are-unchanged
+  "A geometry with ONE bbox gets exactly %BBOX-CELLS' cover.  The GH #103 rework
+must not move a cell for the kinds it never touched: that is what makes the
+format bump a multipolygon-only concern, and what keeps SPATIAL-INDEX-REMOVE
+symmetric for every already-indexed point, polygon and linestring."
+  (let ((poly (make-polygon '(((22.1d0 44.4d0) (40.2d0 44.4d0) (40.2d0 52.4d0)
+                               (22.1d0 52.4d0) (22.1d0 44.4d0))))))
+    (dolist (max-cells '(16384 4096 64))
+      (is (null (set-exclusive-or (graph-db::%geometry-cells poly 7 max-cells)
+                                  (graph-db::%bbox-cells poly 7 max-cells)
+                                  :test #'string=))))))
 
 (test multipolygon-insert-remove-symmetry
   "REMOVE recomputes exactly the cells INSERT wrote for a multipolygon, so the
-area-proportional per-part budget must be a pure deterministic function of the
-geometry -- no residual entries after removal."
+whole-geometry cell budget must be a pure deterministic function of the geometry
+-- no residual entries after removal."
   (with-temp-memory (heap)
     (let* ((idx (make-spatial-index heap :precision 7))
            (big '(((0d0 0d0) (8d0 0d0) (8d0 8d0) (0d0 8d0) (0d0 0d0))))

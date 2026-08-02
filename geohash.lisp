@@ -99,13 +99,21 @@ edge has near neighbours in the adjacent cells) and ring-expansion kNN."
               (push nb result))))))
     (nreverse result)))
 
+(defun %covering-cell-count (dlon dlat precision)
+  "Cells a DLON x DLAT degree box needs at PRECISION.  The single estimate the
+spatial layer budgets with: %COVERING-PRECISION inverts it and %GEOMETRY-CELLS
+sums it across a multipolygon's parts (GH #103), so the two cannot disagree
+about whether a cover fits."
+  (multiple-value-bind (lw lh) (geohash-cell-size precision)
+    (* (+ 1 (ceiling dlon lw)) (+ 1 (ceiling dlat lh)))))
+
 (defun %covering-precision (dlon dlat max-cells)
   "Finest precision whose grid covers a DLON x DLAT degree box in <= MAX-CELLS."
   (let ((best 1))
     (loop for p from 1 to 12 do
-      (multiple-value-bind (lw lh) (geohash-cell-size p)
-        (let ((ncells (* (+ 1 (ceiling dlon lw)) (+ 1 (ceiling dlat lh)))))
-          (if (<= ncells max-cells) (setf best p) (return)))))
+      (if (<= (%covering-cell-count dlon dlat p) max-cells)
+          (setf best p)
+          (return)))
     best))
 
 (defun geohash-covering (min-lon min-lat max-lon max-lat

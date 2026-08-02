@@ -92,11 +92,11 @@ checkpoint image instead."
   nil)
 
 (defun restore-spatial-index-roots (graph)
-  "Reopen the spatial indexes from the v3 sidecar -- no node scan.  Returns T when
-one was present, current, and COMPLETE; NIL to fall back to REBUILD-SPATIAL-INDEXES
-(a fresh graph, a pre-v3 graph, a crash before any root was written, a sidecar too
-damaged to read, or one a crashed rebuild left marked :COMPLETE NIL).  No-op
-returning NIL on a graph with no INDEXES heap.
+  "Reopen the spatial indexes from the v4 sidecar -- no node scan.  Returns T
+when one was present, current, and COMPLETE; NIL to fall back to REBUILD-
+SPATIAL-INDEXES (a fresh graph, a pre-v4 graph, a crash before any root was
+written, a sidecar too damaged to read, or one a crashed rebuild left marked
+:COMPLETE NIL).  No-op returning NIL on a graph with no INDEXES heap.
 
 An UNREADABLE sidecar falls back rather than propagating.  Unlike the unique and
 secondary sidecars -- written only at CLOSE-GRAPH -- this one is also written at
@@ -112,7 +112,10 @@ registry is supposed to hold because the rebuild that wrote it never reached its
 closing save (see SAVE-SPATIAL-INDEX-ROOTS).  A sidecar with no :COMPLETE key at
 all -- the shape written before this marker existed -- reads as complete via the
 DESTRUCTURING-BIND default below, not as a special case, so a graph already on the
-v3 format is never forced into a needless rebuild by this change."
+current format is never forced into a needless rebuild by this change.
+
+A COMPLETE v3 sidecar is the one stale format that is still ADOPTED before the
+fall-back -- see the comment at the OPEN below."
   (let ((file (and (indexes graph) (spatial-indexes-root-file (location graph)))))
     (when (and file (probe-file file))
       (destructuring-bind (&key format indexes (complete t) &allow-other-keys)
@@ -122,7 +125,14 @@ v3 format is never forced into a needless rebuild by this change."
                      indexes from live node geometries, which are authoritative."
                     file e)
               nil))
-        (when (and (eql format +spatial-index-format+) complete)
+        ;; A COMPLETE v3 sidecar has v4's layout and names LIVE ordered maps;
+        ;; only its multipolygon cells are stale (GH #103).  Open those roots
+        ;; too -- not to trust them, but so REBUILD-SPATIAL-INDEXES can FREE
+        ;; them: the registry is the only place it looks for storage to
+        ;; reclaim, so skipping this strands every v3 index in a region GC-HEAP
+        ;; never sweeps.  Returning NIL is what routes to that rebuild.
+        (when (and complete (or (eql format +spatial-index-format+)
+                                (eql format 3)))
           (dolist (r indexes)
             (destructuring-bind (owner slot address precision backend max-cells
                                  &optional counts)
@@ -132,7 +142,7 @@ v3 format is never forced into a needless rebuild by this change."
                                         :precision precision :backend backend
                                         :max-cells max-cells
                                         :precision-counts counts))))
-          t)))))
+          (eql format +spatial-index-format+))))))
 
 (defun all-node-classes-with-vector-index-slots (graph)
   "The node classes of GRAPH that declare at least one :VECTOR-INDEX slot.  Note
@@ -585,15 +595,16 @@ Always CLOSE-GRAPH when finished."
           (regenerate-all-views graph))
         (setf (graph-default-spatial-precision graph) (or spatial-precision 7))
         (setf (graph-default-spatial-max-cells graph) (or spatial-max-cells +spatial-insert-max-cells+))
-        ;; Spatial indexes: reopen from the v3 sidecar by root address (no node
+        ;; Spatial indexes: reopen from the v4 sidecar by root address (no node
         ;; scan, and -- critically -- no fresh allocation orphaning last run's
         ;; ordered maps in a region GC-HEAP never sweeps).
         (if (restore-spatial-index-roots graph)
             (report-degraded-spatial-indexes graph)
             (progn
-              ;; No current sidecar: a fresh graph, or a pre-v3 one whose single
-              ;; index must be re-derived per (owner . slot).  Index only -- node
-              ;; data is untouched and nothing is re-fetched.
+              ;; No current sidecar: a fresh graph, a pre-v3 one whose single
+              ;; index must be re-derived per (owner . slot), or a v3 one whose
+              ;; multipolygon cells predate GH #103.  Index only -- node data is
+              ;; untouched and nothing is re-fetched.
               (when (probe-file (spatial-index-root-file (location graph)))
                 (log:info "Spatial index sidecar is pre-v3; re-deriving per-class ~
                            indexes from live node geometries (index only)."))
