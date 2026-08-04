@@ -82,10 +82,12 @@ rebuild.  The rescan is 12 iterations and runs only on that transition."
 ;; insert cap and precision histogram.  v4 is v3's LAYOUT exactly; it bumps only
 ;; because %GEOMETRY-CELLS changed which cells a multipolygon occupies (GH #103)
 ;; and a remove derives its cells from the geometry -- cells the old budget
-;; wrote would be orphaned by a new remove.  Any older sidecar triggers an
-;; index-only re-derivation from live node geometries at open (RESTORE-SPATIAL-
-;; INDEX-ROOTS).
-(alexandria:define-constant +spatial-index-format+ 4 :test '=)
+;; wrote would be orphaned by a new remove.  v5 is v4's layout too; it bumps
+;; because each entry's VALUE now carries the node's type tag (GH #104) and a v4
+;; index's NIL values would leave every scoped query on the old floor.  Any
+;; older sidecar triggers an index-only re-derivation from live node geometries
+;; at open (RESTORE-SPATIAL-INDEX-ROOTS).
+(alexandria:define-constant +spatial-index-format+ 5 :test '=)
 
 ;; A bbox query covers its window with at most this many (coarse) cells, each of
 ;; which becomes ONE prefix range scan.  Bounding the covering set is what keeps a
@@ -102,9 +104,9 @@ rebuild.  The rescan is 12 iterations and runs only on that transition."
 ;; on disk (find-kv rescans from the head) and silently wrong in RAM (find
 ;; overshoots a taller same-key node).  A cell lookup becomes a prefix range
 ;; scan over [(cell null-id) .. (cell max-id)] and the node-id is read back from
-;; the key's second element; the skip-node value is unused (NIL).  The composite
-;; codec is VIEW-KEY-SERIALIZE (payload string + 16-byte id), shared with views
-;; and unique indexes.
+;; the key's second element; the skip-node VALUE is the node's type tag (GH
+;; #104).  The composite codec is VIEW-KEY-SERIALIZE (payload string + 16-byte
+;; id), shared with views and unique indexes.
 ;; Created through the shared MAKE-HEAP-INDEX (bplus-tree.lisp), so the spatial
 ;; index follows the graph's chosen backend (skip list or B+ tree) like views and
 ;; unique.  INIT-SPATIAL-INDEX passes (GRAPH-INDEX-BACKEND GRAPH).
@@ -232,18 +234,44 @@ SPATIAL-INDEX-REMOVE recompute exactly the set SPATIAL-INDEX-INSERT wrote."
                   (setf (gethash c seen) t)
                   (push c cells)))))))))
 
-(defun spatial-index-insert (idx node-id geom)
+;;; ---------------------------------------------------------------------------
+;;; Type tags (GH #104)
+;;;
+;;; Each entry stores the owning node's type tag as its VALUE, so a scoped query
+;;; can reject a candidate from the index entry alone -- before %NODE-BY-ID
+;;; materialises it.  The kind bit is not redundant: vertex and edge type-ids
+;;; both start at 1, and an index owner only has to be a NODE-CLASS, so a mixin
+;;; inherited by both a vertex and an edge branch can share one index.
+;;; ---------------------------------------------------------------------------
+
+(declaim (inline %spatial-type-tag %tag-admits-p))
+
+(defun %spatial-type-tag (type-id edge-p)
+  "The index-entry tag for a node of TYPE-ID and kind EDGE-P."
+  (+ (* 2 type-id) (if edge-p 1 0)))
+
+(defun %tag-admits-p (tag tags)
+  "True when TAGS -- an EQL set of admitted tags, or NIL for no filtering --
+admits an entry stored under TAG.  An UNTAGGED entry (TAG NIL) is ALWAYS
+admitted: it was written before GH #104, so only the caller's TYPEP filter can
+decide it.  That fall-through is what keeps an un-rebuilt index correct (merely
+slow) rather than silently empty."
+  (or (null tags) (null tag) (gethash tag tags) nil))
+
+(defun spatial-index-insert (idx node-id geom &optional type-tag)
   "Index NODE-ID under every cell GEOM occupies.  NODE-ID is a node's 16-byte
-uuid; it is folded into the composite key (cell . node-id) and the skip-node
-value is unused (NIL).  ADD-TO-SKIP-LIST is a duplicate-key no-op (returns NIL)
-when this exact (cell . node-id) is already stored -- e.g. a replayed or
-double-applied insert -- and PRECISION-COUNTS is only bumped when an entry was
-actually added, so the histogram tracks what the store physically holds."
+uuid; it is folded into the composite key (cell . node-id), and TYPE-TAG -- the
+node's %SPATIAL-TYPE-TAG -- is stored as the entry's value so a scoped query can
+reject it without materialising the node (GH #104).  ADD-TO-SKIP-LIST is a
+duplicate-key no-op (returns NIL) when this exact (cell . node-id) is already
+stored -- e.g. a replayed or double-applied insert -- and PRECISION-COUNTS is
+only bumped when an entry was actually added, so the histogram tracks what the
+store physically holds."
   (let ((sl (spatial-index-skip-list idx)))
     (dolist (cell (%geometry-cells geom (spatial-index-precision idx)
                                    (spatial-index-max-cells idx))
                   node-id)
-      (when (add-to-skip-list sl (list cell node-id) nil)
+      (when (add-to-skip-list sl (list cell node-id) type-tag)
         (%count-cell idx cell)))))
 
 (defun spatial-index-remove (idx node-id geom)
@@ -264,9 +292,10 @@ SPATIAL-INDEX-COARSEST-PRECISION."
       (when (remove-from-skip-list sl (list cell node-id))
         (%uncount-cell idx cell)))))
 
-(defun spatial-index-query-bbox (idx min-lon min-lat max-lon max-lat)
-  "Candidate node-ids whose indexed cells meet the query bounding box.  A
-cell-granular FILTER -- refine with exact geometry predicates.
+(defun map-spatial-index-bbox (fn idx min-lon min-lat max-lon max-lat
+                               &key tags seen)
+  "Call FN on each candidate node-id whose indexed cells meet the query bounding
+box.  A cell-granular FILTER -- refine with exact geometry predicates.
 
 The window is covered with as FEW cells as possible: the covering precision is
 chosen adaptively to stay under +SPATIAL-QUERY-MAX-CELLS+, and never exceeds the
@@ -281,7 +310,15 @@ the exact predicate) and matches the index's existing filter/refine contract.
 
 The covering precision is additionally clamped to the coarsest precision at which
 any cell is currently stored (SPATIAL-INDEX-COARSEST-PRECISION), which is what
-lets an oversized geometry be stored coarsely without becoming unfindable."
+lets an oversized geometry be stored coarsely without becoming unfindable.
+
+TAGS is the scope's admitted type-tag set (NIL = admit everything); an entry it
+rejects is never deduped, never consed and never handed to FN, which is what
+makes a scoped query cost its own results rather than the whole index's
+population (GH #104).  SEEN is the dedup table; a caller scanning several
+indexes for one query passes ONE table so a node reachable through two of them
+is visited once -- and so the query pays for a single table, not one per index
+plus another in the caller."
   (let* ((sl (spatial-index-skip-list idx))
          (cover-prec (min (spatial-index-precision idx)
                           (%covering-precision (max 0d0 (- max-lon min-lon))
@@ -293,8 +330,7 @@ lets an oversized geometry be stored coarsely without becoming unfindable."
                           ;; before the range start.  Without this, a capped insert
                           ;; would be silently invisible.
                           (spatial-index-coarsest-precision idx)))
-         (seen (make-hash-table :test 'equalp))
-         (result '()))
+         (seen (or seen (make-hash-table :test 'equalp))))
     (dolist (cell (geohash-covering min-lon min-lat max-lon max-lat
                                     :precision cover-prec))
       (multiple-value-bind (start end) (geohash-prefix-range cell)
@@ -307,15 +343,38 @@ lets an oversized geometry be stored coarsely without becoming unfindable."
           (when cursor
             (do ((node (cursor-next cursor) (cursor-next cursor)))
                 ((null node))
-              (let ((nid (second (%sn-key node))))
-                (unless (gethash nid seen)
-                  (setf (gethash nid seen) t)
-                  (push nid result))))))))
-    result))
+              ;; Tag first: a rejected entry must not even reach the dedup
+              ;; table, which hashes a 16-byte array.  A rejected node may be
+              ;; re-tested once per cell it occupies -- an integer compare
+              ;; against the hash it avoids.
+              (when (%tag-admits-p (%sn-value node) tags)
+                (let ((nid (second (%sn-key node))))
+                  (unless (gethash nid seen)
+                    (setf (gethash nid seen) t)
+                    (funcall fn nid)))))))))
+    nil))
 
-(defun spatial-index-query-radius (idx lat lon radius-m)
-  "Candidate node-ids within ~RADIUS-M metres of (LAT, LON), via a bounding-box
-prefilter.  Refine with GEODESIC-DISTANCE for an exact radius."
-  (let* ((dlat (/ radius-m 111320d0))
-         (dlon (/ radius-m (* 111320d0 (max 0.01d0 (cos (deg->rad lat)))))))
-    (spatial-index-query-bbox idx (- lon dlon) (- lat dlat) (+ lon dlon) (+ lat dlat))))
+(defun map-spatial-index-radius (fn idx lat lon radius-m &key tags seen)
+  "Call FN on each candidate node-id within ~RADIUS-M metres of (LAT, LON), via
+a bounding-box prefilter.  Refine with GEODESIC-DISTANCE for an exact radius.
+TAGS and SEEN are as for MAP-SPATIAL-INDEX-BBOX."
+  (let ((dlat (/ radius-m 111320d0))
+        (dlon (/ radius-m (* 111320d0 (max 0.01d0 (cos (deg->rad lat)))))))
+    (map-spatial-index-bbox fn idx (- lon dlon) (- lat dlat)
+                            (+ lon dlon) (+ lat dlat) :tags tags :seen seen)))
+
+(defun spatial-index-query-bbox (idx min-lon min-lat max-lon max-lat &key tags)
+  "The candidate node-ids MAP-SPATIAL-INDEX-BBOX would visit, as a list.  Prefer
+the mapping function on a hot path: this conses the whole candidate set, which
+is exactly the cost GH #104 removed from the scoped queries."
+  (let ((result '()))
+    (map-spatial-index-bbox (lambda (id) (push id result))
+                            idx min-lon min-lat max-lon max-lat :tags tags)
+    (nreverse result)))
+
+(defun spatial-index-query-radius (idx lat lon radius-m &key tags)
+  "The candidate node-ids MAP-SPATIAL-INDEX-RADIUS would visit, as a list."
+  (let ((result '()))
+    (map-spatial-index-radius (lambda (id) (push id result))
+                              idx lat lon radius-m :tags tags)
+    (nreverse result)))

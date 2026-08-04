@@ -336,6 +336,8 @@
            #:spatial-index-remove
            #:spatial-index-query-bbox
            #:spatial-index-query-radius
+           #:map-spatial-index-bbox
+           #:map-spatial-index-radius
            #:delete-spatial-index
            #:rebuild-spatial-indexes
            #:regenerate-spatial-index

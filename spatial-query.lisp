@@ -60,6 +60,20 @@ historical behaviour), so results are unchanged when the add-on is absent."
 back from every index in SCOPE.  Dedups by node id across indexes, so a node
 reachable through two of its own slot-indexes is visited once.
 
+The scope's TYPE FILTER is pushed INTO the index scan as a tag set (GH #104):
+each entry carries its node's type tag, so a candidate outside the scope is
+rejected without being deduped, consed or -- above all -- materialised.  Before
+that, a shared index (the normal outcome of a geometry slot on a mixin) made
+every scoped query pay for the whole index's population: 206 results and
+29,739 results cost the same 120 ms because the cost tracked candidates, not
+answers.  %SCOPE-ADMITS-P still runs on the survivors and remains authoritative
+-- the tag set is only ever a conservative pre-filter, and is skipped entirely
+for :ALL and for an entry written before the tag existed.
+
+The dedup table is created ONCE here and threaded through every index scan,
+rather than each scan building its own and this loop building a second one over
+the results; one table, one hash per surviving candidate.
+
 SCOPE is resolved -- and therefore VALIDATED -- BEFORE GUARD is evaluated, so a
 query naming a class that is not spatially indexed signals even when its payload
 argument is junk too.  Signalling on an unscopeable class is the entire point of
@@ -68,25 +82,29 @@ payload happened to be well formed.
 
 GUARD is the payload-validity test; BBOX / RADIUS are evaluated once, after it
 passes, so they may assume a well-formed payload."
-  (let ((indexes (gensym "IX")) (types (gensym "TY")) (seen (gensym "SEEN"))
+  (let ((indexes (gensym "IX")) (types (gensym "TY")) (tags (gensym "TAGS"))
+        (seen (gensym "SEEN")) (visit (gensym "VISIT"))
         (idx (gensym "I")) (id (gensym "ID")) (win (gensym "WINDOW"))
         (a (gensym "A")) (b (gensym "B")) (c (gensym "C")) (d (gensym "D")))
-    `(multiple-value-bind (,indexes ,types) (%resolve-spatial-scope ,scope ,graph)
+    `(multiple-value-bind (,indexes ,types ,tags)
+         (%resolve-spatial-scope ,scope ,graph)
        (when ,guard
          (let ((,seen (make-hash-table :test 'equalp))
                (,win ,(or bbox radius)))
-           (dolist (,idx ,indexes)
-             (dolist (,id ,(if bbox
-                               `(destructuring-bind (,a ,b ,c ,d) ,win
-                                  (spatial-index-query-bbox ,idx ,a ,b ,c ,d))
-                               `(destructuring-bind (,a ,b ,c) ,win
-                                  (spatial-index-query-radius ,idx ,a ,b ,c))))
-               (unless (gethash ,id ,seen)
-                 (setf (gethash ,id ,seen) t)
-                 (let ((,node-var (%node-by-id ,id ,graph)))
-                   (when (and ,node-var (not (deleted-p ,node-var))
-                              (%scope-admits-p ,node-var ,types))
-                     ,@body))))))))))
+           (flet ((,visit (,id)
+                    (let ((,node-var (%node-by-id ,id ,graph)))
+                      (when (and ,node-var (not (deleted-p ,node-var))
+                                 (%scope-admits-p ,node-var ,types))
+                        ,@body))))
+             (dolist (,idx ,indexes)
+               ,(if bbox
+                    `(destructuring-bind (,a ,b ,c ,d) ,win
+                       (map-spatial-index-bbox #',visit ,idx ,a ,b ,c ,d
+                                               :tags ,tags :seen ,seen))
+                    `(destructuring-bind (,a ,b ,c) ,win
+                       (map-spatial-index-radius #',visit ,idx ,a ,b ,c
+                                                 :tags ,tags
+                                                 :seen ,seen))))))))))
 
 (defun find-nodes-within (scope area &key (graph *graph*))
   "Live nodes in SCOPE whose geometry lies within AREA (a :POLYGON or
@@ -309,7 +327,7 @@ full rebuild on every subsequent open until something happened to save it comple
                      (spatial-index-insert
                       (%spatial-index-for
                        graph (%node-spatial-owner-name (class-of node) slot) slot)
-                      (id node) geom)
+                      (id node) geom (%node-spatial-type-tag node))
                      (incf count))))))
         (map-vertices #'reindex graph)
         (map-edges #'reindex graph))
@@ -374,7 +392,7 @@ has no per-index completeness granularity -- but it is the safe direction."
                                     owner-name))
                        (spatial-index-insert
                         (%spatial-index-for graph owner-name slot-name)
-                        (id node) geom)
+                        (id node) geom (%node-spatial-type-tag node))
                        (incf count))))))
           ;; OWNER-NAME is the DECLARING class, and its subclasses share the
           ;; index, so the typed scan must include them -- MAP-VERTICES/MAP-EDGES

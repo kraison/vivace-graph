@@ -14,8 +14,9 @@ between releases; cutting a release renames it to the new version and dates it.
 > The next release is **3.0.0** (MAJOR). Per this file's SemVer preamble, MAJOR is
 > mandatory here on two independent grounds: the spatial-index changes below are a
 > breaking public-API change *and* an on-disk format bump (the spatial sidecar goes to
-> format v4). Existing on-disk graphs still open — the spatial index re-derives itself
-> automatically at first open — but stale call sites and old Prolog arities do not.
+> format v5, and the memory-graph image to v7). Existing on-disk graphs still open —
+> the spatial index re-derives itself automatically at first open — but stale call
+> sites and old Prolog arities do not.
 
 ### Added
 
@@ -129,6 +130,29 @@ between releases; cutting a release renames it to the new version and dates it.
 ### Changed
 
 #### Performance
+
+- **A scoped spatial query now costs its results, not the whole index's
+  population** (#104). Every candidate id the index returned was materialized into a
+  live node *before* the scope's type filter could run, because that filter took a
+  node and called `typep`. Where several classes share one index — the normal
+  outcome of declaring a geometry slot on a mixin, and what
+  `class-spatial-index-keys` documents — a scoped query therefore paid for every
+  class in the index. Measured on a 296,932-point shared index: 206 results cost
+  120 ms and 29,739 results cost 126 ms, while the same query against a per-class
+  index of 5,004 points cost 18 ms. Cost tracked candidates, not answers, so the
+  idiomatic modelling choice was the one that produced the floor.
+  Each index entry now carries its node's type tag (its type-id plus a kind bit),
+  and the scope's admitted tag set is applied *inside* the range scan: a candidate
+  outside the scope is never deduped, never consed and never materialized. The
+  dedup table is also created once per query and threaded through every index
+  scanned, rather than one per index plus a second one over the results.
+  `typep` still runs on the survivors and remains authoritative — the tag set is
+  only ever a conservative pre-filter, skipped entirely for `:all` and for an
+  untagged (pre-#104) entry.
+  *Migration:* the spatial sidecar goes to **format v5** and the memory-graph image
+  to **v7** (native) / **v5** (cl-store); both re-derive the spatial indexes from
+  live nodes at first open. An index that somehow arrives untagged still answers
+  correctly, just at the old cost.
 
 - **A view's map/reduce source is compiled once, not once per node** (#89).
   `add-to-view` called `compile-view-code` on every node addition, and that
@@ -339,11 +363,11 @@ between releases; cutting a release renames it to the new version and dates it.
   geometry slot of its own (a node stored there is still a `parent` by type, but
   the parent scope will not scan it). Scope to the subclass or use `:all`; the
   general fix rides with GitHub #60.
-- **BREAKING: the spatial sidecar is now `spatial-indexes.dat`, format v4**
+- **BREAKING: the spatial sidecar is now `spatial-indexes.dat`, format v5**
   (was `spatial-index.root`, a single plist). It records one entry per
   `(owner . slot)` index — address, precision, backend, insert cap, and precision
   histogram — and is written on every index creation and at `close-graph`. A
-  pre-v4 graph (the old file present, or a stale `:format`) **re-derives its spatial
+  pre-v5 graph (the old file present, or a stale `:format`) **re-derives its spatial
   indexes automatically at first open**: one `map-vertices` + `map-edges` sweep
   routes each node into the `(owner . slot)` index its geometry slot selects, so
   the contents come out identical to what the single index held, merely
@@ -352,8 +376,8 @@ between releases; cutting a release renames it to the new version and dates it.
   is unsupported**: an older build would reopen it as a silently stale (or empty)
   index.
 - **The memory-graph image bumped, and lost a per-open cost.** Both in-memory
-  formats moved — the cl-store image (v4) and the native/lazy image the ECL
-  device uses (v6) — so the spatial payload is now one structural record per
+  formats moved — the cl-store image (v5) and the native/lazy image the ECL
+  device uses (v7) — so the spatial payload is now one structural record per
   `(owner . slot)`, carrying that index's precision, insert cap, and histogram,
   restored directly into its own `mem-skip-list` the way views are. This
   **removes** the rebuild-from-nodes that a memory-graph previously ran on every
@@ -398,11 +422,12 @@ between releases; cutting a release renames it to the new version and dates it.
   coarse the grid — falls back to a single bounded cover of its envelope instead of
   collapsing to precision 1.
   *Migration:* a heap-backed graph re-derives its spatial indexes automatically at
-  first open (this is what the sidecar's v4 bump is for). A **memory-graph restores
-  its spatial grid structurally from the image**, so it keeps the cells the old
-  budget wrote until you call `regenerate-spatial-indexes` once; the image format
-  is deliberately not bumped, since the image is a memory graph's only durable
-  record. Cells covering a single-part geometry are byte-identical either way.
+  first open (this is what the sidecar's v5 bump is for). A memory-graph restores
+  its spatial grid structurally from the image and so would have kept the cells the
+  old budget wrote — but #104's image bump re-derives them from live nodes on the
+  first open of a pre-v7 image, so a memory-graph now picks this fix up
+  automatically too, with no `regenerate-spatial-indexes` call. Cells covering a
+  single-part geometry are byte-identical either way.
 
 - **A skip-list read could return a freed node's data, or loop forever** (#88). The
   direct-mapped node cache is validated by *address*, so anything that frees a node had

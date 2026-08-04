@@ -1195,6 +1195,11 @@ the pathological case of a slotless geometry with no class-specialized method
 ;; SAVE-SPATIAL-INDEX-ROOTS is in graph.lisp; declared for the same reason.
 (declaim (ftype (function (t) t) save-spatial-index-roots))
 
+(defun %node-spatial-type-tag (node)
+  "NODE's spatial index-entry tag (GH #104).  Lives here, not in
+spatial-index.lisp, which loads before VERTEX and EDGE."
+  (%spatial-type-tag (type-id node) (typep node 'edge)))
+
 (defun %spatial-index-node (graph node)
   "Insert NODE into the index its geometry slot selects.  No-op without geometry.
 
@@ -1222,7 +1227,7 @@ miss the entry the insert wrote."
       (let* ((owner (%node-spatial-owner-name (class-of node) slot))
              (idx (%spatial-index-for graph owner slot))
              (before (spatial-index-coarsest-precision idx)))
-        (spatial-index-insert idx (id node) geom)
+        (spatial-index-insert idx (id node) geom (%node-spatial-type-tag node))
         ;; §7.4: an insert whose cover was capped can LOWER the index's coarsest
         ;; occupied precision, which widens every subsequent query's covering
         ;; clamp.  Only this layer can name the node responsible -- the index

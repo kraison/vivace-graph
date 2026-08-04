@@ -1378,3 +1378,153 @@ user-visible property: the recovery path yields a correct, queryable spatial ind
       (collect-garbage))))
 
 
+
+;;; ---------------------------------------------------------------------------
+;;; Type tags on the index entries (GH #104)
+;;;
+;;; A shared index -- the normal outcome of declaring a geometry slot on a
+;;; mixin -- used to make a scoped query materialise EVERY candidate the index
+;;; returned and only then reject it by type, so the cost tracked its population
+;;; rather than the answer.  The entry now carries its node's type tag and the
+;;; scan filters on it, so the tests below assert the cost model, not just the
+;;; results: a scope must TOUCH only its own nodes.
+;;; ---------------------------------------------------------------------------
+
+;; One geometry slot on a shared ancestor, two sibling subclasses -- so all
+;; three classes land in the (SCOPE-SHARED . GEOM) index.
+(def-vertex scope-shared ()
+  ((geom :type geometry :index t))
+  :graph-db-integration-test)
+
+(def-vertex scope-shared-a (scope-shared) () :graph-db-integration-test)
+(def-vertex scope-shared-b (scope-shared) () :graph-db-integration-test)
+
+(defun scope-entry-tags (idx node-id geom)
+  "The stored VALUE of every entry IDX holds for NODE-ID under GEOM's cells."
+  (let ((sl (graph-db::spatial-index-skip-list idx)))
+    (loop for cell in (graph-db::%geometry-cells
+                       geom (spatial-index-precision idx)
+                       (spatial-index-max-cells idx))
+          for node = (graph-db::find-in-skip-list sl (list cell node-id))
+          when node collect (graph-db::%sn-value node))))
+
+(defmacro counting-materialisations ((counter) &body body)
+  "Run BODY with COUNTER counting %NODE-BY-ID calls -- i.e. how many candidates
+the query actually materialised."
+  (let ((orig (gensym "ORIG")))
+    `(let ((,counter 0)
+           (,orig (fdefinition 'graph-db::%node-by-id)))
+       (unwind-protect
+            (progn
+              (setf (fdefinition 'graph-db::%node-by-id)
+                    (lambda (id graph)
+                      (incf ,counter)
+                      (funcall ,orig id graph)))
+              ,@body)
+         (setf (fdefinition 'graph-db::%node-by-id) ,orig)))))
+
+(test vertex-and-edge-tags-are-disjoint
+  "The tag carries the KIND as well as the type-id: vertex and edge type-ids
+both start at 1, and an index owner need only be a NODE-CLASS, so one index can
+hold both kinds."
+  (is (/= (graph-db::%spatial-type-tag 1 nil)
+          (graph-db::%spatial-type-tag 1 t)))
+  (is (= (graph-db::%spatial-type-tag 1 nil)
+         (graph-db::%spatial-type-tag 1 nil))))
+
+(test write-path-tags-each-entry-with-its-node-type
+  "Every cell an insert writes carries the node's own type tag, and two sibling
+subclasses sharing one index get DIFFERENT tags -- that difference IS the
+filter."
+  (with-test-graph (g)
+    (let (a-id b-id (pt (make-point 37.1724d0 49.2020d0)))
+      (with-transaction ()
+        (setq a-id (id (make-scope-shared-a :geom pt)))
+        (setq b-id (id (make-scope-shared-b :geom pt))))
+      (let ((idx (spatial-index-for g 'scope-shared 'geom)))
+        (is (spatial-index-p idx) "both subclasses share the ancestor's index")
+        (let ((a-tags (scope-entry-tags idx a-id pt))
+              (b-tags (scope-entry-tags idx b-id pt)))
+          (is (not (null a-tags)) "A's entries were found")
+          (is (not (null b-tags)) "B's entries were found")
+          (is (every #'integerp a-tags) "every entry carries a tag")
+          (is (every #'integerp b-tags))
+          (is (null (intersection a-tags b-tags))
+              "sibling subclasses must not share a tag"))))))
+
+(test scoped-query-materialises-only-its-own-type
+  "THE regression: with 20 B nodes and 1 A node in one shared index and one
+window, a query scoped to A must materialise exactly ONE node.  Before GH #104
+it materialised all 21 -- and on a real corpus, 39,409 to answer 206."
+  (with-test-graph (g)
+    (let ((pt (make-point 37.1724d0 49.2020d0)))
+      (with-transaction ()
+        (make-scope-shared-a :geom pt)
+        (dotimes (i 20)
+          (make-scope-shared-b :geom (make-point (+ 37.1724d0 (* i 1d-4))
+                                                 49.2020d0))))
+      (let ((window (scope-rect 37.0d0 49.0d0 37.5d0 49.5d0)))
+        ;; Sanity: the index really does hold all 21 candidates.
+        (is (= 21 (length (find-nodes-within 'scope-shared window :graph g)))
+            "the ancestor scope sees every node in the shared index")
+        (let (result)
+          (counting-materialisations (calls)
+            (setq result (find-nodes-within 'scope-shared-a window :graph g))
+            (is (plusp calls)
+                "sanity: the counter must actually intercept %NODE-BY-ID")
+            (is (= 1 calls)
+                "a scoped query must materialise its OWN nodes only, not every ~
+                 candidate the shared index returns"))
+          (is (= 1 (length result)))
+          (is (every #'scope-shared-a-p result)))))))
+
+(test untagged-entries-are-still-found
+  "An entry written before the tag existed (an index not yet rebuilt) stores
+NIL, and NIL must be ADMITTED -- the TYPEP filter then decides it.  Rejecting it
+would turn a stale index into silently empty results, not merely slow ones."
+  (with-test-graph (g)
+    (let ((pt (make-point 37.1724d0 49.2020d0))
+          (window (scope-rect 37.0d0 49.0d0 37.5d0 49.5d0))
+          id)
+      (with-transaction ()
+        (setq id (id (make-scope-shared-a :geom pt))))
+      (let ((idx (spatial-index-for g 'scope-shared 'geom)))
+        ;; Re-write the entries the way a pre-#104 build did: no tag.
+        (spatial-index-remove idx id pt)
+        (spatial-index-insert idx id pt)
+        (is (every #'null (scope-entry-tags idx id pt))
+            "sanity: the entries really are untagged")
+        (let ((result (find-nodes-within 'scope-shared-a window :graph g)))
+          (is (= 1 (length result))
+              "an untagged entry must fall through to the TYPEP filter")
+          (is (equalp id (id (first result)))))
+        ;; ...and the type filter is still applied to it, by TYPEP.
+        (is (null (find-nodes-within 'scope-shared-b window :graph g))
+            "falling through must not mean skipping the filter")))))
+
+(test v4-sidecar-forces-a-rebuild-that-tags
+  "A v4 sidecar names LIVE ordered maps whose entries carry no tag.  It must be
+ADOPTED (so the rebuild can free its storage) but NOT trusted, and the rebuild
+that follows must leave every entry tagged."
+  (with-test-graph (g)
+    (let ((pt (make-point 37.1724d0 49.2020d0)) id)
+      (with-transaction ()
+        (setq id (id (make-scope-shared-a :geom pt))))
+      (graph-db::save-spatial-index-roots g)
+      (let* ((file (graph-db::spatial-indexes-root-file
+                    (namestring (graph-db:location g))))
+             (plist (cl-store:restore file)))
+        (is (= 5 (getf plist :format)) "sanity: this build writes v5")
+        (cl-store:store (list :format 4 :complete t
+                              :indexes (getf plist :indexes))
+                        file))
+      (clrhash (spatial-indexes g))
+      (is (null (graph-db::restore-spatial-index-roots g))
+          "a v4 sidecar must route to the rebuild, not be trusted")
+      (is (plusp (hash-table-count (spatial-indexes g)))
+          "...but its roots must still be ADOPTED, or the rebuild has no ~
+           storage to free and orphans it")
+      (rebuild-spatial-indexes g)
+      (let ((idx (spatial-index-for g 'scope-shared 'geom)))
+        (is (every #'integerp (scope-entry-tags idx id pt))
+            "the rebuild must write the tags the v4 index lacked")))))

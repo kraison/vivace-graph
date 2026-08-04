@@ -190,12 +190,37 @@ spatially indexed at all (an error).  Direct mirror of %SLOT-INDEX-DECLARED-P."
              (%node-geometry-method-owner-name class))
          t)))
 
+(defun %scope-type-tags (names graph)
+  "The set of index-entry type tags (%SPATIAL-TYPE-TAG) NAMES admits, as an EQL
+hash table -- the pre-filter that lets a scoped query reject a candidate from
+the index entry alone, before %NODE-BY-ID materialises it (GH #104).
+
+RESOLVE-NODE-TYPE-IDS expands each name to its registered CLOS subclasses, which
+is exactly what makes this agree with %SCOPE-ADMITS-P's TYPEP.  Both kinds are
+resolved because an index owner need only be a NODE-CLASS, so a mixin inherited
+by a vertex and an edge branch can share one index.
+
+Returns NIL -- meaning DO NOT pre-filter -- when nothing resolved, rather than
+an empty set meaning \"admit nothing\".  A class can be spatially declared (a
+finalized CLOS class with a geometry slot) yet unregistered in THIS graph's
+schema, and an empty set would silently turn that into zero results; falling
+through to TYPEP leaves such a query as correct, and as slow, as it was."
+  (let ((tags (make-hash-table :test 'eql)))
+    (dolist (name names)
+      (dolist (id (resolve-node-type-ids name :vertex :graph graph))
+        (setf (gethash (%spatial-type-tag id nil) tags) t))
+      (dolist (id (resolve-node-type-ids name :edge :graph graph))
+        (setf (gethash (%spatial-type-tag id t) tags) t)))
+    (when (plusp (hash-table-count tags)) tags)))
+
 (defun %resolve-spatial-scope (scope graph)
   "Resolve SCOPE -- a class name, a list of class names, or :ALL -- to
- (values INDEXES TYPE-NAMES).
+ (values INDEXES TYPE-NAMES TAGS).
 
 INDEXES is the set of live spatial indexes to scan; TYPE-NAMES is the class list
-results must satisfy, or NIL for :ALL (no filtering).  A named class contributes
+results must satisfy, or NIL for :ALL (no filtering); TAGS is the same filter
+expressed as index-entry type tags, applied inside the scan (see
+%SCOPE-TYPE-TAGS), or NIL when it cannot be resolved.  A named class contributes
 every (owner . slot) index covering its geometry, so a slot declared on a mixin
 resolves to the ancestor's shared index -- and the type filter is what then keeps
 a sibling subclass's nodes out of the answer.  Indexes are deduped by KEY, not by
@@ -208,7 +233,7 @@ empty result, not a fault.
 Signals when a named class is not spatially indexed at all: that is a programming
 error, and catching it is the reason the scope is required."
   (if (eq scope :all)
-      (values (all-spatial-indexes graph) nil)
+      (values (all-spatial-indexes graph) nil nil)
       (let* ((names (if (listp scope) scope (list scope)))
              (keys (make-hash-table :test 'equalp))
              (indexes '()))
@@ -222,7 +247,7 @@ error, and catching it is the reason the scope is required."
               (setf (gethash key keys) t)
               (let ((idx (spatial-index-for graph (car key) (cdr key))))
                 (when idx (push idx indexes))))))
-        (values indexes names))))
+        (values indexes names (%scope-type-tags names graph)))))
 
 (defun %scope-admits-p (node type-names)
   "True when NODE satisfies the scope's type filter (always, for :ALL)."

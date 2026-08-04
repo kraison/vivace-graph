@@ -609,12 +609,17 @@ lookups return the live object).  Returns the node."
     (nreverse acc)))
 
 (defun write-memory-image-native (graph)
-  "Write GRAPH's full state in the VG-native (v6) format: per-node blob records +
-the same structural derived dumps.  Untouched LZNODEs pass their blob through."
+  "Write GRAPH's full state in the VG-native (v7) format: per-node blob records
+plus the same structural derived dumps.  Untouched LZNODEs pass their blob
+through."
   (let ((buf (ni-mkbuf)))
     ;; v4 added :unique; v5 = composite-key spatial pairs; v6 = one spatial record
-    ;; per (owner . slot), each with its own precision/cap/histogram.
-    (ni-bytes buf *native-image-magic*) (ni-uint buf 6 4)
+    ;; per (owner . slot), each with its own precision/cap/histogram.  v7 is
+    ;; v6's LAYOUT exactly (the pair codec always round-tripped values); it
+    ;; bumps because a spatial entry's value now carries its type tag, and a v6
+    ;; image's NIL values would restore an index no scoped query can filter on
+    ;; (GH #104).
+    (ni-bytes buf *native-image-magic*) (ni-uint buf 7 4)
     (ni-uint buf (load-highest-transaction-id graph) 8)
     (let ((vt (mem-table-data (vertex-table graph)))
           (et (mem-table-data (edge-table graph))))
@@ -642,11 +647,11 @@ the same structural derived dumps.  Untouched LZNODEs pass their blob through."
 journal is cleared on checkpoint (GH #65) -- so the old advice to delete it and
 recover from the journal was actively wrong (it discards the graph and 'succeeds'
 onto an empty one).  Say what remedies actually exist instead."
-  (error "Unsupported memory-image format v~D at ~A (this build reads v5 and v6, ~
-writing v6).  This image is the ONLY durable record of a cleanly-closed memory ~
-graph -- the journal is cleared after every checkpoint, so deleting the image ~
-discards the graph, it does not recover it.  Open it with a build that reads v~D, ~
-or migrate it to v6 first."
+  (error "Unsupported memory-image format v~D at ~A (this build reads v5, v6 ~
+and v7, writing v7).  This image is the ONLY durable record of a cleanly-~
+closed memory graph -- the journal is cleared after every checkpoint, so ~
+deleting the image discards the graph, it does not recover it.  Open it with a ~
+build that reads v~D, or migrate it to v7 first."
          ver file ver))
 
 (defun %custom-node-geometry-classes ()
@@ -710,7 +715,7 @@ only that fraction -- fault-on-access survives for everything else."
                     (spatial-index-insert
                      (%spatial-index-for
                       graph (%node-spatial-owner-name (class-of node) slot) slot)
-                     (id node) geom)
+                     (id node) geom (%node-spatial-type-tag node))
                     (incf count)))))))))))
 
 (defun restore-memory-image-native (graph file)
@@ -735,11 +740,14 @@ was filed for).  Returns :STRUCTURAL and stashes the view dump in
          (ver nil))
     (ri-bytes rc 4)                                ; magic
     (setf ver (ri-uint rc 4))                       ; format version
-    ;; Each format bump is a mid-stream layout change that cannot be read
-    ;; positionally by a parser expecting a different one, so anything but the two
+    ;; A format bump is usually a mid-stream layout change that cannot be read
+    ;; positionally by a parser expecting a different one, so anything but the
     ;; known versions is rejected loudly rather than misparsed (GH #65).  v6 made
-    ;; the spatial section per-(owner . slot); v5 is migrated below.
-    (unless (member ver '(5 6)) (%signal-unsupported-memory-image-version ver file))
+    ;; the spatial section per-(owner . slot); v7 shares v6's layout exactly
+    ;; and differs only in what a spatial entry's value holds (GH #104).  Both
+    ;; v5 and v6 are migrated below.
+    (unless (member ver '(5 6 7))
+      (%signal-unsupported-memory-image-version ver file))
     (ri-uint rc 8)                                 ; highest-tx-id
     (let ((nv (ri-uint rc 4)))
       (dotimes (i nv)
@@ -764,10 +772,14 @@ was filed for).  Returns :STRUCTURAL and stashes the view dump in
     ;; remaining bytes anyway, harmlessly, so a truncated tail cannot signal here.
     (when (< (ric-i rc) (length (ric-bytes rc)))
       (%load-unique-indexes graph (ri-val rc)))
-    ;; v5 migration (GH #65): rederive the spatial index from the nodes -- the one
-    ;; thing v5's image didn't carry.  Lazy-safe (see the function docstring), so
-    ;; this runs unconditionally, not just on a materialized (non-lazy) graph.
-    (when (= ver 5) (%rebuild-memory-spatial-indexes-from-nodes graph))
+    ;; Pre-v7 migration: rederive the spatial index from the nodes.  v5 never
+    ;; carried one (GH #65); v6 carried one whose entries have no type tag, and
+    ;; the rebuild is the only way to write them -- a re-insert over an existing
+    ;; (cell . node-id) is a duplicate-key no-op and would leave the tag NIL
+    ;; (GH #104).  %REBUILD-MEMORY-SPATIAL-INDEXES-FROM-NODES clears the
+    ;; registry first, so the restored v6 indexes are dropped, not merged into.
+    ;; Lazy-safe (see its docstring), so this runs on a LAZY graph too.
+    (when (< ver 7) (%rebuild-memory-spatial-indexes-from-nodes graph))
     :structural))
 
 (defun write-memory-image (graph)
@@ -779,7 +791,9 @@ structures (vs rebuilding on open) is what keeps OPEN-MEMORY-GRAPH fast."
   (if (lazy-p graph)
       (write-memory-image-native graph)
       (cl-store:store
-       (list :version 4   ; v4: per-(owner . slot) spatial records (v3 wrote :spatial NIL)
+       ;; v4: per-(owner . slot) spatial records (v3 wrote :spatial NIL).  v5 is
+       ;; v4's shape with a type tag on each spatial entry (GH #104).
+       (list :version 5
              :highest-tx-id (load-highest-transaction-id graph)
              :vertices (map-mem-table #'identity (vertex-table graph) :collect-p t)
              :edges (map-mem-table #'identity (edge-table graph) :collect-p t)
@@ -808,7 +822,7 @@ mem-index-list is a set, deleted nodes stay indexed and scans filter them)."
                    (spatial-index-insert
                     (%spatial-index-for
                      graph (%node-spatial-owner-name (class-of n) slot) slot)
-                    (id n) geom))))))
+                    (id n) geom (%node-spatial-type-tag n)))))))
       (dolist (v vertices) (reindex v))
       (dolist (e edges)    (reindex e)))))
 
@@ -816,9 +830,10 @@ mem-index-list is a set, deleted nodes stay indexed and scans filter them)."
   "Populate GRAPH's mem-tables -- and, for a current-version image, its derived
 structures -- from its cl-store image if one exists (the schema must already be
 restored so the node classes are defined).  Returns :STRUCTURAL when the image
-restored the indexes/spatial/views directly (no rebuild), :REBUILT when an older
-(pre-v4) image was rebuilt from the nodes, or NIL when no image was present.  The
-per-view dump is stashed in *MEMORY-IMAGE-VIEW-DUMP* for RESTORE-VIEWS."
+restored the indexes/spatial/views directly (no rebuild), :REBUILT when an
+older (pre-v5) image was rebuilt from the nodes, or NIL when no image was
+present.  The per-view dump is stashed in *MEMORY-IMAGE-VIEW-DUMP* for
+RESTORE-VIEWS."
   (setf *memory-image-view-dump* :none)
   (let ((file (memory-image-file (location graph))))
     (when (probe-file file)
@@ -839,11 +854,12 @@ per-view dump is stashed in *MEMORY-IMAGE-VIEW-DUMP* for RESTORE-VIEWS."
           (setf (node-graph e) graph)
           (mem-table-put (edge-table graph) (id e) e))
         (cond
-          ((and (eql version 4) type-vertex)
+          ((and (eql version 5) type-vertex)
            ;; Structural restore -- direct index/skip-list inserts, no map/reduce/
            ;; geohash recompute.  This is what keeps open fast (#50).  An older image
-           ;; (v3 wrote :SPATIAL NIL; v2 keyed cells by bare string) fails the version
-           ;; check and falls through to the rebuild-from-nodes branch below.
+           ;; (v4's entries carry no type tag, GH #104; v3 wrote :SPATIAL NIL;
+           ;; v2 keyed cells by bare string) fails the version check and falls
+           ;; through to the rebuild-from-nodes branch below.
            (%load-mem-index (mem-type-index-data (vertex-index graph)) type-vertex)
            (%load-mem-index (mem-type-index-data (edge-index graph))   type-edge)
            (%load-mem-index (mem-ve-index-data (ve-index-in graph))    ve-in)
