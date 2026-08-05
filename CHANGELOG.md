@@ -82,6 +82,15 @@ between releases; cutting a release renames it to the new version and dates it.
   every class carrying more than one geometry-valued indexed slot and names the
   winning slot, for wiring into a schema test suite (see the inert-slot warning
   under Fixed).
+- **`geometry-empty-p` (g)** — true when a geometry holds no coordinates, i.e. the
+  EMPTY geometry of its kind (the kind is preserved: an empty polygon is still
+  `:polygon`). This is how a caller tells "nothing there" from "could not compute":
+  an empty result is a real answer that a spatial op returns normally — the
+  intersection of two disjoint polygons is empty — while a genuine failure signals.
+  Testing `geometry-coordinates` yourself is not equivalent: the kinds do not
+  represent emptiness alike (an empty linestring's coordinates are a zero-length
+  vector, the rest are `NIL`), and a polygon or multipolygon can hold its emptiness
+  one or two levels down. See #105.
 - **New spatial maintenance and query entry points.** `rebuild-spatial-indexes`
   (all indexes, the migration/repair sweep), `regenerate-spatial-index`
   (one `(owner slot)` index — the manual recovery for a degraded index),
@@ -404,6 +413,27 @@ between releases; cutting a release renames it to the new version and dates it.
   argument as an area.
 
 ### Fixed
+
+- **`wkt->geometry` signalled on every EMPTY geometry** (#105). The type keyword was
+  read as "everything before the first paren", but an EMPTY geometry has no paren —
+  so `"POLYGON EMPTY"` produced the keyword `"POLYGON EMPTY"`, matched no branch, and
+  fell through to `Unsupported WKT geometry type`. The correct EMPTY handling was
+  already there, sitting inside a dispatch that could never reach it. Since GEOS
+  reports an empty result as `"POLYGON EMPTY"`, this fired on the **normal** case —
+  `geometry-intersection` of two disjoint polygons — and through the shared
+  `geos->geometry` path it hit `union` / `difference` / `buffer` / `make-valid` too.
+  The type is now read as the first token.
+  A caller could not distinguish "no overlap" from "could not compute": both a
+  genuine zero-area result and the parse failure came back as an error, and a
+  consuming app that wrapped the call in `ignore-errors` got the same answer either
+  way by coincidence. An empty result is now an empty geometry of area 0, and only a
+  real failure signals.
+  `geometry-empty-p` (below) is the predicate for asking that question.
+  Also fixed in the same branch: `"POINT EMPTY"` returned a point at **(0, 0)**.
+  That line was unreachable before this fix, so nothing had exercised it — but null
+  island is a real location, and `geometry->wkt` would have written it back out as
+  `POINT (0 0)`, making the falsehood durable. An empty point now carries no
+  coordinates, and round-trips as `POINT EMPTY`.
 
 - **One sliver part in a multipolygon collapsed the whole spatial index's query
   precision to 1** (#103). A multipolygon's cell budget was split across its parts in

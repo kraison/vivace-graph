@@ -132,6 +132,25 @@
         (aref c 1)
         (%df (second c)))))
 
+(defun geometry-empty-p (g)
+  "True when G holds no coordinates -- the EMPTY geometry of its KIND, which is
+preserved (an empty polygon is still :POLYGON).
+
+Emptiness is a real answer, not a failure: the intersection of two disjoint
+polygons IS empty, and only a genuine failure signals (GH #105).  Callers that
+must tell \"nothing there\" from \"could not compute\" test this rather than the
+condition.  GEOMETRY->WKT writes such a geometry as \"<TYPE> EMPTY\".
+
+Not simply (NULL (GEOMETRY-COORDINATES G)): an empty linestring's coordinates
+are a zero-length vector, not NIL, and the nested kinds hold their emptiness one
+or two levels down."
+  (labels ((emptyp (c)
+             (cond ((null c) t)
+                   ((and (vectorp c) (not (stringp c))) (zerop (length c)))
+                   ((consp c) (every #'emptyp c))
+                   (t nil))))
+    (emptyp (geometry-coordinates g))))
+
 (defun geometry-bbox (g)
   "Axis-aligned bounding box of G as (values min-lon min-lat max-lon max-lat)."
   (let ((min-lon nil) (min-lat nil) (max-lon nil) (max-lat nil))

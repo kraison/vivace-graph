@@ -133,3 +133,67 @@ returns it to the pool (in-use back to 0)."
         (geos-shutdown)
         (is (= 0 *geos-pool-created*))
         (is (null *geos-pool*)))))
+
+;;; ---- EMPTY geometries (GH #105) ----------------------------------------
+;;;
+;;; GEOS emits an empty result as "POLYGON EMPTY" -- no parenthesis -- and the
+;;; type dispatch used to read the keyword as "everything before the first
+;;; paren", i.e. the whole string.  Every EMPTY form fell through to the
+;;; unsupported-type error, and an empty intersection is the NORMAL result for
+;;; two disjoint polygons, so this fired on the common case.
+
+(test wkt-parses-every-empty-form
+  "Each EMPTY form parses to its own kind, carrying no coordinates.  Pure
+parser -- no GEOS needed."
+  (dolist (spec '(("POINT EMPTY" :point)
+                  ("LINESTRING EMPTY" :linestring)
+                  ("POLYGON EMPTY" :polygon)
+                  ("MULTIPOLYGON EMPTY" :multipolygon)))
+    (destructuring-bind (wkt kind) spec
+      (let ((g (handler-case (wkt->geometry wkt)
+                 (error (e) e))))
+        (is (geometryp g) "~A did not parse: ~A" wkt g)
+        (when (geometryp g)
+          (is (eq kind (geometry-kind g))
+              "~A parsed as ~A" wkt (geometry-kind g))
+          (is (geometry-empty-p g)
+              "~A parsed with coordinates ~A" wkt (geometry-coordinates g)))))))
+
+(test empty-point-is-not-the-origin
+  "POINT EMPTY must NOT become a point at (0, 0).  Null island is a real
+location; returning it turns \"there is nothing here\" into \"there is
+something here, off the coast of Africa\" -- and GEOMETRY->WKT would then write
+it back out as POINT (0 0), so the falsehood persists."
+  (let ((g (wkt->geometry "POINT EMPTY")))
+    (is (geometry-empty-p g))
+    (is (string= "POINT EMPTY" (geometry->wkt g))
+        "an empty point must write back as EMPTY, got ~A" (geometry->wkt g))))
+
+(test wkt-empty-is-case-and-space-insensitive
+  "The type token is read as the first token, so leading/trailing space and
+lower case still dispatch."
+  (dolist (wkt '("  polygon empty  " "Polygon Empty" "POLYGON    EMPTY"))
+    (let ((g (handler-case (wkt->geometry wkt) (error (e) e))))
+      (is (geometryp g) "~S did not parse: ~A" wkt g)
+      (when (geometryp g)
+        (is (eq :polygon (geometry-kind g)))
+        (is (geometry-empty-p g))))))
+
+(test wkt-empty-round-trips
+  "GEOMETRY->WKT and WKT->GEOMETRY stay inverses over the empty geometries, the
+way they already are over the populated ones."
+  (dolist (g (list (graph-db::%make-geometry :kind :point :coordinates nil)
+                   (make-linestring '())
+                   (make-polygon '())
+                   (make-multipolygon '())))
+    (let ((back (handler-case (wkt->geometry (geometry->wkt g)) (error (e) e))))
+      (is (geometryp back) "~A round-trip signalled: ~A" (geometry-kind g) back)
+      (when (geometryp back)
+        (is (eq (geometry-kind g) (geometry-kind back)))
+        (is (geometry-empty-p back))))))
+
+(test unsupported-wkt-type-still-signals
+  "The fallthrough must still reject a type this parser does not implement --
+and name just the type token, not the whole string."
+  (signals geos-error (wkt->geometry "GEOMETRYCOLLECTION EMPTY"))
+  (signals geos-error (wkt->geometry "TRIANGLE ((0 0, 1 0, 1 1, 0 0))")))

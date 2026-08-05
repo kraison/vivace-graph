@@ -126,3 +126,53 @@
 
 
 
+
+;;; ---- GEOMETRY-EMPTY-P (GH #105) ----------------------------------------
+
+(test empty-p-across-every-kind
+  "An empty geometry of each kind reports empty and keeps its KIND.  The four
+kinds do not represent emptiness the same way -- a linestring's coordinates
+come back as a zero-length vector, the others as NIL -- which is exactly why
+callers need a predicate instead of testing GEOMETRY-COORDINATES."
+  (dolist (spec (list (cons (graph-db::%make-geometry :kind :point
+                                                      :coordinates nil)
+                            :point)
+                      (cons (make-linestring '()) :linestring)
+                      (cons (make-polygon '()) :polygon)
+                      (cons (make-multipolygon '()) :multipolygon)))
+    (destructuring-bind (g . kind) spec
+      (is (geometry-empty-p g) "~A was not reported empty (coords ~S)"
+          kind (geometry-coordinates g))
+      (is (eq kind (geometry-kind g)) "empty geometry lost its kind"))))
+
+(test empty-p-is-false-for-populated-geometries
+  "A geometry with coordinates is never empty -- including a point at the
+origin, which is a real location and not an empty point."
+  (dolist (g (list (make-point 0d0 0d0)
+                   (make-point 37.17d0 49.20d0)
+                   (make-linestring '((0d0 0d0) (1d0 1d0)))
+                   (make-polygon '(((0d0 0d0) (1d0 0d0) (1d0 1d0) (0d0 0d0))))
+                   (make-multipolygon
+                    '((((0d0 0d0) (1d0 0d0) (1d0 1d0) (0d0 0d0)))))))
+    (is (not (geometry-empty-p g))
+        "~A reported empty" (geometry-kind g))))
+
+(test empty-p-sees-through-empty-nesting
+  "A polygon whose every ring is empty, and a multipolygon whose every polygon
+is, hold no coordinate positions and so are empty -- the emptiness can sit one
+or two levels down."
+  (is (geometry-empty-p (make-polygon (list '()))))
+  (is (geometry-empty-p (make-multipolygon (list (list '())))))
+  (is (not (geometry-empty-p
+            (make-multipolygon
+             '((((0d0 0d0) (1d0 0d0) (1d0 1d0) (0d0 0d0)))))))))
+
+(test empty-p-survives-a-serialization-round-trip
+  "An empty geometry stays empty, and stays its own kind, through the on-disk
+codec -- so an empty result can be stored in a slot like any other geometry."
+  (dolist (g (list (make-linestring '()) (make-polygon '())
+                   (make-multipolygon '())))
+    (let ((r (geo-roundtrip g)))
+      (is (eq (geometry-kind g) (geometry-kind r)))
+      (is (geometry-empty-p r) "~A lost its emptiness in the codec: ~S"
+          (geometry-kind g) (geometry-coordinates r)))))

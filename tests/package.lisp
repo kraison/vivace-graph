@@ -41,6 +41,7 @@
 
                 #:geometry-lat
                 #:geometry-bbox
+                #:geometry-empty-p
                 ;; geometry refine ops (spatial extension)
                 #:geodesic-distance
                 #:point-in-ring-p

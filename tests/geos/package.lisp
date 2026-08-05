@@ -24,6 +24,7 @@
                 #:make-polygon
                 #:make-multipolygon
                 #:geometry-bbox
+                #:geometry-empty-p
                 ;; bridge + context (S1)
                 #:geometry->wkt
                 #:wkt->geometry

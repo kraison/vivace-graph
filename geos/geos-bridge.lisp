@@ -143,18 +143,36 @@ sub-groups (for nested POLYGON/MULTIPOLYGON structure)."
         (unless end (error 'geos-error :message "Unterminated WKT group"))
         (values (%parse-coord-list (subseq s i end)) (1+ end)))))
 
+(defun %wkt-type-token (s)
+  "S's leading geometry-type token, upcased: everything up to the first
+whitespace or #\\( .
+
+The type is the FIRST token, NOT everything before the first paren: an EMPTY
+geometry has no paren at all, so that reading swallowed \" EMPTY\" into the
+keyword and every empty geometry fell through to the unsupported-type error
+ (GH #105).  An empty intersection is the normal result for two disjoint
+inputs, so that was the common case, not an edge case."
+  (string-upcase
+   (subseq s 0 (or (position-if (lambda (c)
+                                  (or (char= c #\()
+                                      (member c +wkt-whitespace+)))
+                                s)
+                   (length s)))))
+
 (defun wkt->geometry (wkt)
   "Parse a WKT string (POINT/LINESTRING/POLYGON/MULTIPOLYGON, with EMPTY) into a
 VG geometry.  Used to bring GEOS results back into VG.  Signals GEOS-ERROR on an
 unsupported type."
   (let* ((s (string-trim +wkt-whitespace+ wkt))
          (paren (position #\( s))
-         (kw (string-upcase (string-trim +wkt-whitespace+
-                                         (subseq s 0 (or paren (length s)))))))
+         (kw (%wkt-type-token s)))
     (flet ((emptyp () (or (null paren) (search "EMPTY" (string-upcase s)))))
       (cond
         ((string= kw "POINT")
-         (if (emptyp) (make-point 0d0 0d0)
+         ;; An empty point carries NO coordinates.  NOT (0, 0): null island is a
+         ;; real location, and GEOMETRY->WKT would write it back as POINT (0 0),
+         ;; so the falsehood would outlive the parse (GH #105).
+         (if (emptyp) (%make-geometry :kind :point :coordinates nil)
              (let ((c (first (nth-value 0 (%parse-wkt-group s paren)))))
                (make-point (first c) (second c)))))
         ((string= kw "LINESTRING")

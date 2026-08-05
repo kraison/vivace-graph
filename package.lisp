@@ -280,6 +280,7 @@
            #:geometry-lon
            #:geometry-lat
            #:geometry-bbox
+           #:geometry-empty-p
            ;; geometry operations
            #:geodesic-distance
            #:point-in-ring-p
