@@ -61,14 +61,51 @@ matches, which is no worse than the old behaviour."
              (prin1 element stream))
     (write-char #\) stream)))
 
+(defun %backup-literalize-struct (object)
+  "A shallow copy of struct OBJECT with each slot value literalized, or OBJECT
+itself when literalizing changed nothing.
+
+Structs print as #S(...) and their slot values go through the same standard
+printer as everything else, so a specialized vector reached only through a slot
+-- a GEOMETRY's packed coordinate ring, say -- has to be walked too or it prints
+as a bare #(...) and restores with element type T (geometry.lisp's WALK-RING
+then matches nothing and GEOMETRY-BBOX returns NILs).
+
+Unchanged slots are never written back, because on SBCL (SETF SLOT-VALUE) has
+no writer for a :READ-ONLY slot and type-checks a slot with a declared :TYPE.
+A struct that both constrains a slot AND stores a specialized vector in it
+therefore still signals -- loudly, at backup time, which is the intended
+trade against writing a snapshot that cannot be replayed.
+
+Slot access is via the MOP, which GRAPH-DB :USEs per implementation
+(package.lisp); CLASS-SLOTS over a STRUCTURE-CLASS is the same mechanism
+cl-store-ecl.lisp relies on, and is verified on SBCL and ECL."
+  (let ((changed nil))
+    (dolist (slot (class-slots (class-of object)))
+      (let* ((name (slot-definition-name slot))
+             (old (slot-value object name))
+             (new (backup-literalize old)))
+        (unless (eq new old)
+          (push (cons name new) changed))))
+    (if (null changed)
+        object
+        (let ((copy (copy-structure object)))
+          (loop for (name . new) in changed
+                do (setf (slot-value copy name) new))
+          copy))))
+
 (defun backup-literalize (object)
   "Recursively copy OBJECT, wrapping every specialized vector for printing.
 
 A vector whose ARRAY-ELEMENT-TYPE is not T loses that type through the standard
 #(...) printer, so it is wrapped in a BACKUP-VECTOR-LITERAL.  Strings are left
-alone: they already print and read back correctly.  Conses and general (element
-type T) vectors are walked so that specialized vectors nested inside a node's
-data alist are wrapped too."
+alone: they already print and read back correctly.  Conses, general (element
+type T) vectors and structs are walked so that specialized vectors nested
+inside a node's data alist are wrapped too.
+
+The struct branch reads back through the standard #S(...) reader, so the struct
+type must be defined -- and its name readable -- in the restoring image; see
+RECREATE-GRAPH's :PACKAGE-NAME."
   (typecase object
     (cons (cons (backup-literalize (car object))
                 (backup-literalize (cdr object))))
@@ -79,6 +116,7 @@ data alist are wrapped too."
            (dotimes (i (length object) copy)
              (setf (aref copy i) (backup-literalize (aref object i)))))
          (make-backup-vector-literal object)))
+    (structure-object (%backup-literalize-struct object))
     (t object)))
 
 (defun write-backup-plist (plist stream)

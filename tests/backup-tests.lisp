@@ -525,3 +525,123 @@ snapshots must leave two files."
                    (length snaps) (mapcar #'file-namestring snaps))))
         (ignore-errors (close-graph g :snapshot-p nil))
         (collect-garbage)))))
+
+;;; ---------------------------------------------------------------------------
+;;; Struct slot values must be literalized too (issue #56, second half)
+;;;
+;;; BACKUP-LITERALIZE walked conses and vectors but returned a STRUCT untouched,
+;;; so a GEOMETRY in a node's data alist printed via #S(...) and its packed
+;;; coordinate rings printed as bare #(...).  On restore those come back as
+;;; element-type T vectors, GEOMETRY-BBOX's WALK-RING matches nothing, and every
+;;; caller does arithmetic on the resulting NILs.  Measured on production
+;;; snapshots this was 301,569 of the forensics graph's lines.
+;;;
+;;; The assertions below are on ARRAY-ELEMENT-TYPE, not on the values: EQUALP
+;;; compares the two vectors equal either way, which is exactly why the rest of
+;;; this file never caught it.
+;;; ---------------------------------------------------------------------------
+
+(defun %bk-polygon ()
+  "A one-ring :POLYGON whose ring is a (simple-array double-float (*))."
+  (make-polygon (list (list '(30.0d0 50.0d0) '(31.0d0 50.0d0)
+                            '(31.0d0 51.0d0) '(30.0d0 50.0d0)))))
+
+(defstruct (bk-frozen (:constructor make-bk-frozen (label)))
+  (label "" :read-only t))                ; a struct slot with NO setf writer
+
+(test backup-literalize-passes-unchanged-structs-through
+  "A struct no slot of which needs literalizing must come back untouched.
+SBCL has no (SETF SLOT-VALUE) writer for a :READ-ONLY struct slot and
+type-checks a slot with a declared :TYPE, so writing every slot back
+unconditionally would make BACKUP signal on any such struct in node data --
+turning a lossy snapshot into no snapshot at all."
+  (let ((frozen (make-bk-frozen "cold")))
+    (is (eq frozen (graph-db::backup-literalize frozen))
+        "an unchanged struct should be passed through, not rebuilt")))
+
+(test snapshot-text-preserves-geometry-struct-coordinate-element-type
+  "REGRESSION.  A GEOMETRY reached through a node's data alist keeps the packed
+DOUBLE-FLOAT element type of its coordinate ring across the snapshot TEXT round
+trip (real writer + real restore readtable), and #V reads correctly nested
+inside #S.  Before the fix the ring was written as a bare #(...)."
+  (let* ((poly (%bk-polygon))
+         (plist (list :v 'geo-place (list (cons :loc poly))
+                      :id (graph-db::gen-vertex-id)
+                      :revision 0 :deleted-p nil)))
+    (multiple-value-bind (back text) (%backup-text-round-trip plist)
+      (is (search "#V(DOUBLE-FLOAT" text)
+          "writer should emit an element-typed #V ring inside the #S literal; ~
+wrote: ~A" text)
+      ;; the caller's geometry must not have been mutated into a wrapper
+      (is (typep (first (geometry-coordinates poly))
+                 '(simple-array double-float (*)))
+          "BACKUP-LITERALIZE mutated the caller's geometry: ~S"
+          (first (geometry-coordinates poly)))
+      (let ((g (cdr (assoc :loc (third back)))))
+        (is-true (geometryp g) "the :LOC geometry did not survive: ~S" back)
+        (when (geometryp g)
+          (is (eq :polygon (geometry-kind g))
+              "restored geometry kind is ~S" (geometry-kind g))
+          (let ((ring (first (geometry-coordinates g))))
+            (is (equal 'double-float (array-element-type ring))
+                "restored ring lost its element type: ~S (type-of ~S)"
+                (array-element-type ring) (type-of ring))
+            (is (typep ring '(simple-array double-float (*)))
+                "restored ring is not a packed double-float array: ~S"
+                (type-of ring)))
+          ;; the consequence the element type actually buys: WALK-RING is
+          ;; TYPEP-gated on (simple-array double-float (*)), so an untyped ring
+          ;; makes the bbox four NILs and every caller does arithmetic on NIL.
+          (multiple-value-bind (min-lon min-lat max-lon max-lat)
+              (geometry-bbox g)
+            (is (equal (list 30.0d0 50.0d0 31.0d0 51.0d0)
+                       (list min-lon min-lat max-lon max-lat))
+                "restored geometry bbox is ~S, expected (30 50 31 51)"
+                (list min-lon min-lat max-lon max-lat))))))))
+
+(test snapshot-replay-preserves-geometry-slot-element-type
+  "REGRESSION, end to end.  A GEO-PLACE holding a POLYGON survives snapshot +
+replay into a fresh graph with the ring's DOUBLE-FLOAT element type intact, so
+GEOMETRY-BBOX on the restored node still answers.  Snapshot replay is the only
+recovery route for graphs with no rebuild path, so this is the recovery gate."
+  (with-temp-directory (dir1)
+    (with-temp-directory (dir2)
+      (let* ((p1 (namestring dir1)) (p2 (namestring dir2))
+             (id nil))
+        (let ((g (make-graph *integration-graph-name* p1
+                             :buffer-pool-size 1000)))
+          (let ((*graph* g))
+            (with-transaction ()
+              (setq id (id (make-geo-place :loc (%bk-polygon)))))
+            (graph-db:snapshot g))
+          (close-graph g :snapshot-p nil))
+        (let ((g2 (make-graph *integration-graph-name* p2
+                              :buffer-pool-size 1000)))
+          (unwind-protect
+               (let ((*graph* g2))
+                 (graph-db:replay g2 (merge-pathnames "txn-log/" dir1)
+                                  :graph-db/test)
+                 (let ((v (lookup-vertex id)))
+                   (is-true v "the polygon vertex ~A was not restored" id)
+                   (when v
+                     (let* ((geom (slot-value v 'loc))
+                            (ring (and (geometryp geom)
+                                       (first (geometry-coordinates geom)))))
+                       (is-true (geometryp geom)
+                                "restored LOC is not a geometry: ~S" geom)
+                       (when ring
+                         (is (equal 'double-float
+                                    (array-element-type ring))
+                             "restored ring lost its element type: ~S"
+                             (type-of ring))
+                         (is (typep ring '(simple-array double-float (*)))
+                             "restored ring is not packed double-float: ~S"
+                             (type-of ring))
+                         (multiple-value-bind (min-lon min-lat max-lon max-lat)
+                             (geometry-bbox geom)
+                           (is (equal (list 30.0d0 50.0d0 31.0d0 51.0d0)
+                                      (list min-lon min-lat max-lon max-lat))
+                               "restored bbox is ~S, expected (30 50 31 51)"
+                               (list min-lon min-lat max-lon max-lat))))))))
+            (close-graph g2 :snapshot-p nil)
+            (collect-garbage)))))))
