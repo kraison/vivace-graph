@@ -37,6 +37,10 @@ subdirectories, **3,359 checks** as of 2026-08-08. Run a suite through ASDF:
 (asdf:test-system :graph-db/stress-test)
 ```
 
+**SBCL needs `--dynamic-space-size 16384`** to run a suite. The default 1 GiB heap dies
+with "Heap exhausted, game over" partway in — `make-graph`'s type index eagerly builds
+131,072 index-lists, and a suite creates many graphs in one image.
+
 Each `test-op` errors on failure, so they are safe to gate on. Run the main suite before
 committing an engine change; the app that consumes this engine has its own 5115-check suite
 that will not catch a defect in here.

@@ -11,12 +11,14 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ## [Unreleased]
 
-> The next release is **3.0.0** (MAJOR). Per this file's SemVer preamble, MAJOR is
-> mandatory here on two independent grounds: the spatial-index changes below are a
-> breaking public-API change *and* an on-disk format bump (the spatial sidecar goes to
-> format v5, and the memory-graph image to v7). Existing on-disk graphs still open —
-> the spatial index re-derives itself automatically at first open — but stale call
-> sites and old Prolog arities do not.
+## [3.0.0] - 2026-08-09
+
+> **MAJOR.** Per this file's SemVer preamble, MAJOR is mandatory here on two
+> independent grounds: the spatial-index changes below are a breaking public-API
+> change *and* an on-disk format bump (the spatial sidecar goes to format v5, and
+> the memory-graph image to v7). Existing on-disk graphs still open — the spatial
+> index re-derives itself automatically at first open — but stale call sites and
+> old Prolog arities do not.
 
 ### Added
 
@@ -414,6 +416,17 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Fixed
 
+- **`graph-db/algorithms` was unusable on its own.** The add-on depends on
+  `graph-db/core`, but the `NODE-ORIGINS` NIL fallback for a plain graph lived in
+  `peer-merge.lisp`, which is in `graph-db/replication`. `unique-constraint.lisp` is
+  in *core* and reads `NODE-ORIGINS` off any graph, so a core-only consumer hit
+  `no applicable method` on the first `:unique` code path — 52 of the 64 algorithm
+  tests, every one of them that touched a graph. Loading the full `graph-db` system
+  hid it entirely, since that pulls in replication. The fallback now lives in
+  `graph-class.lisp`, beside the class it defaults for. Present since the
+  `graph-db/replication` carve-out and shipped in 2.1.0/2.1.1; found by running the
+  add-on's own suite as a release gate.
+
 - **`wkt->geometry` signalled on every EMPTY geometry** (#105). The type keyword was
   read as "everything before the first paren", but an EMPTY geometry has no paren —
   so `"POLYGON EMPTY"` produced the keyword `"POLYGON EMPTY"`, matched no branch, and
@@ -599,6 +612,30 @@ Shipping with 3.0.0, tracked rather than hidden:
   isolation (20/20) and fail only under a loaded multi-suite run; four attempts to
   reproduce them deliberately failed. Instrumented so the next natural occurrence
   identifies the cause rather than raising the question again.
+- **CCL: a vector-segment writer starves against concurrent scanners** (#118). On CCL
+  a `segment-put` writer contending with sustained `segment-scan` readers never
+  acquires the write lock — measured stalling at 6 of 128 puts while three scanners
+  reached 118,000 scans, so `SCAN-IS-SAFE-AGAINST-GROWING-WRITES` and its
+  `SCORE-SUBSET` twin do not terminate. The cause is that CCL alone does not use this
+  repo's `rw-lock.lisp`, whose FIFO writer queue makes writer starvation structurally
+  impossible; it uses `ccl:make-read-write-lock`, which offers no writer fairness
+  (`rw-lock.lisp:3-5`, `graph-db.asd:50`). Not a 3.0.0 regression — those shims long
+  predate this release, and vector segments are merely the first suite workload with
+  sustained reader/writer contention. In principle any CCL `acquire-write-lock` user is
+  exposed, though only the segment path provokes it today. **SBCL and ECL are
+  unaffected on both macOS arm64 and Linux x86_64**, where the same tests pass in
+  milliseconds. CCL remains the least-supported platform (Linux x86_64 only).
+
+- **`graph-db/algorithms-io` will not load on a current Quicklisp** — its `dso-lex`
+  dependency was dropped from the dist somewhere between 2025-06-22 (where it is
+  present) and 2026-01-01 (where it is not), so `quickload` fails with
+  `System "dso-lex" not found`. This blocks the optional GML/Pajek import +
+  Graphviz export add-on and, with it, `graph-db/algorithms-test`. **The core
+  `graph-db/algorithms` add-on is unaffected** and loads normally — only the
+  parsing-dependent I/O layer is out of reach, which is why it was kept a separate
+  system. Nothing in `graph-db` itself depends on it. Found by validating the release
+  on a host with a current dist; a checkout with an older local dist still loads it.
+
 - **`geometry-contains-point-p` uses a different point-in-polygon implementation from
   every other spatial predicate** (#99). Characterized against GEOS across 45 systematic
   cases plus generative sweeps: they agree everywhere away from a boundary, and differ
@@ -917,7 +954,8 @@ suite, and an ACID-compliance audit.
 - LispWorks support is currently **untested** (no license access; the free
   Personal Edition's heap is too small to compile VivaceGraph).
 
-[Unreleased]: https://github.com/kraison/vivace-graph/compare/v2.1.1...HEAD
+[Unreleased]: https://github.com/kraison/vivace-graph/compare/v3.0.0...HEAD
+[3.0.0]: https://github.com/kraison/vivace-graph/compare/v2.1.1...v3.0.0
 [2.1.1]: https://github.com/kraison/vivace-graph/compare/v2.1.0...v2.1.1
 [2.1.0]: https://github.com/kraison/vivace-graph/compare/v2.0...v2.1.0
 [2.0.0]: https://github.com/kraison/vivace-graph/releases/tag/v2.0
