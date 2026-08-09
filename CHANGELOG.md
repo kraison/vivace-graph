@@ -11,6 +11,34 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A failed snapshot no longer aborts `close-graph`** (#120). `close-graph` deregisters
+  the graph from `*graphs*` and *then* snapshots, with nothing guarding the call — so a
+  snapshot that signalled left every mmap open (heap, indexes, vertex/edge tables, vector
+  segments), `.dirty` still on disk forcing recovery on the next open, and no way to reach
+  the graph by name to retry. The on-disk data was intact the whole time.
+  For a disk graph the snapshot is a *logical backup*; durability is the heap/lhash mmaps
+  plus the transaction journal, so losing one snapshot only means the next `replay` starts
+  from an older snapshot plus more journal. The close now completes and the failure is
+  reported rather than swallowed: `close-graph` returns `(values graph snapshot-problem)`,
+  logs at `:error`, and `warn`s once the teardown is done.
+  The handler is on `serious-condition`, **not** `error`: SBCL's `heap-exhausted-error` is
+  a `storage-condition`, which is not an `error` subtype, and heap exhaustion on a large
+  graph is the failure this exists for (#119). Application code guarding a snapshot with
+  `(handler-case … (error (e) …))` has the same gap.
+  `snapshot` reports integrity problems by *returning* `:data-integrity-issues` rather than
+  signalling, and `close-graph` discarded its return value entirely — so such a graph closed
+  with no snapshot taken and no indication of it. That is now the same second value.
+  Deliberately unchanged: the three `save-*-index-roots` calls above the snapshot still
+  abort the close. Those sidecars write atomically (temp + rename, #63), so a failure leaves
+  the *previous* sidecar naming the *previous* roots; closing past that and clearing `.dirty`
+  would let the next open adopt roots that no longer match the index, with no recovery pass
+  to catch it. A missing snapshot costs replay time; a stale index root is silently wrong.
+  The memory-graph path is also unchanged — it overrides `snapshot` to `nil` and checkpoints
+  in a `close-graph :before` method, where failure *should* be fatal because the image is
+  that graph's only durable record.
+
 ## [3.0.0] - 2026-08-09
 
 > **MAJOR.** Per this file's SemVer preamble, MAJOR is mandatory here on two

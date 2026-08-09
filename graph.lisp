@@ -702,64 +702,113 @@ Always CLOSE-GRAPH when finished."
   "Cleanly close GRAPH: stop replication, flush and unmap all on-disk
 structures (heap, indexes, vertex/edge tables), remove the .dirty marker, and
 deregister it.  With :SNAPSHOT-P true (the default) a snapshot backup is taken
-first.  Returns GRAPH.  Must be called with *GRAPH* bound to GRAPH (the
-snapshot path relies on it).  Failing to close a graph leaves its .dirty marker
-in place, forcing recovery on the next OPEN-GRAPH."
-  (when (graph-open-p graph)
-    (stop-replication graph)
-    (remhash (graph-name graph) *graphs*)
-    ;; Unique constraints (#6): persist the on-disk unique skip-lists' roots while the
-    ;; heap is still open, so OPEN can reopen them without a scan.  No-op on memory.
-    (save-unique-index-roots graph)
-    (save-secondary-index-roots graph)
-    ;; Spatial indexes (v3 sidecar): the addresses are already durable from
-    ;; creation, but the precision histogram is only in RAM, so this close is
-    ;; what makes the coarsest-precision clamp survive the reopen intact.
-    (save-spatial-index-roots graph)
-    (when snapshot-p
-      (log:info "Snapshotting ~A" graph)
-      (snapshot graph))
-    (when (type-index-p (vertex-index graph))
-      (log:info "Closing ~A" (vertex-index graph))
-      (close-type-index (vertex-index graph)))
-    (when (type-index-p (edge-index graph))
-      (log:info "Closing ~A" (edge-index graph))
-      (close-type-index (edge-index graph)))
-    (when (vev-index-p (vev-index graph))
-      (log:info "Closing ~A" (vev-index graph))
-      (close-vev-index (vev-index graph)))
-    (when (ve-index-p (ve-index-in graph))
-      (log:info "Closing ~A" (ve-index-in graph))
-      (close-ve-index (ve-index-in graph)))
-    (when (ve-index-p (ve-index-out graph))
-      (log:info "Closing ~A" (ve-index-out graph))
-      (close-ve-index (ve-index-out graph)))
-    (when (lhash-p (vertex-table graph))
-      (log:info "Closing ~A" (vertex-table graph))
-      (close-lhash (vertex-table graph)))
-    (when (lhash-p (edge-table graph))
-      (log:info "Closing ~A" (edge-table graph))
-      (close-lhash (edge-table graph)))
-    ;; Vector segments (Phase 2 step 6): close every registered segment (each
-    ;; marks itself clean on close, read back by RESTORE-VECTOR-SEGMENTS as
-    ;; the open-as-is-vs-rebuild decision on the next open).
-    (maphash (lambda (k seg) (declare (ignore k)) (close-vector-segment seg))
-             (vector-segments graph))
-    (clrhash (vector-segments graph))
-    (when (memory-p (indexes graph))
-      (log:info "Closing ~A" (indexes graph))
-      (close-memory (indexes graph)))
-    (when (memory-p (heap graph))
-      (log:info "Closing ~A" (heap graph))
-      (close-memory (heap graph)))
-    (setf (heap graph) nil
-          (vertex-table graph) nil
-          (edge-table graph) nil)
-    (let ((dirty-file (format nil "~A/.dirty" (location graph))))
-      (delete-file dirty-file))
-    (close-replication-log graph)
-    (setf (graph-open-p graph) nil))
-  graph)
+first.  Must be called with *GRAPH* bound to GRAPH (the snapshot path relies on
+it).  Failing to close a graph leaves its .dirty marker in place, forcing
+recovery on the next OPEN-GRAPH.
+
+Returns (values GRAPH SNAPSHOT-PROBLEM).  SNAPSHOT-PROBLEM is NIL on the
+ordinary path; otherwise the condition the snapshot signalled, or
+:DATA-INTEGRITY-ISSUES when it declined to run -- see the handler below for why
+a snapshot failure does NOT abort the close (GH #120)."
+  (let ((snapshot-problem nil))
+    (when (graph-open-p graph)
+      (stop-replication graph)
+      (remhash (graph-name graph) *graphs*)
+      ;; Unique constraints (#6): persist the on-disk unique skip-lists' roots
+      ;; while the heap is still open, so OPEN can reopen them without a scan.
+      ;; No-op on a memory graph.
+      ;;
+      ;; These three are deliberately NOT guarded the way the snapshot below is
+      ;; (GH #120).  They write atomically (temp + rename, #63), so a failure
+      ;; leaves the PREVIOUS sidecar naming the PREVIOUS roots; closing past
+      ;; that and deleting .dirty would let the next open adopt roots that no
+      ;; longer match the index, with no recovery pass to catch it.  A missing
+      ;; snapshot costs replay time; a stale index root is silently wrong.
+      (save-unique-index-roots graph)
+      (save-secondary-index-roots graph)
+      ;; Spatial indexes (v3 sidecar): the addresses are already durable from
+      ;; creation, but the precision histogram is only in RAM, so this close is
+      ;; what makes the coarsest-precision clamp survive the reopen intact.
+      (save-spatial-index-roots graph)
+      ;; A failed snapshot must NOT abort the close (GH #120).  For a DISK graph
+      ;; the snapshot is a LOGICAL BACKUP; durability is the heap/lhash mmaps
+      ;; plus the transaction journal.  Aborting here leaves every mmap open and
+      ;; .dirty on disk -- forcing recovery on intact data -- and the
+      ;; graph is already deregistered above, so nothing can find it to retry.
+      ;; Losing a snapshot only means the next REPLAY starts from an older one
+      ;; plus more journal.
+      ;;
+      ;; SERIOUS-CONDITION, not ERROR: SBCL's HEAP-EXHAUSTED-ERROR is a
+      ;; STORAGE-CONDITION, which is NOT an ERROR subtype -- and heap exhaustion
+      ;; on a large graph is the failure this guard exists for (GH #119).
+      ;;
+      ;; A memory-graph never reaches this: it overrides SNAPSHOT to NIL and
+      ;; checkpoints in a CLOSE-GRAPH :BEFORE method, where failure SHOULD be
+      ;; fatal because the image is its only durable record.
+      (when snapshot-p
+        (log:info "Snapshotting ~A" graph)
+        (handler-case
+            ;; :DATA-INTEGRITY-ISSUES is a RETURN value, not a condition, and
+            ;; was discarded here -- so a graph with integrity problems closed
+            ;; with no snapshot taken and no sign of it.  Surfaced the same way.
+            (let ((result (snapshot graph)))
+              (when (eq result :data-integrity-issues)
+                (setf snapshot-problem :data-integrity-issues)))
+          (serious-condition (c)
+            (setf snapshot-problem c)
+            (log:error "Snapshot of ~A FAILED (~A).  Closing anyway: the ~
+                        on-disk data is intact without it, and aborting the ~
+                        close would strand the mmaps and leave .dirty set."
+                       graph c))))
+      (when (type-index-p (vertex-index graph))
+        (log:info "Closing ~A" (vertex-index graph))
+        (close-type-index (vertex-index graph)))
+      (when (type-index-p (edge-index graph))
+        (log:info "Closing ~A" (edge-index graph))
+        (close-type-index (edge-index graph)))
+      (when (vev-index-p (vev-index graph))
+        (log:info "Closing ~A" (vev-index graph))
+        (close-vev-index (vev-index graph)))
+      (when (ve-index-p (ve-index-in graph))
+        (log:info "Closing ~A" (ve-index-in graph))
+        (close-ve-index (ve-index-in graph)))
+      (when (ve-index-p (ve-index-out graph))
+        (log:info "Closing ~A" (ve-index-out graph))
+        (close-ve-index (ve-index-out graph)))
+      (when (lhash-p (vertex-table graph))
+        (log:info "Closing ~A" (vertex-table graph))
+        (close-lhash (vertex-table graph)))
+      (when (lhash-p (edge-table graph))
+        (log:info "Closing ~A" (edge-table graph))
+        (close-lhash (edge-table graph)))
+      ;; Vector segments (Phase 2 step 6): close every registered segment (each
+      ;; marks itself clean on close, read back by RESTORE-VECTOR-SEGMENTS as
+      ;; the open-as-is-vs-rebuild decision on the next open).
+      (maphash (lambda (k seg) (declare (ignore k)) (close-vector-segment seg))
+               (vector-segments graph))
+      (clrhash (vector-segments graph))
+      (when (memory-p (indexes graph))
+        (log:info "Closing ~A" (indexes graph))
+        (close-memory (indexes graph)))
+      (when (memory-p (heap graph))
+        (log:info "Closing ~A" (heap graph))
+        (close-memory (heap graph)))
+      (setf (heap graph) nil
+            (vertex-table graph) nil
+            (edge-table graph) nil)
+      (let ((dirty-file (format nil "~A/.dirty" (location graph))))
+        (delete-file dirty-file))
+      (close-replication-log graph)
+      (setf (graph-open-p graph) nil)
+      ;; Warn only after the close is COMPLETE, so it cannot be mistaken for
+      ;; the close having failed -- and never swallow it silently: the caller
+      ;; asked for a snapshot and did not get one.
+      (when snapshot-problem
+        (warn "CLOSE-GRAPH: ~A closed cleanly, but its snapshot did not ~
+               complete: ~A.  The graph's on-disk data is intact; the next ~
+               REPLAY will start from an older snapshot plus more journal."
+              (graph-name graph) snapshot-problem)))
+    (values graph snapshot-problem)))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Peer replication (WP-3): applied-op-id dedup index lifecycle + API.

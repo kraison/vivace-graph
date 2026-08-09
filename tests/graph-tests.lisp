@@ -392,3 +392,163 @@ close/reopen cycle."
           (close-graph g :snapshot-p nil)))
       (collect-garbage))))
 
+
+;;; ---------------------------------------------------------------------------
+;;; A failed snapshot must not abort CLOSE-GRAPH (GH #120)
+;;;
+;;; CLOSE-GRAPH deregisters the graph and THEN snapshots, so a snapshot that
+;;; signals used to strand every mmap open with .dirty still on disk -- forcing
+;;; recovery on a graph whose data was intact, and leaving nothing able to find
+;;; it by name to retry.  For a disk graph the snapshot is a logical backup, not
+;;; the durability mechanism, so the close must complete and report the failure.
+;;; ---------------------------------------------------------------------------
+
+;; Two failure shapes.  The STORAGE one is the point of the exercise: SBCL's
+;; HEAP-EXHAUSTED-ERROR is a STORAGE-CONDITION, which is NOT an ERROR subtype,
+;; so a guard written on ERROR would miss exactly the failure GH #119 is about.
+(define-condition snapshot-test-error (error) ()
+  (:report (lambda (c s) (declare (ignore c))
+             (format s "simulated snapshot failure"))))
+
+(define-condition snapshot-test-storage-condition (storage-condition) ()
+  (:report (lambda (c s) (declare (ignore c))
+             (format s "simulated heap exhaustion during snapshot"))))
+
+(defmacro with-failing-snapshot ((condition-class) &body body)
+  "Run BODY with GRAPH-DB:SNAPSHOT replaced by one that signals CONDITION-CLASS."
+  (let ((orig (gensym "ORIG")))
+    `(let ((,orig (fdefinition 'graph-db:snapshot)))
+       (unwind-protect
+            (progn
+              (setf (fdefinition 'graph-db:snapshot)
+                    (lambda (graph &rest args)
+                      (declare (ignore graph args))
+                      (error ',condition-class)))
+              ,@body)
+         (setf (fdefinition 'graph-db:snapshot) ,orig)))))
+
+(defun dirty-file-present-p (dir)
+  (probe-file (format nil "~A/.dirty" (namestring dir))))
+
+(test close-graph-completes-when-the-snapshot-signals
+  "A snapshot that signals must not abort the close: .dirty is removed, the
+mmaps are released, and the graph reopens WITHOUT a recovery pass."
+  (with-temp-directory (dir)
+    (let ((g (make-graph *integration-graph-name* (namestring dir)
+                         :buffer-pool-size 1000)))
+      (let ((*graph* g))
+        (with-transaction () (make-g-person :name "Survivor")))
+      (is (dirty-file-present-p dir) "sanity: an open graph is marked dirty")
+      (let ((problem :none))
+        (handler-bind ((warning #'muffle-warning))
+          (with-failing-snapshot (snapshot-test-error)
+            (multiple-value-bind (returned p) (close-graph g)
+              (is (eq g returned) "CLOSE-GRAPH still returns the graph")
+              (setq problem p))))
+        (is (typep problem 'condition)
+            "the snapshot failure must be REPORTED as the second value, got ~S"
+            problem))
+      ;; The whole teardown ran.
+      (is (null (graph-db::graph-open-p g)) "graph must be marked closed")
+      (is (null (graph-db::heap g)) "the heap must be released")
+      (is (not (dirty-file-present-p dir))
+          ".dirty must be gone -- an intact graph must not be forced through ~
+           recovery because its BACKUP failed")
+      (collect-garbage)
+      ;; ...and it really does reopen, with the data intact.
+      (let ((g2 (open-graph *integration-graph-name* (namestring dir))))
+        (unwind-protect
+             (let ((*graph* g2))
+               (is (= 1 (length (map-vertices #'identity g2 :collect-p t)))
+                   "the node written before the failed snapshot must survive"))
+          (ignore-errors (close-graph g2 :snapshot-p nil))
+          (collect-garbage))))))
+
+(test close-graph-survives-a-storage-condition
+  "The guard is on SERIOUS-CONDITION, not ERROR: SBCL's HEAP-EXHAUSTED-ERROR is
+a STORAGE-CONDITION, which is NOT an ERROR subtype, and heap exhaustion on a
+large graph is the failure this exists for (GH #119).  A handler on ERROR would
+let this one through and strand the graph."
+  (is (not (subtypep 'storage-condition 'error))
+      "premise: STORAGE-CONDITION must not be an ERROR subtype")
+  (with-temp-directory (dir)
+    (let ((g (make-graph *integration-graph-name* (namestring dir)
+                         :buffer-pool-size 1000)))
+      (let ((*graph* g))
+        (with-transaction () (make-g-person :name "Storage")))
+      (handler-bind ((warning #'muffle-warning))
+        (with-failing-snapshot (snapshot-test-storage-condition)
+          (multiple-value-bind (returned problem) (close-graph g)
+            (declare (ignore returned))
+            (is (typep problem 'storage-condition)
+                "a STORAGE-CONDITION must be caught and reported, got ~S"
+                problem))))
+      (is (null (graph-db::graph-open-p g)))
+      (is (not (dirty-file-present-p dir)))
+      (collect-garbage))))
+
+(test close-graph-warns-once-the-close-is-complete
+  "The failure is never swallowed: a WARNING is signalled -- after the teardown,
+so it cannot be read as the close itself having failed."
+  (with-temp-directory (dir)
+    (let ((g (make-graph *integration-graph-name* (namestring dir)
+                         :buffer-pool-size 1000))
+          (warned nil))
+      (let ((*graph* g))
+        (with-transaction () (make-g-person :name "Warned")))
+      (handler-bind ((warning (lambda (w)
+                                ;; The graph must ALREADY be closed when the
+                                ;; warning arrives.
+                                (setq warned (list (graph-db::graph-open-p g)
+                                                   (dirty-file-present-p dir)))
+                                (muffle-warning w))))
+        (with-failing-snapshot (snapshot-test-error)
+          (close-graph g)))
+      (is (not (null warned)) "a warning must be signalled")
+      (when warned
+        (is (null (first warned))
+            "the graph must already be closed when the warning is signalled")
+        (is (null (second warned))
+            ".dirty must already be gone when the warning is signalled"))
+      (collect-garbage))))
+
+(test close-graph-reports-data-integrity-issues
+  "SNAPSHOT reports integrity problems by RETURNING :DATA-INTEGRITY-ISSUES
+rather than signalling; CLOSE-GRAPH discarded that, so such a graph closed with
+no snapshot taken and no sign of it.  It is now the second value."
+  (with-temp-directory (dir)
+    (let ((g (make-graph *integration-graph-name* (namestring dir)
+                         :buffer-pool-size 1000))
+          (orig (fdefinition 'graph-db:snapshot)))
+      (let ((*graph* g))
+        (with-transaction () (make-g-person :name "Integrity")))
+      (handler-bind ((warning #'muffle-warning))
+        (unwind-protect
+             (progn
+               (setf (fdefinition 'graph-db:snapshot)
+                     (lambda (graph &rest args)
+                       (declare (ignore graph args))
+                       :data-integrity-issues))
+               (multiple-value-bind (returned problem) (close-graph g)
+                 (declare (ignore returned))
+                 (is (eq :data-integrity-issues problem))))
+          (setf (fdefinition 'graph-db:snapshot) orig)))
+      (is (null (graph-db::graph-open-p g)))
+      (is (not (dirty-file-present-p dir)))
+      (collect-garbage))))
+
+(test close-graph-clean-snapshot-reports-no-problem
+  "The ordinary path is unchanged: a successful snapshotting close returns a NIL
+second value and signals nothing."
+  (with-temp-directory (dir)
+    (let ((g (make-graph *integration-graph-name* (namestring dir)
+                         :buffer-pool-size 1000)))
+      (let ((*graph* g))
+        (with-transaction () (make-g-person :name "Clean")))
+      (let ((*graph* g))
+        (multiple-value-bind (returned problem) (close-graph g)
+          (is (eq g returned))
+          (is (null problem) "a successful snapshot must report no problem")))
+      (is (null (graph-db::graph-open-p g)))
+      (is (not (dirty-file-present-p dir)))
+      (collect-garbage))))
