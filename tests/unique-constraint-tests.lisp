@@ -301,9 +301,10 @@ collide -- SQL semantics, and the unary-claim case (#107)."
   (with-uq-graph (g)
     (with-transaction () (make-uq-claim :ns "ops" :ky nil))
     (finishes (with-transaction () (make-uq-claim :ns "ops" :ky nil)))
-    (is (= 2 (length (map-vertices #'identity g :collect-p t :vertex-type 'uq-claim)))
-        "both null-ky claims were committed -- neither was exempt from being WRITTEN,
-only from the CONSTRAINT")))
+    (is (= 2 (length (map-vertices #'identity g :collect-p t
+                                   :vertex-type 'uq-claim)))
+        "both null-ky claims were committed -- neither was exempt from
+being WRITTEN, only from the CONSTRAINT")))
 
 (test multi-slot-unique-distinct-tuples-allowed
   "Tuples differing in either component are distinct claims."
@@ -315,8 +316,8 @@ only from the CONSTRAINT")))
                 (make-uq-claim :ns "eng" :ky "e1")))))
 
 (test multi-slot-unique-update-and-delete-release
-  "Updating a claim's tuple to another live claim's tuple is rejected; deleting a
-claim releases its tuple so it can be reclaimed."
+  "Updating a claim's tuple to another live claim's tuple is rejected;
+deleting a claim releases its tuple so it can be reclaimed."
   (with-uq-graph (g)
     (let (bid)
       (with-transaction ()
@@ -324,14 +325,41 @@ claim releases its tuple so it can be reclaimed."
         (setq bid (id (make-uq-claim :ns "ops" :ky "e2"))))
       (signals graph-db:unique-constraint-violation
         (with-transaction ()
-          (let ((v (copy (lookup-vertex bid)))) (setf (uqc-ky v) "e1") (save v))))
+          (let ((v (copy (lookup-vertex bid))))
+            (setf (uqc-ky v) "e1") (save v))))
       (with-transaction () (mark-deleted (lookup-vertex bid)))
       (finishes (with-transaction () (make-uq-claim :ns "ops" :ky "e2"))))))
 
+(test multi-slot-unique-declared-after-open-scans-strictly
+  "DEF-UNIQUE evaluated while the graph is already open builds the index
+now, STRICTLY (%BUILD-UNIQUE-TUPLE-FOR-SPEC :STRICT-P T): a pre-existing
+duplicate tuple signals immediately.  Distinct from INSTALL-UNIQUE-TUPLE-
+CONSTRAINTS's tolerant reopen path (Important 1, #107).
+
+Uses a class GENSYMed fresh each run, defined and DEF-UNIQUE'd entirely at
+test-run time via EVAL, rather than the file's load-time UQ-CLAIM fixture:
+UQ-CLAIM's constraint is already globally registered before any test's
+graph opens, so seeding a genuine pre-existing duplicate for it is
+impossible -- the seeding transaction itself would hit the intra-
+transaction check first.  A fresh class sidesteps that, and also keeps
+this test idempotent across repeated FIVEAM runs within one Lisp image
+(DEF-UNIQUE's registry is global and permanent for the session)."
+  (with-uq-graph (g)
+    (declare (ignorable g))
+    (let* ((*package* (find-package :graph-db/test))
+           (cls (gensym "UQ-SOLO"))
+           (mk (intern (format nil "MAKE-~A" cls))))
+      (eval `(def-vertex ,cls () (a b) :graph-db-unique-test))
+      (with-transaction ()
+        (funcall mk :a "x" :b "y")
+        (funcall mk :a "x" :b "y"))
+      (signals graph-db:unique-constraint-violation
+        (eval `(def-unique ,cls (a b) :graph-db-unique-test))))))
+
 (test multi-slot-unique-reopen-restores-durable-index-and-enforces
-  "On-disk the multi-slot unique index is a persistent skip-list too: close saves
-its root, open reopens it from the sidecar WITHOUT scanning nodes (rebuild not
-called), and it still enforces (#107)."
+  "On-disk the multi-slot unique index is a persistent skip-list too: close
+saves its root, open reopens it from the sidecar WITHOUT scanning nodes
+(rebuild not called), and it still enforces (#107)."
   (with-temp-directory (dir)
     (let ((path (namestring dir)))
       (let ((g (make-graph *uq-graph-name* path :buffer-pool-size 1000)))
@@ -347,22 +375,37 @@ called), and it still enforces (#107)."
              (progn
                (setf (fdefinition 'graph-db::rebuild-unique-indexes)
                      (lambda (gr) (setf rebuilt t) (funcall orig-rebuild gr)))
+               ;; Scoped to UQ-CLAIM's own spec: *SCHEMA-UNIQUE-METADATA* is a
+               ;; global, session-lifetime registry keyed by graph NAME, so a
+               ;; different test's GENSYMed class (also :GRAPH-DB-UNIQUE-TEST)
+               ;; is reconciled here too, harmlessly -- BUILT must not flag on
+               ;; that unrelated spec (GH #107).
                (setf (fdefinition 'graph-db::%build-unique-tuple-for-spec)
-                     (lambda (gr spec) (setf built t) (funcall orig-build gr spec)))
+                     (lambda (gr spec &key strict-p)
+                       (when (eq (graph-db::unique-tuple-spec-owner-name spec)
+                                 'uq-claim)
+                         (setf built t))
+                       (funcall orig-build gr spec :strict-p strict-p)))
                (let ((g2 (open-graph *uq-graph-name* path)))
                  (unwind-protect
                       (let ((*graph* g2))
-                        (is (null rebuilt) "reopen restored from the sidecar, no scan")
+                        (is (null rebuilt)
+                            "reopen restored from the sidecar, no scan")
                         (is (null built)
                             "the multi-slot index was restored, not rescanned")
-                        (is (= 2 (uq-index-size g2 'uq-claim '(ns ky))) "index restored")
+                        (is (= 2 (uq-index-size g2 'uq-claim '(ns ky)))
+                            "index restored")
                         (signals graph-db:unique-constraint-violation
-                          (with-transaction () (make-uq-claim :ns "ops" :ky "e1")))
-                        (finishes (with-transaction () (make-uq-claim :ns "ops" :ky "e3"))))
+                          (with-transaction ()
+                            (make-uq-claim :ns "ops" :ky "e1")))
+                        (finishes
+                         (with-transaction ()
+                           (make-uq-claim :ns "ops" :ky "e3"))))
                    (ignore-errors (close-graph g2))
                    (collect-garbage))))
           (setf (fdefinition 'graph-db::rebuild-unique-indexes) orig-rebuild)
-          (setf (fdefinition 'graph-db::%build-unique-tuple-for-spec) orig-build))))))
+          (setf (fdefinition 'graph-db::%build-unique-tuple-for-spec)
+                orig-build))))))
 
 (test multi-slot-unique-concurrent-race-exactly-one-wins
   "The phantom the commit lock defeats, on a multi-slot tuple: N threads racing
@@ -375,7 +418,8 @@ UNIQUE-CONSTRAINT-VIOLATION (#107)."
                (lambda ()
                  (let ((*graph* g))
                    (handler-case
-                       (progn (with-transaction () (make-uq-claim :ns "race" :ky "tuple"))
+                       (progn (with-transaction ()
+                                (make-uq-claim :ns "race" :ky "tuple"))
                               (bt:with-lock-held (lock) (incf oks)))
                      (graph-db:unique-constraint-violation ()
                        (bt:with-lock-held (lock) (incf rejects)))))))
@@ -383,5 +427,6 @@ UNIQUE-CONSTRAINT-VIOLATION (#107)."
       (mapc #'bt:join-thread threads)
       (is (= 1 oks) "exactly one thread committed the tuple (got ~D)" oks)
       (is (= 7 rejects) "the other seven were rejected (got ~D)" rejects)
-      (is (= 1 (length (map-vertices #'identity g :collect-p t :vertex-type 'uq-claim)))
+      (is (= 1 (length (map-vertices #'identity g :collect-p t
+                                     :vertex-type 'uq-claim)))
           "one node exists"))))

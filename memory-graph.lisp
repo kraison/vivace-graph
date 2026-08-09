@@ -319,7 +319,8 @@ structurally instead of regenerating them.")
 ;; (loaded after this file); forward-declared so the image codec here compiles clean.
 ;; The "was it loaded?" flag is defined HERE because OPEN-MEMORY-GRAPH binds it.
 (declaim (ftype (function (t) t) %dump-unique-indexes rebuild-unique-indexes
-                                 rebuild-secondary-indexes install-secondary-indexes
+                                 rebuild-secondary-indexes
+                                 install-secondary-indexes
                                  install-unique-tuple-constraints)
          (ftype (function (t t) t) %load-unique-indexes))
 (defvar *memory-image-unique-loaded* nil

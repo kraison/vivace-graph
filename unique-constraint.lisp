@@ -112,11 +112,12 @@ test + canonicalizer are resolved lazily when the index is created."
   ;; Backing store -- exactly one is set.  TABLE: an in-RAM hash (memory backend;
   ;; persisted via the #50 checkpoint image).  SKIP-LIST: a persistent heap skip-list
   ;; keyed by the composite (canonical-key id) via REDUCE-COMP-LESSP, like a view (on-
-  ;; disk backend; durable + incremental via mmap, address saved in a sidecar).  A
-  ;; multi-slot key is a flat list (v1 ... vn [origin-token]); REDUCE-COMP-LESSP /
-  ;; REDUCE-EQUAL already order/compare nested-list keys lexicographically via
-  ;; LESS-THAN's LIST method (utilities.lisp) -- proven by the existing :ORIGIN-scoped
-  ;; single-slot key, itself a 2-list -- so no new comparator is needed here.
+  ;; disk backend; durable + incremental via mmap, address saved in a sidecar).
+  ;; A multi-slot key is a flat list (v1 ... vn [origin-token]);
+  ;; REDUCE-COMP-LESSP/REDUCE-EQUAL already order/compare nested-list keys
+  ;; lexicographically via LESS-THAN's LIST method (utilities.lisp) -- proven
+  ;; by the existing :ORIGIN-scoped single-slot key, itself a 2-list -- so no
+  ;; new comparator is needed here.
   table skip-list)
 
 ;;; Backend-agnostic operations over the backing store (K = canonical key).
@@ -273,7 +274,8 @@ declarative DEF-UNIQUE registry, mirroring *SCHEMA-INDEX-METADATA*
 
 (defun register-unique-tuple-spec (spec)
   "Phase 1: record SPEC.  Duplicates accumulate; resolved newest-wins."
-  (push spec (gethash (unique-tuple-spec-graph-name spec) *schema-unique-metadata*))
+  (push spec (gethash (unique-tuple-spec-graph-name spec)
+                      *schema-unique-metadata*))
   spec)
 
 (defun %registered-unique-tuple-specs (graph)
@@ -322,6 +324,17 @@ origin token, exactly mirroring %UNIQUE-KEY's single-slot :ORIGIN handling."
           (cons (%origin-token (%node-origin node graph)) k)
           k))))
 
+(defun %make-uix-registry-table ()
+  "An EQUAL-keyed hash table, thread-synchronized where the Lisp supports
+it -- the shape both a GRAPH's UNIQUE-INDEXES registry and a memory-backed
+UNIQUE-INDEX's own TABLE use.  Factored out so %UNIQUE-TUPLE-INDEX-FOR's
+two call sites below stay under 80 columns (GH #107)."
+  (make-hash-table :test 'equal
+                   #+sbcl :synchronized #+sbcl t
+                   #+ccl :shared #+ccl t
+                   #+graph-db-ecl-sync-hash :synchronized
+                   #+graph-db-ecl-sync-hash t))
+
 (defun %unique-tuple-index-for (graph descriptor)
   "Get-or-create the (empty) multi-slot UNIQUE-INDEX for DESCRIPTOR =
 (slot-names owner spec scope), keyed by (owner . slot-names) in GRAPH's
@@ -330,12 +343,7 @@ never collides with a bare-symbol single-slot key under EQUAL), so
 persistence and rebuild are unified across both forms."
   (destructuring-bind (slot-names owner-name spec scope) descriptor
     (let* ((reg (or (unique-indexes graph)
-                    (setf (unique-indexes graph)
-                          (make-hash-table :test 'equal
-                                           #+sbcl :synchronized #+sbcl t
-                                           #+ccl :shared #+ccl t
-                                           #+graph-db-ecl-sync-hash :synchronized
-                                           #+graph-db-ecl-sync-hash t))))
+                    (setf (unique-indexes graph) (%make-uix-registry-table))))
            (key (cons owner-name slot-names)))
       (or (gethash key reg)
           (let* ((canonicalizers (%resolve-index-canonicalizers
@@ -344,26 +352,32 @@ persistence and rebuild are unified across both forms."
                        :owner-name owner-name :slot-names slot-names :spec spec
                        :canonicalizers canonicalizers :scope scope)))
             (if (indexes graph)
-                (setf (unique-index-skip-list uix) (make-unique-skip-list graph))
-                (setf (unique-index-table uix)
-                      (make-hash-table :test 'equal
-                                       #+sbcl :synchronized #+sbcl t
-                                       #+ccl :shared #+ccl t
-                                       #+graph-db-ecl-sync-hash :synchronized
-                                       #+graph-db-ecl-sync-hash t)))
+                (setf (unique-index-skip-list uix)
+                      (make-unique-skip-list graph))
+                (setf (unique-index-table uix) (%make-uix-registry-table)))
             (setf (gethash key reg) uix))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; DEF-UNIQUE build + open-time install (mirrors DEF-INDEX, index.lisp)
 ;;; ---------------------------------------------------------------------------
 
-(defun %build-unique-tuple-for-spec (graph spec)
+(defun %build-unique-tuple-for-spec (graph spec &key strict-p)
   "Create and fully populate the UNIQUE-INDEX for a DEF-UNIQUE SPEC by
-scanning OWNER's live nodes (and subclasses).  UNLIKE %BUILD-INDEX-FOR-SPEC
-(index.lisp), this ENFORCES: a pre-existing duplicate tuple is a genuine
-constraint violation (the graph already had conflicting data when the
-constraint was declared), not something to log-and-keep-first the way the
-v1 whole-graph REBUILD-UNIQUE-INDEXES fallback does."
+scanning OWNER's live nodes (and subclasses).  Not under WITH-TRANSACTION-
+MANAGER-LOCK -- a concurrent commit could slip a duplicate in mid-scan; the
+single locked call site remains VALIDATE-UNIQUE-CONSTRAINTS, but this is a
+second place UNIQUE-CONSTRAINT-VIOLATION can originate from (GH #107).
+
+STRICT-P T (DEF-UNIQUE's own eager path below, run when the graph is
+already open and a NEW constraint is being declared) signals on the first
+duplicate tuple found: the graph had conflicting data when the constraint
+was declared, a genuine error.  STRICT-P NIL (INSTALL-UNIQUE-TUPLE-
+CONSTRAINTS's open-time reconciliation, run on EVERY non-lazy open, not
+only a fresh declaration) instead logs and keeps the first -- the SAME
+tolerant fallback REBUILD-UNIQUE-INDEXES already uses, since a duplicate
+here may have been written by a path that never ran VALIDATE-UNIQUE-
+CONSTRAINTS (e.g. a peer/replication apply), and OPEN-GRAPH must not fail
+hard on that."
   (let* ((owner (unique-tuple-spec-owner-name spec))
          (slot-names (unique-tuple-spec-slot-names spec))
          (uix (%unique-tuple-index-for
@@ -376,54 +390,65 @@ v1 whole-graph REBUILD-UNIQUE-INDEXES fallback does."
                (let ((key (%unique-tuple-key uix node graph)))
                  (when key
                    (let ((existing (uix-lookup uix key)))
-                     (when (and existing (not (equalp existing (id node))))
-                       (error 'unique-constraint-violation
-                              :class-name owner :slot-name slot-names
-                              :value (mapcar (lambda (s) (slot-value node s))
-                                             slot-names)
-                              :existing-id existing))
-                     (uix-put uix key (id node))))))))
+                     (cond
+                       ((not (and existing (not (equalp existing (id node)))))
+                        (uix-put uix key (id node)))
+                       (strict-p
+                        (error 'unique-constraint-violation
+                               :class-name owner :slot-name slot-names
+                               :value (mapcar (lambda (s) (slot-value node s))
+                                              slot-names)
+                               :existing-id existing))
+                       (t
+                        (log:warn "unique-index ~S.~S: pre-existing ~
+                                   duplicate key ~S (~A / ~A); keeping first"
+                                  owner slot-names key
+                                  (string-id existing)
+                                  (string-id (id node)))))))))))
       (if (subtypep owner 'edge)
           (map-edges #'index-node graph :edge-type owner)
           (map-vertices #'index-node graph :vertex-type owner)))
     uix))
 
-(defun %ensure-unique-tuple-built (graph spec)
+(defun %ensure-unique-tuple-built (graph spec &key strict-p)
   "Build SPEC's multi-slot unique index unless it already exists in GRAPH's
-registry (idempotent) -- mirrors %ENSURE-INDEX-BUILT (index.lisp)."
+registry (idempotent) -- mirrors %ENSURE-INDEX-BUILT (index.lisp).  See
+%BUILD-UNIQUE-TUPLE-FOR-SPEC for STRICT-P."
   (let ((key (cons (unique-tuple-spec-owner-name spec)
                    (unique-tuple-spec-slot-names spec))))
     (unless (and (unique-indexes graph) (gethash key (unique-indexes graph)))
-      (%build-unique-tuple-for-spec graph spec))))
+      (%build-unique-tuple-for-spec graph spec :strict-p strict-p))))
 
 (defun install-unique-tuple-constraints (graph)
   "Phase 2 (mirror INSTALL-SECONDARY-INDEXES, index.lisp): build any
 DEF-UNIQUE registered for GRAPH that is missing from its registry -- one
 defined before the graph opened, or added since the last close.  Called at
 open right after the unique-index restore-or-rebuild, so a normal reopen
-(sidecar restored all) does no work."
+(sidecar restored all) does no work.  Runs TOLERANTLY (STRICT-P NIL): this
+fires on every non-lazy open, not only a fresh DEF-UNIQUE, so it must not
+turn a routine reopen into a hard OPEN-GRAPH failure over data that never
+went through VALIDATE-UNIQUE-CONSTRAINTS (GH #107)."
   (dolist (spec (%registered-unique-tuple-specs graph))
     (%ensure-unique-tuple-built graph spec)))
 
 (defmacro def-unique (owner-class slots graph-name &key canonicalize scope)
   "Declare a MULTI-SLOT uniqueness constraint on OWNER-CLASS's SLOTS tuple in
-GRAPH-NAME (spanning OWNER-CLASS's subclasses), enforced at commit
-(VALIDATE-UNIQUE-CONSTRAINTS) -- not merely indexed, unlike DEF-INDEX.  A
-tuple containing ANY null component is EXEMPT (SQL unknown-never-equals-
-unknown), the opposite of DEF-INDEX's +NULL-COMPONENT+ substitution -- see
-the section comment above.  Declarative and idempotent like DEF-INDEX: it
-registers the constraint and, if the graph is already open, builds it now
-(scanning existing nodes -- a pre-existing duplicate signals immediately);
-otherwise INSTALL-UNIQUE-TUPLE-CONSTRAINTS builds it at open.
+GRAPH-NAME, enforced at commit (VALIDATE-UNIQUE-CONSTRAINTS) -- not merely
+indexed, unlike DEF-INDEX.  A tuple with ANY null component is EXEMPT (SQL
+unknown-never-equals-unknown), the opposite of DEF-INDEX's
++NULL-COMPONENT+ substitution -- see the section comment above.
+Declarative and idempotent like DEF-INDEX: registers the constraint, and if
+the graph is already open, builds it now, STRICTLY (a pre-existing
+duplicate signals immediately -- see %BUILD-UNIQUE-TUPLE-FOR-SPEC);
+otherwise INSTALL-UNIQUE-TUPLE-CONSTRAINTS builds it TOLERANTLY at open.
 
-:CANONICALIZE is NIL (identity on every slot) or a positional list of one
-canonicalizer per slot (NIL entry = identity for that slot); it must supply
-exactly (LENGTH SLOTS) entries -- signalled otherwise (%RESOLVE-INDEX-
-CANONICALIZERS, index.lisp).  :SCOPE is :LOCAL (the default) or :ORIGIN,
-exactly as UNIQUE-SCOPE on a single :UNIQUE slot.
+:CANONICALIZE is NIL or a positional list, one entry per slot (NIL entry =
+identity), exactly (LENGTH SLOTS) long -- signalled otherwise
+(%RESOLVE-INDEX-CANONICALIZERS, index.lisp).  :SCOPE is :LOCAL (default) or
+:ORIGIN, as UNIQUE-SCOPE on a single :UNIQUE slot.
 
 A PARALLEL macro, not a DEF-INDEX flag: a flag would silently switch the
-null semantics a reader would reasonably assume were unchanged (GH #107)."
+null semantics a reader would assume were unchanged (GH #107)."
   `(let ((spec (make-unique-tuple-spec
                 :owner-name ',owner-class
                 :slot-names (%normalize-slots ',slots)
@@ -432,7 +457,7 @@ null semantics a reader would reasonably assume were unchanged (GH #107)."
                 :scope ,(or scope :local))))
      (register-unique-tuple-spec spec)
      (let ((g (lookup-graph ',graph-name)))
-       (when g (%ensure-unique-tuple-built g spec)))
+       (when g (%ensure-unique-tuple-built g spec :strict-p t)))
      spec))
 
 ;;; ---------------------------------------------------------------------------
@@ -497,7 +522,8 @@ of an update."
 ;;; Enforcement (VALIDATE, pre-durability)
 ;;; ---------------------------------------------------------------------------
 
-(defun %check-unique-key (uix key owner-name slot-designator raw-value node-id intra)
+(defun %check-unique-key (uix key owner-name slot-designator raw-value
+                           node-id intra)
   "Signal UNIQUE-CONSTRAINT-VIOLATION if KEY is held by another node -- either
 (a) an already-committed row in UIX (the index reflects it, since prior
 commits' APPLY ran under this same lock), or (b) another write earlier in
@@ -519,11 +545,12 @@ null-exempt case).  Shared by VALIDATE-UNIQUE-CONSTRAINTS's single-slot
       (setf (gethash ik intra) node-id))))
 
 (defun validate-unique-constraints (tx graph)
-  "Signal UNIQUE-CONSTRAINT-VIOLATION if any write in TX would duplicate another live
-node's unique value/tuple, or duplicate another write in the same transaction.  Called
-in %COMMIT's manager-locked region, after VALIDATE and before durability, so a
-violation aborts before anything is journaled.  Checks both the single-slot (:UNIQUE)
-and multi-slot (DEF-UNIQUE, GH #107) forms."
+  "Signal UNIQUE-CONSTRAINT-VIOLATION if any write in TX would duplicate
+another live node's unique value/tuple, or duplicate another write in the
+same transaction.  Called in %COMMIT's manager-locked region, after
+VALIDATE and before durability, so a violation aborts before anything is
+journaled.  Checks both the single-slot (:UNIQUE) and multi-slot
+(DEF-UNIQUE, GH #107) forms."
   (let ((intra (make-hash-table :test 'equal)))
     (dolist (write (writes tx))
       (let ((node (node write)))
@@ -586,9 +613,13 @@ removes it."
                      (when key
                        (let ((existing (uix-lookup uix key)))
                          (if (and existing (not (equalp existing (id node))))
-                             (log:warn "unique-index ~S.~S: pre-existing duplicate key ~S (~A / ~A); keeping first"
-                                       (unique-index-owner-name uix) (unique-index-slot-names uix)
-                                       key (string-id existing) (string-id (id node)))
+                             (log:warn "unique-index ~S.~S: pre-existing ~
+                                        duplicate key ~S (~A / ~A); ~
+                                        keeping first"
+                                       (unique-index-owner-name uix)
+                                       (unique-index-slot-names uix)
+                                       key (string-id existing)
+                                       (string-id (id node)))
                              (uix-put uix key (id node))))))))))
         (map-vertices #'index-node graph)
         (map-edges #'index-node graph)))))
@@ -716,22 +747,27 @@ not trigger a spurious rebuild."
                                                 #+graph-db-ecl-sync-hash t)))))
             (dolist (r records)
               ;; BACKEND is absent in pre-B+-tree sidecars (5-tuples) -> defaults to
-              ;; :skip-list, so an existing graph reopens exactly as before.  SLOT is a
-              ;; list for a multi-slot (DEF-UNIQUE) record, a bare symbol for a
-              ;; single-slot (:UNIQUE) one -- SAVE-UNIQUE-INDEX-ROOTS always writes
-              ;; that shape, so dispatching on LISTP here is unambiguous (GH #107).
+              ;; :skip-list, so an existing graph reopens exactly as before.
+              ;; SLOT is a list for a multi-slot (DEF-UNIQUE) record, a bare
+              ;; symbol for a single-slot (:UNIQUE) one -- SAVE-UNIQUE-INDEX-
+              ;; ROOTS always writes that shape, so LISTP dispatch is
+              ;; unambiguous (#107).
               (destructuring-bind (owner slot spec scope address &optional (backend :skip-list)) r
                 (if (listp slot)
                     (setf (gethash (cons owner slot) reg)
                           (%make-unique-index
                            :owner-name owner :slot-names slot :spec spec
-                           :canonicalizers (%resolve-index-canonicalizers spec (length slot))
+                           :canonicalizers (%resolve-index-canonicalizers
+                                            spec (length slot))
                            :scope scope
-                           :skip-list (%open-unique-skip-list graph address backend)))
-                    (multiple-value-bind (test canon) (%resolve-unique-canonicalizer spec)
+                           :skip-list (%open-unique-skip-list
+                                       graph address backend)))
+                    (multiple-value-bind (test canon)
+                        (%resolve-unique-canonicalizer spec)
                       (setf (gethash (cons owner slot) reg)
                             (%make-unique-index
                              :owner-name owner :slot-name slot :spec spec
                              :test test :canonicalizer canon :scope scope
-                             :skip-list (%open-unique-skip-list graph address backend))))))))
+                             :skip-list (%open-unique-skip-list
+                                         graph address backend))))))))
           t)))))
