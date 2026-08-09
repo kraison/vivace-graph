@@ -322,15 +322,6 @@ component is null -- nothing to index (the write-side mirror of
                                        (if c (funcall c v) v)))))))
     (when any key)))
 
-(defun %indexable-value-p (value)
-  "True if VALUE belongs in a general ordered index.  Excludes NULL/unbound (exempt,
-SQL-style) and GEOMETRY values -- an :INDEX-marked geometry slot is the SPATIAL
-index's domain (NODE-GEOMETRY picks it by GEOMETRYP), so the same slot option
-routes a geometry slot to spatial and a scalar slot here, dispatched by value type.
-Detected by runtime value (GEOMETRYP), like the spatial hook -- the declared
-`:type geometry' symbol is not reliably comparable across packages."
-  (and value (not (geometryp value))))
-
 (defun %tuple-indexable-p (node slot-names)
   "True unless some component of NODE's SLOT-NAMES tuple is a real geometry
 value -- geometry is the spatial index's domain, not this one's.  Unlike
@@ -386,7 +377,7 @@ cursor (the efficient path); an open end falls back to an ordered full scan +
 bound filter."
   (let ((sl (slot-index-skip-list six)))
     (if (and start end)
-        ;; Efficient bounded path: [ (start... +null-key+) .. (end... +max-key+) ].
+        ;; Efficient bounded path: [(start.. +null-key+) .. (end.. +max-key+)].
         (let ((cur (make-range-cursor sl (append start (list +null-key+))
                                       (append end (list +max-key+)))))
           (loop for node = (cursor-next cur :eoc) until (eql node :eoc)
@@ -538,22 +529,29 @@ reopen -- only the address+backend are needed to reopen the ordered map."
 class's live :INDEX spec, or from a matching DEF-INDEX spec registered for
 GRAPH; NIL if neither is found.  Used on reopen to re-associate a persisted
 index with its live spec (the canonicalizer is a function, not serializable,
-so it is re-resolved, not stored).  SLOT-NAMES is a list, one or more
-elements; the MOP :INDEX branch below only ever matches on its FIRST element
-since a slot's :INDEX option is inherently single-slot, but a multi-slot
-DEF-INDEX still resolves correctly via the second branch, which compares the
-whole list (GH #107)."
-  (let ((slot-name (first slot-names)))
-    (or (let ((c (ignore-errors (find-class owner-name nil))))
+so it is re-resolved, not stored).
+
+The MOP :INDEX branch only fires when SLOT-NAMES is genuinely single-slot
+(arity 1) -- a slot's :INDEX option is inherently single-slot, so at arity >
+1, matching just (FIRST SLOT-NAMES) with no arity check would find an
+UNRELATED single-slot :INDEX declaration that merely shares its first slot's
+name, and return THAT slot's canonicalizer instead of the composite's.  The
+SIX was originally built (at write time, not reopen) with the composite's own
+canonicalizer via %RESOLVE-INDEX-CANONICALIZER, so that mismatch would
+silently reopen the index keying with a different canonicalizer than the one
+that wrote the entries on disk -- missed matches, no error (GH #107)."
+  (or (when (= (length slot-names) 1)
+        (let ((c (ignore-errors (find-class owner-name nil))))
           (when (and c (class-finalized-p c))
-            (let ((d (find slot-name (class-indexed-slots c) :key #'first)))
-              (when d (%resolve-index-canonicalizer (third d))))))
-        (let* ((matchp (lambda (s)
-                         (and (eq (index-spec-owner-name s) owner-name)
-                              (equal (index-spec-slot-names s) slot-names))))
-               (spec (find-if matchp (%registered-index-specs graph))))
-          (when spec
-            (%resolve-index-canonicalizer (index-spec-canonicalize spec)))))))
+            (let ((d (find (first slot-names) (class-indexed-slots c)
+                           :key #'first)))
+              (when d (%resolve-index-canonicalizer (third d)))))))
+      (let* ((matchp (lambda (s)
+                       (and (eq (index-spec-owner-name s) owner-name)
+                            (equal (index-spec-slot-names s) slot-names))))
+             (spec (find-if matchp (%registered-index-specs graph))))
+        (when spec
+          (%resolve-index-canonicalizer (index-spec-canonicalize spec))))))
 
 (defun restore-secondary-index-roots (graph)
   "Reopen the on-disk secondary indexes from the sidecar -- no node scan.  Returns T
@@ -617,13 +615,13 @@ REGENERATE-UNIQUE-INDEXES / REBUILD-SPATIAL-INDEX for an in-place backend switch
 
 (defun %build-index-for-spec (graph spec)
   "Create and fully populate the ordered index for a DEF-INDEX SPEC by scanning
-OWNER's nodes (and subclasses).  SLOT-NAMES is passed through whole -- unwrapping
-it to (FIRST ...) here was the multi-slot trap: %SLOT-INDEX-FOR would re-wrap a
-bare symbol into a 1-list and silently key a 3-slot spec on its first slot only
-(GH #107).  The geometry gate and key build are wrapped in one IGNORE-ERRORS,
-matching this function's pre-existing tolerance for a legacy node whose slot(s)
-predate the DEF-INDEX (the scan path only; the live commit-apply path in
-%IX-CLAIM does not need this)."
+OWNER's nodes (and subclasses).  SLOT-NAMES is passed through whole --
+unwrapping it to (FIRST ...) here was the multi-slot trap: %SLOT-INDEX-FOR
+would re-wrap a bare symbol into a 1-list and silently key a 3-slot spec on
+its first slot only (GH #107).  The geometry gate and key build are wrapped
+in one IGNORE-ERRORS, matching this function's pre-existing tolerance for a
+legacy node whose slot(s) predate the DEF-INDEX (the scan path only; the
+live commit-apply path in %IX-CLAIM does not need this)."
   (let* ((owner (index-spec-owner-name spec))
          (slot-names (index-spec-slot-names spec))
          (six (%slot-index-for
@@ -682,10 +680,11 @@ with REGENERATE-SECONDARY-INDEXES."
 
 (defun %secondary-index-lookup (graph class-name slot-name)
   "The SLOT-INDEX covering CLASS-NAME.SLOT-NAME, or NIL if none has been CREATED yet.
-An index rooted at an ancestor of CLASS-NAME covers it (subtype IS-A).  NB: indexes
-are created lazily on first non-null value, so NIL here does NOT mean the slot is
-unindexed -- see %SLOT-INDEX-DECLARED-P.  SLOT-NAME may be a bare symbol or
-an already-normalized list -- both resolve (GH #107)."
+An index rooted at an ancestor of CLASS-NAME covers it (subtype IS-A).  NB: a
+declared index's SIX may not exist yet (e.g. every tuple seen so far was
+all-null, or the class simply has no live nodes), so NIL here does NOT mean
+the slot is unindexed -- see %SLOT-INDEX-DECLARED-P.  SLOT-NAME may be a bare
+symbol or an already-normalized list -- both resolve (GH #107)."
   (let ((reg (secondary-indexes graph))
         (slot-names (%normalize-slots slot-name)))
     (when reg
@@ -701,10 +700,14 @@ an already-normalized list -- both resolve (GH #107)."
   "True if CLASS-NAME declares SLOT-NAME as an :INDEX slot (effective, so inherited
 :INDEX from an ancestor counts).  Distinguishes a declared-but-empty index (no
 struct created yet) from a genuinely unindexed slot.  SLOT-NAME may be a bare
-symbol or an already-normalized list (GH #107)."
+symbol or an already-normalized list.  Only matches at arity 1 -- a slot's
+:INDEX option is inherently single-slot, so an undeclared multi-slot
+combination that merely shares its first element with an unrelated :INDEX
+slot must not be misreported as declared here (GH #107)."
   (let ((class (ignore-errors (find-class class-name nil)))
         (slot-names (%normalize-slots slot-name)))
     (and class (class-finalized-p class)
+         (= (length slot-names) 1)
          (find (first slot-names) (class-indexed-slots class) :key #'first)
          t)))
 

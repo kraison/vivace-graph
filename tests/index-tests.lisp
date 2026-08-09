@@ -36,6 +36,21 @@
 
 (def-index ix-claim (ns key rel) :graph-db-index-test)
 
+;; The ambiguous shape from code review: slot A independently marked :index
+;; with ITS OWN canonicalizer, AND the first slot of an unrelated multi-slot
+;; def-index (A B) with a DIFFERENT canonicalizer.  On reopen, resolving
+;; (A B)'s canonicalizer must not accidentally match A's own single-slot
+;; :INDEX declaration just because they share a name -- string-upcase (A's)
+;; vs string-downcase ((A B)'s) are deliberately conflicting transforms, so a
+;; wrong match is observable, not just "no transform happened to still work"
+;; (GH #107).
+(def-vertex ix-dual ()
+  ((a :initarg :a :accessor ix-dual-a :index string-upcase)
+   (b :initarg :b :accessor ix-dual-b))
+  :graph-db-index-test)
+
+(def-index ix-dual (a b) :graph-db-index-test :canonicalize string-downcase)
+
 (def-suite index-suite
   :description "General ordered secondary index (:INDEX / def-index)."
   :in graph-db-suite)
@@ -164,7 +179,7 @@ index is a legitimate empty result, not an error."
     ;; querying a declared index for a value nobody holds -> empty, not an error
     (is (null (index-lookup g 'ix-person 'email "nobody@x")))))
 
-;;; --- multi-slot tuple keys (GH #107) -----------------------------------------
+;;; --- multi-slot tuple keys (GH #107) ------------------------------------
 
 (test multi-slot-index-finds-exact-tuple
   "A three-component index resolves an exact tuple (#107)."
@@ -283,6 +298,31 @@ its :canonicalize (string-downcase) makes it case-insensitive."
     (let ((g (open-graph *ix-graph-name* (namestring dir) :buffer-pool-size 1000)))
       (unwind-protect
            (is (equal '("a" "b") (ix-names (index-lookup g 'ix-person 'age 30))))
+        (ignore-errors (close-graph g))
+        (collect-garbage)))))
+
+(test reopen-resolves-composite-canonicalizer-not-shared-first-slot
+  "A multi-slot DEF-INDEX whose first slot ALSO carries its own independent
+:index declaration must resolve ITS OWN canonicalizer on reopen, not the
+unrelated single-slot one that merely shares a name (#107).  IX-DUAL.A is
+:index STRING-UPCASE; (A B) is STRING-DOWNCASE'd -- deliberately conflicting
+transforms.  Before the fix, %OWNER-SLOT-CANONICALIZER's arity-blind FIND
+matched A's declaration first and returned STRING-UPCASE for the composite
+too, so a reopened lookup -- built by upcasing the query instead of
+downcasing it -- would never match the entry the ORIGINAL write-time
+(correct) canonicalizer stored downcased."
+  (with-temp-directory (dir)
+    (let ((g (make-graph *ix-graph-name* (namestring dir)
+                         :buffer-pool-size 1000)))
+      (unwind-protect
+           (let ((*graph* g))
+             (with-transaction () (make-ix-dual :a "MixedCase" :b "y")))
+        (close-graph g)))
+    (let ((g (open-graph *ix-graph-name* (namestring dir)
+                         :buffer-pool-size 1000)))
+      (unwind-protect
+           (is (= 1 (length (index-lookup g 'ix-dual '(a b)
+                                          (list "MixedCase" "y")))))
         (ignore-errors (close-graph g))
         (collect-garbage)))))
 
