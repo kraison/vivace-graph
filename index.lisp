@@ -133,6 +133,37 @@ order as a view / unique index)."
   (open-heap-index backend :address address :heap (indexes graph)
                    :comparison 'reduce-comp-lessp))
 
+;;; Ordering for a flat index key (v1 ... vn id): every component but the last
+;;; compares with LESS-THAN, the trailing node id with KEY-VECTOR<.  At n=2 this
+;;; is exactly REDUCE-COMP-LESSP, which is what lets an existing single-slot
+;;; index reopen under it without a rebuild (GH #107).  Keys of unequal length
+;;; are tolerated -- the shorter sorts first -- so a prefix bound works.
+
+(defun %index-comp-lessp (key1 key2)
+  "True when KEY1 sorts before KEY2.  See the comment above for the contract."
+  (let ((n1 (length key1))
+        (n2 (length key2)))
+    (loop for a in key1
+          for b in key2
+          for i from 0
+          do (if (and (= i (1- n1)) (= i (1- n2)))
+                 (return (key-vector< a b))
+                 (cond ((less-than a b) (return t))
+                       ((equal a b))
+                       (t (return nil))))
+          finally (return (< n1 n2)))))
+
+(defun %index-equal (key1 key2)
+  "Key equality matching %INDEX-COMP-LESSP: components by EQUAL, trailing id by
+EQUALP.  At n=2 this is exactly REDUCE-EQUAL."
+  (let ((n1 (length key1))
+        (n2 (length key2)))
+    (and (= n1 n2)
+         (loop for a in key1
+               for b in key2
+               for i from 0
+               always (if (= i (1- n1)) (equalp a b) (equal a b))))))
+
 (defun %index-key (six value)
   "The canonical key VALUE maps to in SIX (canonicalizer applied), or NIL for a
 NULL/unbound value (exempt, SQL-style -- not indexed)."

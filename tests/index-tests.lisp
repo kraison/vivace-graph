@@ -45,6 +45,34 @@
 
 (defun ix-names (nodes) (sort (mapcar #'ix-name nodes) #'string<))
 
+;;; --- the generalised composite comparator (GH #107) -------------------------
+
+(test index-comparator-matches-reduce-comp-at-arity-2
+  "%INDEX-COMP-LESSP must order 2-element keys exactly as REDUCE-COMP-LESSP, or
+every existing single-slot index would need a rebuild."
+  (let ((a (list "alice" graph-db::+null-key+))
+        (b (list "bob"   graph-db::+null-key+))
+        (c (list "alice" graph-db::+max-key+)))
+    (is (eq (graph-db::reduce-comp-lessp a b)
+            (graph-db::%index-comp-lessp a b)))
+    (is (eq (graph-db::reduce-comp-lessp a c)
+            (graph-db::%index-comp-lessp a c)))
+    (is (eq (graph-db::reduce-comp-lessp b a)
+            (graph-db::%index-comp-lessp b a)))
+    (is (eq (graph-db::reduce-equal a a) (graph-db::%index-equal a a)))
+    (is (eq (graph-db::reduce-equal a b) (graph-db::%index-equal a b)))))
+
+(test index-comparator-orders-tuples-and-prefix-bounds
+  "Longer keys order component-wise; a short bound key sorts before any
+longer key sharing its prefix, so a prefix range scan terminates correctly."
+  (let ((k  (list "a" "b" "c" graph-db::+null-key+))
+        (lo (list "a" "b"))
+        (hi (list "a" "b" graph-db::+max-sentinel+ graph-db::+max-key+)))
+    (is-true  (graph-db::%index-comp-lessp lo k))
+    (is-false (graph-db::%index-comp-lessp hi k))
+    (is-true  (graph-db::%index-comp-lessp k hi))
+    (is-false (graph-db::%index-equal lo k))))
+
 ;;; --- equality ---------------------------------------------------------------
 
 (test lookup-returns-all-sharing-nodes
