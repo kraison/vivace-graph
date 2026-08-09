@@ -333,8 +333,9 @@ deleting a claim releases its tuple so it can be reclaimed."
 (test multi-slot-unique-declared-after-open-scans-strictly
   "DEF-UNIQUE evaluated while the graph is already open builds the index
 now, STRICTLY (%BUILD-UNIQUE-TUPLE-FOR-SPEC :STRICT-P T): a pre-existing
-duplicate tuple signals immediately.  Distinct from INSTALL-UNIQUE-TUPLE-
-CONSTRAINTS's tolerant reopen path (Important 1, #107).
+duplicate tuple signals once the scan completes, so the published index still
+covers every node.  Distinct from INSTALL-UNIQUE-TUPLE-CONSTRAINTS's tolerant
+reopen path (GH #107).
 
 Uses a class GENSYMed fresh each run, defined and DEF-UNIQUE'd entirely at
 test-run time via EVAL, rather than the file's load-time UQ-CLAIM fixture:

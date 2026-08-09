@@ -636,12 +636,12 @@ if a sidecar was present (caller skips REBUILD-SECONDARY-INDEXES); NIL to fall b
 to rebuild (a fresh graph, or an unreadable sidecar).  The canonicalizer is
 re-resolved from the owner class's live :INDEX spec.
 
-An UNREADABLE sidecar falls back to rebuild rather than failing the open (GH #63),
-mirroring RESTORE-SPATIAL-INDEX-ROOTS -- nodes remain authoritative, so
-REBUILD-SECONDARY-INDEXES reconstructs the truth.  :UNREADABLE is a sentinel
-distinct from NIL: a graph with no secondary indexes declared saves an empty
-list, which must still count as a successfully-restored (if empty) sidecar,
-not trigger a spurious rebuild.
+An unreadable sidecar falls back to rebuild rather than failing the open
+(GH #63), mirroring RESTORE-SPATIAL-INDEX-ROOTS -- nodes remain
+authoritative, so REBUILD-SECONDARY-INDEXES reconstructs the truth.
+Returns T on a successful restore, including the empty case: a graph with
+no secondary indexes declared saves an empty list, which must still count
+as restored rather than trigger a spurious rebuild.
 
 The guard spans the per-record DESTRUCTURING-BIND loop, not just the RESTORE:
 a sidecar can deserialize cleanly and still hold a record shape this build does
@@ -691,10 +691,11 @@ rebuilding from live nodes, which are authoritative."
   "Drop every on-disk secondary index and rebuild it on GRAPH's CURRENT
 :INDEX-BACKEND, persisting the new backend tags.  The parallel of REGENERATE-
 ALL-VIEWS / REGENERATE-UNIQUE-INDEXES / REBUILD-SPATIAL-INDEX for an in-place
-backend switch.  REBUILD then INSTALL, the same pair OPEN-GRAPH runs: REBUILD repopulates from
-the nodes, INSTALL recreates a DEF-INDEX whose owner has no live node.  Without
-INSTALL a declared-but-empty index would be dropped outright, and %REQUIRE-INDEX
-reads that as \"declared, empty\" -- empty results, no error (GH #107)."
+backend switch.  REBUILD then INSTALL, the same pair OPEN-GRAPH runs:
+REBUILD repopulates from the nodes, INSTALL recreates a DEF-INDEX whose
+owner has no live node.  Without INSTALL a declared-but-empty index would
+be dropped outright, and %REQUIRE-INDEX reads that as \"declared, empty\"
+-- empty results, no error (GH #107)."
   (when (secondary-indexes graph)
     (maphash (lambda (k six)
                (declare (ignore k))

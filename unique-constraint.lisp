@@ -387,8 +387,8 @@ was declared, a genuine error.  The signal is deferred to the END of the
 scan, so the published index covers every node -- signalling on the first
 duplicate left the tail unscanned and its duplicates unenforced (GH #107).
 STRICT-P NIL (INSTALL-UNIQUE-TUPLE-
-CONSTRAINTS's open-time reconciliation, run on EVERY non-lazy open, not
-only a fresh declaration) instead logs and keeps the first -- the SAME
+CONSTRAINTS's open-time reconciliation, run on EVERY open, lazy included,
+not only a fresh declaration) instead logs and keeps the first -- the SAME
 tolerant fallback REBUILD-UNIQUE-INDEXES already uses, since a duplicate
 here may have been written by a path that never ran VALIDATE-UNIQUE-
 CONSTRAINTS (e.g. a peer/replication apply), and OPEN-GRAPH must not fail
@@ -463,7 +463,7 @@ DEF-UNIQUE registered for GRAPH that is missing from its registry -- one
 defined before the graph opened, or added since the last close.  Called at
 open right after the unique-index restore-or-rebuild, so a normal reopen
 (sidecar restored all) does no work.  Runs TOLERANTLY (STRICT-P NIL): this
-fires on every non-lazy open, not only a fresh DEF-UNIQUE, so it must not
+fires on every open, lazy included, not only a fresh DEF-UNIQUE, so it must not
 turn a routine reopen into a hard OPEN-GRAPH failure over data that never
 went through VALIDATE-UNIQUE-CONSTRAINTS (GH #107)."
   (dolist (spec (%registered-unique-tuple-specs graph))
