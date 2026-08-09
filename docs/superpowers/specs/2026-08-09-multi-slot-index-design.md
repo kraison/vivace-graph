@@ -77,6 +77,33 @@ sorts before any longer list sharing its prefix.
 Internally every index normalises its slot list to a list of length ≥ 1, so there is one
 code path rather than a single-slot special case.
 
+**What flat costs, which the v1 scope note understated.** "The codec is already
+polymorphic" is true of `less-than` on lists, but **three things are hardcoded to a
+two-element key** and must be generalised:
+
+- `reduce-comp-lessp` (`views.lisp:355`) — `(first …)` via `less-than`, `(second …)` via
+  `key-vector<`;
+- `reduce-equal` (`views.lisp:350`) — `(first …)` via `equal`, `(second …)` via
+  `equalp`;
+- the head / tail sentinel keys `(list +min-sentinel+ +null-key+)` and
+  `(list +max-sentinel+ +max-key+)`, which are arity-dependent and appear on the
+  memory-graph path at `memory-graph.lisp:1263-1267`.
+
+M therefore adds `%index-comp-lessp` and `%index-equal`: compare components `0 … n-2`
+with `less-than` / `equal`, and the final component (the id) with `key-vector<` /
+`equalp`. **At n = 2 these are order-identical to `reduce-comp-lessp` /
+`reduce-equal`**, which is what preserves the no-rebuild property — an existing
+single-slot index reopens under the new comparator and orders exactly as before.
+
+Views keep `reduce-comp-lessp` untouched; only index and unique skip-lists move to the
+generalised pair. The comparator is **passed at open** (`index.lisp:134`) and held in
+the skip-list struct at runtime, never persisted, so swapping it involves no on-disk
+change.
+
+Head / tail keys become arity-derived, which means `make-secondary-skip-list`
+(`index.lisp:124`) and the memory-graph `make-view-skip-list` method must both learn the
+index's arity — today neither takes it.
+
 ### 3.2 A third sentinel for a null component
 
 `+null-component+` (`:gnull`), with `less-than` methods placing it **above
@@ -169,9 +196,14 @@ of `apply-tx-writes-to-unique-indexes` (`transactions.lisp:1713`,
 by `(owner . slot)`. `restore-secondary-index-roots` (`index.lisp:333`) must **accept a
 bare symbol and normalise it to a 1-list**, so existing sidecars restore untouched.
 
-That is the only backward-compatibility point in this work, and it is a reader shim
-rather than a format bump. **No graph rebuilds. No storage-version change.** If the
-implementation finds itself needing either, the flat-key decision (§3.1) has been
+That is the only *on-disk* backward-compatibility point, and it is a reader shim
+rather than a format bump. **No graph rebuilds. No storage-version change.**
+
+That property rests entirely on the generalised comparator being order-identical at
+n = 2 (§3.1), so it is a hard gate rather than an aspiration: the plan must prove that
+an existing single-slot index reopens under `%index-comp-lessp` and returns the same
+results in the same order **before** anything else builds on it. If the implementation
+finds itself needing a rebuild or a version bump, the flat-key decision has been
 violated somewhere and should be revisited rather than worked around.
 
 ## 7. Out of scope
