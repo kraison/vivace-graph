@@ -244,12 +244,12 @@ git commit -m "feat(index): +null-component+ sentinel and its ordering (#107)"
 
 ---
 
-### Task 3: Slot-list normalisation — pure refactor, no behaviour change
+### Task 3: Slot-list normalisation — refactor behind characterisation tests
 
 **Files:**
 - Modify: `index.lisp:68` (`index-spec`), `:117` (`slot-index`), `:76`, `:89`, `:100`,
   `:198`, `:222`, `:233`, `:273`, `:446`, `:461`, `:470`, `:479`
-- Test: existing `index-suite` must pass unchanged
+- Test: `tests/index-tests.lisp` (characterisation tests, added FIRST)
 
 **Interfaces:**
 - Produces: `%normalize-slots (slot-or-list) -> list`. `index-spec-slot-names` and
@@ -258,7 +258,43 @@ git commit -m "feat(index): +null-component+ sentinel and its ordering (#107)"
 - The public API (`def-index`, `index-lookup`, `map-index`, `index-range`) is
   **unchanged** in this task and still takes a bare symbol.
 
-- [ ] **Step 1: Add the normaliser and rename the struct slots**
+- [ ] **Step 1: Write characterisation tests and watch them PASS before refactoring**
+
+These pin the *current* single-slot behaviour so the refactor is provably invisible.
+Unusually for this plan they pass before the change — that is the point: they fail only
+if the refactor alters observable behaviour. Do not assert that the refactor happened;
+assert what a caller sees.
+
+```lisp
+;;; --- characterisation: single-slot behaviour must survive Task 3 (GH #107) --
+
+(test characterise-single-slot-equality-and-range
+  "Pins the caller-visible single-slot contract across the slot-list refactor."
+  (with-ix-graph (g)
+    (with-transaction ()
+      (make-ix-person :name "a" :age 30)
+      (make-ix-person :name "b" :age 40)
+      (make-ix-person :name "c" :age 50))
+    (is (equal '("a") (ix-names (index-lookup g 'ix-person 'name "a"))))
+    (is (equal '("a" "b") (ix-names (index-range g 'ix-person 'age
+                                                 :start 30 :end 40))))
+    (is (null (index-lookup g 'ix-person 'name "nope")))))
+
+(test characterise-single-slot-canonicalizer-and-unindexed
+  "Pins canonicalized lookup and the error on a genuinely unindexed slot."
+  (with-ix-graph (g)
+    (with-transaction () (make-ix-person :name "d" :email "D@X.COM"))
+    (is (equal '("d") (ix-names (index-lookup g 'ix-person 'email "d@x.com"))))
+    (signals error (index-lookup g 'ix-person 'title "x"))))
+```
+
+- [ ] **Step 2: Run them to confirm they PASS on the unmodified code**
+
+Run: `(fiveam:run! 'graph-db/test::index-suite)`
+Expected: PASS. A failure here means the tests describe behaviour the code does not
+have — fix the tests, not the code, before touching `index.lisp`.
+
+- [ ] **Step 3: Add the normaliser and rename the struct slots**
 
 In `index.lisp`, before `register-index-spec`:
 
@@ -274,7 +310,7 @@ Change `(defstruct (index-spec …) owner-name slot-name graph-name canonicalize
 skip-list)` to use `slot-names canonicalizers` (plural; a list of functions, NIL entries
 meaning identity).
 
-- [ ] **Step 2: Update every reader to the plural accessor**
+- [ ] **Step 4: Update every reader to the plural accessor**
 
 Mechanically update the thirteen sites listed under **Files**. Registry keys change from
 `(cons owner-name slot-name)` to `(cons owner-name slot-list)`; the hash tables are
@@ -287,21 +323,21 @@ In the query helpers (`%secondary-index-lookup`, `%slot-index-declared-p`,
 `%def-index-declared-p`, `%require-index`), normalise the incoming `slot-name` argument
 with `%normalize-slots` on entry, so a symbol caller still resolves.
 
-- [ ] **Step 3: Run the whole suite to prove no behaviour changed**
+- [ ] **Step 5: Run the characterisation tests and the whole suite**
 
-Run: `(asdf:test-system :graph-db)`
-Expected: PASS at the same count as before this task. This task adds no tests; its gate
-is that it changes nothing observable.
+Run: `(fiveam:run! 'graph-db/test::index-suite)` then `(asdf:test-system :graph-db)`
+Expected: PASS, with the characterisation tests still green and the total count higher
+than before this task by exactly the two tests added in Step 1.
 
-- [ ] **Step 4: Verify a pre-existing on-disk graph still reopens**
+- [ ] **Step 6: Verify a pre-existing on-disk graph still reopens**
 
 Run: `(fiveam:run! 'graph-db/test::index-suite)` — the suite's durability test reopens a
 graph and re-queries. Confirm it passes rather than rebuilding.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
-git add index.lisp
+git add index.lisp tests/index-tests.lisp
 git commit -m "refactor(index): normalise slot designators to lists, no behaviour change (#107)"
 ```
 
