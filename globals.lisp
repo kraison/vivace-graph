@@ -227,6 +227,11 @@ strictly-safe pre-durability abort.")
 ;; Sentinel values for skip lists
 (alexandria:define-constant +min-sentinel+ :gmin)
 (alexandria:define-constant +max-sentinel+ :gmax)
+;; A stored "this component has no value" marker for a multi-slot index key.
+;; Distinct from +MIN-SENTINEL+ (which stays a pure range bound, so an exact
+;; match on a null component stays expressible) and from NIL (which %INDEX-KEY
+;; already uses to mean "not indexable").  (GH #107)
+(alexandria:define-constant +null-component+ :gnull)
 ;; For views, aggregrate key symbol
 (alexandria:define-constant +reduce-master-key+ :gagg)
 

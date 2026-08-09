@@ -73,6 +73,19 @@ longer key sharing its prefix, so a prefix range scan terminates correctly."
     (is-true  (graph-db::%index-comp-lessp k hi))
     (is-false (graph-db::%index-equal lo k))))
 
+(test null-component-orders-below-real-values
+  "+NULL-COMPONENT+ sits above +MIN-SENTINEL+ and below every real value, so a
+null-bearing tuple falls inside a prefix scan of its populated parts (#107)."
+  (is-true  (less-than graph-db::+min-sentinel+ graph-db::+null-component+))
+  (is-false (less-than graph-db::+null-component+ graph-db::+min-sentinel+))
+  (is-true  (less-than graph-db::+null-component+ graph-db::+max-sentinel+))
+  (is-true  (less-than graph-db::+null-component+ 0))
+  (is-true  (less-than graph-db::+null-component+ "a"))
+  (is-true  (less-than graph-db::+null-component+ 'zzz))
+  (is-false (less-than 0 graph-db::+null-component+))
+  (is-false (less-than "a" graph-db::+null-component+))
+  (is-false (less-than graph-db::+null-component+ graph-db::+null-component+)))
+
 ;;; --- equality ---------------------------------------------------------------
 
 (test lookup-returns-all-sharing-nodes
