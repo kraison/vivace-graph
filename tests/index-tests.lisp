@@ -86,6 +86,19 @@ null-bearing tuple falls inside a prefix scan of its populated parts (#107)."
   (is-false (less-than "a" graph-db::+null-component+))
   (is-false (less-than graph-db::+null-component+ graph-db::+null-component+)))
 
+(test null-component-orders-below-timestamps-and-uuids
+  "The +NULL-COMPONENT+ block enumerates concrete types explicitly rather than
+falling back to a general catch-all, so TIMESTAMP and UUID:UUID -- which have
+their own LESS-THAN methods (utilities.lisp) -- need their own overrides too:
+without one, dispatch silently falls through to the generic SYMBOL methods
+and inverts the ordering, breaking transitivity with e.g. number (#107)."
+  (let ((ts (local-time:now))
+        (id (uuid:make-v4-uuid)))
+    (is-true  (less-than graph-db::+null-component+ ts))
+    (is-false (less-than ts graph-db::+null-component+))
+    (is-true  (less-than graph-db::+null-component+ id))
+    (is-false (less-than id graph-db::+null-component+))))
+
 ;;; --- equality ---------------------------------------------------------------
 
 (test lookup-returns-all-sharing-nodes
