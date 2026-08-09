@@ -520,6 +520,73 @@ even finish opening."
         (ignore-errors (close-graph g))
         (collect-garbage)))))
 
+(test legacy-single-slot-sidecar-restores
+  "A sidecar record carrying a bare symbol (written before #107) must
+restore as a 1-list, with no rebuild."
+  (is (equal '(name)
+             (graph-db::%normalize-slots 'name)))
+  (is (equal '(ns key)
+             (graph-db::%normalize-slots '(ns key)))))
+
+(test legacy-sidecar-record-reopens-without-rebuild
+  "The pre-Task-3 sidecar format stored a bare symbol in the slot position
+(see fb83bf4^:index.lisp's SAVE-SECONDARY-INDEX-ROOTS); Task 3 changed the
+write side to a list, but nothing exercised a sidecar written by the OLD
+code.  DESTRUCTURING-BIND against that shape with no normalisation would
+either error outright or, if masked by a broad handler, silently fall back
+to REBUILD-SECONDARY-INDEXES -- which would look identical from the query
+answer alone.  This constructs a real sidecar file with a legacy bare-symbol
+record, then proves via the same fdefinition-shadow technique as
+REOPEN-RESTORES-DURABLE-INDEX-AND-ENFORCES (unique-constraint-tests.lisp)
+that reopen restores the persisted skip-list and never calls
+REBUILD-SECONDARY-INDEXES (#107)."
+  (with-temp-directory (dir)
+    (let ((path (namestring dir)))
+      (let ((g (make-graph *ix-graph-name* path :buffer-pool-size 1000)))
+        (unwind-protect
+             (let ((*graph* g))
+               (with-transaction ()
+                 (make-ix-person :name "a" :age 30)
+                 (make-ix-person :name "b" :age 30)))
+          (close-graph g)))
+      (let ((file (graph-db::secondary-index-root-file path)))
+        (is-true (probe-file file)
+                  "close-graph saved the secondary-index sidecar")
+        ;; Downgrade every single-slot record's slot field from a 1-list back
+        ;; to the bare symbol pre-Task-3 code wrote -- multi-slot lists did
+        ;; not exist yet, so a genuine legacy file has only this shape.
+        (let ((records (cl-store:restore file)))
+          (graph-db::%atomic-cl-store
+           (mapcar (lambda (r)
+                     (destructuring-bind (owner slot-names address
+                                          &optional (backend :skip-list)) r
+                       (if (= 1 (length slot-names))
+                           (list owner (first slot-names) address backend)
+                           r)))
+                   records)
+           file)))
+      (let ((rebuilt nil)
+            (orig (fdefinition 'graph-db::rebuild-secondary-indexes)))
+        (unwind-protect
+             (progn
+               (setf (fdefinition 'graph-db::rebuild-secondary-indexes)
+                     (lambda (gr) (setf rebuilt t) (funcall orig gr)))
+               (let ((g2 (open-graph *ix-graph-name* path
+                                     :buffer-pool-size 1000)))
+                 (unwind-protect
+                      (progn
+                        (is (null rebuilt)
+                            "reopen restored the legacy sidecar, no scan")
+                        (is (equal '("a")
+                                   (ix-names (index-lookup g2 'ix-person
+                                                            'name "a"))))
+                        (is (equal '("a" "b")
+                                   (ix-names (index-lookup g2 'ix-person
+                                                            'age 30)))))
+                   (ignore-errors (close-graph g2))
+                   (collect-garbage))))
+          (setf (fdefinition 'graph-db::rebuild-secondary-indexes) orig))))))
+
 (test secondary-sidecar-torn-write-falls-back-to-rebuild
   "GH #63: a truncated secondary-index sidecar must not prevent the graph from
 opening.  Before the fix, CL-STORE:RESTORE's error propagated straight out of

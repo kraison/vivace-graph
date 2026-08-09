@@ -650,16 +650,20 @@ not trigger a spurious rebuild."
                                                 #+graph-db-ecl-sync-hash :synchronized
                                                 #+graph-db-ecl-sync-hash t)))))
             (dolist (r records)
-              (destructuring-bind (owner slot-names address
+              (destructuring-bind (owner stored-slot address
                                     &optional (backend :skip-list)) r
-                (setf (gethash (cons owner slot-names) reg)
-                      (%make-slot-index
-                       :owner-name owner :slot-names slot-names
-                       :canonicalizers (%owner-slot-canonicalizer
-                                        owner slot-names graph)
-                       :skip-list (%open-secondary-skip-list
-                                   graph address (length slot-names)
-                                   backend))))))
+                ;; STORED-SLOT is a bare symbol in a sidecar written before
+                ;; #107 (multi-slot lists did not exist yet); normalise so
+                ;; both eras share this one path (GH #107).
+                (let ((slot-names (%normalize-slots stored-slot)))
+                  (setf (gethash (cons owner slot-names) reg)
+                        (%make-slot-index
+                         :owner-name owner :slot-names slot-names
+                         :canonicalizers (%owner-slot-canonicalizer
+                                          owner slot-names graph)
+                         :skip-list (%open-secondary-skip-list
+                                     graph address (length slot-names)
+                                     backend)))))))
           t)))))
 
 (defun regenerate-secondary-indexes (graph)
