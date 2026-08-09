@@ -355,28 +355,44 @@ null component is still indexed, via +NULL-COMPONENT+ in %INDEX-TUPLE-KEY
 
 ;;; Backend-agnostic ops over the ordered map (VALUE = the canonical key).
 
+(defun %index-bounds (six value prefix)
+  "Low/high range-cursor bounds (as VALUES) for VALUE -- a canonical
+component list from %INDEX-KEY, or a bare scalar at arity 1 -- against SIX.
+
+Full arity: [VALUE+NULL-KEY, VALUE+MAX-KEY], an exact-tuple window (the
+pre-Task-7 hardcoded pair).  Fewer components with PREFIX T:
+[VALUE, VALUE padded with +MAX-SENTINEL+ per missing slot, +MAX-KEY+],
+matching every stored tuple with VALUE as a leading prefix -- the low bound
+needs no padding, since a shorter key already sorts below any longer key
+sharing it (%INDEX-COMP-LESSP).  Fewer components with PREFIX NIL, or MORE
+than the arity regardless of PREFIX, signals: a wrong-length value is
+otherwise indistinguishable from an intended prefix and would silently
+return a superset -- silent-wrong-answer is this project's dominant defect
+class (GH #107)."
+  (let* ((vals (if (listp value) value (list value)))
+         (arity (length (slot-index-slot-names six)))
+         (n (length vals)))
+    (cond ((= n arity)
+           (values (append vals (list +null-key+))
+                   (append vals (list +max-key+))))
+          ((and prefix (< n arity))
+           (values vals
+                   (append vals
+                           (make-list (- arity n)
+                                      :initial-element +max-sentinel+)
+                           (list +max-key+))))
+          (t (error "Index on ~S has arity ~D; got ~D value(s)~
+~:[~; -- pass :PREFIX T for a prefix scan~]"
+                    (slot-index-slot-names six) arity n (< n arity))))))
+
 (defun ix-lookup (six key &key prefix)
   "List of node-ids whose indexed tuple matches KEY, the canonical component
 list from %INDEX-KEY: an exact match when KEY supplies SIX's full arity, or --
 with PREFIX T -- a range scan when KEY supplies fewer, matching every stored
-tuple that starts with KEY.  NIL if none.
-
-The lower bound is KEY itself: a strict-prefix key sorts below any longer key
-sharing it (%INDEX-COMP-LESSP), so no id sentinel is needed there.  The upper
-bound pads the missing components with +MAX-SENTINEL+ (each sorts above every
-real value) and the id slot with +MAX-KEY+ -- at full arity this reduces to
-the pre-Task-5 (KEY +MAX-KEY+) exactly (GH #107)."
-  (let* ((arity (length (slot-index-slot-names six)))
-         (n (length key)))
-    (unless (or prefix (= n arity))
-      (error "Incomplete index key ~S (~D of ~D components); pass :PREFIX T ~
-              for a prefix scan" key n arity))
-    (let* ((pad (- arity n))
-           (lo (if (zerop pad) (append key (list +null-key+)) key))
-           (hi (append key (make-list pad :initial-element +max-sentinel+)
-                       (list +max-key+)))
-           (cur (make-range-cursor (slot-index-skip-list six) lo hi))
-           (ids '()))
+tuple that starts with KEY.  NIL if none.  Bounds via %INDEX-BOUNDS (GH #107)."
+  (multiple-value-bind (lo hi) (%index-bounds six key prefix)
+    (let ((cur (make-range-cursor (slot-index-skip-list six) lo hi))
+          (ids '()))
       (loop for node = (cursor-next cur :eoc) until (eql node :eoc)
             do (push (car (last (%sn-key node))) ids))
       (nreverse ids))))
@@ -395,14 +411,21 @@ store NIL, not the raw id byte array (which SERIALIZE cannot round-trip)."
 (defun ix-map (six fn &key start end)
   "Call FN with (KEY ID) for every entry with START <= key <= END (component-
 wise, by %INDEX-VALUE-LESSP), in ascending order; KEY is the component list,
-id excluded.  Open-ended when START/END is NIL.  Bounded ranges use a range
-cursor (the efficient path); an open end falls back to an ordered full scan +
-bound filter."
+id excluded.  Open-ended when START/END is NIL.  START/END are tuples --
+full arity, or fewer components (a range endpoint may always be a prefix, no
+:PREFIX flag needed, unlike an equality IX-LOOKUP).  Bounded ranges use a
+range cursor (the efficient path), its bounds via %INDEX-BOUNDS on each
+endpoint separately -- taking START's low bound and END's high bound -- so a
+short tuple pads the same way a prefix IX-LOOKUP does, rather than an
+id-position sentinel landing in a value-position slot (GH #107).  An open end
+falls back to an ordered full scan + bound filter, which already tolerates a
+short tuple via %INDEX-VALUE-LESSP's own length tie-break."
   (let ((sl (slot-index-skip-list six)))
     (if (and start end)
-        ;; Efficient bounded path: [(start.. +null-key+) .. (end.. +max-key+)].
-        (let ((cur (make-range-cursor sl (append start (list +null-key+))
-                                      (append end (list +max-key+)))))
+        (let ((cur (make-range-cursor
+                    sl
+                    (nth-value 0 (%index-bounds six start t))
+                    (nth-value 1 (%index-bounds six end t)))))
           (loop for node = (cursor-next cur :eoc) until (eql node :eoc)
                 do (funcall fn (butlast (%sn-key node))
                             (car (last (%sn-key node))))))
@@ -792,8 +815,10 @@ ids in GRAPH.  With COLLECT-P NIL, returns T as soon as one match is found
 
 (defun map-index (fn graph class-name slot-name &key start end)
   "Call FN on each live node of CLASS-NAME (and subclasses) whose SLOT-NAME is in
-[START,END] (inclusive; open-ended when NIL), in ascending value order.  Resolves
-ids in GRAPH."
+[START,END] (inclusive; open-ended when NIL), in ascending value order.  START/
+END are scalars for a single-slot index; for a multi-slot index each is a
+tuple (list of component values) -- full arity, or fewer components, which
+bound only on the components given (GH #107).  Resolves ids in GRAPH."
   (let* ((*graph* graph)
          (six (%require-index graph class-name slot-name)))
     (when six                            ; NIL => declared but empty => nothing to map
@@ -809,7 +834,8 @@ ids in GRAPH."
 
 (defun index-range (graph class-name slot-name &key start end)
   "Nodes of CLASS-NAME (and subclasses) whose SLOT-NAME is in [START,END], ascending.
-Resolves ids in GRAPH."
+START/END are tuples for a multi-slot index -- see MAP-INDEX.  Resolves ids in
+GRAPH."
   (let ((result '()))
     (map-index (lambda (node) (push node result)) graph class-name slot-name
                :start start :end end)

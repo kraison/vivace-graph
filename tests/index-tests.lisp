@@ -214,6 +214,69 @@ index is a legitimate empty result, not an error."
     (is (= 1 (length (index-lookup g 'ix-claim '(ns key rel)
                                    (list "ops") :prefix t))))))
 
+;;; --- query API: tuple lookup and :prefix (GH #107, Task 7) -----------------
+
+(test short-value-without-prefix-signals
+  "A value list shorter than the arity must signal, never silently return a
+superset -- silent-wrong-answer is this project's dominant defect shape (#107)."
+  (with-ix-graph (g)
+    (with-transaction () (make-ix-claim :ns "ops" :key "e1" :rel "at"))
+    (signals error (index-lookup g 'ix-claim '(ns key rel) (list "ops")))
+    (is (= 1 (length (index-lookup g 'ix-claim '(ns key rel)
+                                   (list "ops") :prefix t))))))
+
+(test long-value-signals-even-with-prefix
+  "Too MANY values is never a prefix scan -- :PREFIX T does not rescue an
+overshoot, only a shortfall (#107)."
+  (with-ix-graph (g)
+    (with-transaction () (make-ix-claim :ns "ops" :key "e1" :rel "at"))
+    (signals error (index-lookup g 'ix-claim '(ns key rel)
+                                 (list "ops" "e1" "at" "extra") :prefix t))))
+
+(test prefix-lookup-finds-null-trailing-components
+  "A prefix lookup must return a row whose components BEYOND the queried
+prefix are null (stored as +NULL-COMPONENT+) -- otherwise storing nulls
+rather than skipping them (Task 5) buys nothing (#107)."
+  (with-ix-graph (g)
+    (with-transaction () (make-ix-claim :ns "ops" :key "e1" :rel nil))
+    (let ((hits (index-lookup g 'ix-claim '(ns key rel)
+                              (list "ops" "e1") :prefix t)))
+      (is (= 1 (length hits)))
+      (is (string= "e1" (ix-key (first hits))))
+      (is (null (ix-rel (first hits)))))))
+
+(test index-range-multi-slot-full-tuple-bounds
+  "INDEX-RANGE on a multi-slot index accepts a full-arity tuple for :START/
+:END -- an exact-tuple window, the bounded fast path (#107)."
+  (with-ix-graph (g)
+    (with-transaction ()
+      (make-ix-claim :ns "ops" :key "e1" :rel "at")
+      (make-ix-claim :ns "ops" :key "e2" :rel "at")
+      (make-ix-claim :ns "sec" :key "e9" :rel "at"))
+    (is (equal '("e1")
+               (mapcar #'ix-key
+                       (index-range g 'ix-claim '(ns key rel)
+                                   :start (list "ops" "e1" "at")
+                                   :end   (list "ops" "e1" "at")))))))
+
+(test index-range-multi-slot-short-tuple-bounds
+  "INDEX-RANGE on a multi-slot index also accepts a SHORT (fewer than arity)
+tuple for :START/:END, padded like an equality prefix scan so the bounded
+fast path never mis-scopes to an id-position sentinel compared against a
+value component (#107)."
+  (with-ix-graph (g)
+    (with-transaction ()
+      (make-ix-claim :ns "ops" :key "e1" :rel "at")
+      (make-ix-claim :ns "ops" :key "e2" :rel "at")
+      (make-ix-claim :ns "ops" :key "e3" :rel "near")
+      (make-ix-claim :ns "sec" :key "e9" :rel "at"))
+    (is (equal '("e1" "e2")
+               (sort (mapcar #'ix-key
+                             (index-range g 'ix-claim '(ns key rel)
+                                         :start (list "ops" "e1")
+                                         :end   (list "ops" "e2")))
+                     #'string<)))))
+
 ;;; --- declaration surface: positional :canonicalize (GH #107, Task 6) -------
 
 (test resolve-index-canonicalizers-positional-vs-single-spec
