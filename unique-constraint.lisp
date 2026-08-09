@@ -357,6 +357,18 @@ persistence and rebuild are unified across both forms."
                 (setf (unique-index-table uix) (%make-uix-registry-table)))
             (setf (gethash key reg) uix))))))
 
+(defun %unregister-unique-tuple-index (graph owner slot-names)
+  "Drop the multi-slot UIX for (OWNER . SLOT-NAMES) from GRAPH's registry,
+freeing its on-disk backing pages first.  Unwinds a half-built constraint --
+see %BUILD-UNIQUE-TUPLE-FOR-SPEC (GH #107)."
+  (let* ((reg (unique-indexes graph))
+         (key (cons owner slot-names))
+         (uix (and reg (gethash key reg))))
+    (when uix
+      (let ((sl (unique-index-skip-list uix)))
+        (when (and sl (view-index-p sl)) (delete-view-index sl)))
+      (remhash key reg))))
+
 ;;; ---------------------------------------------------------------------------
 ;;; DEF-UNIQUE build + open-time install (mirrors DEF-INDEX, index.lisp)
 ;;; ---------------------------------------------------------------------------
@@ -369,45 +381,71 @@ single locked call site remains VALIDATE-UNIQUE-CONSTRAINTS, but this is a
 second place UNIQUE-CONSTRAINT-VIOLATION can originate from (GH #107).
 
 STRICT-P T (DEF-UNIQUE's own eager path below, run when the graph is
-already open and a NEW constraint is being declared) signals on the first
-duplicate tuple found: the graph had conflicting data when the constraint
-was declared, a genuine error.  STRICT-P NIL (INSTALL-UNIQUE-TUPLE-
+already open and a NEW constraint is being declared) signals if any
+duplicate tuple exists: the graph had conflicting data when the constraint
+was declared, a genuine error.  The signal is deferred to the END of the
+scan, so the published index covers every node -- signalling on the first
+duplicate left the tail unscanned and its duplicates unenforced (GH #107).
+STRICT-P NIL (INSTALL-UNIQUE-TUPLE-
 CONSTRAINTS's open-time reconciliation, run on EVERY non-lazy open, not
 only a fresh declaration) instead logs and keeps the first -- the SAME
 tolerant fallback REBUILD-UNIQUE-INDEXES already uses, since a duplicate
 here may have been written by a path that never ran VALIDATE-UNIQUE-
 CONSTRAINTS (e.g. a peer/replication apply), and OPEN-GRAPH must not fail
-hard on that."
+hard on that.
+
+ALL-OR-NOTHING, in two parts.  (1) A UIX this call created is unregistered
+again if the scan does not finish, so a mid-scan error leaves no partial
+constraint and %ENSURE-UNIQUE-TUPLE-BUILT can retry.  (2) The strict
+duplicate signal fires only after the scan completes, so the constraint
+that survives it is whole.  Neither alone suffices: publishing up front and
+signalling on the first duplicate left the un-scanned tail unenforced, and
+unregistering instead leaves the enforcement path to get-or-create an EMPTY
+UIX on the next commit, which enforces nothing at all (GH #107)."
   (let* ((owner (unique-tuple-spec-owner-name spec))
          (slot-names (unique-tuple-spec-slot-names spec))
+         (reg (unique-indexes graph))
+         (fresh (not (and reg (gethash (cons owner slot-names) reg))))
          (uix (%unique-tuple-index-for
                graph (list slot-names owner
                            (unique-tuple-spec-canonicalize spec)
                            (unique-tuple-spec-scope spec))))
-         (*graph* graph))
+         (*graph* graph)
+         (dup nil)                       ; first (raw-value existing-id) seen
+         (done nil))
     (flet ((index-node (node)
              (unless (deleted-p node)
                (let ((key (%unique-tuple-key uix node graph)))
                  (when key
                    (let ((existing (uix-lookup uix key)))
-                     (cond
-                       ((not (and existing (not (equalp existing (id node)))))
-                        (uix-put uix key (id node)))
-                       (strict-p
-                        (error 'unique-constraint-violation
-                               :class-name owner :slot-name slot-names
-                               :value (mapcar (lambda (s) (slot-value node s))
-                                              slot-names)
-                               :existing-id existing))
-                       (t
-                        (log:warn "unique-index ~S.~S: pre-existing ~
-                                   duplicate key ~S (~A / ~A); keeping first"
-                                  owner slot-names key
-                                  (string-id existing)
-                                  (string-id (id node)))))))))))
-      (if (subtypep owner 'edge)
-          (map-edges #'index-node graph :edge-type owner)
-          (map-vertices #'index-node graph :vertex-type owner)))
+                     (if (not (and existing
+                                   (not (equalp existing (id node)))))
+                         (uix-put uix key (id node))
+                         (progn
+                           (unless dup
+                             (setf dup
+                                   (list (mapcar (lambda (s)
+                                                   (slot-value node s))
+                                                 slot-names)
+                                         existing)))
+                           (log:warn "unique-index ~S.~S: pre-existing ~
+                                      duplicate key ~S (~A / ~A); keeping ~
+                                      first"
+                                     owner slot-names key
+                                     (string-id existing)
+                                     (string-id (id node)))))))))))
+      (unwind-protect
+           (progn
+             (if (subtypep owner 'edge)
+                 (map-edges #'index-node graph :edge-type owner)
+                 (map-vertices #'index-node graph :vertex-type owner))
+             (setf done t))
+        (when (and fresh (not done))
+          (%unregister-unique-tuple-index graph owner slot-names))))
+    (when (and strict-p dup)
+      (error 'unique-constraint-violation
+             :class-name owner :slot-name slot-names
+             :value (first dup) :existing-id (second dup)))
     uix))
 
 (defun %ensure-unique-tuple-built (graph spec &key strict-p)
@@ -439,8 +477,10 @@ unknown-never-equals-unknown), the opposite of DEF-INDEX's
 +NULL-COMPONENT+ substitution -- see the section comment above.
 Declarative and idempotent like DEF-INDEX: registers the constraint, and if
 the graph is already open, builds it now, STRICTLY (a pre-existing
-duplicate signals immediately -- see %BUILD-UNIQUE-TUPLE-FOR-SPEC);
-otherwise INSTALL-UNIQUE-TUPLE-CONSTRAINTS builds it TOLERANTLY at open.
+duplicate signals -- see %BUILD-UNIQUE-TUPLE-FOR-SPEC); otherwise
+INSTALL-UNIQUE-TUPLE-CONSTRAINTS builds it TOLERANTLY at open.  The strict
+signal comes AFTER the full scan, so the constraint left behind is whole
+and enforcing (keep-first on the duplicate) rather than half-built.
 
 :CANONICALIZE is NIL or a positional list, one entry per slot (NIL entry =
 identity), exactly (LENGTH SLOTS) long -- signalled otherwise

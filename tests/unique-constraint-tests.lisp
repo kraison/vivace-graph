@@ -356,6 +356,41 @@ this test idempotent across repeated FIVEAM runs within one Lisp image
       (signals graph-db:unique-constraint-violation
         (eval `(def-unique ,cls (a b) :graph-db-unique-test))))))
 
+(test multi-slot-unique-failed-strict-build-covers-every-node
+  "GH #107 (whole-branch review): a failed STRICT DEF-UNIQUE left a half-built,
+LIVE constraint.  %UNIQUE-TUPLE-INDEX-FOR published the UIX before the scan and
+the strict path signalled on the FIRST duplicate, so the constraint covered
+only the prefix scanned before the error -- duplicates in the un-scanned tail
+committed with no complaint, and %ENSURE-UNIQUE-TUPLE-BUILT never retried, the
+key being present.
+
+Both halves are needed and are asserted here: the scan now RUNS TO COMPLETION
+before the strict signal (so the published index is whole), and a scan that
+dies for any other reason unregisters what it created.  Unregistering ALONE
+would not have fixed this: the enforcement path get-or-creates an EMPTY UIX on
+the next commit, which enforces nothing at all.
+
+Fresh GENSYMed class per run, for the reason
+MULTI-SLOT-UNIQUE-DECLARED-AFTER-OPEN-SCANS-STRICTLY documents.  The count
+assertion, not an ordering assumption, is what proves the whole scan ran:
+MAP-VERTICES walks the type index, whose order is not the insertion order."
+  (with-uq-graph (g)
+    (let* ((*package* (find-package :graph-db/test))
+           (cls (gensym "UQ-TAIL"))
+           (mk (intern (format nil "MAKE-~A" cls))))
+      (eval `(def-vertex ,cls () (a b) :graph-db-unique-test))
+      (with-transaction ()
+        (funcall mk :a "dup"  :b "1")     ; the conflicting pair
+        (funcall mk :a "dup"  :b "1")
+        (funcall mk :a "tail" :b "2")     ; and two innocent bystanders
+        (funcall mk :a "tail" :b "3"))
+      (signals graph-db:unique-constraint-violation
+        (eval `(def-unique ,cls (a b) :graph-db-unique-test)))
+      (is (= 3 (uq-index-size g cls '(a b)))
+          "every node was scanned: the kept-first duplicate plus both tails")
+      (signals graph-db:unique-constraint-violation
+        (with-transaction () (funcall mk :a "tail" :b "3"))))))
+
 (test multi-slot-unique-reopen-restores-durable-index-and-enforces
   "On-disk the multi-slot unique index is a persistent skip-list too: close
 saves its root, open reopens it from the sidecar WITHOUT scanning nodes
