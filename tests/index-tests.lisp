@@ -66,6 +66,30 @@
 
 (def-index ix-solo tag :graph-db-index-test :canonicalize #'string-downcase)
 
+;; A SECOND graph whose schema carries NO MOP :INDEX slot at all, so every
+;; index in it is DEF-INDEX-only.  *IX-GRAPH-NAME* cannot show that shape:
+;; IX-PERSON's :INDEX slots make a MOP-only guard answer T for the whole
+;; graph, masking the case where the guard is the only thing standing between
+;; a DEF-INDEX and a silent drop (GH #107).
+(defparameter *ix-di-graph-name* :graph-db-index-defonly-test)
+
+(eval-when (:load-toplevel :execute)
+  (setf (gethash *ix-di-graph-name* graph-db::*schema-node-metadata*) nil))
+
+(def-vertex ix-di-claim ()
+  ((ns  :initarg :ns  :accessor ix-di-ns)
+   (ky  :initarg :ky  :accessor ix-di-ky))
+  :graph-db-index-defonly-test)
+
+;; Declared, but deliberately never given a node: only INSTALL creates its
+;; SLOT-INDEX, since REBUILD only creates one when it meets a node.
+(def-vertex ix-di-empty ()
+  ((tag :initarg :tag :accessor ix-di-tag))
+  :graph-db-index-defonly-test)
+
+(def-index ix-di-claim (ns ky) :graph-db-index-defonly-test)
+(def-index ix-di-empty tag :graph-db-index-defonly-test)
+
 (def-suite index-suite
   :description "General ordered secondary index (:INDEX / def-index)."
   :in graph-db-suite)
@@ -78,6 +102,16 @@
     `(with-temp-directory (,dir)
        (let ((,g (make-graph *ix-graph-name* (namestring ,dir)
                              :buffer-pool-size 1000 :index-backend ,backend)))
+         (unwind-protect (let ((*graph* ,g)) ,@body)
+           (ignore-errors (close-graph ,g))
+           (collect-garbage))))))
+
+(defmacro with-ix-di-graph ((g) &body body)
+  "A fresh on-disk graph named *IX-DI-GRAPH-NAME* (def-index-only schema)."
+  (let ((dir (gensym)))
+    `(with-temp-directory (,dir)
+       (let ((,g (make-graph *ix-di-graph-name* (namestring ,dir)
+                             :buffer-pool-size 1000)))
          (unwind-protect (let ((*graph* ,g)) ,@body)
            (ignore-errors (close-graph ,g))
            (collect-garbage))))))
@@ -418,6 +452,34 @@ its :canonicalize (string-downcase) makes it case-insensitive."
            (is (equal '("a") (ix-names (index-lookup g 'ix-person 'note "HI"))))
         (ignore-errors (close-graph g))
         (collect-garbage)))))
+
+;;; --- def-index-only schema: rebuild / regenerate (GH #107) -----------------
+
+(test regenerate-rebuilds-def-index-only-indexes
+  "GH #107 (whole-branch review): REGENERATE-SECONDARY-INDEXES silently emptied
+every DEF-INDEX-only index.  %GRAPH-HAS-INDEXED-SLOTS-P consulted only the MOP
+:INDEX slots -- and EVERY multi-slot index is DEF-INDEX-only, there being no
+MOP surface for a tuple -- so the guarded REBUILD no-opped after the delete,
+and an EMPTY sidecar was persisted.  Lookups then returned empty rather than
+signalling, %REQUIRE-INDEX reading that as declared-but-empty.  Its unique
+counterpart %GRAPH-HAS-UNIQUE-SLOTS-P already consulted the DEF-UNIQUE
+registry; the two surfaces diverged exactly here.  REGENERATE also has to run
+INSTALL, as OPEN-GRAPH does, or a declared index with no live node is dropped
+outright."
+  (with-ix-di-graph (g)
+    (with-transaction ()
+      (make-ix-di-claim :ns "ops" :ky "e1")
+      (make-ix-di-claim :ns "ops" :ky "e2"))
+    (is-true (graph-db::%graph-has-indexed-slots-p g)
+             "a DEF-INDEX declaration counts as an indexed slot")
+    (is (= 2 (length (index-lookup g 'ix-di-claim '(ns ky) '("ops")
+                                   :prefix t))))
+    (graph-db::regenerate-secondary-indexes g)
+    (is (= 2 (length (index-lookup g 'ix-di-claim '(ns ky) '("ops")
+                                   :prefix t)))
+        "regenerate rebuilt the def-index-only index from the nodes")
+    (is-true (graph-db::%secondary-index-lookup g 'ix-di-empty '(tag))
+             "INSTALL recreated a declared index whose owner has no nodes")))
 
 ;;; --- range ------------------------------------------------------------------
 

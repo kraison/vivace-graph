@@ -536,12 +536,17 @@ the ordered map on the graph's backend."
 ;;; ---------------------------------------------------------------------------
 
 (defun %graph-has-indexed-slots-p (graph)
-  "Cheap guard so a graph with no :INDEX slots pays nothing at open."
-  (dolist (nt (all-node-types graph) nil)
-    (let* ((name (if (node-type-p nt) (node-type-name nt) nt))
-           (c (and name (ignore-errors (find-class name nil)))))
-      (when (and c (class-finalized-p c) (class-indexed-slots c))
-        (return t)))))
+  "Cheap guard so a graph with no :INDEX slots and no DEF-INDEX declarations
+pays nothing at open.  The DEF-INDEX arm is not optional: there is no MOP
+surface for a tuple, so EVERY multi-slot index is DEF-INDEX-only and a
+MOP-only guard silently makes REBUILD/REGENERATE a no-op for it.  Mirrors
+%GRAPH-HAS-UNIQUE-SLOTS-P (unique-constraint.lisp) (GH #107)."
+  (or (dolist (nt (all-node-types graph) nil)
+        (let* ((name (if (node-type-p nt) (node-type-name nt) nt))
+               (c (and name (ignore-errors (find-class name nil)))))
+          (when (and c (class-finalized-p c) (class-indexed-slots c))
+            (return t))))
+      (and (%registered-index-specs graph) t)))
 
 (defun rebuild-secondary-indexes (graph)
   "(Re)populate the secondary indexes by scanning live nodes once, off the commit
@@ -682,6 +687,7 @@ REGENERATE-UNIQUE-INDEXES / REBUILD-SPATIAL-INDEX for an in-place backend switch
              (secondary-indexes graph))
     (clrhash (secondary-indexes graph)))
   (rebuild-secondary-indexes graph)
+  (install-secondary-indexes graph)
   (save-secondary-index-roots graph)
   graph)
 
