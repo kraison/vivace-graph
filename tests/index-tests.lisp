@@ -277,6 +277,25 @@ value component (#107)."
                                          :end   (list "ops" "e2")))
                      #'string<)))))
 
+(test index-range-open-ended-over-arity-start-signals
+  "An over-arity :START alone (no :END) must signal -- the open-ended
+(single-bound) path needs the same arity ceiling as the bounded one, or it
+silently mis-filters rows out via %INDEX-VALUE-LESSP's length tie-break
+instead of erroring (#107)."
+  (with-ix-graph (g)
+    (with-transaction () (make-ix-claim :ns "ops" :key "e1" :rel "at"))
+    (signals error
+      (index-range g 'ix-claim '(ns key rel)
+                  :start (list "ops" "e1" "at" "extra")))))
+
+(test index-range-open-ended-over-arity-end-signals
+  "Same defect, mirrored on :END alone (no :START) (#107)."
+  (with-ix-graph (g)
+    (with-transaction () (make-ix-claim :ns "ops" :key "e1" :rel "at"))
+    (signals error
+      (index-range g 'ix-claim '(ns key rel)
+                  :end (list "ops" "e1" "at" "extra")))))
+
 ;;; --- declaration surface: positional :canonicalize (GH #107, Task 6) -------
 
 (test resolve-index-canonicalizers-positional-vs-single-spec

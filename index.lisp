@@ -413,23 +413,36 @@ store NIL, not the raw id byte array (which SERIALIZE cannot round-trip)."
 wise, by %INDEX-VALUE-LESSP), in ascending order; KEY is the component list,
 id excluded.  Open-ended when START/END is NIL.  START/END are tuples --
 full arity, or fewer components (a range endpoint may always be a prefix, no
-:PREFIX flag needed, unlike an equality IX-LOOKUP).  Bounded ranges use a
-range cursor (the efficient path), its bounds via %INDEX-BOUNDS on each
-endpoint separately -- taking START's low bound and END's high bound -- so a
-short tuple pads the same way a prefix IX-LOOKUP does, rather than an
-id-position sentinel landing in a value-position slot (GH #107).  An open end
-falls back to an ordered full scan + bound filter, which already tolerates a
-short tuple via %INDEX-VALUE-LESSP's own length tie-break."
-  (let ((sl (slot-index-skip-list six)))
+:PREFIX flag needed, unlike an equality IX-LOOKUP) -- but never MORE than the
+arity, on EITHER path: %INDEX-BOUNDS is called on each given endpoint up
+front, purely for its arity signal, before branching on which path to take.
+Without this the open-ended (single-bound) path would take an over-arity
+tuple silently: %INDEX-VALUE-LESSP's own length tie-break treats a longer
+tuple as sorting after a shorter one it shares no true prefix relationship
+with, so it would just mis-filter rows out rather than error (GH #107).
+
+Bounded ranges (both START and END given) use a range cursor (the efficient
+path), its bounds taken from the precomputed START-BOUNDS/END-BOUNDS --
+START's low bound and END's high bound -- so a short tuple pads the same way
+a prefix IX-LOOKUP does, rather than an id-position sentinel landing in a
+value-position slot.  An open end falls back to an ordered full scan + bound
+filter on the raw (unpadded) START/END, which already tolerates a short
+tuple via %INDEX-VALUE-LESSP's own length tie-break -- only the arity
+ceiling above needs the explicit check."
+  (let* ((sl (slot-index-skip-list six))
+         (start-bounds (and start (multiple-value-list
+                                    (%index-bounds six start t))))
+         (end-bounds   (and end   (multiple-value-list
+                                    (%index-bounds six end t)))))
     (if (and start end)
-        (let ((cur (make-range-cursor
-                    sl
-                    (nth-value 0 (%index-bounds six start t))
-                    (nth-value 1 (%index-bounds six end t)))))
+        (let ((cur (make-range-cursor sl (first start-bounds)
+                                      (second end-bounds))))
           (loop for node = (cursor-next cur :eoc) until (eql node :eoc)
                 do (funcall fn (butlast (%sn-key node))
                             (car (last (%sn-key node))))))
-        ;; Open-ended: ordered full scan, filtering by whatever bound is present.
+        ;; Open-ended: ordered full scan, filtering by whatever bound is
+        ;; present.  START-BOUNDS/END-BOUNDS above already signalled on an
+        ;; over-arity tuple; their VALUES are unused here on purpose.
         (let ((cur (make-cursor sl)))
           (loop for node = (cursor-next cur :eoc) until (eql node :eoc)
                 for k = (butlast (%sn-key node))
