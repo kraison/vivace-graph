@@ -290,6 +290,11 @@
                        :initform nil)
    (peer-thread :accessor peer-thread :initarg :peer-thread :initform nil)))
 
+;; NODE-ORIGINS is a PEER-GRAPH slot, but UNIQUE-CONSTRAINT reads it off any graph.
+;; The fallback lives here, in core, not with the rest of the peer code: it is in
+;; GRAPH-DB/REPLICATION, which a core-only consumer (GRAPH-DB/ALGORITHMS) never loads.
+(defmethod node-origins ((graph graph)) nil)
+
 (defgeneric graph-p (thing)
   (:method ((graph graph)) graph)
   (:method (thing) nil))

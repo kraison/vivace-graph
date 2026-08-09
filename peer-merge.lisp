@@ -171,10 +171,9 @@ NIL origin sorts lowest (an unstamped local field always loses a real op)."
 ;;; persistence shape as FIELD-STAMPS (an in-memory map snapshotted on open/close).
 ;;; ---------------------------------------------------------------------------
 
-;; NODE-ORIGINS is a PEER-GRAPH slot; a plain graph (including a peer graph reopened
-;; without :PEER-ROLE) has no such slot.  A NIL fallback keeps every reader safe there
-;; -- %NODE-ORIGIN then falls back to the graph origin, i.e. :ORIGIN == :LOCAL.
-(defmethod node-origins ((graph graph)) nil)
+;; The NIL fallback for a plain graph (including a peer graph reopened without
+;; :PEER-ROLE) is in graph-class.lisp -- it must load for core-only consumers.
+;; %NODE-ORIGIN then falls back to the graph origin, i.e. :ORIGIN == :LOCAL.
 
 (defun ensure-node-origins (graph)
   (or (node-origins graph)
