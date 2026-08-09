@@ -319,7 +319,8 @@ structurally instead of regenerating them.")
 ;; (loaded after this file); forward-declared so the image codec here compiles clean.
 ;; The "was it loaded?" flag is defined HERE because OPEN-MEMORY-GRAPH binds it.
 (declaim (ftype (function (t) t) %dump-unique-indexes rebuild-unique-indexes
-                                 rebuild-secondary-indexes install-secondary-indexes)
+                                 rebuild-secondary-indexes install-secondary-indexes
+                                 install-unique-tuple-constraints)
          (ftype (function (t t) t) %load-unique-indexes))
 (defvar *memory-image-unique-loaded* nil
   "Bound NIL by OPEN-MEMORY-GRAPH; set T by the image restore when the unique-index
@@ -982,7 +983,10 @@ as deferred blobs and materialize on first touch (needs a VG-native image)."
       ;; checkpoint image (so a lazy reopen needs no scan) is the deferred follow-up.
       (unless (lazy-p graph)
         (rebuild-secondary-indexes graph)
-        (install-secondary-indexes graph)))
+        (install-secondary-indexes graph)
+        ;; Same lazy-graph guard as above: a def-unique build scans nodes, which
+        ;; would materialize LZNODE blobs on a lazy graph (GH #107).
+        (install-unique-tuple-constraints graph)))
     (when peer-role
       (%init-memory-peer-slots graph :open path peer-role origin-id peer-host
                                export-predicate device-registry merge-policy

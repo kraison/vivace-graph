@@ -218,6 +218,7 @@
                 #:index-lookup
                 #:index-range
                 #:map-index
+                #:def-unique
                 #:weight
                 #:to
                 #:from

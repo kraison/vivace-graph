@@ -175,6 +175,8 @@
            #:ucv-class-name #:ucv-slot-name #:ucv-value #:ucv-existing-id
            #:rebuild-unique-indexes
            #:regenerate-unique-indexes
+           ;; multi-slot uniqueness constraint (issue #107)
+           #:def-unique
            ;; general ordered index (:index slot option / def-index)
            #:def-index
            #:index-lookup #:index-range #:map-index

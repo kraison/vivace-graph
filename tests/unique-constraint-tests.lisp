@@ -25,6 +25,15 @@
   ((level :initarg :level :accessor uq-level))
   :graph-db-unique-test)
 
+;; DEF-UNIQUE fixture (GH #107): a multi-slot constraint on (NS KY), where KY
+;; is optional -- the forcing case for the null-exempts-the-tuple semantic.
+(def-vertex uq-claim ()
+  ((ns :initarg :ns :accessor uqc-ns)
+   (ky :initarg :ky :accessor uqc-ky :initform nil))
+  :graph-db-unique-test)
+
+(def-unique uq-claim (ns ky) :graph-db-unique-test)
+
 (def-suite unique-constraint-suite
   :description "Unique constraints (:UNIQUE) -- issue #6."
   :in graph-db-suite)
@@ -272,3 +281,107 @@ safe, unlike rebuild-on-open."
                  (with-transaction () (make-uq-user :uname "u7" :email "dup@x.com"))))
           (ignore-errors (close-graph g2 :snapshot-p nil))
           (collect-garbage))))))
+
+;;;; DEF-UNIQUE -- multi-slot uniqueness constraint (GH #107).  UQ-CLAIM (NS
+;;;; KY) is the fixture: KY is optional, so a null KY is the forcing case for
+;;;; the null-exempts-the-tuple semantic (opposite of an ordinary index's
+;;;; +NULL-COMPONENT+ substitution).
+
+(test multi-slot-unique-rejects-duplicate-tuple
+  "The same (ns, ky) pair twice must signal at the commit boundary (#107)."
+  (with-uq-graph (g)
+    (declare (ignorable g))
+    (with-transaction () (make-uq-claim :ns "ops" :ky "e1"))
+    (signals graph-db:unique-constraint-violation
+      (with-transaction () (make-uq-claim :ns "ops" :ky "e1")))))
+
+(test multi-slot-unique-exempts-null-component
+  "Two tuples sharing their populated component but both null elsewhere do NOT
+collide -- SQL semantics, and the unary-claim case (#107)."
+  (with-uq-graph (g)
+    (with-transaction () (make-uq-claim :ns "ops" :ky nil))
+    (finishes (with-transaction () (make-uq-claim :ns "ops" :ky nil)))
+    (is (= 2 (length (map-vertices #'identity g :collect-p t :vertex-type 'uq-claim)))
+        "both null-ky claims were committed -- neither was exempt from being WRITTEN,
+only from the CONSTRAINT")))
+
+(test multi-slot-unique-distinct-tuples-allowed
+  "Tuples differing in either component are distinct claims."
+  (with-uq-graph (g)
+    (declare (ignorable g))
+    (finishes (with-transaction ()
+                (make-uq-claim :ns "ops" :ky "e1")
+                (make-uq-claim :ns "ops" :ky "e2")
+                (make-uq-claim :ns "eng" :ky "e1")))))
+
+(test multi-slot-unique-update-and-delete-release
+  "Updating a claim's tuple to another live claim's tuple is rejected; deleting a
+claim releases its tuple so it can be reclaimed."
+  (with-uq-graph (g)
+    (let (bid)
+      (with-transaction ()
+        (make-uq-claim :ns "ops" :ky "e1")
+        (setq bid (id (make-uq-claim :ns "ops" :ky "e2"))))
+      (signals graph-db:unique-constraint-violation
+        (with-transaction ()
+          (let ((v (copy (lookup-vertex bid)))) (setf (uqc-ky v) "e1") (save v))))
+      (with-transaction () (mark-deleted (lookup-vertex bid)))
+      (finishes (with-transaction () (make-uq-claim :ns "ops" :ky "e2"))))))
+
+(test multi-slot-unique-reopen-restores-durable-index-and-enforces
+  "On-disk the multi-slot unique index is a persistent skip-list too: close saves
+its root, open reopens it from the sidecar WITHOUT scanning nodes (rebuild not
+called), and it still enforces (#107)."
+  (with-temp-directory (dir)
+    (let ((path (namestring dir)))
+      (let ((g (make-graph *uq-graph-name* path :buffer-pool-size 1000)))
+        (let ((*graph* g))
+          (with-transaction ()
+            (make-uq-claim :ns "ops" :ky "e1")
+            (make-uq-claim :ns "ops" :ky "e2")))
+        (close-graph g))
+      (let ((rebuilt nil) (built nil)
+            (orig-rebuild (fdefinition 'graph-db::rebuild-unique-indexes))
+            (orig-build (fdefinition 'graph-db::%build-unique-tuple-for-spec)))
+        (unwind-protect
+             (progn
+               (setf (fdefinition 'graph-db::rebuild-unique-indexes)
+                     (lambda (gr) (setf rebuilt t) (funcall orig-rebuild gr)))
+               (setf (fdefinition 'graph-db::%build-unique-tuple-for-spec)
+                     (lambda (gr spec) (setf built t) (funcall orig-build gr spec)))
+               (let ((g2 (open-graph *uq-graph-name* path)))
+                 (unwind-protect
+                      (let ((*graph* g2))
+                        (is (null rebuilt) "reopen restored from the sidecar, no scan")
+                        (is (null built)
+                            "the multi-slot index was restored, not rescanned")
+                        (is (= 2 (uq-index-size g2 'uq-claim '(ns ky))) "index restored")
+                        (signals graph-db:unique-constraint-violation
+                          (with-transaction () (make-uq-claim :ns "ops" :ky "e1")))
+                        (finishes (with-transaction () (make-uq-claim :ns "ops" :ky "e3"))))
+                   (ignore-errors (close-graph g2))
+                   (collect-garbage))))
+          (setf (fdefinition 'graph-db::rebuild-unique-indexes) orig-rebuild)
+          (setf (fdefinition 'graph-db::%build-unique-tuple-for-spec) orig-build))))))
+
+(test multi-slot-unique-concurrent-race-exactly-one-wins
+  "The phantom the commit lock defeats, on a multi-slot tuple: N threads racing
+to create the same (ns, ky) tuple -- exactly one commits, the rest get
+UNIQUE-CONSTRAINT-VIOLATION (#107)."
+  (with-uq-graph (g)
+    (let ((oks 0) (rejects 0) (lock (bt:make-lock)) (threads nil))
+      (dotimes (i 8)
+        (push (bt:make-thread
+               (lambda ()
+                 (let ((*graph* g))
+                   (handler-case
+                       (progn (with-transaction () (make-uq-claim :ns "race" :ky "tuple"))
+                              (bt:with-lock-held (lock) (incf oks)))
+                     (graph-db:unique-constraint-violation ()
+                       (bt:with-lock-held (lock) (incf rejects)))))))
+              threads))
+      (mapc #'bt:join-thread threads)
+      (is (= 1 oks) "exactly one thread committed the tuple (got ~D)" oks)
+      (is (= 7 rejects) "the other seven were rejected (got ~D)" rejects)
+      (is (= 1 (length (map-vertices #'identity g :collect-p t :vertex-type 'uq-claim)))
+          "one node exists"))))
