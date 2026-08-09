@@ -37,17 +37,24 @@ hash-test (the ordered map keys by LESS-THAN, not a hash)."
 
 (defun %resolve-index-canonicalizers (spec arity)
   "SPEC -> a list of ARITY canonicalizers (NIL = identity).  A POSITIONAL list
-applies element I to component I; anything else (T, NIL, a bare symbol,
-#'FN, or a LAMBDA form) is a single spec applying to component 0 only, with
-every other component defaulting to identity -- the single-slot / single-
-function backward-compatible form every existing caller uses.
+applies element I to component I, and must supply exactly ARITY entries --
+signalled rather than silently truncated/padded, since a wrong count is
+exactly the \"no error, wrong results\" class of bug this index chases
+elsewhere (GH #107).  Anything else (T, NIL, a bare symbol, #'FN, or a
+LAMBDA form) is a single spec applying to component 0 only, with every
+other component defaulting to identity -- the single-slot / single-function
+backward-compatible form every existing caller uses.
 
 #'FN reads as (FUNCTION FN) and a LAMBDA form as (LAMBDA ...) -- both are
 conses, so \"is it a cons?\" cannot distinguish a positional list from a
-single function designator; excluding those two heads is what does (#107)."
+single function designator; excluding those two heads is what does."
   (if (and (consp spec) (not (member (car spec) '(function lambda))))
-      (loop for i from 0 below arity
-            collect (%resolve-index-canonicalizer (nth i spec)))
+      (progn
+        (unless (= (length spec) arity)
+          (error ":CANONICALIZE list ~S has ~D entries, need exactly ~D ~
+                   (one per indexed slot)" spec (length spec) arity))
+        (loop for i from 0 below arity
+              collect (%resolve-index-canonicalizer (nth i spec))))
       (cons (%resolve-index-canonicalizer spec)
             (make-list (max 0 (1- arity)) :initial-element nil))))
 

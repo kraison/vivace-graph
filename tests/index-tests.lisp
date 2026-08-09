@@ -244,7 +244,25 @@ from a single spec, even though #'FN and a LAMBDA form are both conses."
                '(string-downcase nil) 2)))
     (is (= 2 (length cans)))
     (is (eq (fdefinition 'string-downcase) (first cans)))
-    (is (null (second cans)))))
+    (is (null (second cans))))
+  ;; A positional list entry may itself be #'FN or a LAMBDA form -- the
+  ;; per-position delegation to %RESOLVE-INDEX-CANONICALIZER must handle
+  ;; both, not just a bare symbol, inside the positional branch.
+  (let ((cans (graph-db::%resolve-index-canonicalizers
+               (list '(lambda (x) (string-upcase x)) 'string-downcase
+                     '(function string-upcase))
+               3)))
+    (is (= 3 (length cans)))
+    (is (functionp (first cans)))
+    (is (string= "AB" (funcall (first cans) "ab")))
+    (is (eq (fdefinition 'string-downcase) (second cans)))
+    (is (eq (fdefinition 'string-upcase) (third cans))))
+  ;; A positional list whose length does not match ARITY signals -- silent
+  ;; truncation/padding would hide a caller's miscounted :CANONICALIZE list.
+  (signals error (graph-db::%resolve-index-canonicalizers
+                  '(string-downcase) 2))
+  (signals error (graph-db::%resolve-index-canonicalizers
+                  '(string-downcase nil nil) 2)))
 
 (test multi-slot-canonicalizer-is-positional
   "A per-position canonicalizer applies to its own component only (#107)."
@@ -387,6 +405,36 @@ downcasing it -- would never match the entry the ORIGINAL write-time
       (unwind-protect
            (is (= 1 (length (index-lookup g 'ix-dual '(a b)
                                           (list "MixedCase" "y")))))
+        (ignore-errors (close-graph g))
+        (collect-garbage)))))
+
+(test reopen-resolves-positional-canonicalizer-per-position
+  "A multi-slot DEF-INDEX with a POSITIONAL :canonicalize survives a
+close/reopen cycle, applying each entry to its own component -- not
+signalling on open, and not collapsing to component-0-only (#107, Task 6).
+IX-CLAIM's (NS KEY) index is (string-downcase nil): NS downcased, KEY left
+alone.  Before the %OWNER-SLOT-CANONICALIZER fix, this reopen path handed
+the positional list straight to the SINGULAR resolver, which has no branch
+for a list spec and signals \"Invalid :INDEX spec\" -- the graph could not
+even finish opening."
+  (with-temp-directory (dir)
+    (let ((g (make-graph *ix-graph-name* (namestring dir)
+                         :buffer-pool-size 1000)))
+      (unwind-protect
+           (let ((*graph* g))
+             (with-transaction ()
+               (make-ix-claim :ns "OPS" :key "E1" :rel "at")))
+        (close-graph g)))
+    (let ((g (open-graph *ix-graph-name* (namestring dir)
+                         :buffer-pool-size 1000)))
+      (unwind-protect
+           (progn
+             ;; component 0 (NS) was canonicalized -> a lowercase query matches.
+             (is (= 1 (length (index-lookup g 'ix-claim '(ns key)
+                                            (list "ops" "E1")))))
+             ;; component 1 (KEY) was NOT canonicalized -> case must match.
+             (is (= 0 (length (index-lookup g 'ix-claim '(ns key)
+                                            (list "ops" "e1"))))))
         (ignore-errors (close-graph g))
         (collect-garbage)))))
 
