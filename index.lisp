@@ -65,8 +65,13 @@ canonicalizer)."
   "graph-name (symbol) -> list of INDEX-SPECs (newest first): the declarative
 DEF-INDEX registry, reconciled at open by INSTALL-SECONDARY-INDEXES.")
 
+(defun %normalize-slots (slot-or-list)
+  "A slot designator as a list.  A bare symbol becomes a 1-list, so single-slot
+and multi-slot share one code path (GH #107)."
+  (if (listp slot-or-list) slot-or-list (list slot-or-list)))
+
 (defstruct (index-spec (:constructor make-index-spec))
-  owner-name slot-name graph-name canonicalize)
+  owner-name slot-names graph-name canonicalize)
 
 (defun register-index-spec (spec)
   "Phase 1: record SPEC.  Duplicates accumulate; resolved newest-wins."
@@ -74,10 +79,12 @@ DEF-INDEX registry, reconciled at open by INSTALL-SECONDARY-INDEXES.")
   spec)
 
 (defun %registered-index-specs (graph)
-  "DEF-INDEX specs registered for GRAPH, de-duped by (owner . slot), newest-wins."
+  "DEF-INDEX specs registered for GRAPH, de-duped by (owner . slot-names),
+newest-wins."
   (let ((seen (make-hash-table :test 'equal)) (result '()))
     (dolist (spec (gethash (graph-name graph) *schema-index-metadata*))
-      (let ((k (cons (index-spec-owner-name spec) (index-spec-slot-name spec))))
+      (let ((k (cons (index-spec-owner-name spec)
+                     (index-spec-slot-names spec))))
         (unless (gethash k seen)
           (setf (gethash k seen) t)
           (push spec result))))
@@ -88,11 +95,13 @@ DEF-INDEX registry, reconciled at open by INSTALL-SECONDARY-INDEXES.")
 
 (defun %applicable-index-descriptors (class graph)
   "(slot owner spec) descriptors from the DEF-INDEX registry applying to CLASS:
-owner is CLASS or an ancestor (subtype IS-A) and the slot exists in CLASS."
+owner is CLASS or an ancestor (subtype IS-A) and the slot exists in CLASS.  SLOT
+is still a bare symbol here -- Task 3 keeps every consumer single-slot; only the
+registry key is list-shaped (GH #107)."
   (when (class-finalized-p class)
     (loop for spec in (%registered-index-specs graph)
           for owner = (index-spec-owner-name spec)
-          for slot = (index-spec-slot-name spec)
+          for slot = (first (index-spec-slot-names spec))
           when (and (subtypep (class-name class) owner)
                     (%slot-present-p class slot))
           collect (list slot owner (index-spec-canonicalize spec)))))
@@ -115,7 +124,7 @@ This is the single input to maintenance (apply / rebuild)."
 ;;; ---------------------------------------------------------------------------
 
 (defstruct (slot-index (:constructor %make-slot-index))
-  owner-name slot-name canonicalizer
+  owner-name slot-names canonicalizers
   ;; The backing ordered map: a heap skip-list / B+ tree on an on-disk graph, a
   ;; MEM-SKIP-LIST on a memory-graph -- always ordered (needed for range).  Keyed
   ;; by the composite (canonical-value id) under REDUCE-COMP-LESSP, like a view.
@@ -168,7 +177,7 @@ EQUALP.  At n=2 this is exactly REDUCE-EQUAL."
   "The canonical key VALUE maps to in SIX (canonicalizer applied), or NIL for a
 NULL/unbound value (exempt, SQL-style -- not indexed)."
   (when value
-    (let ((c (slot-index-canonicalizer six)))
+    (let ((c (first (slot-index-canonicalizers six))))
       (if c (funcall c value) value))))
 
 (defun %indexable-value-p (value)
@@ -227,9 +236,10 @@ value order.  Open-ended when START/END is NIL.  Bounded ranges use a range curs
     n))
 
 (defun %slot-index-for (graph descriptor)
-  "Get-or-create the (empty) SLOT-INDEX for DESCRIPTOR = (slot owner spec), keyed by
-(owner . slot) in GRAPH's registry.  Resolves the canonicalizer from SPEC on
-creation and builds the ordered map on the graph's backend."
+  "Get-or-create the (empty) SLOT-INDEX for DESCRIPTOR = (slot owner spec),
+keyed by (owner . slot-names) in GRAPH's registry.  Resolves the
+canonicalizer from SPEC on creation and builds the ordered map on the
+graph's backend."
   (destructuring-bind (slot-name owner-name spec) descriptor
     (let* ((reg (or (secondary-indexes graph)
                     (setf (secondary-indexes graph)
@@ -238,11 +248,13 @@ creation and builds the ordered map on the graph's backend."
                                            #+ccl :shared #+ccl t
                                            #+graph-db-ecl-sync-hash :synchronized
                                            #+graph-db-ecl-sync-hash t))))
-           (key (cons owner-name slot-name)))
+           (slot-names (%normalize-slots slot-name))
+           (key (cons owner-name slot-names))
+           (canonicalizers (list (%resolve-index-canonicalizer spec))))
       (or (gethash key reg)
           (let ((six (%make-slot-index
-                      :owner-name owner-name :slot-name slot-name
-                      :canonicalizer (%resolve-index-canonicalizer spec))))
+                      :owner-name owner-name :slot-names slot-names
+                      :canonicalizers canonicalizers)))
             (setf (slot-index-skip-list six) (make-secondary-skip-list graph))
             (setf (gethash key reg) six))))))
 
@@ -328,38 +340,43 @@ or a crash before the roots were saved)."
   (format nil "~A/secondary-indexes.dat" location))
 
 (defun save-secondary-index-roots (graph)
-  "Persist the on-disk secondary indexes' roots (owner slot address backend-tag).
-No-op with no heap (memory) or no indexes.  Called at CLOSE-GRAPH.  The canonicalizer
-is NOT stored (a function is not serializable); it is re-resolved from the owner
-class's live :INDEX spec on reopen -- only the address+backend are needed to reopen
-the ordered map."
+  "Persist the on-disk secondary indexes' roots (owner slot-names address
+backend-tag).  No-op with no heap (memory) or no indexes.  Called at
+CLOSE-GRAPH.  The canonicalizer is NOT stored (a function is not
+serializable); it is re-resolved from the owner class's live :INDEX spec on
+reopen -- only the address+backend are needed to reopen the ordered map."
   (when (and (indexes graph) (secondary-indexes graph))
     (let ((roots '()))
       (maphash (lambda (k six)
                  (declare (ignore k))
                  (when (and (slot-index-skip-list six)
                             (view-index-p (slot-index-skip-list six)))
-                   (push (list (slot-index-owner-name six) (slot-index-slot-name six)
+                   (push (list (slot-index-owner-name six)
+                               (slot-index-slot-names six)
                                (view-index-address (slot-index-skip-list six))
                                (view-index-backend-tag (slot-index-skip-list six)))
                          roots)))
                (secondary-indexes graph))
       (%atomic-cl-store roots (secondary-index-root-file (location graph))))))
 
-(defun %owner-slot-canonicalizer (owner-name slot-name graph)
-  "Resolve the canonicalizer for (OWNER-NAME . SLOT-NAME) from the owner class's live
-:INDEX spec, or from a matching DEF-INDEX spec registered for GRAPH; NIL if neither
-is found.  Used on reopen to re-associate a persisted index with its live spec (the
-canonicalizer is a function, not serializable, so it is re-resolved, not stored)."
-  (or (let ((c (ignore-errors (find-class owner-name nil))))
-        (when (and c (class-finalized-p c))
-          (let ((d (find slot-name (class-indexed-slots c) :key #'first)))
-            (when d (%resolve-index-canonicalizer (third d))))))
-      (let ((spec (find-if (lambda (s)
-                             (and (eq (index-spec-owner-name s) owner-name)
-                                  (eq (index-spec-slot-name s) slot-name)))
-                           (%registered-index-specs graph))))
-        (when spec (%resolve-index-canonicalizer (index-spec-canonicalize spec))))))
+(defun %owner-slot-canonicalizer (owner-name slot-names graph)
+  "Resolve the canonicalizer for (OWNER-NAME . SLOT-NAMES) from the owner
+class's live :INDEX spec, or from a matching DEF-INDEX spec registered for
+GRAPH; NIL if neither is found.  Used on reopen to re-associate a persisted
+index with its live spec (the canonicalizer is a function, not serializable,
+so it is re-resolved, not stored).  SLOT-NAMES is a list; Task 3 only ever
+sees a 1-list (GH #107)."
+  (let ((slot-name (first slot-names)))
+    (or (let ((c (ignore-errors (find-class owner-name nil))))
+          (when (and c (class-finalized-p c))
+            (let ((d (find slot-name (class-indexed-slots c) :key #'first)))
+              (when d (%resolve-index-canonicalizer (third d))))))
+        (let* ((matchp (lambda (s)
+                         (and (eq (index-spec-owner-name s) owner-name)
+                              (equal (index-spec-slot-names s) slot-names))))
+               (spec (find-if matchp (%registered-index-specs graph))))
+          (when spec
+            (%resolve-index-canonicalizer (index-spec-canonicalize spec)))))))
 
 (defun restore-secondary-index-roots (graph)
   "Reopen the on-disk secondary indexes from the sidecar -- no node scan.  Returns T
@@ -390,12 +407,15 @@ not trigger a spurious rebuild."
                                                 #+graph-db-ecl-sync-hash :synchronized
                                                 #+graph-db-ecl-sync-hash t)))))
             (dolist (r records)
-              (destructuring-bind (owner slot address &optional (backend :skip-list)) r
-                (setf (gethash (cons owner slot) reg)
-                      (%make-slot-index :owner-name owner :slot-name slot
-                                        :canonicalizer (%owner-slot-canonicalizer owner slot graph)
-                                        :skip-list (%open-secondary-skip-list
-                                                    graph address backend))))))
+              (destructuring-bind (owner slot-names address
+                                    &optional (backend :skip-list)) r
+                (setf (gethash (cons owner slot-names) reg)
+                      (%make-slot-index
+                       :owner-name owner :slot-names slot-names
+                       :canonicalizers (list (%owner-slot-canonicalizer
+                                              owner slot-names graph))
+                       :skip-list (%open-secondary-skip-list
+                                   graph address backend))))))
           t)))))
 
 (defun regenerate-secondary-indexes (graph)
@@ -421,7 +441,7 @@ REGENERATE-UNIQUE-INDEXES / REBUILD-SPATIAL-INDEX for an in-place backend switch
   "Create and fully populate the ordered index for a DEF-INDEX SPEC by scanning
 OWNER's nodes (and subclasses)."
   (let* ((owner (index-spec-owner-name spec))
-         (slot (index-spec-slot-name spec))
+         (slot (first (index-spec-slot-names spec)))
          (six (%slot-index-for graph (list slot owner (index-spec-canonicalize spec))))
          (*graph* graph))
     (flet ((index-node (node)
@@ -437,7 +457,7 @@ OWNER's nodes (and subclasses)."
 
 (defun %ensure-index-built (graph spec)
   "Build SPEC's index unless it already exists in GRAPH's registry (idempotent)."
-  (let ((key (cons (index-spec-owner-name spec) (index-spec-slot-name spec))))
+  (let ((key (cons (index-spec-owner-name spec) (index-spec-slot-names spec))))
     (unless (and (secondary-indexes graph) (gethash key (secondary-indexes graph)))
       (%build-index-for-spec graph spec))))
 
@@ -462,7 +482,8 @@ Unlike the (slot :index t) slot option, DEF-INDEX need not touch the class
 definition, and is the home for future composite / multi-slot indexes.  Re-evaluating
 an unchanged DEF-INDEX is a no-op; to adopt a changed :CANONICALIZE, force a rebuild
 with REGENERATE-SECONDARY-INDEXES."
-  `(let ((spec (make-index-spec :owner-name ',owner-class :slot-name ',slot
+  `(let ((spec (make-index-spec :owner-name ',owner-class
+                                :slot-names (%normalize-slots ',slot)
                                 :graph-name ',graph-name
                                 :canonicalize ,(when canonicalize `',canonicalize))))
      (register-index-spec spec)
@@ -478,43 +499,50 @@ with REGENERATE-SECONDARY-INDEXES."
   "The SLOT-INDEX covering CLASS-NAME.SLOT-NAME, or NIL if none has been CREATED yet.
 An index rooted at an ancestor of CLASS-NAME covers it (subtype IS-A).  NB: indexes
 are created lazily on first non-null value, so NIL here does NOT mean the slot is
-unindexed -- see %SLOT-INDEX-DECLARED-P."
-  (let ((reg (secondary-indexes graph)))
+unindexed -- see %SLOT-INDEX-DECLARED-P.  SLOT-NAME may be a bare symbol or
+an already-normalized list -- both resolve (GH #107)."
+  (let ((reg (secondary-indexes graph))
+        (slot-names (%normalize-slots slot-name)))
     (when reg
-      (or (gethash (cons class-name slot-name) reg)
+      (or (gethash (cons class-name slot-names) reg)
           (let ((class (ignore-errors (find-class class-name nil))))
             (when class
               (loop for c in (class-precedence-list class)
-                    for hit = (and (typep c 'node-class)
-                                   (gethash (cons (class-name c) slot-name) reg))
+                    for k = (cons (class-name c) slot-names)
+                    for hit = (and (typep c 'node-class) (gethash k reg))
                     when hit return hit)))))))
 
 (defun %slot-index-declared-p (class-name slot-name)
   "True if CLASS-NAME declares SLOT-NAME as an :INDEX slot (effective, so inherited
 :INDEX from an ancestor counts).  Distinguishes a declared-but-empty index (no
-struct created yet) from a genuinely unindexed slot."
-  (let ((class (ignore-errors (find-class class-name nil))))
+struct created yet) from a genuinely unindexed slot.  SLOT-NAME may be a bare
+symbol or an already-normalized list (GH #107)."
+  (let ((class (ignore-errors (find-class class-name nil)))
+        (slot-names (%normalize-slots slot-name)))
     (and class (class-finalized-p class)
-         (find slot-name (class-indexed-slots class) :key #'first)
+         (find (first slot-names) (class-indexed-slots class) :key #'first)
          t)))
 
 (defun %def-index-declared-p (graph class-name slot-name)
   "True if a DEF-INDEX registered for GRAPH covers CLASS-NAME.SLOT-NAME (owner is
-CLASS-NAME or an ancestor)."
-  (and (ignore-errors (find-class class-name nil))
-       (some (lambda (spec)
-               (and (eq (index-spec-slot-name spec) slot-name)
-                    (subtypep class-name (index-spec-owner-name spec))))
-             (%registered-index-specs graph))))
+CLASS-NAME or an ancestor).  SLOT-NAME may be a bare symbol or an already-
+normalized list (GH #107)."
+  (let ((slot-names (%normalize-slots slot-name)))
+    (and (ignore-errors (find-class class-name nil))
+         (some (lambda (spec)
+                 (and (equal (index-spec-slot-names spec) slot-names)
+                      (subtypep class-name (index-spec-owner-name spec))))
+               (%registered-index-specs graph)))))
 
 (defun %require-index (graph class-name slot-name)
   "The SLOT-INDEX for CLASS-NAME.SLOT-NAME.  Returns NIL when the slot is a declared
 index (via :INDEX or DEF-INDEX) but no entries exist yet (a legitimately empty
 result); signals only when the slot is not indexed at all (a programming error)."
-  (let ((six (%secondary-index-lookup graph class-name slot-name)))
+  (let* ((slot-names (%normalize-slots slot-name))
+         (six (%secondary-index-lookup graph class-name slot-names)))
     (cond (six six)
-          ((or (%slot-index-declared-p class-name slot-name)
-               (%def-index-declared-p graph class-name slot-name))
+          ((or (%slot-index-declared-p class-name slot-names)
+               (%def-index-declared-p graph class-name slot-names))
            nil)                                             ; declared, empty
           (t (error "No secondary index on ~S.~S in ~S"
                     class-name slot-name (graph-name graph))))))

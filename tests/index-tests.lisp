@@ -45,6 +45,27 @@
 
 (defun ix-names (nodes) (sort (mapcar #'ix-name nodes) #'string<))
 
+;;; --- characterisation: single-slot behaviour must survive Task 3 (GH #107) --
+
+(test characterise-single-slot-equality-and-range
+  "Pins the caller-visible single-slot contract across the slot-list refactor."
+  (with-ix-graph (g)
+    (with-transaction ()
+      (make-ix-person :name "a" :age 30)
+      (make-ix-person :name "b" :age 40)
+      (make-ix-person :name "c" :age 50))
+    (is (equal '("a") (ix-names (index-lookup g 'ix-person 'name "a"))))
+    (is (equal '("a" "b") (ix-names (index-range g 'ix-person 'age
+                                                 :start 30 :end 40))))
+    (is (null (index-lookup g 'ix-person 'name "nope")))))
+
+(test characterise-single-slot-canonicalizer-and-unindexed
+  "Pins canonicalized lookup and the error on a genuinely unindexed slot."
+  (with-ix-graph (g)
+    (with-transaction () (make-ix-person :name "d" :email "D@X.COM"))
+    (is (equal '("d") (ix-names (index-lookup g 'ix-person 'email "d@x.com"))))
+    (signals error (index-lookup g 'ix-person 'title "x"))))
+
 ;;; --- the generalised composite comparator (GH #107) -------------------------
 
 (test index-comparator-matches-reduce-comp-at-arity-2
