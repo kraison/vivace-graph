@@ -27,6 +27,15 @@
 ;; then built at open (or maintained on apply for a fresh make-graph).
 (def-index ix-person note :graph-db-index-test :canonicalize string-downcase)
 
+;; Multi-slot: the endpoint-identity shape (namespace, external-key) (GH #107).
+(def-vertex ix-claim ()
+  ((ns  :initarg :ns  :accessor ix-ns)
+   (key :initarg :key :accessor ix-key)
+   (rel :initarg :rel :accessor ix-rel))
+  :graph-db-index-test)
+
+(def-index ix-claim (ns key rel) :graph-db-index-test)
+
 (def-suite index-suite
   :description "General ordered secondary index (:INDEX / def-index)."
   :in graph-db-suite)
@@ -154,6 +163,26 @@ index is a legitimate empty result, not an error."
     (is (= 1 (graph-db::ix-count (graph-db::%secondary-index-lookup g 'ix-person 'email))))
     ;; querying a declared index for a value nobody holds -> empty, not an error
     (is (null (index-lookup g 'ix-person 'email "nobody@x")))))
+
+;;; --- multi-slot tuple keys (GH #107) -----------------------------------------
+
+(test multi-slot-index-finds-exact-tuple
+  "A three-component index resolves an exact tuple (#107)."
+  (with-ix-graph (g)
+    (with-transaction ()
+      (make-ix-claim :ns "ops" :key "e1" :rel "at")
+      (make-ix-claim :ns "ops" :key "e2" :rel "at"))
+    (let ((hits (index-lookup g 'ix-claim '(ns key rel)
+                             (list "ops" "e1" "at"))))
+      (is (= 1 (length hits)))
+      (is (string= "e1" (ix-key (first hits)))))))
+
+(test multi-slot-index-stores-null-component
+  "A tuple with a null component is still indexed, so it stays findable (#107)."
+  (with-ix-graph (g)
+    (with-transaction () (make-ix-claim :ns "ops" :key nil :rel "at"))
+    (is (= 1 (length (index-lookup g 'ix-claim '(ns key rel)
+                                   (list "ops") :prefix t))))))
 
 ;;; --- def-index (standalone declaration surface) -----------------------------
 

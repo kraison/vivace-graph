@@ -94,29 +94,34 @@ newest-wins."
   (and (find slot-name (class-slots class) :key #'slot-definition-name) t))
 
 (defun %applicable-index-descriptors (class graph)
-  "(slot owner spec) descriptors from the DEF-INDEX registry applying to CLASS:
-owner is CLASS or an ancestor (subtype IS-A) and the slot exists in CLASS.  SLOT
-is still a bare symbol here -- Task 3 keeps every consumer single-slot; only the
-registry key is list-shaped (GH #107)."
+  "(slot-names owner spec) descriptors from the DEF-INDEX registry applying to
+CLASS: owner is CLASS or an ancestor (subtype IS-A) and every slot in
+SLOT-NAMES exists in CLASS.  SLOT-NAMES is the full list from the spec --
+truncating it to its first element here (as Task 3 did) is the multi-slot
+trap: a 3-slot DEF-INDEX would key on its first slot only (GH #107)."
   (when (class-finalized-p class)
     (loop for spec in (%registered-index-specs graph)
           for owner = (index-spec-owner-name spec)
-          for slot = (first (index-spec-slot-names spec))
+          for slot-names = (index-spec-slot-names spec)
           when (and (subtypep (class-name class) owner)
-                    (%slot-present-p class slot))
-          collect (list slot owner (index-spec-canonicalize spec)))))
+                    (every (lambda (s) (%slot-present-p class s)) slot-names))
+          collect (list slot-names owner (index-spec-canonicalize spec)))))
 
 (defun class-secondary-index-descriptors (class graph)
-  "All (slot owner spec) descriptors for CLASS: its MOP :INDEX effective slots plus
-the DEF-INDEX definitions applicable to it, de-duped by (owner . slot) (MOP first).
-This is the single input to maintenance (apply / rebuild)."
+  "All (slot-names owner spec) descriptors for CLASS: its MOP :INDEX effective
+slots plus the DEF-INDEX definitions applicable to it, de-duped by
+(owner . slot-names) (MOP first).  SLOT-NAMES is always a list here --
+%NORMALIZE-SLOTS wraps a MOP slot's bare name -- so every downstream
+consumer (write path, query path) sees one uniform shape regardless of
+origin (GH #107).  This is the single input to maintenance (apply / rebuild)."
   (let ((seen (make-hash-table :test 'equal)) (result '()))
     (dolist (d (append (class-indexed-slots class)
                        (%applicable-index-descriptors class graph)))
-      (let ((k (cons (second d) (first d))))
+      (let* ((slot-names (%normalize-slots (first d)))
+             (k (cons (second d) slot-names)))
         (unless (gethash k seen)
           (setf (gethash k seen) t)
-          (push d result))))
+          (push (list slot-names (second d) (third d)) result))))
     (nreverse result)))
 
 ;;; ---------------------------------------------------------------------------
@@ -218,6 +223,18 @@ EQUALP.  At n=2 this is exactly REDUCE-EQUAL."
                for i from 0
                always (if (= i (1- n1)) (equalp a b) (equal a b))))))
 
+(defun %index-value-lessp (a b)
+  "Lexicographic order for two VALUE-only component lists (no trailing id), by
+LESS-THAN per component; a strict prefix sorts before its extension.  Used by
+IX-MAP's open-ended range filter, where there is no id to anchor the
+%INDEX-COMP-LESSP last-position special case (GH #107)."
+  (loop for x in a
+        for y in b
+        do (cond ((less-than x y) (return t))
+                 ((equal x y))
+                 (t (return nil)))
+        finally (return (< (length a) (length b)))))
+
 ;;; ---------------------------------------------------------------------------
 ;;; Index key codec (GH #107)
 ;;; ---------------------------------------------------------------------------
@@ -269,11 +286,41 @@ tuple."
       (view-key-deserialize array)))
 
 (defun %index-key (six value)
-  "The canonical key VALUE maps to in SIX (canonicalizer applied), or NIL for a
-NULL/unbound value (exempt, SQL-style -- not indexed)."
-  (when value
-    (let ((c (first (slot-index-canonicalizers six))))
-      (if c (funcall c value) value))))
+  "The canonical component list for query VALUE against SIX: per-position
+canonicalizer applied, +NULL-COMPONENT+ substituted for a null component.  At
+arity 1, VALUE is SIX's one component as-is (even list-valued -- e.g. a
+list-valued single slot); at arity > 1, VALUE is a list of up to SIX's arity
+components, left-to-right.  NIL when every given component is null --
+nothing to look up (the query-side mirror of %INDEX-TUPLE-KEY, GH #107)."
+  (let* ((arity (length (slot-index-slot-names six)))
+         (cans (slot-index-canonicalizers six))
+         (vals (if (= arity 1) (list value) value))
+         (any nil)
+         (key (loop for v in vals
+                    for i from 0
+                    collect (cond ((null v) +null-component+)
+                                  (t (setf any t)
+                                     (let ((c (nth i cans)))
+                                       (if c (funcall c v) v)))))))
+    (when any key)))
+
+(defun %index-tuple-key (six node)
+  "The value components of NODE's key for SIX: per-position canonicalizer
+applied, +NULL-COMPONENT+ substituted for a null component so the row stays
+findable by a prefix scan of its populated parts.  NIL only when EVERY
+component is null -- nothing to index (the write-side mirror of
+%INDEX-KEY, GH #107)."
+  (let* ((slots (slot-index-slot-names six))
+         (cans  (slot-index-canonicalizers six))
+         (any nil)
+         (key (loop for s in slots
+                    for i from 0
+                    for v = (slot-value node s)
+                    collect (cond ((null v) +null-component+)
+                                  (t (setf any t)
+                                     (let ((c (nth i cans)))
+                                       (if c (funcall c v) v)))))))
+    (when any key)))
 
 (defun %indexable-value-p (value)
   "True if VALUE belongs in a general ordered index.  Excludes NULL/unbound (exempt,
@@ -284,45 +331,74 @@ Detected by runtime value (GEOMETRYP), like the spatial hook -- the declared
 `:type geometry' symbol is not reliably comparable across packages."
   (and value (not (geometryp value))))
 
+(defun %tuple-indexable-p (node slot-names)
+  "True unless some component of NODE's SLOT-NAMES tuple is a real geometry
+value -- geometry is the spatial index's domain, not this one's.  Unlike
+%INDEXABLE-VALUE-P, a null component does NOT fail this gate: a tuple with a
+null component is still indexed, via +NULL-COMPONENT+ in %INDEX-TUPLE-KEY
+(GH #107)."
+  (notany (lambda (s) (geometryp (slot-value node s))) slot-names))
+
 ;;; Backend-agnostic ops over the ordered map (VALUE = the canonical key).
 
-(defun ix-lookup (six value)
-  "List of node-ids whose indexed slot canonicalizes to VALUE (a prefix range scan);
-NIL if none.  VALUE is the already-canonical key."
-  (let ((cur (make-range-cursor (slot-index-skip-list six)
-                                (list value +null-key+) (list value +max-key+)))
-        (ids '()))
-    (loop for node = (cursor-next cur :eoc) until (eql node :eoc)
-          do (push (second (%sn-key node)) ids))
-    (nreverse ids)))
+(defun ix-lookup (six key &key prefix)
+  "List of node-ids whose indexed tuple matches KEY, the canonical component
+list from %INDEX-KEY: an exact match when KEY supplies SIX's full arity, or --
+with PREFIX T -- a range scan when KEY supplies fewer, matching every stored
+tuple that starts with KEY.  NIL if none.
 
-(defun ix-put (six value id)
-  "Enter node ID under canonical VALUE.  The id lives in the composite key's second
-slot (read back by IX-LOOKUP); the skip-node VALUE is unused -- store NIL, not the
-raw id byte array (which SERIALIZE cannot round-trip)."
-  (add-to-skip-list (slot-index-skip-list six) (list value id) nil))
+The lower bound is KEY itself: a strict-prefix key sorts below any longer key
+sharing it (%INDEX-COMP-LESSP), so no id sentinel is needed there.  The upper
+bound pads the missing components with +MAX-SENTINEL+ (each sorts above every
+real value) and the id slot with +MAX-KEY+ -- at full arity this reduces to
+the pre-Task-5 (KEY +MAX-KEY+) exactly (GH #107)."
+  (let* ((arity (length (slot-index-slot-names six)))
+         (n (length key)))
+    (unless (or prefix (= n arity))
+      (error "Incomplete index key ~S (~D of ~D components); pass :PREFIX T ~
+              for a prefix scan" key n arity))
+    (let* ((pad (- arity n))
+           (lo (if (zerop pad) (append key (list +null-key+)) key))
+           (hi (append key (make-list pad :initial-element +max-sentinel+)
+                       (list +max-key+)))
+           (cur (make-range-cursor (slot-index-skip-list six) lo hi))
+           (ids '()))
+      (loop for node = (cursor-next cur :eoc) until (eql node :eoc)
+            do (push (car (last (%sn-key node))) ids))
+      (nreverse ids))))
 
-(defun ix-remove (six value id)
-  "Remove node ID's entry under canonical VALUE (that composite key only)."
-  (remove-from-skip-list (slot-index-skip-list six) (list value id)))
+(defun ix-put (six key id)
+  "Enter node ID under canonical tuple KEY (SIX's full-arity component list).
+The composite skip-list key is (v1 ... vn id) -- id last, read back by
+IX-LOOKUP / IX-MAP via (CAR (LAST ...)); the skip-node VALUE is unused --
+store NIL, not the raw id byte array (which SERIALIZE cannot round-trip)."
+  (add-to-skip-list (slot-index-skip-list six) (append key (list id)) nil))
+
+(defun ix-remove (six key id)
+  "Remove node ID's entry under canonical tuple KEY (that composite key only)."
+  (remove-from-skip-list (slot-index-skip-list six) (append key (list id))))
 
 (defun ix-map (six fn &key start end)
-  "Call FN with (VALUE ID) for every entry with START <= value <= END, in ascending
-value order.  Open-ended when START/END is NIL.  Bounded ranges use a range cursor
-(the efficient path); an open end falls back to an ordered full scan + bound filter."
+  "Call FN with (KEY ID) for every entry with START <= key <= END (component-
+wise, by %INDEX-VALUE-LESSP), in ascending order; KEY is the component list,
+id excluded.  Open-ended when START/END is NIL.  Bounded ranges use a range
+cursor (the efficient path); an open end falls back to an ordered full scan +
+bound filter."
   (let ((sl (slot-index-skip-list six)))
     (if (and start end)
-        ;; Efficient bounded path: [ (start +null-key+) .. (end +max-key+) ].
-        (let ((cur (make-range-cursor sl (list start +null-key+) (list end +max-key+))))
+        ;; Efficient bounded path: [ (start... +null-key+) .. (end... +max-key+) ].
+        (let ((cur (make-range-cursor sl (append start (list +null-key+))
+                                      (append end (list +max-key+)))))
           (loop for node = (cursor-next cur :eoc) until (eql node :eoc)
-                do (funcall fn (first (%sn-key node)) (second (%sn-key node)))))
+                do (funcall fn (butlast (%sn-key node))
+                            (car (last (%sn-key node))))))
         ;; Open-ended: ordered full scan, filtering by whatever bound is present.
         (let ((cur (make-cursor sl)))
           (loop for node = (cursor-next cur :eoc) until (eql node :eoc)
-                for k = (first (%sn-key node))
-                when (and (or (null start) (not (less-than k start)))
-                          (or (null end)   (not (less-than end k))))
-                do (funcall fn k (second (%sn-key node))))))))
+                for k = (butlast (%sn-key node))
+                when (and (or (null start) (not (%index-value-lessp k start)))
+                          (or (null end)   (not (%index-value-lessp end k))))
+                do (funcall fn k (car (last (%sn-key node)))))))))
 
 (defun ix-count (six)
   "Number of live entries in SIX."
@@ -361,21 +437,23 @@ graph's backend."
 (defun %ix-claim (node graph)
   "Index NODE's indexed slot values (create / new value of an update)."
   (dolist (d (class-secondary-index-descriptors (class-of node) graph))
-    (let ((value (slot-value node (first d))))
-      ;; Gate BEFORE %SLOT-INDEX-FOR so a geometry slot never creates an ordered
-      ;; index (it is the spatial index's; %INDEXABLE-VALUE-P skips it).
-      (when (%indexable-value-p value)
+    (let ((slot-names (first d)))
+      ;; Gate BEFORE %SLOT-INDEX-FOR so a geometry component never creates an
+      ;; ordered index (it is the spatial index's; %TUPLE-INDEXABLE-P skips
+      ;; it).  A null component does NOT gate here -- %INDEX-TUPLE-KEY still
+      ;; indexes the row, under +NULL-COMPONENT+ (GH #107).
+      (when (%tuple-indexable-p node slot-names)
         (let* ((six (%slot-index-for graph d))
-               (key (%index-key six value)))
+               (key (%index-tuple-key six node)))
           (when key (ix-put six key (id node))))))))
 
 (defun %ix-release (node graph)
   "Remove NODE's indexed slot values (delete / old value of an update)."
   (dolist (d (class-secondary-index-descriptors (class-of node) graph))
-    (let ((value (slot-value node (first d))))
-      (when (%indexable-value-p value)
+    (let ((slot-names (first d)))
+      (when (%tuple-indexable-p node slot-names)
         (let* ((six (%slot-index-for graph d))
-               (key (%index-key six value)))
+               (key (%index-tuple-key six node)))
           (when key (ix-remove six key (id node))))))))
 
 (defgeneric apply-tx-write-to-secondary-indexes (write graph)
@@ -418,10 +496,10 @@ or a crash before the roots were saved)."
       (flet ((index-node (node)
                (unless (deleted-p node)
                  (dolist (d (class-secondary-index-descriptors (class-of node) graph))
-                   (let ((value (slot-value node (first d))))
-                     (when (%indexable-value-p value)
+                   (let ((slot-names (first d)))
+                     (when (%tuple-indexable-p node slot-names)
                        (let* ((six (%slot-index-for graph d))
-                              (key (%index-key six value)))
+                              (key (%index-tuple-key six node)))
                          (when key (ix-put six key (id node))))))))))
         (map-vertices #'index-node graph)
         (map-edges #'index-node graph)))))
@@ -460,8 +538,11 @@ reopen -- only the address+backend are needed to reopen the ordered map."
 class's live :INDEX spec, or from a matching DEF-INDEX spec registered for
 GRAPH; NIL if neither is found.  Used on reopen to re-associate a persisted
 index with its live spec (the canonicalizer is a function, not serializable,
-so it is re-resolved, not stored).  SLOT-NAMES is a list; Task 3 only ever
-sees a 1-list (GH #107)."
+so it is re-resolved, not stored).  SLOT-NAMES is a list, one or more
+elements; the MOP :INDEX branch below only ever matches on its FIRST element
+since a slot's :INDEX option is inherently single-slot, but a multi-slot
+DEF-INDEX still resolves correctly via the second branch, which compares the
+whole list (GH #107)."
   (let ((slot-name (first slot-names)))
     (or (let ((c (ignore-errors (find-class owner-name nil))))
           (when (and c (class-finalized-p c))
@@ -536,17 +617,24 @@ REGENERATE-UNIQUE-INDEXES / REBUILD-SPATIAL-INDEX for an in-place backend switch
 
 (defun %build-index-for-spec (graph spec)
   "Create and fully populate the ordered index for a DEF-INDEX SPEC by scanning
-OWNER's nodes (and subclasses)."
+OWNER's nodes (and subclasses).  SLOT-NAMES is passed through whole -- unwrapping
+it to (FIRST ...) here was the multi-slot trap: %SLOT-INDEX-FOR would re-wrap a
+bare symbol into a 1-list and silently key a 3-slot spec on its first slot only
+(GH #107).  The geometry gate and key build are wrapped in one IGNORE-ERRORS,
+matching this function's pre-existing tolerance for a legacy node whose slot(s)
+predate the DEF-INDEX (the scan path only; the live commit-apply path in
+%IX-CLAIM does not need this)."
   (let* ((owner (index-spec-owner-name spec))
-         (slot (first (index-spec-slot-names spec)))
-         (six (%slot-index-for graph (list slot owner (index-spec-canonicalize spec))))
+         (slot-names (index-spec-slot-names spec))
+         (six (%slot-index-for
+               graph (list slot-names owner (index-spec-canonicalize spec))))
          (*graph* graph))
     (flet ((index-node (node)
              (unless (deleted-p node)
-               (let ((value (ignore-errors (slot-value node slot))))
-                 (when (%indexable-value-p value)
-                   (let ((key (%index-key six value)))
-                     (when key (ix-put six key (id node)))))))))
+               (let ((key (ignore-errors
+                           (and (%tuple-indexable-p node slot-names)
+                                (%index-tuple-key six node)))))
+                 (when key (ix-put six key (id node)))))))
       (if (subtypep owner 'edge)
           (map-edges #'index-node graph :edge-type owner)
           (map-vertices #'index-node graph :vertex-type owner)))
@@ -644,17 +732,24 @@ result); signals only when the slot is not indexed at all (a programming error).
           (t (error "No secondary index on ~S.~S in ~S"
                     class-name slot-name (graph-name graph))))))
 
-(defun index-lookup (graph class-name slot-name value &key (collect-p t))
-  "Nodes of CLASS-NAME (and subclasses) whose SLOT-NAME equals VALUE, via the
-secondary index (equality).  Signals if no index covers CLASS-NAME.SLOT-NAME.
-Resolves ids in GRAPH.  With COLLECT-P NIL, returns T as soon as one match is found."
+(defun index-lookup (graph class-name slot-name value
+                     &key (collect-p t) prefix)
+  "Nodes of CLASS-NAME (and subclasses) whose indexed slot(s) equal VALUE, via
+the secondary index.  VALUE is a scalar for a single-slot index; for a
+multi-slot index it is a list of component values, one per SLOT-NAME
+position, left-to-right -- the full arity for an exact match, or fewer
+components with PREFIX T for a scan of every tuple that starts with them (a
+tuple with a null component is still findable this way -- see
+%INDEX-TUPLE-KEY).  Signals if no index covers CLASS-NAME.SLOT-NAME.  Resolves
+ids in GRAPH.  With COLLECT-P NIL, returns T as soon as one match is found
+(GH #107)."
   (let* ((*graph* graph)
          (six (%require-index graph class-name slot-name)))
     (when six                            ; NIL => declared but empty => no matches
       (let ((key (%index-key six value))
             (result '()))
         (when key
-          (dolist (id (ix-lookup six key))
+          (dolist (id (ix-lookup six key :prefix prefix))
             (let ((node (%node-by-id id graph)))
               (when (and node (not (deleted-p node)))
                 (if collect-p (push node result) (return-from index-lookup t))))))
@@ -670,8 +765,8 @@ ids in GRAPH."
       (let ((skey (and start (%index-key six start)))
             (ekey (and end   (%index-key six end))))
         (ix-map six
-                (lambda (value id)
-                  (declare (ignore value))
+                (lambda (key id)
+                  (declare (ignore key))
                   (let ((node (%node-by-id id graph)))
                     (when (and node (not (deleted-p node)))
                       (funcall fn node))))
