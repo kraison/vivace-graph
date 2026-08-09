@@ -29,6 +29,11 @@
 (declaim (ftype (function (t &rest t) t) save-spatial-index-roots))
 
 
+;; NOTINLINE so COUNTING-MATERIALISATIONS can intercept this with an FDEFINITION
+;; swap: ECL compiles the same-file call below into a direct C call, bypassing the
+;; symbol, so the counter observed nothing and #104's regression test failed against
+;; correct code.  Same reason as %MUNMAP-OR-WARN (mmap.lisp).
+(declaim (notinline %node-by-id))
 (defun %node-by-id (id graph)
   "Resolve a spatial-index id (uuid bytes) to its live node, or NIL."
   (or (lookup-vertex id :graph graph)
