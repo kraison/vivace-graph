@@ -1341,6 +1341,16 @@ Query a tuple index with a *value list*, one entry per slot, left to right:
 
 The positional list's length must equal the index's arity exactly, or it *signals*. An earlier version of this feature silently truncated or padded a mismatched list; nothing shipped ever relied on that behavior, and a wrong-length list is exactly the "no error, wrong answer" failure this feature exists to rule out everywhere else, so the declaration surface holds itself to the same standard.
 
+*Footgun*: that arity check only applies to a *list*. A single function designator on a *multi-slot* index is legal — and is silently applied to component 0 only, leaving every other component at identity:
+
+#+BEGIN_SRC lisp
+  ;; NOT what it looks like: only NS is downcased. KEY and REL are untouched,
+  ;; with no error or warning -- a bare designator is never arity-checked.
+  (def-index claim (ns key rel) :my-app :canonicalize string-downcase)
+#+END_SRC
+
+This is intentional, pre-existing behavior (the single-slot backward-compatibility case, generalized: "a bare designator names one function for one component"), not a bug — but it sits right next to the list form's strict arity check, so it is easy to reach for a bare symbol on a multi-slot index expecting either "canonicalize everything" or a signal, and get neither. If you want more than component 0 canonicalized, use the positional list, padding with ~nil~ for any component you want left as identity — e.g. ~(string-downcase nil nil)~ to canonicalize only ~ns~ on a three-slot index *explicitly*, or ~(string-downcase string-downcase nil)~ to canonicalize the first two.
+
 **** ~:prefix~ and value-list arity
 
 ~index-lookup~'s ~value~ list must supply exactly as many components as the index's arity — unless you pass ~:prefix t~, in which case a *shorter* list scans every tuple that starts with those components. This is deliberate strictness, not an oversight: a short value list without ~:prefix t~ signals rather than silently returning a superset of what you meant to ask for. Too many components is never rescued by ~:prefix t~ either — an overshoot always signals, on both ~index-lookup~ and ~index-range~.

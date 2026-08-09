@@ -734,7 +734,8 @@ applied to the value before keying -- e.g. STRING-DOWNCASE for a case-insensitiv
 index.  Query with INDEX-LOOKUP / INDEX-RANGE / MAP-INDEX.
 
 Unlike the (slot :index t) slot option, DEF-INDEX need not touch the class
-definition, and is the home for future composite / multi-slot indexes.  Re-evaluating
+definition.  SLOT may also be a list of slot names for a composite /
+multi-slot (tuple) index, keyed left to right (GH #107).  Re-evaluating
 an unchanged DEF-INDEX is a no-op; to adopt a changed :CANONICALIZE, force a rebuild
 with REGENERATE-SECONDARY-INDEXES."
   `(let ((spec (make-index-spec :owner-name ',owner-class

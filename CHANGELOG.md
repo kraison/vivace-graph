@@ -24,6 +24,12 @@ between releases; cutting a release renames it to the new version and dates it.
     to a single-slot index exactly as before. A positional list whose length
     doesn't match the index's arity now **signals** rather than silently
     truncating or padding — nothing shipped relied on the old behavior.
+  - **Footgun, pre-existing and unchanged by this work**: the arity check above
+    applies only to a *list*. A bare function designator (`string-downcase`,
+    not `(string-downcase nil nil)`) is legal on a multi-slot index too, and is
+    silently applied to component 0 only — every other component stays
+    identity, with no signal. Use a positional list, padded with `nil`, to
+    canonicalize more than the first component.
   - `index-lookup` takes `:prefix t` for a value list shorter than the index's
     arity (a prefix scan); without it, a short list **signals** rather than
     silently returning a wider result than asked for. Too many components
