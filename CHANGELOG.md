@@ -11,7 +11,96 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ## [Unreleased]
 
+### Added
+
+- **Multi-slot (tuple) keys for `def-index` and `def-unique`** (#107). Both macros
+  now accept a *slot list* — `(def-index claim (ns key rel) :app)`, `(def-unique
+  claim (ns key) :app)` — giving an ordered index or a uniqueness constraint over
+  the tuple, keyed left to right; a bare symbol still works unchanged, as the
+  arity-1 case of the same machinery. Query a tuple index with a value list:
+  `(index-lookup graph 'claim '(ns key rel) (list "ops" "e1" "at"))`.
+  - `:canonicalize` on a multi-slot index takes a *positional list*, one entry
+    per component (`nil` = identity); a single function designator still applies
+    to a single-slot index exactly as before. A positional list whose length
+    doesn't match the index's arity now **signals** rather than silently
+    truncating or padding — nothing shipped relied on the old behavior.
+  - **Footgun, pre-existing and unchanged by this work**: the arity check above
+    applies only to a *list*. A bare function designator (`string-downcase`,
+    not `(string-downcase nil nil)`) is legal on a multi-slot index too, and is
+    silently applied to component 0 only — every other component stays
+    identity, with no signal. Use a positional list, padded with `nil`, to
+    canonicalize more than the first component.
+  - `index-lookup` takes `:prefix t` for a value list shorter than the index's
+    arity (a prefix scan); without it, a short list **signals** rather than
+    silently returning a wider result than asked for. Too many components
+    always signals, `:prefix t` or not, on both `index-lookup` and
+    `index-range`.
+  - **The null asymmetry, worth stating plainly**: an ordinary index *stores* a
+    null component under a sentinel, so the row stays findable by a prefix scan
+    of its populated components; a `def-unique` constraint instead *exempts*
+    any tuple containing a null component, matching SQL's NULL-never-equals-
+    NULL. Two rows agreeing on every populated component but both `nil`
+    elsewhere therefore do not collide.
+  - `def-unique`'s build is **strict** (signals on a pre-existing duplicate)
+    only when a constraint is newly declared against an already-open graph;
+    it is **tolerant** (logs and keeps the first) when reconciled at graph
+    open, matching the existing single-slot `:unique` split — multi-slot
+    extends that policy rather than introducing a new one.
+  - The peer pull-apply paths (`apply-peer-authored-op`,
+    `apply-peer-create-writes`) maintain multi-slot indexes and constraints the
+    same as the local-commit path, since all three route through the same
+    apply functions — verified directly rather than assumed, with dedicated
+    peer-suite coverage.
+  - **No rebuild and no on-disk storage-version change** for existing
+    single-slot indexes or constraints — a single-slot index is simply the
+    arity-1 case of the tuple machinery. Manual: Chapter 8, "Multi-slot (tuple)
+    indexes and unique constraints".
+
 ### Fixed
+
+- **Multi-slot index/constraint defects found by the whole-branch review** (#107).
+  All five were reproduced before being fixed, and each carries a regression test
+  confirmed to fail against the unfixed code.
+  - **A memory graph carrying any `def-unique` was unopenable after a clean close.**
+    The checkpoint image's unique-index dump had no multi-slot branch — it wrote the
+    singular slot name, which is `nil` for a tuple index — and the reopen fed that to
+    the single-slot resolver, ending in `(fdefinition nil)`. Since the image is the
+    only durable copy of a cleanly-closed memory graph (the journal is cleared at
+    checkpoint), this was data loss. The dump now records the slot *list*, and the
+    loader dispatches on its shape, exactly as the on-disk sidecar already did. An
+    image written by the broken code is skipped with a warning and its constraint
+    rebuilt, rather than failing the open.
+  - **A lazy memory graph reopened with a `def-unique` silently absent** whenever the
+    image did not carry it, because the open-time install sat inside the
+    `(unless (lazy-p graph) …)` block. It now runs on the lazy path too — the same
+    trade `rebuild-unique-indexes` already makes, since a constraint that stops
+    enforcing is worse than materializing its owner's blobs. It scans per owner type,
+    so unrelated classes stay unmaterialized.
+  - **`regenerate-secondary-indexes` silently emptied every `def-index`-only index.**
+    Its guard consulted only the MOP `:index` slots — and every multi-slot index is
+    `def-index`-only, there being no MOP surface for a tuple — so the rebuild no-opped
+    after the delete and an empty sidecar was persisted. Lookups then returned empty
+    instead of signalling. The guard now consults the `def-index` registry the way its
+    `:unique` counterpart already did, and `regenerate` runs `install` after `rebuild`
+    as `open-graph` does, so a declared index whose owner has no live node is
+    recreated rather than dropped.
+  - **An all-null query prefix returned wrong answers.** The query-side key builder
+    computed its "every component is null" gate over the components *given* rather
+    than over the index arity, conflating an all-null prefix — a real query, since the
+    write side stores a null component under a sentinel and the row does sit there —
+    with "no key at all". A prefix lookup missed those rows and a range bound went
+    open-ended. The write side was always correct.
+  - **A failed strict `def-unique` left a half-built, live constraint.** The index was
+    published before the scan and the strict path signalled on the *first* duplicate,
+    so the constraint covered only the prefix scanned before the error and duplicates
+    in the un-scanned tail committed unchecked. The strict signal is now deferred to
+    the end of a complete scan, so the constraint left behind is whole (keep-first on
+    the duplicate) and enforcing; a scan that dies for any other reason unregisters
+    what it created, so the build can be retried.
+  - The secondary and unique sidecar readers' `handler-case` now spans the per-record
+    loop, not just `cl-store:restore`: a sidecar can deserialize cleanly and still
+    hold a record shape this build does not know, and that must degrade to rebuild
+    like a torn write rather than failing `open-graph`.
 
 - **A failed snapshot no longer aborts `close-graph`** (#120). `close-graph` deregisters
   the graph from `*graphs*` and *then* snapshots, with nothing guarding the call — so a

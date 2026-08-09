@@ -319,7 +319,9 @@ structurally instead of regenerating them.")
 ;; (loaded after this file); forward-declared so the image codec here compiles clean.
 ;; The "was it loaded?" flag is defined HERE because OPEN-MEMORY-GRAPH binds it.
 (declaim (ftype (function (t) t) %dump-unique-indexes rebuild-unique-indexes
-                                 rebuild-secondary-indexes install-secondary-indexes)
+                                 rebuild-secondary-indexes
+                                 install-secondary-indexes
+                                 install-unique-tuple-constraints)
          (ftype (function (t t) t) %load-unique-indexes))
 (defvar *memory-image-unique-loaded* nil
   "Bound NIL by OPEN-MEMORY-GRAPH; set T by the image restore when the unique-index
@@ -973,6 +975,14 @@ as deferred blobs and materialize on first touch (needs a VG-native image)."
       ;; the memory backend: no open-time scan, no lazy-node materialization.
       (unless *memory-image-unique-loaded*
         (rebuild-unique-indexes graph))
+      ;; DEF-UNIQUE constraints the image did not carry (one declared while the
+      ;; graph was closed).  Deliberately NOT lazy-guarded, unlike the ordered
+      ;; indexes below: a missing constraint silently stops ENFORCING, so the
+      ;; scan is worth the materialization -- the same trade REBUILD-UNIQUE-
+      ;; INDEXES above already makes.  A normal reopen restores every constraint
+      ;; from the image, so this is a no-op there.  Scans per owner type, so an
+      ;; unrelated class's blobs stay unmaterialized either way (GH #107).
+      (install-unique-tuple-constraints graph)
       ;; General ordered indexes: rebuild-on-open on the memory backend (image
       ;; persistence is a follow-up, mirroring unique's v1).  REBUILD covers the MOP
       ;; :INDEX slots; INSTALL covers DEF-INDEX declarations.  NOT on a LAZY graph:

@@ -218,6 +218,7 @@
                 #:index-lookup
                 #:index-range
                 #:map-index
+                #:def-unique
                 #:weight
                 #:to
                 #:from
@@ -293,6 +294,9 @@
                 #:lookup-functor
                 #:delete-functor
                 #:make-functor-symbol
+                ;; comparison (utilities.lisp) -- ordering used by skip lists
+                ;; and the multi-slot index (GH #107)
+                #:less-than
                 ;; misc helpers
                 #:gen-id)
   (:export #:run-tests

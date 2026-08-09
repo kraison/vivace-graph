@@ -4,6 +4,7 @@
 ;; OPEN-GRAPH / CLOSE-GRAPH hooks below compile without forward-reference warnings.
 (declaim (ftype (function (t) t)
                 rebuild-unique-indexes save-unique-index-roots restore-unique-index-roots
+                install-unique-tuple-constraints
                 rebuild-secondary-indexes save-secondary-index-roots
                 restore-secondary-index-roots install-secondary-indexes
                 ;; spatial-query.lisp / spatial-registry.lisp (both load later)
@@ -661,7 +662,9 @@ Always CLOSE-GRAPH when finished."
           (rebuild-secondary-indexes graph))
         ;; Build any def-index'd index not covered by the sidecar (declared before
         ;; this graph existed, or added since the last close); no-op otherwise.
-        (install-secondary-indexes graph))
+        (install-secondary-indexes graph)
+        ;; Same for a def-unique'd multi-slot constraint (GH #107).
+        (install-unique-tuple-constraints graph))
       (when slave-p
         (setf (master-host graph) master-host))
       (when peer-role

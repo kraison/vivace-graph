@@ -186,6 +186,17 @@ null-bearing tuple falls inside a prefix scan of its populated parts (#107)."
   (is-false (less-than 0 graph-db::+null-component+))
   (is-false (less-than "a" graph-db::+null-component+))
   (is-false (less-than graph-db::+null-component+ graph-db::+null-component+)))
+
+;; timestamp and uuid:uuid have first-class LESS-THAN methods, so without an
+;; explicit override the sentinel dispatches to the generic symbol methods and
+;; sorts ABOVE them -- breaking transitivity silently (GH #107).
+(test null-component-orders-below-timestamps-and-uuids
+  "The sentinel must sort below every concrete type LESS-THAN dispatches on."
+  (let ((ts (local-time:now)) (id (uuid:make-v4-uuid)))
+    (is-true  (less-than graph-db::+null-component+ ts))
+    (is-true  (less-than graph-db::+null-component+ id))
+    (is-false (less-than ts graph-db::+null-component+))
+    (is-false (less-than id graph-db::+null-component+))))
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -220,12 +231,16 @@ In `utilities.lisp`, inside the `less-than` generic, immediately after the
   (:method ((x (eql +null-component+)) (y symbol))  t)
   (:method ((x (eql +null-component+)) (y (eql t))) t)
   (:method ((x (eql +null-component+)) (y cons))    t)
+  (:method ((x (eql +null-component+)) (y timestamp))  t)
+  (:method ((x (eql +null-component+)) (y uuid:uuid))  t)
   (:method ((x (eql +null-component+)) (y null))    nil)
   (:method ((x number)  (y (eql +null-component+))) nil)
   (:method ((x string)  (y (eql +null-component+))) nil)
   (:method ((x symbol)  (y (eql +null-component+))) nil)
   (:method ((x (eql t)) (y (eql +null-component+))) nil)
   (:method ((x cons)    (y (eql +null-component+))) nil)
+  (:method ((x timestamp)  (y (eql +null-component+))) nil)
+  (:method ((x uuid:uuid)  (y (eql +null-component+))) nil)
   (:method ((x null)    (y (eql +null-component+))) t)
 ```
 
@@ -244,12 +259,12 @@ git commit -m "feat(index): +null-component+ sentinel and its ordering (#107)"
 
 ---
 
-### Task 3: Slot-list normalisation — pure refactor, no behaviour change
+### Task 3: Slot-list normalisation — refactor behind characterisation tests
 
 **Files:**
 - Modify: `index.lisp:68` (`index-spec`), `:117` (`slot-index`), `:76`, `:89`, `:100`,
   `:198`, `:222`, `:233`, `:273`, `:446`, `:461`, `:470`, `:479`
-- Test: existing `index-suite` must pass unchanged
+- Test: `tests/index-tests.lisp` (characterisation tests, added FIRST)
 
 **Interfaces:**
 - Produces: `%normalize-slots (slot-or-list) -> list`. `index-spec-slot-names` and
@@ -258,7 +273,43 @@ git commit -m "feat(index): +null-component+ sentinel and its ordering (#107)"
 - The public API (`def-index`, `index-lookup`, `map-index`, `index-range`) is
   **unchanged** in this task and still takes a bare symbol.
 
-- [ ] **Step 1: Add the normaliser and rename the struct slots**
+- [ ] **Step 1: Write characterisation tests and watch them PASS before refactoring**
+
+These pin the *current* single-slot behaviour so the refactor is provably invisible.
+Unusually for this plan they pass before the change — that is the point: they fail only
+if the refactor alters observable behaviour. Do not assert that the refactor happened;
+assert what a caller sees.
+
+```lisp
+;;; --- characterisation: single-slot behaviour must survive Task 3 (GH #107) --
+
+(test characterise-single-slot-equality-and-range
+  "Pins the caller-visible single-slot contract across the slot-list refactor."
+  (with-ix-graph (g)
+    (with-transaction ()
+      (make-ix-person :name "a" :age 30)
+      (make-ix-person :name "b" :age 40)
+      (make-ix-person :name "c" :age 50))
+    (is (equal '("a") (ix-names (index-lookup g 'ix-person 'name "a"))))
+    (is (equal '("a" "b") (ix-names (index-range g 'ix-person 'age
+                                                 :start 30 :end 40))))
+    (is (null (index-lookup g 'ix-person 'name "nope")))))
+
+(test characterise-single-slot-canonicalizer-and-unindexed
+  "Pins canonicalized lookup and the error on a genuinely unindexed slot."
+  (with-ix-graph (g)
+    (with-transaction () (make-ix-person :name "d" :email "D@X.COM"))
+    (is (equal '("d") (ix-names (index-lookup g 'ix-person 'email "d@x.com"))))
+    (signals error (index-lookup g 'ix-person 'title "x"))))
+```
+
+- [ ] **Step 2: Run them to confirm they PASS on the unmodified code**
+
+Run: `(fiveam:run! 'graph-db/test::index-suite)`
+Expected: PASS. A failure here means the tests describe behaviour the code does not
+have — fix the tests, not the code, before touching `index.lisp`.
+
+- [ ] **Step 3: Add the normaliser and rename the struct slots**
 
 In `index.lisp`, before `register-index-spec`:
 
@@ -274,7 +325,7 @@ Change `(defstruct (index-spec …) owner-name slot-name graph-name canonicalize
 skip-list)` to use `slot-names canonicalizers` (plural; a list of functions, NIL entries
 meaning identity).
 
-- [ ] **Step 2: Update every reader to the plural accessor**
+- [ ] **Step 4: Update every reader to the plural accessor**
 
 Mechanically update the thirteen sites listed under **Files**. Registry keys change from
 `(cons owner-name slot-name)` to `(cons owner-name slot-list)`; the hash tables are
@@ -287,21 +338,21 @@ In the query helpers (`%secondary-index-lookup`, `%slot-index-declared-p`,
 `%def-index-declared-p`, `%require-index`), normalise the incoming `slot-name` argument
 with `%normalize-slots` on entry, so a symbol caller still resolves.
 
-- [ ] **Step 3: Run the whole suite to prove no behaviour changed**
+- [ ] **Step 5: Run the characterisation tests and the whole suite**
 
-Run: `(asdf:test-system :graph-db)`
-Expected: PASS at the same count as before this task. This task adds no tests; its gate
-is that it changes nothing observable.
+Run: `(fiveam:run! 'graph-db/test::index-suite)` then `(asdf:test-system :graph-db)`
+Expected: PASS, with the characterisation tests still green and the total count higher
+than before this task by exactly the two tests added in Step 1.
 
-- [ ] **Step 4: Verify a pre-existing on-disk graph still reopens**
+- [ ] **Step 6: Verify a pre-existing on-disk graph still reopens**
 
 Run: `(fiveam:run! 'graph-db/test::index-suite)` — the suite's durability test reopens a
 graph and re-queries. Confirm it passes rather than rebuilding.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
-git add index.lisp
+git add index.lisp tests/index-tests.lisp
 git commit -m "refactor(index): normalise slot designators to lists, no behaviour change (#107)"
 ```
 
@@ -382,6 +433,111 @@ arity-1 head/tail keys — identical ordering to before.
 ```bash
 git add index.lisp memory-graph.lisp tests/index-tests.lisp
 git commit -m "feat(index): arity-aware head/tail keys and the generalised comparator (#107)"
+```
+
+---
+
+### Task 4b: An index-specific key codec
+
+Discovered during Task 4, not present in the original plan. `view-key-serialize`
+(`views.lisp:143`) does `(concatenate 'vector (second key) payload)` — it assumes
+`(second key)` **is** the node id. At arity > 1 that is a value component, so the
+`concatenate` signals a `TYPE-ERROR` and **an on-disk multi-slot index cannot be
+constructed at all**. This is the fourth two-element assumption in the codebase; the spec
+named three and missed this one.
+
+**Do not generalise `view-key-serialize` / `view-key-deserialize`.** They are shared by
+views (`views.lisp:602`) and by `:unique` (`unique-constraint.lisp:104`), and changing
+them risks two subsystems this feature has no business touching. Give indexes their own
+codec instead and leave those two functions byte-for-byte alone.
+
+**Files:**
+- Modify: `views.lisp` (add the new pair beside the existing ones, or `index.lisp` if
+  load order allows — your call, state it), `bplus-tree.lisp:1027-1052`
+  (`make-heap-index` / `open-heap-index` pass the codec by **symbol**)
+- Test: `tests/index-tests.lisp`
+
+**Interfaces:**
+- Consumes: `%index-comp-lessp` / `%index-equal` (Task 1).
+- Produces: `%index-key-serialize (key) -> byte vector` and
+  `%index-key-deserialize (array) -> (values key length)`, handling a flat key
+  `(v1 … vn id)` for any n ≥ 1.
+
+**Two hard requirements.** Both are gates, not aspirations:
+
+1. **At arity 1 the serialized bytes must be identical to today's
+   `view-key-serialize` output**, including its `+string+` fast path. That is what lets
+   every existing on-disk single-slot index reopen without a rebuild — the same property
+   Task 1 established for ordering, now for bytes.
+2. **Round-trip must hold for arity 1 through 4**, including the awkward case: a single
+   component whose value is *itself a list*. That case is why the deserializer cannot
+   simply infer arity from "is the payload a list".
+
+**Suggested encoding** (take a better one if you find it, but keep both requirements):
+arity 1 serializes exactly as today; arity ≥ 2 serializes the value list behind a
+distinguishing marker so the deserializer can tell a tuple from a list-valued single
+component. Document whatever collision the marker admits.
+
+- [ ] **Step 1: Write the failing round-trip test**
+
+```lisp
+(test index-key-codec-round-trips-and-matches-at-arity-1
+  "Arity 1 must be byte-identical to the view codec (no rebuild), and every
+arity must round-trip -- including a single component that is itself a list."
+  (let ((id (uuid:uuid-to-byte-array (uuid:make-v4-uuid))))
+    ;; requirement 1: byte-identical at arity 1
+    (is (equalp (graph-db::view-key-serialize (list "alice" id))
+                (graph-db::%index-key-serialize (list "alice" id))))
+    (is (equalp (graph-db::view-key-serialize (list 42 id))
+                (graph-db::%index-key-serialize (list 42 id))))
+    ;; requirement 2: round-trip at several arities
+    (dolist (key (list (list "alice" id)
+                       (list '("a" "b") id)   ; list-valued single component
+                       (list "ops" "e1" id)
+                       (list "ops" "e1" "at" id)))
+      (is (equal key (graph-db::%index-key-deserialize
+                      (graph-db::%index-key-serialize key)))))))
+```
+
+- [ ] **Step 2: Run it to verify it fails**
+
+Run: `(fiveam:run! 'graph-db/test::index-suite)`
+Expected: FAIL — `%INDEX-KEY-SERIALIZE` is undefined.
+
+- [ ] **Step 3: Implement the codec**
+
+Read `view-key-serialize` / `view-key-deserialize` (`views.lisp:143-160`) in full first,
+including the `+string+` fast path and `extract-length`. Mirror the arity-1 path exactly
+rather than reimplementing it.
+
+- [ ] **Step 4: Point index skip-lists at the new codec**
+
+In `bplus-tree.lisp`, `make-heap-index` / `open-heap-index` currently pass
+`'view-key-serialize` / `'view-key-deserialize` for every caller. Thread the codec
+through as keyword arguments defaulting to the view pair — the same shape Task 4 used for
+`:head-key` / `:tail-key` — and have `make-secondary-skip-list` /
+`%open-secondary-skip-list` pass the index pair. Views, `:unique` and spatial must keep
+the defaults. While there, thread `:key-equal` to `'%index-equal` for index skip-lists
+(a deferred minor from Task 4).
+
+- [ ] **Step 5: Prove an on-disk multi-slot index now constructs**
+
+Add a test that builds an on-disk (`:skip-list`) index of arity 3 and round-trips a
+lookup through it. This is the assertion Task 4 could not make; it is the point of this
+task.
+
+- [ ] **Step 6: Run the suites**
+
+Run `(fiveam:run! 'graph-db/test::index-suite)` then the full suite
+`(asdf:test-system :graph-db)` with `sbcl --dynamic-space-size 12288`. Baseline is
+**3409 checks, 3399 pass, 10 skip, 0 fail**. Views and `:unique` both ride the codec you
+touched — a regression there is the failure this task must not cause.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add views.lisp bplus-tree.lisp index.lisp tests/index-tests.lisp
+git commit -m "feat(index): an index-specific key codec for n-component keys (#107)"
 ```
 
 ---

@@ -227,6 +227,11 @@ strictly-safe pre-durability abort.")
 ;; Sentinel values for skip lists
 (alexandria:define-constant +min-sentinel+ :gmin)
 (alexandria:define-constant +max-sentinel+ :gmax)
+;; A stored "this component has no value" marker for a multi-slot index key.
+;; Distinct from +MIN-SENTINEL+ (which stays a pure range bound, so an exact
+;; match on a null component stays expressible) and from NIL (which %INDEX-KEY
+;; already uses to mean "not indexable").  (GH #107)
+(alexandria:define-constant +null-component+ :gnull)
 ;; For views, aggregrate key symbol
 (alexandria:define-constant +reduce-master-key+ :gagg)
 
@@ -322,6 +327,16 @@ strictly-safe pre-durability abort.")
 (alexandria:define-constant +uuid+ 100)
 (alexandria:define-constant +timestamp+ 101)
 (alexandria:define-constant +geometry+ 102) ;; spatial extension (see geometry.lisp)
+
+;; Marker byte for the INDEX key codec (index.lisp), not a general SERIALIZE
+;; type -- it occupies the same byte position (right after a key's 16-byte
+;; id) that a real type tag would, so the deserializer can tell an arity>=2
+;; tuple from an arity-1 key whose lone value is itself a list (which
+;; serializes starting with +LIST+, not this).  255 is chosen far outside
+;; today's tag range (0-31, 100-102); it collides only if some future
+;; SERIALIZE type ever claims byte 255, at which point this must move (GH
+;; #107).
+(alexandria:define-constant +index-tuple+ 255)
 
 ;; GEOS availability flags.  These are inert in core graph-db (no FFI, no libgeos
 ;; dependency).  The OPTIONAL `graph-db/geos' add-on system flips them at load

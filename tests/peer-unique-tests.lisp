@@ -28,6 +28,16 @@
    (note  :initarg :note  :accessor pu-note))
   :graph-db-peer-unique-test)
 
+;; Multi-slot: mirrors UQ-CLAIM's (ns ky) shape from
+;; unique-constraint-tests.lisp, proving the pull-apply paths enforce a
+;; tuple constraint too, not only a single-slot one (#107).
+(def-vertex pu-claim ()
+  ((ns :initarg :ns :accessor pu-claim-ns)
+   (ky :initarg :ky :accessor pu-claim-ky :initform nil))
+  :graph-db-peer-unique-test)
+
+(def-unique pu-claim (ns ky) :graph-db-peer-unique-test)
+
 (defmacro with-pu-device ((g) &body body)
   "An on-disk DEVICE peer-graph named *PU-GRAPH-NAME* bound to G and *graph*."
   `(with-temp-directory (dir)
@@ -107,6 +117,46 @@ local nodes may not."
     ;; a second LOCAL code=shared (same origin as the first local) -> rejected.
     (signals graph-db:unique-constraint-violation
       (with-transaction () (make-pu-user :code "shared" :email "d2@x.com")))))
+
+;;; --- multi-slot tuple constraint, same call sites (GH #107) ----------------
+
+(test pulled-multi-slot-unique-is-enforced-locally
+  "GAP 1 for a tuple constraint: a pulled (ns, ky) tuple, via the AUTHORED
+pull-apply path (peer-streaming.lisp:818), lands in the device index, so a
+later LOCAL commit reusing the same tuple is rejected."
+  (with-pu-device (g)
+    (is (graph-db::apply-peer-authored-op
+         g (pu-authored-create g 'pu-claim '((:ns . "ops") (:ky . "c1"))
+                               *pu-hub-origin*))
+        "the pulled create applies")
+    (signals graph-db:unique-constraint-violation
+      (with-transaction () (make-pu-claim :ns "ops" :ky "c1")))
+    ;; a distinct tuple still commits fine.
+    (finishes (with-transaction () (make-pu-claim :ns "ops" :ky "c2")))))
+
+(test state-sync-multi-slot-unique-maintains-index
+  "The state-sync pull-apply path (peer-streaming.lisp:781) also enforces a
+pulled tuple's constraint against a later local duplicate."
+  (with-pu-device (g)
+    (let* ((tid (graph-db::node-type-id
+                 (graph-db::lookup-node-type-by-name
+                  'pu-claim :vertex :graph g)))
+           (n (make-instance 'pu-claim :id (gen-id) :type-id tid :revision 0)))
+      (setf (graph-db::data n) '((:ns . "sync") (:ky . "s1")))
+      (graph-db::apply-peer-create-writes
+       g 7777 (list (make-instance 'graph-db::tx-create :node n))
+       *pu-hub-origin*))
+    (signals graph-db:unique-constraint-violation
+      (with-transaction () (make-pu-claim :ns "sync" :ky "s1")))))
+
+(test purge-releases-multi-slot-unique-keys
+  "PEER-PURGE-NODE releases a purged node's multi-slot tuple key too."
+  (with-pu-device (g)
+    (let ((vid (id (with-transaction () (make-pu-claim :ns "ops" :ky "p1")))))
+      (signals graph-db:unique-constraint-violation
+        (with-transaction () (make-pu-claim :ns "ops" :ky "p1")))
+      (graph-db::apply-peer-purge g (list vid))
+      (finishes (with-transaction () (make-pu-claim :ns "ops" :ky "p1"))))))
 
 (test node-origins-persist-and-release-across-reopen
   "The per-node :ORIGIN partition survives close/open (so enforcement AND release
