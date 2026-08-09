@@ -16,15 +16,36 @@
 ;;; Foreign library
 ;;; --------------------------------------------------------------------------
 
+(defparameter +geos-library-dirs+
+  '("/opt/homebrew/lib" "/usr/local/lib" "/opt/local/lib"
+    "/usr/lib/x86_64-linux-gnu" "/usr/lib")
+  "Where to look for libgeos_c, HIGHEST PRIORITY FIRST.
+
+⚠ /opt/* and /usr/local MUST precede the distro dirs.  A distro that caps GEOS
+below what the app needs (Ubuntu 22.04 ships 3.10.2, which rejects extents that
+3.12+ accepts) leaves a source build in /usr/local as the only upgrade path, and
+LD_LIBRARY_PATH cannot rescue it -- CFFI resolves from
+CFFI:*FOREIGN-LIBRARY-DIRECTORIES* before the loader ever sees the name.")
+
+(defun %add-geos-library-directories (&optional (dirs +geos-library-dirs+))
+  "Add each existing directory in DIRS to CFFI:*FOREIGN-LIBRARY-DIRECTORIES* so
+that DIRS' OWN order becomes the search order.  Returns the dirs added.
+
+⚠ PUSHNEW PREPENDS, so DIRS is walked in reverse.  Pushing them forward instead
+inverts the precedence -- which is what this code used to do, leaving
+/usr/lib/x86_64-linux-gnu first and a locally built GEOS silently ignored."
+  (let ((added '()))
+    (dolist (dir (reverse dirs) added)
+      (when (probe-file dir)
+        (push dir added)
+        (pushnew (pathname (concatenate 'string dir "/"))
+                 cffi:*foreign-library-directories*
+                 :test #'equal)))))
+
 ;; Help CFFI find a Homebrew/MacPorts/Linux-packaged libgeos_c without the user
-;; having to set DYLD_/LD_LIBRARY_PATH.  Guarded so we only add real dirs.
+;; having to set DYLD_/LD_LIBRARY_PATH.  Verify with (graph-db::geos-version).
 (eval-when (:load-toplevel :execute)
-  (dolist (dir '("/opt/homebrew/lib" "/usr/local/lib" "/opt/local/lib"
-                 "/usr/lib" "/usr/lib/x86_64-linux-gnu"))
-    (when (probe-file dir)
-      (pushnew (pathname (concatenate 'string dir "/"))
-               cffi:*foreign-library-directories*
-               :test #'equal))))
+  (%add-geos-library-directories))
 
 (cffi:define-foreign-library libgeos-c
   (:darwin (:or "libgeos_c.dylib" "libgeos_c.1.dylib"))
