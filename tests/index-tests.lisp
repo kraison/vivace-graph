@@ -51,6 +51,21 @@
 
 (def-index ix-dual (a b) :graph-db-index-test :canonicalize string-downcase)
 
+;; Multi-slot with a POSITIONAL :canonicalize -- component 0 downcased,
+;; component 1 (NIL entry) left as identity (GH #107, Task 6).
+(def-index ix-claim (ns key) :graph-db-index-test
+  :canonicalize (string-downcase nil))
+
+;; Single-slot backward-compatibility gate: :canonicalize as a #'FN function
+;; designator, not a bare symbol -- #'FN reads as (FUNCTION FN), a cons, so
+;; this pins that a single-slot spec is not misread as a positional list
+;; (GH #107, Task 6).
+(def-vertex ix-solo ()
+  ((tag :initarg :tag :accessor ix-solo-tag))
+  :graph-db-index-test)
+
+(def-index ix-solo tag :graph-db-index-test :canonicalize #'string-downcase)
+
 (def-suite index-suite
   :description "General ordered secondary index (:INDEX / def-index)."
   :in graph-db-suite)
@@ -198,6 +213,55 @@ index is a legitimate empty result, not an error."
     (with-transaction () (make-ix-claim :ns "ops" :key nil :rel "at"))
     (is (= 1 (length (index-lookup g 'ix-claim '(ns key rel)
                                    (list "ops") :prefix t))))))
+
+;;; --- declaration surface: positional :canonicalize (GH #107, Task 6) -------
+
+(test resolve-index-canonicalizers-positional-vs-single-spec
+  "White-box: %RESOLVE-INDEX-CANONICALIZERS must tell a positional list apart
+from a single spec, even though #'FN and a LAMBDA form are both conses."
+  ;; NIL / T -> identity at every position.
+  (is (equal '(nil nil) (graph-db::%resolve-index-canonicalizers nil 2)))
+  (is (equal '(nil nil) (graph-db::%resolve-index-canonicalizers t 2)))
+  ;; A bare symbol is a single spec: component 0 only, the rest identity.
+  (let ((cans (graph-db::%resolve-index-canonicalizers 'string-downcase 3)))
+    (is (= 3 (length cans)))
+    (is (eq (fdefinition 'string-downcase) (first cans)))
+    (is (null (second cans)))
+    (is (null (third cans))))
+  ;; #'FN reads as (FUNCTION FN) -- a cons, but still a single spec.
+  (let ((cans (graph-db::%resolve-index-canonicalizers
+               '(function string-downcase) 2)))
+    (is (= 2 (length cans)))
+    (is (eq (fdefinition 'string-downcase) (first cans)))
+    (is (null (second cans))))
+  ;; A LAMBDA form is also a single spec, not a 3-element positional list.
+  (let ((cans (graph-db::%resolve-index-canonicalizers
+               '(lambda (x) (string-downcase x)) 1)))
+    (is (= 1 (length cans)))
+    (is (functionp (first cans))))
+  ;; A genuine positional list: one entry per component, NIL = identity.
+  (let ((cans (graph-db::%resolve-index-canonicalizers
+               '(string-downcase nil) 2)))
+    (is (= 2 (length cans)))
+    (is (eq (fdefinition 'string-downcase) (first cans)))
+    (is (null (second cans)))))
+
+(test multi-slot-canonicalizer-is-positional
+  "A per-position canonicalizer applies to its own component only (#107)."
+  (with-ix-graph (g)
+    (with-transaction () (make-ix-claim :ns "OPS" :key "E1" :rel "at"))
+    (is (= 1 (length (index-lookup g 'ix-claim '(ns key) (list "ops" "E1")))))
+    (is (= 0 (length (index-lookup g 'ix-claim '(ns key) (list "ops" "e1")))))))
+
+(test single-slot-def-index-function-designator-canonicalizer-unchanged
+  "Backward-compatibility gate: a single-slot DEF-INDEX with a single #'FN
+:canonicalize keeps behaving exactly as before Task 6's positional split --
+applied to the one component, case-insensitive lookup either way."
+  (with-ix-graph (g)
+    (with-transaction () (make-ix-solo :tag "MixedCase"))
+    (is (= 1 (length (index-lookup g 'ix-solo 'tag "mixedcase"))))
+    (is (= 1 (length (index-lookup g 'ix-solo 'tag "MIXEDCASE"))))
+    (is (= 0 (length (index-lookup g 'ix-solo 'tag "nope"))))))
 
 ;;; --- def-index (standalone declaration surface) -----------------------------
 

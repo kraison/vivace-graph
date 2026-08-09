@@ -35,6 +35,22 @@ hash-test (the ordered map keys by LESS-THAN, not a hash)."
     ((symbolp spec)                               (fdefinition spec))
     (t (error "Invalid :INDEX spec ~S" spec))))
 
+(defun %resolve-index-canonicalizers (spec arity)
+  "SPEC -> a list of ARITY canonicalizers (NIL = identity).  A POSITIONAL list
+applies element I to component I; anything else (T, NIL, a bare symbol,
+#'FN, or a LAMBDA form) is a single spec applying to component 0 only, with
+every other component defaulting to identity -- the single-slot / single-
+function backward-compatible form every existing caller uses.
+
+#'FN reads as (FUNCTION FN) and a LAMBDA form as (LAMBDA ...) -- both are
+conses, so \"is it a cons?\" cannot distinguish a positional list from a
+single function designator; excluding those two heads is what does (#107)."
+  (if (and (consp spec) (not (member (car spec) '(function lambda))))
+      (loop for i from 0 below arity
+            collect (%resolve-index-canonicalizer (nth i spec)))
+      (cons (%resolve-index-canonicalizer spec)
+            (make-list (max 0 (1- arity)) :initial-element nil))))
+
 ;;; ---------------------------------------------------------------------------
 ;;; Per-class descriptors (MOP introspection over the :INDEX slot option)
 ;;; ---------------------------------------------------------------------------
@@ -399,9 +415,10 @@ bound filter."
 
 (defun %slot-index-for (graph descriptor)
   "Get-or-create the (empty) SLOT-INDEX for DESCRIPTOR = (slot owner spec),
-keyed by (owner . slot-names) in GRAPH's registry.  Resolves the
-canonicalizer from SPEC on creation and builds the ordered map on the
-graph's backend."
+keyed by (owner . slot-names) in GRAPH's registry.  Resolves SPEC to one
+canonicalizer per slot (positional list, or a single spec applying to
+component 0 -- see %RESOLVE-INDEX-CANONICALIZERS) on creation and builds
+the ordered map on the graph's backend."
   (destructuring-bind (slot-name owner-name spec) descriptor
     (let* ((reg (or (secondary-indexes graph)
                     (setf (secondary-indexes graph)
@@ -412,7 +429,8 @@ graph's backend."
                                            #+graph-db-ecl-sync-hash t))))
            (slot-names (%normalize-slots slot-name))
            (key (cons owner-name slot-names))
-           (canonicalizers (list (%resolve-index-canonicalizer spec))))
+           (canonicalizers (%resolve-index-canonicalizers
+                             spec (length slot-names))))
       (or (gethash key reg)
           (let ((six (%make-slot-index
                       :owner-name owner-name :slot-names slot-names
@@ -525,11 +543,12 @@ reopen -- only the address+backend are needed to reopen the ordered map."
       (%atomic-cl-store roots (secondary-index-root-file (location graph))))))
 
 (defun %owner-slot-canonicalizer (owner-name slot-names graph)
-  "Resolve the canonicalizer for (OWNER-NAME . SLOT-NAMES) from the owner
-class's live :INDEX spec, or from a matching DEF-INDEX spec registered for
-GRAPH; NIL if neither is found.  Used on reopen to re-associate a persisted
-index with its live spec (the canonicalizer is a function, not serializable,
-so it is re-resolved, not stored).
+  "Resolve the ARITY (LENGTH SLOT-NAMES) canonicalizers for (OWNER-NAME .
+SLOT-NAMES) from the owner class's live :INDEX spec, or from a matching
+DEF-INDEX spec registered for GRAPH; a list of ARITY NILs if neither is
+found.  Used on reopen to re-associate a persisted index with its live spec
+(a canonicalizer is a function, not serializable, so it is re-resolved, not
+stored).
 
 The MOP :INDEX branch only fires when SLOT-NAMES is genuinely single-slot
 (arity 1) -- a slot's :INDEX option is inherently single-slot, so at arity >
@@ -537,21 +556,27 @@ The MOP :INDEX branch only fires when SLOT-NAMES is genuinely single-slot
 UNRELATED single-slot :INDEX declaration that merely shares its first slot's
 name, and return THAT slot's canonicalizer instead of the composite's.  The
 SIX was originally built (at write time, not reopen) with the composite's own
-canonicalizer via %RESOLVE-INDEX-CANONICALIZER, so that mismatch would
-silently reopen the index keying with a different canonicalizer than the one
-that wrote the entries on disk -- missed matches, no error (GH #107)."
-  (or (when (= (length slot-names) 1)
-        (let ((c (ignore-errors (find-class owner-name nil))))
-          (when (and c (class-finalized-p c))
-            (let ((d (find (first slot-names) (class-indexed-slots c)
-                           :key #'first)))
-              (when d (%resolve-index-canonicalizer (third d)))))))
-      (let* ((matchp (lambda (s)
-                       (and (eq (index-spec-owner-name s) owner-name)
-                            (equal (index-spec-slot-names s) slot-names))))
-             (spec (find-if matchp (%registered-index-specs graph))))
-        (when spec
-          (%resolve-index-canonicalizer (index-spec-canonicalize spec))))))
+canonicalizer(s) via %RESOLVE-INDEX-CANONICALIZERS, so that mismatch would
+silently reopen the index keying with different canonicalizers than the ones
+that wrote the entries on disk -- missed matches, no error (GH #107).  The
+MOP branch is wrapped in LIST (not left as a bare function-or-NIL) so a found
+D short-circuits the OR even when its canonicalizer is identity -- otherwise
+an identity match and a genuine non-match would be indistinguishable to OR."
+  (let ((arity (length slot-names)))
+    (or (when (= arity 1)
+          (let ((c (ignore-errors (find-class owner-name nil))))
+            (when (and c (class-finalized-p c))
+              (let ((d (find (first slot-names) (class-indexed-slots c)
+                             :key #'first)))
+                (when d (list (%resolve-index-canonicalizer (third d))))))))
+        (let* ((matchp (lambda (s)
+                         (and (eq (index-spec-owner-name s) owner-name)
+                              (equal (index-spec-slot-names s) slot-names))))
+               (spec (find-if matchp (%registered-index-specs graph))))
+          (when spec
+            (%resolve-index-canonicalizers
+             (index-spec-canonicalize spec) arity)))
+        (make-list arity :initial-element nil))))
 
 (defun restore-secondary-index-roots (graph)
   "Reopen the on-disk secondary indexes from the sidecar -- no node scan.  Returns T
@@ -587,8 +612,8 @@ not trigger a spurious rebuild."
                 (setf (gethash (cons owner slot-names) reg)
                       (%make-slot-index
                        :owner-name owner :slot-names slot-names
-                       :canonicalizers (list (%owner-slot-canonicalizer
-                                              owner slot-names graph))
+                       :canonicalizers (%owner-slot-canonicalizer
+                                        owner slot-names graph)
                        :skip-list (%open-secondary-skip-list
                                    graph address (length slot-names)
                                    backend))))))
