@@ -437,6 +437,111 @@ git commit -m "feat(index): arity-aware head/tail keys and the generalised compa
 
 ---
 
+### Task 4b: An index-specific key codec
+
+Discovered during Task 4, not present in the original plan. `view-key-serialize`
+(`views.lisp:143`) does `(concatenate 'vector (second key) payload)` — it assumes
+`(second key)` **is** the node id. At arity > 1 that is a value component, so the
+`concatenate` signals a `TYPE-ERROR` and **an on-disk multi-slot index cannot be
+constructed at all**. This is the fourth two-element assumption in the codebase; the spec
+named three and missed this one.
+
+**Do not generalise `view-key-serialize` / `view-key-deserialize`.** They are shared by
+views (`views.lisp:602`) and by `:unique` (`unique-constraint.lisp:104`), and changing
+them risks two subsystems this feature has no business touching. Give indexes their own
+codec instead and leave those two functions byte-for-byte alone.
+
+**Files:**
+- Modify: `views.lisp` (add the new pair beside the existing ones, or `index.lisp` if
+  load order allows — your call, state it), `bplus-tree.lisp:1027-1052`
+  (`make-heap-index` / `open-heap-index` pass the codec by **symbol**)
+- Test: `tests/index-tests.lisp`
+
+**Interfaces:**
+- Consumes: `%index-comp-lessp` / `%index-equal` (Task 1).
+- Produces: `%index-key-serialize (key) -> byte vector` and
+  `%index-key-deserialize (array) -> (values key length)`, handling a flat key
+  `(v1 … vn id)` for any n ≥ 1.
+
+**Two hard requirements.** Both are gates, not aspirations:
+
+1. **At arity 1 the serialized bytes must be identical to today's
+   `view-key-serialize` output**, including its `+string+` fast path. That is what lets
+   every existing on-disk single-slot index reopen without a rebuild — the same property
+   Task 1 established for ordering, now for bytes.
+2. **Round-trip must hold for arity 1 through 4**, including the awkward case: a single
+   component whose value is *itself a list*. That case is why the deserializer cannot
+   simply infer arity from "is the payload a list".
+
+**Suggested encoding** (take a better one if you find it, but keep both requirements):
+arity 1 serializes exactly as today; arity ≥ 2 serializes the value list behind a
+distinguishing marker so the deserializer can tell a tuple from a list-valued single
+component. Document whatever collision the marker admits.
+
+- [ ] **Step 1: Write the failing round-trip test**
+
+```lisp
+(test index-key-codec-round-trips-and-matches-at-arity-1
+  "Arity 1 must be byte-identical to the view codec (no rebuild), and every
+arity must round-trip -- including a single component that is itself a list."
+  (let ((id (uuid:uuid-to-byte-array (uuid:make-v4-uuid))))
+    ;; requirement 1: byte-identical at arity 1
+    (is (equalp (graph-db::view-key-serialize (list "alice" id))
+                (graph-db::%index-key-serialize (list "alice" id))))
+    (is (equalp (graph-db::view-key-serialize (list 42 id))
+                (graph-db::%index-key-serialize (list 42 id))))
+    ;; requirement 2: round-trip at several arities
+    (dolist (key (list (list "alice" id)
+                       (list '("a" "b") id)   ; list-valued single component
+                       (list "ops" "e1" id)
+                       (list "ops" "e1" "at" id)))
+      (is (equal key (graph-db::%index-key-deserialize
+                      (graph-db::%index-key-serialize key)))))))
+```
+
+- [ ] **Step 2: Run it to verify it fails**
+
+Run: `(fiveam:run! 'graph-db/test::index-suite)`
+Expected: FAIL — `%INDEX-KEY-SERIALIZE` is undefined.
+
+- [ ] **Step 3: Implement the codec**
+
+Read `view-key-serialize` / `view-key-deserialize` (`views.lisp:143-160`) in full first,
+including the `+string+` fast path and `extract-length`. Mirror the arity-1 path exactly
+rather than reimplementing it.
+
+- [ ] **Step 4: Point index skip-lists at the new codec**
+
+In `bplus-tree.lisp`, `make-heap-index` / `open-heap-index` currently pass
+`'view-key-serialize` / `'view-key-deserialize` for every caller. Thread the codec
+through as keyword arguments defaulting to the view pair — the same shape Task 4 used for
+`:head-key` / `:tail-key` — and have `make-secondary-skip-list` /
+`%open-secondary-skip-list` pass the index pair. Views, `:unique` and spatial must keep
+the defaults. While there, thread `:key-equal` to `'%index-equal` for index skip-lists
+(a deferred minor from Task 4).
+
+- [ ] **Step 5: Prove an on-disk multi-slot index now constructs**
+
+Add a test that builds an on-disk (`:skip-list`) index of arity 3 and round-trips a
+lookup through it. This is the assertion Task 4 could not make; it is the point of this
+task.
+
+- [ ] **Step 6: Run the suites**
+
+Run `(fiveam:run! 'graph-db/test::index-suite)` then the full suite
+`(asdf:test-system :graph-db)` with `sbcl --dynamic-space-size 12288`. Baseline is
+**3409 checks, 3399 pass, 10 skip, 0 fail**. Views and `:unique` both ride the codec you
+touched — a regression there is the failure this task must not cause.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add views.lisp bplus-tree.lisp index.lisp tests/index-tests.lisp
+git commit -m "feat(index): an index-specific key codec for n-component keys (#107)"
+```
+
+---
+
 ### Task 5: Tuple key building and maintenance
 
 **Files:**
