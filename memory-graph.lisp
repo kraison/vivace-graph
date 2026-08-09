@@ -975,6 +975,14 @@ as deferred blobs and materialize on first touch (needs a VG-native image)."
       ;; the memory backend: no open-time scan, no lazy-node materialization.
       (unless *memory-image-unique-loaded*
         (rebuild-unique-indexes graph))
+      ;; DEF-UNIQUE constraints the image did not carry (one declared while the
+      ;; graph was closed).  Deliberately NOT lazy-guarded, unlike the ordered
+      ;; indexes below: a missing constraint silently stops ENFORCING, so the
+      ;; scan is worth the materialization -- the same trade REBUILD-UNIQUE-
+      ;; INDEXES above already makes.  A normal reopen restores every constraint
+      ;; from the image, so this is a no-op there.  Scans per owner type, so an
+      ;; unrelated class's blobs stay unmaterialized either way (GH #107).
+      (install-unique-tuple-constraints graph)
       ;; General ordered indexes: rebuild-on-open on the memory backend (image
       ;; persistence is a follow-up, mirroring unique's v1).  REBUILD covers the MOP
       ;; :INDEX slots; INSTALL covers DEF-INDEX declarations.  NOT on a LAZY graph:
@@ -984,10 +992,7 @@ as deferred blobs and materialize on first touch (needs a VG-native image)."
       ;; checkpoint image (so a lazy reopen needs no scan) is the deferred follow-up.
       (unless (lazy-p graph)
         (rebuild-secondary-indexes graph)
-        (install-secondary-indexes graph)
-        ;; Same lazy-graph guard as above: a def-unique build scans nodes, which
-        ;; would materialize LZNODE blobs on a lazy graph (GH #107).
-        (install-unique-tuple-constraints graph)))
+        (install-secondary-indexes graph)))
     (when peer-role
       (%init-memory-peer-slots graph :open path peer-role origin-id peer-host
                                export-predicate device-registry merge-policy

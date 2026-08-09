@@ -656,8 +656,13 @@ the new backend tags to the sidecar."
 
 (defun %dump-unique-indexes (graph)
   "Self-contained snapshot of GRAPH's unique indexes for the checkpoint image:
-a list of (owner slot spec scope ((canonical-key id) ...)).  Proper-list pairs so
-the image codec's tagged value writer handles the byte-array ids."
+a list of (owner slot spec scope ((canonical-key id) ...)).  SLOT is a bare
+symbol for a single-slot (:UNIQUE) index or a LIST for a multi-slot
+(DEF-UNIQUE) one, the same shape SAVE-UNIQUE-INDEX-ROOTS writes to the on-disk
+sidecar -- %LOAD-UNIQUE-INDEXES dispatches on it.  Emitting the singular
+SLOT-NAME unconditionally wrote NIL for a multi-slot index and made the graph
+UNOPENABLE (GH #107).  Proper-list pairs so the image codec's tagged value
+writer handles the byte-array ids."
   (let ((acc '()))
     (when (unique-indexes graph)
       (maphash (lambda (k uix)
@@ -666,7 +671,9 @@ the image codec's tagged value writer handles the byte-array ids."
                    (let ((pairs '()))
                      (maphash (lambda (key id) (push (list key id) pairs))
                               (unique-index-table uix))
-                     (push (list (unique-index-owner-name uix) (unique-index-slot-name uix)
+                     (push (list (unique-index-owner-name uix)
+                                 (or (unique-index-slot-names uix)
+                                     (unique-index-slot-name uix))
                                  (unique-index-spec uix) (unique-index-scope uix) pairs)
                            acc))))
                (unique-indexes graph)))
@@ -674,13 +681,26 @@ the image codec's tagged value writer handles the byte-array ids."
 
 (defun %load-unique-indexes (graph dump)
   "Restore GRAPH's unique indexes from a %DUMP-UNIQUE-INDEXES snapshot -- no node
-scan.  Sets *MEMORY-IMAGE-UNIQUE-LOADED* so OPEN skips the rebuild."
+scan.  Sets *MEMORY-IMAGE-UNIQUE-LOADED* so OPEN skips the rebuild.  Dispatches
+on SLOT's shape exactly as RESTORE-UNIQUE-INDEX-ROOTS does for the on-disk
+sidecar.  A NIL SLOT is a multi-slot record from an image written before the
+dump was fixed: skip it, so the constraint is rebuilt by INSTALL-UNIQUE-TUPLE-
+CONSTRAINTS instead of crashing the open (GH #107)."
   (dolist (u dump)
     (destructuring-bind (owner slot spec scope pairs) u
-      (let ((uix (%unique-index-for graph (list slot owner spec scope))))
-        (dolist (p pairs)
-          (destructuring-bind (key id) p
-            (setf (gethash key (unique-index-table uix)) id))))))
+      (let ((uix (cond ((null slot)
+                        (warn "Unique index ~S in the checkpoint image has no ~
+slot field; rebuilding it from live nodes." owner)
+                        nil)
+                       ((listp slot)
+                        (%unique-tuple-index-for
+                         graph (list slot owner spec scope)))
+                       (t (%unique-index-for
+                           graph (list slot owner spec scope))))))
+        (when uix
+          (dolist (p pairs)
+            (destructuring-bind (key id) p
+              (setf (gethash key (unique-index-table uix)) id)))))))
   (setf *memory-image-unique-loaded* t))
 
 ;;; ---------------------------------------------------------------------------

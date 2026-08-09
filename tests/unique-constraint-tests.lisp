@@ -407,6 +407,64 @@ saves its root, open reopens it from the sidecar WITHOUT scanning nodes
           (setf (fdefinition 'graph-db::%build-unique-tuple-for-spec)
                 orig-build))))))
 
+(test multi-slot-unique-memory-image-reopens-and-enforces
+  "GH #107 (whole-branch review): a MEMORY graph carrying any DEF-UNIQUE was
+UNOPENABLE after a clean close.  %DUMP-UNIQUE-INDEXES had no multi-slot branch
+-- it wrote the singular SLOT-NAME, which is NIL for a tuple index -- and the
+reopen fed that to the single-slot resolver, ending in (FDEFINITION NIL).  The
+checkpoint image is the ONLY durable copy of a cleanly-closed memory graph (the
+journal is cleared at checkpoint), so that was data loss.
+
+The suite missed it because the memory-backend unique tests close with
+:SNAPSHOT-P NIL and never create a node on a memory graph -- so this one does
+both."
+  (with-temp-directory (dir)
+    (let ((path (namestring dir)))
+      (let ((g (graph-db::make-memory-graph *uq-graph-name* path)))
+        (let ((*graph* g))
+          (with-transaction () (make-uq-claim :ns "ops" :ky "e1")))
+        (close-graph g :snapshot-p t))
+      (let ((g2 (graph-db::open-memory-graph *uq-graph-name* path)))
+        (unwind-protect
+             (let ((*graph* g2))
+               (is (= 1 (uq-index-size g2 'uq-claim '(ns ky)))
+                   "the multi-slot constraint came back from the image")
+               (signals graph-db:unique-constraint-violation
+                 (with-transaction () (make-uq-claim :ns "ops" :ky "e1")))
+               (finishes
+                (with-transaction () (make-uq-claim :ns "ops" :ky "e2"))))
+          (ignore-errors (close-graph g2 :snapshot-p nil))
+          (collect-garbage))))))
+
+(test multi-slot-unique-lazy-memory-reopen-installs-and-enforces
+  "GH #107 (whole-branch review), the second half of the image gap: on a LAZY
+memory graph INSTALL-UNIQUE-TUPLE-CONSTRAINTS sat inside the (UNLESS (LAZY-P
+GRAPH) ...) block, so a constraint the image did not carry came back SILENTLY
+ABSENT -- no enforcement, no complaint.  The install is now outside that guard,
+the same trade REBUILD-UNIQUE-INDEXES already makes: a missing constraint stops
+enforcing, which is worse than materializing the owner's blobs.
+
+The REMHASH stands in for \"the DEF-UNIQUE was declared while the graph was
+closed\": *SCHEMA-UNIQUE-METADATA* is a global, session-lifetime registry, so
+un-declaring UQ-CLAIM's constraint for one test is not possible -- dropping its
+UIX before the checkpoint reproduces the same state the image would have."
+  (with-temp-directory (dir)
+    (let ((path (namestring dir)))
+      (let ((g (graph-db::make-memory-graph *uq-graph-name* path :lazy t)))
+        (let ((*graph* g))
+          (with-transaction () (make-uq-claim :ns "ops" :ky "e1")))
+        (remhash (cons 'uq-claim '(ns ky)) (graph-db::unique-indexes g))
+        (close-graph g :snapshot-p t))
+      (let ((g2 (graph-db::open-memory-graph *uq-graph-name* path :lazy t)))
+        (unwind-protect
+             (let ((*graph* g2))
+               (is (= 1 (uq-index-size g2 'uq-claim '(ns ky)))
+                   "install rebuilt the constraint the image did not carry")
+               (signals graph-db:unique-constraint-violation
+                 (with-transaction () (make-uq-claim :ns "ops" :ky "e1"))))
+          (ignore-errors (close-graph g2 :snapshot-p nil))
+          (collect-garbage))))))
+
 (test multi-slot-unique-concurrent-race-exactly-one-wins
   "The phantom the commit lock defeats, on a multi-slot tuple: N threads racing
 to create the same (ns, ky) tuple -- exactly one commits, the rest get
