@@ -34,6 +34,17 @@
 
 (def-unique uq-claim (ns ky) :graph-db-unique-test)
 
+(defun uq-fresh-class-name (prefix)
+  "A fresh class name for a per-run DEF-VERTEX -- INTERNED, not a bare
+GENSYM: every registered DEF-UNIQUE is installed at graph creation now, and
+the memory checkpoint cannot serialize an uninterned owner name (GH #129)."
+  (intern (symbol-name (gensym prefix)) :graph-db/test))
+
+(defun uq-boom-canon (v)
+  "A canonicalizer that signals on one value -- the stand-in for the legacy
+node a build scan chokes on (GH #129)."
+  (if (equal v "boom") (error "canonicalizer refuses ~S" v) v))
+
 (def-suite unique-constraint-suite
   :description "Unique constraints (:UNIQUE) -- issue #6."
   :in graph-db-suite)
@@ -348,7 +359,7 @@ this test idempotent across repeated FIVEAM runs within one Lisp image
   (with-uq-graph (g)
     (declare (ignorable g))
     (let* ((*package* (find-package :graph-db/test))
-           (cls (gensym "UQ-SOLO"))
+           (cls (uq-fresh-class-name "UQ-SOLO"))
            (mk (intern (format nil "MAKE-~A" cls))))
       (eval `(def-vertex ,cls () (a b) :graph-db-unique-test))
       (with-transaction ()
@@ -377,7 +388,7 @@ assertion, not an ordering assumption, is what proves the whole scan ran:
 MAP-VERTICES walks the type index, whose order is not the insertion order."
   (with-uq-graph (g)
     (let* ((*package* (find-package :graph-db/test))
-           (cls (gensym "UQ-TAIL"))
+           (cls (uq-fresh-class-name "UQ-TAIL"))
            (mk (intern (format nil "MAKE-~A" cls))))
       (eval `(def-vertex ,cls () (a b) :graph-db-unique-test))
       (with-transaction ()
@@ -524,3 +535,56 @@ UNIQUE-CONSTRAINT-VIOLATION (#107)."
       (is (= 1 (length (map-vertices #'identity g :collect-p t
                                      :vertex-type 'uq-claim)))
           "one node exists"))))
+
+(test multi-slot-unique-build-scan-tolerates-one-bad-node
+  "GH #129: the DEF-UNIQUE build scan skips a node whose key cannot be
+built, exactly as %BUILD-INDEX-FOR-SPEC (index.lisp) already does for a
+legacy node whose slots predate the DEF-INDEX.  Before this, one such node
+aborted the whole scan and the constraint was left unbuilt.
+
+Fresh class per run (UQ-FRESH-CLASS-NAME), for the reason
+MULTI-SLOT-UNIQUE-DECLARED-AFTER-OPEN-SCANS-STRICTLY documents.  The bad
+node is seeded BEFORE the constraint is declared, so the canonicalizer
+never runs on the commit path -- that path is deliberately intolerant."
+  (with-uq-graph (g)
+    (let* ((*package* (find-package :graph-db/test))
+           (cls (uq-fresh-class-name "UQ-BOOM"))
+           (mk (intern (format nil "MAKE-~A" cls))))
+      (eval `(def-vertex ,cls () (a b) :graph-db-unique-test))
+      (with-transaction ()
+        (funcall mk :a "boom" :b "1")   ; the node the scan chokes on
+        (funcall mk :a "ok"   :b "2")
+        (funcall mk :a "ok"   :b "3"))
+      (finishes
+       (eval `(def-unique ,cls (a b) :graph-db-unique-test
+                :canonicalize (uq-boom-canon nil))))
+      (is (= 2 (uq-index-size g cls '(a b)))
+          "the two good nodes were indexed, the bad one skipped")
+      (signals graph-db:unique-constraint-violation
+        (with-transaction () (funcall mk :a "ok" :b "3"))))))
+
+(test multi-slot-unique-absent-index-is-not-conjured-empty
+  "GH #129: after a build scan unwinds, the registry entry is absent -- and
+absence must mean \"not built yet\" to EVERY path.  A commit used to
+get-or-create an empty UIX (%UIX-CLAIM, then VALIDATE-UNIQUE-CONSTRAINTS),
+which enforced nothing and permanently blocked the retry, because
+%ENSURE-UNIQUE-TUPLE-BUILT short-circuits on registry presence.
+
+The unwind is simulated by calling %UNREGISTER-UNIQUE-TUPLE-INDEX directly:
+that is precisely the state the unwind arm leaves, and the residual triggers
+for it (a heap or storage error mid-scan) are not reproducible in a test."
+  (with-uq-graph (g)
+    (with-transaction () (make-uq-claim :ns "ops" :ky "e1"))
+    (graph-db::%unregister-unique-tuple-index g 'uq-claim '(ns ky))
+    (is (null (uq-index-size g 'uq-claim '(ns ky)))
+        "precondition: the constraint is unbuilt")
+    (finishes (with-transaction () (make-uq-claim :ns "ops" :ky "e2")))
+    (is (null (uq-index-size g 'uq-claim '(ns ky)))
+        "a commit consults the registry; it does not populate it")
+    (dolist (spec (graph-db::%registered-unique-tuple-specs g))
+      (when (eq (graph-db::unique-tuple-spec-owner-name spec) 'uq-claim)
+        (graph-db::%ensure-unique-tuple-built g spec)))
+    (is (= 2 (uq-index-size g 'uq-claim '(ns ky)))
+        "absence was recoverable: the rebuild scanned both nodes")
+    (signals graph-db:unique-constraint-violation
+      (with-transaction () (make-uq-claim :ns "ops" :ky "e1")))))

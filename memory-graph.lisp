@@ -272,6 +272,11 @@ Registers the graph and returns it."
     (init-replication-log graph)
     (start-replication graph :package package)
     (setf (graph-open-p graph) t)
+    ;; As MAKE-GRAPH and OPEN-MEMORY-GRAPH do: register this graph's
+    ;; DEF-UNIQUE constraints so an ABSENT index means "not built yet"
+    ;; rather than "brand new" (GH #129).  No nodes yet, so no scan.
+    (let ((*graph* graph))
+      (install-unique-tuple-constraints graph))
     graph))
 
 ;;; ---------------------------------------------------------------------------

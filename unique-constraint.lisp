@@ -335,27 +335,38 @@ two call sites below stay under 80 columns (GH #107)."
                    #+graph-db-ecl-sync-hash :synchronized
                    #+graph-db-ecl-sync-hash t))
 
-(defun %unique-tuple-index-for (graph descriptor)
-  "Get-or-create the (empty) multi-slot UNIQUE-INDEX for DESCRIPTOR =
-(slot-names owner spec scope), keyed by (owner . slot-names) in GRAPH's
-registry -- the SAME registry %UNIQUE-INDEX-FOR uses (a list-shaped key
-never collides with a bare-symbol single-slot key under EQUAL), so
-persistence and rebuild are unified across both forms."
+(defun %unique-tuple-index-for (graph descriptor &key create-p)
+  "The multi-slot UNIQUE-INDEX for DESCRIPTOR = (slot-names owner spec
+scope), keyed by (owner . slot-names) in GRAPH's registry -- the SAME
+registry %UNIQUE-INDEX-FOR uses (a list-shaped key never collides with a
+bare-symbol single-slot key under EQUAL), so persistence and rebuild are
+unified across both forms.
+
+CREATE-P NIL (the default) returns NIL when the constraint is not built:
+absence has to mean \"not built yet\" to every path that only CONSULTS the
+index, or a read-side get-or-create conjures an empty one that enforces
+nothing and blocks %ENSURE-UNIQUE-TUPLE-BUILT's retry forever (GH #129).
+Only the three paths that go on to POPULATE the index pass CREATE-P T."
   (destructuring-bind (slot-names owner-name spec scope) descriptor
-    (let* ((reg (or (unique-indexes graph)
-                    (setf (unique-indexes graph) (%make-uix-registry-table))))
+    (let* ((reg (if create-p
+                    (or (unique-indexes graph)
+                        (setf (unique-indexes graph)
+                              (%make-uix-registry-table)))
+                    (unique-indexes graph)))
            (key (cons owner-name slot-names)))
-      (or (gethash key reg)
-          (let* ((canonicalizers (%resolve-index-canonicalizers
-                                   spec (length slot-names)))
-                 (uix (%make-unique-index
-                       :owner-name owner-name :slot-names slot-names :spec spec
-                       :canonicalizers canonicalizers :scope scope)))
-            (if (indexes graph)
-                (setf (unique-index-skip-list uix)
-                      (make-unique-skip-list graph))
-                (setf (unique-index-table uix) (%make-uix-registry-table)))
-            (setf (gethash key reg) uix))))))
+      (or (and reg (gethash key reg))
+          (when create-p
+            (let* ((canonicalizers (%resolve-index-canonicalizers
+                                     spec (length slot-names)))
+                   (uix (%make-unique-index
+                         :owner-name owner-name :slot-names slot-names
+                         :spec spec :canonicalizers canonicalizers
+                         :scope scope)))
+              (if (indexes graph)
+                  (setf (unique-index-skip-list uix)
+                        (make-unique-skip-list graph))
+                  (setf (unique-index-table uix) (%make-uix-registry-table)))
+              (setf (gethash key reg) uix)))))))
 
 (defun %unregister-unique-tuple-index (graph owner slot-names)
   "Drop the multi-slot UIX for (OWNER . SLOT-NAMES) from GRAPH's registry,
@@ -396,12 +407,16 @@ hard on that.
 
 ALL-OR-NOTHING, in two parts.  (1) A UIX this call created is unregistered
 again if the scan does not finish, so a mid-scan error leaves no partial
-constraint and %ENSURE-UNIQUE-TUPLE-BUILT can retry.  (2) The strict
-duplicate signal fires only after the scan completes, so the constraint
-that survives it is whole.  Neither alone suffices: publishing up front and
-signalling on the first duplicate left the un-scanned tail unenforced, and
-unregistering instead leaves the enforcement path to get-or-create an EMPTY
-UIX on the next commit, which enforces nothing at all (GH #107)."
+constraint and %ENSURE-UNIQUE-TUPLE-BUILT can retry -- which works only
+because the read-side paths no longer get-or-create (GH #129).  (2) The
+strict duplicate signal fires only after the scan completes, so the
+constraint that survives it is whole; signalling on the first duplicate
+left the un-scanned tail unenforced (GH #107).
+
+A node whose key cannot be built is SKIPPED, not fatal -- the tolerance
+%BUILD-INDEX-FOR-SPEC (index.lisp) already has for a legacy node whose
+slots predate the declaration.  Scan-path only: the live commit path is
+deliberately intolerant (GH #129)."
   (let* ((owner (unique-tuple-spec-owner-name spec))
          (slot-names (unique-tuple-spec-slot-names spec))
          (reg (unique-indexes graph))
@@ -409,13 +424,20 @@ UIX on the next commit, which enforces nothing at all (GH #107)."
          (uix (%unique-tuple-index-for
                graph (list slot-names owner
                            (unique-tuple-spec-canonicalize spec)
-                           (unique-tuple-spec-scope spec))))
+                           (unique-tuple-spec-scope spec))
+               :create-p t))
          (*graph* graph)
          (dup nil)                       ; first (raw-value existing-id) seen
          (done nil))
     (flet ((index-node (node)
              (unless (deleted-p node)
-               (let ((key (%unique-tuple-key uix node graph)))
+               (let ((key (handler-case (%unique-tuple-key uix node graph)
+                            (error (e)
+                              (log:warn "unique-index ~S.~S: skipping ~A, ~
+                                         key build failed: ~A"
+                                        owner slot-names
+                                        (string-id (id node)) e)
+                              nil))))
                  (when key
                    (let ((existing (uix-lookup uix key)))
                      (if (not (and existing
@@ -522,18 +544,23 @@ null semantics a reader would assume were unchanged (GH #107)."
       (let* ((uix (%unique-index-for graph d))
              (key (%unique-key uix (slot-value node (first d)) node graph)))
         (when key (uix-put uix key (id node)))))
+    ;; A NIL UIX means the constraint is not built; claiming into a
+    ;; conjured empty one is what GH #129 fixed.  The build that
+    ;; eventually runs scans this node like any other.
     (dolist (d tuples)
-      (let* ((uix (%unique-tuple-index-for graph d))
-             (key (%unique-tuple-key uix node graph)))
-        (when key (uix-put uix key (id node)))))))
+      (let ((uix (%unique-tuple-index-for graph d)))
+        (when uix
+          (let ((key (%unique-tuple-key uix node graph)))
+            (when key (uix-put uix key (id node)))))))))
 
 (defun %uix-release (node graph)
   "Release NODE's unique keys -- both forms (GH #107) -- on delete / old value
 of an update."
   (dolist (d (class-unique-tuple-specs (class-of node) graph))
-    (let* ((uix (%unique-tuple-index-for graph d))
-           (key (%unique-tuple-key uix node graph)))
-      (when key (uix-remove uix key (id node)))))
+    (let ((uix (%unique-tuple-index-for graph d)))   ; NIL = unbuilt, GH #129
+      (when uix
+        (let ((key (%unique-tuple-key uix node graph)))
+          (when key (uix-remove uix key (id node)))))))
   (dolist (d (class-unique-slots (class-of node)))
     (let* ((uix (%unique-index-for graph d))
            (key (%unique-key uix (slot-value node (first d)) node graph)))
@@ -603,15 +630,21 @@ journaled.  Checks both the single-slot (:UNIQUE) and multi-slot
                                   (unique-index-slot-name uix) val
                                   (id node) intra)))
           (dolist (d (class-unique-tuple-specs (class-of node) graph))
-            (let* ((uix (%unique-tuple-index-for graph d))
-                   (key (%unique-tuple-key uix node graph)))
-              (when key
-                (%check-unique-key
-                 uix key (unique-index-owner-name uix)
-                 (unique-index-slot-names uix)
-                 (mapcar (lambda (s) (slot-value node s))
-                         (unique-index-slot-names uix))
-                 (id node) intra)))))))))
+            (let ((uix (%unique-tuple-index-for graph d)))
+              (if (null uix)
+                  ;; Unbuilt: consult-only, never conjure (GH #129).  Loud,
+                  ;; not silent -- a declared constraint is not enforcing.
+                  (log:warn "unique constraint ~S.~S is not built; this ~
+                             commit is unchecked against it"
+                            (second d) (first d))
+                  (let ((key (%unique-tuple-key uix node graph)))
+                    (when key
+                      (%check-unique-key
+                       uix key (unique-index-owner-name uix)
+                       (unique-index-slot-names uix)
+                       (mapcar (lambda (s) (slot-value node s))
+                               (unique-index-slot-names uix))
+                       (id node) intra)))))))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Rebuild on open (v1)
@@ -648,7 +681,7 @@ removes it."
                                        key (string-id existing) (string-id (id node)))
                              (uix-put uix key (id node)))))))
                  (dolist (d (class-unique-tuple-specs (class-of node) graph))
-                   (let* ((uix (%unique-tuple-index-for graph d))
+                   (let* ((uix (%unique-tuple-index-for graph d :create-p t))
                           (key (%unique-tuple-key uix node graph)))
                      (when key
                        (let ((existing (uix-lookup uix key)))
@@ -734,7 +767,7 @@ slot field; rebuilding it from live nodes." owner)
                         nil)
                        ((listp slot)
                         (%unique-tuple-index-for
-                         graph (list slot owner spec scope)))
+                         graph (list slot owner spec scope) :create-p t))
                        (t (%unique-index-for
                            graph (list slot owner spec scope))))))
         (when uix

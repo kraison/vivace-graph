@@ -1380,6 +1380,14 @@ An ordinary index and a unique constraint treat a ~nil~ component *differently*,
 
 A ~def-unique~ evaluated while its graph is already open builds the constraint's index *now*, and does so *strictly*: a pre-existing duplicate tuple signals ~unique-constraint-violation~ immediately, because a freshly-declared constraint finding conflicting data already in the graph is a real error to surface. The same build run at graph *open* time — reconciling every registered ~def-unique~ against the sidecar on every non-lazy open — is *tolerant* instead: it logs a warning and keeps the first tuple found, because a routine reopen must not turn into a hard failure over data written by a path that never went through enforcement (a peer/replication apply, for instance). This is exactly the existing single-slot ~:unique~ policy; multi-slot did not introduce a new one, only extended the existing split to tuples.
 
+Either build *skips a node whose key cannot be computed* rather than aborting — the same tolerance ~def-index~ has always had for a legacy node whose slots predate the declaration. The skip is logged, and it applies to the scan only: the live commit path is deliberately intolerant, because there a key that will not build is a defect in the data being written, not an artefact of schema evolution.
+
+**** An unbuilt constraint does not enforce, and says so
+
+A ~def-unique~ constraint is *built* at graph creation, at every non-lazy open, and at declaration time when the graph is already open. Between those points it can be missing — most plausibly because a build scan died partway and unwound what it had created.
+
+A missing constraint is *consulted, never conjured*: the commit path reads the registry, finds nothing, and so neither enforces the constraint nor invents an empty index to enforce it with. Every such commit logs a warning naming the constraint. This is a recoverable state — the next open, or a re-evaluated ~def-unique~, scans the live nodes and the constraint enforces again from then on. The alternative, an empty index created on demand by the commit path, looked like a *built* constraint to everything downstream: it enforced nothing, and it permanently suppressed the rebuild, because the rebuild skips any constraint already present in the registry.
+
 **** Compatibility
 
 An existing single-slot index or ~:unique~ constraint needs *no rebuild* to pick up multi-slot support, and there is *no on-disk storage-version change* — a single-slot index is simply the arity-1 case of the same tuple machinery. A graph created before multi-slot support existed reopens exactly as before and returns identical results in identical order.

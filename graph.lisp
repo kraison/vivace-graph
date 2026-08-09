@@ -481,6 +481,14 @@ to disk and remove it."
       (init-replication-log graph)
       (start-replication graph :package package)
       (setf (graph-open-p graph) t)
+      ;; Build the DEF-UNIQUE constraints registered for this graph, as
+      ;; OPEN-GRAPH does.  A fresh graph has no nodes, so this registers empty
+      ;; indexes rather than scanning -- but registration is what lets an
+      ;; ABSENT index mean "not built yet" instead of "brand new", which the
+      ;; consult-only commit path now relies on (GH #129).  After the slave
+      ;; replay above, so a subset replay is covered.
+      (let ((*graph* graph))
+        (install-unique-tuple-constraints graph))
       graph)))
 
 (defun open-graph (name location &key master-p slave-p master-host replication-port
