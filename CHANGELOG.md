@@ -58,6 +58,50 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Fixed
 
+- **Multi-slot index/constraint defects found by the whole-branch review** (#107).
+  All five were reproduced before being fixed, and each carries a regression test
+  confirmed to fail against the unfixed code.
+  - **A memory graph carrying any `def-unique` was unopenable after a clean close.**
+    The checkpoint image's unique-index dump had no multi-slot branch — it wrote the
+    singular slot name, which is `nil` for a tuple index — and the reopen fed that to
+    the single-slot resolver, ending in `(fdefinition nil)`. Since the image is the
+    only durable copy of a cleanly-closed memory graph (the journal is cleared at
+    checkpoint), this was data loss. The dump now records the slot *list*, and the
+    loader dispatches on its shape, exactly as the on-disk sidecar already did. An
+    image written by the broken code is skipped with a warning and its constraint
+    rebuilt, rather than failing the open.
+  - **A lazy memory graph reopened with a `def-unique` silently absent** whenever the
+    image did not carry it, because the open-time install sat inside the
+    `(unless (lazy-p graph) …)` block. It now runs on the lazy path too — the same
+    trade `rebuild-unique-indexes` already makes, since a constraint that stops
+    enforcing is worse than materializing its owner's blobs. It scans per owner type,
+    so unrelated classes stay unmaterialized.
+  - **`regenerate-secondary-indexes` silently emptied every `def-index`-only index.**
+    Its guard consulted only the MOP `:index` slots — and every multi-slot index is
+    `def-index`-only, there being no MOP surface for a tuple — so the rebuild no-opped
+    after the delete and an empty sidecar was persisted. Lookups then returned empty
+    instead of signalling. The guard now consults the `def-index` registry the way its
+    `:unique` counterpart already did, and `regenerate` runs `install` after `rebuild`
+    as `open-graph` does, so a declared index whose owner has no live node is
+    recreated rather than dropped.
+  - **An all-null query prefix returned wrong answers.** The query-side key builder
+    computed its "every component is null" gate over the components *given* rather
+    than over the index arity, conflating an all-null prefix — a real query, since the
+    write side stores a null component under a sentinel and the row does sit there —
+    with "no key at all". A prefix lookup missed those rows and a range bound went
+    open-ended. The write side was always correct.
+  - **A failed strict `def-unique` left a half-built, live constraint.** The index was
+    published before the scan and the strict path signalled on the *first* duplicate,
+    so the constraint covered only the prefix scanned before the error and duplicates
+    in the un-scanned tail committed unchecked. The strict signal is now deferred to
+    the end of a complete scan, so the constraint left behind is whole (keep-first on
+    the duplicate) and enforcing; a scan that dies for any other reason unregisters
+    what it created, so the build can be retried.
+  - The secondary and unique sidecar readers' `handler-case` now spans the per-record
+    loop, not just `cl-store:restore`: a sidecar can deserialize cleanly and still
+    hold a record shape this build does not know, and that must degrade to rebuild
+    like a torn write rather than failing `open-graph`.
+
 - **A failed snapshot no longer aborts `close-graph`** (#120). `close-graph` deregisters
   the graph from `*graphs*` and *then* snapshots, with nothing guarding the call — so a
   snapshot that signalled left every mmap open (heap, indexes, vertex/edge tables, vector
