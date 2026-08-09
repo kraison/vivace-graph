@@ -158,7 +158,10 @@ with no rebuild (GH #107).")
     (make-heap-index (graph-index-backend graph) (indexes graph)
                      '%index-comp-lessp
                      :head-key (%index-head-key arity)
-                     :tail-key (%index-tail-key arity)))
+                     :tail-key (%index-tail-key arity)
+                     :key-equal '%index-equal
+                     :key-serializer '%index-key-serialize
+                     :key-deserializer '%index-key-deserialize))
   (:method ((graph memory-graph-mixin) arity)
     (make-mem-skip-list
      :key-equal '%index-equal
@@ -179,7 +182,10 @@ carry their serialized keys, so reopening does not need to rebuild sentinels
 from it (GH #107)."
   (declare (ignore arity))
   (open-heap-index backend :address address :heap (indexes graph)
-                   :comparison '%index-comp-lessp))
+                   :comparison '%index-comp-lessp
+                   :key-equal '%index-equal
+                   :key-serializer '%index-key-serialize
+                   :key-deserializer '%index-key-deserialize))
 
 ;;; Ordering for a flat index key (v1 ... vn id): every component but the last
 ;;; compares with LESS-THAN, the trailing node id with KEY-VECTOR<.  At n=2 this
@@ -211,6 +217,56 @@ EQUALP.  At n=2 this is exactly REDUCE-EQUAL."
                for b in key2
                for i from 0
                always (if (= i (1- n1)) (equalp a b) (equal a b))))))
+
+;;; ---------------------------------------------------------------------------
+;;; Index key codec (GH #107)
+;;; ---------------------------------------------------------------------------
+;;; VIEW-KEY-SERIALIZE / VIEW-KEY-DESERIALIZE (views.lisp) hard-code a
+;;; 2-element (value id) key -- SECOND is spliced in raw as the id, so a 3+
+;;; element flat index key (v1 ... vn id) signals a TYPE-ERROR.  Views and
+;;; :UNIQUE stay on that pair, byte-for-byte, untouched; this is the index's
+;;; own pair.  At arity 1 it delegates outright (byte-identical output, no
+;;; rebuild for an existing on-disk single-slot index).  At arity >= 2 the
+;;; value tuple (v1 ... vn) is SERIALIZEd as one list behind +INDEX-TUPLE+, a
+;;; marker the deserializer checks first -- without it, a serialized list is
+;;; ambiguous between "the tuple's values" and "the arity-1 value happens to
+;;; be a list" (the case VIEW-KEY-DESERIALIZE already handles via its general,
+;;; non-+STRING+ branch).
+;;;
+;;; VIEW-KEY-SERIALIZE's CONCATENATE builds an unspecialized (VECTOR T), which
+;;; DESERIALIZE / VIEW-KEY-DESERIALIZE's own (ARRAY (UNSIGNED-BYTE 8))
+;;; parameter declarations reject outside of safety-0 code -- invisible in
+;;; production because a serialized key is always written to and re-read from
+;;; the mmap heap before it is next deserialized, never round-tripped in
+;;; memory.  A codec test round-trips in memory with no heap in between, so
+;;; %INDEX-KEY-SERIALIZE always returns a genuinely (UNSIGNED-BYTE 8)-typed
+;;; array (COERCE / CONCATENATE with that result type), which satisfies the
+;;; declaration either way and costs nothing on the disk path.
+
+(defun %index-key-serialize (key)
+  "Serialize flat index KEY, (v1 ... vn id), to a byte vector.  N=1 delegates
+to VIEW-KEY-SERIALIZE outright (byte-identical, including its +STRING+ fast
+path).  N>=2 is ID ++ +INDEX-TUPLE+ ++ SERIALIZE of (v1 ... vn) as one list."
+  (let ((vals (butlast key)))
+    (if (= (length vals) 1)
+        (coerce (view-key-serialize key) '(simple-array (unsigned-byte 8) (*)))
+        (let ((id (car (last key))))
+          (concatenate '(simple-array (unsigned-byte 8) (*))
+                       id (list +index-tuple+) (serialize vals))))))
+
+(defun %index-key-deserialize (array)
+  "Inverse of %INDEX-KEY-SERIALIZE.  Returns (VALUES key length).  +INDEX-TUPLE+
+right after the 16-byte id means an N>=2 value tuple follows; anything else
+(including the +STRING+ fast path) is VIEW-KEY-DESERIALIZE's arity-1 shape,
+so a list-valued single component still comes back as one component, not a
+tuple."
+  (declare (type (array (unsigned-byte 8)) array))
+  (if (and (> (length array) 16) (= (aref array 16) +index-tuple+))
+      (let ((id (make-array 16 :element-type '(unsigned-byte 8))))
+        (dotimes (i 16) (setf (aref id i) (aref array i)))
+        (multiple-value-bind (vals length) (deserialize (subseq array 17))
+          (values (append vals (list id)) (+ 17 length))))
+      (view-key-deserialize array)))
 
 (defun %index-key (six value)
   "The canonical key VALUE maps to in SIX (canonicalizer applied), or NIL for a

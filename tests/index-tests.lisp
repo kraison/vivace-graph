@@ -334,13 +334,11 @@ already does."
 ;;; --- arity-aware skip-list construction (GH #107) ---------------------------
 
 ;; Runs on the memory-graph mem-skip-list, not WITH-IX-GRAPH's on-disk
-;; :skip-list: VIEW-KEY-SERIALIZE (the shared view/unique/spatial codec) still
-;; hardcodes a 2-element (value id) key shape, so an arity-3 head/tail node
-;; cannot round-trip through it yet -- generalising that codec is later work,
-;; not this task's (Task 4 only makes the sentinel-key/comparator plumbing
-;; arity-aware).  MEM-SKIP-LIST stores keys as plain Lisp objects with no
-;; serialization step, so it proves the same head/tail-arity property without
-;; that unrelated, deliberately-deferred limitation (#107).
+;; :skip-list.  MEM-SKIP-LIST stores keys as plain Lisp objects with no
+;; serialization step, so it proves the head/tail-arity property with no
+;; codec involved at all.  The on-disk equivalent -- which DOES need a codec
+;; that can serialize a 4-element key, the gap Task 4 found and Task 4b
+;; closed -- is ON-DISK-ARITY-3-INDEX-CONSTRUCTS-AND-ROUND-TRIPS, below.
 (test secondary-skip-list-head-tail-match-arity
   "Head/tail sentinel keys must have arity+1 elements, or a multi-slot index's
 bounds sort wrongly against real keys (#107).  Neither skip-list backend has a
@@ -353,6 +351,62 @@ here."
            (tail (graph-db::mem-skip-list-tail sl)))
       (is (= 4 (length (graph-db::%sn-key head))))
       (is (= 4 (length (graph-db::%sn-key tail)))))))
+
+;;; --- index key codec (GH #107) ------------------------------------------
+
+;; VIEW-KEY-SERIALIZE (views.lisp) does (concatenate 'vector (second key)
+;; payload) -- it assumes SECOND is the node id, true only at arity 1.  At
+;; arity > 1 SECOND is a value component, not the id, and the CONCATENATE
+;; signals a TYPE-ERROR: an on-disk multi-slot index could not be
+;; constructed at all (Task 4 could only exercise the in-RAM MEM-SKIP-LIST,
+;; above).  %INDEX-KEY-SERIALIZE / %INDEX-KEY-DESERIALIZE (index.lisp) are
+;; the index's own codec -- VIEW-KEY-SERIALIZE / VIEW-KEY-DESERIALIZE stay
+;; untouched (they are shared with views and :UNIQUE).
+;;
+;; NOTE ON THE COMPARATOR: EQUAL, not EQUALP, would be the natural choice for
+;; comparing two deserialized keys, but EQUAL on a general (non-string,
+;; non-bit-vector) array is EQ, not elementwise -- it would report the id
+;; byte-array mismatched even when its 16 bytes match, since deserialize
+;; always allocates a fresh array.  EQUALP compares array elements, which is
+;; what "the same key came back" actually means here.
+(test index-key-codec-round-trips-and-matches-at-arity-1
+  "Arity 1 must be byte-identical to the view codec (no rebuild), and every
+arity must round-trip -- including a single component that is itself a list."
+  (let ((id (uuid:uuid-to-byte-array (uuid:make-v4-uuid))))
+    ;; requirement 1: byte-identical at arity 1
+    (is (equalp (graph-db::view-key-serialize (list "alice" id))
+                (graph-db::%index-key-serialize (list "alice" id))))
+    (is (equalp (graph-db::view-key-serialize (list 42 id))
+                (graph-db::%index-key-serialize (list 42 id))))
+    ;; requirement 2: round-trip at several arities
+    (dolist (key (list (list "alice" id)
+                       (list '("a" "b") id)   ; list-valued single component
+                       (list "ops" "e1" id)
+                       (list "ops" "e1" "at" id)))
+      (is (equalp key (graph-db::%index-key-deserialize
+                       (graph-db::%index-key-serialize key)))))))
+
+;; The assertion Task 4 could not make: an on-disk arity-3 index that
+;; actually constructs (VIEW-KEY-SERIALIZE would TYPE-ERROR on the first
+;; write -- the 4-element head/tail key alone) and round-trips a lookup
+;; through real mmap-backed serialize/deserialize, not MEM-SKIP-LIST's plain
+;; Lisp objects.
+(test on-disk-arity-3-index-constructs-and-round-trips
+  "An on-disk (:skip-list) secondary index of arity 3 constructs, and a
+range-cursor lookup by its full (v1 v2 v3) prefix returns the id inserted
+under it."
+  (with-ix-graph (g)
+    (let* ((sl (graph-db::make-secondary-skip-list g 3))
+           (id (uuid:uuid-to-byte-array (uuid:make-v4-uuid))))
+      (add-to-skip-list sl (list "ops" "e1" "at" id) nil)
+      (let* ((cur (make-range-cursor
+                   sl
+                   (list "ops" "e1" "at" graph-db::+null-key+)
+                   (list "ops" "e1" "at" graph-db::+max-key+)))
+             (node (cursor-next cur :eoc)))
+        (is (not (eql node :eoc)))
+        (is (equalp id (fourth (graph-db::%sn-key node))))
+        (is (eql :eoc (cursor-next cur :eoc)))))))
 
 (test memory-backend-equality-and-range
   "The index works on a memory-graph (mem-skip-list backing), :index t and def-index."
