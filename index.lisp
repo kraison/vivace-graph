@@ -313,8 +313,12 @@ tuple."
 canonicalizer applied, +NULL-COMPONENT+ substituted for a null component.  At
 arity 1, VALUE is SIX's one component as-is (even list-valued -- e.g. a
 list-valued single slot); at arity > 1, VALUE is a list of up to SIX's arity
-components, left-to-right.  NIL when every given component is null --
-nothing to look up (the query-side mirror of %INDEX-TUPLE-KEY, GH #107)."
+components, left-to-right.  NIL only when the given components are all null
+AND they cover the FULL arity -- nothing is stored under an all-null tuple.
+A SHORTER all-null prefix is a real query: the write side stores a null
+component as +NULL-COMPONENT+, so rows do sit under it.  Gating on the given
+components alone conflated the two and lost those rows (the query-side mirror
+of %INDEX-TUPLE-KEY, GH #107)."
   (let* ((arity (length (slot-index-slot-names six)))
          (cans (slot-index-canonicalizers six))
          (vals (if (= arity 1) (list value) value))
@@ -325,7 +329,7 @@ nothing to look up (the query-side mirror of %INDEX-TUPLE-KEY, GH #107)."
                                   (t (setf any t)
                                      (let ((c (nth i cans)))
                                        (if c (funcall c v) v)))))))
-    (when any key)))
+    (when (or any (< (length vals) arity)) key)))
 
 (defun %index-tuple-key (six node)
   "The value components of NODE's key for SIX: per-position canonicalizer

@@ -296,6 +296,30 @@ instead of erroring (#107)."
       (index-range g 'ix-claim '(ns key rel)
                   :end (list "ops" "e1" "at" "extra")))))
 
+(test all-null-query-prefix-is-a-real-prefix
+  "GH #107 (whole-branch review): %INDEX-KEY computed its \"every component is
+null\" gate over the GIVEN components rather than over the index ARITY, so an
+all-null PREFIX -- a legitimate query, since the write side stores a null
+component as +NULL-COMPONENT+ and the row does sit under it -- was
+indistinguishable from \"no key at all\" and silently returned NIL.  The
+lookup then found nothing and MAP-INDEX, seeing a NIL bound, went open-ended.
+Only the read side was wrong; the write side has always been right."
+  (with-ix-graph (g)
+    (with-transaction ()
+      (make-ix-claim :ns nil :key "q" :rel "z")
+      (make-ix-claim :ns "m" :key "n" :rel "o")
+      (make-ix-claim :ns "x" :key "y" :rel "z"))
+    (is (= 1 (length (index-lookup g 'ix-claim '(ns key rel) '(nil)
+                                   :prefix t)))
+        "the null-leading row is findable by its stored +NULL-COMPONENT+")
+    (is (= 1 (length (index-range g 'ix-claim '(ns key rel)
+                                  :start '(nil) :end '(nil))))
+        "a (nil)..(nil) window is the null-leading rows, not every row")
+    ;; The other half of the arity gate: at FULL arity an all-null tuple is
+    ;; genuinely absent (%INDEX-TUPLE-KEY declines to index it), so NIL stands.
+    (is (null (index-lookup g 'ix-claim '(ns key rel) '(nil nil nil)))
+        "a full-arity all-null probe still matches nothing")))
+
 ;;; --- declaration surface: positional :canonicalize (GH #107, Task 6) -------
 
 (test resolve-index-canonicalizers-positional-vs-single-spec
