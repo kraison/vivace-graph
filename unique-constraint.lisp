@@ -785,34 +785,29 @@ sidecar was present (caller skips REBUILD-UNIQUE-INDEXES); NIL to fall back to r
 
 An UNREADABLE sidecar falls back to rebuild rather than failing the open (GH #63),
 mirroring RESTORE-SPATIAL-INDEX-ROOTS -- nodes remain authoritative, so
-REBUILD-UNIQUE-INDEXES reconstructs the truth.  :UNREADABLE is a sentinel
-distinct from NIL: a graph with no unique indexes declared saves an empty
-list, which must still count as a successfully-restored (if empty) sidecar,
-not trigger a spurious rebuild."
+REBUILD-UNIQUE-INDEXES reconstructs the truth.  The guard spans the per-record
+DESTRUCTURING-BIND loop, not just the RESTORE: a sidecar can deserialize
+cleanly and still hold a record shape this build does not know, and an
+unexpected shape must degrade to rebuild like any other unreadable sidecar,
+not fail OPEN-GRAPH.  A graph with no unique indexes declared saves an empty
+list, which still counts as a successfully-restored (if empty) sidecar and
+must not trigger a spurious rebuild -- hence T from the empty loop, not NIL."
   (let ((file (unique-index-root-file (location graph))))
     (when (probe-file file)
-      (let ((records (handler-case (cl-store:restore file)
-                        (error (e)
-                          (warn "Unique index sidecar ~A is unreadable (~A); rebuilding ~
-                                 from live nodes, which are authoritative."
-                                file e)
-                          :unreadable))))
-        (unless (eq records :unreadable)
-          (let ((reg (or (unique-indexes graph)
+      (handler-case
+          (let ((records (cl-store:restore file))
+                (reg (or (unique-indexes graph)
                          (setf (unique-indexes graph)
-                               (make-hash-table :test 'equal
-                                                #+sbcl :synchronized #+sbcl t
-                                                #+ccl :shared #+ccl t
-                                                #+graph-db-ecl-sync-hash :synchronized
-                                                #+graph-db-ecl-sync-hash t)))))
-            (dolist (r records)
+                               (%make-uix-registry-table)))))
+            (dolist (r records t)
               ;; BACKEND is absent in pre-B+-tree sidecars (5-tuples) -> defaults to
               ;; :skip-list, so an existing graph reopens exactly as before.
               ;; SLOT is a list for a multi-slot (DEF-UNIQUE) record, a bare
               ;; symbol for a single-slot (:UNIQUE) one -- SAVE-UNIQUE-INDEX-
               ;; ROOTS always writes that shape, so LISTP dispatch is
               ;; unambiguous (#107).
-              (destructuring-bind (owner slot spec scope address &optional (backend :skip-list)) r
+              (destructuring-bind (owner slot spec scope address
+                                   &optional (backend :skip-list)) r
                 (if (listp slot)
                     (setf (gethash (cons owner slot) reg)
                           (%make-unique-index
@@ -830,4 +825,9 @@ not trigger a spurious rebuild."
                              :test test :canonicalizer canon :scope scope
                              :skip-list (%open-unique-skip-list
                                          graph address backend))))))))
-          t)))))
+        (error (e)
+          (warn "Unique index sidecar ~A is unreadable (~A); rebuilding ~
+from live nodes, which are authoritative." file e)
+          ;; Partially-restored indexes are left in place deliberately -- see
+          ;; RESTORE-SECONDARY-INDEX-ROOTS (GH #107).
+          nil)))))

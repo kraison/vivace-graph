@@ -641,44 +641,60 @@ mirroring RESTORE-SPATIAL-INDEX-ROOTS -- nodes remain authoritative, so
 REBUILD-SECONDARY-INDEXES reconstructs the truth.  :UNREADABLE is a sentinel
 distinct from NIL: a graph with no secondary indexes declared saves an empty
 list, which must still count as a successfully-restored (if empty) sidecar,
-not trigger a spurious rebuild."
+not trigger a spurious rebuild.
+
+The guard spans the per-record DESTRUCTURING-BIND loop, not just the RESTORE:
+a sidecar can deserialize cleanly and still hold a record shape this build does
+not know (the record grew a slot-names list on #107), and an unexpected shape
+must degrade to rebuild like any other unreadable sidecar, not fail OPEN-GRAPH."
   (let ((file (secondary-index-root-file (location graph))))
     (when (probe-file file)
-      (let ((records (handler-case (cl-store:restore file)
-                        (error (e)
-                          (warn "Secondary index sidecar ~A is unreadable (~A); rebuilding ~
-                                 from live nodes, which are authoritative."
-                                file e)
-                          :unreadable))))
-        (unless (eq records :unreadable)
-          (let ((reg (or (secondary-indexes graph)
-                         (setf (secondary-indexes graph)
-                               (make-hash-table :test 'equal
-                                                #+sbcl :synchronized #+sbcl t
-                                                #+ccl :shared #+ccl t
-                                                #+graph-db-ecl-sync-hash :synchronized
-                                                #+graph-db-ecl-sync-hash t)))))
-            (dolist (r records)
-              (destructuring-bind (owner stored-slot address
-                                    &optional (backend :skip-list)) r
-                ;; STORED-SLOT is a bare symbol in a sidecar written before
-                ;; #107 (multi-slot lists did not exist yet); normalise so
-                ;; both eras share this one path (GH #107).
-                (let ((slot-names (%normalize-slots stored-slot)))
-                  (setf (gethash (cons owner slot-names) reg)
-                        (%make-slot-index
-                         :owner-name owner :slot-names slot-names
-                         :canonicalizers (%owner-slot-canonicalizer
-                                          owner slot-names graph)
-                         :skip-list (%open-secondary-skip-list
-                                     graph address (length slot-names)
-                                     backend)))))))
-          t)))))
+      (let ((ok (handler-case
+                    (let ((records (cl-store:restore file))
+                          (reg (or (secondary-indexes graph)
+                                   (setf (secondary-indexes graph)
+                                         (make-hash-table
+                                          :test 'equal
+                                          #+sbcl :synchronized #+sbcl t
+                                          #+ccl :shared #+ccl t
+                                          #+graph-db-ecl-sync-hash :synchronized
+                                          #+graph-db-ecl-sync-hash t)))))
+                      (dolist (r records t)
+                        (destructuring-bind (owner stored-slot address
+                                             &optional (backend :skip-list)) r
+                          ;; STORED-SLOT is a bare symbol in a sidecar written
+                          ;; before #107 (multi-slot lists did not exist yet);
+                          ;; normalise so both eras share this one path.
+                          (let ((slot-names (%normalize-slots stored-slot)))
+                            (setf (gethash (cons owner slot-names) reg)
+                                  (%make-slot-index
+                                   :owner-name owner :slot-names slot-names
+                                   :canonicalizers (%owner-slot-canonicalizer
+                                                    owner slot-names graph)
+                                   :skip-list (%open-secondary-skip-list
+                                               graph address
+                                               (length slot-names)
+                                               backend)))))))
+                  (error (e)
+                    (warn "Secondary index sidecar ~A is unreadable (~A); ~
+rebuilding from live nodes, which are authoritative."
+                          file e)
+                    nil))))
+        ;; A partial restore leaves part of the registry populated.  Left in
+        ;; place on purpose: those indexes were reopened from valid addresses,
+        ;; and the caller's REBUILD repopulates them idempotently (IX-PUT keys
+        ;; by the whole composite) while creating the rest -- clearing them
+        ;; would strand their heap pages.
+        ok))))
 
 (defun regenerate-secondary-indexes (graph)
-  "Drop every on-disk secondary index and rebuild it on GRAPH's CURRENT :INDEX-BACKEND,
-persisting the new backend tags.  The parallel of REGENERATE-ALL-VIEWS /
-REGENERATE-UNIQUE-INDEXES / REBUILD-SPATIAL-INDEX for an in-place backend switch."
+  "Drop every on-disk secondary index and rebuild it on GRAPH's CURRENT
+:INDEX-BACKEND, persisting the new backend tags.  The parallel of REGENERATE-
+ALL-VIEWS / REGENERATE-UNIQUE-INDEXES / REBUILD-SPATIAL-INDEX for an in-place
+backend switch.  REBUILD then INSTALL, the same pair OPEN-GRAPH runs: REBUILD repopulates from
+the nodes, INSTALL recreates a DEF-INDEX whose owner has no live node.  Without
+INSTALL a declared-but-empty index would be dropped outright, and %REQUIRE-INDEX
+reads that as \"declared, empty\" -- empty results, no error (GH #107)."
   (when (secondary-indexes graph)
     (maphash (lambda (k six)
                (declare (ignore k))

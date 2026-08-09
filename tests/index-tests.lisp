@@ -706,6 +706,37 @@ already does."
             (ignore-errors (close-graph g))
             (collect-garbage)))))))
 
+(test secondary-sidecar-unknown-record-shape-falls-back-to-rebuild
+  "GH #107 (whole-branch review): the sidecar's record shape changed on this
+branch (the slot field became a list), so a record shape THIS build does not
+know must degrade to rebuild exactly as a torn write does.  The HANDLER-CASE
+covered only CL-STORE:RESTORE, leaving the per-record DESTRUCTURING-BIND to
+fail OPEN-GRAPH outright on a sidecar that deserialized perfectly well."
+  (with-temp-directory (dir)
+    (let ((path (namestring dir)))
+      (let ((g (make-graph *ix-graph-name* path :buffer-pool-size 1000)))
+        (unwind-protect
+             (let ((*graph* g))
+               (with-transaction ()
+                 (make-ix-person :name "a" :age 30)
+                 (make-ix-person :name "b" :age 30)))
+          (close-graph g)))
+      ;; A record from no era at all: too few fields for any DESTRUCTURING-BIND
+      ;; this file has ever had.  First in the list, so it is hit before any
+      ;; real record is consumed.
+      (let ((file (graph-db::secondary-index-root-file path)))
+        (graph-db::%atomic-cl-store (cons '(:from-the-future)
+                                          (cl-store:restore file))
+                                    file))
+      (handler-bind ((warning #'muffle-warning))    ; the bad-sidecar warning
+        (let ((g (open-graph *ix-graph-name* path :buffer-pool-size 1000)))
+          (unwind-protect
+               (is (equal '("a" "b")
+                          (ix-names (index-lookup g 'ix-person 'age 30)))
+                   "open survived and rebuilt from the still-intact nodes")
+            (ignore-errors (close-graph g))
+            (collect-garbage)))))))
+
 ;;; --- dual backend -----------------------------------------------------------
 
 (test bplus-backend-equality-and-range
