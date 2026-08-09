@@ -186,6 +186,17 @@ null-bearing tuple falls inside a prefix scan of its populated parts (#107)."
   (is-false (less-than 0 graph-db::+null-component+))
   (is-false (less-than "a" graph-db::+null-component+))
   (is-false (less-than graph-db::+null-component+ graph-db::+null-component+)))
+
+;; timestamp and uuid:uuid have first-class LESS-THAN methods, so without an
+;; explicit override the sentinel dispatches to the generic symbol methods and
+;; sorts ABOVE them -- breaking transitivity silently (GH #107).
+(test null-component-orders-below-timestamps-and-uuids
+  "The sentinel must sort below every concrete type LESS-THAN dispatches on."
+  (let ((ts (local-time:now)) (id (uuid:make-v4-uuid)))
+    (is-true  (less-than graph-db::+null-component+ ts))
+    (is-true  (less-than graph-db::+null-component+ id))
+    (is-false (less-than ts graph-db::+null-component+))
+    (is-false (less-than id graph-db::+null-component+))))
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -220,12 +231,16 @@ In `utilities.lisp`, inside the `less-than` generic, immediately after the
   (:method ((x (eql +null-component+)) (y symbol))  t)
   (:method ((x (eql +null-component+)) (y (eql t))) t)
   (:method ((x (eql +null-component+)) (y cons))    t)
+  (:method ((x (eql +null-component+)) (y timestamp))  t)
+  (:method ((x (eql +null-component+)) (y uuid:uuid))  t)
   (:method ((x (eql +null-component+)) (y null))    nil)
   (:method ((x number)  (y (eql +null-component+))) nil)
   (:method ((x string)  (y (eql +null-component+))) nil)
   (:method ((x symbol)  (y (eql +null-component+))) nil)
   (:method ((x (eql t)) (y (eql +null-component+))) nil)
   (:method ((x cons)    (y (eql +null-component+))) nil)
+  (:method ((x timestamp)  (y (eql +null-component+))) nil)
+  (:method ((x uuid:uuid)  (y (eql +null-component+))) nil)
   (:method ((x null)    (y (eql +null-component+))) t)
 ```
 
