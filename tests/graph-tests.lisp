@@ -27,6 +27,15 @@
   ((payload))
   :graph-db-integration-test)
 
+;; Persistent slots carrying an :INITFORM.  No fixture declared one until
+;; GH #128, which is why nothing caught an initform shadowing the stored
+;; value on reopen.  GAP is deliberately never written, standing in for a
+;; slot added to the schema after a node was already stored.
+(def-vertex g-defaulted ()
+  ((name :initform "DEFAULT")
+   (gap  :initform "FILLER"))
+  :graph-db-integration-test)
+
 (def-edge g-knows ()
   ((since))
   :graph-db-integration-test)
@@ -292,6 +301,52 @@ presence, not non-NIL value."
                (is (string= "A" (slot-value v 'name))))
           (close-graph g :snapshot-p nil)
           (collect-garbage))))))
+
+(test stored-value-beats-initform-across-reopen
+  "A persistent slot's STORED value survives a reopen even when the slot
+declares an :INITFORM, and an initform still fills a slot the stored data
+has no entry for -- stored data wins per slot, the initform fills gaps
+(GH #128).  Before the fix the initform populated the DATA alist during
+CHANGE-NODE-CLASS, so MAYBE-INIT-NODE-DATA's (NULL (DATA NODE)) guard
+declined to deserialize and every such slot read back as its default."
+  (with-temp-directory (dir)
+    (let (id)
+      (let ((g (make-graph *integration-graph-name* (namestring dir)
+                           :buffer-pool-size 1000)))
+        (unwind-protect
+             (let ((*graph* g))
+               (with-transaction ()
+                 (setq id (id (make-g-defaulted :name "STORED")))))
+          (close-graph g :snapshot-p nil)))
+      (let ((g (open-graph *integration-graph-name* (namestring dir))))
+        (unwind-protect
+             (let* ((*graph* g) (v (lookup-vertex id)))
+               (is (string= "STORED" (slot-value v 'name))
+                   "stored value must beat the initform after reopen")
+               (is (string= "FILLER" (slot-value v 'gap))
+                   "initform still fills a slot the stored data lacks"))
+          (close-graph g :snapshot-p nil)
+          (collect-garbage))))))
+
+(test stored-value-beats-initform-in-scans
+  "The same holds on the scan path, not only LOOKUP-VERTEX -- MAP-VERTICES
+materializes through the same guard (GH #128)."
+  (with-temp-directory (dir)
+    (let ((g (make-graph *integration-graph-name* (namestring dir)
+                         :buffer-pool-size 1000)))
+      (unwind-protect
+           (let ((*graph* g))
+             (with-transaction () (make-g-defaulted :name "SCANNED")))
+        (close-graph g :snapshot-p nil)))
+    (let ((g (open-graph *integration-graph-name* (namestring dir))))
+      (unwind-protect
+           (let ((seen '()))
+             (map-vertices (lambda (v) (push (slot-value v 'name) seen))
+                           g :vertex-type 'g-defaulted)
+             (is (equal '("SCANNED") seen)
+                 "a typed scan must see the stored value, not the initform"))
+        (close-graph g :snapshot-p nil)
+        (collect-garbage)))))
 
 (test slot-makunbound-clears-persistent-slot
   "slot-makunbound on a persistent slot removes its stored value (and stays

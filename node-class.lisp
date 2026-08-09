@@ -394,6 +394,12 @@ is preserved."
    (deleted-p :accessor deleted-p :initform nil :initarg :deleted-p :type boolean
               :meta t :persistent nil)
    (data :accessor data :initarg :data :initform nil :meta t :persistent nil)
+   ;; True once DATA has been reconciled against the heap bytes.  DATA alone
+   ;; cannot say so: CHANGE-NODE-CLASS applies a persistent slot's :INITFORM
+   ;; through (SETF SLOT-VALUE-USING-CLASS), which writes the alist, so a
+   ;; defaulted node arrives with DATA already non-NIL (GH #128).
+   (heap-merged-p :accessor heap-merged-p :initform nil :initarg :heap-merged-p
+                  :type boolean :meta t :persistent nil)
    (bytes :accessor bytes :initform :init :initarg :bytes :meta t :persistent nil)
    ;; Home graph; NIL = unknown -> caller falls back to *GRAPH* (GH #53)
    (graph :accessor node-graph :initform nil :initarg :graph

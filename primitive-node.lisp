@@ -207,6 +207,17 @@ garbage.  So MAYBE-INIT-NODE-DATA no-ops while this is bound; the data is set
 explicitly afterward (the transaction-node path) or materialized lazily later
 (the lhash path, when this is NIL and the pointer is local).")
 
+(defun %merge-stored-over-defaults (stored current)
+  "STORED wins per slot; entries in CURRENT whose key STORED has no entry for
+survive.  CURRENT holds whatever CHANGE-NODE-CLASS's :INITFORM application put
+in the alist, so this is the rule that lets a slot added to the schema after a
+node was written still read as its default, while a slot the node actually
+stored reads as what was stored (GH #128)."
+  (if (null current)
+      stored
+      (append stored
+              (remove-if (lambda (entry) (assoc (car entry) stored)) current))))
+
 (defun maybe-init-node-data (node &key (graph *graph*))
   (when (and (not *initializing-node*)
              (> (data-pointer node) 0))
@@ -227,10 +238,15 @@ explicitly afterward (the transaction-node path) or materialized lazily later
                          :mmap (memory-mmap (heap (node-home-graph node graph)))
                          :loc (data-pointer node)))))
     ;; Deserialize lazily from the in-memory bytes (safe; *graph* is bound here).
-    (when (and (null (data node))
+    ;; Gated on HEAP-MERGED-P, not on (NULL (DATA NODE)): a slot with an
+    ;; :INITFORM arrives with DATA already populated, and gating on emptiness
+    ;; would silently keep the default instead of the stored value (GH #128).
+    (when (and (not (heap-merged-p node))
                (bytes node)
                (not (eq (bytes node) :init)))
-      (setf (data node) (deserialize (bytes node)))))
+      (setf (data node) (%merge-stored-over-defaults (deserialize (bytes node))
+                                                     (data node))
+            (heap-merged-p node) t)))
   node)
 
 (defmethod lookup-node ((table lhash) (key array) (graph graph))
