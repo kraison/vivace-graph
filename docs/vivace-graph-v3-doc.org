@@ -1031,6 +1031,8 @@ This is the exact problem that indexes solve in a traditional relational databas
 - *Unique constraints* (~:unique~) — an ordered index that additionally *enforces* uniqueness at the commit boundary.
 - *Vector indexes* (~:vector-index~) — dense embeddings with cosine kNN search.
 
+Both ~def-index~ and ~def-unique~ also take a *slot list* instead of one slot, for an index or constraint over a tuple of values — see "Multi-slot (tuple) indexes and unique constraints" below.
+
 If you just want "find the user whose email is X", the general ordered index is what you want, and it is a one-word slot annotation; see "General ordered indexes" below. Views are the more powerful tool for when that is not enough.
 
 *** The "Why": Avoiding Full Graph Scans
@@ -1258,6 +1260,8 @@ By default a constraint is ~:scope :local~ — the value is unique within *this*
 
 Truly global uniqueness — a value that must be unique across *all* devices (~:scope :local~, or a future ~:scope :hub~, in a peer setting) — requires the hub to arbitrate cross-device collisions. That arbiter is not yet built (tracked as issue #51); until then, prefer ~:origin~ for peer-replicated unique values.
 
+~:unique~ above is single-slot; a constraint enforced across a *tuple* of slots is ~def-unique~, covered together with multi-slot ordered indexes in "Multi-slot (tuple) indexes and unique constraints" below.
+
 *** General ordered indexes (~:index~ / ~def-index~)
 
 A *view* is the most general secondary index — you write a ~:map~ lambda that emits arbitrary keys. When all you want is "index a slot for fast equality and range queries," VivaceGraph offers a lighter, declarative *ordered index* on a slot. It is, in effect, a ~:unique~ index without the enforcement: the same durable, backend-agnostic ordered map (skip list or B+ tree; an in-RAM map on a memory-graph), maintained on the commit path, but a value may be shared by many nodes and nothing is ever rejected.
@@ -1300,7 +1304,75 @@ Querying a *declared* index that happens to hold no matching value returns an em
 
 Like views, unique, and spatial, an ordered index is *backend-agnostic* — skip list or B+ tree per the graph's ~:index-backend~ (Chapter 3) — durable on the on-disk backend (reopened from a sidecar, no scan), and rebuilt on open on the memory backend. Devices maintain it for *pulled* nodes too, so a replicated node is findable by index the same as a locally-authored one. Switch a graph's ordered indexes to a different backend in place with ~regenerate-secondary-indexes~ (the parallel of ~regenerate-all-views~; see Chapter 3).
 
-When to reach for which: use a *view* when the index key is computed or you need map-reduce aggregation; use an *ordered index* when you simply want a slot indexed for equality and range. (Two current limitations: multi-slot/composite keys and true reverse-streaming cursors are not yet built but are designed for; and a *lazy* memory-graph does not rebuild its ordered indexes on reopen — see Chapter 3 — so use a non-lazy memory graph if you need them to survive a lazy reopen.)
+When to reach for which: use a *view* when the index key is computed or you need map-reduce aggregation; use an *ordered index* when you simply want a slot indexed for equality and range. (One current limitation: true reverse-streaming cursors are not yet built. A *lazy* memory-graph also does not rebuild its ordered indexes on reopen — see Chapter 3 — so use a non-lazy memory graph if you need them to survive a lazy reopen. Multi-slot/composite keys, formerly on this list as unbuilt, are supported — see the next section.)
+
+*** Multi-slot (tuple) indexes and unique constraints
+
+Both ~def-index~ and ~def-unique~ also accept a *slot list* in place of a single slot name, giving an ordered index — or a uniqueness constraint — over the tuple of values, keyed left to right. A bare symbol is still accepted and behaves exactly as before; the single-slot form is not a special case bolted onto the tuple form, it *is* the tuple form at arity 1.
+
+#+BEGIN_SRC lisp
+  (def-vertex claim ()
+    ((ns  :initarg :ns)      ; namespace
+     (key :initarg :key)     ; external key within that namespace
+     (rel :initarg :rel))    ; relation
+    :my-app)
+
+  (def-index  claim (ns key rel) :my-app)   ; ordered index on the (ns, key, rel) triple
+  (def-unique claim (ns key)     :my-app)   ; (ns, key) must be unique
+#+END_SRC
+
+Query a tuple index with a *value list*, one entry per slot, left to right:
+
+#+BEGIN_SRC lisp
+  (index-lookup graph 'claim '(ns key rel) (list "ops" "e1" "at"))   ; exact tuple
+#+END_SRC
+
+**** Positional canonicalizers
+
+~:canonicalize~ on a multi-slot ~def-index~ or ~def-unique~ takes a *list*, one entry per component, in slot order; ~nil~ in a position means identity (no transform) for that component. A single function designator (a symbol, ~#'fn~, or a ~lambda~ form) still means what it always has — apply that one function to a single-slot index's lone value:
+
+#+BEGIN_SRC lisp
+  ;; :ns downcased, :key left as-is (positional, one entry per slot)
+  (def-index claim (ns key) :my-app :canonicalize (string-downcase nil))
+
+  ;; unchanged single-slot form: one function, not a list
+  (def-index user email :my-app :canonicalize string-downcase)
+#+END_SRC
+
+The positional list's length must equal the index's arity exactly, or it *signals*. An earlier version of this feature silently truncated or padded a mismatched list; nothing shipped ever relied on that behavior, and a wrong-length list is exactly the "no error, wrong answer" failure this feature exists to rule out everywhere else, so the declaration surface holds itself to the same standard.
+
+**** ~:prefix~ and value-list arity
+
+~index-lookup~'s ~value~ list must supply exactly as many components as the index's arity — unless you pass ~:prefix t~, in which case a *shorter* list scans every tuple that starts with those components. This is deliberate strictness, not an oversight: a short value list without ~:prefix t~ signals rather than silently returning a superset of what you meant to ask for. Too many components is never rescued by ~:prefix t~ either — an overshoot always signals, on both ~index-lookup~ and ~index-range~.
+
+#+BEGIN_SRC lisp
+  (index-lookup graph 'claim '(ns key rel) (list "ops"))             ; signals: too short
+  (index-lookup graph 'claim '(ns key rel) (list "ops") :prefix t)   ; ok: prefix scan
+#+END_SRC
+
+**** The null asymmetry
+
+An ordinary index and a unique constraint treat a ~nil~ component *differently*, and the difference is deliberate — it will surprise you if you expect one to mirror the other:
+
+- A ~def-index~ *stores* a null component under a sentinel value, so the row stays findable by a prefix scan of its populated components (the previous section). Silently omitting null-bearing rows would make "look up everything in this namespace" quietly incomplete.
+- A ~def-unique~ constraint instead *exempts* any tuple containing a null component from enforcement entirely, matching SQL's NULL-never-equals-NULL. Two rows that agree on every populated component but are both ~nil~ in the same optional slot do *not* collide — each commits, and neither blocks the other.
+
+#+BEGIN_SRC lisp
+  (def-unique claim (ns key) :my-app)     ; key is optional (initform NIL)
+  (with-transaction ()
+    (make-claim :ns "ops" :key nil)
+    (make-claim :ns "ops" :key nil))      ; both commit: the CONSTRAINT is exempt for
+                                           ; each row, neither exempts the OTHER from
+                                           ; being written
+#+END_SRC
+
+**** Strict vs. tolerant build
+
+A ~def-unique~ evaluated while its graph is already open builds the constraint's index *now*, and does so *strictly*: a pre-existing duplicate tuple signals ~unique-constraint-violation~ immediately, because a freshly-declared constraint finding conflicting data already in the graph is a real error to surface. The same build run at graph *open* time — reconciling every registered ~def-unique~ against the sidecar on every non-lazy open — is *tolerant* instead: it logs a warning and keeps the first tuple found, because a routine reopen must not turn into a hard failure over data written by a path that never went through enforcement (a peer/replication apply, for instance). This is exactly the existing single-slot ~:unique~ policy; multi-slot did not introduce a new one, only extended the existing split to tuples.
+
+**** Compatibility
+
+An existing single-slot index or ~:unique~ constraint needs *no rebuild* to pick up multi-slot support, and there is *no on-disk storage-version change* — a single-slot index is simply the arity-1 case of the same tuple machinery. A graph created before multi-slot support existed reopens exactly as before and returns identical results in identical order.
 
 *** Vector indexes (~:vector-index~) and cosine kNN search
 

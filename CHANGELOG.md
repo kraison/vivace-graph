@@ -11,6 +11,45 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ## [Unreleased]
 
+### Added
+
+- **Multi-slot (tuple) keys for `def-index` and `def-unique`** (#107). Both macros
+  now accept a *slot list* — `(def-index claim (ns key rel) :app)`, `(def-unique
+  claim (ns key) :app)` — giving an ordered index or a uniqueness constraint over
+  the tuple, keyed left to right; a bare symbol still works unchanged, as the
+  arity-1 case of the same machinery. Query a tuple index with a value list:
+  `(index-lookup graph 'claim '(ns key rel) (list "ops" "e1" "at"))`.
+  - `:canonicalize` on a multi-slot index takes a *positional list*, one entry
+    per component (`nil` = identity); a single function designator still applies
+    to a single-slot index exactly as before. A positional list whose length
+    doesn't match the index's arity now **signals** rather than silently
+    truncating or padding — nothing shipped relied on the old behavior.
+  - `index-lookup` takes `:prefix t` for a value list shorter than the index's
+    arity (a prefix scan); without it, a short list **signals** rather than
+    silently returning a wider result than asked for. Too many components
+    always signals, `:prefix t` or not, on both `index-lookup` and
+    `index-range`.
+  - **The null asymmetry, worth stating plainly**: an ordinary index *stores* a
+    null component under a sentinel, so the row stays findable by a prefix scan
+    of its populated components; a `def-unique` constraint instead *exempts*
+    any tuple containing a null component, matching SQL's NULL-never-equals-
+    NULL. Two rows agreeing on every populated component but both `nil`
+    elsewhere therefore do not collide.
+  - `def-unique`'s build is **strict** (signals on a pre-existing duplicate)
+    only when a constraint is newly declared against an already-open graph;
+    it is **tolerant** (logs and keeps the first) when reconciled at graph
+    open, matching the existing single-slot `:unique` split — multi-slot
+    extends that policy rather than introducing a new one.
+  - The peer pull-apply paths (`apply-peer-authored-op`,
+    `apply-peer-create-writes`) maintain multi-slot indexes and constraints the
+    same as the local-commit path, since all three route through the same
+    apply functions — verified directly rather than assumed, with dedicated
+    peer-suite coverage.
+  - **No rebuild and no on-disk storage-version change** for existing
+    single-slot indexes or constraints — a single-slot index is simply the
+    arity-1 case of the tuple machinery. Manual: Chapter 8, "Multi-slot (tuple)
+    indexes and unique constraints".
+
 ### Fixed
 
 - **A failed snapshot no longer aborts `close-graph`** (#120). `close-graph` deregisters
