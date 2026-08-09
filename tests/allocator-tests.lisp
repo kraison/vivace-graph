@@ -47,6 +47,16 @@ and never collide."
         (set-byte mem (+ offset i) (aref payload i)))
       (is (equalp payload (get-bytes mem offset (length payload)))))))
 
+(test active-serialize-header-preserves-payload
+  "serialize-header with :active-p t must preserve user payload bytes and not overwrite them with zeroes."
+  (with-temp-memory (mem)
+    (let ((p (allocate mem 32))
+          (payload #(255 255 255 255 255 255 255 255 255 255 255 255 255 255 255 255)))
+      (dotimes (i (length payload))
+        (set-byte mem (+ p i) (aref payload i)))
+      (graph-db::serialize-header (memory-mmap mem) (- p 8) 32 :active-p t)
+      (is (equalp payload (get-bytes mem p (length payload)))))))
+
 (test free-then-reallocate-reuses-block
   "Freeing an allocation returns its block to the size's free list, and the
 next same-size allocation reuses that exact offset."

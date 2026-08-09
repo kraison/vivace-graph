@@ -69,6 +69,256 @@ list of 16-byte ids."
   (loop for start from 0 below (length string) by 32
         collect (peer-hex->id (subseq string start (+ start 32)))))
 
+;;; ---------------------------------------------------------------------------
+;;; The type table: (kind, id, name, supers), for non-Lisp peers.  A FROZEN EXTERNAL
+;;; CONTRACT -- see PEER-TYPE-TABLE-STRING for the format and the strict parse rules.
+;;;
+;;; A TYPE-ID is an opaque uint16 on the wire and NO type NAME ever crosses it --
+;;; a receiver resolves the raw id against its OWN schema (vertex.lisp).  A Lisp
+;;; device gets away with that only because it evaluates the same schema.lisp; a
+;;; Kotlin/SQLite peer cannot.  So the hub ships the mapping in the auth-ok plist.
+;;; ---------------------------------------------------------------------------
+
+(defun %peer-split (char string)
+  "Split STRING on CHAR.  Empty fields are preserved, so a trailing separator
+yields a trailing empty string (which the type-table format relies on: an empty
+SUPERS field means \"roots directly at VERTEX/EDGE\")."
+  (loop with start = 0
+        for pos = (position char string :start start)
+        collect (subseq string start (or pos (length string)))
+        while pos
+        do (setf start (1+ pos))))
+
+(defparameter *peer-type-name-reserved-chars*
+  '(#\, #\; #\Space #\" #\\ #\Newline #\Tab)
+  "Characters a type-table NAME may not contain.  #\\, and #\\; are the field and record
+separators; #\\Space separates the supers within their field; the rest are excluded
+because they are what a non-Lisp consumer's tokenizer, string literal or line reader is
+most likely to choke on.  A CL symbol name may contain ANY character (|escaped syntax|)
+and DEF-VERTEX constrains nothing, so this is checked at ENCODE time -- see
+PEER-TYPE-TABLE-STRING.")
+
+(defun %peer-type-direct-supers (name)
+  "The downcased names of type NAME's direct graph superclasses, as a LIST of strings.
+NIL when NAME roots directly at VERTEX/EDGE.
+
+A LIST, not a single name: DEF-NODE-TYPE's docstring claims single inheritance but does
+NOT enforce it -- it splices PARENT-TYPES straight into DEFCLASS -- so
+(DEF-VERTEX M-UAV (M-HAZARD M-ASSET) ...) really does define a type that IS an M-ASSET
+on the hub.  Emitting only the first parent would drop M-UAV from a device's \"all
+m-assets\" closure while the hub kept it: silent, per-peer divergent wrong answers.
+
+This CANNOT come from NODE-TYPE-PARENT-TYPE: that slot holds :VERTEX or :EDGE -- the
+KIND, not the superclass (DEF-NODE-TYPE sets it from (LAST1 PARENT-TYPES)).  The
+inheritance graph lives only in CLOS, never in the persisted schema.
+FIND-GRAPH-PARENT-CLASSES is also wrong here: it returns TRANSITIVE ancestors, and we
+want only the direct parents so the consumer can rebuild the closure itself."
+  (let ((class (find-class name nil)))
+    (when class
+      (loop for super in (class-direct-superclasses class)
+            unless (member (class-name super)
+                           '(vertex edge primitive-node node standard-object t))
+              collect (string-downcase (symbol-name (class-name super)))))))
+
+(defun %peer-check-wire-name (name type what)
+  "Signal unless NAME -- a name about to be emitted into the type table -- is
+representable on the peer wire.  TYPE is the node-type SYMBOL whose row it came from and
+WHAT names the field, so the error points at the schema element to fix.
+
+The encoder is the ONLY possible defense.  A #\\, in a name splits it into two FIELDS
+(the parser then throws); a #\\; splits it into two RECORDS, the first of which parses
+SILENTLY as a bogus type.  Either way the table reaching a Kotlin/SQLite device is
+corrupt and unrecoverable there, so a loud error on the hub is strictly better."
+  (when (zerop (length name))
+    (error "Node type ~S is UNREPRESENTABLE on the peer wire: its ~A is the empty string.  ~
+The peer type table cannot encode it; rename the type."
+           type what))
+  (let ((bad (find-if (lambda (c) (member c *peer-type-name-reserved-chars*)) name)))
+    (when bad
+      (error "Node type ~S is UNREPRESENTABLE on the peer wire: its ~A ~S contains the ~
+reserved character ~S.  The peer type table is a delimited external contract (see ~
+PEER-TYPE-TABLE-STRING); a name may not contain a comma, a semicolon, a space, a double ~
+quote, a backslash, a newline or a tab.  Rename the type."
+             type what name bad))))
+
+(defun %peer-type-table-rows (graph)
+  "GRAPH's node types as a list of (KIND-STRING ID NAME SUPERS TYPE): vertex types then
+edge types, each sorted by type-id.  SUPERS is a list of downcased names; TYPE is the
+node-type symbol, carried only so a validation error can name the type the developer
+actually wrote (the emitted NAME is downcased and may be the very thing at fault).
+
+The schema sub-tables are triple-keyed (id -> meta, symbol -> id, keyword -> id; see
+UPDATE-NODE-TYPE in schema.lisp), hence the (INTEGERP K) filter -- without it every type
+appears three times."
+  (loop for kind in '(:vertex :edge)
+        for kind-string in '("v" "e")
+        append (let ((sub (gethash kind (schema-type-table (schema graph)))))
+                 (when sub
+                   (loop for id in (sort (loop for k being the hash-keys in sub
+                                               when (integerp k) collect k)
+                                         #'<)
+                         for meta = (gethash id sub)
+                         when (node-type-p meta)
+                           collect (let ((type (node-type-name meta)))
+                                     (list kind-string
+                                           id
+                                           (string-downcase (symbol-name type))
+                                           (%peer-type-direct-supers type)
+                                           type)))))))
+
+(defun %peer-validate-type-table-rows (rows)
+  "Signal if ROWS cannot be encoded unambiguously: a name carrying a reserved character
+or empty, or two types emitting the SAME name.  Returns ROWS.
+
+Names are otherwise globally unique (each is a CLOS class name), but STRING-DOWNCASE is
+NOT injective -- P-PERSON and |P-Person| are distinct classes that emit one name, as can
+same-named symbols from different packages.  A device would then resolve one type-id's
+name to the other type's row."
+  (let ((seen (make-hash-table :test 'equal)))
+    (dolist (row rows rows)
+      (destructuring-bind (kind id name supers type) row
+        (declare (ignore kind id))
+        (%peer-check-wire-name name type "name")
+        (dolist (super supers)
+          (%peer-check-wire-name super type "superclass name"))
+        (let ((other (gethash name seen)))
+          (when other
+            (error "Node types ~S and ~S are UNREPRESENTABLE together on the peer wire: ~
+both emit the name ~S (STRING-DOWNCASE is not injective).  The peer type table maps ~
+type-id -> name and a device cannot tell them apart; rename one."
+                   other type name))
+          (setf (gethash name seen) type))))))
+
+(defun peer-type-table-string (&optional (graph *graph*))
+  "Encode GRAPH's node-type registry as ONE delimited string, for the plist control
+channel.  A nested list would trip PLIST-TOO-FANCY-ERROR, so the table rides as a
+single string -- the same dodge as PEER-IDS->STRING.
+
+*** THIS FORMAT IS A FROZEN EXTERNAL CONTRACT. *** It is parsed by non-Lisp peers (the
+Kotlin/SQLite device).  PEER-PARSE-TYPE-TABLE is the reference implementation and its
+strictness is part of the spec: match it, do not out-tolerate it.
+
+Format: records separated by #\\; , fields by #\\, :
+
+    kind,id,name,supers
+
+KIND is \"v\" or \"e\"; ID is the decimal type-id; NAME is the downcased type name;
+SUPERS is a SPACE-separated list of the downcased DIRECT graph superclass names, EMPTY
+when the type roots directly at VERTEX/EDGE.  Example:
+
+    v,1,site,;v,2,ord-mine,ordnance-type;v,3,m-uav,m-hazard m-asset;e,1,find-of-type,
+
+SUPERS is a LIST because multiple inheritance WORKS: DEF-NODE-TYPE does not enforce the
+single inheritance its docstring claims (see %PEER-TYPE-DIRECT-SUPERS).  A consumer
+rebuilds the transitive closure itself from the direct edges.
+
+*** CONSUMERS MUST TWO-PASS. ***  Read ALL rows first, THEN resolve superclass names.
+Type-ids are STABLE across schema evolution, so this table is sorted by ID and is NOT
+topologically sorted: inserting a superclass ABOVE an existing type produces a FORWARD
+reference, e.g.
+
+    v,1,t-b,t-a;v,2,t-a,
+
+where T-B (id 1) names T-A (id 2), which has not been read yet.  A single-pass consumer
+that resolves supers as it reads works fine until the first hierarchy refactor and then
+breaks in the field.
+
+STRICT PARSE RULES (the contract; PEER-PARSE-TYPE-TABLE enforces all of them):
+  - every record has EXACTLY 4 fields -- neither 3 nor 5 is tolerated;
+  - KIND is exactly \"v\" or \"e\" -- nothing else, and it is case-sensitive;
+  - ID is decimal digits only, in 0..65535 (type-ids are (UNSIGNED-BYTE 16) on the wire);
+  - NAME is non-empty and contains none of *PEER-TYPE-NAME-RESERVED-CHARS* (this encoder
+    signals rather than emit one);
+  - no record is empty -- no leading, trailing or doubled #\\; -- and no super is empty;
+  - the WHOLE table may be empty (\"\", or the key absent): an old hub sends no table.
+
+Both KIND and ID are required: NEXT-VERTEX-ID and NEXT-EDGE-ID are separate counters
+that BOTH start at 1 (schema.lisp), so a vertex type and an edge type routinely share a
+numeric id.  A consumer must key on (KIND . ID), never ID alone.
+
+Signals an error if the schema cannot be represented -- see
+%PEER-VALIDATE-TYPE-TABLE-ROWS.  That is deliberate: a corrupt table is undebuggable on
+the device, so the failure belongs at the hub.  Note WHERE it lands: this runs on the
+auth-ok path, so an unrepresentable schema fails every device CONNECTION, not the
+offending DEF-VERTEX.  Loud and hub-side either way, but the traceback points at a
+session, not at the schema form that caused it."
+  (let ((rows (%peer-validate-type-table-rows (%peer-type-table-rows graph))))
+    (with-output-to-string (s)
+      (loop for row in rows
+            for firstp = t then nil
+            do (destructuring-bind (kind id name supers type) row
+                 (declare (ignore type))
+                 (unless firstp (write-char #\; s))
+                 (format s "~A,~D,~A,~{~A~^ ~}" kind id name supers))))))
+
+(defun %peer-parse-type-id (field record)
+  "The ID field of a type-table RECORD as an integer: decimal digits only, 0..65535.
+Type-ids are (UNSIGNED-BYTE 16) on the wire, so no sign, no whitespace and no bignum --
+a consumer holding ids in a 16-bit integer must be able to read every id we emit."
+  (let ((id (and (plusp (length field))
+                 (every #'digit-char-p field)
+                 (parse-integer field))))
+    (unless (typep id '(unsigned-byte 16))
+      (error "Malformed peer type table record ~S: id ~S is not a decimal integer in ~
+0..65535 (type-ids are (UNSIGNED-BYTE 16))."
+             record field))
+    id))
+
+(defun %peer-parse-type-supers (field record)
+  "The SUPERS field of a type-table RECORD as a list of names.  Empty field -> NIL (the
+type roots directly at VERTEX/EDGE)."
+  (unless (string= field "")
+    (let ((supers (%peer-split #\Space field)))
+      (when (member "" supers :test #'string=)
+        (error "Malformed peer type table record ~S: the supers field ~S has an empty ~
+name (a leading, trailing or doubled space)."
+               record field))
+      supers)))
+
+(defun %peer-parse-type-record (record)
+  "One RECORD of a type table as (KIND ID NAME SUPERS).  Strict by design: this parser is
+the SPEC the non-Lisp implementations are written against, so every laxness here is a
+place a Kotlin parser will silently diverge from the hub."
+  (when (string= record "")
+    (error "Malformed peer type table: empty record (a leading, trailing or doubled #\\;)."))
+  (let ((fields (%peer-split #\, record)))
+    (unless (= 4 (length fields))
+      (error "Malformed peer type table record ~S: expected exactly 4 comma-separated ~
+fields (kind,id,name,supers), got ~D."
+             record (length fields)))
+    (destructuring-bind (kind id name supers) fields
+      (let ((kind-key (cond ((string= kind "v") :vertex)
+                            ((string= kind "e") :edge)
+                            (t
+                             ;; NOT a fallback to :EDGE.  Silently treating an unknown
+                             ;; kind as an edge is exactly how a mangled record becomes a
+                             ;; wrong answer instead of an error.
+                             (error "Malformed peer type table record ~S: kind must be ~
+\"v\" or \"e\", not ~S."
+                                    record kind)))))
+        (when (string= name "")
+          (error "Malformed peer type table record ~S: the name field is empty." record))
+        (list kind-key
+              (%peer-parse-type-id id record)
+              name
+              (%peer-parse-type-supers supers record))))))
+
+(defun peer-parse-type-table (string)
+  "Inverse of PEER-TYPE-TABLE-STRING, and the REFERENCE PARSER for the frozen peer wire
+format -- see that function's docstring for the format and the strict rules enforced
+here.  Returns a list of (KIND ID NAME SUPERS), where KIND is :VERTEX or :EDGE, ID an
+integer in 0..65535, NAME a string, and SUPERS a LIST of strings (NIL when the type roots
+directly at VERTEX/EDGE).
+
+Signals an error on any malformed record.  NIL or \"\" -- an old hub that sends no table
+-- parses to NIL: that is the device's back-compat path, and the one laxness kept.
+
+Order-independent: consumers MUST two-pass (read all rows, then resolve superclass
+names), because the table is sorted by id and may carry forward references."
+  (unless (or (null string) (string= string ""))
+    (loop for record in (%peer-split #\; string)
+          collect (%peer-parse-type-record record))))
+
 (defun peer-portable-string (value)
   "Coerce a STRING VALUE to a general (CHARACTER) string; pass non-strings through.
 The plist control channel serializes with *PRINT-READABLY* T (via
@@ -352,8 +602,9 @@ replayed onto the device."
   (let ((frontier 0))
     (with-read-snapshot (graph)
       ;; A reader with start-tx-id S sees commits with commit-epoch < S; so the
-      ;; snapshot's frontier -- the highest tx-id it reflects -- is S-1.
-      (setf frontier (1- (start-tx-id *transaction*)))
+      ;; snapshot's frontier -- the highest tx-id it reflects -- is S-1.  The
+      ;; snapshot lives in *READ-SNAPSHOTS*, not *TRANSACTION* (GH #53).
+      (setf frontier (1- (start-tx-id (read-transaction graph))))
       (multiple-value-bind (vset eset)
           (scope-node-set graph (peer-device-roots device) (peer-device-scope device)
                           :edge-types (peer-device-edge-types device))
@@ -399,8 +650,13 @@ replayed onto the device."
 
 (defun make-peer-session-handler (graph socket)
   "Return a thunk handling one device connection on SOCKET (hub side): announce,
-authenticate, serve one pull, then RECEIVE the device's push and re-home it, close.
-Models MAKE-SLAVE-SESSION-HANDLER but stays distinct from it."
+authenticate, ship the schema type table, serve one pull, then RECEIVE the device's
+push and re-home it, close.  Models MAKE-SLAVE-SESSION-HANDLER but stays distinct
+from it.
+
+The auth-ok plist carries :TYPE-TABLE (PEER-TYPE-TABLE-STRING) so a non-Lisp peer can
+resolve a raw type-id to a type NAME.  It is not otherwise recoverable: ids come from
+DEF-VERTEX/DEF-EDGE evaluation order and no name crosses the wire."
   (lambda ()
     (let ((*graph* graph))
       (handler-case
@@ -409,7 +665,14 @@ Models MAKE-SLAVE-SESSION-HANDLER but stays distinct from it."
                  (peer-write-plist (peer-hub-handshake-plist graph) socket)
                  (let* ((auth (read-plist-packet socket))
                         (device (peer-authenticate-device graph auth)))
-                   (peer-write-plist (list :peer-control :auth-ok) socket)
+                   ;; The type table rides on auth-ok, not on the hello: this is
+                   ;; POST-authentication, so an unauthenticated peer never sees the
+                   ;; schema.  Additive and back-compatible -- every peer-path plist
+                   ;; read on both sides is a bare GETF, so an old device simply never
+                   ;; asks for this key, and a new device against an old hub gets NIL.
+                   (peer-write-plist (list :peer-control :auth-ok
+                                           :type-table (peer-type-table-string graph))
+                                     socket)
                    (peer-pull-phase graph socket device
                                     :full-resync-p (and (getf auth :full-resync) t)
                                     :min-cursor (or (getf auth :pull-cursor) 0))
@@ -515,6 +778,7 @@ is the shipped node's origin, recorded for any :ORIGIN-scoped unique partition (
     (apply-tx-writes-to-views writes graph)
     (apply-tx-writes-to-spatial-index writes graph)
     (apply-tx-writes-to-unique-indexes writes graph)   ; #6: keep the device index complete
+    (apply-tx-writes-to-secondary-indexes writes graph) ; general ordered index
     (reap-old-versions writes graph)
     ;; Keep the device's tx-id-counter above this pulled node's hub epoch so a later
     ;; LOCAL edit transaction can see (and thus modify) it (B2d-2b).
@@ -551,6 +815,7 @@ ops."
         (apply-tx-writes-to-views final-writes graph)
         (apply-tx-writes-to-spatial-index final-writes graph)
         (apply-tx-writes-to-unique-indexes final-writes graph)   ; #6: index pulled nodes
+        (apply-tx-writes-to-secondary-indexes final-writes graph) ; general ordered index
         (reap-old-versions final-writes graph)
         ;; Persist the per-field stamps of the fields that took a new value, and
         ;; retain any surfaced conflicts.
@@ -743,8 +1008,9 @@ PUSH-ACK below it, so the device re-streams it next time (re-deduped by op-id)."
     high))
 
 (defun peer-purge-node (graph node)
-  "Hard-remove NODE from the device: drop it from every index/view (and the
-spatial index for a geometry vertex), then from its lhash table and the cache.
+  "Hard-remove NODE from the device: drop it from every index/view (including the
+spatial index, for a geometry-bearing vertex OR edge), then from its lhash table
+and the cache.
 Unlike a tombstone this leaves NO trace -- a captured device must not even reveal
 the existence/id of purged (undisclosed) work (design §7)."
   ;; #6: release the node's unique keys BEFORE removal (reads its :ORIGIN partition,
@@ -753,6 +1019,17 @@ the existence/id of purged (undisclosed) work (design §7)."
   ;; used unique constraints pays nothing.
   (when (unique-indexes graph)
     (%uix-release node graph))
+  ;; General ordered index: release the purged node's index entries too (guarded, so
+  ;; a graph with no secondary indexes pays nothing).
+  (when (secondary-indexes graph)
+    (%ix-release node graph))
+  ;; Spatial index: an EDGE can carry geometry exactly as a vertex can (the write
+  ;; path, REBUILD-SPATIAL-INDEXES and REGENERATE-SPATIAL-INDEX all have an edge
+  ;; path), so this is released for both kinds, before the etypecase rather than
+  ;; inside one of its branches.  A purge leaves no tombstone and no node, so
+  ;; nothing ever visits that index key again: a missed unindex orphans the entry
+  ;; permanently, and the id it still names now resolves to nothing.
+  (%spatial-unindex-node graph node)
   (etypecase node
     (edge
      (remove-from-ve-index node graph)
@@ -761,10 +1038,6 @@ the existence/id of purged (undisclosed) work (design §7)."
      (remove-from-views graph node)
      (lhash-remove (edge-table graph) (id node)))
     (vertex
-     (let ((idx (spatial-index graph)))
-       (when idx
-         (let ((geom (node-geometry node)))
-           (when geom (spatial-index-remove idx (id node) geom)))))
      (remove-from-type-index node graph)
      (remove-from-views graph node)
      (lhash-remove (vertex-table graph) (id node))))

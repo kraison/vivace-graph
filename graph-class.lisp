@@ -8,7 +8,8 @@
   #+ccl
   (make-hash-table :test 'equal :shared t)
   #+ecl
-  (make-hash-table :test 'equal))
+  (make-hash-table :test 'equal #+graph-db-ecl-sync-hash :synchronized
+                    #+graph-db-ecl-sync-hash t))
 
 (defclass graph ()
   ((graph-name :accessor graph-name :initarg :graph-name)
@@ -31,7 +32,30 @@
    (vev-index :accessor vev-index :initarg :vev-index)
    (vertex-index :accessor vertex-index :initarg :vertex-index)
    (edge-index :accessor edge-index :initarg :edge-index)
-   (spatial-index :accessor spatial-index :initarg :spatial-index :initform nil)
+   ;; Spatial indexes: (owner-class-name . slot-name) -> SPATIAL-INDEX.  One index
+   ;; per DECLARING class per geometry slot, exactly like SECONDARY-INDEXES and
+   ;; VECTOR-SEGMENTS below.  Created LAZILY on first geometry-valued insert (an
+   ;; :INDEX slot that never holds a geometry creates nothing), so a declared-but-
+   ;; unpopulated slot costs nothing.  SYNCHRONIZED for the same reason
+   ;; VECTOR-SEGMENTS is: query threads GETHASH here while the apply path may be
+   ;; creating an index.
+   (spatial-indexes :accessor spatial-indexes :initarg :spatial-indexes
+                    :initform
+                    #+ccl (make-hash-table :test 'equal :shared t)
+                    #+lispworks (make-hash-table :test 'equal :single-thread nil)
+                    #+ecl (make-hash-table :test 'equal
+                                            #+graph-db-ecl-sync-hash :synchronized
+                                            #+graph-db-ecl-sync-hash t)
+                    #+sbcl (make-hash-table :test 'equal :synchronized t))
+   ;; Default geohash precision for spatial indexes created on this graph
+   ;; (MAKE-GRAPH / OPEN-GRAPH :spatial-precision).  Per-index overrides are
+   ;; layered on top; see spatial-registry.lisp.
+   (default-spatial-precision :accessor graph-default-spatial-precision
+                              :initarg :default-spatial-precision :initform 7)
+   ;; Default max cells cap for spatial indexes created on this graph
+   ;; (MAKE-GRAPH / OPEN-GRAPH :spatial-max-cells).
+   (default-spatial-max-cells :accessor graph-default-spatial-max-cells
+                              :initarg :default-spatial-max-cells :initform +spatial-insert-max-cells+)
    ;; Which ordered-map backend NEW heap-backed indexes (views, :unique, spatial)
    ;; on THIS graph are built with: :SKIP-LIST or :BPLUS-TREE.  Defaults to the
    ;; global *INDEX-BACKEND* at creation; overridable per graph via MAKE-GRAPH /
@@ -39,10 +63,54 @@
    ;; index carries its own persisted backend tag); this only governs new ones.
    (index-backend :accessor graph-index-backend :initarg :index-backend
                   :initform *index-backend*)
+   ;; Backend for SPATIAL indexes specifically, or NIL to follow INDEX-BACKEND.
+   ;; Spatial queries have a different access pattern from views and :UNIQUE --
+   ;; a handful of SHORT prefix range scans, one per covering geohash cell, most
+   ;; returning nothing -- and the B+ tree's range-scan advantage is per ENTRY,
+   ;; so it does not survive that shape: measured ~600 KB consed for a
+   ;; zero-row query vs ~115 KB on the skip list, and slower at every corpus
+   ;; size (GH #91).  This lets a graph keep B+ trees everywhere else and use
+   ;; the skip list where it actually wins.  Like INDEX-BACKEND, it governs only
+   ;; NEWLY created indexes; existing ones reopen on their own persisted tag.
+   (spatial-index-backend :accessor graph-spatial-index-backend
+                          :initarg :spatial-index-backend
+                          :initform nil)
    ;; Unique constraints (issue #6): (owner-class . slot-name) -> UNIQUE-INDEX.
    ;; A derived structure (v1: rebuilt on open); enforcement is at the commit
    ;; boundary.  See unique-constraint.lisp / docs/unique-constraint-design.md.
    (unique-indexes :accessor unique-indexes :initarg :unique-indexes :initform nil)
+   ;; Vector segments (Phase 2): (class-name . slot-name) -> VECTOR-SEGMENT.
+   ;; A derived index maintained on the apply path; created lazily on first
+   ;; conforming insert; recovered by rebuild-from-nodes on an unclean open.
+   ;; See docs/superpowers/specs/2026-07-21-vector-segment-transaction-integration-design.md
+   ;;
+   ;; SYNCHRONIZED, and it has to be.  The per-segment rw-lock protects a
+   ;; segment's CONTENTS; this table is how a segment is FOUND, and the two
+   ;; sides run on different threads with no lock in common: VECTOR-SEARCH
+   ;; (graph.lisp) does an unlocked GETHASH on a query thread, while
+   ;; %ENSURE-SEGMENT (transactions.lisp) does a (SETF GETHASH) on the apply
+   ;; path when a segment is created lazily on the first conforming write.
+   ;; Writers are serialized against each other by the transaction manager
+   ;; lock, so this is a single-writer/many-reader table -- but an unsynchronized
+   ;; hash table gives no guarantee to a reader concurrent with a PUTHASH that
+   ;; grows/rehashes it (SBCL explicitly leaves that undefined: the reader can
+   ;; see a half-rebuilt vector, miss a present key, or spin).  Making the table
+   ;; itself synchronized closes it: every GETHASH/(SETF GETHASH) is under the
+   ;; table's own lock, so a reader sees either the old value (NIL -> "nothing
+   ;; indexed yet", the documented VECTOR-SEARCH answer) or the fully
+   ;; constructed segment, never a torn intermediate.  Same idiom as
+   ;; WRITE-STATS / READ-STATS below and *GRAPHS* above.
+   (vector-segments :accessor vector-segments :initarg :vector-segments
+                    :initform
+                    #+ccl (make-hash-table :test 'equal :shared t)
+                    #+lispworks (make-hash-table :test 'equal :single-thread nil)
+                    #+ecl (make-hash-table :test 'equal
+                                            #+graph-db-ecl-sync-hash :synchronized
+                                            #+graph-db-ecl-sync-hash t)
+                    #+sbcl (make-hash-table :test 'equal :synchronized t))
+   ;; General ordered secondary indexes (:INDEX slot option / DEF-INDEX); keyed by
+   ;; (owner-name . slot-name).  See index.lisp / docs/general-index-design.md.
+   (secondary-indexes :accessor secondary-indexes :initarg :secondary-indexes :initform nil)
    (views-lock :accessor views-lock :initarg :views-lock
                :initform (make-recursive-lock))
    (views :accessor views :initarg :views)
@@ -50,13 +118,17 @@
                 :initform
                 #+ccl (make-hash-table :test 'eq :shared t)
                 #+lispworks (make-hash-table :test 'eq :single-thread nil)
-                #+ecl (make-hash-table :test 'eq)
+                #+ecl (make-hash-table :test 'eq
+                                        #+graph-db-ecl-sync-hash :synchronized
+                                        #+graph-db-ecl-sync-hash t)
                 #+sbcl (make-hash-table :test 'eq :synchronized t))
    (read-stats :accessor read-stats :initarg :read-stats
                :initform
                #+ccl (make-hash-table :test 'eq :shared t)
                #+lispworks (make-hash-table :test 'eq :single-thread nil)
-               #+ecl (make-hash-table :test 'eq)
+               #+ecl (make-hash-table :test 'eq
+                                       #+graph-db-ecl-sync-hash :synchronized
+                                       #+graph-db-ecl-sync-hash t)
                #+sbcl (make-hash-table :test 'eq :synchronized t))))
 
 (defmethod print-object ((graph graph) stream)
@@ -217,6 +289,11 @@
    (stop-replication-p :accessor stop-replication-p :initarg :stop-replication-p
                        :initform nil)
    (peer-thread :accessor peer-thread :initarg :peer-thread :initform nil)))
+
+;; NODE-ORIGINS is a PEER-GRAPH slot, but UNIQUE-CONSTRAINT reads it off any graph.
+;; The fallback lives here, in core, not with the rest of the peer code: it is in
+;; GRAPH-DB/REPLICATION, which a core-only consumer (GRAPH-DB/ALGORITHMS) never loads.
+(defmethod node-origins ((graph graph)) nil)
 
 (defgeneric graph-p (thing)
   (:method ((graph graph)) graph)

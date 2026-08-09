@@ -47,6 +47,34 @@
 (defconstant +map-anonymous+ #+graph-db-posix-linux #x20   #-graph-db-posix-linux #x1000)
 (defconstant +map-noreserve+ #+graph-db-posix-linux #x4000 #-graph-db-posix-linux #x40)
 
+;; MAP_FIXED_NOREPLACE (Linux 4.17+).  "Place the mapping at exactly ADDR, or
+;; fail with EEXIST" -- the opposite of MAP_FIXED, which places it there by
+;; EVICTING whatever was already mapped.  Used by
+;; EXTEND-RESERVATION-IN-PLACE (mmap.lisp) to claim the range immediately after
+;; a reservation.
+;;
+;; Darwin has no equivalent, so it contributes NO BIT there (0).  That is
+;; deliberate and it is SAFE.  Do NOT be tempted to substitute +MAP-FIXED+ as a
+;; fallback: MAP_FIXED would clobber whatever occupies the range, which is the
+;; one outcome this whole mechanism exists to avoid.
+;;
+;; An unknown flag bit is simply IGNORED by the kernel, which leaves ADDR as an
+;; ADVISORY HINT -- it does NOT degrade to MAP_FIXED.  Measured on two kernels
+;; (a page mapped with a sentinel, then reclaimed at the same address with this
+;; flag):
+;;
+;;   Linux 5.15.0-179 -- flag honoured: rejected with EEXIST, sentinel intact.
+;;   Linux 4.15.0-213 -- flag ignored:  mapping landed at a DIFFERENT address,
+;;                                      sentinel intact.
+;;
+;; So the flag is an efficiency win where it exists (a clean rejection instead
+;; of a map-then-unmap), and the actual SAFETY property everywhere -- Darwin,
+;; pre-4.17 Linux, 4.17+ Linux alike -- is the caller's post-hoc check that the
+;; address it got back is exactly the address it asked for.  No version gate is
+;; needed or wanted.
+(defconstant +map-fixed-noreplace+
+  #+graph-db-posix-linux #x100000 #-graph-db-posix-linux 0)
+
 (defconstant +ms-sync+       #+graph-db-posix-linux #x04   #-graph-db-posix-linux #x10) ; Linux 4, Darwin 16
 
 ;; (void *)-1 as an unsigned 64-bit address: mmap's failure sentinel (MAP_FAILED).
@@ -74,7 +102,32 @@
   (cffi:foreign-funcall "close" :int fd :int))
 
 (defun %posix-lseek (fd offset whence)
-  (cffi:foreign-funcall "lseek" :int fd :long offset :int whence :long))
+  (let ((r (cffi:foreign-funcall "lseek" :int fd :long offset :int whence :long)))
+    (when (minusp r)
+      (error "posix lseek failed for fd ~D (offset ~D, whence ~D)" fd offset whence))
+    r))
+
+(defun %posix-write (fd ptr count)
+  "write(2). FD is an open file descriptor, PTR is a foreign pointer, COUNT is size_t.
+Returns the number of bytes written, or signals an error on failure."
+  (let ((r (cffi:foreign-funcall "write"
+                                 :int fd
+                                 :pointer ptr
+                                 :unsigned-long count
+                                 :long)))
+    (when (minusp r)
+      (error "posix write failed for fd ~D (count ~D)" fd count))
+    r))
+
+(defun %posix-extend-file-backing (fd new-length)
+  "Extends the file backed by FD to NEW-LENGTH bytes by seeking to (1- NEW-LENGTH) and writing a zero byte.
+Signals an error if lseek or write fails (e.g. ENOSPC)."
+  (%posix-lseek fd (1- new-length) +seek-set+)
+  (cffi:with-foreign-string (null-buf (string (code-char 0)))
+    (let ((written (%posix-write fd null-buf 1)))
+      (unless (= written 1)
+        (error "posix write failed to extend file fd ~D to ~D bytes (wrote ~D bytes)"
+               fd new-length written)))))
 
 (defun %posix-fchmod (fd mode)
   (cffi:foreign-funcall "fchmod" :int fd :unsigned-int mode :int))
@@ -110,6 +163,14 @@ pointer, signals on MAP_FAILED."
 
 (defun %posix-msync (addr length flags)
   (cffi:foreign-funcall "msync" :pointer addr :unsigned-long length :int flags :int))
+
+(defun %posix-page-size ()
+  "getpagesize(3): the mapping granularity, in bytes.  Present on glibc, Bionic
+and Darwin alike, unlike sysconf's _SC_PAGESIZE constant, whose VALUE differs
+between Linux (30) and Darwin (29) and would therefore need yet another
+platform conditional.  Not a constant: Darwin/arm64 is 16 KiB where
+Linux/x86-64 is 4 KiB, and this file is compiled on one host per target."
+  (cffi:foreign-funcall "getpagesize" :int))
 
 ;;; ---------------------------------------------------------------------------
 ;;; File size without stat(2).  Avoids mirroring the platform-specific struct

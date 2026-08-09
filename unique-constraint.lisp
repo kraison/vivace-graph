@@ -195,7 +195,9 @@ from SPEC on creation."
                     (setf (unique-indexes graph)
                           (make-hash-table :test 'equal
                                            #+sbcl :synchronized #+sbcl t
-                                           #+ccl :shared #+ccl t))))
+                                           #+ccl :shared #+ccl t
+                                           #+graph-db-ecl-sync-hash :synchronized
+                                           #+graph-db-ecl-sync-hash t))))
            (key (cons owner-name slot-name)))
       (or (gethash key reg)
           (multiple-value-bind (test canon) (%resolve-unique-canonicalizer spec)
@@ -208,7 +210,9 @@ from SPEC on creation."
                   (setf (unique-index-table uix)
                         (make-hash-table :test test
                                          #+sbcl :synchronized #+sbcl t
-                                         #+ccl :shared #+ccl t)))
+                                         #+ccl :shared #+ccl t
+                                         #+graph-db-ecl-sync-hash :synchronized
+                                         #+graph-db-ecl-sync-hash t)))
               (setf (gethash key reg) uix)))))))
 
 ;;; ---------------------------------------------------------------------------
@@ -412,26 +416,42 @@ with no heap (memory) or no unique indexes.  Called at CLOSE-GRAPH."
                                (view-index-backend-tag (unique-index-skip-list uix)))
                          roots)))
                (unique-indexes graph))
-      (cl-store:store roots (unique-index-root-file (location graph))))))
+      (%atomic-cl-store roots (unique-index-root-file (location graph))))))
 
 (defun restore-unique-index-roots (graph)
   "Reopen the on-disk unique indexes from the sidecar -- no node scan.  Returns T if a
 sidecar was present (caller skips REBUILD-UNIQUE-INDEXES); NIL to fall back to rebuild
-(a fresh graph, or a crash before the roots were saved)."
+(a fresh graph, a crash before the roots were saved, or an unreadable sidecar).
+
+An UNREADABLE sidecar falls back to rebuild rather than failing the open (GH #63),
+mirroring RESTORE-SPATIAL-INDEX-ROOTS -- nodes remain authoritative, so
+REBUILD-UNIQUE-INDEXES reconstructs the truth.  :UNREADABLE is a sentinel
+distinct from NIL: a graph with no unique indexes declared saves an empty
+list, which must still count as a successfully-restored (if empty) sidecar,
+not trigger a spurious rebuild."
   (let ((file (unique-index-root-file (location graph))))
     (when (probe-file file)
-      (let ((reg (or (unique-indexes graph)
-                     (setf (unique-indexes graph)
-                           (make-hash-table :test 'equal
-                                            #+sbcl :synchronized #+sbcl t
-                                            #+ccl :shared #+ccl t)))))
-        (dolist (r (cl-store:restore file))
-          ;; BACKEND is absent in pre-B+-tree sidecars (5-tuples) -> defaults to
-          ;; :skip-list, so an existing graph reopens exactly as before.
-          (destructuring-bind (owner slot spec scope address &optional (backend :skip-list)) r
-            (multiple-value-bind (test canon) (%resolve-unique-canonicalizer spec)
-              (setf (gethash (cons owner slot) reg)
-                    (%make-unique-index :owner-name owner :slot-name slot :spec spec
-                                        :test test :canonicalizer canon :scope scope
-                                        :skip-list (%open-unique-skip-list graph address backend)))))))
-      t)))
+      (let ((records (handler-case (cl-store:restore file)
+                        (error (e)
+                          (warn "Unique index sidecar ~A is unreadable (~A); rebuilding ~
+                                 from live nodes, which are authoritative."
+                                file e)
+                          :unreadable))))
+        (unless (eq records :unreadable)
+          (let ((reg (or (unique-indexes graph)
+                         (setf (unique-indexes graph)
+                               (make-hash-table :test 'equal
+                                                #+sbcl :synchronized #+sbcl t
+                                                #+ccl :shared #+ccl t
+                                                #+graph-db-ecl-sync-hash :synchronized
+                                                #+graph-db-ecl-sync-hash t)))))
+            (dolist (r records)
+              ;; BACKEND is absent in pre-B+-tree sidecars (5-tuples) -> defaults to
+              ;; :skip-list, so an existing graph reopens exactly as before.
+              (destructuring-bind (owner slot spec scope address &optional (backend :skip-list)) r
+                (multiple-value-bind (test canon) (%resolve-unique-canonicalizer spec)
+                  (setf (gethash (cons owner slot) reg)
+                        (%make-unique-index :owner-name owner :slot-name slot :spec spec
+                                            :test test :canonicalizer canon :scope scope
+                                            :skip-list (%open-unique-skip-list graph address backend)))))))
+          t)))))

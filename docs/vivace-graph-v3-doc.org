@@ -184,6 +184,27 @@ We define these using the ~def-vertex~ and ~def-edge~ macros. Notice that each d
 
 These macros automatically generate constructor functions (~make-user~, ~make-post~, etc.) and accessor methods for the slots you define.
 
+**** Persistent, ephemeral and meta slots
+
+A slot is *persistent* by default: its value lives in the node's ~data~ alist and is written to disk with the node. Two slot options change that.
+
+- ~:ephemeral t~ ::
+  Per-instance state that is *never written to disk*. The slot becomes an ordinary CLOS slot — read and written with ~slot-value~ as usual, and simply absent from everything the node serializes. Use it for a cache or a derived value you want to hang off a node without paying to store it.
+
+  Give an ephemeral slot an ~:initform~. An unset *persistent* slot reads back as ~nil~ (it resolves through the ~data~ alist), but an unset *ephemeral* slot is an unbound CLOS slot and signals ~unbound-slot~ — standard CLOS behaviour, and a sharp edge if you expect the persistent slot's forgiving ~nil~.
+
+  Ephemeral values do not survive a reopen, are not replicated, and are not visible to another process holding the same graph.
+
+- ~:meta t~ ::
+  Engine-managed metadata (id, revision, type-id and friends). Not part of a node's user data. You will rarely declare this yourself.
+
+#+BEGIN_SRC lisp
+  (def-vertex sensor ()
+    ((serial      :type string)          ; persistent, the default
+     (last-report :ephemeral t :initform nil))  ; live only, never stored
+    :social-app)
+#+END_SRC
+
 *** Connecting to the Database (~make-graph~, ~open-graph~, ~close-graph~)
 
 With our schema defined, we can connect to the database. We will store our graph's files in a directory, for example, ~"/var/tmp/social-app/"~.
@@ -438,13 +459,32 @@ The recommended path is an *in-place reindex*: reopen the graph on the new backe
   (let ((g (open-graph :my-app "/var/tmp/my-app/" :index-backend :bplus-tree)))
     (regenerate-all-views g)          ; map/reduce views
     (regenerate-unique-indexes g)     ; :unique constraints
-    (rebuild-spatial-index g)         ; spatial index
+    (regenerate-secondary-indexes g)  ; general ordered indexes (:index / def-index)
+    (regenerate-spatial-indexes g)    ; spatial indexes
     (close-graph g))                  ; persists the new backend tags
 #+END_SRC
 
 Each ~regenerate-*~ / ~rebuild-*~ drops the old on-disk index and rebuilds it by scanning the nodes (via the backend-agnostic ~map-vertices~ / ~map-edges~) on the graph's *current* backend, then persists the new tag; a subsequent plain ~open-graph~ then reopens on B+ trees. Your node data is left in place throughout. (Omit any family your schema doesn't use.)
 
 A logical *snapshot + replay into a fresh graph* also works and rebuilds every index on the target's backend (see Chapter 11, "Backup and Recovery"): snapshot the source, ~make-graph~ the target with ~:index-backend :bplus-tree~, adopt the source schema, and ~replay~. For a pure backend switch the in-place reindex above is simpler — one graph, node data untouched — but snapshot/replay is a sound alternative and the right tool when you also want a clean, defragmented copy.
+
+*** Vector segments (~vseg-*.dat~)
+
+One more derived index lives outside ~indexes.dat~ entirely, because it is not ordered and not a map: the *vector segment* that backs a ~:vector-index~ slot (Chapter 8, "Vector indexes and cosine kNN search"). Each segment is its own memory-mapped file in the graph directory — ~vseg-<owner>-<slot>.dat~, one per indexed slot, named for the *declaring* class that owns it.
+
+The layout is deliberately flat, so that a kNN scan reads one long run of floats:
+
+#+BEGIN_EXAMPLE
+  [ header 64 bytes ][ id array: capacity × 16 ][ vector block: capacity × dimension × 4 ]
+#+END_EXAMPLE
+
+- *Header* (64 bytes) — magic, format version, ~dimension~, element type (only ~single-float~ today; a foreign value signals rather than being misread), ~capacity~, ~live-count~, the free-list head, and a *clean-shutdown flag*.
+- *Id array* — slot /i/ holds the 16-byte node id occupying vector slot /i/. This array is the *authoritative* record of what the segment contains; the id→slot hash used for point lookups is RAM-only and is rebuilt at open by sweeping it. A free cell is marked by all-ones in its first 8 bytes, with the *next* free slot in its second 8 — the free list is threaded through the array itself, costing no extra space. (A freshly created or freshly grown region is free-marked for exactly this reason, so "never written" and "removed" are the same on-disk state.)
+- *Vector block* — ~capacity × dimension × 4~ bytes of contiguous little-endian IEEE binary32, slot /i/'s vector at offset /i/ × ~dimension~ × 4. Occupied slots are *not* dense once the free list has been used, so a scan sweeps ~[0, capacity)~ and skips free cells.
+
+*Growth is in-place doubling.* Because the vector block starts after the id array, doubling ~capacity~ moves it: the file is extended, then the existing vectors are relocated to the new block offset high slot first (so the copy never overwrites unread source bytes), and the new id cells are free-marked. The mapping's base address never moves — extension re-maps into the reserved window — so a concurrent reader never faults.
+
+The clean-shutdown flag is what makes recovery cheap: it is cleared (and synced) at open and set again at ~close-graph~. On the next open, a segment that was closed cleanly is reopened and trusted as-is; one that was not is *dropped and rebuilt from the nodes*, since a segment is derived data and always reconstructible.
 
 *** Durability and the Dirty File (~graph.lisp~)
 
@@ -980,11 +1020,18 @@ Let's assume we have a helper Lisp function, `(haversine-distance lat1 lon1 lat2
 In this advanced pattern, the custom functor acts as an efficient, domain-specific index. It bridges the gap between the declarative query language and the high-performance, procedural code needed to implement custom access paths, giving you the best of both worlds.
 
 
-** Chapter 8: Indexing with Views
+** Chapter 8: Indexing (Views, Ordered, Unique and Vector Indexes)
 
 You've seen how to create nodes and query them using the Prolog engine. But what happens when your graph grows to millions of nodes? Searching for a user by their username by iterating through every single user in the database, as we did in the last chapter, will become unacceptably slow.
 
-This is the exact problem that indexes solve in a traditional relational database. In VivaceGraph, the equivalent and more powerful concept is the *view*. This chapter will teach you how to use views to make your queries fast and to perform powerful data aggregations.
+This is the exact problem that indexes solve in a traditional relational database. VivaceGraph offers four kinds of secondary index, and this chapter covers all of them:
+
+- *Views* (~def-view~) — the most general: an arbitrary ~:map~ function decides what a node contributes, and an optional ~:reduce~ aggregates. Reach for these when the index key is computed rather than simply stored.
+- *General ordered indexes* (~:index~ / ~def-index~) — the simplest: index a slot by its value, for equality and range lookups, with no map function to write.
+- *Unique constraints* (~:unique~) — an ordered index that additionally *enforces* uniqueness at the commit boundary.
+- *Vector indexes* (~:vector-index~) — dense embeddings with cosine kNN search.
+
+If you just want "find the user whose email is X", the general ordered index is what you want, and it is a one-word slot annotation; see "General ordered indexes" below. Views are the more powerful tool for when that is not enough.
 
 *** The "Why": Avoiding Full Graph Scans
 
@@ -1210,6 +1257,182 @@ By default a constraint is ~:scope :local~ — the value is unique within *this*
 ~:scope :origin~ *partitions* the constraint by the node's authoring origin: two devices may each mint a ~code~ of ~"A-1"~ without colliding (they are different authors), while a single device may not reuse its own. This is the recommended default for offline-first fleets — it needs no coordination. Devices also maintain the constraint index for *pulled* nodes, so a locally-authored value is checked against everything the device holds, not only what it authored. On a non-peer graph there is a single origin, so ~:origin~ collapses to ~:local~.
 
 Truly global uniqueness — a value that must be unique across *all* devices (~:scope :local~, or a future ~:scope :hub~, in a peer setting) — requires the hub to arbitrate cross-device collisions. That arbiter is not yet built (tracked as issue #51); until then, prefer ~:origin~ for peer-replicated unique values.
+
+*** General ordered indexes (~:index~ / ~def-index~)
+
+A *view* is the most general secondary index — you write a ~:map~ lambda that emits arbitrary keys. When all you want is "index a slot for fast equality and range queries," VivaceGraph offers a lighter, declarative *ordered index* on a slot. It is, in effect, a ~:unique~ index without the enforcement: the same durable, backend-agnostic ordered map (skip list or B+ tree; an in-RAM map on a memory-graph), maintained on the commit path, but a value may be shared by many nodes and nothing is ever rejected.
+
+Declare one in either of two ways. As a *slot option*, symmetric with ~:unique~:
+
+#+BEGIN_SRC lisp
+  (def-vertex user ()
+    ((username :type string :index t)                 ; ordered index on username
+     (email    :type string :index string-downcase)   ; case-insensitive index
+     (age      :index t))                              ; numeric range index
+    :social-app)
+#+END_SRC
+
+or, for a slot you would rather not annotate on the class, with the standalone ~def-index~ (declarative and idempotent like ~def-view~; also the intended home for future composite/multi-slot indexes):
+
+#+BEGIN_SRC lisp
+  (def-index user email :social-app :canonicalize string-downcase)
+#+END_SRC
+
+Both forms produce the same index; ~def-index~ may even be evaluated before its graph exists (it is reconciled at open, like ~def-view~).
+
+Semantics:
+
+- *Scope* — an index on a class covers that class *and its subclasses* (a subtype IS-A), rooted at the class you name. So an index on ~user.email~ also indexes an ~admin~ subclass; ~(def-index user email …)~ indexes the ~user~ subtree even if ~email~ is declared on a parent.
+- *Any slot is indexable* — a declared ~:type~ is *not* required. The type is a *hint*: with it, the index validates values and advertises ordered/range support; without it, the index is equality-first and range scans are meaningful only for homogeneous (mutually comparable) values, exactly the contract untyped slots carry everywhere in VivaceGraph.
+- *NULL-exempt* — a node whose indexed slot is ~nil~/unbound is not indexed (like ~:unique~; also keeps the index proportional to nodes that actually have the value). Ordered iteration therefore omits value-less nodes.
+- *Collation* — an optional canonicalizer (a 1-arg function: a symbol, ~#'fn~, or a lambda; e.g. ~string-downcase~) transforms the value before keying, for case-insensitive or normalized indexes. A canonicalized index orders by the canonical form, so you get case-insensitive lookup at the cost of original-case ordering from that same index. *Descending* order is a query-time concern (reverse the result), not a separate index.
+
+Query with three functions, each taking the graph explicitly and resolving nodes in *that* graph:
+
+#+BEGIN_SRC lisp
+  (index-lookup graph 'user 'email "alice@x.com")     ; => list of matching nodes (equality)
+  (index-range  graph 'user 'age :start 18 :end 65)   ; => nodes in [18,65], ascending
+  (index-range  graph 'user 'age :start 18)           ; open-ended range
+  (map-index (lambda (u) ...) graph 'user 'age)       ; stream every user in age order
+#+END_SRC
+
+Querying a *declared* index that happens to hold no matching value returns an empty result; only a slot with no index at all signals an error.
+
+Like views, unique, and spatial, an ordered index is *backend-agnostic* — skip list or B+ tree per the graph's ~:index-backend~ (Chapter 3) — durable on the on-disk backend (reopened from a sidecar, no scan), and rebuilt on open on the memory backend. Devices maintain it for *pulled* nodes too, so a replicated node is findable by index the same as a locally-authored one. Switch a graph's ordered indexes to a different backend in place with ~regenerate-secondary-indexes~ (the parallel of ~regenerate-all-views~; see Chapter 3).
+
+When to reach for which: use a *view* when the index key is computed or you need map-reduce aggregation; use an *ordered index* when you simply want a slot indexed for equality and range. (Two current limitations: multi-slot/composite keys and true reverse-streaming cursors are not yet built but are designed for; and a *lazy* memory-graph does not rebuild its ordered indexes on reopen — see Chapter 3 — so use a non-lazy memory graph if you need them to survive a lazy reopen.)
+
+*** Vector indexes (~:vector-index~) and cosine kNN search
+
+Views, ~:unique~ and ~:index~ all key on values you can *order*. An embedding — the dense float vector an LLM or an image model produces — is not that kind of value: you never ask "which documents have exactly this vector," you ask "which documents are *nearest* this vector." VivaceGraph answers that with a third kind of index, the *vector segment*: a memory-mapped block of fixed-width ~single-float~ vectors, one per node, over which it runs a bounded top-k cosine k-nearest-neighbour search.
+
+Declare it with the ~:vector-index~ slot option, exactly where you would write ~:unique~ or ~:index~:
+
+#+BEGIN_SRC lisp
+  (def-vertex document ()
+    ((title     :type string)
+     (embedding :vector-index t))
+    :search-app)
+#+END_SRC
+
+That is the whole declaration. Maintenance is automatic and lives on the *transaction apply path*, alongside views, unique constraints and the spatial index — you never call an "add to index" function:
+
+#+BEGIN_SRC lisp
+  ;; EMBED is your own function; it must return a (simple-array single-float (*)).
+  (with-transaction ()
+    (make-document :title "Landmine risk survey"
+                   :embedding (embed "Landmine risk survey")))
+#+END_SRC
+
+Creating a node stores its vector; updating one overwrites it (and *removes* it if the new value is no longer a conforming vector); deleting a node removes it. The segment is created *lazily*, on the first conforming write, and is sized to that first vector's length.
+
+**** Searching
+
+#+BEGIN_SRC lisp
+  ;; (vector-search graph class-name slot-name query-vector k)
+  (vector-search *graph* 'document 'embedding (embed "buried ordnance") 10)
+  ;;=> ((0.93 . #<16-byte id>) (0.88 . #<16-byte id>) ...)
+#+END_SRC
+
+The result is a list of ~(score . node-id)~ conses, best first — a ~single-float~ cosine score in the ~car~ and the node's 16-byte id in the ~cdr~.
+
+*It returns ids, not nodes, and that is the entire point.* A scan touches only the segment's id array and its contiguous block of floats; it never deserializes a node, never touches the heap, never conses one object per candidate. Materialize only the handful you actually want:
+
+#+BEGIN_SRC lisp
+  (loop for (score . id) in (vector-search *graph* 'document 'embedding q 10)
+        collect (cons score (lookup-vertex id :graph *graph*)))
+#+END_SRC
+
+The *ranking contract* is precise and worth relying on:
+
+- *Full cosine*, not a dot product — vectors are *not* assumed to be unit-normalized; whatever you stored is what is scored. Either norm being zero yields a score of ~0.0~ rather than a division error.
+- Results are ordered by *score DESCENDING*, and ties are broken by *node id ASCENDING*.
+- That tiebreak is applied during collection, not only at the end, so the answer is *deterministic*: the same corpus and the same query give the same k in the same order, whether the segment was built incrementally or rebuilt from scratch.
+- ~k~ bounds what is retained, not what is examined: every occupied slot is scored, and only k are kept.
+
+~vector-search~ returns ~nil~ when no segment exists yet. That is deliberately ambiguous — it also covers a misspelled class or slot name, and a slot that carries no ~:vector-index~ declaration at all. If a search comes back unexpectedly empty, check the declaration before you go looking at the data.
+
+**** Ownership: one segment per *declaring* class
+
+This is the detail that trips people up. A segment is keyed by ~(owner-name . slot-name)~, where the owner is the *most general* class in the precedence list that declares the slot ~:vector-index~ — not the node's runtime class. One segment therefore spans the declaring class and *all of its subclasses*, and lives in one file per ~(owner, slot)~ pair.
+
+#+BEGIN_SRC lisp
+  (def-vertex document ()  ((embedding :vector-index t)) :search-app)
+  (def-vertex report (document) ((author :type string)) :search-app)
+
+  ;; A REPORT's embedding is stored in DOCUMENT's segment, and this search
+  ;; resolves to that same segment -- so it returns DOCUMENTs as well as REPORTs.
+  (vector-search *graph* 'report 'embedding q 10)
+#+END_SRC
+
+This mirrors ~:unique~ and ~:index~ scoping exactly. Searching a subclass does *not* give you a subclass-only result set; if you need one, filter the returned ids by type. Rebuilds follow the same rule, sweeping the owner's whole subtree into the one shared segment.
+
+**** What counts as a vector
+
+A value is indexed only if it is a ~(simple-array single-float (*))~. Anything else — a list, a ~double-float~ array, a general vector, ~nil~, an unbound slot — is *silently ignored* by the index. Nothing is signalled, and the node is simply absent from every search over that slot. This is the one sharp edge in the feature: if your embedding function returns a ~(vector single-float)~ that is not simple, or a double-float array, your corpus will index as empty and look like a bug elsewhere. Coerce at the boundary:
+
+#+BEGIN_SRC lisp
+  (defun as-embedding (list-of-numbers)
+    (make-array (length list-of-numbers)
+                :element-type 'single-float
+                :initial-contents (mapcar (lambda (x) (coerce x 'single-float))
+                                          list-of-numbers)))
+#+END_SRC
+
+*Dimension is fixed by the first vector stored* in a segment and cannot change afterwards. A write whose vector length disagrees is *rejected at the commit boundary* — the check runs inside the committing transaction, before anything durable happens, so the whole transaction aborts cleanly and no node/index drift is possible. A query vector of the wrong length signals for the same reason. Length mismatches are loud; wrong *types* are silent. Only the two behave differently.
+
+**** The lower-level entry points
+
+~vector-search~ is a thin resolver over two exported primitives that take a segment object directly. You reach a segment through the graph's internal ~vector-segments~ table, keyed by the owner cons:
+
+#+BEGIN_SRC lisp
+  (let ((seg (gethash (cons 'document 'embedding)
+                      (graph-db::vector-segments *graph*))))
+    ;; Exactly what vector-search does: bounded top-k over every occupied slot.
+    (segment-scan seg q 10)
+
+    ;; Score ONLY a candidate set, exactly, best first.  No k -- the caller
+    ;; already chose the candidates -- and the same total order as above.
+    (segment-score-subset seg q (list id-a id-b id-c)))
+#+END_SRC
+
+~segment-score-subset~ exists as an *extension seam*. It makes no assumption that it has seen every vector in the segment, and ids it does not hold are silently skipped, so an approximate index (ANN, or an int8 pre-rank) can propose a cheap candidate set and have it re-scored *exactly* against the float32 block. Note that it does not de-duplicate: an id offered twice is scored and returned twice.
+
+**** Migrating an existing corpus
+
+Because maintenance is on the apply path, nodes written *before* you added the ~:vector-index~ declaration were never indexed. Fill them in with ~rebuild-vector-segment-batched~, which sweeps live nodes and *adds* what is missing without disturbing what is already there:
+
+#+BEGIN_SRC lisp
+  ;; => (values INSERTED SKIPPED)
+  (rebuild-vector-segment-batched *graph* 'document 'embedding
+                                  :batch-size 5000
+                                  :progress-fn (lambda (done seen)
+                                                 (format t "~D/~D~%" done seen)))
+#+END_SRC
+
+It is *resumable by construction*: the segment itself records which ids it holds, so an interrupted run followed by a clean ~close-graph~ simply leaves a partial segment that the next call finishes. There is no progress file, deliberately — a marker that can disagree with the segment is worse than no marker. ~:batch-size~ is the *cadence* at which ~:progress-fn~ is called (with ~done~ = inserted+skipped and ~seen~ = conforming nodes encountered *in this run*), not a memory buffer; each vector is written as it is met. Over a real corpus this takes minutes, so pass a ~:progress-fn~ — a silent migration looks hung. You may name either the declaring class or any subclass; both resolve to the one owner segment. Serialize migrations of a given segment at the call site — do not run two at once against the same ~(owner, slot)~.
+
+**** Concurrency
+
+Each segment carries its own reader/writer lock. ~segment-scan~, ~segment-score-subset~ and reads take the read side; the apply path's inserts and removals take the write side. Concurrent searches are therefore safe against concurrent commits — including a commit that *grows* the segment — and share the segment freely with each other. Rebuilds are the exception: they run at open, before the graph accepts queries, and are not safe against a live concurrent search.
+
+**** Performance, and the ceiling
+
+Be clear-eyed about what this is: a *brute-force* exact scan over every occupied slot. There is no approximate (ANN) index yet. What you get in exchange is exactness, determinism, and a per-vector cost low enough that brute force carries you a long way.
+
+Measured on SBCL 2.5.5 / macOS arm64 (M3) at dimension 1024, the scan runs at *~1.85 ms per 1000 vectors* while the vector block fits in available page cache — about 190 ms for 100k vectors, sub-second to ~500k.
+
+Past that point it is a *cliff, not a slope*. The vector block is exactly
+
+#+BEGIN_EXAMPLE
+  live-count × dimension × 4 bytes
+#+END_EXAMPLE
+
+so at dimension 1024 each vector costs 4 KB and one million of them is 4 GB. On an 18 GB laptop, 1M vectors measured *11.3 s* per query against the ~1.9 s a linear extrapolation from 500k predicts — 6x worse, because every query now re-reads the block from disk. Repeated scans did not improve, confirming it is architectural rather than a cold cache.
+
+Use the formula to compute your own ceiling: the cliff sits where ~live × dimension × 4~ crosses the memory the machine can actually keep resident. Its *position* is hardware-dependent; its *shape* is not — performance does not degrade gracefully as you approach it, it falls off. On a large-memory host the constraint becomes CPU instead: at ~1.85 ms/1k, a resident million-vector segment is still roughly 1.9 s per query, which no amount of RAM fixes. That is the point at which an approximate index — proposing candidates for ~segment-score-subset~ to re-score exactly — becomes the answer, and it is the reason that seam exists.
+
+A note on implementations: the hot vector-decode path has an SBCL-specific fast implementation, with a portable fallback used on CCL, ECL and LispWorks. The query layer was developed and tested on SBCL.
 
 * Part IV: Advanced Topics & API
 
@@ -1474,10 +1697,12 @@ When you call ~snapshot~, it performs several important steps to ensure a high-q
 The resulting file contains a series of Lisp s-expressions, one for each node in the graph. This format is not only easy to inspect but is also crucial for the restore process.
 
 #+BEGIN_EXAMPLE
-  ;; A snapshot file looks like this:
-  (:V USER ((:USERNAME . "alice")) :ID #<"uuid-bytes"> :REVISION 2 :DELETED-P NIL)
-  (:V USER ((:USERNAME . "bob")) :ID #<"uuid-bytes"> :REVISION 1 :DELETED-P NIL)
-  (:E FOLLOWS ("<bob's-id>") ("<alice's-id>") 1.0 NIL :ID #<"uuid-bytes"> ...)
+  ;; A snapshot file looks like this (ids abbreviated):
+  (:V USER ((:USERNAME . "alice")) :ID #V((UNSIGNED-BYTE 8) 37 22 12 ...) :REVISION 2 :DELETED-P NIL)
+  (:V USER ((:USERNAME . "bob")) :ID #V((UNSIGNED-BYTE 8) 91 4 200 ...) :REVISION 1 :DELETED-P NIL)
+  (:E FOLLOWS #V((UNSIGNED-BYTE 8) 91 4 200 ...) #V((UNSIGNED-BYTE 8) 37 22 12 ...) 1.0 NIL :ID ... )
+  ;; a vector-valued slot carries its element type too:
+  (:V DOC ((:EMBEDDING . #V(SINGLE-FLOAT 1.0 1.25 1.5))) :ID ... :REVISION 0 :DELETED-P NIL)
   ...
 #+END_EXAMPLE
 
@@ -1498,6 +1723,38 @@ The restoration process is as follows:
 3.  `replay` will automatically find the *most recent* snapshot file in that directory.
 4.  It reads the snapshot file one s-expression at a time and, in small, manageable transactions, recreates each vertex and edge.
 5.  *Crucially, after all nodes and edges have been restored, ~replay~ automatically regenerates all defined views.* The snapshot file contains only the raw node data, not the indexes. This final step rebuilds the high-performance view indexes from the restored data, making the new graph ready for querying.
+
+The same "indexes are derived, node data is not" principle covers *vector segments* (Chapter 8): a segment never appears in a snapshot file, and because it is maintained on the transaction apply path, it is repopulated as the restoring transactions recreate the nodes.
+
+#+BEGIN_QUOTE
+*Vector-valued slots in the snapshot text (issue #56, fixed).* A snapshot file is Lisp
+text, and standard ~#(...)~ syntax throws a vector's element type away — it always reads
+back as a ~simple-vector~. graph-db used to paper over that by coercing *every* ~#(...)~
+in a snapshot to ~(simple-array (unsigned-byte 8) (*))~, because node ~:ID~ values (and an
+edge's ~from~ / ~to~) are byte vectors and the reader could not tell an id from slot data.
+That made any non-byte vector slot — a ~single-float~ embedding, say — a hard restore
+failure: /The value 1.0 is not of type (UNSIGNED-BYTE 8)/.
+
+The snapshot format now writes the element type down. ~backup~ prints any vector whose
+element type is not ~T~ as ~#V(<element-type> e1 e2 ...)~ — for example
+~#V(SINGLE-FLOAT 1.0 1.25 1.5)~ or ~#V((UNSIGNED-BYTE 8) 37 22 12)~ — and ~replay~ rebuilds
+the array with exactly that element type. Plain ~#(...)~ now reads as an ordinary
+~simple-vector~, and strings are untouched. (~*print-readably*~ is deliberately not used:
+SBCL's ~#A((3) SINGLE-FLOAT ...)~ is an SBCL extension, and a snapshot taken on one
+implementation must restore on SBCL, CCL, ECL and LispWorks alike.) So a graph holding
+~:vector-index~ slots now round-trips through ~snapshot~ and ~replay~ with its embeddings
+intact, and the segment repopulation described above happens as advertised.
+
+*Compatibility is one-way.* A snapshot written by this version is *not* readable by an
+older graph-db, which does not know ~#V~. A snapshot written by an older graph-db *is*
+readable by this one: its bare-~#(...)~ ids, and an edge's ~from~ / ~to~, are coerced back
+into id byte vectors during the replay. The one thing an old file cannot give back is
+the element type of a node's own vector-valued *slots* — that was never recorded — so
+such a slot restores as a plain ~simple-vector~; take a fresh snapshot afterwards to
+capture the types. The on-disk graph format is unchanged by all of this.
+#+END_QUOTE
+
+The same derivation is what makes crash recovery cheap outside of backup entirely — a segment that was not cleanly closed is dropped and rebuilt from the nodes on the next ~open-graph~ (Chapter 3, "Vector segments").
 
 **** Complete Example: Backup and Restore
 
@@ -1646,24 +1903,25 @@ Note that, because the on-disk format uses ~cl-store~ for some structures, graph
 
 VivaceGraph ships a general-purpose *spatial extension*: a geohash-backed index that answers "what's near here?" and "what's inside this area?" over nodes that carry a geometry. It is domain-agnostic — it stores only ids and geometry — and it is maintained automatically as part of normal transactions. This chapter shows how to make a node type spatial and how to query it.
 
-The design is the classic *filter then refine*: the geohash index quickly narrows the whole graph down to a small candidate set whose grid cells meet your query window, and exact predicates (great-circle distance, point-in-polygon) then refine that set to the true answer.
-
 *** Geometry values
 
-Locations are represented by the ~geometry~ value type. Coordinates are WGS84 and, following the GIS / GeoJSON convention, are written *(lon lat)* order, stored internally as ~double-float~. Four kinds are supported, built with these constructors:
+Locations are represented by the ~geometry~ value type. Coordinates are WGS84 and, following the GIS / GeoJSON convention, are written *(lon lat)* order, stored internally as packed ~(simple-array double-float (*))~ vectors (reducing memory overhead by 3–4x and avoiding consing/unboxing during spatial predicates). Four kinds are supported, built with these constructors:
+
 
 #+BEGIN_SRC lisp
   (make-point lon lat)                 ; a single position
   (make-linestring '((lon lat) ...))   ; a path
-  (make-polygon '(exterior-ring hole-ring ...))   ; ring = ((lon lat) ...)
+  (make-polygon '(exterior-ring hole-ring ...))   ; ring = ((lon lat) ...), or packed double-float vectors
   (make-multipolygon '(polygon ...))   ; polygon = (ring ...)
 #+END_SRC
 
-A ~geometry~ is a normal serializable value, so you store one in a node slot just like a string or number. Useful accessors include ~geometry-kind~, ~geometry-coordinates~, ~geometry-lon~ / ~geometry-lat~ (for points), and ~geometry-bbox~ (axis-aligned bounding box as ~(values min-lon min-lat max-lon max-lat)~).
+A ~geometry~ is a normal serializable value, so you store one in a node slot just like a string or number. Legacy nested list serializations are transparently upgraded to packed arrays upon deserialization. When optional GEOS integration is loaded, foreign geometries are built directly via GEOS C API FFI calls without WKT text round-trips (~27x faster predicate execution). Useful accessors include ~geometry-kind~, ~geometry-coordinates~ (packed array representation), ~geometry-coordinate-pairs~ (classic nested list of ~(lon lat)~ pairs for exporters and GeoJSON), ~map-geometry-coordinates~ (zero-allocation vertex iterator), ~geometry-lon~ / ~geometry-lat~ (for points), and ~geometry-bbox~ (axis-aligned bounding box as ~(values min-lon min-lat max-lon max-lat)~).
+
+
 
 *** Making a node type spatial
 
-To put a node type on the map, give it a geometry slot and mark that slot ~:index t~. That is all it takes: every create/update/delete of such a node then automatically maintains the graph's spatial index — there is no separate "add to index" call.
+To put a node type on the map, give it a geometry slot and mark that slot ~:index t~. That is all it takes: every create/update/delete of such a node then automatically maintains that class's spatial index — there is no separate "add to index" call.
 
 #+BEGIN_SRC lisp
   (def-vertex observation ()
@@ -1685,23 +1943,55 @@ Under the hood, indexing goes through the ~node-geometry~ generic function, whic
     (slot-value o 'location))
 #+END_SRC
 
-The index itself lives inside the graph's index region (~indexes.dat~), is created by ~make-graph~, and is reopened automatically by ~open-graph~ — you do not manage it directly.
+*One index per declaring class per geometry slot.* Spatial indexes form a registry keyed ~(owner-class . slot)~, exactly like ~:unique~, ~:vector-index~ and ~:index~. Each spatially indexed class+slot gets its /own/ index, which is what lets a query be scoped to just one class (see /Querying/ below). Two consequences are worth stating:
+
+- A geometry slot declared on a *mixin* gives all of that mixin's subclasses /one shared/ index — the index is owned by the class that /declares/ the slot, not by each subclass. Sibling subclasses are then kept apart at query time by the scope's type filter, not by storage — and that filter runs /inside/ the index scan, so sharing an index costs a scoped query nothing. A class that declares its own geometry slot (no mixin) gets an index to itself.
+- Indexes are created *lazily*, on the first geometry-valued write for that class+slot — not by ~make-graph~. A slot marked ~:index t~ that never actually holds a geometry creates no index at all, and a query scoped to it simply returns ~nil~. Each index lives in the graph's index region (~indexes.dat~) and is reopened automatically by ~open-graph~; you never manage it directly.
+- *Known limitation — scoping to a parent does not reach a subclass's /own/ extra index.* A scope resolves the /named/ class's geometry slots, but the result type-filter admits subclasses. So if a subclass declares an /additional/ geometry slot of its own, ~(find-nodes-within 'parent …)~ will not scan that subclass-declared index, even though a node stored in it is a ~parent~ by ~typep~. Scope to the exact subclass (or use ~:all~) to reach it. This is not data loss — the node is indexed and findable — only the parent scope misses it; it is folded into the "index a node under every geometry slot" work (GitHub #60), where the multi-index semantics are solved once.
+
+Here is a second spatial type, so the query examples below have two classes to scope across. Because ~sensor~ declares its own geometry slot, it gets its own index, independent of ~observation~'s:
+
+#+BEGIN_SRC lisp
+  (def-vertex sensor ()
+    ((location :type geometry :index t)
+     (kind     :type string))
+    :survey-app)
+#+END_SRC
+
+*Per-index grid precision and max-cells cap.* A geometry slot may set its index's geohash precision with the ~:spatial-precision~ slot option (default 7, ≈150 m cells — set graph default via ~make-graph~'s ~:spatial-precision~) and its max-cells cap with the ~:spatial-max-cells~ slot option (default 16384 — set graph default via ~make-graph~'s ~:spatial-max-cells~). Coarser grids and lower cell caps suit large area geometries, while finer grids suit dense point data. Changing a declared precision re-grids that one index automatically the next time the graph is opened — on the *on-disk* backend. A ~memory-graph~ reopens its index at the *persisted* precision and does not adopt a changed declaration until you rebuild explicitly; it over-covers at the old grid, so results stay correct but a stale precision costs selectivity rather than accuracy (see #66).
+
+
+#+BEGIN_SRC lisp
+  (def-vertex zone ()
+    ((extent :type geometry :index t :spatial-precision 3 :spatial-max-cells 64))  ; coarse grid for big polygons
+    :survey-app)
+#+END_SRC
+
+
+*One geometry slot per node is indexed.* A node is indexed by the /first/ geometry-valued indexed slot ~node-geometry~ finds; a second geometry-valued indexed slot on the same class is silently /inert/. Because the effective geometry is decided by value at write time (the ~:type geometry~ declaration cannot be compared reliably across application packages), VivaceGraph reports this by value rather than by declaration: a class whose nodes bind two geometry slots triggers a ~warn~ on the write path — naming the class, the geometry slots found, and which one wins — sampled over the class's first 64 nodes, so it costs nothing steady-state. ~audit-spatial-slots~ (graph) is the exhaustive, read-only counterpart: it sweeps every live node and reports every such class with its winning and inert slots — the thing to run after a migration or wire into a schema test suite.
 
 *** Querying
 
 Two read styles are provided, both refining the index's candidates with exact geometry math.
 
+Every query takes a *scope* as its first argument: a node-class name, a list of names, or ~:all~. The scope both /selects/ which per-class indexes are scanned and /filters/ the results by type. Both halves matter — a geometry slot declared on a mixin gives its subclasses one *shared* index, so storage separation alone would not keep a sibling subclass's nodes out of the answer. Naming a class that is not spatially indexed signals an error; a class whose index simply holds nothing yet returns ~nil~, which is a legitimate empty result.
+
 *Lisp API:*
 
 #+BEGIN_SRC lisp
-  ;; Nodes within RADIUS metres of a point, nearest first, as (node . distance):
-  (find-nodes-near 49.20 37.17 500.0)
+  ;; Observations within RADIUS metres of a point, nearest first, as (node . distance):
+  (find-nodes-near 'observation 49.20 37.17 500.0)
 
-  ;; The K nodes nearest a point, nearest first (also (node . distance) pairs):
-  (find-nearest-k 49.20 37.17 5)
+  ;; The K observations nearest a point, nearest first (also (node . distance) pairs):
+  (find-nearest-k 'observation 49.20 37.17 5)
 
-  ;; Nodes whose location falls inside a :POLYGON / :MULTIPOLYGON area:
-  (find-nodes-within my-task-area)
+  ;; Observations whose location falls inside a :POLYGON / :MULTIPOLYGON area:
+  (find-nodes-within 'observation my-task-area)
+
+  ;; A list scope unions the named classes (here OBSERVATION and SENSOR);
+  ;; :all scans every index in the graph.
+  (find-nodes-within '(observation sensor) my-task-area)
+  (find-nodes-within :all my-task-area)
 #+END_SRC
 
 ~find-nearest-k~ is bounded by ~:max-radius~ (default 25 km): the geohash index answers a window by enumerating its grid cells, so an unbounded nearest-neighbour search is not supported — it returns the K nearest /within max-radius/ (widen it only if you accept the per-query cost, which grows with the square of the radius).
@@ -1711,25 +2001,23 @@ Two read styles are provided, both refining the index's candidates with exact ge
 #+BEGIN_SRC lisp
   ;; All observations within 500 m of (49.20, 37.17):
   (select-flat (?o)
-    (is-a ?o observation)
-    (find-near ?o 49.20 37.17 500.0))
+    (find-near ?o observation 49.20 37.17 500.0))
 
   ;; The 5 observations nearest (49.20, 37.17):
   (select-flat (?o)
-    (is-a ?o observation)
-    (find-nearest ?o 49.20 37.17 5))
+    (find-nearest ?o observation 49.20 37.17 5))
 
   ;; All observations inside a task-area geometry bound to ?area:
   (select-flat (?o)
-    (is-a ?o observation)
-    (find-within ?o ?area))
+    (find-within ?o observation ?area))
 #+END_SRC
 
-~find-near/4~ takes ~?node lat lon radius-metres~; ~find-nearest/4~ takes ~?node lat lon k~; ~find-within/2~ takes ~?node area~.
+~find-near/5~ takes ~?node scope lat lon radius-metres~; ~find-nearest/5~ takes ~?node scope lat lon k~; ~find-within/3~ and ~find-intersects/3~ take ~?node scope area~. The scope is written as a bare class-name atom (or ~:all~); it already restricts the answer by type, so the ~is-a~ goal these examples once needed is no longer required.
 
 *** Under the hood, and a few caveats
 
-- *The index* is an ordered index (in the graph's index region, ~indexes.dat~) — a skip list by default, or a B+ tree if the graph's ~:index-backend~ selects one (see Chapter 3) — keyed by the composite ~(geohash-cell . node-id)~: a node's id is entered under every fixed-precision grid cell its geometry occupies. Folding the id into the key keeps the index *duplicate-free*, so insert and — especially — *remove* are O(log n) (an older duplicate-cell layout made removal O(n)). A query covers its window with as few, possibly coarser, cells as it can and does one *prefix range scan* per covering cell — geohash keys are prefix-nested, so every finer cell within a coarse one sorts inside its range — touching only the cells in view. The grid precision is set with ~make-graph~'s ~:spatial-precision~ keyword (default 7, ≈150 m cells; 9 ≈ 5 m); it is persisted with the index and read back by ~open-graph~, which rebuilds an index written in the older format from node geometries on first open.
+- *The indexes* are ordered indexes (in the graph's index region, ~indexes.dat~) — a skip list by default, or a B+ tree if the graph's ~:index-backend~ selects one (see Chapter 3) — one per spatially indexed ~(class . slot)~, each keyed by the composite ~(geohash-cell . node-id)~: a node's id is entered under every grid cell its geometry occupies, at that index's precision. Folding the id into the key keeps the index *duplicate-free*, so insert and — especially — *remove* are O(log n) (an older duplicate-cell layout made removal O(n)). Each entry also stores the *type tag* of the node it points at, which is what lets a scoped query reject an out-of-scope candidate from the index entry alone, without materialising the node — so a query on an index /shared/ by several classes costs its own results, not the whole index's population. A query covers its window with as few, possibly coarser, cells as it can and does one *prefix range scan* per covering cell — geohash keys are prefix-nested, so every finer cell within a coarse one sorts inside its range — touching only the cells in view. Each index carries its own precision: the ~:spatial-precision~ slot option if the geometry slot declares one, else the graph default (~make-graph~'s ~:spatial-precision~ keyword, default 7 ≈150 m cells; 9 ≈ 5 m). A precision is persisted with its index and read back by ~open-graph~. A graph written before the current scheme (the spatial sidecar is now ~spatial-indexes.dat~, format v5) re-derives /all/ its spatial indexes from the live node geometries on first open — index only, node data untouched, nothing re-fetched.
+- *A bounded insert, self-healed at query time.* To stop a huge polygon from covering an astronomical number of fine cells, an insert caps its cover (16384 cells per index) and, when it must, stores that geometry more coarsely. The coarsening is made safe by the same /filter then refine/ contract: each index remembers the coarsest precision it actually holds and a query never covers finer than that, so a coarsely-stored country-scale polygon is still found (then refined exactly). Deleting the oversized geometry lets the finer selectivity return on its own, with no rebuild. Per-index precision (above) is the real control; the cap and clamp are a safety net for data that does not match the grid. The cap bounds a /whole geometry's/ cover: a multipolygon is covered part by part (so the gaps between separated parts are not indexed) but at one precision — the finest whose total fits — so a small island in a large boundary keeps full precision rather than dragging the index's clamp down with it (GH #103).
 - *Matching uses a representative point*: a ~:point~ matches exactly; an extended geometry (line, polygon) is matched by the centre of its bounding box, so radius/containment results for extended geometries are approximate. Point-in-polygon refinement honours holes.
 - *Distance* is the haversine great-circle distance — accurate to roughly half a percent, ample for most uses; a more precise geodesic can replace it later without changing the API.
 - *Heavier topology* (intersection, union, validity repair) is intentionally out of this dependency-free core and is left to an optional GEOS-backed module.
@@ -1762,14 +2050,14 @@ Core ~graph-db~ never depends on libgeos. Loading the add-on binds the library i
 The add-on /upgrades/ a set of generic functions in place (no API change). When it is loaded:
 
 - ~find-nodes-within~ judges extended-geometry nodes by **exact containment**, not their bbox centre.
-- ~find-nodes-intersecting~ / ~find-intersects/2~ become **exact** (without GEOS they fall back to a coarse bounding-box overlap).
+- ~find-nodes-intersecting~ / ~find-intersects/3~ become **exact** (without GEOS they fall back to a coarse bounding-box overlap).
 - ~geometry-intersects-p~, ~geometry-contains-geometry-p~ answer exactly for all geometry kinds.
 - ~geometry-make-valid~ repairs an invalid geometry (e.g. a self-intersecting polygon from a messy KML); ~geometry-valid-p~ tests validity. (~make-valid~ needs GEOS >= 3.8.)
 - ~geometry-distance-exact~ gives planar distance — note this is in *coordinate units* (degrees for lon/lat), not metres; use ~geodesic-distance~ / ~geometry-distance~ for metric distance between points.
 
 #+BEGIN_SRC lisp
   ;; nodes whose footprint actually overlaps the area (exact with GEOS):
-  (find-nodes-intersecting my-task-area)
+  (find-nodes-intersecting 'observation my-task-area)
 
   ;; repair a self-intersecting polygon before indexing it:
   (let ((clean (geometry-make-valid messy-polygon)))
@@ -2127,6 +2415,96 @@ The storage backend is orthogonal to the replication role: ~make-memory-graph~ a
 - ~docs/peer-replication-proposal.md~ — the originally approved proposal.
 
 
+** Chapter 17: Multiple Graphs in One Image
+
+VivaceGraph supports opening several graphs in one Lisp image. This chapter states
+the contract; it is enforced, not advisory.
+
+*** A read-write transaction belongs to exactly one graph
+
+The transaction manager is per graph. ~with-transaction~ defaults to
+~(transaction-manager *graph*)~, each graph has its own transaction-id counter, its own
+committed-transaction set for validation, and its own write-ahead log. Touching a node
+whose home graph differs from the transaction's — reading it *or* writing it — signals
+~cross-graph-transaction-error~.
+
+This is not a restriction added for convenience; it is what atomicity and durability
+already mean here. A transaction spanning two graphs would need a global ordering across
+independent counters and two-phase commit across two logs. Without 2PC, a crash between
+the two commits leaves one graph committed and the other not.
+
+To write to several graphs, use one transaction per graph and sequence them yourself.
+*That coordination is not atomic.* If the second transaction fails, the first has already
+committed, and nothing rolls it back. Design for that, or keep the invariant inside one
+graph.
+
+*** The rule covers the transactional path, not literally every read
+
+"Touching a node ... signals" means every read that resolves through ~lookup-object~
+(~lookup-vertex~, ~lookup-edge~, and any typed scan built on them) and every mutation entry
+point — ~create-node~, ~save~/~update-node~, ~delete-node~/~mark-deleted~. Two call paths
+read a node's storage without going through that check. ~copy~'s ~maybe-init-node-data~ may
+fault a node's bytes in from its own home graph's heap while a read-write transaction on a
+*different* graph is active; the misuse is still caught one step later, at the following
+~save~. And a fully untyped ~map-vertices~/~map-edges~ scan (no ~:vertex-type~) walks the
+lhash directly and never reaches ~lookup-object~ — consistent with "A note on scans" in
+Chapter 12, which documents that untyped scans bypass MVCC entirely and are meant for
+quiescent, read-only passes. Scanning a foreign graph that way from inside a read-write
+transaction reads without a pin; the result is correct only if the other graph is quiescent,
+and that is the caller's responsibility, not something the engine checks.
+
+*** Read-only snapshots are per graph and compose
+
+~with-read-snapshot~ records its snapshot per graph, so several may be active at once. A
+query may hold one snapshot per participating graph, each internally consistent and
+repeatable.
+
+There is deliberately *no single instant across graphs*: two graphs may be observed at
+different logical moments. A cross-graph instant would need an epoch shared by every
+transaction manager, which is not implemented.
+
+A read-write transaction takes precedence and does *not* fall through to a snapshot. If a
+read-write transaction on graph A is active, reading graph B signals — even if a snapshot
+of B exists. Satisfying that read from a different consistency domain would be worse than
+refusing it.
+
+*** Nodes know which graph they came from
+
+Every node carries its home graph. A node's heap, tables and schema resolve through that
+rather than through the ambient ~*graph*~, so a node found via an explicit ~:graph~ reads
+correctly whatever ~*graph*~ happens to be bound to. The value is never serialized.
+
+One consequence worth knowing: a node retained past its graph's ~close-graph~ now
+dereferences an unmapped heap rather than silently decoding whatever lies at that offset
+in another graph's file. Do not hold nodes across a close.
+
+*** Class names are global
+
+Common Lisp has one class namespace, so a node class name must be unique across *all*
+graph schemas. Defining the same name for a second graph signals
+~duplicate-node-class-error~. Redefining a type under the *same* graph name remains
+legal — that is ordinary schema evolution and works at runtime.
+
+Previously a second definition silently replaced the first class's slots, leaving the
+first graph's stored data unreachable through the API while still on disk.
+
+*** ~*transaction*~ is NIL inside a read-only snapshot
+
+~with-read-snapshot~ (and ~select~/~do-query~ with ~:snapshot t~) records its snapshot per
+graph in ~*read-snapshots*~ rather than binding ~*transaction*~, so code that reads
+~*transaction*~ to tell whether it is inside a query sees ~NIL~ there. Call
+~(read-transaction &optional graph)~ instead: it returns the read-write ~*transaction*~ when
+one is active and covers ~graph~, else ~graph~'s read snapshot from ~*read-snapshots*~, else
+~NIL~. This has second-order effects inside a snapshot: ~copy~ now signals
+~no-transaction-in-progress-warning~, ~commit~/~rollback~ now signal
+~no-transaction-in-progress~, and ~make-<type>~/~mark-deleted~ now auto-wrap their own real,
+committing transaction instead of silently joining a snapshot that was never going to
+commit.
+
+Also note: ~graph~ is now a *reserved* slot name on node classes — it backs the ~:META~
+home-graph tracking slot described above. A user-defined slot named ~graph~ shadows it and
+silently disables home-graph tracking for that class; do not use it as a slot name.
+
 ** API Reference
 
 This chapter provides a categorized reference for the most important exported symbols from the ~graph-db~ package. It is not an exhaustive list of every internal function but focuses on the public API you will use most often when building applications.
@@ -2242,7 +2620,17 @@ This chapter provides a categorized reference for the most important exported sy
   Force-rebuilds every view in the graph.  ~open-graph~ (and ~open-memory-graph~) accept ~:regenerate-views t~ to run this at open time.  Also the views half of an index-backend migration: after reopening with a new ~:index-backend~, this rebuilds every view on the current backend (see Chapter 3).
 
 - ~regenerate-unique-indexes (graph)~ ::
-  Drops and rebuilds every ~:unique~ constraint index on the graph's *current* index backend, re-persisting each index's backend tag.  The unique-index half of an in-place skip-list→B+ tree migration (paired with ~regenerate-all-views~ and ~rebuild-spatial-index~; see Chapter 3).
+  Drops and rebuilds every ~:unique~ constraint index on the graph's *current* index backend, re-persisting each index's backend tag.  The unique-index half of an in-place skip-list→B+ tree migration (paired with ~regenerate-all-views~ and ~regenerate-spatial-indexes~; see Chapter 3).
+
+**** General ordered indexes (~:index~ / ~def-index~; see Chapter 8)
+- ~def-index (owner-class slot graph-name &key canonicalize)~ ::
+  Declares an ordered secondary index on ~owner-class.slot~ (spanning subclasses) in ~graph-name~; declarative and idempotent like ~def-view~.  The slot-option form ~(slot :index t | <canonicalizer>)~ is equivalent for a single slot.  ~:canonicalize~ is an optional 1-arg function applied before keying (e.g. ~string-downcase~).
+- ~index-lookup (graph class slot value &key (collect-p t))~ ::
+  The nodes of ~class~ (and subclasses) whose ~slot~ equals ~value~, via the ordered index (equality).  Resolves nodes in ~graph~.  A declared-but-empty index returns an empty result; an unindexed slot signals an error.
+- ~index-range (graph class slot &key start end)~ / ~map-index (function graph class slot &key start end)~ ::
+  The nodes whose ~slot~ is in ~[start,end]~ (inclusive; open-ended when ~nil~), in ascending value order — collected, or streamed to ~function~.
+- ~regenerate-secondary-indexes (graph)~ ::
+  Drops and rebuilds every ordered index on the graph's *current* index backend — the ~:index~/~def-index~ half of an in-place backend migration (paired with ~regenerate-all-views~, ~regenerate-unique-indexes~, ~regenerate-spatial-indexes~; see Chapter 3).
 
 **** Graph Traversal & Mapping
 - ~map-vertices (function graph &key vertex-type include-vertex-types exclude-vertex-types include-subclasses-p ... )~ ::
@@ -2301,28 +2689,69 @@ This chapter provides a categorized reference for the most important exported sy
   Construct WGS84 ~geometry~ values ((lon lat) order). Accessors: ~geometry-kind~, ~geometry-coordinates~, ~geometry-lon~, ~geometry-lat~, ~geometry-bbox~.
 
 - ~node-geometry (node)~ ::
-  Generic function (default ~nil~) returning the geometry a node occupies. Marking a geometry slot ~:index t~ wires its default up automatically; specialize it explicitly only for a *computed* geometry. Geometry-bearing nodes are then maintained automatically in the spatial index.
+  Generic function (default ~nil~) returning the geometry a node occupies /and/ the slot it came from, as ~(values geometry slot-name)~. Marking a geometry slot ~:index t~ wires its default up automatically; specialize it explicitly only for a *computed* geometry (such a method reports no slot, and its class is indexed — and scoped — under the most general class carrying the method). Geometry-bearing nodes are then maintained automatically in the spatial index.
 
-- ~find-nodes-near (lat lon radius &key graph)~ ::
-  Live nodes within ~radius~ metres of ~(lat lon)~, nearest first, as ~(node . distance)~.
+- ~(slot :type geometry :index t :spatial-precision N :spatial-max-cells M)~ (slot options) ::
+  ~:index t~ opts a geometry slot into spatial indexing; optional
+  ~:spatial-precision N~ sets that index's geohash grid precision (default 7);
+  optional ~:spatial-max-cells M~ sets that index's max-cells cap (default 16384).
 
-- ~find-nearest-k (lat lon k &key graph max-radius)~ ::
-  The ~k~ nearest live nodes to ~(lat lon)~, nearest first, as ~(node . distance)~. Bounded by ~max-radius~ (default 25 km); returns fewer than ~k~ if fewer nodes lie within it.
+  Graph-wide defaults are set via ~make-graph~'s ~:spatial-precision~ and ~:spatial-max-cells~.
 
-- ~find-nodes-within (area &key graph)~ ::
-  Live nodes whose location lies inside the ~:polygon~ / ~:multipolygon~ ~area~ geometry.
 
-- ~(find-near ?node lat lon radius)~ / ~(find-nearest ?node lat lon k)~ / ~(find-within ?node area)~ ::
+- *scope* (first argument to every query below) ::
+  A node-class name, a list of node-class names, or ~:all~. Selects which per-class spatial indexes are scanned /and/ filters the results by type. Signals when it names a class that is not spatially indexed; returns ~nil~ for a class whose index is simply empty.
+
+- ~find-nodes-near (scope lat lon radius &key graph)~ ::
+  Live nodes in ~scope~ within ~radius~ metres of ~(lat lon)~, nearest first, as ~(node . distance)~.
+
+- ~find-nearest-k (scope lat lon k &key graph max-radius)~ ::
+  The ~k~ nearest live nodes in ~scope~ to ~(lat lon)~, nearest first, as ~(node . distance)~. Bounded by ~max-radius~ (default 25 km); returns fewer than ~k~ if fewer nodes lie within it.
+
+- ~find-nodes-within (scope area &key graph)~ / ~find-nodes-intersecting (scope area &key graph)~ ::
+  Live nodes in ~scope~ whose location lies inside — respectively, overlaps — the ~area~ geometry.
+
+- ~(find-near ?node scope lat lon radius)~ / ~(find-nearest ?node scope lat lon k)~ / ~(find-within ?node scope area)~ / ~(find-intersects ?node scope area)~ ::
   Prolog functors that yield matching nodes, composable with the rest of a query.
 
 - ~geohash-neighbor (cell dlon dlat)~ / ~geohash-neighbors (cell)~ ::
   Grid helpers: the cell ~dlon~/~dlat~ steps away (wraps the antimeridian, ~nil~ off a pole), and the 8 same-precision cells surrounding ~cell~.
 
-- ~rebuild-spatial-index (graph &key precision)~ ::
-  Rebuild the index from scratch by scanning every live node with a
-  ~node-geometry~. Use to change the grid ~precision~, adopt the index on a
-  graph that predates the spatial extension, or repair it. Run when the graph is
-  quiescent (like ~regenerate-view~). Returns the number of nodes indexed.
+- ~spatial-indexes (graph)~ / ~spatial-index-for (graph owner-class slot)~ ::
+  The per-~(owner-class . slot)~ spatial-index registry, and the one index for a
+  given owner class and geometry slot. Per-index introspection:
+  ~spatial-index-precision~, ~spatial-index-max-cells~,
+  ~spatial-index-precision-counts~, ~spatial-index-coarsest-precision~.
+
+- ~rebuild-spatial-indexes (graph)~ ::
+  Rebuild /every/ spatial index from scratch by scanning every live node with a
+  ~node-geometry~ and routing it into the ~(owner . slot)~ index its geometry slot
+  selects. Adopts the per-class scheme on a graph that predates it, or repairs.
+  Run when the graph is quiescent (like ~regenerate-view~). Returns the number of
+  nodes indexed.
+
+- ~regenerate-spatial-index (graph owner-class slot)~ ::
+  Drop and rebuild /one/ ~(owner . slot)~ index, re-deriving its precision
+  histogram from live nodes. The manual recovery for an index whose selectivity a
+  single oversized insert degraded — prefer this to rebuilding every index.
+
+- ~regenerate-spatial-indexes (graph)~ ::
+  Rebuild every spatial index on the graph's *current* index backend — the
+  spatial half of an in-place skip-list→B+ tree migration (paired with
+  ~regenerate-all-views~, ~regenerate-unique-indexes~,
+  ~regenerate-secondary-indexes~; see Chapter 3).
+
+- ~install-spatial-indexes (graph)~ ::
+  Called at open (the mirror of ~install-views~ / ~install-secondary-indexes~):
+  rebuilds any spatial index whose /persisted/ precision no longer matches the
+  ~:spatial-precision~ its slot option now declares. Creates nothing — indexes are
+  still created lazily, at the first geometry-valued write.
+
+- ~audit-spatial-slots (graph)~ ::
+  Read-only exhaustive sweep: reports each class carrying more than one
+  geometry-valued indexed slot — as ~(class winning-slot . inert-slots)~. The
+  counterpart to the write-path inert-slot warning (see "Making a node type
+  spatial"); wire it into a schema test suite or run it after a migration.
 
 - ~make-spatial-replication-filter (area)~ ::
   Build a slave-graph ~:replication-filter~ predicate from ~area~ (a ~:polygon~ /

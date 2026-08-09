@@ -98,7 +98,7 @@
                 #:make-point
                 #:make-polygon
                 #:geometryp
-                #:spatial-index
+                #:all-spatial-indexes
                 #:spatial-index-query-bbox
                 #:spatial-index-query-radius
                 #:find-nodes-near

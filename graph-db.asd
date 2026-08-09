@@ -14,7 +14,7 @@
   :name "VivaceGraph (embeddable core)"
   :maintainer "Kevin Raison"
   :author "Kevin Raison <last name @ chatsubo dot net>"
-  :version "2.1.1"
+  :version "3.0.0"
   :depends-on (:bordeaux-threads
                :alexandria
                :iterate
@@ -42,7 +42,9 @@
                (:file "globals" :depends-on ("package"))
                (:file "conditions" :depends-on ("package"))
                (:file "posix" :depends-on ("package"))
-               (:file "utilities" :depends-on ("globals"))
+               ;; "posix" for %POSIX-GETTIMEOFDAY, the portable fallback arm of
+               ;; GETTIMEOFDAY (GH #100).
+               (:file "utilities" :depends-on ("globals" "posix"))
                (:file "queue" :depends-on ("utilities"))
                (:file "mailbox" :depends-on ("queue"))
                #+(or sbcl lispworks ecl) (:file "rw-lock" :depends-on ("queue"))
@@ -57,6 +59,7 @@
                (:file "geohash" :depends-on ("package"))
                (:file "linear-hash" :depends-on ("serialize"))
                (:file "allocator" :depends-on ("serialize"))
+               (:file "segment" :depends-on ("allocator" "mmap"))
                (:file "graph-class" :depends-on ("globals"))
                (:file "cursors" :depends-on ("package"))
                (:file "skip-list" :depends-on ("allocator" "linear-hash"))
@@ -74,7 +77,7 @@
                (:file "type-index" :depends-on ("vev-index"))
                (:file "graph" :depends-on
                       ("ve-index" "vev-index" "type-index" "linear-hash" "allocator"
-                       "spatial-index"))
+                       "spatial-index" "posix"))
                (:file "stats" :depends-on ("graph"))
                (:file "schema" :depends-on ("stats"))
                (:file "node-class" :depends-on ("schema"))
@@ -96,7 +99,14 @@
                (:file "interface" :depends-on ("schema" "edge" "vertex" "views"))
                (:file "traverse" :depends-on ("interface"))
                (:file "memory-graph" :depends-on ("traverse" "transactions" "graph" "mem-skip-list"))
-               (:file "unique-constraint" :depends-on ("traverse" "transactions" "graph" "memory-graph" "node-class" "schema"))))
+               (:file "unique-constraint" :depends-on ("traverse" "transactions" "graph" "memory-graph" "node-class" "schema"))
+               (:file "index" :depends-on ("unique-constraint" "spatial-query" "interface"))
+               ;; The per-(owner . slot) spatial index registry.  Loaded LAST so it
+               ;; can see the MOP helpers (node-class), the graph, the memory-graph
+               ;; backend and the ordered-index factory; TRANSACTIONS.LISP,
+               ;; GRAPH.LISP and SPATIAL-QUERY.LISP reach it through DECLAIM FTYPE
+               ;; forward declarations.
+               (:file "spatial-registry" :depends-on ("index"))))
 
 ;; REPLICATION: core + the usocket network transport, but NO HTTP server.  This is
 ;; the master/slave + hub/peer replication layer -- transaction-streaming (usocket
@@ -110,7 +120,7 @@
   :name "VivaceGraph (replication transport)"
   :maintainer "Kevin Raison"
   :author "Kevin Raison <last name @ chatsubo dot net>"
-  :version "2.1.1"
+  :version "3.0.0"
   :depends-on (:graph-db/core
                :usocket)
   :serial t
@@ -131,7 +141,7 @@
   :name "VivaceGraph"
   :maintainer "Kevin Raison"
   :author "Kevin Raison <last name @ chatsubo dot net>"
-  :version "2.1.1"
+  :version "3.0.0"
   :depends-on (:graph-db/replication
                :hunchentoot
                :ningle
@@ -195,7 +205,9 @@
                (:file "storage-stress")
                (:file "graph-stress")
                (:file "transaction-stress")
-               (:file "view-stress"))
+               (:file "view-stress")
+               (:file "unique-stress")
+               (:file "index-stress"))
   :perform (test-op (op c)
                     (unless (uiop:symbol-call :graph-db/stress-test :run-stress-tests)
                       (error "graph-db stress tests failed."))))
@@ -211,6 +223,8 @@
                (:file "graph-storm")
                (:file "transaction-storm")
                (:file "view-storm")
+               (:file "unique-storm")
+               (:file "index-storm")
                (:file "mixed-storm")
                (:file "mmap-remap-stress"))
   :perform (test-op (op c)
@@ -233,6 +247,39 @@
                (:file "bplus-bench"))
   :perform (test-op (op c)
                     (uiop:symbol-call :graph-db/perf-test :run-perf)))
+
+(defsystem graph-db/profiler
+  :name "VivaceGraph Profiler"
+  :description "Reusable SBCL-focused performance profiling tool (sb-sprof + sb-profile) for VivaceGraph."
+  ;; GRAPH-DB/GEOS is required, not optional: without it the entire GEOS
+  ;; topology layer (union/intersection/difference/make-valid/area) is not
+  ;; fbound, so the profiler registered a single :GEOS function and the
+  ;; real-world coverage workload could not run at all.
+  :depends-on (:graph-db :graph-db/geos :cl-ppcre :alexandria :parse-float
+               :cl-typesetting :cl-pdf :cl-pdf-parser)
+  :pathname "profiling/"
+  :serial t
+  :components ((:file "package")
+               (:file "registry")
+               (:file "sprof")
+               (:file "profile")
+               (:file "harness")
+               (:module "modules"
+                :components ((:file "mmap")
+                             (:file "serialization")
+                             (:file "index")
+                             (:file "graph")
+                             (:file "transactions")
+                             (:file "views")
+                             (:file "spatial")
+                             (:file "prolog")
+                             (:file "real_world")
+                             (:file "suite")))
+               (:module "reporting"
+                :components ((:file "pdf")))))
+
+
+
 
 ;; OPTIONAL graph-algorithms add-on: analysis algorithms (shortest path,
 ;; ranking, components, flow, ...) ported from the standalone graph-utils
@@ -336,27 +383,54 @@
   :components ((:file "package")
                (:file "suite")
                (:file "serialize-tests")
+               ;; node-class-tests defines only bare NODE-CLASS metaobjects (no
+               ;; graph, no schema registration), so it has no ordering
+               ;; constraint against the graph-level files below.
+               (:file "node-class-tests")
                (:file "geometry-tests")
                (:file "geometry-ops-tests")
                (:file "geohash-tests")
                (:file "allocator-tests")
                (:file "spatial-index-tests")
+               (:file "segment-tests")
                (:file "linear-hash-tests")
                (:file "skip-list-tests")
                (:file "index-list-tests")
                (:file "type-index-tests")
                (:file "graph-tests")
+               ;; segment-integration-tests declares si-doc/si-sub under
+               ;; *integration-graph-name*; it must load AFTER graph-tests,
+               ;; whose load-time (setf (gethash *integration-graph-name*
+               ;; *schema-node-metadata*) nil) idempotent-reload guard would
+               ;; otherwise wipe si-doc/si-sub's registration if it ran later
+               ;; (segment-integration-tests used to sit above, before
+               ;; graph-tests -- discovered when CREATE-POPULATES-THE-SEGMENT
+               ;; tried to MAKE-SI-DOC and hit "NIL is not of type NODE-TYPE").
+               (:file "segment-integration-tests")
+               (:file "segment-query-tests")
+               ;; multi-graph-tests declares its own graph names (:mg-alpha /
+               ;; :mg-beta / :mg-gamma), distinct from *integration-graph-name*,
+               ;; so it is not exposed to the graph-tests reload hazard noted
+               ;; above.  Appended here anyway, after every file in this run's
+               ;; segment-integration lineage, rather than inserted earlier --
+               ;; the same "append, don't insert" discipline that hazard was a
+               ;; regression test for, so a future file with a colliding graph
+               ;; name can't rediscover it the hard way.
+               (:file "multi-graph-tests")
                (:file "type-mapping-tests")
                (:file "graph-spatial-tests")
                (:file "spatial-hook-tests")
                (:file "spatial-query-tests")
                (:file "spatial-intersect-tests")
+               (:file "spatial-scope-tests")
                (:file "subset-replication-tests")
                (:file "peer-lamport-tests")
                (:file "peer-merge-tests")
                (:file "peer-merge-apply-tests")
                (:file "peer-rehome-tests")
                (:file "peer-conflict-tests")
+               (:file "peer-type-table-tests")
+               (:file "peer-scope-tests")
                (:file "view-tests")
                (:file "query-tests")
                (:file "prolog-mutation-tests")
@@ -372,7 +446,9 @@
                (:file "prolog-stress-tests")
                (:file "memory-graph-tests")
                (:file "unique-constraint-tests")
-               (:file "peer-unique-tests"))
+               (:file "index-tests")
+               (:file "peer-unique-tests")
+               (:file "peer-index-tests"))
   :perform (test-op (op c)
                     (unless (uiop:symbol-call :graph-db/test :run-tests)
                       (error "graph-db test suite failed."))))

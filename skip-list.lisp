@@ -3,9 +3,11 @@
 ;;; The skip list's node-cache is read/written lock-free by every concurrent
 ;;; reader and writer (READ-SKIP-NODE etc.).  On SBCL/CCL/LispWorks the cache is
 ;;; a per-op thread-safe hash table (:synchronized / :shared / :single-thread
-;;; nil).  ECL hash tables have no such option, so concurrent access corrupts the
-;;; table internally (rehash races) and crashes (SIGSEGV) under real concurrency.
-;;; Guard the ECL node-cache with its own lock; a no-op everywhere else.
+;;; nil).  ECL 26.5.5 does support :synchronized (GH #101), but this explicit
+;;; lock predates that and also covers older ECLs that don't, so it stays --
+;;; adding :synchronized to the table too would just double-lock the hottest
+;;; read path in the engine.  Guard the ECL node-cache with its own lock; a
+;;; no-op everywhere else.
 (defmacro with-sl-cache-lock ((skip-list) &body body)
   #+ecl `(mp:with-lock ((%sl-cache-lock ,skip-list)) ,@body)
   #-ecl `(progn ,@body))
@@ -235,41 +237,72 @@ L1: 50%, L2: 25%, L3: 12.5%, ..."
     (let ((bytes (get-bytes (%sl-heap skip-list) addr size)))
       (values bytes size))))
 
+(declaim (inline %node-cache-vec-index))
+(defun %node-cache-vec-index (addr)
+  "Slot ADDR maps to in the direct-mapped NODE-CACHE-VEC."
+  (logand (ash addr -6) 2047))
+
+(defun invalidate-cached-skip-node (skip-list addr)
+  "Evict ADDR from BOTH node caches.
+
+Must be called wherever ADDR is freed.  NODE-CACHE-VEC is direct-mapped and
+validated by ADDRESS, so once ADDR goes back to the allocator a later node
+handed the same address would match a stale entry's (%SN-ADDR CACHED) guard and
+READ-SKIP-NODE would return the previous node's key, value and POINTERS --
+silently wrong reads, and cyclic traversals where the stale pointers form a
+loop.  The weak hash cache does not have this problem (a freed node becomes
+garbage), but is cleared here too so both caches are dropped in one place."
+  (let* ((vec (%sl-node-cache-vec skip-list))
+         (idx (%node-cache-vec-index addr))
+         (cached (aref vec idx)))
+    (when (and cached (= (%sn-addr cached) addr))
+      (setf (aref vec idx) nil)))
+  (with-sl-cache-lock (skip-list)
+    (remhash addr (%sl-node-cache skip-list))))
+
 (defun read-skip-node (skip-list addr)
+  (declare (type word addr))
   (if (= addr 0)
       nil
-      (or (and *cache-enabled*
-               (with-sl-cache-lock (skip-list)
-                 (gethash addr (%sl-node-cache skip-list))))
-          (let ((node (get-skip-node-buffer)) (pointer 8))
-            (setf (%sn-addr node) addr)
-            ;;(log:debug "READING SKIP NODE BYTES AT ~S" addr)
-            (multiple-value-bind (bytes size)
-                (read-skip-node-bytes skip-list addr)
-              ;;(log:debug "READ ~S: ~S" size bytes)
-              (setf (%sn-size node) size
-                    (%sn-level node) (aref bytes pointer)
-                    (%sn-flags node) (aref bytes (incf pointer))
-                    (%sn-pointers node) (make-array (%sn-level node)
-                                                    :element-type 'word))
-              (incf pointer)
-              (dotimes (i (%sn-level node))
-                (let ((p (read-uint64-from-seq (subseq bytes pointer))))
-                  ;;(log:debug "READING POINTER (~S OF ~S) => ~S"
-                  ;;i (1- (%sn-level node)) p)
-                  (setf (aref (%sn-pointers node) i) p)
-                  (incf pointer 8)))
-              ;;(log:debug "READ POINTERS, OFFSET IS ~S" pointer)
-              (multiple-value-bind (key length)
-                  (funcall (%sl-key-deserializer skip-list) (subseq bytes pointer))
-                ;;(log:debug "GOT KEY ~S OF LEN ~S" key length)
-                (let ((value (funcall (%sl-value-deserializer skip-list)
-                                      (subseq bytes (+ pointer length)))))
-                  (setf (%sn-key node) key
-                        (%sn-value node) value)
-                  (with-sl-cache-lock (skip-list)
-                    (setf (gethash addr (%sl-node-cache skip-list))
-                          node)))))))))
+      (let* ((cache (%sl-node-cache-vec skip-list))
+             (idx (%node-cache-vec-index addr))
+             (cached (and *cache-enabled* (aref cache idx))))
+        (if (and cached (= (%sn-addr cached) addr))
+            cached
+            (or (and *cache-enabled*
+                     (with-sl-cache-lock (skip-list)
+                       (gethash addr (%sl-node-cache skip-list))))
+                (let ((node (get-skip-node-buffer)) (pointer 8))
+                  (setf (%sn-addr node) addr)
+                  (multiple-value-bind (bytes size)
+                      (read-skip-node-bytes skip-list addr)
+                    (setf (%sn-size node) size
+                          (%sn-level node) (aref bytes pointer)
+                          (%sn-flags node) (aref bytes (incf pointer))
+                          (%sn-pointers node) (make-array (%sn-level node)
+                                                          :element-type 'word))
+                    (incf pointer)
+                    (dotimes (i (%sn-level node))
+                      (let ((p (read-uint64-from-seq (subseq bytes pointer))))
+                        (setf (aref (%sn-pointers node) i) p)
+                        (incf pointer 8)))
+                    (multiple-value-bind (key length)
+                        (funcall (%sl-key-deserializer skip-list) (subseq bytes pointer))
+                      (let ((value (funcall (%sl-value-deserializer skip-list)
+                                            (subseq bytes (+ pointer length)))))
+                        (setf (%sn-key node) key
+                              (%sn-value node) value)
+                        ;; Both caches are populated only when caching is on, so
+                        ;; binding *CACHE-ENABLED* to NIL really does force a
+                        ;; fresh read (the profiler's cold-read workloads and
+                        ;; any correctness-sensitive bypass depend on that).
+                        (when *cache-enabled*
+                          (setf (aref cache idx) node)
+                          (with-sl-cache-lock (skip-list)
+                            (setf (gethash addr (%sl-node-cache skip-list))
+                                  node)))
+                        node)))))))))
+
 
 (defstruct
     (skip-list
@@ -299,13 +332,16 @@ L1: 50%, L2: 25%, L3: 12.5%, ..."
   (key-deserializer 'deserialize)
   (value-serializer 'identity)
   (value-deserializer 'identity)
+  (node-cache-vec (make-array 2048 :element-type 't :initial-element nil))
   (node-cache
    #+sbcl (make-hash-table :test 'eq :weakness :value :synchronized t)
    #+lispworks (make-hash-table :test 'eq :weak-kind :value :single-thread nil)
    #+ccl (make-hash-table :test 'eq :weak :value :shared t)
    #+ecl (make-hash-table :test 'eq :weakness :value))
-  ;; ECL hash tables aren't thread-safe and have no :synchronized option, so the
-  ;; node-cache above needs an explicit lock (see WITH-SL-CACHE-LOCK).
+
+  ;; Explicit lock retained instead of :synchronized on NODE-CACHE itself: it
+  ;; also covers ECLs predating that option, and :synchronized would be
+  ;; redundant given this lock (GH #101).  See WITH-SL-CACHE-LOCK.
   #+ecl (cache-lock (mp:make-lock))
   ;; ECL-only: a per-skip-list reader/writer lock (see WITH-SL-READ-LOCK /
   ;; WITH-SL-WRITE-LOCK).  Shared among concurrent readers, exclusive for writers.
@@ -430,6 +466,9 @@ L1: 50%, L2: 25%, L3: 12.5%, ..."
             (%sl-heap skip-list) nil
             (%sl-mmap skip-list) nil
             (%sl-locks skip-list) #())
+      ;; Every address above has just been freed, so the direct-mapped cache
+      ;; must be dropped along with the hash one (INVALIDATE-CACHED-SKIP-NODE).
+      (fill (%sl-node-cache-vec skip-list) nil)
       (with-sl-cache-lock (skip-list)
         (clrhash (%sl-node-cache skip-list)))
       nil)))
@@ -580,7 +619,7 @@ L1: 50%, L2: 25%, L3: 12.5%, ..."
                  ;;(error 'skip-list-duplicate-error
                  ;;:skip-list skip-list :key key :value value)
                  (let ((*print-pretty* nil))
-                   (log:error "ATTEMPT TO INSERT DUP KV '~A/~A' IN ~A" key value skip-list))
+                   (log:debug "ATTEMPT TO INSERT DUP KV '~A/~A' IN ~A" key value skip-list))
                  (return-from add-to-skip-list nil)))))
          (log:debug "~S / ~S:~%  ~S~%  ~S~%" key value (elt preds 0) (elt succs 0))
          (let ((locks nil) pred succ prev-pred (valid-p t))
@@ -750,9 +789,11 @@ none matched."
                                    level
                                    (aref (%sn-pointers node-to-delete) level)))
                              (decf-skip-list-count skip-list)
-                             (with-sl-cache-lock (skip-list)
-                               (remhash (%sn-addr node-to-delete)
-                                        (%sl-node-cache skip-list)))
+                             ;; Evict from BOTH caches BEFORE handing the address
+                             ;; back to the allocator -- see
+                             ;; INVALIDATE-CACHED-SKIP-NODE.
+                             (invalidate-cached-skip-node
+                              skip-list (%sn-addr node-to-delete))
                              (free (%sl-heap skip-list) (%sn-addr node-to-delete))
                              (unlock-skip-node skip-list lock)
                              (setq lock nil)

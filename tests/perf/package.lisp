@@ -32,6 +32,9 @@
                 ;; views
                 #:invoke-graph-view
                 #:map-view
+                #:index-lookup
+                #:index-range
+                #:map-index
                 #:yield
                 ;; prolog
                 #:select-flat

@@ -109,9 +109,15 @@ node, its slot data, the subclass, and the edge topology."
       ;; v2 code refuses to open the v1 graph directly (the format gate).
       (signals error (graph-db:open-graph :mvcc-mig-guard old-dir
                                           :buffer-pool-p nil :gc-heap-p nil))
-      ;; ...but MIGRATE-GRAPH brings it forward to v2.
+      ;; ...but MIGRATE-GRAPH brings it forward to v2.  The default snapshot-file
+      ;; is per-run since GH #98, so this no longer has to dodge a shared path --
+      ;; but keep it inside our temp tree anyway, so a killed run leaves nothing
+      ;; behind in the system temp directory.
       (let ((g (graph-db::migrate-graph :graph-db-mvcc-migration old-dir new-dir
-                                        :package :graph-db/test)))
+                                        :package :graph-db/test
+                                        :snapshot-file
+                                        (namestring
+                                         (merge-pathnames "migrate.snapshot" root)))))
         (unwind-protect
              (let ((*graph* g))
                (is (= 2 graph-db::+storage-version+)
@@ -134,6 +140,44 @@ node, its slot data, the subclass, and the edge topology."
                (is (= 1 (length (map-edges #'identity g
                                            :collect-p t :edge-type 'g-likes)))))
           (graph-db:close-graph g))))))
+
+(test migration-snapshot-path-is-per-run
+  "GH #98: the default snapshot path must not be keyed on the graph name alone.
+A name-only path is constant across runs, users and processes on a host, so one
+aborted migration made every later migration of that name die with a bare
+FILE-EXISTS naming a path the caller never chose."
+  (let ((a (graph-db::%migration-snapshot-file :g-dup))
+        (b (graph-db::%migration-snapshot-file :g-dup)))
+    (is (not (equal a b))
+        "two runs must not collide; got ~A twice" a)
+    ;; Guard the cosmetic half too: the old formatter produced `/tmp//migrate-...'.
+    (is (not (search "//" (subseq a (min 1 (length a)))))
+        "path should not contain a doubled separator: ~A" a)))
+
+(test failed-migration-does-not-leak-its-snapshot
+  "GH #98: cleanup used to sit on the success path only, so any abort between the
+snapshot and the replay leaked the file permanently.  It is now on every exit."
+  #+ecl
+  (skip "v1 fixture was cl-store'd by SBCL; ECL's cl-store cannot restore it.")
+  #-ecl
+  (with-temp-directory (root)
+    (let* ((old-dir (extract-v1-fixture (merge-pathnames "v1/" root)))
+           (new-dir (namestring (merge-pathnames "v2/" root)))
+           (snap (namestring (merge-pathnames "leak.snapshot" root)))
+           (orig (fdefinition 'graph-db::recreate-graph)))
+      ;; Abort in step 2, AFTER the snapshot exists -- the window that leaked.
+      (setf (fdefinition 'graph-db::recreate-graph)
+            (lambda (&rest args)
+              (declare (ignore args))
+              (error "forced failure for the leak test")))
+      (unwind-protect
+           (signals error
+             (graph-db::migrate-graph :graph-db-mvcc-migration old-dir new-dir
+                                      :package :graph-db/test
+                                      :snapshot-file snap))
+        (setf (fdefinition 'graph-db::recreate-graph) orig))
+      (is (not (probe-file snap))
+          "the snapshot must be removed even when the migration fails"))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Versioned write path + reaper (P2)
@@ -381,15 +425,21 @@ did a single untyped lhash scan that read live versions and leaked the phantom."
 
 (test snapshot-option-establishes-a-read-transaction
   "SELECT :snapshot t runs the query inside a read transaction (so reads resolve
-at one epoch); a plain query has no transaction bound."
+at one epoch); a plain query has no transaction bound.  The snapshot lives in
+*READ-SNAPSHOTS* keyed by graph, not in *TRANSACTION* (GH #53), so the escape
+asks READ-TRANSACTION -- which answers for either."
   (with-test-graph (g)
     (declare (ignore g))
     ;; the lisp escape reports whether a transaction is active during the query
     (is (equal '(:yes)
                (select (:flat t :snapshot t) (?b)
-                       (lisp ?b (if graph-db:*transaction* :yes :no)))))
+                       (lisp ?b (if (graph-db::read-transaction *graph*) :yes :no)))))
     (is (equal '(:no)
                (select (:flat t) (?b)
+                       (lisp ?b (if (graph-db::read-transaction *graph*) :yes :no)))))
+    ;; and it is specifically NOT the read-write *TRANSACTION*
+    (is (equal '(:no)
+               (select (:flat t :snapshot t) (?b)
                        (lisp ?b (if graph-db:*transaction* :yes :no)))))))
 
 (test snapshot-query-is-stable-across-a-concurrent-commit

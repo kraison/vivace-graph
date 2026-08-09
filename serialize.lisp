@@ -3,6 +3,16 @@
 ;;(declaim (optimize (speed 3)))
 
 (defgeneric serialize (object))
+(defgeneric serialize-raw-bytes (object))
+
+(defmethod serialize-raw-bytes (object)
+  (serialize object))
+
+(defmethod serialize-raw-bytes ((v vector))
+  (if (typep v '(vector (unsigned-byte 8)))
+      v
+      (serialize v)))
+
 (defgeneric deserialize-help (become object))
 (defgeneric deserialize-help-mmap (become object length header-length))
 (defgeneric make-serialized-key (object))
@@ -12,7 +22,8 @@
 (let ((length-table #+sbcl (make-hash-table :synchronized t)
                     #+lispworks (make-hash-table :single-thread nil)
                     #+ccl (make-hash-table :shared t)
-                    #+ecl (make-hash-table)))
+                    #+ecl (make-hash-table #+graph-db-ecl-sync-hash :synchronized
+                                            #+graph-db-ecl-sync-hash t)))
   (defun encode-length (int)
     (declare (type integer int))
     (or (gethash int length-table)
@@ -31,9 +42,10 @@
       (setq int (dpb (aref bytes i) (byte 8 (* i 8)) int)))
     int))
 
-(defun extract-length (a)
-  (declare (type (array (unsigned-byte 8)) a))
-  (let ((id-byte (aref a 0)))
+(defun extract-length (a &key (start 0))
+  (declare (type (array (unsigned-byte 8)) a)
+           (type fixnum start))
+  (let ((id-byte (aref a start)))
     (cond ((or (= id-byte +uuid+) ;; These are all fixed length
                (= id-byte +bit-vector+)
                (= id-byte +positive-integer+)
@@ -41,7 +53,7 @@
                (= id-byte +character+)
                (= id-byte +single-float+)
                (= id-byte +double-float+))
-           (values (aref a 1) 2))
+           (values (aref a (+ start 1)) 2))
           ((= id-byte +timestamp+)
            (values 24 1))
           ((= id-byte +mpointer+)
@@ -52,8 +64,8 @@
           ((or (= id-byte +t+) (= id-byte +null+))
            (values 1 0))
           (t ;; strings, lists, vectors, blobs, nodes, triples have variable bytes
-           (let ((header-length (+ 2 (aref a 1))))
-             (values (decode-length (subseq a 2 header-length)) header-length))))))
+           (let ((header-length (+ 2 (aref a (+ start 1)))))
+             (values (decode-length (subseq a (+ start 2) (+ start header-length))) header-length))))))
 
 (defun decode-length-mmap (mf n-bytes offset)
   (let ((int 0))
@@ -89,13 +101,15 @@
 
 (defun extract-all-subseqs (a)
   (declare (type (array (unsigned-byte 8)) a))
-  (cond
-    ((= 0 (length a))
-     nil)
-    (t
-     (multiple-value-bind (data-length header-length) (extract-length a)
-       (cons (subseq a 0 (+ header-length data-length))
-             (extract-all-subseqs (subseq a (+ header-length data-length))))))))
+  (loop with i of-type fixnum = 0
+        with end of-type fixnum = (length a)
+        while (< i end)
+        collect (multiple-value-bind (data-length header-length)
+                    (extract-length a :start i)
+                  (let ((next (+ i header-length data-length)))
+                    (prog1 (subseq a i next)
+                      (setf i next))))))
+
 
 (defun read-bytes (mpointer)
   (multiple-value-bind (len h-len) (extract-length-mmap mpointer)
@@ -184,7 +198,7 @@
 
 (defmethod make-slot-key (id slot-name)
   (if (symbolp slot-name) (setq slot-name (symbol-name slot-name)))
-  (let* ((serialized-id (serialize id))
+  (let* ((serialized-id (serialize-raw-bytes id))
          (serialized-slot-name (serialize slot-name))
          (total-length (+ (length serialized-id) (length serialized-slot-name))))
     (declare (type fixnum total-length))
@@ -218,24 +232,127 @@
   (declare (type integer become))
   (map 'vector #'deserialize (extract-all-subseqs bytes)))
 
+(defun %serialize-float-vector (v)
+  "Encode V, a (simple-array single-float (*)) or (simple-array double-float (*)), as one contiguous block:
+a type byte followed by DIM float32s or float64s."
+  (etypecase v
+    ((simple-array single-float (*))
+     (let* ((dim (length v))
+            (payload-length (+ 1 (* 4 dim)))
+            (encoded-length (encode-length payload-length))
+            (l-of-l (length encoded-length))
+            (vec (make-array (+ 1 l-of-l payload-length)
+                             :element-type '(unsigned-byte 8))))
+       (setf (aref vec 0) +float-vector+)
+       (dotimes (i l-of-l)
+         (setf (aref vec (+ 1 i)) (aref encoded-length i)))
+       (let ((base (+ 1 l-of-l)))
+         (setf (aref vec base) +fv-single-float+)
+         (dotimes (i dim)
+           (let ((bits (ieee-floats:encode-float32 (aref v i)))
+                 (off (+ base 1 (* 4 i))))
+             (dotimes (b 4)
+               (setf (aref vec (+ off b)) (ldb (byte 8 (* b 8)) bits))))))
+       vec))
+    ((simple-array double-float (*))
+     (let* ((dim (length v))
+            (payload-length (+ 1 (* 8 dim)))
+            (encoded-length (encode-length payload-length))
+            (l-of-l (length encoded-length))
+            (vec (make-array (+ 1 l-of-l payload-length)
+                             :element-type '(unsigned-byte 8))))
+       (setf (aref vec 0) +float-vector+)
+       (dotimes (i l-of-l)
+         (setf (aref vec (+ 1 i)) (aref encoded-length i)))
+       (let ((base (+ 1 l-of-l)))
+         (setf (aref vec base) +fv-double-float+)
+         (dotimes (i dim)
+           (let ((bits (ieee-floats:encode-float64 (aref v i)))
+                 (off (+ base 1 (* 8 i))))
+             (dotimes (b 8)
+               (setf (aref vec (+ off b)) (ldb (byte 8 (* b 8)) bits))))))
+       vec))))
+
+(defmethod deserialize-help ((become (eql +float-vector+)) (bytes array))
+  "Decode a contiguous float32 or float64 block into a fresh float array.
+BYTES is the payload only: a type byte followed by DIM float32s or float64s."
+  (declare (type (array (unsigned-byte 8)) bytes))
+  (let ((etype (aref bytes 0)))
+    (cond
+      ((= etype +fv-single-float+)
+       (unless (zerop (mod (- (length bytes) 1) 4))
+         (error "float-vector payload is not 4-byte aligned: ~A bytes after the type byte"
+                (- (length bytes) 1)))
+       (let* ((dim (floor (- (length bytes) 1) 4))
+              (v (make-array dim :element-type 'single-float)))
+         (dotimes (i dim v)
+           (let ((bits 0)
+                 (off (+ 1 (* 4 i))))
+             (dotimes (b 4)
+               (setf bits (dpb (aref bytes (+ off b)) (byte 8 (* b 8)) bits)))
+             (setf (aref v i) (ieee-floats:decode-float32 bits))))))
+      ((= etype +fv-double-float+)
+       (unless (zerop (mod (- (length bytes) 1) 8))
+         (error "float-vector payload is not 8-byte aligned: ~A bytes after the type byte"
+                (- (length bytes) 1)))
+       (let* ((dim (floor (- (length bytes) 1) 8))
+              (v (make-array dim :element-type 'double-float)))
+         (dotimes (i dim v)
+           (let ((bits 0)
+                 (off (+ 1 (* 8 i))))
+             (dotimes (b 8)
+               (setf bits (dpb (aref bytes (+ off b)) (byte 8 (* b 8)) bits)))
+             (setf (aref v i) (ieee-floats:decode-float64 bits))))))
+      (t
+       (error "unknown float-vector element type ~A" etype)))))
+
+(defun %serialize-octet-vector (v)
+  "Encode V, a (vector (unsigned-byte 8)), as a tagged +blob+ object:
+tag byte (+blob+ = 13), encoded length, followed by the octet payload."
+  (declare (type (vector (unsigned-byte 8)) v))
+  (let* ((payload-length (length v))
+         (encoded-length (encode-length payload-length))
+         (l-of-l (length encoded-length))
+         (vec (make-array (+ 1 l-of-l payload-length)
+                          :element-type '(unsigned-byte 8))))
+    (setf (aref vec 0) +blob+)
+    (dotimes (i l-of-l)
+      (setf (aref vec (1+ i)) (aref encoded-length i)))
+    (dotimes (i payload-length)
+      (setf (aref vec (+ 1 l-of-l i)) (aref v i)))
+    vec))
+
+(defmethod deserialize-help ((become (eql +blob+)) (bytes array))
+  "Decode uninterpreted octets (+blob+)."
+  (declare (type (array (unsigned-byte 8)) bytes))
+  (let ((copy (make-array (length bytes) :element-type '(unsigned-byte 8))))
+    (replace copy bytes)
+    copy))
+
 (defmethod serialize ((v vector))
-  (if (equal (array-element-type v) '(unsigned-byte 8))
-      v
-      (let* ((serialized-items (map 'list #'serialize v))
-             (total-length (reduce #'+ serialized-items :key 'length))
-             (encoded-length (encode-length total-length))
-             (length-of-encoded-length (length encoded-length))
-             (vec (make-array 0 :fill-pointer t :adjustable t
-                              :element-type '(unsigned-byte 8))))
-        (declare (type fixnum total-length length-of-encoded-length))
-        (declare (type (array (unsigned-byte 8)) encoded-length))
-        (vector-push-extend +vector+ vec)
-        (dotimes (i length-of-encoded-length)
-          (vector-push-extend (aref encoded-length i) vec))
-        (dolist (item serialized-items)
-          (dotimes (i (length item))
-            (vector-push-extend (aref item i) vec)))
-        vec)))
+  (cond
+    ((typep v '(vector (unsigned-byte 8)))
+     (%serialize-octet-vector v))
+    ((typep v '(simple-array single-float (*)))
+     (%serialize-float-vector v))
+    ((typep v '(simple-array double-float (*)))
+     (%serialize-float-vector v))
+    (t
+     (let* ((serialized-items (map 'list #'serialize v))
+            (total-length (reduce #'+ serialized-items :key 'length))
+            (encoded-length (encode-length total-length))
+            (length-of-encoded-length (length encoded-length))
+            (vec (make-array 0 :fill-pointer t :adjustable t
+                             :element-type '(unsigned-byte 8))))
+       (declare (type fixnum total-length length-of-encoded-length))
+       (declare (type (array (unsigned-byte 8)) encoded-length))
+       (vector-push-extend +vector+ vec)
+       (dotimes (i length-of-encoded-length)
+         (vector-push-extend (aref encoded-length i) vec))
+       (dolist (item serialized-items)
+         (dotimes (i (length item))
+           (vector-push-extend (aref item i) vec)))
+       vec))))
 
 (defun bit-vector->integer (bit-vector)
   "Create a positive integer from a bit-vector."
@@ -368,10 +485,28 @@ to match the layout extract-length / deserialize-help expect for +uuid+."
       (setf (aref vec (+ 2 i)) (ldb (byte 8 (* i 8)) code)))
     vec))
 
+(defun %octets-to-string-fast (bytes &key (start 0) (end (length bytes)))
+  (declare (type (array (unsigned-byte 8)) bytes)
+           (type fixnum start end))
+  (let ((len (- end start)))
+    (declare (type fixnum len))
+    (let ((ascii-p t))
+      (loop for i from start below end do
+        (when (>= (aref bytes i) 128)
+          (setf ascii-p nil)
+          (return)))
+      (if ascii-p
+          (let ((str (make-string len :element-type 'character)))
+            (loop for i from 0 below len do
+              (setf (schar str i) (code-char (aref bytes (+ start i)))))
+            str)
+          (babel:octets-to-string bytes :start start :end end)))))
+
 (defmethod deserialize-help ((become (eql +string+)) (bytes array))
   (declare (type (array (unsigned-byte 8)) bytes))
   (declare (type (integer 0 255) become))
-  (babel:octets-to-string bytes))
+  (%octets-to-string-fast bytes))
+
 
 (defmethod serialize ((string string))
   "Unicode aware string encoding. Not as efficient as it could be: creates 2

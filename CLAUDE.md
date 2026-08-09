@@ -27,7 +27,30 @@ Dependencies (bordeaux-threads, alexandria, cffi, osicat, uuid, cl-store, hunche
 
 ## Tests
 
-There is **no automated test framework**. Tests are ad-hoc functions you load and call from the REPL:
+**There IS an automated test framework** — FiveAM, ~50 files across `tests/` and its
+subdirectories, **3,359 checks** as of 2026-08-08. Run a suite through ASDF:
+
+```
+(asdf:test-system :graph-db)              ; the main suite
+(asdf:test-system :graph-db/concurrency-test)
+(asdf:test-system :graph-db/acid-test)
+(asdf:test-system :graph-db/stress-test)
+```
+
+**SBCL needs `--dynamic-space-size 16384`** to run a suite. The default 1 GiB heap dies
+with "Heap exhausted, game over" partway in — `make-graph`'s type index eagerly builds
+131,072 index-lists, and a suite creates many graphs in one image.
+
+Each `test-op` errors on failure, so they are safe to gate on. Run the main suite before
+committing an engine change; the app that consumes this engine has its own 5115-check suite
+that will not catch a defect in here.
+
+⚠ **This line said "there is no automated test framework" until 2026-08-08, long after the
+suites existed.** The consuming app's CLAUDE.md records the same false claim propagating
+into five documents and costing a feature its verification. Correct stale facts *here*, at
+the source, not only in whatever tripped over them.
+
+The older ad-hoc REPL exercises still exist alongside the suites:
 
 - `test.lisp` — allocator/mmap exercises (`test-bins`, `test-alloc`) and vertex/edge stress tests (`vertex-test`, `edge-test`, `stress-test`); creates a graph under `/var/tmp/graph/`.
 - `test-lhash.lisp` — linear-hash benchmarks and `sb-profile` profiling helpers (SBCL-only).

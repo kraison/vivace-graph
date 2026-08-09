@@ -141,8 +141,16 @@ skip list uses ~52 MB and the B+ tree ~23 MB, so 256 MB is ample.)"
   (format t "~&~%############  B+ TREE  vs  SKIP-LIST  (~A, page ~A B)  ############~%"
           (lisp-implementation-type) page-size)
   (dolist (n sizes)
-    (let* ((sl-path (format nil "/var/tmp/bench-sl-~A.dat" n))
-           (bp-path (format nil "/var/tmp/bench-bp-~A.dat" n))
+    ;; Scratch names must be unique per PROCESS, not just per N: two benchmark
+    ;; runs on a shared host would otherwise map the same heap file.  The default
+    ;; *RANDOM-STATE* is a fixed constant on SBCL, so seed from entropy.
+    (let* ((tag (random (expt 36 12) (make-random-state t)))
+           (sl-path (namestring
+                     (merge-pathnames (format nil "bench-sl-~36R-~A.dat" tag n)
+                                      (uiop:temporary-directory))))
+           (bp-path (namestring
+                     (merge-pathnames (format nil "bench-bp-~36R-~A.dat" tag n)
+                                      (uiop:temporary-directory))))
            ;; CREATE-MEMORY does NOT truncate an existing file -- it maps it at its
            ;; current size.  A stale file left by a prior crashed/oversized run
            ;; (e.g. a 1 GB file from :heap-mb 1024) is then reused with a

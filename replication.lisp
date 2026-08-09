@@ -42,6 +42,7 @@ node-id -> node, holding exactly the disclosable closure."
   (let ((vset (make-id-table))
         (eset (make-id-table))
         (dcache (make-id-table))      ; id -> :yes / :no  (memoize disclosable-p)
+        (refs (and (typep graph 'peer-graph) (reference-classes graph)))
         (queue '()))
     (labels ((disc (v)
                (let ((cached (gethash (id v) dcache)))
@@ -51,10 +52,23 @@ node-id -> node, holding exactly the disclosable closure."
                    (t (let ((d (disclosable-p graph v device-scope)))
                         (setf (gethash (id v) dcache) (if d :yes :no))
                         d)))))
+             (reference-vertex-p (v)
+               "True if V belongs to a REFERENCE-CLASS (subclass-inclusive)."
+               (some (lambda (class) (typep v class)) refs))
              (visit (v)
                (when (and v (not (gethash (id v) vset)) (disc v))
                  (setf (gethash (id v) vset) v)
-                 (push v queue))))
+                 ;; Reference-class vertices are TERMINAL in the walk: ship them, but never
+                 ;; traverse OUT of them -- no matter how they were reached.  The reference-set
+                 ;; pass below adds them without enqueueing for exactly this reason; making it a
+                 ;; property of WHAT the vertex IS (rather than of HOW it was added) closes the
+                 ;; other door.  Otherwise an edge INTO the catalogue -- e.g. FIND-OF-TYPE, which
+                 ;; a device needs so a pulled find carries its ordnance classification -- fans the
+                 ;; walk back out along that vertex's INCOMING edges to every find in the database
+                 ;; that shares the type, paying a DISCLOSABLE-P (and its survey/project traversal)
+                 ;; on each one before rejecting it.  Correct, but O(all finds) per sync.
+                 (unless (reference-vertex-p v)
+                   (push v queue)))))
       (with-read-snapshot (graph)
         (dolist (r roots) (visit (%resolve-vertex r graph)))
         (loop while queue do

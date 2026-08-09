@@ -70,10 +70,25 @@
 ;;; Temp dirs / gc (same pattern as the stress suite)
 ;;; ---------------------------------------------------------------------------
 
+;; SBCL's initial *RANDOM-STATE* is a fixed constant, so an unseeded (RANDOM ...)
+;; produces the SAME name sequence in every image: two concurrent suite runs on a
+;; shared host would share -- and delete -- each other's scratch dirs.  Seed from
+;; entropy, lazily so a dumped image reseeds in each new process, and add a
+;; counter so one image can never repeat a name either.
+(defvar *scratch-random-state* nil)
+(defvar *scratch-counter* 0)
+
+(defun scratch-tag ()
+  "A name fragment unique across concurrent processes and across calls."
+  (unless *scratch-random-state*
+    (setf *scratch-random-state* (make-random-state t)))
+  (format nil "~36R-~36R"
+          (random (expt 36 12) *scratch-random-state*)
+          (incf *scratch-counter*)))
+
 (defun make-temp-directory ()
-  (let ((dir (merge-pathnames
-              (format nil "graph-db-perf-~36R/" (random (expt 36 12)))
-              (uiop:temporary-directory))))
+  (let ((dir (merge-pathnames (format nil "graph-db-perf-~A/" (scratch-tag))
+                              (uiop:temporary-directory))))
     (ensure-directories-exist dir)
     dir))
 
@@ -110,6 +125,19 @@
 
 (def-edge p-knows ()
   ()
+  :graph-db-perf-test)
+
+;; A :UNIQUE-constrained type and an :INDEX-ed type for the unique / general-index
+;; benchmarks (bench-unique / bench-index).  Separate types so they don't perturb
+;; the other benchmarks' node path.
+(def-vertex pu-node ()
+  ((uval :unique t)
+   (label))
+  :graph-db-perf-test)
+
+(def-vertex pi-node ()
+  ((ival :index t)
+   (label))
   :graph-db-perf-test)
 
 (defun define-perf-views ()

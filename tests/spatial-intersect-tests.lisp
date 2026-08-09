@@ -27,15 +27,15 @@ find-nodes-within; a far point (Lviv) by neither.  Exact regardless of GEOS."
       (with-transaction ()
         (setq inside  (id (make-geo-place :loc (make-point 37.1724d0 49.2021d0)))
               outside (id (make-geo-place :loc (make-point 23.7183d0 50.0263d0)))))
-      (let ((hit-i (mapcar #'id (find-nodes-intersecting *aoi* :graph g)))
-            (hit-w (mapcar #'id (find-nodes-within *aoi* :graph g))))
+      (let ((hit-i (mapcar #'id (find-nodes-intersecting 'geo-place *aoi* :graph g)))
+            (hit-w (mapcar #'id (find-nodes-within 'geo-place *aoi* :graph g))))
         (is (member inside hit-i :test 'equalp))
         (is (not (member outside hit-i :test 'equalp)))
         (is (member inside hit-w :test 'equalp))
         (is (not (member outside hit-w :test 'equalp)))))))
 
 (test find-intersects-functor-yields-nodes
-  "The Prolog find-intersects/2 functor yields nodes intersecting a bound area,
+  "The Prolog find-intersects/3 functor yields nodes intersecting a bound area,
 composing with is-a."
   (with-test-graph (g)
     (declare (ignore g))
@@ -49,7 +49,7 @@ composing with is-a."
                            (is ?area (make-polygon '(((37.170d0 49.200d0) (37.180d0 49.200d0)
                                                       (37.180d0 49.206d0) (37.170d0 49.206d0)
                                                       (37.170d0 49.200d0)))))
-                           (find-intersects ?n ?area)))))
+                           (find-intersects ?n geo-place ?area)))))
         (is (member inside ids :test 'equalp))
         (is (= 1 (length ids)))))))
 
@@ -68,6 +68,6 @@ loaded in this image (then the test would assert exactness instead)."
                                   '(((37.178d0 49.204d0) (37.200d0 49.204d0)
                                      (37.200d0 49.212d0) (37.178d0 49.212d0)
                                      (37.178d0 49.204d0))))))))
-          (is (member poly (mapcar #'id (find-nodes-intersecting *aoi* :graph g))
+          (is (member poly (mapcar #'id (find-nodes-intersecting 'geo-place *aoi* :graph g))
                       :test 'equalp)
               "coarse bbox overlap should include the polygon node")))))

@@ -61,9 +61,9 @@
   (geometry-make-valid (make-polygon                       ; repair a bowtie
                         '(((0d0 0d0) (4d0 4d0) (4d0 0d0) (0d0 4d0) (0d0 0d0)))))
   (geometry-intersects-p *storm-aoi* (storm-poly 0.002d0 0.002d0 0.02d0 0.02d0))
-  (length (find-nodes-within *storm-aoi* :graph g))
+  (length (find-nodes-within 'geos-place *storm-aoi* :graph g))
   (sort (mapcar (lambda (n) (format nil "~A" (id n)))
-                (find-nodes-intersecting *storm-aoi* :graph g))
+                (find-nodes-intersecting 'geos-place *storm-aoi* :graph g))
         #'string<))
 
 (test pool-correct-under-concurrency

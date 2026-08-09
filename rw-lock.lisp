@@ -163,18 +163,18 @@ Old ECL: readers poll, so nothing to signal."
 ;;; Read lock.
 ;;; ---------------------------------------------------------------------------
 
+(defun %decrement-readers (rw-lock)
+  "Caller holds lock-lock. Decrements lock-readers, and if it reaches 0 and a writer is parked, signals lock-semaphore."
+  (when (eql 0 (decf (lock-readers rw-lock)))
+    (when (lock-writer rw-lock)
+      #+sbcl (sb-thread:signal-semaphore (lock-semaphore rw-lock))
+      #+lispworks (mp:semaphore-release (lock-semaphore rw-lock))
+      #+graph-db-ecl-modern-mp (mp:signal-semaphore (lock-semaphore rw-lock)))))
+
 (defun release-read-lock (rw-lock)
   (with-recursive-lock-held ((lock-lock rw-lock))
     (assert (not (eql 0 (lock-readers rw-lock))))
-    (when (eql 0 (decf (lock-readers rw-lock)))
-      (when (lock-writer rw-lock)
-        ;; The active writer is parked waiting for readers to drain; wake it.
-        ;; (This targets exactly one thread — not part of the herd.)  Old ECL
-        ;; can't (mp:wait-on-semaphore blocked indefinitely on 21.2.1); there
-        ;; the writer polls lock-readers instead.
-        #+sbcl (sb-thread:signal-semaphore (lock-semaphore rw-lock))
-        #+lispworks (mp:semaphore-release (lock-semaphore rw-lock))
-        #+graph-db-ecl-modern-mp (mp:signal-semaphore (lock-semaphore rw-lock))))))
+    (%decrement-readers rw-lock)))
 
 (defun acquire-read-lock (rw-lock &key (max-tries 1000))
   (declare (ignore max-tries))
@@ -191,11 +191,18 @@ Old ECL: readers poll, so nothing to signal."
      #+(and ecl (not graph-db-ecl-modern-mp)) (sleep 0.001)))
 
 (defmacro with-read-lock ((rw-lock) &body body)
-  `(unwind-protect
-        (if (rw-lock-p (acquire-read-lock ,rw-lock))
-            (progn ,@body)
-            (error "Unable to get rw-lock: ~A" ,rw-lock))
-     (release-read-lock ,rw-lock)))
+  (let ((lock-var (gensym "LOCK"))
+        (acquired-var (gensym "ACQUIRED")))
+    `(let ((,lock-var ,rw-lock)
+           (,acquired-var nil))
+       (unwind-protect
+            (progn
+              (setf ,acquired-var (acquire-read-lock ,lock-var))
+              (if (rw-lock-p ,acquired-var)
+                  (progn ,@body)
+                  (error "Unable to get rw-lock: ~A" ,lock-var)))
+         (when ,acquired-var
+           (release-read-lock ,lock-var))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Write lock.
@@ -223,76 +230,108 @@ Old ECL: readers poll, so nothing to signal."
 (defun acquire-write-lock (rw-lock &key (max-tries 1000) reading-p (wait-p t))
   (declare (ignore max-tries))
   (let ((self (current-thread))
-        (my-entry nil))
+        (my-entry nil)
+        (acquired-p nil))
     (declare (ignorable my-entry))
-    (with-recursive-lock-held ((lock-lock rw-lock))
-      (cond
-        ;; Recursive re-acquire by the active writer: push a fresh entry on the
-        ;; FRONT so queue-front identity stays = self, and return immediately.
-        ((and (%next-in-queue-p rw-lock self)
-              (eq (lock-writer rw-lock) self))
-         (enqueue-front (lock-writer-queue rw-lock)
-                        (make-writer-wait :thread self))
-         (return-from acquire-write-lock rw-lock))
-        ;; Blocking acquire: enqueue our entry and fall through to the wait loop.
-        (wait-p
-         (setf my-entry (make-writer-wait :thread self))
-         (enqueue (lock-writer-queue rw-lock) my-entry))
-        ;; Non-blocking try (:wait-p nil): take it iff the lock is idle.
-        (t
-         (if (%lock-unused-p rw-lock)
-             (progn
-               (enqueue (lock-writer-queue rw-lock)
-                        (make-writer-wait :thread self))
-               (setf (lock-writer rw-lock) self)
-               (when reading-p
-                 (decf (lock-readers rw-lock)))
-               (return-from acquire-write-lock rw-lock))
-             (return-from acquire-write-lock nil)))))
-    ;; --- Wait loop (reached only on the wait-p path; my-entry is set). ---
-    (loop
-       (when (eq (lock-writer rw-lock) self)
-         (return-from acquire-write-lock rw-lock))
-       (let ((internal-wait-p nil)
-             (park-on-waker nil))
-         (declare (ignorable park-on-waker))
-         (handler-case
-             (with-recursive-lock-held ((lock-lock rw-lock))
-               (if (and (null (lock-writer rw-lock))
-                        (%next-in-queue-p rw-lock self))
-                   ;; Our turn: become the active writer.
-                   (progn
-                     (setf (lock-writer rw-lock) self)
-                     (when reading-p
-                       (decf (lock-readers rw-lock)))
-                     (unless (eql 0 (lock-readers rw-lock))
-                       (setf internal-wait-p t)))
-                   ;; Not our turn yet: park on OUR private waker (modern) or
-                   ;; spin-sleep (old ECL).
-                   (progn
-                     #+(or sbcl lispworks graph-db-ecl-modern-mp)
-                     (setf park-on-waker t))))
-           (error (c)
-             (log:error "Got error ~A while acquiring write lock ~A"
-                        c rw-lock)))
-         (cond
-           (internal-wait-p
-            ;; We are the writer; block until the remaining readers drain.
-            (%wait-for-readers-to-drain rw-lock))
-           #+(or sbcl lispworks graph-db-ecl-modern-mp)
-           (park-on-waker
-            ;; Block on our private semaphore until release signals exactly us.
-            (ww-wait my-entry))
-           ;; Old ECL: didn't become writer this round; sleep before retrying.
-           #+(and ecl (not graph-db-ecl-modern-mp))
-           (t (sleep 0.001)))))))
+    (unwind-protect
+         (progn
+           (with-recursive-lock-held ((lock-lock rw-lock))
+             (cond
+               ;; Recursive re-acquire by the active writer: push a fresh entry on the
+               ;; FRONT so queue-front identity stays = self, and return immediately.
+               ((and (%next-in-queue-p rw-lock self)
+                     (eq (lock-writer rw-lock) self))
+                (enqueue-front (lock-writer-queue rw-lock)
+                               (make-writer-wait :thread self))
+                (setf acquired-p t)
+                (return-from acquire-write-lock rw-lock))
+               ;; Blocking acquire: enqueue our entry and fall through to the wait loop.
+               (wait-p
+                (when reading-p
+                  ;; Fix for #76: Decrement read lock immediately on enqueue so we
+                  ;; don't hold lock-readers > 0 while waiting behind other writers.
+                  (%decrement-readers rw-lock))
+                (setf my-entry (make-writer-wait :thread self))
+                (enqueue (lock-writer-queue rw-lock) my-entry))
+               ;; Non-blocking try (:wait-p nil): take it iff the lock is idle.
+               (t
+                (if (%lock-unused-p rw-lock)
+                    (progn
+                      (enqueue (lock-writer-queue rw-lock)
+                               (make-writer-wait :thread self))
+                      (setf (lock-writer rw-lock) self)
+                      (when reading-p
+                        (%decrement-readers rw-lock))
+                      (setf acquired-p t)
+                      (return-from acquire-write-lock rw-lock))
+                    (return-from acquire-write-lock nil)))))
+           ;; --- Wait loop (reached only on the wait-p path; my-entry is set). ---
+           (loop
+              (when (eq (lock-writer rw-lock) self)
+                (setf acquired-p t)
+                (return-from acquire-write-lock rw-lock))
+              (let ((internal-wait-p nil)
+                    (park-on-waker nil))
+                (declare (ignorable park-on-waker))
+                (handler-case
+                    (with-recursive-lock-held ((lock-lock rw-lock))
+                      (if (and (null (lock-writer rw-lock))
+                               (%next-in-queue-p rw-lock self))
+                          ;; Our turn: become the active writer.
+                          (progn
+                            (setf (lock-writer rw-lock) self)
+                            (unless (eql 0 (lock-readers rw-lock))
+                              (setf internal-wait-p t)))
+                          ;; Not our turn yet: park on OUR private waker (modern) or
+                          ;; spin-sleep (old ECL).
+                          (progn
+                            #+(or sbcl lispworks graph-db-ecl-modern-mp)
+                            (setf park-on-waker t))))
+                  (error (c)
+                    (log:error "Got error ~A while acquiring write lock ~A"
+                               c rw-lock)))
+                (cond
+                  (internal-wait-p
+                   ;; We are the writer; block until the remaining readers drain.
+                   (%wait-for-readers-to-drain rw-lock))
+                  #+(or sbcl lispworks graph-db-ecl-modern-mp)
+                  (park-on-waker
+                   ;; Block on our private semaphore until release signals exactly us.
+                   (ww-wait my-entry))
+                  ;; Old ECL: didn't become writer this round; sleep before retrying.
+                  #+(and ecl (not graph-db-ecl-modern-mp))
+                  (t (sleep 0.001))))))
+      ;; Fix for #74: If acquire unwinds without completing, clean up queue & hand off signal
+      (unless acquired-p
+        (when my-entry
+          (with-recursive-lock-held ((lock-lock rw-lock))
+            (let ((was-front (%next-in-queue-p rw-lock self)))
+              (queue-remove (lock-writer-queue rw-lock) my-entry)
+              (when reading-p
+                ;; Restore read lock if upgrade failed/unwound
+                (incf (lock-readers rw-lock)))
+              (when was-front
+                (if (empty-queue-p (lock-writer-queue rw-lock))
+                    (%wake-all-readers rw-lock)
+                    (%wake-next-writer rw-lock))))))))))
 
-(defmacro with-write-lock ((rw-lock &key reading-p) &body body)
-  `(unwind-protect
-        (if (rw-lock-p (acquire-write-lock ,rw-lock :reading-p ,reading-p))
-            (progn ,@body)
-            (error "Unable to get rw-lock: ~A" ,rw-lock))
-     (release-write-lock ,rw-lock :reading-p ,reading-p)))
+(defmacro with-write-lock ((rw-lock &key reading-p (wait-p t)) &body body)
+  (let ((lock-var (gensym "LOCK"))
+        (acquired-var (gensym "ACQUIRED"))
+        (reading-p-var (gensym "READING-P"))
+        (wait-p-var (gensym "WAIT-P")))
+    `(let ((,lock-var ,rw-lock)
+           (,acquired-var nil)
+           (,reading-p-var ,reading-p)
+           (,wait-p-var ,wait-p))
+       (unwind-protect
+            (progn
+              (setf ,acquired-var (acquire-write-lock ,lock-var :reading-p ,reading-p-var :wait-p ,wait-p-var))
+              (if (rw-lock-p ,acquired-var)
+                  (progn ,@body)
+                  (error "Unable to get rw-lock: ~A" ,lock-var)))
+         (when ,acquired-var
+           (release-write-lock ,lock-var :reading-p ,reading-p-var))))))
 
 #|
 (defun test-rw-locks ()

@@ -21,7 +21,17 @@
 
 (in-suite rest-http-suite)
 
+;; A FIXED port is a cross-run contaminator on a shared host exactly like a fixed
+;; temp path, but fails worse: a second concurrent run either cannot bind, or its
+;; requests reach the FIRST run's server and read that run's graph.  Ask the OS
+;; for a free port per server instead.
 (defparameter *http-test-port* 17893)
+
+(defun free-tcp-port ()
+  "An unused loopback port: bind port 0, read what the OS assigned, release it."
+  (let ((s (usocket:socket-listen "127.0.0.1" 0 :reuse-address t)))
+    (unwind-protect (usocket:get-local-port s)
+      (usocket:socket-close s))))
 
 ;; A trivial procedure to exercise the /procedure route over HTTP.
 (def-rest-procedure :echo (msg)
@@ -31,7 +41,8 @@
   "Start a real REST server on *HTTP-TEST-PORT* with AUTH-REST-USER stubbed to
 accept USER/PASS, run BODY, then stop the server and restore auth."
   (let ((saved (gensym "AUTH")))
-    `(let ((,saved (symbol-function 'graph-db::auth-rest-user)))
+    `(let ((,saved (symbol-function 'graph-db::auth-rest-user))
+           (*http-test-port* (free-tcp-port)))
        (unwind-protect
             (progn
               (setf (symbol-function 'graph-db::auth-rest-user)

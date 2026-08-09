@@ -26,6 +26,7 @@
            #:*default-index-size*
            #:*index-backend*
            #:graph-index-backend
+           #:graph-spatial-index-backend
            #:open-graph
            #:close-graph
            #:lookup-graph
@@ -34,6 +35,39 @@
            #:snapshot
            #:replay
            #:restore
+           ;; Vector segments (dense-vector index + cosine kNN query layer).
+           #:vector-search
+           #:rebuild-vector-segment-batched
+           #:segment-scan
+           #:segment-score-subset
+           ;; Signalled pre-durability when a commit would grow a segment past
+           ;; its mmap reservation.  Exported so a caller can tell "reopen the
+           ;; graph / raise the reservation and retry" apart from a genuine data
+           ;; error; the accessors go with it (as UCV-* do) so that decision can
+           ;; be made from the numbers rather than by parsing the report text.
+           #:vector-segment-capacity-exhausted
+           #:vsce-owner #:vsce-slot #:vsce-required
+           #:vsce-reserved #:vsce-needed-bytes
+           #:vsce-path #:vsce-reason
+           ;; The one knob that actually raises a segment's mmap reservation
+           ;; ceiling (see VECTOR-SEGMENT-CAPACITY-EXHAUSTED's report and
+           ;; %SEG-RESERVATION-FOR).  Exported so raising it before OPEN-GRAPH
+           ;; is a supported call, not the internal-symbol surgery
+           ;; (GRAPH-DB::*SEGMENT-MIN-RESERVATION*) it used to require;
+           ;; *MMAP-RESERVATION-MULTIPLIER* and *MMAP-MIN-RESERVATION*
+           ;; deliberately stay internal here -- they reach every mapped file
+           ;; in the graph (heap, indexes, linear hashes), not just segments,
+           ;; so exporting them is a broader API decision than this fix.
+           #:*segment-min-reservation*
+           ;; The kill-switch for growth-by-relocation.  Exported for the same
+           ;; reason as the floor above: turning relocation off is a supported
+           ;; operational decision (it restores the old, strictly-safe
+           ;; pre-durability abort), not internal-symbol surgery.
+           #:*segment-relocate-on-exhaustion*
+           ;; The kill-switch for the CHEAP half of the same mechanism: growth
+           ;; by claiming the adjacent address range, which relocation is only
+           ;; the fallback for.  Exported alongside it for the same reason.
+           #:*segment-extend-adjacent-on-exhaustion*
            #:location
            #:schema
            #:indexes
@@ -42,6 +76,8 @@
            #:transaction-p
            #:graph-name
            #:transaction-error
+           #:cross-graph-transaction-error
+           #:duplicate-node-class-error
            #:master-host
            #:replication-port
            #:slave-socket
@@ -78,6 +114,8 @@
            #:commit
            #:rollback
            #:*transaction*
+           #:*read-snapshots*
+           #:read-transaction
            #:no-transaction-in-progress
 
            #:def-node-type
@@ -107,6 +145,8 @@
            #:make-edge
            #:lookup-vertex
            #:lookup-edge
+           ;; MVCC: public read path over the versions KEEP-REVISIONS retains
+           #:vertex-history
            #:to
            #:from
            #:weight
@@ -135,6 +175,10 @@
            #:ucv-class-name #:ucv-slot-name #:ucv-value #:ucv-existing-id
            #:rebuild-unique-indexes
            #:regenerate-unique-indexes
+           ;; general ordered index (:index slot option / def-index)
+           #:def-index
+           #:index-lookup #:index-range #:map-index
+           #:rebuild-secondary-indexes #:regenerate-secondary-indexes
 
            #:def-view
            #:*view-rv*
@@ -230,9 +274,13 @@
            #:make-multipolygon
            #:geometry-kind
            #:geometry-coordinates
+           #:geometry-coordinate-pairs
+           #:do-geometry-coordinates
+           #:map-geometry-coordinates
            #:geometry-lon
            #:geometry-lat
            #:geometry-bbox
+           #:geometry-empty-p
            ;; geometry operations
            #:geodesic-distance
            #:point-in-ring-p
@@ -269,18 +317,42 @@
            #:geohash-neighbor
            #:geohash-neighbors
            ;; spatial index
-           #:spatial-index
+           #:spatial-indexes
+           #:spatial-index-for
+           #:all-spatial-indexes
+           #:class-spatial-index-keys
+           #:graph-default-spatial-precision
+           #:graph-default-spatial-max-cells
+           #:spatial-precision-spec
+           #:spatial-max-cells-spec
            #:spatial-index-p
            #:make-spatial-index
            #:open-spatial-index
            #:spatial-index-precision
+           #:spatial-index-max-cells
+           #:spatial-index-precision-counts
+           #:spatial-index-coarsest-precision
            #:spatial-index-address
            #:spatial-index-insert
            #:spatial-index-remove
            #:spatial-index-query-bbox
            #:spatial-index-query-radius
+           #:map-spatial-index-bbox
+           #:map-spatial-index-radius
            #:delete-spatial-index
-           #:rebuild-spatial-index
+           #:rebuild-spatial-indexes
+           #:regenerate-spatial-index
+           #:regenerate-spatial-indexes
+           ;; §8: the inert second geometry slot.  Only the FIRST geometry-valued
+           ;; :INDEX slot of a class is ever indexed; AUDIT-SPATIAL-SLOTS is the
+           ;; exhaustive read-only sweep for the rest, and
+           ;; NODE-GEOMETRY-SLOTS-WITH-VALUES is the per-node predicate behind it.
+           #:audit-spatial-slots
+           #:node-geometry-slots-with-values
+           ;; declaring a spatial index's grid precision: the reader for the
+           ;; (slot :spatial-precision N) slot option, its one declaration surface
+           #:spatial-precision-spec
+           #:install-spatial-indexes
            ;; write-path protocol (applications specialize this)
            #:node-geometry
            ;; subset replication (field devices)
@@ -291,10 +363,10 @@
            #:find-nodes-intersecting
            #:find-nodes-near
            #:find-nearest-k
-           #:find-within/2
-           #:find-intersects/2
-           #:find-near/4
-           #:find-nearest/4
+           #:find-within/3
+           #:find-intersects/3
+           #:find-near/5
+           #:find-nearest/5
            #:geo-distance/5
            #:geo-near/5
            #:geo-within/3

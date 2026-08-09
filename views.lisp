@@ -8,7 +8,9 @@
   (table #+sbcl (make-hash-table :test 'eql :synchronized t)
          #+lispworks (make-hash-table :test 'eql :single-thread nil)
          #+ccl (make-hash-table :test 'eql :shared t)
-         #+ecl (make-hash-table :test 'eql))
+         #+ecl (make-hash-table :test 'eql
+                                #+graph-db-ecl-sync-hash :synchronized
+                                #+graph-db-ecl-sync-hash t))
   (lock (make-rw-lock)))
 
 (defstruct (view
@@ -29,6 +31,11 @@
   skip-list
   (lock (make-rw-lock))
   lookup-fn
+  ;; The (map-code . reduce-code) the cached MAP-FN/REDUCE-FN were built from, so
+  ;; COMPILE-VIEW-CODE can skip a recompile that would produce identical functions
+  ;; (GH #89).  Transient: SAVE-VIEWS persists an explicit field alist, not the
+  ;; struct, so this never reaches disk.
+  compiled-from
   (sort-order :lessp))
 
 (defun yield (key value)
@@ -58,8 +65,14 @@ once per entry you want the node to contribute (zero, one, or many times)."
 (defmethod lookup-view-group ((group-name symbol) (graph graph))
   (gethash group-name (views graph)))
 
+(defmethod lookup-view-group (group-name (graph null))
+  (declare (ignore group-name graph))
+  nil)
+
 (defmethod lookup-view-group ((group-name symbol) (graph-name symbol))
-  (lookup-view-group group-name (lookup-graph graph-name)))
+  (let ((g (lookup-graph graph-name)))
+    (when g
+      (lookup-view-group group-name g))))
 
 (defmethod lookup-view-group ((node node) graph)
   (lookup-view-group (class-name (class-of node)) graph))
@@ -133,17 +146,25 @@ once per entry you want the node to contribute (zero, one, or many times)."
       d)))
 
 (defun view-key-deserialize (array)
-  (multiple-value-bind (payload length)
-      (deserialize (subseq array 16))
-    (let ((d (list payload (subseq array 0 16))))
-      (values d (+ length 16)))))
+  (declare (type (array (unsigned-byte 8)) array))
+  (let ((node-id (make-array 16 :element-type '(unsigned-byte 8))))
+    (dotimes (i 16) (setf (aref node-id i) (aref array i)))
+    (if (and (> (length array) 16) (= (aref array 16) +string+))
+        (multiple-value-bind (data-len header-len) (extract-length array :start 16)
+          (let ((str (%octets-to-string-fast array :start (+ 16 header-len) :end (+ 16 header-len data-len))))
+            (values (list str node-id) (+ 16 header-len data-len))))
+        (multiple-value-bind (payload length) (deserialize (subseq array 16))
+          (values (list payload node-id) (+ length 16))))))
+
 
 (defmethod restore-views ((graph graph))
   (let ((views-file (format nil "~A/views.dat" (location graph)))
         (view-table (make-hash-table
                      #+sbcl :synchronized #+sbcl t
                      #+ccl :shared #+ccl t
-                     #+lispworks :single-thread #+lispworks nil)))
+                     #+lispworks :single-thread #+lispworks nil
+                     #+graph-db-ecl-sync-hash :synchronized
+                     #+graph-db-ecl-sync-hash t)))
     (when (probe-file views-file)
       (let ((blob (cl-store:restore views-file)))
         (dolist (view-data blob)
@@ -300,11 +321,31 @@ once per entry you want the node to contribute (zero, one, or many times)."
 |#
 
 (defmethod compile-view-code ((view view))
-  (setf (view-map-fn view)
-        (eval (read-from-string (view-map-code view))))
-  (when (view-reduce-code view)
-    (setf (view-reduce-fn view)
-          (eval (read-from-string (view-reduce-code view))))))
+  "Compile the view's map/reduce source into functions, memoized on the SOURCE.
+
+ADD-TO-VIEW calls this on EVERY node addition, and it used to READ-FROM-STRING
+and EVAL unconditionally -- invoking the reader and the compiler once per view
+per node to rebuild functions that had not changed.  That was ~77% of with-view
+write time and ~193 KB/node of pure garbage (GH #89).
+
+Keyed on the source rather than on (FUNCTIONP MAP-FN), so a redefined view still
+recompiles: the bare functionp guard would cache the first compile forever.
+
+Deliberately unlocked, like %NODE-SLOT-INFO's cache: two threads racing here
+compile equal functions and one wins, which is harmless.  What must not happen is
+publishing COMPILED-FROM before the functions it describes, so it is set LAST --
+otherwise another thread could skip the compile while the functions are stale."
+  (let ((key (cons (view-map-code view) (view-reduce-code view))))
+    (unless (and (functionp (view-map-fn view))
+                 (equal key (view-compiled-from view)))
+      (setf (view-map-fn view)
+            (eval (read-from-string (view-map-code view))))
+      ;; Assigned unconditionally so dropping a view's :REDUCE clears the stale
+      ;; function rather than leaving the old one bound.
+      (setf (view-reduce-fn view)
+            (when (view-reduce-code view)
+              (eval (read-from-string (view-reduce-code view)))))
+      (setf (view-compiled-from view) key))))
 
 (defun reduce-equal (key1 key2)
   ;;(log:debug "REDUCE-EQUAL ~S < ~S" key1 key2)

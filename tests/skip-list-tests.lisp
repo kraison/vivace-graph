@@ -96,13 +96,13 @@ chain correctly, and %SL-LENGTH is the maintained counter."
       (is (= 60 (sl-find-value sl 6)))
       (is (equal '(0 1 2 3 4 6 7 8 9) (mapcar #'car (skip-list-to-list sl)))))))
 
-(test duplicate-add-ignored-without-duplicates
+(test skip-list-disallows-duplicates
   "With duplicates disallowed, re-adding an existing key is a no-op: the
-count and the original value are unchanged."
+count and the original value are unchanged, and add-to-skip-list returns NIL."
   (with-temp-memory (heap)
     (let ((sl (make-integer-skip-list heap)))
-      (add-to-skip-list sl 7 "first")
-      (add-to-skip-list sl 7 "second")
+      (is-true (add-to-skip-list sl 7 "first"))
+      (is (null (add-to-skip-list sl 7 "second")))
       (is (= 1 (sl-live-count sl)))
       (is (= 1 (%sl-length sl)))
       (is (string= "first" (sl-find-value sl 7))))))
@@ -321,3 +321,67 @@ missing key is a no-op."
     (let ((sl (make-integer-skip-list heap)))
       (dotimes (i 20) (add-to-skip-list sl i i))
       (finishes (delete-skip-list sl)))))
+
+;;; ---- node-cache coherence (GH #83 regression) --------------------------
+;;;
+;;; READ-SKIP-NODE consults NODE-CACHE-VEC, a direct-mapped array cache added
+;;; by cab4c9a.  It is keyed AND validated by heap address, so it is only sound
+;;; if an address is evicted before it is freed: otherwise the allocator hands
+;;; the same address to a new node, the (%SN-ADDR CACHED) guard matches, and the
+;;; read returns the PREVIOUS node's key, value and pointers.
+
+(test removing-a-node-evicts-its-address-from-the-node-cache
+  "THE INVARIANT that makes the direct-mapped NODE-CACHE-VEC sound: an address
+must not remain in it once REMOVE-FROM-SKIP-LIST hands that address back to the
+allocator.
+
+That cache is validated by address -- (= (%SN-ADDR CACHED) ADDR) -- so a stale
+entry for a freed address becomes indistinguishable from a live one the moment
+the allocator reissues the address, and READ-SKIP-NODE then returns the previous
+node's key, value and POINTERS: wrong reads, and traversal cycles where the
+stale pointers loop.  GH #83 (cab4c9a) added the cache without this eviction.
+
+Note the CLRHASH below.  ADD-TO-SKIP-LIST populates only the weak hash cache, so
+an immediate read is served from there and never touches the direct-mapped one;
+the vec is filled only by a genuinely cold read, i.e. after GC has dropped the
+weak entry.  Clearing the hash makes that cold read -- and hence this invariant
+-- deterministic instead of dependent on when a GC happens to run."
+  (with-temp-memory (heap)
+    (let ((sl (make-integer-skip-list heap)))
+      (add-to-skip-list sl 42 "forty-two")
+      ;; stand in for the weak cache having been collected
+      (clrhash (graph-db::%sl-node-cache sl))
+      (let* ((node (find-in-skip-list sl 42))
+             (addr (graph-db::%sn-addr node))
+             (idx (graph-db::%node-cache-vec-index addr)))
+        (is (eq node (aref (graph-db::%sl-node-cache-vec sl) idx))
+            "precondition: a cold read must populate the direct-mapped cache")
+        (remove-from-skip-list sl 42)
+        ;; NB: compute the boolean OUTSIDE the IS.  FiveAM destructures
+        ;; (is (not (f ...))) and evaluates the inner forms separately to build
+        ;; its failure message, which defeats AND's short-circuit -- so an
+        ;; (is (not (and cached ...))) would call %SN-ADDR on NIL.
+        (let* ((cached (aref (graph-db::%sl-node-cache-vec sl) idx))
+               (stale-p (and cached (= (graph-db::%sn-addr cached) addr))))
+          (is (null stale-p)
+              "address ~D was freed but is still in the direct-mapped cache; a ~
+node later allocated at that address would read back this stale entry" addr))
+        (is (null (sl-find-value sl 42)) "the removed key must be gone")))))
+
+(test cache-enabled-nil-forces-a-fresh-read
+  "Binding *CACHE-ENABLED* to NIL must bypass BOTH node caches.  The
+direct-mapped cache added by cab4c9a was consulted before the flag was tested
+and written unconditionally, so the flag silently stopped disabling skip-list
+node caching -- which the profiler's cold-read workloads rely on."
+  (with-temp-memory (heap)
+    (let ((sl (make-integer-skip-list heap)))
+      (add-to-skip-list sl 7 "seven")
+      (is (string= "seven" (sl-find-value sl 7)))
+      (let ((graph-db::*cache-enabled* nil))
+        (is (string= "seven" (sl-find-value sl 7))
+            "a read with caching disabled must still return the right value")
+        ;; and it must not have been served from, or written to, the vec cache
+        (is (null (aref (graph-db::%sl-node-cache-vec sl)
+                        (graph-db::%node-cache-vec-index
+                         (graph-db::%sn-addr (find-in-skip-list sl 7)))))
+            "a read with caching disabled populated the direct-mapped cache")))))

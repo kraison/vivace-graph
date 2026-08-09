@@ -22,6 +22,11 @@
   ((title))
   :graph-db-integration-test)
 
+;; For the dense float-vector serialization round trip.
+(def-vertex g-embedded ()
+  ((payload))
+  :graph-db-integration-test)
+
 (def-edge g-knows ()
   ((since))
   :graph-db-integration-test)
@@ -334,3 +339,56 @@ removed across a reopen)."
       (is (slot-boundp v 'name)  "inherited slot, set -> bound")
       (is (slot-boundp v 'title) "own slot, set -> bound")
       (is (not (slot-boundp v 'age)) "inherited slot, unset -> unbound"))))
+
+;;; ---------------------------------------------------------------------------
+;;; dense float-vector slot durability (Task 3: serialization round-trip gate)
+;;; ---------------------------------------------------------------------------
+
+(test float-vector-slot-survives-close-and-reopen
+  "A single-float vector stored in a vertex slot reads back bit-exactly after a
+close/reopen cycle."
+  (with-temp-directory (dir)
+    (let ((v (make-array 512 :element-type 'single-float))
+          (id nil))
+      (dotimes (i 512)
+        (setf (aref v i) (coerce (/ i 512.0) 'single-float)))
+      (let ((g (make-graph *integration-graph-name* (namestring dir)
+                           :buffer-pool-size 1000)))
+        (let ((*graph* g))
+          (with-transaction ()
+            (setf id (id (make-g-embedded :payload v)))))
+        (close-graph g :snapshot-p nil))
+      (let ((g (open-graph *integration-graph-name* (namestring dir))))
+        (unwind-protect
+             (let* ((*graph* g)
+                    (back (slot-value (lookup-vertex id :graph g) 'payload)))
+               (is (typep back '(simple-array single-float (*)))
+                   "reopened slot has type ~S" (type-of back))
+               (is (= 512 (length back)))
+               (is (every #'= v back)))
+          (close-graph g :snapshot-p nil)))
+      (collect-garbage))))
+
+(test octet-vector-slot-survives-close-and-reopen
+  "An (unsigned-byte 8) octet vector stored in a vertex slot reads back bit-exactly after a close/reopen cycle (issue #68)."
+  (with-temp-directory (dir)
+    (let ((bytes (make-array 6 :element-type '(unsigned-byte 8)
+                               :initial-contents '(#x41 #x42 #x43 #x44 #x45 #x46)))
+          (id nil))
+      (let ((g (make-graph *integration-graph-name* (namestring dir)
+                           :buffer-pool-size 1000)))
+        (let ((*graph* g))
+          (with-transaction ()
+            (setf id (id (make-g-embedded :payload bytes)))))
+        (close-graph g :snapshot-p nil))
+      (let ((g (open-graph *integration-graph-name* (namestring dir))))
+        (unwind-protect
+             (let* ((*graph* g)
+                    (back (slot-value (lookup-vertex id :graph g) 'payload)))
+               (is (typep back '(vector (unsigned-byte 8)))
+                   "reopened slot has type ~S" (type-of back))
+               (is (= 6 (length back)))
+               (is (equalp bytes back)))
+          (close-graph g :snapshot-p nil)))
+      (collect-garbage))))
+

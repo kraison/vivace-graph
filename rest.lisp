@@ -7,7 +7,9 @@
   #+sbcl (make-hash-table :synchronized t :test 'equalp)
   #+lispworks (make-hash-table :single-thread nil :test 'equalp)
   #+ccl (make-hash-table :shared t :test 'equalp)
-  #+ecl (make-hash-table :test 'equalp))
+  #+ecl (make-hash-table :test 'equalp
+                          #+graph-db-ecl-sync-hash :synchronized
+                          #+graph-db-ecl-sync-hash t))
 (defvar *rest-passwd-file* "rpasswd")
 (defvar *htpasswd-bin* "/usr/bin/htpasswd")
 
@@ -26,7 +28,9 @@
   #+sbcl (make-hash-table :synchronized t :test 'equalp)
   #+lispworks (make-hash-table :single-thread nil :test 'equalp)
   #+ccl (make-hash-table :shared t :test 'equalp)
-  #+ecl (make-hash-table :test 'equalp))
+  #+ecl (make-hash-table :test 'equalp
+                          #+graph-db-ecl-sync-hash :synchronized
+                          #+graph-db-ecl-sync-hash t))
 
 (defvar *query-default-limit* 1000
   "Maximum solutions a DEF-QUERY returns unless it overrides :LIMIT.")

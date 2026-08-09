@@ -24,7 +24,8 @@
    #+sbcl (make-hash-table :synchronized t)
    #+lispworks (make-hash-table :single-thread nil)
    #+ccl (make-hash-table :shared t)
-   #+ecl (make-hash-table))
+   #+ecl (make-hash-table #+graph-db-ecl-sync-hash :synchronized
+                           #+graph-db-ecl-sync-hash t))
   free-list-thread
   (pointer 0 :type (UNSIGNED-BYTE 64))
   (lock (make-rw-lock))
@@ -35,7 +36,9 @@
    #+sbcl (make-hash-table :synchronized t :weakness :value)
    #+lispworks (make-hash-table :single-thread nil :weak-kind :value)
    #+ccl (make-hash-table :shared t :weak :value)
-   #+ecl (make-hash-table :weakness :value)))
+   #+ecl (make-hash-table :weakness :value
+                           #+graph-db-ecl-sync-hash :synchronized
+                           #+graph-db-ecl-sync-hash t)))
 
 (defmethod set-byte ((memory memory) offset byte)
   (declare (type word offset))
@@ -147,12 +150,13 @@
   (assert (typep data-size 'allocation-data-size))
   (let ((int (logior (ash data-size 1) (if active-p 1 0))))
     (serialize-uint64 mmap int allocation-offset)
-    ;; Zero out the next and previous offsets
-    (serialize-pointer mmap 0 (+ +allocation-header-size+
-                                 allocation-offset))
-    (serialize-pointer mmap 0 (+ +allocation-header-size+
-                                 +allocation-pointer-size+
-                                 allocation-offset)))
+    (unless active-p
+      ;; Zero out the next and previous offsets for free blocks
+      (serialize-pointer mmap 0 (+ +allocation-header-size+
+                                   allocation-offset))
+      (serialize-pointer mmap 0 (+ +allocation-header-size+
+                                   +allocation-pointer-size+
+                                   allocation-offset))))
   (+ +allocation-header-size+ allocation-offset))
 
 (defun allocation-free-p (memory allocation-offset)

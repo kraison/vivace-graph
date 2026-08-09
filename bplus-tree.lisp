@@ -397,13 +397,17 @@ EXACT-P is true when key[IDX] = DKEY."
     (buf-u64 buf (+ slot 2 (buf-u16 buf slot)))))
 
 (defun %bpt-descend-leaf-addr (tree dkey)
-  "Return the address of the leaf that would hold DKEY, binary-searching each
-internal node without decoding it wholesale."
+  "Return (values LEAF-ADDR LEAF-BUF), binary-searching each internal node
+without decoding it wholesale.  Returning the leaf's already-read BUF (not just
+its address) matters: every caller used to immediately re-issue %BPT-READ-PAGE
+on this same address, paying a second full-page memcpy + fresh allocation for a
+page this function had just read -- one wasted ~page-size cons on every point
+lookup, insert/delete descent, and range-cursor open (GH #97 localization)."
   (let ((addr (%bpt-root tree)))
     (loop
       (let ((buf (%bpt-read-page tree addr)))
         (if (%bpt-leaf-p buf)
-            (return addr)
+            (return (values addr buf))
             (let ((n (buf-u16 buf +bpt-p-count-offset+)))
               (multiple-value-bind (idx exact) (%bpt-page-bsearch tree buf n dkey)
                 (declare (ignore exact))
@@ -419,8 +423,7 @@ internal node without decoding it wholesale."
   "Return (values LEAF-ADDR LEAF-BUF LEAF-LINK LEAF-ENTRIES) for the leaf that
 would hold DKEY.  Internal nodes are binary-searched (not decoded); only the
 final leaf is decoded into entries (its caller needs them)."
-  (let* ((addr (%bpt-descend-leaf-addr tree dkey))
-         (buf (%bpt-read-page tree addr)))
+  (multiple-value-bind (addr buf) (%bpt-descend-leaf-addr tree dkey)
     (multiple-value-bind (leaf-p link entries) (%bpt-decode-page tree buf)
       (declare (ignore leaf-p))
       (values addr buf link entries))))
@@ -432,9 +435,9 @@ final leaf is decoded into entries (its caller needs them)."
 (defun %bpt-find (tree dkey)
   "Return (values SVAL FOUND-P) for DKEY -- SVAL is the raw serialized value.
 Fully lean: binary-search all the way down, decode only the one matching cell."
-  (let ((addr (%bpt-descend-leaf-addr tree dkey)))
-    (let* ((buf (%bpt-read-page tree addr))
-           (n (buf-u16 buf +bpt-p-count-offset+)))
+  (multiple-value-bind (addr buf) (%bpt-descend-leaf-addr tree dkey)
+    (declare (ignore addr))
+    (let ((n (buf-u16 buf +bpt-p-count-offset+)))
       (multiple-value-bind (idx exact) (%bpt-page-bsearch tree buf n dkey)
         (if exact
             (let* ((slot (buf-u16 buf (+ +bpt-p-slots-offset+ (* idx 2))))
@@ -819,32 +822,58 @@ Merges underfull pages on the way up and collapses a degenerate root."
 
 (defclass bplus-cursor (cursor)
   ((tree :initarg :tree :accessor bpc-tree)
-   (entries :initarg :entries :accessor bpc-entries)   ; vector of current-leaf entries
-   (index :initarg :index :accessor bpc-index)
-   (next-addr :initarg :next-addr :accessor bpc-next-addr) ; link of current leaf
-   (end :initarg :end :accessor bpc-end)               ; deserialized end key, or NIL
+   (buf :initarg :buf :accessor bpc-buf)                ; raw page buffer
+   (count :initarg :count :accessor bpc-count)          ; number of entries in page
+   (index :initarg :index :accessor bpc-index)          ; current slot index
+   (next-addr :initarg :next-addr :accessor bpc-next-addr) ; link of sibling leaf
+   (end :initarg :end :accessor bpc-end)                ; deserialized end key, or NIL
    (bounded-p :initarg :bounded-p :accessor bpc-bounded-p)))
 
+(defun %bpt-decode-page-entry (tree buf slot leaf-p)
+  "Decode just one entry at SLOT in page BUF."
+  (let* ((klen (buf-u16 buf slot))
+         (kstart (+ slot 2))
+         (skey (subseq buf kstart (+ kstart klen)))
+         (dkey (funcall (%bpt-key-deserializer tree) skey)))
+    (if leaf-p
+        (let* ((voff (+ kstart klen))
+               (vlen (buf-u16 buf voff))
+               (vstart (+ voff 2))
+               (sval (subseq buf vstart (+ vstart vlen))))
+          (list dkey skey sval))
+        (let ((child (buf-u64 buf (+ kstart klen))))
+          (list dkey skey child)))))
+
 (defun %bpt-leftmost-leaf (tree)
-  "Return (values ENTRIES-VECTOR NEXT-ADDR) for the first (leftmost) leaf."
+  "Return (values BUF COUNT NEXT-ADDR) for the first (leftmost) leaf."
   (let ((addr (%bpt-root tree)))
     (loop
-      (multiple-value-bind (leaf-p link entries)
-          (%bpt-decode-page tree (%bpt-read-page tree addr))
+      (let* ((buf (%bpt-read-page tree addr))
+             (leaf-p (%bpt-leaf-p buf))
+             (link (buf-u64 buf +bpt-p-link-offset+))
+             (count (buf-u16 buf +bpt-p-count-offset+)))
         (if leaf-p
-            (return (values (coerce entries 'vector) link))
-            (setf addr link))))))          ; leftmost child == P0 == link
+            (return (values buf count link))
+            (setf addr link))))))
 
 (defun %bpt-leaf-at (tree dkey)
-  "Return (values ENTRIES-VECTOR NEXT-ADDR START-INDEX) positioned at the first
+  "Return (values BUF COUNT NEXT-ADDR START-INDEX) positioned at the first
 entry with key >= DKEY in the leaf that would hold DKEY."
-  (multiple-value-bind (addr buf link entries) (%bpt-descend-to-leaf tree dkey)
-    (declare (ignore addr buf))
-    (let ((v (coerce entries 'vector)) (idx 0))
-      (loop while (and (< idx (length v))
-                       (bpt-key< tree (first (aref v idx)) dkey))
-            do (incf idx))
-      (values v link idx))))
+  (multiple-value-bind (addr buf) (%bpt-descend-leaf-addr tree dkey)
+    (declare (ignore addr))
+    (let* ((count (buf-u16 buf +bpt-p-count-offset+))
+           (link (buf-u64 buf +bpt-p-link-offset+)))
+      (multiple-value-bind (idx exact) (%bpt-page-bsearch tree buf count dkey)
+        (declare (ignore exact))
+        (let ((start 0))
+          (if (< idx 0)
+              (setf start 0)
+              (let* ((slot (buf-u16 buf (+ +bpt-p-slots-offset+ (* idx 2))))
+                     (mk (%bpt-slot-key tree buf slot)))
+                (if (bpt-key< tree mk dkey)
+                    (setf start (1+ idx))
+                    (setf start idx))))
+          (values buf count link (min count (max 0 start))))))))
 
 (defun %bpt-materialize (tree entry)
   "Build a SKIP-NODE from a leaf ENTRY so consumers (views/spatial/unique) read
@@ -856,36 +885,42 @@ entry with key >= DKEY in the leaf that would hold DKEY."
   (with-bpt-read-lock ((bpc-tree c))
     (let ((tree (bpc-tree c)))
       (loop
-        (when (>= (bpc-index c) (length (bpc-entries c)))
+        (when (>= (bpc-index c) (bpc-count c))
           ;; Advance to the next leaf via the sibling link (sequential pages).
           (if (zerop (bpc-next-addr c))
               (return eoc)
-              (multiple-value-bind (leaf-p link entries)
-                  (%bpt-decode-page tree (%bpt-read-page tree (bpc-next-addr c)))
-                (declare (ignore leaf-p))
-                (setf (bpc-entries c) (coerce entries 'vector)
+              (let* ((next-addr (bpc-next-addr c))
+                     (buf (%bpt-read-page tree next-addr))
+                     (count (buf-u16 buf +bpt-p-count-offset+))
+                     (link (buf-u64 buf +bpt-p-link-offset+)))
+                (setf (bpc-buf c) buf
+                      (bpc-count c) count
                       (bpc-index c) 0
                       (bpc-next-addr c) link))))
-        (if (>= (bpc-index c) (length (bpc-entries c)))
-            (when (zerop (bpc-next-addr c)) (return eoc))  ; empty trailing leaf
-            (let ((e (aref (bpc-entries c) (bpc-index c))))
+        (if (>= (bpc-index c) (bpc-count c))
+            (when (zerop (bpc-next-addr c)) (return eoc))
+            (let* ((idx (bpc-index c))
+                   (buf (bpc-buf c))
+                   (slot (buf-u16 buf (+ +bpt-p-slots-offset+ (* idx 2))))
+                   (entry (%bpt-decode-page-entry tree buf slot t)))
               (incf (bpc-index c))
               (if (and (bpc-bounded-p c)
-                       (bpt-key< tree (bpc-end c) (first e)))  ; key > end -> stop
+                       (bpt-key< tree (bpc-end c) (first entry)))
                   (return eoc)
-                  (return (%bpt-materialize tree e)))))))))
+                  (return (%bpt-materialize tree entry)))))))))
 
 (defmethod make-cursor ((tree bplus-tree) &key &allow-other-keys)
   (with-bpt-read-lock (tree)
-    (multiple-value-bind (entries next-addr) (%bpt-leftmost-leaf tree)
-      (make-instance 'bplus-cursor :tree tree :entries entries :index 0
+    (multiple-value-bind (buf count next-addr) (%bpt-leftmost-leaf tree)
+      (make-instance 'bplus-cursor :tree tree :buf buf :count count :index 0
                                    :next-addr next-addr :end nil :bounded-p nil))))
 
 (defmethod make-range-cursor ((tree bplus-tree) start end &key &allow-other-keys)
   (with-bpt-read-lock (tree)
-    (multiple-value-bind (entries next-addr idx) (%bpt-leaf-at tree start)
-      (make-instance 'bplus-cursor :tree tree :entries entries :index idx
+    (multiple-value-bind (buf count next-addr idx) (%bpt-leaf-at tree start)
+      (make-instance 'bplus-cursor :tree tree :buf buf :count count :index idx
                                    :next-addr next-addr :end end :bounded-p t))))
+
 
 ;;; ---------------------------------------------------------------------------
 ;;; Ordered-map generics -- the drop-in protocol (dispatch on BPLUS-TREE)

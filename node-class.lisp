@@ -1,7 +1,11 @@
 (in-package :graph-db)
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
-(defclass node-class (standard-class) nil)
+(defclass node-class (standard-class)
+  ;; Cached slot categorization; see %NODE-SLOT-INFO below.  NIL means "not
+  ;; computed yet"; it is never written with anything but a complete,
+  ;; freshly-built NODE-SLOT-INFO or NIL.
+  ((slot-info :initform nil :accessor %node-class-slot-info)))
 
 (defmethod validate-superclass ((class node-class) (super standard-class))
   "Node classes may inherit from ordinary classes."
@@ -19,7 +23,20 @@
    ;; docs/unique-constraint-design.md.
    (unique :accessor unique-spec :initarg :unique :initform nil :allocation :instance)
    (unique-scope :accessor unique-scope :initarg :scope :initform :local
-                 :allocation :instance)))
+                 :allocation :instance)
+   (vector-index :accessor vector-index-p :initarg :vector-index :initform nil
+                 :allocation :instance)
+   ;; Geohash grid precision for this geometry slot's spatial index, or NIL for
+   ;; the graph default.  A type-as-hint option: it means nothing on a slot that
+   ;; never holds a geometry.  It is the ONLY precision-declaration surface (there
+   ;; is deliberately no per-index macro); see %SPATIAL-PRECISION-FOR /
+   ;; %DECLARED-SPATIAL-PRECISION in spatial-registry.lisp for how it resolves.
+   (spatial-precision :accessor spatial-precision-spec :initarg :spatial-precision
+                      :initform nil :allocation :instance)
+   ;; Max cells cap for this geometry slot's spatial index, or NIL for the graph
+   ;; default.  Declared via the :SPATIAL-MAX-CELLS slot option.
+   (spatial-max-cells :accessor spatial-max-cells-spec :initarg :spatial-max-cells
+                      :initform nil :allocation :instance)))
 
 (defmethod persistent-p (slot-def)
   nil)
@@ -32,6 +49,15 @@
 
 (defmethod unique-scope (slot-def)
   :local)
+
+(defmethod vector-index-p (slot-def)
+  nil)
+
+(defmethod spatial-precision-spec (slot-def)
+  nil)
+
+(defmethod spatial-max-cells-spec (slot-def)
+  nil)
 
 (defmethod ephemeral-p (slot-def)
   nil)
@@ -47,46 +73,127 @@
     (standard-effective-slot-definition node-slot-definition)
   ())
 
+;;; ---------------------------------------------------------------------------
+;;; Per-class slot categorization, computed once (GH #87)
+;;;
+;;; PERSISTENT-P / EPHEMERAL-P / META-P are generic functions, and the four
+;;; SLOT-*-USING-CLASS :AROUND methods in primitive-node.lisp consult them on
+;;; EVERY slot access.  Walking CLASS-SLOTS and consing a fresh name list per
+;;; access cost ~28 list rebuilds and ~532 predicate dispatches per node
+;;; materialized -- about 59% of one profiler workload -- to recompute answers
+;;; that cannot change once the class is finalized.
+;;;
+;;; So compute the breakdown once and cache it on the class.  The correctness
+;;; obligation is invalidation: see %INVALIDATE-NODE-SLOT-INFO below for the two
+;;; places a class definition can change out from under the cache.
+;;; ---------------------------------------------------------------------------
+
+(defstruct (node-slot-info (:conc-name %nsi-))
+  ;; slot-name -> the keyword naming its entry in a node's DATA alist.  Holds
+  ;; ONLY persistent slots, so GETHASH answers "is this persistent?" and "what
+  ;; keyword?" in one lookup -- which is all the hot path needs, because every
+  ;; non-persistent branch of those :AROUND methods just calls the next method.
+  (persistent-keywords (make-hash-table :test 'eq) :type hash-table)
+  (persistent-names nil :type list)
+  (ephemeral-names nil :type list)
+  (meta-names nil :type list)
+  (data-names nil :type list))
+
+(defun %compute-node-slot-info (class)
+  "Build CLASS's NODE-SLOT-INFO.  Each list is filtered independently, exactly
+as the separate walks it replaces did, so a slot carrying more than one flag
+still appears in each list it qualifies for."
+  (let ((keywords (make-hash-table :test 'eq))
+        (persistent '()) (ephemeral '()) (meta '()) (data '()))
+    (dolist (slot (class-slots class))
+      (let ((name (slot-definition-name slot))
+            (persistentp (persistent-p slot))
+            (ephemeralp (ephemeral-p slot)))
+        (when persistentp
+          (push name persistent)
+          (setf (gethash name keywords) (intern (symbol-name name) :keyword)))
+        (when ephemeralp (push name ephemeral))
+        (when (meta-p slot) (push name meta))
+        (when (or persistentp ephemeralp) (push name data))))
+    (make-node-slot-info :persistent-keywords keywords
+                         :persistent-names (nreverse persistent)
+                         :ephemeral-names (nreverse ephemeral)
+                         :meta-names (nreverse meta)
+                         :data-names (nreverse data))))
+
+(defun %node-slot-info (class)
+  "CLASS's cached slot categorization, computing it on first use.
+Deliberately unlocked: two threads racing here build equal structures and one
+SETF wins, which is harmless.  What must never happen is publishing a partially
+filled structure, so the SETF stores an already-complete one."
+  (or (%node-class-slot-info class)
+      (setf (%node-class-slot-info class) (%compute-node-slot-info class))))
+
+(defvar *node-class-cache-invalidators* '()
+  "Functions of one NODE-CLASS, run whenever its effective slots may have changed.
+
+VG supports RUNTIME SCHEMA MUTATION -- DEF-VERTEX / DEF-EDGE can be evaluated
+against a live image to add or redefine a type -- so anything that memoizes a
+CLASS-SLOTS-derived answer must be dropped when that happens.  Register the
+dropper here rather than adding another FINALIZE-INHERITANCE :AFTER method:
+a second :AFTER with the same specializer would REPLACE this file's, silently
+disabling the invalidation it was meant to add.
+
+Each function is called for the changed class AND for every node-class subclass
+of it -- the walk is done by %INVALIDATE-NODE-CLASS-CACHES -- so an invalidator
+only has to handle the one class it is given.")
+
+(defun %invalidate-node-class-caches (class)
+  "Drop every memoized view of CLASS's effective slots, and its subclasses'.
+
+The subclass walk is the part that is easy to miss: a subclass's effective slots
+are recomputed when a SUPERCLASS is redefined, so invalidating only the class
+that was redefined leaves subclasses serving stale answers."
+  (setf (%node-class-slot-info class) nil)
+  (dolist (fn *node-class-cache-invalidators*)
+    (funcall fn class))
+  (dolist (sub (class-direct-subclasses class))
+    (when (typep sub 'node-class)
+      (%invalidate-node-class-caches sub))))
+
+(defmethod finalize-inheritance :after ((class node-class))
+  "Effective slots have just been recomputed, so any cached view of them is stale."
+  (%invalidate-node-class-caches class))
+
+(defmethod reinitialize-instance :after ((class node-class) &rest initargs
+                                         &key &allow-other-keys)
+  "Class redefinition (a re-evaluated DEF-VERTEX / DEF-EDGE / DEFCLASS)."
+  (declare (ignore initargs))
+  (%invalidate-node-class-caches class))
+
+(defun %persistent-slot-keyword (class slot-name)
+  "The keyword naming SLOT-NAME's entry in a node's DATA alist, or NIL when
+SLOT-NAME is not a persistent slot of CLASS.  This is the whole question the
+SLOT-*-USING-CLASS :AROUND methods need to ask."
+  (values (gethash slot-name (%nsi-persistent-keywords (%node-slot-info class)))))
+
+;;; The four readers below return the CACHED lists, not fresh copies as they did
+;;; before #87.  Treat them as read-only: SORT / NREVERSE / DELETE on a returned
+;;; list corrupts the class's cache.  COPY-LIST first if you need to mutate.
+
 (defmethod data-slots ((instance node-class))
   "Return a list of managed slot names for an instance."
-  (map 'list 'slot-definition-name
-       (remove-if-not #'(lambda (i)
-                          (or (persistent-p i) (ephemeral-p i)))
-                      (class-slots instance))))
+  (%nsi-data-names (%node-slot-info instance)))
 
 (defmethod meta-slot-names ((instance node-class))
   "Return a list of metadata slot names for an instance."
-  ;;(log:debug "meta-slot-names(~A)" instance)
-  (let ((names
-         (map 'list 'slot-definition-name
-              (remove-if-not #'(lambda (i)
-                                 (meta-p i))
-
-               (class-slots instance)))))
-    ;;(log:debug "meta-slot-names(~A): ~A" instance names)
-    names))
+  (%nsi-meta-names (%node-slot-info instance)))
 
 (defmethod persistent-slot-names ((instance node-class))
   "Return a list of persistent slot names for an instance."
-  ;;(log:debug "persistent-slot-names(~A)" instance)
-  (let ((names
-         (map 'list 'slot-definition-name
-              (remove-if-not #'(lambda (i)
-                                 (persistent-p i))
-                             (class-slots instance)))))
-    ;;(log:debug "persistent-slot-names(~A): ~A" instance names)
-    names))
+  (%nsi-persistent-names (%node-slot-info instance)))
 
 (defmethod ephemeral-slot-names ((instance node-class))
-  "Return a list of persistent slot names for an instance."
-  ;;(log:debug "ephemeral-slot-names(~A)" instance)
-  (let ((names
-         (map 'list 'slot-definition-name
-              (remove-if-not #'(lambda (i)
-                                 (ephemeral-p i))
-                             (class-slots instance)))))
-    ;;(log:debug "ephemeral-slot-names(~A): ~A" instance names)
-    names))
+  "Return a list of ephemeral slot names for an instance.
+Note that this is empty for every node class as things stand -- :EPHEMERAL never
+reaches the effective slot; see the EPHEMERAL-DECLARATION-IS-CURRENTLY-INERT
+test in tests/node-class-tests.lisp."
+  (%nsi-ephemeral-names (%node-slot-info instance)))
 
 (defmethod direct-slot-definition-class ((class node-class) &rest initargs)
   (declare (ignore initargs))
@@ -105,18 +212,24 @@
   (log:trace "compute-effective-slot-definition for ~A / ~A: ~A" class slot-name direct-slots)
   (let ((slot (call-next-method)))
     ;;(log:debug "  SLOT: ~A" slot)
+    ;; Test :EPHEMERAL against the DIRECT slots only.  CALL-NEXT-METHOD returns a
+    ;; freshly built effective slot and the standard method does not carry custom
+    ;; slot-definition slots across, so the effective slot always arrives with
+    ;; EPHEMERAL NIL and PERSISTENT T (their initforms).  The old middle clause
+    ;; therefore always matched and :EPHEMERAL never took effect (GH #90).
     (cond ((or (meta-p slot) (some 'meta-p direct-slots))
            (setf (slot-value slot 'meta) t)
            (setf (slot-value slot 'persistent) nil))
-          ((or (persistent-p slot) (some 'persistent-p direct-slots))
-           (setf (slot-value slot 'persistent) t))
+          ((some 'ephemeral-p direct-slots)
+           (setf (slot-value slot 'ephemeral) t)
+           (setf (slot-value slot 'persistent) nil))
           (t
-           (setf (slot-value slot 'persistent) nil)
-           (setf (slot-value slot 'ephemeral) t)))
-    (when (or (indexed-p slot) (some 'indexed-p direct-slots))
-      (setf (slot-value slot 'indexed) t)
-      ;; FIXME: Generate index if needed
-      )
+           (setf (slot-value slot 'persistent) t)))
+    ;; Inherit the :INDEX spec (T or a canonicalizer) from the declaring direct slot,
+    ;; so an :INDEX slot on a parent indexes across its subclasses (general index).
+    (let ((i (find-if #'indexed-p direct-slots)))
+      (when (or (indexed-p slot) i)
+        (setf (slot-value slot 'indexed) (or (indexed-p slot) (indexed-p i)))))
     ;; Inherit the uniqueness constraint from the declaring direct slot (issue #6),
     ;; so a :UNIQUE slot on a parent enforces across its subclasses.
     (let ((u (find-if #'unique-spec direct-slots)))
@@ -124,7 +237,43 @@
         (setf (slot-value slot 'unique) (or (unique-spec slot) (unique-spec u))
               (slot-value slot 'unique-scope) (or (and u (unique-scope u))
                                                   (unique-scope slot)))))
+    ;; Inherit the :VECTOR-INDEX flag from the declaring direct slot, so a
+    ;; :VECTOR-INDEX slot on a parent is indexed across its subclasses (like
+    ;; :INDEX / :UNIQUE above).
+    (let ((vi (find-if #'vector-index-p direct-slots)))
+      (when (or (vector-index-p slot) vi)
+        (setf (slot-value slot 'vector-index) (or (vector-index-p slot)
+                                                  (and vi (vector-index-p vi))))))
+    ;; Inherit :SPATIAL-PRECISION from the declaring direct slot, so a geometry
+    ;; slot on a parent carries one grid precision across its subclasses -- the
+    ;; same shared-index semantics as :INDEX / :UNIQUE / :VECTOR-INDEX above.
+    (let ((sp (find-if #'spatial-precision-spec direct-slots)))
+      (when (or (spatial-precision-spec slot) sp)
+        (setf (slot-value slot 'spatial-precision)
+              (or (spatial-precision-spec slot)
+                  (and sp (spatial-precision-spec sp))))))
+    ;; Inherit :SPATIAL-MAX-CELLS from the declaring direct slot.
+    (let ((smc (find-if #'spatial-max-cells-spec direct-slots)))
+      (when (or (spatial-max-cells-spec slot) smc)
+        (setf (slot-value slot 'spatial-max-cells)
+              (or (spatial-max-cells-spec slot)
+                  (and smc (spatial-max-cells-spec smc))))))
     slot))
+
+(defun %indexed-slot-owner-name (class slot-name)
+  "The most-general node-class in CLASS's precedence list that declares SLOT-NAME as
+an :INDEX direct slot -- the cross-subtype index owner (an :INDEX slot on a parent is
+one shared index across its subclasses).  Lives here rather than in index.lisp so both
+the general ordered index and the spatial index can reach it: index.lisp loads after
+transactions.lisp, which needs this on the spatial maintenance path."
+  (let ((owner (loop for c in (reverse (class-precedence-list class))
+                     when (and (typep c 'node-class)
+                               (find-if (lambda (ds)
+                                          (and (eq (slot-definition-name ds) slot-name)
+                                               (indexed-p ds)))
+                                        (class-direct-slots c)))
+                     return c)))
+    (class-name (or owner class))))
 
 (defmethod find-all-subclasses ((class class))
   ;;(log:debug "Finding subclasses for ~A" class)
@@ -245,5 +394,21 @@ is preserved."
    (deleted-p :accessor deleted-p :initform nil :initarg :deleted-p :type boolean
               :meta t :persistent nil)
    (data :accessor data :initarg :data :initform nil :meta t :persistent nil)
-   (bytes :accessor bytes :initform :init :initarg :bytes :meta t :persistent nil))
+   (bytes :accessor bytes :initform :init :initarg :bytes :meta t :persistent nil)
+   ;; Home graph; NIL = unknown -> caller falls back to *GRAPH* (GH #53)
+   (graph :accessor node-graph :initform nil :initarg :graph
+          :meta t :persistent nil))
   (:metaclass node-class))
+
+;; A node's GRAPH is a live object, not data: cl-store does not honour
+;; :PERSISTENT NIL, so storing it would pull the whole graph into the image
+;; and restore a phantom graph (GH #53).
+(defmethod cl-store:serializable-slots ((object node))
+  (remove 'graph (call-next-method) :key #'slot-definition-name))
+
+(defun node-home-graph (node &optional (default *graph*))
+  "NODE's graph, or DEFAULT when unknown. Use instead of a bare *GRAPH* when
+resolving a node's heap, tables or schema (GH #53)."
+  (if (slot-boundp node 'graph)
+      (or (node-graph node) default)
+      default))

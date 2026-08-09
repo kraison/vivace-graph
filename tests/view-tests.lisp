@@ -528,3 +528,73 @@ lazily on the next add-to-view."
                      "the kept view indexes the new node (decade 2 now 11)"))
             (ignore-errors (close-graph g2 :snapshot-p nil))
             (collect-garbage)))))))
+
+(test lookup-view-group-and-invoke-view-with-nil-or-unknown-graph-signals
+  "LOOKUP-VIEW-GROUP returns NIL and INVOKE-GRAPH-VIEW signals INVALID-VIEW-ERROR when graph is NIL or an unknown symbol."
+  (is (null (graph-db::lookup-view-group 'g-person nil)))
+  (is (null (graph-db::lookup-view-group 'g-person 'non-existent-graph-name)))
+  (signals graph-db::invalid-view-error
+    (graph-db::invoke-graph-view 'g-person 'people-by-name :graph nil))
+  (signals graph-db::invalid-view-error
+    (graph-db::invoke-graph-view 'g-person 'people-by-name :graph 'non-existent-graph-name)))
+
+
+;;; ---------------------------------------------------------------------------
+;;; GH #89: COMPILE-VIEW-CODE is memoized on the view's SOURCE
+;;; ---------------------------------------------------------------------------
+
+(test compile-view-code-does-not-recompile-unchanged-source
+  "GH #89: ADD-TO-VIEW calls COMPILE-VIEW-CODE on EVERY node addition, and it
+used to READ-FROM-STRING + EVAL unconditionally -- rebuilding identical functions
+once per view per node (~77% of with-view write time, ~193 KB/node of garbage).
+
+EQ on the function object is the direct evidence: a fresh EVAL necessarily
+produces a new object, so an unchanged source that yields the same object proves
+no recompile happened."
+  (let ((v (graph-db::make-view
+            :name 'v89 :class-name 'ignored :graph-name 'ignored
+            :map-code "(lambda (n) (declare (ignore n)) :mapped)"
+            :reduce-code nil)))
+    (graph-db::compile-view-code v)
+    (let ((fn1 (graph-db::view-map-fn v)))
+      (is (functionp fn1) "first call must compile the map fn")
+      (graph-db::compile-view-code v)
+      (graph-db::compile-view-code v)
+      (is (eq fn1 (graph-db::view-map-fn v))
+          "unchanged source recompiled -- the memoization is not holding"))))
+
+(test compile-view-code-recompiles-when-source-changes
+  "GH #89: the memoization must key on the SOURCE, not merely on whether a
+function is already bound.  A bare (functionp map-fn) guard -- the obvious
+version, and the one used to attribute the cost in the issue -- would cache the
+first compile forever and silently ignore a redefined view."
+  (let ((v (graph-db::make-view
+            :name 'v89b :class-name 'ignored :graph-name 'ignored
+            :map-code "(lambda (n) (declare (ignore n)) :first)"
+            :reduce-code nil)))
+    (graph-db::compile-view-code v)
+    (let ((fn1 (graph-db::view-map-fn v)))
+      (is (eq :first (funcall fn1 nil)))
+      ;; Redefine, exactly as a changed DEF-VIEW would.
+      (setf (graph-db::view-map-code v)
+            "(lambda (n) (declare (ignore n)) :second)")
+      (graph-db::compile-view-code v)
+      (is (not (eq fn1 (graph-db::view-map-fn v)))
+          "changed source did NOT recompile -- a redefined view would be ignored")
+      (is (eq :second (funcall (graph-db::view-map-fn v) nil))
+          "the recompiled fn is not the new source"))))
+
+(test compile-view-code-clears-a-dropped-reduce-fn
+  "GH #89: REDUCE-FN is now assigned unconditionally, so removing a view's
+:REDUCE clears the stale function instead of leaving the previous one bound --
+which would make a plain map view keep behaving as a map-reduce view."
+  (let ((v (graph-db::make-view
+            :name 'v89c :class-name 'ignored :graph-name 'ignored
+            :map-code "(lambda (n) (declare (ignore n)) :mapped)"
+            :reduce-code "(lambda (k v) (declare (ignore k)) v)")))
+    (graph-db::compile-view-code v)
+    (is (functionp (graph-db::view-reduce-fn v)) "reduce fn must compile")
+    (setf (graph-db::view-reduce-code v) nil)
+    (graph-db::compile-view-code v)
+    (is (null (graph-db::view-reduce-fn v))
+        "dropping :REDUCE left a stale reduce fn bound")))

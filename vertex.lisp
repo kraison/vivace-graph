@@ -145,6 +145,9 @@ the id on a duplicate-key collision."
                                 :bytes bytes
                                 :data data)))
           (setf (bytes v) bytes)
+          ;; Stamped from birth: the node is live for the whole creating
+          ;; transaction, long before commit stamps it (GH #53).
+          (setf (node-graph v) graph)
           (handler-case
               (create-node v graph)
             (duplicate-key-error (c)
@@ -236,6 +239,9 @@ per-type instead of using the untyped scan.)"
                                (when (and (written-p vertex)
                                           (or include-deleted-p (not (deleted-p vertex))))
                                  (setf (id vertex) (car pair))
+                                 ;; The deserializer builds these; a side-effect
+                                 ;; scan never sees ENSURE-NODE-BYTES (GH #53).
+                                 (setf (node-graph vertex) graph)
                                  (if collect-p
                                      (push (funcall fn vertex) result)
                                      (funcall fn vertex)))))

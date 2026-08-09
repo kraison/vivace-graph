@@ -37,6 +37,34 @@ fault-on-access invariant.  Call at the start of any test that reopens a graph."
    (geom :index t))
   :graph-db-memory-test)
 
+;; A SECOND geometry-bearing type declaring its OWN geometry slot, so it lands in
+;; a DISTINCT (owner . slot) spatial index from M-PLACE -- the per-index image
+;; round-trip needs two indexes to prove it keeps them apart.
+(def-vertex m-region ()
+  ((label)
+   (extent :type geometry :index t))
+  :graph-db-memory-test)
+
+;; A geometry-LESS type with an indexed SCALAR slot.  NODE-GEOMETRY returns NIL for
+;; it (a string is not a geometry), so it is never spatially indexed -- yet its
+;; :INDEX slot is exactly what the old lazy-open spatial REBUILD over-approximated
+;; as "may be spatial", faulting every such node in and defeating :LAZY.
+(def-vertex m-tag ()
+  ((label :type string :index t))
+  :graph-db-memory-test)
+
+;; A :vector-index slot, for the vector-segment reopen test below (GH #58).
+(def-vertex m-doc ()
+  ((title :type string)
+   (embedding :vector-index t))
+  :graph-db-memory-test)
+
+;; A :unique slot, isolated to its own type so the v5->v6 migration test below
+;; (GH #65) can't interact with any other test's duplicate-name fixtures.
+(def-vertex m-widget ()
+  ((sku :type string :unique t))
+  :graph-db-memory-test)
+
 (defmacro with-test-memory-graph ((g) &body body)
   "Fresh memory-graph in a temp dir; closed (no checkpoint) + GC'd afterward."
   (let ((dir (gensym "DIR")))
@@ -176,16 +204,184 @@ is rebuilt on reopen."
             (make-m-place :label "lviv"    :geom (graph-db::make-point 24.0d0 49.8d0))
             (make-m-place :label "london"  :geom (graph-db::make-point -0.1d0 51.5d0)))
           (let ((hits (graph-db::spatial-index-query-bbox
-                       (graph-db::spatial-index g) 22.0d0 48.0d0 40.0d0 51.0d0)))
+                       (graph-db::spatial-index-for g 'm-place 'geom) 22.0d0 48.0d0 40.0d0 51.0d0)))
             (is (= 2 (length hits)))))
         (close-graph g :snapshot-p t))
       (let ((g2 (graph-db::open-memory-graph *mem-test-graph-name* loc)))
         (unwind-protect
              (let ((hits (graph-db::spatial-index-query-bbox
-                          (graph-db::spatial-index g2) 22.0d0 48.0d0 40.0d0 51.0d0)))
+                          (graph-db::spatial-index-for g2 'm-place 'geom) 22.0d0 48.0d0 40.0d0 51.0d0)))
                (is (= 2 (length hits))))
           (ignore-errors (close-graph g2 :snapshot-p nil))
           (collect-garbage))))))
+
+;;; --- vector segments -----------------------------------------------------
+
+(defun %m-embedding (dim base)
+  (let ((v (make-array dim :element-type 'single-float)))
+    (dotimes (i dim v) (setf (aref v i) (coerce (+ base (* 0.01 i)) 'single-float)))))
+
+(test vector-segment-survives-reopen
+  "GH #58: a :vector-index slot's segment must survive a clean close/reopen of a
+memory graph, not just live while the image is up.  OPEN-MEMORY-GRAPH did not
+call RESTORE-VECTOR-SEGMENTS at all, so before the fix VECTOR-SEARCH returns
+nothing on the reopened graph even though the segment file (written by ordinary
+live maintenance, same as the on-disk backend) is sitting right there on disk."
+  (with-temp-directory (dir)
+    (let ((loc (namestring dir)) near far)
+      (let ((g (graph-db::make-memory-graph *mem-test-graph-name* loc)))
+        (let ((*graph* g))
+          (with-transaction ()
+            (setq near (id (make-m-doc :title "near" :embedding (%m-embedding 8 1.0))))
+            (setq far (id (make-m-doc :title "far" :embedding (%m-embedding 8 50.0)))))
+          ;; Confirm the segment is live and correct BEFORE the reopen, so a
+          ;; later empty result can only be the reopen's fault.
+          (let ((hits (vector-search g 'm-doc 'embedding (%m-embedding 8 1.0) 5)))
+            (is (= 2 (length hits)))))
+        (close-graph g :snapshot-p t))
+      (let ((g2 (graph-db::open-memory-graph *mem-test-graph-name* loc)))
+        (unwind-protect
+             (let ((hits (vector-search g2 'm-doc 'embedding (%m-embedding 8 1.0) 5)))
+               (is (= 2 (length hits))
+                   "vector segment did not survive the reopen -- got ~S" hits)
+               (is (member far (mapcar #'cdr hits) :test #'equalp)
+                   "the far doc ~A is missing from the reopened segment" far)
+               (when hits
+                 (is (equalp near (cdr (first hits)))
+                     "the nearest doc should rank first; got ~S" hits)))
+          (ignore-errors (close-graph g2 :snapshot-p nil))
+          (collect-garbage))))))
+
+(test memory-image-round-trips-per-class-spatial-indexes
+  "The image carries one spatial record per (owner . slot): a memory graph with TWO
+distinct geometry classes reopens with BOTH indexes restored STRUCTURALLY.  The
+canary -- a raw index entry under an id no live node has -- is what proves it: a
+rebuild-from-nodes could not reproduce it, so its survival across the reopen means
+the indexes were loaded from the image, not re-derived by scanning the nodes."
+  (reset-mem-view-registry)
+  (with-temp-directory (dir)
+    (let ((loc (namestring dir))
+          (canary (graph-db::gen-vertex-id))
+          place-id region-id)
+      (let ((g (graph-db::make-memory-graph *mem-test-graph-name* loc)))
+        (let ((*graph* g))
+          (with-transaction ()
+            (setq place-id (id (make-m-place :label "kharkiv"
+                                             :geom (graph-db::make-point 36.3d0 50.0d0))))
+            (setq region-id (id (make-m-region
+                                 :label "east"
+                                 :extent (scope-rect 22.1d0 44.4d0 40.2d0 52.4d0)))))
+          ;; Canary straight into M-PLACE's index at a corner nothing else occupies.
+          (graph-db::spatial-index-insert
+           (graph-db::spatial-index-for g 'm-place 'geom)
+           canary (graph-db::make-point 10d0 10d0)))
+        (close-graph g :snapshot-p t))
+      (let ((g2 (graph-db::open-memory-graph *mem-test-graph-name* loc)))
+        (unwind-protect
+             (let ((place-ix  (graph-db::spatial-index-for g2 'm-place 'geom))
+                   (region-ix (graph-db::spatial-index-for g2 'm-region 'extent)))
+               (is (graph-db::spatial-index-p place-ix))
+               (is (graph-db::spatial-index-p region-ix))
+               (is (not (eq place-ix region-ix))
+                   "the two classes keep their own indexes across a reopen")
+               (is (has-p place-id
+                          (graph-db::spatial-index-query-bbox
+                           place-ix 36.0d0 49.9d0 36.5d0 50.1d0)))
+               (is (has-p region-id
+                          (graph-db::spatial-index-query-bbox
+                           region-ix 30.0d0 48.0d0 31.0d0 49.0d0)))
+               (is (has-p canary
+                          (graph-db::spatial-index-query-bbox
+                           place-ix 9.0d0 9.0d0 11.0d0 11.0d0))
+                   "the canary survived -- the index was RESTORED structurally, not ~
+                    rebuilt from the live nodes"))
+          (ignore-errors (close-graph g2 :snapshot-p nil))
+          (collect-garbage))))))
+
+(test memory-coarse-geometry-survives-a-reopen
+  "The image carries each index's PRECISION HISTOGRAM, not just its cells.  A
+geometry too large to cover within +SPATIAL-INSERT-MAX-CELLS+ is stored coarsely
+and the query clamp is lowered to match; that clamp is derived from the histogram,
+which lives only in RAM between closes.  An image that dropped it would reopen with
+the clamp back at the configured precision, and a prefix range scan would sort PAST
+the coarser stored key -- a silent miss on an index that is physically intact."
+  (reset-mem-view-registry)
+  (handler-bind ((warning #'muffle-warning))    ; coarsening is EXPECTED here
+    (with-temp-directory (dir)
+      (let ((loc (namestring dir)) big-id)
+        (let ((g (graph-db::make-memory-graph *mem-test-graph-name* loc)))
+          (let ((*graph* g))
+            (with-transaction ()
+              ;; ~1 degree square: far more than 16384 cells at precision 7, so the
+              ;; insert cover is capped and the entry stored coarsely.
+              (setq big-id (id (make-m-region
+                                :label "big"
+                                :extent (scope-rect 10d0 40d0 11d0 41d0)))))
+            (let ((idx (graph-db::spatial-index-for g 'm-region 'extent)))
+              (is (< (graph-db::spatial-index-coarsest-precision idx)
+                     (graph-db::spatial-index-precision idx))
+                  "the oversized polygon really did coarsen the index")))
+          (close-graph g :snapshot-p t))
+        (let ((g2 (graph-db::open-memory-graph *mem-test-graph-name* loc)))
+          (unwind-protect
+               (let ((idx (graph-db::spatial-index-for g2 'm-region 'extent)))
+                 (is (< (graph-db::spatial-index-coarsest-precision idx)
+                        (graph-db::spatial-index-precision idx))
+                     "the clamp came back from the image, not reset to the ~
+                      configured precision")
+                 (is (has-p big-id
+                            (graph-db::spatial-index-query-bbox
+                             idx 10.4d0 40.4d0 10.6d0 40.6d0))
+                     "a small window inside the coarsely-stored polygon still finds ~
+                      it after the reopen"))
+            (ignore-errors (close-graph g2 :snapshot-p nil))
+            (collect-garbage)))))))
+
+(test lazy-reopen-keeps-geometryless-indexed-scalars-lazy
+  "Restoring spatial STRUCTURALLY removes the lazy-open REBUILD that used to fault in
+every node of any class with ANY :INDEX slot.  A class with an indexed SCALAR slot
+and no geometry now reopens with its nodes STILL LZNODE blobs -- the fault-on-access
+property the Android field device depends on -- while a geometry class's index is
+still restored and queryable without a scan."
+  (reset-mem-view-registry)
+  (flet ((n-materialized (g)
+           (loop for v being the hash-values of
+                 (graph-db::mem-table-data (graph-db::vertex-table g))
+                 count (graph-db::node-p v)))
+         (n-lznodes (g)
+           (loop for v being the hash-values of
+                 (graph-db::mem-table-data (graph-db::vertex-table g))
+                 count (graph-db::lznode-p v))))
+    (with-temp-directory (dir)
+      (let ((loc (namestring dir)))
+        (let ((g (graph-db::make-memory-graph *mem-test-graph-name* loc :lazy t)))
+          (let ((*graph* g))
+            (with-transaction ()
+              (dotimes (i 10) (make-m-tag :label (format nil "t~D" i)))
+              (make-m-place :label "site" :geom (graph-db::make-point 36.3d0 50.0d0))))
+          (close-graph g :snapshot-p t))
+        (let ((g2 (graph-db::open-memory-graph *mem-test-graph-name* loc :lazy t)))
+          (unwind-protect
+               (let ((*graph* g2))
+                 (is (= 11 (graph-db::mem-table-count (graph-db::vertex-table g2))))
+                 ;; The whole point: open faulted in NONE of them.  Before this task,
+                 ;; the spatial rebuild materialized all 11 (10 indexed-scalar + 1
+                 ;; geometry) because NODE-GEOMETRY-INDEX-SLOTS returns scalar :INDEX
+                 ;; slots too.
+                 (is (= 0 (n-materialized g2))
+                     "no node was materialized on lazy open")
+                 (is (= 11 (n-lznodes g2))
+                     "every node is still a deferred LZNODE blob")
+                 ;; ...and the geometry index came back structurally, queryable.
+                 (is (= 1 (length (graph-db::spatial-index-query-bbox
+                                   (graph-db::spatial-index-for g2 'm-place 'geom)
+                                   22.0d0 48.0d0 40.0d0 51.0d0)))
+                     "the geometry index restored structurally, still findable")
+                 ;; And the query did not have to materialize any node either.
+                 (is (= 0 (n-materialized g2))
+                     "a spatial bbox query returns ids without materializing nodes"))
+            (ignore-errors (close-graph g2 :snapshot-p nil))
+            (collect-garbage)))))))
 
 ;;; --- views -------------------------------------------------------------------
 
@@ -456,7 +652,7 @@ access."
                (is (= 1 (length (incoming-edges (lookup-vertex b)))))
                ;; spatial bbox (restored structurally; hit id -> materialize)
                (is (= 1 (length (graph-db::spatial-index-query-bbox
-                                 (graph-db::spatial-index g2) 22.0d0 48.0d0 40.0d0 51.0d0))))
+                                 (graph-db::spatial-index-for g2 'm-place 'geom) 22.0d0 48.0d0 40.0d0 51.0d0))))
                ;; reduce view (decade 3 = Ann + Bo = 2), no node materialization
                (is (equal '((3 . 2))
                           (map-reduced-view (lambda (k id v) (declare (ignore id)) (cons k v))
@@ -526,3 +722,207 @@ materialize them), while the reduce view still answers correctly."
                           "install-views did NOT rebuild: nodes remain unmaterialized"))
             (ignore-errors (close-graph g2 :snapshot-p nil))
             (collect-garbage)))))))
+
+;;; --- v5 -> v6 native-image migration (GH #65) --------------------------------
+;;;
+;;; #65's premise was that a version-mismatched image is safe to discard because
+;;; the transaction journal can rebuild it -- false for a memory graph: a clean
+;;; close writes the image and THEN clears the journal, so after that the image is
+;;; the ONLY durable copy.  The real fix is migrating v5 (3.0's pre-per-(owner .
+;;; slot) spatial format) forward on read.  %WRITE-V5-TEST-IMAGE below is the
+;;; ACTUAL v5 writer, recovered from 714eb3ba^ (before the per-index spatial
+;;; section existed), reusing every codec it shares with today's writer -- NI-NODE
+;;; / NI-INDEX / NI-PAIRS / NI-VIEWS / NI-VAL are byte-identical between v5 and v6,
+;;; only the version number and the spatial section differ -- so the test below
+;;; exercises the real historical byte layout, not a hand-authored guess at it.
+
+(defun %write-v5-test-image (graph)
+  "Write GRAPH's current state as a v5 native image -- a v5 CHECKPOINT, exactly like
+CHECKPOINT-MEMORY-GRAPH/CLOSE-GRAPH's clean-close path: write the image, THEN clear
+the retained journal, so a subsequent OPEN-MEMORY-GRAPH's RECOVER-TRANSACTIONS has
+nothing to replay on top of the restored (still-LZNODE, on a lazy graph) state.
+Skipping the journal clear would replay the original CREATEs and materialize every
+node regardless of the spatial migration's own selectivity, confusing what the test
+is actually checking.
+
+The image itself is what WRITE-MEMORY-IMAGE-NATIVE wrote before 714eb3ba: its
+spatial section is a single, unconditionally-empty flat pair list (v5 restore
+rebuilt the spatial indexes from the nodes instead of reading it).  Everything else
+is the same call sequence as today's writer."
+  (let ((buf (graph-db::ni-mkbuf)))
+    (graph-db::ni-bytes buf graph-db::*native-image-magic*)
+    (graph-db::ni-uint buf 5 4)
+    (graph-db::ni-uint buf (graph-db::load-highest-transaction-id graph) 8)
+    (let ((vt (graph-db::mem-table-data (graph-db::vertex-table graph)))
+          (et (graph-db::mem-table-data (graph-db::edge-table graph))))
+      (graph-db::ni-uint buf (hash-table-count vt) 4)
+      (maphash (lambda (id x) (graph-db::ni-node buf id x nil)) vt)
+      (graph-db::ni-uint buf (hash-table-count et) 4)
+      (maphash (lambda (id x) (graph-db::ni-node buf id x t)) et))
+    (graph-db::ni-index buf (graph-db::%dump-mem-index
+                              (graph-db::mem-type-index-data (graph-db::vertex-index graph)))
+                         #'graph-db::ni-key-type)
+    (graph-db::ni-index buf (graph-db::%dump-mem-index
+                              (graph-db::mem-type-index-data (graph-db::edge-index graph)))
+                         #'graph-db::ni-key-type)
+    (graph-db::ni-index buf (graph-db::%dump-mem-index
+                              (graph-db::mem-ve-index-data (graph-db::ve-index-in graph)))
+                         #'graph-db::ni-key-ve)
+    (graph-db::ni-index buf (graph-db::%dump-mem-index
+                              (graph-db::mem-ve-index-data (graph-db::ve-index-out graph)))
+                         #'graph-db::ni-key-ve)
+    (graph-db::ni-index buf (graph-db::%dump-mem-index
+                              (graph-db::mem-vev-index-data (graph-db::vev-index graph)))
+                         #'graph-db::ni-key-vev)
+    (graph-db::ni-pairs buf '())          ; v5's flat spatial section: always empty
+    (graph-db::ni-views buf graph)
+    (graph-db::ni-val buf (graph-db::%dump-unique-indexes graph))
+    (with-open-file (s (graph-db::memory-image-file (graph-db::location graph))
+                       :direction :output :element-type '(unsigned-byte 8)
+                       :if-exists :supersede :if-does-not-exist :create)
+      (write-sequence buf s))
+    (graph-db::clear-memory-journal graph)))
+
+(test v5-memory-image-migrates-on-open
+  "A real v5 native image -- nodes, an indexed scalar slot, two distinct spatial
+classes, a map view and a unique constraint -- restores fully on the current
+(v6-writing) build.  The spatial section v5 couldn't carry comes back by
+rebuilding from the just-restored nodes; everything else (the part that is NOT
+derivable, and whose loss is unrecoverable) comes through the wire untouched."
+  (reset-mem-view-registry)
+  (with-temp-directory (dir)
+    (let ((loc (namestring dir))
+          place-id region-id tag-id person-id)
+      (let ((g (graph-db::make-memory-graph *mem-test-graph-name* loc)))
+        (let ((*graph* g))
+          (def-view m65-by-name :lessp (m-person :graph-db-memory-test)
+            (:map (lambda (p) (yield (slot-value p 'name) (slot-value p 'age)))))
+          (with-transaction ()
+            (setq person-id (id (make-m-person :name "alice" :age 30)))
+            (make-m-person :name "bob" :age 40)
+            (setq tag-id (id (make-m-tag :label "urgent")))
+            (setq place-id (id (make-m-place :label "kharkiv"
+                                             :geom (graph-db::make-point 36.3d0 50.0d0))))
+            (setq region-id (id (make-m-region
+                                 :label "east"
+                                 :extent (scope-rect 22.1d0 44.4d0 40.2d0 52.4d0))))
+            (make-m-widget :sku "SKU-1")
+            (make-m-widget :sku "SKU-2")))
+        ;; Write the REAL v5 layout, then close WITHOUT a checkpoint so the clean
+        ;; close doesn't overwrite it with today's v6 format.
+        (%write-v5-test-image g)
+        (close-graph g :snapshot-p nil))
+      (is-true (graph-db::%native-image-p (graph-db::memory-image-file loc))
+               "the file on disk really is a v5/v6-shaped native image")
+      (let ((g2 (graph-db::open-memory-graph *mem-test-graph-name* loc)))
+        (unwind-protect
+             (let ((*graph* g2))
+               (is (= 7 (graph-db::mem-table-count (graph-db::vertex-table g2)))
+                   "all 7 vertices survived")
+               (is (string= "alice" (slot-value (lookup-vertex person-id) 'name)))
+               ;; indexed scalar slot (m-tag) survived
+               (is (string= "urgent" (slot-value (lookup-vertex tag-id) 'label)))
+               ;; spatial: not on v5's wire -- rebuilt from nodes, still two
+               ;; distinct per-class indexes, both queryable
+               (let ((place-ix  (graph-db::spatial-index-for g2 'm-place 'geom))
+                     (region-ix (graph-db::spatial-index-for g2 'm-region 'extent)))
+                 (is (not (eq place-ix region-ix))
+                     "the two classes still keep their own indexes post-migration")
+                 (is (has-p place-id
+                            (graph-db::spatial-index-query-bbox
+                             place-ix 36.0d0 49.9d0 36.5d0 50.1d0)))
+                 (is (has-p region-id
+                            (graph-db::spatial-index-query-bbox
+                             region-ix 30.0d0 48.0d0 31.0d0 49.0d0))))
+               ;; view
+               (is (equal '("alice" "bob")
+                          (map-view (lambda (k id v) (declare (ignore id v)) k)
+                                    'm-person 'm65-by-name :graph g2 :collect-p t)))
+               ;; unique constraint: rejects a duplicate SKU post-migration
+               (signals graph-db:unique-constraint-violation
+                 (with-transaction () (make-m-widget :sku "SKU-1"))))
+          (ignore-errors (close-graph g2 :snapshot-p nil))
+          (collect-garbage))))))
+
+(test v5-memory-image-lazy-open-migrates-selectively
+  "A LAZY v5 image migrates too -- v5 itself proved this is safe: its own deleted
+%REBUILD-MEMORY-SPATIAL-INDEXES touched an LZNODE only when its class MIGHT carry a
+geometry, via NODE-GEOMETRY-INDEX-SLOTS -- which returns every :INDEX-marked slot,
+scalars included, so a class like M-TAG (an indexed STRING) is over-approximated
+and materialized too, same as v5 always did.  Plain M-PERSON, with no :INDEX slot
+at all, is the one guaranteed to stay a deferred LZNODE blob -- the property
+fault-on-access depends on.  A test that only checked the query would pass even if
+migration materialized everything; this also pins down what did and didn't get
+touched (GH #65)."
+  (reset-mem-view-registry)
+  (flet ((n-materialized (g)
+           (loop for v being the hash-values of
+                 (graph-db::mem-table-data (graph-db::vertex-table g))
+                 count (graph-db::node-p v)))
+         (n-lznodes (g)
+           (loop for v being the hash-values of
+                 (graph-db::mem-table-data (graph-db::vertex-table g))
+                 count (graph-db::lznode-p v))))
+    (with-temp-directory (dir)
+      (let ((loc (namestring dir)) place-id region-id)
+        (let ((g (graph-db::make-memory-graph *mem-test-graph-name* loc :lazy t)))
+          (let ((*graph* g))
+            (with-transaction ()
+              (dotimes (i 5) (make-m-tag :label (format nil "t~D" i)))
+              (dotimes (i 3) (make-m-person :name (format nil "p~D" i) :age (+ 20 i)))
+              (setq place-id (id (make-m-place :label "kharkiv"
+                                               :geom (graph-db::make-point 36.3d0 50.0d0))))
+              (setq region-id (id (make-m-region
+                                   :label "east"
+                                   :extent (scope-rect 22.1d0 44.4d0 40.2d0 52.4d0))))))
+          (%write-v5-test-image g)
+          (close-graph g :snapshot-p nil))
+        (let ((g2 (graph-db::open-memory-graph *mem-test-graph-name* loc :lazy t)))
+          (unwind-protect
+               (progn
+                 (is (= 10 (graph-db::mem-table-count (graph-db::vertex-table g2))))
+                 ;; spatial: migrated and queryable, even lazily
+                 (is (has-p place-id
+                            (graph-db::spatial-index-query-bbox
+                             (graph-db::spatial-index-for g2 'm-place 'geom)
+                             36.0d0 49.9d0 36.5d0 50.1d0)))
+                 (is (has-p region-id
+                            (graph-db::spatial-index-query-bbox
+                             (graph-db::spatial-index-for g2 'm-region 'extent)
+                             30.0d0 48.0d0 31.0d0 49.0d0)))
+                 ;; the 3 plain M-PERSON nodes (no :INDEX slot at all) are untouched
+                 (is (= 3 (n-lznodes g2))
+                     "nodes with no :INDEX slot were never touched by the migration")
+                 ;; the 2 geometry nodes AND the 5 M-TAG (:INDEX scalar,
+                 ;; over-approximated, same as v5 always did) were materialized
+                 (is (= 7 (n-materialized g2))
+                     "geometry nodes plus the over-approximated :INDEX-scalar class"))
+            (ignore-errors (close-graph g2 :snapshot-p nil))
+            (collect-garbage)))))))
+
+(test unsupported-memory-image-version-message-is-corrected
+  "The version-mismatch error names the actual remedy -- open with a build that
+reads the image's version, or migrate it -- instead of the old advice to delete
+the image and 'rebuild from the journal': after a clean close that journal is
+empty, and deleting the image discards the ONLY durable copy of the graph
+(GH #65)."
+  (with-temp-directory (dir)
+    (let ((loc (namestring dir)))
+      (let ((g (graph-db::make-memory-graph *mem-test-graph-name* loc)))
+        (close-graph g :snapshot-p nil))
+      ;; Hand-craft a bogus-version image: magic + version 99 (LE u32).  The
+      ;; version check fires before anything else is read, so no body is needed.
+      (with-open-file (s (graph-db::memory-image-file loc) :direction :output
+                         :element-type '(unsigned-byte 8) :if-exists :supersede
+                         :if-does-not-exist :create)
+        (write-sequence graph-db::*native-image-magic* s)
+        (write-byte 99 s) (write-byte 0 s) (write-byte 0 s) (write-byte 0 s))
+      (let ((msg (handler-case
+                     (progn (graph-db::open-memory-graph *mem-test-graph-name* loc) nil)
+                   (error (e) (princ-to-string e)))))
+        (is-true msg "opening an unknown-version image signals an error")
+        (when msg
+          (is (search "v5" msg))
+          (is (search "v6" msg))
+          (is (not (search "Delete" msg)))
+          (is (not (search "delete" msg))))))))

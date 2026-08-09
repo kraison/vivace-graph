@@ -40,4 +40,9 @@
 
 (defun queue-length (q)
   (length (queue-elements q)))
+
+(defun queue-remove (q item)
+  (when (member item (queue-elements q))
+    (setf (queue-elements q) (delete item (queue-elements q)))
+    (setf (queue-last q) (last (queue-elements q)))))
 ;; End of adapted code

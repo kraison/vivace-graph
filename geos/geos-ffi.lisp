@@ -180,6 +180,27 @@ dependency-free fallbacks. (~A)" e)
 (cffi:defcfun ("GEOSCoordSeq_destroy_r" %geos-coordseq-destroy) :void
   (handle :pointer) (seq :pointer))
 
+;; Coordinate sequence creation and setting.
+(cffi:defcfun ("GEOSCoordSeq_create_r" %geos-coordseq-create) :pointer
+  (handle :pointer) (size :unsigned-int) (dims :unsigned-int))
+(cffi:defcfun ("GEOSCoordSeq_setX_r" %geos-coordseq-setx) :int
+  (handle :pointer) (seq :pointer) (idx :unsigned-int) (val :double))
+(cffi:defcfun ("GEOSCoordSeq_setY_r" %geos-coordseq-sety) :int
+  (handle :pointer) (seq :pointer) (idx :unsigned-int) (val :double))
+
+;; Direct geometry constructors.
+(cffi:defcfun ("GEOSGeom_createPoint_r" %geos-create-point) :pointer
+  (handle :pointer) (seq :pointer))
+(cffi:defcfun ("GEOSGeom_createLineString_r" %geos-create-linestring) :pointer
+  (handle :pointer) (seq :pointer))
+(cffi:defcfun ("GEOSGeom_createLinearRing_r" %geos-create-linear-ring) :pointer
+  (handle :pointer) (seq :pointer))
+(cffi:defcfun ("GEOSGeom_createPolygon_r" %geos-create-polygon) :pointer
+  (handle :pointer) (shell :pointer) (holes :pointer) (nholes :unsigned-int))
+(cffi:defcfun ("GEOSGeom_createCollection_r" %geos-create-collection) :pointer
+  (handle :pointer) (type :int) (geoms :pointer) (ngeoms :unsigned-int))
+
+
 ;; Attempt the load when this add-on system is loaded.  Inert for core graph-db,
 ;; which never loads this file.
 (eval-when (:load-toplevel :execute)

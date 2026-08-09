@@ -24,6 +24,7 @@
                 #:make-polygon
                 #:make-multipolygon
                 #:geometry-bbox
+                #:geometry-empty-p
                 ;; bridge + context (S1)
                 #:geometry->wkt
                 #:wkt->geometry
@@ -64,7 +65,7 @@
                 #:mark-deleted
                 #:map-vertices
                 #:node-geometry
-                #:spatial-index
+                #:all-spatial-indexes
                 #:find-nodes-intersecting
                 #:find-nodes-within
                 #:find-nodes-near

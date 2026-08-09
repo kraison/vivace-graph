@@ -99,3 +99,26 @@ apart by nearest-points geodesic distance (NOT planar degrees)."
     ;; geodesic distance: point-point still works (haversine), extended signals
     (is (numberp (geometry-geodesic-distance (make-point 0d0 0d0) (make-point 1d0 1d0))))
     (signals geos-required-for-operation (geometry-geodesic-distance *oa* *ob*))))
+
+(test disjoint-intersection-is-empty-not-an-error
+  "GH #105: two disjoint polygons intersect in nothing, and GEOS reports that as
+\"POLYGON EMPTY\".  That is the NORMAL result, not a failure -- it must come
+back as an empty geometry of area 0, not signal.  A caller that cannot tell
+\"no overlap\" from \"could not compute\" cannot answer the question it asked."
+  (if (not *geos-available-p*) (skip "GEOS not available")
+      (let* ((far (osq 100d0 100d0 104d0 104d0))
+             (i (handler-case (geometry-intersection *oa* far)
+                  (error (e) e))))
+        (is (geometryp i) "disjoint intersection signalled: ~A" i)
+        (when (geometryp i)
+          (is (approx2 0d0 (geometry-area i)))))))
+
+(test difference-that-erodes-everything-is-empty
+  "The same path through any overlay op: A minus a B that covers it is empty."
+  (if (not *geos-available-p*) (skip "GEOS not available")
+      (let* ((cover (osq -1d0 -1d0 9d0 9d0))
+             (d (handler-case (geometry-difference *oa* cover)
+                  (error (e) e))))
+        (is (geometryp d) "fully-covered difference signalled: ~A" d)
+        (when (geometryp d)
+          (is (approx2 0d0 (geometry-area d)))))))

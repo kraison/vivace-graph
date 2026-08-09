@@ -344,3 +344,53 @@ Reuse **idioms**, not the transient projection structs:
 - **`bytes` laziness:** decide whether to pre-serialize `bytes` on create (needed
   for the journal anyway) or fully lazily. Minor; default to journal-time
   serialize.
+
+---
+
+## 13. As-built addendum — the checkpoint image and its versions
+
+Not part of the original design: §7 above specifies snapshot + journal, and the
+single-write **checkpoint image** was added during implementation (GH #50, #65).
+Recorded here because its version numbers are an operational concern for the
+Android field build, which is the only deployment that opens a pre-existing
+image.
+
+Two formats, chosen by `lazy-p`:
+
+| graph | format | writer | current version |
+|---|---|---|---|
+| non-lazy | cl-store plist | `write-memory-image` | **v5** |
+| `:lazy` (the field device) | VG-native blobs | `write-memory-image-native` | **v7** |
+
+`restore-memory-image-native` reads v5, v6 and v7; anything else signals through
+`%signal-unsupported-memory-image-version` (the image is a cleanly-closed memory
+graph's *only* durable record — the journal is cleared on checkpoint — so it
+refuses loudly rather than opening onto an empty graph). The cl-store reader
+restores structurally at v5 only; anything older falls through to
+`%rebuild-derived-from-nodes`.
+
+**Version history and what each bump migrates:**
+
+- **native v5 → v6** (GH #65): the spatial section became one record per
+  `(owner . slot)` instead of one flat pair list. v5's section was empty by
+  design, so v5 rebuilds spatial from nodes on open.
+- **native v6 → v7, cl-store v4 → v5** (GH #104): identical layout — the pair
+  codec always round-tripped values — but a spatial entry's value now carries
+  its node's type tag. A v6 image's `NIL` values would restore an index no
+  scoped query can filter on, so **pre-v7 images rebuild their spatial indexes
+  from live nodes at open**.
+
+Two consequences worth knowing before shipping a build:
+
+- The pre-v7 rebuild is **lazy-safe**:
+  `%rebuild-memory-spatial-indexes-from-nodes` materialises an LZNODE only when
+  its class could carry geometry, so fault-on-access survives for everything
+  else. It is still a one-time cost on the first open after the upgrade.
+- That rebuild re-derives cells through the current `%geometry-cells`, so it
+  also lands GH #103's multipolygon cover fix on memory graphs. Before the
+  bump those graphs kept the old budget's cells until someone called
+  `regenerate-spatial-indexes` by hand.
+
+A rebuild cannot be replaced by re-inserting over the existing index: a repeat
+`(cell . node-id)` is a duplicate-key no-op, so the tag would stay `NIL`. This is
+why the version bump exists rather than an in-place upgrade.

@@ -3,9 +3,13 @@
 ;; Defined in unique-constraint.lisp (loaded after this file); declared here so the
 ;; %COMMIT / APPLY-TRANSACTION hooks below compile without a forward-reference warning.
 (declaim (ftype (function (t t) t)
-                validate-unique-constraints apply-tx-writes-to-unique-indexes))
+                validate-unique-constraints apply-tx-writes-to-unique-indexes
+                apply-tx-writes-to-secondary-indexes))
 
 (defvar *transaction* nil)
+(defvar *read-snapshots* nil
+  "Graph -> read-only snapshot transaction, or NIL.  Read-only snapshots are
+per graph and may compose; read-write transactions are not (GH #53).")
 (defvar *end-of-transaction-action* '%commit)
 (defparameter *maximum-transaction-attempts* 8
   "The number of times a transaction is retried after failing
@@ -75,8 +79,10 @@
 
 (defclass object-set ()
   ((table
-    ;; Validation reads object-sets from other threads; CCL requires :shared t.
-    :initform (make-id-table #+ccl :synchronized #+ccl t)
+    ;; Validation reads object-sets from other threads; CCL requires :shared t,
+    ;; and ECL needs the same guard where it supports it (GH #101).
+    :initform (make-id-table #+ccl :synchronized #+ccl t
+                              #+ecl :synchronized #+ecl t)
     :reader table)))
 
 (defmethod object-set-list ((set object-set))
@@ -189,6 +195,11 @@
 
 (defgeneric lookup-object (id table transaction graph)
   (:method (id table (transaction null) graph)
+    ;; No read-write transaction: a read-only snapshot of GRAPH, if one is
+    ;; active, resolves the read (GH #53).
+    (let ((snapshot (and *read-snapshots* (gethash graph *read-snapshots*))))
+      (when snapshot
+        (return-from lookup-object (lookup-object id table snapshot graph))))
     ;; Non-transactional read: pin the read epoch so the reaper retains whatever
     ;; version we observe.  If this is a STANDALONE lookup (no enclosing pin), the
     ;; node escapes our pin, so materialize its bytes now (the lhash value-
@@ -198,18 +209,36 @@
     ;; covered by the transaction's own start-tx-id.
     (let ((standalone (not *read-pinned-p*)))
       (with-read-pin (graph)
-        (let ((node (lookup-node table id graph)))
-          (when (and standalone (node-p node))
-            (ensure-node-bytes node graph))
-          node))))
+        ;; Bind *GRAPH* to GRAPH so the vertex/edge value-deserializer
+        ;; (DESERIALIZE-VERTEX-HEAD / -EDGE-HEAD) resolves the stored type-id ->
+        ;; CLASS against THIS graph's schema, and the escape-materialization below
+        ;; reads THIS graph's heap -- even when LOOKUP-VERTEX is called with an
+        ;; explicit :GRAPH while ambient *GRAPH* is a different graph.  type-ids
+        ;; are per-graph, so without this a cross-graph read materializes the wrong
+        ;; class.  MAP-VERTICES / MAP-EDGES already bind *GRAPH* around their scans
+        ;; for exactly this reason; LOOKUP-OBJECT was the gap (issue #53, reachable).
+        (let ((*graph* graph))
+          (let ((node (lookup-node table id graph)))
+            (when (and standalone (node-p node))
+              (ensure-node-bytes node graph))
+            node)))))
   (:method (id table transaction (graph t))
+    ;; A read-write transaction is single-graph (GH #53).
+    (let ((txn-graph (graph transaction)))
+      (unless (eq graph txn-graph)
+        (error 'cross-graph-transaction-error
+               :node id :transaction-graph txn-graph :node-graph graph)))
     (let ((local-cache (local-cache transaction))
           (graph-cache (graph-cache transaction)))
       (let ((local (gethash id local-cache)))
         (if local
             local
             (let ((value (or (gethash id graph-cache)
-                             (lookup-node table id (graph transaction)))))
+                             ;; Same per-graph type-id resolution as the null-txn
+                             ;; method: bind *GRAPH* to the graph LOOKUP-NODE reads
+                             ;; so the value-deserializer picks the right schema.
+                             (let ((*graph* (graph transaction)))
+                               (lookup-node table id (graph transaction))))))
               (when value
                 ;; P4: resolve the version visible at this transaction's snapshot
                 ;; (commit-epoch < start-tx-id).  The resolved (possibly archived)
@@ -240,15 +269,43 @@
 
 (defgeneric validate (transaction)
   (:method (transaction)
-    (let ((write-set (write-set transaction)))
+    (let ((write-set (write-set transaction))
+          (read-set (read-set transaction)))
       (or (zerop (object-set-count write-set))
           (loop for other-transaction in (overlapping-transactions
                                           transaction
                                           (transaction-manager transaction))
+             ;; BACKWARD validation, against transactions that COMMITTED during
+             ;; this one's lifetime -- the only population OVERLAPPING-TRANSACTIONS
+             ;; returns.  Two conflicts matter:
+             ;;   write/write -- a lost update;
+             ;;   read/write  -- this transaction read a value the other has since
+             ;;                  overwritten, so its reads are stale (#73).
              never (object-sets-intersect-p write-set
-                                            (read-set other-transaction))
-             never (object-sets-intersect-p write-set
+                                            (write-set other-transaction))
+             never (object-sets-intersect-p read-set
                                             (write-set other-transaction)))))))
+
+;;; NOTE on a clause that used to live in VALIDATE and was removed (GH #92):
+;;;
+;;;   never (object-sets-intersect-p write-set (read-set other-transaction))
+;;;
+;;; That is FORWARD validation -- "am I about to invalidate someone?" -- and
+;;; forward validation is only meaningful against transactions that are still
+;;; ACTIVE and can therefore still be invalidated.  OVERLAPPING-TRANSACTIONS
+;;; returns COMMITTED transactions only, and a committed transaction is finished
+;;; and immutable: nothing written now can invalidate it, and its own reads were
+;;; validated at its commit.  Since it committed first the serial order is
+;;; other < this, so `other read the old value, this writes the new one' is an
+;;; ordinary read-then-write dependency and is serializable.
+;;;
+;;; So it never prevented an anomaly; it only caused retries.  Demonstrated: T2
+;;; reads X and writes Y and commits; T1, started earlier, then writes X -- a
+;;; node T2 only READ.  T1 needed 2 attempts with the clause and 1 without.
+;;; Retries are not free here -- *MAXIMUM-TRANSACTION-ATTEMPTS* is 8 and the
+;;; fallback is a GLOBAL transaction-manager lock -- so the spurious aborts push
+;;; contended workloads toward full serialization.
+
 
 (defgeneric %commit (transaction))
 (defgeneric %rollback (transaction))
@@ -465,6 +522,73 @@ live head is newer than EPOCH."
             (if (< (commit-epoch ver) epoch)
                 (progn (ensure-node-bytes ver graph) (return ver))
                 (setf p (prev-pointer ver))))))))
+
+;;; --- Public read path over the retained version chain -----------------------
+;;; The walk above exists for snapshot isolation: it stops at the first version
+;;; old enough for the reader.  VERTEX-HISTORY is the same walk run to the end
+;;; (or to :LIMIT) and handed to a caller -- the supported way to read what
+;;; KEEP-REVISIONS retains.
+
+(defun vertex-history (graph id &key limit)
+  "Return the retained versions of the vertex ID in GRAPH as a list of
+\(VERSION . COMMIT-EPOCH) conses, NEWEST FIRST.  The live version is included
+and is always the first entry.  ID is a 16-byte id array or its string form.
+Returns NIL if GRAPH holds no vertex with that id.  LIMIT, when given, caps the
+result at the LIMIT newest versions.
+
+Each VERSION is a fully materialized VERTEX (bytes and data read while this
+call held its read pin), so it stays valid after the call and outside any
+*GRAPH* binding.  Treat them as READ-ONLY: only the first entry is the node the
+graph will hand out again, and archived versions are not saveable.  To modify a
+vertex, COPY the live one inside a transaction as usual.
+
+The chain starts from the committed LIVE head, deliberately independent of any
+enclosing transaction's snapshot: an audit read wants everything committed, not
+the subset visible at some reader's start epoch.  Uncommitted writes in the
+calling transaction are therefore not shown, and a soft-deleted vertex still
+reports its history (the deletion is itself a version, with DELETED-P set on
+the live head).
+
+⚠ THE DEPTH AVAILABLE IS BOUNDED BY KEEP-REVISIONS -- the node type's if it
+sets one, otherwise the graph's (default 0, i.e. NO history beyond the live
+version).  REAP-OLD-VERSIONS discards versions past that window as soon as no
+active reader could still observe them.  So a SHORT HISTORY DOES NOT MEAN THE
+VERTEX WAS EDITED FEW TIMES: it may equally mean the reaper did its job and the
+older versions are gone for good.  Anyone reading this as an audit trail must
+not read absence of history as absence of change; if the full trail matters,
+the graph must be created with a KEEP-REVISIONS window wide enough to hold it,
+and a vertex reaching that window is a signal to surface, not a case to absorb.
+
+Concurrency: the walk holds a read pin, which bounds the reaper's floor and so
+protects every version an active reader could observe.  Versions already older
+than that floor remain reclaimable, so a history walk that races a concurrent
+UPDATE of the SAME vertex may see its deep tail cut short -- the same
+truncation KEEP-REVISIONS can cause, and indistinguishable from it.  Quiescent
+vertices (the normal case for ingested source records) are unaffected."
+  (when (and limit (<= limit 0))
+    (return-from vertex-history nil))
+  (let ((*graph* graph)   ; DESERIALIZE-VERTEX-HEAD resolves the node type
+                          ; through *GRAPH*, not through an argument.
+        (key (if (stringp id) (read-id-array-from-string id) id)))
+    (with-read-pin (graph)
+      (let ((live (lookup-node (vertex-table graph) key graph)))
+        (when (node-p live)
+          (ensure-node-bytes live graph)
+          (maybe-init-node-data live :graph graph)
+          (let ((history (list (cons live (commit-epoch live))))
+                (count 1)
+                (p (prev-pointer live)))
+            (loop
+              (when (or (zerop p) (and limit (>= count limit)))
+                (return))
+              (let ((version (deserialize-vertex-head (heap graph) p)))
+                (setf (id version) key)
+                (ensure-node-bytes version graph)
+                (maybe-init-node-data version :graph graph)
+                (push (cons version (commit-epoch version)) history)
+                (incf count)
+                (setf p (prev-pointer version))))
+            (nreverse history)))))))
 
 ;;; Read-epoch pins (non-transactional reads).  A reader records the current
 ;;; epoch BEFORE it reads a node head and holds the pin until it has finished
@@ -688,6 +812,9 @@ APPLY-TRANSACTION)."
           (ldb (byte 32 0) (1+ (revision old-node))))
     (setf (bytes new-node)
           (serialize (data new-node)))
+    ;; Stamp home graph, symmetric with the create path's FINALIZE-NODE (GH #53).
+    (setf (node-graph new-node) graph
+          (node-graph old-node) graph)
     (maybe-write-to-heap new-node graph)
     ;; MVCC: archive the prior version's head (it still points at the retained
     ;; old data block) and chain the new live head to it.  The old data block is
@@ -806,7 +933,7 @@ APPLY-TRANSACTION)."
   #+sbcl (make-hash-table :test 'eq :synchronized t)
   #+ccl (make-hash-table :test 'eq :shared t)
   #+lispworks (make-hash-table :test 'eq :single-thread nil)
-  #+ecl (make-hash-table :test 'eq)
+  #+ecl (make-hash-table :test 'eq #+graph-db-ecl-sync-hash :synchronized #+graph-db-ecl-sync-hash t)
   "Cache CLASS -> list of its :INDEX-marked slot names (candidate geometry slots).")
 
 (defun node-geometry-index-slots (class)
@@ -818,63 +945,659 @@ symbol is read in the *application's* package, which is not necessarily EQ to
 GRAPH-DB:GEOMETRY (and a user need not even declare a type).  Instead we return
 every indexed slot, and NODE-GEOMETRY picks the one whose runtime value is an
 actual GEOMETRY (via GEOMETRYP) -- robust across packages and to mixed
-geometry/non-geometry indexed slots on the same type.  Cached per class (runtime
-schema redefinition is not expected)."
+geometry/non-geometry indexed slots on the same type.
+
+Cached per class, and INVALIDATED on class redefinition via
+*NODE-CLASS-CACHE-INVALIDATORS* -- VG supports runtime schema mutation, and a
+subclass must be dropped too when a SUPERCLASS gains or loses an :INDEX slot."
   (multiple-value-bind (val present) (gethash class *node-geometry-slot-cache*)
     (if present
         val
-        (setf (gethash class *node-geometry-slot-cache*)
-              (when (class-finalized-p class)
+        ;; Do NOT cache before finalization.  CLASS-SLOTS is unavailable then, and
+        ;; storing the resulting NIL would make that negative answer PERMANENT --
+        ;; the class could never be spatially indexed again for the life of the
+        ;; image, even after it finalized.
+        (when (class-finalized-p class)
+          (setf (gethash class *node-geometry-slot-cache*)
                 (loop for slot in (class-slots class)
                       when (indexed-p slot)
                         collect (slot-definition-name slot)))))))
 
+(defparameter *node-geometry-multi-sample-limit* 64
+  "How many nodes of a class are checked for a SECOND geometry-valued indexed
+slot before the check is retired for that class.  Checking only the first node
+would miss a schema where a centroid is populated at creation and an extent is
+filled in later; checking always would cost a slot read per :INDEX slot -- scalars
+included, since NODE-GEOMETRY-INDEX-SLOTS returns them all -- on every spatial
+write forever.  AUDIT-SPATIAL-SLOTS is the exhaustive sweep.")
+
+(defvar *node-geometry-multi-sample-counts*
+  #+sbcl (make-hash-table :test 'eq :synchronized t)
+  #+ccl (make-hash-table :test 'eq :shared t)
+  #+lispworks (make-hash-table :test 'eq :single-thread nil)
+  #+ecl (make-hash-table :test 'eq #+graph-db-ecl-sync-hash :synchronized #+graph-db-ecl-sync-hash t)
+  "CLASS -> nodes sampled so far, or :DONE once the check has fired or expired.")
+
+(defun node-geometry-slots-with-values (node)
+  "Every indexed slot of NODE that actually holds a geometry, in effective-slot
+order.  The first is the one NODE-GEOMETRY selects; any others are INERT."
+  (loop for slot in (node-geometry-index-slots (class-of node))
+        when (geometryp (ignore-errors (slot-value node slot)))
+          collect slot))
+
+(defun %maybe-warn-inert-geometry-slots (node)
+  "Warn once per class when a node carries more than one geometry-valued indexed
+slot: only the first is indexed, and the rest are silently inert.
+
+Deliberately NOT a finalization-time check.  NODE-GEOMETRY-INDEX-SLOTS refuses to
+compare the declared `:type geometry' symbol -- it is read in the *application's*
+package and is not reliably EQ to GRAPH-DB:GEOMETRY, and a user need not declare a
+type at all -- so which slots will hold geometry is unknowable until a node exists.
+Hence a value-based check, here on the maintenance path.
+
+Bounded, not permanent: *NODE-GEOMETRY-MULTI-SAMPLE-LIMIT* nodes per class, then
+the class is retired.  A class with ONE geometry slot and several indexed scalars
+is the ordinary case and stays silent -- :INDEX is also the general ordered-index
+option, so most of the slots this walks are not geometry at all.
+
+No lock: this runs on the spatial write path, and a diagnostic does not justify
+serializing it.  Two threads can both read SEEN before either writes, so the
+final store below re-reads the hash-table entry rather than trusting SEEN, and
+only ever writes something at least as large as what that re-read saw, never
+blindly SEEN.  Without that re-check, a descheduled thread could clobber a
+concurrently-set :DONE with a plain integer, or move the count backwards, on
+the strength of a SEEN it read long before it finally stored -- an arbitrarily
+wide window.  The re-read narrows that window to the gap between the re-read
+and the SETF a few lines below, which is real and worth having, but it does NOT
+close it: those two forms are still separate operations, not a single atomic
+compare-and-swap, so a thread can still be preempted between them.  Losing
+:DONE is still possible (A re-reads CUR=5, computes 6, is preempted; B warns
+and sets :DONE; A resumes and stores 6, un-retiring the class) and so is going
+backwards (A re-reads CUR=5, computes (MAX 4 5)=5, is preempted; B stores 6; A
+resumes and stores 5).  Both windows are now two hash-table operations wide
+instead of spanning the whole slot walk, which is the improvement this re-read
+actually buys; the count can also still under-count (two threads both reading
+SEEN=N and each computing N+1).  No lock or CAS closes the remaining window --
+there is no portable compare-and-swap on a hash-table entry across
+SBCL/CCL/ECL/LispWorks, and a diagnostic does not justify inventing one; the
+64-sample bound and the single warning are therefore best-effort, not
+guaranteed, under concurrent writers to the same class."
+  (let* ((class (class-of node))
+         (seen (gethash class *node-geometry-multi-sample-counts* 0)))
+    (unless (eq seen :done)
+      (let ((slots (node-geometry-slots-with-values node)))
+        (cond ((rest slots)
+               (setf (gethash class *node-geometry-multi-sample-counts*) :done)
+               (warn "~S declares ~D geometry-valued indexed slots ~S; only ~S is ~
+                      indexed and the rest are INERT.  Index under one slot, or ~
+                      run AUDIT-SPATIAL-SLOTS to review the whole graph."
+                     (class-name class) (length slots) slots (first slots)))
+              ((>= (1+ seen) *node-geometry-multi-sample-limit*)
+               (setf (gethash class *node-geometry-multi-sample-counts*) :done))
+              (t
+               (let ((cur (gethash class *node-geometry-multi-sample-counts* 0)))
+                 (unless (eq cur :done)
+                   (setf (gethash class *node-geometry-multi-sample-counts*)
+                         (max (1+ seen) (if (integerp cur) cur 0)))))))))))
+
+(defvar *node-vector-index-slot-cache*
+  #+sbcl (make-hash-table :test 'eq :synchronized t)
+  #+ccl (make-hash-table :test 'eq :shared t)
+  #+lispworks (make-hash-table :test 'eq :single-thread nil)
+  #+ecl (make-hash-table :test 'eq #+graph-db-ecl-sync-hash :synchronized #+graph-db-ecl-sync-hash t))
+
+(defun node-vector-index-slots (class)
+  "Names of CLASS's :VECTOR-INDEX slots -- the slots that get a vector segment.
+Cached per class, and INVALIDATED on class redefinition via
+*NODE-CLASS-CACHE-INVALIDATORS*.  Value gating is done at maintenance time, not
+here: only a conforming (simple-array single-float (*)) value is actually
+indexed."
+  (multiple-value-bind (val present) (gethash class *node-vector-index-slot-cache*)
+    (if present
+        val
+        ;; Not cached before finalization -- see NODE-GEOMETRY-INDEX-SLOTS for why
+        ;; caching that NIL would be permanent.
+        (when (class-finalized-p class)
+          (setf (gethash class *node-vector-index-slot-cache*)
+                (loop for slot in (class-slots class)
+                      when (vector-index-p slot)
+                        collect (slot-definition-name slot)))))))
+
+(defun %invalidate-node-class-slot-caches (class)
+  "Drop CLASS's memoized CLASS-SLOTS-derived answers.  Registered on
+*NODE-CLASS-CACHE-INVALIDATORS*, which handles the subclass walk."
+  (remhash class *node-geometry-slot-cache*)
+  (remhash class *node-vector-index-slot-cache*)
+  ;; Also the multi-geometry sampling state: its :DONE marker retires a class
+  ;; from sampling, and a redefined class deserves to be looked at afresh.
+  (remhash class *node-geometry-multi-sample-counts*))
+
+(pushnew '%invalidate-node-class-slot-caches *node-class-cache-invalidators*)
+
+(defun %vector-index-slot-owner-name (class slot-name)
+  "The most-general node-class in CLASS's precedence list that declares SLOT-NAME
+as a :VECTOR-INDEX direct slot -- the cross-subtype segment owner (so a
+:VECTOR-INDEX slot on a parent is maintained across its subclasses through one
+shared segment, spanning subclasses -- one segment per DECLARING class).  Direct
+mirror of %UNIQUE-SLOT-OWNER-NAME (unique-constraint.lisp:61)."
+  (let ((owner (loop for c in (reverse (class-precedence-list class))
+                     when (and (typep c 'node-class)
+                               (find-if (lambda (ds)
+                                          (and (eq (slot-definition-name ds) slot-name)
+                                               (vector-index-p ds)))
+                                        (class-direct-slots c)))
+                     return c)))
+    (class-name (or owner class))))
+
+(defun %segment-key (node slot-name)
+  "The (OWNER-NAME . SLOT-NAME) key identifying NODE's vector segment for
+SLOT-NAME.  This is the ONE place the owner key is computed; every maintenance
+path (create/update/delete/validate) and rebuild goes through this so a
+subclass instance's vector always lands in the declaring ancestor's segment,
+never a per-subclass one -- mirroring :UNIQUE / :INDEX exactly."
+  (cons (%vector-index-slot-owner-name (class-of node) slot-name) slot-name))
+
 (defgeneric node-geometry (node)
   (:documentation
-   "The GEOMETRY a node occupies, or NIL if it has none.  By default this is the
-value of the node's :INDEX-marked geometry slot (see NODE-GEOMETRY-INDEX-SLOTS);
-declaring (slot :type geometry :index t) is enough to make a node type spatially
-indexed.  Applications may instead specialize this method (e.g. for a computed
-geometry); an explicit method takes precedence over the default.")
+   "The GEOMETRY a node occupies and the slot it came from, as (values geometry
+slot-name), or (values nil nil).  By default the geometry is the value of the
+node's :INDEX-marked geometry slot (see NODE-GEOMETRY-INDEX-SLOTS); declaring
+ (slot :type geometry :index t) is enough to make a node type spatially indexed.
+Applications may instead specialize this method (e.g. for a computed geometry);
+an explicit method takes precedence over the default.  A specializing method that
+returns only ONE value reports no slot: such a node is indexed under
+ (METHOD-OWNER . NIL), where METHOD-OWNER is the most general class carrying an
+applicable method (see %NODE-GEOMETRY-METHOD-OWNER-NAME), so the class is still
+scopeable by name exactly as a declared :INDEX slot is.
+
+CAVEAT for a two-value method: if a specializing method returns (values geom
+slot-name), the node is indexed under (CLASS . SLOT-NAME) -- but a class scope
+resolves through NODE-GEOMETRY-INDEX-SLOTS, i.e. the :INDEX-marked slots only, so
+if SLOT-NAME names a slot that is NOT declared :INDEX, no class scope will
+enumerate that key and the node is reachable ONLY via the :ALL scope.  Return the
+declared :INDEX slot's name (or one value) to keep the node scopeable by class.")
   (:method (node) (declare (ignore node)) nil)
   (:method ((node node))
     ;; NB: do NOT gate on SLOT-BOUNDP -- node-class persistent slots are read
     ;; through SLOT-VALUE-USING-CLASS from the serialized buffer, and
     ;; SLOT-BOUNDP reports the (always-unbound) backing CLOS slot, so it would
     ;; skip every persistent slot.  Read the value and test it directly.
+    ;; Returns (values GEOMETRY SLOT-NAME): the slot is what selects the node's
+    ;; spatial index, and it is chosen PER NODE, so two instances of one class
+    ;; can legitimately land in different indexes when different slots are bound.
     (loop for slot in (node-geometry-index-slots (class-of node))
           for v = (ignore-errors (slot-value node slot))
-          when (geometryp v) return v)))
+          when (geometryp v) return (values v slot))))
+
+(defun %node-geometry-method-owner-name (class)
+  "The most general class carrying an applicable application-supplied
+NODE-GEOMETRY method, or NIL when CLASS relies on the engine's default method.
+
+Overriding NODE-GEOMETRY is a documented extension point (see example.lisp): the
+method returns a computed geometry and NO slot name, so such a node is indexed
+under the key (OWNER . NIL).  This resolves OWNER the same way
+%INDEXED-SLOT-OWNER-NAME resolves a slot's -- most general first -- so a method
+defined on a parent gives its subclasses ONE shared index, exactly as an :INDEX
+slot on a parent does.  Keying on each node's own class instead would scatter a
+hierarchy across per-subclass indexes and make a scope on the parent miss them.
+
+The MOP idiom -- GENERIC-FUNCTION-METHODS / METHOD-SPECIALIZERS -- comes from the
+MOP package this package USEs per implementation (sb-mop, closer-mop, clos).  The
+two built-in methods specialize on T and on NODE; only something more specific
+counts as custom.  The TYPEP guard keeps an EQL specializer -- which is not a type
+specifier -- away from SUBTYPEP.
+
+CAVEAT.  GENERIC-FUNCTION-METHODS returns the methods in an implementation-defined
+ORDER, unlike %INDEXED-SLOT-OWNER-NAME's deterministic reversed-CPL walk.  The
+SUBTYPEP most-general test above makes the RESULT order-independent for any fixed
+set of methods, so this is not a portability hazard in itself.
+
+The exposure is temporal, and it is real: defining a NODE-GEOMETRY method on a MORE
+GENERAL class at runtime, after nodes of a subclass are already indexed, relocates
+the owner.  Every entry written under the old key then orphans -- the remove looks
+in the new owner's index, and nothing ever visits the old key again.  Declare the
+NODE-GEOMETRY methods for a hierarchy before writing its nodes; if one is added
+later, REBUILD-SPATIAL-INDEXES re-derives every key from scratch.  This is the same
+exposure an :INDEX slot has under class redefinition -- consistent with existing
+engine behaviour, not a new risk introduced by the method-owner key."
+  (let ((owner nil))
+    (dolist (m (generic-function-methods #'node-geometry) owner)
+      (let ((spec (first (method-specializers m))))
+        (when (and (typep spec 'class)
+                   (not (member (class-name spec) '(t node)))
+                   (subtypep (class-name class) (class-name spec))
+                   (or (null owner) (subtypep owner (class-name spec))))
+          (setf owner (class-name spec)))))))
+
+(defun %node-spatial-owner-name (class slot-name)
+  "The owner half of the (OWNER . SLOT) key CLASS's geometry is indexed under.
+
+This is the ONE place the spatial owner is computed.  Every path that touches a
+spatial index -- insert, remove, whole-graph rebuild, per-index regenerate, the
+memory-graph rebuilds, and the scope resolver -- goes through it, because an
+insert and its matching remove that disagreed about the owner would orphan the
+index entry permanently.
+
+A declared :INDEX slot resolves to the most general class DECLARING that slot; a
+geometry from an application's own NODE-GEOMETRY method has no slot and resolves
+to the most general class carrying that method.  The CLASS-NAME fallback covers
+the pathological case of a slotless geometry with no class-specialized method
+ (e.g. an EQL-specialized one): still indexed, still symmetrically removable."
+  (if slot-name
+      (%indexed-slot-owner-name class slot-name)
+      (or (%node-geometry-method-owner-name class) (class-name class))))
+
+;; Forward reference: %SPATIAL-INDEX-FOR / SPATIAL-INDEX-FOR live in
+;; spatial-registry.lisp, which loads after this file (it needs the graph, the
+;; MOP helpers and the memory-graph backend).  Same idiom as graph.lisp's
+;; declaim for the unique/secondary index functions.
+(declaim (ftype (function (t t t) t) %spatial-index-for spatial-index-for))
+;; SAVE-SPATIAL-INDEX-ROOTS is in graph.lisp; declared for the same reason.
+(declaim (ftype (function (t) t) save-spatial-index-roots))
+
+(defun %node-spatial-type-tag (node)
+  "NODE's spatial index-entry tag (GH #104).  Lives here, not in
+spatial-index.lisp, which loads before VERTEX and EDGE."
+  (%spatial-type-tag (type-id node) (typep node 'edge)))
+
+(defun %spatial-index-node (graph node)
+  "Insert NODE into the index its geometry slot selects.  No-op without geometry.
+
+A node whose geometry came from a declared :INDEX slot is keyed by (OWNER . SLOT);
+one reported by an application's own NODE-GEOMETRY method has no slot and is keyed
+by (METHOD-OWNER . NIL).  Both go through %NODE-SPATIAL-OWNER-NAME, which is also
+what %SPATIAL-UNINDEX-NODE uses -- the two must agree exactly or a remove would
+miss the entry the insert wrote."
+  (multiple-value-bind (geom slot) (node-geometry node)
+    (when (and geom (not (deleted-p node)))
+      ;; §8: a class declaring two geometry slots indexes only the first, and the
+      ;; rest are silently inert.  Sampled here, on the one path every geometry
+      ;; write goes through; bounded per class, so it costs nothing after a class
+      ;; has been seen.  Before the insert, so the diagnostic still reaches an
+      ;; operator whose insert then fails.
+      ;;
+      ;; Only when SLOT is non-NIL: a NIL slot means this geometry came from an
+      ;; application's own NODE-GEOMETRY method (the documented workaround for
+      ;; wanting more than one geometry-valued input -- e.g. combining two
+      ;; indexed slots into one geometry), not from the "first indexed slot
+      ;; wins" default.  The multi-slot rule does not apply there at all, so
+      ;; warning would be a false positive against the very workaround the
+      ;; warning's own message recommends.
+      (when slot (%maybe-warn-inert-geometry-slots node))
+      (let* ((owner (%node-spatial-owner-name (class-of node) slot))
+             (idx (%spatial-index-for graph owner slot))
+             (before (spatial-index-coarsest-precision idx)))
+        (spatial-index-insert idx (id node) geom (%node-spatial-type-tag node))
+        ;; §7.4: an insert whose cover was capped can LOWER the index's coarsest
+        ;; occupied precision, which widens every subsequent query's covering
+        ;; clamp.  Only this layer can name the node responsible -- the index
+        ;; itself sees a bare node-id -- so the warning is emitted here.
+        (let ((after (spatial-index-coarsest-precision idx)))
+          (when (< after before)
+            ;; NO sidecar save here.  The histogram lives in RAM between closes and
+            ;; is persisted at CLOSE-GRAPH; a crash (which loses the RAM copy) forces
+            ;; recovery, and OPEN-GRAPH re-derives every spatial index from the
+            ;; recovered node geometries after replaying the WAL (see the crash-
+            ;; recovery rebuild there), so a lost decrease is reconstructed from
+            ;; authoritative data rather than from a file written on the hot commit
+            ;; path under the transaction-manager lock.  §7.2's silent-miss concern
+            ;; is met by that rebuild, not by an incremental write.
+            (multiple-value-bind (mnl mnt mxl mxt) (geometry-bbox geom)
+              ;; Report REQUESTED vs GRANTED (§7.4): naming only the previous
+              ;; coarsest would tell an operator "coarsened to 4 (was 5)" on a
+              ;; second coarsening and never reveal that the index was CONFIGURED
+              ;; at 7 -- the number they need to judge how far selectivity has
+              ;; fallen and what a regenerate would restore.
+              (warn "Spatial index ~S.~S coarsened to precision ~D (configured ~D; ~
+                     previously ~D) for node ~S, bbox (~,4F ~,4F ~,4F ~,4F).  ~
+                     Queries on this index now cover at precision ~D.  Removing ~
+                     every node stored at that precision restores it automatically ~
+                     (the clamp is self-healing), or call ~
+                     (REGENERATE-SPATIAL-INDEX graph '~S '~S)."
+                    owner slot after (spatial-index-precision idx) before
+                    (id node) mnl mnt mxl mxt after owner slot))))))))
+
+(defun %spatial-unindex-node (graph node)
+  "Remove NODE from the index its geometry slot selects.  No-op without geometry,
+and no-op when that index does not exist (nothing was ever written).  Resolves the
+owner through %NODE-SPATIAL-OWNER-NAME, exactly as %SPATIAL-INDEX-NODE does."
+  (multiple-value-bind (geom slot) (node-geometry node)
+    (when geom
+      (let* ((owner (%node-spatial-owner-name (class-of node) slot))
+             (idx (spatial-index-for graph owner slot)))
+        (when idx
+          (let ((before (spatial-index-coarsest-precision idx)))
+            (spatial-index-remove idx (id node) geom)
+            ;; Symmetric to the warning above: the clamp is self-healing, so note
+            ;; when removing this node gave the index its selectivity back.
+            (let ((after (spatial-index-coarsest-precision idx)))
+              (when (> after before)
+                (log:info "Spatial index ~S.~S recovered to precision ~D (was ~D) ~
+after removing node ~S." owner slot after before (id node))))))))))
 
 (defgeneric apply-tx-write-to-spatial-index (write graph)
   (:method (write graph) (declare (ignore write graph)) nil))
 
 (defmethod apply-tx-write-to-spatial-index ((write tx-create) graph)
-  (let ((node (node write)) (idx (spatial-index graph)))
-    (when idx
-      (let ((geom (node-geometry node)))
-        (when (and geom (not (deleted-p node)))
-          (spatial-index-insert idx (id node) geom))))))
+  (%spatial-index-node graph (node write)))
 
 (defmethod apply-tx-write-to-spatial-index ((write tx-update) graph)
-  (let ((new-node (node write)) (old-node (old-node write)) (idx (spatial-index graph)))
-    (when idx
-      (let ((old-geom (node-geometry old-node))
-            (new-geom (node-geometry new-node)))
-        (when old-geom (spatial-index-remove idx (id old-node) old-geom))
-        (when (and new-geom (not (deleted-p new-node)))
-          (spatial-index-insert idx (id new-node) new-geom))))))
+  (%spatial-unindex-node graph (old-node write))
+  (%spatial-index-node graph (node write)))
 
 (defmethod apply-tx-write-to-spatial-index ((write tx-delete) graph)
-  (let ((node (node write)) (idx (spatial-index graph)))
-    (when idx
-      (let ((geom (node-geometry node)))
-        (when geom (spatial-index-remove idx (id node) geom))))))
+  (%spatial-unindex-node graph (node write)))
 
 (defgeneric apply-tx-writes-to-spatial-index (writes graph)
   (:method (writes graph)
     (dolist (write writes)
       (apply-tx-write-to-spatial-index write graph))))
+
+;;; Applying transaction vector-segment updates (Phase 2 step 3).
+;;;
+;;; Mirrors the spatial-index-maintenance pass immediately above: a node's
+;;; :vector-index slots (NODE-VECTOR-INDEX-SLOTS) are (re)stored into their
+;;; per-(class,slot) VECTOR-SEGMENT on create/update and removed on delete.
+;;; The segment keys on node id, so -- like the spatial index -- it is
+;;; independent of the MVCC version chains and the reaper.  A segment is
+;;; created lazily, on first conforming insert, sized to that first vector's
+;;; length.
+
+(defun %conforming-vector-p (v)
+  "True when V is a value a vector segment can store."
+  (typep v '(simple-array single-float (*))))
+
+(defun %node-segment-value (node slot-name)
+  "The conforming vector in NODE's SLOT-NAME, or NIL.  Reads via SLOT-VALUE
+directly (NOT slot-boundp) -- persistent slots read as unbound on the backing
+CLOS slot, exactly as node-geometry does."
+  (let ((v (ignore-errors (slot-value node slot-name))))
+    (when (%conforming-vector-p v) v)))
+
+(defun %segment-file (graph owner-name slot-name)
+  "OWNER-NAME is the segment's OWNING class (see %VECTOR-INDEX-SLOT-OWNER-NAME /
+%SEGMENT-KEY) -- NOT necessarily a node's exact runtime class.  One file per
+owner, spanning subclasses."
+  (format nil "~A/vseg-~A-~A.dat"
+          (location graph) (string-downcase owner-name) (string-downcase slot-name)))
+
+(defun %ensure-segment (graph owner-name slot-name dimension)
+  "The segment for (OWNER-NAME, SLOT-NAME), created lazily if absent with
+DIMENSION (the length of the first conforming vector).  Registered in the graph's
+VECTOR-SEGMENTS table.  OWNER-NAME must be the segment OWNER (from
+%SEGMENT-KEY), not a node's exact class -- callers pass the owner name so a
+subclass instance is created into, and thereafter maintained in, the ancestor's
+segment."
+  (let* ((key (cons owner-name slot-name))
+         (table (vector-segments graph)))
+    (or (gethash key table)
+        (let ((path (%segment-file graph owner-name slot-name)))
+          (setf (gethash key table)
+                ;; Keyed on the FILE, not only on table registration (GH #55).
+                ;; CREATE-VECTOR-SEGMENT rewrites the header and free-marks the
+                ;; capacity, so creating over an existing file destroys it
+                ;; silently -- and an unregistered file is reachable: whenever
+                ;; RESTORE-VECTOR-SEGMENTS could not register it at open (owner
+                ;; class not yet finalized, a re-added :VECTOR-INDEX leaving a
+                ;; stale file, a lazily generated node type), or on a memory
+                ;; graph before GH #58 made it restore segments at all.
+                (if (probe-file path)
+                    (progn
+                      (warn "Vector segment ~A exists on disk but was not ~
+                             registered at open; adopting it rather than ~
+                             overwriting.  Expect this only if its owner class ~
+                             was undefined or unfinalized when the graph was ~
+                             opened (GH #55)."
+                            path)
+                      (open-vector-segment path))
+                    (create-vector-segment path dimension)))))))
+
+;;; ---------------------------------------------------------------------------
+;;; Enforcement (VALIDATE, pre-durability)
+;;; ---------------------------------------------------------------------------
+;;;
+;;; Mirrors VALIDATE-UNIQUE-CONSTRAINTS: a dimension mismatch must abort the
+;;; transaction BEFORE FINALIZE-TX-PERSISTENCE / APPLY-TRANSACTION, not during
+;;; the apply path.  SEGMENT-PUT's own dimension check (inside
+;;; APPLY-TX-WRITE-TO-VECTOR-SEGMENTS) fires too late to prevent drift: by the
+;;; time apply-transaction runs, the node write has already been journaled and
+;;; applied to the heap, so a SEGMENT-PUT error there leaves a persisted node
+;;; with no corresponding segment entry.  Checking here, under the same
+;;; manager lock as VALIDATE-UNIQUE-CONSTRAINTS and before anything is
+;;; journaled, makes the whole transaction -- node write included -- roll
+;;; back cleanly on a mismatch.
+
+(defun validate-vector-segment-dimensions (tx graph)
+  "Signal an error if any write in TX would store a :vector-index value whose
+length disagrees with the established dimension for that (class, slot) --
+established either by an already-committed segment, or by an earlier write
+of the SAME (class, slot) within this same transaction (an INTRA hash,
+mirroring VALIDATE-UNIQUE-CONSTRAINTS's intra-transaction check).  A
+(class, slot) with no established segment and no prior write in this
+transaction cannot mismatch -- the first conforming vector seen (from
+either source) establishes the dimension."
+  (let ((intra (make-hash-table :test 'equal)))
+    (dolist (write (writes tx))
+      (let ((node (node write)))
+        (unless (deleted-p node)
+          (dolist (slot (node-vector-index-slots (class-of node)))
+            (let ((v (%node-segment-value node slot)))
+              (when v
+                (let* ((key (%segment-key node slot))
+                       (seg (gethash key (vector-segments graph)))
+                       (expected (if seg
+                                     (segment-dimension seg)
+                                     (gethash key intra))))
+                  (cond
+                    ((null expected)
+                     ;; first conforming write of this (owner, slot) in this
+                     ;; transaction, and no committed segment yet -- this
+                     ;; write establishes the dimension for the rest of TX
+                     (setf (gethash key intra) (length v)))
+                    ((/= (length v) expected)
+                     (error "vector-index slot ~A on ~A: vector length ~D does not ~
+match established segment dimension ~D"
+                            slot (car key) (length v) expected))))))))))))
+
+(defun ensure-vector-segment-capacity (tx graph)
+  "Grow every vector segment TX writes to until it can hold what TX will put in
+it, so APPLY-TRANSACTION provably never has to grow.  Runs in the same
+manager-locked, pre-FINALIZE-TX-PERSISTENCE region as
+VALIDATE-VECTOR-SEGMENT-DIMENSIONS and for the same reason: %SEG-GROW can signal
+ (if it cannot relocate to a larger reservation), and from inside
+APPLY-TRANSACTION that signal lands after the node write is journaled, leaving a
+persisted node with no segment entry -- invisible to VECTOR-SEARCH, with no error
+and no self-correction.
+
+WHY IT GROWS RATHER THAN MERELY VALIDATING.  It used to only validate: it
+computed the capacity TX needed and signalled if the segment could not reach it
+within its mmap reservation.  Once %SEG-GROW could recover from exhaustion by
+re-reserving and relocating (%SEG-ENSURE-RESERVATION), a pure check became
+over-eager -- it would abort transactions that would now succeed -- and merely
+raising its bound would have replaced a guarantee with a guess about what
+relocation might achieve.  Performing the grow HERE keeps the guarantee.
+
+EXACTLY WHAT IS GUARANTEED -- stated carefully, because the obvious phrasing
+ (\"validation and apply are serialised under the manager lock, so nothing can
+consume the capacity in between\") IS NOT TRUE, and contradicts the paragraph
+below about REBUILD-VECTOR-SEGMENT-BATCHED in this very docstring.  The manager
+lock serialises COMMITS against each other, and nothing else.  So:
+
+  APPLY-TRANSACTION cannot need to grow ABSENT A CONCURRENT LOCK-FREE MUTATOR.
+  After this returns, capacity >= live-count + the distinct new ids TX writes,
+  and %SEG-CLAIM-SLOT therefore takes either a free-list slot or the LIVE index
+  with live < capacity -- it cannot reach its %SEG-GROW branch.  No other
+  COMMIT can invalidate that, because commits are serialised here.
+
+  REBUILD-VECTOR-SEGMENT-BATCHED can.  It deliberately runs WITHOUT the manager
+  lock (see below) and raises LIVE-COUNT via SEGMENT-PUT.  If it interleaves
+  between this function and apply, apply's %SEG-CLAIM-SLOT can find
+  live >= capacity and reach %SEG-GROW after all -- inside apply, POST-DURABILITY.
+  That is not a regression: wave 1's validate-only version had the identical
+  hole.  And it is BENIGN while relocation is on, because that grow relocates
+  and succeeds.  The wave-1 failure mode -- a persisted node with no segment
+  entry -- returns only if *SEGMENT-RELOCATE-ON-EXHAUSTION* is NIL or relocation
+  genuinely fails (out of address space) at that exact moment.
+  Do not paper over this by claiming a serialisation that does not exist; if it
+  ever needs closing, the fix is to make the batched rebuild's SEGMENT-PUTs
+  visible to the pre-flight, not to reword the guarantee.
+
+TWO ACCEPTED CONSEQUENCES, stated here rather than left implied:
+
+  1. A transaction that fails LATER leaves an over-sized segment.  Only
+     FINALIZE-TX-PERSISTENCE and APPLY-TRANSACTION remain after this point, so
+     the window is small, but it is real.  It is harmless: capacity is not
+     semantic.  LIVE-COUNT is untouched, no id-array cell is claimed, and the
+     freshly added cells are free-marked exactly as %SEG-GROW always marks them,
+     so the segment stays fully consistent -- the file is merely larger than it
+     needed to be, and the next transaction uses the space.
+
+  2. A crash MID-GROW leaves the segment dirty, so RESTORE-VECTOR-SEGMENTS
+     rebuilds it at the next open.  That is the pre-existing recovery path and
+     this does not make it worse -- but note it leans on wave 1: before rebuilds
+     were created at the corpus size, that automatic rebuild could not complete
+     above 131,072 entries.
+
+Every per-segment access here takes the segment's OWN LOCK -- the read side while
+counting new ids, the WRITE side around the grow (which mutates the segment and
+may relocate its mapping).  Holding the manager
+lock is NOT sufficient: REBUILD-VECTOR-SEGMENT-BATCHED deliberately runs WITHOUT
+the manager lock (a long hold would stall every commit) and mutates LIVE-COUNT,
+CAPACITY and the ID->SLOT table via SEGMENT-PUT while commits are in flight.
+Unlocked, ID->SLOT could be read mid-rehash (undefined behaviour), and the
+byte-wise header reads could tear -- either aborting a legitimate transaction or,
+worse, missing a real exhaustion and failing after durability, which is precisely
+what this function exists to prevent.  (REBUILD-VECTOR-SEGMENT, the non-batched
+one, IS quiescent -- it runs only from RESTORE-VECTOR-SEGMENTS during OPEN-GRAPH
+-- so it is not the reason for the lock.)  Lock order is manager -> segment, the
+existing direction, and the batched rebuild never takes the manager lock, so no
+inversion is possible.
+
+The free list needs no separate accounting, and this is already tight against
+it: SEGMENT-REMOVE decrements LIVE-COUNT while pushing the slot onto the free
+list, and SEGMENT-PUT increments LIVE-COUNT even when it pops a freed slot, so
+live + free = highwater <= capacity, and REQUIRED <= CAPACITY exactly when no
+grow is needed.  Do not \"fix\" it by crediting the free list.  The one real
+conservatism is that deletes in the SAME transaction are not credited, so a
+transaction that frees at least as many slots as it claims can still grow the
+segment it did not have to.  That wastes space, which is recoverable; failing
+after durability is not.
+
+A (owner, slot) with no committed segment yet is skipped -- there is nothing to
+grow, since the segment does not exist until APPLY-TRANSACTION creates it, and
+CREATE-VECTOR-SEGMENT sizes both the file and its reservation for
+INITIAL-CAPACITY (1024) slots.  Such a segment can still need to grow inside
+APPLY-TRANSACTION, if ONE transaction inserts more new vectors than the fresh
+reservation covers (over a GiB of vectors in a single transaction, with the
+defaults) -- not reachable per-document, but reachable by a bulk loader
+committing a whole corpus at once.  That residual gap is now much narrower than
+it was: %SEG-GROW relocates rather than signalling, so it fails only if the
+process is out of address space."
+  ;; Overwhelmingly common case: no vector segments at all.  Cost nothing there.
+  (when (plusp (hash-table-count (vector-segments graph)))
+    (let ((new-ids (make-hash-table :test 'equal)))
+      ;; Count DISTINCT new ids per segment key: an id already in the segment
+      ;; reuses its slot, and the same id written twice in one transaction still
+      ;; claims only one.  The per-key set is a hash table, not a list: a bulk
+      ;; transaction would otherwise cost O(n^2) 16-byte EQUALP comparisons
+      ;; while holding the manager lock, blocking every other commit.
+      (dolist (write (writes tx))
+        (let ((node (node write)))
+          (unless (deleted-p node)
+            (dolist (slot (node-vector-index-slots (class-of node)))
+              (let ((v (%node-segment-value node slot)))
+                (when v
+                  (let* ((key (%segment-key node slot))
+                         (seg (gethash key (vector-segments graph))))
+                    (when (and seg
+                               (with-read-lock ((segment-lock seg))
+                                 (null (%seg-slot-of seg (id node)))))
+                      (setf (gethash (id node)
+                                     (or (gethash key new-ids)
+                                         (setf (gethash key new-ids)
+                                               (make-hash-table :test 'equalp))))
+                            t)))))))))
+      (maphash
+       (lambda (key ids)
+         (let ((seg (gethash key (vector-segments graph))))
+           ;; WRITE lock, not the read lock this used to take: the grow below
+           ;; mutates the segment (and may relocate its mapping), which is
+           ;; exactly what the segment's write side exists to make exclusive.
+           ;; Lock order is unchanged -- manager -> segment.
+           (with-write-lock ((segment-lock seg))
+             (let ((required (+ (segment-live-count seg)
+                                (hash-table-count ids))))
+               (when (> required (segment-capacity seg))
+                 ;; PRE-FLIGHT THE RESERVATION ONCE, FOR THE FULL TARGET.
+                 ;; %SEG-GROW would re-reserve per doubling, and would signal
+                 ;; from whichever doubling actually overruns -- i.e. possibly
+                 ;; after earlier doublings have already extended the file and
+                 ;; bumped CAPACITY, and carrying PATH instead of the OWNER and
+                 ;; SLOT this pre-flight exists to add.  Obtaining a reservation
+                 ;; that covers the FINAL capacity up front makes the abort
+                 ;; genuinely atomic -- nothing changed at all -- whether
+                 ;; relocation is switched off or attempted and failed.  It also
+                 ;; costs at most one relocation for the whole grow instead of
+                 ;; one per doubling.  The loop below then finds every
+                 ;; intermediate %SEG-ENSURE-RESERVATION a no-op.
+                 (let ((cap (segment-capacity seg)))
+                   (loop while (< cap required) do (setf cap (* 2 cap)))
+                   (let ((needed (%seg-file-bytes cap (segment-dimension seg))))
+                     (handler-case
+                         (%seg-ensure-reservation (segment-mmap seg) needed cap)
+                       (vector-segment-capacity-exhausted (e)
+                         ;; Re-signal naming the segment.  %SEG-ENSURE-RESERVATION
+                         ;; knows only the path; REQUIRED is the transaction's
+                         ;; own figure, which is the one an operator wants.
+                         (error 'vector-segment-capacity-exhausted
+                                :owner (car key) :slot (cdr key)
+                                :required required :needed-bytes needed
+                                :reserved (vsce-reserved e)
+                                :reason (vsce-reason e))))))
+                 ;; Now actually grow, so APPLY-TRANSACTION cannot need to.
+                 ;; The reservation is already large enough, so no doubling
+                 ;; below can signal.
+                 (loop while (> required (segment-capacity seg))
+                       do (%seg-grow seg)))))))
+       new-ids))))
+
+(defgeneric apply-tx-write-to-vector-segments (write graph)
+  (:method (write graph) (declare (ignore write graph)) nil))
+
+(defmethod apply-tx-write-to-vector-segments ((write tx-create) graph)
+  (let ((node (node write)))
+    (when (not (deleted-p node))
+      (dolist (slot (node-vector-index-slots (class-of node)))
+        (let ((v (%node-segment-value node slot)))
+          (when v
+            (let* ((key (%segment-key node slot))
+                   (seg (%ensure-segment graph (car key) slot (length v))))
+              (segment-put seg (id node) v))))))))
+
+(defmethod apply-tx-write-to-vector-segments ((write tx-update) graph)
+  (let* ((new-node (node write)))
+    (dolist (slot (node-vector-index-slots (class-of new-node)))
+      (let* ((key (%segment-key new-node slot))
+             (v (and (not (deleted-p new-node)) (%node-segment-value new-node slot))))
+        (if v
+            (let ((seg (%ensure-segment graph (car key) slot (length v))))
+              (segment-put seg (id new-node) v))
+            ;; value cleared/invalidated or node now deleted -> drop any entry
+            ;; from the OWNER's segment (gethash on the owner key, not the
+            ;; node's exact class -- a subclass's entry lives there too)
+            (let ((seg (gethash key (vector-segments graph))))
+              (when seg (segment-remove seg (id new-node)))))))))
+
+(defmethod apply-tx-write-to-vector-segments ((write tx-delete) graph)
+  (let* ((node (node write)))
+    (dolist (slot (node-vector-index-slots (class-of node)))
+      (let* ((key (%segment-key node slot))
+             (seg (gethash key (vector-segments graph))))
+        (when seg (segment-remove seg (id node)))))))
+
+(defgeneric apply-tx-writes-to-vector-segments (writes graph)
+  (:method (writes graph)
+    (dolist (write writes) (apply-tx-write-to-vector-segments write graph))))
 
 ;; NB: the old free-the-prior-version GARBAGE-COLLECT-HEAP is gone.  Under MVCC
 ;; the prior version is retained (archived + chained) and reclaimed later by
@@ -986,7 +1709,9 @@ With no FILTER, returns WRITES unchanged."
             (funcall hook)))
         (apply-tx-writes-to-views writes graph)
         (apply-tx-writes-to-spatial-index writes graph)
+        (apply-tx-writes-to-vector-segments writes graph)
         (apply-tx-writes-to-unique-indexes writes graph)   ; issue #6
+        (apply-tx-writes-to-secondary-indexes writes graph) ; general ordered index
         (reap-old-versions writes graph)
         (persist-highest-transaction-id (transaction-id transaction) graph)))))
 
@@ -1806,6 +2531,25 @@ and it reads these patched bytes, never the .txn files)."
 
 (defgeneric create-node (node graph)
   (:method (node graph)
+    ;; A read-write transaction is single-graph (GH #53).  ENSURE-TRANSACTION
+    ;; reuses the ambient *TRANSACTION* rather than one scoped to GRAPH, so
+    ;; without this check a node stamped :GRAPH GA inside a transaction on GB
+    ;; is created and silently written into GB (GH #96).  The :AROUND
+    ;; guarantees *TRANSACTION* is bound here, so no guard on it.
+    ;;
+    ;; Only a user-level TX carries a graph.  RECOVERY-TRANSACTION does not
+    ;; (only its REPLICATED-TRANSACTION subclass does), and logical-snapshot
+    ;; replay re-creates nodes through this same public constructor path under
+    ;; a RESTORE-TRANSACTION -- so the test is load-bearing, not defensive:
+    ;; reading GRAPH unconditionally is a NO-APPLICABLE-METHOD on every replay.
+    ;; Replay targets GRAPH by construction and has no second graph to disagree
+    ;; with.  Tested positively on TX because RECOVERY-TRANSACTION is defined
+    ;; further down this file.
+    (when (typep *transaction* 'tx)
+      (let ((txn-graph (graph *transaction*)))
+        (unless (eq graph txn-graph)
+          (error 'cross-graph-transaction-error
+                 :node node :transaction-graph txn-graph :node-graph graph))))
     (%create-node node graph *transaction*)))
 
 (defmethod create-node :around (node graph)
@@ -1822,6 +2566,7 @@ and it reads these patched bytes, never the .txn files)."
                                    :deleted-p (slot-value node 'deleted-p)
                                    :written-p (slot-value node 'written-p)
                                    :data-pointer (slot-value node 'data-pointer))))
+      (setf (node-graph new-node) (node-graph node))
       (setf (data new-node) (copy-tree (slot-value node 'data)))
       ;; Copy bytes so maybe-init-node-data on the copy does not try to
       ;; re-read from data-pointer (which may be freed by a concurrent commit).
@@ -1848,6 +2593,13 @@ NEW-NODE was not produced by COPY.")
       (unless old-node
         (error 'modifying-non-copy
                :node new-node))
+      ;; A read-write transaction is single-graph (GH #53).  A NIL home is
+      ;; unknown, not foreign.
+      (let ((home (node-home-graph new-node nil))
+            (txn-graph (graph *transaction*)))
+        (when (and home (not (eq home txn-graph)))
+          (error 'cross-graph-transaction-error
+                 :node new-node :transaction-graph txn-graph :node-graph home)))
       ;; Refresh the serialized bytes from the (modified) data: NEW-NODE is a
       ;; COPY that still carries the ORIGINAL node's bytes, and mutating a slot
       ;; updates DATA but not BYTES.  The write is serialized from BYTES into
@@ -1867,6 +2619,15 @@ NEW-NODE was not produced by COPY.")
 needed): records a deletion of a copy with its deleted flag set, so the node
 stops appearing in queries.  MARK-DELETED is the usual entry point.")
   (:method (node graph)
+    ;; A read-write transaction is single-graph (GH #53).  A NIL home is
+    ;; unknown, not foreign.  DELETE-NODE bypasses UPDATE-NODE, so it needs its
+    ;; own check.  The :AROUND guarantees *TRANSACTION* is bound here, so no
+    ;; guard on it -- a foreign delete must error, never pass silently.
+    (let ((home (node-home-graph node nil))
+          (txn-graph (graph *transaction*)))
+      (when (and home (not (eq home txn-graph)))
+        (error 'cross-graph-transaction-error
+               :node node :transaction-graph txn-graph :node-graph home)))
     (let ((old-node node)
           (new-node (copy node)))
       (setf (bytes new-node) (bytes old-node))
@@ -2103,28 +2864,61 @@ stops appearing in queries.  MARK-DELETED is the usual entry point.")
       (setf (state tx) :active)
       tx)))
 
+(defun %transaction-covers-graph-p (transaction graph)
+  "True when TRANSACTION governs reads of GRAPH.  RECOVERY-TRANSACTION and its
+subclasses carry no graph at all, and covered everything before (GH #53)."
+  (let ((tg (and (slot-exists-p transaction 'graph)
+                 (slot-boundp transaction 'graph)
+                 (slot-value transaction 'graph))))
+    (or (null tg) (eq tg graph))))
+
+(defun read-transaction (&optional (graph *graph*))
+  "The transaction a read of GRAPH resolves through: the read-write
+*TRANSACTION* when it is on GRAPH, otherwise GRAPH's read-only snapshot from
+*READ-SNAPSHOTS*, otherwise NIL (read non-transactionally).  Enforcement of the
+cross-graph rule lives at the read/write sites themselves, not here (GH #53)."
+  (if (and *transaction* (%transaction-covers-graph-p *transaction* graph))
+      *transaction*
+      (and *read-snapshots* (gethash graph *read-snapshots*))))
+
 (defun call-with-read-snapshot (thunk &optional (graph *graph*))
-  "Run THUNK with *TRANSACTION* bound to a fresh, read-only MVCC snapshot of
-GRAPH, so every read THUNK performs resolves at one consistent epoch (a node
+  "Run THUNK with reads of GRAPH resolving through a fresh, read-only MVCC
+snapshot of GRAPH, so every such read resolves at one consistent epoch (a node
 committed after the snapshot started is invisible).  The snapshot transaction is
 registered active for THUNK's dynamic extent -- which holds the reaper's floor
 so the observed versions are retained -- and is simply discarded on exit, never
-validated or committed (a query writes nothing).  If a transaction is already
-active, THUNK runs under it unchanged so an enclosing snapshot is inherited.  A
-no-op (THUNK runs directly) when GRAPH has no transaction manager yet."
+validated or committed (a query writes nothing).
+
+The snapshot is recorded in *READ-SNAPSHOTS* under GRAPH rather than bound to
+*TRANSACTION*, so snapshots on several graphs COMPOSE: a cross-graph query holds
+one snapshot per participating graph, each internally consistent, with
+deliberately no single instant across them (GH #53).  An enclosing snapshot of
+the SAME graph is inherited, as is a read-write transaction on it.  A no-op
+(THUNK runs directly) when GRAPH has no transaction manager yet."
   (let ((tm (and graph
                  (slot-boundp graph 'transaction-manager)
                  (transaction-manager graph))))
-    (if (or *transaction* (null tm))
-        (funcall thunk)
-        (let ((txn (create-transaction tm)))
-          (unwind-protect
-               (let ((*transaction* txn))
-                 (funcall thunk))
-            (remove-transaction txn tm))))))
+    (cond
+      ((null tm) (funcall thunk))
+      ;; a read-write transaction on this graph already provides a snapshot
+      ((and *transaction* (%transaction-covers-graph-p *transaction* graph))
+       (funcall thunk))
+      ;; already snapshotted this graph -> inherit
+      ((and *read-snapshots* (gethash graph *read-snapshots*)) (funcall thunk))
+      (t
+       (let ((txn (create-transaction tm))
+             (table (or *read-snapshots* (make-hash-table :test 'eq))))
+         (unwind-protect
+              (let ((*read-snapshots* table))
+                (setf (gethash graph table) txn)
+                (funcall thunk))
+           ;; the entry must not outlive the extent: a stale snapshot pins the
+           ;; reaper's floor and retains versions forever (GH #53)
+           (remhash graph table)
+           (remove-transaction txn tm)))))))
 
 (defmacro with-read-snapshot ((&optional (graph '*graph*)) &body body)
-  "Evaluate BODY with reads pinned to a single consistent MVCC snapshot of GRAPH.
+  "Evaluate BODY with reads of GRAPH pinned to a single consistent MVCC snapshot.
 See CALL-WITH-READ-SNAPSHOT."
   `(call-with-read-snapshot (lambda () ,@body) ,graph))
 
@@ -2172,6 +2966,22 @@ See CALL-WITH-READ-SNAPSHOT."
                ;; manager lock -- a violation aborts before FINALIZE-TX-PERSISTENCE, so
                ;; nothing is journaled (the UNWIND-PROTECT below drops the temp file).
                (validate-unique-constraints tx (graph tx))
+               ;; Vector-segment dimension check (Task 4 fix): same pre-durability,
+               ;; manager-locked region as the unique-constraint check above -- a
+               ;; mismatch aborts before FINALIZE-TX-PERSISTENCE, so the node write
+               ;; is never journaled/applied and no node/segment drift can occur.
+               (validate-vector-segment-dimensions tx (graph tx))
+               ;; Vector-segment capacity: same region, same reason.  This one
+               ;; does not merely check -- it GROWS each segment to the capacity
+               ;; this transaction needs, so APPLY-TRANSACTION does not need to
+               ;; grow (and cannot fail a grow after the node write is durable).
+               ;; The manager lock serialises COMMITS, so no other commit can
+               ;; consume the capacity in between.  It does NOT exclude
+               ;; REBUILD-VECTOR-SEGMENT-BATCHED, which runs lock-free by
+               ;; design; read ENSURE-VECTOR-SEGMENT-CAPACITY's docstring for
+               ;; exactly what that leaves reachable and why it is benign while
+               ;; relocation is on.
+               (ensure-vector-segment-capacity tx (graph tx))
                (setf (transaction-id tx) (tx-id-counter tm))
                (incf (tx-id-counter tm))
                (prune-committed-transactions tm)

@@ -117,3 +117,113 @@
                          (save item)))))
       (is (= 2 (slot-value (lookup-vertex vid) 'value))
           "Final counter must be 2 (initial 0 + 2 successful increments)"))))
+
+;;; ---------------------------------------------------------------------------
+;;; Test 4: read-write conflict (stale read) forces validation failure / retry
+;;;
+;;; T1 reads Node X and writes Node Y.
+;;; T2 concurrently modifies Node X and commits.
+;;; T1's read-set (containing Node X) conflicts with T2's write-set (containing Node X).
+;;; OCC validation for T1 MUST fail because T1 read a stale version of Node X.
+;;; ---------------------------------------------------------------------------
+
+(test read-write-conflict-forces-retry
+  "T1 reads X and writes Y while T2 modifies X and commits: T1 validation fails / retries."
+  (with-acid-graph (g)
+    (let (x-id y-id)
+      (with-transaction ()
+        (setq x-id (id (make-ac-item :value 10 :label "X"))
+              y-id (id (make-ac-item :value 100 :label "Y"))))
+      (let ((t1-read-x (make-semaphore))
+            (t2-committed-x (make-semaphore))
+            (first-pass t))
+        (make-thread
+         (lambda ()
+           (let ((*graph* g))
+             (wait-on-semaphore t1-read-x)
+             (with-transaction ()
+               (let ((x (copy (lookup-vertex x-id))))
+                 (setf (slot-value x 'value) 20)
+                 (save x)))
+             (signal-semaphore t2-committed-x)))
+         :name "acid-read-write-t2")
+        (with-transaction ()
+          ;; T1 reads X
+          (let ((x-val (slot-value (lookup-vertex x-id) 'value)))
+            (when first-pass
+              (setq first-pass nil)
+              (signal-semaphore t1-read-x)
+              (wait-on-semaphore t2-committed-x))
+            ;; T1 writes Y based on its read of X
+            (let ((y (copy (lookup-vertex y-id))))
+              (setf (slot-value y 'value) (+ (slot-value y 'value) x-val))
+              (save y))))
+        ;; After T1 retries, it sees T2's updated X=20, so Y becomes 100 + 20 = 120 (not 100 + 10 = 110)
+        (is (= 20 (slot-value (lookup-vertex x-id) 'value)))
+        (is (= 120 (slot-value (lookup-vertex y-id) 'value))
+            "T1 must re-read updated X (20) on retry, making Y = 100 + 20 = 120; got ~D"
+            (slot-value (lookup-vertex y-id) 'value))))))
+
+
+
+;;; ---------------------------------------------------------------------------
+;;; Test 5: a COMMITTED transaction's reads must not abort a later writer (#92)
+;;;
+;;; VALIDATE used to carry a forward-validation clause,
+;;;   (object-sets-intersect-p write-set (read-set other-transaction)),
+;;; against OVERLAPPING-TRANSACTIONS -- which returns COMMITTED transactions
+;;; only.  Forward validation is meaningful against transactions that are still
+;;; ACTIVE and can still be invalidated; a committed one is finished, and since
+;;; it committed first the serial order is other < this.  "Other read the old
+;;; value, this writes the new one" is an ordinary read-then-write dependency.
+;;; The clause prevented no anomaly and only produced retries.
+;;; ---------------------------------------------------------------------------
+
+(test committed-readers-do-not-abort-a-later-writer
+  "T2 reads X and writes Y, then commits.  T1 -- started earlier, so T2 commits
+inside T1's validation window -- then writes X, which T2 only READ.  T1 must
+commit on its FIRST attempt: there is no anomaly to prevent, and a needless
+retry is expensive (8 attempts, then a global transaction-manager lock)."
+  (with-acid-graph (g)
+    (let (x-id y-id z-id)
+      (with-transaction ()
+        (setq x-id (id (make-ac-item :value 1 :label "X"))
+              y-id (id (make-ac-item :value 1 :label "Y"))
+              z-id (id (make-ac-item :value 1 :label "Z"))))
+      (let ((t1-started (make-semaphore))
+            (t2-committed (make-semaphore))
+            (first-pass t)
+            (attempts 0))
+        (make-thread
+         (lambda ()
+           (let ((*graph* g))
+             (wait-on-semaphore t1-started)
+             ;; T2 READS x and WRITES y.  It never writes x.
+             (with-transaction ()
+               (let ((xv (slot-value (lookup-vertex x-id) 'value))
+                     (y (copy (lookup-vertex y-id))))
+                 (setf (slot-value y 'value) (+ 100 xv))
+                 (save y)))
+             (signal-semaphore t2-committed)))
+         :name "acid-committed-reader-t2")
+        (with-transaction ()
+          (incf attempts)
+          ;; establish T1's window on an unrelated node, then let T2 commit
+          (let ((z (copy (lookup-vertex z-id))))
+            (setf (slot-value z 'value) 42)
+            (save z))
+          (when first-pass
+            (setq first-pass nil)
+            (signal-semaphore t1-started)
+            (wait-on-semaphore t2-committed))
+          ;; T1 writes X -- a node the committed T2 only READ
+          (let ((x (copy (lookup-vertex x-id))))
+            (setf (slot-value x 'value) 99)
+            (save x)))
+        (is (= 1 attempts)
+            "T1 retried ~D time(s): a COMMITTED transaction's read-set must not ~
+force a later writer to abort" (1- attempts))
+        (is (= 99 (slot-value (lookup-vertex x-id) 'value))
+            "T1's write must be durable")
+        (is (= 101 (slot-value (lookup-vertex y-id) 'value))
+            "T2's write must be durable")))))

@@ -72,8 +72,11 @@
   (let ((random-states (list (make-random-state)
                              (progn (sleep 1) (make-random-state)))))
     (defun gen-test-id ()
+      ;; GETTIMEOFDAY returns (VALUES SEC USEC) on every implementation since
+      ;; GH #100; it used to return a single fractional-second rational on SBCL.
       (let* ((now (format nil "~,6F~6D~' :@/graph-db::print-byte-array/"
-                          (coerce (gettimeofday) 'double-float)
+                          (multiple-value-bind (sec usec) (gettimeofday)
+                            (coerce (+ sec (/ usec 1000000)) 'double-float))
                           (random 1000000 (nth (random 2) random-states))
                           (get-random-bytes 16))))
         now)))

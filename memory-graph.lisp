@@ -33,7 +33,9 @@
   (data (make-hash-table :test 'equalp
                          #+sbcl :synchronized #+sbcl t
                          #+ccl :shared #+ccl t
-                         #+lispworks :single-thread #+lispworks nil))
+                         #+lispworks :single-thread #+lispworks nil
+                         #+graph-db-ecl-sync-hash :synchronized
+                         #+graph-db-ecl-sync-hash t))
   ;; Writes are single-threaded (the transaction-manager lock serializes commit
   ;; apply), so this lock only guards the rare non-commit mutation; reads are
   ;; lock-free and see a whole node via atomic slot replacement.
@@ -120,7 +122,9 @@ generics dispatch on this class."))
 ;;; type-guarded teardown tolerates.
 ;;; ---------------------------------------------------------------------------
 
-(defun make-mem-spatial-index (&key (precision 7))
+(defun make-mem-spatial-index (&key (precision 7)
+                                    (max-cells +spatial-insert-max-cells+)
+                                    precision-counts)
   "A spatial-index whose skip-list slot is an in-RAM mem-skip-list, keyed by the
 same composite (cell . node-id) as the on-disk index (duplicate-free).  Every
 spatial op -- insert / remove / query-bbox / query-radius -- goes through
@@ -128,14 +132,31 @@ spatial-index-skip-list -> add-to-skip-list / make-range-cursor, which dispatch
 to the mem list, so all of spatial-index.lisp (and the base
 apply-tx-write-to-spatial-index maintenance) runs UNCHANGED on a memory-graph.
 The composite key also removes the duplicate-key %mem-find overshoot that made
-in-RAM REMOVE silently drop the wrong node."
-  (%make-spatial-index
-   :skip-list (make-mem-skip-list :key-comparison 'reduce-comp-lessp
-                                  :key-equal 'reduce-equal
-                                  :value-equal 'equal :duplicates-allowed-p nil
-                                  :head-key (list +min-sentinel+ +null-key+) :head-value nil
-                                  :tail-key (list +max-sentinel+ +max-key+)  :tail-value nil)
-   :heap nil :precision precision))
+in-RAM REMOVE silently drop the wrong node.
+
+COARSEST is seeded to PRECISION -- the SAME initial value MAKE-SPATIAL-INDEX /
+OPEN-SPATIAL-INDEX give it -- so a memory index created at a non-default precision
+starts its query clamp at the right level rather than one that is too fine.  A
+structural image restore additionally passes the persisted PRECISION-COUNTS (the
+histogram) and MAX-CELLS: COUNTS is replayed and COARSEST re-derived from it,
+exactly as OPEN-SPATIAL-INDEX does on disk, so a coarsely-stored geometry stays
+findable after a memory reopen instead of sorting past the clamped query range."
+  (let ((idx (%make-spatial-index
+              :skip-list (make-mem-skip-list :key-comparison 'reduce-comp-lessp
+                                             :key-equal 'reduce-equal
+                                             :value-equal 'equal :duplicates-allowed-p nil
+                                             :head-key (list +min-sentinel+ +null-key+) :head-value nil
+                                             :tail-key (list +max-sentinel+ +max-key+)  :tail-value nil)
+              :heap nil :precision precision
+              :max-cells max-cells :coarsest precision)))
+    (when precision-counts
+      (replace (spatial-index-precision-counts idx) precision-counts)
+      (setf (spatial-index-coarsest idx)
+            (or (loop for p from 1 to 12
+                      when (plusp (aref (spatial-index-precision-counts idx) p))
+                        return p)
+                precision)))
+    idx))
 
 (defun %make-empty-memory-graph (name location &key (class 'memory-graph)
                                                  replication-key replication-port
@@ -153,7 +174,8 @@ MEMORY-PEER-GRAPH.  With LAZY, the node tables materialize on first touch."
                               #+sbcl (make-hash-table :synchronized t)
                               #+ccl (make-hash-table :shared t)
                               #+lispworks (make-hash-table :single-thread nil)
-                              #+ecl (make-hash-table)
+                              #+ecl (make-hash-table #+graph-db-ecl-sync-hash :synchronized
+                                                      #+graph-db-ecl-sync-hash t)
                               :cache (make-id-table :synchronized t :weakness :value)
                               :vertex-table (make-mem-table)
                               :edge-table (make-mem-table)
@@ -164,7 +186,12 @@ MEMORY-PEER-GRAPH.  With LAZY, the node tables materialize on first touch."
                               :vev-index (make-mem-vev-index)
                               :vertex-index (make-mem-type-index)
                               :edge-index (make-mem-type-index)
-                              :spatial-index (make-mem-spatial-index))))
+                              ;; Spatial indexes are created LAZILY, per
+                              ;; (owner-class . slot), by %SPATIAL-INDEX-FOR --
+                              ;; which dispatches through MAKE-GRAPH-SPATIAL-INDEX
+                              ;; to MAKE-MEM-SPATIAL-INDEX here.  Nothing to wire
+                              ;; up at construction.
+                              )))
     ;; Wire the node tables back to the graph + their kind, so lazy materialization
     ;; (MEM-MATERIALIZE) is self-contained (needs the schema + the right ctor).
     (setf (mem-table-kind (vertex-table graph)) :vertex
@@ -291,7 +318,8 @@ structurally instead of regenerating them.")
 ;; Unique constraints (#6): the dump/load helpers live in unique-constraint.lisp
 ;; (loaded after this file); forward-declared so the image codec here compiles clean.
 ;; The "was it loaded?" flag is defined HERE because OPEN-MEMORY-GRAPH binds it.
-(declaim (ftype (function (t) t) %dump-unique-indexes rebuild-unique-indexes)
+(declaim (ftype (function (t) t) %dump-unique-indexes rebuild-unique-indexes
+                                 rebuild-secondary-indexes install-secondary-indexes)
          (ftype (function (t t) t) %load-unique-indexes))
 (defvar *memory-image-unique-loaded* nil
   "Bound NIL by OPEN-MEMORY-GRAPH; set T by the image restore when the unique-index
@@ -337,8 +365,40 @@ dump was loaded, so OPEN skips the fresh-graph / crash REBUILD-UNIQUE-INDEXES.")
              (views graph))
     acc))
 
+;;; Per-(owner . slot) spatial-index image records (shared by both image formats).
+;;; Each record is (OWNER SLOT PAIRS PRECISION MAX-CELLS COUNTS): the flat
+;;; (cell . node-id)->NIL skip-list dump plus everything OPEN-SPATIAL-INDEX needs to
+;;; recreate the index without touching a node -- its grid precision, insert cap and
+;;; precision histogram.  Restoring these directly is what lets a memory graph reopen
+;;; its spatial indexes structurally (no node scan), and on a LAZY graph without
+;;; materializing the nodes that would have been scanned.
+
+(defun %dump-mem-spatial-indexes (graph)
+  "One image record per (owner . slot) spatial index GRAPH holds."
+  (let ((dumps '()))
+    (maphash (lambda (key idx)
+               (push (list (car key) (cdr key)
+                           (%dump-mem-skip-list (spatial-index-skip-list idx))
+                           (spatial-index-precision idx)
+                           (spatial-index-max-cells idx)
+                           (copy-seq (spatial-index-precision-counts idx)))
+                     dumps))
+             (spatial-indexes graph))
+    dumps))
+
+(defun %restore-mem-spatial-index (graph owner slot pairs precision max-cells counts)
+  "Recreate GRAPH's (OWNER . SLOT) spatial index STRUCTURALLY from an image record:
+a fresh mem index at the persisted PRECISION / MAX-CELLS / histogram COUNTS, its
+cells loaded straight from PAIRS -- no node scan, no geohash recompute."
+  (let ((idx (make-mem-spatial-index :precision precision
+                                     :max-cells max-cells
+                                     :precision-counts counts)))
+    (%load-mem-skip-list (spatial-index-skip-list idx) pairs)
+    (setf (gethash (cons owner slot) (spatial-indexes graph)) idx)
+    idx))
+
 ;;; ===========================================================================
-;;; VG-native image format (v3) + fault-on-access (lazy) materialization.
+;;; VG-native image format + fault-on-access (lazy) materialization.
 ;;;
 ;;; WHY a second format: on ECL, restoring the image is ~85% MAKE-INSTANCE cost
 ;;; (building the live CLOS nodes), ~15% deserialize, ~0.5% byte-parse -- so the
@@ -424,15 +484,19 @@ dump was loaded, so OPEN skips the fresh-graph / crash REBUILD-UNIQUE-INDEXES.")
          (class (node-type-name
                  (lookup-node-type-by-id type-id (if edge-p :edge :vertex) :graph graph)))
          (blob (lznode-data-blob lz))
-         (data (when blob (deserialize blob))))
-    (if edge-p
-        (%make-edge :id id :type-id type-id :revision (lznode-revision lz)
-                    :commit-epoch (lznode-commit-epoch lz) :deleted-p (lznode-deleted-p lz)
-                    :from (lznode-from lz) :to (lznode-to lz) :weight (lznode-weight lz)
-                    :data data :bytes blob :written-p t :data-pointer 0 :class class)
-        (%make-vertex :id id :type-id type-id :revision (lznode-revision lz)
-                      :commit-epoch (lznode-commit-epoch lz) :deleted-p (lznode-deleted-p lz)
-                      :data data :bytes blob :written-p t :data-pointer 0 :class class))))
+         (data (when blob (deserialize blob)))
+         (node
+          (if edge-p
+              (%make-edge :id id :type-id type-id :revision (lznode-revision lz)
+                          :commit-epoch (lznode-commit-epoch lz) :deleted-p (lznode-deleted-p lz)
+                          :from (lznode-from lz) :to (lznode-to lz) :weight (lznode-weight lz)
+                          :data data :bytes blob :written-p t :data-pointer 0 :class class)
+              (%make-vertex :id id :type-id type-id :revision (lznode-revision lz)
+                            :commit-epoch (lznode-commit-epoch lz) :deleted-p (lznode-deleted-p lz)
+                            :data data :bytes blob :written-p t :data-pointer 0 :class class))))
+    ;; Fault-in builds the node from a blob; stamp it here (GH #53).
+    (setf (node-graph node) graph)
+    node))
 
 (defun mem-materialize (table id lz)
   "Build the live node from LZ and atomically swap it into TABLE under ID (so later
@@ -508,11 +572,54 @@ lookups return the live object).  Returns the node."
     (and (>= (file-length s) 4)
          (loop for b across *native-image-magic* always (eql b (read-byte s))))))
 
+;;; ---- spatial: per-(owner . slot) index records ----
+;;;
+;;; The image carries one record per (owner . slot) index (%DUMP-MEM-SPATIAL-INDEXES),
+;;; each with its own cells, precision, insert cap and histogram, so restore loads the
+;;; skip-lists DIRECTLY -- no node scan, and on a LAZY graph no materialization.  This
+;;; is what removed the old rebuild-from-nodes pass (and its %MEM-LZNODE-MAY-BE-
+;;; SPATIAL-P over-approximation, which faulted in every node of any class with any
+;;; :INDEX slot).  Only the cl-store v1 (nodes-only) fallback still rebuilds, through
+;;; %REBUILD-DERIVED-FROM-NODES, which is why this declaim stays.
+
+;; spatial-registry.lisp loads after this file.
+(declaim (ftype (function (t t t) t) %spatial-index-for))
+
+(defun ni-spatial (buf graph)
+  "Write GRAPH's per-(owner . slot) spatial index records into the native buffer."
+  (let ((recs (%dump-mem-spatial-indexes graph)))
+    (ni-uint buf (length recs) 4)
+    (dolist (rec recs)
+      (destructuring-bind (owner slot pairs precision max-cells counts) rec
+        (ni-lisp buf owner) (ni-lisp buf slot)
+        (ni-uint buf precision 2) (ni-uint buf max-cells 4)
+        (dotimes (p 13) (ni-uint buf (aref counts p) 4))
+        (ni-pairs buf pairs)))))
+
+(defun ri-spatial (rc)
+  "Read the per-(owner . slot) spatial records back into a list of
+ (OWNER SLOT PAIRS PRECISION MAX-CELLS COUNTS)."
+  (let ((n (ri-uint rc 4)) (acc '()))
+    (dotimes (i n)
+      (let* ((owner (ri-lisp rc)) (slot (ri-lisp rc))
+             (precision (ri-uint rc 2)) (max-cells (ri-uint rc 4))
+             (counts (make-array 13 :element-type 'fixnum :initial-element 0)))
+        (dotimes (p 13) (setf (aref counts p) (ri-uint rc 4)))
+        (push (list owner slot (ri-pairs rc) precision max-cells counts) acc)))
+    (nreverse acc)))
+
 (defun write-memory-image-native (graph)
-  "Write GRAPH's full state in the VG-native (v3) format: per-node blob records +
-the same structural derived dumps.  Untouched LZNODEs pass their blob through."
+  "Write GRAPH's full state in the VG-native (v7) format: per-node blob records
+plus the same structural derived dumps.  Untouched LZNODEs pass their blob
+through."
   (let ((buf (ni-mkbuf)))
-    (ni-bytes buf *native-image-magic*) (ni-uint buf 5 4)   ; v4 added :unique; v5 = composite-key spatial pairs
+    ;; v4 added :unique; v5 = composite-key spatial pairs; v6 = one spatial record
+    ;; per (owner . slot), each with its own precision/cap/histogram.  v7 is
+    ;; v6's LAYOUT exactly (the pair codec always round-tripped values); it
+    ;; bumps because a spatial entry's value now carries its type tag, and a v6
+    ;; image's NIL values would restore an index no scoped query can filter on
+    ;; (GH #104).
+    (ni-bytes buf *native-image-magic*) (ni-uint buf 7 4)
     (ni-uint buf (load-highest-transaction-id graph) 8)
     (let ((vt (mem-table-data (vertex-table graph)))
           (et (mem-table-data (edge-table graph))))
@@ -525,8 +632,9 @@ the same structural derived dumps.  Untouched LZNODEs pass their blob through."
     (ni-index buf (%dump-mem-index (mem-ve-index-data (ve-index-in graph)))    #'ni-key-ve)
     (ni-index buf (%dump-mem-index (mem-ve-index-data (ve-index-out graph)))   #'ni-key-ve)
     (ni-index buf (%dump-mem-index (mem-vev-index-data (vev-index graph)))     #'ni-key-vev)
-    (let ((idx (spatial-index graph)))
-      (ni-pairs buf (if idx (%dump-mem-skip-list (spatial-index-skip-list idx)) '())))
+    ;; Spatial: one record per (owner . slot), so restore reloads the skip-lists
+    ;; directly -- no rebuild-from-nodes, no lazy materialization.
+    (ni-spatial buf graph)
     (ni-views buf graph)
     (ni-val buf (%dump-unique-indexes graph))   ; unique constraints (#6)
     (with-open-file (s (memory-image-file (location graph)) :direction :output
@@ -534,28 +642,112 @@ the same structural derived dumps.  Untouched LZNODEs pass their blob through."
                        :if-does-not-exist :create)
       (write-sequence buf s))))
 
+(defun %signal-unsupported-memory-image-version (ver file)
+  "The image is the ONLY durable copy of a cleanly-closed memory graph -- the
+journal is cleared on checkpoint (GH #65) -- so the old advice to delete it and
+recover from the journal was actively wrong (it discards the graph and 'succeeds'
+onto an empty one).  Say what remedies actually exist instead."
+  (error "Unsupported memory-image format v~D at ~A (this build reads v5, v6 ~
+and v7, writing v7).  This image is the ONLY durable record of a cleanly-~
+closed memory graph -- the journal is cleared after every checkpoint, so ~
+deleting the image discards the graph, it does not recover it.  Open it with a ~
+build that reads v~D, or migrate it to v7 first."
+         ver file ver))
+
+(defun %custom-node-geometry-classes ()
+  "The classes carrying an application-supplied NODE-GEOMETRY method -- i.e. every
+method specializer other than the engine's own T and NODE defaults.  Such a node
+has a geometry that no slot declaration reveals, so it cannot be skipped when
+deciding whether an LZNODE is worth materializing during a v5 spatial migration
+(GH #65)."
+  (let ((defaults (list (find-class t) (find-class 'node))))
+    (loop for m in (generic-function-methods #'node-geometry)
+          for spec = (first (method-specializers m))
+          ;; TYPEP guard: an EQL specializer is not a type specifier, so it must
+          ;; never reach the SUBTYPEP test below.
+          when (and (typep spec 'class) (not (member spec defaults)))
+            collect spec)))
+
+(defun %mem-lznode-may-be-spatial-p (graph lz edge-p custom-classes)
+  "True when the class of the unmaterialized LZ could carry a geometry, so it is
+worth the MAKE-INSTANCE cost while migrating a v5 image's spatial index (GH #65)."
+  (let* ((meta (ignore-errors
+                (lookup-node-type-by-id (lznode-type-id lz)
+                                        (if edge-p :edge :vertex) :graph graph)))
+         (class (and meta (find-class (node-type-name meta) nil))))
+    (and class
+         (or (node-geometry-index-slots class)
+             (some (lambda (c) (subtypep class c)) custom-classes))
+         t)))
+
+(defun %rebuild-memory-spatial-indexes-from-nodes (graph)
+  "Rebuild GRAPH's per-(owner . slot) spatial indexes by visiting every node --
+the v5 migration path (GH #65).  v5's writer emitted its spatial section EMPTY
+BY DESIGN (see WRITE-MEMORY-IMAGE-NATIVE's v5 comment in history) -- restore was
+always meant to rederive it from the nodes, so this is not a lossy compromise,
+it is what v5 specified.  Recovers the logic 714eb3b deleted (pre-per-(owner .
+slot) registry) and re-targets it at today's registry.
+
+Lazy-safe -- and this is why it serves BOTH lazy and non-lazy graphs, not just a
+non-lazy fallback: an LZNODE is materialized ONLY when its class could carry a
+geometry (NODE-GEOMETRY-INDEX-SLOTS, or a class a NODE-GEOMETRY method
+specializes on), so a graph with one geometry-bearing class among many touches
+only that fraction -- fault-on-access survives for everything else."
+  (clrhash (spatial-indexes graph))            ; in-RAM indexes own no heap storage
+  (let ((*graph* graph)                        ; node reads must resolve in GRAPH
+        (customs (%custom-node-geometry-classes))
+        (count 0))
+    (dolist (edge-p (list nil t) count)
+      (let ((table (if edge-p (edge-table graph) (vertex-table graph)))
+            (entries '()))
+        (when table
+          (maphash (lambda (id x) (push (cons id x) entries))
+                   (mem-table-data table))
+          (dolist (e entries)
+            (let* ((raw (cdr e))
+                   (node (if (lznode-p raw)
+                             (when (%mem-lznode-may-be-spatial-p graph raw edge-p customs)
+                               (mem-materialize table (car e) raw))
+                             raw)))
+              (when (and node (not (deleted-p node)))
+                (multiple-value-bind (geom slot) (node-geometry node)
+                  (when geom
+                    (spatial-index-insert
+                     (%spatial-index-for
+                      graph (%node-spatial-owner-name (class-of node) slot) slot)
+                     (id node) geom (%node-spatial-type-tag node))
+                    (incf count)))))))))))
+
 (defun restore-memory-image-native (graph file)
-  "Restore a VG-native (v3) image.  When GRAPH is LAZY, node tables receive LZNODE
-blobs (no MAKE-INSTANCE -- fault-on-access); otherwise each node is materialized
-now.  Indexes/spatial/views are restored structurally either way.  Returns
-:STRUCTURAL and stashes the view dump in *MEMORY-IMAGE-VIEW-DUMP*."
+  "Restore a VG-native image, v5 or v6.  When GRAPH is LAZY, node tables receive
+LZNODE blobs (no MAKE-INSTANCE -- fault-on-access); otherwise each node is
+materialized now.  The ve/vev/type indexes and the views are restored
+STRUCTURALLY either way.  v6's per-(owner . slot) spatial records are also
+restored structurally; v5 (whose spatial section is one flat, always-empty
+(cell . node-id) pair list -- empty BY DESIGN, not truncated) has that section
+discarded and its spatial index rebuilt from the just-restored nodes instead
+(GH #65), via %REBUILD-MEMORY-SPATIAL-INDEXES-FROM-NODES -- lazy-safe, so this
+runs on a LAZY graph too (the Android field device's config, and the case #65
+was filed for).  Returns :STRUCTURAL and stashes the view dump in
+*MEMORY-IMAGE-VIEW-DUMP*."
   (let* ((bytes (with-open-file (s file :element-type '(unsigned-byte 8))
                   (let ((a (make-array (file-length s) :element-type '(unsigned-byte 8))))
                     (read-sequence a s) a)))
          (rc (ni-ric bytes))
          (lazy (lazy-p graph))
          (vtable (vertex-table graph))
-         (etable (edge-table graph)))
+         (etable (edge-table graph))
+         (ver nil))
     (ri-bytes rc 4)                                ; magic
-    (let ((ver (ri-uint rc 4)))                    ; format version
-      ;; v5 changed the spatial dump to composite (cell . id) keys AND added the
-      ;; :unique dump -- a mid-stream layout change that cannot be read positionally
-      ;; by older parsers or vice versa.  Reject a stale image loudly rather than
-      ;; misparse it; the memory graph then rebuilds from its transaction journal.
-      (unless (= ver 5)
-        (error "Unsupported memory-image format v~D (this build writes/reads v5). ~
-Delete the stale image at ~A and reopen to rebuild from the journal."
-               ver file)))
+    (setf ver (ri-uint rc 4))                       ; format version
+    ;; A format bump is usually a mid-stream layout change that cannot be read
+    ;; positionally by a parser expecting a different one, so anything but the
+    ;; known versions is rejected loudly rather than misparsed (GH #65).  v6 made
+    ;; the spatial section per-(owner . slot); v7 shares v6's layout exactly
+    ;; and differs only in what a spatial entry's value holds (GH #104).  Both
+    ;; v5 and v6 are migrated below.
+    (unless (member ver '(5 6 7))
+      (%signal-unsupported-memory-image-version ver file))
     (ri-uint rc 8)                                 ; highest-tx-id
     (let ((nv (ri-uint rc 4)))
       (dotimes (i nv)
@@ -570,13 +762,24 @@ Delete the stale image at ~A and reopen to rebuild from the journal."
     (%load-mem-index (mem-ve-index-data (ve-index-in graph))    (ri-index rc #'ri-key-ve))
     (%load-mem-index (mem-ve-index-data (ve-index-out graph))   (ri-index rc #'ri-key-ve))
     (%load-mem-index (mem-vev-index-data (vev-index graph))     (ri-index rc #'ri-key-vev))
-    (let ((idx (spatial-index graph)) (sp (ri-pairs rc)))
-      (when idx (%load-mem-skip-list (spatial-index-skip-list idx) sp)))
+    (if (= ver 5)
+        (ri-pairs rc)         ; v5's flat spatial pairs: always empty, discard (GH #65)
+        (dolist (rec (ri-spatial rc))
+          (destructuring-bind (owner slot pairs precision max-cells counts) rec
+            (%restore-mem-spatial-index graph owner slot pairs precision max-cells counts))))
     (setf *memory-image-view-dump* (or (ri-views rc) '()))
-    ;; unique constraints (#6): present only in v4+ images -- guard on remaining bytes
-    ;; so a v3 image (pre-#6) restores cleanly.
+    ;; unique constraints (#6): both v5 and v6 always write the section -- guard on
+    ;; remaining bytes anyway, harmlessly, so a truncated tail cannot signal here.
     (when (< (ric-i rc) (length (ric-bytes rc)))
       (%load-unique-indexes graph (ri-val rc)))
+    ;; Pre-v7 migration: rederive the spatial index from the nodes.  v5 never
+    ;; carried one (GH #65); v6 carried one whose entries have no type tag, and
+    ;; the rebuild is the only way to write them -- a re-insert over an existing
+    ;; (cell . node-id) is a duplicate-key no-op and would leave the tag NIL
+    ;; (GH #104).  %REBUILD-MEMORY-SPATIAL-INDEXES-FROM-NODES clears the
+    ;; registry first, so the restored v6 indexes are dropped, not merged into.
+    ;; Lazy-safe (see its docstring), so this runs on a LAZY graph too.
+    (when (< ver 7) (%rebuild-memory-spatial-indexes-from-nodes graph))
     :structural))
 
 (defun write-memory-image (graph)
@@ -588,7 +791,9 @@ structures (vs rebuilding on open) is what keeps OPEN-MEMORY-GRAPH fast."
   (if (lazy-p graph)
       (write-memory-image-native graph)
       (cl-store:store
-       (list :version 3   ; v3: composite-key spatial dump (v2 keyed cells by bare string)
+       ;; v4: per-(owner . slot) spatial records (v3 wrote :spatial NIL).  v5 is
+       ;; v4's shape with a type tag on each spatial entry (GH #104).
+       (list :version 5
              :highest-tx-id (load-highest-transaction-id graph)
              :vertices (map-mem-table #'identity (vertex-table graph) :collect-p t)
              :edges (map-mem-table #'identity (edge-table graph) :collect-p t)
@@ -597,8 +802,9 @@ structures (vs rebuilding on open) is what keeps OPEN-MEMORY-GRAPH fast."
              :ve-in       (%dump-mem-index (mem-ve-index-data (ve-index-in graph)))
              :ve-out      (%dump-mem-index (mem-ve-index-data (ve-index-out graph)))
              :vev         (%dump-mem-index (mem-vev-index-data (vev-index graph)))
-             :spatial     (let ((idx (spatial-index graph)))
-                            (and idx (%dump-mem-skip-list (spatial-index-skip-list idx))))
+             ;; One record per (owner-class . slot) index: cells + precision + cap +
+             ;; histogram, so restore recreates each index directly (no node scan).
+             :spatial     (%dump-mem-spatial-indexes graph)
              :views       (%dump-views graph)
              :unique      (%dump-unique-indexes graph))   ; #6
        (memory-image-file (location graph)))))
@@ -609,22 +815,25 @@ mem-index-list is a set, deleted nodes stay indexed and scans filter them)."
   (let ((*graph* graph))
     (dolist (v vertices) (add-node-to-indexes v graph :unless-present t))
     (dolist (e edges)     (add-node-to-indexes e graph :unless-present t))
-    (let ((idx (spatial-index graph)))
-      (when idx
-        (flet ((reindex (n)
-                 (let ((geom (node-geometry n)))
-                   (when (and geom (not (deleted-p n)))
-                     (spatial-index-insert idx (id n) geom)))))
-          (dolist (v vertices) (reindex v))
-          (dolist (e edges)    (reindex e)))))))
+    (flet ((reindex (n)
+             (unless (deleted-p n)
+               (multiple-value-bind (geom slot) (node-geometry n)
+                 (when geom
+                   (spatial-index-insert
+                    (%spatial-index-for
+                     graph (%node-spatial-owner-name (class-of n) slot) slot)
+                    (id n) geom (%node-spatial-type-tag n)))))))
+      (dolist (v vertices) (reindex v))
+      (dolist (e edges)    (reindex e)))))
 
 (defun restore-memory-image (graph)
-  "Populate GRAPH's mem-tables -- and, for a v2 image, its derived structures --
-from its cl-store image if one exists (the schema must already be restored so the
-node classes are defined).  Returns :STRUCTURAL when a v2 image restored the
-indexes/spatial/views directly (no rebuild), :REBUILT when a v1 (nodes-only) image
-was rebuilt from the nodes, or NIL when no image was present.  The per-view dump is
-stashed in *MEMORY-IMAGE-VIEW-DUMP* for RESTORE-VIEWS."
+  "Populate GRAPH's mem-tables -- and, for a current-version image, its derived
+structures -- from its cl-store image if one exists (the schema must already be
+restored so the node classes are defined).  Returns :STRUCTURAL when the image
+restored the indexes/spatial/views directly (no rebuild), :REBUILT when an
+older (pre-v5) image was rebuilt from the nodes, or NIL when no image was
+present.  The per-view dump is stashed in *MEMORY-IMAGE-VIEW-DUMP* for
+RESTORE-VIEWS."
   (setf *memory-image-view-dump* :none)
   (let ((file (memory-image-file (location graph))))
     (when (probe-file file)
@@ -636,22 +845,32 @@ stashed in *MEMORY-IMAGE-VIEW-DUMP* for RESTORE-VIEWS."
                            &allow-other-keys)
           (cl-store:restore file)
         (declare (ignore highest-tx-id))
-        (dolist (v vertices) (mem-table-put (vertex-table graph) (id v) v))
-        (dolist (e edges)     (mem-table-put (edge-table graph) (id e) e))
+        ;; The image never carries a node's graph, so stamp on the way in --
+        ;; the rebuild below uses these nodes before any lookup (GH #53).
+        (dolist (v vertices)
+          (setf (node-graph v) graph)
+          (mem-table-put (vertex-table graph) (id v) v))
+        (dolist (e edges)
+          (setf (node-graph e) graph)
+          (mem-table-put (edge-table graph) (id e) e))
         (cond
-          ((and (eql version 3) type-vertex)
+          ((and (eql version 5) type-vertex)
            ;; Structural restore -- direct index/skip-list inserts, no map/reduce/
-           ;; geohash recompute.  This is what keeps open fast (#50).  A v2 image
-           ;; (bare-string spatial keys) falls through to the rebuild branch below,
-           ;; which re-indexes geometry through the current composite-key insert.
+           ;; geohash recompute.  This is what keeps open fast (#50).  An older image
+           ;; (v4's entries carry no type tag, GH #104; v3 wrote :SPATIAL NIL;
+           ;; v2 keyed cells by bare string) fails the version check and falls
+           ;; through to the rebuild-from-nodes branch below.
            (%load-mem-index (mem-type-index-data (vertex-index graph)) type-vertex)
            (%load-mem-index (mem-type-index-data (edge-index graph))   type-edge)
            (%load-mem-index (mem-ve-index-data (ve-index-in graph))    ve-in)
            (%load-mem-index (mem-ve-index-data (ve-index-out graph))   ve-out)
            (%load-mem-index (mem-vev-index-data (vev-index graph))     vev)
-           (let ((idx (spatial-index graph)))
-             (when (and idx spatial)
-               (%load-mem-skip-list (spatial-index-skip-list idx) spatial)))
+           ;; Spatial: one record per (owner . slot), recreated structurally from its
+           ;; own cells, precision, cap and histogram -- no rebuild from the nodes.
+           (dolist (rec spatial)
+             (destructuring-bind (owner slot pairs precision max-cells counts) rec
+               (%restore-mem-spatial-index graph owner slot pairs precision
+                                           max-cells counts)))
            (setf *memory-image-view-dump* (or views '()))
            (when unique (%load-unique-indexes graph unique))   ; #6
            :structural)
@@ -717,17 +936,32 @@ as deferred blobs and materialize on first touch (needs a VG-native image)."
       ;; Restore the checkpoint, then replay the journal tail committed after it.
       ;; Recovery runs BEFORE the transaction-manager is installed (the reaper
       ;; tolerates the unbound slot); the retain hook keeps the journal.
-      (if (eq (restore-memory-image graph) :structural)
-          ;; v2 image: views/indexes/spatial were restored structurally.  Create +
-          ;; populate the views from the image dump, THEN replay the journal tail so
-          ;; its authored ops update the already-restored derived structures
-          ;; incrementally (fast open -- no map/reduce regen; #50).
-          (progn (restore-views graph)
-                 (recover-transactions graph))
-          ;; v1 / no image: load the journal tail into the tables first, then
-          ;; rebuild views in-RAM from ALL restored nodes (rebuild-on-open fallback).
-          (progn (recover-transactions graph)
-                 (restore-views graph)))
+      (let ((image-restore-result (restore-memory-image graph)))
+        ;; Vector segments (GH #58): reopen-or-rebuild BEFORE any journal
+        ;; replay, mirroring OPEN-GRAPH.  RECOVER-TRANSACTIONS replays through
+        ;; the shared APPLY-TRANSACTION, which maintains segments via
+        ;; %ENSURE-SEGMENT -- and an unregistered (owner . slot) there
+        ;; unconditionally CREATE-VECTOR-SEGMENTs over any same-named file
+        ;; already on disk, destroying it.  RESTORE-MEMORY-IMAGE above has
+        ;; already populated the type index (structurally, or via the v1
+        ;; rebuild-from-nodes fallback) for either branch below, so a rebuild
+        ;; here sweeps the right checkpoint-time corpus; replay then updates
+        ;; the segment(s) incrementally, same story as the spatial index.
+        ;; Skipped on a LAZY graph, same reason RESTORE-SECONDARY-INDEXES is
+        ;; skipped below: a rebuild sweep would materialize every LZNODE blob.
+        (unless (lazy-p graph)
+          (restore-vector-segments graph))
+        (if (eq image-restore-result :structural)
+            ;; v2 image: views/indexes/spatial were restored structurally.  Create +
+            ;; populate the views from the image dump, THEN replay the journal tail so
+            ;; its authored ops update the already-restored derived structures
+            ;; incrementally (fast open -- no map/reduce regen; #50).
+            (progn (restore-views graph)
+                   (recover-transactions graph))
+            ;; v1 / no image: load the journal tail into the tables first, then
+            ;; rebuild views in-RAM from ALL restored nodes (rebuild-on-open fallback).
+            (progn (recover-transactions graph)
+                   (restore-views graph))))
       ;; Reconcile the declarative view registry (issue #49) after views are
       ;; restored AND the journal tail is replayed, so any regenerate sees all nodes.
       (install-views graph)
@@ -738,7 +972,17 @@ as deferred blobs and materialize on first touch (needs a VG-native image)."
       ;; graph, or a pre-#6 v3 image / crash fallback).  This is the durable path on
       ;; the memory backend: no open-time scan, no lazy-node materialization.
       (unless *memory-image-unique-loaded*
-        (rebuild-unique-indexes graph)))
+        (rebuild-unique-indexes graph))
+      ;; General ordered indexes: rebuild-on-open on the memory backend (image
+      ;; persistence is a follow-up, mirroring unique's v1).  REBUILD covers the MOP
+      ;; :INDEX slots; INSTALL covers DEF-INDEX declarations.  NOT on a LAZY graph:
+      ;; rebuilding scans every node and would thus MATERIALIZE the LZNODE blobs,
+      ;; defeating fault-on-access (a geometry :INDEX slot alone would trip it).  A
+      ;; lazy graph maintains its indexes in-session via APPLY; persisting them in the
+      ;; checkpoint image (so a lazy reopen needs no scan) is the deferred follow-up.
+      (unless (lazy-p graph)
+        (rebuild-secondary-indexes graph)
+        (install-secondary-indexes graph)))
     (when peer-role
       (%init-memory-peer-slots graph :open path peer-role origin-id peer-host
                                export-predicate device-registry merge-policy
@@ -778,9 +1022,15 @@ as deferred blobs and materialize on first touch (needs a VG-native image)."
 ;; LAZY table an untouched node is an LZNODE blob; materialize it on first touch
 ;; (fault-on-access) and swap the live node in, so subsequent lookups are direct.
 (defmethod lookup-node ((table mem-table) key graph)
-  (declare (ignore graph))
   (let ((v (mem-table-get table key)))
-    (if (lznode-p v) (mem-materialize table key v) v)))
+    (let ((node (if (lznode-p v) (mem-materialize table key v) v)))
+      ;; Nodes reach the mem-table unstamped (peer apply, image restore), so
+      ;; every node this hands out is stamped here (GH #53) -- but only when
+      ;; wrong, so this hot read path stays a pure read (no cache-line write
+      ;; on every lookup, matching the on-disk lookup-node above).
+      (when (and (node-p node) (not (eq (node-graph node) graph)))
+        (setf (node-graph node) graph))
+      node)))
 
 ;; Create: publish the live node into the mem-table.  No heap write, no index
 ;; update yet (Step 3), no version chain (MVCC dropped).  Mirrors the on-disk
@@ -798,7 +1048,10 @@ as deferred blobs and materialize on first touch (needs a VG-native image)."
           (written-p node) t
           (commit-epoch node) *commit-epoch*
           (prev-pointer node) 0
-          (data-pointer node) 0)
+          (data-pointer node) 0
+          ;; This override replaces FINALIZE-NODE, which stamps on the
+          ;; on-disk path (GH #53).
+          (node-graph node) graph)
     (mem-table-put table (id node) node)
     ;; Index maintenance mirrors the on-disk tx-create: type-index for every node,
     ;; plus ve/vev adjacency for edges (add-node-to-indexes dispatches).  Update /
@@ -818,13 +1071,17 @@ as deferred blobs and materialize on first touch (needs a VG-native image)."
     (setf (revision new-node) (ldb (byte 32 0) (1+ (revision old-node)))
           (commit-epoch new-node) *commit-epoch*
           (prev-pointer new-node) 0
-          (data-pointer new-node) 0)      ; never a heap address (see tx-create)
+          (data-pointer new-node) 0      ; never a heap address (see tx-create)
+          ;; Stamp home graph, symmetric with tx-create above (GH #53).
+          (node-graph new-node) graph
+          (node-graph old-node) graph)
     (mem-table-put table (id new-node) new-node))
   write)
 
-;; Spatial index maintenance (Step 4b): a memory-graph now carries a mem-backed
-;; spatial-index (make-mem-spatial-index), so the BASE apply-tx-writes-to-spatial-
-;; index runs unchanged -- no memory override needed (the Step-2 no-op is gone).
+;; Spatial index maintenance (Step 4b): a memory-graph's per-(owner . slot) spatial
+;; indexes are mem-backed (MAKE-GRAPH-SPATIAL-INDEX dispatches to MAKE-MEM-SPATIAL-
+;; INDEX), so the BASE apply-tx-writes-to-spatial-index runs unchanged -- no memory
+;; override needed (the Step-2 no-op is gone).
 
 ;;; ---------------------------------------------------------------------------
 ;;; Portable s-expr SNAPSHOT.  Durability on a memory-graph is the cl-store image
@@ -880,7 +1137,9 @@ as deferred blobs and materialize on first touch (needs a VG-native image)."
   (data (make-hash-table :test 'eql
                          #+sbcl :synchronized #+sbcl t
                          #+ccl :shared #+ccl t
-                         #+lispworks :single-thread #+lispworks nil)))
+                         #+lispworks :single-thread #+lispworks nil
+                         #+graph-db-ecl-sync-hash :synchronized
+                         #+graph-db-ecl-sync-hash t)))
 (defun make-mem-type-index () (%make-mem-type-index))
 
 (defun %mem-ti-list (idx type-id &optional create)
@@ -908,7 +1167,9 @@ as deferred blobs and materialize on first touch (needs a VG-native image)."
   (data (make-hash-table :test 'equalp
                          #+sbcl :synchronized #+sbcl t
                          #+ccl :shared #+ccl t
-                         #+lispworks :single-thread #+lispworks nil)))
+                         #+lispworks :single-thread #+lispworks nil
+                         #+graph-db-ecl-sync-hash :synchronized
+                         #+graph-db-ecl-sync-hash t)))
 (defun make-mem-ve-index () (%make-mem-ve-index))
 
 (defmethod ve-index-push ((idx mem-ve-index) (key ve-key) (id array)
@@ -937,7 +1198,9 @@ as deferred blobs and materialize on first touch (needs a VG-native image)."
   (data (make-hash-table :test 'equalp
                          #+sbcl :synchronized #+sbcl t
                          #+ccl :shared #+ccl t
-                         #+lispworks :single-thread #+lispworks nil)))
+                         #+lispworks :single-thread #+lispworks nil
+                         #+graph-db-ecl-sync-hash :synchronized
+                         #+graph-db-ecl-sync-hash t)))
 (defun make-mem-vev-index () (%make-mem-vev-index))
 
 (defmethod add-to-vev-index ((edge edge) (graph memory-graph-mixin) &key unless-present)

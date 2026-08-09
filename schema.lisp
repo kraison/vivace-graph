@@ -6,12 +6,16 @@
    #+sbcl (make-hash-table :test 'eql :synchronized t)
    #+ccl (make-hash-table :test 'eql :shared t)
    #+lispworks (make-hash-table :test 'eql :single-thread nil)
-   #+ecl (make-hash-table :test 'eql))
+   #+ecl (make-hash-table :test 'eql
+                          #+graph-db-ecl-sync-hash :synchronized
+                          #+graph-db-ecl-sync-hash t))
   (class-locks
    #+sbcl (make-hash-table :test 'eql :synchronized t)
    #+ccl (make-hash-table :test 'eql :shared t)
    #+lispworks (make-hash-table :test 'eql :single-thread nil)
-   #+ecl (make-hash-table :test 'eql))
+   #+ecl (make-hash-table :test 'eql
+                          #+graph-db-ecl-sync-hash :synchronized
+                          #+graph-db-ecl-sync-hash t))
   (next-edge-id 1 :type (unsigned-byte 16))
   (next-vertex-id 1 :type (unsigned-byte 16))
   ;; MVCC: graph-wide default number of prior node versions the reaper retains
@@ -83,12 +87,16 @@
           #+sbcl (make-hash-table :test 'eql :synchronized t)
           #+ccl (make-hash-table :test 'eql :shared t)
           #+lispworks (make-hash-table :test 'eql :single-thread nil)
-          #+ecl (make-hash-table :test 'eql))
+          #+ecl (make-hash-table :test 'eql
+                          #+graph-db-ecl-sync-hash :synchronized
+                          #+graph-db-ecl-sync-hash t))
     (setf (gethash :vertex (schema-type-table (schema graph)))
           #+sbcl (make-hash-table :test 'eql :synchronized t)
           #+ccl (make-hash-table :test 'eql :shared t)
           #+lispworks (make-hash-table :test 'eql :single-thread nil)
-          #+ecl (make-hash-table :test 'eql))
+          #+ecl (make-hash-table :test 'eql
+                          #+graph-db-ecl-sync-hash :synchronized
+                          #+graph-db-ecl-sync-hash t))
     (setf (gethash 'edge (schema-class-locks schema))
           (make-rw-lock))
     (setf (gethash 'vertex (schema-class-locks schema))
@@ -118,7 +126,9 @@ persisted type-ids (unlike re-running INIT-SCHEMA from scratch)."
   (let ((locks #+sbcl (make-hash-table :test 'eql :synchronized t)
                #+ccl (make-hash-table :test 'eql :shared t)
                #+lispworks (make-hash-table :test 'eql :single-thread nil)
-               #+ecl (make-hash-table :test 'eql)))
+               #+ecl (make-hash-table :test 'eql
+                          #+graph-db-ecl-sync-hash :synchronized
+                          #+graph-db-ecl-sync-hash t)))
     (setf (gethash 'vertex locks) (make-rw-lock)
           (gethash 'edge locks) (make-rw-lock))
     ;; The type-table nests sub-tables (by parent type) whose VALUES include the
@@ -221,6 +231,17 @@ replication for a quick schema compatibility check."
   (finalize-inheritance (find-class (node-type-name meta)))
   (save-schema (schema graph) graph))
 
+(defun %check-node-class-graph-unique (name graph-name)
+  "Signal if NAME is registered under a graph other than GRAPH-NAME. Keys on
+graph-name identity, not presence: a same-graph redefinition legitimately
+re-registers under the same key (GH #53)."
+  (maphash (lambda (gname metas)
+             (unless (equal gname graph-name)
+               (when (find name metas :key #'node-type-name)
+                 (error 'duplicate-node-class-error
+                        :name name :existing-graph gname :new-graph graph-name))))
+           *schema-node-metadata*))
+
 (defmacro def-node-type (name parent-types slot-specs graph-name &key keep-revisions)
   "Define a persistent node type NAME for the graph named GRAPH-NAME.  This is
 the machinery behind DEF-VERTEX and DEF-EDGE; you normally use those instead.
@@ -235,7 +256,7 @@ MAKE-<NAME> (constructor), LOOKUP-<NAME> (id -> node, skipping deleted unless
 Prolog functors <NAME>/2 and <NAME>/3.  The type metadata is registered under
 GRAPH-NAME and instantiated into the graph if it already exists, so a type may
 be defined before or after the graph is created."
-  (with-gensyms (meta graph)
+  (with-gensyms (meta graph metas pos)
     (let* ((constructor (intern (format nil "MAKE-~A" name)))
            (predicate (intern (format nil "~A-P" name)))
            (lookup-fn (intern (format nil "LOOKUP-~A" name))))
@@ -252,6 +273,7 @@ be defined before or after the graph is created."
                             (append s1 (list :initarg (intern (symbol-name (first s1)) :keyword))))))
                     slot-specs))
       `(progn
+         (%check-node-class-graph-unique ',name ',graph-name)
          (defclass ,name (,@parent-types)
            (,@slot-specs)
            (:metaclass node-class))
@@ -420,7 +442,16 @@ be defined before or after the graph is created."
                                          *graph*
                                          :edge-type ',name)))))
                   )
-           (push ,meta (gethash ',graph-name *schema-node-metadata*))
+           ;; Replace in place, preserving position: UPDATE-SCHEMA applies the
+           ;; list oldest-to-newest and INSTANTIATE-NODE-TYPE assigns type-ids in
+           ;; that order, so moving a redefined type would change its type-id on
+           ;; a fresh graph (GH #53).
+           (let* ((,metas (gethash ',graph-name *schema-node-metadata*))
+                  (,pos (position ',name ,metas :key #'node-type-name)))
+             (if ,pos
+                 (setf (nth ,pos ,metas) ,meta)
+                 (setf (gethash ',graph-name *schema-node-metadata*)
+                       (append ,metas (list ,meta)))))
            (let ((,graph (lookup-graph ',graph-name)))
              (when ,graph
                (instantiate-node-type ,meta ,graph)))
@@ -467,6 +498,13 @@ Example:
 
 (defmethod instantiate-node-type ((meta node-type) (graph graph))
   (with-recursive-lock-held ((schema-lock (schema graph)))
+    (let ((cl (find-class (node-type-name meta) nil)))
+      ;; Drop EVERY memoized CLASS-SLOTS-derived answer for this class and its
+      ;; subclasses, not just the geometry one for this class: re-instantiating a
+      ;; node type is a schema mutation, and a subclass's effective slots change
+      ;; with its superclass.  (FINALIZE-INHERITANCE :AFTER normally covers this;
+      ;; this keeps the guarantee on any path that reaches here without it.)
+      (when (typep cl 'node-class) (%invalidate-node-class-caches cl)))
     ;; Check if this type exists and if it differs from old spec
     (log:debug "Looking up ~A: ~A ~A" meta (node-type-name meta) (node-type-parent-type meta))
     (let ((old-meta (lookup-node-type-by-name (node-type-name meta)
@@ -494,6 +532,7 @@ Example:
                                     (node-type-parent-type meta)))
             (update-node-type meta graph))))))
 
+
 (defmethod update-schema ((graph-name symbol))
   (let ((graph (lookup-graph graph-name)))
     (if graph
@@ -503,8 +542,7 @@ Example:
 (defmethod update-schema ((graph graph))
   (with-recursive-lock-held ((schema-lock (schema graph)))
     (let ((node-metadata (gethash (graph-name graph) *schema-node-metadata*)))
-      ;; New metadata is pushed on the front of its list; apply
-      ;; metadata oldest to newest by reversing
-      (dolist (meta (reverse node-metadata))
+      ;; The list is maintained oldest-first (GH #53); apply in order.
+      (dolist (meta node-metadata)
         (instantiate-node-type meta graph)))
     (save-schema (schema graph) graph)))

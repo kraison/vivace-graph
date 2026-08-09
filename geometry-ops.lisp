@@ -29,26 +29,59 @@ needed."
                (* (cos phi1) (cos phi2) (expt (sin (/ dlam 2)) 2)))))
     (* 2d0 +earth-radius-m+ (atan (sqrt a) (sqrt (- 1d0 a))))))
 
+(defun %point-in-packed-ring-p (lon lat ring)
+  "PNPOLY over a packed (lon lat lon lat ...) double-float ring.
+The declarations are load-bearing, not decoration: the packed representation
+exists so coordinates stay unboxed, and without them SBCL re-boxes every AREF
+and every arithmetic intermediate -- ~24 KB of garbage per call on a
+country-scale 740-vertex ring, and ~20x slower (GH #86).  With them it conses
+nothing.  Callers coerce LON/LAT; see POINT-IN-RING-P."
+  (declare (type double-float lon lat)
+           (type (simple-array double-float (*)) ring))
+  (let* ((len2 (length ring))
+         (n (ash len2 -1))
+         (inside nil))
+    (declare (type fixnum len2 n))
+    (when (< n 3) (return-from %point-in-packed-ring-p nil))
+    (loop for i of-type fixnum from 0 below n
+          ;; the previous vertex, wrapping: (mod (+ i n -1) n) without the divide
+          for j of-type fixnum = (if (= i 0) (1- n) (1- i))
+          do (let* ((idx-i (* 2 i))
+                    (idx-j (* 2 j))
+                    (xi (aref ring idx-i))
+                    (yi (aref ring (1+ idx-i)))
+                    (xj (aref ring idx-j))
+                    (yj (aref ring (1+ idx-j))))
+               (declare (type fixnum idx-i idx-j)
+                        (type double-float xi yi xj yj))
+               (when (and (not (eq (> yi lat) (> yj lat)))
+                          (< lon (+ xi (/ (* (- xj xi) (- lat yi)) (- yj yi)))))
+                 (setf inside (not inside)))))
+    inside))
+
 (defun point-in-ring-p (lon lat ring)
-  "True if (LON, LAT) lies inside RING -- a list of (lon lat) -- by the
-even-odd ray-casting rule (Franklin's PNPOLY).  Points exactly on the boundary
-are resolved consistently rather than specially flagged."
-  (let ((n (length ring)))
-    (when (< n 3) (return-from point-in-ring-p nil))
-    (let ((v (coerce ring 'vector)) (inside nil))
-      (loop for i from 0 below n
-            for j = (mod (+ i n -1) n)        ; previous vertex, wrapping
-            do (let* ((vi (aref v i)) (vj (aref v j))
-                      (xi (coerce (first vi) 'double-float))
-                      (yi (coerce (second vi) 'double-float))
-                      (xj (coerce (first vj) 'double-float))
-                      (yj (coerce (second vj) 'double-float)))
-                 ;; The (yi>lat) != (yj>lat) guard ensures (yj-yi) is non-zero
-                 ;; before we divide, so this is short-circuit safe.
-                 (when (and (not (eq (> yi lat) (> yj lat)))
-                            (< lon (+ xi (/ (* (- xj xi) (- lat yi)) (- yj yi)))))
-                   (setf inside (not inside)))))
-      inside)))
+  "True if (LON, LAT) lies inside RING -- a list of (lon lat) or a packed double-float array -- by the
+even-odd ray-casting rule (Franklin's PNPOLY).
+LON and LAT are any REALs; GEO-WITHIN/3 admits any NUMBERP, so the packed
+kernel's DOUBLE-FLOAT contract is met by coercing here rather than by declaring
+the parameters."
+  (if (typep ring '(simple-array double-float (*)))
+      (%point-in-packed-ring-p (float lon 1d0) (float lat 1d0) ring)
+      (let ((n (length ring)))
+        (when (< n 3) (return-from point-in-ring-p nil))
+        (let ((v (coerce ring 'vector)) (inside nil))
+          (loop for i from 0 below n
+                for j = (mod (+ i n -1) n)
+                do (let* ((vi (aref v i)) (vj (aref v j))
+                          (xi (coerce (first vi) 'double-float))
+                          (yi (coerce (second vi) 'double-float))
+                          (xj (coerce (first vj) 'double-float))
+                          (yj (coerce (second vj) 'double-float)))
+                     (when (and (not (eq (> yi lat) (> yj lat)))
+                                (< lon (+ xi (/ (* (- xj xi) (- lat yi)) (- yj yi)))))
+                       (setf inside (not inside)))))
+          inside))))
+
 
 (defun point-in-polygon-rings-p (lon lat rings)
   "RINGS is an exterior ring followed by zero or more hole rings.  True when the

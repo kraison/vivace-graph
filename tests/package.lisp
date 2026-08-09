@@ -18,6 +18,13 @@
                 #:serialize
                 #:deserialize
                 #:serialized-equal
+                #:decode-length
+                #:+vector+
+                #:+float-vector+
+                #:+fv-single-float+
+                #:+fv-double-float+
+
+                #:serialization-error
                 ;; geometry (spatial extension)
                 #:make-point
                 #:make-linestring
@@ -26,9 +33,15 @@
                 #:geometryp
                 #:geometry-kind
                 #:geometry-coordinates
+                #:geometry-coordinate-pairs
+                #:do-geometry-coordinates
+                #:map-geometry-coordinates
+
                 #:geometry-lon
+
                 #:geometry-lat
                 #:geometry-bbox
+                #:geometry-empty-p
                 ;; geometry refine ops (spatial extension)
                 #:geodesic-distance
                 #:point-in-ring-p
@@ -46,34 +59,50 @@
                 #:geohash-neighbor
                 #:geohash-neighbors
                 ;; spatial index (spatial extension)
-                #:spatial-index            ; graph slot accessor
+                #:spatial-indexes          ; graph registry: (owner . slot) -> index
+                #:spatial-index-for        ; one index, or NIL if not created yet
+                #:all-spatial-indexes
+                #:class-spatial-index-keys
+                #:graph-default-spatial-precision
+                #:graph-default-spatial-max-cells
                 #:node-geometry            ; write-path indexing protocol
                 #:make-spatial-index
                 #:open-spatial-index
                 #:spatial-index-p
                 #:spatial-index-address
                 #:spatial-index-precision
+                #:spatial-index-max-cells
+                #:spatial-index-precision-counts
+                #:spatial-index-coarsest-precision
                 #:spatial-index-insert
                 #:spatial-index-remove
                 #:spatial-index-query-bbox
                 #:spatial-index-query-radius
                 #:delete-spatial-index
-                #:rebuild-spatial-index
-                ;; index lifecycle helpers (graph.lisp) for rebuild tests
-                #:init-spatial-index
+                #:rebuild-spatial-indexes
+                #:regenerate-spatial-index
+                #:regenerate-spatial-indexes
+                ;; §8: the inert second geometry slot (exhaustive read-only sweep)
+                #:audit-spatial-slots
+                #:node-geometry-slots-with-values
+                ;; the declaration surface for a spatial index's grid precision and max-cells
+                #:spatial-precision-spec
+                #:spatial-max-cells-spec
+
                 ;; index-backed spatial queries (spatial extension)
                 #:find-nodes-within
                 #:find-nodes-intersecting
                 #:find-nodes-near
                 #:find-nearest-k
-                #:find-within/2
-                #:find-intersects/2
-                #:find-near/4
-                #:find-nearest/4
+                #:find-within/3
+                #:find-intersects/3
+                #:find-near/5
+                #:find-nearest/5
                 ;; topology seam (exact only with graph-db/geos; fallback here)
                 #:geometry-intersects-p
                 #:geometry-contains-geometry-p
                 #:geos-available-p
+                #:geometry-valid-p
                 ;; subset replication
                 #:replication-filter
                 #:make-spatial-replication-filter
@@ -140,6 +169,29 @@
                 #:remove-from-index-list
                 #:index-list-head
                 #:delete-index-list
+                ;; vector segment (segment.lisp)
+                #:create-vector-segment
+                #:open-vector-segment
+                #:close-vector-segment
+                #:segment-capacity
+                #:segment-live-count
+                #:segment-dimension
+                #:segment-id->slot
+                #:segment-put
+                #:segment-get
+                #:segment-remove
+                #:segment-clean-shutdown-p
+                #:rebuild-vector-segment
+                #:rebuild-vector-segment-batched
+                #:%id-less-p
+                #:%score-before-p
+                #:%make-topk
+                #:%topk-offer
+                #:%topk-results
+                #:%cosine
+                #:segment-scan
+                #:segment-score-subset
+                #:vector-search
                 ;; type index
                 #:make-type-index
                 #:close-type-index
@@ -154,6 +206,7 @@
                 #:with-transaction
                 #:lookup-vertex
                 #:lookup-edge
+                #:vertex-history
                 #:outgoing-edges
                 #:incoming-edges
                 #:traverse
@@ -161,6 +214,10 @@
                 #:end-vertex
                 #:map-vertices
                 #:map-edges
+                #:def-index
+                #:index-lookup
+                #:index-range
+                #:map-index
                 #:weight
                 #:to
                 #:from
@@ -173,6 +230,7 @@
                 #:def-edge
                 #:node-slot-value
                 #:*schema-node-metadata*
+                #:duplicate-node-class-error
                 ;; views
                 #:def-view
                 #:invoke-graph-view
