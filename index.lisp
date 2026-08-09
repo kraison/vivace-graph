@@ -127,20 +127,59 @@ This is the single input to maintenance (apply / rebuild)."
   owner-name slot-names canonicalizers
   ;; The backing ordered map: a heap skip-list / B+ tree on an on-disk graph, a
   ;; MEM-SKIP-LIST on a memory-graph -- always ordered (needed for range).  Keyed
-  ;; by the composite (canonical-value id) under REDUCE-COMP-LESSP, like a view.
+  ;; by the flat composite (v1 ... vn id) under %INDEX-COMP-LESSP, arity-aware
+  ;; since Task 4 (GH #107).
   skip-list)
 
-(defun make-secondary-skip-list (graph)
-  "The ordered map backing a secondary index -- a view-style composite
-(canonical-value id) map under REDUCE-COMP-LESSP.  Follows *INDEX-BACKEND* on an
-on-disk graph and returns a MEM-SKIP-LIST on a memory-graph."
-  (make-view-skip-list graph (make-view :sort-order :lessp)))
+(defun %index-head-key (arity)
+  "Lower sentinel key for an index of ARITY value components (GH #107)."
+  (append (make-list arity :initial-element +min-sentinel+) (list +null-key+)))
 
-(defun %open-secondary-skip-list (graph address &optional (backend :skip-list))
-  "Reopen an on-disk secondary index at ADDRESS with BACKEND's opener (same codec/
-order as a view / unique index)."
+(defun %index-tail-key (arity)
+  "Upper sentinel key for an index of ARITY value components (GH #107)."
+  (append (make-list arity :initial-element +max-sentinel+) (list +max-key+)))
+
+;; MAKE-SECONDARY-SKIP-LIST does not go through MAKE-VIEW-SKIP-LIST: that
+;; generic is shared with real views, which must stay on REDUCE-COMP-LESSP /
+;; REDUCE-EQUAL (GH #107) -- moving it would silently change every view's
+;; ordering too.  Dispatch here is its own generic, specializing the same way
+;; (GRAPH default, MEMORY-GRAPH-MIXIN override) so an index skip-list gets
+;; %INDEX-COMP-LESSP / %INDEX-EQUAL on both backends without touching the view
+;; path.  Both methods live here (not in memory-graph.lisp, which loads before
+;; this file) since they need %INDEX-COMP-LESSP et al., defined below.
+(defgeneric make-secondary-skip-list (graph arity)
+  (:documentation "The ordered map backing a secondary index of ARITY value
+components -- a flat (v1 ... vn id) composite under %INDEX-COMP-LESSP /
+%INDEX-EQUAL.  Follows *INDEX-BACKEND* on an on-disk graph and returns a
+MEM-SKIP-LIST on a memory-graph.  At ARITY 1 this orders identically to the
+pre-Task-4 REDUCE-COMP-LESSP map, so an existing single-slot index reopens
+with no rebuild (GH #107).")
+  (:method ((graph graph) arity)
+    (make-heap-index (graph-index-backend graph) (indexes graph)
+                     '%index-comp-lessp
+                     :head-key (%index-head-key arity)
+                     :tail-key (%index-tail-key arity)))
+  (:method ((graph memory-graph-mixin) arity)
+    (make-mem-skip-list
+     :key-equal '%index-equal
+     :key-comparison '%index-comp-lessp
+     :value-equal 'equal
+     :head-key (%index-head-key arity)
+     :head-value nil
+     :tail-key (%index-tail-key arity)
+     :tail-value nil
+     :duplicates-allowed-p nil)))
+
+(defun %open-secondary-skip-list (graph address arity
+                                  &optional (backend :skip-list))
+  "Reopen an on-disk secondary index of ARITY value components at ADDRESS with
+BACKEND's opener, on %INDEX-COMP-LESSP.  ARITY is accepted for signature
+symmetry with MAKE-SECONDARY-SKIP-LIST; the persisted head/tail nodes already
+carry their serialized keys, so reopening does not need to rebuild sentinels
+from it (GH #107)."
+  (declare (ignore arity))
   (open-heap-index backend :address address :heap (indexes graph)
-                   :comparison 'reduce-comp-lessp))
+                   :comparison '%index-comp-lessp))
 
 ;;; Ordering for a flat index key (v1 ... vn id): every component but the last
 ;;; compares with LESS-THAN, the trailing node id with KEY-VECTOR<.  At n=2 this
@@ -255,7 +294,8 @@ graph's backend."
           (let ((six (%make-slot-index
                       :owner-name owner-name :slot-names slot-names
                       :canonicalizers canonicalizers)))
-            (setf (slot-index-skip-list six) (make-secondary-skip-list graph))
+            (setf (slot-index-skip-list six)
+                  (make-secondary-skip-list graph (length slot-names)))
             (setf (gethash key reg) six))))))
 
 ;;; ---------------------------------------------------------------------------
@@ -415,7 +455,8 @@ not trigger a spurious rebuild."
                        :canonicalizers (list (%owner-slot-canonicalizer
                                               owner slot-names graph))
                        :skip-list (%open-secondary-skip-list
-                                   graph address backend))))))
+                                   graph address (length slot-names)
+                                   backend))))))
           t)))))
 
 (defun regenerate-secondary-indexes (graph)

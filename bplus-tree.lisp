@@ -1000,23 +1000,33 @@ the right opener.")
 ;;; there is no load-order problem.  (*INDEX-BACKEND* -- the DEFAULT backend -- is
 ;;; defined in globals.lisp so the graph class's INDEX-BACKEND slot can default to it.)
 
-(defun make-heap-index (backend heap comparison)
+(defun make-heap-index (backend heap comparison
+                        &key (head-key (if (eq comparison 'reduce-comp-greaterp)
+                                            (list +max-sentinel+ +max-key+)
+                                            (list +min-sentinel+ +null-key+)))
+                             (tail-key (if (eq comparison 'reduce-comp-greaterp)
+                                           (list +min-sentinel+ +null-key+)
+                                           (list +max-sentinel+ +max-key+))))
   "Create a fresh heap-backed composite-key ordered map (skip list or B+ tree) with
-the shared view/unique/spatial codec.  COMPARISON is REDUCE-COMP-LESSP or
-REDUCE-COMP-GREATERP (it also picks the skip list's head/tail sentinels)."
+the shared view/unique/spatial codec.  COMPARISON is REDUCE-COMP-LESSP,
+REDUCE-COMP-GREATERP, or (since GH #107) %INDEX-COMP-LESSP.  HEAD-KEY / TAIL-KEY
+are the skip list's sentinels; they default to the arity-1 REDUCE-COMP-LESSP/
+-GREATERP pair, so the view / :unique / spatial callers that omit them are
+unaffected -- only an arity-aware caller (the general index, GH #107) need pass
+its own."
   (ecase backend
     (:skip-list
-     (let ((greaterp (eq comparison 'reduce-comp-greaterp)))
-       (make-skip-list
-        :heap heap :duplicates-allowed-p nil
-        :key-equal 'reduce-equal :key-comparison comparison
-        :head-key (if greaterp (list +max-sentinel+ +max-key+) (list +min-sentinel+ +null-key+))
-        :head-value nil
-        :tail-key (if greaterp (list +min-sentinel+ +null-key+) (list +max-sentinel+ +max-key+))
-        :tail-value nil
-        :value-equal 'equal
-        :key-serializer 'view-key-serialize :key-deserializer 'view-key-deserialize
-        :value-serializer 'serialize :value-deserializer 'deserialize)))
+     (make-skip-list
+      :heap heap :duplicates-allowed-p nil
+      :key-equal 'reduce-equal :key-comparison comparison
+      :head-key head-key
+      :head-value nil
+      :tail-key tail-key
+      :tail-value nil
+      :value-equal 'equal
+      :key-serializer 'view-key-serialize
+      :key-deserializer 'view-key-deserialize
+      :value-serializer 'serialize :value-deserializer 'deserialize))
     (:bplus-tree
      (make-bplus-tree
       :heap heap :key-equal 'reduce-equal :key-comparison comparison

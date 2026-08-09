@@ -331,6 +331,29 @@ already does."
            (ignore-errors (close-graph ,g :snapshot-p nil))
            (collect-garbage))))))
 
+;;; --- arity-aware skip-list construction (GH #107) ---------------------------
+
+;; Runs on the memory-graph mem-skip-list, not WITH-IX-GRAPH's on-disk
+;; :skip-list: VIEW-KEY-SERIALIZE (the shared view/unique/spatial codec) still
+;; hardcodes a 2-element (value id) key shape, so an arity-3 head/tail node
+;; cannot round-trip through it yet -- generalising that codec is later work,
+;; not this task's (Task 4 only makes the sentinel-key/comparator plumbing
+;; arity-aware).  MEM-SKIP-LIST stores keys as plain Lisp objects with no
+;; serialization step, so it proves the same head/tail-arity property without
+;; that unrelated, deliberately-deferred limitation (#107).
+(test secondary-skip-list-head-tail-match-arity
+  "Head/tail sentinel keys must have arity+1 elements, or a multi-slot index's
+bounds sort wrongly against real keys (#107).  Neither skip-list backend has a
+%SL-HEAD-KEY / %SL-TAIL-KEY reader: head/tail are SKIP-NODEs, keyed via
+%SN-KEY -- MEM-SKIP-LIST-HEAD / MEM-SKIP-LIST-TAIL on the in-RAM backend used
+here."
+  (with-ix-memory-graph (g)
+    (let* ((sl (graph-db::make-secondary-skip-list g 3))
+           (head (graph-db::mem-skip-list-head sl))
+           (tail (graph-db::mem-skip-list-tail sl)))
+      (is (= 4 (length (graph-db::%sn-key head))))
+      (is (= 4 (length (graph-db::%sn-key tail)))))))
+
 (test memory-backend-equality-and-range
   "The index works on a memory-graph (mem-skip-list backing), :index t and def-index."
   (with-ix-memory-graph (g)
