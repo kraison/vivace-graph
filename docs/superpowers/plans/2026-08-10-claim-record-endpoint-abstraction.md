@@ -242,9 +242,16 @@ package so two claim families share one set of accessors (design §5).")
   "Slots only BINARY-CLAIM carries.  Their absence from UNARY-CLAIM is what
 makes a unary claim unable to carry an object (design §3.1).")
 
-(defmethod initialize-instance :after ((c t) &key)
-  ;; Placeholder specialised in Step 5 below; see DEF-CLAIM-CLASSES.
-  nil)
+(defclass claim-standing-mixin () ()
+  (:documentation "Specialisation point for the STANDING check.  Holds no
+slots and is never persisted; a plain STANDARD-CLASS superclass of a
+NODE-CLASS is accepted (verified on SBCL, GH #131)."))
+
+(defmethod initialize-instance :after ((c claim-standing-mixin) &key)
+  ;; STANDING is required and validated here rather than by convention
+  ;; (design §5).  Specialised on the mixin, never on T -- a T method would
+  ;; run on every object created anywhere in the image.
+  (check-standing (claim-standing c)))
 
 (defmacro def-claim-classes (parent graph-name &key extra-slots)
   "Define PARENT and its UNARY/BINARY subclasses in GRAPH-NAME, and register
@@ -258,7 +265,8 @@ slots and the shared indexes, and carries no uniqueness constraint of its own
   (let ((unary (intern (format nil "~A-UNARY" parent)))
         (binary (intern (format nil "~A-BINARY" parent))))
     `(progn
-       (def-vertex ,parent () (,@+claim-shared-slots+ ,@extra-slots)
+       (def-vertex ,parent (claim-standing-mixin)
+           (,@+claim-shared-slots+ ,@extra-slots)
          ,graph-name)
        (def-vertex ,unary (,parent) () ,graph-name)
        (def-vertex ,binary (,parent) (,@+claim-object-slots+) ,graph-name)
@@ -272,40 +280,18 @@ Note the `fmakunbound`: `def-vertex` always generates `MAKE-<NAME>`, so the
 parent's constructor is removed after the fact rather than never created. That
 is the only lever the engine offers (design §3.3).
 
-- [ ] **Step 5: Validate standing at construction**
-
-Append to `claim.lisp`, replacing the placeholder method from Step 4:
-
-```lisp
-(defmethod initialize-instance :after ((c claim-standing-mixin) &key)
-  (check-standing (claim-standing c)))
-```
-
-This needs a class to specialise on that exists before any tenant calls the
-macro. Add it above `def-claim-classes` and make the generated parent inherit
-it:
-
-```lisp
-(defclass claim-standing-mixin () ()
-  (:documentation "Specialisation point for the STANDING check.  Not a node
-class -- it holds no slots and is never persisted."))
-```
-
-and change the parent's `def-vertex` line to
-`(def-vertex ,parent (claim-standing-mixin) ...)`.
-
-- [ ] **Step 6: Add the ASDF components**
+- [ ] **Step 5: Add the ASDF components**
 
 `(:file "claim")` after `(:file "allen")` in `graph-db/spacetime`, and
 `(:file "claim-tests")` after `(:file "conformance-tests")` in
 `graph-db/spacetime-test`. Both systems are `:serial t`.
 
-- [ ] **Step 7: Run the tests to verify they pass**
+- [ ] **Step 6: Run the tests to verify they pass**
 
 Same command as Step 3. Expected: the six new tests pass, and the existing 47
 spacetime tests still pass.
 
-- [ ] **Step 8: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
 git add spacetime/claim.lisp spacetime/package.lisp \
