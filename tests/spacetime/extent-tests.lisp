@@ -99,3 +99,13 @@ be a keyword, an integer, or a LOCAL-TIME:TIMESTAMP."
   (signals invalid-standing
     (make-granule-interval (ts 2026 1 15) :month :standing :probably))
   (signals invalid-extent (make-granule-interval (ts 2026 1 15) :fortnight)))
+
+(test make-interval-rejects-only-a-value-degenerate-pair
+  "Design §3.2.  START = END exactly is a point in time -- MAKE-INSTANT's
+job -- so MAKE-INTERVAL must reject it.  Bounds that merely overlap are
+uncertain, not collapsed, and must still construct (GH #130)."
+  (signals invalid-extent
+    (make-interval (exact-bound (ts 2026 1 15)) (exact-bound (ts 2026 1 15))))
+  (let ((e (make-interval (make-bound (ts 2026 1 10) (ts 2026 1 20))
+                          (make-bound (ts 2026 1 15) (ts 2026 1 25)))))
+    (is (eq :interval (extent-kind e)))))

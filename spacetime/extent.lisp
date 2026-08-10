@@ -41,7 +41,11 @@ SAME bound object -- that identity is the endpoint coupling (design §3.3)."
 (defun make-interval (start end &key (precision :nsec) (semantics :event)
                                      (standing :observed))
   "An extent spanning [START, END], both BOUNDs, whose endpoints move
-independently.  Intervals are closed (design §3.2)."
+independently.  Intervals are closed (design §3.2).  Signals INVALID-EXTENT
+when START and END compare := -- that is a point in time; use MAKE-INSTANT."
+  (when (eq (bound-compare start end) :=)
+    (error 'invalid-extent
+           :reason "START = END exactly -- a point in time; use MAKE-INSTANT"))
   (%make-extent :interval start end
                 (%check-precision precision) semantics
                 (check-standing standing)))

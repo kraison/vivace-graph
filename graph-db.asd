@@ -402,7 +402,8 @@
                (:file "bound-tests")
                (:file "extent-tests")
                (:file "allen-tests")
-               (:file "instant-tests"))
+               (:file "instant-tests")
+               (:file "property-tests"))
   :perform (test-op (op c)
                     (unless (uiop:symbol-call :graph-db/spacetime-test
                                               :run-spacetime-tests)
