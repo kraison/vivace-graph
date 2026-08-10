@@ -403,6 +403,16 @@ to NIL is bound.  Materializes the data first (mirrors NODE-SLOT-VALUE)."
         (node-slot-value instance slot-keyword-name)
         (call-next-method))))
 
+(defun check-slot-mutation-allowed (node slot-name)
+  "Signal MUTATING-UNREGISTERED-NODE unless the current transaction may write
+NODE's persistent slots: it may write a COPY it registered, or a node it
+created.  Anything else is either lost at commit or a mutation of the shared
+cached instance (GH #135)."
+  (unless (and *transaction*
+               (or (gethash node (copies *transaction*))
+                   (object-set-member-p node (create-set *transaction*))))
+    (error 'mutating-unregistered-node :node node :slot slot-name)))
+
 (defmethod (setf slot-value-using-class) :around
     (new-value (class node-class) instance slot)
   "Is alternate-version aware and will update values for the current, working private
@@ -413,8 +423,10 @@ to NIL is bound.  Materializes the data first (mirrors NODE-SLOT-VALUE)."
          (slot-name (slot-definition-name slot))
          (slot-keyword-name (%persistent-slot-keyword class slot-name)))
     (if slot-keyword-name
-        ;; FIXME: Check for txn and handle
-        (setf (node-slot-value instance slot-keyword-name) new-value)
+        (progn
+          (unless *initializing-node*
+            (check-slot-mutation-allowed instance slot-name))
+          (setf (node-slot-value instance slot-keyword-name) new-value))
         (call-next-method))))
 
 ;; *INITIALIZING-NODE* is defvar'd above MAYBE-INIT-NODE-DATA (it guards that

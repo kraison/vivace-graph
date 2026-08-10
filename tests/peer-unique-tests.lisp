@@ -50,11 +50,19 @@
 
 (defun pu-authored-create (graph type data origin &key (lamport 5) (tx-id 9000))
   "An AUTHORED peer-op that CREATEs a fresh TYPE node with DATA, attributed to ORIGIN
-(as if pulled from that author).  Returns (values op new-id)."
+(as if pulled from that author).  Returns (values op new-id).
+
+Built via %MAKE-VERTEX, the engine's own node-construction primitive
+(GH #135) -- not MAKE-<type>, which would CREATE-NODE the node into GRAPH via
+its own implicit transaction (ENSURE-TRANSACTION) before
+APPLY-PEER-AUTHORED-OP ever ran, defeating the point of these tests: proving
+the peer-apply path itself populates the unique index, not the ordinary
+local-commit path it's standing in for."
   (let* ((tid (graph-db::node-type-id
                (graph-db::lookup-node-type-by-name type :vertex :graph graph)))
          (nid (gen-id))
-         (n (make-instance type :id nid :type-id tid :revision 0)))
+         (n (graph-db::%make-vertex :class type :id nid
+                                    :type-id tid :revision 0)))
     (setf (graph-db::data n) data)
     (values (graph-db::make-peer-op
              :kind :authored :op-id (graph-db::gen-op-id) :origin origin
@@ -141,7 +149,10 @@ pulled tuple's constraint against a later local duplicate."
     (let* ((tid (graph-db::node-type-id
                  (graph-db::lookup-node-type-by-name
                   'pu-claim :vertex :graph g)))
-           (n (make-instance 'pu-claim :id (gen-id) :type-id tid :revision 0)))
+           ;; %MAKE-VERTEX, not a bare (MAKE-INSTANCE 'pu-claim ...): see
+           ;; PU-AUTHORED-CREATE's docstring above (GH #135).
+           (n (graph-db::%make-vertex :class 'pu-claim :id (gen-id)
+                                      :type-id tid :revision 0)))
       (setf (graph-db::data n) '((:ns . "sync") (:ky . "s1")))
       (graph-db::apply-peer-create-writes
        g 7777 (list (make-instance 'graph-db::tx-create :node n))

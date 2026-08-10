@@ -80,16 +80,25 @@ staying in/out keeps/drops.  (Generalises filter-writes with slave presence.)"
              (mv (lambda (src lon-lat-geom)            ; copy SRC, set its loc
                    (let ((v (copy src)))
                      (setf (slot-value v 'loc) lon-lat-geom) v)))
-             (w-p-out (make-instance 'graph-db::tx-update
-                                     :node (funcall mv live-p lviv) :old-node live-p))
-             (w-p-in  (make-instance 'graph-db::tx-update
-                                     :node (funcall mv live-p (make-point 37.177d0 49.205d0))
-                                     :old-node live-p))
-             (w-a-in  (make-instance 'graph-db::tx-update
-                                     :node (funcall mv a (make-point 37.178d0 49.205d0))
-                                     :old-node a))
-             (w-a-out (make-instance 'graph-db::tx-update
-                                     :node (funcall mv a lviv) :old-node a)))
+             w-p-out w-p-in w-a-in w-a-out)
+        ;; COPY only registers a copy as writable against a live *TRANSACTION*
+        ;; (GH #135); building these synthetic tx-updates outside one relied on
+        ;; unsupported behaviour (a bare warning today, not a contract).
+        (with-transaction ()
+          (setq w-p-out (make-instance
+                        'graph-db::tx-update
+                        :node (funcall mv live-p lviv) :old-node live-p))
+          (setq w-p-in  (make-instance
+                        'graph-db::tx-update
+                        :node (funcall mv live-p (make-point 37.177d0 49.205d0))
+                        :old-node live-p))
+          (setq w-a-in  (make-instance
+                        'graph-db::tx-update
+                        :node (funcall mv a (make-point 37.178d0 49.205d0))
+                        :old-node a))
+          (setq w-a-out (make-instance
+                        'graph-db::tx-update
+                        :node (funcall mv a lviv) :old-node a)))
         (flet ((one (w) (graph-db::reconcile-slave-writes (list w) filter g)))
           ;; present + leaves subset -> delete
           (let ((r (one w-p-out)))

@@ -117,6 +117,7 @@
            #:*read-snapshots*
            #:read-transaction
            #:no-transaction-in-progress
+           #:mutating-unregistered-node
 
            #:def-node-type
            #:def-vertex

@@ -850,7 +850,12 @@ RESTORE-VIEWS."
                                 type-vertex type-edge ve-in ve-out vev spatial views
                                 unique
                            &allow-other-keys)
-          (cl-store:restore file)
+          ;; CL-STORE reconstructs each node's persistent slots via (SETF
+          ;; SLOT-VALUE-USING-CLASS), outside any transaction.  This is
+          ;; materialization from durable bytes, not user mutation -- the
+          ;; case *INITIALIZING-NODE* exists for (GH #135).
+          (let ((*initializing-node* t))
+            (cl-store:restore file))
         (declare (ignore highest-tx-id))
         ;; The image never carries a node's graph, so stamp on the way in --
         ;; the rebuild below uses these nodes before any lookup (GH #53).

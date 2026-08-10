@@ -141,6 +141,23 @@ per graph and may compose; read-write transactions are not (GH #53).")
              (format stream "Modifying ~A without copying first"
                      (modifying-non-copy-node condition)))))
 
+(define-condition mutating-unregistered-node (error)
+  ((node
+    :initarg :node
+    :reader mutating-unregistered-node-node)
+   (slot
+    :initarg :slot
+    :reader mutating-unregistered-node-slot))
+  (:report
+   (lambda (condition stream)
+     (format stream
+             "Cannot write persistent slot ~A of ~A: this transaction may ~
+              write only a node it created, or a COPY it registered.  A node ~
+              from LOOKUP-* is the shared cached instance -- COPY it inside ~
+              the transaction, SETF the copy, then SAVE it."
+             (mutating-unregistered-node-slot condition)
+             (mutating-unregistered-node-node condition)))))
+
 ;;; Transaction manager
 (defgeneric create-transaction (transaction-manager))
 (defgeneric cleanup-transaction (transaction))

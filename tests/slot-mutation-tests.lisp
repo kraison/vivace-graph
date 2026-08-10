@@ -79,3 +79,52 @@ and the guard is a fix -- update this test's name and docstring accordingly."
       ;; Deliberately asserts only that we learned something: the printed
       ;; result is the deliverable.  Task 4 replaces this with a real gate.
       (is (or opened-ok (not opened-ok))))))
+
+(test pattern-d-setf-on-looked-up-node-signals
+  "PATTERN D (GH #135).  LOOKUP-NODE returns the SHARED cached instance, so a
+SETF on it mutates state every other reader and thread can see, is never
+persisted, and reads back correctly until restart.  This is what COPY exists
+to prevent."
+  (with-temp-directory (dir)
+    (let (id)
+      (with-sm-graph (g dir)
+        (with-transaction () (setq id (id (make-sm-thing :name "X"))))
+        (with-transaction ()
+          (signals graph-db:mutating-unregistered-node
+            (setf (note (lookup-vertex id :graph g)) "no copy")))))))
+
+(test setf-outside-any-transaction-signals
+  "The same write with no transaction at all: also unregistered, also signals."
+  (with-temp-directory (dir)
+    (let (id)
+      (with-sm-graph (g dir)
+        (with-transaction () (setq id (id (make-sm-thing :name "X"))))
+        (signals graph-db:mutating-unregistered-node
+          (setf (note (lookup-vertex id :graph g)) "no txn"))))))
+
+(test setf-on-a-copy-is-allowed
+  "PATTERN C is unchanged: a copy registered by COPY is writable, and persists."
+  (with-temp-directory (dir)
+    (let (id)
+      (with-sm-graph (g dir)
+        (with-transaction () (setq id (id (make-sm-thing :name "X"))))
+        (with-transaction ()
+          (let ((c (copy (lookup-vertex id :graph g))))
+            (setf (note c) "via copy")
+            (save c))))
+      (with-sm-reopen (g dir)
+        (is (equal "via copy" (note (lookup-vertex id :graph g))))))))
+
+(test ephemeral-and-meta-slots-stay-mutable
+  "The guard covers PERSISTENT slots only.  Ephemeral and meta slots are real
+CLOS slots holding per-instance state and must stay freely writable -- guarding
+them would be a regression."
+  (with-temp-directory (dir)
+    (let (id)
+      (with-sm-graph (g dir)
+        (with-transaction () (setq id (id (make-sm-thing :name "X"))))
+        (let ((n (lookup-vertex id :graph g)))
+          (finishes (setf (e1 n) :ephemeral-ok))
+          (finishes (setf (m1 n) :meta-ok))
+          (is (eq :ephemeral-ok (e1 n)))
+          (is (eq :meta-ok (m1 n))))))))
