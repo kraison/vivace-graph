@@ -111,7 +111,7 @@ between tenants.
   :extra-slots ((weight :type double-float)))
 ```
 
-expands to three `def-vertex` forms and four declarations:
+expands to three `def-vertex` forms and five declarations:
 
 ```
 site-claim              parent -- shared slots + :extra-slots
@@ -124,6 +124,7 @@ def-unique site-claim-binary (producer subject-namespace subject-key
                               object-namespace object-key relation)
 def-index  site-claim         (subject-namespace subject-key)
 def-index  site-claim-binary  (object-namespace object-key)
+def-index  site-claim         (producer)
 ```
 
 **`:extra-slots` go on the parent**, so both arities inherit them and the tenant
@@ -135,6 +136,10 @@ the parent would also work — `%applicable-index-descriptors` requires every na
 slot to exist in the class, so it would silently restrict itself to the subclass
 that has them — but relying on a rule to rescue a declaration that reads as a
 mistake is worse than putting it where it belongs.
+
+**The producer index is declared on the parent too**, reaching both arities the
+same way the subject index does. It exists so the regeneration sweep
+(`delete-claims-by-producer`, §6.4) is an index lookup, not a full scan.
 
 ---
 
@@ -231,9 +236,21 @@ engine already serializes, so the persistent slot — named `extent-sexp`, so th
 stored form and the decoded value never share a name — holds that list and **no
 serialize type byte is reserved**. S1a's no-core-change property carries forward.
 
-`claim-extent` decodes on read and `(setf claim-extent)` encodes on write, so
-callers see a `temporal-extent` and never the wire form. Nothing stops a caller
-reaching `extent-sexp` directly; it is not hidden, only unnecessary.
+**Construction is the write path.** The engine only persists values supplied at
+construction; a `setf` on a slot of a node that has not yet committed is silently
+lost across a close/reopen (GH #135) — the node's bytes are already cached by the
+time the `setf` runs, so the mutation is visible in memory but never reaches
+disk. `make-<arity>` therefore accepts `:extent` directly: the constructor
+wrapper encodes it via `extent->sexp` into `extent-sexp` before the node is
+built, so it is part of the node's initial bytes rather than a later mutation.
+
+`claim-extent` decodes `extent-sexp` back into a `temporal-extent` on read, so
+callers never see the wire form. `(setf claim-extent)` still exists, but its job
+is narrower than "the ordinary write path": it is for mutating a claim already
+read back from the graph, under the engine's usual `copy`, mutate, `save`
+pattern — never for a claim still inside the transaction that created it. Nothing
+stops a caller reaching `extent-sexp` directly; it is not hidden, only
+unnecessary.
 
 Decoding on every read is a real cost. It is cheap enough to ignore until
 measured; the programme's §11 discipline is to measure rather than guess.
