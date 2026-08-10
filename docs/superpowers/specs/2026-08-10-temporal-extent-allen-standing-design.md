@@ -111,29 +111,39 @@ the other pair of endpoints settles it. `[2030, :unbounded]` against
 far either side runs. Only the comparison that no endpoint pair can settle is
 `:ambiguous`.
 
-**A `:interval` may not be value-degenerate.** `make-interval` signals
-`invalid-extent` when its two bounds compare `:=` — both exact and equal —
-directing the caller to `make-instant`.
+**A `:interval` must be well-formed.** `make-interval` signals `invalid-extent`
+when its two bounds compare `:=` — both exact and equal, a point in time —
+directing the caller to `make-instant`; and again when they compare `:>` —
+`end` strictly precedes `start`, a reversed and incoherent extent. Both
+comparisons are `bound-compare` (§3.1), not a raw timestamp check, so a
+*ranged* pair whose end-window sits entirely before its start-window is
+rejected exactly as an exact reversed pair is.
 
-Without that rule a point in time has two spellings, `kind :instant` and a
+Without the `:=` rule a point in time has two spellings, `kind :instant` and a
 collapsed `:interval`, and only one of them works: the signature table in §4.1
 assumes `start < end` strictly, so a degenerate interval against another
 degenerate interval computes `(:= := := :=)`, matches no row, and yields the
 empty set. Found by §7.1's soundness property on its first run, which is what
-that property is for.
+that property is for. Without the `:>` rule a reversed extent constructs
+silently and `allen-relations` returns a confident, wrong answer for it — the
+same hole, one comparison result over (GH #130).
 
 Rejecting is the fix rather than widening the table, because extra rows would
 re-open the disjointness collision §3.3.1 resolves. The bad state becomes
 unrepresentable rather than handled — the same move §3.4 makes for standing.
 
-Intervals whose endpoint *ranges* merely overlap stay legal: their ordering is
-uncertain, not collapsed, and rejecting them would forbid a legitimate record.
+Intervals whose endpoint *ranges* merely overlap stay legal: `bound-compare`
+reads that as `:ambiguous`, not `:>`, so their ordering is uncertain, not
+reversed, and rejecting them would forbid a legitimate record.
 
 **Intervals are closed, `[start, end]`.** This is Allen's own convention and it
 is what makes `meets` mean anything: A's end and B's start are the same
-instant, not merely adjacent. Granule ends are therefore the last representable
-instant of the granule — `2026-01-31T23:59:59.999999999Z` for January at month
-precision — which is what the UTC arithmetic in §3.5 produces.
+instant, not merely adjacent. A closed `[start, end]` also presupposes
+`start` precedes `end` — which is exactly what the well-formedness rule above
+now enforces, rather than merely assuming. Granule ends are therefore the
+last representable instant of the granule — `2026-01-31T23:59:59.999999999Z`
+for January at month precision — which is what the UTC arithmetic in §3.5
+produces.
 
 **`precision` never enters comparison.** It is what *produced* a bound's width
 at construction, retained for rendering and provenance. The width already
@@ -247,8 +257,32 @@ differently on two machines. Every construction passes
 `:timezone local-time:+utc-zone+` explicitly.
 
 Zero the parts below the precision to get the granule start. Get the granule
-end by **encoding the next granule's start explicitly and subtracting one
-nanosecond** — never by adding one unit with `local-time:timestamp+`.
+end by computing the *next* granule's start and subtracting one nanosecond —
+but the next granule's start is not computed the same way for every
+precision, because `local-time:timestamp+` is UTC-safe for some units and not
+others.
+
+**`:year` and `:month` carry explicitly, because a calendar-unit step through
+`timestamp+` is not UTC-safe.** Passed `:year`, `:month` or `:day`,
+`timestamp+` performs calendar arithmetic in `local-time:*default-timezone*`
+— it takes no `:timezone` argument — so on any DST-observing host the result
+shifts by an hour across a transition. Measured on a host in EET:
+
+| granule | `timestamp+ :day/:month` gives | correct |
+|---|---|---|
+| March 2026 | `2026-03-31T22:59:59Z` | `2026-03-31T23:59:59Z` |
+| October 2026 | `2026-11-01T00:59:59Z` | `2026-10-31T23:59:59Z` |
+| 2026-03-29, `:day` | 82800s long | 86400s |
+
+The October row is the dangerous one: the granule **spills into November**, so
+two adjacent month granules *overlap* instead of meeting — corrupting the
+algebra rather than merely the boundary. `:year` and `:month` avoid this by
+never taking that path: their next-granule start is an explicit
+`local-time:encode-timestamp` call on the next calendar field (`1+ year`, or
+`next-month`/`next-year` with December carrying), always with
+`:timezone local-time:+utc-zone+`. A calendar unit's length varies (28–31
+days, 365–366 days), so there is no fixed duration to add; carrying the
+calendar field is the only correct move.
 
 ```lisp
 (let* ((z local-time:+utc-zone+)
@@ -259,23 +293,22 @@ nanosecond** — never by adding one unit with `local-time:timestamp+`.
   ...)
 ```
 
-**`timestamp+` is not UTC-safe for calendar units and takes no `:timezone`
-argument.** It performs `:year`, `:month` and `:day` arithmetic in
-`local-time:*default-timezone*`, so on any DST-observing host the result
-shifts by an hour across a transition. Measured on a host in EET:
+**`:day`, `:hour`, `:minute` and `:second` add a fixed second count instead,
+which *is* UTC-safe.** Each of these has a fixed duration — a day is always
+86400 seconds, an hour always 3600 — so their next-granule start is this
+granule's own start plus that duration, added via `(timestamp+ start n :sec)`.
+This is safe for a reason the table above does not contradict: `timestamp+`
+only reads `*default-timezone*` for its *calendar*-unit arguments (`:year`,
+`:month`, `:day`-as-a-step); its `:sec` path is pure elapsed-time arithmetic
+and never consults a timezone at all. The trap in the table is passing `:day`
+to `timestamp+` as a calendar step (row three); adding `86400 :sec` — a
+duration, not a calendar unit — is exact regardless of host timezone or DST,
+which is what the code actually does for these four precisions.
 
-| granule | `timestamp+` gives | correct |
-|---|---|---|
-| March 2026 | `2026-03-31T22:59:59Z` | `2026-03-31T23:59:59Z` |
-| October 2026 | `2026-11-01T00:59:59Z` | `2026-10-31T23:59:59Z` |
-| 2026-03-29, `:day` | 82800s long | 86400s |
-
-The October row is the dangerous one: the granule **spills into November**, so
-two adjacent month granules *overlap* instead of meeting — corrupting the
-algebra rather than merely the boundary.
-
-Encoding the next granule's start keeps every unit in UTC by construction, and
-still gets February and leap years right without a table.
+Splitting the two paths — explicit calendar carry for `:year`/`:month`, fixed
+UTC seconds for everything sub-day — keeps every granule boundary pinned to
+an absolute instant, and still gets February and leap years right without a
+table.
 
 This was found by the real `serialize`/`deserialize` round trip added in the
 conformance work, on an instant built from a DST-affected month. The structural

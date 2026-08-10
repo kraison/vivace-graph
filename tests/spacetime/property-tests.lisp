@@ -64,8 +64,8 @@ path (ranged vs ranged) get exercised."
 extent with EXACT bounds.  :UNBOUNDED is drawn from a window well outside
 the January range the generators use, so it stays outside every interval.
 For an interval, END is picked STRICTLY after the chosen START -- never
-equal, since MAKE-INTERVAL now rejects that, and never earlier, since no
-caller could construct that (GH #130)."
+equal and never earlier, since MAKE-INTERVAL now rejects both := and :>
+(GH #130)."
   (labels ((pick (b)
              (let ((lo (bound-earliest b))
                    (hi (bound-latest b)))

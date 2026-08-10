@@ -139,3 +139,31 @@ uncertain, not collapsed, and must still construct (GH #130)."
   (let ((e (make-interval (make-bound (ts 2026 1 10) (ts 2026 1 20))
                           (make-bound (ts 2026 1 15) (ts 2026 1 25)))))
     (is (eq :interval (extent-kind e)))))
+
+(test make-interval-rejects-a-reversed-exact-pair
+  "Design §3.2, GH #130.  END strictly before START is incoherent, not
+merely degenerate, and used to construct silently."
+  (signals invalid-extent
+    (make-interval (exact-bound (ts 2026 6 1)) (exact-bound (ts 2026 1 1)))))
+
+(test make-interval-rejects-a-reversed-ranged-pair
+  "Design §3.2, GH #130.  A ranged pair whose END range is entirely before
+its START range is still reversed -- BOUND-COMPARE reads :> here, not just
+for exact bounds -- and ALLEN-RELATIONS must never see it."
+  (signals invalid-extent
+    (make-interval (make-bound (ts 2026 6 1) (ts 2026 6 10))
+                   (make-bound (ts 2026 1 1) (ts 2026 1 10)))))
+
+(test make-interval-still-accepts-merely-overlapping-ranges
+  "Design §3.2, GH #130.  Ranges that overlap compare :AMBIGUOUS, not :>
+-- their order is uncertain, not reversed, and this must keep constructing."
+  (let ((e (make-interval (make-bound (ts 2026 1 10) (ts 2026 1 20))
+                          (make-bound (ts 2026 1 15) (ts 2026 1 25)))))
+    (is (eq :interval (extent-kind e)))))
+
+(test make-granule-interval-signals-at-nsec-precision
+  "Design §3.5.  A :NSEC granule's start and end coincide, so the
+well-formedness guard rejects it -- use MAKE-GRANULE-INSTANT for a single
+timestamp known only to the nanosecond."
+  (signals invalid-extent
+    (make-granule-interval (ts 2026 1 15) :nsec)))

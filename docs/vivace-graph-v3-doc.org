@@ -2724,11 +2724,15 @@ onto the other:
 
 An ~:INTERVAL~'s endpoints are both inclusive — ~[START, END]~, not a
 half-open range — so ~MAKE-INTERVAL~ rejects a ~START~ = ~END~ pair as
-ill-formed: that is a point in time, and ~MAKE-INSTANT~ is what builds one.
-~GRANULE-BOUNDS~, and the two granule constructors built on it, always decode
-and encode in UTC regardless of the host's ambient timezone, so a granule
-boundary is a fixed absolute instant rather than one that moves depending on
-where the code happens to run.
+ill-formed: that is a point in time, and ~MAKE-INSTANT~ is what builds one. It
+likewise rejects a *reversed* pair, ~END~ strictly before ~START~ — including
+a ranged pair whose end-window sits entirely before its start-window, not
+only an exact one — since a closed interval presupposes ~START~ precedes
+~END~ (GH #130). Endpoint ranges that merely overlap are still legal: their
+order is uncertain, not reversed. ~GRANULE-BOUNDS~, and the two granule
+constructors built on it, always decode and encode in UTC regardless of the
+host's ambient timezone, so a granule boundary is a fixed absolute instant
+rather than one that moves depending on where the code happens to run.
 
 *** Worked examples
 

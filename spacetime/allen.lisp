@@ -22,7 +22,8 @@ own inverse.")
 (defun allen-inverse (relation)
   "The relation R such that (R b a) holds exactly when (RELATION a b) does."
   (or (cdr (assoc relation +allen-inverses+))
-      (error 'spacetime-error)))
+      (error 'invalid-extent
+             :reason (format nil "~S is not an Allen relation" relation))))
 
 (defparameter +allen-signatures+
   ;; (relation s1?s2 s1?e2 e1?s2 e1?e2), read off canonical NON-degenerate

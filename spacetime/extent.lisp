@@ -37,10 +37,16 @@ SAME bound object -- that identity is the endpoint coupling (design §3.3)."
                                      (standing :observed))
   "An extent spanning [START, END], both BOUNDs, whose endpoints move
 independently.  Intervals are closed (design §3.2).  Signals INVALID-EXTENT
-when START and END compare := -- that is a point in time; use MAKE-INSTANT."
-  (when (eq (bound-compare start end) :=)
-    (error 'invalid-extent
-           :reason "START = END exactly -- a point in time; use MAKE-INSTANT"))
+when START and END compare := -- that is a point in time; use MAKE-INSTANT
+-- or :> -- END precedes START, a reversed and incoherent extent."
+  (ecase (bound-compare start end)
+    (:=
+     (error 'invalid-extent
+            :reason
+            "START = END exactly -- a point in time; use MAKE-INSTANT"))
+    (:>
+     (error 'invalid-extent :reason "END precedes START"))
+    ((:< :ambiguous) nil))
   (%make-extent :interval start end
                 (%check-precision precision) semantics
                 (check-standing standing)))
@@ -121,7 +127,9 @@ TIMESTAMP, as two values, computed in UTC (design §3.5)."
 
 (defun make-granule-interval (timestamp precision &rest args)
   "The granule itself, as an interval with EXACT endpoints -- \"January
-2026\".  Contrast MAKE-GRANULE-INSTANT (design §3.3)."
+2026\".  Contrast MAKE-GRANULE-INSTANT (design §3.3).  At :NSEC the granule
+is a single instant, so START = END and this signals INVALID-EXTENT; use
+MAKE-GRANULE-INSTANT instead."
   (%check-precision precision)
   (multiple-value-bind (start end) (granule-bounds timestamp precision)
     (apply #'make-interval (exact-bound start) (exact-bound end)
