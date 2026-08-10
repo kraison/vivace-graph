@@ -90,3 +90,35 @@ CLOSER-MOP is not loaded here and this test package sees neither."
       (with-transaction ()
         (make-ct-claim-unary :subject-namespace :ns :subject-key "s"
                              :relation :r :producer :p :standing :probably)))))
+
+(test a-graph-holding-claims-closes-and-reopens-cleanly
+  "Regression test for GH #131: an earlier STANDING check hooked
+UPDATE-INSTANCE-FOR-DIFFERENT-CLASS, which also fires while an existing node
+is deserialized (its DATA alist not populated yet) -- CLOSE-GRAPH's snapshot
+silently failed for any graph holding claim data.  The wrapped-constructor
+approach must not reintroduce that (design §5)."
+  (with-temp-directory (dir)
+    (let ((path (namestring dir)) uid bid)
+      (let ((g (make-graph *claim-graph-name* path :buffer-pool-size 1000)))
+        (let ((graph-db:*graph* g))
+          (with-transaction ()
+            (setq uid (id (make-ct-claim-unary
+                           :subject-namespace :ns :subject-key "s"
+                           :relation :r :producer :p :standing :observed)))
+            (setq bid (id (make-ct-claim-binary
+                           :subject-namespace :ns :subject-key "s"
+                           :relation :r :object-namespace :ns
+                           :object-key "o" :producer :p
+                           :standing :observed))))
+          (close-graph g)))              ; :snapshot-p t (default)
+      (let ((g2 (open-graph *claim-graph-name* path)))
+        (unwind-protect
+             (let ((graph-db:*graph* g2))
+               (let ((u (lookup-ct-claim-unary uid))
+                     (b (lookup-ct-claim-binary bid)))
+                 (is-true u)
+                 (is-true b)
+                 (is (eq :observed (claim-standing u)))
+                 (is (eq :observed (claim-standing b)))))
+          (ignore-errors (close-graph g2))
+          (collect-garbage))))))
