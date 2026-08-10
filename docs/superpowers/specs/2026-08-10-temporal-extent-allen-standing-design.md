@@ -97,9 +97,20 @@ bound
 
 `:unbounded` is **polarised by position**: in `earliest` it denotes negative
 infinity, in `latest` positive infinity. A bound of `(:unbounded, :unbounded)`
-is therefore "anywhere in time", not an error and not an empty range. Both
-comparisons involving an unbounded side are `ambiguous` unless the other side
-is unbounded in the same direction.
+is therefore "anywhere in time", not an error and not an empty range.
+
+`:unbounded` never satisfies a strict inequality, so it can never *produce* a
+definite verdict — but a comparison involving it can still *be* definite when
+the other pair of endpoints settles it. `[2030, :unbounded]` against
+`[:unbounded, 2020]` is definitely `:>`, because 2030 > 2020 regardless of how
+far either side runs. Only the comparison that no endpoint pair can settle is
+`:ambiguous`.
+
+**Intervals are closed, `[start, end]`.** This is Allen's own convention and it
+is what makes `meets` mean anything: A's end and B's start are the same
+instant, not merely adjacent. Granule ends are therefore the last representable
+instant of the granule — `2026-01-31T23:59:59.999999999Z` for January at month
+precision — which is what the UTC arithmetic in §3.5 produces.
 
 **`precision` never enters comparison.** It is what *produced* a bound's width
 at construction, retained for rendering and provenance. The width already
@@ -135,6 +146,50 @@ humble.
 `kind :instant` couples the two endpoints to one bound. This is what "an
 instant is a degenerate interval" has to mean concretely.
 
+**One option is explicitly ruled out.** Giving an instant a granule-width
+interval — "sometime in January" *becomes* the January interval — would restore
+`start < end` and let classical Allen apply untouched. It also makes the two
+extents above identical again, which is the bug this section exists to prevent.
+Recorded so it is not re-proposed as a simplification.
+
+### 3.3.1 Degenerate intervals and the thirteen
+
+Allen's thirteen relations are jointly exhaustive and pairwise disjoint **only
+where `start < end` strictly**. `kind :instant` puts us outside that domain by
+construction, and the collision is not hypothetical: an instant at
+`2026-01-02T00:00:00Z` against `[Jan 2, Jan 3]` satisfies both `meets`
+(`e1 = s2`) and `starts` (`s1 = s2 ∧ e1 < e2`).
+
+Returning both would look like honest uncertainty while actually being a
+definitional collision — indistinguishable, downstream, from a real ambiguity,
+and therefore worse than the failure §3.3 prevents.
+
+**Resolution: one closed vocabulary, with degenerate cases folded onto it by
+documented rule.** For an instant against an interval:
+
+| instant lies | relation |
+|---|---|
+| before the interval | `:before` |
+| coincident with its start | `:starts` |
+| strictly inside | `:during` |
+| coincident with its end | `:finishes` |
+| after the interval | `:after` |
+
+`:meets`, `:overlaps`, `:contains`, `:finished-by`, `:started-by`, `:equals`
+and the remaining inverses are **unreachable** when either side is an instant
+and the other an interval. Instant against instant yields only `:before`,
+`:equals`, `:after`.
+
+The tie-break is principled rather than arbitrary: under closed intervals a
+point at B's start *is* inside B, so `starts` — coincident beginning plus
+containment — states strictly more than `meets` does, and `meets` states
+nothing `starts` does not.
+
+The alternative considered was a Vilain-style point-interval sub-algebra with
+its own relation names. Rejected because `temporal-relation` would stop being
+one closed set, and every consumer — including S4's Prolog functor — would have
+to branch on which algebra produced a result.
+
 ### 3.4 Standing is orthogonal to precision
 
 `standing` is `observed | inferred | asserted | searched-empty | uncovered |
@@ -154,6 +209,34 @@ area rendered downstream as a confident claim of full coverage. The API must
 make that collapse **unrepresentable**, not merely reviewed against.
 
 ---
+
+### 3.5 Granules are computed in UTC
+
+A precision-P record like "January 2026" denotes the granule
+`[2026-01-01T00:00:00.000000000Z, 2026-01-31T23:59:59.999999999Z]`. The
+constructor derives those two timestamps from the precision.
+
+**Pinned to UTC, always.** `local-time:encode-timestamp` uses
+`local-time:*default-timezone*` unless told otherwise, so an unpinned
+constructor would put January's boundaries at a different absolute instant on a
+host in Helsinki than on one in UTC — and the same source record would compare
+differently on two machines. Every construction passes
+`:timezone local-time:+utc-zone+` explicitly.
+
+The arithmetic, verified against `local-time` before this spec was written:
+
+```lisp
+(let* ((z local-time:+utc-zone+)
+       (start (local-time:encode-timestamp 0 0 0 0 1 month year :timezone z))
+       (end   (local-time:timestamp- (local-time:timestamp+ start 1 :month)
+                                     1 :nsec)))
+  ...)
+```
+
+Zero the parts below the precision to get the granule start; add one unit of
+the precision and subtract one nanosecond to get the granule end. Uniform
+across `:year` through `:nsec`, and it gets February and leap years right
+without a table.
 
 ## 4. The algebra
 
@@ -182,6 +265,9 @@ are closed, unlike `semantics` and `standing`.
 ```
 
 `:equals` is its own inverse, which is why thirteen and not fourteen.
+
+Not all thirteen are reachable for every pair: §3.3.1 restricts which apply
+when either extent is an instant. The vocabulary stays closed regardless.
 
 ### 4.3 Surface
 
@@ -294,8 +380,14 @@ instant bug of §3.3, which soundness alone would pass.
 
 ### 7.3 Exactness
 
-Extents with exact endpoints return singletons equal to classical Allen, and
-the thirteen relations remain jointly exhaustive and pairwise disjoint there.
+Two **interval** extents with exact endpoints return singletons equal to
+classical Allen, and the thirteen relations are jointly exhaustive and pairwise
+disjoint there.
+
+Where either side is an **instant**, exact endpoints must still return a
+singleton — the one §3.3.1's table names — and the relations that section marks
+unreachable must never appear. That is the assertion that catches a
+reintroduced `meets`/`starts` collision.
 
 ### 7.4 Absence-vs-value conformance
 
