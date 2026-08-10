@@ -414,7 +414,8 @@
                (:file "conformance-tests")
                (:file "claim-tests")
                (:file "claim-identity-tests")
-               (:file "claim-query-tests"))
+               (:file "claim-query-tests")
+               (:file "claim-concurrency-tests"))
   :perform (test-op (op c)
                     (unless (uiop:symbol-call :graph-db/spacetime-test
                                               :run-spacetime-tests)
