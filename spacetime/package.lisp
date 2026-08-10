@@ -11,6 +11,8 @@
   (:export
    ;; conditions
    #:spacetime-error #:invalid-standing #:invalid-bound #:invalid-extent
+   #:missing-claim-identity-component
+   #:missing-claim-identity-component-slot
    ;; standing
    #:standing #:standingp #:standing-absence-p #:standing-present-p
    #:check-standing #:+standings+ #:+absence-standings+

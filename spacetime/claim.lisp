@@ -53,20 +53,48 @@ package so two claim families share one set of accessors (design §5).")
         unless (eq k key)
           collect k and collect v))
 
+(defun %plist-key-p (plist key)
+  "True when KEY occupies a KEY position in PLIST.  MEMBER would also match
+KEY sitting in a VALUE position -- :EXTENT is a legal open-vocabulary
+RELATION, so (MAKE-B :RELATION :EXTENT ...) must not spuriously trip an
+:EXTENT check (GH #131 finding 6)."
+  (loop for (k) on plist by #'cddr thereis (eq k key)))
+
 (defun %claim-encode-extent-arg (args)
   "Rewrite a claim constructor's ARGS: an :EXTENT is encoded via
 EXTENT->SEXP and passed through as :EXTENT-SEXP, the slot that actually
 persists.  The value must arrive at construction -- a SETF on a node not
 yet committed is silently lost, not merely deferred (GH #135).  Signals
 if both :EXTENT and :EXTENT-SEXP are given, rather than picking one."
-  (if (member :extent args)
+  (if (%plist-key-p args :extent)
       (progn
-        (when (member :extent-sexp args)
+        (when (%plist-key-p args :extent-sexp)
           (error "Pass only one of :EXTENT or :EXTENT-SEXP, not both."))
         (let ((extent (getf args :extent)))
           (list* :extent-sexp (and extent (extent->sexp extent))
                  (%plist-remove args :extent))))
       args))
+
+(defparameter +claim-identity-slots+
+  '(:producer :subject-namespace :subject-key :relation)
+  "Every claim's identity components -- the UNARY constraint tuple.
+BINARY adds +CLAIM-OBJECT-IDENTITY-SLOTS+.  DEF-UNIQUE exempts any tuple
+containing a null, so a caller who omits one of these is silently exempt
+from the constraint unless every component is checked non-nil first
+(design §3.1, GH #131 finding 1).")
+
+(defparameter +claim-object-identity-slots+
+  '(:object-namespace :object-key)
+  "BINARY-CLAIM's identity components beyond +CLAIM-IDENTITY-SLOTS+.")
+
+(defun %check-claim-identity (args keys)
+  "Signal MISSING-CLAIM-IDENTITY-COMPONENT naming the first of KEYS that is
+absent or NIL in ARGS.  Checked on the raw constructor arguments, before
+the node is built, so a caller who omits one never gets even a transient
+claim (design §3.1, GH #131 finding 1)."
+  (dolist (key keys)
+    (when (null (getf args key))
+      (error 'missing-claim-identity-component :slot key))))
 
 (defparameter +claim-object-slots+
   '((object-namespace :initarg :object-namespace
@@ -126,16 +154,20 @@ DATA alist is not populated yet -- it would reject already-valid claims."
        ;; DEF-VERTEX redefines each raw constructor on every expansion, so
        ;; this cannot double-wrap on a re-evaluated DEF-CLAIM-CLASSES form.
        ,@(mapcar
-          (lambda (class)
+          (lambda (class identity-keys)
             (let ((ctor (intern (format nil "MAKE-~A" class))))
               `(let ((%raw (fdefinition ',ctor)))
                  (setf (fdefinition ',ctor)
                        (lambda (&rest args)
+                         (%check-claim-identity args ',identity-keys)
                          (let ((c (apply %raw
                                         (%claim-encode-extent-arg args))))
                            (check-standing (claim-standing c))
                            c))))))
-          (list unary binary))
+          (list unary binary)
+          (list +claim-identity-slots+
+                (append +claim-identity-slots+
+                        +claim-object-identity-slots+)))
        (setf (gethash ',parent *claim-families*)
              (%make-claim-family ',parent ',unary ',binary))
        ',parent)))

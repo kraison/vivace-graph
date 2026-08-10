@@ -23,3 +23,10 @@
   ((reason :initarg :reason :reader invalid-extent-reason))
   (:report (lambda (c s)
              (format s "Bad extent: ~A." (invalid-extent-reason c)))))
+
+(define-condition missing-claim-identity-component (spacetime-error)
+  ((slot :initarg :slot :reader missing-claim-identity-component-slot))
+  (:report (lambda (c s)
+             (format s "~S is a claim identity component and may not ~
+                        be NIL (design §3.1)."
+                     (missing-claim-identity-component-slot c)))))
