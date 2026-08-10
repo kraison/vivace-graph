@@ -385,7 +385,8 @@
   :serial t
   :components ((:file "package")
                (:file "conditions")
-               (:file "standing")))
+               (:file "standing")
+               (:file "bound")))
 
 (defsystem graph-db/spacetime-test
   :name "VivaceGraph spacetime test suite"
@@ -395,7 +396,8 @@
   :serial t
   :components ((:file "package")
                (:file "suite")
-               (:file "standing-tests"))
+               (:file "standing-tests")
+               (:file "bound-tests"))
   :perform (test-op (op c)
                     (unless (uiop:symbol-call :graph-db/spacetime-test
                                               :run-spacetime-tests)
