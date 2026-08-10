@@ -79,6 +79,18 @@ DATA alist is not populated yet -- it would reject already-valid claims."
        (graph-db:def-vertex ,unary (,parent) () ,graph-name)
        (graph-db:def-vertex ,binary (,parent) (,@+claim-object-slots+)
            ,graph-name)
+       ;; The unary constraint goes on UNARY, never on PARENT: PARENT has
+       ;; exactly the unary slot set, so declaring it there would bind
+       ;; BINARY too (CLASS-UNIQUE-TUPLE-SPECS matches on SUBTYPEP) and
+       ;; forbid one producer relating a subject to several objects
+       ;; (design §3.2).
+       (graph-db:def-unique ,unary
+           (producer subject-namespace subject-key relation)
+         ,graph-name)
+       (graph-db:def-unique ,binary
+           (producer subject-namespace subject-key
+            object-namespace object-key relation)
+         ,graph-name)
        (fmakunbound ',(intern (format nil "MAKE-~A" parent)))
        ;; DEF-VERTEX redefines each raw constructor on every expansion, so
        ;; this cannot double-wrap on a re-evaluated DEF-CLAIM-CLASSES form.
