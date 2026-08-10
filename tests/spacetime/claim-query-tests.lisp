@@ -90,6 +90,44 @@ pins that failure mode so it stays a known contract, not a regression."
     (with-transaction ()
       (is (null (claim-extent (make-u)))))))
 
+(test the-sweep-removes-only-the-named-producers-claims
+  (with-claim-graph (g)
+    (with-transaction ()
+      (make-b :producer :rule-a :object "o1")
+      (make-b :producer :rule-a :object "o2")
+      (make-u :producer :rule-a)
+      (make-b :producer :rule-b :object "o1"))
+    (is (= 3 (with-transaction ()
+               (delete-claims-by-producer g 'ct-claim :rule-a))))
+    (is (= 1 (length (claims-touching g 'ct-claim :ns "s1"))))))
+
+(test regeneration-leaves-no-orphan-when-a-rule-stops-producing-a-claim
+  "Design §6.4 -- the case the constraint alone cannot fix.  v1 produces two
+claims, v2 produces one; without the sweep the dropped claim would survive
+forever, because no upsert ever touches it."
+  (with-claim-graph (g)
+    (with-transaction ()
+      (make-b :producer :rule-a :object "kept")
+      (make-b :producer :rule-a :object "dropped"))
+    (with-transaction ()
+      (delete-claims-by-producer g 'ct-claim :rule-a)
+      (make-b :producer :rule-a :object "kept"))
+    (let ((live (claims-touching g 'ct-claim :ns "s1")))
+      (is (= 1 (length live)))
+      (is (string= "kept" (claim-object-key (first live)))))))
+
+(test the-sweep-makes-a-claim-re-insertable
+  "After a sweep the constraint must not still be holding the old key."
+  (with-claim-graph (g)
+    (with-transaction () (make-b))
+    (with-transaction () (delete-claims-by-producer g 'ct-claim :rule-a))
+    (finishes (with-transaction () (make-b)))))
+
+(test the-sweep-signals-on-an-unregistered-parent
+  (with-claim-graph (g)
+    (signals unknown-claim-family
+      (delete-claims-by-producer g 'no-such-claim :rule-a))))
+
 (test setf-claim-extent-does-not-persist-on-an-uncommitted-claim
   "Pins GH #135: a not-yet-committed node's bytes are cached at
 construction, so a plain (SETF (CLAIM-EXTENT ...)) between MAKE-<ARITY>

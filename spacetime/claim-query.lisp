@@ -49,3 +49,19 @@ close/reopen (GH #135); pass :EXTENT to the MAKE-<ARITY> constructor
 instead, which encodes it before the node's bytes are ever cached."
   (setf (claim-extent-sexp claim) (and extent (extent->sexp extent)))
   extent)
+
+(defun delete-claims-by-producer (graph claim-class producer)
+  "Mark every claim PRODUCER wrote as deleted; return how many.  CLAIM-CLASS
+is the PARENT, so one call sweeps both arities.
+
+Regeneration is sweep-then-insert, and the uniqueness constraint is NOT what
+makes it work: a rule that stops producing a claim leaves an orphan no upsert
+can remove (design §6.4).  Uses the PRODUCER index, so this is O(matching)
+rather than a scan of every claim."
+  (let ((family (claim-family claim-class))
+        (n 0))
+    (dolist (c (graph-db:index-lookup graph (claim-family-parent family)
+                                      '(producer) producer)
+             n)
+      (graph-db:mark-deleted c)
+      (incf n))))
