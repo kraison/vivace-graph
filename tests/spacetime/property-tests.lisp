@@ -99,7 +99,9 @@ endpoints must produce a relation the uncertain answer already contains.  If
 this can fail, the algebra emits confidently-wrong answers."
   (let ((state (sb-ext:seed-random-state *property-seed*))
         (checked 0)
-        (indefinite 0))
+        (indefinite 0)
+        (ii-pairs 0)
+        (ii-ambiguous 0))
     (dotimes (i *property-trials*)
       (let* ((a (random-extent state))
              (b (random-extent state))
@@ -107,7 +109,12 @@ this can fail, the algebra emits confidently-wrong answers."
              (ca (concretise a state))
              (cb (concretise b state))
              (truth (allen-relation ca cb)))
-        (when (> (length set) 1) (incf indefinite))
+        (when (> (length set) 1)
+          (incf indefinite)
+          (when (and (not (extent-instant-p a)) (not (extent-instant-p b)))
+            (incf ii-ambiguous)))
+        (unless (or (extent-instant-p a) (extent-instant-p b))
+          (incf ii-pairs))
         (when truth
           (incf checked)
           (is-true (member truth set)
@@ -115,13 +122,31 @@ this can fail, the algebra emits confidently-wrong answers."
                    set))))
     (is (> checked (floor *property-trials* 2))
         "only ~D of ~D trials concretised to a definite relation -- the ~
-         generators are not exercising the exact path"
+         generators are not exercising the exact path (the oracle side ~
+         of the property is vacuous)"
         checked *property-trials*)
     (is (> indefinite (floor *property-trials* 10))
-        "only ~D of ~D trials produced an indefinite (ambiguous) relation ~
-         set -- the generators are not exercising the uncertain path, so ~
-         a regression in the wildcard branch could pass here silently"
-        indefinite *property-trials*)))
+        "only ~D of ~D trials produced ANY indefinite relation set -- ~
+         overall ambiguity (instant- or interval-based) is too rare for ~
+         this property to mean anything"
+        indefinite *property-trials*)
+    ;; This is the guard GH #133 was about.  %COMPATIBLE-P's :AMBIGUOUS
+    ;; wildcard is reachable ONLY when BOTH extents are :INTERVAL-kind,
+    ;; so the INDEFINITE counter above (which instant-involving pairs
+    ;; dominate via RANDOM-BOUND) cannot detect a regression in it: if
+    ;; %RANGED-INTERVAL were ever reverted to always-exact bounds --
+    ;; GH #133's original vacuity -- II-AMBIGUOUS drops to exactly 0
+    ;; while INDEFINITE stays comfortably over its own threshold.  Seed
+    ;; 20260810 gives ~25 of ~96 interval-vs-interval pairs genuinely
+    ;; ambiguous (~26%); a floor of a quarter of that (6) has headroom
+    ;; against ordinary seed/count variation while still catching any
+    ;; reversion to zero, which is the only failure mode that matters.
+    (is (> ii-ambiguous 6)
+        "only ~D of ~D interval-vs-interval trials produced an ~
+         indefinite relation set -- %RANGED-INTERVAL is not generating ~
+         overlapping bounds, and a regression to always-exact intervals ~
+         (GH #133) would pass here silently"
+        ii-ambiguous ii-pairs)))
 
 (test concretising-an-extent-always-gives-a-definite-answer
   "Guards the oracle itself: if an exact pair ever went indefinite, the
