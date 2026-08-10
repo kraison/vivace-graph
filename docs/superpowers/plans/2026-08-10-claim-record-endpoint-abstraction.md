@@ -242,17 +242,6 @@ package so two claim families share one set of accessors (design §5).")
   "Slots only BINARY-CLAIM carries.  Their absence from UNARY-CLAIM is what
 makes a unary claim unable to carry an object (design §3.1).")
 
-(defclass claim-standing-mixin () ()
-  (:documentation "Specialisation point for the STANDING check.  Holds no
-slots and is never persisted; a plain STANDARD-CLASS superclass of a
-NODE-CLASS is accepted (verified on SBCL, GH #131)."))
-
-(defmethod initialize-instance :after ((c claim-standing-mixin) &key)
-  ;; STANDING is required and validated here rather than by convention
-  ;; (design §5).  Specialised on the mixin, never on T -- a T method would
-  ;; run on every object created anywhere in the image.
-  (check-standing (claim-standing c)))
-
 (defmacro def-claim-classes (parent graph-name &key extra-slots)
   "Define PARENT and its UNARY/BINARY subclasses in GRAPH-NAME, and register
 the family.  The subsystem cannot ship these classes: DEF-VERTEX binds a node
@@ -265,12 +254,29 @@ slots and the shared indexes, and carries no uniqueness constraint of its own
   (let ((unary (intern (format nil "~A-UNARY" parent)))
         (binary (intern (format nil "~A-BINARY" parent))))
     `(progn
-       (def-vertex ,parent (claim-standing-mixin)
-           (,@+claim-shared-slots+ ,@extra-slots)
+       (def-vertex ,parent () (,@+claim-shared-slots+ ,@extra-slots)
          ,graph-name)
        (def-vertex ,unary (,parent) () ,graph-name)
        (def-vertex ,binary (,parent) (,@+claim-object-slots+) ,graph-name)
        (fmakunbound ',(intern (format nil "MAKE-~A" parent)))
+       ;; STANDING is validated at construction (design §5).  Not via a CLOS
+       ;; hook: node construction goes through CHANGE-CLASS, so
+       ;; INITIALIZE-INSTANCE never fires, and UPDATE-INSTANCE-FOR-DIFFERENT-
+       ;; CLASS fires on the READ path too -- where the DATA alist is not yet
+       ;; populated, so the check would reject valid stored claims and break
+       ;; CLOSE-GRAPH's snapshot.  Wrapping the constructor runs the check on
+       ;; the construction path only.  DEF-VERTEX above re-defines the raw
+       ;; constructor on every expansion, so this cannot double-wrap.
+       ,@(mapcar
+          (lambda (class)
+            (let ((ctor (intern (format nil "MAKE-~A" class))))
+              `(let ((%raw (fdefinition ',ctor)))
+                 (setf (fdefinition ',ctor)
+                       (lambda (&rest args)
+                         (let ((c (apply %raw args)))
+                           (check-standing (claim-standing c))
+                           c))))))
+          (list unary binary))
        (setf (gethash ',parent *claim-families*)
              (%make-claim-family ',parent ',unary ',binary))
        ',parent)))
@@ -925,6 +931,6 @@ git commit -m "test(spacetime): claim conformance, and document the record (#131
 
 **Two risks checked against the engine before this plan shipped, rather than left for the implementer to discover.**
 
-*The standing mixin works.* Task 1 Step 5 makes `claim-standing-mixin`, a plain `standard-class`, a superclass of a `def-vertex` class whose metaclass is `node-class`. I verified SBCL accepts this: the class defines, finalizes, and reports its 19 inherited slots. No fallback needed.
+*Standing is validated by wrapping the generated constructor, not by a CLOS hook.* An earlier revision of this plan used `initialize-instance :after` on a mixin. That never fires: node construction goes through `change-class`, not `make-instance`. `update-instance-for-different-class :after` does fire, but on the **read** path as well, where the data alist is not yet populated — so the check rejects valid stored claims and breaks `close-graph`'s snapshot. `*initializing-node*` is bound on both paths and cannot discriminate, and there is no per-node validation hook at commit (`validate` is on the transaction). Wrapping the constructor runs the check exactly where §5 says and nowhere else, and needs nothing unexported from core.
 
 *`closer-mop` is not available here.* `graph-db`'s package `:use`s `sb-mop` on SBCL and `closer-mop` only on CCL and LispWorks (`package.lisp:7-10`), and this test package uses neither. Task 1's slot-existence test therefore uses CL's `slot-exists-p` on instances. Any later task reaching for a MOP call must go through `graph-db::class-slots`, not `closer-mop`.
