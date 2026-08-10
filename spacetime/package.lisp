@@ -35,4 +35,14 @@
    #:extent-finished-by-p #:extent-contains-p #:extent-starts-p
    #:extent-equals-p #:extent-started-by-p #:extent-during-p
    #:extent-finishes-p #:extent-overlapped-by-p #:extent-met-by-p
-   #:extent-after-p))
+   #:extent-after-p
+   ;; claim (GH #131)
+   #:def-claim-classes #:claim-family #:claim-family-parent
+   #:claim-family-unary #:claim-family-binary
+   #:claim-subject-namespace #:claim-subject-key
+   #:claim-object-namespace #:claim-object-key
+   #:claim-relation #:claim-producer #:claim-rule-version
+   #:claim-method #:claim-standing #:claim-confidence
+   #:claim-extent-sexp #:claim-geometry
+   #:claim-extent #:claims-touching #:delete-claims-by-producer
+   #:unknown-claim-family))

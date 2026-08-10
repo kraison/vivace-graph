@@ -14,4 +14,10 @@
   ;; package.lisp imports them the same way) -- needed to round-trip
   ;; EXTENT->SEXP through the real engine function (#130).
   (:import-from #:graph-db #:serialize #:deserialize)
+  ;; MAKE-GRAPH/CLOSE-GRAPH/WITH-TRANSACTION for claim-tests.lisp's on-disk
+  ;; graph fixture (#131); *GRAPH* and *SCHEMA-NODE-METADATA* stay package-
+  ;; qualified at the call sites instead, matching GRAPH-DB/GEOS-TEST and
+  ;; GRAPH-DB/ALGORITHMS-TEST's import lists (tests/geos/package.lisp,
+  ;; tests/algorithms/package.lisp).
+  (:import-from #:graph-db #:make-graph #:close-graph #:with-transaction)
   (:export #:run-spacetime-tests #:spacetime-suite))

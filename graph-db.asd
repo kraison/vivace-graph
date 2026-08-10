@@ -388,7 +388,8 @@
                (:file "standing")
                (:file "bound")
                (:file "extent")
-               (:file "allen")))
+               (:file "allen")
+               (:file "claim")))
 
 (defsystem graph-db/spacetime-test
   :name "VivaceGraph spacetime test suite"
@@ -409,7 +410,8 @@
                (:file "allen-tests")
                (:file "instant-tests")
                (:file "property-tests")
-               (:file "conformance-tests"))
+               (:file "conformance-tests")
+               (:file "claim-tests"))
   :perform (test-op (op c)
                     (unless (uiop:symbol-call :graph-db/spacetime-test
                                               :run-spacetime-tests)
