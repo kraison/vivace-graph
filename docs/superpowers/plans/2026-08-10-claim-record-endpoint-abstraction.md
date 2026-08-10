@@ -21,7 +21,14 @@
 - **The unary constraint is declared on `unary-claim`, never on `claim`** — `subtypep` would bind `binary-claim` too and forbid one producer relating a subject to several objects.
 - **SBCL only.** ECL is demoted to periodic; say explicitly when skipped.
 - Work on a branch off `experiment`. Show the full diff under `## 📋 DIFF FOR REVIEW` before each commit. Do not push.
-- After any deliberate break-and-restore, delete `~/.cache/common-lisp/sbcl-*/Users/kraison/work/vivace-graph-v3/spacetime` and `.../tests/spacetime` before trusting a run — a stale FASL makes a restored tree look broken.
+- After any deliberate break-and-restore, clear the FASL cache before trusting a run — a stale FASL makes a restored tree look broken. **Both paths are under `~/.cache`; neither is in the repository.** Copy them exactly:
+
+```bash
+rm -rf ~/.cache/common-lisp/sbcl-*/Users/kraison/work/vivace-graph-v3/spacetime
+rm -rf ~/.cache/common-lisp/sbcl-*/Users/kraison/work/vivace-graph-v3/tests/spacetime
+```
+
+  Never abbreviate the second as "and the matching `tests/spacetime` directory" — that reads as the *source* tree, and an implementer following it aimed an `rm -rf` at `tests/spacetime/` before a sandbox check stopped it.
 
 ### Three plan-level refinements the spec does not carry
 
