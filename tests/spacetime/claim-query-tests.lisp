@@ -54,18 +54,23 @@ the correct answer for \"nothing touches this endpoint\"."
 
 (test a-claim-carries-a-temporal-extent-across-a-reopen
   "Design §7: the slot holds the sexp, the accessor decodes.  The reopen is
-the point -- an in-memory round trip would not exercise serialization."
+the point -- an in-memory round trip would not exercise serialization.
+
+EXTENT arrives via the constructor, not a post-construction SETF: a
+not-yet-committed node's bytes are cached at construction and a plain
+SETF before commit never reaches them (GH #135) -- see
+SETF-CLAIM-EXTENT-DOES-NOT-PERSIST-ON-AN-UNCOMMITTED-CLAIM below, which
+pins that failure mode so it stays a known contract, not a regression."
   (with-temp-directory (dir)
     (let ((path (namestring dir)) (id nil))
       (let ((g (make-graph *claim-graph-name* path :buffer-pool-size 1000)))
         (unwind-protect
              (let ((graph-db:*graph* g))
                (with-transaction ()
-                 (let ((c (make-u)))
-                   (setf (claim-extent c)
-                         (make-granule-instant (ts 2026 3 15) :month
-                                               :standing :observed))
-                   (setq id (id c)))))
+                 (setq id (id (make-u
+                               :extent
+                               (make-granule-instant (ts 2026 3 15) :month
+                                                     :standing :observed))))))
           (close-graph g)))
       (let ((g2 (open-graph *claim-graph-name* path)))
         (unwind-protect
@@ -84,3 +89,33 @@ the point -- an in-memory round trip would not exercise serialization."
     (declare (ignorable g))
     (with-transaction ()
       (is (null (claim-extent (make-u)))))))
+
+(test setf-claim-extent-does-not-persist-on-an-uncommitted-claim
+  "Pins GH #135: a not-yet-committed node's bytes are cached at
+construction, so a plain (SETF (CLAIM-EXTENT ...)) between MAKE-<ARITY>
+and commit is visible in-memory but silently absent after a
+close/reopen.  This is the documented contract, not a bug in this
+subsystem -- MAKE-<ARITY>'s :EXTENT initarg is the correct way to give a
+claim an extent at construction (see the reopen test above); SETF is for
+mutating an already-committed claim (COPY, mutate, SAVE)."
+  (with-temp-directory (dir)
+    (let ((path (namestring dir)) (id nil))
+      (let ((g (make-graph *claim-graph-name* path :buffer-pool-size 1000)))
+        (unwind-protect
+             (let ((graph-db:*graph* g))
+               (with-transaction ()
+                 (let ((c (make-u)))
+                   (setf (claim-extent c)
+                         (make-granule-instant (ts 2026 3 15) :month
+                                               :standing :observed))
+                   (is-true (claim-extent c)
+                            "visible in-memory, before commit")
+                   (setq id (id c)))))
+          (close-graph g)))
+      (let ((g2 (open-graph *claim-graph-name* path)))
+        (unwind-protect
+             (let ((graph-db:*graph* g2))
+               (is (null (claim-extent (lookup-vertex id)))
+                   "silently absent once read back from disk"))
+          (ignore-errors (close-graph g2 :snapshot-p nil))
+          (collect-garbage))))))

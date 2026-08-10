@@ -42,11 +42,10 @@ the other (design §7)."
   "Store EXTENT on CLAIM as its sexp.  Only values GRAPH-DB:SERIALIZE
 already handles reach the heap, so no core type byte is reserved.
 
-Also resets CLAIM's cached BYTES to :INIT: a not-yet-committed node's
-BYTES is populated eagerly at construction from the constructor's
-initial args and never refreshed for a plain post-construction SETF, so
-without this the extent survives in-memory but is silently absent after
-a close/reopen (core bug, GH #135)."
+Only safe post-commit, on a CLAIM already looked up from the graph (MVCC
+pattern: COPY, mutate, SAVE).  On a claim not yet committed -- still in
+the transaction that created it -- this SETF is silently lost across a
+close/reopen (GH #135); pass :EXTENT to the MAKE-<ARITY> constructor
+instead, which encodes it before the node's bytes are ever cached."
   (setf (claim-extent-sexp claim) (and extent (extent->sexp extent)))
-  (setf (graph-db::bytes claim) :init)
   extent)

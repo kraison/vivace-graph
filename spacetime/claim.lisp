@@ -47,6 +47,27 @@ from the parent name alone."
   "Slots every claim carries, on the PARENT class.  Symbols live in this
 package so two claim families share one set of accessors (design §5).")
 
+(defun %plist-remove (plist key)
+  "PLIST with every KEY/value pair removed."
+  (loop for (k v) on plist by #'cddr
+        unless (eq k key)
+          collect k and collect v))
+
+(defun %claim-encode-extent-arg (args)
+  "Rewrite a claim constructor's ARGS: an :EXTENT is encoded via
+EXTENT->SEXP and passed through as :EXTENT-SEXP, the slot that actually
+persists.  The value must arrive at construction -- a SETF on a node not
+yet committed is silently lost, not merely deferred (GH #135).  Signals
+if both :EXTENT and :EXTENT-SEXP are given, rather than picking one."
+  (if (member :extent args)
+      (progn
+        (when (member :extent-sexp args)
+          (error "Pass only one of :EXTENT or :EXTENT-SEXP, not both."))
+        (let ((extent (getf args :extent)))
+          (list* :extent-sexp (and extent (extent->sexp extent))
+                 (%plist-remove args :extent))))
+      args))
+
 (defparameter +claim-object-slots+
   '((object-namespace :initarg :object-namespace
                       :accessor claim-object-namespace)
@@ -110,7 +131,8 @@ DATA alist is not populated yet -- it would reject already-valid claims."
               `(let ((%raw (fdefinition ',ctor)))
                  (setf (fdefinition ',ctor)
                        (lambda (&rest args)
-                         (let ((c (apply %raw args)))
+                         (let ((c (apply %raw
+                                        (%claim-encode-extent-arg args))))
                            (check-standing (claim-standing c))
                            c))))))
           (list unary binary))

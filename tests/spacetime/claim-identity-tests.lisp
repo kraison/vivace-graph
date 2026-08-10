@@ -5,16 +5,17 @@
 (in-suite spacetime-suite)
 
 (defun make-b (&key (producer :rule-a) (subject "s1") (object "o1")
-                    (relation :r) (standing :inferred))
+                    (relation :r) (standing :inferred) extent)
   (make-ct-claim-binary :subject-namespace :ns :subject-key subject
                         :relation relation
                         :object-namespace :ns :object-key object
-                        :producer producer :standing standing))
+                        :producer producer :standing standing
+                        :extent extent))
 
-(defun make-u (&key (producer :rule-a) (subject "s1") (relation :r))
+(defun make-u (&key (producer :rule-a) (subject "s1") (relation :r) extent)
   (make-ct-claim-unary :subject-namespace :ns :subject-key subject
                        :relation relation :producer producer
-                       :standing :inferred))
+                       :standing :inferred :extent extent))
 
 (test two-producers-may-disagree
   "Design §6.2.  This is the entire reason for reifying: an edge model would
