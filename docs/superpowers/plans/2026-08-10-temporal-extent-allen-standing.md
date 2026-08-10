@@ -262,7 +262,10 @@ Append to `graph-db.asd`, after the `graph-db/geos-test` form. List **only** the
 - [ ] **Step 6: Run the tests to verify they fail**
 
 ```bash
-sbcl --dynamic-space-size 4096 --non-interactive --eval '(progn (require :asdf) (load "~/quicklisp/setup.lisp") (ql:quickload :graph-db/spacetime-test) (graph-db/spacetime-test:run-spacetime-tests))'
+sbcl --dynamic-space-size 4096 --non-interactive \
+  --eval '(progn (require :asdf) (load "~/quicklisp/setup.lisp"))' \
+  --eval '(ql:quickload :graph-db/spacetime-test)' \
+  --eval '(graph-db/spacetime-test:run-spacetime-tests)'
 ```
 
 Expected: the build fails to load `standing.lisp` — the file does not exist yet.
@@ -393,7 +396,10 @@ endpoint pair can still settle the comparison."
 - [ ] **Step 2: Run the tests to verify they fail**
 
 ```bash
-sbcl --dynamic-space-size 4096 --non-interactive --eval '(progn (require :asdf) (load "~/quicklisp/setup.lisp") (ql:quickload :graph-db/spacetime-test) (graph-db/spacetime-test:run-spacetime-tests))'
+sbcl --dynamic-space-size 4096 --non-interactive \
+  --eval '(progn (require :asdf) (load "~/quicklisp/setup.lisp"))' \
+  --eval '(ql:quickload :graph-db/spacetime-test)' \
+  --eval '(graph-db/spacetime-test:run-spacetime-tests)'
 ```
 
 Expected: load failure — `bound.lisp` does not exist.
