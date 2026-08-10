@@ -97,35 +97,49 @@ retreat to a DST-safe month."
     (is (= 1775001599
            (local-time:timestamp-to-unix (bound-latest (extent-start back)))))))
 
-(test a-unary-claim-is-distinguishable-from-an-unknown-object
-  "Design §3.1 and §10.  Structural absence and epistemic absence must not
-share a spelling -- the defect class this whole subsystem exists to prevent,
-arriving in the first record built on top of it."
+(test structural-absence-is-distinguishable-from-a-claims-own-standing
+  "Design §3.1 and §10.  A unary claim's missing object is structural: the
+slot does not exist, full stop. A binary claim's OBJECT-KEY, by contrast,
+must always hold a real, non-nil value -- the identity constraint requires
+it (Finding 1), so STANDING cannot be used to spell 'the object is
+unknown' by pairing a real object slot with a fake sentinel value. What
+STANDING can and does say, independently of the object, is whether the
+CLAIM ITSELF is known to hold. That is what this test checks; whether a
+binary relation can name an undetermined object at all is not yet
+representable here (deferred to #132)."
   (with-claim-graph (g)
     (declare (ignorable g))
     (with-transaction ()
       (let ((unary (make-u))
-            (unknown (make-ct-claim-binary
-                      :subject-namespace :ns :subject-key "s9"
-                      :relation :r :object-namespace :ns :object-key "?"
-                      :producer :p :standing :indeterminate)))
+            (uncertain (make-ct-claim-binary
+                        :subject-namespace :ns :subject-key "s9"
+                        :relation :r :object-namespace :ns
+                        :object-key "o9"
+                        :producer :p :standing :indeterminate)))
         ;; Structural absence: the slot does not exist at all.
         (is-false (slot-exists-p unary 'graph-db.spacetime::object-key))
-        ;; Epistemic absence: the slot exists, and STANDING says why.
-        (is-true (slot-exists-p unknown 'graph-db.spacetime::object-key))
-        (is-true (standing-absence-p (claim-standing unknown)))
+        ;; The binary claim's object slot exists and holds a real value;
+        ;; STANDING here says the claim's own status is unresolved, not
+        ;; that the object is unknown.
+        (is-true (slot-exists-p uncertain 'graph-db.spacetime::object-key))
+        (is-true (standing-absence-p (claim-standing uncertain)))
         (is-false (standing-absence-p (claim-standing unary)))))))
 
 (test a-claims-standing-and-its-extents-standing-are-independent
   "Design §5: one records how the claim came to be known, the other how the
-TIME was known."
+TIME was known.
+
+EXTENT arrives via the constructor, not a post-construction SETF -- a SETF
+on a node not yet committed is silently lost (GH #135), which would make
+the CLAIM-EXTENT read below come back NIL, not :OBSERVED, defeating the
+one thing this file exists to guard against."
   (with-claim-graph (g)
     (declare (ignorable g))
     (with-transaction ()
-      (let ((c (make-ct-claim-unary :subject-namespace :ns :subject-key "s"
-                                    :relation :r :producer :p
-                                    :standing :asserted)))
-        (setf (claim-extent c)
-              (make-granule-instant (ts 2026 1 15) :day :standing :observed))
+      (let ((c (make-ct-claim-unary
+                :subject-namespace :ns :subject-key "s" :relation :r
+                :producer :p :standing :asserted
+                :extent (make-granule-instant (ts 2026 1 15) :day
+                                              :standing :observed))))
         (is (eq :asserted (claim-standing c)))
         (is (eq :observed (extent-standing (claim-extent c))))))))

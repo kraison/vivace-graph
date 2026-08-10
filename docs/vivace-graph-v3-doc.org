@@ -2827,13 +2827,26 @@ was built to make impossible, in the very first record built on top of it.
 Making arity a *type* sidesteps both failure modes at once. A unary claim's
 class has no object slot, full stop — Common Lisp's ~SLOT-EXISTS-P~ answers
 false for it, not "false because it happens to be unset." A binary claim's
-object slot always exists, and if that object is unknown, ~standing~ says
-which of the three ways it is unknown. Neither constraint ever needs the
-null exemption, so nothing is silently exempted from deduplication. The
-parent class exists only to hold the shared slots and shared indexes; it is
-deliberately given no ~make-~ constructor, so ~(make-site-claim ...)~ is
-simply undefined rather than something that quietly builds a half-formed
-claim.
+object slot always exists and, because every uniqueness-constraint
+component must be non-nil or the null exemption above reopens, must always
+hold a real value: the constructor rejects an omitted or ~NIL~
+~object-key~ outright, naming the missing component. Neither constraint
+ever needs the null exemption, so nothing is silently exempted from
+deduplication. The parent class exists only to hold the shared slots and
+shared indexes; it is deliberately given no ~make-~ constructor, so
+~(make-site-claim ...)~ is simply undefined rather than something that
+quietly builds a half-formed claim.
+
+Requiring a real ~object-key~ leaves a real gap, worth naming rather than
+papering over: this record currently has *no defined representation* for
+"binary relation, object not yet determined." ~NIL~ is not available —
+the paragraph above rules it out — and inventing a sentinel value (an
+"unknown" or "?" object-key) is exactly the fake-value confusion the
+preceding paragraphs rule out too; it would just relocate the defect
+rather than fix it. Representing an undetermined object correctly needs
+the same stable-external-key identity contract that endpoint resolution
+depends on, so it is deferred to #132 alongside that work rather than
+guessed at here.
 
 *** What the identity constraint permits and forbids
 
@@ -2864,7 +2877,7 @@ That shape is chosen to permit two things and forbid a third:
                               :producer :rule-a :standing :inferred)
       (make-site-claim-binary :subject-namespace :device :subject-key "d42"
                               :relation :failure-cause
-                              :object-namespace :cause :object-key "unknown"
+                              :object-namespace :cause :object-key "cable-fault"
                               :producer :operator-o :standing :asserted))
   #+END_SRC
 
