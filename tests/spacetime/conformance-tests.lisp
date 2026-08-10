@@ -96,3 +96,36 @@ retreat to a DST-safe month."
     (is (= 999999999 (local-time:nsec-of (bound-latest (extent-start back)))))
     (is (= 1775001599
            (local-time:timestamp-to-unix (bound-latest (extent-start back)))))))
+
+(test a-unary-claim-is-distinguishable-from-an-unknown-object
+  "Design §3.1 and §10.  Structural absence and epistemic absence must not
+share a spelling -- the defect class this whole subsystem exists to prevent,
+arriving in the first record built on top of it."
+  (with-claim-graph (g)
+    (declare (ignorable g))
+    (with-transaction ()
+      (let ((unary (make-u))
+            (unknown (make-ct-claim-binary
+                      :subject-namespace :ns :subject-key "s9"
+                      :relation :r :object-namespace :ns :object-key "?"
+                      :producer :p :standing :indeterminate)))
+        ;; Structural absence: the slot does not exist at all.
+        (is-false (slot-exists-p unary 'graph-db.spacetime::object-key))
+        ;; Epistemic absence: the slot exists, and STANDING says why.
+        (is-true (slot-exists-p unknown 'graph-db.spacetime::object-key))
+        (is-true (standing-absence-p (claim-standing unknown)))
+        (is-false (standing-absence-p (claim-standing unary)))))))
+
+(test a-claims-standing-and-its-extents-standing-are-independent
+  "Design §5: one records how the claim came to be known, the other how the
+TIME was known."
+  (with-claim-graph (g)
+    (declare (ignorable g))
+    (with-transaction ()
+      (let ((c (make-ct-claim-unary :subject-namespace :ns :subject-key "s"
+                                    :relation :r :producer :p
+                                    :standing :asserted)))
+        (setf (claim-extent c)
+              (make-granule-instant (ts 2026 1 15) :day :standing :observed))
+        (is (eq :asserted (claim-standing c)))
+        (is (eq :observed (extent-standing (claim-extent c))))))))

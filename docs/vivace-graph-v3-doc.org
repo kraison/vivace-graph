@@ -2758,6 +2758,246 @@ algebra correctly refuses to pick one relation to a known five-day window:
   ;;    the three out, so all three come back.
 #+END_SRC
 
+*** Claims: a relation with provenance, not an edge
+
+An ordinary edge records *one* version of the truth: two nodes and a weight,
+overwritten the moment something changes its mind. That is fine when there is
+only one authority, but a system with several rules or operators asserting
+things about the world needs the disagreements to *survive*, not get
+silently resolved to whichever write happened last. A ~CLAIM~ is how
+~graph-db/spacetime~ represents that: a relation reified as an ordinary
+vertex, carrying who asserted it, how, and how sure they were, alongside the
+relation itself.
+
+The endpoints a claim names — its subject, and its object if it has one —
+are *stored values*, a namespace keyword plus a key string, never a
+reference to another vertex. This is not a stylistic choice: a read-write
+transaction in this engine is single-graph, and touching a node in another
+graph from inside one signals an error. An edge to a node the transaction
+cannot see could not be created in the first place. Storing the endpoint as
+data rather than a live reference sidesteps the problem entirely — there is
+nothing left to resolve *inside* the transaction, so the cross-graph
+question never comes up. Resolving ~(namespace, key)~ back into an actual
+node is deliberately left to a later add-on; see below.
+
+Claims are defined with a macro, not shipped as ready-made classes —
+~DEF-VERTEX~ binds a class to one graph at definition time, and class names
+are global, so a class this system shipped would collide the moment two
+tenants both loaded it:
+
+#+BEGIN_SRC lisp
+  (def-claim-classes site-claim :my-graph
+    :extra-slots ((weight :initarg :weight :accessor site-claim-weight
+                          :initform nil)))
+#+END_SRC
+
+Every claim, regardless of arity, carries the same core: ~subject-namespace~
+/ ~subject-key~ (the triple's subject), ~relation~ (an open keyword
+vocabulary), ~producer~ (which rule or operator made the claim), an optional
+~rule-version~ kept as provenance only, ~method~, ~standing~ (S1a's
+provenance vocabulary — see above — validated by ~check-standing~ at
+construction, so an invalid one cannot be built), ~confidence~, an encoded
+temporal extent, and an optional ~geometry~. ~:extra-slots~ land on the
+shared parent, so a tenant that adds ~weight~ gets it on both arities for
+free.
+
+*** Arity is a type, not a nullable slot
+
+~DEF-CLAIM-CLASSES~ generates *three* classes, not one:
+
+#+BEGIN_SRC lisp
+  site-claim            ; parent: shared slots, no constructor, no
+                        ; uniqueness constraint of its own
+  site-claim-unary      ; no object slots at all
+  site-claim-binary     ; adds object-namespace and object-key
+#+END_SRC
+
+The obvious alternative — one class, with a nullable ~object-key~ — looks
+simpler and is wrong. This engine's uniqueness constraints exempt any tuple
+containing a null, so a unary claim (object always null) would never
+deduplicate against itself: rerunning the rule that produced it would double
+it every time, silently. Patching that with a reserved "no object" marker
+just moves the problem — it collapses *"this relation has no object,
+structurally"* with *"this claim has an object and we do not know what it
+is,"* which are different facts. The second is exactly what ~standing~'s
+three absence values already exist to say (see "Standing" above); spelling
+it as a fake object value reintroduces the exact confusion this subsystem
+was built to make impossible, in the very first record built on top of it.
+
+Making arity a *type* sidesteps both failure modes at once. A unary claim's
+class has no object slot, full stop — Common Lisp's ~SLOT-EXISTS-P~ answers
+false for it, not "false because it happens to be unset." A binary claim's
+object slot always exists, and if that object is unknown, ~standing~ says
+which of the three ways it is unknown. Neither constraint ever needs the
+null exemption, so nothing is silently exempted from deduplication. The
+parent class exists only to hold the shared slots and shared indexes; it is
+deliberately given no ~make-~ constructor, so ~(make-site-claim ...)~ is
+simply undefined rather than something that quietly builds a half-formed
+claim.
+
+*** What the identity constraint permits and forbids
+
+Each arity carries its own uniqueness constraint — deliberately *not* on
+the parent, because the parent has exactly the unary slot set, and a
+constraint declared there would silently bind the binary class too. The
+constraints are:
+
+#+BEGIN_SRC lisp
+  ;; site-claim-unary
+  (producer subject-namespace subject-key relation)
+  ;; site-claim-binary
+  (producer subject-namespace subject-key object-namespace object-key
+   relation)
+#+END_SRC
+
+That shape is chosen to permit two things and forbid a third:
+
+- *Two producers may disagree.* A rule and an operator can both assert an
+  object for the same subject and relation, and both persist, because
+  ~producer~ differs:
+
+  #+BEGIN_SRC lisp
+    (with-transaction ()
+      (make-site-claim-binary :subject-namespace :device :subject-key "d42"
+                              :relation :failure-cause
+                              :object-namespace :cause :object-key "overheat"
+                              :producer :rule-a :standing :inferred)
+      (make-site-claim-binary :subject-namespace :device :subject-key "d42"
+                              :relation :failure-cause
+                              :object-namespace :cause :object-key "unknown"
+                              :producer :operator-o :standing :asserted))
+  #+END_SRC
+
+  This is the entire reason to reify the relation as a node instead of an
+  edge: an edge has one slot for "the" object, so the second write would
+  simply have overwritten the first.
+
+- *One producer may relate a subject to many objects.* The object is part
+  of the tuple, so this is an ordinary one-to-many and stays legal:
+
+  #+BEGIN_SRC lisp
+    (with-transaction ()
+      (make-site-claim-binary :subject-namespace :device :subject-key "d42"
+                              :relation :symptom :object-namespace :sym
+                              :object-key "wifi-drop" :producer :rule-a
+                              :standing :observed)
+      (make-site-claim-binary :subject-namespace :device :subject-key "d42"
+                              :relation :symptom :object-namespace :sym
+                              :object-key "power-flicker" :producer :rule-a
+                              :standing :observed))
+  #+END_SRC
+
+- *The same producer may not assert the identical claim twice.* That
+  collides at commit — a ~unique-constraint-violation~ under the same
+  transaction-manager lock that arbitrates any other write race, so two
+  concurrent producers racing to write the same claim resolve to exactly
+  one winner and one signalled loser.
+
+*** Regeneration: sweep, then insert, in two transactions
+
+Rules get re-run and change their minds. If v2 of a rule stops producing a
+claim that v1 used to produce, no amount of re-inserting v2's claims removes
+the one v1 left behind — nothing ever writes over it, because nothing with
+its exact identity is written again. The only way to retire it is an
+explicit sweep:
+
+#+BEGIN_SRC lisp
+  (delete-claims-by-producer graph 'site-claim :rule-a)
+#+END_SRC
+
+~CLAIM-CLASS~ is always the *parent* class name, so one call reaches both
+arities. Regeneration is then: sweep every claim the producer previously
+wrote, then insert whatever it produces this time round.
+
+**Those two steps must be two separate ~WITH-TRANSACTION~ forms, not one —
+this is a hard requirement, not a style preference.** Inside a single
+commit, the check that enforces a uniqueness constraint runs *before*
+durability, while the bookkeeping that actually releases a deleted claim's
+key runs *after* durability, later in the same commit. So a sweep and a
+same-transaction re-insert of an unchanged claim has its insert checked
+against a key the sweep has not released yet, from that check's point of
+view — and it collides with the very row being deleted (GH #131). Splitting
+sweep and insert into two committed transactions gives the release time to
+actually take effect before the insert's check runs:
+
+#+BEGIN_SRC lisp
+  (with-transaction ()
+    (delete-claims-by-producer graph 'site-claim :rule-a))
+  (with-transaction ()
+    (make-site-claim-binary :subject-namespace :device :subject-key "d42"
+                            :relation :symptom :object-namespace :sym
+                            :object-key "wifi-drop" :producer :rule-a
+                            :standing :observed))
+#+END_SRC
+
+The uniqueness constraint itself still earns its keep here: it is what
+stops a buggy or racing producer from duplicating a claim *within* one run,
+which the sweep alone cannot do. Supersession is regeneration; there is no
+second mechanism.
+
+*** Finding claims, and reading their extent
+
+~CLAIMS-TOUCHING~ is the inverse query: given an endpoint, which claims
+name it. It answers entirely from the claim graph's own indexes, so it
+never needs a cross-graph read or a snapshot:
+
+#+BEGIN_SRC lisp
+  (claims-touching graph 'site-claim :device "d42")
+  ;; every claim naming (:DEVICE "d42") as subject or object
+
+  (claims-touching graph 'site-claim :sym "wifi-drop" :role :object)
+  ;; only claims naming it as the object
+#+END_SRC
+
+~CLAIM-CLASS~ is again the parent — a graph can host more than one claim
+family, so there is no single "the" claim class to infer. ~:ROLE~ defaults
+to ~:EITHER~; an unrecognized role signals rather than returning ~NIL~,
+because ~NIL~ is also the correct, honest answer to "nothing touches this
+endpoint," and the two must not be confused.
+
+A claim's temporal extent — built from the ~temporal-extent~ machinery
+described earlier in this chapter — is stored encoded, as a sexp, in the
+~extent-sexp~ slot: no on-disk type byte is spent on it, because the sexp
+holds only values ~GRAPH-DB:SERIALIZE~ already knows how to write.
+~CLAIM-EXTENT~ decodes it back into a real ~temporal-extent~ on read:
+
+#+BEGIN_SRC lisp
+  (let (claim)
+    (with-transaction ()
+      (setq claim
+            (make-site-claim-unary
+             :subject-namespace :device :subject-key "d42"
+             :relation :offline :producer :rule-a :standing :observed
+             :extent (make-granule-instant jan-15 :day
+                                           :standing :observed))))
+    (claim-extent claim))  ; => the decoded TEMPORAL-EXTENT, or NIL
+#+END_SRC
+
+An extent must be handed to the constructor via ~:EXTENT~. ~(SETF
+CLAIM-EXTENT)~ exists too, but only for a claim already read back from the
+graph — a claim still inside the transaction that created it has its bytes
+already cached, so a ~SETF~ before that transaction commits is visible in
+memory and then silently lost the moment the graph is closed and reopened.
+The pattern for changing an *existing* claim's extent is the engine's usual
+one: ~COPY~, mutate, ~SAVE~.
+
+A claim's own ~standing~ and its extent's ~standing~ answer different
+questions and vary independently — the claim's says how the claim came to
+be known, the extent's says how the *time* was known. An ~:asserted~ claim
+can carry an ~:observed~ extent, or any other combination; neither one
+determines the other.
+
+*** What is not here yet
+
+Two things are deliberately absent from this unit, both because they belong
+to the identity contract a later add-on establishes, not because they were
+forgotten: *endpoint resolution* — turning a claim's ~(namespace, key)~
+back into the actual node it names — and the ~precision~ / ~fraction~
+slots that describe how confidently that resolution matched. Both need
+every participating node class to declare a stable external key to resolve
+against; adding them here, ahead of that contract, would mean guessing at a
+shape no tenant has committed to yet.
+
 ** API Reference
 
 This chapter provides a categorized reference for the most important exported symbols from the ~graph-db~ package. It is not an exhaustive list of every internal function but focuses on the public API you will use most often when building applications.

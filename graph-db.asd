@@ -411,11 +411,13 @@
                (:file "allen-tests")
                (:file "instant-tests")
                (:file "property-tests")
-               (:file "conformance-tests")
                (:file "claim-tests")
                (:file "claim-identity-tests")
                (:file "claim-query-tests")
-               (:file "claim-concurrency-tests"))
+               (:file "claim-concurrency-tests")
+               ;; Last: draws on MAKE-U/MAKE-B and WITH-CLAIM-GRAPH from the
+               ;; claim test files above (#131 Task 7).
+               (:file "conformance-tests"))
   :perform (test-op (op c)
                     (unless (uiop:symbol-call :graph-db/spacetime-test
                                               :run-spacetime-tests)
