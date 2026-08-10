@@ -66,9 +66,41 @@ Correct only when NEITHER extent is an instant."
                     (%compatible-p c3 s3) (%compatible-p c4 s4))
             collect rel)))
 
+(defun %instant-vs-instant (a b)
+  "Two points relate only three ways.  :AMBIGUOUS admits all three."
+  (let ((c (bound-compare (extent-start a) (extent-start b))))
+    (ecase c
+      (:< '(:before))
+      (:= '(:equals))
+      (:> '(:after))
+      (:ambiguous '(:before :equals :after)))))
+
+(defun %instant-vs-interval (p i)
+  "Point P against interval I, per the design §3.3.1 table.  :MEETS and the
+other eight are unreachable: under closed intervals a point at I's start is
+INSIDE I, so :STARTS states strictly more than :MEETS."
+  (let ((cs (bound-compare (extent-start p) (extent-start i)))
+        (ce (bound-compare (extent-start p) (extent-end i)))
+        (rels '()))
+    (flet ((maybe (comparison &rest admissible)
+             (member comparison admissible)))
+      (when (maybe cs :< :ambiguous) (push :before rels))
+      (when (maybe cs := :ambiguous) (push :starts rels))
+      (when (and (maybe cs :> :ambiguous) (maybe ce :< :ambiguous))
+        (push :during rels))
+      (when (maybe ce := :ambiguous) (push :finishes rels))
+      (when (maybe ce :> :ambiguous) (push :after rels)))
+    (nreverse rels)))
+
 (defun %relations-between (a b)
-  "Dispatch on degeneracy.  Task 5 replaces the instant arms."
-  (%interval-relations a b))
+  "Dispatch on degeneracy: the signature table is read off non-degenerate
+examples and does not describe instants (design §3.3.1)."
+  (let ((ai (extent-instant-p a))
+        (bi (extent-instant-p b)))
+    (cond ((and ai bi) (%instant-vs-instant a b))
+          (ai (%instant-vs-interval a b))
+          (bi (mapcar #'allen-inverse (%instant-vs-interval b a)))
+          (t (%interval-relations a b)))))
 
 (defun allen-relations (a b)
   "The TEMPORAL-RELATION between extents A and B: every Allen relation
