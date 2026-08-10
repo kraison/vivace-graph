@@ -38,6 +38,22 @@ symptom pattern B produces, so this is load-bearing, not scaffolding."
        (ignore-errors (close-graph ,g))
        (collect-garbage))))
 
+;; A persistent slot with an :INITFORM.  On a DISK graph COPY-NODE's
+;; DATA-POINTER let MAYBE-INIT-NODE-DATA materialize the alist before any
+;; :INITFORM could fire against it; a MEMORY graph has no DATA-POINTER (0),
+;; so it was the only backend that ever ran the :INITFORM path (GH #135).
+(def-vertex sm-defaulted ()
+  ((name :type string)
+   (gap :initform "FILLER"))
+  :graph-db-slot-mutation-test)
+
+(defmacro with-sm-memory-graph ((g dir) &body body)
+  "A fresh MEMORY graph in DIR (a bound temp directory), closed on exit."
+  `(let ((,g (graph-db::make-memory-graph *sm-graph-name* (namestring ,dir))))
+     (unwind-protect (let ((*graph* ,g)) ,@body)
+       (ignore-errors (close-graph ,g :snapshot-p nil))
+       (collect-garbage))))
+
 (test created-node-mutation-survives-reopen
   "PATTERN A (GH #135).  A node created and then SETF'd in the same transaction
 must persist the mutation.  APPLY-TX-WRITE (tx-create) wrote construction-time
@@ -128,3 +144,31 @@ them would be a regression."
           (finishes (setf (m1 n) :meta-ok))
           (is (eq :ephemeral-ok (e1 n)))
           (is (eq :meta-ok (m1 n))))))))
+
+(test copy-and-mark-deleted-survive-initform-on-memory-graph
+  "CRITICAL (GH #135).  COPY-NODE used to build the copy via a bare
+MAKE-INSTANCE and only SETF DATA afterward, so CLOS applied any persistent
+slot's :INITFORM against the still-empty alist -- a write, through the
+guarded funnel, on a node not yet registered in this transaction.  A DISK
+graph masked it: COPY-NODE passes :DATA-POINTER, so MAYBE-INIT-NODE-DATA
+materializes the alist from bytes before any :INITFORM could fire.  A MEMORY
+graph has no DATA-POINTER (0) -- the only backend that ever exercised the
+:INITFORM path, and the Android production path.  Covers both COPY (via
+SETF+SAVE) and MARK-DELETED (which copies internally)."
+  (with-temp-directory (dir)
+    (let (id)
+      (with-sm-memory-graph (g dir)
+        (with-transaction ()
+          (setq id (id (make-sm-defaulted :name "x"))))
+        (finishes
+         (with-transaction ()
+           (let ((c (copy (lookup-vertex id :graph g))))
+             (setf (name c) "y")
+             (save c))))
+        (is (equal "y" (name (lookup-vertex id :graph g))))
+        (is (equal "FILLER" (gap (lookup-vertex id :graph g)))
+            "the untouched :INITFORM-defaulted slot must survive the copy")
+        (finishes
+         (with-transaction ()
+           (mark-deleted (lookup-vertex id :graph g))))
+        (is (deleted-p (lookup-vertex id :graph g)))))))

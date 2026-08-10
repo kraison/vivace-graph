@@ -2583,15 +2583,24 @@ and it reads these patched bytes, never the .txn files)."
 (defgeneric copy-node (node)
   (:method ((node node))
     (maybe-init-node-data node)
+    ;; :DATA is supplied here, not SETF'd after MAKE-INSTANCE returns, so the
+    ;; alist is already populated by the time CLOS reaches any persistent
+    ;; slot's :INITFORM (DATA precedes user slots in CLASS-SLOTS order): each
+    ;; already has an entry, SLOT-BOUNDP-USING-CLASS reports it bound, and the
+    ;; initform is skipped rather than written through the guarded funnel
+    ;; against an as-yet-unregistered node.  On a DISK graph this was masked
+    ;; by DATA-POINTER (MAYBE-INIT-NODE-DATA had bytes to materialize from
+    ;; instead); on a MEMORY graph DATA-POINTER is 0 and nothing masked it
+    ;; (GH #135).
     (let ((new-node (make-instance (type-of node)
                                    :id (slot-value node 'id)
                                    :type-id (slot-value node 'type-id)
                                    :revision (slot-value node 'revision)
                                    :deleted-p (slot-value node 'deleted-p)
                                    :written-p (slot-value node 'written-p)
-                                   :data-pointer (slot-value node 'data-pointer))))
+                                   :data-pointer (slot-value node 'data-pointer)
+                                   :data (copy-tree (slot-value node 'data)))))
       (setf (node-graph new-node) (node-graph node))
-      (setf (data new-node) (copy-tree (slot-value node 'data)))
       ;; Copy bytes so maybe-init-node-data on the copy does not try to
       ;; re-read from data-pointer (which may be freed by a concurrent commit).
       (setf (bytes new-node) (bytes node))

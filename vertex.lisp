@@ -24,13 +24,8 @@
   ;; pooled base buffer + CHANGE-CLASS path unchanged (the pool is a real perf
   ;; win there).  *INITIALIZING-NODE* is bound as CHANGE-NODE-CLASS does, so
   ;; persistent-slot init leaves the (empty) data alist alone.
-  ;; Unconditional across implementations: node construction/materialization,
-  ;; not user mutation -- CLOS runs a persistent slot's :INITFORM through
-  ;; (SETF SLOT-VALUE-USING-CLASS) same as any other write, including the one
-  ;; CHANGE-NODE-CLASS triggers below on promotion (GH #135).
-  (let* ((*initializing-node* t)
-         (vertex #+ecl (make-instance class)
-                 #-ecl (get-vertex-buffer)))
+  (let ((vertex #+ecl (let ((*initializing-node* t)) (make-instance class))
+                #-ecl (get-vertex-buffer)))
     (cond (id
            (setf (id vertex) id))
           ((equalp +null-key+ (id vertex))

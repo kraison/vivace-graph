@@ -32,13 +32,8 @@
   ;; ECL ONLY: construct the target CLASS directly (ECL's CHANGE-CLASS leaks per
   ;; call -- #47), giving up the node buffer pool on ECL.  SBCL/CCL/LispWorks
   ;; keep the pooled base EDGE + CHANGE-CLASS path (no leak, pool is a perf win).
-  ;; Unconditional across implementations: node construction/materialization,
-  ;; not user mutation -- CLOS runs a persistent slot's :INITFORM through
-  ;; (SETF SLOT-VALUE-USING-CLASS) same as any other write, including the one
-  ;; CHANGE-NODE-CLASS triggers below on promotion (GH #135).
-  (let* ((*initializing-node* t)
-         (edge #+ecl (make-instance class)
-               #-ecl (get-edge-buffer)))
+  (let ((edge #+ecl (let ((*initializing-node* t)) (make-instance class))
+              #-ecl (get-edge-buffer)))
     (cond (id
            (setf (id edge) id))
           ((equalp +null-key+ (id edge))

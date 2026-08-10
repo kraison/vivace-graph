@@ -833,6 +833,17 @@ mem-index-list is a set, deleted nodes stay indexed and scans filter them)."
       (dolist (v vertices) (reindex v))
       (dolist (e edges)    (reindex e)))))
 
+(defun %restore-node-image (file)
+  "CL-STORE:RESTORE FILE with *INITIALIZING-NODE* bound.  A checkpoint image's
+node objects have their persistent slots reconstructed via (SETF
+SLOT-VALUE-USING-CLASS), outside any transaction -- materialization from
+durable bytes, not user mutation, which is what *INITIALIZING-NODE* exists
+for (GH #135).  The single implementation of that escape: also called by
+tests/multi-graph-tests.lisp, which restores a raw image directly to inspect
+its shape."
+  (let ((*initializing-node* t))
+    (cl-store:restore file)))
+
 (defun restore-memory-image (graph)
   "Populate GRAPH's mem-tables -- and, for a current-version image, its derived
 structures -- from its cl-store image if one exists (the schema must already be
@@ -850,12 +861,7 @@ RESTORE-VIEWS."
                                 type-vertex type-edge ve-in ve-out vev spatial views
                                 unique
                            &allow-other-keys)
-          ;; CL-STORE reconstructs each node's persistent slots via (SETF
-          ;; SLOT-VALUE-USING-CLASS), outside any transaction.  This is
-          ;; materialization from durable bytes, not user mutation -- the
-          ;; case *INITIALIZING-NODE* exists for (GH #135).
-          (let ((*initializing-node* t))
-            (cl-store:restore file))
+          (%restore-node-image file)
         (declare (ignore highest-tx-id))
         ;; The image never carries a node's graph, so stamp on the way in --
         ;; the rebuild below uses these nodes before any lookup (GH #53).
