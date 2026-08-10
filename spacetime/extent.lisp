@@ -9,11 +9,6 @@
   "Granularities a record may be stated at.  PRECISION never enters
 comparison -- the bound width already encodes it (design §3.2).")
 
-(defparameter +precision-units+
-  '((:year . :year) (:month . :month) (:day . :day) (:hour . :hour)
-    (:minute . :minute) (:second . :sec) (:nsec . :nsec))
-  "Our precision names mapped to LOCAL-TIME's arithmetic unit names.")
-
 (defstruct (temporal-extent
             (:conc-name extent-)
             (:constructor %make-extent
@@ -58,6 +53,41 @@ and END share the bound, so the two endpoints cannot move apart."
                 (%check-precision precision) semantics
                 (check-standing standing)))
 
+(defun %next-granule-start (precision year month day hour minute sec z)
+  "The instant one PRECISION granule after the one starting at YEAR/MONTH/
+DAY/HOUR/MINUTE/SEC, computed entirely in timezone Z.  Never
+LOCAL-TIME:TIMESTAMP+ on a calendar unit -- it takes no :TIMEZONE argument
+and does :YEAR/:MONTH/:DAY arithmetic in *DEFAULT-TIMEZONE*, so on a
+DST-observing host a month/day granule's end could land up to an hour off,
+and two adjacent month granules could overlap instead of meet (design
+§3.5, GH #134).  :YEAR and :MONTH carry through an explicit next-calendar-
+field ENCODE-TIMESTAMP call, since their length varies.  :DAY/:HOUR/
+:MINUTE/:SECOND are each a fixed UTC duration, so adding that duration in
+seconds to this granule's own start is exact and needs no calendar carry."
+  (ecase precision
+    (:year (local-time:encode-timestamp 0 0 0 0 1 1 (1+ year) :timezone z))
+    (:month (multiple-value-bind (next-month next-year)
+                (if (= month 12)
+                    (values 1 (1+ year))
+                    (values (1+ month) year))
+              (local-time:encode-timestamp 0 0 0 0 1 next-month next-year
+                                           :timezone z)))
+    (:day (local-time:timestamp+
+           (local-time:encode-timestamp 0 0 0 0 day month year :timezone z)
+           86400 :sec))
+    (:hour (local-time:timestamp+
+            (local-time:encode-timestamp 0 0 0 hour day month year
+                                         :timezone z)
+            3600 :sec))
+    (:minute (local-time:timestamp+
+              (local-time:encode-timestamp 0 0 minute hour day month year
+                                           :timezone z)
+              60 :sec))
+    (:second (local-time:timestamp+
+              (local-time:encode-timestamp 0 sec minute hour day month year
+                                           :timezone z)
+              1 :sec))))
+
 (defun granule-bounds (timestamp precision)
   "The first and last instants of the PRECISION granule containing
 TIMESTAMP, as two values, computed in UTC (design §3.5)."
@@ -85,8 +115,8 @@ TIMESTAMP, as two values, computed in UTC (design §3.5)."
                 (if (eq precision :nsec)
                     start
                     (local-time:timestamp-
-                     (local-time:timestamp+
-                      start 1 (cdr (assoc precision +precision-units+)))
+                     (%next-granule-start precision year month day hour
+                                          minute sec z)
                      1 :nsec)))))))
 
 (defun make-granule-interval (timestamp precision &rest args)

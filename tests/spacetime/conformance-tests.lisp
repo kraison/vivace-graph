@@ -80,9 +80,10 @@ six -- the collapse is unrepresentable, not merely discouraged."
 (test an-instant-survives-graph-db-serialize-deserialize-coupled
   "The round trip must not just preserve the timestamp -- it must preserve
 the START/END identity that makes an instant an instant (design §3.3).
-January, not a DST-crossing month, so this isolates the codec round trip
-from GRANULE-BOUNDS' own month-arithmetic behaviour."
-  (let* ((e (make-granule-instant (ts 2026 1 15) :month
+March, a DST-crossing month on a EU/EET host, is what this test caught the
+GH #134 granule-end bug against originally -- keep it here rather than
+retreat to a DST-safe month."
+  (let* ((e (make-granule-instant (ts 2026 3 15) :month
                                   :semantics :event :standing :observed))
          (wire (serialize (extent->sexp e)))
          (back (sexp->extent (deserialize wire))))
@@ -91,6 +92,7 @@ from GRANULE-BOUNDS' own month-arithmetic behaviour."
     (is (eq :event (extent-semantics back)))
     (is (eq :observed (extent-standing back)))
     (is (eq (extent-start back) (extent-end back)))
-    (is-true (timestamp= (ts 2026 1 1) (bound-earliest (extent-start back))))
-    (is-true (timestamp= (timestamp- (ts 2026 2 1) 1 :nsec)
-                         (bound-latest (extent-start back))))))
+    (is-true (timestamp= (ts 2026 3 1) (bound-earliest (extent-start back))))
+    (is (= 999999999 (local-time:nsec-of (bound-latest (extent-start back)))))
+    (is (= 1775001599
+           (local-time:timestamp-to-unix (bound-latest (extent-start back)))))))

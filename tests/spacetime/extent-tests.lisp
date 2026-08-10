@@ -33,6 +33,36 @@ have made this test vacuous."
     (is (= 1769903999 (local-time:timestamp-to-unix end)))
     (is (= 999999999 (local-time:nsec-of end)))))
 
+(test granule-end-does-not-shift-across-a-dst-transition-month
+  "Design §3.5, GH #134.  LOCAL-TIME:TIMESTAMP+ takes no :TIMEZONE and does
+:MONTH arithmetic in *DEFAULT-TIMEZONE*, so on a DST-observing host March's
+granule end used to land an hour short of 23:59:59Z.  Asserted against a
+hard-coded Unix second, which no host timezone can move."
+  (multiple-value-bind (start end) (granule-bounds (ts 2026 3 15) :month)
+    (declare (ignore start))
+    (is (= 1775001599 (local-time:timestamp-to-unix end)))
+    (is (= 999999999 (local-time:nsec-of end)))))
+
+(test granule-end-does-not-spill-into-the-next-month
+  "Design §3.5, GH #134.  October's granule end used to compute as
+2026-11-01T00:59:59Z on a DST-observing host -- inside November, so two
+adjacent month granules overlapped instead of meeting.  This asserts both
+the exact correct end and, directly, that it falls strictly before
+November 1st."
+  (multiple-value-bind (start end) (granule-bounds (ts 2026 10 15) :month)
+    (declare (ignore start))
+    (is (= 1793491199 (local-time:timestamp-to-unix end)))
+    (is-true (timestamp< end (ts 2026 11 1))
+             "October's granule end reaches into November")))
+
+(test a-day-granule-spans-exactly-86400-seconds-across-dst
+  "Design §3.5, GH #134.  A :DAY granule crossing the EU spring-forward
+transition used to be 82800s wide instead of a fixed UTC day."
+  (multiple-value-bind (start end) (granule-bounds (ts 2026 3 29) :day)
+    (is (= 86399 (- (local-time:timestamp-to-unix end)
+                    (local-time:timestamp-to-unix start))))
+    (is (= 999999999 (local-time:nsec-of end)))))
+
 (test granule-construction-ignores-the-ambient-timezone
   "The other half: rebinding *DEFAULT-TIMEZONE* must not move a granule.
 Strong on a non-UTC host, trivially true on a UTC one -- which is why the
