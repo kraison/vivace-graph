@@ -97,21 +97,29 @@
   (persistent-names nil :type list)
   (ephemeral-names nil :type list)
   (meta-names nil :type list)
-  (data-names nil :type list))
+  (data-names nil :type list)
+  ;; keyword -> a fresh instance's :INITFORM value, for persistent slots that
+  ;; declare one.  A class-level constant, computed once (GH #135); see
+  ;; %PERSISTENT-SLOT-DEFAULTS.
+  (persistent-defaults nil :type list))
 
 (defun %compute-node-slot-info (class)
   "Build CLASS's NODE-SLOT-INFO.  Each list is filtered independently, exactly
 as the separate walks it replaces did, so a slot carrying more than one flag
 still appears in each list it qualifies for."
   (let ((keywords (make-hash-table :test 'eq))
-        (persistent '()) (ephemeral '()) (meta '()) (data '()))
+        (persistent '()) (ephemeral '()) (meta '()) (data '()) (defaults '()))
     (dolist (slot (class-slots class))
       (let ((name (slot-definition-name slot))
             (persistentp (persistent-p slot))
-            (ephemeralp (ephemeral-p slot)))
+            (ephemeralp (ephemeral-p slot))
+            (initfun (slot-definition-initfunction slot)))
         (when persistentp
           (push name persistent)
-          (setf (gethash name keywords) (intern (symbol-name name) :keyword)))
+          (setf (gethash name keywords) (intern (symbol-name name) :keyword))
+          (when initfun
+            (push (cons (intern (symbol-name name) :keyword) (funcall initfun))
+                  defaults)))
         (when ephemeralp (push name ephemeral))
         (when (meta-p slot) (push name meta))
         (when (or persistentp ephemeralp) (push name data))))
@@ -119,7 +127,8 @@ still appears in each list it qualifies for."
                          :persistent-names (nreverse persistent)
                          :ephemeral-names (nreverse ephemeral)
                          :meta-names (nreverse meta)
-                         :data-names (nreverse data))))
+                         :data-names (nreverse data)
+                         :persistent-defaults defaults)))
 
 (defun %node-slot-info (class)
   "CLASS's cached slot categorization, computing it on first use.
@@ -187,6 +196,14 @@ SLOT-*-USING-CLASS :AROUND methods need to ask."
 (defmethod persistent-slot-names ((instance node-class))
   "Return a list of persistent slot names for an instance."
   (%nsi-persistent-names (%node-slot-info instance)))
+
+(defun %persistent-slot-defaults (class)
+  "CLASS's (keyword . default-value) alist for persistent slots with an
+:INITFORM.  A node's own DATA alist can lack an entry a fresh instance would
+have -- SLOT-MAKUNBOUND removes one, or the slot postdates the node (GH #128)
+-- so any caller building a DATA alist by hand must fill from this, not rely
+on the node's own history (GH #135)."
+  (%nsi-persistent-defaults (%node-slot-info class)))
 
 (defmethod ephemeral-slot-names ((instance node-class))
   "Return a list of ephemeral slot names for an instance.

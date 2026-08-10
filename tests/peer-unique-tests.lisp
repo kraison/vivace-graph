@@ -92,7 +92,10 @@ duplicate is rejected."
   (with-pu-device (g)
     (let* ((tid (graph-db::node-type-id
                  (graph-db::lookup-node-type-by-name 'pu-user :vertex :graph g)))
-           (n (make-instance 'pu-user :id (gen-id) :type-id tid :revision 0)))
+           ;; %MAKE-VERTEX, not a bare (MAKE-INSTANCE 'pu-user ...): see
+           ;; PU-AUTHORED-CREATE's docstring above (GH #135).
+           (n (graph-db::%make-vertex :class 'pu-user :id (gen-id)
+                                      :type-id tid :revision 0)))
       (setf (graph-db::data n) '((:code . "s1") (:email . "sync@x.com")))
       (graph-db::apply-peer-create-writes
        g 7777 (list (make-instance 'graph-db::tx-create :node n)) *pu-hub-origin*))

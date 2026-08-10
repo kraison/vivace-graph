@@ -2583,23 +2583,23 @@ and it reads these patched bytes, never the .txn files)."
 (defgeneric copy-node (node)
   (:method ((node node))
     (maybe-init-node-data node)
-    ;; :DATA is supplied here, not SETF'd after MAKE-INSTANCE returns, so the
-    ;; alist is already populated by the time CLOS reaches any persistent
-    ;; slot's :INITFORM (DATA precedes user slots in CLASS-SLOTS order): each
-    ;; already has an entry, SLOT-BOUNDP-USING-CLASS reports it bound, and the
-    ;; initform is skipped rather than written through the guarded funnel
-    ;; against an as-yet-unregistered node.  On a DISK graph this was masked
-    ;; by DATA-POINTER (MAYBE-INIT-NODE-DATA had bytes to materialize from
-    ;; instead); on a MEMORY graph DATA-POINTER is 0 and nothing masked it
-    ;; (GH #135).
-    (let ((new-node (make-instance (type-of node)
-                                   :id (slot-value node 'id)
-                                   :type-id (slot-value node 'type-id)
-                                   :revision (slot-value node 'revision)
-                                   :deleted-p (slot-value node 'deleted-p)
-                                   :written-p (slot-value node 'written-p)
-                                   :data-pointer (slot-value node 'data-pointer)
-                                   :data (copy-tree (slot-value node 'data)))))
+    ;; :DATA must be complete at MAKE-INSTANCE time: an :INITFORM CLOS still
+    ;; finds unbound fires through the guarded funnel, on an unregistered
+    ;; node.  NODE's own alist can be short an entry (SLOT-MAKUNBOUND; GH
+    ;; #128 schema evolution) -- %PERSISTENT-SLOT-DEFAULTS fills the gaps.
+    ;; Depends on DATA preceding user slots in CLASS-SLOTS order; verified on
+    ;; SBCL only (GH #135).
+    (let ((new-node (make-instance
+                     (type-of node)
+                     :id (slot-value node 'id)
+                     :type-id (slot-value node 'type-id)
+                     :revision (slot-value node 'revision)
+                     :deleted-p (slot-value node 'deleted-p)
+                     :written-p (slot-value node 'written-p)
+                     :data-pointer (slot-value node 'data-pointer)
+                     :data (%merge-stored-over-defaults
+                            (copy-tree (slot-value node 'data))
+                            (%persistent-slot-defaults (class-of node))))))
       (setf (node-graph new-node) (node-graph node))
       ;; Copy bytes so maybe-init-node-data on the copy does not try to
       ;; re-read from data-pointer (which may be freed by a concurrent commit).

@@ -106,7 +106,10 @@ hub with the incoming state and re-journals it under the op-id."
     (let* ((tid (graph-db::node-type-id
                  (graph-db::lookup-node-type-by-name 'g-person :vertex :graph g)))
            (newid (gen-id))
-           (base (make-instance 'g-person :id newid :type-id tid :revision 0))
+           ;; %MAKE-VERTEX, not a bare (MAKE-INSTANCE 'g-person ...): see
+           ;; tests/peer-unique-tests.lisp's PU-AUTHORED-CREATE (GH #135).
+           (base (graph-db::%make-vertex :class 'g-person :id newid
+                                         :type-id tid :revision 0))
            (op (progn (setf (graph-db::data base) '((:name . "Fresh") (:age . 3)))
                       (graph-db::make-peer-op
                        :kind :authored :op-id (graph-db::gen-op-id)
@@ -222,11 +225,14 @@ silently (no surface) -- the still-live gate is what makes it a conflict."
          (close-graph ,g :snapshot-p nil)))))
 
 (defun make-edge-create-op (edge-type from to graph origin lamport)
-  "An authored op creating a fresh EDGE-TYPE edge FROM->TO (ids)."
+  "An authored op creating a fresh EDGE-TYPE edge FROM->TO (ids).
+
+%MAKE-EDGE, not a bare (MAKE-INSTANCE edge-type ...): see
+tests/peer-unique-tests.lisp's PU-AUTHORED-CREATE docstring (GH #135)."
   (let* ((tid (graph-db::node-type-id
                (graph-db::lookup-node-type-by-name edge-type :edge :graph graph)))
-         (e (make-instance edge-type :id (gen-id) :type-id tid :revision 0
-                                     :from from :to to)))
+         (e (graph-db::%make-edge :class edge-type :id (gen-id) :type-id tid
+                                  :revision 0 :from from :to to)))
     (setf (graph-db::data e) nil (graph-db::bytes e) (graph-db::serialize nil))
     (graph-db::make-peer-op
      :kind :authored :op-id (graph-db::gen-op-id) :origin origin :lamport lamport :tx-id 60

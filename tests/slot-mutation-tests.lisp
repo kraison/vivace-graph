@@ -146,15 +146,9 @@ them would be a regression."
           (is (eq :meta-ok (m1 n))))))))
 
 (test copy-and-mark-deleted-survive-initform-on-memory-graph
-  "CRITICAL (GH #135).  COPY-NODE used to build the copy via a bare
-MAKE-INSTANCE and only SETF DATA afterward, so CLOS applied any persistent
-slot's :INITFORM against the still-empty alist -- a write, through the
-guarded funnel, on a node not yet registered in this transaction.  A DISK
-graph masked it: COPY-NODE passes :DATA-POINTER, so MAYBE-INIT-NODE-DATA
-materializes the alist from bytes before any :INITFORM could fire.  A MEMORY
-graph has no DATA-POINTER (0) -- the only backend that ever exercised the
-:INITFORM path, and the Android production path.  Covers both COPY (via
-SETF+SAVE) and MARK-DELETED (which copies internally)."
+  "GH #135.  COPY (and MARK-DELETED, which copies internally) must survive a
+persistent :INITFORM slot on a MEMORY graph -- the one backend with no
+DATA-POINTER to mask a COPY-NODE bug against a missing alist entry."
   (with-temp-directory (dir)
     (let (id)
       (with-sm-memory-graph (g dir)
@@ -172,3 +166,32 @@ SETF+SAVE) and MARK-DELETED (which copies internally)."
          (with-transaction ()
            (mark-deleted (lookup-vertex id :graph g))))
         (is (deleted-p (lookup-vertex id :graph g)))))))
+
+(test copy-survives-a-makunbound-initform-slot-on-memory-graph
+  "GH #135 (the durable-brick case).  SLOT-MAKUNBOUND on a persistent
+:INITFORM slot drops its DATA-alist entry permanently -- surviving a
+memory-graph close/reopen, since CL-STORE restore never re-runs initforms
+(the same gap GH #128 schema evolution hits).  A node in that state must
+still be COPYable: %PERSISTENT-SLOT-DEFAULTS backs the missing entry with the
+class default rather than the copy tripping the guard on every future copy."
+  (with-temp-directory (dir)
+    (let ((loc (namestring dir)) id)
+      (let ((g (graph-db::make-memory-graph *sm-graph-name* loc)))
+        (let ((*graph* g))
+          (with-transaction ()
+            (setq id (id (make-sm-defaulted :name "x"))))
+          (slot-makunbound (lookup-vertex id :graph g) 'gap))
+        (close-graph g :snapshot-p t))
+      (let ((g (graph-db::open-memory-graph *sm-graph-name* loc)))
+        (unwind-protect
+             (let ((*graph* g))
+               (finishes
+                (with-transaction ()
+                  (let ((c (copy (lookup-vertex id :graph g))))
+                    (setf (name c) "z")
+                    (save c))))
+               (is (equal "z" (name (lookup-vertex id :graph g))))
+               (is (equal "FILLER" (gap (lookup-vertex id :graph g)))
+                   "the makunbound slot must come back as the class default"))
+          (ignore-errors (close-graph g :snapshot-p nil))
+          (collect-garbage))))))
