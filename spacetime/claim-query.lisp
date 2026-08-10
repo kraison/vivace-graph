@@ -8,7 +8,12 @@
   "Claims in GRAPH naming (NAMESPACE, KEY) as subject, object, or either.
 CLAIM-CLASS is the PARENT class name; one call covers both arities.  Answers
 from the claim graph's own indexes -- no cross-graph read, no snapshot, which
-is what makes it implementable in this unit (design §8)."
+is what makes it implementable in this unit (design §8).
+
+An out-of-range ROLE signals rather than silently returning NIL -- NIL is
+also the correct answer for \"no claims touch this endpoint\", and this
+subsystem exists to keep those two cases from being confused."
+  (check-type role (member :subject :object :either))
   (let* ((family (claim-family claim-class))
          (want (list namespace key))
          (subjects (when (member role '(:subject :either))

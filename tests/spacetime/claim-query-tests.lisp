@@ -29,12 +29,25 @@ is a different endpoint."
 
 (test claims-touching-returns-each-claim-once
   "A claim naming the same endpoint as BOTH subject and object must not be
-returned twice by the :EITHER union."
+returned twice by the :EITHER union.  The node cache would hand back one EQ
+instance for both lookups, which is deduplicated by EQL alone and would let
+a wrong (plain REMOVE-DUPLICATES) implementation pass; disabling it forces
+two distinct instances for the same node, so the :KEY/:TEST choice is what
+is actually under test."
   (with-claim-graph (g)
     (with-transaction () (make-b :subject "self" :object "self"))
-    (is (= 1 (length (claims-touching g 'ct-claim :ns "self"))))))
+    (let ((graph-db::*cache-enabled* nil))
+      (is (= 1 (length (claims-touching g 'ct-claim :ns "self")))))))
 
 (test claims-touching-signals-on-an-unregistered-parent
   (with-claim-graph (g)
     (signals unknown-claim-family
       (claims-touching g 'no-such-claim :ns "x"))))
+
+(test claims-touching-signals-on-a-bad-role
+  "An out-of-range ROLE must signal, not silently return NIL -- NIL is also
+the correct answer for \"nothing touches this endpoint\"."
+  (with-claim-graph (g)
+    (with-transaction () (make-b :subject "alpha"))
+    (signals error
+      (claims-touching g 'ct-claim :ns "alpha" :role :subjet))))
