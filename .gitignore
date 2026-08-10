@@ -12,3 +12,7 @@
 
 # Claude
 .claude
+
+# Local dev tooling (REPL server, memory probe) and CLI state -- not engine
+/tools/
+/.local/
