@@ -30,3 +30,23 @@ subsystem exists to keep those two cases from being confused."
         (remove-duplicates (append subjects objects)
                             :key #'graph-db:id :test #'equalp)
         (or subjects objects))))
+
+(defun claim-extent (claim)
+  "CLAIM's TEMPORAL-EXTENT, decoded from the stored sexp, or NIL.  The stored
+form is EXTENT-SEXP; the two never share a name so neither is mistaken for
+the other (design §7)."
+  (let ((s (claim-extent-sexp claim)))
+    (when s (sexp->extent s))))
+
+(defun (setf claim-extent) (extent claim)
+  "Store EXTENT on CLAIM as its sexp.  Only values GRAPH-DB:SERIALIZE
+already handles reach the heap, so no core type byte is reserved.
+
+Also resets CLAIM's cached BYTES to :INIT: a not-yet-committed node's
+BYTES is populated eagerly at construction from the constructor's
+initial args and never refreshed for a plain post-construction SETF, so
+without this the extent survives in-memory but is silently absent after
+a close/reopen (core bug, GH #135)."
+  (setf (claim-extent-sexp claim) (and extent (extent->sexp extent)))
+  (setf (graph-db::bytes claim) :init)
+  extent)

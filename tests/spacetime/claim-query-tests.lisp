@@ -51,3 +51,36 @@ the correct answer for \"nothing touches this endpoint\"."
     (with-transaction () (make-b :subject "alpha"))
     (signals error
       (claims-touching g 'ct-claim :ns "alpha" :role :subjet))))
+
+(test a-claim-carries-a-temporal-extent-across-a-reopen
+  "Design §7: the slot holds the sexp, the accessor decodes.  The reopen is
+the point -- an in-memory round trip would not exercise serialization."
+  (with-temp-directory (dir)
+    (let ((path (namestring dir)) (id nil))
+      (let ((g (make-graph *claim-graph-name* path :buffer-pool-size 1000)))
+        (unwind-protect
+             (let ((graph-db:*graph* g))
+               (with-transaction ()
+                 (let ((c (make-u)))
+                   (setf (claim-extent c)
+                         (make-granule-instant (ts 2026 3 15) :month
+                                               :standing :observed))
+                   (setq id (id c)))))
+          (close-graph g)))
+      (let ((g2 (open-graph *claim-graph-name* path)))
+        (unwind-protect
+             (let* ((graph-db:*graph* g2)
+                    (e (claim-extent (lookup-vertex id))))
+               (is (eq :instant (extent-kind e)))
+               (is (eq :month (extent-precision e)))
+               (is (eq :observed (extent-standing e)))
+               (is (eq (extent-start e) (extent-end e))
+                   "the instant coupling survives storage"))
+          (ignore-errors (close-graph g2 :snapshot-p nil))
+          (collect-garbage))))))
+
+(test a-claim-without-an-extent-reads-as-nil-not-as-an-error
+  (with-claim-graph (g)
+    (declare (ignorable g))
+    (with-transaction ()
+      (is (null (claim-extent (make-u)))))))

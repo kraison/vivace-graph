@@ -21,5 +21,5 @@
   ;; TEST's import lists (tests/geos/package.lisp, tests/algorithms/package.
   ;; lisp).
   (:import-from #:graph-db #:make-graph #:close-graph #:with-transaction
-                #:open-graph #:id)
+                #:open-graph #:id #:lookup-vertex)
   (:export #:run-spacetime-tests #:spacetime-suite))
