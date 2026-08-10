@@ -206,6 +206,17 @@ explicit delete does. So the unit ships:
 `claim-class` is the **parent** class name, so one call sweeps both arities;
 `producer` is matched exactly. Regeneration is: sweep, then insert.
 
+**The sweep and the insert must be two separate transactions.** This is not a
+style preference — a single transaction cannot work. `validate-unique-
+constraints` is a **pre-durability** check, while the key release for a deleted
+node happens in `apply-tx-writes-to-unique-indexes`, which runs
+**post-durability**. So within one transaction the insert's uniqueness check
+runs *before* the sweep's release is visible, and re-inserting an unchanged
+claim collides with the copy the same transaction just deleted.
+
+Sweep, commit, then insert. Found while building the sweep (GH #131); the
+ordering is visible in `%commit`, `transactions.lisp`.
+
 The constraint's job is narrower and still worth having — it stops a buggy or
 racing producer duplicating within a run, which a sweep cannot.
 
