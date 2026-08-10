@@ -2595,6 +2595,165 @@ Also note: ~graph~ is now a *reserved* slot name on node classes — it backs th
 home-graph tracking slot described above. A user-defined slot named ~graph~ shadows it and
 silently disables home-graph tracking for that class; do not use it as a slot name.
 
+** Chapter 18: Temporal Extents — graph-db/spacetime (optional)
+
+Every timestamp a real system records comes with some story about how sure
+you are of it. "The device failed on the 14th" is not the same claim as "the
+device failed sometime in March" or "we searched the logs for a failure and
+found none." Modeling all of these as a bare timestamp — or worse, as a
+timestamp plus a comment nobody queries — is how a downstream reader ends up
+treating "we never checked" the same as "we checked, and there was nothing
+there." ~graph-db/spacetime~ is a small, *optional* add-on system that gives
+these distinctions their own types, so a query can tell them apart instead of
+discovering the difference by reading commit messages.
+
+It is its own ASDF system, in its own package, ~GRAPH-DB.SPACETIME~ — not
+exported from ~GRAPH-DB~, because a public API grafted onto core's package
+would mean editing core for a feature core has no use for. Loading it is a
+pure add-on decision, the same as ~graph-db/geos~ or ~graph-db/algorithms~:
+
+#+BEGIN_SRC lisp
+  (ql:quickload :graph-db/spacetime)
+#+END_SRC
+
+Core does not depend on it and does not know it exists. It reserves no
+on-disk type byte either — an extent is stored as an ordinary sexp of
+keywords, integers and ~LOCAL-TIME:TIMESTAMP~ objects that ~GRAPH-DB:SERIALIZE~
+already knows how to write, so it lives happily inside any node slot without
+any change to the storage layer.
+
+*** Endpoints are ranges, not points
+
+The idea underneath everything else here: instead of a timestamp, an
+endpoint is a ~BOUND~ — an ~[earliest, latest]~ pair, each side either a
+~LOCAL-TIME:TIMESTAMP~ or ~:UNBOUNDED~. That one shape covers three different
+kinds of not knowing, which would otherwise need three different mechanisms:
+
+- *Imprecision* — "sometime between the 10th and the 15th" is a bound whose
+  two sides are distinct, known timestamps.
+- *Open-endedness* — "started on the 3rd, and as far as we know has not
+  ended" is a bound whose ~LATEST~ side is ~:UNBOUNDED~.
+- *Total ignorance* — "we have no idea when" is ~(UNKNOWN-BOUND)~, both sides
+  ~:UNBOUNDED~.
+
+A single known instant is just the degenerate case, ~(EXACT-BOUND ts)~, where
+both sides are the same timestamp. Every comparison — ~BOUND-COMPARE~, which
+answers ~:<~, ~:>~, ~:=~ or ~:AMBIGUOUS~ — runs the same logic regardless of which
+of these three a bound represents, so nothing built on top of it has to
+special-case "we don't know."
+
+*** "January 2026" versus "sometime in January 2026"
+
+A month can be read two ways, and the constructors keep them as two
+different extents rather than quietly picking one:
+
+- ~MAKE-GRANULE-INTERVAL~ builds the granule *itself* — an ~:INTERVAL~ extent
+  whose endpoints are the granule's exact first and last instants. This is
+  "January 2026" read as a span.
+- ~MAKE-GRANULE-INSTANT~ builds *one point somewhere inside* the granule — an
+  ~:INSTANT~ extent whose single bound spans the whole granule. This is
+  "sometime in January 2026" read as one uncertain moment.
+
+#+BEGIN_SRC lisp
+  (make-granule-interval january-15th :month)  ; January 2026, as a span
+  (make-granule-instant january-15th :month)   ; one moment, somewhere in it
+#+END_SRC
+
+An ~:INSTANT~'s ~START~ and ~END~ are the *same* ~BOUND~ object, not merely two
+equal ones — that identity is the coupling that keeps its two endpoints from
+drifting apart under further operations, and it is exactly what a codec or a
+serializer has to preserve to avoid silently turning a point into a span.
+
+*** The algebra returns a set
+
+~ALLEN-RELATIONS~ compares two extents and returns a ~TEMPORAL-RELATION~
+holding every one of the thirteen Allen relations consistent with their
+endpoint ranges — never fewer than one, and never zero, because two extents
+always stand in *some* relation to each other. When both extents are exact
+that set collapses to one relation; when either is imprecise, several
+relations can remain simultaneously possible, and the algebra returns all of
+them rather than guessing:
+
+#+BEGIN_SRC lisp
+  (temporal-relation-relations (allen-relations a b))  ; the relation set
+  (allen-relation a b)               ; the ONE relation, or NIL if ambiguous
+  (allen-definite-p a b)             ; T iff the set has exactly one member
+  (extent-before-p a b)              ; "is :BEFORE possible", one per relation
+  (extent-overlaps-p a b)
+  ;; ... and the other eleven relation predicates
+#+END_SRC
+
+~ALLEN-RELATION~ returns ~NIL~ exactly when more than one relation remains
+possible — never as a stand-in for "these are unrelated." There is no such
+thing as unrelated here; the only question is how precisely the relation is
+known.
+
+*** Standing: a value's provenance, and three ways to have none
+
+~STANDING~ answers a different question from the bound machinery: not *when*,
+but *whether there is a value at all, and how it was obtained*. It is a
+closed, six-member vocabulary, deliberately *unordered* — ~:ASSERTED~ and
+~:INFERRED~ cannot be ranked against each other, so no comparison operator
+over standings exists. Three members record a value:
+
+- ~:OBSERVED~, ~:INFERRED~, ~:ASSERTED~.
+
+and three record an *absence*, each for a different reason:
+
+- ~:SEARCHED-EMPTY~ — we looked, and there was nothing there.
+- ~:UNCOVERED~ — we never looked.
+- ~:INDETERMINATE~ — we cannot tell whether there is anything to find.
+
+Collapsing those three into one generic "unknown" is the exact defect this
+subsystem exists to make unrepresentable: "we checked and found nothing" and
+"we never checked" are different facts, and code that cannot tell them apart
+will eventually treat one as the other. ~STANDING-ABSENCE-P~ and
+~STANDING-PRESENT-P~ classify a standing; every constructor runs
+~CHECK-STANDING~, so a value outside the six is not merely discouraged, it is
+impossible to construct.
+
+Because an Allen relation is a claim about *two* extents, a
+~TEMPORAL-RELATION~ carries *both* endpoints' standings — never one collapsed
+onto the other:
+
+#+BEGIN_SRC lisp
+  (temporal-relation-standings (allen-relations a b))  ; both standings, deduped
+#+END_SRC
+
+*** Intervals are closed; granules are UTC
+
+An ~:INTERVAL~'s endpoints are both inclusive — ~[START, END]~, not a
+half-open range — so ~MAKE-INTERVAL~ rejects a ~START~ = ~END~ pair as
+ill-formed: that is a point in time, and ~MAKE-INSTANT~ is what builds one.
+~GRANULE-BOUNDS~, and the two granule constructors built on it, always decode
+and encode in UTC regardless of the host's ambient timezone, so a granule
+boundary is a fixed absolute instant rather than one that moves depending on
+where the code happens to run.
+
+*** Worked examples
+
+Two exact intervals settle to a single, definite relation:
+
+#+BEGIN_SRC lisp
+  (let ((survey (make-interval (exact-bound jan-1) (exact-bound jan-5)))
+        (clearance (make-interval (exact-bound jan-5) (exact-bound jan-10))))
+    (allen-relation survey clearance))
+  ;; => :MEETS
+#+END_SRC
+
+An imprecise endpoint widens the answer to a genuine set. Here a report only
+narrows a device failure to somewhere between the 3rd and the 8th, and the
+algebra correctly refuses to pick one relation to a known five-day window:
+
+#+BEGIN_SRC lisp
+  (let ((reported (make-instant (make-bound jan-3 jan-8) :standing :asserted))
+        (window (make-interval (exact-bound jan-5) (exact-bound jan-10))))
+    (temporal-relation-relations (allen-relations reported window)))
+  ;; => (:BEFORE :STARTS :DURING) -- REPORTED might land before WINDOW,
+  ;;    exactly at its start, or inside it; nothing in hand rules any of
+  ;;    the three out, so all three come back.
+#+END_SRC
+
 ** API Reference
 
 This chapter provides a categorized reference for the most important exported symbols from the ~graph-db~ package. It is not an exhaustive list of every internal function but focuses on the public API you will use most often when building applications.

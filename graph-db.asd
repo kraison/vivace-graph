@@ -393,7 +393,12 @@
 (defsystem graph-db/spacetime-test
   :name "VivaceGraph spacetime test suite"
   :description "FiveAM tests for graph-db/spacetime."
-  :depends-on (:graph-db/spacetime :fiveam)
+  ;; GRAPH-DB/CORE (not the full GRAPH-DB) so conformance-tests.lisp can
+  ;; drive EXTENT->SEXP output through the real GRAPH-DB:SERIALIZE /
+  ;; GRAPH-DB:DESERIALIZE rather than a structural predicate (#130).  It is
+  ;; already a transitive dependency via GRAPH-DB/SPACETIME; listed
+  ;; explicitly here so the test system's needs are not implicit.
+  :depends-on (:graph-db/spacetime :graph-db/core :fiveam)
   :pathname "tests/spacetime/"
   :serial t
   :components ((:file "package")
@@ -403,7 +408,8 @@
                (:file "extent-tests")
                (:file "allen-tests")
                (:file "instant-tests")
-               (:file "property-tests"))
+               (:file "property-tests")
+               (:file "conformance-tests"))
   :perform (test-op (op c)
                     (unless (uiop:symbol-call :graph-db/spacetime-test
                                               :run-spacetime-tests)

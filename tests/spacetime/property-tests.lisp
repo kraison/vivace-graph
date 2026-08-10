@@ -130,17 +130,9 @@ this can fail, the algebra emits confidently-wrong answers."
          overall ambiguity (instant- or interval-based) is too rare for ~
          this property to mean anything"
         indefinite *property-trials*)
-    ;; This is the guard GH #133 was about.  %COMPATIBLE-P's :AMBIGUOUS
-    ;; wildcard is reachable ONLY when BOTH extents are :INTERVAL-kind,
-    ;; so the INDEFINITE counter above (which instant-involving pairs
-    ;; dominate via RANDOM-BOUND) cannot detect a regression in it: if
-    ;; %RANGED-INTERVAL were ever reverted to always-exact bounds --
-    ;; GH #133's original vacuity -- II-AMBIGUOUS drops to exactly 0
-    ;; while INDEFINITE stays comfortably over its own threshold.  Seed
-    ;; 20260810 gives ~25 of ~96 interval-vs-interval pairs genuinely
-    ;; ambiguous (~26%); a floor of a quarter of that (6) has headroom
-    ;; against ordinary seed/count variation while still catching any
-    ;; reversion to zero, which is the only failure mode that matters.
+    ;; Floor sits well below this seed's observed ~26% ambiguous rate, so
+    ;; a regression to always-exact intervals fails loudly instead of
+    ;; passing silently (GH #133).
     (is (> ii-ambiguous 6)
         "only ~D of ~D interval-vs-interval trials produced an ~
          indefinite relation set -- %RANGED-INTERVAL is not generating ~
