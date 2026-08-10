@@ -24,24 +24,48 @@ re-run is worse than no property test.")
              (exact-bound (ts 2026 1 d1))
              (make-bound (ts 2026 1 d1) (ts 2026 1 d2)))))))
 
-(defun random-extent (state)
+(defun %exact-interval (state)
   "S is capped at 27 (not RANDOM-DAY's 28) so S+1 always leaves a January
-day for E -- MAKE-INTERVAL now rejects a value-degenerate S = E pair
+day for E -- an exact S = E pair is what MAKE-INTERVAL now rejects
 (GH #130, design §3.2)."
+  (let* ((s (1+ (random 27 state)))
+         (e (min 28 (+ s 1 (random 10 state)))))
+    (make-interval (exact-bound (ts 2026 1 s))
+                   (exact-bound (ts 2026 1 e)))))
+
+(defun %ranged-interval (state)
+  "Each endpoint a several-day window, not a pinned instant.  GAP keeps
+the start window's LATEST strictly before the end window's EARLIEST, so
+the interval stays well-formed and never trips MAKE-INTERVAL's :=
+guard.  The windows are wide enough (up to 3 days) that two
+independently drawn intervals can plausibly overlap and drive
+BOUND-COMPARE to :AMBIGUOUS -- the branch %COMPATIBLE-P exists for
+(GH #130)."
+  (let* ((s-lo (1+ (random 18 state)))
+         (s-hi (+ s-lo (random 4 state)))
+         (gap (1+ (random 3 state)))
+         (e-lo (+ s-hi gap))
+         (e-hi (min 28 (+ e-lo (random 4 state)))))
+    (make-interval (make-bound (ts 2026 1 s-lo) (ts 2026 1 s-hi))
+                   (make-bound (ts 2026 1 e-lo) (ts 2026 1 e-hi)))))
+
+(defun random-extent (state)
+  "Interval endpoints are exact about a third of the time and genuinely
+ranged the rest, so both the oracle (exact vs exact) and the uncertain
+path (ranged vs ranged) get exercised."
   (if (zerop (random 2 state))
       (make-instant (random-bound state))
-      (let* ((s (1+ (random 27 state)))
-             (e (min 28 (+ s 1 (random 10 state)))))
-        (make-interval (exact-bound (ts 2026 1 s))
-                       (exact-bound (ts 2026 1 e))))))
+      (if (zerop (random 3 state))
+          (%exact-interval state)
+          (%ranged-interval state))))
 
 (defun concretise (e state)
   "Pick one admissible timestamp inside each of E's bounds and return an
 extent with EXACT bounds.  :UNBOUNDED is drawn from a window well outside
 the January range the generators use, so it stays outside every interval.
-For an interval, END is picked no earlier than the chosen START -- picking
-both endpoints independently could otherwise invert an interval that no
-caller could ever have constructed (GH #130)."
+For an interval, END is picked STRICTLY after the chosen START -- never
+equal, since MAKE-INTERVAL now rejects that, and never earlier, since no
+caller could construct that (GH #130)."
   (labels ((pick (b)
              (let ((lo (bound-earliest b))
                    (hi (bound-latest b)))
@@ -51,24 +75,22 @@ caller could ever have constructed (GH #130)."
                      ((eq hi :unbounded) lo)
                      ((timestamp= lo hi) lo)
                      (t (if (zerop (random 2 state)) lo hi)))))
-           (pick-from (floor-ts b)
-             "Like PICK, but constrained to timestamps >= FLOOR-TS.  Falls
-back to FLOOR-TS itself when nothing admissible in B clears it."
-             (let* ((hi (bound-latest b))
-                    (lo0 (bound-earliest b))
-                    (lo (if (or (eq lo0 :unbounded)
-                                (timestamp< lo0 floor-ts))
-                            floor-ts lo0)))
-               (cond ((eq hi :unbounded) lo)
-                     ((timestamp< hi lo) floor-ts)
-                     ((timestamp= lo hi) lo)
-                     (t (if (zerop (random 2 state)) lo hi))))))
+           (pick-after (floor-ts b)
+             "Like PICK, but the result must be STRICTLY after FLOOR-TS.
+RANDOM-EXTENT keeps every interval well-formed -- the start bound's
+LATEST strictly precedes the end bound's EARLIEST -- so B's own PICK
+already clears FLOOR-TS; BOUND-EARLIEST is the fallback for a B that
+somehow does not."
+             (let ((picked (pick b)))
+               (if (timestamp< floor-ts picked)
+                   picked
+                   (bound-earliest b)))))
     (if (extent-instant-p e)
         (make-instant (exact-bound (pick (extent-start e)))
                       :standing (extent-standing e))
         (let ((start (pick (extent-start e))))
           (make-interval (exact-bound start)
-                         (exact-bound (pick-from start (extent-end e)))
+                         (exact-bound (pick-after start (extent-end e)))
                          :standing (extent-standing e))))))
 
 (test the-relation-set-never-omits-the-truth
@@ -76,7 +98,8 @@ back to FLOOR-TS itself when nothing admissible in B clears it."
 endpoints must produce a relation the uncertain answer already contains.  If
 this can fail, the algebra emits confidently-wrong answers."
   (let ((state (sb-ext:seed-random-state *property-seed*))
-        (checked 0))
+        (checked 0)
+        (indefinite 0))
     (dotimes (i *property-trials*)
       (let* ((a (random-extent state))
              (b (random-extent state))
@@ -84,6 +107,7 @@ this can fail, the algebra emits confidently-wrong answers."
              (ca (concretise a state))
              (cb (concretise b state))
              (truth (allen-relation ca cb)))
+        (when (> (length set) 1) (incf indefinite))
         (when truth
           (incf checked)
           (is-true (member truth set)
@@ -92,7 +116,12 @@ this can fail, the algebra emits confidently-wrong answers."
     (is (> checked (floor *property-trials* 2))
         "only ~D of ~D trials concretised to a definite relation -- the ~
          generators are not exercising the exact path"
-        checked *property-trials*)))
+        checked *property-trials*)
+    (is (> indefinite (floor *property-trials* 10))
+        "only ~D of ~D trials produced an indefinite (ambiguous) relation ~
+         set -- the generators are not exercising the uncertain path, so ~
+         a regression in the wildcard branch could pass here silently"
+        indefinite *property-trials*)))
 
 (test concretising-an-extent-always-gives-a-definite-answer
   "Guards the oracle itself: if an exact pair ever went indefinite, the
