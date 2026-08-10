@@ -111,6 +111,24 @@ the other pair of endpoints settles it. `[2030, :unbounded]` against
 far either side runs. Only the comparison that no endpoint pair can settle is
 `:ambiguous`.
 
+**A `:interval` may not be value-degenerate.** `make-interval` signals
+`invalid-extent` when its two bounds compare `:=` — both exact and equal —
+directing the caller to `make-instant`.
+
+Without that rule a point in time has two spellings, `kind :instant` and a
+collapsed `:interval`, and only one of them works: the signature table in §4.1
+assumes `start < end` strictly, so a degenerate interval against another
+degenerate interval computes `(:= := := :=)`, matches no row, and yields the
+empty set. Found by §7.1's soundness property on its first run, which is what
+that property is for.
+
+Rejecting is the fix rather than widening the table, because extra rows would
+re-open the disjointness collision §3.3.1 resolves. The bad state becomes
+unrepresentable rather than handled — the same move §3.4 makes for standing.
+
+Intervals whose endpoint *ranges* merely overlap stay legal: their ordering is
+uncertain, not collapsed, and rejecting them would forbid a legitimate record.
+
 **Intervals are closed, `[start, end]`.** This is Allen's own convention and it
 is what makes `meets` mean anything: A's end and B's start are the same
 instant, not merely adjacent. Granule ends are therefore the last representable

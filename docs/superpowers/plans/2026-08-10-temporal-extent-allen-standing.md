@@ -23,10 +23,11 @@
 - Work on a branch off `experiment`. Show the full diff under `## 📋 DIFF FOR REVIEW` before each commit. Do not push.
 - Verify the tree under test with `(asdf:system-source-directory :graph-db)` — `~/quicklisp/local-projects/graph-db.asd` is a symlink to this checkout.
 
-### Two spec corrections this plan carries
+### Three spec corrections this plan carries
 
 1. **§5's component list gains `conditions.lisp`** (six files, not five). Conditions belong with neither `standing` nor `bound`, and both need them.
-2. **§3.1's "all thirteen" is exact only for interval-vs-interval.** An *instant* of wholly unknown position against an interval yields the five relations §3.3.1 marks reachable, not thirteen. Fewer, and correct — the instant coupling constrains the answer even when the position does not. Task 5 asserts this.
+2. **Added during execution: `make-interval` must reject a value-degenerate interval.** Both bounds exact and equal is a point in time, which `make-instant` already expresses; the collapsed `:interval` spelling matches no signature row and yields the empty set. Task 6's soundness property found it on its first run — before it reached its own non-vacuity check. The guard and its test were folded into Task 6 rather than re-opening Task 3, and §3.2 of the spec gained the rule.
+3. **§3.1's "all thirteen" is exact only for interval-vs-interval.** An *instant* of wholly unknown position against an interval yields the five relations §3.3.1 marks reachable, not thirteen. Fewer, and correct — the instant coupling constrains the answer even when the position does not. Task 5 asserts this.
 
 ---
 
