@@ -5,12 +5,12 @@
 (in-suite spacetime-suite)
 
 (defun make-b (&key (producer :rule-a) (subject "s1") (object "o1")
-                    (relation :r) (standing :inferred) extent)
+                    (relation :r) (standing :inferred) extent rule-version)
   (make-ct-claim-binary :subject-namespace :ns :subject-key subject
                         :relation relation
                         :object-namespace :ns :object-key object
                         :producer producer :standing standing
-                        :extent extent))
+                        :extent extent :rule-version rule-version))
 
 (defun make-u (&key (producer :rule-a) (subject "s1") (relation :r) extent)
   (make-ct-claim-unary :subject-namespace :ns :subject-key subject
@@ -78,11 +78,79 @@ the same producer, subject and relation coexist."
 
 (test rule-version-is-not-part-of-identity
   "Design §6.1: PRODUCER excludes the version, so re-running a rule at a new
-version collides with its own prior claim rather than adding a second one."
+version collides with its own prior claim rather than adding a second one.
+
+RULE-VERSION arrives via the constructor, not a post-construction SETF --
+a SETF on a node not yet committed is silently lost (GH #135)."
   (with-claim-graph (g)
     (declare (ignorable g))
-    (with-transaction ()
-      (let ((c (make-b))) (setf (claim-rule-version c) "v1")))
+    (with-transaction () (make-b :rule-version "v1"))
     (signals graph-db:unique-constraint-violation
-      (with-transaction ()
-        (let ((c (make-b))) (setf (claim-rule-version c) "v2"))))))
+      (with-transaction () (make-b :rule-version "v2")))))
+
+;;; --- Finding 1: every identity component must be non-nil (design §3.1) ---
+
+(test omitting-a-unary-identity-component-signals
+  "PRODUCER, SUBJECT-NAMESPACE, SUBJECT-KEY, RELATION are the UNARY
+constraint tuple; DEF-UNIQUE exempts any tuple containing a null, so each
+must be checked non-nil before the node is built (GH #131 finding 1)."
+  (with-claim-graph (g)
+    (declare (ignorable g))
+    (flet ((try (&rest args)
+             (with-transaction ()
+               (signals missing-claim-identity-component
+                 (apply #'make-ct-claim-unary args)))))
+      (try :subject-key "s" :relation :r :producer :p :standing :inferred)
+      (try :subject-namespace :ns :relation :r :producer :p
+           :standing :inferred)
+      (try :subject-namespace :ns :subject-key "s" :producer :p
+           :standing :inferred)
+      (try :subject-namespace :ns :subject-key "s" :relation :r
+           :standing :inferred))))
+
+(test omitting-a-binary-identity-component-signals
+  "The six components of the BINARY constraint tuple; each must be non-nil
+before the node is built (GH #131 finding 1)."
+  (with-claim-graph (g)
+    (declare (ignorable g))
+    (flet ((try (&rest args)
+             (with-transaction ()
+               (signals missing-claim-identity-component
+                 (apply #'make-ct-claim-binary args)))))
+      ;; omit :producer
+      (try :subject-namespace :ns :subject-key "s" :relation :r
+           :object-namespace :ns :object-key "o" :standing :inferred)
+      ;; omit :subject-namespace
+      (try :subject-key "s" :relation :r :object-namespace :ns
+           :object-key "o" :producer :p :standing :inferred)
+      ;; omit :subject-key
+      (try :subject-namespace :ns :relation :r :object-namespace :ns
+           :object-key "o" :producer :p :standing :inferred)
+      ;; omit :relation
+      (try :subject-namespace :ns :subject-key "s" :object-namespace :ns
+           :object-key "o" :producer :p :standing :inferred)
+      ;; omit :object-namespace
+      (try :subject-namespace :ns :subject-key "s" :relation :r
+           :object-key "o" :producer :p :standing :inferred)
+      ;; omit :object-key
+      (try :subject-namespace :ns :subject-key "s" :relation :r
+           :object-namespace :ns :producer :p :standing :inferred))))
+
+(test omitting-object-key-closes-the-exemption
+  "Before this fix, two binary claims identical except for an omitted
+OBJECT-KEY both committed silently -- NIL is exempt from DEF-UNIQUE's
+uniqueness check, so the duplicate was invisible to it (Finding 1). Now
+the first omission cannot even construct a claim, so there is nothing
+left to duplicate."
+  (with-claim-graph (g)
+    (declare (ignorable g))
+    (flet ((try-without-object-key ()
+             (with-transaction ()
+               (signals missing-claim-identity-component
+                 (make-ct-claim-binary
+                  :subject-namespace :ns :subject-key "s1" :relation :r
+                  :object-namespace :ns :producer :rule-a
+                  :standing :inferred)))))
+      (try-without-object-key)
+      (try-without-object-key)
+      (is (null (claims-touching g 'ct-claim :ns "s1"))))))
