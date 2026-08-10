@@ -386,7 +386,8 @@
   :components ((:file "package")
                (:file "conditions")
                (:file "standing")
-               (:file "bound")))
+               (:file "bound")
+               (:file "extent")))
 
 (defsystem graph-db/spacetime-test
   :name "VivaceGraph spacetime test suite"
@@ -397,7 +398,8 @@
   :components ((:file "package")
                (:file "suite")
                (:file "standing-tests")
-               (:file "bound-tests"))
+               (:file "bound-tests")
+               (:file "extent-tests"))
   :perform (test-op (op c)
                     (unless (uiop:symbol-call :graph-db/spacetime-test
                                               :run-spacetime-tests)
