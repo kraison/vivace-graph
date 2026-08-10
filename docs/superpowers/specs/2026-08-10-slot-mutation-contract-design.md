@@ -35,12 +35,27 @@ construction-time bytes and discards every post-construction mutation.
 
 This is an asymmetry between two sibling methods, not a contract the caller broke.
 
-### Why B happens
+### Why B happens — mechanism NOT established
 
 `COPY` of a not-yet-created node produces a `tx-update` whose `old-node` is the pending
-create. At apply, `ARCHIVE-NODE-VERSION` runs against a node whose heap state the create
-is simultaneously establishing, and two writes land on one lhash key. The graph cannot
-be reopened.
+create, and the node's stored bytes end up as `#(0 0)` — reading it back signals
+`DESERIALIZATION-ERROR: no applicable method for DESERIALIZE-HELP (0 #())`. Two zero
+bytes means a pointer or length was written as zero. **Which one, and where, is not yet
+known.** Do not state a mechanism in code comments or the changelog until it is.
+
+An earlier revision of this spec claimed `ARCHIVE-NODE-VERSION` races a create that is
+"simultaneously establishing" the node's heap state. That is **wrong**: `(writes
+transaction)` concatenates the create-set *before* the write-set and `APPLY-TRANSACTION`
+applies them sequentially, so the `tx-create` always writes a valid head before the
+`tx-update` reads it. There is no interleaving.
+
+**Reproducing it — read this before writing a test.** `OPEN-GRAPH` **succeeds**. The
+damage is in the node, not the graph, so a test that opens and closes without reading the
+node back sees nothing and passes. The issue body's phrasing ("`open-graph` signals") is
+imprecise; a repro built to that sentence reported ten consecutive clean runs against a
+graph whose node was destroyed. **Assert on reading the node back after reopen.** The
+canonical repro is `repro-135-deserialization.lisp` (untracked, at the root of the main
+working tree).
 
 ### Why D is the worst of them
 
