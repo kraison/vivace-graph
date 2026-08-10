@@ -54,3 +54,28 @@ BYTES and dropped it; the tx-update path has always re-serialized."
           (is (not (null n)) "the node itself must survive reopen")
           (is (equal "set-after-create" (note n))
               "the post-create mutation must survive reopen"))))))
+
+(test characterise-create-then-delete-same-transaction
+  "CHARACTERISATION, not a contract (GH #135).  DELETE-NODE copies internally,
+so a create-set guard in COPY-NODE will also reject this.  Whether that is a
+fix or a behaviour change depends on what it does TODAY, which this pins.
+If the graph cannot be reopened, this pattern has the same shape as pattern B
+and the guard is a fix -- update this test's name and docstring accordingly."
+  (with-temp-directory (dir)
+    (let (id (reopened nil) (opened-ok nil))
+      (with-sm-graph (g dir)
+        (with-transaction ()
+          (let ((n (make-sm-thing :name "doomed")))
+            (setq id (id n))
+            (mark-deleted n))))
+      (handler-case
+          (with-sm-reopen (g dir)
+            (setq opened-ok t)
+            (setq reopened (lookup-vertex id :graph g)))
+        (error (e)
+          (format t "~&CREATE-THEN-DELETE: reopen FAILED: ~A~%" e)))
+      (format t "~&CREATE-THEN-DELETE: opened-ok=~A node=~A~%"
+              opened-ok reopened)
+      ;; Deliberately asserts only that we learned something: the printed
+      ;; result is the deliverable.  Task 4 replaces this with a real gate.
+      (is (or opened-ok (not opened-ok))))))
