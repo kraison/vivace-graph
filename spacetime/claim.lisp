@@ -91,6 +91,16 @@ DATA alist is not populated yet -- it would reject already-valid claims."
            (producer subject-namespace subject-key
             object-namespace object-key relation)
          ,graph-name)
+       ;; Subject index on PARENT reaches both arities via SUBTYPEP.  Object
+       ;; index on BINARY, where those slots live -- declaring it on PARENT
+       ;; also works (%APPLICABLE-INDEX-DESCRIPTORS requires every named slot
+       ;; to exist) but reads as a mistake.  PRODUCER index exists so the
+       ;; regeneration sweep is not a full scan (design §4, plan note 2).
+       (graph-db:def-index ,parent (subject-namespace subject-key)
+           ,graph-name)
+       (graph-db:def-index ,binary (object-namespace object-key)
+           ,graph-name)
+       (graph-db:def-index ,parent (producer) ,graph-name)
        (fmakunbound ',(intern (format nil "MAKE-~A" parent)))
        ;; DEF-VERTEX redefines each raw constructor on every expansion, so
        ;; this cannot double-wrap on a re-evaluated DEF-CLAIM-CLASSES form.
