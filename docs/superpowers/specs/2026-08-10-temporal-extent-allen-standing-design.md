@@ -246,20 +246,42 @@ host in Helsinki than on one in UTC — and the same source record would compare
 differently on two machines. Every construction passes
 `:timezone local-time:+utc-zone+` explicitly.
 
-The arithmetic, verified against `local-time` before this spec was written:
+Zero the parts below the precision to get the granule start. Get the granule
+end by **encoding the next granule's start explicitly and subtracting one
+nanosecond** — never by adding one unit with `local-time:timestamp+`.
 
 ```lisp
 (let* ((z local-time:+utc-zone+)
        (start (local-time:encode-timestamp 0 0 0 0 1 month year :timezone z))
-       (end   (local-time:timestamp- (local-time:timestamp+ start 1 :month)
-                                     1 :nsec)))
+       (next  (local-time:encode-timestamp 0 0 0 0 1 next-month next-year
+                                           :timezone z))
+       (end   (local-time:timestamp- next 1 :nsec)))
   ...)
 ```
 
-Zero the parts below the precision to get the granule start; add one unit of
-the precision and subtract one nanosecond to get the granule end. Uniform
-across `:year` through `:nsec`, and it gets February and leap years right
-without a table.
+**`timestamp+` is not UTC-safe for calendar units and takes no `:timezone`
+argument.** It performs `:year`, `:month` and `:day` arithmetic in
+`local-time:*default-timezone*`, so on any DST-observing host the result
+shifts by an hour across a transition. Measured on a host in EET:
+
+| granule | `timestamp+` gives | correct |
+|---|---|---|
+| March 2026 | `2026-03-31T22:59:59Z` | `2026-03-31T23:59:59Z` |
+| October 2026 | `2026-11-01T00:59:59Z` | `2026-10-31T23:59:59Z` |
+| 2026-03-29, `:day` | 82800s long | 86400s |
+
+The October row is the dangerous one: the granule **spills into November**, so
+two adjacent month granules *overlap* instead of meeting — corrupting the
+algebra rather than merely the boundary.
+
+Encoding the next granule's start keeps every unit in UTC by construction, and
+still gets February and leap years right without a table.
+
+This was found by the real `serialize`/`deserialize` round trip added in the
+conformance work, on an instant built from a DST-affected month. The structural
+predicate that preceded it could not have found it — it checked the *types* the
+codec emits, which is a restatement of the assumption rather than a test of the
+values.
 
 ## 4. The algebra
 
