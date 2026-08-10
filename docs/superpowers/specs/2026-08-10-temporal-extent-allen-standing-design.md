@@ -70,10 +70,15 @@ lies**. That single change absorbs three separate problems:
 | open-endedness — *"since March, still true"* | end range runs March → `:unbounded` |
 | total ignorance — *"we have no idea when"* | both ranges `(:unbounded, :unbounded)` |
 
-The third case matters most. An extent with no knowable interval yields a
-relation set containing all thirteen relations — "we cannot say", expressed in
+The third case matters most. An extent with no knowable interval yields the
+full set of relations still consistent with it — "we cannot say", expressed in
 the algebra's own terms. It composes with everything downstream instead of
 requiring a special case at each consumer, and it is never `nil`.
+
+That set is all thirteen for an **interval** of wholly unknown extent. For an
+**instant** of wholly unknown position it is the five §3.3.1 marks reachable:
+fewer, and correct — the endpoint coupling constrains the answer even when the
+position does not.
 
 ### 3.2 The records
 
@@ -328,6 +333,7 @@ Follows `graph-db/geos`:
   :pathname "spacetime/"
   :serial t
   :components ((:file "package")
+               (:file "conditions")
                (:file "standing")
                (:file "bound")
                (:file "extent")
@@ -394,8 +400,8 @@ reintroduced `meets`/`starts` collision.
 The category §11 of the programme design mandates. For every constructor:
 
 - "no interval" is distinguishable from "zero-length interval at the epoch";
-- an unbounded extent yields all thirteen relations, not an error and not a
-  default;
+- an unbounded extent yields relations rather than an error or a default —
+  thirteen for an interval, the five reachable ones for an instant (§3.1);
 - no accessor returns a value that a caller could mistake for a measurement.
 
 ---
