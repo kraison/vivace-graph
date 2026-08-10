@@ -782,6 +782,13 @@ APPLY-TRANSACTION)."
   (let ((table (tx-write-table write graph))
         (node (node write)))
     (setf (revision node) 0)
+    ;; Refresh BYTES from DATA before sizing the allocation.  BYTES is a cache
+    ;; filled at construction and MAYBE-INITIALIZE-BYTES only fills an empty
+    ;; one, so a SETF between MAKE-<TYPE> and commit updates DATA alone and the
+    ;; node persists its construction-time value.  The tx-update path has always
+    ;; done this; the create path never did (GH #135).
+    (when (data node)
+      (setf (bytes node) (serialize (data node))))
     (maybe-write-to-heap node graph)
     (add-node-to-indexes node graph
                          :unless-present *add-to-indexes-unless-present-p*)

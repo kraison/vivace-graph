@@ -479,6 +479,7 @@
                (:file "spatial-prolog-tests")
                (:file "traverse-tests")
                (:file "write-path-tests")
+               (:file "slot-mutation-tests")
                (:file "reopen-tests")
                (:file "backup-tests")
                (:file "mvcc-tests")
