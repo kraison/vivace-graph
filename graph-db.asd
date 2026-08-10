@@ -374,6 +374,33 @@
                     (unless (uiop:symbol-call :graph-db/geos-test :run-geos-tests)
                       (error "graph-db GEOS tests failed."))))
 
+;; OPTIONAL spacetime add-on: temporal extents, the Allen interval algebra,
+;; and standing.  Pure value types and total functions -- core graph-db does
+;; NOT depend on this, and this reserves no serialize type byte (GH #130).
+(defsystem graph-db/spacetime
+  :name "VivaceGraph spacetime (temporal substrate)"
+  :description "Temporal extents, the Allen interval algebra, and standing."
+  :depends-on (:graph-db/core :local-time)
+  :pathname "spacetime/"
+  :serial t
+  :components ((:file "package")
+               (:file "conditions")
+               (:file "standing")))
+
+(defsystem graph-db/spacetime-test
+  :name "VivaceGraph spacetime test suite"
+  :description "FiveAM tests for graph-db/spacetime."
+  :depends-on (:graph-db/spacetime :fiveam)
+  :pathname "tests/spacetime/"
+  :serial t
+  :components ((:file "package")
+               (:file "suite")
+               (:file "standing-tests"))
+  :perform (test-op (op c)
+                    (unless (uiop:symbol-call :graph-db/spacetime-test
+                                              :run-spacetime-tests)
+                      (error "graph-db spacetime tests failed."))))
+
 (defsystem graph-db/test
   :name "VivaceGraph test suite"
   :description "FiveAM unit tests for graph-db."
