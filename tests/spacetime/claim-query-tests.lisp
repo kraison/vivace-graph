@@ -104,17 +104,40 @@ pins that failure mode so it stays a known contract, not a regression."
 (test regeneration-leaves-no-orphan-when-a-rule-stops-producing-a-claim
   "Design §6.4 -- the case the constraint alone cannot fix.  v1 produces two
 claims, v2 produces one; without the sweep the dropped claim would survive
-forever, because no upsert ever touches it."
+forever, because no upsert ever touches it.
+
+Sweep and reinsert are two SEPARATE transactions, not one: the unique
+constraint's release (APPLY-TX-WRITES-TO-UNIQUE-INDEXES) is post-durability,
+but its check (VALIDATE-UNIQUE-CONSTRAINTS) is pre-durability and runs first
+within the same commit, so a same-transaction reinsert of an unchanged claim
+would never see its own sweep's release (design §6.4) -- see
+SWEEP-THEN-INSERT-OF-AN-UNCHANGED-CLAIM-COLLIDES-WITHIN-ONE-TRANSACTION
+below, which pins that as the enforced boundary."
   (with-claim-graph (g)
     (with-transaction ()
       (make-b :producer :rule-a :object "kept")
       (make-b :producer :rule-a :object "dropped"))
     (with-transaction ()
-      (delete-claims-by-producer g 'ct-claim :rule-a)
+      (delete-claims-by-producer g 'ct-claim :rule-a))
+    (with-transaction ()
       (make-b :producer :rule-a :object "kept"))
     (let ((live (claims-touching g 'ct-claim :ns "s1")))
       (is (= 1 (length live)))
       (is (string= "kept" (claim-object-key (first live)))))))
+
+(test sweep-then-insert-of-an-unchanged-claim-collides-within-one-transaction
+  "Pins #131: MARK-DELETED's release lands in
+APPLY-TX-WRITES-TO-UNIQUE-INDEXES, which runs post-durability, after
+VALIDATE-UNIQUE-CONSTRAINTS's pre-durability check -- both inside the same
+commit.  So a sweep and a reinsert of the identical claim in ONE transaction
+always collide; the split into two transactions above is required, not
+stylistic (design §6.4)."
+  (with-claim-graph (g)
+    (with-transaction () (make-b))
+    (signals graph-db:unique-constraint-violation
+      (with-transaction ()
+        (delete-claims-by-producer g 'ct-claim :rule-a)
+        (make-b)))))
 
 (test the-sweep-makes-a-claim-re-insertable
   "After a sweep the constraint must not still be holding the old key."
