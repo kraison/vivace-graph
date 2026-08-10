@@ -16,3 +16,6 @@
 # Local dev tooling (REPL server, memory probe) and CLI state -- not engine
 /tools/
 /.local/
+
+# Superpowers SDD scratch (ledger, briefs, reports) -- regenerable
+/.superpowers/
