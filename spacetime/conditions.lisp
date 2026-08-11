@@ -61,3 +61,24 @@
   (:report (lambda (c s)
              (format s "No source class is registered under namespace ~S."
                      (unknown-namespace-namespace c)))))
+
+(define-condition resolution-in-transaction (spacetime-error)
+  ((namespace :initarg :namespace :reader resolution-in-transaction-namespace)
+   (key :initarg :key :reader resolution-in-transaction-key))
+  (:report (lambda (c s)
+             (format s "RESOLVE-ENDPOINT ~S/~S was called inside a ~
+read-write transaction.  Resolution can cross graphs, and a read-write ~
+transaction is single-graph; resolve before opening it."
+                     (resolution-in-transaction-namespace c)
+                     (resolution-in-transaction-key c)))))
+
+(define-condition ambiguous-endpoint (spacetime-error)
+  ((namespace :initarg :namespace :reader ambiguous-endpoint-namespace)
+   (key :initarg :key :reader ambiguous-endpoint-key)
+   (classes :initarg :classes :reader ambiguous-endpoint-classes))
+  (:report (lambda (c s)
+             (format s "~S/~S resolves in more than one class: ~{~S~^, ~}.~
+  An external key must be unique within its namespace."
+                     (ambiguous-endpoint-namespace c)
+                     (ambiguous-endpoint-key c)
+                     (ambiguous-endpoint-classes c)))))
