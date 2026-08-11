@@ -159,13 +159,13 @@ cannot be defined at all, so the violation surfaces at macroexpansion."
       (signals missing-source-facet (macroexpand-1 form)))))
 
 (test none-is-accepted-for-every-facet
-  "Design §1: the rule is uniform, with no exceptions."
-  (dolist (f +source-facets+)
-    (declare (ignorable f))
-    (finishes
-      (macroexpand-1
-       `(def-source st-allnone :graph-db-source-test ((a :initarg :a))
-          ,@(loop for g in +source-facets+ append (list g :none)))))))
+  "Design §1: the rule is uniform, with no exceptions.  One expansion with
+every facet :NONE proves it for all seven at once -- looping over the facets
+here would expand an identical form seven times and assert nothing extra."
+  (finishes
+    (macroexpand-1
+     `(def-source st-allnone :graph-db-source-test ((a :initarg :a))
+        ,@(loop for g in +source-facets+ append (list g :none))))))
 
 (test a-malformed-facet-signals-and-names-the-facet
   (signals invalid-source-facet
