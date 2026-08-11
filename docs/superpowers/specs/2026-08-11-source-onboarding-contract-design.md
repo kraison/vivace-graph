@@ -151,9 +151,18 @@ write `:none` and leave a lie in the record.
 `:time`'s function returns a `temporal-extent` (S1a) — a function rather than a
 slot because an extent is often derived from several slots.
 
-`:indexed-text` generalises the existing `indexed-text` generic, already
-documented as "the class's own answer to what part of VERTEX gets embedded".
-That generic is the precedent this whole contract follows.
+`:indexed-text` names the function answering "what part of this record gets
+embedded".
+
+**A correction to an earlier draft of this spec, and to Stage A's framing.**
+Both said this facet "generalises the existing `indexed-text` generic" and that
+"a seventh of the contract already exists". It does not exist *here*: that
+generic and its mixin live in a tenant application, not in `graph-db`. The
+pattern is proven — one class answering for itself what part of it is
+indexable — and that is why the contract adopts it. But the substrate is
+adopting a tenant's good idea, not generalising its own existing code, and
+saying otherwise in this unit's spec is the boundary rule slipping in the unit
+whose whole job is boundary discipline.
 
 ---
 
