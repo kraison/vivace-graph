@@ -56,11 +56,11 @@ the correct answer for \"nothing touches this endpoint\"."
   "Design §7: the slot holds the sexp, the accessor decodes.  The reopen is
 the point -- an in-memory round trip would not exercise serialization.
 
-EXTENT arrives via the constructor, not a post-construction SETF: a
-not-yet-committed node's bytes are cached at construction and a plain
-SETF before commit never reaches them (GH #135) -- see
-SETF-CLAIM-EXTENT-DOES-NOT-PERSIST-ON-AN-UNCOMMITTED-CLAIM below, which
-pins that failure mode so it stays a known contract, not a regression."
+EXTENT arrives via the constructor here; a post-construction SETF works
+too, now that GH #135 is fixed -- see
+SETF-CLAIM-EXTENT-PERSISTS-ON-AN-UNCOMMITTED-CLAIM below.  The initarg
+remains the preferred form for ergonomics and validation placement, not
+because SETF fails to persist."
   (with-temp-directory (dir)
     (let ((path (namestring dir)) (id nil))
       (let ((g (make-graph *claim-graph-name* path :buffer-pool-size 1000)))
@@ -151,14 +151,14 @@ stylistic (design §6.4)."
     (signals unknown-claim-family
       (delete-claims-by-producer g 'no-such-claim :rule-a))))
 
-(test setf-claim-extent-does-not-persist-on-an-uncommitted-claim
-  "Pins GH #135: a not-yet-committed node's bytes are cached at
-construction, so a plain (SETF (CLAIM-EXTENT ...)) between MAKE-<ARITY>
-and commit is visible in-memory but silently absent after a
-close/reopen.  This is the documented contract, not a bug in this
-subsystem -- MAKE-<ARITY>'s :EXTENT initarg is the correct way to give a
-claim an extent at construction (see the reopen test above); SETF is for
-mutating an already-committed claim (COPY, mutate, SAVE)."
+(test setf-claim-extent-persists-on-an-uncommitted-claim
+  "GH #135 is fixed: SETF on a node created in the current transaction now
+persists correctly, because the create path re-serializes BYTES from DATA
+just as the update path always did.  So (SETF (CLAIM-EXTENT ...)) on a
+just-created, not-yet-committed claim survives a close/reopen, exactly
+like the :EXTENT initarg does (see the reopen test above).  The reopen
+here is the point -- an in-memory assertion would pass whether or not the
+fix landed."
   (with-temp-directory (dir)
     (let ((path (namestring dir)) (id nil))
       (let ((g (make-graph *claim-graph-name* path :buffer-pool-size 1000)))
@@ -175,8 +175,11 @@ mutating an already-committed claim (COPY, mutate, SAVE)."
           (close-graph g)))
       (let ((g2 (open-graph *claim-graph-name* path)))
         (unwind-protect
-             (let ((graph-db:*graph* g2))
-               (is (null (claim-extent (lookup-vertex id)))
-                   "silently absent once read back from disk"))
+             (let* ((graph-db:*graph* g2)
+                    (e (claim-extent (lookup-vertex id))))
+               (is (eq :instant (extent-kind e))
+                   "the SETF extent survived the reopen")
+               (is (eq :month (extent-precision e)))
+               (is (eq :observed (extent-standing e))))
           (ignore-errors (close-graph g2 :snapshot-p nil))
           (collect-garbage))))))
