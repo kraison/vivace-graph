@@ -58,4 +58,4 @@
    #:missing-source-facet #:invalid-source-facet #:not-a-source
    #:resolve-endpoint #:disclosable-p #:+disclosure-classes+
    #:unknown-namespace #:ambiguous-endpoint
-   #:resolution-in-transaction))
+   #:resolution-in-transaction #:*namespace-sources* #:namespace-sources))

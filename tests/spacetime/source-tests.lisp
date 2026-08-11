@@ -94,3 +94,58 @@ test in the suite."
 facts; NIL for both would let a consumer treat an unconverted class as a
 conforming one with empty facets."
   (signals not-a-source (source-contract 'uq-claim)))
+
+(defmacro with-source-graph ((g) &body body)
+  "A fresh on-disk graph named *SOURCE-GRAPH-NAME* in a temp dir."
+  (let ((dir (gensym "DIR")))
+    `(with-temp-directory (,dir)
+       (let ((,g (make-graph *source-graph-name* (namestring ,dir)
+                             :buffer-pool-size 1000)))
+         (unwind-protect (let ((graph-db:*graph* ,g)) ,@body)
+           (ignore-errors (close-graph ,g))
+           (collect-garbage))))))
+
+(def-source st-photo :graph-db-source-test
+    ((sha :initarg :sha :accessor st-sha))
+  :identity     (:namespace :st-media :key-slot sha)
+  :space        :none
+  :time         :none
+  :attribution  :none
+  :sensitivity  (:class :restricted)
+  :registration :none
+  :indexed-text :none)
+
+(def-source st-note :graph-db-source-test
+    ((body :initarg :body :accessor st-body))
+  :identity     :none
+  :space        :none
+  :time         :none
+  :attribution  :none
+  :sensitivity  :none
+  :registration :none
+  :indexed-text :none)
+
+(test identity-registers-the-class-under-its-namespace
+  (is (member 'st-report (namespace-sources :st-reports)))
+  (is (member 'st-photo (namespace-sources :st-media)))
+  (is-false (member 'st-photo (namespace-sources :st-reports))))
+
+(test identity-none-registers-nothing
+  "Plan clarification: :IDENTITY :NONE means records of this class are never
+endpoint targets.  It is legal, and it registers no namespace."
+  (dolist (ns '(:st-reports :st-media))
+    (is-false (member 'st-note (namespace-sources ns)))))
+
+(test an-unregistered-namespace-signals
+  "Design §4: an unknown namespace is a programming error, distinct from a
+key that simply matches nothing."
+  (signals unknown-namespace (namespace-sources :st-no-such)))
+
+(test identity-emits-an-index-on-the-key-slot
+  "Without this index RESOLVE-ENDPOINT would be a full scan.  Proved by
+using the index rather than by inspecting the registry: INDEX-LOOKUP signals
+if no index covers the class and slot, so a successful call IS the evidence."
+  (with-source-graph (g)
+    (with-transaction () (make-st-report :headline "x" :report-id "idx-1"))
+    (is (= 1 (length (graph-db:index-lookup g 'st-report '(report-id)
+                                            "idx-1"))))))

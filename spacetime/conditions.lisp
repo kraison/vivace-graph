@@ -55,3 +55,9 @@
   (:report (lambda (c s)
              (format s "~S was not defined with DEF-SOURCE."
                      (not-a-source-class c)))))
+
+(define-condition unknown-namespace (spacetime-error)
+  ((namespace :initarg :namespace :reader unknown-namespace-namespace))
+  (:report (lambda (c s)
+             (format s "No source class is registered under namespace ~S."
+                     (unknown-namespace-namespace c)))))

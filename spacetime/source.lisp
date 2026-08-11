@@ -35,6 +35,24 @@ facts (design §5)."
   (or (gethash class *source-contracts*)
       (error 'not-a-source :class class)))
 
+(defvar *namespace-sources* (make-hash-table :test 'eq)
+  "Namespace keyword -> list of class names declaring it.  Populated by the
+:IDENTITY facet, and read by RESOLVE-ENDPOINT (design §4).")
+
+(defun namespace-sources (namespace)
+  "Class names registered under NAMESPACE.  Signals UNKNOWN-NAMESPACE when
+none are -- a typo or an unloaded system, distinct from a key that matches
+nothing (design §4)."
+  (or (gethash namespace *namespace-sources*)
+      (error 'unknown-namespace :namespace namespace)))
+
+(defun %register-identity (class identity)
+  "Register CLASS under its namespace.  :NONE registers nothing: such a
+class is never an endpoint target (plan clarification)."
+  (unless (eq identity :none)
+    (let ((ns (getf identity :namespace)))
+      (pushnew class (gethash ns *namespace-sources*)))))
+
 (defun %plist-has-p (plist &rest keys)
   (every (lambda (k) (member k plist)) keys))
 
@@ -98,6 +116,10 @@ use :NONE to say a facet does not apply (design §2)."
   (%check-facet :indexed-text indexed-text)
   `(progn
      (graph-db:def-vertex ,name () ,slots ,graph-name)
+     ,@(unless (eq identity :none)
+         `((graph-db:def-index ,name (,(getf identity :key-slot))
+             ,graph-name)))
+     (%register-identity ',name ',identity)
      (setf (gethash ',name *source-contracts*)
            (make-source-facets :class ',name :graph ',graph-name
                                :identity ',identity :space ',space
