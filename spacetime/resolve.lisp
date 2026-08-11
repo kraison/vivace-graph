@@ -60,7 +60,12 @@ outside a transaction (design §4.1)."
     ;; once per class name -- de-duplicating by node id before counting
     ;; keeps that legal, resolvable, and distinct from genuine ambiguity:
     ;; two DIFFERENT records still signal (Fix 2, GH #132 review).
-    (let ((distinct (remove-duplicates hits :key #'graph-db:id)))
+    ;; EQUALP, not the default EQL: an id is a byte vector, and two hits
+    ;; are the same instance only while the node cache holds them -- with
+    ;; *CACHE-ENABLED* nil each lookup builds a fresh node.  Same test
+    ;; GRAPH-DB itself uses for this (clos.lisp).
+    (let ((distinct (remove-duplicates hits :key #'graph-db:id
+                                            :test #'equalp)))
       (when (cdr distinct)
         (error 'ambiguous-endpoint :namespace namespace :key key
                                    :classes classes))

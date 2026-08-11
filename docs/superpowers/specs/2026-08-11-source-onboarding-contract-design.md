@@ -86,6 +86,12 @@ value the macro accepts; the second does not compile.
 names the stable **external** key — not a node id. A node id is a location; an
 external key is an identity.
 
+`:namespace` must be a keyword and `:key-slot` a non-keyword symbol, and the
+macro enforces both. The asymmetry matters: `:key-slot :report-id` reads
+naturally, is a symbol, and never matches the slot `report-id` — so it would
+validate, define, accept writes, and resolve nothing for the life of the
+class.
+
 `def-source` emits a `def-index` on the key slot and registers the class under
 its namespace. That pairing is exactly what makes §4's resolution possible, and
 it is why #131 deferred resolution to this unit rather than pull this facet
@@ -235,6 +241,16 @@ naming both classes**.
 Returning the first would make which record you get depend on class-definition
 order, which is the kind of silent, order-dependent answer this programme
 exists to eliminate.
+
+**Two class *names* answering is not the same as two records.** A source
+class may inherit another, and `index-lookup` matches a class together with
+its subclasses — so one physical record answers under both the parent's name
+and the child's. Counting class names would make that legal declaration
+permanently unresolvable. Resolution therefore counts **distinct records, by
+node id**, and compares those ids with `equalp`: an id is a byte vector, and
+two hits are the same Lisp object only for as long as the node cache holds
+them. Comparing by identity passes with the cache on and fails with it off,
+which is a defect that hides from any test that does not disable it.
 
 ---
 

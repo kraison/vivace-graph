@@ -128,13 +128,20 @@ subclasses (index.lisp), so ST-PSRC's own index-lookup call and ST-CSRC's
 own both find the SAME physical ST-CSRC record.  Before the fix, that made
 RESOLVE-ENDPOINT see two classes answering and signal AMBIGUOUS-ENDPOINT
 for a namespace that has, in truth, exactly one record -- permanently
-unresolvable, since nothing about the data ever changes that count."
+unresolvable, since nothing about the data ever changes that count.
+
+Runs with the node cache OFF, which is what makes the test discriminate.
+Cached, both lookups return one shared instance and even an EQL de-dup
+passes; uncached, LOOKUP-NODE builds a fresh node per call and the two
+ids are EQUALP but not EQL.  De-duplicating by anything narrower than
+EQUALP fails here and only here."
   (with-source-graph (g)
     (declare (ignorable g))
     (with-transaction () (make-st-csrc :pid "inh-solo"))
-    (let ((n (resolve-endpoint :st-inherited "inh-solo")))
-      (is-true n)
-      (is (string= "inh-solo" (st-psrc-pid n))))))
+    (let ((graph-db::*cache-enabled* nil))
+      (let ((n (resolve-endpoint :st-inherited "inh-solo")))
+        (is-true n)
+        (is (string= "inh-solo" (st-psrc-pid n)))))))
 
 (test resolve-endpoint-guards-cross-class-ambiguity-after-dedup
   "Fix 2 (fix-wave review), the other half: de-duplicating HITS by node id
