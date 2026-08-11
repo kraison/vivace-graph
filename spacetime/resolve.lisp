@@ -39,3 +39,21 @@ outside a transaction (design §4.1)."
       (error 'ambiguous-endpoint :namespace namespace :key key
                                  :classes classes))
     (first hits)))
+
+(defparameter +disclosure-classes+
+  '(:public :internal :restricted :secret)
+  "Least to most restricted.  A class outside this list -- including :NONE --
+is treated as more restricted than every member (design §3.2).")
+
+(defun %disclosure-rank (class)
+  "CLASS's position, or NIL when unrecognised."
+  (position class +disclosure-classes+))
+
+(defun disclosable-p (class clearance)
+  "True when CLASS may be disclosed at CLEARANCE.  FAIL-CLOSED: an
+unrecognised CLASS or CLEARANCE yields NIL, so the unknown case withholds
+rather than releases.  The substrate never calls this itself -- enforcement
+belongs to whoever reads or exports (design §3.2)."
+  (let ((c (%disclosure-rank class))
+        (k (%disclosure-rank clearance)))
+    (and c k (<= c k))))

@@ -187,3 +187,15 @@ DEF-SOURCE would add nothing."
   (graph-db.spacetime::%register-identity
    'st-report '(:namespace :st-reports :key-slot report-id))
   (is (= 1 (count 'st-report (namespace-sources :st-reports)))))
+
+;; Deliberately shares :ST-REPORTS with ST-REPORT, to exercise §4.2.
+(def-source st-summary :graph-db-source-test
+    ((topic :initarg :topic :accessor st-topic)
+     (summary-id :initarg :summary-id :accessor st-summary-id))
+  :identity     (:namespace :st-reports :key-slot summary-id)
+  :space        :none
+  :time         :none
+  :attribution  :none
+  :sensitivity  :none
+  :registration :none
+  :indexed-text :none)
