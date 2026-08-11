@@ -118,6 +118,7 @@
            #:read-transaction
            #:no-transaction-in-progress
            #:mutating-unregistered-node
+           #:copying-uncommitted-node
 
            #:def-node-type
            #:def-vertex

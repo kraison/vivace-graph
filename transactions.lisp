@@ -158,6 +158,18 @@ per graph and may compose; read-write transactions are not (GH #53).")
              (mutating-unregistered-node-slot condition)
              (mutating-unregistered-node-node condition)))))
 
+(define-condition copying-uncommitted-node (error)
+  ((node
+    :initarg :node
+    :reader copying-uncommitted-node-node))
+  (:report
+   (lambda (condition stream)
+     (format stream
+             "Cannot COPY ~A: it was created in this transaction, so it has no ~
+              committed version to update against.  SETF its slots directly -- ~
+              a node you created is writable without a copy."
+             (copying-uncommitted-node-node condition)))))
+
 ;;; Transaction manager
 (defgeneric create-transaction (transaction-manager))
 (defgeneric cleanup-transaction (transaction))
@@ -2662,7 +2674,10 @@ stops appearing in queries.  MARK-DELETED is the usual entry point.")
         (error 'cross-graph-transaction-error
                :node node :transaction-graph txn-graph :node-graph home)))
     (let ((old-node node)
-          (new-node (copy node)))
+          ;; COPY-NODE, not the public COPY: a node created and then
+          ;; MARK-DELETED in this same transaction must keep working, and the
+          ;; create-set guard lives in COPY, not here (GH #135).
+          (new-node (copy-node node)))
       (setf (bytes new-node) (bytes old-node))
       (setf (deleted-p new-node) t)
       (add-to-object-set (make-instance 'tx-delete

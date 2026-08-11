@@ -71,30 +71,61 @@ BYTES and dropped it; the tx-update path has always re-serialized."
           (is (equal "set-after-create" (note n))
               "the post-create mutation must survive reopen"))))))
 
-(test characterise-create-then-delete-same-transaction
-  "CHARACTERISATION, not a contract (GH #135).  DELETE-NODE copies internally,
-so a create-set guard in COPY-NODE will also reject this.  Whether that is a
-fix or a behaviour change depends on what it does TODAY, which this pins.
-If the graph cannot be reopened, this pattern has the same shape as pattern B
-and the guard is a fix -- update this test's name and docstring accordingly."
+(test create-then-delete-same-transaction-still-works
+  "GH #135.  DELETE-NODE copies internally, but calls COPY-NODE directly
+rather than the public COPY, so it is exempt from the create-set guard
+COPY now carries (see PATTERN-B-COPY-OF-CREATED-NODE-SIGNALS below).
+Create-then-MARK-DELETED in one transaction worked before the guard and
+must keep working -- this is the gate that catches a future change to the
+guard silently breaking it."
   (with-temp-directory (dir)
-    (let (id (reopened nil) (opened-ok nil))
+    (let (id)
       (with-sm-graph (g dir)
         (with-transaction ()
           (let ((n (make-sm-thing :name "doomed")))
             (setq id (id n))
             (mark-deleted n))))
-      (handler-case
-          (with-sm-reopen (g dir)
-            (setq opened-ok t)
-            (setq reopened (lookup-vertex id :graph g)))
-        (error (e)
-          (format t "~&CREATE-THEN-DELETE: reopen FAILED: ~A~%" e)))
-      (format t "~&CREATE-THEN-DELETE: opened-ok=~A node=~A~%"
-              opened-ok reopened)
-      ;; Deliberately asserts only that we learned something: the printed
-      ;; result is the deliverable.  Task 4 replaces this with a real gate.
-      (is (or opened-ok (not opened-ok))))))
+      (with-sm-reopen (g dir)
+        (let ((n (lookup-vertex id :graph g)))
+          (is (not (null n)) "the node itself must survive reopen")
+          (is (deleted-p n) "the deletion must survive reopen"))))))
+
+(test pattern-b-copy-of-created-node-signals
+  "PATTERN B (GH #135).  COPY of a node created in this same transaction built
+a tx-update whose OLD-NODE was a pending create; it committed and closed
+cleanly and the graph then could not be opened at all.  It signals at the
+public COPY now."
+  (with-temp-directory (dir)
+    (with-sm-graph (g dir)
+      (with-transaction ()
+        (let ((n (make-sm-thing :name "A")))
+          (signals graph-db:copying-uncommitted-node
+            (copy n)))))))
+
+(test graph-opens-after-a-rejected-pattern-b
+  "The point of the guard: the transaction is refused, so no half-built node
+reaches disk.  OPEN-GRAPH alone succeeding is not enough to show that -- the
+damage in the un-guarded bug was in the NODE, not the graph -- so this asserts
+on a READ-BACK, not merely that reopen finishes.  A non-local exit rolls the
+whole transaction back (WITH-TRANSACTION only commits on normal return), so
+the create never lands either; the id must read back as cleanly absent, not
+as a node whose bytes signal DESERIALIZATION-ERROR (see
+repro-135-deserialization.lisp)."
+  (with-temp-directory (dir)
+    (let (id)
+      (with-sm-graph (g dir)
+        (ignore-errors
+         (with-transaction ()
+           (let ((n (make-sm-thing :name "A")))
+             (setq id (id n))
+             (let ((c (copy n)))
+               (setf (note c) "B")
+               (save c))))))
+      (with-sm-reopen (g dir)
+        (finishes (lookup-vertex id :graph g))
+        (is (null (lookup-vertex id :graph g))
+            "the rejected transaction must leave nothing behind: a clean
+absent read, never a DESERIALIZATION-ERROR")))))
 
 (test pattern-d-setf-on-looked-up-node-signals
   "PATTERN D (GH #135).  LOOKUP-NODE returns the SHARED cached instance, so a

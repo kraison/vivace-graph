@@ -4,12 +4,25 @@
   (:documentation
    "Return a mutable copy of vertex or edge NODE, registered with the current
 transaction.  This is the first step of the copy-modify-save update pattern:
-copy the node inside a WITH-TRANSACTION, SETF its slots, then SAVE the copy.")
+copy the node inside a WITH-TRANSACTION, SETF its slots, then SAVE the copy.
+Signals COPYING-UNCOMMITTED-NODE if NODE was created in this same
+transaction -- it has no committed version yet, and is already writable
+without a copy.")
   (:method (thing)
     (error "Cannot save ~S of type ~S" thing (type-of thing)))
   (:method ((vertex vertex))
+    ;; A node created in THIS transaction has no committed version to update
+    ;; against; copying it built a tx-update whose OLD-NODE was a pending
+    ;; create, which committed cleanly and left the graph unopenable
+    ;; (GH #135).  DELETE-NODE calls COPY-NODE directly and so bypasses this.
+    (when (and *transaction*
+               (object-set-member-p vertex (create-set *transaction*)))
+      (error 'copying-uncommitted-node :node vertex))
     (copy-vertex vertex))
   (:method ((edge edge))
+    (when (and *transaction*
+               (object-set-member-p edge (create-set *transaction*)))
+      (error 'copying-uncommitted-node :node edge))
     (copy-edge edge)))
 
 (defgeneric mark-deleted (node)
