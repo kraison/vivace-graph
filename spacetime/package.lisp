@@ -47,4 +47,15 @@
    #:claim-method #:claim-standing #:claim-confidence
    #:claim-extent-sexp #:claim-geometry
    #:claim-extent #:claims-touching #:delete-claims-by-producer
-   #:unknown-claim-family))
+   #:unknown-claim-family
+   ;; source onboarding contract (GH #132)
+   #:def-source #:source-contract #:+source-facets+
+   #:source-facets #:source-facets-p #:source-facets-class
+   #:source-facets-graph #:source-facets-identity #:source-facets-space
+   #:source-facets-time #:source-facets-attribution
+   #:source-facets-sensitivity #:source-facets-registration
+   #:source-facets-indexed-text
+   #:missing-source-facet #:invalid-source-facet #:not-a-source
+   #:resolve-endpoint #:disclosable-p #:+disclosure-classes+
+   #:unknown-namespace #:ambiguous-endpoint
+   #:resolution-in-transaction))
