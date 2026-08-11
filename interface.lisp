@@ -18,8 +18,15 @@ without a copy.")
     ;; drift between them; %COPY (transactions.lisp) carries the same
     ;; vertex/edge dispatch this used to duplicate.  DELETE-NODE calls
     ;; %COPY directly and so bypasses this guard.
+    ;; CREATE-SET is a TX-only reader; a non-TX *TRANSACTION* (e.g. replay's
+    ;; RESTORE-TRANSACTION) has none, so is trusted unconditionally here
+    ;; rather than signalling NO-APPLICABLE-METHOD (GH #135).
+    ;; NODE-CREATED-IN-TRANSACTION-P checks by EQ, not shared id: a
+    ;; re-created id (:ID is accepted by MAKE-<TYPE>) must not let an
+    ;; unrelated instance skip the guard.
     (when (and *transaction*
-               (object-set-member-p node (create-set *transaction*)))
+               (typep *transaction* 'tx)
+               (node-created-in-transaction-p node *transaction*))
       (error 'copying-uncommitted-node :node node))
     (%copy node)))
 

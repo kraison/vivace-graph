@@ -129,13 +129,25 @@ between releases; cutting a release renames it to the new version and dates it.
   that graph's only durable record.
 
 - **A slot mutation made after `MAKE-<TYPE>` in the same transaction was
-  discarded** (#135). `APPLY-TX-WRITE (tx-create)` wrote the node's
-  construction-time `BYTES`; `MAYBE-INITIALIZE-BYTES` only serializes an
-  empty one, so a `SETF` between construction and commit updated `DATA`
-  alone. The value read back correctly for the rest of the session — the
-  node cache serves `DATA` — and came back `NIL` after reopen. The
-  `tx-update` path had always re-serialized for this reason; the create
-  path never did.
+  discarded** (#135). `MAKE-<TYPE>` serializes `BYTES` once at construction;
+  a `SETF` between construction and commit updated `DATA` alone, and
+  `MAYBE-INITIALIZE-BYTES` only fills an *empty* `BYTES`, so the
+  construction-time value was what persisted. The value read back correctly
+  for the rest of the session — the node cache serves `DATA` — and came
+  back `NIL` after reopen. The `tx-update` path had always re-serialized
+  for this reason; the create path never did.
+  The fix went through two iterations, caught by a subsequent whole-branch
+  review: refreshing `BYTES` in `APPLY-TX-WRITE (tx-create)` fixed a disk
+  graph's own heap, but `%COMMIT` serializes the durable record (the `.txn`
+  file, and — for a graph that journals its own feed — the replication log)
+  in `PREPARE-TX-PERSISTENCE`, which runs *before* `APPLY-TRANSACTION`. So
+  the journal and replication log still carried the pre-mutation bytes,
+  permanently, no crash required — worst on a memory graph, which keeps
+  every committed `.txn` as its durable journal until a clean-close
+  checkpoint (the Android/ECL production backend). The refresh now runs in
+  `PREPARE-TX-PERSISTENCE`, over the transaction's create-set, before that
+  record is written; `APPLY-TX-WRITE (tx-create)`'s copy was redundant
+  (same node object, already refreshed) and was removed.
 
 - **`COPY` of a node created in the same transaction corrupted the graph**
   (#135). It built a `tx-update` whose `OLD-NODE` was a pending create.
@@ -147,15 +159,19 @@ between releases; cutting a release renames it to the new version and dates it.
   tracing the apply order, and no replacement has been confirmed. It now
   signals the new `COPYING-UNCOMMITTED-NODE` at the `COPY` instead of
   committing.
+  The create-set membership check this guard (and the slot-mutation guard
+  below) relies on was itself keyed by node id, not node identity — any
+  instance carrying a re-created id (`MAKE-<TYPE>` accepts `:ID`) passed,
+  letting exactly the shared-cache mutation this branch exists to stop
+  through. Both guards now check by `EQ` against the create-set's
+  registered node.
 
-- **Redefining a class to add an `:initform` persistent slot while
-  instances were live made a plain read signal** (#135). Found while
-  installing the guard below: CLOS runs
-  `UPDATE-INSTANCE-FOR-REDEFINED-CLASS` lazily on the next slot access to
-  an obsolete instance, and that wrote the new slot's initform through
-  the same guarded path — on the shared cached node, with no transaction
-  bound and nothing registered. `*INITIALIZING-NODE*` is now bound
-  around it, matching `CHANGE-NODE-CLASS`.
+- **`interface.lisp` was missing an ASDF dependency on `transactions`**
+  (#135), the file that defines `%COPY`, `CREATE-SET`,
+  `OBJECT-SET-MEMBER-P` and `COPYING-UNCOMMITTED-NODE`, all used by `COPY`
+  above. It built only because `graph-db.asd` happens to declare
+  `transactions` earlier in the component list; `graph-db/core`'s
+  `:depends-on` now says so explicitly.
 
 ### Changed
 
@@ -173,6 +189,21 @@ between releases; cutting a release renames it to the new version and dates it.
   guard — it copies internally, and create-then-`MARK-DELETED` in one
   transaction was measured to work correctly before this change and
   still does.
+  A consequence found while installing the guard: redefining a class to
+  add an `:initform` persistent slot while instances are live made a
+  plain *read* signal. CLOS runs `UPDATE-INSTANCE-FOR-REDEFINED-CLASS`
+  lazily on the next slot access to an obsolete instance, and that wrote
+  the new slot's initform through this same guarded path — on the shared
+  cached node, with no transaction bound and nothing registered.
+  `*INITIALIZING-NODE*` is now bound around it, matching
+  `CHANGE-NODE-CLASS`; this never shipped, so it is not a user-facing fix,
+  only a defect this branch introduced and removed before release.
+  Both halves of the guard (the `SETF` check and `COPY`'s create-set
+  check) treated a non-`TX` `*TRANSACTION*` — e.g. a `RESTORE-TRANSACTION`
+  during snapshot replay — as `NO-APPLICABLE-METHOD` rather than behaving,
+  since `COPIES` and `CREATE-SET` are readers on `TX` alone. Both now test
+  `(TYPEP *TRANSACTION* 'TX)` first, matching `CREATE-NODE`'s existing
+  guard, and trust a non-`TX` transaction unconditionally.
   Not addressed here: `SLOT-MAKUNBOUND` semantics are unchanged on both
   backends, including the pre-existing divergence where an `:initform`
   slot resurrects as its default after reopen on a disk graph but stays

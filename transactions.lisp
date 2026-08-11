@@ -438,6 +438,16 @@ inside the transaction, mutate the copy, then SAVE it."
             (object-set-count (write-set transaction))
             (state transaction))))
 
+(defun node-created-in-transaction-p (node transaction)
+  "True iff NODE -- by EQ, not merely by shared id -- is the exact node
+CREATE-NODE registered in TRANSACTION's create-set.  OBJECT-SET-MEMBER-P
+keys by (ID OBJECT) alone, so any instance carrying a re-created id (the
+generated constructor accepts :ID) would otherwise pass -- letting the
+create-set branch of the slot-mutation guard, and COPY's create-set check,
+through for a node this transaction never created (GH #135)."
+  (let ((entry (gethash (id node) (table (create-set transaction)))))
+    (and entry (eq (node entry) node))))
+
 
 ;;; Applying transaction writes to the graph
 
@@ -811,13 +821,11 @@ APPLY-TRANSACTION)."
   (let ((table (tx-write-table write graph))
         (node (node write)))
     (setf (revision node) 0)
-    ;; Refresh BYTES from DATA before sizing the allocation.  BYTES is a cache
-    ;; filled at construction and MAYBE-INITIALIZE-BYTES only fills an empty
-    ;; one, so a SETF between MAKE-<TYPE> and commit updates DATA alone and the
-    ;; node persists its construction-time value.  The tx-update path has always
-    ;; done this; the create path never did (GH #135).
-    (when (data node)
-      (setf (bytes node) (serialize (data node))))
+    ;; BYTES is refreshed from DATA once, in REFRESH-CREATE-SET-BYTES, which
+    ;; runs in PREPARE-TX-PERSISTENCE before the durable record (.txn file +
+    ;; replication log) is written -- doing it again here would be redundant
+    ;; on the same NODE object and, worse, too late to fix what is already
+    ;; on disk/wire (GH #135).
     (maybe-write-to-heap node graph)
     (add-node-to-indexes node graph
                          :unless-present *add-to-indexes-unless-present-p*)
@@ -2439,6 +2447,18 @@ op-class).  Asserts the packet's type byte."
             (deserialize-uint64 vector (+ i 32))
             (aref vector (+ i 40)))))
 
+(defun refresh-create-set-bytes (transaction)
+  "Refresh each created node's BYTES from DATA before TRANSACTION is
+serialized for the durable record.  BYTES is a cache filled at construction;
+a SETF between MAKE-<TYPE> and commit updates DATA alone (pattern A), and
+without this the .txn file / replication log carry the pre-mutation bytes
+permanently -- no crash required.  Mirrors UPDATE-NODE's own re-serialize
+below, and must run before WRITE-TX-WRITES-TO-STREAM, which freezes BYTES
+into the wire vector (GH #135)."
+  (dolist (w (object-set-list (create-set transaction)))
+    (let ((n (node w)))
+      (when (data n) (setf (bytes n) (serialize (data n)))))))
+
 (defun prepare-tx-persistence (transaction)
   "Serialize TRANSACTION to a temp file and populate its BYTES slot.  Runs BEFORE
 the transaction-manager lock, so the bulk serialization + disk write (and the
@@ -2446,6 +2466,7 @@ flush at close) are off the serialized commit path.  The header id is written as
 the placeholder 0 — the real id is encoded in the final FILENAME by the rename in
 FINALIZE-TX-PERSISTENCE, and recovery reads it from there.  Returns the temp
 pathname."
+  (refresh-create-set-bytes transaction)
   (let ((tmp (transaction-prepare-pathname transaction)))
     (with-open-file (stream tmp :direction :output
                             :if-exists :supersede

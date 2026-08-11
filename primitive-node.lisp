@@ -407,11 +407,17 @@ to NIL is bound.  Materializes the data first (mirrors NODE-SLOT-VALUE)."
   "Signal MUTATING-UNREGISTERED-NODE unless the current transaction may write
 NODE's persistent slots: it may write a COPY it registered, or a node it
 created.  Anything else is either lost at commit or a mutation of the shared
-cached instance (GH #135)."
-  (unless (and *transaction*
-               (or (gethash node (copies *transaction*))
-                   (object-set-member-p node (create-set *transaction*))))
-    (error 'mutating-unregistered-node :node node :slot slot-name)))
+cached instance (GH #135).
+COPIES and CREATE-SET are TX-only readers: a non-TX *TRANSACTION* (e.g. a
+RESTORE-TRANSACTION replay, transaction-restore.lisp) has neither, so is
+trusted unconditionally here, mirroring CREATE-NODE's own TYPEP guard
+(transactions.lisp) rather than signalling NO-APPLICABLE-METHOD."
+  (unless *transaction*
+    (error 'mutating-unregistered-node :node node :slot slot-name))
+  (when (typep *transaction* 'tx)
+    (unless (or (gethash node (copies *transaction*))
+                (node-created-in-transaction-p node *transaction*))
+      (error 'mutating-unregistered-node :node node :slot slot-name))))
 
 (defmethod (setf slot-value-using-class) :around
     (new-value (class node-class) instance slot)

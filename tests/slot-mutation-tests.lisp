@@ -77,6 +77,36 @@ BYTES and dropped it; the tx-update path has always re-serialized."
           (is (equal "set-after-create" (note n))
               "the post-create mutation must survive reopen"))))))
 
+(test created-node-mutation-survives-memory-graph-journal-replay
+  "CRITICAL (GH #135).  Pattern A on a MEMORY graph with NO clean-close
+checkpoint: the retained .txn file IS the durable record (see
+DURABILITY-CRASH-RECOVERY, memory-graph-tests.lisp), and %COMMIT serializes
+it in PREPARE-TX-PERSISTENCE, which runs BEFORE APPLY-TRANSACTION -- so a
+refresh placed only in APPLY-TX-WRITE (tx-create) fixed the graph's own live
+heap but left the journaled bytes stale.  A memory graph keeps every
+committed .txn as its durable journal until a clean-close checkpoint (the
+Android/ECL production backend), so this is the gap that survived the first
+pass at #135: no crash needed, just no checkpoint yet."
+  (with-temp-directory (dir)
+    (let ((loc (namestring dir)) id)
+      (let ((g (graph-db::make-memory-graph *sm-graph-name* loc)))
+        (let ((*graph* g))
+          (with-transaction ()
+            (let ((n (make-sm-thing :name "A")))
+              (setq id (id n))
+              (setf (note n) "set-after-create")))))
+      ;; g intentionally NOT closed/checkpointed (simulated crash) -- the
+      ;; .txn journal is the only durable record of this commit.
+      (let ((g2 (graph-db::open-memory-graph *sm-graph-name* loc)))
+        (unwind-protect
+             (let ((*graph* g2))
+               (let ((n (lookup-vertex id :graph g2)))
+                 (is (not (null n)) "the node itself must survive replay")
+                 (is (equal "set-after-create" (note n))
+                     "the post-create mutation must survive journal replay")))
+          (ignore-errors (close-graph g2 :snapshot-p nil))
+          (collect-garbage))))))
+
 (test create-then-delete-same-transaction-still-works
   "GH #135.  DELETE-NODE copies internally, but calls %COPY directly rather
 than the public COPY, so it is exempt from the create-set guard COPY now
@@ -368,3 +398,52 @@ at all.  A read of an unrelated, already-existing slot must not signal."
                 :graph-db-slot-mutation-test))
         (finishes (slot-value cached 'alpha))
         (is (equal "x" (slot-value cached 'alpha)))))))
+
+(test create-set-guard-checks-identity-not-id
+  "IMPORTANT-2 (GH #135).  OBJECT-SET-MEMBER-P keys the create-set by node id
+alone (GETHASH (ID OBJECT) ...), so any instance carrying a created node's
+id passed the guard -- including the SHARED cached instance a re-created id
+leaves stale.  MAKE-<TYPE> accepts :ID, so any deterministic-id or
+upsert-by-recreate pattern reaches this: re-create under an id already held
+by a live SHARED node, and the guard let SHARED's own mutation through, lost
+silently on reopen.  The guard now checks by EQ against the node CREATE-NODE
+actually registered for that id."
+  (with-temp-directory (dir)
+    (let (id)
+      (with-sm-graph (g dir)
+        (with-transaction () (setq id (id (make-sm-thing :name "original")))))
+      (with-sm-reopen (g dir)
+        (let ((shared (lookup-vertex id :graph g)))
+          (with-transaction ()
+            ;; Re-create under SHARED's own id: legal (MAKE-<TYPE> accepts
+            ;; :ID), and this transaction's create-set now holds an entry
+            ;; for ID -- but the entry's NODE is the FRESH instance, not
+            ;; SHARED.
+            (make-sm-thing :id id :name "re-created")
+            (signals graph-db:mutating-unregistered-node
+              (setf (note shared) "leaked")))))
+      (with-sm-reopen (g dir)
+        (let ((n (lookup-vertex id :graph g)))
+          (is (equal "re-created" (name n))
+              "the re-create must have gone through")
+          (is (not (equal "leaked" (note n)))
+              "SHARED's rejected mutation must not have reached disk"))))))
+
+(test setf-permitted-under-a-non-tx-transaction
+  "IMPORTANT-1 (GH #135).  CHECK-SLOT-MUTATION-ALLOWED reads COPIES and
+CREATE-SET, both TX-only readers.  With *TRANSACTION* bound to a
+RESTORE-TRANSACTION (the class RECREATE-GRAPH's replay uses,
+transaction-restore.lisp), the SETF guard signalled NO-APPLICABLE-METHOD
+instead of behaving.  It now tests (TYPEP *TRANSACTION* 'TX) first and
+trusts a non-TX transaction unconditionally, mirroring CREATE-NODE's own
+guard (transactions.lisp)."
+  (with-temp-directory (dir)
+    (let (id)
+      (with-sm-graph (g dir)
+        (with-transaction () (setq id (id (make-sm-thing :name "X"))))
+        (let ((n (lookup-vertex id :graph g))
+              (graph-db:*transaction*
+                (make-instance 'graph-db::restore-transaction
+                               :transaction-id 999999999)))
+          (finishes (setf (note n) "under a restore-transaction"))
+          (is (equal "under a restore-transaction" (note n))))))))
