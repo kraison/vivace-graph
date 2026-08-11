@@ -68,6 +68,27 @@ here would expand an identical form seven times and assert nothing extra."
         :attribution (:licence "x")        ; missing :CITATION
         :sensitivity :none :registration :none :indexed-text :none))))
 
+(test explicit-nil-differs-from-omission-for-a-facet
+  "Design §1: the whole subtlety of DEF-SOURCE is telling a facet that was
+never mentioned apart from one explicitly given as NIL -- that is why the
+macro checks the &KEY supplied-p variables rather than the facet values.
+An explicit NIL is a (malformed) value and signals INVALID-SOURCE-FACET;
+an omitted facet was never given a value at all and signals
+MISSING-SOURCE-FACET.  A 'simplification' that tested values instead of
+supplied-p would collapse this distinction while still passing every other
+test in the suite."
+  (signals invalid-source-facet
+    (macroexpand-1
+     `(def-source st-bad4 :graph-db-source-test ((a :initarg :a))
+        :identity nil
+        :space :none :time :none :attribution :none
+        :sensitivity :none :registration :none :indexed-text :none)))
+  (signals missing-source-facet
+    (macroexpand-1
+     `(def-source st-bad5 :graph-db-source-test ((a :initarg :a))
+        :space :none :time :none :attribution :none
+        :sensitivity :none :registration :none :indexed-text :none))))
+
 (test source-contract-signals-for-a-non-source
   "Design §5: \"declared nothing\" and \"is not a source\" are different
 facts; NIL for both would let a consumer treat an unconverted class as a
