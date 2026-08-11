@@ -125,16 +125,43 @@ conforming one with empty facets."
   :registration :none
   :indexed-text :none)
 
+(def-source st-clip :graph-db-source-test
+    ((clip-id :initarg :clip-id :accessor st-clip-id))
+  :identity     (:namespace :st-media :key-slot clip-id)
+  :space        :none
+  :time         :none
+  :attribution  :none
+  :sensitivity  :none
+  :registration :none
+  :indexed-text :none)
+
 (test identity-registers-the-class-under-its-namespace
   (is (member 'st-report (namespace-sources :st-reports)))
   (is (member 'st-photo (namespace-sources :st-media)))
   (is-false (member 'st-photo (namespace-sources :st-reports))))
+
+(test identity-registration-accumulates-within-a-namespace
+  "Task-2 review finding 1: ST-PHOTO and ST-CLIP share :ST-MEDIA.  A SETF
+that overwrote instead of PUSHNEW-ing would leave only the most recently
+loaded class registered, and every other test here stays green regardless
+-- Task 4 depends on multiple classes sharing one namespace, so accumulation
+must hold now, proven directly rather than incidentally."
+  (is (member 'st-photo (namespace-sources :st-media)))
+  (is (member 'st-clip (namespace-sources :st-media))))
 
 (test identity-none-registers-nothing
   "Plan clarification: :IDENTITY :NONE means records of this class are never
 endpoint targets.  It is legal, and it registers no namespace."
   (dolist (ns '(:st-reports :st-media))
     (is-false (member 'st-note (namespace-sources ns)))))
+
+(test identity-none-emits-no-index
+  "Task-2 review finding 2: the other half of :IDENTITY :NONE is no index,
+not just no namespace entry.  Asserts the SIGNAL, not an empty result --
+an empty result is also what a declared-but-empty index returns, which is
+a different state from no index at all (INDEX-LOOKUP / %REQUIRE-INDEX)."
+  (with-source-graph (g)
+    (signals error (graph-db:index-lookup g 'st-note '(body) "x"))))
 
 (test an-unregistered-namespace-signals
   "Design §4: an unknown namespace is a programming error, distinct from a
@@ -149,3 +176,14 @@ if no index covers the class and slot, so a successful call IS the evidence."
     (with-transaction () (make-st-report :headline "x" :report-id "idx-1"))
     (is (= 1 (length (graph-db:index-lookup g 'st-report '(report-id)
                                             "idx-1"))))))
+
+(test identity-registration-is-idempotent
+  "Task-2 review finding 3: PUSHNEW makes re-evaluating a DEF-SOURCE form
+safe.  Calls %REGISTER-IDENTITY directly -- the property under test is
+registry accumulation, not macroexpansion, so re-expanding a whole
+DEF-SOURCE would add nothing."
+  (graph-db.spacetime::%register-identity
+   'st-report '(:namespace :st-reports :key-slot report-id))
+  (graph-db.spacetime::%register-identity
+   'st-report '(:namespace :st-reports :key-slot report-id))
+  (is (= 1 (count 'st-report (namespace-sources :st-reports)))))
