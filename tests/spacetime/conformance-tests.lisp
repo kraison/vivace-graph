@@ -142,3 +142,24 @@ fixed."
                                               :standing :observed))))
         (is (eq :asserted (claim-standing c)))
         (is (eq :observed (extent-standing (claim-extent c))))))))
+
+(test a-declared-none-facet-is-distinguishable-from-a-value
+  "The absence-vs-value category, third unit running.  :NONE is a
+declaration; it must never read as a configured value."
+  (let ((c (source-contract 'st-report)))
+    (is (eq :none (source-facets-space c)))
+    ;; :NONE is not a plist at all (GETF on it would signal, verified by
+    ;; running); a declared facet is a plist and answers its sub-keys.
+    (is-false (listp (source-facets-space c))
+              ":NONE is not a plist")
+    (is (listp (source-facets-attribution c))
+        "a declared facet is a plist, not :NONE")
+    (is (equal "CC-BY-4.0" (getf (source-facets-attribution c) :licence))
+        "a declared facet answers its sub-keys")))
+
+(test an-undeclared-facet-cannot-exist-to-be-confused-with-none
+  "Enforcement is structural, so there is no third state to test for at
+runtime -- the class does not compile.  This records that reasoning."
+  (signals missing-source-facet
+    (macroexpand-1 '(def-source st-nope :graph-db-source-test ((a :initarg :a))
+                     :identity :none))))

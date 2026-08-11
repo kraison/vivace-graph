@@ -391,7 +391,9 @@
                (:file "extent")
                (:file "allen")
                (:file "claim")
-               (:file "claim-query")))
+               (:file "claim-query")
+               (:file "source")
+               (:file "resolve")))
 
 (defsystem graph-db/spacetime-test
   :name "VivaceGraph spacetime test suite"
@@ -416,6 +418,8 @@
                (:file "claim-identity-tests")
                (:file "claim-query-tests")
                (:file "claim-concurrency-tests")
+               (:file "source-tests")
+               (:file "resolve-tests")
                ;; Last: draws on MAKE-U/MAKE-B and WITH-CLAIM-GRAPH from the
                ;; claim test files above (#131 Task 7).
                (:file "conformance-tests"))

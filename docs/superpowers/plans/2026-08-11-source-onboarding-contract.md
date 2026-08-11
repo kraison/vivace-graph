@@ -39,7 +39,7 @@ The spec says every facet accepts `:none` but does not say what `:identity :none
 | File | Responsibility |
 |---|---|
 | `spacetime/source.lisp` | facet vocabulary, shape validation, `def-source`, the two registries, `source-contract` |
-| `spacetime/resolve.lisp` | `resolve-endpoint`, `disclosable-p` |
+| `spacetime/resolve.lisp` | `resolve-endpoint`, `source-disclosable-p` |
 | `tests/spacetime/source-tests.lisp` | conformance by construction, facet shapes, `:none` |
 | `tests/spacetime/resolve-tests.lisp` | resolution, ambiguity, the transaction guard, fail-closed |
 | `graph-db.asd` | two components per system |
@@ -101,7 +101,7 @@ In `spacetime/package.lisp`, add to the existing `(:export ...)` form:
    #:source-facets-sensitivity #:source-facets-registration
    #:source-facets-indexed-text
    #:missing-source-facet #:invalid-source-facet #:not-a-source
-   #:resolve-endpoint #:disclosable-p #:+disclosure-classes+
+   #:resolve-endpoint #:source-disclosable-p #:+disclosure-classes+
    #:unknown-namespace #:ambiguous-endpoint
    #:resolution-in-transaction
 ```
@@ -159,13 +159,13 @@ cannot be defined at all, so the violation surfaces at macroexpansion."
       (signals missing-source-facet (macroexpand-1 form)))))
 
 (test none-is-accepted-for-every-facet
-  "Design §1: the rule is uniform, with no exceptions."
-  (dolist (f +source-facets+)
-    (declare (ignorable f))
-    (finishes
-      (macroexpand-1
-       `(def-source st-allnone :graph-db-source-test ((a :initarg :a))
-          ,@(loop for g in +source-facets+ append (list g :none)))))))
+  "Design §1: the rule is uniform, with no exceptions.  One expansion with
+every facet :NONE proves it for all seven at once -- looping over the facets
+here would expand an identical form seven times and assert nothing extra."
+  (finishes
+    (macroexpand-1
+     `(def-source st-allnone :graph-db-source-test ((a :initarg :a))
+        ,@(loop for g in +source-facets+ append (list g :none))))))
 
 (test a-malformed-facet-signals-and-names-the-facet
   (signals invalid-source-facet
@@ -614,7 +614,7 @@ git commit -m "feat(spacetime): resolve-endpoint, the forward direction (#132)"
 - Modify: `spacetime/resolve.lisp`, `tests/spacetime/resolve-tests.lisp`, `tests/spacetime/source-tests.lisp`
 
 **Interfaces:**
-- Produces: `+disclosure-classes+`; `disclosable-p (class clearance)` → boolean.
+- Produces: `+disclosure-classes+`; `source-disclosable-p (class clearance)` → boolean.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -660,24 +660,24 @@ owners and the constraint registry keys on owner."
     (is (string= "r" (st-headline (resolve-endpoint :st-reports "k-1"))))
     (is (string= "s" (st-topic (resolve-endpoint :st-reports "k-2"))))))
 
-(test disclosable-p-is-fail-closed
+(test source-disclosable-p-is-fail-closed
   "Design §3.2.  An unrecognised class, and :NONE, are treated as MORE
 restricted than every known one -- never less.  If this test is ever
 inverted the facet becomes worse than nothing, because a caller trusts it."
-  (is-true (disclosable-p :public :public))
-  (is-true (disclosable-p :public :restricted))
-  (is-false (disclosable-p :restricted :public))
-  (is-true (disclosable-p :restricted :restricted))
-  (is-false (disclosable-p :no-such-class :restricted))
-  (is-false (disclosable-p :none :restricted))
-  (is-false (disclosable-p :public :no-such-clearance)))
+  (is-true (source-disclosable-p :public :public))
+  (is-true (source-disclosable-p :public :restricted))
+  (is-false (source-disclosable-p :restricted :public))
+  (is-true (source-disclosable-p :restricted :restricted))
+  (is-false (source-disclosable-p :no-such-class :restricted))
+  (is-false (source-disclosable-p :none :restricted))
+  (is-false (source-disclosable-p :public :no-such-clearance)))
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Expected: `disclosable-p` undefined; the ambiguity test fails because `resolve-endpoint` currently returns the first hit.
+Expected: `source-disclosable-p` undefined; the ambiguity test fails because `resolve-endpoint` currently returns the first hit.
 
-- [ ] **Step 3: Implement `disclosable-p`**
+- [ ] **Step 3: Implement `source-disclosable-p`**
 
 Append to `spacetime/resolve.lisp`:
 
@@ -691,7 +691,7 @@ is treated as more restricted than every member (design §3.2).")
   "CLASS's position, or NIL when unrecognised."
   (position class +disclosure-classes+))
 
-(defun disclosable-p (class clearance)
+(defun source-disclosable-p (class clearance)
   "True when CLASS may be disclosed at CLEARANCE.  FAIL-CLOSED: an
 unrecognised CLASS or CLEARANCE yields NIL, so the unknown case withholds
 rather than releases.  The substrate never calls this itself -- enforcement
@@ -702,7 +702,7 @@ belongs to whoever reads or exports (design §3.2)."
 ```
 
 The ambiguity check is already in `resolve-endpoint` from Task 3; Step 2's
-failure is expected to come only from `disclosable-p`. If the ambiguity test
+failure is expected to come only from `source-disclosable-p`. If the ambiguity test
 also fails, the Task 3 implementation is wrong — report it rather than
 patching the test.
 
@@ -754,7 +754,7 @@ Expected: green.
 
 - [ ] **Step 3: Document the contract in the org manual**
 
-Extend the `graph-db/spacetime` chapter with a source-contract section covering: the seven facets and that every one accepts `:none`; that `def-source` defines the class and will not expand without all seven, so a non-conforming source cannot exist; that identity is the **only facet with behaviour** here, emitting the index and the namespace registration, while the other six are declared and consulted by nothing inside `graph-db`; that sensitivity is fail-closed and **the substrate never enforces it — a tenant that never calls `disclosable-p` gets no protection**; `resolve-endpoint` with its two distinct failure modes and its transaction restriction; and that registration is stored uninterpreted until #138.
+Extend the `graph-db/spacetime` chapter with a source-contract section covering: the seven facets and that every one accepts `:none`; that `def-source` defines the class and will not expand without all seven, so a non-conforming source cannot exist; that identity is the **only facet with behaviour** here, emitting the index and the namespace registration, while the other six are declared and consulted by nothing inside `graph-db`; that sensitivity is fail-closed and **the substrate never enforces it — a tenant that never calls `source-disclosable-p` gets no protection**; `resolve-endpoint` with its two distinct failure modes and its transaction restriction; and that registration is stored uninterpreted until #138.
 
 Check every code sample against the shipped API rather than writing from memory.
 

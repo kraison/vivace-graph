@@ -86,6 +86,12 @@ value the macro accepts; the second does not compile.
 names the stable **external** key — not a node id. A node id is a location; an
 external key is an identity.
 
+`:namespace` must be a keyword and `:key-slot` a non-keyword symbol, and the
+macro enforces both. The asymmetry matters: `:key-slot :report-id` reads
+naturally, is a symbol, and never matches the slot `report-id` — so it would
+validate, define, accept writes, and resolve nothing for the life of the
+class.
+
 `def-source` emits a `def-index` on the key slot and registers the class under
 its namespace. That pairing is exactly what makes §4's resolution possible, and
 it is why #131 deferred resolution to this unit rather than pull this facet
@@ -111,12 +117,20 @@ uniform "every facet is `:none`-able" rule that makes the contract learnable,
 and it offered no better outcome than a fail-closed default already gives.
 
 **Fail-closed means an unrecognised class also compares as most-restricted**,
-never least. The substrate ships a predicate for consumers to call and **enforces
-nothing itself**: the things that would enforce it — retrieval, export — live
-above `graph-db` entirely, and inventing an enforcement point here would mean
-inventing a source-to-claim data flow this unit has no other reason to build,
-and putting an access-control decision in an engine with no notion of a
-principal.
+never least. The substrate ships a predicate for consumers to call —
+**`source-disclosable-p (class clearance)`** — and **enforces nothing itself**:
+the things that would enforce it — retrieval, export — live above `graph-db`
+entirely, and inventing an enforcement point here would mean inventing a
+source-to-claim data flow this unit has no other reason to build, and putting
+an access-control decision in an engine with no notion of a principal.
+
+It is named `source-disclosable-p`, not the shorter `disclosable-p`, because
+`replication.lisp` already defines a `disclosable-p` — the peer-replication
+export filter, shaped differently (`graph`, `vertex`, `device-scope`) and,
+unlike this one, fail-**open**. Two same-named predicates with opposite
+failure modes in one image is exactly the kind of silent, fail-open collision
+this facet exists to guard against; the longer name keeps them from ever
+being confused at a call site.
 
 The spec and the manual must both say plainly that a tenant which never calls
 the predicate gets no protection.
@@ -182,9 +196,23 @@ the second is an ordinary miss. Collapsing both to `NIL` would make a
 misspelled namespace indistinguishable from an absent record, which is this
 programme's recurring defect in miniature.
 
-Today a namespace **is** a graph name, resolved through `lookup-graph`;
-#110 replaces that mapping without changing this signature, which is what makes
-#131 §6.1's "two implementations" a swap rather than a rewrite.
+**A namespace is not a graph name.** An earlier draft of this section said it
+was, and that a namespace could be resolved with `lookup-graph`. It cannot:
+`*graphs*` is keyed by the name `make-graph` was called with, while
+`*namespace-sources*` is keyed by the `:namespace` a class declares. They are
+two registries and nothing keeps them in step — the claim was found false by
+running the code, not by reading it.
+
+What actually holds the mapping is the **class**: `def-source` records the
+graph it was declared in, so resolution takes the graph from
+`source-facets-graph` per class rather than from the namespace. That is also
+more correct than the draft, because two classes sharing a namespace need not
+share a graph.
+
+Namespaces are therefore, today, **labels that group source classes** —
+nothing more. #110 gives them a real identity, and can do so without changing
+this signature, which is what makes #131 §6.1's "two implementations" a swap
+rather than a rewrite.
 
 This completes a pair. #131 shipped the inverse — `claims-touching`, answerable
 from the claim graph's own indexes with no cross-graph read at all. This is the
@@ -213,6 +241,16 @@ naming both classes**.
 Returning the first would make which record you get depend on class-definition
 order, which is the kind of silent, order-dependent answer this programme
 exists to eliminate.
+
+**Two class *names* answering is not the same as two records.** A source
+class may inherit another, and `index-lookup` matches a class together with
+its subclasses — so one physical record answers under both the parent's name
+and the child's. Counting class names would make that legal declaration
+permanently unresolvable. Resolution therefore counts **distinct records, by
+node id**, and compares those ids with `equalp`: an id is a byte vector, and
+two hits are the same Lisp object only for as long as the node cache holds
+them. Comparing by identity passes with the cache on and fails with it off,
+which is a defect that hides from any test that does not disable it.
 
 ---
 
