@@ -7,7 +7,14 @@
 (defparameter *source-graph-name* :graph-db-source-test)
 
 (eval-when (:load-toplevel :execute)
-  (setf (gethash *source-graph-name* graph-db::*schema-node-metadata*) nil))
+  (setf (gethash *source-graph-name* graph-db::*schema-node-metadata*) nil)
+  ;; Finding 4 (S1c review): ST-ELSEWHERE below declares this graph but
+  ;; nothing ever opens it -- WITH-SOURCE-GRAPH only opens
+  ;; *SOURCE-GRAPH-NAME*, above -- so RESOLVE-ENDPOINT must find it
+  ;; genuinely unopened, not merely never-cleared from a prior run.
+  (setf (gethash :graph-db-source-test-elsewhere
+                 graph-db::*schema-node-metadata*)
+        nil))
 
 (def-source st-report :graph-db-source-test
     ((headline :initarg :headline :accessor st-headline)
@@ -88,6 +95,60 @@ test in the suite."
      `(def-source st-bad5 :graph-db-source-test ((a :initarg :a))
         :space :none :time :none :attribution :none
         :sensitivity :none :registration :none :indexed-text :none))))
+
+(test a-plist-checked-by-position-rejects-a-value-only-match
+  "Finding 1 (S1c review).  %PLIST-HAS-P used MEMBER over the whole list,
+so a facet's own VALUE could stand in for a missing KEY.  Both forms below
+were accepted before the fix: the first registered ST-BAD6 under namespace
+:KEY-SLOT with a NIL key slot; the second could never resolve, silently,
+because *NAMESPACE-SOURCES* is an EQ table and \"reports\" is a string."
+  (signals invalid-source-facet
+    (macroexpand-1
+     `(def-source st-bad6 :graph-db-source-test ((a :initarg :a))
+        :identity (:namespace :key-slot)   ; no :KEY-SLOT key at all
+        :space :none :time :none :attribution :none
+        :sensitivity :none :registration :none :indexed-text :none)))
+  (signals invalid-source-facet
+    (macroexpand-1
+     `(def-source st-bad7 :graph-db-source-test ((a :initarg :a))
+        :identity (:namespace "reports" :key-slot a) ; string, not keyword
+        :space :none :time :none :attribution :none
+        :sensitivity :none :registration :none :indexed-text :none))))
+
+(test each-facets-sub-keys-are-type-checked
+  "Finding 1 (S1c review): rigour applied uniformly, not just to :IDENTITY."
+  (signals invalid-source-facet
+    (macroexpand-1
+     `(def-source st-bad8 :graph-db-source-test ((a :initarg :a))
+        :identity :none
+        :space (:geometry-slot "not-a-symbol" :kind :point :precision :city)
+        :time :none :attribution :none
+        :sensitivity :none :registration :none :indexed-text :none)))
+  (signals invalid-source-facet
+    (macroexpand-1
+     `(def-source st-bad9 :graph-db-source-test ((a :initarg :a))
+        :identity :none :space :none
+        :time (:extent-fn "not-a-symbol")
+        :attribution :none
+        :sensitivity :none :registration :none :indexed-text :none)))
+  (signals invalid-source-facet
+    (macroexpand-1
+     `(def-source st-bad10 :graph-db-source-test ((a :initarg :a))
+        :identity :none :space :none :time :none
+        :attribution (:licence :not-a-string :citation "x")
+        :sensitivity :none :registration :none :indexed-text :none)))
+  (signals invalid-source-facet
+    (macroexpand-1
+     `(def-source st-bad11 :graph-db-source-test ((a :initarg :a))
+        :identity :none :space :none :time :none :attribution :none
+        :sensitivity (:class "not-a-keyword")
+        :registration :none :indexed-text :none)))
+  (signals invalid-source-facet
+    (macroexpand-1
+     `(def-source st-bad12 :graph-db-source-test ((a :initarg :a))
+        :identity :none :space :none :time :none :attribution :none
+        :sensitivity :none :registration :none
+        :indexed-text (:text-fn 42)))))
 
 (test source-contract-signals-for-a-non-source
   "Design §5: \"declared nothing\" and \"is not a source\" are different
@@ -188,6 +249,63 @@ DEF-SOURCE would add nothing."
    'st-report '(:namespace :st-reports :key-slot report-id))
   (is (= 1 (count 'st-report (namespace-sources :st-reports)))))
 
+(test re-registering-with-a-changed-namespace-updates-both-registries
+  "Finding 2 (S1c review).  Before the fix, *SOURCE-CONTRACTS* is
+overwritten by SETF but *NAMESPACE-SOURCES* only ever PUSHNEW-s, so
+editing a class's :NAMESPACE and re-evaluating DEF-SOURCE -- ordinary
+practice -- left it registered under the OLD namespace forever, and
+RESOLVE-ENDPOINT would keep answering for a namespace no class declares."
+  (eval '(def-source st-movable :graph-db-source-test
+          ((k :initarg :k :accessor st-movable-k))
+          :identity     (:namespace :st-movable-a :key-slot k)
+          :space        :none
+          :time         :none
+          :attribution  :none
+          :sensitivity  :none
+          :registration :none
+          :indexed-text :none))
+  (is (member 'st-movable (namespace-sources :st-movable-a)))
+  (eval '(def-source st-movable :graph-db-source-test
+          ((k :initarg :k :accessor st-movable-k))
+          :identity     (:namespace :st-movable-b :key-slot k)
+          :space        :none
+          :time         :none
+          :attribution  :none
+          :sensitivity  :none
+          :registration :none
+          :indexed-text :none))
+  (is (member 'st-movable (namespace-sources :st-movable-b)))
+  ;; The old namespace has nothing left declaring it: NAMESPACE-SOURCES
+  ;; signals rather than returning a stale, now-meaningless list.
+  (signals unknown-namespace (namespace-sources :st-movable-a)))
+
+(test re-registering-to-identity-none-clears-the-old-namespace
+  "Finding 2 (S1c review), the second half: changing a class's :IDENTITY
+to :NONE must also clear its old namespace entry -- before the fix, the
+stale entry not only lingered, RESOLVE-ENDPOINT would then hit it and
+evaluate (GETF :NONE :KEY-SLOT), a raw TYPE-ERROR rather than a
+SPACETIME-ERROR."
+  (eval '(def-source st-orphanable :graph-db-source-test
+          ((k :initarg :k :accessor st-orphanable-k))
+          :identity     (:namespace :st-orphanable :key-slot k)
+          :space        :none
+          :time         :none
+          :attribution  :none
+          :sensitivity  :none
+          :registration :none
+          :indexed-text :none))
+  (is (member 'st-orphanable (namespace-sources :st-orphanable)))
+  (eval '(def-source st-orphanable :graph-db-source-test
+          ((k :initarg :k :accessor st-orphanable-k))
+          :identity     :none
+          :space        :none
+          :time         :none
+          :attribution  :none
+          :sensitivity  :none
+          :registration :none
+          :indexed-text :none))
+  (signals unknown-namespace (namespace-sources :st-orphanable)))
+
 ;; Deliberately shares :ST-REPORTS with ST-REPORT, to exercise §4.2.
 (def-source st-summary :graph-db-source-test
     ((topic :initarg :topic :accessor st-topic)
@@ -199,3 +317,44 @@ DEF-SOURCE would add nothing."
   :sensitivity  :none
   :registration :none
   :indexed-text :none)
+
+;; Finding 5 (S1c review): DEF-SOURCE hardcoded () for DEF-VERTEX's
+;; PARENT-TYPES, so no source class could inherit.  ST-BASE-THING is a
+;; plain (non-source) vertex; ST-DERIVED is a source that inherits it.
+(graph-db:def-vertex st-base-thing ()
+    ((label :initarg :label :accessor st-base-label))
+  :graph-db-source-test)
+
+(def-source st-derived :graph-db-source-test
+    ((extra :initarg :extra :accessor st-derived-extra))
+  :parent-types (st-base-thing)
+  :identity     (:namespace :st-derived :key-slot extra)
+  :space        :none
+  :time         :none
+  :attribution  :none
+  :sensitivity  :none
+  :registration :none
+  :indexed-text :none)
+
+;; Finding 4 (S1c review): a source class in a graph that WITH-SOURCE-GRAPH
+;; never opens, so RESOLVE-ENDPOINT must meet a genuinely unopened graph.
+(def-source st-elsewhere :graph-db-source-test-elsewhere
+    ((eid :initarg :eid :accessor st-elsewhere-id))
+  :identity     (:namespace :st-elsewhere-ns :key-slot eid)
+  :space        :none
+  :time         :none
+  :attribution  :none
+  :sensitivity  :none
+  :registration :none
+  :indexed-text :none)
+
+(test a-source-class-can-inherit-from-a-parent-vertex-type
+  "Finding 5 (S1c review): PARENT-TYPES now reaches DEF-VERTEX, so
+ST-DERIVED is a genuine subtype of ST-BASE-THING and inherits its slot."
+  (is (subtypep 'st-derived 'st-base-thing))
+  (with-source-graph (g)
+    (declare (ignorable g))
+    (with-transaction ()
+      (let ((n (make-st-derived :label "l" :extra "e9")))
+        (is (string= "l" (st-base-label n)))
+        (is (string= "e9" (st-derived-extra n)))))))

@@ -64,6 +64,64 @@ owners and the constraint registry keys on owner."
     (is (string= "r" (st-headline (resolve-endpoint :st-reports "k-1"))))
     (is (string= "s" (st-topic (resolve-endpoint :st-reports "k-2"))))))
 
+(test def-source-makes-a-same-class-duplicate-key-unrepresentable
+  "Finding 3, layer 1 (S1c review).  Before the fix, two ST-REPORT records
+sharing one REPORT-ID resolved silently to whichever was created first --
+the ambiguity check only ever compared how many CLASSES answered, and both
+hits here come from one.  DEF-SOURCE now emits a DEF-UNIQUE on the key
+slot, so the second CREATE cannot even commit."
+  (with-source-graph (g)
+    (declare (ignorable g))
+    (signals graph-db:unique-constraint-violation
+      (with-transaction ()
+        (make-st-report :headline "one" :report-id "dup")
+        (make-st-report :headline "two" :report-id "dup")))))
+
+(test resolve-endpoint-guards-a-same-class-multi-hit-directly
+  "Finding 3, layer 2 (S1c review).  DEF-UNIQUE (layer 1, above) protects
+only prospectively: it exempts any tuple with a NULL component outright,
+and cannot retroactively catch data written before it existed, which a
+later TOLERANT re-open leaves untouched (DEF-UNIQUE's own docstring,
+unique-constraint.lisp) -- so GRAPH-DB:INDEX-LOOKUP can still, in
+principle, return more than one hit for ONE class.  A single-slot
+secondary index does not retain a NULL-keyed row at all
+(%INDEX-TUPLE-KEY, index.lisp -- confirmed directly: a NIL REPORT-ID never
+reaches the index to begin with), so that specific case cannot be driven
+through the public API here.  This exercises RESOLVE-ENDPOINT's guard
+directly, by making INDEX-LOOKUP answer as stale duplicate data would."
+  (with-source-graph (g)
+    (declare (ignorable g))
+    (with-transaction () (make-st-report :headline "one" :report-id "solo"))
+    (let ((real (fdefinition 'graph-db:index-lookup)))
+      (unwind-protect
+          (progn
+            (setf (fdefinition 'graph-db:index-lookup)
+                  (lambda (graph class-name slot-name value
+                          &key collect-p prefix)
+                    (declare (ignore graph class-name slot-name value
+                                     collect-p prefix))
+                    (list :stale-hit-1 :stale-hit-2)))
+            (handler-case (progn (resolve-endpoint :st-reports "solo")
+                                 (is-true nil "expected AMBIGUOUS-ENDPOINT"))
+              (ambiguous-endpoint (c)
+                (is (equal '(st-report) (ambiguous-endpoint-classes c))))))
+        (setf (fdefinition 'graph-db:index-lookup) real)))))
+
+(test resolve-endpoint-signals-a-clear-condition-for-an-unopened-graph
+  "Finding 4 (S1c review).  Before the fix, a registered class whose graph
+is not open made RESOLVE-ENDPOINT pass NIL into GRAPH-DB:INDEX-LOOKUP,
+failing at a low level.  ST-ELSEWHERE's graph is never opened by
+WITH-SOURCE-GRAPH, so it stands in for that case; the condition must name
+the class and the graph, not just crash."
+  (with-source-graph (g)
+    (declare (ignorable g))
+    (handler-case (progn (resolve-endpoint :st-elsewhere-ns "whatever")
+                         (is-true nil "expected UNOPENED-SOURCE-GRAPH"))
+      (unopened-source-graph (c)
+        (is (eq 'st-elsewhere (unopened-source-graph-class c)))
+        (is (eq :graph-db-source-test-elsewhere
+               (unopened-source-graph-graph-name c)))))))
+
 (test source-disclosable-p-is-fail-closed
   "Design §3.2.  An unrecognised class, and :NONE, are treated as MORE
 restricted than every known one -- never less.  If this test is ever

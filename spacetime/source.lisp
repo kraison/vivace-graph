@@ -46,49 +46,100 @@ nothing (design §4)."
   (or (gethash namespace *namespace-sources*)
       (error 'unknown-namespace :namespace namespace)))
 
+(defun %unregister-old-identity (class)
+  "Remove CLASS from whatever namespace it was PREVIOUSLY registered under
+in *SOURCE-CONTRACTS*, if any.  Called before a (re-)registration, so
+re-evaluating DEF-SOURCE with a changed :IDENTITY -- ordinary practice --
+leaves *NAMESPACE-SOURCES* in step with *SOURCE-CONTRACTS* instead of
+accumulating a stale entry forever (Finding 2, GH #132 review)."
+  (let ((old (gethash class *source-contracts*)))
+    (when old
+      (let ((old-identity (source-facets-identity old)))
+        (unless (eq old-identity :none)
+          (let ((old-ns (getf old-identity :namespace)))
+            (setf (gethash old-ns *namespace-sources*)
+                  (remove class (gethash old-ns *namespace-sources*)))))))))
+
 (defun %register-identity (class identity)
   "Register CLASS under its namespace.  :NONE registers nothing: such a
-class is never an endpoint target (plan clarification)."
+class is never an endpoint target (plan clarification).  Always drops
+CLASS's prior registration first (Finding 2, GH #132 review), so this is
+correct whether the new IDENTITY names the same namespace, a different
+one, or :NONE."
+  (%unregister-old-identity class)
   (unless (eq identity :none)
     (let ((ns (getf identity :namespace)))
       (pushnew class (gethash ns *namespace-sources*)))))
 
-(defun %plist-has-p (plist &rest keys)
-  (every (lambda (k) (member k plist)) keys))
+(defparameter +facet-absent+ (list :absent)
+  "Sentinel for GETF's default argument, to distinguish a sub-key that is
+genuinely absent from one explicitly bound to NIL -- the same NIL-vs-
+omitted distinction DEF-SOURCE itself draws for facets, one level down for
+a facet's own sub-keys.")
+
+(defun %facet-value (plist key)
+  "KEY's value in PLIST, or +FACET-ABSENT+ if KEY is not present.  GETF
+looks only at even (key) positions, so unlike MEMBER over the whole list
+it cannot mistake a key appearing as someone else's VALUE for the key
+itself being present (Finding 1, GH #132 review)."
+  (getf plist key +facet-absent+))
 
 (defun %check-facet (facet value)
   "Return VALUE if it is a well-formed FACET, else signal.  :NONE is always
 well-formed (design §1)."
-  (flet ((bad (reason)
-           (error 'invalid-source-facet :facet facet :value value
-                                        :reason reason)))
+  (labels ((bad (reason)
+             (error 'invalid-source-facet :facet facet :value value
+                                          :reason reason))
+           (req (key)
+             "VALUE's KEY sub-value, or signal that it is missing."
+             (let ((v (%facet-value value key)))
+               (when (eq v +facet-absent+)
+                 (bad (format nil "missing ~S" key)))
+               v))
+           (req-symbol (key)
+             "A required sub-key whose value must be a non-NIL symbol."
+             (let ((v (req key)))
+               (unless (and (symbolp v) v)
+                 (bad (format nil "~S must be a symbol, not ~S" key v)))
+               v))
+           (req-keyword (key)
+             "A required sub-key whose value must be a keyword."
+             (let ((v (req key)))
+               (unless (keywordp v)
+                 (bad (format nil "~S must be a keyword, not ~S" key v)))
+               v))
+           (req-string (key)
+             "A required sub-key whose value must be a string."
+             (let ((v (req key)))
+               (unless (stringp v)
+                 (bad (format nil "~S must be a string, not ~S" key v)))
+               v)))
     (unless (eq value :none)
       (unless (listp value) (bad "expected a plist or :NONE"))
       (ecase facet
         (:identity
-         (unless (%plist-has-p value :namespace :key-slot)
-           (bad "expected (:NAMESPACE <keyword> :KEY-SLOT <slot>)")))
+         (req-keyword :namespace)
+         (req-symbol :key-slot))
         (:space
-         (unless (%plist-has-p value :geometry-slot :kind :precision)
-           (bad "expected (:GEOMETRY-SLOT <slot> :KIND k :PRECISION p)")))
+         (req-symbol :geometry-slot)
+         (req :kind)
+         (req :precision))
         (:time
-         (unless (%plist-has-p value :extent-fn)
-           (bad "expected (:EXTENT-FN <function-name>)")))
+         (req-symbol :extent-fn))
         (:attribution
-         (unless (%plist-has-p value :licence :citation)
-           (bad "expected (:LICENCE <string> :CITATION <string>)")))
+         (req-string :licence)
+         (req-string :citation))
         (:sensitivity
-         (unless (%plist-has-p value :class)
-           (bad "expected (:CLASS <keyword>)")))
+         (req-keyword :class))
         ;; Uninterpreted here; #138 defines its shape (design §3.3).
         (:registration value)
         (:indexed-text
-         (unless (%plist-has-p value :text-fn)
-           (bad "expected (:TEXT-FN <function-name>)")))))
+         (req-symbol :text-fn))))
     value))
 
 (defmacro def-source (name graph-name slots
-                      &key (identity nil identity-p)
+                      &key (parent-types nil)
+                           (identity nil identity-p)
                            (space nil space-p)
                            (time nil time-p)
                            (attribution nil attribution-p)
@@ -97,7 +148,9 @@ well-formed (design §1)."
                            (indexed-text nil indexed-text-p))
   "Define NAME as a source vertex in GRAPH-NAME with SLOTS, declaring all
 seven facets.  Omitting any signals MISSING-SOURCE-FACET at macroexpansion;
-use :NONE to say a facet does not apply (design §2)."
+use :NONE to say a facet does not apply (design §2).  PARENT-TYPES is
+DEF-VERTEX's own parent-types list (default (), Finding 5, GH #132
+review) -- a source class inherits exactly as any other vertex does."
   (let ((missing (append (unless identity-p '(:identity))
                          (unless space-p '(:space))
                          (unless time-p '(:time))
@@ -115,9 +168,16 @@ use :NONE to say a facet does not apply (design §2)."
   (%check-facet :registration registration)
   (%check-facet :indexed-text indexed-text)
   `(progn
-     (graph-db:def-vertex ,name () ,slots ,graph-name)
+     (graph-db:def-vertex ,name ,parent-types ,slots ,graph-name)
      ,@(unless (eq identity :none)
          `((graph-db:def-index ,name (,(getf identity :key-slot))
+             ,graph-name)
+           ;; A single class owns its key slot, so the engine's own
+           ;; constraint makes a duplicate unrepresentable at write time,
+           ;; going forward -- Finding 3 layer 1, GH #132 review.
+           ;; RESOLVE-ENDPOINT's read-side guard (resolve.lisp) is layer
+           ;; 2, for what this constraint cannot retroactively cover.
+           (graph-db:def-unique ,name (,(getf identity :key-slot))
              ,graph-name)))
      (%register-identity ',name ',identity)
      (setf (gethash ',name *source-contracts*)

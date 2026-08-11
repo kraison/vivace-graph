@@ -82,3 +82,12 @@ transaction is single-graph; resolve before opening it."
                      (ambiguous-endpoint-namespace c)
                      (ambiguous-endpoint-key c)
                      (ambiguous-endpoint-classes c)))))
+
+(define-condition unopened-source-graph (spacetime-error)
+  ((class :initarg :class :reader unopened-source-graph-class)
+   (graph-name :initarg :graph-name :reader unopened-source-graph-graph-name))
+  (:report (lambda (c s)
+             (format s "~S's graph ~S is not open; RESOLVE-ENDPOINT cannot ~
+  consult it (Finding 4, GH #132 review)."
+                     (unopened-source-graph-class c)
+                     (unopened-source-graph-graph-name c)))))

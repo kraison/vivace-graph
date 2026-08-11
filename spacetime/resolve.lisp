@@ -9,10 +9,19 @@
 (defun resolve-endpoint (namespace key)
   "The node in NAMESPACE whose external key is KEY, or NIL.
 
-Signals UNKNOWN-NAMESPACE when nothing is registered under NAMESPACE, and
-AMBIGUOUS-ENDPOINT when two classes both answer -- an external key must be
-unique within its namespace, and returning the first would make the answer
-depend on class-definition order (design §4.2).
+Signals UNKNOWN-NAMESPACE when nothing is registered under NAMESPACE,
+UNOPENED-SOURCE-GRAPH when a registered class's graph is not open (Finding
+4, GH #132 review), and AMBIGUOUS-ENDPOINT when more than one record
+answers -- either two classes, or two records of ONE class (Finding 3,
+GH #132 review).  DEF-SOURCE's DEF-UNIQUE (write time) stops the latter
+going forward, but is prospective only: it exempts any tuple with a NULL
+component outright, and cannot retroactively catch data written before it
+existed, which a later, TOLERANT re-open leaves untouched (DEF-UNIQUE's
+own docstring, unique-constraint.lisp).  So this is checked again here, on
+read, rather than trusted to DEF-UNIQUE alone.  An external key must be
+unique within its namespace, and returning the first hit would make the
+answer depend on class-definition or record-insertion order (design
+§4.2).
 
 Must NOT be called inside a read-write transaction: resolution can cross
 graphs, and cross-graph reads are legal only from a read-only snapshot or
@@ -29,10 +38,20 @@ outside a transaction (design §4.1)."
              ;; Each class names its own graph (SOURCE-FACETS-GRAPH); the
              ;; namespace keyword is not a graph name, so it cannot be
              ;; looked up once outside this loop (design §4).
-             (graph (graph-db:lookup-graph (source-facets-graph facets)))
+             (graph-name (source-facets-graph facets))
+             (graph (or (graph-db:lookup-graph graph-name)
+                        (error 'unopened-source-graph
+                               :class class :graph-name graph-name)))
              (slot (getf (source-facets-identity facets) :key-slot))
              (found (graph-db:index-lookup graph class (list slot) key)))
         (when found
+          ;; More than one hit from a SINGLE class: the classes-count
+          ;; check below would never see it, and DEF-UNIQUE's own
+          ;; protection is prospective only (see the docstring above) --
+          ;; Finding 3 layer 2.
+          (when (cdr found)
+            (error 'ambiguous-endpoint :namespace namespace :key key
+                                       :classes (list class)))
           (push class classes)
           (setf hits (append hits found)))))
     (when (cdr classes)

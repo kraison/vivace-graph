@@ -58,4 +58,6 @@
    #:missing-source-facet #:invalid-source-facet #:not-a-source
    #:resolve-endpoint #:source-disclosable-p #:+disclosure-classes+
    #:unknown-namespace #:ambiguous-endpoint #:ambiguous-endpoint-classes
-   #:resolution-in-transaction #:*namespace-sources* #:namespace-sources))
+   #:resolution-in-transaction #:namespace-sources
+   #:unopened-source-graph #:unopened-source-graph-class
+   #:unopened-source-graph-graph-name))
