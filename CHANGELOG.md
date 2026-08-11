@@ -146,8 +146,9 @@ between releases; cutting a release renames it to the new version and dates it.
   every committed `.txn` as its durable journal until a clean-close
   checkpoint (the Android/ECL production backend). The refresh now runs in
   `PREPARE-TX-PERSISTENCE`, over the transaction's create-set, before that
-  record is written; `APPLY-TX-WRITE (tx-create)`'s copy was redundant
-  (same node object, already refreshed) and was removed.
+  record is written; `APPLY-TX-WRITE (tx-create)`'s own copy was removed,
+  returning that apply path to master's shipped behavior, which never
+  re-serialized there either.
 
 - **`COPY` of a node created in the same transaction corrupted the graph**
   (#135). It built a `tx-update` whose `OLD-NODE` was a pending create.
@@ -167,11 +168,13 @@ between releases; cutting a release renames it to the new version and dates it.
   registered node.
 
 - **`interface.lisp` was missing an ASDF dependency on `transactions`**
-  (#135), the file that defines `%COPY`, `CREATE-SET`,
-  `OBJECT-SET-MEMBER-P` and `COPYING-UNCOMMITTED-NODE`, all used by `COPY`
-  above. It built only because `graph-db.asd` happens to declare
-  `transactions` earlier in the component list; `graph-db/core`'s
-  `:depends-on` now says so explicitly.
+  (#135), the file that defines `%COPY`, `COPYING-UNCOMMITTED-NODE` and
+  `NODE-CREATED-IN-TRANSACTION-P`, all used by `COPY` above. The gap
+  predates this branch — master's `interface.lisp` already called
+  `UPDATE-NODE` (also defined in `transactions.lisp`) from `SAVE` — and it
+  built only because `graph-db.asd` happens to declare `transactions`
+  earlier in the component list; `graph-db/core`'s `:depends-on` now says
+  so explicitly.
 
 ### Changed
 

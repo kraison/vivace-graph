@@ -429,6 +429,32 @@ actually registered for that id."
           (is (not (equal "leaked" (note n)))
               "SHARED's rejected mutation must not have reached disk"))))))
 
+(test copy-guard-checks-identity-not-id
+  "IMPORTANT-2, the COPY half (GH #135).  COPY's create-set check has the
+same id-vs-identity hazard as the SETF guard above: an id-keyed check
+would treat any instance carrying a created node's id as newly created in
+this transaction.  Re-create a node under an id already held by a live
+SHARED instance, then COPY SHARED itself -- a legitimate copy of an
+already-committed node.  An id-keyed check rejects it with
+COPYING-UNCOMMITTED-NODE, because the create-set now has an entry for
+SHARED's id (even though that entry's NODE is the fresh re-created
+instance, not SHARED).  The identity check must not reject it."
+  (with-temp-directory (dir)
+    (let (id)
+      (with-sm-graph (g dir)
+        (with-transaction () (setq id (id (make-sm-thing :name "original")))))
+      (with-sm-reopen (g dir)
+        (let ((shared (lookup-vertex id :graph g))
+              (copied nil))
+          (with-transaction ()
+            ;; Re-create under SHARED's own id: this transaction's
+            ;; create-set now holds an entry for ID, but the entry's NODE
+            ;; is the FRESH instance, not SHARED.
+            (make-sm-thing :id id :name "re-created")
+            (finishes (setq copied (copy shared))))
+          (is (equal "original" (name copied))
+              "COPY of the shared committed instance must succeed"))))))
+
 (test setf-permitted-under-a-non-tx-transaction
   "IMPORTANT-1 (GH #135).  CHECK-SLOT-MUTATION-ALLOWED reads COPIES and
 CREATE-SET, both TX-only readers.  With *TRANSACTION* bound to a
