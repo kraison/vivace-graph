@@ -49,11 +49,14 @@ is treated as more restricted than every member (design §3.2).")
   "CLASS's position, or NIL when unrecognised."
   (position class +disclosure-classes+))
 
-(defun disclosable-p (class clearance)
-  "True when CLASS may be disclosed at CLEARANCE.  FAIL-CLOSED: an
-unrecognised CLASS or CLEARANCE yields NIL, so the unknown case withholds
-rather than releases.  The substrate never calls this itself -- enforcement
-belongs to whoever reads or exports (design §3.2)."
+(defun source-disclosable-p (class clearance)
+  "True when a source's declared disclosure CLASS may be disclosed at
+CLEARANCE.  FAIL-CLOSED: an unrecognised CLASS or CLEARANCE yields NIL, so
+the unknown case withholds rather than releases.  The substrate never calls
+this itself -- enforcement belongs to whoever reads or exports (design
+§3.2).  Not to be confused with replication.lisp's DISCLOSABLE-P, the
+peer-replication export filter, which is fail-OPEN and shaped differently
+(graph, vertex, device-scope)."
   (let ((c (%disclosure-rank class))
         (k (%disclosure-rank clearance)))
     (and c k (<= c k))))

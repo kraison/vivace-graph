@@ -56,6 +56,6 @@
    #:source-facets-sensitivity #:source-facets-registration
    #:source-facets-indexed-text
    #:missing-source-facet #:invalid-source-facet #:not-a-source
-   #:resolve-endpoint #:disclosable-p #:+disclosure-classes+
+   #:resolve-endpoint #:source-disclosable-p #:+disclosure-classes+
    #:unknown-namespace #:ambiguous-endpoint #:ambiguous-endpoint-classes
    #:resolution-in-transaction #:*namespace-sources* #:namespace-sources))

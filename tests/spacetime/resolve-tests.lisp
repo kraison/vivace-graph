@@ -64,14 +64,14 @@ owners and the constraint registry keys on owner."
     (is (string= "r" (st-headline (resolve-endpoint :st-reports "k-1"))))
     (is (string= "s" (st-topic (resolve-endpoint :st-reports "k-2"))))))
 
-(test disclosable-p-is-fail-closed
+(test source-disclosable-p-is-fail-closed
   "Design §3.2.  An unrecognised class, and :NONE, are treated as MORE
 restricted than every known one -- never less.  If this test is ever
 inverted the facet becomes worse than nothing, because a caller trusts it."
-  (is-true (disclosable-p :public :public))
-  (is-true (disclosable-p :public :restricted))
-  (is-false (disclosable-p :restricted :public))
-  (is-true (disclosable-p :restricted :restricted))
-  (is-false (disclosable-p :no-such-class :restricted))
-  (is-false (disclosable-p :none :restricted))
-  (is-false (disclosable-p :public :no-such-clearance)))
+  (is-true (source-disclosable-p :public :public))
+  (is-true (source-disclosable-p :public :restricted))
+  (is-false (source-disclosable-p :restricted :public))
+  (is-true (source-disclosable-p :restricted :restricted))
+  (is-false (source-disclosable-p :no-such-class :restricted))
+  (is-false (source-disclosable-p :none :restricted))
+  (is-false (source-disclosable-p :public :no-such-clearance)))
