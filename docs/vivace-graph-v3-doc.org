@@ -3029,13 +3029,16 @@ holds only values ~GRAPH-DB:SERIALIZE~ already knows how to write.
     (claim-extent claim))  ; => the decoded TEMPORAL-EXTENT, or NIL
 #+END_SRC
 
-An extent must be handed to the constructor via ~:EXTENT~. ~(SETF
-CLAIM-EXTENT)~ exists too, but only for a claim already read back from the
-graph — a claim still inside the transaction that created it has its bytes
-already cached, so a ~SETF~ before that transaction commits is visible in
-memory and then silently lost the moment the graph is closed and reopened.
-The pattern for changing an *existing* claim's extent is the engine's usual
-one: ~COPY~, mutate, ~SAVE~.
+An extent can be handed to the constructor via ~:EXTENT~, or set afterwards
+with ~(SETF CLAIM-EXTENT)~ — both persist, on a claim this transaction is
+entitled to mutate (see "Which node may I write?" above): a claim just
+created in this transaction, or a copy of one already read back from the
+graph. The initarg is still the preferred form, but the reason is
+ergonomics and validation placement, not persistence — it lets a caller
+build a fully-formed claim in one call, with extent validation sitting
+next to the other construction-time checks. For an *existing*, already
+committed claim, the pattern is the engine's usual one: ~COPY~, mutate,
+~SAVE~.
 
 A claim's own ~standing~ and its extent's ~standing~ answer different
 questions and vary independently — the claim's says how the claim came to

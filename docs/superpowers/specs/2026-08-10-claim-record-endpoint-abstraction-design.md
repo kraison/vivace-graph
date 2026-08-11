@@ -236,21 +236,31 @@ engine already serializes, so the persistent slot — named `extent-sexp`, so th
 stored form and the decoded value never share a name — holds that list and **no
 serialize type byte is reserved**. S1a's no-core-change property carries forward.
 
-**Construction is the write path.** The engine only persists values supplied at
-construction; a `setf` on a slot of a node that has not yet committed is silently
-lost across a close/reopen (GH #135) — the node's bytes are already cached by the
-time the `setf` runs, so the mutation is visible in memory but never reaches
-disk. `make-<arity>` therefore accepts `:extent` directly: the constructor
-wrapper encodes it via `extent->sexp` into `extent-sexp` before the node is
-built, so it is part of the node's initial bytes rather than a later mutation.
+**Both the initarg and `setf` work — GH #135 is fixed.** An earlier revision of
+this section was written against a since-fixed engine defect: the create path
+used to skip the re-serialize that the update path always did, so a `setf` on a
+node not yet committed was silently lost across a close/reopen. That asymmetry
+is gone (`docs/superpowers/specs/2026-08-10-slot-mutation-contract-design.md`);
+`setf` on a claim created in the current transaction now persists exactly like
+the initarg does. Do not read the old advice below as still describing a
+persistence hazard — there isn't one.
+
+`make-<arity>` accepts `:extent` directly: the constructor wrapper encodes it
+via `extent->sexp` into `extent-sexp` before the node is built, so it is part of
+the node's initial bytes rather than a later mutation. This is still the
+**preferred** form, but the reason has changed — it is ergonomics and validation
+placement, not persistence. Handing `:extent` to the constructor lets a caller
+build a fully-formed claim in one call, and keeps extent validation (via
+`extent->sexp`) sitting next to the other construction-time checks
+(`%check-claim-identity`, `check-standing`) instead of scattered across a
+separate mutation call.
 
 `claim-extent` decodes `extent-sexp` back into a `temporal-extent` on read, so
-callers never see the wire form. `(setf claim-extent)` still exists, but its job
-is narrower than "the ordinary write path": it is for mutating a claim already
-read back from the graph, under the engine's usual `copy`, mutate, `save`
-pattern — never for a claim still inside the transaction that created it. Nothing
-stops a caller reaching `extent-sexp` directly; it is not hidden, only
-unnecessary.
+callers never see the wire form. `(setf claim-extent)` works on any claim this
+transaction is entitled to mutate — a claim it just created, or a copy of one
+looked up from the graph (the engine's usual `copy`, mutate, `save` pattern for
+an already-committed claim). Nothing stops a caller reaching `extent-sexp`
+directly; it is not hidden, only unnecessary.
 
 Decoding on every read is a real cost. It is cheap enough to ignore until
 measured; the programme's §11 discipline is to measure rather than guess.
