@@ -197,10 +197,9 @@ review) -- a source class inherits exactly as any other vertex does."
            ;; RESOLVE-ENDPOINT's read-side guard (resolve.lisp) is layer
            ;; 2, for what this constraint cannot retroactively cover.
            ;; Re-defining with a changed :KEY-SLOT leaves the OLD slot's
-           ;; DEF-UNIQUE spec live (registry keyed on owner+slots); DEF-
-           ;; INDEX has the identical leak.  Parked -- fixing needs an
-           ;; unregister API in unique-constraint.lisp, off limits as
-           ;; graph-db/core (GH #132).
+           ;; DEF-UNIQUE spec live and enforced -- nothing can retract one
+           ;; (GH #139; #140 is DEF-INDEX's identical leak).  Both need an
+           ;; engine-side unregister API, so neither is fixable here.
            (graph-db:def-unique ,name (,(getf identity :key-slot))
              ,graph-name)))
      (%register-identity ',name ',identity)

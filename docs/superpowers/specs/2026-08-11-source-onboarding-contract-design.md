@@ -101,6 +101,14 @@ forward and split the contract across two units.
 share a namespace; two answering the same key is a contract violation, handled
 in §4.2.
 
+**Known limitation.** Changing a declared `:key-slot` and re-evaluating
+leaves the *previous* slot's `def-unique` live and still enforced, so writes
+valid under the current declaration can be rejected. The engine offers no way
+to retract a schema spec — [#139](https://github.com/kraison/vivace-graph/issues/139),
+with [#140](https://github.com/kraison/vivace-graph/issues/140) for the
+identical `def-index` leak. Neither is fixable from this unit: both registries
+live in `graph-db/core`.
+
 ### 3.2 Sensitivity — declared here, enforced above
 
 ```
