@@ -182,9 +182,23 @@ the second is an ordinary miss. Collapsing both to `NIL` would make a
 misspelled namespace indistinguishable from an absent record, which is this
 programme's recurring defect in miniature.
 
-Today a namespace **is** a graph name, resolved through `lookup-graph`;
-#110 replaces that mapping without changing this signature, which is what makes
-#131 §6.1's "two implementations" a swap rather than a rewrite.
+**A namespace is not a graph name.** An earlier draft of this section said it
+was, and that a namespace could be resolved with `lookup-graph`. It cannot:
+`*graphs*` is keyed by the name `make-graph` was called with, while
+`*namespace-sources*` is keyed by the `:namespace` a class declares. They are
+two registries and nothing keeps them in step — the claim was found false by
+running the code, not by reading it.
+
+What actually holds the mapping is the **class**: `def-source` records the
+graph it was declared in, so resolution takes the graph from
+`source-facets-graph` per class rather than from the namespace. That is also
+more correct than the draft, because two classes sharing a namespace need not
+share a graph.
+
+Namespaces are therefore, today, **labels that group source classes** —
+nothing more. #110 gives them a real identity, and can do so without changing
+this signature, which is what makes #131 §6.1's "two implementations" a swap
+rather than a rewrite.
 
 This completes a pair. #131 shipped the inverse — `claims-touching`, answerable
 from the claim graph's own indexes with no cross-graph read at all. This is the
