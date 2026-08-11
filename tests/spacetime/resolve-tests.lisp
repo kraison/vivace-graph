@@ -122,6 +122,53 @@ the class and the graph, not just crash."
         (is (eq :graph-db-source-test-elsewhere
                (unopened-source-graph-graph-name c)))))))
 
+(test inheriting-a-source-with-one-record-resolves-cleanly
+  "Fix 2 (fix-wave review).  GRAPH-DB:INDEX-LOOKUP matches a class and its
+subclasses (index.lisp), so ST-PSRC's own index-lookup call and ST-CSRC's
+own both find the SAME physical ST-CSRC record.  Before the fix, that made
+RESOLVE-ENDPOINT see two classes answering and signal AMBIGUOUS-ENDPOINT
+for a namespace that has, in truth, exactly one record -- permanently
+unresolvable, since nothing about the data ever changes that count."
+  (with-source-graph (g)
+    (declare (ignorable g))
+    (with-transaction () (make-st-csrc :pid "inh-solo"))
+    (let ((n (resolve-endpoint :st-inherited "inh-solo")))
+      (is-true n)
+      (is (string= "inh-solo" (st-psrc-pid n))))))
+
+(test resolve-endpoint-guards-cross-class-ambiguity-after-dedup
+  "Fix 2 (fix-wave review), the other half: de-duplicating HITS by node id
+must not swallow genuine ambiguity -- two DIFFERENT physical records
+answering under two different classes.  A live ST-PSRC/ST-CSRC pair
+cannot drive this through the public API: DEF-UNIQUE turns out to make a
+subtype honour its ancestor's own uniqueness too (the same inheritance-
+awareness FIX 2 corrects on the read side), so creating both records
+signals UNIQUE-CONSTRAINT-VIOLATION before RESOLVE-ENDPOINT ever runs.
+So, as the layer-2 test above does, this exercises the guard directly by
+making INDEX-LOOKUP answer with two real, but distinct, nodes."
+  (with-source-graph (g)
+    (declare (ignorable g))
+    (with-transaction ()
+      (make-st-psrc :pid "solo-a")
+      (make-st-csrc :pid "solo-b"))
+    (let ((real (fdefinition 'graph-db:index-lookup))
+          (a (first (graph-db:index-lookup g 'st-psrc '(pid) "solo-a")))
+          (b (first (graph-db:index-lookup g 'st-csrc '(pid) "solo-b"))))
+      (unwind-protect
+          (progn
+            (setf (fdefinition 'graph-db:index-lookup)
+                  (lambda (graph class-name slot-name value
+                          &key collect-p prefix)
+                    (declare (ignore graph slot-name value
+                                     collect-p prefix))
+                    (list (if (eq class-name 'st-psrc) a b))))
+            (handler-case
+                (progn (resolve-endpoint :st-inherited "whatever")
+                       (is-true nil "expected AMBIGUOUS-ENDPOINT"))
+              (ambiguous-endpoint (c)
+                (is (= 2 (length (ambiguous-endpoint-classes c)))))))
+        (setf (fdefinition 'graph-db:index-lookup) real)))))
+
 (test source-disclosable-p-is-fail-closed
   "Design §3.2.  An unrecognised class, and :NONE, are treated as MORE
 restricted than every known one -- never less.  If this test is ever

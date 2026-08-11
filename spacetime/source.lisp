@@ -84,6 +84,17 @@ it cannot mistake a key appearing as someone else's VALUE for the key
 itself being present (Finding 1, GH #132 review)."
   (getf plist key +facet-absent+))
 
+(defun %proper-plist-p (x)
+  "True when X is a proper list of even length.  GETF assumes this and
+signals a raw SIMPLE-TYPE-ERROR when it does not hold; checking first lets
+a malformed facet -- a dropped value, a dotted list -- signal
+INVALID-SOURCE-FACET like every other malformed declaration (Fix 3, GH
+#132 review)."
+  (loop (cond ((null x) (return t))
+              ((not (consp x)) (return nil))
+              ((not (consp (cdr x))) (return nil))
+              (t (setf x (cddr x))))))
+
 (defun %check-facet (facet value)
   "Return VALUE if it is a well-formed FACET, else signal.  :NONE is always
 well-formed (design §1)."
@@ -97,10 +108,17 @@ well-formed (design §1)."
                  (bad (format nil "missing ~S" key)))
                v))
            (req-symbol (key)
-             "A required sub-key whose value must be a non-NIL symbol."
+             "A required sub-key naming a slot or function: a non-NIL
+symbol that is not itself a keyword.  A keyword like :PID never matches
+slot name PID, so RESOLVE-ENDPOINT would validate cleanly and then
+resolve nothing, forever (Fix 1, GH #132 review)."
              (let ((v (req key)))
-               (unless (and (symbolp v) v)
-                 (bad (format nil "~S must be a symbol, not ~S" key v)))
+               (cond
+                 ((keywordp v)
+                  (bad (format nil "~S must be a slot or function name, ~
+not the keyword ~S" key v)))
+                 ((not (and (symbolp v) v))
+                  (bad (format nil "~S must be a symbol, not ~S" key v))))
                v))
            (req-keyword (key)
              "A required sub-key whose value must be a keyword."
@@ -115,7 +133,8 @@ well-formed (design §1)."
                  (bad (format nil "~S must be a string, not ~S" key v)))
                v)))
     (unless (eq value :none)
-      (unless (listp value) (bad "expected a plist or :NONE"))
+      (unless (%proper-plist-p value)
+        (bad "expected a well-formed plist or :NONE"))
       (ecase facet
         (:identity
          (req-keyword :namespace)
@@ -177,6 +196,11 @@ review) -- a source class inherits exactly as any other vertex does."
            ;; going forward -- Finding 3 layer 1, GH #132 review.
            ;; RESOLVE-ENDPOINT's read-side guard (resolve.lisp) is layer
            ;; 2, for what this constraint cannot retroactively cover.
+           ;; Re-defining with a changed :KEY-SLOT leaves the OLD slot's
+           ;; DEF-UNIQUE spec live (registry keyed on owner+slots); DEF-
+           ;; INDEX has the identical leak.  Parked -- fixing needs an
+           ;; unregister API in unique-constraint.lisp, off limits as
+           ;; graph-db/core (GH #132).
            (graph-db:def-unique ,name (,(getf identity :key-slot))
              ,graph-name)))
      (%register-identity ',name ',identity)

@@ -54,10 +54,17 @@ outside a transaction (design §4.1)."
                                        :classes (list class)))
           (push class classes)
           (setf hits (append hits found)))))
-    (when (cdr classes)
-      (error 'ambiguous-endpoint :namespace namespace :key key
-                                 :classes classes))
-    (first hits)))
+    ;; GRAPH-DB:INDEX-LOOKUP matches a class AND its subclasses
+    ;; (index.lisp), so a source class inheriting another one (Finding 5,
+    ;; GH #132 review) can put the SAME physical record into HITS twice,
+    ;; once per class name -- de-duplicating by node id before counting
+    ;; keeps that legal, resolvable, and distinct from genuine ambiguity:
+    ;; two DIFFERENT records still signal (Fix 2, GH #132 review).
+    (let ((distinct (remove-duplicates hits :key #'graph-db:id)))
+      (when (cdr distinct)
+        (error 'ambiguous-endpoint :namespace namespace :key key
+                                   :classes classes))
+      (first distinct))))
 
 (defparameter +disclosure-classes+
   '(:public :internal :restricted :secret)

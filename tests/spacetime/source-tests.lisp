@@ -358,3 +358,68 @@ ST-DERIVED is a genuine subtype of ST-BASE-THING and inherits its slot."
       (let ((n (make-st-derived :label "l" :extra "e9")))
         (is (string= "l" (st-base-label n)))
         (is (string= "e9" (st-derived-extra n)))))))
+
+;; Fix 2 (fix-wave review): ST-PSRC and ST-CSRC both a source, ST-CSRC
+;; inheriting ST-PSRC and sharing its namespace.  GRAPH-DB:INDEX-LOOKUP
+;; matches a class and its subclasses (index.lisp), so one physical
+;; ST-CSRC record answers under both class names -- resolve-tests.lisp
+;; proves RESOLVE-ENDPOINT must not treat that as ambiguity.
+(def-source st-psrc :graph-db-source-test
+    ((pid :initarg :pid :accessor st-psrc-pid))
+  :identity     (:namespace :st-inherited :key-slot pid)
+  :space        :none
+  :time         :none
+  :attribution  :none
+  :sensitivity  :none
+  :registration :none
+  :indexed-text :none)
+
+(def-source st-csrc :graph-db-source-test
+    ()
+  :parent-types (st-psrc)
+  :identity     (:namespace :st-inherited :key-slot pid)
+  :space        :none
+  :time         :none
+  :attribution  :none
+  :sensitivity  :none
+  :registration :none
+  :indexed-text :none)
+
+(test a-source-class-can-inherit-from-a-source-parent
+  (is (subtypep 'st-csrc 'st-psrc))
+  (with-source-graph (g)
+    (declare (ignorable g))
+    (with-transaction ()
+      (let ((n (make-st-csrc :pid "inh-1")))
+        (is (string= "inh-1" (st-psrc-pid n)))))))
+
+(test a-keyword-key-slot-signals-and-names-the-mistake
+  "Fix 1 (fix-wave review).  :KEY-SLOT :PID passed the old REQ-SYMBOL
+check -- a non-NIL symbol -- because keywords are symbols too.  The class
+defined, records wrote, and RESOLVE-ENDPOINT returned NIL for the life of
+the class, because keyword :PID never matches slot name PID.  This is the
+likeliest slip a user makes, and must be caught at macroexpansion."
+  (handler-case
+      (progn
+        (macroexpand-1
+         `(def-source st-badkw :graph-db-source-test
+              ((pid :initarg :pid :accessor st-badkw-pid))
+            :identity (:namespace :st-badkw-ns :key-slot :pid) ; keyword!
+            :space :none :time :none :attribution :none
+            :sensitivity :none :registration :none :indexed-text :none))
+        (is-true nil "expected INVALID-SOURCE-FACET"))
+    (invalid-source-facet (c)
+      (is (search "keyword"
+                  (graph-db.spacetime::invalid-source-facet-reason c))))))
+
+(test a-malformed-plist-signals-instead-of-a-raw-type-error
+  "Fix 3 (fix-wave review).  A dropped value -- the likeliest typo -- left
+an odd-length plist, which reached SBCL's malformed-property-list error
+straight out of GETF.  Every other malformed declaration in this unit
+signals INVALID-SOURCE-FACET; this one must too."
+  (signals invalid-source-facet
+    (macroexpand-1
+     `(def-source st-baddrop :graph-db-source-test ((a :initarg :a))
+        :identity (:namespace :st-baddrop-ns :key-slot) ; dropped value
+        :space :none :time :none :attribution :none
+        :sensitivity :none :registration :none :indexed-text :none))))
