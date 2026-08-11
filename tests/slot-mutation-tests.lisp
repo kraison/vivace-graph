@@ -169,11 +169,12 @@ DATA-POINTER to mask a COPY-NODE bug against a missing alist entry."
 
 (test copy-survives-a-makunbound-initform-slot-on-memory-graph
   "GH #135 (the durable-brick case).  SLOT-MAKUNBOUND on a persistent
-:INITFORM slot drops its DATA-alist entry permanently -- surviving a
-memory-graph close/reopen, since CL-STORE restore never re-runs initforms
-(the same gap GH #128 schema evolution hits).  A node in that state must
-still be COPYable: %PERSISTENT-SLOT-DEFAULTS backs the missing entry with the
-class default rather than the copy tripping the guard on every future copy."
+:INITFORM slot drops its DATA-alist entry permanently on a MEMORY graph --
+surviving close/reopen, since CL-STORE restore never re-runs initforms.  That
+stays true here: this fix changes no semantics (the disk/memory divergence on
+reopen is a separate, tracked bug).  A node in that state must still be
+COPYable and deletable -- that is the brick this escape fixes -- with the
+slot continuing to read NIL, not the class default."
   (with-temp-directory (dir)
     (let ((loc (namestring dir)) id)
       (let ((g (graph-db::make-memory-graph *sm-graph-name* loc)))
@@ -185,13 +186,42 @@ class default rather than the copy tripping the guard on every future copy."
       (let ((g (graph-db::open-memory-graph *sm-graph-name* loc)))
         (unwind-protect
              (let ((*graph* g))
+               (is (null (gap (lookup-vertex id :graph g)))
+                   "precondition: still unbound after reopen")
                (finishes
                 (with-transaction ()
                   (let ((c (copy (lookup-vertex id :graph g))))
                     (setf (name c) "z")
                     (save c))))
                (is (equal "z" (name (lookup-vertex id :graph g))))
-               (is (equal "FILLER" (gap (lookup-vertex id :graph g)))
-                   "the makunbound slot must come back as the class default"))
+               (is (null (gap (lookup-vertex id :graph g)))
+                   "must stay unbound -- resurrecting the default would be a
+semantic change this task must not make")
+               (finishes
+                (with-transaction ()
+                  (mark-deleted (lookup-vertex id :graph g))))
+               (is (deleted-p (lookup-vertex id :graph g))))
           (ignore-errors (close-graph g :snapshot-p nil))
           (collect-garbage))))))
+
+(test class-redefinition-with-live-instance-does-not-signal-on-read
+  "GH #135.  Redefining a class to add a persistent :INITFORM slot while an
+instance is live in the node cache fires UPDATE-INSTANCE-FOR-REDEFINED-CLASS
+lazily on its next slot access -- CLOS applies the new slot's :INITFORM the
+same way CHANGE-CLASS does, through the guarded funnel, with no transaction
+at all.  A read of an unrelated, already-existing slot must not signal."
+  (with-temp-directory (dir)
+    (let (id cached)
+      (with-sm-graph (g dir)
+        (eval '(def-vertex sm-redef-thing () ((alpha :type string))
+                :graph-db-slot-mutation-test))
+        (with-transaction ()
+          (setq id (id (graph-db::make-vertex 'sm-redef-thing
+                                              '((:alpha . "x"))
+                                              :graph g))))
+        (setq cached (lookup-vertex id :graph g))
+        (eval '(def-vertex sm-redef-thing ()
+                ((alpha :type string) (beta :initform "DEFAULT"))
+                :graph-db-slot-mutation-test))
+        (finishes (slot-value cached 'alpha))
+        (is (equal "x" (slot-value cached 'alpha)))))))

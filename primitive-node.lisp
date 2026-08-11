@@ -439,6 +439,17 @@ slot values (see *INITIALIZING-NODE*)."
   `(let ((*initializing-node* t))
      (change-class ,node ,subclass)))
 
+(defmethod update-instance-for-redefined-class :around
+    ((instance node) added-slots discarded-slots property-list &rest initargs)
+  "A redefined class (re-evaluated DEF-VERTEX/DEF-EDGE) fires this lazily on
+a live instance's next slot access -- CLOS applies a newly added persistent
+slot's :INITFORM the same way CHANGE-CLASS does, through the guarded funnel,
+on what may be a bare read with no transaction at all.  Same escape as
+CHANGE-NODE-CLASS (GH #135)."
+  (declare (ignore added-slots discarded-slots property-list initargs))
+  (let ((*initializing-node* t))
+    (call-next-method)))
+
 (defmethod slot-boundp-using-class :around ((class node-class) instance slot)
   "Persistent slot VALUES live in the node's DATA alist, not in the real CLOS
 slot (which is always unbound), so SLOT-BOUNDP must consult the alist for them.
