@@ -3046,16 +3046,154 @@ be known, the extent's says how the *time* was known. An ~:asserted~ claim
 can carry an ~:observed~ extent, or any other combination; neither one
 determines the other.
 
+*** The source onboarding contract: what a source declares about itself
+
+A claim's subject and object are stored as ~(namespace, key)~ pairs rather
+than live references — the previous section explains why — but nothing so
+far has said what a namespace's key actually *means*, or how to turn one
+back into a node. ~DEF-SOURCE~ is that declaration: a class states, once, at
+definition time, what it is for resolution, retrieval and a tenant's own
+ingest to read, instead of each of those layers inventing its own
+convention (GH #132).
+
+A source declares seven facets, and *every one of the seven accepts
+~:NONE~* — the uniform rule is what keeps the contract learnable, with no
+per-facet exception to remember:
+
+#+BEGIN_SRC lisp
+  (def-source incident-report :my-graph
+    ((headline :initarg :headline) (body :initarg :body)
+     (report-id :initarg :report-id))
+    :identity      (:namespace :reports :key-slot report-id)
+    :space         (:geometry-slot where :kind :point :precision :exact)
+    :time          (:extent-fn report-extent)
+    :attribution   (:licence "CC-BY-4.0" :citation "Example Reports")
+    :sensitivity   (:class :public)
+    :registration  :none
+    :indexed-text  (:text-fn report-indexed-text))
+#+END_SRC
+
+~DEF-SOURCE~ both *defines* the class — it wraps ~DEF-VERTEX~, the same way
+~DEF-CLAIM-CLASSES~ wraps it — and validates the declaration: omitting any
+of the seven facets signals ~MISSING-SOURCE-FACET~ at macroexpansion,
+before the class exists at all. A class defined with plain ~DEF-VERTEX~ is
+simply not a source; there is no separate registry it could be missing
+from. Because the check runs at expansion time, a non-conforming source
+cannot exist at runtime for anything downstream to mistake for a
+conforming one.
+
+~SOURCE-CONTRACT~ reads a class's declared facets back:
+
+#+BEGIN_SRC lisp
+  (source-contract 'incident-report)   ; => a SOURCE-FACETS struct
+#+END_SRC
+
+It signals ~NOT-A-SOURCE~ for a class never defined with ~DEF-SOURCE~,
+rather than returning ~NIL~ — "declared nothing" and "is not a source" are
+different facts, and a caller that got ~NIL~ for both would treat an
+unconverted class as a conforming one with empty facets.
+
+**** Identity is the only facet with behaviour in this unit
+
+Of the seven, only ~:IDENTITY~ does anything inside ~graph-db~ here. It
+emits a ~DEF-INDEX~ on the key slot and registers the class under its
+namespace, and that pairing is what makes endpoint resolution (below)
+possible at all. The other six — space, time, attribution, sensitivity,
+registration, indexed-text — are declared, shape-checked at
+macroexpansion, and stored; *nothing inside ~graph-db~ consults them*. This
+is worth stating outright, because the natural assumption runs the other
+way. Acting on them belongs to layers above ~graph-db~: registration to a
+later unit, retrieval and disclosure to a tenant's own code (next).
+
+**** Sensitivity is fail-closed, and the substrate enforces none of it
+
+~:SENSITIVITY~ accepts ~(:CLASS <keyword>)~ or ~:NONE~, and ~:NONE~ means
+*most-restricted*, not unrestricted — a source that declines to state a
+disclosure class gets the safest reading, never the loosest.
+~SOURCE-DISCLOSABLE-P~ compares a declared class against a caller's
+clearance along the ordered vocabulary ~+DISCLOSURE-CLASSES+~ (least to
+most restricted: ~:PUBLIC~, ~:INTERNAL~, ~:RESTRICTED~, ~:SECRET~):
+
+#+BEGIN_SRC lisp
+  (source-disclosable-p :internal :public)    ; => NIL
+  (source-disclosable-p :public :internal)    ; => T
+#+END_SRC
+
+An unrecognised class or clearance — ~:NONE~ included — also compares as
+more restricted than every recognised member, never less: the unknown case
+withholds rather than releases.
+
+*The substrate never enforces this itself, and calls the predicate
+nowhere.* ~SOURCE-DISCLOSABLE-P~ is a tool for whoever reads or exports a
+source's records to call at that boundary; a tenant that never calls it
+gets no protection at all from having declared ~:SENSITIVITY~ in the first
+place — the declaration is inert until something reads it. (It is a
+different predicate from ~replication.lisp~'s own ~DISCLOSABLE-P~, the
+peer-replication export filter from Chapter 16 — that one is fail-*open*,
+answers a different question, whether a vertex crosses a replication
+boundary, and is not this unit's enforcement point either.)
+
+**** Resolving an endpoint
+
+~RESOLVE-ENDPOINT~ turns a stored ~(namespace, key)~ back into the node it
+names:
+
+#+BEGIN_SRC lisp
+  (resolve-endpoint :reports "r42")   ; => the INCIDENT-REPORT node, or NIL
+#+END_SRC
+
+It has two distinct failure modes, kept apart deliberately:
+
+- a namespace nothing is registered under *signals* ~UNKNOWN-NAMESPACE~ —
+  a typo or an unloaded system, a programming error;
+- a key that matches nothing within a known namespace *returns ~NIL~* — an
+  ordinary miss.
+
+Collapsing those into one would make a misspelled namespace
+indistinguishable from an absent record. A third case — two source classes
+sharing a namespace and both answering the same key, which should not
+happen because an external key is supposed to be unique within its
+namespace — signals ~AMBIGUOUS-ENDPOINT~, naming both classes, rather than
+silently returning whichever class's index happened to be checked first.
+
+~RESOLVE-ENDPOINT~ *must not be called inside a read-write transaction.*
+Resolution can read across graphs — a namespace only groups source
+classes, each with its own graph (next) — and this engine's read-write
+transactions are single-graph. Calling it from inside one signals
+~RESOLUTION-IN-TRANSACTION~ at the call site, rather than letting a
+lower-level cross-graph error surface from wherever the read happened to
+fail; resolve endpoints before opening the transaction that uses them.
+
+**** A namespace is not a graph name
+
+It is tempting to read a namespace keyword as a graph's name and look it up
+with ~LOOKUP-GRAPH~. That is wrong: the graph registry is keyed by whatever
+name ~MAKE-GRAPH~ was called with, and the namespace registry is keyed by
+the ~:NAMESPACE~ a class declares — two separate registries, with nothing
+keeping them in step. What actually carries the mapping is the *class*:
+each source class records its own graph at ~DEF-SOURCE~ time, and
+~RESOLVE-ENDPOINT~ looks up each candidate class's graph individually
+rather than the namespace's. A namespace, today, is nothing more than a
+*label grouping source classes* that may perfectly well live in different
+graphs from one another.
+
+**** Registration is stored, not yet interpreted
+
+~:REGISTRATION~ accepts any value, or ~:NONE~, and is passed through
+uninterpreted — there is no shape check beyond "declared, or ~:NONE~".
+Nothing reads it yet; the facet exists so a source with a real
+registration to declare is not forced to write ~:NONE~ and leave a false
+statement in the record while its meaning waits on a later unit.
+
 *** What is not here yet
 
-Two things are deliberately absent from this unit, both because they belong
-to the identity contract a later add-on establishes, not because they were
-forgotten: *endpoint resolution* — turning a claim's ~(namespace, key)~
-back into the actual node it names — and the ~precision~ / ~fraction~
-slots that describe how confidently that resolution matched. Both need
-every participating node class to declare a stable external key to resolve
-against; adding them here, ahead of that contract, would mean guessing at a
-shape no tenant has committed to yet.
+One thing marked absent from the previous unit has since landed: endpoint
+resolution needed every participating node class to declare a stable
+external key to resolve against, and the source onboarding contract above
+is that declaration. What remains absent is narrower — the ~precision~ /
+~fraction~ slots that would describe how confidently a resolved match was
+made, and any interpretation of the ~:REGISTRATION~ facet beyond storing
+it. Both wait on a later unit rather than being guessed at here.
 
 ** API Reference
 

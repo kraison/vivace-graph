@@ -142,3 +142,23 @@ fixed."
                                               :standing :observed))))
         (is (eq :asserted (claim-standing c)))
         (is (eq :observed (extent-standing (claim-extent c))))))))
+
+(test a-declared-none-facet-is-distinguishable-from-a-value
+  "The absence-vs-value category, third unit running.  :NONE is a
+declaration; it must never read as a configured value."
+  (let ((c (source-contract 'st-report)))
+    (is (eq :none (source-facets-space c)))
+    ;; :NONE is not even a plist -- GETF on a bare keyword signals
+    ;; (verified by running, not assumed), so LISTP gates the probe.
+    (is-false (and (listp (source-facets-space c))
+                   (getf (source-facets-space c) :geometry-slot))
+              ":NONE must not answer a facet's sub-keys")
+    (is (listp (source-facets-attribution c))
+        "a declared facet is a plist, not :NONE")))
+
+(test an-undeclared-facet-cannot-exist-to-be-confused-with-none
+  "Enforcement is structural, so there is no third state to test for at
+runtime -- the class does not compile.  This records that reasoning."
+  (signals missing-source-facet
+    (macroexpand-1 '(def-source st-nope :graph-db-source-test ((a :initarg :a))
+                     :identity :none))))
