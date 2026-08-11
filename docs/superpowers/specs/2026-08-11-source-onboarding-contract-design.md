@@ -111,12 +111,20 @@ uniform "every facet is `:none`-able" rule that makes the contract learnable,
 and it offered no better outcome than a fail-closed default already gives.
 
 **Fail-closed means an unrecognised class also compares as most-restricted**,
-never least. The substrate ships a predicate for consumers to call and **enforces
-nothing itself**: the things that would enforce it — retrieval, export — live
-above `graph-db` entirely, and inventing an enforcement point here would mean
-inventing a source-to-claim data flow this unit has no other reason to build,
-and putting an access-control decision in an engine with no notion of a
-principal.
+never least. The substrate ships a predicate for consumers to call —
+**`source-disclosable-p (class clearance)`** — and **enforces nothing itself**:
+the things that would enforce it — retrieval, export — live above `graph-db`
+entirely, and inventing an enforcement point here would mean inventing a
+source-to-claim data flow this unit has no other reason to build, and putting
+an access-control decision in an engine with no notion of a principal.
+
+It is named `source-disclosable-p`, not the shorter `disclosable-p`, because
+`replication.lisp` already defines a `disclosable-p` — the peer-replication
+export filter, shaped differently (`graph`, `vertex`, `device-scope`) and,
+unlike this one, fail-**open**. Two same-named predicates with opposite
+failure modes in one image is exactly the kind of silent, fail-open collision
+this facet exists to guard against; the longer name keeps them from ever
+being confused at a call site.
 
 The spec and the manual must both say plainly that a tenant which never calls
 the predicate gets no protection.
