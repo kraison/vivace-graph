@@ -129,10 +129,9 @@ representable here (deferred to #132)."
   "Design §5: one records how the claim came to be known, the other how the
 TIME was known.
 
-EXTENT arrives via the constructor, not a post-construction SETF -- a SETF
-on a node not yet committed is silently lost (GH #135), which would make
-the CLAIM-EXTENT read below come back NIL, not :OBSERVED, defeating the
-one thing this file exists to guard against."
+EXTENT arrives via the constructor here, the preferred form (see design
+§7) -- a post-construction SETF would persist too, now that GH #135 is
+fixed."
   (with-claim-graph (g)
     (declare (ignorable g))
     (with-transaction ()

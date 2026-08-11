@@ -63,9 +63,12 @@ RELATION, so (MAKE-B :RELATION :EXTENT ...) must not spuriously trip an
 (defun %claim-encode-extent-arg (args)
   "Rewrite a claim constructor's ARGS: an :EXTENT is encoded via
 EXTENT->SEXP and passed through as :EXTENT-SEXP, the slot that actually
-persists.  The value must arrive at construction -- a SETF on a node not
-yet committed is silently lost, not merely deferred (GH #135).  Signals
-if both :EXTENT and :EXTENT-SEXP are given, rather than picking one."
+persists.  Handing it to the constructor is the preferred form -- a
+just-built claim is complete in one call, with extent validation next to
+the other construction-time checks -- not a persistence requirement:
+(SETF CLAIM-EXTENT) on the resulting node works too (GH #135 is fixed).
+Signals if both :EXTENT and :EXTENT-SEXP are given, rather than picking
+one."
   (if (%plist-key-p args :extent)
       (progn
         (when (%plist-key-p args :extent-sexp)

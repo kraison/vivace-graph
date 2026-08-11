@@ -80,8 +80,10 @@ the same producer, subject and relation coexist."
   "Design §6.1: PRODUCER excludes the version, so re-running a rule at a new
 version collides with its own prior claim rather than adding a second one.
 
-RULE-VERSION arrives via the constructor, not a post-construction SETF --
-a SETF on a node not yet committed is silently lost (GH #135)."
+RULE-VERSION arrives via the constructor here, for convenience -- a
+post-construction SETF would persist too (GH #135 is fixed), but
+identity depends only on PRODUCER, never on RULE-VERSION, so this is not
+under test either way."
   (with-claim-graph (g)
     (declare (ignorable g))
     (with-transaction () (make-b :rule-version "v1"))

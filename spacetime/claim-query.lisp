@@ -42,11 +42,13 @@ the other (design §7)."
   "Store EXTENT on CLAIM as its sexp.  Only values GRAPH-DB:SERIALIZE
 already handles reach the heap, so no core type byte is reserved.
 
-Only safe post-commit, on a CLAIM already looked up from the graph (MVCC
-pattern: COPY, mutate, SAVE).  On a claim not yet committed -- still in
-the transaction that created it -- this SETF is silently lost across a
-close/reopen (GH #135); pass :EXTENT to the MAKE-<ARITY> constructor
-instead, which encodes it before the node's bytes are ever cached."
+Legal on any CLAIM this transaction is entitled to mutate (engine
+slot-mutation contract, GH #135, now fixed): a claim created in this
+transaction -- SETF its slots directly, no COPY needed, since COPY of an
+uncommitted node signals COPYING-UNCOMMITTED-NODE -- or a COPY of a claim
+looked up from the graph, mutated, then SAVEd.  MAKE-<ARITY>'s :EXTENT
+initarg is still preferred for a brand-new claim, for ergonomics and
+validation placement, not because this SETF would fail to persist."
   (setf (claim-extent-sexp claim) (and extent (extent->sexp extent)))
   extent)
 
