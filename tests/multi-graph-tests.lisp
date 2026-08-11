@@ -838,8 +838,11 @@ a phantom graph (GH #53)."
           (ignore-errors (close-graph g :snapshot-p nil))
           (collect-garbage)))
       ;; ... and nothing graph-shaped may come back out of the image file.
+      ;; %RESTORE-NODE-IMAGE (memory-graph.lisp): the one place that binds
+      ;; *INITIALIZING-NODE* around a raw image restore (GH #135), shared
+      ;; rather than re-bound here.
       (let* ((image (graph-db::memory-image-file (pathname loc)))
-             (blob (cl-store:restore image))
+             (blob (graph-db::%restore-node-image image))
              (stored (append (getf blob :vertices) (getf blob :edges))))
         (is (= 3 (length stored))
             "precondition: the image must hold the 2 vertices + 1 edge, got ~D"

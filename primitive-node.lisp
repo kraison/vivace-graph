@@ -403,6 +403,22 @@ to NIL is bound.  Materializes the data first (mirrors NODE-SLOT-VALUE)."
         (node-slot-value instance slot-keyword-name)
         (call-next-method))))
 
+(defun check-slot-mutation-allowed (node slot-name)
+  "Signal MUTATING-UNREGISTERED-NODE unless the current transaction may write
+NODE's persistent slots: it may write a COPY it registered, or a node it
+created.  Anything else is either lost at commit or a mutation of the shared
+cached instance (GH #135).
+COPIES and CREATE-SET are TX-only readers: a non-TX *TRANSACTION* (e.g. a
+RESTORE-TRANSACTION replay, transaction-restore.lisp) has neither, so is
+trusted unconditionally here, mirroring CREATE-NODE's own TYPEP guard
+(transactions.lisp) rather than signalling NO-APPLICABLE-METHOD."
+  (unless *transaction*
+    (error 'mutating-unregistered-node :node node :slot slot-name))
+  (when (typep *transaction* 'tx)
+    (unless (or (gethash node (copies *transaction*))
+                (node-created-in-transaction-p node *transaction*))
+      (error 'mutating-unregistered-node :node node :slot slot-name))))
+
 (defmethod (setf slot-value-using-class) :around
     (new-value (class node-class) instance slot)
   "Is alternate-version aware and will update values for the current, working private
@@ -413,8 +429,10 @@ to NIL is bound.  Materializes the data first (mirrors NODE-SLOT-VALUE)."
          (slot-name (slot-definition-name slot))
          (slot-keyword-name (%persistent-slot-keyword class slot-name)))
     (if slot-keyword-name
-        ;; FIXME: Check for txn and handle
-        (setf (node-slot-value instance slot-keyword-name) new-value)
+        (progn
+          (unless *initializing-node*
+            (check-slot-mutation-allowed instance slot-name))
+          (setf (node-slot-value instance slot-keyword-name) new-value))
         (call-next-method))))
 
 ;; *INITIALIZING-NODE* is defvar'd above MAYBE-INIT-NODE-DATA (it guards that
@@ -426,6 +444,17 @@ re-initialization CLOS performs does not destroy NODE's alist-backed persistent
 slot values (see *INITIALIZING-NODE*)."
   `(let ((*initializing-node* t))
      (change-class ,node ,subclass)))
+
+(defmethod update-instance-for-redefined-class :around
+    ((instance node) added-slots discarded-slots property-list &rest initargs)
+  "A redefined class (re-evaluated DEF-VERTEX/DEF-EDGE) fires this lazily on
+a live instance's next slot access -- CLOS applies a newly added persistent
+slot's :INITFORM the same way CHANGE-CLASS does, through the guarded funnel,
+on what may be a bare read with no transaction at all.  Same escape as
+CHANGE-NODE-CLASS (GH #135)."
+  (declare (ignore added-slots discarded-slots property-list initargs))
+  (let ((*initializing-node* t))
+    (call-next-method)))
 
 (defmethod slot-boundp-using-class :around ((class node-class) instance slot)
   "Persistent slot VALUES live in the node's DATA alist, not in the real CLOS

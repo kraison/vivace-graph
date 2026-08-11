@@ -46,11 +46,15 @@
 
 (defun pi-authored-create (graph type data origin &key (lamport 5) (tx-id 9000))
   "An AUTHORED peer-op that CREATEs a TYPE node with DATA, attributed to ORIGIN (as
-if pulled from that author).  Returns (values op new-id)."
+if pulled from that author).  Returns (values op new-id).
+
+%MAKE-VERTEX, not a bare (MAKE-INSTANCE type ...): see
+tests/peer-unique-tests.lisp's PU-AUTHORED-CREATE docstring (GH #135)."
   (let* ((tid (graph-db::node-type-id
                (graph-db::lookup-node-type-by-name type :vertex :graph graph)))
          (nid (gen-id))
-         (n (make-instance type :id nid :type-id tid :revision 0)))
+         (n (graph-db::%make-vertex :class type :id nid
+                                    :type-id tid :revision 0)))
     (setf (graph-db::data n) data)
     (values (graph-db::make-peer-op
              :kind :authored :op-id (graph-db::gen-op-id) :origin origin
@@ -73,7 +77,9 @@ index (findable by INDEX-LOOKUP)."
   (with-pi-device (g)
     (let* ((tid (graph-db::node-type-id
                  (graph-db::lookup-node-type-by-name 'pi-item :vertex :graph g)))
-           (n (make-instance 'pi-item :id (gen-id) :type-id tid :revision 0)))
+           ;; %MAKE-VERTEX (GH #135) -- see PI-AUTHORED-CREATE above.
+           (n (graph-db::%make-vertex :class 'pi-item :id (gen-id)
+                                      :type-id tid :revision 0)))
       (setf (graph-db::data n) '((:sku . "S-9") (:name . "gadget")))
       (graph-db::apply-peer-create-writes
        g 7777 (list (make-instance 'graph-db::tx-create :node n)) *pi-remote-origin*))
@@ -114,7 +120,9 @@ pulled multi-slot tuple."
     (let* ((tid (graph-db::node-type-id
                  (graph-db::lookup-node-type-by-name
                   'pi-claim :vertex :graph g)))
-           (n (make-instance 'pi-claim :id (gen-id) :type-id tid :revision 0)))
+           ;; %MAKE-VERTEX (GH #135) -- see PI-AUTHORED-CREATE above.
+           (n (graph-db::%make-vertex :class 'pi-claim :id (gen-id)
+                                      :type-id tid :revision 0)))
       (setf (graph-db::data n) '((:ns . "sync") (:key . "e9") (:rel . "near")))
       (graph-db::apply-peer-create-writes
        g 7777 (list (make-instance 'graph-db::tx-create :node n))
