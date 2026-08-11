@@ -141,6 +141,35 @@ per graph and may compose; read-write transactions are not (GH #53).")
              (format stream "Modifying ~A without copying first"
                      (modifying-non-copy-node condition)))))
 
+(define-condition mutating-unregistered-node (error)
+  ((node
+    :initarg :node
+    :reader mutating-unregistered-node-node)
+   (slot
+    :initarg :slot
+    :reader mutating-unregistered-node-slot))
+  (:report
+   (lambda (condition stream)
+     (format stream
+             "Cannot write persistent slot ~A of ~A: this transaction may ~
+              write only a node it created, or a COPY it registered.  A node ~
+              from LOOKUP-* is the shared cached instance -- COPY it inside ~
+              the transaction, SETF the copy, then SAVE it."
+             (mutating-unregistered-node-slot condition)
+             (mutating-unregistered-node-node condition)))))
+
+(define-condition copying-uncommitted-node (error)
+  ((node
+    :initarg :node
+    :reader copying-uncommitted-node-node))
+  (:report
+   (lambda (condition stream)
+     (format stream
+             "Cannot COPY ~A: it was created in this transaction, so it has no ~
+              committed version to update against.  SETF its slots directly -- ~
+              a node you created is writable without a copy."
+             (copying-uncommitted-node-node condition)))))
+
 ;;; Transaction manager
 (defgeneric create-transaction (transaction-manager))
 (defgeneric cleanup-transaction (transaction))
@@ -408,6 +437,16 @@ inside the transaction, mutate the copy, then SAVE it."
             (object-set-count (create-set transaction))
             (object-set-count (write-set transaction))
             (state transaction))))
+
+(defun node-created-in-transaction-p (node transaction)
+  "True iff NODE -- by EQ, not merely by shared id -- is the exact node
+CREATE-NODE registered in TRANSACTION's create-set.  OBJECT-SET-MEMBER-P
+keys by (ID OBJECT) alone, so any instance carrying a re-created id (the
+generated constructor accepts :ID) would otherwise pass -- letting the
+create-set branch of the slot-mutation guard, and COPY's create-set check,
+through for a node this transaction never created (GH #135)."
+  (let ((entry (gethash (id node) (table (create-set transaction)))))
+    (and entry (eq (node entry) node))))
 
 
 ;;; Applying transaction writes to the graph
@@ -782,6 +821,11 @@ APPLY-TRANSACTION)."
   (let ((table (tx-write-table write graph))
         (node (node write)))
     (setf (revision node) 0)
+    ;; BYTES is refreshed from DATA once, in REFRESH-CREATE-SET-BYTES, which
+    ;; runs in PREPARE-TX-PERSISTENCE before the durable record (.txn file +
+    ;; replication log) is written -- doing it again here would be redundant
+    ;; on the same NODE object and, worse, too late to fix what is already
+    ;; on disk/wire (GH #135).
     (maybe-write-to-heap node graph)
     (add-node-to-indexes node graph
                          :unless-present *add-to-indexes-unless-present-p*)
@@ -2403,6 +2447,18 @@ op-class).  Asserts the packet's type byte."
             (deserialize-uint64 vector (+ i 32))
             (aref vector (+ i 40)))))
 
+(defun refresh-create-set-bytes (transaction)
+  "Refresh each created node's BYTES from DATA before TRANSACTION is
+serialized for the durable record.  BYTES is a cache filled at construction;
+a SETF between MAKE-<TYPE> and commit updates DATA alone (pattern A), and
+without this the .txn file / replication log carry the pre-mutation bytes
+permanently -- no crash required.  Mirrors UPDATE-NODE's own re-serialize
+below, and must run before WRITE-TX-WRITES-TO-STREAM, which freezes BYTES
+into the wire vector (GH #135)."
+  (dolist (w (object-set-list (create-set transaction)))
+    (let ((n (node w)))
+      (when (data n) (setf (bytes n) (serialize (data n)))))))
+
 (defun prepare-tx-persistence (transaction)
   "Serialize TRANSACTION to a temp file and populate its BYTES slot.  Runs BEFORE
 the transaction-manager lock, so the bulk serialization + disk write (and the
@@ -2410,6 +2466,7 @@ flush at close) are off the serialized commit path.  The header id is written as
 the placeholder 0 — the real id is encoded in the final FILENAME by the rename in
 FINALIZE-TX-PERSISTENCE, and recovery reads it from there.  Returns the temp
 pathname."
+  (refresh-create-set-bytes transaction)
   (let ((tmp (transaction-prepare-pathname transaction)))
     (with-open-file (stream tmp :direction :output
                             :if-exists :supersede
@@ -2559,13 +2616,22 @@ and it reads these patched bytes, never the .txn files)."
 (defgeneric copy-node (node)
   (:method ((node node))
     (maybe-init-node-data node)
-    (let ((new-node (make-instance (type-of node)
-                                   :id (slot-value node 'id)
-                                   :type-id (slot-value node 'type-id)
-                                   :revision (slot-value node 'revision)
-                                   :deleted-p (slot-value node 'deleted-p)
-                                   :written-p (slot-value node 'written-p)
-                                   :data-pointer (slot-value node 'data-pointer))))
+    (let ((new-node
+           ;; Internal construction of a node not yet registered with this
+           ;; transaction: any :INITFORM MAKE-INSTANCE applies here must not
+           ;; fire through the guarded funnel.  DATA is set below, not as an
+           ;; initarg here -- NODE's own alist may be short an entry
+           ;; (SLOT-MAKUNBOUND; GH #128 schema evolution on a memory graph),
+           ;; and today's behavior for that gap must not change: it stays a
+           ;; gap on the copy, not backfilled from the class default (GH #135).
+           (let ((*initializing-node* t))
+             (make-instance (type-of node)
+                            :id (slot-value node 'id)
+                            :type-id (slot-value node 'type-id)
+                            :revision (slot-value node 'revision)
+                            :deleted-p (slot-value node 'deleted-p)
+                            :written-p (slot-value node 'written-p)
+                            :data-pointer (slot-value node 'data-pointer)))))
       (setf (node-graph new-node) (node-graph node))
       (setf (data new-node) (copy-tree (slot-value node 'data)))
       ;; Copy bytes so maybe-init-node-data on the copy does not try to
@@ -2575,6 +2641,21 @@ and it reads these patched bytes, never the .txn files)."
           (setf (gethash new-node (copies *transaction*)) node)
           (warn 'no-transaction-in-progress-warning))
       new-node)))
+
+(defgeneric %copy (node)
+  (:documentation
+   "Dispatch NODE to COPY-VERTEX or COPY-EDGE with no create-set guard --
+the same dispatch the public COPY (interface.lisp) uses, minus the guard.
+COPY-EDGE additionally copies FROM/TO/WEIGHT, which COPY-NODE does not; a
+delete's new node (the one persisted as the live head) must carry those or
+COMPACT-EDGES and the peer purge path unindex nothing and orphan the
+ve/vev entries (GH #135).  DELETE-NODE calls this directly, bypassing the
+guard: a node created and then MARK-DELETED in one transaction has no
+committed version either, but must keep working.")
+  (:method ((vertex vertex))
+    (copy-vertex vertex))
+  (:method ((edge edge))
+    (copy-edge edge)))
 
 (defgeneric update-node (new-node graph)
   (:documentation
@@ -2629,7 +2710,11 @@ stops appearing in queries.  MARK-DELETED is the usual entry point.")
         (error 'cross-graph-transaction-error
                :node node :transaction-graph txn-graph :node-graph home)))
     (let ((old-node node)
-          (new-node (copy node)))
+          ;; %COPY, not the public COPY: same dispatch (so an edge's
+          ;; FROM/TO/WEIGHT survive), minus the create-set guard -- a node
+          ;; created and then MARK-DELETED in this same transaction must
+          ;; keep working (GH #135).
+          (new-node (%copy node)))
       (setf (bytes new-node) (bytes old-node))
       (setf (deleted-p new-node) t)
       (add-to-object-set (make-instance 'tx-delete

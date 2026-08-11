@@ -96,7 +96,8 @@
                (:file "prologc" :depends-on ("functor"))
                (:file "prolog-functors" :depends-on ("prologc" "geometry" "geometry-ops"))
                (:file "spatial-query" :depends-on ("prolog-functors" "transactions" "spatial-index" "geometry-ops"))
-               (:file "interface" :depends-on ("schema" "edge" "vertex" "views"))
+               (:file "interface" :depends-on
+                      ("schema" "edge" "vertex" "views" "transactions"))
                (:file "traverse" :depends-on ("interface"))
                (:file "memory-graph" :depends-on ("traverse" "transactions" "graph" "mem-skip-list"))
                (:file "unique-constraint" :depends-on ("traverse" "transactions" "graph" "memory-graph" "node-class" "schema"))
@@ -487,6 +488,7 @@
                (:file "spatial-prolog-tests")
                (:file "traverse-tests")
                (:file "write-path-tests")
+               (:file "slot-mutation-tests")
                (:file "reopen-tests")
                (:file "backup-tests")
                (:file "mvcc-tests")

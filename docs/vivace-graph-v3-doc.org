@@ -628,6 +628,49 @@ Specifically, the transaction manager checks if the current transaction's *write
 
 This optimistic approach avoids taking heavyweight locks during the transaction's execution, allowing for very high read performance. In the rare case of a conflict, the work is simply and safely retried.
 
+**** Which node may I write?
+
+A persistent slot may be written only on a node the current transaction
+is entitled to mutate: a copy registered by ~copy~, or a node created in
+that same transaction. Any other write signals (GH #135).
+
+~lookup-*~ (and view-backed helpers built on it, like
+~find-user-by-username~ above) returns the *shared cached instance* --
+the same object every other reader and thread in the process holds.
+Writing its slots in place would be invisible to disk, since nothing
+marks it dirty, and visible to every other reader immediately, with no
+transaction protecting it. This is why ~copy~ exists: it is not
+ceremony, it is the mechanism that keeps a mutation off the shared
+instance until it is safely inside a transaction and ready to ~save~.
+
+Four shapes cover every case:
+
+| Pattern | Shape                              | Outcome            |
+|---------+-------------------------------------+---------------------|
+| A       | create, then ~setf~, same txn      | legal; persists     |
+| B       | create, ~copy~+~setf~+~save~, same txn | signals at ~copy~ |
+| C       | create in txn 1; ~copy~+~setf~+~save~ in txn 2 | legal      |
+| D       | ~setf~ on a ~lookup-*~ node, no ~copy~ | signals at ~setf~ |
+
+Pattern B signals because a node created in this transaction has no
+committed version to update against -- it is already writable directly,
+per pattern A, so copying it first is always a mistake, not a stricter
+form of correctness. The one deliberate exception to pattern B:
+~mark-deleted~ copies internally and is exempt from this guard, so
+create-then-~mark-deleted~ in one transaction continues to work.
+
+The two new conditions:
+
+- ~mutating-unregistered-node~ -- signaled from the offending ~setf~;
+  names the node and the slot, and states the fix (copy it, or if you
+  created it this transaction, write it directly -- nothing is wrong
+  with the node).
+- ~copying-uncommitted-node~ -- signaled from ~copy~; names the node and
+  states that it needs no copy.
+
+Ephemeral and meta slots are unaffected -- the guard only ever sees
+persistent slots.
+
 *** Locking and Concurrency (~rw-lock.lisp~)
 
 While the transactional system uses an optimistic model for application-level data, the database still relies on low-level locks to protect the integrity of its own internal data structures. VivaceGraph implements a custom, fair *Read-Write Lock*, defined in ~rw-lock.lisp~.

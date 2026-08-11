@@ -903,9 +903,13 @@ of (node-id slot lamport origin)."
        ;; B3-2b: a 2nd concurrent :safety-surface-edge (find-of-type) on the same source
        ;; SURFACES a multiplicity conflict (both edges kept -- edges union).  Check
        ;; BEFORE the create so the incoming edge is not its own sibling.
+       ;; *INITIALIZING-NODE* around the internal construction only -- see
+       ;; COPY-NODE, transactions.lisp (GH #135).
        (let ((conflicts (edge-multiplicity-conflicts graph policy incoming origin lamport))
-             (n (make-instance (type-of incoming)
-                               :id nid :type-id (type-id incoming) :revision 0)))
+             (n (let ((*initializing-node* t))
+                  (make-instance (type-of incoming)
+                                 :id nid :type-id (type-id incoming)
+                                 :revision 0))))
          (setf (data n) (copy-tree (data incoming))
                (bytes n) (serialize (data incoming)))
          (when (typep incoming 'edge)
