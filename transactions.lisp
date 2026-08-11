@@ -2621,6 +2621,21 @@ and it reads these patched bytes, never the .txn files)."
           (warn 'no-transaction-in-progress-warning))
       new-node)))
 
+(defgeneric %copy (node)
+  (:documentation
+   "Dispatch NODE to COPY-VERTEX or COPY-EDGE with no create-set guard --
+the same dispatch the public COPY (interface.lisp) uses, minus the guard.
+COPY-EDGE additionally copies FROM/TO/WEIGHT, which COPY-NODE does not; a
+delete's new node (the one persisted as the live head) must carry those or
+COMPACT-EDGES and the peer purge path unindex nothing and orphan the
+ve/vev entries (GH #135).  DELETE-NODE calls this directly, bypassing the
+guard: a node created and then MARK-DELETED in one transaction has no
+committed version either, but must keep working.")
+  (:method ((vertex vertex))
+    (copy-vertex vertex))
+  (:method ((edge edge))
+    (copy-edge edge)))
+
 (defgeneric update-node (new-node graph)
   (:documentation
    "Persist NEW-NODE -- which must be a COPY (made with COPY inside the current
@@ -2674,10 +2689,11 @@ stops appearing in queries.  MARK-DELETED is the usual entry point.")
         (error 'cross-graph-transaction-error
                :node node :transaction-graph txn-graph :node-graph home)))
     (let ((old-node node)
-          ;; COPY-NODE, not the public COPY: a node created and then
-          ;; MARK-DELETED in this same transaction must keep working, and the
-          ;; create-set guard lives in COPY, not here (GH #135).
-          (new-node (copy-node node)))
+          ;; %COPY, not the public COPY: same dispatch (so an edge's
+          ;; FROM/TO/WEIGHT survive), minus the create-set guard -- a node
+          ;; created and then MARK-DELETED in this same transaction must
+          ;; keep working (GH #135).
+          (new-node (%copy node)))
       (setf (bytes new-node) (bytes old-node))
       (setf (deleted-p new-node) t)
       (add-to-object-set (make-instance 'tx-delete

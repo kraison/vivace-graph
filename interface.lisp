@@ -10,20 +10,18 @@ transaction -- it has no committed version yet, and is already writable
 without a copy.")
   (:method (thing)
     (error "Cannot save ~S of type ~S" thing (type-of thing)))
-  (:method ((vertex vertex))
+  (:method ((node node))
     ;; A node created in THIS transaction has no committed version to update
     ;; against; copying it built a tx-update whose OLD-NODE was a pending
     ;; create, which committed cleanly and left the graph unopenable
-    ;; (GH #135).  DELETE-NODE calls COPY-NODE directly and so bypasses this.
+    ;; (GH #135).  One method for both VERTEX and EDGE so the guard can't
+    ;; drift between them; %COPY (transactions.lisp) carries the same
+    ;; vertex/edge dispatch this used to duplicate.  DELETE-NODE calls
+    ;; %COPY directly and so bypasses this guard.
     (when (and *transaction*
-               (object-set-member-p vertex (create-set *transaction*)))
-      (error 'copying-uncommitted-node :node vertex))
-    (copy-vertex vertex))
-  (:method ((edge edge))
-    (when (and *transaction*
-               (object-set-member-p edge (create-set *transaction*)))
-      (error 'copying-uncommitted-node :node edge))
-    (copy-edge edge)))
+               (object-set-member-p node (create-set *transaction*)))
+      (error 'copying-uncommitted-node :node node))
+    (%copy node)))
 
 (defgeneric mark-deleted (node)
   (:documentation

@@ -21,6 +21,12 @@
    (m1 :meta t))
   :graph-db-slot-mutation-test)
 
+;; FROM/TO/WEIGHT are CLOS :META slots on the EDGE class itself, not part of
+;; DATA -- COPY-EDGE copies them, COPY-NODE does not (GH #135).
+(def-edge sm-link ()
+  ()
+  :graph-db-slot-mutation-test)
+
 (defmacro with-sm-graph ((g dir) &body body)
   "A fresh on-disk graph in DIR (a bound temp directory), closed on exit."
   `(let ((,g (make-graph *sm-graph-name* (namestring ,dir)
@@ -72,9 +78,9 @@ BYTES and dropped it; the tx-update path has always re-serialized."
               "the post-create mutation must survive reopen"))))))
 
 (test create-then-delete-same-transaction-still-works
-  "GH #135.  DELETE-NODE copies internally, but calls COPY-NODE directly
-rather than the public COPY, so it is exempt from the create-set guard
-COPY now carries (see PATTERN-B-COPY-OF-CREATED-NODE-SIGNALS below).
+  "GH #135.  DELETE-NODE copies internally, but calls %COPY directly rather
+than the public COPY, so it is exempt from the create-set guard COPY now
+carries (see PATTERN-B-COPY-OF-CREATED-NODE-SIGNALS below).
 Create-then-MARK-DELETED in one transaction worked before the guard and
 must keep working -- this is the gate that catches a future change to the
 guard silently breaking it."
@@ -89,6 +95,58 @@ guard silently breaking it."
         (let ((n (lookup-vertex id :graph g)))
           (is (not (null n)) "the node itself must survive reopen")
           (is (deleted-p n) "the deletion must survive reopen"))))))
+
+(test edge-endpoints-and-weight-survive-mark-deleted-same-transaction
+  "GH #135.  FROM/TO/WEIGHT are CLOS :META slots on EDGE, not part of DATA --
+COPY-EDGE copies them, COPY-NODE does not.  DELETE-NODE's internal %COPY
+must dispatch to COPY-EDGE for an edge (the same dispatch the public COPY
+uses), or a soft-deleted edge's endpoints go to +NULL-KEY+ and its weight
+to the class default, silently breaking COMPACT-EDGES and the peer purge
+path (both key their VE/VEV unindex off (FROM EDGE)/(TO EDGE)).  Exercised
+here in the SAME transaction as the edge's own creation -- the shape that
+sends DELETE-NODE through %COPY instead of the guarded public COPY."
+  (with-temp-directory (dir)
+    (let (aid bid eid)
+      (with-sm-graph (g dir)
+        (with-transaction ()
+          (let ((a (make-sm-thing :name "A"))
+                (b (make-sm-thing :name "B")))
+            (setq aid (id a) bid (id b))
+            (let ((e (make-sm-link :from a :to b :weight 3.5)))
+              (setq eid (id e))
+              (mark-deleted e)))))
+      (with-sm-reopen (g dir)
+        (let ((e (lookup-edge eid :graph g)))
+          (is (not (null e)) "the edge itself must survive reopen")
+          (is (deleted-p e) "the deletion must survive reopen")
+          (is (equalp aid (from e)) "FROM must survive MARK-DELETED")
+          (is (equalp bid (to e)) "TO must survive MARK-DELETED")
+          (is (= 3.5 (weight e)) "WEIGHT must survive MARK-DELETED"))))))
+
+(test edge-endpoints-and-weight-survive-mark-deleted-later-transaction
+  "GH #135, companion to the same-transaction case above.  MARK-DELETED on an
+edge created in an EARLIER, already-committed transaction also goes through
+DELETE-NODE's %COPY (the create-set guard never applies here regardless --
+the edge is not in this later transaction's create-set -- but FROM/TO/WEIGHT
+must survive either way, and this is the ordinary shape that pattern-D-style
+tests already cover for the equivalent vertex case)."
+  (with-temp-directory (dir)
+    (let (aid bid eid)
+      (with-sm-graph (g dir)
+        (with-transaction ()
+          (let ((a (make-sm-thing :name "A"))
+                (b (make-sm-thing :name "B")))
+            (setq aid (id a) bid (id b))
+            (setq eid (id (make-sm-link :from a :to b :weight 3.5)))))
+        (with-transaction ()
+          (mark-deleted (lookup-edge eid :graph g))))
+      (with-sm-reopen (g dir)
+        (let ((e (lookup-edge eid :graph g)))
+          (is (not (null e)) "the edge itself must survive reopen")
+          (is (deleted-p e) "the deletion must survive reopen")
+          (is (equalp aid (from e)) "FROM must survive MARK-DELETED")
+          (is (equalp bid (to e)) "TO must survive MARK-DELETED")
+          (is (= 3.5 (weight e)) "WEIGHT must survive MARK-DELETED"))))))
 
 (test pattern-b-copy-of-created-node-signals
   "PATTERN B (GH #135).  COPY of a node created in this same transaction built
@@ -105,27 +163,33 @@ public COPY now."
 (test graph-opens-after-a-rejected-pattern-b
   "The point of the guard: the transaction is refused, so no half-built node
 reaches disk.  OPEN-GRAPH alone succeeding is not enough to show that -- the
-damage in the un-guarded bug was in the NODE, not the graph -- so this asserts
-on a READ-BACK, not merely that reopen finishes.  A non-local exit rolls the
-whole transaction back (WITH-TRANSACTION only commits on normal return), so
-the create never lands either; the id must read back as cleanly absent, not
-as a node whose bytes signal DESERIALIZATION-ERROR (see
-repro-135-deserialization.lisp)."
+damage in the un-guarded bug was in the NODE, not the graph, and surfaces
+only when a DATA slot is read (LOOKUP-VERTEX alone deserializes just the
+node head) -- so this asserts on a READ of a data slot, not merely that
+reopen or the lookup finishes.  The COPY error is caught right where it is
+raised, inside the transaction, so the surrounding CREATE still commits
+normally (a non-local exit out of WITH-TRANSACTION would roll back the
+whole transaction, including the create -- that is a different scenario
+from what corrupted the graph in the original bug).  Before the guard, this
+sequence committed, closed, and then reported open: ok, read back:
+DESERIALIZATION-ERROR (see repro-135-deserialization.lisp)."
   (with-temp-directory (dir)
     (let (id)
       (with-sm-graph (g dir)
-        (ignore-errors
-         (with-transaction ()
-           (let ((n (make-sm-thing :name "A")))
-             (setq id (id n))
+        (with-transaction ()
+          (let ((n (make-sm-thing :name "A")))
+            (setq id (id n))
+            (ignore-errors
              (let ((c (copy n)))
                (setf (note c) "B")
                (save c))))))
       (with-sm-reopen (g dir)
-        (finishes (lookup-vertex id :graph g))
-        (is (null (lookup-vertex id :graph g))
-            "the rejected transaction must leave nothing behind: a clean
-absent read, never a DESERIALIZATION-ERROR")))))
+        (let ((n (lookup-vertex id :graph g)))
+          (is (not (null n)) "the create must survive: only the rejected
+copy/save is discarded, not the surrounding transaction")
+          (is (equal "A" (name n))
+              "reading a DATA slot must succeed cleanly, not signal
+DESERIALIZATION-ERROR"))))))
 
 (test pattern-d-setf-on-looked-up-node-signals
   "PATTERN D (GH #135).  LOOKUP-NODE returns the SHARED cached instance, so a
