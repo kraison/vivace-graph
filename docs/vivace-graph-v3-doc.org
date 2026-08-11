@@ -3183,7 +3183,7 @@ graphs from one another.
 uninterpreted — there is no shape check beyond "declared, or ~:NONE~".
 Nothing reads it yet; the facet exists so a source with a real
 registration to declare is not forced to write ~:NONE~ and leave a false
-statement in the record while its meaning waits on a later unit.
+statement in the record while its meaning waits on a later unit, GH #138.
 
 *** What is not here yet
 
