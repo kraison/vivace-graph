@@ -193,4 +193,27 @@
 (select-flat (?m)
   (find-near ?m merchant 49.2020d0 37.1724d0 2000d0))
 
+;;; Updating a node ------------------------------------------------------
+;;;
+;;; LOOKUP-* (and view helpers like LOOKUP-CUSTOMER-BY-EMAIL above) return
+;;; the SHARED cached node -- the same object every other reader and thread
+;;; holds.  Writing its slots in place would be invisible to disk and
+;;; visible to everyone else immediately, with no transaction protecting
+;;; it.  So COPY it inside the transaction, modify the copy, and SAVE that.
+;;; Writing an uncopied node signals MUTATING-UNREGISTERED-NODE (GH #135).
+
+(with-transaction ()
+  (let ((c (copy (lookup-customer-by-email "joe@blow.com"))))
+    (setf (email c) "joe@blowfish.com")
+    (save c)))
+
+;;; A node created in THIS transaction is different: it has no committed
+;;; version to update against, so it needs no copy -- and COPY of it
+;;; signals COPYING-UNCOMMITTED-NODE.  Just set its slots directly.
+
+(with-transaction ()
+  (let ((c3 (make-customer :first-name "Cara" :last-name "Blow"
+                            :email "cara@blow.com")))
+    (setf (email c3) "cara.blow@blow.com")))
+
 (close-graph *graph*)

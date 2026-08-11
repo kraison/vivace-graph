@@ -128,6 +128,57 @@ between releases; cutting a release renames it to the new version and dates it.
   in a `close-graph :before` method, where failure *should* be fatal because the image is
   that graph's only durable record.
 
+- **A slot mutation made after `MAKE-<TYPE>` in the same transaction was
+  discarded** (#135). `APPLY-TX-WRITE (tx-create)` wrote the node's
+  construction-time `BYTES`; `MAYBE-INITIALIZE-BYTES` only serializes an
+  empty one, so a `SETF` between construction and commit updated `DATA`
+  alone. The value read back correctly for the rest of the session — the
+  node cache serves `DATA` — and came back `NIL` after reopen. The
+  `tx-update` path had always re-serialized for this reason; the create
+  path never did.
+
+- **`COPY` of a node created in the same transaction corrupted the graph**
+  (#135). It built a `tx-update` whose `OLD-NODE` was a pending create.
+  The transaction committed, the graph closed, and `OPEN-GRAPH` then
+  *succeeded* — the damage was in the node, not the graph: reading a data
+  slot back signalled `DESERIALIZATION-ERROR` (`Deserialization failed
+  for #(0 0)`). The exact mechanism is not established — an earlier
+  explanation (a race with `ARCHIVE-NODE-VERSION`) was disproven by
+  tracing the apply order, and no replacement has been confirmed. It now
+  signals the new `COPYING-UNCOMMITTED-NODE` at the `COPY` instead of
+  committing.
+
+- **Redefining a class to add an `:initform` persistent slot while
+  instances were live made a plain read signal** (#135). Found while
+  installing the guard below: CLOS runs
+  `UPDATE-INSTANCE-FOR-REDEFINED-CLASS` lazily on the next slot access to
+  an obsolete instance, and that wrote the new slot's initform through
+  the same guarded path — on the shared cached node, with no transaction
+  bound and nothing registered. `*INITIALIZING-NODE*` is now bound
+  around it, matching `CHANGE-NODE-CLASS`.
+
+### Changed
+
+- **Writing a persistent slot now requires a node the current transaction
+  may mutate** (#135) — a copy registered by `COPY`, or a node created in
+  that same transaction. Anything else signals the new
+  `MUTATING-UNREGISTERED-NODE`. The case this matters most for is not in
+  the issue: `lookup-*` returns the **shared cached instance**, so `(setf
+  (slot (lookup-thing id)) v)` mutated state every other reader and
+  thread could see, was never persisted, and read back correctly until
+  restart — wrong and invisible until a restart exposed it. Ephemeral
+  and meta slots are unaffected; the guard only ever sees persistent
+  slots.
+  `MARK-DELETED` is deliberately exempt from the `COPY` half of this
+  guard — it copies internally, and create-then-`MARK-DELETED` in one
+  transaction was measured to work correctly before this change and
+  still does.
+  Not addressed here: `SLOT-MAKUNBOUND` semantics are unchanged on both
+  backends, including the pre-existing divergence where an `:initform`
+  slot resurrects as its default after reopen on a disk graph but stays
+  unbound on a memory graph. That gap is out of scope for #135 and is
+  getting its own spec.
+
 ## [3.0.0] - 2026-08-09
 
 > **MAJOR.** Per this file's SemVer preamble, MAJOR is mandatory here on two
