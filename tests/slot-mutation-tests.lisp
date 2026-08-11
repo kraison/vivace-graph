@@ -299,6 +299,49 @@ semantic change this task must not make")
           (ignore-errors (close-graph g :snapshot-p nil))
           (collect-garbage))))))
 
+(test initializing-node-escape-still-permits-writes
+  "GH #135.  *INITIALIZING-NODE* is the engine-internal escape (bound by
+CHANGE-NODE-CLASS and, on ECL, around construction) that the guard in
+(SETF SLOT-VALUE-USING-CLASS) defers to.  Pins that the escape still
+suppresses CHECK-SLOT-MUTATION-ALLOWED, not merely that the guard denies
+without it -- a future edit could drop the escape and every CHANGE-CLASS
+path (and ECL construction) would start signalling.  EXEMPT from the
+plan's close-and-reopen rule (task 5 brief): this asserts on signalling,
+not persistence, so a reopen adds cost and no signal."
+  (with-temp-directory (dir)
+    (let (id)
+      (with-sm-graph (g dir)
+        (with-transaction () (setq id (id (make-sm-thing :name "X"))))
+        (let ((n (lookup-vertex id :graph g)))
+          ;; Not a copy and not created here: guarded WITHOUT the escape...
+          (signals graph-db:mutating-unregistered-node
+            (setf (note n) "denied"))
+          ;; ...and permitted WITH it.
+          (finishes
+           (let ((graph-db::*initializing-node* t))
+             (setf (note n) "permitted")))
+          (is (equal "permitted" (note n))))))))
+
+(test construction-does-not-trip-the-guard
+  "GH #135.  MAKE-<TYPE> builds an alist and hands it to MAKE-VERTEX as DATA;
+the DATA slot is assigned as a whole, so no persistent-slot SETF (and hence
+no CHECK-SLOT-MUTATION-ALLOWED call) happens while a node is under
+construction -- the guard cannot fire before %CREATE-NODE registers the node
+in the transaction's create-set.  Pins that, since a constructor rewrite that
+started SETF-ing slots per-field would signal on every write in the engine.
+EXEMPT from the plan's close-and-reopen rule (task 5 brief): this asserts on
+construction succeeding, not persistence, so a reopen adds cost and no
+signal."
+  (with-temp-directory (dir)
+    (with-sm-graph (g dir)
+      (finishes
+       (with-transaction ()
+         (make-sm-thing :name "built" :note "at construction")))
+      (with-transaction ()
+        (let ((n (first (map-vertices #'identity g :vertex-type 'sm-thing
+                                                   :collect-p t))))
+          (is (equal "at construction" (note n))))))))
+
 (test class-redefinition-with-live-instance-does-not-signal-on-read
   "GH #135.  Redefining a class to add a persistent :INITFORM slot while an
 instance is live in the node cache fires UPDATE-INSTANCE-FOR-REDEFINED-CLASS
