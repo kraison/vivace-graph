@@ -225,17 +225,32 @@ to branch on which algebra produced a result.
 
 ### 3.4 Standing is orthogonal to precision
 
-`standing` is `observed | inferred | asserted | searched-empty | uncovered |
-indeterminate`, as its own field.
+`standing` is `observed | inferred | asserted | searched-empty |
+determined-empty | uncovered | indeterminate`, as its own field.
 
 An `observed` month-precision extent is **fully observed and badly bounded**.
 Those are different facts: standing records *how we came to know*, precision
 records *how sharply it is pinned*. Folding imprecision into `indeterminate`
 standing would destroy both.
 
-Standing is a **type, not a convention**. The three absence cases — a source
-looked and found nothing; no source covers this; we could not find out — must
-be distinguishable by construction. The absence-vs-value defect class has
+Standing is a **type, not a convention**. The four absence cases — a source
+looked and found nothing; the subject itself has no value; no source covers
+this; we could not find out — must be distinguishable by construction.
+
+`determined-empty` was added by GH #142, reported by the second tenant. It
+and `searched-empty` are both *determined* absences and differ in **what they
+are about**: name the population you searched and it is `searched-empty`; if
+the emptiness follows from the subject itself it is `determined-empty`. A
+draft version that was never in force is the second — its validity interval
+is empty, which is not the same as a search that came back empty.
+
+It is an absence rather than a value **by necessity**, not preference: an
+empty interval is unrepresentable (`make-interval` signals when start = end)
+and `temporal-relation` documents that `relations` is never empty, which an
+empty interval would violate by standing in none of the thirteen. As an
+absence it flows through the existing machinery unchanged, yielding all
+thirteen like its siblings — the *reason* rides on the standing, which is
+exactly §4.4's argument. The absence-vs-value defect class has
 seven-plus confirmed instances in the reference application, silent every time;
 the canonical one coerced a never-computed gap to `0d0`, so a 4.1%-surveyed
 area rendered downstream as a confident claim of full coverage. The API must

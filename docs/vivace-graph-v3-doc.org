@@ -2735,25 +2735,41 @@ known.
 
 ~STANDING~ answers a different question from the bound machinery: not *when*,
 but *whether there is a value at all, and how it was obtained*. It is a
-closed, six-member vocabulary, deliberately *unordered* — ~:ASSERTED~ and
+closed, seven-member vocabulary, deliberately *unordered* — ~:ASSERTED~ and
 ~:INFERRED~ cannot be ranked against each other, so no comparison operator
 over standings exists. Three members record a value:
 
 - ~:OBSERVED~, ~:INFERRED~, ~:ASSERTED~.
 
-and three record an *absence*, each for a different reason:
+and four record an *absence*, each for a different reason:
 
-- ~:SEARCHED-EMPTY~ — we looked, and there was nothing there.
+- ~:SEARCHED-EMPTY~ — we searched a population and there was nothing there.
+- ~:DETERMINED-EMPTY~ — the subject itself has no value, and we know it.
 - ~:UNCOVERED~ — we never looked.
 - ~:INDETERMINATE~ — we cannot tell whether there is anything to find.
 
-Collapsing those three into one generic "unknown" is the exact defect this
+Collapsing those four into one generic "unknown" is the exact defect this
 subsystem exists to make unrepresentable: "we checked and found nothing" and
 "we never checked" are different facts, and code that cannot tell them apart
 will eventually treat one as the other. ~STANDING-ABSENCE-P~ and
 ~STANDING-PRESENT-P~ classify a standing; every constructor runs
-~CHECK-STANDING~, so a value outside the six is not merely discouraged, it is
-impossible to construct.
+~CHECK-STANDING~, so a value outside the seven is not merely discouraged, it
+is impossible to construct.
+
+The two *determined* absences are the pair most easily confused, so the rule
+is worth stating: **if you can name the population you searched, it is
+~:SEARCHED-EMPTY~; if the emptiness follows from the subject itself, it is
+~:DETERMINED-EMPTY~.** A document draft that was never in force is the
+second — its validity interval is empty, which is a different fact from a
+search that came back empty. A ~:SEARCHED-EMPTY~ that cannot say what it
+covered is how a wrong fact gets recorded confidently.
+
+Note that ~:DETERMINED-EMPTY~ is an *absence*, not an empty interval. An
+empty interval has no representation — ~MAKE-INTERVAL~ signals when start
+and end compare equal, and ~TEMPORAL-RELATION~ guarantees ~RELATIONS~ is
+never empty, which an empty interval would break by standing in none of the
+thirteen relations. Nor is it *inapplicability*: it says the answer is
+none, not that the question does not apply.
 
 Because an Allen relation is a claim about *two* extents, a
 ~TEMPORAL-RELATION~ carries *both* endpoints' standings — never one collapsed

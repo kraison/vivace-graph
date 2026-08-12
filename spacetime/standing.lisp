@@ -1,22 +1,28 @@
 ;;;; The standing vocabulary: how we came to know a thing, including the
-;;;; three distinct ways of not knowing it (GH #130, design §3.4).
+;;;; four distinct ways of not knowing it (GH #130, #142, design §3.4).
 
 (in-package #:graph-db.spacetime)
 
 (defparameter +standings+
-  '(:observed :inferred :asserted :searched-empty :uncovered :indeterminate)
+  '(:observed :inferred :asserted
+    :searched-empty :determined-empty :uncovered :indeterminate)
   "The closed standing vocabulary.  Deliberately UNORDERED: ASSERTED and
 INFERRED cannot be ranked, so no comparison operator over standings exists
 in this subsystem (design §4.4).")
 
 (defparameter +absence-standings+
-  '(:searched-empty :uncovered :indeterminate)
-  "The three standings meaning THERE IS NO VALUE, each for a different
-reason.  Keeping them apart is the whole point of the type.")
+  '(:searched-empty :determined-empty :uncovered :indeterminate)
+  "The four standings meaning THERE IS NO VALUE, each for a different
+reason.  Keeping them apart is the whole point of the type.
+
+Two of them are DETERMINED absences and differ in what they are about: if
+you can name the population you searched it is SEARCHED-EMPTY; if the
+emptiness follows from the subject itself it is DETERMINED-EMPTY.  A draft
+that was never in force is the second, not the first (GH #142).")
 
 (deftype standing ()
   '(member :observed :inferred :asserted
-    :searched-empty :uncovered :indeterminate))
+    :searched-empty :determined-empty :uncovered :indeterminate))
 
 (defun standingp (x)
   "True when X belongs to the standing vocabulary."
