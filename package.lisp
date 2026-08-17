@@ -183,6 +183,8 @@
            #:def-index
            ;; schema retraction: withdraw a declaration (GH #139, #140)
            #:undef-index #:undef-unique
+           ;; declarative value constraints (GH #149)
+           #:def-value-constraint #:undef-value-constraint
            #:unregister-index-spec #:unregister-unique-tuple-spec
            #:index-lookup #:index-range #:map-index
            ;; index-backed generator predicates for Prolog (GH #102)
