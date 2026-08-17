@@ -94,10 +94,23 @@ Create `tests/value-constraint-tests.lisp`:
 
 (defparameter +vc-statuses+ '(:draft :final :withdrawn))
 
+;; A fresh on-disk graph per test, verbatim after WITH-UQ-GRAPH
+;; (tests/unique-constraint-tests.lisp:54).
+(defmacro with-vc-graph ((g) &body body)
+  (let ((dir (gensym "DIR")))
+    `(with-temp-directory (,dir)
+       (let ((,g (make-graph *vc-graph-name* (namestring ,dir)
+                             :buffer-pool-size 1000)))
+         (unwind-protect (let ((*graph* ,g)) ,@body)
+           (ignore-errors (close-graph ,g))
+           (collect-garbage))))))
+
 (defun %vc-specs ()
   (gethash *vc-graph-name*
            graph-db::*schema-value-constraint-metadata*))
 
+;; The registry is keyed by graph NAME, so it outlives the fixture's
+;; teardown and must be cleared per test.
 (defun %vc-clear ()
   (setf (gethash *vc-graph-name*
                  graph-db::*schema-value-constraint-metadata*)
@@ -166,7 +179,7 @@ both (design, \"Registry\")."
   (%vc-clear)
   (def-value-constraint vc-doc status :graph-db-vc-test
     :one-of +vc-statuses+ :name vc-status)
-  (let ((g (lookup-graph *vc-graph-name*)))
+  (with-vc-graph (g)
     (is (= 1 (length (graph-db::class-value-constraint-specs
                       (find-class 'vc-report) g))))))
 
@@ -174,7 +187,7 @@ both (design, \"Registry\")."
   (%vc-clear)
   (def-value-constraint vc-doc no-such-slot :graph-db-vc-test
     :one-of '(:a :b) :name vc-absent)
-  (let ((g (lookup-graph *vc-graph-name*)))
+  (with-vc-graph (g)
     (is (= 0 (length (graph-db::class-value-constraint-specs
                       (find-class 'vc-doc) g))))))
 
@@ -188,8 +201,6 @@ guard -- the counter-that-cannot-fail shape.  Refused at declaration."
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
-
-The graph for these tests must exist. Check how `tests/suite.lisp` and `graph-tests.lisp` create theirs and follow the same pattern; `lookup-graph` returning `NIL` in the two applicability tests means the graph was never made and the test is testing nothing.
 
 Run:
 
@@ -398,69 +409,85 @@ Append to `tests/value-constraint-tests.lisp`:
 ```lisp
 ;;; --- the evaluator -------------------------------------------------------
 
-(defun %vc-violations-for (node)
-  (graph-db::%value-constraint-violations
-   node (lookup-graph *vc-graph-name*)))
+;; ⚠ ORDERING, in every test below: CREATE THE NODE FIRST, DECLARE THE
+;; CONSTRAINT SECOND.  Task 3 makes a violating commit signal, so a node
+;; created under a live constraint could not be committed at all -- and
+;; creating it first is also the only way to obtain the pre-constraint damage
+;; the audit pass (Task 4) exists to find.
+(defun %vc-make (g &rest initargs)
+  "Commit a VC-DOC and return it, read back from G."
+  (let ((id (with-transaction () (id (apply #'make-vc-doc initargs)))))
+    (lookup-vertex id)))
+
+(defun %vc-violations-for (node g)
+  (graph-db::%value-constraint-violations node g))
 
 (test a-value-outside-the-enumeration-is-a-violation
   (%vc-clear)
-  (def-value-constraint vc-doc status :graph-db-vc-test
-    :one-of +vc-statuses+ :name vc-status)
-  (with-transaction ()
-    (let* ((v (make-vc-doc :status :nonsense))
-           (vs (%vc-violations-for v)))
-      (is (= 1 (length vs)))
-      (is (eq :not-in-vocabulary
-              (graph-db::vc-violation-reason (first vs))))
-      (is (eq :nonsense (graph-db::vc-violation-actual (first vs))))
-      (is (equal +vc-statuses+
-                 (graph-db::vc-violation-expected (first vs)))))))
+  (with-vc-graph (g)
+    (let ((v (%vc-make g :status :nonsense)))
+      (def-value-constraint vc-doc status :graph-db-vc-test
+        :one-of +vc-statuses+ :name vc-status)
+      (let ((vs (%vc-violations-for v g)))
+        (is (= 1 (length vs)))
+        (is (eq :not-in-vocabulary
+                (graph-db::vc-violation-reason (first vs))))
+        (is (eq :nonsense (graph-db::vc-violation-actual (first vs))))
+        (is (equal +vc-statuses+
+                   (graph-db::vc-violation-expected (first vs))))))))
 
 (test every-member-of-the-enumeration-is-accepted
   "⚠ A guard bought by refusing everything is not a guard."
   (%vc-clear)
-  (def-value-constraint vc-doc status :graph-db-vc-test
-    :one-of +vc-statuses+ :name vc-status)
-  (with-transaction ()
-    (dolist (s +vc-statuses+)
-      (is (null (%vc-violations-for (make-vc-doc :status s)))
-          "~S is in the vocabulary and must not be a violation" s))))
+  (with-vc-graph (g)
+    (let ((nodes (mapcar (lambda (s) (%vc-make g :status s))
+                         +vc-statuses+)))
+      (def-value-constraint vc-doc status :graph-db-vc-test
+        :one-of +vc-statuses+ :name vc-status)
+      (dolist (v nodes)
+        (is (null (%vc-violations-for v g))
+            "~S is in the vocabulary and must not be a violation"
+            (vc-doc-status v))))))
 
 (test nil-is-exempt-without-required
   "Matches DEF-UNIQUE's null rule: \"if present, it must be one of these\".
 Diverging would be the trap GH #107 named."
   (%vc-clear)
-  (def-value-constraint vc-doc status :graph-db-vc-test
-    :one-of +vc-statuses+ :name vc-status)
-  (with-transaction ()
-    (is (null (%vc-violations-for (make-vc-doc :status nil))))))
+  (with-vc-graph (g)
+    (let ((v (%vc-make g :status nil)))
+      (def-value-constraint vc-doc status :graph-db-vc-test
+        :one-of +vc-statuses+ :name vc-status)
+      (is (null (%vc-violations-for v g))))))
 
 (test nil-is-a-violation-under-required
   (%vc-clear)
-  (def-value-constraint vc-doc status :graph-db-vc-test
-    :one-of +vc-statuses+ :required t :name vc-status)
-  (with-transaction ()
-    (let ((vs (%vc-violations-for (make-vc-doc :status nil))))
-      (is (= 1 (length vs)))
-      (is (eq :missing (graph-db::vc-violation-reason (first vs)))))))
+  (with-vc-graph (g)
+    (let ((v (%vc-make g :status nil)))
+      (def-value-constraint vc-doc status :graph-db-vc-test
+        :one-of +vc-statuses+ :required t :name vc-status)
+      (let ((vs (%vc-violations-for v g)))
+        (is (= 1 (length vs)))
+        (is (eq :missing (graph-db::vc-violation-reason (first vs))))))))
 
 (test required-alone-checks-presence-only
   (%vc-clear)
-  (def-value-constraint vc-doc status :graph-db-vc-test
-    :required t :name vc-status)
-  (with-transaction ()
-    (is (null (%vc-violations-for (make-vc-doc :status :anything))))
-    (is (= 1 (length (%vc-violations-for (make-vc-doc :status nil)))))))
+  (with-vc-graph (g)
+    (let ((present (%vc-make g :status :anything))
+          (absent (%vc-make g :status nil)))
+      (def-value-constraint vc-doc status :graph-db-vc-test
+        :required t :name vc-status)
+      (is (null (%vc-violations-for present g)))
+      (is (= 1 (length (%vc-violations-for absent g)))))))
 
 (test two-constraints-on-one-node-both-report
   (%vc-clear)
-  (def-value-constraint vc-doc status :graph-db-vc-test
-    :one-of +vc-statuses+ :name vc-status)
-  (def-value-constraint vc-doc note :graph-db-vc-test
-    :required t :name vc-note)
-  (with-transaction ()
-    (is (= 2 (length (%vc-violations-for
-                      (make-vc-doc :status :nonsense :note nil)))))))
+  (with-vc-graph (g)
+    (let ((v (%vc-make g :status :nonsense :note nil)))
+      (def-value-constraint vc-doc status :graph-db-vc-test
+        :one-of +vc-statuses+ :name vc-status)
+      (def-value-constraint vc-doc note :graph-db-vc-test
+        :required t :name vc-note)
+      (is (= 2 (length (%vc-violations-for v g)))))))
 
 (test the-report-names-the-vocabulary-it-expected
   "⚠ This is why :ONE-OF is an enumeration rather than :SATISFIES a
@@ -607,55 +634,65 @@ Append to `tests/value-constraint-tests.lisp`:
 
 (test an-invalid-value-is-refused-at-commit
   (%vc-clear)
-  (def-value-constraint vc-doc status :graph-db-vc-test
-    :one-of +vc-statuses+ :name vc-status)
-  (signals value-constraint-violation
-    (with-transaction ()
-      (make-vc-doc :status :nonsense))))
+  (with-vc-graph (g)
+    (declare (ignorable g))
+    (def-value-constraint vc-doc status :graph-db-vc-test
+      :one-of +vc-statuses+ :name vc-status)
+    (signals value-constraint-violation
+      (with-transaction ()
+        (make-vc-doc :status :nonsense)))))
 
 (test a-valid-value-commits
   "The guard must not have been bought by refusing everything."
   (%vc-clear)
-  (def-value-constraint vc-doc status :graph-db-vc-test
-    :one-of +vc-statuses+ :name vc-status)
-  (finishes
-    (with-transaction ()
-      (make-vc-doc :status :final))))
+  (with-vc-graph (g)
+    (declare (ignorable g))
+    (def-value-constraint vc-doc status :graph-db-vc-test
+      :one-of +vc-statuses+ :name vc-status)
+    (finishes
+      (with-transaction ()
+        (make-vc-doc :status :final)))))
 
 (test an-invalid-value-is-refused-on-the-UPDATE-path
   "⚠ THE REASON THIS UNIT EXISTS.  A construction-time check cannot see
 this: COPY + SETF + SAVE never goes through the constructor (#149)."
   (%vc-clear)
-  (def-value-constraint vc-doc status :graph-db-vc-test
-    :one-of +vc-statuses+ :name vc-status)
-  (let ((id (with-transaction ()
-              (id (make-vc-doc :status :final)))))
-    (signals value-constraint-violation
-      (with-transaction ()
-        (let ((v (copy (lookup-vertex id))))
-          (setf (vc-doc-status v) :nonsense)
-          (save v))))))
+  (with-vc-graph (g)
+    (declare (ignorable g))
+    (def-value-constraint vc-doc status :graph-db-vc-test
+      :one-of +vc-statuses+ :name vc-status)
+    (let ((id (with-transaction ()
+                (id (make-vc-doc :status :final)))))
+      (signals value-constraint-violation
+        (with-transaction ()
+          (let ((v (copy (lookup-vertex id))))
+            (setf (vc-doc-status v) :nonsense)
+            (save v)))))))
 
 (test a-withdrawn-constraint-stops-being-enforced
   (%vc-clear)
-  (def-value-constraint vc-doc status :graph-db-vc-test
-    :one-of +vc-statuses+ :name vc-status)
-  (undef-value-constraint vc-doc :graph-db-vc-test :name vc-status)
-  (finishes
-    (with-transaction ()
-      (make-vc-doc :status :nonsense))))
+  (with-vc-graph (g)
+    (declare (ignorable g))
+    (def-value-constraint vc-doc status :graph-db-vc-test
+      :one-of +vc-statuses+ :name vc-status)
+    (undef-value-constraint vc-doc :graph-db-vc-test :name vc-status)
+    (finishes
+      (with-transaction ()
+        (make-vc-doc :status :nonsense)))))
 
 (test deleting-a-node-is-not-blocked-by-its-own-violation
   "A delete claims nothing, exactly as in VALIDATE-UNIQUE-CONSTRAINTS --
 otherwise a store holding pre-constraint damage could not be repaired."
   (%vc-clear)
-  (let ((id (with-transaction ()
-              (id (make-vc-doc :status :final)))))
-    (def-value-constraint vc-doc status :graph-db-vc-test
-      :one-of '(:nothing-matches) :name vc-status)
-    (finishes
-      (with-transaction ()
-        (mark-deleted (lookup-vertex id))))))
+  (with-vc-graph (g)
+    (declare (ignorable g))
+    (let ((id (with-transaction ()
+                (id (make-vc-doc :status :final)))))
+      (def-value-constraint vc-doc status :graph-db-vc-test
+        :one-of '(:nothing-matches) :name vc-status)
+      (finishes
+        (with-transaction ()
+          (mark-deleted (lookup-vertex id)))))))
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
@@ -756,40 +793,43 @@ Append to `tests/value-constraint-tests.lisp`:
 writable today, so an existing store may already hold them -- a guard that
 only protects future writes would leave that undetectable."
   (%vc-clear)
-  (with-transaction () (make-vc-doc :status :nonsense))
-  (def-value-constraint vc-doc status :graph-db-vc-test
-    :one-of +vc-statuses+ :name vc-status)
-  (multiple-value-bind (violations checked specs)
-      (check-value-constraints (lookup-graph *vc-graph-name*)
-                               :vertex-type 'vc-doc)
-    (is (<= 1 (length violations)))
-    (is (eq :not-in-vocabulary
-            (graph-db::vc-violation-reason (first violations))))
-    (is (< 0 checked) "a violation count with no population is not a result")
-    (is (= 1 specs))))
+  (with-vc-graph (g)
+    (with-transaction () (make-vc-doc :status :nonsense))
+    (def-value-constraint vc-doc status :graph-db-vc-test
+      :one-of +vc-statuses+ :name vc-status)
+    (multiple-value-bind (violations checked specs)
+        (check-value-constraints g :vertex-type 'vc-doc)
+      (is (= 1 (length violations)))
+      (is (eq :not-in-vocabulary
+              (graph-db::vc-violation-reason (first violations))))
+      (is (= 1 checked)
+          "a violation count with no population is not a result")
+      (is (= 1 specs)))))
 
 (test the-audit-pass-reports-the-population-it-checked
   "⚠ This programme's most repeated error is a count with no population.
 Zero violations over zero specs is an unchecked graph, not a clean one, and
 the caller must be able to tell them apart."
   (%vc-clear)
-  (multiple-value-bind (violations checked specs)
-      (check-value-constraints (lookup-graph *vc-graph-name*)
-                               :vertex-type 'vc-doc)
-    (is (null violations))
-    (is (= 0 specs) "no constraints are declared, so nothing was checked")
-    (is (integerp checked))))
+  (with-vc-graph (g)
+    (with-transaction () (make-vc-doc :status :nonsense))
+    (multiple-value-bind (violations checked specs)
+        (check-value-constraints g :vertex-type 'vc-doc)
+      (is (null violations))
+      (is (= 0 specs) "no constraints are declared, so nothing was checked")
+      (is (= 1 checked)
+          "⚠ the graph is NOT empty -- zero violations here means unchecked,
+which is exactly what SPECS lets the caller tell apart"))))
 
 (test the-audit-pass-does-not-signal
   "It collects.  Signalling would stop at the first find, which is the
 opposite of what a survey is for."
   (%vc-clear)
-  (with-transaction () (make-vc-doc :status :nonsense))
-  (def-value-constraint vc-doc status :graph-db-vc-test
-    :one-of +vc-statuses+ :name vc-status)
-  (finishes
-    (check-value-constraints (lookup-graph *vc-graph-name*)
-                             :vertex-type 'vc-doc)))
+  (with-vc-graph (g)
+    (with-transaction () (make-vc-doc :status :nonsense))
+    (def-value-constraint vc-doc status :graph-db-vc-test
+      :one-of +vc-statuses+ :name vc-status)
+    (finishes (check-value-constraints g :vertex-type 'vc-doc))))
 ```
 
 Note the first test writes `:nonsense` **before** declaring the constraint — that is deliberate and is the only way to create pre-constraint damage now that Task 3 refuses it at commit.
