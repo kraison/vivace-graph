@@ -219,6 +219,9 @@
                 #:index-range
                 #:map-index
                 #:def-unique
+                ;; schema retraction (GH #139, #140)
+                #:undef-index
+                #:undef-unique
                 #:weight
                 #:to
                 #:from

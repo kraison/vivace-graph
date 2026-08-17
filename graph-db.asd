@@ -502,6 +502,7 @@
                (:file "memory-graph-tests")
                (:file "unique-constraint-tests")
                (:file "index-tests")
+               (:file "schema-retraction-tests")   ; GH #139, #140
                (:file "peer-unique-tests")
                (:file "peer-index-tests"))
   :perform (test-op (op c)

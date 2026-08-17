@@ -1333,6 +1333,30 @@ Semantics:
 - *Any slot is indexable* — a declared ~:type~ is *not* required. The type is a *hint*: with it, the index validates values and advertises ordered/range support; without it, the index is equality-first and range scans are meaningful only for homogeneous (mutually comparable) values, exactly the contract untyped slots carry everywhere in VivaceGraph.
 - *NULL-exempt* — a node whose indexed slot is ~nil~/unbound is not indexed (like ~:unique~; also keeps the index proportional to nodes that actually have the value). Ordered iteration therefore omits value-less nodes.
 - *Collation* — an optional canonicalizer (a 1-arg function: a symbol, ~#'fn~, or a lambda; e.g. ~string-downcase~) transforms the value before keying, for case-insensitive or normalized indexes. A canonicalized index orders by the canonical form, so you get case-insensitive lookup at the cost of original-case ordering from that same index. *Descending* order is a query-time concern (reverse the result), not a separate index.
+- *Identity, and re-declaring* — by default a declaration is identified by ~(owner . slot-names)~, so re-evaluating an unchanged ~def-index~ is a no-op while two declarations on one owner with *different* slot lists are two different indexes and both stay live. That is right for hand-written schema and wrong for generated schema — see "Naming a declaration" below.
+
+**** Naming a declaration, and withdrawing one
+
+Give a declaration a ~:name~ and its identity becomes ~(owner . name)~ instead, so *re-declaring that name replaces it, whatever the slots became*:
+
+#+BEGIN_SRC lisp
+  (def-index user (email) :social-app :name user-lookup-key)
+  (def-index user (login) :social-app :name user-lookup-key)  ; REPLACES the first
+#+END_SRC
+
+⚠ *Name a declaration whenever a macro emits it on a caller's behalf.* A macro cannot name what a previous version of itself emitted, so slot-name identity gives it no way to say "this constraint changed shape" — both specs stay live, and for ~def-unique~ the stale one keeps *rejecting writes the current schema permits* (GH #139; GH #140 is ~def-index~'s quieter twin, a stale index built and maintained for nothing). ~def-source~ and ~def-claim-classes~ both name every spec they emit for exactly this reason.
+
+Withdraw a declaration with ~undef-index~ / ~undef-unique~ — by name, or by slots for an unnamed one:
+
+#+BEGIN_SRC lisp
+  (undef-index  user :social-app :name user-lookup-key)
+  (undef-index  user :social-app :slots (email))
+  (undef-unique user :social-app :name user-identity)
+#+END_SRC
+
+Both take the graph positionally and the rest by keyword, because a graph name is itself a keyword — a positional slot list could not be told from a graph without guessing. Withdrawing something never declared is a no-op, not an error, so a macro that clears before declaring need not know whether it ran before.
+
+What withdrawal does: the declaration stops being enforced or maintained immediately, and the on-disk sidecar is reconciled against the live schema at the next open, so the retired index is not reopened. What it does *not* do: reclaim the heap pages the retired index occupied (GH #147), or retroactively release unique keys already claimed in the live image — that happens at the next open.
 
 Query with three functions, each taking the graph explicitly and resolving nodes in *that* graph:
 

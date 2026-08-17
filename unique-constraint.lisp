@@ -37,7 +37,10 @@
 ;; TRANSACTIONS.LISP / MEMORY-GRAPH.LISP already use for functions this file
 ;; defines (GH #107).
 (declaim (ftype (function (t) t) %normalize-slots)
-         (ftype (function (t t) t) %resolve-index-canonicalizers))
+         (ftype (function (t t) t) %resolve-index-canonicalizers)
+         ;; The shared declaration-identity rule lives with the index registry
+         ;; so both registries key alike (GH #139, #140).
+         (ftype (function (t t t) t) %spec-identity))
 
 (define-condition unique-constraint-violation (error)
   ((class-name :initarg :class-name :reader ucv-class-name)
@@ -270,21 +273,69 @@ declarative DEF-UNIQUE registry, mirroring *SCHEMA-INDEX-METADATA*
 (index.lisp).")
 
 (defstruct (unique-tuple-spec (:constructor make-unique-tuple-spec))
-  owner-name slot-names graph-name canonicalize scope)
+  owner-name slot-names graph-name canonicalize scope name)
+
+(defun unique-tuple-spec-identity (spec)
+  "See %SPEC-IDENTITY (index.lisp).  The two registries share ONE identity rule
+on purpose -- GH #140: \"the two registries want one mechanism, not two\"."
+  (%spec-identity (unique-tuple-spec-owner-name spec)
+                  (unique-tuple-spec-slot-names spec)
+                  (unique-tuple-spec-name spec)))
 
 (defun register-unique-tuple-spec (spec)
-  "Phase 1: record SPEC.  Duplicates accumulate; resolved newest-wins."
-  (push spec (gethash (unique-tuple-spec-graph-name spec)
-                      *schema-unique-metadata*))
+  "Phase 1: record SPEC, REPLACING any spec of the same identity in place.
+Replacing rather than pushing is what stops the table growing one entry per
+evaluation (GH #139)."
+  (let* ((g (unique-tuple-spec-graph-name spec))
+         (id (unique-tuple-spec-identity spec))
+         (existing (gethash g *schema-unique-metadata*))
+         (hit (find id existing :key #'unique-tuple-spec-identity
+                                :test #'equal)))
+    (setf (gethash g *schema-unique-metadata*)
+          (if hit (substitute spec hit existing) (cons spec existing))))
   spec)
 
+(defun unregister-unique-tuple-spec (owner-name graph-name
+                                     &key slot-names name)
+  "Withdraw the DEF-UNIQUE declaration identified by (OWNER . NAME) or
+(OWNER . SLOT-NAMES).  Returns T if one was withdrawn; a no-op otherwise.
+
+⚠ This withdraws the DECLARATION: the constraint stops being enforced from here
+on, and stops being rebuilt at the next open.  Keys already claimed in the live
+unique index are released at that open, not retroactively mid-image."
+  (let* ((id (%spec-identity owner-name (%normalize-slots slot-names) name))
+         (existing (gethash graph-name *schema-unique-metadata*))
+         (hit (find id existing :key #'unique-tuple-spec-identity
+                                :test #'equal)))
+    (when hit
+      (setf (gethash graph-name *schema-unique-metadata*) (remove hit existing))
+      t)))
+
+(defun %unique-spec-declared-p (owner-name slot-names graph)
+  "True when a LIVE DEF-UNIQUE declaration, or the owner class's own :UNIQUE
+slots, covers (OWNER-NAME . SLOT-NAMES).  The unique sidecar is reconciled
+against this at open, for the same reason the secondary-index one is.
+
+Fails safe towards KEEPING when the class is absent or unfinalized -- see
+%INDEX-SPEC-DECLARED-P (index.lisp) for why the failure direction matters."
+  (or (find-if (lambda (s)
+                 (and (eq (unique-tuple-spec-owner-name s) owner-name)
+                      (equal (unique-tuple-spec-slot-names s) slot-names)))
+               (%registered-unique-tuple-specs graph))
+      (let ((class (find-class owner-name nil)))
+        (cond ((or (null class) (not (class-finalized-p class))) t)
+              (t (and (find slot-names (class-unique-slots class)
+                            :key (lambda (d) (%normalize-slots (first d)))
+                            :test #'equal)
+                      t))))))
+
 (defun %registered-unique-tuple-specs (graph)
-  "DEF-UNIQUE specs registered for GRAPH, de-duped by (owner . slot-names),
-newest-wins."
+  "DEF-UNIQUE specs registered for GRAPH, de-duped by identity, newest-wins.
+REGISTER now replaces in place; the de-dupe stays so a table populated by an
+older build still resolves."
   (let ((seen (make-hash-table :test 'equal)) (result '()))
     (dolist (spec (gethash (graph-name graph) *schema-unique-metadata*))
-      (let ((k (cons (unique-tuple-spec-owner-name spec)
-                     (unique-tuple-spec-slot-names spec))))
+      (let ((k (unique-tuple-spec-identity spec)))
         (unless (gethash k seen)
           (setf (gethash k seen) t)
           (push spec result))))
@@ -491,7 +542,8 @@ went through VALIDATE-UNIQUE-CONSTRAINTS (GH #107)."
   (dolist (spec (%registered-unique-tuple-specs graph))
     (%ensure-unique-tuple-built graph spec)))
 
-(defmacro def-unique (owner-class slots graph-name &key canonicalize scope)
+(defmacro def-unique (owner-class slots graph-name
+                      &key canonicalize scope name)
   "Declare a MULTI-SLOT uniqueness constraint on OWNER-CLASS's SLOTS tuple in
 GRAPH-NAME, enforced at commit (VALIDATE-UNIQUE-CONSTRAINTS) -- not merely
 indexed, unlike DEF-INDEX.  A tuple with ANY null component is EXEMPT (SQL
@@ -515,12 +567,26 @@ null semantics a reader would assume were unchanged (GH #107)."
                 :owner-name ',owner-class
                 :slot-names (%normalize-slots ',slots)
                 :graph-name ',graph-name
+                :name ',name
                 :canonicalize ,(when canonicalize `',canonicalize)
                 :scope ,(or scope :local))))
      (register-unique-tuple-spec spec)
      (let ((g (lookup-graph ',graph-name)))
        (when g (%ensure-unique-tuple-built g spec :strict-p t)))
      spec))
+
+(defmacro undef-unique (owner-class graph-name &key slots name)
+  "Withdraw a DEF-UNIQUE declaration, by :NAME or by :SLOTS:
+
+  (undef-unique owner :my-graph :name uq-key)
+  (undef-unique owner :my-graph :slots (a b))
+
+Keyword rather than positional for the same reason as UNDEF-INDEX: a graph name
+is itself a keyword, so a positional slot list could only be told apart by
+guessing.  A no-op when nothing matches; see UNREGISTER-UNIQUE-TUPLE-SPEC for
+what withdrawal does and does not undo."
+  `(unregister-unique-tuple-spec ',owner-class ',graph-name
+                                 :slot-names ',slots :name ',name))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Maintenance (APPLY, post-durability, journal-replayable)
@@ -841,23 +907,32 @@ must not trigger a spurious rebuild -- hence T from the empty loop, not NIL."
               ;; unambiguous (#107).
               (destructuring-bind (owner slot spec scope address
                                    &optional (backend :skip-list)) r
-                (if (listp slot)
-                    (setf (gethash (cons owner slot) reg)
-                          (%make-unique-index
-                           :owner-name owner :slot-names slot :spec spec
-                           :canonicalizers (%resolve-index-canonicalizers
-                                            spec (length slot))
-                           :scope scope
-                           :skip-list (%open-unique-skip-list
-                                       graph address backend)))
-                    (multiple-value-bind (test canon)
-                        (%resolve-unique-canonicalizer spec)
+                ;; ⚠ RECONCILE AGAINST THE LIVE SCHEMA (GH #139, #140).
+                ;; Enforcement is SPEC-driven and this restore is
+                ;; SIDECAR-driven; those agreed only while a spec could never
+                ;; be withdrawn.  Reopening a withdrawn constraint would keep
+                ;; REJECTING WRITES the current schema permits -- the very
+                ;; defect #139 reports, merely relocated from the registry to
+                ;; the sidecar.
+                (when (%unique-spec-declared-p owner (%normalize-slots slot)
+                                                graph)
+                  (if (listp slot)
                       (setf (gethash (cons owner slot) reg)
                             (%make-unique-index
-                             :owner-name owner :slot-name slot :spec spec
-                             :test test :canonicalizer canon :scope scope
+                             :owner-name owner :slot-names slot :spec spec
+                             :canonicalizers (%resolve-index-canonicalizers
+                                              spec (length slot))
+                             :scope scope
                              :skip-list (%open-unique-skip-list
-                                         graph address backend))))))))
+                                         graph address backend)))
+                      (multiple-value-bind (test canon)
+                          (%resolve-unique-canonicalizer spec)
+                        (setf (gethash (cons owner slot) reg)
+                              (%make-unique-index
+                               :owner-name owner :slot-name slot :spec spec
+                               :test test :canonicalizer canon :scope scope
+                               :skip-list (%open-unique-skip-list
+                                           graph address backend)))))))))
         (error (e)
           (warn "Unique index sidecar ~A is unreadable (~A); rebuilding ~
 from live nodes, which are authoritative." file e)

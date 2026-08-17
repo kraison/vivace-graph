@@ -196,12 +196,15 @@ review) -- a source class inherits exactly as any other vertex does."
            ;; going forward -- Finding 3 layer 1, GH #132 review.
            ;; RESOLVE-ENDPOINT's read-side guard (resolve.lisp) is layer
            ;; 2, for what this constraint cannot retroactively cover.
-           ;; Re-defining with a changed :KEY-SLOT leaves the OLD slot's
-           ;; DEF-UNIQUE spec live and enforced -- nothing can retract one
-           ;; (GH #139; #140 is DEF-INDEX's identical leak).  Both need an
-           ;; engine-side unregister API, so neither is fixable here.
+           ;; NAMED, so re-defining with a changed :KEY-SLOT REPLACES the
+           ;; constraint instead of leaving the old slot's spec live and
+           ;; enforced.  That leak was this macro's, and unfixable here, until
+           ;; the engine grew named declarations (GH #139; #140 was
+           ;; DEF-INDEX's identical one).  The name is stable across a change
+           ;; of key slot, which is exactly what a generated declaration needs
+           ;; and what an unregister keyed by slot-names could not express.
            (graph-db:def-unique ,name (,(getf identity :key-slot))
-             ,graph-name)))
+             ,graph-name :name source-identity-key)))
      (%register-identity ',name ',identity)
      (setf (gethash ',name *source-contracts*)
            (make-source-facets :class ',name :graph ',graph-name

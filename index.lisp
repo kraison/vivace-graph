@@ -94,24 +94,89 @@ and multi-slot share one code path (GH #107)."
   (if (listp slot-or-list) slot-or-list (list slot-or-list)))
 
 (defstruct (index-spec (:constructor make-index-spec))
-  owner-name slot-names graph-name canonicalize)
+  owner-name slot-names graph-name canonicalize name)
+
+(defun %spec-identity (owner-name slot-names name)
+  "A declaration's identity: (OWNER . NAME) when named, (OWNER . SLOT-NAMES)
+otherwise (GH #139, #140).
+
+⚠ Naming exists for one reason: A MACRO THAT EMITS SPECS ON A CALLER'S BEHALF
+CANNOT NAME WHAT A PREVIOUS VERSION OF ITSELF EMITTED.  Retraction keyed by
+slot-names therefore cannot express \"this declaration changed shape\" for a
+generated spec -- the old shape is exactly the history the new macro does not
+carry.  A name is stable across that change, so re-declaring it REPLACES,
+whatever the slots became.
+
+Unnamed declarations keep slot-name identity, so everything written before this
+change behaves as it did: two unnamed indexes on one owner with different slot
+lists are two DIFFERENT indexes and both stay live, which is the legitimate
+multi-index case.  A name is a symbol and SLOT-NAMES a list, so the two
+identity spaces cannot collide under EQUAL."
+  (cons owner-name (or name slot-names)))
+
+(defun index-spec-identity (spec)
+  (%spec-identity (index-spec-owner-name spec) (index-spec-slot-names spec)
+                  (index-spec-name spec)))
 
 (defun register-index-spec (spec)
-  "Phase 1: record SPEC.  Duplicates accumulate; resolved newest-wins."
-  (push spec (gethash (index-spec-graph-name spec) *schema-index-metadata*))
+  "Phase 1: record SPEC, REPLACING any spec of the same identity in place.
+
+Replacing rather than pushing is what stops the table growing one entry per
+EVALUATION: a long-lived image that reloads schema paid for every reload
+forever, and this table is scanned linearly (GH #139, #140)."
+  (let* ((g (index-spec-graph-name spec))
+         (id (index-spec-identity spec))
+         (existing (gethash g *schema-index-metadata*))
+         (hit (find id existing :key #'index-spec-identity :test #'equal)))
+    (setf (gethash g *schema-index-metadata*)
+          (if hit (substitute spec hit existing) (cons spec existing))))
   spec)
 
+(defun unregister-index-spec (owner-name graph-name &key slot-names name)
+  "Withdraw the DEF-INDEX declaration identified by (OWNER . NAME) or (OWNER .
+SLOT-NAMES).  Returns T if one was withdrawn.
+
+Withdrawing something never declared is a no-op, not an error: a macro that
+clears before declaring must not have to know whether it ran before."
+  (let* ((id (%spec-identity owner-name (%normalize-slots slot-names) name))
+         (existing (gethash graph-name *schema-index-metadata*))
+         (hit (find id existing :key #'index-spec-identity :test #'equal)))
+    (when hit
+      (setf (gethash graph-name *schema-index-metadata*) (remove hit existing))
+      t)))
+
 (defun %registered-index-specs (graph)
-  "DEF-INDEX specs registered for GRAPH, de-duped by (owner . slot-names),
-newest-wins."
+  "DEF-INDEX specs registered for GRAPH, de-duped by identity, newest-wins.
+
+REGISTER-INDEX-SPEC now replaces in place, so the table is already unique; the
+de-dupe stays so a table populated by an older build still resolves."
   (let ((seen (make-hash-table :test 'equal)) (result '()))
     (dolist (spec (gethash (graph-name graph) *schema-index-metadata*))
-      (let ((k (cons (index-spec-owner-name spec)
-                     (index-spec-slot-names spec))))
+      (let ((k (index-spec-identity spec)))
         (unless (gethash k seen)
           (setf (gethash k seen) t)
           (push spec result))))
     (nreverse result)))
+
+(defun %index-spec-declared-p (owner-name slot-names graph)
+  "True when some LIVE declaration covers (OWNER-NAME . SLOT-NAMES) for GRAPH --
+a registered DEF-INDEX spec, or the owner class's own MOP :INDEX slots.  The
+sidecar is reconciled against this at open.
+
+⚠ FAILS SAFE TOWARDS KEEPING.  When the owner class cannot be found or is not
+yet finalized we answer T, because dropping an index that IS declared is a
+regression while keeping one that is not is merely today's behaviour.  Positive
+evidence is required to drop, never the absence of evidence to keep."
+  (or (find-if (lambda (s)
+                 (and (eq (index-spec-owner-name s) owner-name)
+                      (equal (index-spec-slot-names s) slot-names)))
+               (%registered-index-specs graph))
+      (let ((class (find-class owner-name nil)))
+        (cond ((or (null class) (not (class-finalized-p class))) t)
+              (t (and (find slot-names (class-indexed-slots class)
+                            :key (lambda (d) (%normalize-slots (first d)))
+                            :test #'equal)
+                      t))))))
 
 (defun %slot-present-p (class slot-name)
   (and (find slot-name (class-slots class) :key #'slot-definition-name) t))
@@ -666,15 +731,29 @@ must degrade to rebuild like any other unreadable sidecar, not fail OPEN-GRAPH."
                           ;; before #107 (multi-slot lists did not exist yet);
                           ;; normalise so both eras share this one path.
                           (let ((slot-names (%normalize-slots stored-slot)))
-                            (setf (gethash (cons owner slot-names) reg)
-                                  (%make-slot-index
-                                   :owner-name owner :slot-names slot-names
-                                   :canonicalizers (%owner-slot-canonicalizer
-                                                    owner slot-names graph)
-                                   :skip-list (%open-secondary-skip-list
-                                               graph address
-                                               (length slot-names)
-                                               backend)))))))
+                            ;; ⚠ RECONCILE AGAINST THE LIVE SCHEMA (GH #139,
+                            ;; #140).  Maintenance is SPEC-driven
+                            ;; (CLASS-SECONDARY-INDEX-DESCRIPTORS, "the single
+                            ;; input to maintenance") while this restore is
+                            ;; SIDECAR-driven.  Those agreed only while specs
+                            ;; could never go away.  Reopening a withdrawn
+                            ;; index would leave one that is no longer
+                            ;; maintained, is re-saved at close, and can still
+                            ;; be READ -- INDEX-LOOKUP takes its slot names
+                            ;; from the caller.  A stale index that answers
+                            ;; queries is worse than the useless-but-correct
+                            ;; one retraction was meant to remove.
+                            (when (%index-spec-declared-p owner slot-names
+                                                          graph)
+                              (setf (gethash (cons owner slot-names) reg)
+                                    (%make-slot-index
+                                     :owner-name owner :slot-names slot-names
+                                     :canonicalizers (%owner-slot-canonicalizer
+                                                      owner slot-names graph)
+                                     :skip-list (%open-secondary-skip-list
+                                                 graph address
+                                                 (length slot-names)
+                                                 backend))))))))
                   (error (e)
                     (warn "Secondary index sidecar ~A is unreadable (~A); ~
 rebuilding from live nodes, which are authoritative."
@@ -751,7 +830,7 @@ does no work.  Called at open right after the restore-or-rebuild."
   (dolist (spec (%registered-index-specs graph))
     (%ensure-index-built graph spec)))
 
-(defmacro def-index (owner-class slot graph-name &key canonicalize)
+(defmacro def-index (owner-class slot graph-name &key canonicalize name)
   "Declare an ordered secondary index on OWNER-CLASS.SLOT in GRAPH-NAME (spanning
 OWNER-CLASS's subclasses).  Declarative and idempotent like DEF-VIEW: it registers
 the index and, if the graph is already open, builds it now; otherwise INSTALL-
@@ -768,11 +847,29 @@ with REGENERATE-SECONDARY-INDEXES."
   `(let ((spec (make-index-spec :owner-name ',owner-class
                                 :slot-names (%normalize-slots ',slot)
                                 :graph-name ',graph-name
+                                :name ',name
                                 :canonicalize ,(when canonicalize `',canonicalize))))
      (register-index-spec spec)
      (let ((g (lookup-graph ',graph-name)))
        (when g (%ensure-index-built g spec)))
      spec))
+
+(defmacro undef-index (owner-class graph-name &key slots name)
+  "Withdraw a DEF-INDEX declaration, by :NAME or by :SLOTS:
+
+  (undef-index owner :my-graph :name idx-key)
+  (undef-index owner :my-graph :slots (a b))
+
+Both are keywords rather than mirroring DEF-INDEX's positional SLOT, because a
+graph name IS a keyword here -- a positional form could not tell a slot list
+from a graph without guessing, and guessing wrong is silent.
+
+A no-op when nothing matches.  This withdraws the DECLARATION; the index
+structure it built is dropped at the next open, when the sidecar is reconciled
+against the live schema (RESTORE-SECONDARY-INDEX-ROOTS).  Its heap pages are
+not reclaimed -- GH #147."
+  `(unregister-index-spec ',owner-class ',graph-name
+                          :slot-names ',slots :name ',name))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Query API -- all resolve node ids in the PASSED graph (wrong-graph discipline).

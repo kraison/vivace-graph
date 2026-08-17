@@ -13,6 +13,35 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Added
 
+- **Named schema declarations and retraction** (#139, #140). `def-index` and
+  `def-unique` take an optional `:name`; a named declaration is identified by
+  `(owner . name)` rather than `(owner . slot-names)`, so **re-declaring the name
+  replaces it whatever the slots became**. Unnamed declarations keep slot-name
+  identity and behave exactly as before. New `undef-index` / `undef-unique`
+  withdraw a declaration by name or by slots; withdrawing something never
+  declared is a no-op.
+  - **Why naming, rather than an unregister keyed by slots:** a macro that emits
+    schema on a caller's behalf cannot name what a *previous version of itself*
+    emitted, so slot-name identity gives it no way to express "this changed
+    shape". Both specs stayed live — the stale `def-unique` rejecting writes the
+    current schema permits, the stale `def-index` built and maintained for
+    nothing, with no retraction path anywhere in the image.
+  - `def-source` and `def-claim-classes` now name every spec they emit (one
+    unique for the former; two uniques and three indexes for the latter).
+  - **Registration replaces in place**, so `*schema-index-metadata*` and
+    `*schema-unique-metadata*` hold one entry per logical declaration rather
+    than one per *evaluation* — both tables are scanned linearly and previously
+    grew forever in a long-lived image that reloads schema.
+  - **The sidecars are reconciled against the live schema at open.**
+    Maintenance is spec-driven while reopen was sidecar-driven; those agreed
+    only while a spec could never go away. Without this, a withdrawn index would
+    be reopened, left unmaintained, re-saved at close, and still be *readable*
+    via `index-lookup` — a stale index that answers queries, which is worse than
+    the useless one retraction removes. Reconciliation fails safe towards
+    keeping: positive evidence is required to drop a record, never the absence
+    of evidence to keep it.
+  - Not included: reclaiming a retired index's heap pages (#147).
+
 - **`claims-by-producer`** (#145) — the non-destructive counterpart to
   `delete-claims-by-producer`, returning every live claim a producer wrote across
   both arities. Same contract as the sweep: parent claim class, the producer index

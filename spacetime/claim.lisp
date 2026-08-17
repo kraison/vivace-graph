@@ -136,23 +136,32 @@ DATA alist is not populated yet -- it would reject already-valid claims."
        ;; BINARY too (CLASS-UNIQUE-TUPLE-SPECS matches on SUBTYPEP) and
        ;; forbid one producer relating a subject to several objects
        ;; (design §3.2).
+       ;; ⚠ ALL FIVE DECLARATIONS BELOW ARE NAMED (GH #139, #140).  This macro
+       ;; emits schema on a tenant's behalf, and a LATER VERSION OF IT CANNOT
+       ;; NAME WHAT AN EARLIER VERSION EMITTED.  Unnamed, identity is
+       ;; (owner . slot-names), so changing what is declared here would leave
+       ;; BOTH the old and the new spec live in every long-lived image -- the
+       ;; stale unique rejecting writes the current schema permits, the stale
+       ;; index built and maintained for nothing.  A name is stable across a
+       ;; change of shape, so re-declaring replaces.  #138 changes this record.
        (graph-db:def-unique ,unary
            (producer subject-namespace subject-key relation)
-         ,graph-name)
+         ,graph-name :name claim-unary-identity)
        (graph-db:def-unique ,binary
            (producer subject-namespace subject-key
             object-namespace object-key relation)
-         ,graph-name)
+         ,graph-name :name claim-binary-identity)
        ;; Subject index on PARENT reaches both arities via SUBTYPEP.  Object
        ;; index on BINARY, where those slots live -- declaring it on PARENT
        ;; also works (%APPLICABLE-INDEX-DESCRIPTORS requires every named slot
        ;; to exist) but reads as a mistake.  PRODUCER index exists so the
        ;; regeneration sweep is not a full scan (design §4, plan note 2).
        (graph-db:def-index ,parent (subject-namespace subject-key)
-           ,graph-name)
+           ,graph-name :name claim-subject)
        (graph-db:def-index ,binary (object-namespace object-key)
-           ,graph-name)
-       (graph-db:def-index ,parent (producer) ,graph-name)
+           ,graph-name :name claim-object)
+       (graph-db:def-index ,parent (producer) ,graph-name
+                           :name claim-producer)
        (fmakunbound ',(intern (format nil "MAKE-~A" parent)))
        ;; DEF-VERTEX redefines each raw constructor on every expansion, so
        ;; this cannot double-wrap on a re-evaluated DEF-CLAIM-CLASSES form.

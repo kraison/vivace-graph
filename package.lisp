@@ -181,6 +181,9 @@
            #:def-unique
            ;; general ordered index (:index slot option / def-index)
            #:def-index
+           ;; schema retraction: withdraw a declaration (GH #139, #140)
+           #:undef-index #:undef-unique
+           #:unregister-index-spec #:unregister-unique-tuple-spec
            #:index-lookup #:index-range #:map-index
            #:rebuild-secondary-indexes #:regenerate-secondary-indexes
 
