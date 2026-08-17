@@ -13,6 +13,25 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Added
 
+- **The general ordered index is reachable from Prolog** (#102). Two *generating*
+  predicates — `(find-by-slot ?node CLASS SLOT VALUE)` for equality and
+  `(find-slot-range ?node CLASS SLOT START END)` for an ascending range — bind
+  `?node` once per hit. Previously the index accelerated Lisp callers and was
+  invisible to the query language: `node-slot-value/3` is a *filter*, not a
+  lookup, so a query over an indexed slot generated candidates with `is-a/2`
+  (every instance of the class) and tested them one at a time — O(instances)
+  against an O(log n) index already maintained on every commit.
+  - `?node` comes first, matching the other generating predicates
+    (`find-within/3`, `find-near/5`) rather than the filtering `geo-*` ones.
+  - A subclass argument resolves to the owning index; an unindexed slot
+    **signals** (silence would make "no index" look like "no rows", and a scan
+    fallback would make the cost unpredictable); a *declared but unbuilt* index
+    correctly yields nothing.
+  - Either range bound may be `nil` **or left unbound** for open-ended.
+  - `find-slot-range` streams via `map-index`, so an early cut does not
+    materialise the whole range.
+  - Not included: making the **planner** index-aware, which is separate work.
+
 - **Named schema declarations and retraction** (#139, #140). `def-index` and
   `def-unique` take an optional `:name`; a named declaration is identified by
   `(owner . name)` rather than `(owner . slot-names)`, so **re-declaring the name

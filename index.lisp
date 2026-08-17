@@ -982,3 +982,75 @@ GRAPH."
     (map-index (lambda (node) (push node result)) graph class-name slot-name
                :start start :end end)
     (nreverse result)))
+
+;;; ---------------------------------------------------------------------------
+;;; Prolog surface -- index-backed GENERATOR predicates (GH #102).
+;;;
+;;; The index accelerated Lisp callers and was invisible to the query language,
+;;; which is the surface most users reach for.  NODE-SLOT-VALUE/3 is a FILTER:
+;;; it reads a slot off a node it has already been handed, so a query over an
+;;; indexed slot had to generate candidates with IS-A/2 -- every instance of the
+;;; class -- and test them one at a time, O(instances) against an O(log n) index
+;;; that was already being maintained on every commit.
+;;;
+;;; ⚠ These GENERATE: they call CONT once per hit.  GEO-WITHIN/3 is the obvious
+;;; template and the wrong one -- it filters bound arguments and calls CONT at
+;;; most once.  FIND-WITHIN/3 (spatial-query.lisp) is the right model, and its
+;;; trail discipline is copied verbatim: save the fill pointer, unify, call,
+;;; undo, so a failure downstream backtracks cleanly into the next hit.
+;;;
+;;; ?NODE comes FIRST, matching every other generating predicate, rather than
+;;; last as GH #102's sketch had it -- consistency inside the query language
+;;; matters more than the sketch.
+;;;
+;;; An unindexed slot SIGNALS, inherited from %REQUIRE-INDEX rather than
+;;; re-decided here: silence would make "no index" indistinguishable from "no
+;;; matching rows", and a scan fallback would make the predicate's cost
+;;; unpredictable.  A DECLARED but not-yet-built index is different and yields
+;;; nothing, which is correct -- it genuinely has no rows.
+;;; ---------------------------------------------------------------------------
+
+(defun %prolog-index-bound (x)
+  "A Prolog range bound: NIL for an unbound variable or an explicit NIL, else
+the value.  MAP-INDEX already treats NIL as open-ended, so this surfaces that
+convention rather than inventing a second one -- and it means a caller need not
+know NIL is the sentinel: leaving the argument unbound says the same thing.
+Without it an unbound ?START would deref to a variable struct and be handed to
+the index as a key."
+  (let ((v (var-deref x)))
+    (if (var-p v) nil v)))
+
+(def-global-prolog-functor find-by-slot/4 (?node ?class ?slot ?value cont)
+  "Yield each node of ?CLASS (and its subclasses) whose indexed ?SLOT equals
+?VALUE, via the secondary index.  ?CLASS may name a subclass of the class the
+index is declared on -- it resolves to the owning index.  Signals if no index
+covers ?CLASS.?SLOT."
+  (let ((node-var (var-deref ?node))
+        (class (var-deref ?class))
+        (slot (var-deref ?slot))
+        (value (var-deref ?value)))
+    (dolist (node (index-lookup *graph* class slot value))
+      (let ((old-trail (fill-pointer *trail*)))
+        (when (unify node-var node)
+          (funcall cont))
+        (undo-bindings old-trail)))))
+
+(def-global-prolog-functor find-slot-range/5 (?node ?class ?slot ?start ?end cont)
+  "Yield each node of ?CLASS (and its subclasses) whose indexed ?SLOT lies in
+[?START, ?END], inclusive, in ascending value order.  Either bound may be NIL
+or left unbound for an open-ended range.  Signals if no index covers
+?CLASS.?SLOT.
+
+Streams through MAP-INDEX rather than INDEX-RANGE so a query that cuts early
+does not materialise the whole range first."
+  (let ((node-var (var-deref ?node))
+        (class (var-deref ?class))
+        (slot (var-deref ?slot))
+        (start (%prolog-index-bound ?start))
+        (end (%prolog-index-bound ?end)))
+    (map-index (lambda (node)
+                 (let ((old-trail (fill-pointer *trail*)))
+                   (when (unify node-var node)
+                     (funcall cont))
+                   (undo-bindings old-trail)))
+               *graph* class slot :start start :end end)))

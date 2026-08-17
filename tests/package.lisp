@@ -222,6 +222,9 @@
                 ;; schema retraction (GH #139, #140)
                 #:undef-index
                 #:undef-unique
+                ;; index-backed generator predicates (GH #102)
+                #:find-by-slot/4
+                #:find-slot-range/5
                 #:weight
                 #:to
                 #:from

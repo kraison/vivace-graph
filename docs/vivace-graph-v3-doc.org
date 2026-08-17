@@ -1358,6 +1358,25 @@ Both take the graph positionally and the rest by keyword, because a graph name i
 
 What withdrawal does: the declaration stops being enforced or maintained immediately, and the on-disk sidecar is reconciled against the live schema at the next open, so the retired index is not reopened. What it does *not* do: reclaim the heap pages the retired index occupied (GH #147), or retroactively release unique keys already claimed in the live image — that happens at the next open.
 
+**** Reaching the index from Prolog
+
+Two *generating* predicates put the index in front of the query language, which for most users is the surface they actually reach for:
+
+#+BEGIN_SRC prolog
+  (find-by-slot    ?node user email "alice@x.com")   ; equality
+  (find-slot-range ?node user age 18 65)             ; ordered range, ascending
+  (find-slot-range ?node user age 18 nil)            ; open above; ?end may also be left unbound
+#+END_SRC
+
+⚠ These *generate* — they bind ~?node~ once per hit. That is a different shape from ~geo-within/3~, which *filters* already-bound arguments; ~find-within/3~ is the right analogue, and ~?node~ comes first for the same reason it does there. Without them, a query over an indexed slot had to generate candidates with ~is-a/2~ — every instance of the class — and filter one at a time with ~node-slot-value/3~, which is a filter and not a lookup. That is O(instances) against an O(log n) index the graph was already maintaining on every commit.
+
+- ~?class~ may name a *subclass* of the class the index is declared on; it resolves to the owning index, the same owner-resolution the write path does.
+- Either range bound may be ~nil~ *or left unbound* for an open-ended range — the same convention ~map-index~ uses, so the caller need not know which spelling is the sentinel.
+- An **unindexed slot signals**, inherited from the Lisp layer rather than re-decided. Silence would make "no index" indistinguishable from "no matching rows", and a scan fallback would make the predicate's cost unpredictable. A *declared but not yet built* index is a different case and correctly yields nothing.
+- ~find-slot-range~ streams through ~map-index~, so a query that cuts early does not materialise the whole range first.
+
+Teaching the *planner* to reach for an index automatically — so that a ~select~ constraining an indexed slot uses one without being told — is a separate, larger piece of work and is not done. These predicates are the additive half (GH #102).
+
 Query with three functions, each taking the graph explicitly and resolving nodes in *that* graph:
 
 #+BEGIN_SRC lisp
