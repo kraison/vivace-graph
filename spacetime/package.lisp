@@ -46,7 +46,8 @@
    #:claim-relation #:claim-producer #:claim-rule-version
    #:claim-method #:claim-standing #:claim-confidence
    #:claim-extent-sexp #:claim-geometry
-   #:claim-extent #:claims-touching #:delete-claims-by-producer
+   #:claim-extent #:claims-touching
+   #:claims-by-producer #:delete-claims-by-producer   ; GH #145
    #:unknown-claim-family
    ;; source onboarding contract (GH #132)
    #:def-source #:source-contract #:+source-facets+

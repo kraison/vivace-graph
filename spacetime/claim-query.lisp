@@ -52,6 +52,26 @@ validation placement, not because this SETF would fail to persist."
   (setf (claim-extent-sexp claim) (and extent (extent->sexp extent)))
   extent)
 
+(defun claims-by-producer (graph claim-class producer)
+  "Every live claim PRODUCER wrote, both arities.  CLAIM-CLASS is the PARENT,
+so one call covers unary and binary -- the same contract as this function's
+destructive twin, DELETE-CLAIMS-BY-PRODUCER.
+
+This is the audit direction CLAIMS-TOUCHING cannot serve: that one answers
+only for an endpoint the caller already thinks of, so it structurally cannot
+find a claim nothing justifies -- the orphan case §6.4 says the uniqueness
+constraint cannot catch either (GH #145).
+
+NIL means PRODUCER has written nothing, which is a real answer.  An
+unregistered CLAIM-CLASS signals UNKNOWN-CLAIM-FAMILY instead, so \"no such
+family\" and \"that family, nothing produced\" stay distinguishable.
+
+Uses the PRODUCER index, so this is O(matching) rather than a scan of every
+claim."
+  (let ((family (claim-family claim-class)))
+    (graph-db:index-lookup graph (claim-family-parent family)
+                           '(producer) producer)))
+
 (defun delete-claims-by-producer (graph claim-class producer)
   "Mark every claim PRODUCER wrote as deleted; return how many.  CLAIM-CLASS
 is the PARENT, so one call sweeps both arities.

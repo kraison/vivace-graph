@@ -13,6 +13,16 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Added
 
+- **`claims-by-producer`** (#145) — the non-destructive counterpart to
+  `delete-claims-by-producer`, returning every live claim a producer wrote across
+  both arities. Same contract as the sweep: parent claim class, the producer index
+  (so O(matching), not a scan), `unknown-claim-family` on an unregistered class,
+  and `NIL` for a producer that has written nothing. Swept claims are not
+  returned. Fills the audit direction `claims-touching` cannot serve — that one
+  answers only for an endpoint the caller already names, so it structurally cannot
+  find a claim nothing justifies, which is the same orphan case the uniqueness
+  constraint cannot catch. Purely additive; nothing existing changes behaviour.
+
 - **Multi-slot (tuple) keys for `def-index` and `def-unique`** (#107). Both macros
   now accept a *slot list* — `(def-index claim (ns key rel) :app)`, `(def-unique
   claim (ns key) :app)` — giving an ordered index or a uniqueness constraint over

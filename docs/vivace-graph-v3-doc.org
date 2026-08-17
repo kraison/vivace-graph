@@ -3027,6 +3027,28 @@ to ~:EITHER~; an unrecognized role signals rather than returning ~NIL~,
 because ~NIL~ is also the correct, honest answer to "nothing touches this
 endpoint," and the two must not be confused.
 
+~CLAIMS-BY-PRODUCER~ asks the other question: not "what names this endpoint"
+but "what did this rule write". It is the non-destructive twin of
+~DELETE-CLAIMS-BY-PRODUCER~, sharing its contract — parent class, both
+arities, the producer index, so O(matching) rather than a scan:
+
+#+BEGIN_SRC lisp
+  (claims-by-producer graph 'site-claim :rule-a)
+  ;; every live claim :RULE-A wrote, unary and binary alike
+#+END_SRC
+
+Reach for it to *audit* a producer's output rather than retire it —
+typically to check that a projection still agrees with whatever it was
+projected from. ~CLAIMS-TOUCHING~ cannot answer that: it reports only on an
+endpoint the caller already thought to ask about, so it structurally cannot
+find a claim that nothing justifies — the same orphan case the uniqueness
+constraint cannot catch either (GH #145).
+
+Swept claims do not come back from it. ~NIL~ means the producer has written
+nothing, which is a real answer; an unregistered claim class signals
+~UNKNOWN-CLAIM-FAMILY~ instead, so "no such family" stays distinguishable
+from "that family, nothing produced."
+
 A claim's temporal extent — built from the ~temporal-extent~ machinery
 described earlier in this chapter — is stored encoded, as a sexp, in the
 ~extent-sexp~ slot: no on-disk type byte is spent on it, because the sexp

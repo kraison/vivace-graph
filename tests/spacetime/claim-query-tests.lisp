@@ -183,3 +183,42 @@ fix landed."
                (is (eq :observed (extent-standing e))))
           (ignore-errors (close-graph g2 :snapshot-p nil))
           (collect-garbage))))))
+
+;;; Reading by producer -- the audit counterpart of the sweep (GH #145).
+
+(test claims-by-producer-finds-both-arities
+  "CLAIM-CLASS is the PARENT, so one call covers unary and binary, exactly
+as DELETE-CLAIMS-BY-PRODUCER does."
+  (with-claim-graph (g)
+    (with-transaction ()
+      (make-b :producer :rule-a :object "o1")
+      (make-u :producer :rule-a)
+      (make-b :producer :rule-b :object "o2"))
+    (is (= 2 (length (claims-by-producer g 'ct-claim :rule-a))))
+    (is (= 1 (length (claims-by-producer g 'ct-claim :rule-b))))))
+
+(test claims-by-producer-returns-nil-for-a-producer-that-wrote-nothing
+  "NIL is a real answer here -- 'that rule has produced nothing' -- and must
+not be an error."
+  (with-claim-graph (g)
+    (with-transaction () (make-b :producer :rule-a))
+    (is (null (claims-by-producer g 'ct-claim :rule-never-ran)))))
+
+(test claims-by-producer-does-not-return-swept-claims
+  "⚠ The sweep MARKS DELETED rather than removing, so whether the producer
+index still surfaces those nodes decides whether an auditing caller sees
+ghosts.  A reconciliation built on this would report a stale projection as
+current -- the failure it exists to catch."
+  (with-claim-graph (g)
+    (with-transaction ()
+      (make-b :producer :rule-a :object "o1")
+      (make-u :producer :rule-a))
+    (with-transaction () (delete-claims-by-producer g 'ct-claim :rule-a))
+    (is (null (claims-by-producer g 'ct-claim :rule-a)))))
+
+(test claims-by-producer-signals-on-an-unregistered-parent
+  "Same contract as the sweep: an unknown family signals rather than
+answering NIL, which is also the correct answer for 'wrote nothing'."
+  (with-claim-graph (g)
+    (signals unknown-claim-family
+      (claims-by-producer g 'no-such-claim :rule-a))))
