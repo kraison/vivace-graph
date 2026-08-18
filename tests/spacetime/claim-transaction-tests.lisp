@@ -308,7 +308,7 @@ epoch: a fabricated audit time is worse than an admitted unknown (#148)."
           (is (eq :indeterminate standing))
           (is (not (eq :observed standing))))))))
 
-;;; --- Both arities are stamped (GH #148 fix wave) ---
+;;; --- Both arities are stamped (GH #148) ---
 
 (test a-binary-claim-is-stamped-too
   "Every test above is unary.  Task 4's write-once guard was declared
@@ -323,13 +323,12 @@ not."
         (is (typep ts 'local-time:timestamp))
         (is (eq :asserted standing))))))
 
-;;; --- CLAIM-RECORDED-AT on a non-exact start bound (fix-wave pin,
-;;; #148) ---
+;;; --- CLAIM-RECORDED-AT on a non-exact start bound (GH #148) ---
 
 (test claim-recorded-at-on-a-non-exact-start-is-the-earliest-edge
   "⚠ CLAIM-RECORDED-AT returns (BOUND-EARLIEST (EXTENT-START E)) raw.
-Pinning, not fixing -- changing the return shape is a design call
-outside a fix wave (#148).  An UNBOUNDED start reports the keyword
+Pinning, not fixing -- altering the return shape is work for a
+later unit (#148).  An UNBOUNDED start reports the keyword
 :UNBOUNDED; a fuzzy (non-exact) start silently reports its earliest
 edge, discarding the latest.  Both are legal :TRANSACTION-EXTENT
 values -- exactly what an imprecise ingest source time produces."
