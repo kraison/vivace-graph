@@ -49,6 +49,7 @@
    #:claim-extent #:claims-touching
    #:claim-transaction-extent-sexp                     ; GH #148
    #:claim-transaction-extent #:claim-recorded-at
+   #:transaction-extent-immutable
    #:claims-by-producer #:delete-claims-by-producer   ; GH #145
    #:unknown-claim-family
    ;; source onboarding contract (GH #132)

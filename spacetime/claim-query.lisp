@@ -59,8 +59,13 @@ predates the axis (GH #148).  NIL is INDETERMINATE, never the epoch."
     (when s (sexp->extent s))))
 
 (defun (setf claim-transaction-extent) (extent claim)
-  "Store EXTENT as CLAIM's transaction extent.  See CLAIM-EXTENT's SETF for
-the slot-mutation contract; the immutability rule is added in Task 4."
+  "Store EXTENT as CLAIM's transaction extent, once.  Signals
+TRANSACTION-EXTENT-IMMUTABLE if CLAIM already has one -- an audit field is
+written at creation and not revised (GH #148).  Writing
+CLAIM-TRANSACTION-EXTENT-SEXP bypasses this; engine-level enforcement waits
+on a constraint family (#109)."
+  (when (claim-transaction-extent-sexp claim)
+    (error 'transaction-extent-immutable))
   (setf (claim-transaction-extent-sexp claim)
         (and extent (extent->sexp extent)))
   extent)

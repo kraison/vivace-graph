@@ -91,3 +91,13 @@ transaction is single-graph; resolve before opening it."
   consult it (Finding 4, GH #132 review)."
                      (unopened-source-graph-class c)
                      (unopened-source-graph-graph-name c)))))
+
+(define-condition transaction-extent-immutable (spacetime-error)
+  ()
+  (:report
+   (lambda (c s)
+     (declare (ignore c))
+     (format s "A claim's transaction extent is written once (GH #148).")))
+  (:documentation
+   "Signalled when a claim that already carries a transaction extent is
+given another.  Accessor-level only; see the design's immutability note."))
