@@ -135,7 +135,8 @@ guard -- the counter-that-cannot-fail shape.  Refused at declaration."
 ;; creating it first is also the only way to obtain the pre-constraint damage
 ;; the audit pass (Task 4) exists to find.
 (defun %vc-make (g &rest initargs)
-  "Commit a VC-DOC and return it, read back from G."
+  "Commit a VC-DOC and return it, read back through *GRAPH*."
+  (declare (ignore g))
   (let ((id (with-transaction () (id (apply #'make-vc-doc initargs)))))
     (lookup-vertex id)))
 
@@ -215,12 +216,41 @@ predicate -- a predicate could only say that it returned NIL."
   (%vc-clear)
   (def-value-constraint vc-doc status :graph-db-vc-test
     :one-of +vc-statuses+ :name vc-status)
+  (let* ((expected (graph-db::value-constraint-spec-one-of
+                    (first (%vc-specs))))
+         (text (princ-to-string
+                (make-condition 'value-constraint-violation
+                                :class-name 'vc-doc :slot-name 'status
+                                :value :nonsense :expected expected
+                                :reason :not-in-vocabulary
+                                :node-id (graph-db::gen-vertex-id)))))
+    (is (search "NONSENSE" text))
+    (is (search "WITHDRAWN" text)
+        "the report must name the vocabulary, not merely the bad value"))
+  (%vc-clear))
+
+(test the-report-names-the-slot-as-required-when-missing
+  "The :MISSING branch of VALUE-CONSTRAINT-VIOLATION's report, untested
+until now -- a :REQUIRED-only spec has EXPECTED = NIL, so the vocabulary
+branch would silently name nothing (review of #149 commit 5b9a671)."
   (let ((text (princ-to-string
                (make-condition 'value-constraint-violation
                                :class-name 'vc-doc :slot-name 'status
-                               :value :nonsense :expected +vc-statuses+
-                               :reason :not-in-vocabulary
+                               :value nil :expected nil
+                               :reason :missing
                                :node-id (graph-db::gen-vertex-id)))))
-    (is (search "NONSENSE" text))
-    (is (search "WITHDRAWN" text)
-        "the report must name the vocabulary, not merely the bad value")))
+    (is (search "STATUS" text))
+    (is (search "required" text))))
+
+(test one-of-uses-equal-so-a-string-vocabulary-works
+  "⚠ Pins value-constraint.lisp's EQUAL choice: every vocabulary elsewhere
+in this file is keywords, so EQL would pass here too and the choice would
+go untested (review of #149 commit 5b9a671)."
+  (%vc-clear)
+  (with-vc-graph (g)
+    (let ((ok (%vc-make g :status "draft"))
+          (bad (%vc-make g :status "nope")))
+      (def-value-constraint vc-doc status :graph-db-vc-test
+        :one-of '("draft" "final") :name vc-status)
+      (is (null (%vc-violations-for ok g)))
+      (is (= 1 (length (%vc-violations-for bad g)))))))
