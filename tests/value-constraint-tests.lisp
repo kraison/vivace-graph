@@ -265,7 +265,10 @@ go untested (review of #149 commit 5b9a671)."
       :one-of +vc-statuses+ :name vc-status)
     (signals value-constraint-violation
       (with-transaction ()
-        (make-vc-doc :status :nonsense)))))
+        (make-vc-doc :status :nonsense)))
+    (is (null (map-vertices #'identity g :collect-p t
+                            :vertex-type 'vc-doc))
+        "the refused create left nothing behind")))
 
 (test a-valid-value-commits
   "The guard must not have been bought by refusing everything."
@@ -292,6 +295,23 @@ this: COPY + SETF + SAVE never goes through the constructor (#149)."
         (with-transaction ()
           (let ((v (copy (lookup-vertex id))))
             (setf (vc-doc-status v) :nonsense)
+            (save v))))
+      (is (eq :final (vc-doc-status (lookup-vertex id)))
+          "the refused update did not reach the store"))))
+
+(test an-invalid-required-value-is-refused-on-the-UPDATE-path
+  "Task 5 depends on :REQUIRED refusing a NIL through the commit path."
+  (%vc-clear)
+  (with-vc-graph (g)
+    (declare (ignorable g))
+    (let ((id (with-transaction ()
+                (id (make-vc-doc :status :final)))))
+      (def-value-constraint vc-doc status :graph-db-vc-test
+        :one-of +vc-statuses+ :required t :name vc-status)
+      (signals value-constraint-violation
+        (with-transaction ()
+          (let ((v (copy (lookup-vertex id))))
+            (setf (vc-doc-status v) nil)
             (save v)))))))
 
 (test a-withdrawn-constraint-stops-being-enforced

@@ -1,7 +1,8 @@
 (in-package :graph-db)
 
-;; Defined in unique-constraint.lisp (loaded after this file); declared here so the
-;; %COMMIT / APPLY-TRANSACTION hooks below compile without a forward-reference warning.
+;; Defined in later-loaded files (unique-constraint / index / value-constraint);
+;; declared here so the %COMMIT / APPLY-TRANSACTION hooks below compile
+;; without a forward-reference warning.
 (declaim (ftype (function (t t) t)
                 validate-unique-constraints apply-tx-writes-to-unique-indexes
                 apply-tx-writes-to-secondary-indexes
