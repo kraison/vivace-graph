@@ -166,17 +166,23 @@ ask for; parity with :EXTENT versus :EXTENT-SEXP (claim.lisp)."
 (test overwriting-a-stamp-is-refused
   "Transaction time is an audit field.  ⚠ Accessor-level only -- writing
 CLAIM-TRANSACTION-EXTENT-SEXP directly still bypasses this, and that limit
-is recorded in the design and in #148."
+is recorded in the design and in #148.  Via the sanctioned write path
+(COPY inside WITH-TRANSACTION, then SETF) so an ablated guard leaves
+nothing to signal, rather than tripping the engine's own copy-before-
+write check first (review finding, GH #148)."
   (with-claim-graph (g)
     (declare (ignorable g))
     (with-transaction () (make-u :subject "s1"))
     (let ((c (first (claims-touching g 'ct-claim :ns "s1"))))
       (signals transaction-extent-immutable
-        (setf (claim-transaction-extent c)
-              (make-interval (exact-bound (local-time:now))
-                             (unknown-bound)
-                             :semantics :transaction
-                             :standing :asserted))))))
+        (with-transaction ()
+          (let ((copy (graph-db::copy c)))
+            (setf (claim-transaction-extent copy)
+                  (make-interval (exact-bound (local-time:now))
+                                 (unknown-bound)
+                                 :semantics :transaction
+                                 :standing :asserted))
+            (graph-db::save copy)))))))
 
 (test a-refused-overwrite-leaves-the-original-stamp
   "⚠ The refusal is only half of it; the store must still hold the
