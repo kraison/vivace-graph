@@ -112,11 +112,9 @@ write-once (GH #148)."
   "⚠ THEN is deliberately ~25 years from now: a stamp that ignored the
 argument and used the clock would still produce a valid timestamp and
 would pass a weaker assertion -- only a THEN this far off forces the
-comparison to actually discriminate.  Must stay post-2000: GRAPH-DB's
-TIMESTAMP codec corrupts any pre-epoch (pre-2000-03-01) date on the
-read side (kraison/vivace-graph#153).  Do not 'tidy' this back to a
-more dramatic historical date before #153 is fixed -- it would
-reintroduce a silent failure, not a more interesting test."
+comparison to actually discriminate.  The date was originally chosen
+post-2000 to dodge the codec defect this unit found; #153 has since
+fixed that, so the constraint is now only distance from now."
   (with-claim-graph (g)
     (declare (ignorable g))
     (let ((then (local-time:parse-timestring "2001-06-15T12:00:00Z")))
@@ -187,12 +185,10 @@ write check first (review finding, GH #148)."
 
 (test a-refused-overwrite-leaves-the-original-stamp
   "⚠ The refusal is only half of it; the store must still hold the
-original.  Reopened, not read from the node cache.  THEN must stay
-post-2000: GRAPH-DB's TIMESTAMP codec corrupts any pre-epoch
-(pre-2000-03-01) date, this time on the snapshot/close path rather than
-plain DESERIALIZE (kraison/vivace-graph#153).  Same stand-in-date swap
-Task 3 made for the same reason -- do not 'tidy' this back to
-1999-12-31 before #153 is fixed."
+original.  Reopened, not read from the node cache.  THEN was moved
+post-2000 to dodge the codec defect this unit found, which surfaced here
+on the snapshot/close path rather than at DESERIALIZE; #153 has since
+fixed it, so any date works."
   (with-temp-directory (dir)
     (let ((path (namestring dir))
           (then (local-time:parse-timestring "2003-07-04T16:20:11Z")))

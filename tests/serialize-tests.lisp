@@ -253,3 +253,27 @@ not silently corrupt non-finite data: it refuses to store it at all."
 
 
 
+
+(test timestamps-before-the-local-time-epoch
+  "⚠ LOCAL-TIME:DAY-OF is days since 2000-03-01 and is NEGATIVE before it.
+SERIALIZE writes it with LDB -- a faithful two's-complement low-64-bits --
+so the bytes on disk were always right; only the read was unsigned, which
+silently turned every pre-2000 timestamp into a bogus year (GH #153).  The
+TIMESTAMPS test above uses NOW and so could never see this."
+  (dolist (s '("1999-12-31T23:59:58Z"     ; day -61
+               "2000-02-29T23:59:59Z"     ; the day before the epoch, -1
+               "2000-03-01T00:00:00Z"     ; the epoch itself, day 0
+               "1970-01-01T00:00:00Z"     ; the Unix epoch, deeply negative
+               "1900-01-01T00:00:00Z"))
+    (let ((ts (local-time:parse-timestring s)))
+      (is (local-time:timestamp= ts (deserialized ts))
+          "~a did not survive a serialize/deserialize round trip" s))))
+
+(test a-negative-day-survives-as-a-negative-day
+  "The failure mode was not a wrong timestamp but a HUGE POSITIVE day: -61
+read back as 18446744073709551555.  Pinning the sign directly, so a future
+codec change cannot satisfy TIMESTAMP= by some other route."
+  (let* ((ts (local-time:parse-timestring "1999-12-31T23:59:58Z"))
+         (round-tripped (deserialized ts)))
+    (is (minusp (local-time:day-of ts)))
+    (is (= (local-time:day-of ts) (local-time:day-of round-tripped)))))

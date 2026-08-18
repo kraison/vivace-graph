@@ -286,7 +286,7 @@ unconditionally, with no opt-out.** At a million claims that is roughly
 `exact-bound` stores `earliest = latest`, so the open interval's start
 bound serializes the same instant twice.
 
-## GH #153: the ingest override is not usable for pre-2000 dates
+## GH #153: the pre-2000 codec defect (found here, fixed separately)
 
 `serialize.lisp`'s `LOCAL-TIME:TIMESTAMP` codec has a pre-existing,
 unrelated defect that lands squarely on this unit's headline use case.
@@ -324,10 +324,11 @@ list, and deserves its own review.
 This is the sharpest caveat in the unit, because it is not abstract: the
 whole point of `:recorded-at` is letting an ingest path record a source
 system's own time, and historical documents plausibly predate 2000-03-01.
-**The feature's headline use case — ingesting a genuinely old
-recorded-at — is partly unusable until #153 lands.** Two of this plan's own
-tests hit it directly and had to move their stand-in dates off pre-2000
-values:
+**This unit found the defect and #153 has since fixed it**, so ingesting a
+genuinely old recorded-at now works. The account below is kept because it
+records how the defect was found and why two of this plan's own tests carry
+the stand-in dates they do — they hit it directly and had to move off
+pre-2000 values while it stood:
 
 - `recorded-at-overrides-the-default-stamp` originally used
   `1999-12-31T23:59:58Z` and hit plain read-side corruption
@@ -349,8 +350,8 @@ date already used in the file, with a docstring note against a future
 **The defect is read-side (and write-path-serialization-side) only — the
 bytes actually written to disk are a faithful two's-complement
 representation of the correct day.** A signed read recovers every pre-2000
-timestamp already on disk once #153 is fixed; no migration is needed to
-repair existing data, only a codec fix.
+timestamp already on disk, which is what let #153 be fixed with no migration
+— deploying the corrected read repairs existing stores.
 
 ## API surface
 
@@ -378,8 +379,10 @@ No existing export changes meaning.
   before a query needs it would be building an index for nobody.
 - **No change to the Allen algebra.** It already operates on any extent, so
   both axes are already comparable with the operators that exist.
-- **No fix to GH #153.** The codec defect above stays filed, out of scope
-  for this unit.
+- **No fix to GH #153 *in this unit*.** The codec defect was filed rather
+  than fixed here, deliberately: it touches every persisted timestamp in the
+  engine and deserved its own change and its own regression tests. It has
+  since been fixed.
 - **Claim identity is unchanged.** `(producer, subject-namespace,
   subject-key, relation)` stays the unary key; transaction time is not
   part of it, so regenerating a claim — sweep, then insert, see
@@ -394,7 +397,7 @@ No existing export changes meaning.
       a tenant passes an initarg key with an explicit `NIL` value.
 - [x] `:recorded-at` and `:transaction-extent` let an ingest path record a
       source system's own time, distinct from the construction-time clock
-      — confirmed post-2000; not usable pre-2000 until #153 lands.
+      — confirmed post-2000, and pre-2000 once #153 was fixed.
 - [x] Passing more than one of `:recorded-at`, `:transaction-extent`,
       `:transaction-extent-sexp` signals, checked by key presence rather
       than value.

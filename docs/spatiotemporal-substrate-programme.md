@@ -31,7 +31,7 @@ deliberately unfiled until unit 1's shape informs theirs.
 S1 gained a second temporal axis — transaction time, stamped at construction,
 immutable at the accessor only — on `experiment`; see
 `docs/transaction-time-design.md`. Tracked by #148. Its ingest override
-(`:recorded-at`) is not usable for dates before 2000-03-01 until GH #153 lands.
+(`:recorded-at`) accepts dates before 2000-03-01 now that GH #153 is fixed.
 
 ## Why this matters to the engine
 

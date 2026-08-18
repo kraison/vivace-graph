@@ -222,8 +222,16 @@
       (setf (aref v (incf offset)) (ldb (byte 8 (* i 8)) (nsec-of ts))))
     v))
 
+(defun %sign-extend-64 (n)
+  "Reinterpret an unsigned 64-bit read as two's complement.  SERIALIZE
+writes signed fields with LDB, which stores the low 64 bits faithfully;
+only the read needed to know they were signed (GH #153)."
+  (if (logbitp 63 n) (- n (ash 1 64)) n))
+
 (defmethod deserialize-help ((become (eql +timestamp+)) (bytes array))
-  (make-timestamp :day (deserialize-uint64 bytes 0)
+  ;; DAY-OF is negative before local-time's 2000-03-01 epoch; SEC and NSEC
+  ;; are normalised non-negative, so only DAY is sign-extended (GH #153).
+  (make-timestamp :day (%sign-extend-64 (deserialize-uint64 bytes 0))
                   :sec (deserialize-uint64 bytes 8)
                   :nsec (deserialize-uint64 bytes 16)))
 

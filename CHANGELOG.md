@@ -116,6 +116,23 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Fixed
 
+- **Every `LOCAL-TIME:TIMESTAMP` before 2000-03-01 was silently corrupted on
+  read** (#153). `SERIALIZE` writes `day-of` — which is negative before
+  local-time's epoch — through `LDB`, but `DESERIALIZE-HELP` read it back with
+  `DESERIALIZE-UINT64`, so a day of `-61` returned as `18446744073709551555`
+  and the timestamp came back with a nonsense year. No error was signalled at
+  write or at read.
+
+  **Read-side only, so no migration is needed.** The bytes on disk were always
+  a faithful two's-complement representation; only the read was wrong.
+  Deploying the fix recovers every affected timestamp already stored. Anything
+  that had already *derived* a value from a corrupted read is not recovered.
+
+  `DESERIALIZE-UINT64` itself is untouched — the rest of the storage layer uses
+  it for pointers, sizes and packet lengths, which are genuinely unsigned. The
+  timestamp codec now sign-extends its `day` field alone; `sec` and `nsec` are
+  normalised non-negative by local-time.
+
 - **Multi-slot index/constraint defects found by the whole-branch review** (#107).
   All five were reproduced before being fixed, and each carries a regression test
   confirmed to fail against the unfixed code.
