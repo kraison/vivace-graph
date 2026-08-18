@@ -189,7 +189,13 @@ over zero specs is an UNCHECKED graph, not a clean one; a caller that prints
 
 :VERTEX-TYPE narrows the scan and keeps it snapshot-consistent; the untyped
 scan reads live node versions and bypasses MVCC (see MAP-VERTICES), so it is
-for admin passes over a quiescent graph."
+for admin passes over a quiescent graph.
+
+⚠ SPEC-COUNT counts declarations registered on GRAPH, not declarations
+that apply to what was scanned -- with a spec on class B only, scanning
+:VERTEX-TYPE 'A returns SPECS > 0 while none of them touched a scanned
+node.  The scan is also vertices-only, so a spec on an edge class inflates
+SPECS without ever being audited."
   (let ((violations '())
         (checked 0))
     (map-vertices (lambda (v)

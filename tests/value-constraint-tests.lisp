@@ -354,7 +354,7 @@ only protects future writes would leave that undetectable."
         (check-value-constraints g :vertex-type 'vc-doc)
       (is (= 1 (length violations)))
       (is (eq :not-in-vocabulary
-              (graph-db::vc-violation-reason (first violations))))
+              (graph-db:vc-violation-reason (first violations))))
       (is (= 1 checked)
           "a violation count with no population is not a result")
       (is (= 1 specs)))))
@@ -374,12 +374,58 @@ the caller must be able to tell them apart."
           "⚠ the graph is NOT empty -- zero violations here means unchecked,
 which is exactly what SPECS lets the caller tell apart"))))
 
-(test the-audit-pass-does-not-signal
-  "It collects.  Signalling would stop at the first find, which is the
-opposite of what a survey is for."
+(test the-audit-pass-collects-every-violation-not-only-the-first
+  "⚠ Every other audit test damages exactly one node with exactly one
+violated spec, so nothing would notice an audit that returned only the
+first find -- which is exactly what signalling would do, hence this also
+replaces a dedicated does-not-signal test (review of #149 commit 492c0ec).
+Two damaged nodes, one of them doubly damaged, closes that gap."
+  (%vc-clear)
+  (with-vc-graph (g)
+    (with-transaction () (make-vc-doc :status :nonsense :note "ok"))
+    (with-transaction () (make-vc-doc :status :nonsense :note nil))
+    (def-value-constraint vc-doc status :graph-db-vc-test
+      :one-of +vc-statuses+ :name vc-status)
+    (def-value-constraint vc-doc note :graph-db-vc-test
+      :required t :name vc-note)
+    (multiple-value-bind (violations checked specs)
+        (finishes (check-value-constraints g :vertex-type 'vc-doc))
+      (is (= 3 (length violations))
+          "1 from the first node, 2 from the second -- collected, not
+stopped at the first find")
+      (is (= 2 checked))
+      (is (= 2 specs)))))
+
+(test the-audit-pass-does-not-see-a-repaired-deleted-node
+  "⚠ Pins the exclusion, not just observes it.  MAP-VERTICES only skips
+deleted nodes because this call omits :INCLUDE-DELETED-P; deletion is the
+repair path (deleting-a-node-is-not-blocked-by-its-own-violation), so a
+later change adding :INCLUDE-DELETED-P T to \"see everything\" must not
+pass silently -- it would report damage on a node already repaired."
+  (%vc-clear)
+  (with-vc-graph (g)
+    (let ((id (with-transaction ()
+                (id (make-vc-doc :status :nonsense)))))
+      (def-value-constraint vc-doc status :graph-db-vc-test
+        :one-of +vc-statuses+ :name vc-status)
+      (with-transaction () (mark-deleted (lookup-vertex id)))
+      (multiple-value-bind (violations checked specs)
+          (check-value-constraints g :vertex-type 'vc-doc)
+        (is (null violations))
+        (is (= 0 checked))
+        (is (= 1 specs))))))
+
+(test the-audit-pass-defaults-to-an-untyped-scan
+  "The untyped branch is a materially different path through MAP-VERTICES
+-- raw MAP-LHASH rather than the type index -- and every other audit test
+passes :VERTEX-TYPE, leaving it untested."
   (%vc-clear)
   (with-vc-graph (g)
     (with-transaction () (make-vc-doc :status :nonsense))
     (def-value-constraint vc-doc status :graph-db-vc-test
       :one-of +vc-statuses+ :name vc-status)
-    (finishes (check-value-constraints g :vertex-type 'vc-doc))))
+    (multiple-value-bind (violations checked specs)
+        (check-value-constraints g)
+      (is (= 1 (length violations)))
+      (is (= 1 checked))
+      (is (= 1 specs)))))

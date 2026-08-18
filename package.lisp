@@ -189,6 +189,10 @@
            #:vcv-class-name #:vcv-slot-name #:vcv-value
            #:vcv-expected #:vcv-reason #:vcv-node-id
            #:check-value-constraints
+           #:vc-violation-spec #:vc-violation-node-id
+           #:vc-violation-class-name #:vc-violation-slot
+           #:vc-violation-actual #:vc-violation-expected
+           #:vc-violation-reason
            #:unregister-index-spec #:unregister-unique-tuple-spec
            #:index-lookup #:index-range #:map-index
            ;; index-backed generator predicates for Prolog (GH #102)
