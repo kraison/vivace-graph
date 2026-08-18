@@ -226,6 +226,7 @@
                 #:def-value-constraint
                 #:undef-value-constraint
                 #:value-constraint-violation
+                #:check-value-constraints
                 ;; index-backed generator predicates (GH #102)
                 #:find-by-slot/4
                 #:find-slot-range/5

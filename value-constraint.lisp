@@ -178,3 +178,25 @@ and before durability, so a violation aborts before anything is journaled
                      :expected (vc-violation-expected v)
                      :reason (vc-violation-reason v)
                      :node-id (vc-violation-node-id v)))))))))
+
+(defun check-value-constraints (graph &key vertex-type)
+  "Survey live vertices of GRAPH and COLLECT violations without signalling.
+Returns (values VIOLATIONS CHECKED-COUNT SPEC-COUNT).
+
+⚠ The two counts are part of the answer, not diagnostics.  Zero violations
+over zero specs is an UNCHECKED graph, not a clean one; a caller that prints
+\"OK\" without reading them is reporting a count with no population.
+
+:VERTEX-TYPE narrows the scan and keeps it snapshot-consistent; the untyped
+scan reads live node versions and bypasses MVCC (see MAP-VERTICES), so it is
+for admin passes over a quiescent graph."
+  (let ((violations '())
+        (checked 0))
+    (map-vertices (lambda (v)
+                    (incf checked)
+                    (let ((vs (%value-constraint-violations v graph)))
+                      (when vs
+                        (setf violations (nconc violations vs)))))
+                  graph :vertex-type vertex-type)
+    (values violations checked
+            (length (%registered-value-constraint-specs graph)))))

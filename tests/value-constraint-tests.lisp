@@ -338,3 +338,48 @@ otherwise a store holding pre-constraint damage could not be repaired."
       (finishes
         (with-transaction ()
           (mark-deleted (lookup-vertex id)))))))
+
+;;; --- the audit pass ------------------------------------------------------
+
+(test the-audit-pass-finds-damage-written-before-the-constraint
+  "⚠ Not speculative tooling.  The probe on #149 proves invalid values are
+writable today, so an existing store may already hold them -- a guard that
+only protects future writes would leave that undetectable."
+  (%vc-clear)
+  (with-vc-graph (g)
+    (with-transaction () (make-vc-doc :status :nonsense))
+    (def-value-constraint vc-doc status :graph-db-vc-test
+      :one-of +vc-statuses+ :name vc-status)
+    (multiple-value-bind (violations checked specs)
+        (check-value-constraints g :vertex-type 'vc-doc)
+      (is (= 1 (length violations)))
+      (is (eq :not-in-vocabulary
+              (graph-db::vc-violation-reason (first violations))))
+      (is (= 1 checked)
+          "a violation count with no population is not a result")
+      (is (= 1 specs)))))
+
+(test the-audit-pass-reports-the-population-it-checked
+  "⚠ This programme's most repeated error is a count with no population.
+Zero violations over zero specs is an unchecked graph, not a clean one, and
+the caller must be able to tell them apart."
+  (%vc-clear)
+  (with-vc-graph (g)
+    (with-transaction () (make-vc-doc :status :nonsense))
+    (multiple-value-bind (violations checked specs)
+        (check-value-constraints g :vertex-type 'vc-doc)
+      (is (null violations))
+      (is (= 0 specs) "no constraints are declared, so nothing was checked")
+      (is (= 1 checked)
+          "⚠ the graph is NOT empty -- zero violations here means unchecked,
+which is exactly what SPECS lets the caller tell apart"))))
+
+(test the-audit-pass-does-not-signal
+  "It collects.  Signalling would stop at the first find, which is the
+opposite of what a survey is for."
+  (%vc-clear)
+  (with-vc-graph (g)
+    (with-transaction () (make-vc-doc :status :nonsense))
+    (def-value-constraint vc-doc status :graph-db-vc-test
+      :one-of +vc-statuses+ :name vc-status)
+    (finishes (check-value-constraints g :vertex-type 'vc-doc))))
