@@ -89,11 +89,23 @@ believed; an end genuinely unknown is :INDETERMINATE (GH #148)."
   (make-interval (exact-bound timestamp) (unknown-bound)
                  :semantics :transaction :standing :asserted))
 
+(defun %stamp-now (args)
+  "ARGS with a fresh open :TRANSACTION-EXTENT-SEXP stamp prepended -- the
+default whenever none of the three transaction initargs carries a value.
+A key present with a NIL value counts as this default too: the caller is
+saying \"nothing to say about transaction time\", not \"leave this
+unstamped\" (design, Stamping; GH #148 review)."
+  (list* :transaction-extent-sexp
+        (extent->sexp (%open-transaction-extent (local-time:now)))
+        args))
+
 (defun %claim-encode-transaction-arg (args)
   "Rewrite a claim constructor's ARGS so the transaction axis is always
 populated: :TRANSACTION-EXTENT and :RECORDED-AT are encoded to
 :TRANSACTION-EXTENT-SEXP, and an unstamped claim is stamped now.  Signals
-if more than one form is given, rather than picking one (GH #148)."
+if more than one KEY is given, rather than picking one -- checked on key
+presence, not on value, so passing two keys still conflicts even when one
+is NIL (GH #148)."
   (let ((n (count-if (lambda (k) (%plist-key-p args k))
                      '(:transaction-extent :recorded-at
                        :transaction-extent-sexp))))
@@ -102,18 +114,24 @@ if more than one form is given, rather than picking one (GH #148)."
 :TRANSACTION-EXTENT-SEXP."))
     (cond
       ((%plist-key-p args :transaction-extent)
-       (let ((e (getf args :transaction-extent)))
-         (list* :transaction-extent-sexp (and e (extent->sexp e))
-                (%plist-remove args :transaction-extent))))
+       (let ((e (getf args :transaction-extent))
+             (rest (%plist-remove args :transaction-extent)))
+         (if e
+             (list* :transaction-extent-sexp (extent->sexp e) rest)
+             (%stamp-now rest))))
       ((%plist-key-p args :recorded-at)
-       (let ((ts (getf args :recorded-at)))
-         (list* :transaction-extent-sexp
-                (extent->sexp (%open-transaction-extent ts))
-                (%plist-remove args :recorded-at))))
-      ((%plist-key-p args :transaction-extent-sexp) args)
-      (t (list* :transaction-extent-sexp
-                (extent->sexp (%open-transaction-extent (local-time:now)))
-                args)))))
+       (let ((ts (getf args :recorded-at))
+             (rest (%plist-remove args :recorded-at)))
+         (if ts
+             (list* :transaction-extent-sexp
+                    (extent->sexp (%open-transaction-extent ts))
+                    rest)
+             (%stamp-now rest))))
+      ((%plist-key-p args :transaction-extent-sexp)
+       (if (getf args :transaction-extent-sexp)
+           args
+           (%stamp-now (%plist-remove args :transaction-extent-sexp))))
+      (t (%stamp-now args)))))
 
 (defparameter +claim-identity-slots+
   '(:producer :subject-namespace :subject-key :relation)

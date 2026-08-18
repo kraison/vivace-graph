@@ -167,3 +167,69 @@ ask for; parity with :EXTENT versus :EXTENT-SEXP (claim.lisp)."
                                             (unknown-bound)
                                             :semantics :transaction
                                             :standing :asserted))))))
+
+;;; --- A NIL value on a transaction key means "nothing to say", not
+;;; "leave this unstamped" (GH #148 review) ---
+
+(test a-nil-transaction-extent-still-stamps
+  "Passing :TRANSACTION-EXTENT NIL is not the same as omitting it: the
+tenant is saying nothing about transaction time, and the substrate's
+answer is still the default stamp."
+  (with-claim-graph (g)
+    (declare (ignorable g))
+    (with-transaction ()
+      (make-ct-claim-unary :subject-namespace :ns :subject-key "s1"
+                           :relation :r :producer :p
+                           :standing :inferred
+                           :transaction-extent nil))
+    (let ((c (first (claims-touching g 'ct-claim :ns "s1"))))
+      (multiple-value-bind (ts standing) (claim-recorded-at c)
+        (is (typep ts 'local-time:timestamp))
+        (is (eq :asserted standing))))))
+
+(test a-nil-recorded-at-still-stamps
+  "Same guarantee via :RECORDED-AT NIL."
+  (with-claim-graph (g)
+    (declare (ignorable g))
+    (with-transaction ()
+      (make-ct-claim-unary :subject-namespace :ns :subject-key "s1"
+                           :relation :r :producer :p
+                           :standing :inferred
+                           :recorded-at nil))
+    (let ((c (first (claims-touching g 'ct-claim :ns "s1"))))
+      (multiple-value-bind (ts standing) (claim-recorded-at c)
+        (is (typep ts 'local-time:timestamp))
+        (is (eq :asserted standing))))))
+
+(test a-nil-transaction-extent-sexp-still-stamps
+  "Same guarantee via :TRANSACTION-EXTENT-SEXP NIL -- the raw slot
+initarg, closest to how a legacy pre-#148 claim would arrive."
+  (with-claim-graph (g)
+    (declare (ignorable g))
+    (with-transaction ()
+      (make-ct-claim-unary :subject-namespace :ns :subject-key "s1"
+                           :relation :r :producer :p
+                           :standing :inferred
+                           :transaction-extent-sexp nil))
+    (let ((c (first (claims-touching g 'ct-claim :ns "s1"))))
+      (multiple-value-bind (ts standing) (claim-recorded-at c)
+        (is (typep ts 'local-time:timestamp))
+        (is (eq :asserted standing))))))
+
+(test nil-value-on-one-key-still-conflicts-with-another-key-present
+  "Conflict detection counts KEY PRESENCE, not VALUE -- so this must keep
+signalling even though :RECORDED-AT's value is NIL.  Pins the fix from
+weakening into counting values instead of keys."
+  (with-claim-graph (g)
+    (declare (ignorable g))
+    (signals error
+      (with-transaction ()
+        (make-ct-claim-unary :subject-namespace :ns :subject-key "s1"
+                             :relation :r :producer :p
+                             :standing :inferred
+                             :recorded-at nil
+                             :transaction-extent
+                             (make-interval (exact-bound (local-time:now))
+                                            (unknown-bound)
+                                            :semantics :transaction
+                                            :standing :asserted))))))
