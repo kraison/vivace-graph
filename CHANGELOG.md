@@ -253,6 +253,25 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Changed
 
+- **The temporal algebra now lives in its own library**,
+  [cl-temporal-extent](https://github.com/kraison/cl-temporal-extent) (#159).
+  Bounds, extents, the Allen relations and the standing vocabulary never
+  depended on the graph — the only occurrence of `graph-db` in any of those
+  files was the `in-package` form — so they are now usable without loading a
+  database engine. `graph-db/spacetime` depends on the library and keeps the
+  claim record, the source-onboarding contract and endpoint resolution.
+
+  **No consumer needs to change.** `graph-db.spacetime` `:use`s the new
+  package and re-exports every symbol it previously exported, so code
+  written against `graph-db.spacetime:make-interval`,
+  `graph-db.spacetime:+standings+` and the rest compiles unchanged. The root
+  condition keeps the name `spacetime-error` for the same reason.
+
+  922 of the spacetime suite's 1169 checks moved with the code; the
+  remaining 247 are the claim and source layers, and 247 + 922 accounts for
+  all of them.
+
+
 - **Writing a persistent slot now requires a node the current transaction
   may mutate** (#135) — a copy registered by `COPY`, or a node created in
   that same transaction. Anything else signals the new

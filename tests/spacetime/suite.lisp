@@ -13,6 +13,12 @@ Invoked by (asdf:test-system :graph-db/spacetime)."
     (explain! results)
     (results-status results)))
 
+(defun exact-interval (s e)
+  "An interval extent with exact endpoints.  Three lines, duplicated from
+cl-temporal-extent's own suite rather than shared: coupling two test suites
+so one can borrow a fixture costs more than the duplication (#159)."
+  (make-interval (exact-bound s) (exact-bound e)))
+
 (defun ts (year month day &optional (hour 0) (minute 0) (sec 0) (nsec 0))
   "A UTC timestamp.  Every test builds times through this, so none of them
 can accidentally depend on the host timezone (design §3.5)."

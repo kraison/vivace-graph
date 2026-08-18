@@ -383,16 +383,13 @@
 ;; NOT depend on this, and this reserves no serialize type byte (GH #130).
 (defsystem graph-db/spacetime
   :name "VivaceGraph spacetime (temporal substrate)"
-  :description "Temporal extents, the Allen interval algebra, and standing."
-  :depends-on (:graph-db/core :local-time)
+  :description "The claim record and source-onboarding contract over
+cl-temporal-extent."
+  :depends-on (:graph-db/core :local-time :cl-temporal-extent)
   :pathname "spacetime/"
   :serial t
   :components ((:file "package")
                (:file "conditions")
-               (:file "standing")
-               (:file "bound")
-               (:file "extent")
-               (:file "allen")
                (:file "claim")
                (:file "claim-query")
                (:file "source")
@@ -411,12 +408,6 @@
   :serial t
   :components ((:file "package")
                (:file "suite")
-               (:file "standing-tests")
-               (:file "bound-tests")
-               (:file "extent-tests")
-               (:file "allen-tests")
-               (:file "instant-tests")
-               (:file "property-tests")
                (:file "claim-tests")
                (:file "claim-identity-tests")
                (:file "claim-query-tests")

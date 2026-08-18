@@ -15,7 +15,7 @@ in `kraison/cl-llm`.
 | | Unit | Issue | Phase |
 |---|---|---|---|
 | M | Multi-slot indexes — composite `def-index`, leading-prefix lookup, class-level multi-slot unique | #107 | 1 |
-| S1 | `graph-db/spacetime` — claim + temporal-extent substrate, opt-in subsystem | #108 | 1 |
+| S1 | `graph-db/spacetime` — claim substrate over [cl-temporal-extent](https://github.com/kraison/cl-temporal-extent), opt-in subsystem | #108 | 1 |
 | S4 | `graph-db/ontology` — declarative formalism + constraint validator | #109 | 3 |
 | S0 | Namespaces — complete the graphs-as-namespaces design | #110 | 3→4 |
 

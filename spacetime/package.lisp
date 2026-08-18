@@ -7,9 +7,12 @@
 (in-package #:cl-user)
 
 (defpackage #:graph-db.spacetime
-  (:use #:cl)
+  ;; The temporal layer is cl-temporal-extent (#159).  It is :USEd and its
+  ;; symbols re-exported below, so a consumer of GRAPH-DB.SPACETIME sees the
+  ;; same API it always did.
+  (:use #:cl #:temporal-extent)
   (:export
-   ;; conditions
+   ;; conditions -- the first four are cl-temporal-extent's, re-exported
    #:spacetime-error #:invalid-standing #:invalid-bound #:invalid-extent
    #:missing-claim-identity-component
    #:missing-claim-identity-component-slot
