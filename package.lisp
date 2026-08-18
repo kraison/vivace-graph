@@ -185,6 +185,9 @@
            #:undef-index #:undef-unique
            ;; declarative value constraints (GH #149)
            #:def-value-constraint #:undef-value-constraint
+           #:value-constraint-violation
+           #:vcv-class-name #:vcv-slot-name #:vcv-value
+           #:vcv-expected #:vcv-reason #:vcv-node-id
            #:unregister-index-spec #:unregister-unique-tuple-spec
            #:index-lookup #:index-range #:map-index
            ;; index-backed generator predicates for Prolog (GH #102)

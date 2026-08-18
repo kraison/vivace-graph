@@ -12,6 +12,26 @@
 
 (in-package :graph-db)
 
+(define-condition value-constraint-violation (error)
+  ((class-name :initarg :class-name :reader vcv-class-name)
+   (slot-name  :initarg :slot-name  :reader vcv-slot-name)
+   (value      :initarg :value      :reader vcv-value)
+   (expected   :initarg :expected   :reader vcv-expected)
+   (reason     :initarg :reason     :reader vcv-reason)
+   (node-id    :initarg :node-id    :reader vcv-node-id))
+  (:report
+   (lambda (c s)
+     (if (eq (vcv-reason c) :missing)
+         (format s "Value constraint on ~S.~S violated by node ~A: the ~
+                    slot is required but holds NIL."
+                 (vcv-class-name c) (vcv-slot-name c)
+                 (string-id (vcv-node-id c)))
+         (format s "Value constraint on ~S.~S violated by node ~A: ~
+                    expected one of~{ ~S~}; got ~S."
+                 (vcv-class-name c) (vcv-slot-name c)
+                 (string-id (vcv-node-id c))
+                 (vcv-expected c) (vcv-value c))))))
+
 (defvar *schema-value-constraint-metadata* (make-hash-table)
   "graph-name (symbol) -> list of VALUE-CONSTRAINT-SPECs (newest first).")
 
@@ -79,6 +99,36 @@ CLASS-UNIQUE-TUPLE-SPECS (unique-constraint.lisp)."
                     (find slot (class-slots class)
                           :key #'slot-definition-name))
           collect spec)))
+
+(defstruct (vc-violation (:constructor %make-vc-violation))
+  spec node-id class-name slot actual expected reason)
+
+(defun %value-constraint-violations (node graph)
+  "Every value constraint NODE violates, as VC-VIOLATION records.  The one
+evaluator behind both consumers: the write path signals on the first, the
+audit pass collects them all (design, \"Violation shape\").
+
+EQUAL, not EQL, so a non-keyword enumeration works."
+  (let ((class (class-of node)))
+    (loop for spec in (class-value-constraint-specs class graph)
+          for slot = (value-constraint-spec-slot-name spec)
+          for one-of = (value-constraint-spec-one-of spec)
+          for val = (slot-value node slot)
+          append
+          (cond
+            ((null val)
+             (when (value-constraint-spec-required spec)
+               (list (%make-vc-violation
+                      :spec spec :node-id (id node)
+                      :class-name (class-name class) :slot slot
+                      :actual nil :expected one-of :reason :missing))))
+            ((and one-of (not (member val one-of :test #'equal)))
+             (list (%make-vc-violation
+                    :spec spec :node-id (id node)
+                    :class-name (class-name class) :slot slot
+                    :actual val :expected one-of
+                    :reason :not-in-vocabulary)))
+            (t nil)))))
 
 (defmacro def-value-constraint (owner-class slot graph-name
                                 &key one-of required name)

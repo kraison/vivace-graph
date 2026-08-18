@@ -126,3 +126,101 @@ guard -- the counter-that-cannot-fail shape.  Refused at declaration."
   (signals error
     (eval '(graph-db:def-value-constraint
             vc-doc status :graph-db-vc-test))))
+
+;;; --- the evaluator -------------------------------------------------------
+
+;; ⚠ ORDERING, in every test below: CREATE THE NODE FIRST, DECLARE THE
+;; CONSTRAINT SECOND.  Task 3 makes a violating commit signal, so a node
+;; created under a live constraint could not be committed at all -- and
+;; creating it first is also the only way to obtain the pre-constraint damage
+;; the audit pass (Task 4) exists to find.
+(defun %vc-make (g &rest initargs)
+  "Commit a VC-DOC and return it, read back from G."
+  (let ((id (with-transaction () (id (apply #'make-vc-doc initargs)))))
+    (lookup-vertex id)))
+
+(defun %vc-violations-for (node g)
+  (graph-db::%value-constraint-violations node g))
+
+(test a-value-outside-the-enumeration-is-a-violation
+  (%vc-clear)
+  (with-vc-graph (g)
+    (let ((v (%vc-make g :status :nonsense)))
+      (def-value-constraint vc-doc status :graph-db-vc-test
+        :one-of +vc-statuses+ :name vc-status)
+      (let ((vs (%vc-violations-for v g)))
+        (is (= 1 (length vs)))
+        (is (eq :not-in-vocabulary
+                (graph-db::vc-violation-reason (first vs))))
+        (is (eq :nonsense (graph-db::vc-violation-actual (first vs))))
+        (is (equal +vc-statuses+
+                   (graph-db::vc-violation-expected (first vs))))))))
+
+(test every-member-of-the-enumeration-is-accepted
+  "⚠ A guard bought by refusing everything is not a guard."
+  (%vc-clear)
+  (with-vc-graph (g)
+    (let ((nodes (mapcar (lambda (s) (%vc-make g :status s))
+                         +vc-statuses+)))
+      (def-value-constraint vc-doc status :graph-db-vc-test
+        :one-of +vc-statuses+ :name vc-status)
+      (dolist (v nodes)
+        (is (null (%vc-violations-for v g))
+            "~S is in the vocabulary and must not be a violation"
+            (vc-doc-status v))))))
+
+(test nil-is-exempt-without-required
+  "Matches DEF-UNIQUE's null rule: \"if present, it must be one of these\".
+Diverging would be the trap GH #107 named."
+  (%vc-clear)
+  (with-vc-graph (g)
+    (let ((v (%vc-make g :status nil)))
+      (def-value-constraint vc-doc status :graph-db-vc-test
+        :one-of +vc-statuses+ :name vc-status)
+      (is (null (%vc-violations-for v g))))))
+
+(test nil-is-a-violation-under-required
+  (%vc-clear)
+  (with-vc-graph (g)
+    (let ((v (%vc-make g :status nil)))
+      (def-value-constraint vc-doc status :graph-db-vc-test
+        :one-of +vc-statuses+ :required t :name vc-status)
+      (let ((vs (%vc-violations-for v g)))
+        (is (= 1 (length vs)))
+        (is (eq :missing (graph-db::vc-violation-reason (first vs))))))))
+
+(test required-alone-checks-presence-only
+  (%vc-clear)
+  (with-vc-graph (g)
+    (let ((present (%vc-make g :status :anything))
+          (absent (%vc-make g :status nil)))
+      (def-value-constraint vc-doc status :graph-db-vc-test
+        :required t :name vc-status)
+      (is (null (%vc-violations-for present g)))
+      (is (= 1 (length (%vc-violations-for absent g)))))))
+
+(test two-constraints-on-one-node-both-report
+  (%vc-clear)
+  (with-vc-graph (g)
+    (let ((v (%vc-make g :status :nonsense :note nil)))
+      (def-value-constraint vc-doc status :graph-db-vc-test
+        :one-of +vc-statuses+ :name vc-status)
+      (def-value-constraint vc-doc note :graph-db-vc-test
+        :required t :name vc-note)
+      (is (= 2 (length (%vc-violations-for v g)))))))
+
+(test the-report-names-the-vocabulary-it-expected
+  "⚠ This is why :ONE-OF is an enumeration rather than :SATISFIES a
+predicate -- a predicate could only say that it returned NIL."
+  (%vc-clear)
+  (def-value-constraint vc-doc status :graph-db-vc-test
+    :one-of +vc-statuses+ :name vc-status)
+  (let ((text (princ-to-string
+               (make-condition 'value-constraint-violation
+                               :class-name 'vc-doc :slot-name 'status
+                               :value :nonsense :expected +vc-statuses+
+                               :reason :not-in-vocabulary
+                               :node-id (graph-db::gen-vertex-id)))))
+    (is (search "NONSENSE" text))
+    (is (search "WITHDRAWN" text)
+        "the report must name the vocabulary, not merely the bad value")))
