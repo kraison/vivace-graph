@@ -23,6 +23,11 @@ S0 is the design already recorded in `namespace-design-discussion.md` and
 `namespace-design-handoff.md` in this directory. **Do not re-derive its agreed shape** —
 the open items are the work.
 
+S4's unit 1 — declarative value constraints, `def-value-constraint` — landed on
+`experiment`; see `docs/value-constraint-design.md`. Tracked by #149, one unit of the
+#109 epic; units 2-4 (cardinality beyond `:required`, domain/range, disjointness) are
+deliberately unfiled until unit 1's shape informs theirs.
+
 ## Why this matters to the engine
 
 The substrate (S1) is an **opt-in subsystem** beside `graph-db/geos` and
