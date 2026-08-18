@@ -52,6 +52,28 @@ validation placement, not because this SETF would fail to persist."
   (setf (claim-extent-sexp claim) (and extent (extent->sexp extent)))
   extent)
 
+(defun claim-transaction-extent (claim)
+  "CLAIM's transaction-time TEMPORAL-EXTENT, decoded, or NIL when the claim
+predates the axis (GH #148).  NIL is INDETERMINATE, never the epoch."
+  (let ((s (claim-transaction-extent-sexp claim)))
+    (when s (sexp->extent s))))
+
+(defun (setf claim-transaction-extent) (extent claim)
+  "Store EXTENT as CLAIM's transaction extent.  See CLAIM-EXTENT's SETF for
+the slot-mutation contract; the immutability rule is added in Task 4."
+  (setf (claim-transaction-extent-sexp claim)
+        (and extent (extent->sexp extent)))
+  extent)
+
+(defun claim-recorded-at (claim)
+  "Two values: when CLAIM was recorded, and that extent's STANDING.  A claim
+predating the axis returns (VALUES NIL :INDETERMINATE) -- we do not know
+when it was recorded, and that is not the same as the epoch (GH #148)."
+  (let ((e (claim-transaction-extent claim)))
+    (if (null e)
+        (values nil :indeterminate)
+        (values (bound-earliest (extent-start e)) (extent-standing e)))))
+
 (defun claims-by-producer (graph claim-class producer)
   "Every live claim PRODUCER wrote, both arities.  CLAIM-CLASS is the PARENT,
 so one call covers unary and binary -- the same contract as this function's

@@ -426,7 +426,8 @@
                ;; Draws on MAKE-U/MAKE-B and WITH-CLAIM-GRAPH from the
                ;; claim test files above (#131 Task 7).
                (:file "conformance-tests")
-               (:file "claim-standing-guard-tests"))   ; GH #149
+               (:file "claim-standing-guard-tests")    ; GH #149
+               (:file "claim-transaction-tests"))      ; GH #148
   :perform (test-op (op c)
                     (unless (uiop:symbol-call :graph-db/spacetime-test
                                               :run-spacetime-tests)

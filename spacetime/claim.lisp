@@ -43,6 +43,11 @@ from the parent name alone."
                 :initform nil)
     (extent-sexp :initarg :extent-sexp :accessor claim-extent-sexp
                  :initform nil)
+    ;; The transaction axis (GH #148).  Same codec as EXTENT-SEXP; the two
+    ;; never share a name so neither is mistaken for the other.
+    (transaction-extent-sexp :initarg :transaction-extent-sexp
+                             :accessor claim-transaction-extent-sexp
+                             :initform nil)
     (geometry :initarg :geometry :accessor claim-geometry :initform nil))
   "Slots every claim carries, on the PARENT class.  Symbols live in this
 package so two claim families share one set of accessors (design §5).")
