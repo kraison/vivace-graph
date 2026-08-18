@@ -7,7 +7,7 @@
 
 (test an-invalid-standing-is-refused-on-the-update-path
   "⚠ THE REGRESSION TEST FOR #149.  CHECK-STANDING fires inside the
-generated MAKE-<NAME> wrapper only (claim.lisp:177), so COPY + SETF + SAVE
+generated MAKE-<NAME> wrapper only (claim.lisp:195), so COPY + SETF + SAVE
 committed an invalid standing and it survived a reopen."
   (with-claim-graph (g)
     (declare (ignorable g))
@@ -20,9 +20,9 @@ committed an invalid standing and it survived a reopen."
             (graph-db::save copy)))))))
 
 (test a-binary-claim-is-also-refused-on-the-update-path
-  "The constraint is declared once, on PARENT (claim.lisp:135-138), and
+  "The constraint is declared once, on PARENT (claim.lisp:146-149), and
 reaches BINARY only via SUBTYPEP -- unlike the unique constraints just
-below it, which are declared per-arity on purpose (claim.lisp:141-146).
+below it, which are declared per-arity on purpose (claim.lisp:165-171).
 A maintainer 'fixing' DEF-VALUE-CONSTRAINT to name UNARY by analogy with
 those would pass every other test in this file while silently dropping
 the guard on binary claims; this is what pins it."
@@ -50,12 +50,10 @@ write would still commit and the claim would carry no standing at all."
             (graph-db::save copy)))))))
 
 (test a-valid-standing-still-commits-on-the-update-path
-  "Under-refusal (above) is only half the guard.  If COPY ever dropped a
-slot from the data alist, STANDING would read NIL and :REQUIRED would
-reject a perfectly legitimate update -- every consumer's normal update
-idiom would break.  Nothing else in this file or in
-value-constraint-tests.lisp exercises a VALID value through COPY + SETF +
-SAVE under a live constraint; this is that test."
+  "The narrow half of over-refusal: an explicitly re-set, currently-valid
+standing is not rejected.  It does NOT pin the COPY-drop case -- this test
+writes STANDING itself, so a COPY that lost the slot would be repaired by
+the test's own SETF before SAVE ever saw it.  That case is the test below."
   (with-claim-graph (g)
     (declare (ignorable g))
     (with-transaction () (make-u :subject "s1"))
@@ -68,6 +66,31 @@ SAVE under a live constraint; this is that test."
       (is (eq :asserted
               (claim-standing
                (first (claims-touching g 'ct-claim :ns "s1"))))))))
+
+(test an-unrelated-update-leaves-the-standing-intact
+  "⚠ The COPY-drop case, which the test above cannot reach.  The update
+idiom every consumer actually uses mutates one slot and never mentions
+STANDING, so the existing value has to survive COPY on its own -- if it
+did not, :REQUIRED would refuse a legitimate write.  CONFIDENCE is chosen
+because it is unrelated to the constraint (claim.lisp:42).  Proven RED by
+stripping :STANDING in a COPY-NODE :AROUND *and* pinning HEAP-MERGED-P on
+the copy -- stripping alone is not enough, MAYBE-INIT-NODE-DATA re-derives
+DATA from the intact bytes.  See task-5-report.md."
+  (with-claim-graph (g)
+    (declare (ignorable g))
+    (with-transaction () (make-u :subject "s1"))
+    (let ((c (first (claims-touching g 'ct-claim :ns "s1"))))
+      (finishes
+        (with-transaction ()
+          (let ((copy (graph-db::copy c)))
+            (setf (claim-confidence copy) 0.5)
+            (graph-db::save copy))))
+      (let ((c2 (first (claims-touching g 'ct-claim :ns "s1"))))
+        (is (eq :inferred (claim-standing c2))
+            "an update that never mentioned STANDING lost it")
+        ;; Without this the test would still pass if SAVE were a no-op.
+        (is (eql 0.5 (claim-confidence c2))
+            "the unrelated update did not actually commit")))))
 
 (test the-refused-standing-is-not-durable
   "⚠ The in-session read is not the test.  The node cache has made two
