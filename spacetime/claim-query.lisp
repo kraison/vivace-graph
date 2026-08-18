@@ -73,7 +73,11 @@ on a constraint family (#109)."
 (defun claim-recorded-at (claim)
   "Two values: when CLAIM was recorded, and that extent's STANDING.  A claim
 predating the axis returns (VALUES NIL :INDETERMINATE) -- we do not know
-when it was recorded, and that is not the same as the epoch (GH #148)."
+when it was recorded, and that is not the same as the epoch (GH #148).  The
+first value is the raw BOUND-EARLIEST of the extent's start: :UNBOUNDED
+when that start is itself unbounded, and only the earliest edge of a
+fuzzy (non-exact) start otherwise -- a caller must not assume it is a
+TIMESTAMP without checking (GH #148)."
   (let ((e (claim-transaction-extent claim)))
     (if (null e)
         (values nil :indeterminate)

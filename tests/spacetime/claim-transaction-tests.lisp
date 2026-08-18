@@ -94,7 +94,8 @@ write-once (GH #148)."
           (collect-garbage))))))
 
 (test every-new-claim-is-stamped-without-the-tenant-asking
-  "Nothing a tenant does leaves a new claim unstamped (design, Stamping)."
+  "Nothing a tenant does leaves a new claim built via MAKE-<class> unstamped
+(design, Stamping)."
   (with-claim-graph (g)
     (declare (ignorable g))
     (with-transaction () (make-u :subject "s1"))
@@ -306,3 +307,56 @@ epoch: a fabricated audit time is worse than an admitted unknown (#148)."
           (is (null ts))
           (is (eq :indeterminate standing))
           (is (not (eq :observed standing))))))))
+
+;;; --- Both arities are stamped (GH #148 fix wave) ---
+
+(test a-binary-claim-is-stamped-too
+  "Every test above is unary.  Task 4's write-once guard was declared
+once on the parent and reached BINARY only through SUBTYPEP (design,
+Testing #9) -- a suite exercising only MAKE-U looked complete and was
+not."
+  (with-claim-graph (g)
+    (declare (ignorable g))
+    (with-transaction () (make-b))
+    (let ((c (first (claims-touching g 'ct-claim :ns "s1"))))
+      (multiple-value-bind (ts standing) (claim-recorded-at c)
+        (is (typep ts 'local-time:timestamp))
+        (is (eq :asserted standing))))))
+
+;;; --- CLAIM-RECORDED-AT on a non-exact start bound (fix-wave pin,
+;;; #148) ---
+
+(test claim-recorded-at-on-a-non-exact-start-is-the-earliest-edge
+  "⚠ CLAIM-RECORDED-AT returns (BOUND-EARLIEST (EXTENT-START E)) raw.
+Pinning, not fixing -- changing the return shape is a design call
+outside a fix wave (#148).  An UNBOUNDED start reports the keyword
+:UNBOUNDED; a fuzzy (non-exact) start silently reports its earliest
+edge, discarding the latest.  Both are legal :TRANSACTION-EXTENT
+values -- exactly what an imprecise ingest source time produces."
+  (with-claim-graph (g)
+    (declare (ignorable g))
+    (with-transaction ()
+      (make-ct-claim-unary :subject-namespace :ns :subject-key "s1"
+                           :relation :r :producer :p
+                           :standing :inferred
+                           :transaction-extent
+                           (make-interval (unknown-bound) (unknown-bound)
+                                          :semantics :transaction
+                                          :standing :asserted)))
+    (with-transaction ()
+      (make-ct-claim-unary :subject-namespace :ns :subject-key "s2"
+                           :relation :r :producer :p
+                           :standing :inferred
+                           :transaction-extent
+                           (make-interval
+                             (make-bound (ts 2020 1 1) (ts 2020 6 1))
+                             (unknown-bound)
+                             :semantics :transaction :standing :asserted)))
+    (let ((c1 (first (claims-touching g 'ct-claim :ns "s1")))
+          (c2 (first (claims-touching g 'ct-claim :ns "s2"))))
+      (multiple-value-bind (recorded standing) (claim-recorded-at c1)
+        (is (eq :unbounded recorded))
+        (is (eq :asserted standing)))
+      (multiple-value-bind (recorded standing) (claim-recorded-at c2)
+        (is (local-time:timestamp= (ts 2020 1 1) recorded))
+        (is (eq :asserted standing))))))

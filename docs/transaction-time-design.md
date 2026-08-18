@@ -74,6 +74,14 @@ already follows (#130). The extent's standing is independent of the
 **claim's** own `claim-standing` — a claim can be `:inferred` while the
 record of when it was inferred is `:asserted`.
 
+**`:indeterminate` is overloaded, so it cannot signal absence by itself.**
+The table above lists `:indeterminate` as a legitimate standing for a
+*recorded* claim whose end is genuinely unknown — the same value
+`claim-recorded-at` returns for a claim that predates the axis entirely
+(see "Absence" below). A caller asking "does this claim carry a stamp at
+all" must test `claim-recorded-at`'s first value for `NIL`, not compare
+its standing to `:indeterminate`.
+
 ## Stamping
 
 The substrate stamps every claim; the caller may override only at
@@ -125,6 +133,26 @@ claim to "now" would record a falsehood for that ingest path; the
 alternative — a per-tenant `:extra-slots` field for the real value — is
 exactly the divergence this unit exists to end.
 
+## Regeneration re-stamps
+
+Supersession in this substrate *is* regeneration — sweep, then insert,
+with no second mechanism
+(`docs/superpowers/specs/2026-08-10-claim-record-endpoint-abstraction-design.md`
+§6.4). A producer's re-run marks every claim it owns deleted
+(`delete-claims-by-producer`), then re-inserts its current output as
+brand-new claims in a second transaction. Each new claim gets a fresh
+transaction stamp — there is no update-in-place path that could let a
+stamp survive a producer's re-run.
+
+For rule-produced claims — this substrate's primary population —
+`claim-recorded-at` therefore reports **when the producer last ran**, not
+"when the substrate first learned it." That value is correct under
+bitemporal semantics for that version of the claim: it really was
+(re)recorded at that instant. But a tenant regenerating nightly will find
+every claim that producer touched stamped last night, indistinguishable
+from one whose belief genuinely changed for the first time that night —
+and nothing currently warns them of that.
+
 ## Immutability, and its honest limit — accessor-level only
 
 Transaction time is an audit field: once written it should not change.
@@ -146,8 +174,17 @@ decoded accessor on a claim that already carries a stamp, signalling
 **This is not tamper-proof, and the doc says so plainly rather than
 implying otherwise.** Writing the raw slot,
 `(setf (claim-transaction-extent-sexp claim) ...)`, bypasses the guard
-entirely — nothing checks it, nothing refuses it. Any code with a handle on
-the claim object can overwrite the stamp through the raw accessor. Real,
+entirely — nothing checks it, nothing refuses it. This is reachable by
+more than an abstract "any code with a handle on the claim object":
+`rest-put-vertex` (`rest.lisp:666-681`) copies the node inside a
+transaction and writes **every** named data slot through `slot-value`, so
+an authenticated REST client can clear or rewrite any claim's stamp over
+the wire, no Lisp access required. Contrast `standing` on that same
+endpoint: it *is* caught at commit by #149's value constraint, while
+`transaction-extent-sexp` is caught by nothing — precisely the gap the
+#109 constraint family, below, would close. (`graph-db/spacetime` depends
+only on `graph-db/core`, so `rest.lisp` is absent from a tenant image
+unless it also loads `:graph-db` and starts the REST server.) Real,
 engine-level enforcement needs a "this slot may not change after creation"
 constraint family, evaluated on the write path the way
 `validate-value-constraints` now evaluates enumerated values for `standing`
@@ -185,7 +222,7 @@ permanent state that a legacy claim is allowed to carry indefinitely.
 writing the raw slot to `NIL` on a copy of a real claim and confirming both
 return values.
 
-## The measured answer: what a persistent class gaining a slot costs (Task 1)
+## The measured answer: does an old store open cleanly (Task 1)
 
 `+claim-shared-slots+` gaining `transaction-extent-sexp` means **every claim
 family's parent class gains a persistent slot**, in every tenant image that
@@ -234,6 +271,20 @@ committed anywhere. A reader deciding whether to trust an upgrade against a
 real production store should weigh this measurement, not the test suite, and
 should be aware the measurement itself is not preserved as a re-runnable
 artefact.
+
+## The measured storage cost
+
+Task 1's probe above answers schema compatibility, not price — whether a
+persistent class can gain a slot is a different question from what that
+slot costs once every claim carries one. Measured separately: the
+default stamp's `extent->sexp` form serializes to **147 bytes** through
+`graph-db:serialize`, and the `transaction-extent-sexp` slot key itself
+costs another **26 bytes** — **173 bytes added to every claim,
+unconditionally, with no opt-out.** At a million claims that is roughly
+173 MB, before counting anything else the claim already carries. About
+50 of those 147 bytes are two copies of the same timestamp:
+`exact-bound` stores `earliest = latest`, so the open interval's start
+bound serializes the same instant twice.
 
 ## GH #153: the ingest override is not usable for pre-2000 dates
 
@@ -330,15 +381,17 @@ No existing export changes meaning.
 - **No fix to GH #153.** The codec defect above stays filed, out of scope
   for this unit.
 - **Claim identity is unchanged.** `(producer, subject-namespace,
-  subject-key, relation)` stays the unary key; a stamp model updates one
-  claim in place rather than creating a new identity per transaction-time
-  value, so "the current belief" stays well defined.
+  subject-key, relation)` stays the unary key; transaction time is not
+  part of it, so regenerating a claim — sweep, then insert, see
+  "Regeneration re-stamps" above, not an in-place update — still lands on
+  the same identity rather than creating a new one per transaction-time
+  value, and "the current belief" stays well defined.
 
 ## Acceptance criteria
 
-- [x] Every newly created claim carries a transaction extent, with no
-      tenant action required — including when a tenant passes an initarg
-      key with an explicit `NIL` value.
+- [x] Every newly created claim, via `MAKE-<class>`, carries a
+      transaction extent, with no tenant action required — including when
+      a tenant passes an initarg key with an explicit `NIL` value.
 - [x] `:recorded-at` and `:transaction-extent` let an ingest path record a
       source system's own time, distinct from the construction-time clock
       — confirmed post-2000; not usable pre-2000 until #153 lands.

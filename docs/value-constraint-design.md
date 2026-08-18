@@ -168,10 +168,14 @@ GH #152 for the proposed fix; it is not re-argued here.
 
 - **Other claim slots.** `claim-extent`, `claim-producer`, `claim-relation` and
   the rest of the claim accessors have the *same* unguarded update path that
-  the probe exposed for `standing` — `def-claim-classes` declares a value
-  constraint only on `standing`. Whether extent well-formedness (or any other
-  claim slot) becomes declarative is a later unit's question, not an oversight
-  in this one.
+  the probe exposed for `standing` — `def-claim-classes` declares a
+  *declarative*, commit-enforced value constraint only on `standing`.
+  (`claim-transaction-extent` is the one exception: its accessor later
+  gained a write-once guard, #148 — an accessor-level check, not a
+  declarative value constraint, but also not freely overwritable through
+  that accessor.) Whether extent well-formedness (or any other claim slot)
+  becomes declarative is a later unit's question, not an oversight in this
+  one.
 - **Multi-slot / cross-slot constraints.** A value constraint is slot-only.
   Generalising it is deferred until a unit actually needs it (design spec,
   GH #149 Q2).

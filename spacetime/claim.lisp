@@ -96,8 +96,8 @@ A key present with a NIL value counts as this default too: the caller is
 saying \"nothing to say about transaction time\", not \"leave this
 unstamped\" (design, Stamping; GH #148 review)."
   (list* :transaction-extent-sexp
-        (extent->sexp (%open-transaction-extent (local-time:now)))
-        args))
+         (extent->sexp (%open-transaction-extent (local-time:now)))
+         args))
 
 (defun %claim-encode-transaction-arg (args)
   "Rewrite a claim constructor's ARGS so the transaction axis is always
