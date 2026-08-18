@@ -138,7 +138,11 @@ MAKE-<NAME> wrapper (GH #149)."
        ;; The closed vocabulary, enforced on every write path -- not only at
        ;; construction, where CHECK-STANDING alone left it (GH #149).
        ;; :ONE-OF is evaluated, so this names +STANDINGS+ rather than
-       ;; duplicating it and cannot drift from STANDINGP.
+       ;; duplicating it and cannot drift from STANDINGP.  :NAME is load-
+       ;; bearing, not decoration -- see the ⚠ block below: this macro
+       ;; cannot name what an earlier version of itself emitted, so a
+       ;; stable name is what makes re-declaration REPLACE rather than
+       ;; stack (%SPEC-IDENTITY, index.lisp:99).
        (graph-db:def-value-constraint ,parent standing ,graph-name
          :one-of +standings+
          :required t
@@ -148,14 +152,16 @@ MAKE-<NAME> wrapper (GH #149)."
        ;; BINARY too (CLASS-UNIQUE-TUPLE-SPECS matches on SUBTYPEP) and
        ;; forbid one producer relating a subject to several objects
        ;; (design §3.2).
-       ;; ⚠ ALL FIVE DECLARATIONS BELOW ARE NAMED (GH #139, #140).  This macro
-       ;; emits schema on a tenant's behalf, and a LATER VERSION OF IT CANNOT
-       ;; NAME WHAT AN EARLIER VERSION EMITTED.  Unnamed, identity is
-       ;; (owner . slot-names), so changing what is declared here would leave
-       ;; BOTH the old and the new spec live in every long-lived image -- the
-       ;; stale unique rejecting writes the current schema permits, the stale
-       ;; index built and maintained for nothing.  A name is stable across a
-       ;; change of shape, so re-declaring replaces.  #138 changes this record.
+       ;; ⚠ EVERY DECLARATION THIS MACRO EMITS IS NAMED -- the value
+       ;; constraint above included (GH #139, #140, #149).  This macro
+       ;; emits schema on a tenant's behalf, and a LATER VERSION OF IT
+       ;; CANNOT NAME WHAT AN EARLIER VERSION EMITTED.  Unnamed, identity
+       ;; is (owner . slot-names), so changing what is declared here would
+       ;; leave BOTH the old and the new spec live in every long-lived
+       ;; image -- the stale unique rejecting writes the current schema
+       ;; permits, the stale index built and maintained for nothing.  A
+       ;; name is stable across a change of shape, so re-declaring
+       ;; replaces.  #138 changes this record.
        (graph-db:def-unique ,unary
            (producer subject-namespace subject-key relation)
          ,graph-name :name claim-unary-identity)
