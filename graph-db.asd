@@ -423,9 +423,10 @@
                (:file "claim-concurrency-tests")
                (:file "source-tests")
                (:file "resolve-tests")
-               ;; Last: draws on MAKE-U/MAKE-B and WITH-CLAIM-GRAPH from the
+               ;; Draws on MAKE-U/MAKE-B and WITH-CLAIM-GRAPH from the
                ;; claim test files above (#131 Task 7).
-               (:file "conformance-tests"))
+               (:file "conformance-tests")
+               (:file "claim-standing-guard-tests"))   ; GH #149
   :perform (test-op (op c)
                     (unless (uiop:symbol-call :graph-db/spacetime-test
                                               :run-spacetime-tests)

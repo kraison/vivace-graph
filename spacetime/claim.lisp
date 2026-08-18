@@ -121,7 +121,11 @@ construction hook (design §5).  Construction goes through CHANGE-CLASS
 (%MAKE-VERTEX promotes a pooled VERTEX to the target class), so
 INITIALIZE-INSTANCE never fires; UPDATE-INSTANCE-FOR-DIFFERENT-CLASS does
 fire, but also on the READ path (deserializing an existing node), where the
-DATA alist is not populated yet -- it would reject already-valid claims."
+DATA alist is not populated yet -- it would reject already-valid claims.
+
+STANDING is ALSO declared as a value constraint on PARENT, so the closed
+vocabulary is enforced at commit on every write path, not only through the
+MAKE-<NAME> wrapper (GH #149)."
   (let ((unary (intern (format nil "~A-UNARY" parent)))
         (binary (intern (format nil "~A-BINARY" parent))))
     `(progn
@@ -131,6 +135,14 @@ DATA alist is not populated yet -- it would reject already-valid claims."
        (graph-db:def-vertex ,unary (,parent) () ,graph-name)
        (graph-db:def-vertex ,binary (,parent) (,@+claim-object-slots+)
            ,graph-name)
+       ;; The closed vocabulary, enforced on every write path -- not only at
+       ;; construction, where CHECK-STANDING alone left it (GH #149).
+       ;; :ONE-OF is evaluated, so this names +STANDINGS+ rather than
+       ;; duplicating it and cannot drift from STANDINGP.
+       (graph-db:def-value-constraint ,parent standing ,graph-name
+         :one-of +standings+
+         :required t
+         :name standing-vocabulary)
        ;; The unary constraint goes on UNARY, never on PARENT: PARENT has
        ;; exactly the unary slot set, so declaring it there would bind
        ;; BINARY too (CLASS-UNIQUE-TUPLE-SPECS matches on SUBTYPEP) and
