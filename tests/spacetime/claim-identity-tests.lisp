@@ -17,6 +17,13 @@
                        :relation relation :producer producer
                        :standing :inferred :extent extent))
 
+(defun make-u-at (&key (producer :rule-a) (subject "s1") (relation :r)
+                       recorded-at)
+  "MAKE-U with an explicit transaction stamp (GH #148)."
+  (make-ct-claim-unary :subject-namespace :ns :subject-key subject
+                       :relation relation :producer producer
+                       :standing :inferred :recorded-at recorded-at))
+
 (test two-producers-may-disagree
   "Design §6.2.  This is the entire reason for reifying: an edge model would
 have to resolve this at write time."

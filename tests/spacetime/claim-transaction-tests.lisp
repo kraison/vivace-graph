@@ -99,3 +99,71 @@ tests in this programme vacuous by serving the right answer from memory."
                  (is (local-time:timestamp= then (claim-recorded-at c)))))
           (ignore-errors (close-graph g2))
           (collect-garbage))))))
+
+(test every-new-claim-is-stamped-without-the-tenant-asking
+  "Nothing a tenant does leaves a new claim unstamped (design, Stamping)."
+  (with-claim-graph (g)
+    (declare (ignorable g))
+    (with-transaction () (make-u :subject "s1"))
+    (let ((c (first (claims-touching g 'ct-claim :ns "s1"))))
+      (multiple-value-bind (ts standing) (claim-recorded-at c)
+        (is (typep ts 'local-time:timestamp))
+        (is (eq :asserted standing)))
+      (let ((e (claim-transaction-extent c)))
+        (is (eq :interval (extent-kind e)))
+        (is (eq :transaction (extent-semantics e)))
+        (is (eq :unbounded (bound-latest (extent-end e))))))))
+
+(test recorded-at-overrides-the-default-stamp
+  "⚠ THEN is deliberately ~25 years from now: a stamp that ignored the
+argument and used the clock would still produce a valid timestamp and
+would pass a weaker assertion -- only a THEN this far off forces the
+comparison to actually discriminate.  Must stay post-2000: GRAPH-DB's
+TIMESTAMP codec corrupts any pre-epoch (pre-2000-03-01) date on the
+read side (kraison/vivace-graph#153).  Do not 'tidy' this back to a
+more dramatic historical date before #153 is fixed -- it would
+reintroduce a silent failure, not a more interesting test."
+  (with-claim-graph (g)
+    (declare (ignorable g))
+    (let ((then (local-time:parse-timestring "2001-06-15T12:00:00Z")))
+      (with-transaction () (make-u-at :subject "s1" :recorded-at then))
+      (let ((c (first (claims-touching g 'ct-claim :ns "s1"))))
+        (is (local-time:timestamp= then (claim-recorded-at c)))))))
+
+(test an-explicit-transaction-extent-is-stored-as-given
+  "An ingest path may know a CLOSED period, or a standing other than
+:ASSERTED."
+  (with-claim-graph (g)
+    (declare (ignorable g))
+    (let ((e (make-interval
+              (exact-bound (local-time:parse-timestring "2001-01-01T00:00:00Z"))
+              (exact-bound (local-time:parse-timestring "2002-01-01T00:00:00Z"))
+              :semantics :transaction :standing :indeterminate)))
+      (with-transaction ()
+        (make-ct-claim-unary :subject-namespace :ns :subject-key "s1"
+                             :relation :r :producer :p
+                             :standing :inferred
+                             :transaction-extent e))
+      (let ((c (first (claims-touching g 'ct-claim :ns "s1"))))
+        (is (eq :indeterminate
+                (extent-standing (claim-transaction-extent c))))
+        (is (not (eq :unbounded
+                     (bound-latest
+                      (extent-end (claim-transaction-extent c))))))))))
+
+(test conflicting-transaction-initargs-signal
+  "Picking one silently is how a caller ends up with a stamp they did not
+ask for; parity with :EXTENT versus :EXTENT-SEXP (claim.lisp)."
+  (with-claim-graph (g)
+    (declare (ignorable g))
+    (signals error
+      (with-transaction ()
+        (make-ct-claim-unary :subject-namespace :ns :subject-key "s1"
+                             :relation :r :producer :p
+                             :standing :inferred
+                             :recorded-at (local-time:now)
+                             :transaction-extent
+                             (make-interval (exact-bound (local-time:now))
+                                            (unknown-bound)
+                                            :semantics :transaction
+                                            :standing :asserted))))))

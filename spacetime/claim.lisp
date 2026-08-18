@@ -83,6 +83,38 @@ one."
                  (%plist-remove args :extent))))
       args))
 
+(defun %open-transaction-extent (timestamp)
+  "The transaction period [TIMESTAMP, open).  :ASSERTED means still
+believed; an end genuinely unknown is :INDETERMINATE (GH #148)."
+  (make-interval (exact-bound timestamp) (unknown-bound)
+                 :semantics :transaction :standing :asserted))
+
+(defun %claim-encode-transaction-arg (args)
+  "Rewrite a claim constructor's ARGS so the transaction axis is always
+populated: :TRANSACTION-EXTENT and :RECORDED-AT are encoded to
+:TRANSACTION-EXTENT-SEXP, and an unstamped claim is stamped now.  Signals
+if more than one form is given, rather than picking one (GH #148)."
+  (let ((n (count-if (lambda (k) (%plist-key-p args k))
+                     '(:transaction-extent :recorded-at
+                       :transaction-extent-sexp))))
+    (when (> n 1)
+      (error "Pass only one of :TRANSACTION-EXTENT, :RECORDED-AT or ~
+:TRANSACTION-EXTENT-SEXP."))
+    (cond
+      ((%plist-key-p args :transaction-extent)
+       (let ((e (getf args :transaction-extent)))
+         (list* :transaction-extent-sexp (and e (extent->sexp e))
+                (%plist-remove args :transaction-extent))))
+      ((%plist-key-p args :recorded-at)
+       (let ((ts (getf args :recorded-at)))
+         (list* :transaction-extent-sexp
+                (extent->sexp (%open-transaction-extent ts))
+                (%plist-remove args :recorded-at))))
+      ((%plist-key-p args :transaction-extent-sexp) args)
+      (t (list* :transaction-extent-sexp
+                (extent->sexp (%open-transaction-extent (local-time:now)))
+                args)))))
+
 (defparameter +claim-identity-slots+
   '(:producer :subject-namespace :subject-key :relation)
   "Every claim's identity components -- the UNARY constraint tuple.
@@ -196,7 +228,8 @@ MAKE-<NAME> wrapper (GH #149)."
                        (lambda (&rest args)
                          (%check-claim-identity args ',identity-keys)
                          (let ((c (apply %raw
-                                        (%claim-encode-extent-arg args))))
+                                        (%claim-encode-transaction-arg
+                                         (%claim-encode-extent-arg args)))))
                            (check-standing (claim-standing c))
                            c))))))
           (list unary binary)
