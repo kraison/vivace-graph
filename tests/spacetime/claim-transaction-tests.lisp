@@ -284,3 +284,25 @@ weakening into counting values instead of keys."
                                             (unknown-bound)
                                             :semantics :transaction
                                             :standing :asserted))))))
+
+;;; --- A claim predating the axis is indeterminate, not the epoch
+;;; (GH #148) ---
+
+(test a-claim-predating-the-axis-reports-indeterminate-not-the-epoch
+  "⚠ The whole migration story rests on this.  NIL must never read as the
+epoch: a fabricated audit time is worse than an admitted unknown (#148)."
+  (with-claim-graph (g)
+    (declare (ignorable g))
+    (with-transaction () (make-u :subject "s1"))
+    (let ((c (first (claims-touching g 'ct-claim :ns "s1"))))
+      (with-transaction ()
+        (let ((copy (graph-db::copy c)))
+          ;; The raw slot, which is exactly what an old on-disk node has.
+          (setf (claim-transaction-extent-sexp copy) nil)
+          (graph-db::save copy)))
+      (let ((c2 (first (claims-touching g 'ct-claim :ns "s1"))))
+        (is (null (claim-transaction-extent c2)))
+        (multiple-value-bind (ts standing) (claim-recorded-at c2)
+          (is (null ts))
+          (is (eq :indeterminate standing))
+          (is (not (eq :observed standing))))))))
