@@ -28,6 +28,11 @@ S4's unit 1 — declarative value constraints, `def-value-constraint` — landed
 #109 epic; units 2-4 (cardinality beyond `:required`, domain/range, disjointness) are
 deliberately unfiled until unit 1's shape informs theirs.
 
+S1 gained a second temporal axis — transaction time, stamped at construction,
+immutable at the accessor only — on `experiment`; see
+`docs/transaction-time-design.md`. Tracked by #148. Its ingest override
+(`:recorded-at`) is not usable for dates before 2000-03-01 until GH #153 lands.
+
 ## Why this matters to the engine
 
 The substrate (S1) is an **opt-in subsystem** beside `graph-db/geos` and
