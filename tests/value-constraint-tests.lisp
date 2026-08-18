@@ -254,3 +254,67 @@ go untested (review of #149 commit 5b9a671)."
         :one-of '("draft" "final") :name vc-status)
       (is (null (%vc-violations-for ok g)))
       (is (= 1 (length (%vc-violations-for bad g)))))))
+
+;;; --- commit-time enforcement --------------------------------------------
+
+(test an-invalid-value-is-refused-at-commit
+  (%vc-clear)
+  (with-vc-graph (g)
+    (declare (ignorable g))
+    (def-value-constraint vc-doc status :graph-db-vc-test
+      :one-of +vc-statuses+ :name vc-status)
+    (signals value-constraint-violation
+      (with-transaction ()
+        (make-vc-doc :status :nonsense)))))
+
+(test a-valid-value-commits
+  "The guard must not have been bought by refusing everything."
+  (%vc-clear)
+  (with-vc-graph (g)
+    (declare (ignorable g))
+    (def-value-constraint vc-doc status :graph-db-vc-test
+      :one-of +vc-statuses+ :name vc-status)
+    (finishes
+      (with-transaction ()
+        (make-vc-doc :status :final)))))
+
+(test an-invalid-value-is-refused-on-the-UPDATE-path
+  "⚠ THE REASON THIS UNIT EXISTS.  A construction-time check cannot see
+this: COPY + SETF + SAVE never goes through the constructor (#149)."
+  (%vc-clear)
+  (with-vc-graph (g)
+    (declare (ignorable g))
+    (def-value-constraint vc-doc status :graph-db-vc-test
+      :one-of +vc-statuses+ :name vc-status)
+    (let ((id (with-transaction ()
+                (id (make-vc-doc :status :final)))))
+      (signals value-constraint-violation
+        (with-transaction ()
+          (let ((v (copy (lookup-vertex id))))
+            (setf (vc-doc-status v) :nonsense)
+            (save v)))))))
+
+(test a-withdrawn-constraint-stops-being-enforced
+  (%vc-clear)
+  (with-vc-graph (g)
+    (declare (ignorable g))
+    (def-value-constraint vc-doc status :graph-db-vc-test
+      :one-of +vc-statuses+ :name vc-status)
+    (undef-value-constraint vc-doc :graph-db-vc-test :name vc-status)
+    (finishes
+      (with-transaction ()
+        (make-vc-doc :status :nonsense)))))
+
+(test deleting-a-node-is-not-blocked-by-its-own-violation
+  "A delete claims nothing, exactly as in VALIDATE-UNIQUE-CONSTRAINTS --
+otherwise a store holding pre-constraint damage could not be repaired."
+  (%vc-clear)
+  (with-vc-graph (g)
+    (declare (ignorable g))
+    (let ((id (with-transaction ()
+                (id (make-vc-doc :status :final)))))
+      (def-value-constraint vc-doc status :graph-db-vc-test
+        :one-of '(:nothing-matches) :name vc-status)
+      (finishes
+        (with-transaction ()
+          (mark-deleted (lookup-vertex id)))))))

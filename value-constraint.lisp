@@ -159,3 +159,24 @@ Keyword rather than positional for the same reason as UNDEF-INDEX: a graph
 name is itself a keyword."
   `(unregister-value-constraint-spec ',owner-class ',graph-name
                                      :slot ',slot :name ',name))
+
+(defun validate-value-constraints (tx graph)
+  "Signal VALUE-CONSTRAINT-VIOLATION if any write in TX violates a declared
+value constraint.  Called in %COMMIT's manager-locked region, after VALIDATE
+and before durability, so a violation aborts before anything is journaled --
+the same placement, and the same reason, as VALIDATE-UNIQUE-CONSTRAINTS.
+
+That placement is the point: it sees every write whatever accessor produced
+it, which a construction-time check cannot (GH #149)."
+  (dolist (write (writes tx))
+    (let ((node (node write)))
+      (unless (deleted-p node)      ; a delete claims nothing
+        (let ((v (first (%value-constraint-violations node graph))))
+          (when v
+            (error 'value-constraint-violation
+                   :class-name (vc-violation-class-name v)
+                   :slot-name (vc-violation-slot v)
+                   :value (vc-violation-actual v)
+                   :expected (vc-violation-expected v)
+                   :reason (vc-violation-reason v)
+                   :node-id (vc-violation-node-id v))))))))
