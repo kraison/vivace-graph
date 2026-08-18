@@ -25,8 +25,9 @@ the open items are the work.
 
 S4's unit 1 — declarative value constraints, `def-value-constraint` — landed on
 `experiment`; see `docs/value-constraint-design.md`. Tracked by #149, one unit of the
-#109 epic; units 2-4 (cardinality beyond `:required`, domain/range, disjointness) are
-deliberately unfiled until unit 1's shape informs theirs.
+#109 epic. Units 2-5 are now filed — #155 cardinality, #156 domain/range, #157
+disjointness, and #158 a write-once slot, which #148 generated rather than the
+epic's original enumeration.
 
 S1 gained a second temporal axis — transaction time, stamped at construction,
 immutable at the accessor only — on `experiment`; see
