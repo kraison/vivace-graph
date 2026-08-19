@@ -2242,6 +2242,42 @@ The add-on /upgrades/ a set of generic functions in place (no API change). When 
 
 Threading: GEOS's reentrant API forbids sharing a context between concurrent threads, and VivaceGraph runs transactions in the caller's thread. The add-on keeps a process-global **borrow/return context pool** (~with-geos-context~): each operation checks out a context for its duration, so a context is only ever used by one thread at a time, and contexts are reused across threads (bounded by peak concurrency). ~geos-shutdown~ releases the pool. This is validated under a concurrency storm and cross-checked against Python ~shapely~ in =tests/geos/=.
 
+*** Area and length: coordinate units versus metres
+
+~geometry-area~ (GEOS-backed; signals
+~geos-required-for-operation~ without the add-on) returns SQUARED
+COORDINATE UNITS — squared degrees for lon/lat, *not* m². That is only
+accidentally a usable ratio: a degree of longitude is a different
+distance at every latitude, so dividing one squared-degree area by
+another is not the same as dividing one m² area by another.
+
+Two core functions give an exact metric answer instead, and need no
+GEOS:
+
+#+BEGIN_SRC lisp
+  (geometry-geodesic-area g)     ; square metres, by spherical excess
+  (geometry-geodesic-length g)   ; metres, haversine over vertices
+#+END_SRC
+
+⚠ ~geometry-geodesic-area~ returns SQUARE METRES — do not confuse it
+with ~geometry-area~'s squared coordinate units. The math is spherical
+excess over the geometry's own coordinate pairs (outer ring minus
+holes), touching GEOS nowhere. It is zero for a ~:point~ or
+~:linestring~ — deliberately: a line's extent is its *length*, not an
+area, which is what the second function is for.
+
+~geometry-geodesic-length~ is metres, by haversine distance folded
+over consecutive vertices. It is zero for a ~:point~ and, also
+deliberately, zero for a ~:polygon~ or ~:multipolygon~ — a ring's
+*perimeter* is a different quantity from its area, and returning it
+here would let a caller divide a perimeter by an area and get a
+plausible-looking, wrong, number. Use ~geometry-geodesic-area~ for a
+polygon's extent.
+
+These are the measures ~graph-db/spacetime~'s registration divides an
+intersection by to get an overlap fraction — see "Registration:
+binding geometry to a registry" in Chapter 18.
+
 ** Chapter 14: Graph Algorithms
 
 VivaceGraph ships an optional *graph-algorithms* add-on — classic analysis algorithms (shortest paths, ranking, components, flow, random-graph generation) that run over a real, persistent graph. It is the ~graph-db/algorithms~ system, and it depends only on the embeddable core (~graph-db/core~), so it is usable from a headless deployment with no HTTP layer:
@@ -2899,9 +2935,22 @@ vocabulary), ~producer~ (which rule or operator made the claim), an optional
 ~rule-version~ kept as provenance only, ~method~, ~standing~ (S1a's
 provenance vocabulary — see above — validated by ~check-standing~ at
 construction, so an invalid one cannot be built), ~confidence~, an encoded
-temporal extent, and an optional ~geometry~. ~:extra-slots~ land on the
-shared parent, so a tenant that adds ~weight~ gets it on both arities for
-free.
+temporal extent, an optional ~geometry~, ~precision-m~ (a double-float
+metres value, or ~nil~), and ~fraction~ (a dimensionless ratio,
+defaulting to ~1.0d0~). ~:extra-slots~ land on the shared parent, so a
+tenant that adds ~weight~ gets it on both arities for free.
+
+~precision-m~ and ~fraction~ are what a registration (below) records
+about *how* a subject binds to a region: ~precision-m~ how accurately
+the subject's own position is known, and ~fraction~ how much of its
+geometry falls within the region. ~precision-m~ is not a discount
+factor, and it flows in both directions — a source can be *finer* than
+the region it joins to, not only coarser. ⚠ It is a different quantity
+from the ~:space~ facet's ~:precision~ (below): that one is a KEYWORD a
+source declares once, about its own geometry, at ~DEF-SOURCE~ time;
+~precision-m~ is a magnitude computed per claim. The ~-m~ suffix is
+what keeps the two apart in code that reads only the accessor names —
+do not "harmonise" them.
 
 *** Arity is a type, not a nullable slot
 
@@ -3258,23 +3307,140 @@ rather than the namespace's. A namespace, today, is nothing more than a
 *label grouping source classes* that may perfectly well live in different
 graphs from one another.
 
-**** Registration is stored, not yet interpreted
+**** The :REGISTRATION facet's shape
 
-~:REGISTRATION~ accepts any value, or ~:NONE~, and is passed through
-uninterpreted — there is no shape check beyond "declared, or ~:NONE~".
-Nothing reads it yet; the facet exists so a source with a real
-registration to declare is not forced to write ~:NONE~ and leave a false
-statement in the record while its meaning waits on a later unit, GH #138.
+Every key but the ~:NONE~ escape is required, same as every other
+facet:
+
+#+BEGIN_SRC lisp
+  :registration (:registry <class>          ; a DEF-SOURCE class
+                 :registry-namespace <kw>    ; where its regions live
+                 :claim-class <symbol>       ; a DEF-CLAIM-CLASSES parent
+                 :producer <string>          ; who wrote the claim
+                 :relation <string>          ; the claim's relation
+                 :method <string>            ; how the binding was made
+                 :rule-version <string>      ; bumped when the rule changes
+                 :precision-fn <fname-or-nil>
+                 :confidence-fn <fname-or-nil>)
+    | :none
+#+END_SRC
+
+~:precision-fn~ and ~:confidence-fn~ are required KEYS whose VALUE may
+be ~nil~ — a source with no measure of either says so explicitly,
+rather than by omitting the key. ~:registry-namespace~ is a KEYWORD,
+matching ~:identity~'s own ~:namespace~ and what a claim's
+~object-namespace~ slot actually holds — never a string, which would
+force interning at the boundary. ~:registry~ must name a class defined
+with ~DEF-SOURCE~, not a bare vertex: a claim's object endpoint is
+~(object-namespace object-key)~, and the key comes from the region
+class's own ~:identity :key-slot~, so a registry with no declared
+identity cannot be pointed at. ~:claim-class~ and ~:producer~ are
+needed because a claim cannot be written without them — the family
+registry ~DEF-CLAIM-CLASSES~ populates is keyed by parent class name
+alone, and ~producer~ is part of ~DEF-UNIQUE~'s binary identity tuple,
+so a wrong or missing value would silently defeat the idempotency
+registration exists to provide.
+
+~STANDING~ is not a facet field: every claim ~REGISTER-NODE~ writes
+carries ~:INFERRED~, because a registration is derived by computation.
+See "Registration: binding geometry to a registry" below for what
+reads this facet.
+
+*** Registration: binding geometry to a registry
+
+~REGISTER-GEOMETRY~ and ~REGISTER-NODE~ turn a ~:REGISTRATION~ facet
+(above) into claims, binding a subject's geometry to the regions of a
+registry:
+
+#+BEGIN_SRC lisp
+  (register-geometry geometry registry &key graph)
+    ;; => (values registrations evaluated-p)
+
+  (register-node node &key graph registry-graph)
+    ;; => (values claims-written evaluated-p)
+#+END_SRC
+
+~registry~ is a spatial SCOPE — a class name, a list of names, or
+~:all~ — exactly as ~find-nodes-intersecting~ (Chapter 13), which is
+what ~register-geometry~ queries under the hood: there is no separate
+candidates-then-verify phase, because that query already refines
+exactly through GEOS. ~registrations~ is a list of
+~(:region node :fraction double)~, deliberately UNORDERED — "most
+specific" is a tenant's notion (a place hierarchy, say), not the
+substrate's, so a tenant sorts for itself.
+
+**Registration is fractional, not boolean.** A point registers to one
+region at fraction 1.0. A polygon's fraction is an AREA ratio —
+~geometry-geodesic-area~ of the intersection over the subject's own
+area (see "Area and length", Chapter 13). A LINE's fraction is a
+LENGTH ratio instead: a line's area is zero, so an area ratio would
+give it 1.0 in every region it crosses, summing to more than 1 over
+several regions. A region the subject merely TOUCHES — GEOS
+~intersects~ is true for boundary contact alone — comes back with a
+zero fraction and is dropped rather than written; registering it would
+bind the subject to a region it does not actually overlap.
+
+~register-node~ reads ~node~'s source contract, computes the
+registrations against the facet's ~:registry~, and upserts one claim
+per region under the facet's ~:claim-class~, ~:producer~, ~:relation~
+and ~:method~. Every claim it writes carries ~STANDING :INFERRED~. It
+is idempotent on the full ~DEF-UNIQUE~ binary tuple, PRODUCER
+included: re-running it against an unchanged subject updates the same
+claim rather than duplicating it. ~:graph~ is where the subject's own
+slots are read; ~:registry-graph~ (default: the same graph) is where
+the regions live and the claims are written — a node object itself
+never crosses that boundary, only plain values do (Chapter 17,
+~cross-graph-transaction-error~). A source declaring
+~:REGISTRATION :NONE~ writes nothing but still reports an evaluated
+scan (~T~) — that is structural absence, not an unanswered question.
+
+**** EVALUATED-P: false means "could not tell"
+
+Both functions return a second value. Read ~(values nil nil)~ — or,
+from ~register-node~, ~(values 0 nil)~ — as "the scan was never
+answered," and *never* as "no regions here." An empty ~registrations~
+list with ~evaluated-p~ true IS a real "no region here" answer; a
+false ~evaluated-p~ is a refusal, not a result.
+
+~evaluated-p~ is false in exactly four cases, and none of them
+signal — ~register-geometry~ catches only ~geos-error~, deliberately
+no broader, so it cannot swallow a cross-graph node-escape error:
+
+- GEOS is not loaded and the subject's geometry is extended (a line
+  or polygon). Without GEOS the spatial index's candidates are only a
+  COARSE bounding box, which is over-inclusive, so a fraction cannot
+  be computed at all. A ~:point~ is unaffected — its candidates are
+  exact and its fraction is 1.0 by definition — so points register
+  with or without GEOS.
+- GEOS rejects the subject's geometry as topologically invalid. Which
+  polygons are invalid is host- and GEOS-version-dependent.
+- The intersection GEOS returns is a geometry kind this engine's
+  ~geometry~ type has no representation for — a MULTILINESTRING, from
+  two polygons that share only an edge, for instance.
+- The subject's geometry slot is unset, or unreadable under the
+  ambient graph binding (~register-node~ only — ~node-geometry~
+  returns ~nil~ either way). Reporting an evaluated scan there would
+  assert "this record is in no region" when the truth is "its
+  position is unknown."
+
+All four take the same exit: **registration refuses rather than
+approximates.** A bounding box is over-inclusive, so approximating
+here would silently write claims binding a record to regions it does
+not actually touch. A caller aggregating registrations across many
+subjects should carry its own partial-coverage flag rather than let a
+false ~evaluated-p~ disappear into "0 claims written."
 
 *** What is not here yet
 
-One thing marked absent from the previous unit has since landed: endpoint
-resolution needed every participating node class to declare a stable
-external key to resolve against, and the source onboarding contract above
-is that declaration. What remains absent is narrower — the ~precision~ /
-~fraction~ slots that would describe how confidently a resolved match was
-made, and any interpretation of the ~:REGISTRATION~ facet beyond storing
-it. Both wait on a later unit rather than being guessed at here.
+No spatial index covers a claim's own ~geometry~ slot: no shipped
+producer populates it, so indexing something nothing writes would be
+speculative — add it when a producer needs to ask "which registrations
+overlap this area."
+
+There is no verify phase for a backend whose spatial index only
+bounds. Without GEOS, ~register-geometry~ refuses an extended geometry
+outright (above) rather than approximating and then trying to confirm
+the approximation; build that step only if a backend ever needs it.
 
 ** API Reference
 
@@ -3458,6 +3624,9 @@ This chapter provides a categorized reference for the most important exported sy
 
 - ~make-point (lon lat)~ / ~make-linestring (coords)~ / ~make-polygon (rings)~ / ~make-multipolygon (polygons)~ ::
   Construct WGS84 ~geometry~ values ((lon lat) order). Accessors: ~geometry-kind~, ~geometry-coordinates~, ~geometry-lon~, ~geometry-lat~, ~geometry-bbox~.
+
+- ~geometry-area (g)~ ::
+  Area in SQUARED COORDINATE UNITS (squared degrees for lon/lat, not m²). Requires ~graph-db/geos~. ~geometry-geodesic-area (g)~ / ~geometry-geodesic-length (g)~ are the metric, GEOS-free alternatives — square metres and metres respectively; see "Area and length" above.
 
 - ~node-geometry (node)~ ::
   Generic function (default ~nil~) returning the geometry a node occupies /and/ the slot it came from, as ~(values geometry slot-name)~. Marking a geometry slot ~:index t~ wires its default up automatically; specialize it explicitly only for a *computed* geometry (such a method reports no slot, and its class is indexed — and scoped — under the most general class carrying the method). Geometry-bearing nodes are then maintained automatically in the spatial index.
