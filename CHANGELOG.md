@@ -13,6 +13,52 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Added
 
+- **Registration — binding a record's geometry to a registry's regions**
+  (#138). `graph-db/spacetime` gains `register-geometry` and `register-node`,
+  which turn a source's `:REGISTRATION` facet into one claim per region the
+  subject overlaps. Registration is **partial and fractional, not boolean**: a
+  point registers at fraction 1.0, a polygon at its share of each region by
+  AREA, a line at its share by LENGTH — a line's area is zero, so an area ratio
+  would give it 1.0 in every region it crossed.
+  - **`fraction` and `precision-m` join `+claim-shared-slots+`**, so every
+    claim of every tenant carries them rather than a tenant declaring them in
+    `:extra-slots`. A retrieval layer weighting expansion by overlap is
+    domain-neutral and cannot know each tenant's accessor names. `precision-m`
+    is a magnitude in METRES (or `nil`) and is **not** the `:space` facet's
+    `:precision` keyword; `fraction` is a ratio defaulting to `1.0d0`.
+  - **The `:REGISTRATION` facet carries a payload** where #132 stored an
+    opaque value nothing consulted: `:registry` (which must name a
+    `def-source` class, since a claim's object endpoint is
+    `(object-namespace object-key)`), `:registry-namespace` (a KEYWORD),
+    `:claim-class`, `:producer`, `:relation`, `:method`, `:rule-version`,
+    `:precision-fn` and `:confidence-fn`. `:none` stays fully supported.
+    `standing` is deliberately not a field: a registration is derived by
+    computation, so every claim written carries `:inferred`.
+  - **`geometry-geodesic-area`** (m², by spherical excess, holes subtracted)
+    and **`geometry-geodesic-length`** (metres, haversine folded over
+    consecutive vertices) are CORE geometry ops — neither needs
+    `graph-db/geos`. Not to be confused with `geometry-area`, which returns
+    SQUARED DEGREES and does need the add-on; a degree of longitude is a
+    different distance at every latitude, so a ratio of two such areas is only
+    accidentally right.
+  - **A refusal is a first-class result.** Both functions return `evaluated-p`
+    as a second value, and `(values nil nil)` means "the scan was never
+    answered", never "no region here". Three things refuse: no GEOS for an
+    extended geometry (the index falls back to an over-inclusive bounding box,
+    so approximating would write false positives), a geometry GEOS rejects as
+    invalid (which polygons those are is host-dependent), and an intersection
+    whose kind this engine's `geometry` type cannot represent.
+    `register-node` adds a fourth — a subject whose geometry is unset or
+    unreadable. None of them signals, and the handler catches `geos-error` and
+    nothing wider, so it cannot swallow a cross-graph node escape (#53).
+  - **`register-node` is idempotent** on the full `def-unique` binary tuple,
+    `producer` included, so a re-ingest updates its claim instead of doubling
+    it; a region the subject merely TOUCHES has a zero fraction and is dropped
+    rather than written. `:graph` is where the subject is read,
+    `:registry-graph` where the regions live and the claims are written — only
+    plain values cross between them. Manual: Chapter 18, "Registration:
+    binding geometry to a registry".
+
 - **The general ordered index is reachable from Prolog** (#102). Two *generating*
   predicates — `(find-by-slot ?node CLASS SLOT VALUE)` for equality and
   `(find-slot-range ?node CLASS SLOT START END)` for an ascending range — bind

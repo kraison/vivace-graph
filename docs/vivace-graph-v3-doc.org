@@ -2930,8 +2930,9 @@ tenants both loaded it:
 #+END_SRC
 
 Every claim, regardless of arity, carries the same core: ~subject-namespace~
-/ ~subject-key~ (the triple's subject), ~relation~ (an open keyword
-vocabulary), ~producer~ (which rule or operator made the claim), an optional
+/ ~subject-key~ (the triple's subject), ~relation~ (an open vocabulary,
+whose TYPE is not settled — see below), ~producer~ (which rule or operator
+made the claim), an optional
 ~rule-version~ kept as provenance only, ~method~, ~standing~ (S1a's
 provenance vocabulary — see above — validated by ~check-standing~ at
 construction, so an invalid one cannot be built), ~confidence~, an encoded
@@ -2939,6 +2940,16 @@ temporal extent, an optional ~geometry~, ~precision-m~ (a double-float
 metres value, or ~nil~), and ~fraction~ (a dimensionless ratio,
 defaulting to ~1.0d0~). ~:extra-slots~ land on the shared parent, so a
 tenant that adds ~weight~ gets it on both arities for free.
+
+⚠ ~relation~'s TYPE is an open question, not a free choice per call.
+This engine's own tests pass keywords (~:relation :r~), while the
+~:REGISTRATION~ facet (below) requires a STRING, following the tenant
+whose 345,939 deployed claims already use strings. The trap a reader must
+know: ~relation~ is part of ~DEF-UNIQUE~'s identity tuple, so
+~:registered-at~ and ~"registered-at"~ are DIFFERENT claims — a producer
+that changed representation would silently DOUBLE every claim it holds
+rather than updating them. Pick one per producer and do not migrate it
+casually. Tracked as vivace-graph#160.
 
 ~precision-m~ and ~fraction~ are what a registration (below) records
 about *how* a subject binds to a region: ~precision-m~ how accurately
@@ -3223,17 +3234,21 @@ rather than returning ~NIL~ — "declared nothing" and "is not a source" are
 different facts, and a caller that got ~NIL~ for both would treat an
 unconverted class as a conforming one with empty facets.
 
-**** Identity is the only facet with behaviour in this unit
+**** Only identity and registration have behaviour
 
-Of the seven, only ~:IDENTITY~ does anything inside ~graph-db~ here. It
-emits a ~DEF-INDEX~ on the key slot and registers the class under its
-namespace, and that pairing is what makes endpoint resolution (below)
-possible at all. The other six — space, time, attribution, sensitivity,
-registration, indexed-text — are declared, shape-checked at
-macroexpansion, and stored; *nothing inside ~graph-db~ consults them*. This
-is worth stating outright, because the natural assumption runs the other
-way. Acting on them belongs to layers above ~graph-db~: registration to a
-later unit, retrieval and disclosure to a tenant's own code (next).
+~:IDENTITY~ is the only facet core ~graph-db~ itself acts on. It emits a
+~DEF-INDEX~ on the key slot and registers the class under its namespace,
+and that pairing is what makes endpoint resolution (below) possible at
+all. Five of the remaining six — space, time, attribution, sensitivity,
+indexed-text — are declared, shape-checked at macroexpansion, and stored;
+*nothing consults them*. This is worth stating outright, because the
+natural assumption runs the other way. Acting on them belongs to a
+tenant's own code: retrieval and disclosure, next.
+
+~:REGISTRATION~ is the exception. ~REGISTER-NODE~ reads it and writes the
+claims it describes — in this ~graph-db/spacetime~ add-on, not in core
+~graph-db~, which still consults no facet but ~:IDENTITY~. See
+"Registration: binding geometry to a registry", below.
 
 **** Sensitivity is fail-closed, and the substrate enforces none of it
 
@@ -3353,7 +3368,7 @@ reads this facet.
 registry:
 
 #+BEGIN_SRC lisp
-  (register-geometry geometry registry &key graph)
+  (register-geometry geometry registry &key registry-graph)
     ;; => (values registrations evaluated-p)
 
   (register-node node &key graph registry-graph)
@@ -3390,7 +3405,12 @@ claim rather than duplicating it. ~:graph~ is where the subject's own
 slots are read; ~:registry-graph~ (default: the same graph) is where
 the regions live and the claims are written — a node object itself
 never crosses that boundary, only plain values do (Chapter 17,
-~cross-graph-transaction-error~). A source declaring
+~cross-graph-transaction-error~). ⚠ ~register-geometry~'s one graph
+argument is named ~:registry-graph~ for the same reason: it is the
+REGISTRY's graph, never the subject's. Passing the subject's reads every
+region under the wrong binding, which ~node-geometry~ turns into ~nil~
+through its own ~ignore-errors~ — an empty list with ~evaluated-p~ TRUE.
+A source declaring
 ~:REGISTRATION :NONE~ writes nothing but still reports an evaluated
 scan (~T~) — that is structural absence, not an unanswered question.
 
@@ -3406,8 +3426,9 @@ false ~evaluated-p~ is a refusal, not a result.
 signal — ~register-geometry~ catches only ~geos-error~, deliberately
 no broader, so it cannot swallow a cross-graph node-escape error:
 
-- GEOS is not loaded and the subject's geometry is extended (a line
-  or polygon). Without GEOS the spatial index's candidates are only a
+- GEOS is not loaded and the subject's geometry is extended (a
+  ~:linestring~, ~:polygon~ or ~:multipolygon~). Without GEOS the
+  spatial index's candidates are only a
   COARSE bounding box, which is over-inclusive, so a fraction cannot
   be computed at all. A ~:point~ is unaffected — its candidates are
   exact and its fraction is 1.0 by definition — so points register
