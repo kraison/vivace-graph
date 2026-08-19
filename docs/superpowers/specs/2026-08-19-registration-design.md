@@ -62,13 +62,15 @@ ones — says `:none`, because there was nothing to say yet. This unit
 defines what it carries:
 
 ```
-:registration (:registry <class>            ; the region class to bind to
-               :registry-namespace <string> ; where those regions live
-               :relation <string>           ; the claim's relation
-               :method <string>             ; how the binding was made
-               :rule-version <string>       ; bumped when the rule changes
-               :precision-fn <fname>        ; => metres, or nil
-               :confidence-fn <fname>)      ; => double-float, or nil
+:registration (:registry <class>             ; the region class to bind to
+               :registry-namespace <keyword> ; where those regions live
+               :claim-class <symbol>         ; the claim family to write
+               :producer <string>            ; who wrote it
+               :relation <string>            ; the claim's relation
+               :method <string>              ; how the binding was made
+               :rule-version <string>        ; bumped when the rule changes
+               :precision-fn <fname>         ; => metres, or nil
+               :confidence-fn <fname>)       ; => double-float, or nil
        | :none
 ```
 
@@ -76,6 +78,28 @@ Every field is derived from what the spine's rules already pass to
 `upsert-spine-claim`; none is invented. The geometry itself comes from the
 `:space` facet's `:geometry-slot`, and the subject namespace from
 `:identity` — registration does not restate either.
+
+**`:claim-class` and `:producer` were added after Task 5 found the facet
+could not write a claim without them.** A claim family is a tenant's
+`def-claim-classes` output and `*claim-families*` is keyed by parent name
+alone, so there is no graph-to-family lookup that is not guesswork.
+`producer` is worse than missing: it is part of `def-unique`'s binary
+identity tuple `(producer subject-namespace subject-key object-namespace
+object-key relation)`, so a derived-but-wrong value re-inserts instead of
+updating — defeating the idempotency registration exists to provide,
+across every claim a tenant has already written.
+
+**`:registry-namespace` is a KEYWORD**, matching `:identity`'s
+`:namespace` and the keywords the substrate's
+`subject-namespace`/`object-namespace` slots actually hold. An earlier
+draft said string, which would have forced interning at the boundary and
+invited a silent mismatch with deployed data.
+
+**`standing` is not a facet field.** `register-node` writes `:inferred`,
+because a registration is derived by computation — that is what the
+standing vocabulary means, and it matches what tenants already store for
+these claims. A tenant needing otherwise is a change with a reason, not a
+default to configure.
 
 `:none` must stay fully supported. The map-less tenant is what proves it.
 
