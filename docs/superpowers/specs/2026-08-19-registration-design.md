@@ -189,19 +189,25 @@ the claim write is registry-graph-local by construction.
 
 ## 8. Geodesic polygon area joins the engine
 
-A fraction is `area(intersection) / area(subject)`. `graph-db` exports
-`geometry-intersection` and `geometry-geodesic-distance` but no polygon
-area; the tenant's `geodesic-polygon-area-ha` supplies it today.
+A fraction is `area(intersection) / area(subject)`.
 
-`geometry-geodesic-area` joins the GEOS ops as a sibling of the geodesic
-distance already there: a generic whose base method signals
-`geos-required-for-operation`, and an `:around` method that computes when
-`*geos-available-p*`. That is the pattern every other op in that file
-follows, and it is what makes §6's no-GEOS refusal fall out of the existing
-machinery rather than needing a special case.
+`graph-db` has `geometry-area`, but it returns **squared coordinate units**
+(squared degrees), not m², and requires GEOS. Squared degrees are not a
+usable measure here: a degree of longitude is a different distance at every
+latitude, so a ratio of two such areas is only accidentally right.
 
-Putting it in the substrate is what makes `fraction` mean the same thing
-for every tenant, which is the whole point of §2's promotion — a
+`geometry-geodesic-area` is therefore a **core** op in `geometry-ops.lisp`,
+not a GEOS one. The tenant's `geodesic-polygon-area-ha` shows why: it is
+spherical-excess math over coordinate pairs — outer ring minus holes, zero
+for points and lines — and touches GEOS nowhere. Porting it needs no
+add-on and no `geos-required-for-operation` method.
+
+GEOS is still required for the *intersection*, which is what §6's refusal
+is about. Area and intersection are separate dependencies and the spec
+should not conflate them.
+
+Putting the measure in the substrate is what makes `fraction` mean the same
+thing for every tenant, which is the whole point of §2's promotion — a
 tenant-supplied measure would make a shared slot carry a per-tenant
 meaning.
 
