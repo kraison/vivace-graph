@@ -150,8 +150,20 @@ not the keyword ~S" key v)))
          (req-string :citation))
         (:sensitivity
          (req-keyword :class))
-        ;; Uninterpreted here; #138 defines its shape (design §3.3).
-        (:registration value)
+        ;; #138 defines the shape #132 deliberately left opaque.
+        ;; :PRECISION-FN and :CONFIDENCE-FN are required KEYS but may be
+        ;; NIL -- a source with no measure of either says so explicitly
+        ;; rather than by omission.  REQ (not REQ-SYMBOL) is used for
+        ;; both: REQ only checks presence via +FACET-ABSENT+, so a
+        ;; present NIL passes, unlike REQ-SYMBOL which would reject it.
+        (:registration
+         (req-symbol :registry)
+         (req-string :registry-namespace)
+         (req-string :relation)
+         (req-string :method)
+         (req-string :rule-version)
+         (req :precision-fn)
+         (req :confidence-fn))
         (:indexed-text
          (req-symbol :text-fn))))
     value))

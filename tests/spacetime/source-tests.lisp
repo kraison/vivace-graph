@@ -423,3 +423,24 @@ signals INVALID-SOURCE-FACET; this one must too."
         :identity (:namespace :st-baddrop-ns :key-slot) ; dropped value
         :space :none :time :none :attribution :none
         :sensitivity :none :registration :none :indexed-text :none))))
+
+(test a-registration-facet-declares-what-it-binds-to
+  (finishes
+    (graph-db.spacetime::%check-facet
+     :registration
+     '(:registry ct-region :registry-namespace "reg"
+       :relation "registered-at" :method "centroid-within"
+       :rule-version "r/1" :precision-fn nil
+       :confidence-fn nil))))
+
+(test registration-none-stays-supported
+  "The map-less tenant declares :NONE and is what proves the spatial
+facets are optional rather than merely defaulted (design §3)."
+  (finishes (graph-db.spacetime::%check-facet :registration :none)))
+
+(test a-registration-facet-missing-its-registry-is-refused
+  (signals invalid-source-facet
+    (graph-db.spacetime::%check-facet
+     :registration
+     '(:relation "registered-at" :method "centroid-within"
+       :rule-version "r/1"))))
