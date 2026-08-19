@@ -65,7 +65,44 @@ Settled with Kevin before planning:
 
 ---
 
-### Task 1: `:method-fn` in the facet, and `register-node` using it
+### Task 1: the tenant declares `:method-fn nil` — FIRST, and alone
+
+**Why this task exists and why it is first.** Task 2 makes `:method-fn` a
+required facet key. The tenant's three declared facets do not have it, and
+a required key they lack makes them invalid **at macroexpansion** — so the
+moment Task 2 lands, mine-action stops building. That is not hypothetical:
+`~/quicklisp/local-projects/graph-db.asd` is a symlink into this engine
+checkout, so engine work is live for anything that builds on this host,
+and a previous unit broke a production repair exactly this way.
+
+`%check-facet` validates only the keys it names; it does not reject
+unknown ones. So declaring `:method-fn nil` **before** the engine requires
+it is accepted today, ignored today, and leaves no window in which the
+tenant cannot build.
+
+**Files (tenant):** `src/schema.lisp`, `src/forensics-schema.lisp`,
+`src/imsma-schema.lisp` — the three `:registration` facets.
+
+**Interfaces:**
+- Produces, relied on by Task 2: all three facets carry `:method-fn nil`.
+
+- [ ] **Step 1: Confirm the premise before relying on it.** Read
+      `%check-facet` in the engine's `spacetime/source.lisp` and confirm
+      it neither enumerates permitted keys nor signals on an unknown one.
+      **If it does reject unknown keys, STOP and report** — this task's
+      whole basis is gone and the ordering must change.
+
+- [ ] **Step 2: Add `:method-fn nil`** to each of the three facets.
+
+- [ ] **Step 3: Run the full tenant suite.** It must be unchanged at
+      5621 — nothing reads the key yet, in either repo.
+
+- [ ] **Step 4: Commit** (tenant), noting that the key is inert until the
+      engine requires it.
+
+---
+
+### Task 2: `:method-fn` in the facet, and `register-node` using it
 
 **Files (engine):**
 - Modify: `spacetime/source.lisp` (`%check-facet`'s `:registration` clause)
@@ -76,7 +113,7 @@ Settled with Kevin before planning:
 - Modify: `docs/vivace-graph-v3-doc.org` (the facet's shape)
 
 **Interfaces:**
-- Produces, relied on by Task 4: the facet accepts `:method-fn <fname>`,
+- Produces, relied on by Task 5: the facet accepts `:method-fn <fname>`,
   required key, `nil` permitted. When non-nil, `register-node` calls it
   with the subject node and writes the result as the claim's `method`;
   when `nil`, `:method`'s string is written as today.
@@ -92,7 +129,7 @@ fixture: give the test source a `:method-fn` reading a special, register,
 and assert the stored `claim-method` is what the function returned, not
 the facet's `:method` string. Then set the special to a different value,
 re-register, and assert the stored method **changed** — the update branch
-is what Task 4's `site` will exercise on every re-ingest.
+is what Task 5's `site` will exercise on every re-ingest.
 
 - [ ] **Step 2: Run and confirm RED.** Expect the facet test to fail
       because the current clause accepts a facet with no `:method-fn`, and
@@ -121,7 +158,7 @@ is what Task 4's `site` will exercise on every re-ingest.
 
 ---
 
-### Task 2: `node-geometry` on `site`
+### Task 3: `node-geometry` on `site`
 
 Without this the cutover silently registers by whichever indexed geometry
 slot the default method reaches first. `site` declares both `centroid` and
@@ -132,7 +169,7 @@ slot the default method reaches first. `site` declares both `centroid` and
 - Modify: `tests/spine-tests.lisp`
 
 **Interfaces:**
-- Produces, relied on by Task 4: `(graph-db:node-geometry <site>)` returns
+- Produces, relied on by Task 5: `(graph-db:node-geometry <site>)` returns
   the site's `extent` when it has one, else its `centroid`.
 
 - [ ] **Step 1: Write the failing test.** A site with both slots returns
@@ -157,7 +194,7 @@ slot the default method reaches first. `site` declares both `centroid` and
 
 ---
 
-### Task 3: normalise IMSMA ids at ingest
+### Task 4: normalise IMSMA ids at ingest
 
 **Files (tenant):** the IMSMA ingest path — find it with
 `git grep -n 'imsma-id' src/ | head`, and read `%imsma-area-facts`'s
@@ -186,7 +223,7 @@ slot the default method reaches first. `site` declares both `centroid` and
 
 ---
 
-### Task 4: cut the three rules over to `register-node`
+### Task 5: cut the three rules over to `register-node`
 
 The dangerous task. Read §9 twice before starting.
 
@@ -233,7 +270,7 @@ and whatever else calls the three rules — find every caller first.
 
 ---
 
-### Task 5: delete what the tenant no longer does
+### Task 6: delete what the tenant no longer does
 
 - [ ] **Step 1:** Delete the now-dead candidate query, fraction math and
       upsert from `src/spine-register.lisp`, and any helper left with no
@@ -256,7 +293,7 @@ and whatever else calls the three rules — find every caller first.
 
 ---
 
-### Task 6: prove it against deployed data, and close the parked minor
+### Task 7: prove it against deployed data, and close the parked minor
 
 The acceptance test for the whole cutover.
 
@@ -288,14 +325,15 @@ The acceptance test for the whole cutover.
 
 ## Self-Review
 
-**Decision coverage.** `:method-fn` → Task 1. `geoconfirmed` stays →
-Task 5 Step 1's explicit keep. IMSMA ids at ingest → Task 3.
+**Decision coverage.** `:method-fn` → Tasks 1 and 2, in that order
+and for the reason Task 1 states. `geoconfirmed` stays →
+Task 6 Step 1's explicit keep. IMSMA ids at ingest → Task 4.
 
-**Hazard coverage against §9.** The relabelling risk → Tasks 1 and 4
-Step 1's centroid-only case, and Task 6 Step 2's equivalence check. The
-`node-geometry` prerequisite → Task 2. The inverted flag and its three
-positions → Task 4 Steps 4-5. The `nonblank` key divergence → Task 3. The
-duplicated literals → Task 5 Step 2. The one 0.0-fraction claim → left
+**Hazard coverage against §9.** The relabelling risk → Tasks 2 and 5
+Step 1's centroid-only case, and Task 7 Step 2's equivalence check. The
+`node-geometry` prerequisite → Task 3. The inverted flag and its three
+positions → Task 5 Steps 4-5. The `nonblank` key divergence → Task 4. The
+duplicated literals → Task 6 Step 2. The one 0.0-fraction claim → left
 alone deliberately; the substrate drops zero-fraction touches and the
 retraction pass clears it, which §9 already records.
 
@@ -303,5 +341,5 @@ retraction pass clears it, which §9 already records.
 the site definition's file, the ingest path, the callers of each rule —
 the step says to find it and report what was found.
 
-**The riskiest step** is Task 4 Step 3, and it is deliberately "one at a
+**The riskiest step** is Task 5 Step 3, and it is deliberately "one at a
 time, running the suite between them" rather than a single sweep.
