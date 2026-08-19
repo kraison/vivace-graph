@@ -49,6 +49,7 @@
    #:claim-relation #:claim-producer #:claim-rule-version
    #:claim-method #:claim-standing #:claim-confidence
    #:claim-extent-sexp #:claim-geometry
+   #:claim-precision-m #:claim-fraction                 ; GH #138
    #:claim-extent #:claims-touching
    #:claim-transaction-extent-sexp                     ; GH #148
    #:claim-transaction-extent #:claim-recorded-at

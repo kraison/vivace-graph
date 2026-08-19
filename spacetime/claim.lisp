@@ -48,7 +48,14 @@ from the parent name alone."
     (transaction-extent-sexp :initarg :transaction-extent-sexp
                              :accessor claim-transaction-extent-sexp
                              :initform nil)
-    (geometry :initarg :geometry :accessor claim-geometry :initform nil))
+    (geometry :initarg :geometry :accessor claim-geometry :initform nil)
+    ;; Registration outputs (#138).  PRECISION-M is metres, a real
+    ;; quantity that flows in both directions -- a source can be finer
+    ;; than the region it joins to -- never a discount factor.
+    (precision-m :initarg :precision-m :accessor claim-precision-m
+                 :initform nil)
+    (fraction :initarg :fraction :accessor claim-fraction
+              :initform 1.0d0))
   "Slots every claim carries, on the PARENT class.  Symbols live in this
 package so two claim families share one set of accessors (design §5).")
 
