@@ -62,7 +62,7 @@ ones — says `:none`, because there was nothing to say yet. This unit
 defines what it carries:
 
 ```
-:registration (:registry <class>             ; the region class to bind to
+:registration (:registry <class>             ; region class, a DEF-SOURCE
                :registry-namespace <keyword> ; where those regions live
                :claim-class <symbol>         ; the claim family to write
                :producer <string>            ; who wrote it
@@ -100,6 +100,12 @@ because a registration is derived by computation — that is what the
 standing vocabulary means, and it matches what tenants already store for
 these claims. A tenant needing otherwise is a change with a reason, not a
 default to configure.
+
+**`:registry` must name a `DEF-SOURCE` class, not a bare vertex.** A
+claim's object endpoint is `(object-namespace object-key)`, and the key
+comes from the region class's own `:identity :key-slot` — so a registry
+without an identity facet cannot be pointed at. `register-node` signals
+rather than writing a claim whose endpoint nothing could resolve.
 
 `:none` must stay fully supported. The map-less tenant is what proves it.
 
@@ -168,12 +174,20 @@ hit itself.
 
 ## 6. Partial coverage is a first-class result
 
-Two different things make a scan unanswerable, and both take the same exit.
+Three different things make a scan unanswerable, and all take the same
+exit.
 
 **An invalid polygon.** GEOS raises `TopologyException`, and **which
 polygons are invalid depends on the host's GEOS version** — four sites
 killed an entire backfill on GEOS 3.10.2 while the same run succeeded on
 3.14.1.
+
+**A subject with no geometry.** Its geometry slot is unset, or was read
+under the wrong ambient graph — `node-geometry`'s default wraps the read in
+`ignore-errors`, so both look identical and both yield `NIL`. Reporting an
+evaluated scan there would assert "this record is in no region" when the
+truth is "its position is unknown". Found by Task 5, which is the path a
+caller is most likely to hit.
 
 **No GEOS at all.** Without the add-on, an extended geometry's candidates
 are bounding-box approximate and its fraction cannot be computed. A
