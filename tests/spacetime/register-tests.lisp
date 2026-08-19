@@ -284,6 +284,12 @@ tells the upsert's update branch apart from its insert branch.")
 (defparameter *ctr-confidence* 0.75d0
   "What CTR-CONFIDENCE reports; see *CTR-PRECISION-M*.")
 
+(defparameter *ctr-method* "geometry-overlap"
+  "What CTR-METHOD reports.  Defaults to CTR-RECORD's own static :METHOD
+string, so tests that never bind this special see the same value either
+way; a test that binds it to something else is the only kind that can
+tell the :METHOD-FN path apart from the facet's static string.")
+
 (defun ctr-precision (node)
   "The same value for every record, so a test can assert the facet's
 :PRECISION-FN was consulted at all."
@@ -293,6 +299,10 @@ tells the upsert's update branch apart from its insert branch.")
 (defun ctr-confidence (node)
   (declare (ignore node))
   *ctr-confidence*)
+
+(defun ctr-method (node)
+  (declare (ignore node))
+  *ctr-method*)
 
 (def-source ctr-record :graph-db-register-test
     ((record-key :type string)
@@ -308,7 +318,8 @@ tells the upsert's update branch apart from its insert branch.")
                  :relation "registered-at" :method "geometry-overlap"
                  :rule-version "r/1"
                  :precision-fn ctr-precision
-                 :confidence-fn ctr-confidence)
+                 :confidence-fn ctr-confidence
+                 :method-fn ctr-method)
   :indexed-text :none)
 
 ;; An extended subject, for the refusal test: a polygon's overlap needs
@@ -326,7 +337,8 @@ tells the upsert's update branch apart from its insert branch.")
                  :producer "graph-db/spacetime-test/register"
                  :relation "registered-at" :method "geometry-overlap"
                  :rule-version "r/1"
-                 :precision-fn nil :confidence-fn nil)
+                 :precision-fn nil :confidence-fn nil
+                 :method-fn nil)
   :indexed-text :none)
 
 ;; The map-less tenant's shape: everything else declared, registration not.
@@ -355,7 +367,8 @@ tells the upsert's update branch apart from its insert branch.")
                  :producer "graph-db/spacetime-test/register"
                  :relation "registered-at" :method "geometry-overlap"
                  :rule-version "r/1"
-                 :precision-fn nil :confidence-fn nil)
+                 :precision-fn nil :confidence-fn nil
+                 :method-fn nil)
   :indexed-text :none)
 
 (defmacro with-two-graphs ((subject registry) &body body)
@@ -446,7 +459,46 @@ invokes the macro, so a bare SUBJECT-KEY here would name another symbol."
           "a registration is derived by computation (design §3)")
       (is (= 25.0d0 (claim-precision-m c))
           "the facet's :PRECISION-FN was consulted")
-      (is (= 0.75d0 (claim-confidence c))))))
+      (is (= 0.75d0 (claim-confidence c)))
+      (is (string= "geometry-overlap" (claim-method c))
+          "*CTR-METHOD* defaults to the facet's own :METHOD string, so ~
+this holds whether :METHOD-FN is consulted or the facet's static ~
+:METHOD is written -- the control for the Task 2 ablation."))))
+
+(test registering-a-node-writes-the-method-fns-result-not-the-static-string
+  "⚠ CTR-RECORD's facet carries both a static :METHOD, \"geometry-overlap\",
+and a :METHOD-FN.  Binding *CTR-METHOD* away from that string is the only
+way to tell which one was written (design §3, plan Task 2)."
+  (with-region-graph (g)
+    (%make-place g "p-a" +ctr-square+)
+    (let ((n (%make-record g "s-1b" (make-point 1d0 1d0)))
+          (*ctr-method* "special-method-1"))
+      (register-node n :graph g))
+    (let ((c (first (%subject-claims g :ctr-records "s-1b"))))
+      (is (string= "special-method-1" (claim-method c))
+          "the :METHOD-FN's result was written, not the facet's static ~
+:METHOD string"))))
+
+(test re-registering-a-node-writes-the-new-method-not-the-old-one
+  "⚠ The important case: SITE's re-ingest hits exactly this branch on
+every pass, and the facet's :METHOD does not vary but *CTR-METHOD* does
+-- so a re-registration must overwrite the STORED method, not just count
+a claim (plan Task 2, brief Step 1)."
+  (with-region-graph (g)
+    (%make-place g "p-a" +ctr-square+)
+    (let ((n (%make-record g "s-1c" (make-point 1d0 1d0))))
+      (let ((*ctr-method* "special-method-a"))
+        (register-node n :graph g))
+      (let ((c (first (%subject-claims g :ctr-records "s-1c"))))
+        (is (string= "special-method-a" (claim-method c))
+            "the first pass's method"))
+      (let ((*ctr-method* "special-method-b"))
+        (register-node n :graph g)))
+    (is (= 1 (length (%subject-claims g :ctr-records "s-1c")))
+        "still ONE claim -- the UPDATE branch, not a second insert")
+    (let ((c (first (%subject-claims g :ctr-records "s-1c"))))
+      (is (string= "special-method-b" (claim-method c))
+          "the second pass's method was written over the first's"))))
 
 (test registering-the-same-node-twice-writes-one-claim
   "⚠ Idempotent on DEF-UNIQUE's binary tuple -- PRODUCER, the subject

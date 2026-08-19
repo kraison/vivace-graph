@@ -86,8 +86,9 @@ represent -- a MULTILINESTRING, from two polygons sharing only an edge
 
 (defun %call-or-nil (fname node)
   "(FUNCALL FNAME NODE) when FNAME is non-NIL, else NIL.  The facet's
-:PRECISION-FN and :CONFIDENCE-FN are required KEYS whose value may be NIL
--- a source with no measure of either says so explicitly (design §3)."
+:PRECISION-FN, :CONFIDENCE-FN and :METHOD-FN are required KEYS whose
+value may be NIL -- a source with no per-record measure of any of the
+three says so explicitly (design §3)."
   (when fname (funcall fname node)))
 
 (defun %source-endpoint (node graph)
@@ -127,11 +128,17 @@ accessors, which only BINARY has."
        (equal object-key (claim-object-key c))))
 
 (defun %upsert-registration-claim (registration facet subject-ns
-                                   subject-key precision confidence
+                                   subject-key precision confidence method
                                    registry-graph)
   "Create or update the one claim binding (SUBJECT-NS . SUBJECT-KEY) to
 REGISTRATION's region under FACET's contract.  Returns T; REGISTER-NODE
 counts created and updated claims alike.
+
+METHOD is already resolved by the caller -- FACET's :METHOD-FN result
+when non-NIL, else its static :METHOD string (design §3) -- so both the
+insert and update branches write the same value a re-registration would
+also produce, which is what makes the UPDATE branch overwrite a stale
+method rather than leaving it (plan Task 2).
 
 Idempotent on DEF-UNIQUE's binary tuple -- PRODUCER, the subject pair, the
 object pair and RELATION.  Looked up through the declared subject index
@@ -164,7 +171,7 @@ transaction or SAVE signals MODIFYING-NON-COPY."
     (graph-db:with-transaction ()
       (if existing
           (let ((c (graph-db:copy existing)))
-            (setf (claim-method c) (getf facet :method)
+            (setf (claim-method c) method
                   (claim-rule-version c) (getf facet :rule-version)
                   (claim-confidence c) confidence
                   (claim-precision-m c) precision
@@ -175,7 +182,7 @@ transaction or SAVE signals MODIFYING-NON-COPY."
                    :subject-namespace subject-ns :subject-key subject-key
                    :object-namespace object-ns :object-key object-key
                    :relation relation :producer producer
-                   :method (getf facet :method)
+                   :method method
                    :rule-version (getf facet :rule-version)
                    :confidence confidence :precision-m precision
                    :fraction (getf registration :fraction)
@@ -206,12 +213,18 @@ anyway."
                 (source-contract (type-of node)))))
     (if (eq facet :none)
         (values 0 t)
-        (let (geometry subject-ns subject-key precision confidence)
+        (let (geometry subject-ns subject-key precision confidence method)
           (let ((graph-db:*graph* graph))
             (setf geometry (graph-db:node-geometry node)
                   precision (%call-or-nil (getf facet :precision-fn) node)
                   confidence (%call-or-nil (getf facet :confidence-fn)
-                                           node))
+                                           node)
+                  ;; Non-NIL :METHOD-FN wins; NIL means "no per-record
+                  ;; measure", so the facet's own static :METHOD string is
+                  ;; written, exactly as before :METHOD-FN existed
+                  ;; (design §3, plan Task 2).
+                  method (or (%call-or-nil (getf facet :method-fn) node)
+                             (getf facet :method)))
             (multiple-value-setq (subject-ns subject-key)
               (%source-endpoint node graph)))
           (if (null geometry)
@@ -225,6 +238,6 @@ anyway."
                       (values (loop for r in regs
                                     count (%upsert-registration-claim
                                            r facet subject-ns subject-key
-                                           precision confidence
+                                           precision confidence method
                                            registry-graph))
                               t)))))))))

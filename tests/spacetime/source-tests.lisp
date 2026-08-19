@@ -428,9 +428,10 @@ signals INVALID-SOURCE-FACET; this one must too."
   '(:registry ct-region :registry-namespace :reg
     :claim-class ct-claim :producer "graph-db/spacetime-test"
     :relation "registered-at" :method "centroid-within"
-    :rule-version "r/1" :precision-fn nil :confidence-fn nil)
+    :rule-version "r/1" :precision-fn nil :confidence-fn nil
+    :method-fn nil)
   "One well-formed :REGISTRATION facet, so the refusal tests below can each
-drop exactly one key from it rather than restate eight (design §3).")
+drop exactly one key from it rather than restate nine (design §3).")
 
 (defun %facet-without (key)
   "+A-REGISTRATION-FACET+ with KEY and its value removed."
@@ -456,6 +457,15 @@ tenant already has (design §3)."
   (signals invalid-source-facet
     (graph-db.spacetime::%check-facet :registration
                                       (%facet-without :producer))))
+
+(test a-registration-facet-missing-its-method-fn-is-refused
+  "⚠ :METHOD-FN is a required KEY whose VALUE may be NIL -- like
+:PRECISION-FN and :CONFIDENCE-FN, omitting the key entirely (not merely
+binding it to NIL) is refused, so a source cannot silently skip declaring
+whether its method is a per-record fact (design §3)."
+  (signals invalid-source-facet
+    (graph-db.spacetime::%check-facet :registration
+                                      (%facet-without :method-fn))))
 
 (test a-registry-namespace-must-be-a-keyword
   "It names the same kind of thing :IDENTITY's :NAMESPACE does, and the

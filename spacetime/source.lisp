@@ -151,14 +151,19 @@ not the keyword ~S" key v)))
         (:sensitivity
          (req-keyword :class))
         ;; #138 defines the shape #132 deliberately left opaque.
-        ;; :PRECISION-FN and :CONFIDENCE-FN are required KEYS but may be
-        ;; NIL -- a source with no measure of either says so explicitly
-        ;; rather than by omission.  REQ (not REQ-SYMBOL) is used for
-        ;; both: REQ only checks presence via +FACET-ABSENT+, so a
-        ;; present NIL passes, unlike REQ-SYMBOL which would reject it.
+        ;; :PRECISION-FN, :CONFIDENCE-FN and :METHOD-FN are required KEYS
+        ;; but may be NIL -- a source with no per-record measure of any of
+        ;; the three says so explicitly rather than by omission.  REQ (not
+        ;; REQ-SYMBOL) is used for all three: REQ only checks presence via
+        ;; +FACET-ABSENT+, so a present NIL passes, unlike REQ-SYMBOL which
+        ;; would reject it.
         ;; :CLAIM-CLASS and :PRODUCER were added once REGISTER-NODE found a
         ;; claim cannot be written without them, PRODUCER being part of
         ;; DEF-UNIQUE's binary identity tuple (spec 3c9a0b2, design §3).
+        ;; :METHOD-FN joined once a source with a per-record method (e.g.
+        ;; the place spine's SITE) needed to avoid writing one static
+        ;; :METHOD for every record (cl-llm#13 unit 2, vivace-graph#138
+        ;; task 6b).
         (:registration
          (req-symbol :registry)
          (req-keyword :registry-namespace)
@@ -168,7 +173,8 @@ not the keyword ~S" key v)))
          (req-string :method)
          (req-string :rule-version)
          (req :precision-fn)
-         (req :confidence-fn))
+         (req :confidence-fn)
+         (req :method-fn))
         (:indexed-text
          (req-symbol :text-fn))))
     value))

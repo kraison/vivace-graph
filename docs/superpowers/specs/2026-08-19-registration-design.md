@@ -70,7 +70,8 @@ defines what it carries:
                :method <string>              ; how the binding was made
                :rule-version <string>        ; bumped when the rule changes
                :precision-fn <fname>         ; => metres, or nil
-               :confidence-fn <fname>)       ; => double-float, or nil
+               :confidence-fn <fname>        ; => double-float, or nil
+               :method-fn <fname>)           ; => string, or nil
        | :none
 ```
 
@@ -78,6 +79,20 @@ Every field is derived from what the spine's rules already pass to
 `upsert-spine-claim`; none is invented. The geometry itself comes from the
 `:space` facet's `:geometry-slot`, and the subject namespace from
 `:identity` — registration does not restate either.
+
+**`:method-fn` joined once a source's method turned out to be a
+per-record fact, not a source-wide constant** (cl-llm#13 unit 2, task 6b).
+The place spine's `register-site` writes `"geometry-overlap"` for a site
+with an extent and `"centroid-within"` for one with only a centroid — one
+`:method` string cannot say both, and `method` is not part of
+`def-unique`'s identity tuple, so writing the wrong one would silently
+*update* a deployed claim's method rather than leaving it. `:method`
+**stays** and remains required; `:method-fn` is a required key whose
+value may be `nil`, exactly like `:precision-fn` and `:confidence-fn`.
+`register-node` calls it when non-nil and writes the result as the
+claim's method; when nil, `:method`'s string is written, unchanged from
+before this key existed. This keeps a source with a genuinely constant
+method from having to write a one-line function that returns a literal.
 
 **`:claim-class` and `:producer` were added after Task 5 found the facet
 could not write a claim without them.** A claim family is a tenant's

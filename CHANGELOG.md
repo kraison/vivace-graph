@@ -31,7 +31,8 @@ between releases; cutting a release renames it to the new version and dates it.
     `def-source` class, since a claim's object endpoint is
     `(object-namespace object-key)`), `:registry-namespace` (a KEYWORD),
     `:claim-class`, `:producer`, `:relation`, `:method`, `:rule-version`,
-    `:precision-fn` and `:confidence-fn`. `:none` stays fully supported.
+    `:precision-fn`, `:confidence-fn` and `:method-fn`. `:none` stays fully
+    supported.
     `standing` is deliberately not a field: a registration is derived by
     computation, so every claim written carries `:inferred`.
   - **`geometry-geodesic-area`** (m², by spherical excess, holes subtracted)

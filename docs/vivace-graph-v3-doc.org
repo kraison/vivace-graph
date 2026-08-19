@@ -3336,13 +3336,23 @@ facet:
                  :method <string>            ; how the binding was made
                  :rule-version <string>      ; bumped when the rule changes
                  :precision-fn <fname-or-nil>
-                 :confidence-fn <fname-or-nil>)
+                 :confidence-fn <fname-or-nil>
+                 :method-fn <fname-or-nil>)
     | :none
 #+END_SRC
 
-~:precision-fn~ and ~:confidence-fn~ are required KEYS whose VALUE may
-be ~nil~ — a source with no measure of either says so explicitly,
-rather than by omitting the key. ~:registry-namespace~ is a KEYWORD,
+~:precision-fn~, ~:confidence-fn~ and ~:method-fn~ are required KEYS
+whose VALUE may be ~nil~ — a source with no per-record measure of any
+of the three says so explicitly, rather than by omitting the key.  When
+~:method-fn~ is non-~nil~, ~REGISTER-NODE~ calls it with the subject
+node and writes the result as the claim's method; when ~nil~, ~:method~'s
+own string is written, exactly as when ~:method-fn~ did not exist.
+~:method~ stays required either way: ~method~ is not part of
+~DEF-UNIQUE~'s identity tuple, so a source whose method varies per
+record — the place spine's ~site~, writing ~"geometry-overlap"~ for an
+extent and ~"centroid-within"~ for a bare centroid — cannot say so with
+one static string without silently relabelling deployed claims on
+re-registration. ~:registry-namespace~ is a KEYWORD,
 matching ~:identity~'s own ~:namespace~ and what a claim's
 ~object-namespace~ slot actually holds — never a string, which would
 force interning at the boundary. ~:registry~ must name a class defined
