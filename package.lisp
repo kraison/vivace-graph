@@ -321,6 +321,7 @@
            #:geometry-buffer
            #:geometry-area
            #:geometry-geodesic-area
+           #:geometry-geodesic-length
            #:geos-available-p
            #:geos-shutdown
            #:*geos-available-p*

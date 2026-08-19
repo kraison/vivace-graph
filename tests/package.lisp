@@ -50,6 +50,7 @@
                 #:bbox-overlap-p
                 #:geometry-distance
                 #:geometry-geodesic-area
+                #:geometry-geodesic-length
                 ;; geohash (spatial extension)
                 #:geohash-encode
                 #:geohash-decode

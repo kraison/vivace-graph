@@ -110,3 +110,57 @@ it this cannot tell 'refused correctly' from 'broken everywhere'
         (is-true evaluated
                  "a point's candidates are exact with or without GEOS")
         (is (= 1 (length regs)))))))
+
+(test a-line-registers-by-length-not-by-area
+  "⚠ A line's AREA is zero, so an area ratio gives it 1.0 in EVERY
+region it crosses -- three regions summing to 3.0.  Its fraction is a
+LENGTH ratio (design §13).  The regions are stacked north/south and the
+line runs along a meridian, where great-circle segments are exactly
+additive, so the halves really do sum to the whole."
+  (if (not graph-db::*geos-available-p*)
+      (skip "GEOS not available")
+      (with-region-graph (g)
+        (%make-region g "south" '((0d0 0d0) (2d0 0d0) (2d0 1d0) (0d0 1d0)
+                                  (0d0 0d0)))
+        (%make-region g "north" '((0d0 1d0) (2d0 1d0) (2d0 2d0) (0d0 2d0)
+                                  (0d0 1d0)))
+        (multiple-value-bind (regs evaluated)
+            (register-geometry
+             (make-linestring '((1d0 0.5d0) (1d0 1.5d0)))
+             'ct-region :graph g)
+          (is-true evaluated)
+          (is (= 2 (length regs)))
+          (let ((fs (mapcar #'%fraction-of regs)))
+            (is (%near 1d0 (reduce #'+ fs :initial-value 0d0))
+                "the halves partition the line, so the fractions sum to ~
+1, but they are ~S" fs)
+            (dolist (f fs)
+              (is (< 0.4d0 f 0.6d0)
+                  "each half is about half the line, not ~A" f)))))))
+
+(test a-region-the-subject-only-touches-is-not-registered
+  "GEOS `intersects' is true for boundary contact, so an abutting region
+comes back as a candidate with a zero-measure intersection.  Registering
+it would bind a record to a region it does not overlap -- the mild form
+of the false positive design §6 exists to prevent (design §13).  The
+second assertion is the control: without it this passes when
+registration is broken entirely."
+  (if (not graph-db::*geos-available-p*)
+      (skip "GEOS not available")
+      (with-region-graph (g)
+        (%make-region g "overlapped" '((0d0 0d0) (1d0 0d0) (1d0 2d0)
+                                       (0d0 2d0) (0d0 0d0)))
+        (%make-region g "touched" '((1d0 0d0) (2d0 0d0) (2d0 2d0)
+                                    (1d0 2d0) (1d0 0d0)))
+        (multiple-value-bind (regs evaluated)
+            (register-geometry
+             (make-polygon '(((0.25d0 0.5d0) (1d0 0.5d0) (1d0 1.5d0)
+                              (0.25d0 1.5d0) (0.25d0 0.5d0))))
+             'ct-region :graph g)
+          (is-true evaluated)
+          (is (= 1 (length regs))
+              "only the overlapped region registers, not ~S"
+              (mapcar (lambda (r) (name (getf r :region))) regs))
+          (is (string= "overlapped" (name (getf (first regs) :region)))
+              "it still registers to the region it genuinely overlaps")
+          (is (%near 1d0 (%fraction-of (first regs))))))))

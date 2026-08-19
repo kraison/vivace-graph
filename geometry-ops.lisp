@@ -259,3 +259,27 @@ squared coordinate units and needs GEOS; this needs neither (design §8)."
       (:multipolygon (reduce #'+ (geometry-coordinate-pairs g)
                              :key #'poly :initial-value 0d0))
       ((:point :linestring) 0d0))))
+
+(defun %pairs-geodesic-length-m (pairs)
+  "Length in metres of the polyline PAIRS, a list of (lon lat) degree
+pairs.  Fewer than two vertices is zero, not an error."
+  (let ((total 0d0))
+    (loop for (p1 p2) on pairs
+          while p2
+          do (incf total (geodesic-distance (second p1) (first p1)
+                                            (second p2) (first p2))))
+    total))
+
+(defun geometry-geodesic-length (g)
+  "Length of G in METRES, by haversine over consecutive vertices.
+Zero for a :POINT, and zero for a :POLYGON or :MULTIPOLYGON, whose
+extent is GEOMETRY-GEODESIC-AREA -- a ring's perimeter is a different
+quantity, and returning it here would let a caller divide a perimeter by
+an area and get a plausible-looking number (design §13).
+
+⚠ This is the measure a LINE's overlap fraction is taken against: its
+area is zero, so an area ratio would give a line 1.0 in every region it
+crosses."
+  (ecase (geometry-kind g)
+    (:linestring (%pairs-geodesic-length-m (geometry-coordinate-pairs g)))
+    ((:point :polygon :multipolygon) 0d0)))

@@ -457,3 +457,24 @@ ratio of two such areas is only accidentally right (design §8)."
   (is (= 0d0 (geometry-geodesic-area (make-point 1d0 1d0))))
   (is (= 0d0 (geometry-geodesic-area
               (make-linestring '((0d0 0d0) (1d0 1d0)))))))
+
+;;; ---- geodesic length (m) ------------------------------------------------
+
+(test geodesic-length-sums-the-segments
+  "A line's fraction of a region is a LENGTH ratio, since its area is
+zero (design §13).  One degree of latitude is ~111195 m, so a two-segment
+meridian line spanning two of them is twice that."
+  (let ((l (geometry-geodesic-length
+            (make-linestring '((0d0 0d0) (0d0 1d0) (0d0 2d0))))))
+    (is (< (abs (- l (* 2 111194.927d0))) 1d0))
+    (is (typep l 'double-float))))
+
+(test geodesic-length-of-a-point-or-polygon-is-zero
+  "A polygon reports zero rather than its perimeter: its extent is
+GEOMETRY-GEODESIC-AREA, and a perimeter divided by an area is a
+plausible-looking number that means nothing."
+  (is (= 0d0 (geometry-geodesic-length (make-point 1d0 1d0))))
+  (is (= 0d0 (geometry-geodesic-length
+              (make-polygon '(((0d0 0d0) (1d0 0d0) (1d0 1d0)
+                               (0d0 1d0) (0d0 0d0)))))))
+  (is (= 0d0 (geometry-geodesic-length (make-linestring '())))))

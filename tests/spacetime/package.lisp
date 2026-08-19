@@ -26,5 +26,5 @@
   ;; region fixture (#138); GEOMETRY is the slot type symbol, which must be
   ;; GRAPH-DB's rather than a same-named symbol of this package.
   (:import-from #:graph-db #:def-vertex #:geometry #:make-point
-                #:make-polygon)
+                #:make-polygon #:make-linestring)
   (:export #:run-spacetime-tests #:spacetime-suite))
