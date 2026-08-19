@@ -223,3 +223,39 @@ circle (default 8).  Requires graph-db/geos.")
 NOT m^2).  Requires graph-db/geos.")
   (:method ((g geometry))
     (error 'geos-required-for-operation :operation 'geometry-area)))
+
+(defun %ring-geodesic-area-m2 (ring)
+  "Unsigned spherical area in m^2 of RING, a closed list of (lon lat)
+degree pairs.  Fewer than three vertices is zero, not an error."
+  (let* ((v (coerce ring 'vector))
+         (n (length v)))
+    (if (< n 3)
+        0d0
+        (let ((total 0d0))
+          (dotimes (i n)
+            (let* ((p1 (aref v i))
+                   (p2 (aref v (mod (1+ i) n)))
+                   (lon1 (* (first p1) (/ pi 180d0)))
+                   (lon2 (* (first p2) (/ pi 180d0)))
+                   (lat1 (* (second p1) (/ pi 180d0)))
+                   (lat2 (* (second p2) (/ pi 180d0))))
+              (incf total (* (- lon2 lon1)
+                             (+ 2d0 (sin lat1) (sin lat2))))))
+          (abs (/ (* total +earth-radius-m+ +earth-radius-m+) 2d0))))))
+
+(defun geometry-geodesic-area (g)
+  "Area of G in SQUARE METRES, by spherical excess.  Zero for a :POINT or
+:LINESTRING.  Holes are subtracted.  ⚠ Not GEOMETRY-AREA, which returns
+squared coordinate units and needs GEOS; this needs neither (design §8)."
+  (flet ((poly (rings)
+           (if (null rings)
+               0d0
+               (- (%ring-geodesic-area-m2 (first rings))
+                  (reduce #'+ (rest rings)
+                          :key #'%ring-geodesic-area-m2
+                          :initial-value 0d0)))))
+    (ecase (geometry-kind g)
+      (:polygon (poly (geometry-coordinate-pairs g)))
+      (:multipolygon (reduce #'+ (geometry-coordinate-pairs g)
+                             :key #'poly :initial-value 0d0))
+      ((:point :linestring) 0d0))))

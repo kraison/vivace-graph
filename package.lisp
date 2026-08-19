@@ -320,6 +320,7 @@
            #:geometry-difference
            #:geometry-buffer
            #:geometry-area
+           #:geometry-geodesic-area
            #:geos-available-p
            #:geos-shutdown
            #:*geos-available-p*

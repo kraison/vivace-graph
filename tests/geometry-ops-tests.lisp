@@ -431,3 +431,29 @@ point reported as exterior, or vice versa. Refs GH #99."
   (is (< (abs (- (geometry-distance (make-point 0d0 0d0) (make-point 0d0 1d0))
                  111194.927d0))
          1d0)))
+
+;;; ---- geodesic area (m^2) ------------------------------------------------
+
+(test geodesic-area-is-square-metres-not-square-degrees
+  "GEOMETRY-AREA returns squared degrees, which is not a usable measure:
+a degree of longitude is a different distance at every latitude, so a
+ratio of two such areas is only accidentally right (design §8)."
+  (let ((sq (make-polygon '(((0d0 0d0) (1d0 0d0) (1d0 1d0)
+                              (0d0 1d0) (0d0 0d0))))))
+    (let ((m2 (geometry-geodesic-area sq)))
+      (is (< 1.2d10 m2 1.3d10))
+      (is (typep m2 'double-float)))))
+
+(test geodesic-area-subtracts-holes
+  (let* ((outer '((0d0 0d0) (1d0 0d0) (1d0 1d0) (0d0 1d0) (0d0 0d0)))
+         (hole '((0.25d0 0.25d0) (0.75d0 0.25d0) (0.75d0 0.75d0)
+                 (0.25d0 0.75d0) (0.25d0 0.25d0)))
+         (solid (make-polygon (list outer)))
+         (holed (make-polygon (list outer hole))))
+    (is (< (geometry-geodesic-area holed)
+           (geometry-geodesic-area solid)))))
+
+(test geodesic-area-of-a-point-or-line-is-zero
+  (is (= 0d0 (geometry-geodesic-area (make-point 1d0 1d0))))
+  (is (= 0d0 (geometry-geodesic-area
+              (make-linestring '((0d0 0d0) (1d0 1d0)))))))
