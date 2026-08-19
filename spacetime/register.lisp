@@ -27,11 +27,15 @@ wherever it is found, so it takes 1.0 rather than dividing by zero."
                   (graph-db:geometry-intersection subject region-geometry))
          subject-measure)))
 
-(defun register-geometry (geometry registry &key (graph graph-db:*graph*))
-  "Registrations of GEOMETRY against REGISTRY's regions in GRAPH.
+(defun register-geometry (geometry registry
+                          &key (registry-graph graph-db:*graph*))
+  "Registrations of GEOMETRY against REGISTRY's regions in REGISTRY-GRAPH.
 
 REGISTRY is a spatial SCOPE -- a node-class name, a list of them, or
-:ALL (spatial-query.lisp).
+:ALL (spatial-query.lisp).  ⚠ REGISTRY-GRAPH is the REGISTRY'S graph, not
+the subject's; REGISTER-NODE's :GRAPH is the subject's, and passing that
+here reads every region under the wrong binding, which NODE-GEOMETRY's
+IGNORE-ERRORS turns into an empty list with EVALUATED-P true (GH #53).
 
 Two values: a list of (:REGION node :FRACTION double), and whether the
 scan was EVALUATED at all.  A registration is PARTIAL AND FRACTIONAL: a
@@ -46,10 +50,13 @@ fraction is 0, and writing it would bind a record to a region it does
 not overlap.
 
 ⚠ Read (VALUES NIL NIL) as 'not answered', never as 'no region here'.
-The scan is unevaluated when GEOS is absent for an extended geometry --
-the index falls back to a COARSE bounding box, which is over-inclusive,
-and a fraction cannot be computed at all -- or when GEOS rejects the
-geometry as invalid, which is host-dependent (design §6)."
+The scan is unevaluated for any of three reasons: GEOS is absent and the
+geometry is extended -- the index falls back to a COARSE bounding box,
+which is over-inclusive, and a fraction cannot be computed at all; GEOS
+rejects the geometry as invalid, which is host-dependent; or the
+intersection GEOS returns is a kind this engine's GEOMETRY type cannot
+represent -- a MULTILINESTRING, from two polygons sharing only an edge
+(design §6)."
   (if (and (%extended-geometry-p geometry)
            (not graph-db::*geos-available-p*))
       (values nil nil)
@@ -57,12 +64,12 @@ geometry as invalid, which is host-dependent (design §6)."
           ;; Region slots are read under the registry graph's own binding:
           ;; NODE-SLOT-VALUE defaults to *GRAPH*, and reading a node under
           ;; the wrong one is the node-escape class (design §7, GH #53).
-          (let* ((graph-db:*graph* graph)
+          (let* ((graph-db:*graph* registry-graph)
                  (measure (%measure-fn geometry))
                  (subject-measure (funcall measure geometry)))
             (values
              (loop for region in (graph-db:find-nodes-intersecting
-                                  registry geometry :graph graph)
+                                  registry geometry :graph registry-graph)
                    for g = (graph-db:node-geometry region)
                    for f = (and g (%overlap-fraction geometry g measure
                                                      subject-measure))
@@ -138,6 +145,10 @@ transaction or SAVE signals MODIFYING-NON-COPY."
          (binary (claim-family-binary family))
          (relation (getf facet :relation))
          (producer (getf facet :producer))
+         ;; OBJECT-NS is the FACET's; OBJECT-KEY is the region's own
+         ;; :IDENTITY.  Nothing checks the two agree, deliberately: the
+         ;; facet must be able to name the namespace deployed claims
+         ;; already carry, which need not be the registry's own (design §3).
          (object-ns (getf facet :registry-namespace))
          (object-key (nth-value 1 (%source-endpoint
                                    (getf registration :region)
@@ -207,7 +218,7 @@ anyway."
               (values 0 nil)
               (multiple-value-bind (regs evaluated)
                   (register-geometry geometry (getf facet :registry)
-                                     :graph registry-graph)
+                                     :registry-graph registry-graph)
                 (if (not evaluated)
                     (values 0 nil)
                     (let ((graph-db:*graph* registry-graph))

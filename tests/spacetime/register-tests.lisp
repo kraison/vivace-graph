@@ -51,7 +51,8 @@ cap in spatial-index.lisp)."
     (%make-region g "a" '((0d0 0d0) (2d0 0d0) (2d0 2d0) (0d0 2d0)
                           (0d0 0d0)))
     (multiple-value-bind (regs evaluated)
-        (register-geometry (make-point 1d0 1d0) 'ct-region :graph g)
+        (register-geometry (make-point 1d0 1d0) 'ct-region
+                           :registry-graph g)
       (is-true evaluated)
       (is (= 1 (length regs)))
       (is (%near 1d0 (%fraction-of (first regs)))))))
@@ -69,7 +70,7 @@ cap in spatial-index.lisp)."
             (register-geometry
              (make-polygon '(((0.5d0 0.5d0) (1.5d0 0.5d0) (1.5d0 1.5d0)
                               (0.5d0 1.5d0) (0.5d0 0.5d0))))
-             'ct-region :graph g)
+             'ct-region :registry-graph g)
           (is-true evaluated)
           (is (= 2 (length regs)))
           (is (%near 1d0 (reduce #'+ regs :key #'%fraction-of
@@ -83,7 +84,8 @@ cap in spatial-index.lisp)."
     (%make-region g "a" '((0d0 0d0) (1d0 0d0) (1d0 1d0) (0d0 1d0)
                           (0d0 0d0)))
     (multiple-value-bind (regs evaluated)
-        (register-geometry (make-point 50d0 50d0) 'ct-region :graph g)
+        (register-geometry (make-point 50d0 50d0) 'ct-region
+                           :registry-graph g)
       (is-true evaluated "an empty result is an ANSWER, not a failed scan")
       (is (null regs)))))
 
@@ -102,11 +104,12 @@ it this cannot tell 'refused correctly' from 'broken everywhere'
           (register-geometry
            (make-polygon '(((0.5d0 0.5d0) (1.5d0 0.5d0) (1.5d0 1.5d0)
                             (0.5d0 1.5d0) (0.5d0 0.5d0))))
-           'ct-region :graph g)
+           'ct-region :registry-graph g)
         (is-false evaluated)
         (is (null regs)))
       (multiple-value-bind (regs evaluated)
-          (register-geometry (make-point 1d0 1d0) 'ct-region :graph g)
+          (register-geometry (make-point 1d0 1d0) 'ct-region
+                           :registry-graph g)
         (is-true evaluated
                  "a point's candidates are exact with or without GEOS")
         (is (= 1 (length regs)))))))
@@ -127,7 +130,7 @@ additive, so the halves really do sum to the whole."
         (multiple-value-bind (regs evaluated)
             (register-geometry
              (make-linestring '((1d0 0.5d0) (1d0 1.5d0)))
-             'ct-region :graph g)
+             'ct-region :registry-graph g)
           (is-true evaluated)
           (is (= 2 (length regs)))
           (let ((fs (mapcar #'%fraction-of regs)))
@@ -156,7 +159,7 @@ registration is broken entirely."
             (register-geometry
              (make-polygon '(((0.25d0 0.5d0) (1d0 0.5d0) (1d0 1.5d0)
                               (0.25d0 1.5d0) (0.25d0 0.5d0))))
-             'ct-region :graph g)
+             'ct-region :registry-graph g)
           (is-true evaluated)
           (is (= 1 (length regs))
               "only the overlapped region registers, not ~S"
@@ -164,6 +167,86 @@ registration is broken entirely."
           (is (string= "overlapped" (name (getf (first regs) :region)))
               "it still registers to the region it genuinely overlaps")
           (is (%near 1d0 (%fraction-of (first regs))))))))
+
+;;; --- The GEOS refusal, and the handler's NARROWNESS (design §6) ---------
+;;;
+;;; Which polygons GEOS calls invalid depends on the host's version -- four
+;;; sites killed a whole backfill on 3.10.2 that 3.14.1 ran clean -- so a
+;;; real invalid polygon makes a poor unit test.  CTR-TRAP-REGION signals
+;;; from NODE-GEOMETRY instead, which REGISTER-GEOMETRY calls inside the
+;;; very HANDLER-CASE under test, deterministically on any host.
+
+(defparameter *ctr-region-trap* nil
+  "What CTR-TRAP-REGION's NODE-GEOMETRY signals: :GEOS, :OTHER, or NIL to
+read the slot normally.  NIL while the fixture is written, so the region
+indexes like any other and is a genuine candidate; set only around the
+scan under test.")
+
+(def-vertex ctr-trap-region ()
+  ((name :type string)
+   (geom :type geometry :index t))
+  :graph-db-register-test)
+
+(defmethod graph-db:node-geometry ((n ctr-trap-region))
+  (declare (ignorable n))
+  (case *ctr-region-trap*
+    (:geos (error 'graph-db:geos-error
+                  :message "TopologyException (fixture, no GEOS call made)"))
+    (:other (error "a non-GEOS failure raised inside the scan (fixture)"))
+    (t (call-next-method))))
+
+(defun %make-trap-region (graph name ring)
+  (let ((graph-db:*graph* graph))
+    (with-transaction ()
+      (make-ctr-trap-region :name name
+                            :geom (make-polygon (list ring))))))
+
+(test a-geos-error-anywhere-in-the-scan-refuses-the-whole-scan
+  "⚠ The refusal with production history: four sites killed a backfill on
+GEOS 3.10.2 that 3.14.1 ran clean, so a scan that meets one is UNANSWERED,
+not empty.  A valid region sits in the same scan, so this cannot pass by
+finding nothing, and the first scan is the control -- same run, same
+fixture, trap off."
+  (with-region-graph (g)
+    (%make-region g "valid" '((0d0 0d0) (2d0 0d0) (2d0 2d0) (0d0 2d0)
+                              (0d0 0d0)))
+    (%make-trap-region g "trap" '((0d0 0d0) (2d0 0d0) (2d0 2d0) (0d0 2d0)
+                                  (0d0 0d0)))
+    (let ((scope '(ct-region ctr-trap-region))
+          (subject (make-point 1d0 1d0)))
+      (multiple-value-bind (regs evaluated)
+          (register-geometry subject scope :registry-graph g)
+        (is-true evaluated "the control scan is evaluated")
+        (is (= 2 (length regs))
+            "with the trap off BOTH regions register, so the refusal below ~
+is not just an empty registry"))
+      (let ((*ctr-region-trap* :geos))
+        (multiple-value-bind (regs evaluated)
+            (register-geometry subject scope :registry-graph g)
+          (is-false evaluated "a GEOS-ERROR is a REFUSAL, never a signal")
+          (is (null regs)
+              "the VALID region's registration goes too: the scan was ~
+never answered, and a partial answer would be the false positive design ~
+§6 exists to prevent"))))))
+
+(test a-non-geos-error-in-the-scan-propagates-rather-than-being-caught
+  "⚠ The handler catches GEOS-ERROR and NOTHING WIDER.  Widening it to
+ERROR leaves every other test in this file green while silently swallowing
+the multi-graph node-escape class (GH #53) the narrow catch exists to
+protect.  The second scan is the control: without it a fixture that never
+reaches the handler at all would look the same."
+  (with-region-graph (g)
+    (%make-trap-region g "trap" '((0d0 0d0) (2d0 0d0) (2d0 2d0) (0d0 2d0)
+                                  (0d0 0d0)))
+    (let ((*ctr-region-trap* :other))
+      (signals simple-error
+        (register-geometry (make-point 1d0 1d0) 'ctr-trap-region
+                           :registry-graph g)))
+    (multiple-value-bind (regs evaluated)
+        (register-geometry (make-point 1d0 1d0) 'ctr-trap-region
+                           :registry-graph g)
+      (is-true evaluated "the same scan answers with the trap off")
+      (is (= 1 (length regs))))))
 
 ;;; --- REGISTER-NODE: the registration, written as claims (Task 5) --------
 ;;;
@@ -193,15 +276,23 @@ registration is broken entirely."
   :registration :none
   :indexed-text :none)
 
+(defparameter *ctr-precision-m* 25.0d0
+  "What CTR-PRECISION reports.  A special, so a re-registration can change
+what the facet PRODUCES without redefining the facet -- which is what
+tells the upsert's update branch apart from its insert branch.")
+
+(defparameter *ctr-confidence* 0.75d0
+  "What CTR-CONFIDENCE reports; see *CTR-PRECISION-M*.")
+
 (defun ctr-precision (node)
-  "25 metres for every record.  A constant, so a test can assert the
-facet's :PRECISION-FN was consulted at all."
+  "The same value for every record, so a test can assert the facet's
+:PRECISION-FN was consulted at all."
   (declare (ignore node))
-  25.0d0)
+  *ctr-precision-m*)
 
 (defun ctr-confidence (node)
   (declare (ignore node))
-  0.75d0)
+  *ctr-confidence*)
 
 (def-source ctr-record :graph-db-register-test
     ((record-key :type string)
@@ -310,6 +401,25 @@ accidentally the same graph, which every Task 4 test left them."
   (let ((graph-db:*graph* graph))
     (with-transaction () (make-ctr-remote :remote-key key :where point))))
 
+(defun %refind (namespace key)
+  "The source record (NAMESPACE . KEY), read FRESH through the substrate's
+own resolver.  A node object held across a SAVE still reads the OLD
+serialized bytes, so a mutation test must re-read rather than re-use."
+  (resolve-endpoint namespace key))
+
+(defun %move-area (graph key polygon)
+  "Give the CTR-AREA called KEY a new geometry -- a record whose position
+was corrected between two ingests.  The COPY is INSIDE the transaction, or
+SAVE signals MODIFYING-NON-COPY."
+  ;; RESOLVE-ENDPOINT refuses to run inside a read-write transaction
+  ;; (resolve.lisp), so the re-read is OUTSIDE it and only the COPY is in.
+  (let* ((graph-db:*graph* graph)
+         (n (%refind :ctr-areas key)))
+    (with-transaction ()
+      (let ((c (graph-db:copy n)))
+        (setf (shape c) polygon)
+        (graph-db:save c)))))
+
 (defun %subject-claims (graph namespace key)
   "Claims in GRAPH naming (NAMESPACE . KEY) as subject.  Goes through the
 substrate's own CLAIMS-TOUCHING rather than INDEX-LOOKUP: the index slot
@@ -414,3 +524,54 @@ until now (design §7, GH #53)."
       (is-true c "the claim is written in the REGISTRY graph")
       (is (string= "p-b" (claim-object-key c))
           "the region's key was read under the registry graph too"))))
+
+(test re-registering-a-node-writes-the-new-values-not-the-old-ones
+  "⚠ Counting claims does NOT test the upsert's UPDATE branch: deleting
+its SETF block, or its SAVE, leaves a count-only test green.  What the
+facet produces is changed between the two passes, and what is STORED must
+follow (design §4).  This branch runs on every re-ingest."
+  (with-region-graph (g)
+    (%make-place g "p-a" +ctr-square+)
+    (let ((n (%make-record g "s-6" (make-point 1d0 1d0))))
+      (register-node n :graph g)
+      (let ((c (first (%subject-claims g :ctr-records "s-6"))))
+        (is (= 25.0d0 (claim-precision-m c)) "the first pass's value")
+        (is (= 0.75d0 (claim-confidence c))))
+      (let ((*ctr-precision-m* 40.0d0)
+            (*ctr-confidence* 0.9d0))
+        (register-node n :graph g)))
+    (is (= 1 (length (%subject-claims g :ctr-records "s-6")))
+        "still ONE claim -- the UPDATE branch, not a second insert")
+    (let ((c (first (%subject-claims g :ctr-records "s-6"))))
+      (is (= 40.0d0 (claim-precision-m c))
+          "the second pass's PRECISION-M was written over the first's")
+      (is (= 0.9d0 (claim-confidence c))
+          "and its CONFIDENCE with it"))))
+
+(test a-moved-subject-re-registers-with-the-new-fraction
+  "⚠ FRACTION is what the update branch exists for: a re-ingest whose
+geometry was corrected must overwrite the stored share, not keep the one
+the first pass computed."
+  (if (not graph-db::*geos-available-p*)
+      (skip "GEOS not available")
+      (with-region-graph (g)
+        (%make-place g "p-a" +ctr-square+)
+        (register-node
+         (%make-area g "a-2"
+                     (make-polygon '(((0.5d0 0.5d0) (1.5d0 0.5d0)
+                                      (1.5d0 1.5d0) (0.5d0 1.5d0)
+                                      (0.5d0 0.5d0)))))
+         :graph g)
+        (is (%near 1d0 (claim-fraction
+                        (first (%subject-claims g :ctr-areas "a-2"))))
+            "wholly inside the region to begin with")
+        ;; Half of it now lies east of the region's 2° edge.
+        (%move-area g "a-2"
+                    (make-polygon '(((1d0 0.5d0) (3d0 0.5d0) (3d0 1.5d0)
+                                     (1d0 1.5d0) (1d0 0.5d0)))))
+        (register-node (%refind :ctr-areas "a-2") :graph g)
+        (is (= 1 (length (%subject-claims g :ctr-areas "a-2")))
+            "still ONE claim -- the UPDATE branch, not a second insert")
+        (is (%near 0.5d0 (claim-fraction
+                          (first (%subject-claims g :ctr-areas "a-2"))))
+            "the NEW share was written over the old 1.0"))))

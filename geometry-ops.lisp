@@ -232,13 +232,17 @@ degree pairs.  Fewer than three vertices is zero, not an error."
     (if (< n 3)
         0d0
         (let ((total 0d0))
+          ;; DEG->RAD, not (/ pi 180d0): PI is a LONG-FLOAT, and on a
+          ;; build where that is wider than a double (ECL with long
+          ;; double) the product leaks a LONG-FLOAT into FRACTION, whose
+          ;; serializer dispatches on DOUBLE-FLOAT (serialize.lisp).
           (dotimes (i n)
             (let* ((p1 (aref v i))
                    (p2 (aref v (mod (1+ i) n)))
-                   (lon1 (* (first p1) (/ pi 180d0)))
-                   (lon2 (* (first p2) (/ pi 180d0)))
-                   (lat1 (* (second p1) (/ pi 180d0)))
-                   (lat2 (* (second p2) (/ pi 180d0))))
+                   (lon1 (deg->rad (first p1)))
+                   (lon2 (deg->rad (first p2)))
+                   (lat1 (deg->rad (second p1)))
+                   (lat2 (deg->rad (second p2))))
               (incf total (* (- lon2 lon1)
                              (+ 2d0 (sin lat1) (sin lat2))))))
           (abs (/ (* total +earth-radius-m+ +earth-radius-m+) 2d0))))))

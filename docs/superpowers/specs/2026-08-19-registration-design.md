@@ -122,12 +122,20 @@ rather than updating them. Tracked as vivace-graph#160.
 ## 4. The API
 
 ```lisp
-(register-geometry geometry registry &key graph)
+(register-geometry geometry registry &key registry-graph)
   ;; => (values registrations evaluated-p)
 ```
 
 `registrations` is a list of `(:region <node> :fraction <double>)`,
 **unordered** — see §13. `evaluated-p` is §6.
+
+**The keyword is `registry-graph`, not `graph`.** `register-node` has
+both, and its `:graph` is the *subject's*; a caller reaching for
+`register-geometry` by analogy and passing the subject's graph would get
+a silent wrong answer, since `node-geometry` on a foreign region returns
+`NIL` through its own `ignore-errors`, the region is dropped, and the
+caller sees an empty list with `evaluated-p` **true**. One name, one
+meaning, in both functions.
 
 ```lisp
 (register-node node &key graph registry-graph)
@@ -183,7 +191,7 @@ hit itself.
 
 ## 6. Partial coverage is a first-class result
 
-Three different things make a scan unanswerable, and all take the same
+Four different things make a scan unanswerable, and all take the same
 exit.
 
 **An invalid polygon.** GEOS raises `TopologyException`, and **which
@@ -206,10 +214,19 @@ substrate whose whole posture is that absence carries a reason. A **point**
 is unaffected: its candidates are exact and its fraction is 1.0 by
 definition, so points register normally with or without GEOS.
 
-In both cases `register-geometry` returns `evaluated-p` = `nil` rather than
-a result. It never signals for either, and it never catches anything
-broader than `geos-error` — a broader handler would swallow the multi-graph
-node-escape class (#53).
+**An intersection this engine cannot represent.** Two polygons sharing
+only an edge intersect in a MULTILINESTRING, which the `geometry` type has
+no kind for, so `wkt->geometry` signals `geos-error` on the way back —
+the same exit as an invalid polygon, for a different reason. Found by
+Task 4's review.
+
+In every one of the four, `evaluated-p` is `nil` rather than a result:
+`register-geometry` answers so for the three the scan itself meets, and
+`register-node` for the missing geometry, which it detects before
+scanning. It never signals for any of them, and it never catches anything
+broader than `geos-error` — a broader handler would swallow the
+multi-graph node-escape class (#53), and nothing but a test that signals a
+plain `error` through the scan can hold that line.
 
 Without the second value, "no regions here" and "the scan never ran" are
 the same answer. A caller that ignores `evaluated-p` degrades its own
@@ -302,10 +319,18 @@ back through the substrate accessors with their values intact.
 - **Engine, synthetic registry:** a point in one region; a polygon
   spanning two, fractions summing to 1.0 within tolerance; a line
   traversing three; a subject outside every region.
-- **`evaluated-p`, invalid polygon:** yields `(values nil nil)` and signals
+- **The upsert's UPDATE branch, not only its count.** Re-registering a
+  subject whose registration now produces different values must overwrite
+  the stored `fraction` and `precision-m`. A count-only assertion leaves
+  the whole `setf` block deletable with the suite still green.
+- **`evaluated-p`, `geos-error`:** yields `(values nil nil)` and signals
   nothing. Proven by ablation — the same call on a valid polygon must
   return `(values ... t)` in the same run, or the test cannot tell a skip
-  from an empty result.
+  from an empty result. **Which polygons GEOS rejects is host-dependent,
+  so the condition is raised deterministically instead**, from a region
+  class's own `node-geometry`, which the scan calls inside the handler.
+  A second region class signalling a plain `error` must **propagate**:
+  that, and only that, pins the handler's narrowness.
 - **`evaluated-p`, no GEOS:** with `*geos-available-p*` bound to `nil`, a
   polygon yields `(values nil nil)` and a **point still registers**, in the
   same run. The point is the control: without it the test cannot tell
