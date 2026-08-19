@@ -108,14 +108,24 @@ so "a direct index query has no candidate/hit distinction left", and
 `find-spine-places-near` was deleted along with the old centroid-only
 index.
 
-**Exactness is a property of the query, stated in one place.** Callers may
-read an empty `registrations` as "no region here" *because the query
-refines exactly*, and that sentence lives in `register-geometry`'s
-docstring rather than being assumed at each call site. A backend whose
-index only bounds would need a verify step; adding one then is a change to
-this function and its contract, not to its callers. No hook is built for
-that today — an extension point designed against an imagined consumer is
-the failure this issue's deferral was written to prevent.
+**Exactness is conditional, and the condition is `*geos-available-p*`.**
+`graph-db/geos` is an optional add-on — the engine does not depend on it,
+and loading it is what flips that flag. Without it,
+`find-nodes-intersecting` falls back to a **coarse bounding-box** test for
+extended geometry (points stay exact), and `geometry-intersection` signals
+`geos-required-for-operation`.
+
+So the "backend whose index only bounds" is not hypothetical or future: it
+is this engine without `libgeos_c`. Registration handles it by refusing
+rather than approximating — see §6. Callers may read an empty
+`registrations` as "no region here" **only when `evaluated-p` is true**,
+and that sentence lives in `register-geometry`'s docstring rather than
+being assumed at each call site.
+
+No verify-phase hook is built. If an inexact backend ever needs to *serve*
+registration rather than refuse it, the verify step is added here, in one
+function; designing that extension now, against a consumer that does not
+exist, is the failure this issue's deferral was written to prevent.
 
 ## 5. The query-direction trap
 
@@ -134,15 +144,25 @@ hit itself.
 
 ## 6. Partial coverage is a first-class result
 
-GEOS raises `TopologyException` on an invalid polygon, and **which
+Two different things make a scan unanswerable, and both take the same exit.
+
+**An invalid polygon.** GEOS raises `TopologyException`, and **which
 polygons are invalid depends on the host's GEOS version** — four sites
 killed an entire backfill on GEOS 3.10.2 while the same run succeeded on
 3.14.1.
 
-So `register-geometry` catches `geos-error`, counts the skip, and returns
-`evaluated-p` = `nil`. It never signals, and it never catches anything
-broader than `geos-error` — a broader handler would swallow the
-multi-graph node-escape class (#53).
+**No GEOS at all.** Without the add-on, an extended geometry's candidates
+are bounding-box approximate and its fraction cannot be computed. A
+bounding box is *over*-inclusive, so approximating here would write claims
+binding records to regions they do not touch — silent false positives in a
+substrate whose whole posture is that absence carries a reason. A **point**
+is unaffected: its candidates are exact and its fraction is 1.0 by
+definition, so points register normally with or without GEOS.
+
+In both cases `register-geometry` returns `evaluated-p` = `nil` rather than
+a result. It never signals for either, and it never catches anything
+broader than `geos-error` — a broader handler would swallow the multi-graph
+node-escape class (#53).
 
 Without the second value, "no regions here" and "the scan never ran" are
 the same answer. A caller that ignores `evaluated-p` degrades its own
@@ -174,10 +194,16 @@ A fraction is `area(intersection) / area(subject)`. `graph-db` exports
 area; the tenant's `geodesic-polygon-area-ha` supplies it today.
 
 `geometry-geodesic-area` joins the GEOS ops as a sibling of the geodesic
-distance already there. Putting it in the substrate is what makes
-`fraction` mean the same thing for every tenant, which is the whole point
-of §2's promotion — a tenant-supplied measure would make a shared slot
-carry a per-tenant meaning.
+distance already there: a generic whose base method signals
+`geos-required-for-operation`, and an `:around` method that computes when
+`*geos-available-p*`. That is the pattern every other op in that file
+follows, and it is what makes §6's no-GEOS refusal fall out of the existing
+machinery rather than needing a special case.
+
+Putting it in the substrate is what makes `fraction` mean the same thing
+for every tenant, which is the whole point of §2's promotion — a
+tenant-supplied measure would make a shared slot carry a per-tenant
+meaning.
 
 **Validation, not assertion.** The new function is checked against
 mine-action's existing `geodesic-polygon-area-ha` over real spine
@@ -223,10 +249,14 @@ back through the substrate accessors with their values intact.
 - **Engine, synthetic registry:** a point in one region; a polygon
   spanning two, fractions summing to 1.0 within tolerance; a line
   traversing three; a subject outside every region.
-- **`evaluated-p`:** an invalid polygon yields `(values nil nil)` and
-  signals nothing. Proven by ablation — the same call on a valid polygon
-  must return `(values ... t)` in the same run, or the test cannot tell a
-  skip from an empty result.
+- **`evaluated-p`, invalid polygon:** yields `(values nil nil)` and signals
+  nothing. Proven by ablation — the same call on a valid polygon must
+  return `(values ... t)` in the same run, or the test cannot tell a skip
+  from an empty result.
+- **`evaluated-p`, no GEOS:** with `*geos-available-p*` bound to `nil`, a
+  polygon yields `(values nil nil)` and a **point still registers**, in the
+  same run. The point is the control: without it the test cannot tell
+  "refused correctly" from "broken everywhere".
 - **`:registration :none`:** a source declaring it registers nothing, and
   its claims still read. This is the map-less tenant's contribution and it
   must not be a synthetic fixture.
