@@ -107,13 +107,22 @@ comes from the region class's own `:identity :key-slot` — so a registry
 without an identity facet cannot be pointed at. `register-node` signals
 rather than writing a claim whose endpoint nothing could resolve.
 
+**`:relation` and `:method` are strings here, and the substrate has not
+settled that.** `claim.lisp` calls `relation` an open vocabulary and the
+engine's own tests pass keywords (`:relation :r`); the place spine writes
+strings (`"registered-at"`), and this facet's `req-string` follows the
+tenant because 345,939 deployed claims already use strings. The trap a
+reader must know: `relation` is part of `def-unique`'s identity tuple, so
+`:registered-at` and `"registered-at"` are DIFFERENT claims — a tenant
+that changed representation would silently double every claim it holds
+rather than updating them. Tracked as vivace-graph#160.
+
 `:none` must stay fully supported. The map-less tenant is what proves it.
 
 ## 4. The API
 
 ```lisp
-(register-geometry geometry registry
-                   &key graph registry-graph precision-m)
+(register-geometry geometry registry &key graph)
   ;; => (values registrations evaluated-p)
 ```
 
