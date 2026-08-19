@@ -144,6 +144,23 @@ rather than updating them. Tracked as vivace-graph#160.
 `registrations` is a list of `(:region <node> :fraction <double>)`,
 **unordered** — see §13. `evaluated-p` is §6.
 
+**Both geometries are repaired before intersecting, and the fraction is
+clamped to 1.0.** `geometry-make-valid` runs on the subject once (so the
+denominator is the *repaired* subject's measure, not a self-intersecting
+ring's abs-summed spherical excess) and on each region, with
+`ignore-errors` falling back to the original — the repair is unavailable
+without the add-on and on GEOS < 3.8. Skipping the repair would let an
+invalid ring that cleared the index's `intersects` refinement throw
+inside `GEOSIntersection` and refuse the **whole subject**, dropping
+every region it genuinely overlaps; that is the host-dependent invalid-
+polygon population §6 describes, and turning a recoverable case into a
+total refusal is strictly worse than the partial-coverage report it
+replaces. The clamp is the `[0,1]` contract §1 states: a repaired
+intersection can measure a hair over its repaired subject, and a stored
+`fraction` above 1 is a contract violation, not a larger overlap. Added
+in task 6b's task 5, from the tenant rule this API replaced — which did
+both, and whose loss would have been silent.
+
 **The keyword is `registry-graph`, not `graph`.** `register-node` has
 both, and its `:graph` is the *subject's*; a caller reaching for
 `register-geometry` by analogy and passing the subject's graph would get
@@ -229,11 +246,22 @@ substrate whose whole posture is that absence carries a reason. A **point**
 is unaffected: its candidates are exact and its fraction is 1.0 by
 definition, so points register normally with or without GEOS.
 
-**An intersection this engine cannot represent.** Two polygons sharing
-only an edge intersect in a MULTILINESTRING, which the `geometry` type has
-no kind for, so `wkt->geometry` signals `geos-error` on the way back —
-the same exit as an invalid polygon, for a different reason. Found by
-Task 4's review.
+**An intersection this engine cannot represent.** `wkt->geometry` parses
+POINT, LINESTRING, POLYGON and MULTIPOLYGON; anything else signals
+`geos-error` on the way back — the same exit as an invalid polygon, for a
+different reason. Found by Task 4's review.
+
+⚠ **A single-edge touch is NOT this case.** An earlier draft said two
+polygons sharing only an edge intersect in a MULTILINESTRING. They do
+not: one contiguous shared edge gives a **LINESTRING**, which parses, and
+whose geodesic *area* is zero — so that region is dropped as a touch
+(§13) while every other region still registers and `evaluated-p` stays
+true. What cannot be represented is a **multi-component** boundary
+intersection: a **MULTILINESTRING** (two *disjoint* shared edges) or a
+**GEOMETRYCOLLECTION** (a vertex touch together with an edge touch),
+which no earlier draft named at all. Corrected in task 6b's task 5; the
+wrong wording had also reached the manual and the tenant's §9, where it
+would have sent an equivalence pass hunting the wrong signature.
 
 In every one of the four, `evaluated-p` is `nil` rather than a result:
 `register-geometry` answers so for the three the scan itself meets, and
@@ -393,7 +421,11 @@ back through the substrate accessors with their values intact.
   back from the candidate query with an intersection of zero area or
   length. Registering it would bind a record to a region it does not
   overlap — the mild form of the false positive §6 exists to prevent — so
-  a zero fraction is dropped rather than written.
+  a zero fraction is dropped rather than written. This is the ordinary
+  path for a **single shared edge**, whose intersection is a LINESTRING
+  of zero area: the touching region drops, the rest of the scan is
+  unaffected. Only a *multi-component* boundary intersection takes §6's
+  refusal exit instead — see the correction there.
 - **Fraction tolerance.** Fractions over a partition should sum to 1.0, but
   GEOS intersection on adjacent polygons double-counts shared boundaries by
   a negligible amount. The test needs a stated tolerance rather than an

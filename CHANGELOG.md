@@ -20,6 +20,13 @@ between releases; cutting a release renames it to the new version and dates it.
   point registers at fraction 1.0, a polygon at its share of each region by
   AREA, a line at its share by LENGTH — a line's area is zero, so an area ratio
   would give it 1.0 in every region it crossed.
+  - **Both geometries are repaired with `geometry-make-valid` before
+    intersecting, and `fraction` is clamped to 1.0.** An invalid ring can clear
+    the spatial index's `intersects` refinement and then throw inside
+    `GEOSIntersection`, which would refuse the *whole* subject and drop every
+    region it genuinely overlaps — the host-dependent invalid-polygon case that
+    partial coverage exists to report, turned into a total loss. The clamp
+    holds `fraction`'s documented `[0,1]` contract.
   - **`fraction` and `precision-m` join `+claim-shared-slots+`**, so every
     claim of every tenant carries them rather than a tenant declaring them in
     `:extra-slots`. A retrieval layer weighting expansion by overlap is

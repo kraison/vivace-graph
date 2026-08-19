@@ -16,16 +16,49 @@ region it crosses -- and AREA otherwise (design §13)."
       #'graph-db:geometry-geodesic-length
       #'graph-db:geometry-geodesic-area))
 
+(defun %repaired (g)
+  "G repaired by GEOMETRY-MAKE-VALID, or G itself when it cannot be.
+
+Only EXTENDED geometry is repaired: a :POINT cannot be invalid, and
+ACLED-scale point registration would otherwise pay a GEOS call per
+record for nothing.
+
+⚠ THE IGNORE-ERRORS IS WHAT MAKES THE FALLBACK TOTAL, and it is not
+dead code: GEOMETRY-MAKE-VALID signals GEOS-REQUIRED-FOR-OPERATION
+without the add-on AND on GEOS < 3.8, which has no GEOSMakeValid.  A
+repair that cannot happen must leave the caller holding the original."
+  (if (%extended-geometry-p g)
+      (or (ignore-errors (graph-db:geometry-make-valid g)) g)
+      g))
+
 (defun %overlap-fraction (subject region-geometry measure subject-measure)
   "How much of SUBJECT falls within REGION-GEOMETRY, in [0,1], under
 MEASURE (%MEASURE-FN) with SUBJECT-MEASURE its value for SUBJECT.
 A zero-measure subject -- a point, or a degenerate line -- is wholly
-wherever it is found, so it takes 1.0 rather than dividing by zero."
+wherever it is found, so it takes 1.0 rather than dividing by zero.
+
+⚠ THE REGION IS REPAIRED BEFORE INTERSECTING, and SUBJECT arrives
+already repaired -- REGISTER-GEOMETRY does that once, because
+SUBJECT-MEASURE is the denominator and a raw self-intersecting ring's
+abs-summed spherical excess is not the area an intersection is a share
+of.  An invalid ring can pass the index's INTERSECTS refinement and
+then throw inside GEOSIntersection, which REGISTER-GEOMETRY turns into
+a refusal for the WHOLE subject -- so one bad polygon would drop every
+region the subject really does overlap.  That is the 4-of-341
+population the partial-coverage machinery exists for (design §6), and
+repairing is geometry hygiene, not a caller's policy.
+
+⚠ CLAMPED AT 1.0.  FRACTION is a SHARE, defined in [0,1] (design §1).
+A repaired intersection can measure a hair over its repaired subject,
+and a value above 1 breaks the substrate's own contract rather than
+reporting a larger overlap."
   (if (zerop subject-measure)
       1.0d0
-      (/ (funcall measure
-                  (graph-db:geometry-intersection subject region-geometry))
-         subject-measure)))
+      (min 1.0d0
+           (/ (funcall measure
+                       (graph-db:geometry-intersection
+                        subject (%repaired region-geometry)))
+              subject-measure))))
 
 (defun register-geometry (geometry registry
                           &key (registry-graph graph-db:*graph*))
@@ -55,8 +88,17 @@ geometry is extended -- the index falls back to a COARSE bounding box,
 which is over-inclusive, and a fraction cannot be computed at all; GEOS
 rejects the geometry as invalid, which is host-dependent; or the
 intersection GEOS returns is a kind this engine's GEOMETRY type cannot
-represent -- a MULTILINESTRING, from two polygons sharing only an edge
-(design §6)."
+represent (design §6).
+
+⚠ A SINGLE-EDGE TOUCH IS NOT THAT THIRD CASE, and reading it as one
+sends a reader hunting the wrong signature in their data.  Two polygons
+sharing ONE contiguous edge intersect in a LINESTRING, which
+WKT->GEOMETRY parses; its geodesic AREA is zero, so that region is
+dropped as a touch and every OTHER region still registers, with
+EVALUATED-P true.  What cannot be represented is a MULTI-COMPONENT
+boundary intersection: a MULTILINESTRING (two DISJOINT shared edges) or
+a GEOMETRYCOLLECTION (a vertex touch together with an edge touch).
+Those two refuse the whole scan."
   (if (and (%extended-geometry-p geometry)
            (not graph-db::*geos-available-p*))
       (values nil nil)
@@ -65,13 +107,20 @@ represent -- a MULTILINESTRING, from two polygons sharing only an edge
           ;; NODE-SLOT-VALUE defaults to *GRAPH*, and reading a node under
           ;; the wrong one is the node-escape class (design §7, GH #53).
           (let* ((graph-db:*graph* registry-graph)
-                 (measure (%measure-fn geometry))
-                 (subject-measure (funcall measure geometry)))
+                 ;; Repaired ONCE, and the denominator taken from the
+                 ;; REPAIRED geometry (%OVERLAP-FRACTION's docstring).
+                 ;; The index query below still passes the ORIGINAL: its
+                 ;; INTERSECTS refinement is what decides candidacy, and
+                 ;; repairing first would change which regions are
+                 ;; candidates rather than how much of each is covered.
+                 (subject (%repaired geometry))
+                 (measure (%measure-fn subject))
+                 (subject-measure (funcall measure subject)))
             (values
              (loop for region in (graph-db:find-nodes-intersecting
                                   registry geometry :graph registry-graph)
                    for g = (graph-db:node-geometry region)
-                   for f = (and g (%overlap-fraction geometry g measure
+                   for f = (and g (%overlap-fraction subject g measure
                                                      subject-measure))
                    ;; A zero fraction is a TOUCH, not an overlap: dropped
                    ;; rather than written as a claim (design §13).

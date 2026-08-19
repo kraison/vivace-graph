@@ -627,3 +627,51 @@ the first pass computed."
         (is (%near 0.5d0 (claim-fraction
                           (first (%subject-claims g :ctr-areas "a-2"))))
             "the NEW share was written over the old 1.0"))))
+
+;;; --- invalid subject geometry (#138 task 6b task 5, finding I1) --------
+;;; The tenant rule this API replaced repaired BOTH geometries with
+;;; GEOMETRY-MAKE-VALID before intersecting and clamped the result to 1.0.
+;;; Dropping either is not a simplification: an invalid ring can clear the
+;;; index's INTERSECTS refinement and then throw inside GEOSIntersection,
+;;; which refuses the WHOLE subject -- and its raw abs-summed spherical
+;;; excess is not the area an intersection is a share of, so an unclamped
+;;; ratio can exceed 1 and be written to a claim.
+
+(defun %bowtie ()
+  "A self-intersecting ring with two UNEQUAL lobes: (0,0)-(10,10) crosses
+ (10,0)-(0,2) at about (1.67, 1.67).  Unequal deliberately -- a symmetric
+bow-tie's two lobes cancel in the signed excess sum, which the ABS in
+%RING-GEODESIC-AREA-M2 then reports as ~0, and a zero-measure subject
+takes the 1.0 shortcut instead of exercising the ratio at all."
+  (make-polygon '(((0d0 0d0) (10d0 10d0) (10d0 0d0) (0d0 2d0)
+                   (0d0 0d0)))))
+
+(test an-invalid-subject-polygon-is-repaired-not-refused
+  "⚠ AN INVALID EXTENT MUST NOT COST THE SUBJECT ITS OTHER REGIONS.
+GEOS validity is host- and version-dependent -- 4 of 341 site extents
+that GEOS 3.14.1 tolerates were rejected by 3.10.2 -- so a self-
+intersecting ring is a real deployed population, not a contrived input.
+The scan must still be EVALUATED, and the fraction must still be a
+SHARE: in [0,1], never above it (design §1, §6)."
+  (cond
+    ((not graph-db::*geos-available-p*) (skip "GEOS not available"))
+    ((not graph-db::*geos-makevalid-available-p*)
+     (skip "GEOS < 3.8: no makeValid"))
+    (t
+     (with-region-graph (g)
+       ;; A region comfortably containing the whole bow-tie, so the only
+       ;; thing under test is the subject's own validity.
+       (%make-region g "cover" '((-1d0 -1d0) (11d0 -1d0) (11d0 11d0)
+                                 (-1d0 11d0) (-1d0 -1d0)))
+       (is-false (graph-db:geometry-valid-p (%bowtie))
+                 "fixture sanity: the bow-tie really is invalid")
+       (multiple-value-bind (regs evaluated)
+           (register-geometry (%bowtie) 'ct-region :registry-graph g)
+         (is-true evaluated
+                  "an invalid ring must be repaired, not refused")
+         (is (= 1 (length regs)))
+         (let ((f (%fraction-of (first regs))))
+           (is (<= f 1.0d0)
+               "FRACTION is a share in [0,1]; got ~S" f)
+           (is (plusp f)
+               "a repaired bow-tie inside the region is not a touch")))))))

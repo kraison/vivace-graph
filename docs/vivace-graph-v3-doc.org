@@ -3394,6 +3394,16 @@ exactly through GEOS. ~registrations~ is a list of
 specific" is a tenant's notion (a place hierarchy, say), not the
 substrate's, so a tenant sorts for itself.
 
+⚠ Both geometries are run through ~geometry-make-valid~ before the
+intersection, falling back to the original where the repair is
+unavailable (no add-on, or GEOS < 3.8), and the resulting fraction is
+clamped to 1.0. Without the repair, an invalid ring that cleared the
+index's ~intersects~ refinement can throw inside ~GEOSIntersection~ and
+refuse the WHOLE subject — dropping every region it genuinely overlaps
+rather than the one it could not measure. The clamp is the ~[0,1]~
+contract: a repaired intersection can measure a hair over its repaired
+subject.
+
 **Registration is fractional, not boolean.** A point registers to one
 region at fraction 1.0. A polygon's fraction is an AREA ratio —
 ~geometry-geodesic-area~ of the intersection over the subject's own
@@ -3446,8 +3456,14 @@ no broader, so it cannot swallow a cross-graph node-escape error:
 - GEOS rejects the subject's geometry as topologically invalid. Which
   polygons are invalid is host- and GEOS-version-dependent.
 - The intersection GEOS returns is a geometry kind this engine's
-  ~geometry~ type has no representation for — a MULTILINESTRING, from
-  two polygons that share only an edge, for instance.
+  ~geometry~ type has no representation for. ~wkt->geometry~ parses
+  POINT, LINESTRING, POLYGON and MULTIPOLYGON; a *multi-component*
+  boundary intersection is what falls outside that — a MULTILINESTRING
+  (two *disjoint* shared edges) or a GEOMETRYCOLLECTION (a vertex touch
+  together with an edge touch). ⚠ A *single* shared edge is NOT this
+  case: it intersects in a LINESTRING, which parses, and whose geodesic
+  area is zero, so that one region drops as a touch and the rest of the
+  scan is unaffected.
 - The subject's geometry slot is unset, or unreadable under the
   ambient graph binding (~register-node~ only — ~node-geometry~
   returns ~nil~ either way). Reporting an evaluated scan there would
