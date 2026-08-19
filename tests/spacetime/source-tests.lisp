@@ -424,14 +424,47 @@ signals INVALID-SOURCE-FACET; this one must too."
         :space :none :time :none :attribution :none
         :sensitivity :none :registration :none :indexed-text :none))))
 
+(defparameter +a-registration-facet+
+  '(:registry ct-region :registry-namespace :reg
+    :claim-class ct-claim :producer "graph-db/spacetime-test"
+    :relation "registered-at" :method "centroid-within"
+    :rule-version "r/1" :precision-fn nil :confidence-fn nil)
+  "One well-formed :REGISTRATION facet, so the refusal tests below can each
+drop exactly one key from it rather than restate eight (design §3).")
+
+(defun %facet-without (key)
+  "+A-REGISTRATION-FACET+ with KEY and its value removed."
+  (graph-db.spacetime::%plist-remove +a-registration-facet+ key))
+
 (test a-registration-facet-declares-what-it-binds-to
   (finishes
+    (graph-db.spacetime::%check-facet :registration
+                                      +a-registration-facet+)))
+
+(test a-registration-facet-missing-its-claim-class-is-refused
+  "A claim family is a tenant's DEF-CLAIM-CLASSES output and
+*CLAIM-FAMILIES* is keyed by parent name alone, so there is no
+graph-to-family lookup to fall back on (design §3)."
+  (signals invalid-source-facet
+    (graph-db.spacetime::%check-facet :registration
+                                      (%facet-without :claim-class))))
+
+(test a-registration-facet-missing-its-producer-is-refused
+  "⚠ PRODUCER is part of DEF-UNIQUE's binary identity tuple, so a
+derived-but-wrong value re-inserts instead of updating every claim a
+tenant already has (design §3)."
+  (signals invalid-source-facet
+    (graph-db.spacetime::%check-facet :registration
+                                      (%facet-without :producer))))
+
+(test a-registry-namespace-must-be-a-keyword
+  "It names the same kind of thing :IDENTITY's :NAMESPACE does, and the
+substrate's OBJECT-NAMESPACE slot holds keywords.  A string here would be
+interned at the boundary and mismatch deployed data (design §3)."
+  (signals invalid-source-facet
     (graph-db.spacetime::%check-facet
      :registration
-     '(:registry ct-region :registry-namespace "reg"
-       :relation "registered-at" :method "centroid-within"
-       :rule-version "r/1" :precision-fn nil
-       :confidence-fn nil))))
+     (list* :registry-namespace "reg" (%facet-without :registry-namespace)))))
 
 (test registration-none-stays-supported
   "The map-less tenant declares :NONE and is what proves the spatial

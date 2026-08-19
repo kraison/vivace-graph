@@ -70,4 +70,4 @@
    #:unopened-source-graph #:unopened-source-graph-class
    #:unopened-source-graph-graph-name
    ;; registration (GH #138)
-   #:register-geometry))
+   #:register-geometry #:register-node))

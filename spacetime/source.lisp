@@ -156,9 +156,14 @@ not the keyword ~S" key v)))
         ;; rather than by omission.  REQ (not REQ-SYMBOL) is used for
         ;; both: REQ only checks presence via +FACET-ABSENT+, so a
         ;; present NIL passes, unlike REQ-SYMBOL which would reject it.
+        ;; :CLAIM-CLASS and :PRODUCER were added once REGISTER-NODE found a
+        ;; claim cannot be written without them, PRODUCER being part of
+        ;; DEF-UNIQUE's binary identity tuple (spec 3c9a0b2, design §3).
         (:registration
          (req-symbol :registry)
-         (req-string :registry-namespace)
+         (req-keyword :registry-namespace)
+         (req-symbol :claim-class)
+         (req-string :producer)
          (req-string :relation)
          (req-string :method)
          (req-string :rule-version)

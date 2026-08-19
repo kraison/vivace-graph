@@ -164,3 +164,253 @@ registration is broken entirely."
           (is (string= "overlapped" (name (getf (first regs) :region)))
               "it still registers to the region it genuinely overlaps")
           (is (%near 1d0 (%fraction-of (first regs))))))))
+
+;;; --- REGISTER-NODE: the registration, written as claims (Task 5) --------
+;;;
+;;; A second graph NAME, so the ambient/registry distinction can be
+;;; exercised with two graphs that genuinely differ (design §7).
+
+(defparameter *subject-graph-name* :graph-db-register-subject-test)
+
+(eval-when (:load-toplevel :execute)
+  (setf (gethash *subject-graph-name* graph-db::*schema-node-metadata*)
+        nil))
+
+(def-claim-classes ctr-claim :graph-db-register-test)
+
+;; The registry is a SOURCE, not a bare vertex like CT-REGION above: a
+;; claim names its object by EXTERNAL KEY, and OBJECT-KEY is part of
+;; DEF-UNIQUE's binary identity tuple, so a registry with no declared key
+;; cannot be registered against at all.
+(def-source ctr-place :graph-db-register-test
+    ((place-key :type string)
+     (extent :type geometry :index t))
+  :identity     (:namespace :ctr-places :key-slot place-key)
+  :space        (:geometry-slot extent :kind :polygon :precision :exact)
+  :time         :none
+  :attribution  :none
+  :sensitivity  (:class :internal)
+  :registration :none
+  :indexed-text :none)
+
+(defun ctr-precision (node)
+  "25 metres for every record.  A constant, so a test can assert the
+facet's :PRECISION-FN was consulted at all."
+  (declare (ignore node))
+  25.0d0)
+
+(defun ctr-confidence (node)
+  (declare (ignore node))
+  0.75d0)
+
+(def-source ctr-record :graph-db-register-test
+    ((record-key :type string)
+     (loc :type geometry :index t))
+  :identity     (:namespace :ctr-records :key-slot record-key)
+  :space        (:geometry-slot loc :kind :point :precision :exact)
+  :time         :none
+  :attribution  :none
+  :sensitivity  (:class :internal)
+  :registration (:registry ctr-place :registry-namespace :ctr-places
+                 :claim-class ctr-claim
+                 :producer "graph-db/spacetime-test/register"
+                 :relation "registered-at" :method "geometry-overlap"
+                 :rule-version "r/1"
+                 :precision-fn ctr-precision
+                 :confidence-fn ctr-confidence)
+  :indexed-text :none)
+
+;; An extended subject, for the refusal test: a polygon's overlap needs
+;; GEOS, a point's does not (design §6).
+(def-source ctr-area :graph-db-register-test
+    ((area-key :type string)
+     (shape :type geometry :index t))
+  :identity     (:namespace :ctr-areas :key-slot area-key)
+  :space        (:geometry-slot shape :kind :polygon :precision :exact)
+  :time         :none
+  :attribution  :none
+  :sensitivity  (:class :internal)
+  :registration (:registry ctr-place :registry-namespace :ctr-places
+                 :claim-class ctr-claim
+                 :producer "graph-db/spacetime-test/register"
+                 :relation "registered-at" :method "geometry-overlap"
+                 :rule-version "r/1"
+                 :precision-fn nil :confidence-fn nil)
+  :indexed-text :none)
+
+;; The map-less tenant's shape: everything else declared, registration not.
+(def-source ctr-plain :graph-db-register-test
+    ((plain-key :type string)
+     (spot :type geometry :index t))
+  :identity     (:namespace :ctr-plains :key-slot plain-key)
+  :space        (:geometry-slot spot :kind :point :precision :exact)
+  :time         :none
+  :attribution  :none
+  :sensitivity  (:class :internal)
+  :registration :none
+  :indexed-text :none)
+
+;; Lives in the OTHER graph, so its registry is genuinely foreign.
+(def-source ctr-remote :graph-db-register-subject-test
+    ((remote-key :type string)
+     (where :type geometry :index t))
+  :identity     (:namespace :ctr-remotes :key-slot remote-key)
+  :space        (:geometry-slot where :kind :point :precision :exact)
+  :time         :none
+  :attribution  :none
+  :sensitivity  (:class :internal)
+  :registration (:registry ctr-place :registry-namespace :ctr-places
+                 :claim-class ctr-claim
+                 :producer "graph-db/spacetime-test/register"
+                 :relation "registered-at" :method "geometry-overlap"
+                 :rule-version "r/1"
+                 :precision-fn nil :confidence-fn nil)
+  :indexed-text :none)
+
+(defmacro with-two-graphs ((subject registry) &body body)
+  "A fresh SUBJECT graph and a fresh REGISTRY graph, both on disk, with the
+ambient GRAPH-DB:*GRAPH* bound to the SUBJECT's -- so the two are never
+accidentally the same graph, which every Task 4 test left them."
+  (let ((d1 (gensym "D1")) (d2 (gensym "D2")))
+    `(with-temp-directory (,d1)
+       (with-temp-directory (,d2)
+         (let* ((,registry (make-graph *region-graph-name* (namestring ,d1)
+                                       :buffer-pool-size 1000
+                                       :spatial-precision 5))
+                (,subject (make-graph *subject-graph-name* (namestring ,d2)
+                                      :buffer-pool-size 1000
+                                      :spatial-precision 5)))
+           (unwind-protect (let ((graph-db:*graph* ,subject)) ,@body)
+             (ignore-errors (close-graph ,subject))
+             (ignore-errors (close-graph ,registry))
+             (collect-garbage)))))))
+
+(defparameter +ctr-square+
+  '((0d0 0d0) (2d0 0d0) (2d0 2d0) (0d0 2d0) (0d0 0d0))
+  "The one region every REGISTER-NODE test binds to.")
+
+(defun %make-place (graph key ring)
+  (let ((graph-db:*graph* graph))
+    (with-transaction ()
+      (make-ctr-place :place-key key :extent (make-polygon (list ring))))))
+
+(defun %make-record (graph key point)
+  (let ((graph-db:*graph* graph))
+    (with-transaction () (make-ctr-record :record-key key :loc point))))
+
+(defun %make-area (graph key polygon)
+  (let ((graph-db:*graph* graph))
+    (with-transaction () (make-ctr-area :area-key key :shape polygon))))
+
+(defun %make-plain (graph key point)
+  (let ((graph-db:*graph* graph))
+    (with-transaction () (make-ctr-plain :plain-key key :spot point))))
+
+(defun %make-remote (graph key point)
+  (let ((graph-db:*graph* graph))
+    (with-transaction () (make-ctr-remote :remote-key key :where point))))
+
+(defun %subject-claims (graph namespace key)
+  "Claims in GRAPH naming (NAMESPACE . KEY) as subject.  Goes through the
+substrate's own CLAIMS-TOUCHING rather than INDEX-LOOKUP: the index slot
+names are DEF-CLAIM-CLASSES's, interned in GRAPH-DB.SPACETIME whoever
+invokes the macro, so a bare SUBJECT-KEY here would name another symbol."
+  (claims-touching graph 'ctr-claim namespace key :role :subject))
+
+(test registering-a-node-writes-one-claim-per-region
+  (with-region-graph (g)
+    (%make-place g "p-a" +ctr-square+)
+    (let ((n (%make-record g "s-1" (make-point 1d0 1d0))))
+      (multiple-value-bind (written evaluated) (register-node n :graph g)
+        (is-true evaluated)
+        (is (= 1 written))))
+    (let ((c (first (%subject-claims g :ctr-records "s-1"))))
+      (is-true c "one claim was written for the subject")
+      (is (= 1.0d0 (claim-fraction c)))
+      (is (string= "registered-at" (claim-relation c)))
+      (is (string= "graph-db/spacetime-test/register" (claim-producer c)))
+      (is (eq :ctr-places (claim-object-namespace c)))
+      (is (string= "p-a" (claim-object-key c))
+          "the region's EXTERNAL key, from its own :IDENTITY facet")
+      (is (eq :inferred (claim-standing c))
+          "a registration is derived by computation (design §3)")
+      (is (= 25.0d0 (claim-precision-m c))
+          "the facet's :PRECISION-FN was consulted")
+      (is (= 0.75d0 (claim-confidence c))))))
+
+(test registering-the-same-node-twice-writes-one-claim
+  "⚠ Idempotent on DEF-UNIQUE's binary tuple -- PRODUCER, the subject
+pair, the object pair and RELATION.  A re-run of an ingest must not
+double a corpus (design §4)."
+  (with-region-graph (g)
+    (%make-place g "p-a" +ctr-square+)
+    (let ((n (%make-record g "s-2" (make-point 1d0 1d0))))
+      (register-node n :graph g)
+      (multiple-value-bind (written evaluated) (register-node n :graph g)
+        (is-true evaluated)
+        (is (= 1 written) "the second pass still reports the claim")))
+    (is (= 1 (length (%subject-claims g :ctr-records "s-2")))
+        "the second pass UPDATED the claim rather than adding one")))
+
+(test a-source-declaring-registration-none-writes-nothing
+  (with-region-graph (g)
+    (%make-place g "p-a" +ctr-square+)
+    (let ((n (%make-plain g "u-1" (make-point 1d0 1d0))))
+      (multiple-value-bind (written evaluated) (register-node n :graph g)
+        (is (zerop written))
+        (is-true evaluated ":NONE is an answer, not an unevaluated scan")))
+    (is (null (%subject-claims g :ctr-plains "u-1")))))
+
+(test an-unevaluated-scan-writes-nothing-and-says-so
+  "⚠ A refusal is never converted into 'wrote 0 claims, all fine'
+(design §6).  The point is the control, in the same binding: without it
+this cannot tell 'refused correctly' from 'broken everywhere'."
+  (with-region-graph (g)
+    (%make-place g "p-a" +ctr-square+)
+    (let ((a (%make-area g "a-1" (make-polygon
+                                  '(((0.5d0 0.5d0) (1.5d0 0.5d0)
+                                     (1.5d0 1.5d0) (0.5d0 1.5d0)
+                                     (0.5d0 0.5d0))))))
+          (p (%make-record g "s-4" (make-point 1d0 1d0))))
+      (let ((graph-db::*geos-available-p* nil))
+        (multiple-value-bind (written evaluated) (register-node a :graph g)
+          (is (zerop written))
+          (is-false evaluated))
+        (multiple-value-bind (written evaluated) (register-node p :graph g)
+          (is-true evaluated "a point's candidates are exact without GEOS")
+          (is (= 1 written)))))
+    (is (null (%subject-claims g :ctr-areas "a-1"))
+        "the refused scan wrote nothing at all")))
+
+(test a-subject-with-no-geometry-is-not-answered
+  "Where the record is, is unknown -- which is not the same as its being
+in no region (design §6)."
+  (with-region-graph (g)
+    (%make-place g "p-a" +ctr-square+)
+    (let ((n (%make-record g "s-5" nil)))
+      (multiple-value-bind (written evaluated) (register-node n :graph g)
+        (is (zerop written))
+        (is-false evaluated)))))
+
+(test the-registry-is-read-under-its-own-graph-not-the-ambient-one
+  "⚠ Here the subject's graph and the registry's genuinely differ, and the
+ambient GRAPH-DB:*GRAPH* is the SUBJECT's.  A region read under that
+binding comes back NIL through NODE-GEOMETRY's IGNORE-ERRORS, so the
+region is dropped and the caller sees 'no regions here' with EVALUATED-P
+true -- a wrong-graph read wearing an answer's clothes.  Every Task 4 test
+bound *GRAPH* and passed :GRAPH to the same graph, so this was untested
+until now (design §7, GH #53)."
+  (with-two-graphs (subject registry)
+    (is-false (eq subject registry) "the two graphs must genuinely differ")
+    (is (eq subject graph-db:*graph*) "the ambient graph is the subject's")
+    (%make-place registry "p-b" +ctr-square+)
+    (let ((n (%make-remote subject "r-1" (make-point 1d0 1d0))))
+      (multiple-value-bind (written evaluated)
+          (register-node n :graph subject :registry-graph registry)
+        (is-true evaluated)
+        (is (= 1 written) "the region is found under the REGISTRY's graph")))
+    (let ((c (first (claims-touching registry 'ctr-claim :ctr-remotes "r-1"
+                                     :role :subject))))
+      (is-true c "the claim is written in the REGISTRY graph")
+      (is (string= "p-b" (claim-object-key c))
+          "the region's key was read under the registry graph too"))))
