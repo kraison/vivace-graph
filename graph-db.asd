@@ -393,7 +393,8 @@ cl-temporal-extent."
                (:file "claim")
                (:file "claim-query")
                (:file "source")
-               (:file "resolve")))
+               (:file "resolve")
+               (:file "register")))
 
 (defsystem graph-db/spacetime-test
   :name "VivaceGraph spacetime test suite"
@@ -403,7 +404,12 @@ cl-temporal-extent."
   ;; GRAPH-DB:DESERIALIZE rather than a structural predicate (#130).  It is
   ;; already a transitive dependency via GRAPH-DB/SPACETIME; listed
   ;; explicitly here so the test system's needs are not implicit.
-  :depends-on (:graph-db/spacetime :graph-db/core :fiveam)
+  ;; GRAPH-DB/GEOS so register-tests.lisp can exercise the EXACT path: an
+  ;; extended geometry's overlap fraction needs GEOMETRY-INTERSECTION, and
+  ;; without the add-on REGISTER-GEOMETRY correctly refuses to answer at
+  ;; all (#138, design §6).  The GEOS-dependent test skips when libgeos_c
+  ;; is absent, as tests/geos/ does.
+  :depends-on (:graph-db/spacetime :graph-db/core :graph-db/geos :fiveam)
   :pathname "tests/spacetime/"
   :serial t
   :components ((:file "package")
@@ -418,7 +424,8 @@ cl-temporal-extent."
                ;; claim test files above (#131 Task 7).
                (:file "conformance-tests")
                (:file "claim-standing-guard-tests")    ; GH #149
-               (:file "claim-transaction-tests"))      ; GH #148
+               (:file "claim-transaction-tests")       ; GH #148
+               (:file "register-tests"))               ; GH #138
   :perform (test-op (op c)
                     (unless (uiop:symbol-call :graph-db/spacetime-test
                                               :run-spacetime-tests)

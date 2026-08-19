@@ -68,4 +68,6 @@
    #:unknown-namespace #:ambiguous-endpoint #:ambiguous-endpoint-classes
    #:resolution-in-transaction #:namespace-sources
    #:unopened-source-graph #:unopened-source-graph-class
-   #:unopened-source-graph-graph-name))
+   #:unopened-source-graph-graph-name
+   ;; registration (GH #138)
+   #:register-geometry))

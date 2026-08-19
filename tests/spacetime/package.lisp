@@ -22,4 +22,9 @@
   ;; lisp).
   (:import-from #:graph-db #:make-graph #:close-graph #:with-transaction
                 #:open-graph #:id #:lookup-vertex)
+  ;; DEF-VERTEX and the geometry constructors for register-tests.lisp's
+  ;; region fixture (#138); GEOMETRY is the slot type symbol, which must be
+  ;; GRAPH-DB's rather than a same-named symbol of this package.
+  (:import-from #:graph-db #:def-vertex #:geometry #:make-point
+                #:make-polygon)
   (:export #:run-spacetime-tests #:spacetime-suite))
