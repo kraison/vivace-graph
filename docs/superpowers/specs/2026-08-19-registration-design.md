@@ -87,8 +87,8 @@ Every field is derived from what the spine's rules already pass to
   ;; => (values registrations evaluated-p)
 ```
 
-`registrations` is a list of `(:region <node> :fraction <double>)`, most
-specific first. `evaluated-p` is §6.
+`registrations` is a list of `(:region <node> :fraction <double>)`,
+**unordered** — see §13. `evaluated-p` is §6.
 
 ```lisp
 (register-node node &key graph registry-graph)
@@ -282,11 +282,31 @@ back through the substrate accessors with their values intact.
 
 ## 13. Open items
 
-- **Line traversal ordering.** A line's regions have a natural order and
-  the spine sorts by place level, which is a tenant's notion of specificity.
-  Whether the substrate promises an order for a traversal, or returns them
-  unordered with the fractions, is unsettled. Decide before implementing
-  `register-geometry` for lines.
+- **Line traversal ordering — SETTLED: unordered.** A line's regions have
+  a natural order, and the spine sorts by place level — but that is a
+  tenant's notion of specificity, meaningless to another registry. The
+  substrate returns what the index returned, each with its fraction, and a
+  tenant sorts for itself.
+
+- **A line's fraction is a LENGTH ratio, not an area ratio.** Discovered in
+  Task 4's review. `geometry-geodesic-area` is zero for a `:linestring`,
+  so an area-based fraction gives a line 1.0 in *every* region it crosses,
+  summing to 3.0 over three regions — which contradicts §1's "the useful
+  fact is what fraction of it falls in each" and makes `fraction`
+  unusable for lines by the domain-neutral reader §2 promoted it for.
+  A line's fraction is therefore
+  `length(intersection) / length(subject)`, computed by a core
+  `geometry-geodesic-length` folding the existing haversine
+  `geodesic-distance` over consecutive vertices. A zero-length subject —
+  a degenerate line, or a point — keeps 1.0, which is correct for a point
+  and the only defensible answer for a degenerate one.
+
+- **A region the subject merely touches is not registered.** GEOS
+  `intersects` is true for boundary contact, so an abutting region comes
+  back from the candidate query with an intersection of zero area or
+  length. Registering it would bind a record to a region it does not
+  overlap — the mild form of the false positive §6 exists to prevent — so
+  a zero fraction is dropped rather than written.
 - **Fraction tolerance.** Fractions over a partition should sum to 1.0, but
   GEOS intersection on adjacent polygons double-counts shared boundaries by
   a negligible amount. The test needs a stated tolerance rather than an
