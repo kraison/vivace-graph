@@ -206,9 +206,30 @@ wrong derived data whose provenance does not record the skew.
 - **Cost:** a cross-store `with-read-snapshot` must register its read pin with every
   participating store, so a long cross-store query delays reaping in each store it touched.
   Per-store reaping must fold in foreign pins.
-- **Required audit:** each WAL will now contain epoch *gaps*. `load-highest-transaction-id`
-  takes a max and is fine; the peer/pull-cursor code compares epochs and takes maxima and
-  appears fine. Anything assuming epoch density must be found **before** this lands.
+- **Epoch-density audit: complete, clean** (2026-08-20, recorded on #168). No code assumes
+  contiguous ids. Consumers either take a max/min over an actual collection, filter an
+  existing collection by comparison, or use `(1+ x)` as an exclusive *lower bound*.
+  `replication-log-ranges` derives log N's end from log N+1's start, which looked dangerous
+  and is not: it over-approximates, and monotonicity still puts log N's ids in
+  `[start_N, start_{N+1})`.
+- **What the audit did find: `restore-graph` is a second id allocator that bypasses the
+  transaction manager.** `transaction-restore.lisp:133-152` mints ids by `(incf tx-id)` from
+  `(load-highest-transaction-id graph)` — a *per-store* scalar — and persists a per-store
+  high-water mark. Under a global clock it would allocate epochs **below** the global
+  counter, putting distinct events in different stores at the same epoch: precisely what
+  this section exists to prevent, arriving through the back door. **Re-pointing it at the
+  global clock is in scope for the unit.** This is load-bearing, not incidental — logical
+  replay is the proven per-store recovery path and §9 depends on restore semantics.
+- **Stated property, not a surprise: the global clock is not purely local.**
+  `peer-observe-epoch` advances the counter to strictly exceed a *foreign* epoch carried by
+  a pulled node — another image's clock. Under a per-graph counter that was local
+  bookkeeping; under an image-level clock a peer sync can advance the whole image's clock.
+  Mechanically sound (Lamport-style max, 64-bit ids, leases allocated ahead of the current
+  clock), but it must be documented rather than discovered.
+- **Three counters exist; one is in scope.** The transaction id (global, this section); the
+  per-graph `lamport` counter for peer conflict resolution, which orders events across
+  *devices* — separate images — and **stays per-graph**; and the per-node 32-bit `revision`,
+  untouched. Stated so nobody globalises the lamport counter by analogy.
 
 **Sequencing:** the debt is monotonic. Every write before the migration lands below the
 watermark permanently. This does not block other units, but its cost accrues daily.
@@ -364,7 +385,6 @@ because its migration debt accrues daily (§6).
 - Whether the shadow swap supersedes logical replay as the per-store restore mechanism. The
   trade is real: logical replay needs no journal and no retention but is not atomic. Since
   unit 5 requires the journal anyway, the marginal cost of consolidating is zero.
-- **WAL epoch-density audit** (§6) — blocking for unit 3.
 - **Identity-slot indexing audit** — external-key slots used for cross-store assertion
   resolution must be `:unique` or at least `:index t`, else assertions resolve by scan.
   Largely answered by the multi-slot index work (#107), which made these keys composite.
