@@ -306,7 +306,8 @@ debugging an unexpectedly empty result, check the declaration before the data."
                                    export-predicate device-registry merge-policy
                                    reference-classes (peer-schema-version '(1 0))
                                    (index-backend *index-backend*)
-                                   spatial-index-backend)
+                                   spatial-index-backend
+                                   (system-clock *system-clock*))
   "Create a brand-new graph named NAME with its on-disk files under the
 directory LOCATION, register it (so LOOKUP-GRAPH and *GRAPH* can find it), and
 return it.  The directory is created if necessary and must not already contain
@@ -357,6 +358,12 @@ Keyword arguments:
                           applies only replicated writes whose node it accepts,
                           so it holds just a subset (e.g. its area of operations).
                           See MAKE-SPATIAL-REPLICATION-FILTER.
+  :SYSTEM-CLOCK           the image-level epoch clock (GH #168) this
+                          store's transactions allocate ids from, or NIL
+                          (the default, via *SYSTEM-CLOCK*) to keep this
+                          store's own counter -- the pre-#168 behaviour.
+                          Attaching raises the clock above this store's
+                          persisted highest id.
 
 A .dirty marker file is written on creation; always CLOSE-GRAPH to flush data
 to disk and remove it."
@@ -477,6 +484,8 @@ to disk and remove it."
       (setf (transaction-manager graph)
             (make-instance 'transaction-manager
                            :graph graph))
+      (when system-clock
+        (attach-to-system-clock graph system-clock))
       (ensure-directories-exist (persistent-transaction-directory graph))
       (init-replication-log graph)
       (start-replication graph :package package)
@@ -507,10 +516,13 @@ to disk and remove it."
                    ;; so this governs only indexes created after the open -- and,
                    ;; for a pre-v3 graph, the ones its migration re-derives.
                    (spatial-precision 7)
-                   (spatial-max-cells +spatial-insert-max-cells+))
+                   (spatial-max-cells +spatial-insert-max-cells+)
+                   (system-clock *system-clock*))
   "Open the existing graph named NAME whose files live under directory
 LOCATION, register it, and return it.  Use this to reopen a graph created
-earlier with MAKE-GRAPH; the keyword arguments mirror MAKE-GRAPH's.
+earlier with MAKE-GRAPH; the keyword arguments mirror MAKE-GRAPH's, including
+:SYSTEM-CLOCK -- attaching raises the clock above this store's persisted
+highest id (the spec §6 watermark).
 
 Signals an error if LOCATION holds a .dirty marker, which means the graph was
 not closed cleanly and must be recovered first (see RECOVER-TRANSACTIONS and
@@ -703,6 +715,8 @@ Always CLOSE-GRAPH when finished."
       (setf (transaction-manager graph)
             (make-instance 'transaction-manager
                            :graph graph))
+      (when system-clock
+        (attach-to-system-clock graph system-clock))
       (ensure-directories-exist (persistent-transaction-directory graph))
       (init-replication-log graph)
       (start-replication graph :package package)

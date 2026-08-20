@@ -126,15 +126,24 @@ as bare #(...): their ids, and an edge's FROM / TO, are repaired here by
 ENSURE-ID-ARRAY, but the element type of a node's own vector-valued SLOTS was
 never recorded in those files and cannot be recovered -- such a slot restores as
 a plain SIMPLE-VECTOR.  Re-snapshot after restoring to get the types back."
-  (let ((*package* (find-package package-name))
-        (*readtable* *restore-readtable*)
-        (*graph* graph)
-        (count 0)
-        (tx-id (load-highest-transaction-id graph))
-        (start-time (get-universal-time)))
+  (let* ((*package* (find-package package-name))
+         (*readtable* *restore-readtable*)
+         (*graph* graph)
+         (count 0)
+         ;; GH #168; slot-boundp mirrors WITH-READ-PIN (graph-class.lisp):
+         ;; the manager is unbound on the :replay-txn-dir path, and no
+         ;; clock can be attached before it either.
+         (tm (and (slot-boundp graph 'transaction-manager)
+                  (transaction-manager graph)))
+         (local-tx-id (unless tm (load-highest-transaction-id graph)))
+         (tx-id nil)
+         (start-time (get-universal-time)))
     (do-snapshot-sexps (plists snapshot-file *restore-objects-per-transaction*)
-      (let ((*transaction* (make-instance 'restore-transaction
-                                          :transaction-id (incf tx-id))))
+      (let ((*transaction*
+              (make-instance
+               'restore-transaction
+               :transaction-id
+               (setf tx-id (if tm (tm-next-epoch tm) (incf local-tx-id))))))
         (dolist (plist plists)
           (when (zerop (mod (incf count) 1000))
             (log:info "~A RESTORED ~A NODES" (current-thread) count))
@@ -149,7 +158,8 @@ a plain SIMPLE-VECTOR.  Re-snapshot after restoring to get the types back."
             (otherwise
              (log:error "RESTORE: Unknown input: ~S" plist))))
         (apply-transaction *transaction* graph)))
-    (persist-highest-transaction-id (incf tx-id) graph)
+    (when tx-id
+      (persist-highest-transaction-id tx-id graph))
     (let ((elapsed-time (- (get-universal-time) start-time)))
       (log:info "RESTORE TOOK ~A SECONDS" elapsed-time)
       (values graph :count count :elapsed-time elapsed-time))))

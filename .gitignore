@@ -19,3 +19,6 @@
 
 # Superpowers SDD scratch (ledger, briefs, reports) -- regenerable
 /.superpowers/
+
+# Local git worktrees for parallel unit work (superpowers:using-git-worktrees)
+.worktrees/

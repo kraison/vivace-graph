@@ -54,6 +54,9 @@
                (:file "node-id" :depends-on ("package" "posix"))
                (:file "buffer-pool" :depends-on ("pcons" "node-id"))
                (:file "serialize" :depends-on ("conditions" "buffer-pool" "cl-store-ecl"))
+               ;; The image-level epoch clock (GH #168).  No graph dependency,
+               ;; so it loads early and tests without one.
+               (:file "system-clock" :depends-on ("serialize" "utilities"))
                (:file "geometry" :depends-on ("serialize"))
                (:file "geometry-ops" :depends-on ("geometry"))
                (:file "geohash" :depends-on ("package"))
@@ -86,7 +89,7 @@
                (:file "vertex" :depends-on ("primitive-node"))
                (:file "edge" :depends-on ("vertex"))
                (:file "gc" :depends-on ("edge" "vertex" "views"))
-               (:file "transactions" :depends-on ("graph-class" "type-index" "vev-index" "ve-index" "edge" "vertex" "gc" "spatial-index" "posix"))
+               (:file "transactions" :depends-on ("graph-class" "type-index" "vev-index" "ve-index" "edge" "vertex" "gc" "spatial-index" "posix" "system-clock"))
                (:file "transaction-restore" :depends-on ("transactions"))
                (:file "transaction-log-streaming" :depends-on ("transactions"))
                (:file "backup" :depends-on ("edge"))
@@ -499,6 +502,7 @@ cl-temporal-extent."
                (:file "reopen-tests")
                (:file "backup-tests")
                (:file "mvcc-tests")
+               (:file "system-clock-tests")       ; GH #168
                (:file "rest-tests")
                (:file "rest-http-tests")
                (:file "prolog-stress-tests")

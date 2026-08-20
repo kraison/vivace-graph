@@ -2718,6 +2718,157 @@ Also note: ~graph~ is now a *reserved* slot name on node classes — it backs th
 home-graph tracking slot described above. A user-defined slot named ~graph~ shadows it and
 silently disables home-graph tracking for that class; do not use it as a slot name.
 
+*** The image-level system clock (optional)
+
+Chapter 17 says a cross-graph instant "would need an epoch shared by every
+transaction manager, which is not implemented." As of GH #168, it can be:
+a ~system-clock~ is one epoch counter shared by every store attached to it,
+in place of each store's own ~transaction-id~ counter.
+
+~*system-clock*~ defaults to ~nil~. With no clock bound and no ~:system-clock~
+argument passed, every store keeps its own counter exactly as before —
+~tm-next-epoch~'s NIL branch is byte-for-byte the pre-#168
+~(prog1 counter (incf counter))~. Nothing about this feature is on by
+default; a production server upgrading past #168 sees no behaviour change
+until it explicitly opens a clock.
+
+To open one and attach stores to it:
+
+#+BEGIN_SRC lisp
+(let ((clock (open-system-clock "/path/to/clock-dir/")))
+  (unwind-protect
+       (let ((a (make-graph :store-a "/path/to/a/" :system-clock clock))
+             (b (make-graph :store-b "/path/to/b/" :system-clock clock)))
+         ;; every transaction on A or B now draws its epoch from CLOCK,
+         ;; so no two transactions anywhere on this clock share one
+         (unwind-protect (progn ...)
+           (close-graph a)
+           (close-graph b)))
+    (close-system-clock clock)))
+#+END_SRC
+
+~make-graph~ and ~open-graph~ both take ~:system-clock~, defaulting to
+~*system-clock*~ — bind that special once per image instead of passing the
+keyword to every call. Attaching (at either ~make-graph~ or ~open-graph~)
+raises the clock above the store's own persisted history — its highest
+committed transaction id, and for a peer-graph, its pull-cursor too, since
+those are distinct number spaces — so the clock can never hand out an
+epoch that store has already used. This is the watermark; it runs under
+the store's transaction-manager lock and refuses (signalling
+~attach-with-active-transactions~) if the store has any in-flight
+transaction, since attaching mid-transaction would poison that
+transaction's overlap window.
+
+**One limitation**: the watermark only ever raises the clock forward. It
+cannot place the clock *below* a store's history, so a store cannot be
+attached to reconstruct what its epoch numbering would have been had the
+clock existed since that store's creation — there is no snapshotting into
+the pre-migration past across stores. A store's own history before attach
+remains ordered correctly by its own counter; only new activity after
+attach shares the image-wide sequence.
+
+This guarantee does not extend to ~make-graph :replay-txn-dir D
+:system-clock C~: replay runs before the transaction manager and the
+attach exist, so it mints local ids from zero and the later attach's
+watermark observation is then a no-op, leaving the restored store
+holding epochs the clock already issued to other stores. See
+vivace-graph#180.
+
+*** Epoch leases for a detached store
+
+~clock-lease-epochs~ reserves a contiguous range on the clock for a store
+that is about to go offline (a detach, per spec §8 — not yet built; see
+~docs/superpowers/specs/2026-08-20-namespaces-design.md~ §6): the range
+is skipped so the clock never hands the same epochs to anyone else, and
+the detached store can allocate from its own leased range with no further
+coordination while it is disconnected.
+
+#+BEGIN_SRC lisp
+(multiple-value-bind (start end) (clock-lease-epochs clock 100000)
+  ;; the detached store now owns every epoch in [start, end)
+  ...)
+#+END_SRC
+
+Epoch ids are 64-bit, so a lease large enough for any realistic bulk load
+still leaves exhaustion unreachable. As of GH #168, this is a primitive
+with no caller yet — #170's shadow-generation swap is the first thing
+that will call it, to hand a detached bulk load its own private range.
+
+*** The lifecycle journal
+
+Every ~system-clock~ also keeps a small append-only journal of store
+lifecycle events, living beside the clock's own counter file in the same
+directory. ~journal-append~ writes one record — kind ~:create~, ~:detach~
+(with its lease range), ~:swap~, ~:attach~, or ~:retire~, plus whatever
+else the caller supplies — and ~journal-records~ reads every record back,
+oldest first. ~attach-to-system-clock~ already appends an ~:attach~
+record on every attach; the other four kinds are for #170 and #171 to
+write as they build detach, swap and restore on top of this.
+
+**The journal is read with ~*read-eval*~ bound to ~nil~: it is data, and
+is never evaluated.** This is load-bearing, not a stylistic default —
+#170's shadow swap and #171's restore both plan to trust journal contents
+without re-checking them, so a record must never be able to execute code
+just by being read back.
+
+*** Cross-image effects: a peer sync can advance the clock
+
+A pulled node carries the *hub's* commit epoch, and ~peer-observe-epoch~
+raises the pulling store's own epoch source past it so a subsequent local
+edit cannot start before the epoch it just pulled. With no clock bound
+this only ever touches that one store's own counter, as before #168. With
+a clock bound, the store's own ~tx-id-counter~ is dead — every epoch call
+routes through the clock instead — so the observation goes to the clock:
+~clock-observe-epoch~, not the counter.
+
+One consequence worth stating plainly: **the image clock is therefore not
+purely local.** A peer sync on one store can advance the *whole* image's
+clock, driven by another image's clock entirely. This is intentional and
+monotonic — Lamport-style, never moves backward — but it means the clock
+a store observes reflects more than just that image's own activity once
+peer replication and a system clock are both in use.
+
+*** Restore's watermark now matches the rest of the engine
+
+~recreate-graph~ (used by both ~replay~ — snapshot/backup restore — and
+~migrate-graph~) used to mint ids from a per-store scalar,
+~load-highest-transaction-id~, entirely bypassing the transaction
+manager. Under a shared clock that could reissue an epoch some *other*
+store had already committed at — precisely the collision a system clock
+exists to prevent. It now allocates through ~tm-next-epoch~, which draws
+from the image clock when the graph has one, or the store's own counter
+otherwise (unchanged behaviour with no clock bound).
+
+One more change rides along, and it is a *correction*, not a regression:
+the id restore persists as the store's watermark afterward is now the
+last id actually *used*, not one past it. The old ~(incf tx-id)~ before
+the final persist always wasted one epoch — including on an empty
+snapshot, where it bumped the watermark for zero work — and disagreed
+with the convention everywhere else in the engine: ~apply-transaction~
+persists the id it actually used, and a fresh transaction manager's
+~initialize-instance :after~ already re-adds the missing one itself, via
+~(1+ (max ...))~. Restored ids are unchanged; only the trailing watermark
+is one lower than before, closing a gap that was always wasted.
+
+*** Cross-store snapshots pin every store they touch
+
+~with-read-snapshot~ composes by nesting — a query spanning stores looks
+like ~(with-read-snapshot (a) (with-read-snapshot (b) ...))~ — and each
+nested call now takes a read-epoch pin on *its own* graph's transaction
+manager for the snapshot's extent, alongside the snapshot transaction it
+already registered. Because each call only ever pins its own graph, the
+composition covers every participating store for free: nothing about the
+outermost or innermost call is special.
+
+**Name the cost plainly:** for as long as a cross-store snapshot is open,
+every store it touched has its reaper floor held down by that reader —
+not only the store the query happens to be reading from right now. A
+long cross-store query therefore delays reclaiming old versions in every
+store it participated in, for its full duration. This is the intended
+price of giving a cross-store query a genuine shared instant (spec §6);
+without it, one store's reaper could free a version a snapshot on another
+store still depends on.
+
 ** Chapter 18: Temporal Extents — graph-db/spacetime (optional)
 
 Every timestamp a real system records comes with some story about how sure
