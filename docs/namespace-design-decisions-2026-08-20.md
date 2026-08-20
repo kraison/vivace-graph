@@ -372,6 +372,22 @@ No new file — D9 requires the object regardless.
    approximated; this is the differential recovery policy again.
 6. Emit a **manifest** naming, per store, rewound-to-T or rebuilt-at-now.
 
+**Rebuild is not equivalent to restore, and step 4 cascades.** Restoring a retained
+generation preserves node ids (`backup` preserves `:id` and `:revision`). **Rebuilding from
+source does not** — re-derivation mints fresh UUIDs, so every cross-store reference *into*
+the rebuilt store by node id dangles. The store-id tag from D5 is stable across this (it is
+the same store, a new generation), but the node ids are not.
+
+So step 4 must cascade: rebuilding a derivable store invalidates its dependents, whose
+repair is regeneration. That is agreed-shape point 4 doing its job — the derived namespace
+is wholly disposable and a dangle after a partial restore is a signal, not a corruption —
+and it is why point 5 keys *authored* cross-boundary assertions on external identity rather
+than node id. A node id is a location; an external key is an identity. Anything holding a
+cross-store reference must therefore be either regenerable or externally keyed; there is no
+third option that survives a rebuild.
+
+The manifest must name the cascade, not just the rebuild.
+
 Step 6 is not bookkeeping. A restore that silently mixes rewound and rebuilt stores
 produces exactly the inconsistent instant D9 exists to prevent, and nothing in the data
 would record that it happened — the same failure shape that put #94 back in scope. Making
