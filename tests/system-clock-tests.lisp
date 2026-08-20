@@ -319,3 +319,73 @@
                       (is (null (graph-system-clock g))))
                  (close-system-clock clock)))
           (close-graph g :snapshot-p nil))))))
+
+(test recreate-graph-allocates-from-the-image-clock
+  ;; The audit finding (GH #168): RECREATE-GRAPH minted ids from a per-store
+  ;; scalar, so under a shared clock it reissued epochs another store had
+  ;; already used.  Drives the real path: SNAPSHOT then REPLAY.  (The plan's
+  ;; sketch reached the source graph via LOOKUP-GRAPH post-close and via
+  ;; PERSISTENT-TRANSACTION-DIRECTORY, neither of which line up with how
+  ;; CLOSE-GRAPH deregisters or where SNAPSHOT actually writes; and empty
+  ;; transaction bodies leave nothing in the snapshot for REPLAY to
+  ;; allocate ids against.  Fixed by reusing backup-tests.lisp's txn-log/
+  ;; convention and g-person schema, both already loaded by graph-tests.lisp.
+  ;; The source and destination graphs share *INTEGRATION-GRAPH-NAME* -- as
+  ;; many other tests do sequentially -- because that is the schema key
+  ;; G-PERSON is registered under; they never overlap while open.
+  ;;
+  ;; RECORD-COUNT exceeds *RESTORE-OBJECTS-PER-TRANSACTION* (10) so REPLAY
+  ;; spans several batches -- several allocator calls, not one -- and the
+  ;; clock's ADVANCE (not just a floor on the persisted id) is asserted:
+  ;; a TM-CURRENT-EPOCH-for-TM-NEXT-EPOCH substitution peeks the same
+  ;; floor without moving the clock, which a floor-only check cannot see
+  ;; but an exact advance-by-BATCHES check does.
+  (with-temp-directory (cdir)
+    (let ((clock (open-system-clock (namestring cdir)))
+          (record-count 25))
+      (unwind-protect
+           (with-temp-directory (sdir)
+             (with-temp-directory (odir)
+               ;; Source store: enough real history to span several REPLAY
+               ;; batches, then a snapshot on disk.
+               (let ((src (make-graph *integration-graph-name* (namestring sdir)
+                                      :buffer-pool-size 1000
+                                      :system-clock clock)))
+                 (let ((*graph* src))
+                   (dotimes (i record-count)
+                     (with-transaction ((graph-db::transaction-manager src))
+                       (make-g-person :name "restore-probe" :age i)))
+                   (graph-db::snapshot src))
+                 (close-graph src :snapshot-p nil))
+               ;; A second store burns epochs, pushing the clock far past
+               ;; anything the restore target's own scalar knows about.
+               (let ((other (make-graph :sc-other (namestring odir)
+                                        :buffer-pool-size 1000
+                                        :system-clock clock)))
+                 (dotimes (i 50)
+                   (with-transaction ((graph-db::transaction-manager other))
+                     t))
+                 (let* ((per graph-db::*restore-objects-per-transaction*)
+                        (floor-epoch (clock-current-epoch clock))
+                        (batches (ceiling record-count per)))
+                   (with-temp-directory (rdir)
+                     (let ((dst (make-graph *integration-graph-name*
+                                            (namestring rdir)
+                                            :buffer-pool-size 1000
+                                            :system-clock clock)))
+                       (graph-db::replay
+                        dst
+                        (merge-pathnames "txn-log/" sdir)
+                        :graph-db/test)
+                       ;; Every id the replay issued sits above the clock's
+                       ;; position when it started ...
+                       (is (>= (graph-db::load-highest-transaction-id dst)
+                               floor-epoch))
+                       ;; ... and the clock advanced by exactly one epoch
+                       ;; per batch -- the property TM-NEXT-EPOCH provides
+                       ;; and a peek-only TM-CURRENT-EPOCH does not.
+                       (is (= batches
+                              (- (clock-current-epoch clock) floor-epoch)))
+                       (close-graph dst :snapshot-p nil))))
+                 (close-graph other :snapshot-p nil))))
+        (close-system-clock clock)))))
