@@ -26,7 +26,11 @@ between releases; cutting a release renames it to the new version and dates it.
     `GEOSIntersection`, which would refuse the *whole* subject and drop every
     region it genuinely overlaps — the host-dependent invalid-polygon case that
     partial coverage exists to report, turned into a total loss. The clamp
-    holds `fraction`'s documented `[0,1]` contract.
+    holds `fraction`'s documented `[0,1]` contract — and is pinned by a
+    DIRECT unit test on `%overlap-fraction`, because end to end it cannot be
+    made to fire: with subject and region both repaired the intersection is a
+    subset of the subject, so the ratio never exceeds 1 by more than float
+    noise.
   - **`fraction` and `precision-m` join `+claim-shared-slots+`**, so every
     claim of every tenant carries them rather than a tenant declaring them in
     `:extra-slots`. A retrieval layer weighting expansion by overlap is

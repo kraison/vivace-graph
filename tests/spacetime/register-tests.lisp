@@ -676,6 +676,29 @@ SHARE: in [0,1], never above it (design §1, §6)."
            (is (plusp f)
                "a repaired bow-tie inside the region is not a touch")))))))
 
+(test the-clamp-is-what-holds-the-upper-bound
+  "⚠ A UNIT TEST ON %OVERLAP-FRACTION, DELIBERATELY.  The test above
+does NOT pin the clamp: with subject and region both repaired the
+intersection is a subset of the subject, so the ratio never exceeds 1 by
+more than float noise and (IS (<= F 1.0D0)) passes with the MIN deleted.
+Neither the implementer nor two reviewers could construct an end-to-end
+input that overruns it.
+
+Calling the function directly does what no fixture can: SUBJECT-MEASURE
+is the caller's, so understating it makes the ratio genuinely 2.0 and
+only the clamp brings it back to 1.0.  Verified RED with the MIN removed
+(#138 task 6b, final review M-1; design §2's [0,1] range)."
+  (if (not graph-db::*geos-available-p*)
+      (skip "GEOS not available: GEOMETRY-INTERSECTION needs it")
+      (let* ((square (make-polygon '(((0d0 0d0) (1d0 0d0) (1d0 1d0)
+                                      (0d0 1d0) (0d0 0d0)))))
+             (measure #'graph-db:geometry-geodesic-area)
+             (whole (funcall measure square)))
+        (is (plusp whole) "fixture sanity: the square has area")
+        (is (= 1.0d0 (graph-db.spacetime::%overlap-fraction
+                      square square measure (/ whole 2)))
+            "an understated denominator must still not exceed 1.0"))))
+
 ;;; --- the repair that came back a GEOMETRYCOLLECTION (GH #163) ----------
 ;;; %REPAIRED's fallback to the original is for a repair that CANNOT
 ;;; happen (no add-on, GEOS < 3.8).  A mixed-dimension repair can happen
