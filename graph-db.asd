@@ -444,6 +444,9 @@ cl-temporal-extent."
                ;; graph, no schema registration), so it has no ordering
                ;; constraint against the graph-level files below.
                (:file "node-class-tests")
+               ;; Likewise no graph/schema-registration ordering constraint:
+               ;; a throwaway MAKE-SCHEMA and raw mmap'd byte layouts (#166).
+               (:file "type-id-width-tests")
                (:file "geometry-tests")
                (:file "geometry-ops-tests")
                (:file "geohash-tests")

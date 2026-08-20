@@ -20,8 +20,9 @@
 (def-vertex mvcc-kept-node () ((n)) :mvcc-keep-test :keep-revisions 2)
 
 (test node-head-v2-round-trip-vertex
-  "A vertex head round-trips revision, data-pointer, commit-epoch and prev-pointer
-through serialize-node-head / deserialize-node-head (31-byte v2 head)."
+  "A vertex head round-trips revision, data-pointer, commit-epoch and
+prev-pointer through serialize-node-head / deserialize-node-head (33-byte
+head; type-id widened to 4 bytes, GH #166)."
   (with-test-graph (g)
     (declare (ignore g))
     (let (v)
@@ -31,9 +32,9 @@ through serialize-node-head / deserialize-node-head (31-byte v2 head)."
             (graph-db::commit-epoch v) 123456789
             (graph-db::prev-pointer v) 987654321)
       (let ((buf (graph-db::make-byte-vector graph-db::+node-header-size+)))
-        (is (= 31 graph-db::+node-header-size+))
-        (is (= 30 (graph-db::serialize-node-head buf v 0))
-            "serialize returns the final offset (31-byte head ends at 30)")
+        (is (= 33 graph-db::+node-header-size+))
+        (is (= 32 (graph-db::serialize-node-head buf v 0))
+            "serialize returns the final offset (33-byte head ends at 32)")
         (multiple-value-bind (del wr hw tiw vw vew vvw type-id rev ptr epoch prev offset)
             (graph-db::deserialize-node-head buf 0)
           (declare (ignore del wr hw tiw vw vew vvw))
@@ -42,7 +43,7 @@ through serialize-node-head / deserialize-node-head (31-byte v2 head)."
           (is (= 4242 ptr))
           (is (= 123456789 epoch) "commit-epoch round-trips")
           (is (= 987654321 prev) "prev-pointer round-trips")
-          (is (= 30 offset)))))))
+          (is (= 32 offset)))))))
 
 (test node-head-v2-round-trip-edge
   "An edge head round-trips its from/to/weight AND the new commit-epoch /
@@ -59,7 +60,7 @@ auto-shifts with the larger v2 head)."
             (graph-db::commit-epoch e) 555
             (graph-db::prev-pointer e) 666)
       (let ((buf (graph-db::make-byte-vector graph-db::+edge-header-size+)))
-        (is (= 71 graph-db::+edge-header-size+))
+        (is (= 73 graph-db::+edge-header-size+))
         (graph-db::serialize-edge-head buf e 0)
         (let ((e2 (graph-db::deserialize-edge-head buf 0)))
           (is (= 4 (graph-db::revision e2)))

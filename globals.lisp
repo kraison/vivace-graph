@@ -239,7 +239,7 @@ strictly-safe pre-durability abort.")
 (alexandria:define-constant +index-list-bytes+ 17)
 
 ;; ve-key / ve-index
-(alexandria:define-constant +ve-key-bytes+ 18)
+(alexandria:define-constant +ve-key-bytes+ 20)
 (alexandria:define-constant +null-ve-key+
     (make-array +ve-key-bytes+ :initial-element 0 :element-type '(unsigned-byte 8))
   :test 'equalp)
@@ -248,7 +248,7 @@ strictly-safe pre-durability abort.")
   :test 'equalp)
 
 ;; vev-key / vev-index
-(alexandria:define-constant +vev-key-bytes+ 34)
+(alexandria:define-constant +vev-key-bytes+ 36)
 (alexandria:define-constant +null-vev-key+
     (make-array +vev-key-bytes+ :initial-element 0 :element-type '(unsigned-byte 8))
   :test 'equalp)

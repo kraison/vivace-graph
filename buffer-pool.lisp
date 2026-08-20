@@ -27,9 +27,9 @@
              (:conc-name bps-))
   (buffer-8 0 :type (UNSIGNED-BYTE 64))
   (buffer-16 0 :type (UNSIGNED-BYTE 64))
-  (buffer-18 0 :type (UNSIGNED-BYTE 64))
+  (buffer-20 0 :type (UNSIGNED-BYTE 64))
   (buffer-24 0 :type (UNSIGNED-BYTE 64))
-  (buffer-34 0 :type (UNSIGNED-BYTE 64))
+  (buffer-36 0 :type (UNSIGNED-BYTE 64))
   (pcons 0 :type (UNSIGNED-BYTE 64))
   (vertex 0 :type (UNSIGNED-BYTE 64))
   (edge 0 :type (UNSIGNED-BYTE 64))
@@ -41,9 +41,9 @@
            (cons :cache-misses
                  (list (cons :BUFFER-8 (bps-buffer-8 *buffer-pool-stats*))
                        (cons :BUFFER-16 (bps-buffer-16 *buffer-pool-stats*))
-                       (cons :BUFFER-18 (bps-buffer-18 *buffer-pool-stats*))
+                       (cons :BUFFER-20 (bps-buffer-20 *buffer-pool-stats*))
                        (cons :BUFFER-24 (bps-buffer-24 *buffer-pool-stats*))
-                       (cons :BUFFER-34 (bps-buffer-34 *buffer-pool-stats*))
+                       (cons :BUFFER-36 (bps-buffer-36 *buffer-pool-stats*))
                        (cons :pcons (bps-pcons *buffer-pool-stats*))
                        (cons :vertex (bps-vertex *buffer-pool-stats*))
                        (cons :edge (bps-edge *buffer-pool-stats*))
@@ -90,7 +90,7 @@
                      #+ecl
                      (mp:with-lock (*buffer-pool-lock*)
                        (push b (first (gethash 16 *buffer-pool*)))))))
-                ((8 18 24 34)
+                ((8 20 24 36)
                  (log:info "BUFFER-POOL: Refreshing byte-vector-~D buffers (~D)"
                            (car stat) (- small (cdr stat)))
                  (dotimes (i (- small (cdr stat)))
@@ -230,20 +230,20 @@
       (mp:with-lock (*buffer-pool-lock*)
         (push b (first (gethash 16 *buffer-pool*)))))))
 
-(defun make-byte-vector-18-buffer ()
+(defun make-byte-vector-20-buffer ()
   (let ((*package* (find-package :graph-db)))
-    ;;(log:debug "refreshing byte-vector-buffer-18")
-    (let ((b (make-byte-vector 18)))
+    ;;(log:debug "refreshing byte-vector-buffer-20")
+    (let ((b (make-byte-vector 20)))
       #+sbcl
-      (sb-ext:atomic-push b (first (gethash 18 *buffer-pool*)))
+      (sb-ext:atomic-push b (first (gethash 20 *buffer-pool*)))
       #+lispworks
-      (sys:atomic-push b (car (gethash 18 *buffer-pool*)))
+      (sys:atomic-push b (car (gethash 20 *buffer-pool*)))
       #+ccl
       (ccl:with-lock-grabbed (*buffer-pool-lock*)
-        (push b (first (gethash 18 *buffer-pool*))))
+        (push b (first (gethash 20 *buffer-pool*))))
       #+ecl
       (mp:with-lock (*buffer-pool-lock*)
-        (push b (first (gethash 18 *buffer-pool*)))))))
+        (push b (first (gethash 20 *buffer-pool*)))))))
 
 (defun make-byte-vector-24-buffer ()
   (let ((*package* (find-package :graph-db)))
@@ -260,20 +260,20 @@
       (mp:with-lock (*buffer-pool-lock*)
         (push b (first (gethash 24 *buffer-pool*)))))))
 
-(defun make-byte-vector-34-buffer ()
+(defun make-byte-vector-36-buffer ()
   (let ((*package* (find-package :graph-db)))
-    ;;(log:debug "refreshing byte-vector-buffer-34")
-    (let ((b (make-byte-vector 34)))
+    ;;(log:debug "refreshing byte-vector-buffer-36")
+    (let ((b (make-byte-vector 36)))
       #+sbcl
-      (sb-ext:atomic-push b (first (gethash 34 *buffer-pool*)))
+      (sb-ext:atomic-push b (first (gethash 36 *buffer-pool*)))
       #+lispworks
-      (sys:atomic-push b (car (gethash 34 *buffer-pool*)))
+      (sys:atomic-push b (car (gethash 36 *buffer-pool*)))
       #+ccl
       (ccl:with-lock-grabbed (*buffer-pool-lock*)
-        (push b (first (gethash 34 *buffer-pool*))))
+        (push b (first (gethash 36 *buffer-pool*))))
       #+ecl
       (mp:with-lock (*buffer-pool-lock*)
-        (push b (first (gethash 34 *buffer-pool*)))))))
+        (push b (first (gethash 36 *buffer-pool*)))))))
 
 (defun buffer-pool-running-p ()
   (and (threadp *buffer-pool-thread*)
@@ -301,7 +301,7 @@
         (list nil)
         (gethash :skip-node *buffer-pool*)
         (list nil))
-  (dolist (num '(8 16 18 24 34))
+  (dolist (num '(8 16 20 24 36))
     (setf (gethash num *buffer-pool*)
           (list nil)))
   (dotimes (i buffer-pool-size)
@@ -310,9 +310,9 @@
     #-ecl (make-vertex-buffer)
     #-ecl (make-edge-buffer)
     (make-byte-vector-8-buffer)
-    (make-byte-vector-18-buffer)
+    (make-byte-vector-20-buffer)
     (make-byte-vector-24-buffer)
-    (make-byte-vector-34-buffer))
+    (make-byte-vector-36-buffer))
   (dotimes (i (* 10 buffer-pool-size))
     (make-pcons-buffer)
     (make-skip-node-buffer)
@@ -342,7 +342,7 @@
 
 (defparameter +buffer-pool-classes+
   ;; ECL builds vertices/edges directly and never pops those pools (#47).
-  '(:pcons :skip-node 16 8 18 24 34 #-ecl :vertex #-ecl :edge)
+  '(:pcons :skip-node 16 8 20 24 36 #-ecl :vertex #-ecl :edge)
   "The buffer classes the pool maintains, keyed as in *BUFFER-POOL*.")
 
 (defun buffer-pool-class-target (class)
@@ -363,9 +363,9 @@
       #-ecl (:edge (make-edge-buffer))
       (8 (make-byte-vector-8-buffer))
       (16 (make-byte-vector-16-buffer))
-      (18 (make-byte-vector-18-buffer))
+      (20 (make-byte-vector-20-buffer))
       (24 (make-byte-vector-24-buffer))
-      (34 (make-byte-vector-34-buffer)))))
+      (36 (make-byte-vector-36-buffer)))))
 
 (defun %trim-pool-class (class n)
   "Drop N buffers of CLASS (they become garbage), using the pool's own pop
@@ -430,17 +430,17 @@ INIT-BUFFER-POOL."
        (sys:atomic-incf (bps-buffer-16 *buffer-pool-stats*))
        #+sbcl
        (sb-ext:atomic-incf (bps-buffer-16 *buffer-pool-stats*)))
-      (18
+      (20
        #+ecl
        (mp:with-lock (*buffer-pool-lock*)
-         (incf (bps-buffer-18 *buffer-pool-stats*)))
+         (incf (bps-buffer-20 *buffer-pool-stats*)))
        #+ccl
        (ccl:with-lock-grabbed (*buffer-pool-lock*)
-         (incf (bps-buffer-18 *buffer-pool-stats*)))
+         (incf (bps-buffer-20 *buffer-pool-stats*)))
        #+lispworks
-       (sys:atomic-incf (bps-buffer-18 *buffer-pool-stats*))
+       (sys:atomic-incf (bps-buffer-20 *buffer-pool-stats*))
        #+sbcl
-       (sb-ext:atomic-incf (bps-buffer-18 *buffer-pool-stats*)))
+       (sb-ext:atomic-incf (bps-buffer-20 *buffer-pool-stats*)))
       (24
        #+ecl
        (mp:with-lock (*buffer-pool-lock*)
@@ -452,17 +452,17 @@ INIT-BUFFER-POOL."
        (sys:atomic-incf (bps-buffer-24 *buffer-pool-stats*))
        #+sbcl
        (sb-ext:atomic-incf (bps-buffer-24 *buffer-pool-stats*)))
-      (34
+      (36
        #+ecl
        (mp:with-lock (*buffer-pool-lock*)
-         (incf (bps-buffer-34 *buffer-pool-stats*)))
+         (incf (bps-buffer-36 *buffer-pool-stats*)))
        #+ccl
        (ccl:with-lock-grabbed (*buffer-pool-lock*)
-         (incf (bps-buffer-34 *buffer-pool-stats*)))
+         (incf (bps-buffer-36 *buffer-pool-stats*)))
        #+lispworks
-       (sys:atomic-incf (bps-buffer-34 *buffer-pool-stats*))
+       (sys:atomic-incf (bps-buffer-36 *buffer-pool-stats*))
        #+sbcl
-       (sb-ext:atomic-incf (bps-buffer-34 *buffer-pool-stats*))))))
+       (sb-ext:atomic-incf (bps-buffer-36 *buffer-pool-stats*))))))
 
 (defun get-buffer (size)
   (or (and (buffer-pool-running-p)

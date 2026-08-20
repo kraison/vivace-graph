@@ -9,7 +9,7 @@
                           (string-id (ve-key-id i))
                           (ve-key-type-id i))))))
   (id +null-key+ :type (simple-array (unsigned-byte 8) (16))) ;; node-id
-  (type-id 0 :type (integer 0 65535))) ;; type-id
+  (type-id 0 :type (integer 0 4294967295))) ;; type-id
 
 (defvar *ve-null-key* (make-ve-key))
 
@@ -82,10 +82,15 @@
   (dotimes (i 16)
     (set-byte mf offset (aref (ve-key-id ve-key) i))
     (incf offset))
-  ;; Big endian ints for easy comparison in ve-key-lessp
-  (set-byte mf offset (ldb (byte 8 (* 1 8)) (ve-key-type-id ve-key)))
+  ;; MSB-first by convention (no ordered index reads these yet -- the ve-index
+  ;; is an lhash, keys are only ever compared for equality).
+  (set-byte mf offset (ldb (byte 8 24) (ve-key-type-id ve-key)))
   (incf offset)
-  (set-byte mf offset (ldb (byte 8 (* 0 8)) (ve-key-type-id ve-key)))
+  (set-byte mf offset (ldb (byte 8 16) (ve-key-type-id ve-key)))
+  (incf offset)
+  (set-byte mf offset (ldb (byte 8 8) (ve-key-type-id ve-key)))
+  (incf offset)
+  (set-byte mf offset (ldb (byte 8 0) (ve-key-type-id ve-key)))
   (incf offset))
 
 (defmethod deserialize-ve-key-mmap ((mf mapped-file) (offset integer))
@@ -96,22 +101,28 @@
     (dotimes (i 16)
       (setf (aref id i) (get-byte mf offset))
       (incf offset))
-    ;; Big endian ints for easy comparison in ve-key-lessp
-    (setq type-id (dpb (get-byte mf offset) (byte 8 (* 1 8)) type-id))
+    ;; MSB-first by convention; see the write-side comment above.
+    (setq type-id (dpb (get-byte mf offset) (byte 8 24) type-id))
     (incf offset)
-    (setq type-id (dpb (get-byte mf offset) (byte 8 (* 0 8)) type-id))
+    (setq type-id (dpb (get-byte mf offset) (byte 8 16) type-id))
+    (incf offset)
+    (setq type-id (dpb (get-byte mf offset) (byte 8 8) type-id))
+    (incf offset)
+    (setq type-id (dpb (get-byte mf offset) (byte 8 0) type-id))
     (make-ve-key :id id :type-id type-id)))
 
 (defmethod serialize-ve-key ((array array))
   array)
 
 (defmethod serialize-ve-key ((ve-key ve-key))
-  (let ((vec (get-buffer 18)))
+  (let ((vec (get-buffer +ve-key-bytes+)))
     (dotimes (i 16)
       (setf (aref vec i) (aref (ve-key-id ve-key) i)))
-    ;; Big endian ints for easy comparison in ve-key-lessp
-    (setf (aref vec 16) (ldb (byte 8 (* 1 8)) (ve-key-type-id ve-key)))
-    (setf (aref vec 17) (ldb (byte 8 (* 0 8)) (ve-key-type-id ve-key)))
+    ;; MSB-first by convention; see the write-side comment above.
+    (setf (aref vec 16) (ldb (byte 8 24) (ve-key-type-id ve-key)))
+    (setf (aref vec 17) (ldb (byte 8 16) (ve-key-type-id ve-key)))
+    (setf (aref vec 18) (ldb (byte 8 8) (ve-key-type-id ve-key)))
+    (setf (aref vec 19) (ldb (byte 8 0) (ve-key-type-id ve-key)))
     vec))
 
 (defmethod deserialize-ve-key ((vec array))
@@ -120,10 +131,12 @@
     (declare (type word type-id))
     (dotimes (i 16)
       (setf (aref id i) (aref vec i)))
-    ;; Big endian ints for easy comparison in ve-key-lessp
-    (setq type-id (dpb (aref vec 16) (byte 8 (* 1 8)) type-id))
-    (setq type-id (dpb (aref vec 17) (byte 8 (* 0 8)) type-id))
-    (values (make-ve-key :id id :type-id type-id) 18)))
+    ;; MSB-first by convention; see the write-side comment above.
+    (setq type-id (dpb (aref vec 16) (byte 8 24) type-id))
+    (setq type-id (dpb (aref vec 17) (byte 8 16) type-id))
+    (setq type-id (dpb (aref vec 18) (byte 8 8) type-id))
+    (setq type-id (dpb (aref vec 19) (byte 8 0) type-id))
+    (values (make-ve-key :id id :type-id type-id) +ve-key-bytes+)))
 
 (defun make-ve-index (location)
   (let* ((idx (make-lhash :test 've-key-equal
