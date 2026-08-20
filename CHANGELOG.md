@@ -27,6 +27,35 @@ between releases; cutting a release renames it to the new version and dates it.
   transaction. See docs/vivace-graph-v3-doc.org, Chapter 17, "The
   image-level system clock (optional)".
 
+- **Epoch leases and the store lifecycle journal** (#168). `clock-lease-epochs`
+  reserves a range `[start, end)` on a system clock and skips the clock past
+  it, so a store being detached can allocate offline from its own range with
+  no further coordination — the mechanism #170's shadow-generation swap will
+  use. `journal-append` / `journal-records` keep a small append-only journal
+  of store lifecycle events (`:create`, `:detach`, `:swap`, `:attach`,
+  `:retire`) beside the clock's own counter file; `attach-to-system-clock`
+  already appends an `:attach` record. `journal-records` reads with
+  `*read-eval*` bound to `nil` — the journal is data and is never evaluated.
+  Both are new, currently-unconsumed primitives that #170/#171 build a
+  restore path on. See docs/vivace-graph-v3-doc.org, Chapter 17.
+
+- **`peer-observe-epoch` observes the image clock** (#168). A pulled node
+  carries the *hub's* commit epoch; when the pulling store has a system
+  clock bound, that observation now raises the clock instead of the store's
+  own `tx-id-counter` (which a bound clock leaves dead). Without a clock the
+  original per-store counter path is unchanged. Consequence worth knowing:
+  the image clock is therefore not purely local — a peer sync on one store
+  can advance the whole image's clock, driven by another image's clock.
+
+- **Cross-store read snapshots pin every participating store** (#168).
+  `with-read-snapshot` composes by nesting, and each nested call now takes a
+  read-epoch pin on its own graph's transaction manager for the snapshot's
+  extent, so a cross-store composition ends up pinning every store it
+  touches, not just the innermost or outermost one. Named cost: a long
+  cross-store query delays reaping in every store it touched, for its full
+  duration — the intended price of a shared instant across stores, not a
+  regression.
+
 - **Registration — binding a record's geometry to a registry's regions**
   (#138). `graph-db/spacetime` gains `register-geometry` and `register-node`,
   which turn a source's `:REGISTRATION` facet into one claim per region the
@@ -194,6 +223,29 @@ between releases; cutting a release renames it to the new version and dates it.
     indexes and unique constraints".
 
 ### Fixed
+
+- **`recreate-graph` (restore/replay) minted ids from a per-store scalar,
+  bypassing both the transaction manager and any bound system clock**
+  (#168). Reached via `replay` (snapshot and backup restore) and
+  `migrate-graph`. Under a shared clock this could reissue an epoch some
+  other store had already committed at — exactly the collision a system
+  clock exists to prevent. Restore now allocates through `tm-next-epoch`,
+  which draws from the system clock when the graph has one and otherwise
+  falls back to the store's own counter (unchanged behaviour with no clock
+  bound).
+
+  **Behaviour change, independent of any clock:** the watermark restore
+  persists afterward is now the last id actually used, not one past it —
+  the old code always wasted one epoch on the trailing `+1`, including on
+  an empty snapshot, which bumped the watermark for zero work. This brings
+  `recreate-graph` in line with `apply-transaction` (which persists the id
+  it actually used) and a fresh transaction manager's own `(1+ (max ...))`
+  re-seeding; it closes a gap that was always wasted, it does not shift
+  any restored node's id. Anyone who read a restored store's persisted
+  highest-transaction-id and expected it one past the last restored id
+  will now see it one lower. Separately, under a bound clock, restored ids
+  also stop being dense from a fresh store's own zero — they draw from the
+  clock's shared, current position instead, which is the point of the fix.
 
 - **`GEOSMakeValid` returning a `GEOMETRYCOLLECTION` refused the whole
   subject** (#163). A repair that splits its input across dimensions — the

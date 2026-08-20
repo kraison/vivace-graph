@@ -184,6 +184,14 @@ wrong answer, and the fallback is the full sweep.
 
 ## 6. Time
 
+**Status: implemented (#168).** `system-clock.lisp` (clock, leases,
+journal), `attach-to-system-clock` (watermark), `peer-observe-epoch`
+(foreign epochs), `recreate-graph` (restore no longer bypasses it), and
+the cross-store pin in `call-with-read-snapshot` cover every bullet
+below. User-facing docs: `docs/vivace-graph-v3-doc.org`, Chapter 17,
+starting at "The image-level system clock (optional)". The bullets below
+are kept as the original design record, including the audit finding.
+
 One image-level clock (#94), adopted now rather than deferred: co-locating things that share
 invariants makes cross-store skew rarer, not impossible, and the failure mode is silently
 wrong derived data whose provenance does not record the skew.
@@ -220,6 +228,8 @@ wrong derived data whose provenance does not record the skew.
   this section exists to prevent, arriving through the back door. **Re-pointing it at the
   global clock is in scope for the unit.** This is load-bearing, not incidental — logical
   replay is the proven per-store recovery path and §9 depends on restore semantics.
+  **Done** — `recreate-graph` now allocates through `tm-next-epoch`, same
+  as every other path.
 - **Stated property, not a surprise: the global clock is not purely local.**
   `peer-observe-epoch` advances the counter to strictly exceed a *foreign* epoch carried by
   a pulled node — another image's clock. Under a per-graph counter that was local
