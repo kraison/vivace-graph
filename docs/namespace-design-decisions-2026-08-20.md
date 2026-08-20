@@ -202,6 +202,65 @@ write: the lookup consults only the stores that class has actually occupied. It 
 safe — a lost or stale set costs a wasted lookup, never a wrong answer, and the fallback
 is the full sweep.
 
+### D8 — A read into a detached store resolves to an unresolved marker
+
+The parked design specifies only the write side (transactions touching a detached
+namespace fail rather than block). A traversal that reaches an edge into a detached store
+returns an **unresolved marker carrying the store id** — "there is an edge here, its far
+end is in store 7, which is offline" — and the caller decides.
+
+Rejected: *signal* (makes every traversal an error site, and will be caught-and-ignored
+somewhere within a month) and *skip silently* (returns a subgraph that looks complete and
+is not — a wrong answer wearing a right answer's clothes).
+
+D5's tagged id is what makes the marker possible at all: the scan-based resolver could
+only ever report "not found anywhere" and could not distinguish an absent store from a
+missing node. That distinction is the whole difference between a degraded answer and a
+wrong one.
+
+**Detach is not confined to the source stores.** The memory layer bulk-loads too —
+ingesting a pre-existing knowledge base, and restoring a corrupt store — so any store may
+be offline mid-traversal and every traversal path must handle the marker.
+
+### D9 — The global cross-graph epoch (#94) is in scope now, not deferred
+
+Kevin's call, overruling the demotion argued above: co-locating things that share
+invariants makes cross-store skew *rarer*, not impossible, and the failure mode is
+silently-wrong derived data. Reasoning over a skewed pair records a conclusion whose
+provenance does not say it was skewed. Deferring it means every day of new data is written
+under per-store clocks.
+
+Design sketch, to be confirmed before implementation:
+
+- **The clock is image-level, not store-level.** A *system* (a directory of N stores) owns
+  one clock. Opening any subset of stores opens the system, so a store opened alone still
+  allocates from the shared clock.
+- **Detach takes an epoch lease.** A detaching store is granted a range `[E1, E2)` at
+  detach and allocates within it while offline; the global clock skips past `E2`. One
+  handshake at detach, one at reattach, and no cross-process coordination in between —
+  which is what keeps the dedicated-SBCL bulk-load path (the real 286k ACLED case) working.
+  Epochs are 64-bit, so a lease of 2^32 makes exhaustion a non-issue.
+- **Existing data migrates by watermark, not by rewrite.** Start the global clock above the
+  max of every store's current counter. Epochs below the watermark are not cross-store
+  comparable; epochs above it are. This degrades gracefully rather than breaking: an old
+  node's version is still visible at any snapshot above the watermark, and the relative
+  order of two pre-migration epochs in different stores is meaningless but also
+  unobservable, since no snapshot can be taken between them. The stated limitation is that
+  you cannot snapshot *into* the pre-migration past across stores. No record is rewritten.
+- **Cost, named honestly:** a cross-store `with-read-snapshot` must register its read pin
+  with every participating store, so a long cross-store query delays reaping in every store
+  it touched. Per-store reaping must fold in pins from cross-store snapshots that include
+  it, not just its own.
+- **Audit needed:** each store's WAL will now contain epoch *gaps* (epochs consumed by
+  other stores). `load-highest-transaction-id` takes a max and is fine; the peer/pull cursor
+  code compares epochs and takes maxima and looks fine; but anything assuming epoch density
+  must be found before this lands rather than after.
+
+**Sequencing consequence: the cost of delay is monotonic.** Every write between now and the
+migration lands below the watermark and can never be cross-store snapshotted. That is the
+concrete argument for doing this early in the namespace work rather than late — not that it
+blocks anything, but that its debt accrues daily.
+
 ## Newly identified constraints
 
 - **Two global monotonic id spaces with no reclamation.** `type-id` is
@@ -225,13 +284,10 @@ is the full sweep.
 ## Still open
 
 - The `backup` policy of D2 (edge placement is answered by D7).
-- **What a *read* does when a store is detached.** The parked design specifies that
-  writes touching a detached namespace fail rather than block; it says nothing about a
-  traversal that reaches an edge into one. Needs an answer — unresolved-marker, signal,
-  or skip — and it is the same question whether the edge is direct or reified.
 - Detached / exclusive bulk-load mode, the parked design's largest open item, now
   reframed as a per-*store* operation.
-- One transaction manager and one snapshot clock (#94) — a correctness gate.
+- Two-phase commit across stores (#93) — still deferred; D9 takes the clock, not
+  cross-store atomicity.
 - Type-id renumbering migration for existing graphs.
 - Inbound cross-namespace index lookup ("which claims touch this vertex?"), whose shape
   is driven by the retrieval and agent-memory API.
