@@ -261,14 +261,51 @@ migration lands below the watermark and can never be cross-store snapshotted. Th
 concrete argument for doing this early in the namespace work rather than late — not that it
 blocks anything, but that its debt accrues daily.
 
+### D10 — `backup` includes a dangling cross-store edge and warns
+
+Chosen over omit and over refuse. A dangling edge on restore is diagnosable and
+repairable; silent omission loses connectivity with no signal; refusing turns a routine
+backup into an operator event over a condition D1 explicitly permits.
+
+### D11 — `type-id` widens from 16 to 32 bits
+
+Rejected 24 (bit-packing games to save ~1 MB across a corpus the size of mine-action's)
+and 64 (doubles the `ve-key` for nothing). 32 aligns, matches `revision`, and needs no
+packing tricks.
+
+**This is the first on-disk format change in this design** — everything else so far was
+additive or watermarked. It is affordable because the codebase has done exactly this
+migration once already: `*node-head-reader*` (`primitive-node.lisp:124`) is a dispatch
+variable, `deserialize-node-head-v1` reads the pre-MVCC 15-byte head, and `migrate-graph`
+rebinds it so a v1 graph can be logically backed up and replayed into v2. Widening adds a
+v3 reader the same way. The head goes 31 → 33 bytes (flags 1, type-id 2→**4**, revision 4,
+data-pointer 8, commit-epoch 8, prev-pointer 8) and `ve-key` goes 18 → 20; both are rebuilt
+by the replay, so the migration is **logical replay, not an in-place rewrite** — the
+"replayable and reversible" property the parked design asked for.
+
+**The real cost is not the field, it is the type-index.** `make-type-index` allocates
+densely: `(* +max-node-types+ +index-list-bytes+)`. At 16 bits that is 65536 × 17 ≈ 1.1 MB;
+at 32 bits it would be ~73 GB. **Widening therefore forces the type-index to become
+sparse** — a keyed structure rather than an array indexed by type-id.
+
+That is a cleanup worth doing on its own account. Today every type-index also allocates
+`(make-array +max-node-types+)` filled with **65,536 mutexes** (`type-index.lisp:13`),
+per index, per store, regardless of how many types the store actually uses. The widening
+pays for removing a cost nobody had noticed.
+
+**What widening does not buy: unlimited types.** Each type remains a CLOS class —
+finalized, with interned accessors and a schema entry. 100k runtime-defined types means
+100k CLOS classes. Widening moves the *hard* ceiling out of reach and leaves a *soft* one
+around CLOS and memory. If the memory layer ever wants genuinely high-cardinality types,
+the discarded option — runtime types sharing a type-id and discriminating on a slot —
+comes back. Widening buys time, not infinity.
+
 ## Newly identified constraints
 
-- **Two global monotonic id spaces with no reclamation.** `type-id` is
-  `(unsigned-byte 16)`. Today each graph has its own 65536; globally, all stores share
-  one. Retired type-ids cannot safely be reclaimed while any persisted node references
-  them, so **65536 becomes a lifetime budget for the whole system**, not a per-store
-  ceiling. An LLM defining types at runtime consumes it monotonically. Store-ids have the
-  same property. Decide the policy now rather than discovering it at 60,000.
+- **Two global monotonic id spaces with no reclamation.** Retired type-ids cannot be
+  safely reclaimed while any persisted node references them, so the type-id space is a
+  whole-system lifetime budget rather than a per-store ceiling. Resolved for type-ids by
+  D11 (widen to 32 bits). Store-ids have the same property but stay tiny, so no action.
 
 - **`(intern (symbol-name ...) :keyword)` in `update-node-type` is package-blind.** The
   type table registers three keys per type and the third is a keyword alias, so
@@ -283,7 +320,6 @@ blocks anything, but that its debt accrues daily.
 
 ## Still open
 
-- The `backup` policy of D2 (edge placement is answered by D7).
 - Detached / exclusive bulk-load mode, the parked design's largest open item, now
   reframed as a per-*store* operation.
 - Two-phase commit across stores (#93) — still deferred; D9 takes the clock, not
