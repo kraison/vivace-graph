@@ -114,7 +114,10 @@
         (close-system-clock c2)))))
 
 (test journal-refuses-to-evaluate-on-read
-  ;; A journal is data.  Reading it must never evaluate.
+  ;; A journal is data.  Reading it must never evaluate.  Must assert the
+  ;; condition TYPE: bare `signals error' passes under *READ-EVAL* T too
+  ;; (the crafted form's own ERROR call also signals an ERROR), so it
+  ;; proves nothing.  READER-ERROR only comes from the reader refusing.
   (with-temp-directory (dir)
     (let ((c (open-system-clock (namestring dir))))
       (close-system-clock c))
@@ -124,5 +127,5 @@
       (format s "(:kind :bogus :value #.(error \"evaluated\"))~%"))
     (let ((c2 (open-system-clock (namestring dir))))
       (unwind-protect
-           (signals error (journal-records c2))
+           (signals reader-error (journal-records c2))
         (close-system-clock c2)))))
