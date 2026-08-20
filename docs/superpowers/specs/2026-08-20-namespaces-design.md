@@ -352,15 +352,19 @@ before this ships. That is a release gate, not a design gate.
 
 | # | Unit | Depends on |
 |---|---|---|
-| 1 | Global type-id space, sparse type-index, 32-bit widening, v3 head codec, migration | — |
-| 2 | Packages as namespaces; store/namespace decoupling; placement defaults; delete the uniqueness check | 1 |
+| 1a | Widen `type-id` to 32 bits, sparse type-index, v3 head codec, migration — **ids stay per-graph** | — |
+| 1b | Global type-ids: canonical registry (D14), distribution, handshake guard (D15), delete the uniqueness check | 1a |
+| 2 | Packages as namespaces; store/namespace decoupling; placement defaults | **1b** |
 | 3 | Image-level clock, system journal, epoch leases | — |
 | 4 | Tagged UUIDv8 store field, resolver, detached-read marker | 3 |
 | 5 | Detach quiescence protocol and shadow bulk load | 3, 4 |
 | 6 | Restore: retention policy, algorithm, manifest, cascade | 5 |
-| 7 | Runtime schema from persisted metadata | 1, 2 |
+| 7 | Runtime schema from persisted metadata | 1b, 2 |
 
-Units 1 and 3 have no dependencies and may start in parallel. Unit 3 should start early
+Units 1a and 3 have no dependencies and may start in parallel. Unit 1 was split:
+1a is the only on-disk format change in this design, and a migration failure should be
+unambiguous rather than tangled with a semantic one. 1a is verifiable on its own terms —
+same data, same behaviour, wider field. Unit 3 should start early
 because its migration debt accrues daily (§6).
 
 ## 12. Acceptance
