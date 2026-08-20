@@ -675,3 +675,43 @@ SHARE: in [0,1], never above it (design §1, §6)."
                "FRACTION is a share in [0,1]; got ~S" f)
            (is (plusp f)
                "a repaired bow-tie inside the region is not a touch")))))))
+
+;;; --- the repair that came back a GEOMETRYCOLLECTION (GH #163) ----------
+;;; %REPAIRED's fallback to the original is for a repair that CANNOT
+;;; happen (no add-on, GEOS < 3.8).  A mixed-dimension repair can happen
+;;; -- GEOSMakeValid just answers it with a GEOMETRYCOLLECTION -- and
+;;; taking that for "cannot" cost seven deployed subjects every region
+;;; they overlapped.
+
+(defun %tailed-square ()
+  "A square whose ring runs on past its start out to 20°E and back: the
+tail has no width, so the repair is a POLYGON plus a LINESTRING."
+  (make-polygon '(((0d0 0d0) (10d0 0d0) (10d0 10d0) (0d0 10d0) (0d0 0d0)
+                   (20d0 0d0) (0d0 0d0)))))
+
+(test a-subject-whose-repair-is-a-collection-still-registers
+  "⚠ THE WHOLE SUBJECT WAS LOST, not one region: GEOMETRY-MAKE-VALID
+signalled on the GEOMETRYCOLLECTION, %REPAIRED handed back the
+unrepaired ring, GEOMETRY-INTERSECTION threw on it and the GEOS-ERROR
+handler returned (VALUES NIL NIL).  Measured on 7 of 4,196 deployed
+subjects (GH #163)."
+  (cond
+    ((not graph-db::*geos-available-p*) (skip "GEOS not available"))
+    ((not graph-db::*geos-makevalid-available-p*)
+     (skip "GEOS < 3.8: no makeValid"))
+    (t
+     (with-region-graph (g)
+       ;; Covers the square but NOT the tail, so a repair that kept the
+       ;; tail as area would not measure 1.0 either.
+       (%make-region g "cover" '((-1d0 -1d0) (11d0 -1d0) (11d0 11d0)
+                                 (-1d0 11d0) (-1d0 -1d0)))
+       (is-false (graph-db:geometry-valid-p (%tailed-square))
+                 "fixture sanity: the tailed square really is invalid")
+       (multiple-value-bind (regs evaluated)
+           (register-geometry (%tailed-square) 'ct-region
+                              :registry-graph g)
+         (is-true evaluated
+                  "a mixed-dimension repair is a repair, not a refusal")
+         (is (= 1 (length regs)))
+         (is (%near 1d0 (%fraction-of (first regs)))
+             "the repaired square lies wholly inside the region"))))))

@@ -156,6 +156,27 @@ dependency-free fallbacks. (~A)" e)
 (cffi:defcfun ("GEOSFree_r" %geos-free) :void
   (handle :pointer) (buffer :pointer))
 
+;; Geometry inspection + collection walking (GH #163): GEOSMakeValid can
+;; answer a mixed-dimension repair with a GEOMETRYCOLLECTION, and only its
+;; POLYGONAL parts are the repaired area.
+;; int GEOSGeomTypeId_r(handle, g) -> GEOSGeomTypes below, -1 on exception.
+(cffi:defcfun ("GEOSGeomTypeId_r" %geos-geom-type-id) :int
+  (handle :pointer) (geom :pointer))
+;; Direct children of a collection; 1 for a simple geometry, -1 on exception.
+(cffi:defcfun ("GEOSGetNumGeometries_r" %geos-get-num-geometries) :int
+  (handle :pointer) (geom :pointer))
+;; ⚠ BORROWED, unlike every other geometry the bindings hand back: this is
+;; INTERNAL STORAGE of GEOM, freed when GEOM is.  Passing it to
+;; %GEOS-GEOM-DESTROY is a double free (geos_c.h: "do not free!").
+(cffi:defcfun ("GEOSGetGeometryN_r" %geos-get-geometry-n) :pointer
+  (handle :pointer) (geom :pointer) (n :int))
+
+;; enum GEOSGeomTypes (geos_c.h) -- what %GEOS-GEOM-TYPE-ID returns and what
+;; GEOSGeom_createCollection_r takes.
+(defconstant +geos-polygon+ 3)
+(defconstant +geos-multipolygon+ 6)
+(defconstant +geos-geometrycollection+ 7)
+
 ;; Binary predicates: return char 1 (true) / 0 (false) / 2 (exception).
 (cffi:defcfun ("GEOSIntersects_r" %geos-intersects) :char
   (handle :pointer) (g1 :pointer) (g2 :pointer))

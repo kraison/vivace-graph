@@ -26,7 +26,13 @@ record for nothing.
 ⚠ THE IGNORE-ERRORS IS WHAT MAKES THE FALLBACK TOTAL, and it is not
 dead code: GEOMETRY-MAKE-VALID signals GEOS-REQUIRED-FOR-OPERATION
 without the add-on AND on GEOS < 3.8, which has no GEOSMakeValid.  A
-repair that cannot happen must leave the caller holding the original."
+repair that cannot happen must leave the caller holding the original.
+
+⚠ IT IS NOT FOR A REPAIR THAT MERELY LOOKS ODD.  A mixed-dimension
+repair arrives as a GEOMETRYCOLLECTION and GEOMETRY-MAKE-VALID resolves
+it to its polygonal union; taking that for 'cannot' refused 7 of 4,196
+deployed subjects entirely (GH #163).  What still signals here is a
+repair with no area left at all."
   (if (%extended-geometry-p g)
       (or (ignore-errors (graph-db:geometry-make-valid g)) g)
       g))

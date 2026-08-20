@@ -2229,6 +2229,7 @@ The add-on /upgrades/ a set of generic functions in place (no API change). When 
 - ~find-nodes-intersecting~ / ~find-intersects/3~ become **exact** (without GEOS they fall back to a coarse bounding-box overlap).
 - ~geometry-intersects-p~, ~geometry-contains-geometry-p~ answer exactly for all geometry kinds.
 - ~geometry-make-valid~ repairs an invalid geometry (e.g. a self-intersecting polygon from a messy KML); ~geometry-valid-p~ tests validity. (~make-valid~ needs GEOS >= 3.8.)
+  - ⚠ A repair can be MIXED-DIMENSION — an area plus the zero-width slivers the repair shed — and GEOS answers that with a GEOMETRYCOLLECTION, which this engine's ~geometry~ type cannot hold. ~geometry-make-valid~ keeps the collection's POLYGONAL parts and returns their union; the linear parts are discarded. A collection with no polygonal part at all signals ~geos-error~ rather than yielding an empty polygon: nothing was repaired, and "covers nothing" is a measurement, not a repair (GH #163).
 - ~geometry-distance-exact~ gives planar distance — note this is in *coordinate units* (degrees for lon/lat), not metres; use ~geodesic-distance~ / ~geometry-distance~ for metric distance between points.
 
 #+BEGIN_SRC lisp
@@ -3397,7 +3398,11 @@ substrate's, so a tenant sorts for itself.
 ⚠ Both geometries are run through ~geometry-make-valid~ before the
 intersection, falling back to the original where the repair is
 unavailable (no add-on, or GEOS < 3.8), and the resulting fraction is
-clamped to 1.0. Without the repair, an invalid ring that cleared the
+clamped to 1.0. "Unavailable" means a repair that CANNOT happen; a
+repair that comes back as a GEOMETRYCOLLECTION is a repair, and
+~geometry-make-valid~ resolves it to its polygonal union rather than
+signalling — reading it as "unavailable" refused seven deployed
+subjects outright (GH #163). Without the repair, an invalid ring that cleared the
 index's ~intersects~ refinement can throw inside ~GEOSIntersection~ and
 refuse the WHOLE subject — dropping every region it genuinely overlaps
 rather than the one it could not measure. The clamp is the ~[0,1]~

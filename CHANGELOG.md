@@ -170,6 +170,42 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Fixed
 
+- **`GEOSMakeValid` returning a `GEOMETRYCOLLECTION` refused the whole
+  subject** (#163). A repair that splits its input across dimensions — the
+  polygonal area plus the zero-width slivers the repair shed — comes back from
+  GEOS as a `GEOMETRYCOLLECTION`, which `wkt->geometry` has no kind for, so
+  `geometry-make-valid` signalled. `spacetime::%repaired`'s `ignore-errors`
+  then handed back the **unrepaired** ring, `geometry-intersection` threw on
+  it, and `register-geometry`'s `geos-error` handler returned
+  `(values nil nil)` — losing every region the subject genuinely overlapped,
+  the exact loss the repair was added to close.
+
+  **`geometry-make-valid` now keeps the collection's polygonal components and
+  returns their union**, which is what `GEOSMakeValid` callers are expected to
+  do: the linear components are degenerate slivers, the polygons are the
+  repaired area. Valid geometry is untouched — `GEOSMakeValid` answers it with
+  a `POLYGON`/`MULTIPOLYGON`, which takes the same path it always did — and
+  without the add-on the base method still signals
+  `geos-required-for-operation`.
+
+  **A collection with no polygonal component at all signals `geos-error`**
+  rather than yielding an empty polygon. Nothing was repaired, and "covers
+  nothing" is a *measurement*: fabricating it is the same fault inverted.
+  `%repaired`'s contract — something usable, else the original — is what the
+  caller wants there.
+
+  Three bindings are new in `geos/geos-ffi.lisp`: `GEOSGeomTypeId_r`,
+  `GEOSGetNumGeometries_r` and `GEOSGetGeometryN_r`. ⚠ `GEOSGetGeometryN_r`
+  returns **internal storage owned by the parent collection** — unlike every
+  other geometry the bindings hand back, it must NOT be destroyed. The fold
+  over the extracted parts frees only the intermediate unions it creates
+  itself.
+
+  Measured on the deployed data that found it: 7 of 4,196 subjects took this
+  path and lost every region. Regression tests cover the repair
+  (`tests/geos/makevalid-tests.lisp`) and the registration it broke
+  (`tests/spacetime/register-tests.lisp`).
+
 - **Every `LOCAL-TIME:TIMESTAMP` before 2000-03-01 was silently corrupted on
   read** (#153). `SERIALIZE` writes `day-of` — which is negative before
   local-time's epoch — through `LDB`, but `DESERIALIZE-HELP` read it back with
