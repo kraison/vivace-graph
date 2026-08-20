@@ -349,7 +349,22 @@ git commit -m "perf(type-index): stripe the locks, size for types in use (#166)"
 
 ### Task 3: The v2 → v3 migration
 
-**Files:** Modify `backup.lisp`. Test in `tests/type-id-width-tests.lisp`.
+**Files:** Modify `backup.lisp`, **`globals.lisp`**, **`graph.lisp`**. Test in
+`tests/type-id-width-tests.lisp`.
+
+**⚠ Scope added after Task 1 (controller ruling).** `+storage-version+` is still `#x02`,
+so a v3 graph and a v2 graph carry the **same** version byte. `open-graph`'s
+`:accept-versions (list +storage-version+)` therefore cannot tell them apart: a v3 engine
+opens a v2 graph, succeeds, and **misreads every head**. Silent corruption on open.
+
+Task 1 deliberately left this alone — the bump spans files outside its authorisation and
+it flagged the gap in its report. It belongs here:
+
+- Bump `+storage-version+` to `#x03`.
+- Make a v3 engine **refuse a v2 graph loudly**, naming the version it found and pointing
+  at `migrate-graph`. Refusing is the whole point; a v2 graph that opens and misreads is
+  the failure this task exists to prevent.
+- Confirm `migrate-graph` still opens the *source* at its own version while writing v3.
 
 **Interfaces:** Consumes Task 1's `deserialize-node-head-v2`.
 
@@ -380,6 +395,10 @@ its id, revision, type and slot values intact, and that the source directory is 
 it reads v2 bytes with the v3 reader, confirm the test **FAILS**, restore byte-for-byte and
 confirm it **PASSES**. Report both observations. Six tests in the sibling unit (#168) passed
 while proving nothing; a green migration test is not evidence.
+
+- [ ] **Step 1b: Also test the version gate.** Assert that opening a v2 graph with a v3
+      engine **signals**, rather than succeeding. Ablate it: drop the version check,
+      confirm the test fails, restore, confirm it passes. Report both.
 
 - [ ] **Step 2: Run, watch it fail.**
 - [ ] **Step 3: Implement** the v2 → v3 path alongside the v1 → v2 one.
