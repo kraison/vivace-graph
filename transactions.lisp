@@ -3058,7 +3058,15 @@ The snapshot is recorded in *READ-SNAPSHOTS* under GRAPH rather than bound to
 one snapshot per participating graph, each internally consistent, with
 deliberately no single instant across them (GH #53).  An enclosing snapshot of
 the SAME graph is inherited, as is a read-write transaction on it.  A no-op
-(THUNK runs directly) when GRAPH has no transaction manager yet."
+(THUNK runs directly) when GRAPH has no transaction manager yet.
+
+Also takes a read-epoch pin on GRAPH's own manager for the extent (GH #168):
+under a shared image clock, a cross-store composition holds one such pin per
+participating store, so store B's reaper cannot free a version store A's
+snapshot could still dereference.  Nesting composes this for free -- each
+graph's own CALL-WITH-READ-SNAPSHOT pins only its own manager, and the named
+cost (spec sec.6) is that a long cross-store query delays reaping in every
+store it touched."
   (let ((tm (and graph
                  (slot-boundp graph 'transaction-manager)
                  (transaction-manager graph))))
@@ -3071,7 +3079,8 @@ the SAME graph is inherited, as is a read-write transaction on it.  A no-op
       ((and *read-snapshots* (gethash graph *read-snapshots*)) (funcall thunk))
       (t
        (let ((txn (create-transaction tm))
-             (table (or *read-snapshots* (make-hash-table :test 'eq))))
+             (table (or *read-snapshots* (make-hash-table :test 'eq)))
+             (pin (pin-read-epoch tm)))
          (unwind-protect
               (let ((*read-snapshots* table))
                 (setf (gethash graph table) txn)
@@ -3079,7 +3088,8 @@ the SAME graph is inherited, as is a read-write transaction on it.  A no-op
            ;; the entry must not outlive the extent: a stale snapshot pins the
            ;; reaper's floor and retains versions forever (GH #53)
            (remhash graph table)
-           (remove-transaction txn tm)))))))
+           (remove-transaction txn tm)
+           (unpin-read-epoch tm pin)))))))
 
 (defmacro with-read-snapshot ((&optional (graph '*graph*)) &body body)
   "Evaluate BODY with reads of GRAPH pinned to a single consistent MVCC snapshot.

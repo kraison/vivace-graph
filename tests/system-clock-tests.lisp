@@ -462,3 +462,117 @@
                       (is (> (clock-current-epoch clock) 999999)))
                  (close-graph g :snapshot-p nil))))
         (close-system-clock clock)))))
+
+;;; Cross-store read snapshots pin every participating store (GH #168 task 6).
+;;; See spec sec.6: a long cross-store query delays reaping in EVERY store it
+;;; touched -- the intended trade, not a regression.
+
+(test cross-store-snapshot-pins-every-store
+  ;; Identity, not just presence (review round 2): a hypothetical swapped
+  ;; implementation -- GA's snapshot pinning TM-B, GB's pinning TM-A --
+  ;; would still pass a count-only check, since both tables end up with
+  ;; one entry each.  Under a SHARED clock the two managers' epochs are
+  ;; usually the same number, so a value comparison alone can't tell them
+  ;; apart -- unless something advances the clock between the two
+  ;; snapshots' establishment.  A real write on GB before GB's own
+  ;; snapshot does exactly that, so GA's and GB's own pin-time epochs
+  ;; diverge and a swap becomes visible as a value mismatch.
+  (with-temp-directory (cdir)
+    (let ((clock (open-system-clock (namestring cdir))))
+      (unwind-protect
+           (with-temp-directory (da)
+             (with-temp-directory (db)
+               (let* ((ga (make-graph :sc-pin-a (namestring da)
+                                      :buffer-pool-size 1000
+                                      :system-clock clock))
+                      (gb (make-graph :sc-pin-b (namestring db)
+                                      :buffer-pool-size 1000
+                                      :system-clock clock))
+                      (tm-a (graph-db::transaction-manager ga))
+                      (tm-b (graph-db::transaction-manager gb)))
+                 (flet ((pin-values (tm)
+                          (loop for v being the hash-values
+                                  of (graph-db::read-pins tm)
+                                collect v)))
+                   (unwind-protect
+                        (graph-db:with-read-snapshot (ga)
+                          (let ((epoch-a (graph-db::tm-peek-epoch tm-a)))
+                            ;; Bumps the shared clock before GB pins.
+                            (with-transaction (tm-b) t)
+                            (graph-db:with-read-snapshot (gb)
+                              (let ((epoch-b
+                                      (graph-db::tm-peek-epoch tm-b)))
+                                ;; Both managers hold a pin.
+                                (is (plusp (hash-table-count
+                                            (graph-db::read-pins tm-a))))
+                                (is (plusp (hash-table-count
+                                            (graph-db::read-pins tm-b))))
+                                ;; Each table's value is its OWN
+                                ;; manager's pin-time epoch -- not the
+                                ;; other store's.
+                                (is (equal (list epoch-a)
+                                           (pin-values tm-a)))
+                                (is (equal (list epoch-b)
+                                           (pin-values tm-b)))))))
+                     (close-graph ga)
+                     (close-graph gb))))))
+        (close-system-clock clock)))))
+
+(test cross-store-snapshot-releases-pins-after-normal-return
+  ;; A pin taken and never released wedges the reaper forever in the store it
+  ;; leaked on -- worse than the visibility bug this unit fixes.  Assert both
+  ;; stores' pins are gone once the composed snapshot exits normally.
+  (with-temp-directory (cdir)
+    (let ((clock (open-system-clock (namestring cdir))))
+      (unwind-protect
+           (with-temp-directory (da)
+             (with-temp-directory (db)
+               (let* ((ga (make-graph :sc-pin-c (namestring da)
+                                      :buffer-pool-size 1000
+                                      :system-clock clock))
+                      (gb (make-graph :sc-pin-d (namestring db)
+                                      :buffer-pool-size 1000
+                                      :system-clock clock))
+                      (tm-a (graph-db::transaction-manager ga))
+                      (tm-b (graph-db::transaction-manager gb)))
+                 (unwind-protect
+                      (progn
+                        (graph-db:with-read-snapshot (ga)
+                          (graph-db:with-read-snapshot (gb) t))
+                        (is (zerop (hash-table-count
+                                    (graph-db::read-pins tm-a))))
+                        (is (zerop (hash-table-count
+                                    (graph-db::read-pins tm-b)))))
+                   (close-graph ga)
+                   (close-graph gb)))))
+        (close-system-clock clock)))))
+
+(test cross-store-snapshot-releases-pins-on-non-local-exit
+  ;; Same property, but the body THROWs out instead of returning -- this is
+  ;; the whole point of putting the release in UNWIND-PROTECT.
+  (with-temp-directory (cdir)
+    (let ((clock (open-system-clock (namestring cdir))))
+      (unwind-protect
+           (with-temp-directory (da)
+             (with-temp-directory (db)
+               (let* ((ga (make-graph :sc-pin-e (namestring da)
+                                      :buffer-pool-size 1000
+                                      :system-clock clock))
+                      (gb (make-graph :sc-pin-f (namestring db)
+                                      :buffer-pool-size 1000
+                                      :system-clock clock))
+                      (tm-a (graph-db::transaction-manager ga))
+                      (tm-b (graph-db::transaction-manager gb)))
+                 (unwind-protect
+                      (progn
+                        (catch 'bail-out
+                          (graph-db:with-read-snapshot (ga)
+                            (graph-db:with-read-snapshot (gb)
+                              (throw 'bail-out nil))))
+                        (is (zerop (hash-table-count
+                                    (graph-db::read-pins tm-a))))
+                        (is (zerop (hash-table-count
+                                    (graph-db::read-pins tm-b)))))
+                   (close-graph ga)
+                   (close-graph gb)))))
+        (close-system-clock clock)))))
