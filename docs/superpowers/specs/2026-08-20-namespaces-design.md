@@ -212,7 +212,7 @@ wrong derived data whose provenance does not record the skew.
   `replication-log-ranges` derives log N's end from log N+1's start, which looked dangerous
   and is not: it over-approximates, and monotonicity still puts log N's ids in
   `[start_N, start_{N+1})`.
-- **What the audit did find: `restore-graph` is a second id allocator that bypasses the
+- **What the audit did find: `recreate-graph` is a second id allocator that bypasses the
   transaction manager.** `transaction-restore.lisp:133-152` mints ids by `(incf tx-id)` from
   `(load-highest-transaction-id graph)` — a *per-store* scalar — and persists a per-store
   high-water mark. Under a global clock it would allocate epochs **below** the global
