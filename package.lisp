@@ -21,7 +21,17 @@
   #+ccl (:shadowing-import-from "CLOSER-MOP" "COMPUTE-EFFECTIVE-METHOD")
   #+ccl (:shadowing-import-from "CLOSER-MOP" "METHOD-FUNCTION")
   #+ccl (:shadowing-import-from "CLOSER-MOP" "MAKE-METHOD-LAMBDA")
-  (:export #:make-graph
+  (:export
+           ;; image-level epoch clock (GH #168)
+           #:*system-clock*
+           #:system-clock
+           #:open-system-clock
+           #:close-system-clock
+           #:clock-next-epoch
+           #:clock-current-epoch
+           #:clock-observe-epoch
+           #:clock-lease-epochs
+           #:make-graph
            #:*default-heap-size*
            #:*default-index-size*
            #:*index-backend*

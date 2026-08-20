@@ -14,6 +14,15 @@
   ;; so the Prolog compiler recognizes ! in query goals as cut.
   (:shadowing-import-from #:graph-db #:!)
   (:import-from #:graph-db
+                ;; image-level epoch clock (GH #168)
+                #:*system-clock*
+                #:system-clock
+                #:open-system-clock
+                #:close-system-clock
+                #:clock-next-epoch
+                #:clock-current-epoch
+                #:clock-observe-epoch
+                #:clock-lease-epochs
                 ;; serialization
                 #:serialize
                 #:deserialize
