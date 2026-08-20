@@ -61,7 +61,6 @@ the persisted ceiling, so a crash never reissues one."
                                     :ceiling ceiling
                                     :block-size block-size)))
     (%write-clock-ceiling clock (+ ceiling block-size))
-    (setf (system-clock-counter clock) ceiling)
     clock))
 
 (defun close-system-clock (clock)
@@ -96,7 +95,8 @@ holds the lock."
 (defun clock-observe-epoch (clock epoch)
   "Raise CLOCK so it strictly exceeds EPOCH.  Monotonic and idempotent; a
 lower EPOCH is a no-op.  Foreign epochs reach here from peer sync, so the
-clock is not purely local -- see spec §6."
+clock is not purely local -- see spec §6.  EPOCH may be NIL (a no-op):
+callers like PEER-OBSERVE-EPOCH may not always have one to report."
   (with-recursive-lock-held ((system-clock-lock clock))
     (when (and epoch (>= epoch (system-clock-counter clock)))
       (setf (system-clock-counter clock) (1+ epoch))

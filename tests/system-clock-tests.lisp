@@ -61,6 +61,21 @@
              (is (> (clock-next-epoch c2) highest))
           (close-system-clock c2))))))
 
+(test clock-survives-crash-after-refilling-its-block
+  ;; The above stays below BLOCK-SIZE, so it never exercises the
+  ;; incremental refill in %CLOCK-RESERVE -- OPEN-SYSTEM-CLOCK's one-time
+  ;; upfront reservation alone would satisfy it.  This one issues past
+  ;; the block boundary (block-size 8, 20 ids) so refill's own disk write
+  ;; is what has to be durable, not just the initial one.
+  (with-temp-directory (dir)
+    (let* ((c (open-system-clock (namestring dir) :block-size 8))
+           (issued (loop repeat 20 collect (clock-next-epoch c)))
+           (highest (reduce #'max issued)))
+      (let ((c2 (open-system-clock (namestring dir) :block-size 8)))
+        (unwind-protect
+             (is (> (clock-next-epoch c2) highest))
+          (close-system-clock c2))))))
+
 (test clock-lease-is-disjoint-and-advances-the-clock
   (with-temp-directory (dir)
     (let ((c (open-system-clock (namestring dir))))
