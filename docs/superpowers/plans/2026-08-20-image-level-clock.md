@@ -279,6 +279,10 @@ Add to `graph-db.asd`, in `graph-db/core` components, after `"serialize"`:
                (:file "system-clock" :depends-on ("serialize" "utilities"))
 ```
 
+**⚠ `graph-db/test` does NOT `:use` `#:graph-db`.** It uses only `#:cl #:fiveam` plus an
+explicit `:import-from` list, so a new symbol is invisible in test code until it is added
+there. Export from `package.lisp` **and** import into `tests/package.lisp`.
+
 Export from `package.lisp`:
 
 ```lisp
@@ -291,6 +295,9 @@ Export from `package.lisp`:
            #:clock-observe-epoch
            #:clock-lease-epochs
 ```
+
+Add the same names to the `:import-from #:graph-db` list in `tests/package.lisp`, in a
+block commented `;; image-level epoch clock (GH #168)`.
 
 Register the test file in `graph-db.asd` under `graph-db/test`, after `"mvcc-tests"`:
 
@@ -410,7 +417,8 @@ the journal is data and must never execute."
                 collect r))))))
 ```
 
-Export `#:journal-append` and `#:journal-records` from `package.lisp`.
+Export `#:journal-append` and `#:journal-records` from `package.lisp`, and add both to
+the `:import-from` list in `tests/package.lisp`.
 
 - [ ] **Step 4: Run to verify they pass**
 
@@ -426,12 +434,13 @@ git commit -m "feat(clock): append-only lifecycle journal, read with *read-eval*
 ### Task 3: Route epoch allocation through the clock
 
 **Files:**
-- Modify: `transactions.lisp` (`assign-transaction-id`, and the three counter reads)
+- Modify: `transactions.lisp` (the counter reads and the commit-time assignment)
 - Modify: `graph.lisp` (`make-graph` / `open-graph` gain `:system-clock`)
 - Test: `tests/system-clock-tests.lisp`
 
 **Interfaces:**
-- Consumes: Task 1's clock API.
+- Consumes: Task 1's clock API **and Task 2's `JOURNAL-APPEND`** (used by
+  `ATTACH-TO-SYSTEM-CLOCK` below).
 - Produces:
   - `(tm-next-epoch transaction-manager) => (unsigned-byte 64)`
   - `(tm-current-epoch transaction-manager) => (unsigned-byte 64)`
@@ -534,7 +543,7 @@ In `graph-class.lisp`, add to `defclass graph`:
                  :initform nil)
 ```
 
-In `transactions.lisp`, replace `assign-transaction-id`'s body and add the two helpers:
+In `transactions.lisp`, add the two helpers:
 
 ```lisp
 (defun tm-next-epoch (transaction-manager)
@@ -554,13 +563,11 @@ otherwise from this manager's own counter (pre-#168 behaviour)."
     (if clock
         (clock-current-epoch clock)
         (tx-id-counter transaction-manager))))
-
-(defgeneric assign-transaction-id (transaction transaction-manager)
-  (:method (transaction transaction-manager)
-    (let ((new-id (tm-next-epoch transaction-manager)))
-      (setf (transaction-id transaction) new-id)
-      new-id)))
 ```
+
+**Do NOT touch `assign-transaction-id`.** It has zero callers — the live assignment is
+`transactions.lisp:3075`. Editing a dead generic adds diff noise and implies it is the
+live path; a separate issue tracks removing it.
 
 Replace the three counter reads with `TM-CURRENT-EPOCH`:
 
@@ -603,7 +610,7 @@ git commit -m "feat(clock): route epoch allocation through the image clock (#168
 
 ---
 
-### Task 4: Stop `restore-graph` minting its own ids
+### Task 4: Stop `recreate-graph` minting its own ids
 
 **Files:**
 - Modify: `transaction-restore.lisp:133-152`
@@ -614,54 +621,65 @@ git commit -m "feat(clock): route epoch allocation through the image clock (#168
 **This is the audit finding, and it has no test today** — which is how it survived. Write
 the failing test first.
 
-`restore-graph` currently mints ids with `(incf tx-id)` seeded from
+`recreate-graph` (`transaction-restore.lisp:116`) mints ids with `(incf tx-id)` seeded from
 `(load-highest-transaction-id graph)`, a *per-store* scalar, bypassing the transaction
 manager entirely. Under a shared clock it allocates **below** the global counter, so a
 restore mints epochs another store already committed at.
 
+It is reached by two routes — `replay` (`txn-log.lisp:47`) and the restore-from-backup path
+(`backup.lisp:290`) — so fixing it once covers both. The test drives `SNAPSHOT` + `REPLAY`,
+the real path, rather than calling the internal directly.
+
 - [ ] **Step 1: Write the failing test**
 
 ```lisp
-(test restore-allocates-from-the-image-clock
-  ;; The audit finding (GH #168): RESTORE-GRAPH minted ids from a per-store
+(test recreate-graph-allocates-from-the-image-clock
+  ;; The audit finding (GH #168): RECREATE-GRAPH minted ids from a per-store
   ;; scalar, so under a shared clock it reissued epochs another store had
-  ;; already used.
+  ;; already used.  Drives the real path: SNAPSHOT then REPLAY.
   (with-temp-directory (cdir)
     (let ((clock (open-system-clock (namestring cdir))))
       (unwind-protect
            (with-temp-directory (sdir)
-             (with-temp-directory (ddir)
-               (with-temp-directory (bdir)
-                 ;; Source store: a little history, then a snapshot.
-                 (let ((src (make-graph :sc-src (namestring sdir)
+             (with-temp-directory (odir)
+               ;; Source store: a little history, then a snapshot on disk.
+               (let ((src (make-graph :sc-src (namestring sdir)
+                                      :buffer-pool-size 1000
+                                      :system-clock clock)))
+                 (dotimes (i 3) (with-transaction (:graph src) t))
+                 (graph-db::snapshot src)
+                 (close-graph src))
+               ;; A second store burns epochs, pushing the clock far past
+               ;; anything the restore target's own scalar knows about.
+               (let ((other (make-graph :sc-other (namestring odir)
                                         :buffer-pool-size 1000
-                                        :system-clock clock))
-                       (snap (merge-pathnames "snap.txt" bdir)))
-                   (dotimes (i 3) (with-transaction (:graph src) t))
-                   (backup src :path snap)
-                   (close-graph src))
-                 ;; A second store burns epochs, pushing the clock well past
-                 ;; anything the restore target's own scalar knows about.
-                 (let ((other (make-graph :sc-other (namestring ddir)
-                                          :buffer-pool-size 1000
-                                          :system-clock clock)))
-                   (dotimes (i 50) (with-transaction (:graph other) t))
-                   (let ((floor-epoch (clock-current-epoch clock)))
-                     (with-temp-directory (rdir)
-                       (let ((dst (make-graph :sc-dst (namestring rdir)
-                                              :buffer-pool-size 1000
-                                              :system-clock clock)))
-                         (restore-graph dst
-                                        (merge-pathnames "snap.txt" bdir)
-                                        :package-name "GRAPH-DB/TEST")
-                         ;; Every id the restore issued must sit above the
-                         ;; clock's position when it started.
-                         (is (>= (load-highest-transaction-id dst)
-                                 floor-epoch))
-                         (close-graph dst))))
-                   (close-graph other)))))
+                                        :system-clock clock)))
+                 (dotimes (i 50) (with-transaction (:graph other) t))
+                 (let ((floor-epoch (clock-current-epoch clock)))
+                   (with-temp-directory (rdir)
+                     (let ((dst (make-graph :sc-dst (namestring rdir)
+                                            :buffer-pool-size 1000
+                                            :system-clock clock)))
+                       (graph-db::replay
+                        dst
+                        (graph-db::persistent-transaction-directory
+                         (lookup-graph :sc-src))
+                        "GRAPH-DB/TEST")
+                       ;; Every id the replay issued sits above the clock's
+                       ;; position when it started.
+                       (is (>= (graph-db::load-highest-transaction-id dst)
+                               floor-epoch))
+                       (close-graph dst))))
+                 (close-graph other))))
         (close-system-clock clock)))))
 ```
+
+**Note for the implementer:** `SNAPSHOT`, `REPLAY`, `LOAD-HIGHEST-TRANSACTION-ID` and
+`PERSISTENT-TRANSACTION-DIRECTORY` are internals — reach them with `graph-db::`, matching
+`tests/backup-tests.lisp`. If threading the source graph's txn-log directory to the
+replay proves awkward, copying the `snap-*` file into the destination's txn-log directory
+and replaying from there is an acceptable equivalent; what the test must pin is that the
+ids issued during replay are `>= floor-epoch`.
 
 - [ ] **Step 2: Run to verify it fails**
 
@@ -669,7 +687,8 @@ Expected: FAIL — the restored ids start near 0, well below `floor-epoch`.
 
 - [ ] **Step 3: Implement**
 
-In `transaction-restore.lisp`, replace the local `tx-id` allocator:
+In `transaction-restore.lisp`, inside `RECREATE-GRAPH`, replace the local `tx-id`
+allocator:
 
 ```lisp
         (tx-id nil)
@@ -696,14 +715,15 @@ and the trailing persist:
 
 - [ ] **Step 4: Run to verify it passes**
 
-Then the full suites, including the NIL path — `restore-graph` with no clock must still
-produce ascending ids from the store's own counter.
+Then the full suites, including the NIL path — `recreate-graph` with no clock must still
+produce ascending ids from the store's own counter. `backup-tests` and any replay test are
+the existing coverage of that branch.
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add transaction-restore.lisp tests/system-clock-tests.lisp
-git commit -m "fix(clock): restore-graph allocates from the manager (#168)"
+git commit -m "fix(clock): recreate-graph allocates from the manager (#168)"
 ```
 
 ---
@@ -865,7 +885,7 @@ that **the clock is not purely local** because `peer-observe-epoch` admits forei
 
 - [ ] **Step 2: CHANGELOG entry**
 
-Note the new exports, the NIL default, and the `restore-graph` fix as a **behaviour
+Note the new exports, the NIL default, and the `recreate-graph` fix as a **behaviour
 change for anyone who was relying on restore's ids being dense from zero**.
 
 - [ ] **Step 3: Mark §6 of the spec implemented**, leaving the epoch-density audit result
