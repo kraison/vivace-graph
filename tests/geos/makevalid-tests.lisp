@@ -83,7 +83,13 @@ REGISTER-GEOMETRY turns into a refusal of the WHOLE subject (GH #163)."
 POLYGON.  'Covers nothing' is a measurement, and fabricating it is the
 fault #163 is about, inverted; signalling leaves %REPAIRED's IGNORE-
 ERRORS to hand back the original, and the scan to report itself
-unevaluated."
+unevaluated.
+
+⚠ WHICH PATH IT EXERCISES: the NON-collection one.  A wholly
+degenerate ring repairs to a MULTILINESTRING, so the GEOS-ERROR comes
+from WKT->GEOMETRY having no such kind -- the pre-#163 refusal,
+unchanged.  It passes with the polygonal-parts branch present or
+absent; the %GEOS-REPAIRED->GEOMETRY tests below guard that branch."
   (cond ((not *geos-available-p*) (skip "GEOS not available"))
         ((not *geos-makevalid-available-p*) (skip "GEOS < 3.8: no makeValid"))
         (t (is-false (geometry-valid-p (collapsed-ring))
@@ -149,6 +155,37 @@ the no-part guard would catch")
                       "fixture sanity: and it really is empty"))
            (signals geos-error
              (graph-db::%geos-repaired->geometry ctx coll)))))))
+
+(test a-top-level-empty-repair-is-refused-too
+  "⚠ THE SAME HOLE ONE BRANCH TO THE LEFT.  A top-level POLYGON EMPTY is
+not a GEOMETRYCOLLECTION, so it took the pass-through branch and slipped
+the guard entirely -- %REPAIRED would hand REGISTER-GEOMETRY a
+zero-measure subject and %OVERLAP-FRACTION answers 1.0 for every
+candidate region the ORIGINAL ring turned up.  The guard is hoisted
+above the branch so both paths meet it.
+
+⚠ DEFENSIVE CONSISTENCY, NOT A LIVE BUG: no reachable input is known.
+GEOSMakeValid_r defaults to linework mode, which preserves linework as
+LINES rather than collapsing it to an empty polygon, and the structure
+mode that yields empties is not bound here.  Fixed anyway because the
+manual and the CHANGELOG state the guard unconditionally, and because
+the sibling hole above was ruled in on the same grounds (GH #163)."
+  (if (not *geos-available-p*) (skip "GEOS not available")
+      (with-geos-context (ctx)
+        (let* ((handle (graph-db::geos-ctx-handle ctx))
+               (empty (geometry->geos ctx (make-polygon '()))))
+          (unwind-protect
+               (progn
+                 ;; Fixture sanity: it must reach the function as a
+                 ;; POLYGON, or this passes on the collection branch.
+                 (is (= graph-db::+geos-polygon+
+                        (graph-db::%geos-geom-type-id handle empty))
+                     "fixture sanity: a POLYGON, not a collection")
+                 (is-true (geometry-empty-p (geos->geometry ctx empty))
+                          "fixture sanity: and it really is empty")
+                 (signals geos-error
+                   (graph-db::%geos-repaired->geometry ctx empty)))
+            (graph-db::%geos-geom-destroy handle empty))))))
 
 ;;; ---- exact planar distance ---------------------------------------------
 

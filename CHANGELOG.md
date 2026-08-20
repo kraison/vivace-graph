@@ -194,9 +194,14 @@ between releases; cutting a release renames it to the new version and dates it.
   1.0 in *every* candidate region, so fabricating one is the same fault
   inverted. `%repaired`'s contract — something usable, else the original — is
   what the caller wants there. ⚠ The test is on the **emptiness of the
-  result**, not on whether any polygonal component was found: `POLYGON EMPTY`
-  has the type id of a polygon, so a component-count test alone passes it
-  straight through.
+  result, on both paths**, not on whether any polygonal component was found:
+  `POLYGON EMPTY` has the type id of a polygon, so a component-count test alone
+  passes it through inside a collection, and a *top-level* one is not a
+  collection at all. No reachable input is known for either — `GEOSMakeValid_r`
+  defaults to linework mode, which keeps degenerate linework as lines rather
+  than collapsing it to an empty polygon, and the structure mode that yields
+  empties is not bound — so covering both is defensive consistency, not a live
+  bug; a guard with a gap in it reads as covered.
 
   Three bindings are new in `geos/geos-ffi.lisp`: `GEOSGeomTypeId_r`,
   `GEOSGetNumGeometries_r` and `GEOSGetGeometryN_r`. ⚠ `GEOSGetGeometryN_r`

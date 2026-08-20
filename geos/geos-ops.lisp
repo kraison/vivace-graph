@@ -97,20 +97,26 @@ reads as a zero-measure subject and answers with fraction 1.0 in every
 candidate region.  The caller wants %REPAIRED's fallback to the
 original, not a fabricated share.
 
-⚠ EMPTINESS IS TESTED ON THE RESULT, NOT ON THE PART LIST: POLYGON
-EMPTY's type id is +GEOS-POLYGON+, so it is collected as a polygonal
-part and a no-parts test alone would pass it straight through."
-  (let ((handle (geos-ctx-handle ctx)))
-    (if (/= (%geos-geom-type-id handle valid) +geos-geometrycollection+)
-        (geos->geometry ctx valid)
-        (let* ((parts (nreverse (%geos-polygonal-parts handle valid '())))
-               (repaired (and parts (%geos-union-of-borrowed ctx parts))))
-          (when (or (null repaired) (geometry-empty-p repaired))
-            (error 'geos-error
-                   :message
-                   (format nil "GEOSMakeValid returned a ~
-GEOMETRYCOLLECTION with no polygonal area")))
-          repaired))))
+⚠ EMPTINESS IS TESTED ON THE RESULT, ON BOTH PATHS, and not on the
+part list: POLYGON EMPTY's type id is +GEOS-POLYGON+, so a no-parts
+test passes it through inside a collection AND a top-level one is not a
+collection at all.  No reachable input is known for either -- linework
+mode, GEOSMakeValid_r's default, keeps degenerate linework as LINES
+rather than collapsing it to an empty polygon -- so this is defensive
+consistency, not a live bug; a guard with a gap in it reads as covered
+(GH #163)."
+  (let* ((handle (geos-ctx-handle ctx))
+         (repaired
+           (if (/= (%geos-geom-type-id handle valid)
+                   +geos-geometrycollection+)
+               (geos->geometry ctx valid)
+               (let ((parts (nreverse
+                             (%geos-polygonal-parts handle valid '()))))
+                 (and parts (%geos-union-of-borrowed ctx parts))))))
+    (when (or (null repaired) (geometry-empty-p repaired))
+      (error 'geos-error
+             :message "GEOSMakeValid returned a repair with no area in it"))
+    repaired))
 
 (defmethod geometry-make-valid :around ((g geometry))
   ;; Requires GEOS >= 3.8 (GEOSMakeValid_r).  When unavailable, fall through to
