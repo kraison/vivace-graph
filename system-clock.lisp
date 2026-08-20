@@ -23,6 +23,9 @@ transaction-id counter, which is the pre-#168 behaviour and the default.")
 (defun %clock-counter-file (location)
   (make-pathname :name "system-clock" :type "dat" :defaults location))
 
+(defun %clock-journal-file (location)
+  (make-pathname :name "system-journal" :type "log" :defaults location))
+
 (defun %write-clock-ceiling (clock value)
   "Persist VALUE as the durable ceiling.  Every id issued is < VALUE.
 :OVERWRITE, not :SUPERSEDE: the file is always 8 bytes, so a crash
@@ -71,6 +74,36 @@ the persisted ceiling, so a crash never reissues one."
       (close (system-clock-journal clock))
       (setf (system-clock-journal clock) nil)))
   clock)
+
+(defun journal-append (clock kind &rest plist)
+  "Append one lifecycle record.  KIND is :CREATE :DETACH :SWAP :ATTACH or
+:RETIRE.  Consumed by #170 and #171."
+  (let ((record (list* :kind kind :epoch (clock-current-epoch clock) plist)))
+    (with-recursive-lock-held ((system-clock-lock clock))
+      (unless (system-clock-journal clock)
+        (setf (system-clock-journal clock)
+              (open (%clock-journal-file (system-clock-location clock))
+                    :direction :output
+                    :if-exists :append
+                    :if-does-not-exist :create)))
+      (let ((s (system-clock-journal clock)))
+        (let ((*print-readably* nil) (*print-pretty* nil))
+          (format s "~S~%" record))
+        (finish-output s)))
+    record))
+
+(defun journal-records (clock)
+  "Every lifecycle record, oldest first.  Read with evaluation disabled --
+the journal is data and must never execute."
+  (let ((file (%clock-journal-file (system-clock-location clock))))
+    (when (system-clock-journal clock)
+      (finish-output (system-clock-journal clock)))
+    (when (probe-file file)
+      (with-open-file (s file :direction :input)
+        (let ((*read-eval* nil))
+          (loop for r = (read s nil :eof)
+                until (eq r :eof)
+                collect r))))))
 
 (defun %clock-reserve (clock needed)
   "Raise the durable ceiling so COUNTER + NEEDED stays below it.  Caller

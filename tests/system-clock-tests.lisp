@@ -86,3 +86,43 @@
              ;; can collide with an id the lease holder allocates.
              (is (>= (clock-next-epoch c) end)))
         (close-system-clock c)))))
+
+(test journal-appends-and-reads-back
+  (with-temp-directory (dir)
+    (let ((c (open-system-clock (namestring dir))))
+      (unwind-protect
+           (progn
+             (journal-append c :detach :store :alpha
+                              :lease-start 10 :lease-end 20)
+             (journal-append c :attach :store :alpha)
+             (let ((rs (journal-records c)))
+               (is (= 2 (length rs)))
+               (is (eq :detach (getf (first rs) :kind)))
+               (is (eq :alpha (getf (first rs) :store)))
+               (is (eq :attach (getf (second rs) :kind)))))
+        (close-system-clock c)))))
+
+(test journal-survives-reopen
+  (with-temp-directory (dir)
+    (let ((c (open-system-clock (namestring dir))))
+      (journal-append c :create :store :beta)
+      (close-system-clock c))
+    (let ((c2 (open-system-clock (namestring dir))))
+      (unwind-protect
+           (is (equal '(:create) (mapcar (lambda (r) (getf r :kind))
+                                         (journal-records c2))))
+        (close-system-clock c2)))))
+
+(test journal-refuses-to-evaluate-on-read
+  ;; A journal is data.  Reading it must never evaluate.
+  (with-temp-directory (dir)
+    (let ((c (open-system-clock (namestring dir))))
+      (close-system-clock c))
+    (with-open-file (s (merge-pathnames "system-journal.log" dir)
+                       :direction :output :if-exists :append
+                       :if-does-not-exist :create)
+      (format s "(:kind :bogus :value #.(error \"evaluated\"))~%"))
+    (let ((c2 (open-system-clock (namestring dir))))
+      (unwind-protect
+           (signals error (journal-records c2))
+        (close-system-clock c2)))))

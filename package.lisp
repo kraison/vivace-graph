@@ -31,6 +31,8 @@
            #:clock-current-epoch
            #:clock-observe-epoch
            #:clock-lease-epochs
+           #:journal-append
+           #:journal-records
            #:make-graph
            #:*default-heap-size*
            #:*default-index-size*

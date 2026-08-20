@@ -23,6 +23,8 @@
                 #:clock-current-epoch
                 #:clock-observe-epoch
                 #:clock-lease-epochs
+                #:journal-append
+                #:journal-records
                 ;; serialization
                 #:serialize
                 #:deserialize
