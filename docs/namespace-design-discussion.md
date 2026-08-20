@@ -1,5 +1,12 @@
 # Graphs as namespaces — parked design discussion
 
+> ⚠ **AMENDED 2026-08-20 — read `namespace-design-decisions-2026-08-20.md` first.**
+> That document is current where the two disagree. Two things here are superseded:
+> the **two-axis framing** below (there are three axes; ontological scoping is a
+> kept axis with its own mechanism), and **agreed-shape point 3**, "source
+> namespaces are closed — no cross-namespace edges" (demoted from engine invariant
+> to convention). Everything else in this file still holds.
+
 **Status:** PARKED, not built, not agreed as a commitment. This is a record of a design
 conversation held 2026-07-29 between Kevin and Claude while brainstorming a
 "SpatioTemporalGraphRAG" system spanning mine-action, vivace-graph-v3 and cl-llm. It was
@@ -92,7 +99,9 @@ exactly why a node read under the wrong ambient `*graph*` materialized as the wr
      carry a namespace touch-set and the operation must fail-closed when the sets are not
      disjoint since the snapshot point.
 
-3. **Source namespaces are closed — no cross-namespace edges.** This is what keeps a
+3. **Source namespaces are closed — no cross-namespace edges.**
+   *(SUPERSEDED 2026-08-20: now a convention, not an engine invariant — see D1/D2
+   of the decisions doc.)* This is what keeps a
    per-namespace logical backup self-consistent. Without it, a namespace backup either
    contains edges referencing nodes that are not in the backup, or omits connectivity that
    dangles from the other side; either way the self-consistency that per-namespace snapshot
