@@ -13,6 +13,20 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Added
 
+- **The image-level system clock** (#168). `open-system-clock` /
+  `close-system-clock` open a durable, crash-safe epoch counter shared by
+  every store attached to it, in place of each store's own per-graph
+  `transaction-id` counter. `*system-clock*` defaults to `nil`; with no
+  clock bound, `make-graph`/`open-graph` and every transaction-allocation
+  path behave exactly as before #168. `make-graph` and `open-graph` gain
+  `:system-clock` (default `*system-clock*`); attaching a store raises the
+  clock above that store's own persisted history (its highest committed
+  transaction id, and for a peer-graph, its pull-cursor too, since those
+  are distinct number spaces) so the clock can never reissue an epoch that
+  store has already used, and refuses while the store has an in-flight
+  transaction. See docs/vivace-graph-v3-doc.org, Chapter 17, "The
+  image-level system clock (optional)".
+
 - **Registration — binding a record's geometry to a registry's regions**
   (#138). `graph-db/spacetime` gains `register-geometry` and `register-node`,
   which turn a source's `:REGISTRATION` facet into one claim per region the

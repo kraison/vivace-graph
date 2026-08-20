@@ -29,6 +29,7 @@
            #:close-system-clock
            #:clock-next-epoch
            #:clock-current-epoch
+           #:clock-peek-epoch
            #:clock-observe-epoch
            #:clock-lease-epochs
            #:journal-append
@@ -37,6 +38,7 @@
            #:attach-to-system-clock
            #:tm-next-epoch
            #:tm-current-epoch
+           #:tm-peek-epoch
            #:make-graph
            #:*default-heap-size*
            #:*default-index-size*

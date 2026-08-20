@@ -145,15 +145,15 @@
                                      :buffer-pool-size 1000
                                      :system-clock clock)))
                  (unwind-protect
-                      (let ((ids '()))
+                      (let ((tm-a (graph-db::transaction-manager ga))
+                            (tm-b (graph-db::transaction-manager gb))
+                            (ids '()))
                         (dotimes (i 3)
-                          (push (transaction-id
-                                 (with-transaction ((graph-db::transaction-manager ga))
-                                   *transaction*))
+                          (push (transaction-id (with-transaction (tm-a)
+                                                  *transaction*))
                                 ids)
-                          (push (transaction-id
-                                 (with-transaction ((graph-db::transaction-manager gb))
-                                   *transaction*))
+                          (push (transaction-id (with-transaction (tm-b)
+                                                  *transaction*))
                                 ids))
                         (let ((sorted (sort (copy-list ids) #'<)))
                           ;; No two transactions anywhere share an epoch.
@@ -166,19 +166,32 @@
 (test no-clock-means-per-store-counters-unchanged
   ;; The backward-compatibility hinge: with *SYSTEM-CLOCK* nil and no
   ;; :SYSTEM-CLOCK argument, two graphs allocate independently, exactly as
-  ;; before #168 -- so both start low and their ids DO collide.
-  (with-temp-directory (da)
-    (with-temp-directory (db)
-      (let ((ga (make-graph :sc-gamma (namestring da) :buffer-pool-size 1000))
-            (gb (make-graph :sc-delta (namestring db) :buffer-pool-size 1000)))
-        (unwind-protect
-             (let ((ia (transaction-id (with-transaction ((graph-db::transaction-manager ga))
-                                         *transaction*)))
-                   (ib (transaction-id (with-transaction ((graph-db::transaction-manager gb))
-                                         *transaction*))))
-               (is (= ia ib)))
-          (close-graph ga)
-          (close-graph gb))))))
+  ;; before #168 -- so both start low and their ids DO collide.  Assert the
+  ;; actual pre-#168 values, not just their equality: an off-by-one NIL
+  ;; branch (e.g. a bare INCF instead of PROG1-then-INCF) would still
+  ;; satisfy (= IA IB) without this.  *SYSTEM-CLOCK* is bound explicitly
+  ;; rather than relied on as a lambda-list default, so this test's premise
+  ;; does not depend on run order against any test that SETFs the global.
+  (let ((*system-clock* nil))
+    (with-temp-directory (da)
+      (with-temp-directory (db)
+        (let ((ga (make-graph :sc-gamma (namestring da)
+                              :buffer-pool-size 1000))
+              (gb (make-graph :sc-delta (namestring db)
+                              :buffer-pool-size 1000)))
+          (unwind-protect
+               (let* ((tm-a (graph-db::transaction-manager ga))
+                      (tm-b (graph-db::transaction-manager gb))
+                      (ia (transaction-id (with-transaction (tm-a)
+                                            *transaction*)))
+                      (ib (transaction-id (with-transaction (tm-b)
+                                            *transaction*)))
+                      (ia2 (transaction-id (with-transaction (tm-a)
+                                             *transaction*))))
+                 (is (= 1 ia ib))
+                 (is (= 2 ia2)))
+            (close-graph ga)
+            (close-graph gb)))))))
 
 (test attaching-a-store-raises-the-clock-above-its-history
   ;; The watermark: a store with existing history must not hand the clock a
@@ -186,7 +199,8 @@
   (with-temp-directory (cdir)
     (with-temp-directory (gdir)
       (let ((g (make-graph :sc-eps (namestring gdir) :buffer-pool-size 1000)))
-        (dotimes (i 5) (with-transaction ((graph-db::transaction-manager g)) t))
+        (dotimes (i 5)
+          (with-transaction ((graph-db::transaction-manager g)) t))
         (let ((highest (load-highest-transaction-id g)))
           (close-graph g)
           (let ((clock (open-system-clock (namestring cdir))))
@@ -195,6 +209,113 @@
                                        :buffer-pool-size 1000
                                        :system-clock clock)))
                    (unwind-protect
-                        (is (> (clock-current-epoch clock) highest))
+                        (progn
+                          (is (> (clock-current-epoch clock) highest))
+                          ;; The property the watermark exists for: the
+                          ;; NEXT id this store actually allocates must
+                          ;; exceed its own history, not just leave the
+                          ;; clock's internal counter above it (which
+                          ;; would also catch an attach that raced ahead
+                          ;; of its own watermark -- fix 2 in the review).
+                          (let ((tm-2 (graph-db::transaction-manager g2)))
+                            (is (> (transaction-id (with-transaction (tm-2)
+                                                     *transaction*))
+                                   highest))))
                      (close-graph g2)))
               (close-system-clock clock))))))))
+
+(test start-and-finish-tx-id-bracket-the-shared-epoch
+  ;; The gap that matters most (reviewer finding): an implementation that
+  ;; drew only the COMMIT id from the clock while leaving start-tx-id and
+  ;; finish-tx-id on the local counter would pass every test above and
+  ;; still corrupt this store's overlap window (OVERLAPPING-TRANSACTIONS
+  ;; filters committed transactions by (<= START (TRANSACTION-ID TX)
+  ;; FINISH)).  Interleave commits across two stores sharing one clock and
+  ;; check each transaction's own start/finish bracket its own
+  ;; transaction-id -- proving all three come from the same sequence.
+  (with-temp-directory (cdir)
+    (let ((clock (open-system-clock (namestring cdir))))
+      (unwind-protect
+           (with-temp-directory (da)
+             (with-temp-directory (db)
+               (let ((ga (make-graph :sc-theta (namestring da)
+                                     :buffer-pool-size 1000
+                                     :system-clock clock))
+                     (gb (make-graph :sc-iota (namestring db)
+                                     :buffer-pool-size 1000
+                                     :system-clock clock)))
+                 (unwind-protect
+                      (let ((tm-a (graph-db::transaction-manager ga))
+                            (tm-b (graph-db::transaction-manager gb))
+                            (txs '()))
+                        (dotimes (i 3)
+                          (push (with-transaction (tm-a) *transaction*) txs)
+                          (push (with-transaction (tm-b) *transaction*) txs))
+                        (dolist (tx txs)
+                          (is (<= (graph-db::start-tx-id tx)
+                                  (transaction-id tx)
+                                  (graph-db::finish-tx-id tx)))))
+                   (close-graph ga)
+                   (close-graph gb)))))
+        (close-system-clock clock)))))
+
+(test attach-watermarks-a-peer-graphs-pull-cursor-too
+  ;; Correctness (reviewer fix 1): a peer-graph's pull-cursor and its local
+  ;; highest-transaction-id are DISTINCT number spaces (see
+  ;; PEER-OBSERVE-EPOCH's docstring; tests/peer-lamport-tests.lisp confirms
+  ;; they diverge).  ATTACH-TO-SYSTEM-CLOCK must watermark past whichever
+  ;; is higher, or a node this device pulled at the hub's epoch becomes
+  ;; MVCC-invisible to a subsequent local edit once the clock takes over.
+  (with-temp-directory (cdir)
+    (with-temp-directory (gdir)
+      (let ((origin (make-array 16 :element-type '(unsigned-byte 8)
+                                :initial-element 7)))
+        (let ((g (make-graph :sc-lambda (namestring gdir)
+                             :peer-role :device :origin-id origin
+                             :peer-host "localhost" :replication-port 0
+                             :buffer-pool-size 1000)))
+          (let ((*graph* g))
+            ;; Local feed-seq advances to 3 ...
+            (dotimes (i 3)
+              (with-transaction ((graph-db::transaction-manager g)) t)))
+          ;; ... while the pull-cursor (a hub frontier) is far above it.
+          (graph-db::persist-peer-pull-cursor 42 g)
+          (close-graph g :snapshot-p nil))
+        (let ((clock (open-system-clock (namestring cdir))))
+          (unwind-protect
+               (let ((g2 (open-graph :sc-lambda (namestring gdir)
+                                     :peer-role :device :origin-id origin
+                                     :peer-host "localhost" :replication-port 0
+                                     :buffer-pool-size 1000
+                                     :system-clock clock)))
+                 (unwind-protect
+                      (is (> (clock-current-epoch clock) 42))
+                   (close-graph g2 :snapshot-p nil)))
+            (close-system-clock clock)))))))
+
+(test attach-does-not-half-apply-when-watermark-computation-fails
+  ;; Ordering (reviewer fix 2): ATTACH-TO-SYSTEM-CLOCK must compute and
+  ;; raise the watermark BEFORE it sets GRAPH-SYSTEM-CLOCK, so a failure
+  ;; mid-attach leaves the graph un-attached rather than attached-but-
+  ;; un-watermarked (a store whose epoch source is a clock not yet raised
+  ;; above its own history -- and already findable via *GRAPHS* by any
+  ;; other thread).  Corrupt the persisted highest-id file so
+  ;; LOAD-HIGHEST-TRANSACTION-ID signals, and assert the slot never moved.
+  (with-temp-directory (cdir)
+    (with-temp-directory (gdir)
+      (let ((g (make-graph :sc-kappa (namestring gdir) :buffer-pool-size 1000)))
+        (with-transaction ((graph-db::transaction-manager g)) t)
+        (unwind-protect
+             (let ((clock (open-system-clock (namestring cdir))))
+               (unwind-protect
+                    (progn
+                      (with-open-file
+                          (s (graph-db::highest-transaction-id-file g)
+                             :direction :output
+                             :element-type '(unsigned-byte 8)
+                             :if-exists :supersede)
+                        (write-byte 0 s))
+                      (signals error (attach-to-system-clock g clock))
+                      (is (null (graph-system-clock g))))
+                 (close-system-clock clock)))
+          (close-graph g :snapshot-p nil))))))

@@ -125,6 +125,12 @@ holds the lock."
   (with-recursive-lock-held ((system-clock-lock clock))
     (system-clock-counter clock)))
 
+(defun clock-peek-epoch (clock)
+  "The counter without taking the lock.  Monotonic, so a stale (smaller)
+value only makes the reaper more conservative -- never less.  For
+PIN-READ-EPOCH; use CLOCK-CURRENT-EPOCH where exactness matters."
+  (system-clock-counter clock))
+
 (defun clock-observe-epoch (clock epoch)
   "Raise CLOCK so it strictly exceeds EPOCH.  Monotonic and idempotent; a
 lower EPOCH is a no-op.  Foreign epochs reach here from peer sync, so the

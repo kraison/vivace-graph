@@ -2718,6 +2718,55 @@ Also note: ~graph~ is now a *reserved* slot name on node classes — it backs th
 home-graph tracking slot described above. A user-defined slot named ~graph~ shadows it and
 silently disables home-graph tracking for that class; do not use it as a slot name.
 
+*** The image-level system clock (optional)
+
+Chapter 17 says a cross-graph instant "would need an epoch shared by every
+transaction manager, which is not implemented." As of GH #168, it can be:
+a ~system-clock~ is one epoch counter shared by every store attached to it,
+in place of each store's own ~transaction-id~ counter.
+
+~*system-clock*~ defaults to ~nil~. With no clock bound and no ~:system-clock~
+argument passed, every store keeps its own counter exactly as before —
+~tm-next-epoch~'s NIL branch is byte-for-byte the pre-#168
+~(prog1 counter (incf counter))~. Nothing about this feature is on by
+default; a production server upgrading past #168 sees no behaviour change
+until it explicitly opens a clock.
+
+To open one and attach stores to it:
+
+#+BEGIN_SRC lisp
+(let ((clock (open-system-clock "/path/to/clock-dir/")))
+  (unwind-protect
+       (let ((a (make-graph :store-a "/path/to/a/" :system-clock clock))
+             (b (make-graph :store-b "/path/to/b/" :system-clock clock)))
+         ;; every transaction on A or B now draws its epoch from CLOCK,
+         ;; so no two transactions anywhere on this clock share one
+         (unwind-protect (progn ...)
+           (close-graph a)
+           (close-graph b)))
+    (close-system-clock clock)))
+#+END_SRC
+
+~make-graph~ and ~open-graph~ both take ~:system-clock~, defaulting to
+~*system-clock*~ — bind that special once per image instead of passing the
+keyword to every call. Attaching (at either ~make-graph~ or ~open-graph~)
+raises the clock above the store's own persisted history — its highest
+committed transaction id, and for a peer-graph, its pull-cursor too, since
+those are distinct number spaces — so the clock can never hand out an
+epoch that store has already used. This is the watermark; it runs under
+the store's transaction-manager lock and refuses (signalling
+~attach-with-active-transactions~) if the store has any in-flight
+transaction, since attaching mid-transaction would poison that
+transaction's overlap window.
+
+**One limitation**: the watermark only ever raises the clock forward. It
+cannot place the clock *below* a store's history, so a store cannot be
+attached to reconstruct what its epoch numbering would have been had the
+clock existed since that store's creation — there is no snapshotting into
+the pre-migration past across stores. A store's own history before attach
+remains ordered correctly by its own counter; only new activity after
+attach shares the image-wide sequence.
+
 ** Chapter 18: Temporal Extents — graph-db/spacetime (optional)
 
 Every timestamp a real system records comes with some story about how sure

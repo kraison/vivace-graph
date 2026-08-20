@@ -25,6 +25,9 @@
                 #:clock-lease-epochs
                 #:journal-append
                 #:journal-records
+                #:graph-system-clock
+                #:attach-to-system-clock
+                #:clock-peek-epoch
                 ;; serialization
                 #:serialize
                 #:deserialize

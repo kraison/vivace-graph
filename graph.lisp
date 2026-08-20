@@ -358,11 +358,12 @@ Keyword arguments:
                           applies only replicated writes whose node it accepts,
                           so it holds just a subset (e.g. its area of operations).
                           See MAKE-SPATIAL-REPLICATION-FILTER.
-  :SYSTEM-CLOCK           the image-level epoch clock (GH #168) this store's
-                          transactions allocate ids from, or NIL (the default,
-                          via *SYSTEM-CLOCK*) to keep this store's own counter --
-                          the pre-#168 behaviour.  Attaching raises the clock
-                          above this store's persisted highest id.
+  :SYSTEM-CLOCK           the image-level epoch clock (GH #168) this
+                          store's transactions allocate ids from, or NIL
+                          (the default, via *SYSTEM-CLOCK*) to keep this
+                          store's own counter -- the pre-#168 behaviour.
+                          Attaching raises the clock above this store's
+                          persisted highest id.
 
 A .dirty marker file is written on creation; always CLOSE-GRAPH to flush data
 to disk and remove it."
