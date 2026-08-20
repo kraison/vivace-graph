@@ -44,6 +44,13 @@ between releases; cutting a release renames it to the new version and dates it.
     `:claim-class`, `:producer`, `:relation`, `:method`, `:rule-version`,
     `:precision-fn`, `:confidence-fn` and `:method-fn`. `:none` stays fully
     supported.
+    ⚠ **`:method-fn` is REQUIRED, and that constrains the upgrade order.** A
+    tenant already on an older engine must declare the key on every
+    `:registration` facet — `NIL` where that source's method is a source-wide
+    constant — and land that change *first*; taking this version before it
+    fails `def-source` at MACROEXPANSION for every faceted class. Declaring it
+    early is inert on the older engine, which accepts and ignores facet keys
+    it does not know.
     `standing` is deliberately not a field: a registration is derived by
     computation, so every claim written carries `:inferred`.
   - **`geometry-geodesic-area`** (m², by spherical excess, holes subtracted)
