@@ -121,8 +121,8 @@ node, its slot data, the subclass, and the edge topology."
                                          (merge-pathnames "migrate.snapshot" root)))))
         (unwind-protect
              (let ((*graph* g))
-               (is (= 2 graph-db::+storage-version+)
-                   "the migrated graph is written in the current (v2) format")
+               (is (= 3 graph-db::+storage-version+)
+                   "the migrated graph is written in the current (v3) format")
                ;; All three people survive, with name + age intact.  :vertex-type
                ;; g-person includes the g-employee subclass (Carol) by default.
                (let ((people (sort (map-vertices

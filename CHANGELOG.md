@@ -417,6 +417,24 @@ between releases; cutting a release renames it to the new version and dates it.
   unbound on a memory graph. That gap is out of scope for #135 and is
   getting its own spec.
 
+- **`type-id` widened from 16 to 32 bits; on-disk storage format bumped to
+  v3** (#166, unit 1a, task 1). Every place `type-id` was written or typed
+  widens together (no useful intermediate state): the node head (2 -> 4
+  bytes; head grows 31 -> 33, edge head 71 -> 73), `ve-key` (18 -> 20
+  bytes) and `vev-key` (34 -> 36 bytes), the CLOS `type-id` slot, and the
+  schema's `next-vertex-id` / `next-edge-id` counters. Type-ids remain
+  **per-graph** — no global registry, no distribution change; that is a
+  separate issue (#186).
+  A v2 graph cannot be opened directly by this build — `open-graph`
+  signals rather than silently misreading a 2-byte type-id as 4 (which
+  would otherwise corrupt every subsequent field in the head, and every
+  adjacent record via the widened `ve-key`/`vev-key`). The v2 -> v3
+  migration path (an extension of the existing `migrate-graph` snapshot +
+  replay, following the v1 -> v2 precedent) lands in a follow-up task of
+  #166; until then, a pre-#166 graph must stay on a pre-#166 build.
+  `deserialize-node-head-v2` (a byte-for-byte copy of the prior 31-byte
+  reader) already exists for that migration to use.
+
 ## [3.0.0] - 2026-08-09
 
 > **MAJOR.** Per this file's SemVer preamble, MAJOR is mandatory here on two

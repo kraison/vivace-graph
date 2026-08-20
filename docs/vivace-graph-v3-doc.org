@@ -417,13 +417,13 @@ A linear hash table is designed for graceful, incremental growth, which is essen
 - *Splitting:* When a bucket overflows with too many entries, the table does not resize all at once. Instead, it maintains a `next-split` pointer. It "splits" the single bucket at this pointer into two, re-distributing its contents. The pointer then advances to the next bucket. This ensures that the work of growing the hash table is spread out over time.
 - *Overflow:* If a bucket overflows before it is scheduled to be split, any additional items are placed in a separate ~overflow.dat~ file and chained together.
 
-For these primary node tables, the *key* is the node's 16-byte UUID, and the *value* is a compact, serialized representation of the node's core metadata — its *head*. As of storage format *v2* (the MVCC release) the head is 31 bytes for a vertex (71 for an edge, which appends its ~from~/~to~/~weight~) and is laid out append-only as:
+For these primary node tables, the *key* is the node's 16-byte UUID, and the *value* is a compact, serialized representation of the node's core metadata — its *head*. As of storage format *v3* (the type-id widening, GH #166) the head is 33 bytes for a vertex (73 for an edge, which appends its ~from~/~to~/~weight~) and is laid out append-only as:
 
 #+BEGIN_EXAMPLE
-  flags(1)  type-id(2)  revision(4)  data-pointer(8)  commit-epoch(8)  prev-pointer(8)
+  flags(1)  type-id(4)  revision(4)  data-pointer(8)  commit-epoch(8)  prev-pointer(8)
 #+END_EXAMPLE
 
-The first 15 bytes are byte-for-byte identical to the original (v1) head; ~commit-epoch~ and ~prev-pointer~ were *appended*, which is what makes the v1→v2 migration a simple matter (see Chapter 12, "MVCC: Immutable Versioned Nodes"). ~data-pointer~ is the all-important offset to the node's data in the heap file; ~commit-epoch~ and ~prev-pointer~ drive the versioning machinery described in that chapter. The on-disk storage version is recorded in each memory-mapped region; opening a v1 graph with a v2 build signals an error directing you to ~migrate-graph~.
+~type-id~ widened from 2 to 4 bytes in v3, which breaks the byte-for-byte prefix the v1 and v2 heads used to share (both had ~flags(1) type-id(2) ...~); a v2 head must be read with ~deserialize-node-head-v2~, not reinterpreted against the v3 layout in place. ~data-pointer~ is the all-important offset to the node's data in the heap file; ~commit-epoch~ and ~prev-pointer~ drive the versioning machinery described in Chapter 12, "MVCC: Immutable Versioned Nodes". The on-disk storage version is recorded in each memory-mapped region; opening a v1 *or v2* graph with a v3 build signals an error directing you to ~migrate-graph~ (as of GH #166 task 1, the v2→v3 migration path itself is not yet implemented — only the refusal is; see task 3 of that issue).
 
 *** Ordered indexes and pluggable backends (~indexes.dat~)
 
