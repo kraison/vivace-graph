@@ -188,7 +188,11 @@ wrong answer, and the fallback is the full sweep.
 journal), `attach-to-system-clock` (watermark), `peer-observe-epoch`
 (foreign epochs), `recreate-graph` (restore no longer bypasses it), and
 the cross-store pin in `call-with-read-snapshot` cover every bullet
-below. User-facing docs: `docs/vivace-graph-v3-doc.org`, Chapter 17,
+below, for explicitly-nested `with-read-snapshot` calls -- `*read-
+snapshots*` is keyed by graph, so a read that walks into another store
+without its own nested snapshot gets only the momentary pin inside
+`lookup-object`, not an extent-length one. User-facing docs:
+`docs/vivace-graph-v3-doc.org`, Chapter 17,
 starting at "The image-level system clock (optional)". The bullets below
 are kept as the original design record, including the audit finding.
 

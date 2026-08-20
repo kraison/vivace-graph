@@ -89,7 +89,7 @@
                (:file "vertex" :depends-on ("primitive-node"))
                (:file "edge" :depends-on ("vertex"))
                (:file "gc" :depends-on ("edge" "vertex" "views"))
-               (:file "transactions" :depends-on ("graph-class" "type-index" "vev-index" "ve-index" "edge" "vertex" "gc" "spatial-index" "posix"))
+               (:file "transactions" :depends-on ("graph-class" "type-index" "vev-index" "ve-index" "edge" "vertex" "gc" "spatial-index" "posix" "system-clock"))
                (:file "transaction-restore" :depends-on ("transactions"))
                (:file "transaction-log-streaming" :depends-on ("transactions"))
                (:file "backup" :depends-on ("edge"))

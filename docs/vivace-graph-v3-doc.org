@@ -2767,6 +2767,13 @@ the pre-migration past across stores. A store's own history before attach
 remains ordered correctly by its own counter; only new activity after
 attach shares the image-wide sequence.
 
+This guarantee does not extend to ~make-graph :replay-txn-dir D
+:system-clock C~: replay runs before the transaction manager and the
+attach exist, so it mints local ids from zero and the later attach's
+watermark observation is then a no-op, leaving the restored store
+holding epochs the clock already issued to other stores. See
+vivace-graph#180.
+
 *** Epoch leases for a detached store
 
 ~clock-lease-epochs~ reserves a contiguous range on the clock for a store

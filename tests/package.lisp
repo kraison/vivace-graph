@@ -27,6 +27,7 @@
                 #:journal-records
                 #:graph-system-clock
                 #:attach-to-system-clock
+                #:attach-with-active-transactions
                 #:clock-peek-epoch
                 ;; serialization
                 #:serialize

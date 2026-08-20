@@ -150,5 +150,4 @@ Returns (values START END); the holder allocates in [START, END)."
     (let* ((start (system-clock-counter clock))
            (end (+ start n)))
       (setf (system-clock-counter clock) end)
-      (%clock-reserve clock 0)
       (values start end))))

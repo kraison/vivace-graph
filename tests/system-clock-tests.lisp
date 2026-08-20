@@ -76,6 +76,21 @@
              (is (> (clock-next-epoch c2) highest))
           (close-system-clock c2))))))
 
+(test clock-observe-epoch-persists-its-jump-across-a-crash
+  ;; No coverage before this (GH #168 review): both crash tests above
+  ;; exercise CLOCK-NEXT-EPOCH only, never an OBSERVE.  CLOCK-OBSERVE-
+  ;; EPOCH's trailing %CLOCK-RESERVE forces the ceiling write that makes
+  ;; a large foreign jump durable; without it a crash right after an
+  ;; observe loses the jump and reopen resumes below it.
+  (with-temp-directory (dir)
+    (let* ((c (open-system-clock (namestring dir) :block-size 8))
+           (observed 999999))
+      (clock-observe-epoch c observed)
+      (let ((c2 (open-system-clock (namestring dir) :block-size 8)))
+        (unwind-protect
+             (is (> (clock-next-epoch c2) observed))
+          (close-system-clock c2))))))
+
 (test clock-lease-is-disjoint-and-advances-the-clock
   (with-temp-directory (dir)
     (let ((c (open-system-clock (namestring dir))))
@@ -319,6 +334,26 @@
                       (is (null (graph-system-clock g))))
                  (close-system-clock clock)))
           (close-graph g :snapshot-p nil))))))
+
+(test attach-refuses-a-store-with-an-active-transaction
+  ;; No coverage before this (GH #168 review): the quiescence guard in
+  ;; ATTACH-TO-SYSTEM-CLOCK exists to prevent the FINISH-TX-ID skew
+  ;; described in its docstring.  Attach from inside an open transaction
+  ;; and confirm both the signal and that the graph is left un-attached.
+  (with-temp-directory (cdir)
+    (let ((clock (open-system-clock (namestring cdir))))
+      (unwind-protect
+           (with-temp-directory (gdir)
+             (let ((g (make-graph :sc-quiescence (namestring gdir)
+                                  :buffer-pool-size 1000)))
+               (unwind-protect
+                    (progn
+                      (with-transaction ((graph-db::transaction-manager g))
+                        (signals attach-with-active-transactions
+                          (attach-to-system-clock g clock)))
+                      (is (null (graph-system-clock g))))
+                 (close-graph g :snapshot-p nil))))
+        (close-system-clock clock)))))
 
 (test recreate-graph-allocates-from-the-image-clock
   ;; The audit finding (GH #168): RECREATE-GRAPH minted ids from a per-store

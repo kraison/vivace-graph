@@ -135,6 +135,7 @@
            #:*read-snapshots*
            #:read-transaction
            #:no-transaction-in-progress
+           #:attach-with-active-transactions
            #:mutating-unregistered-node
            #:copying-uncommitted-node
 
