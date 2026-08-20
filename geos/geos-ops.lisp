@@ -90,21 +90,27 @@ GEOMETRYCOLLECTION of polygonal AND linear parts; the polygons are the
 repaired area and the lines are the slivers it shed, so the answer is
 the polygons' union (GH #163).
 
-⚠ A collection with NO polygonal part signals GEOS-ERROR rather than
-yielding an empty polygon: nothing was repaired, and an empty polygon
-would be reported as the measurement 'covers nothing' instead.  The
-caller wants %REPAIRED's fallback to the original, not a fabricated
-zero."
+⚠ A REPAIR WITH NO AREA IN IT SIGNALS GEOS-ERROR rather than yielding
+an empty polygon.  Nothing was repaired, and an empty geometry is not
+that -- it is the MEASUREMENT 'covers nothing', which %OVERLAP-FRACTION
+reads as a zero-measure subject and answers with fraction 1.0 in every
+candidate region.  The caller wants %REPAIRED's fallback to the
+original, not a fabricated share.
+
+⚠ EMPTINESS IS TESTED ON THE RESULT, NOT ON THE PART LIST: POLYGON
+EMPTY's type id is +GEOS-POLYGON+, so it is collected as a polygonal
+part and a no-parts test alone would pass it straight through."
   (let ((handle (geos-ctx-handle ctx)))
     (if (/= (%geos-geom-type-id handle valid) +geos-geometrycollection+)
         (geos->geometry ctx valid)
-        (let ((parts (nreverse (%geos-polygonal-parts handle valid '()))))
-          (unless parts
+        (let* ((parts (nreverse (%geos-polygonal-parts handle valid '())))
+               (repaired (and parts (%geos-union-of-borrowed ctx parts))))
+          (when (or (null repaired) (geometry-empty-p repaired))
             (error 'geos-error
                    :message
                    (format nil "GEOSMakeValid returned a ~
-GEOMETRYCOLLECTION with no polygonal part")))
-          (%geos-union-of-borrowed ctx parts)))))
+GEOMETRYCOLLECTION with no polygonal area")))
+          repaired))))
 
 (defmethod geometry-make-valid :around ((g geometry))
   ;; Requires GEOS >= 3.8 (GEOSMakeValid_r).  When unavailable, fall through to

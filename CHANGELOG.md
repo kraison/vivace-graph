@@ -188,11 +188,15 @@ between releases; cutting a release renames it to the new version and dates it.
   without the add-on the base method still signals
   `geos-required-for-operation`.
 
-  **A collection with no polygonal component at all signals `geos-error`**
-  rather than yielding an empty polygon. Nothing was repaired, and "covers
-  nothing" is a *measurement*: fabricating it is the same fault inverted.
-  `%repaired`'s contract — something usable, else the original — is what the
-  caller wants there.
+  **A repair with no area in it signals `geos-error`** rather than yielding an
+  empty polygon. Nothing was repaired, and "covers nothing" is a
+  *measurement*: `%overlap-fraction` reads a zero-measure subject as fraction
+  1.0 in *every* candidate region, so fabricating one is the same fault
+  inverted. `%repaired`'s contract — something usable, else the original — is
+  what the caller wants there. ⚠ The test is on the **emptiness of the
+  result**, not on whether any polygonal component was found: `POLYGON EMPTY`
+  has the type id of a polygon, so a component-count test alone passes it
+  straight through.
 
   Three bindings are new in `geos/geos-ffi.lisp`: `GEOSGeomTypeId_r`,
   `GEOSGetNumGeometries_r` and `GEOSGetGeometryN_r`. ⚠ `GEOSGetGeometryN_r`

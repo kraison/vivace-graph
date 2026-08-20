@@ -90,28 +90,65 @@ unevaluated."
                      "fixture sanity: the collapsed ring is invalid")
            (signals geos-error (geometry-make-valid (collapsed-ring))))))
 
+(defun call-with-geos-collection (ctx geometries fn)
+  "Call FN on a GEOS GEOMETRYCOLLECTION pointer built from GEOMETRIES,
+then destroy it.  Collections like these are built by hand because no
+ring in reach makes GEOSMakeValid emit one -- a wholly degenerate ring
+comes back as a MULTILINESTRING instead.
+
+⚠ GEOSGeom_createCollection_r TAKES OWNERSHIP of its members, so
+destroying the collection frees them too; FN must not free anything."
+  (let ((handle (graph-db::geos-ctx-handle ctx))
+        (n (length geometries)))
+    (cffi:with-foreign-object (arr :pointer n)
+      (loop for g in geometries
+            for i from 0
+            do (setf (cffi:mem-aref arr :pointer i) (geometry->geos ctx g)))
+      (let ((coll (graph-db::%geos-create-collection
+                   handle graph-db::+geos-geometrycollection+ arr n)))
+        (unwind-protect (funcall fn coll)
+          (graph-db::%geos-geom-destroy handle coll))))))
+
 (test a-polygon-free-collection-is-refused-not-emptied
   "The same rule one level down, on a GEOMETRYCOLLECTION built by hand:
-%GEOS-REPAIRED->GEOMETRY has no polygonal part to keep, so it signals.
-Built here because no ring in reach makes GEOSMakeValid emit one -- a
-wholly degenerate ring comes back as a MULTILINESTRING instead."
+%GEOS-REPAIRED->GEOMETRY has no polygonal part to keep, so it signals."
   (if (not *geos-available-p*) (skip "GEOS not available")
       (with-geos-context (ctx)
-        (let ((handle (graph-db::geos-ctx-handle ctx)))
-          (cffi:with-foreign-object (arr :pointer 2)
-            ;; GEOSGeom_createCollection_r TAKES OWNERSHIP of the members,
-            ;; so destroying the collection frees all three.
-            (setf (cffi:mem-aref arr :pointer 0)
-                  (geometry->geos ctx (make-point 0d0 0d0))
-                  (cffi:mem-aref arr :pointer 1)
-                  (geometry->geos ctx (make-linestring
-                                       '((0d0 0d0) (1d0 1d0)))))
-            (let ((coll (graph-db::%geos-create-collection
-                         handle graph-db::+geos-geometrycollection+ arr 2)))
-              (unwind-protect
-                   (signals geos-error
-                     (graph-db::%geos-repaired->geometry ctx coll))
-                (graph-db::%geos-geom-destroy handle coll))))))))
+        (call-with-geos-collection
+         ctx (list (make-point 0d0 0d0)
+                   (make-linestring '((0d0 0d0) (1d0 1d0))))
+         (lambda (coll)
+           (signals geos-error
+             (graph-db::%geos-repaired->geometry ctx coll)))))))
+
+(test an-empty-polygonal-part-is-refused-too
+  "⚠ THE SIBLING HOLE, ONE TYPE ID TO THE LEFT.  POLYGON EMPTY's type id
+is +GEOS-POLYGON+, so it IS collected as a polygonal part: the no-part
+guard never fires, WKT->GEOMETRY parses \"POLYGON EMPTY\" into a real
+empty geometry, and %OVERLAP-FRACTION reads its zero measure as fraction
+1.0 in every candidate region the ORIGINAL ring turned up.  That is the
+fabrication the polygon-free branch exists to stop, arriving one step
+over (GH #163)."
+  (if (not *geos-available-p*) (skip "GEOS not available")
+      (with-geos-context (ctx)
+        (call-with-geos-collection
+         ctx (list (make-polygon '())
+                   (make-linestring '((0d0 0d0) (1d0 1d0))))
+         (lambda (coll)
+           ;; Fixture sanity, and it is the whole point of this test: the
+           ;; empty member must really reach the walker AS A POLYGON, or
+           ;; this passes for the polygon-free reason instead.
+           (let ((part (graph-db::%geos-get-geometry-n
+                        (graph-db::geos-ctx-handle ctx) coll 0)))
+             (is (= graph-db::+geos-polygon+
+                    (graph-db::%geos-geom-type-id
+                     (graph-db::geos-ctx-handle ctx) part))
+                 "fixture sanity: member 0 is a POLYGON, not something ~
+the no-part guard would catch")
+             (is-true (geometry-empty-p (geos->geometry ctx part))
+                      "fixture sanity: and it really is empty"))
+           (signals geos-error
+             (graph-db::%geos-repaired->geometry ctx coll)))))))
 
 ;;; ---- exact planar distance ---------------------------------------------
 
