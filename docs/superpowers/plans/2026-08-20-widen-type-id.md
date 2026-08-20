@@ -29,9 +29,12 @@ Decision log: `docs/namespace-design-decisions-2026-08-20.md` D11, and the spike
   do not narrate.
 - **No semantic change.** Ids remain per-graph. No global registry, no distribution, no
   replication change — that is #186. If you find yourself touching `peer-*`, stop.
-- **`ve-key`'s type-id is big-endian on purpose** — the comment says *"Big endian ints for
-  easy comparison in `ve-key-lessp`"*. Widening must keep MSB-first ordering. Getting the
-  byte order wrong silently corrupts index ordering rather than erroring.
+- **`ve-key`'s big-endian byte order is a convention, not a requirement.** Four comments
+  say *"Big endian ints for easy comparison in `ve-key-lessp`"* — but **`ve-key-lessp` does
+  not exist**; it was removed. The ve-index is an `lhash` created `:test 've-key-equal`, so
+  the bytes are only ever compared for **equality**. Keep MSB-first anyway (it costs
+  nothing and a future ordered index may want it) and **fix those four stale comments** to
+  say the ordering is conventional.
 - **Baseline to preserve:** `graph-db/test` **3684 checks / 3674 pass / 10 skip / 0 fail**,
   `graph-db/spacetime-test` 342, `graph-db/geos-test` 185.
 - ⚠ **The baseline is load-order dependent.** "10 skips" identifies the GEOS-**unloaded**
@@ -49,8 +52,10 @@ Decision log: `docs/namespace-design-decisions-2026-08-20.md` D11, and the spike
 | File | Change |
 |---|---|
 | `primitive-node.lisp` | `+node-header-size+` 31→33; `pack-node-head` writes 4 bytes; `deserialize-node-head` reads 4; **new** `deserialize-node-head-v2` legacy reader |
-| `ve-index.lisp` | `ve-key`'s `type-id` type; three serialisation sites 2→4 bytes, big-endian |
-| `globals.lisp` | `+ve-key-bytes+` 18→20; `+max-node-types+` becomes an initial sizing hint, not a ceiling |
+| `ve-index.lisp` | `ve-key`'s `type-id` type; four serialisation sites 2→4 bytes; **two hardcoded `18`s** at `:109` and `:126` |
+| `vev-index.lisp` | `vev-key`'s `type-id` type; four serialisation sites at `:102, :120, :138, :152` |
+| `buffer-pool.lisp` | pooled buffer sizes: **18 is `ve-key`, 34 is `vev-key`** |
+| `globals.lisp` | `+ve-key-bytes+` 18→20; `+vev-key-bytes+` 34→36; `+max-node-types+` becomes an initial sizing hint |
 | `node-class.lisp` | the `type-id` slot's `:type` |
 | `schema.lisp` | `next-edge-id` / `next-vertex-id` types |
 | `type-index.lisp` | lock striping; grow-on-demand sizing |
@@ -61,8 +66,8 @@ Decision log: `docs/namespace-design-decisions-2026-08-20.md` D11, and the spike
 
 ### Task 1: Widen the field everywhere, and add the v2 legacy reader
 
-**Files:** Modify `primitive-node.lisp`, `ve-index.lisp`, `globals.lisp`,
-`node-class.lisp`, `schema.lisp`. Create `tests/type-id-width-tests.lisp`. Register it and
+**Files:** Modify `primitive-node.lisp`, `ve-index.lisp`, **`vev-index.lisp`**,
+**`buffer-pool.lisp`**, `globals.lisp`, `node-class.lisp`, `schema.lisp`. Create `tests/type-id-width-tests.lisp`. Register it and
 run.
 
 **Interfaces:**
@@ -70,7 +75,7 @@ run.
   with the same value shape as `deserialize-node-head`.
 - `+node-header-size+` becomes 33; `+ve-key-bytes+` becomes 20.
 
-**⚠ These five files must change together.** Widening the head without the CLOS slot gives
+**⚠ These seven files must change together.** Widening the head without the CLOS slot gives
 a type error; widening the slot without the schema counters caps assignment at 65535. There
 is no useful intermediate state, so this is one task.
 
@@ -116,8 +121,9 @@ is no useful intermediate state, so this is one task.
     (is (= 70000 (graph-db::ve-key-type-id back)))))
 
 (test ve-key-type-id-stays-big-endian
-  ;; The byte order is load-bearing: VE-KEY-LESSP compares these bytes
-  ;; directly, so LSB-first would silently reorder the index.
+  ;; Convention, not a requirement -- the ve-index is a hash table, so these
+  ;; bytes are only compared for equality.  Pinned so the convention is not
+  ;; lost by accident.
   (let* ((k (graph-db::make-ve-key :id (graph-db::gen-vertex-id)
                                    :type-id #x01020304))
          (vec (graph-db::serialize-ve-key k)))
@@ -125,12 +131,19 @@ is no useful intermediate state, so this is one task.
                (list (aref vec 16) (aref vec 17)
                      (aref vec 18) (aref vec 19))))))
 
-(test ve-key-ordering-survives-the-widening
-  ;; A smaller type-id must still sort before a larger one.
-  (let ((id (graph-db::gen-vertex-id)))
-    (is (graph-db::ve-key-lessp
-         (graph-db::make-ve-key :id id :type-id 1)
-         (graph-db::make-ve-key :id id :type-id 70000)))))
+(test vev-key-round-trips-a-type-id-above-16-bits
+  ;; The vev-index carries its own type-id.  Omitting it truncates silently.
+  (let* ((k (graph-db::make-vev-key :out-id (graph-db::gen-vertex-id)
+                                    :in-id (graph-db::gen-vertex-id)
+                                    :type-id 70000))
+         (vec (graph-db::serialize-vev-key k))
+         (back (graph-db::deserialize-vev-key vec)))
+    (is (= 70000 (graph-db::vev-key-type-id back)))))
+
+(test key-width-constants-match-their-buffers
+  ;; buffer-pool.lisp pre-allocates by size; 18 was ve-key and 34 vev-key.
+  (is (= 20 graph-db::+ve-key-bytes+))
+  (is (= 36 graph-db::+vev-key-bytes+)))
 
 (test v2-legacy-reader-still-reads-a-31-byte-head
   ;; Migration depends on this: the OLD layout must remain readable.
@@ -188,14 +201,26 @@ right reason.
   for `migrate-graph` and is not on any live read path. Model it on
   `deserialize-node-head-v1` directly above.
 
-`ve-index.lisp` — three sites, all big-endian, MSB first:
+`ve-index.lisp` — **four** sites, all big-endian, MSB first, **plus two literals**:
 - `serialize-ve-key-mmap`: write bytes 3,2,1,0 of the type-id.
 - `deserialize-ve-key-mmap`: read four bytes MSB-first.
 - `serialize-ve-key` / `deserialize-ve-key` (the vector forms): indices 16–19.
 - The `ve-key` struct's `type-id` type becomes `(integer 0 4294967295)`.
+- **Replace the hardcoded `18` at `:109` (`(get-buffer 18)`) and at `:126`** (the bare `18`
+  in `deserialize-ve-key`'s return) with `+ve-key-bytes+`.
+- Fix the four stale `ve-key-lessp` comments per the constraint above.
 
-`globals.lisp`: `+ve-key-bytes+` 18 → **20**. Leave `+max-node-types+` alone in this task —
-Task 2 owns it.
+`vev-index.lisp` — **the same treatment**, and it is easy to miss because the plan's first
+draft omitted it entirely: the `vev-key` struct's `type-id` type, and the four 2-byte sites
+at `:102`, `:120`, `:138`, `:152`. Its key layout is out-id(16) in-id(16) type-id, so the
+type-id starts at offset 32.
+
+`buffer-pool.lisp` — the pool pre-allocates by size and serves 8/16/18/24/34. **18 is
+`ve-key` and 34 is `vev-key`**; both must follow the widths. `serialize.lisp:403`'s 18 is a
+UUID (tag + length + 16) and is **unrelated** — leave it.
+
+`globals.lisp`: `+ve-key-bytes+` 18 → **20**, `+vev-key-bytes+` 34 → **36**. Leave
+`+max-node-types+` alone in this task — Task 2 owns it.
 
 `node-class.lisp`: the `type-id` slot's `:type` becomes `(unsigned-byte 32)`.
 
@@ -211,8 +236,9 @@ for. If a pre-existing count moves, stop and report.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add primitive-node.lisp ve-index.lisp globals.lisp node-class.lisp \
-        schema.lisp graph-db.asd tests/type-id-width-tests.lisp tests/package.lisp
+git add primitive-node.lisp ve-index.lisp vev-index.lisp buffer-pool.lisp \
+        globals.lisp node-class.lisp schema.lisp graph-db.asd \
+        tests/type-id-width-tests.lisp tests/package.lisp
 git commit -m "feat(schema): widen type-id to 32 bits, add the v2 head reader (#166)"
 ```
 
@@ -345,8 +371,10 @@ Three things to get right:
 
 - [ ] **Step 1: Write the failing test**
 
-Build a graph, snapshot it, migrate it, and assert that every node survives with its id,
-revision, type and slot values intact — and that the source directory is unchanged.
+**Model it on the existing migration test.** `tests/mvcc-tests.lisp:116` and `:175` already
+exercise `migrate-graph` for v1 → v2 — read them first and follow their shape rather than
+inventing one. Build a graph, snapshot it, migrate it, and assert every node survives with
+its id, revision, type and slot values intact, and that the source directory is unchanged.
 
 **Then prove the test is not vacuous:** make the migration skip the head-reader rebinding so
 it reads v2 bytes with the v3 reader, confirm the test **FAILS**, restore byte-for-byte and
