@@ -2423,20 +2423,32 @@ mint).  Persists if it moved.  A NIL/zero RECEIVED is a no-op."
   graph)
 
 (defun peer-observe-epoch (graph epoch)
-  "Advance GRAPH's TX-ID-COUNTER so it STRICTLY EXCEEDS EPOCH -- the MVCC commit
-epoch of an op this peer just APPLIED from a remote origin (a pulled node carries the
-HUB's epoch).  A device seeds its counter from its OWN feed-seq; without this the
-counter can sit at or below the epochs it applied, so a subsequent LOCAL edit
-transaction starts at a START-TX-ID that MVCC-hides the very node it means to edit
-(the node is invisible until the counter passes its epoch).  Under the tm lock, so it
-composes with CREATE-TRANSACTION; idempotent + monotonic; a NIL/zero EPOCH is a no-op.
-The durable side is the pull-cursor, which the barrier advances to the pull frontier T
-(>= every applied epoch) and which TX-ID-COUNTER is re-seeded from on open."
+  "Advance GRAPH's epoch source so it STRICTLY EXCEEDS EPOCH -- the MVCC
+commit epoch of an op this peer just APPLIED from a remote origin (a pulled
+node carries the HUB's epoch).  A device seeds its counter from its OWN
+feed-seq; without this the counter can sit at or below the epochs it
+applied, so a subsequent LOCAL edit transaction starts at a START-TX-ID that
+MVCC-hides the very node it means to edit (the node is invisible until the
+counter passes its epoch).  With an image clock bound (GH #168), TX-ID-
+COUNTER is dead -- TM-NEXT-EPOCH/TM-CURRENT-EPOCH/TM-PEEK-EPOCH all route
+around it -- so the observation goes to CLOCK-OBSERVE-EPOCH instead,
+taking only the clock's lock, not the tm lock.  That is safe only because
+this function runs solely on the device's peer-writer thread -- WP-8 funnels
+every local write through the same thread (see PEER-WRITER-LOOP and
+PEER-ENQUEUE-WRITE, peer-streaming.lisp) -- so it can never interleave with
+a local CREATE-TRANSACTION on this store.  Without a clock it falls back to
+the manager's own counter under its lock.  Idempotent + monotonic; a
+NIL/zero EPOCH is a no-op.  The durable side is the pull-cursor, which the
+barrier advances to the pull frontier T (>= every applied epoch) and which
+TX-ID-COUNTER is re-seeded from on open."
   (when (and epoch (> epoch 0) (typep graph 'peer-graph))
-    (let ((tm (transaction-manager graph)))
-      (with-recursive-lock-held ((lock tm))
-        (when (>= epoch (tx-id-counter tm))
-          (setf (tx-id-counter tm) (1+ epoch))))))
+    (let* ((tm (transaction-manager graph))
+           (clock (tm-clock tm)))
+      (if clock
+          (clock-observe-epoch clock epoch)
+          (with-recursive-lock-held ((lock tm))
+            (when (>= epoch (tx-id-counter tm))
+              (setf (tx-id-counter tm) (1+ epoch)))))))
   graph)
 
 (defun serialize-peer-meta (origin-id op-id lamport op-class)

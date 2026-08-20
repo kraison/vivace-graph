@@ -389,3 +389,76 @@
                        (close-graph dst :snapshot-p nil))))
                  (close-graph other :snapshot-p nil))))
         (close-system-clock clock)))))
+
+(defparameter *observe-epoch-origin*
+  (make-array 16 :element-type '(unsigned-byte 8) :initial-element 9)
+  "A fixed device origin id for the PEER-OBSERVE-EPOCH tests.")
+
+(test peer-observe-epoch-raises-the-image-clock
+  ;; PEER-OBSERVE-EPOCH exists so a pulled node's HUB epoch can't outrun this
+  ;; store's next start-tx-id (see PEER-OBSERVE-EPOCH's docstring).  With a
+  ;; clock bound, TX-ID-COUNTER is dead -- TM-NEXT-EPOCH/TM-CURRENT-EPOCH
+  ;; route to the clock (GH #168) -- so the observation must land there too.
+  ;; Also pins monotonicity in both directions: a high epoch raises the
+  ;; clock, and a later LOWER epoch is a no-op, not a regression.
+  (with-temp-directory (cdir)
+    (let ((clock (open-system-clock (namestring cdir))))
+      (unwind-protect
+           (with-temp-directory (gdir)
+             (let ((g (make-graph :sc-peer (namestring gdir)
+                                  :buffer-pool-size 1000
+                                  :peer-role :device
+                                  :origin-id *observe-epoch-origin*
+                                  :system-clock clock)))
+               (unwind-protect
+                    (progn
+                      (graph-db::peer-observe-epoch g 999999)
+                      (is (> (clock-current-epoch clock) 999999)))
+                 (close-graph g :snapshot-p nil))))
+        (close-system-clock clock)))))
+
+(test peer-observe-epoch-does-not-drag-the-clock-backwards
+  (with-temp-directory (cdir)
+    (let ((clock (open-system-clock (namestring cdir))))
+      (unwind-protect
+           (with-temp-directory (gdir)
+             (let ((g (make-graph :sc-peer-lo (namestring gdir)
+                                  :buffer-pool-size 1000
+                                  :peer-role :device
+                                  :origin-id *observe-epoch-origin*
+                                  :system-clock clock)))
+               (unwind-protect
+                    (progn
+                      (graph-db::peer-observe-epoch g 999999)
+                      (let ((raised (clock-current-epoch clock)))
+                        (graph-db::peer-observe-epoch g 5)
+                        (is (= raised (clock-current-epoch clock)))))
+                 (close-graph g :snapshot-p nil))))
+        (close-system-clock clock)))))
+
+(test peer-observe-epoch-ignores-the-dead-counter
+  ;; The nearest wrong implementation: route to the clock but keep the old
+  ;; `(>= epoch (tx-id-counter tm))' guard.  Under a clock TX-ID-COUNTER is
+  ;; dead -- nothing ever advances it -- so gating on it either always
+  ;; passes (masking the bug for a fresh store, where the guard is
+  ;; vacuously true) or, once something has left a stale high value in the
+  ;; slot, wrongly SKIPS the clock observation.  Force that stale value
+  ;; directly and confirm the clock still raises regardless.
+  (with-temp-directory (cdir)
+    (let ((clock (open-system-clock (namestring cdir))))
+      (unwind-protect
+           (with-temp-directory (gdir)
+             (let ((g (make-graph :sc-peer-stale (namestring gdir)
+                                  :buffer-pool-size 1000
+                                  :peer-role :device
+                                  :origin-id *observe-epoch-origin*
+                                  :system-clock clock)))
+               (unwind-protect
+                    (progn
+                      (setf (graph-db::tx-id-counter
+                             (graph-db::transaction-manager g))
+                            5000000)
+                      (graph-db::peer-observe-epoch g 999999)
+                      (is (> (clock-current-epoch clock) 999999)))
+                 (close-graph g :snapshot-p nil))))
+        (close-system-clock clock)))))
