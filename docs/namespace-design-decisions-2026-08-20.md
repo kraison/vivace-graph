@@ -300,6 +300,99 @@ around CLOS and memory. If the memory layer ever wants genuinely high-cardinalit
 the discarded option — runtime types sharing a type-id and discriminating on a slot —
 comes back. Widening buys time, not infinity.
 
+### D12 — Bulk load builds a shadow store and swaps it in
+
+Rather than taking a store offline for the duration of a load, the loader writes a **new
+generation of files** while readers continue on the current generation at the current
+epoch. Reattach is an atomic swap plus a brief quiesce.
+
+This changes the cost profile: the store is unavailable for the swap, not for the 68
+minutes of a DeepState sweep or the hours of a 286k backfill. And a crashed load stops
+being a recovery event — discard the shadow, the live store was never touched. Copying
+first is not a real cost: the 3.8 GB forensics graph copies in about 6 seconds against a
+load measured in tens of minutes, so shadow-by-copy beats any copy-on-write cleverness.
+
+**Detach remains a quiescence protocol**, and the pin machinery is the tool: refuse new
+pins and transactions on S, drain the existing ones, close, hand over. The hazard is not
+concurrency in the abstract — the server holds live node objects, buffer-pool pages,
+spatial-index handles and cache entries into S's mmap, and a stale node dereferenced after
+close is a **segfault, not a condition**. `pin-read-epoch` / `reap-safe-floor` already
+exist to prove no reader is mid-flight.
+
+**Access semantics split by intent.** Explicit access naming a detached store *signals*
+(`store-detached-error`) — the caller asked for something specific. Incidental traversal
+into one yields D8's marker — that caller merely walked there, and an exception from the
+middle of a graph walk is worse than a degraded answer.
+
+**Recovery policy licenses the fast path.** Non-transactional bulk apply — direct heap and
+index writes, no WAL, no MVCC versions — is available exactly to stores whose policy is
+*derivable*, because a crash mid-load is repaired by redoing the load. Authored stores
+load transactionally. The differential recovery policy the parked design preserved turns
+out to already encode this; it does new work here without being extended.
+
+**The vector-segment ceiling improves rather than worsens.** The parked doc flagged it as
+sharpening this problem (a capacity failure inside APPLY leaves a persisted node with no
+segment entry — invisible to retrieval, `store-count` still correct). A bulk load knows N
+upfront and can **presize the segment**, turning a mid-apply failure into an upfront
+allocation that fails before anything is written.
+
+**In-process detach becomes viable for the first time.** The dedicated SBCL with
+`MINE_ACTION_FORENSICS=false` existed precisely to stop the server holding the graph.
+D9's lease still accommodates out-of-process later without redesign.
+
+### D13 — The swap's interaction with whole-system restore
+
+Whole-system restore is a *physical rewind of the log and all heaps together* (agreed
+shape point 2). A shadow swap breaks that naively: after the swap, the shared WAL holds
+transactions applied to a generation of S that no longer exists. Restoring to a point
+before the detach wants the old S, which may have been deleted.
+
+**Resolution: the pre-swap generation is a snapshot artifact, and retention is keyed on
+recovery policy.**
+
+- **Authored store — retention is mandatory.** The pre-swap generation is retained for at
+  least the system's restore window and is subject to the same retention policy as any
+  other backup. The swap refuses to discard it while the window still covers it.
+- **Derivable store — retention is optional.** A restore predating the swap may instead
+  rebuild the store from its source.
+
+**Where the swap is recorded.** D9 already introduces an image-level durable object for the
+global clock. The same object becomes a small append-only **system journal** of store
+lifecycle events: create, detach at `E1` with lease `[E1,E2)`, swap at `E3`, attach, retire.
+No new file — D9 requires the object regardless.
+
+**Restore to T, algorithm:**
+
+1. Read the journal; find every swap with `E3 > T`.
+2. For each store so affected, the current generation is post-swap and must be replaced by
+   the pre-swap one.
+3. Pre-swap generation retained → use it; rewind physically to T.
+4. Not retained, store derivable → rebuild, and **mark it rebuilt-not-rewound**.
+5. Not retained, store authored → **refuse.** Authored data must never be silently
+   approximated; this is the differential recovery policy again.
+6. Emit a **manifest** naming, per store, rewound-to-T or rebuilt-at-now.
+
+Step 6 is not bookkeeping. A restore that silently mixes rewound and rebuilt stores
+produces exactly the inconsistent instant D9 exists to prevent, and nothing in the data
+would record that it happened — the same failure shape that put #94 back in scope. Making
+it *recorded* rather than silent is the fix, as it was there.
+
+**T falling inside a detach window** (`E1 <= T < E2`) resolves cleanly: the old generation
+was frozen at its last committed epoch `E0` and every reader saw `E0` throughout, so the
+restore yields the pre-swap generation rewound to `E0`, noted in the manifest.
+
+**Rejected: forbidding restore across a swap.** Fail-closed and simple, but it silently
+truncates the restore window every time any store is bulk-loaded — backfill forensics and
+discover the *ops* restore window collapsed to today. The restore window is a system
+property; one store's maintenance must not shorten it.
+
+**Consequence to decide separately:** the shadow swap is arguably a better per-store
+restore than the logical replay of agreed-shape point 2 — same machinery as bulk load, and
+atomic. The trade is real: logical replay needs no journal and no retention, but is not
+atomic and writes its history forward as new transactions. Since D12 requires the journal
+anyway, the marginal cost of using shadow for restore too is zero. Left open rather than
+folded in.
+
 ## Newly identified constraints
 
 - **Two global monotonic id spaces with no reclamation.** Retired type-ids cannot be
@@ -320,8 +413,8 @@ comes back. Widening buys time, not infinity.
 
 ## Still open
 
-- Detached / exclusive bulk-load mode, the parked design's largest open item, now
-  reframed as a per-*store* operation.
+- Whether the shadow swap supersedes logical replay as the per-store restore mechanism
+  (see D13's closing note).
 - Two-phase commit across stores (#93) — still deferred; D9 takes the clock, not
   cross-store atomicity.
 - Type-id renumbering migration for existing graphs.
