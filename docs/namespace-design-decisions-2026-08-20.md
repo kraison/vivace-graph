@@ -168,6 +168,40 @@ runtime-defined type needs a home for its symbol; without packages you need name
 namespace's package is exactly the primitive for materialising a persisted type meta into
 a live class.
 
+### D7 — Placement is a default per class, overridable at the write
+
+`def-vertex` / `def-edge` keep their trailing argument, which becomes the class's
+**default store** rather than a binding. Any individual write may override it.
+
+Chosen over the alternatives — explicit at every write (a footgun: omit it and you
+silently get `*graph*`), default per namespace, or a placement *rule* function. The rule
+function was tempting for the memory case ("derived goes to the disposable store") but
+placement determines recovery policy, so a bug in a placement rule is a bug that quietly
+loses data at the next unattended rebuild. Placement stays visible at the call site.
+
+Exactly backward compatible: every existing `def-vertex` keeps its trailing graph name,
+every existing call site writes where it always did, and nothing in mine-action or odm
+changes behaviour. It also makes cl-llm#20's fix a call-site change rather than a
+redefinition — the chunk class keeps its default store and the second store is reached by
+passing `:graph`.
+
+**Corollary — this answers "whose store holds a cross-namespace edge" with no special
+case.** An edge is a node; it is placed by D7 like any other. Not the `from` endpoint's
+store, not the `to` endpoint's — its own class default, overridable. So a derived
+`descends-from` claim defaults to the disposable store while an authored operator
+assertion defaults to the durable one, and each lands where its *policy* says it should
+rather than where its endpoints happen to live.
+
+**Corollary — D7 supplies the index hint the parked design wanted, for free.** The parked
+design proposed consulting every namespace's edge index, narrowed later by a schema-level
+"namespaces that may hold edges of type T" hint. Under decoupling, indexes live in stores
+and stores stay few, so the unhinted sweep is a handful of lookups — and the edge class's
+default store *is* the hint. Since a write may override placement, the hint can be stale,
+so the exact form should be a small per-edge-class **store-occupancy set** maintained on
+write: the lookup consults only the stores that class has actually occupied. It fails
+safe — a lost or stale set costs a wasted lookup, never a wrong answer, and the fallback
+is the full sweep.
+
 ## Newly identified constraints
 
 - **Two global monotonic id spaces with no reclamation.** `type-id` is
@@ -190,7 +224,7 @@ a live class.
 
 ## Still open
 
-- Whose store holds a cross-namespace edge, and the `backup` policy of D2.
+- The `backup` policy of D2 (edge placement is answered by D7).
 - **What a *read* does when a store is detached.** The parked design specifies that
   writes touching a detached namespace fail rather than block; it says nothing about a
   traversal that reaches an edge into one. Needs an answer — unresolved-marker, signal,
