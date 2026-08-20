@@ -129,7 +129,11 @@
                #+ecl (make-hash-table :test 'eq
                                        #+graph-db-ecl-sync-hash :synchronized
                                        #+graph-db-ecl-sync-hash t)
-               #+sbcl (make-hash-table :test 'eq :synchronized t))))
+               #+sbcl (make-hash-table :test 'eq :synchronized t))
+   ;; The image-level epoch clock (GH #168), or NIL for this store's own
+   ;; counter.  NIL is the pre-#168 behaviour and the default.
+   (system-clock :accessor graph-system-clock :initarg :system-clock
+                 :initform nil)))
 
 (defmethod print-object ((graph graph) stream)
   (print-unreadable-object (graph stream :type t :identity t)

@@ -129,3 +129,72 @@
       (unwind-protect
            (signals reader-error (journal-records c2))
         (close-system-clock c2)))))
+
+;;; Routing epoch allocation through the clock (GH #168 task 3).
+
+(test two-stores-on-one-clock-get-disjoint-ordered-epochs
+  (with-temp-directory (cdir)
+    (let ((clock (open-system-clock (namestring cdir))))
+      (unwind-protect
+           (with-temp-directory (da)
+             (with-temp-directory (db)
+               (let ((ga (make-graph :sc-alpha (namestring da)
+                                     :buffer-pool-size 1000
+                                     :system-clock clock))
+                     (gb (make-graph :sc-beta (namestring db)
+                                     :buffer-pool-size 1000
+                                     :system-clock clock)))
+                 (unwind-protect
+                      (let ((ids '()))
+                        (dotimes (i 3)
+                          (push (transaction-id
+                                 (with-transaction ((graph-db::transaction-manager ga))
+                                   *transaction*))
+                                ids)
+                          (push (transaction-id
+                                 (with-transaction ((graph-db::transaction-manager gb))
+                                   *transaction*))
+                                ids))
+                        (let ((sorted (sort (copy-list ids) #'<)))
+                          ;; No two transactions anywhere share an epoch.
+                          (is (= (length sorted)
+                                 (length (remove-duplicates sorted))))))
+                   (close-graph ga)
+                   (close-graph gb)))))
+        (close-system-clock clock)))))
+
+(test no-clock-means-per-store-counters-unchanged
+  ;; The backward-compatibility hinge: with *SYSTEM-CLOCK* nil and no
+  ;; :SYSTEM-CLOCK argument, two graphs allocate independently, exactly as
+  ;; before #168 -- so both start low and their ids DO collide.
+  (with-temp-directory (da)
+    (with-temp-directory (db)
+      (let ((ga (make-graph :sc-gamma (namestring da) :buffer-pool-size 1000))
+            (gb (make-graph :sc-delta (namestring db) :buffer-pool-size 1000)))
+        (unwind-protect
+             (let ((ia (transaction-id (with-transaction ((graph-db::transaction-manager ga))
+                                         *transaction*)))
+                   (ib (transaction-id (with-transaction ((graph-db::transaction-manager gb))
+                                         *transaction*))))
+               (is (= ia ib)))
+          (close-graph ga)
+          (close-graph gb))))))
+
+(test attaching-a-store-raises-the-clock-above-its-history
+  ;; The watermark: a store with existing history must not hand the clock a
+  ;; reason to reissue an epoch that store already used.
+  (with-temp-directory (cdir)
+    (with-temp-directory (gdir)
+      (let ((g (make-graph :sc-eps (namestring gdir) :buffer-pool-size 1000)))
+        (dotimes (i 5) (with-transaction ((graph-db::transaction-manager g)) t))
+        (let ((highest (load-highest-transaction-id g)))
+          (close-graph g)
+          (let ((clock (open-system-clock (namestring cdir))))
+            (unwind-protect
+                 (let ((g2 (open-graph :sc-eps (namestring gdir)
+                                       :buffer-pool-size 1000
+                                       :system-clock clock)))
+                   (unwind-protect
+                        (is (> (clock-current-epoch clock) highest))
+                     (close-graph g2)))
+              (close-system-clock clock))))))))

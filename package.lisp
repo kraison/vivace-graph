@@ -33,6 +33,10 @@
            #:clock-lease-epochs
            #:journal-append
            #:journal-records
+           #:graph-system-clock
+           #:attach-to-system-clock
+           #:tm-next-epoch
+           #:tm-current-epoch
            #:make-graph
            #:*default-heap-size*
            #:*default-index-size*

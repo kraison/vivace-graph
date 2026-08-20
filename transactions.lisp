@@ -639,9 +639,9 @@ vertices (the normal case for ingested source records) are unaffected."
 
 (defun pin-read-epoch (transaction-manager)
   "Register a read pin at the current epoch; return its token (for UNPIN)."
-  ;; Racy read of tx-id-counter is fine: it is monotonic, and a slightly stale
+  ;; Racy read of the epoch is fine: it is monotonic, and a slightly stale
   ;; (smaller) value only makes the reaper MORE conservative, never less.
-  (let ((epoch (tx-id-counter transaction-manager)))
+  (let ((epoch (tm-current-epoch transaction-manager)))
     (with-recursive-lock-held ((read-pins-lock transaction-manager))
       (let ((token (incf (read-pin-counter transaction-manager))))
         (setf (gethash token (read-pins transaction-manager)) epoch)
@@ -2925,6 +2925,33 @@ stops appearing in queries.  MARK-DELETED is the usual entry point.")
         (when (< (transaction-id tx) min-id)
           (remove-transaction tx transaction-manager))))))
 
+(defun tm-next-epoch (transaction-manager)
+  "Allocate a fresh epoch: from the image clock when the graph has one,
+otherwise from this manager's own counter (pre-#168 behaviour)."
+  (let ((clock (and (slot-boundp transaction-manager 'graph)
+                    (graph-system-clock (graph transaction-manager)))))
+    (if clock
+        (clock-next-epoch clock)
+        (prog1 (tx-id-counter transaction-manager)
+          (incf (tx-id-counter transaction-manager))))))
+
+(defun tm-current-epoch (transaction-manager)
+  "The next epoch TM-NEXT-EPOCH would return."
+  (let ((clock (and (slot-boundp transaction-manager 'graph)
+                    (graph-system-clock (graph transaction-manager)))))
+    (if clock
+        (clock-current-epoch clock)
+        (tx-id-counter transaction-manager))))
+
+(defun attach-to-system-clock (graph clock)
+  "Raise CLOCK above GRAPH's persisted highest id and record the attach.
+This is the spec §6 watermark, applied per store at attach rather than as a
+separate migration pass."
+  (setf (graph-system-clock graph) clock)
+  (clock-observe-epoch clock (load-highest-transaction-id graph))
+  (journal-append clock :attach :store (graph-name graph))
+  graph)
+
 (defgeneric remove-transaction (transaction transaction-manager)
   (:method (transaction transaction-manager)
     (remhash (sequence-number transaction)
@@ -2941,7 +2968,7 @@ stops appearing in queries.  MARK-DELETED is the usual entry point.")
            (cache (cache graph))
            (tx (make-instance 'tx
                               :sequence-number sequence-number
-                              :start-tx-id (tx-id-counter transaction-manager)
+                              :start-tx-id (tm-current-epoch transaction-manager)
                               :finish-tx-id nil
                               :tx-id nil
                               :transaction-manager transaction-manager
@@ -3042,11 +3069,12 @@ See CALL-WITH-READ-SNAPSHOT."
              (setf tmp (prepare-tx-persistence tx))
              (with-transaction-manager-lock (tm)
                ;; finish-tx-id must be set inside the manager lock so the overlap
-               ;; window computed by validate is consistent with tx-id-counter.
-               ;; Setting it outside would let concurrent commits advance the
-               ;; counter between the read and the lock acquisition, making lost
-               ;; updates invisible.
-               (setf (finish-tx-id tx) (tx-id-counter tm))
+               ;; window computed by validate is consistent with the epoch source
+               ;; (this store's counter, or the shared clock -- GH #168).  Setting
+               ;; it outside would let concurrent commits advance the epoch
+               ;; between the read and the lock acquisition, making lost updates
+               ;; invisible.
+               (setf (finish-tx-id tx) (tm-current-epoch tm))
                (unless (validate tx)
                  (error 'validation-conflict :transaction tx))
                ;; Unique constraints (issue #6): a pre-durability check under the same
@@ -3072,8 +3100,7 @@ See CALL-WITH-READ-SNAPSHOT."
                ;; exactly what that leaves reachable and why it is benign while
                ;; relocation is on.
                (ensure-vector-segment-capacity tx (graph tx))
-               (setf (transaction-id tx) (tx-id-counter tm))
-               (incf (tx-id-counter tm))
+               (setf (transaction-id tx) (tm-next-epoch tm))
                (prune-committed-transactions tm)
                ;; Cheap under the lock: rename temp to its final id-keyed name
                ;; (+ append replication log in commit order for masters).  Must

@@ -217,6 +217,9 @@
                 #:open-graph
                 #:close-graph
                 #:with-transaction
+                #:*transaction*
+                #:transaction-id
+                #:load-highest-transaction-id
                 #:lookup-vertex
                 #:lookup-edge
                 #:vertex-history
