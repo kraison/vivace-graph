@@ -104,6 +104,26 @@ a type-id and discriminating on a slot) returns. This buys time, not infinity.
 `(intern (symbol-name (node-type-name meta)) :keyword)`. That alias is package-blind, so
 `:SPECIES` from two packages collides in a shared type table.
 
+**The registry is persisted and distributed, not recomputed (D14).** Today's determinism is
+free: `*schema-node-metadata*` is keyed per graph and populated in source order, so two hosts
+loading the same `schema.lisp` assign identical ids and replication can ship a raw `uint16`
+with no name crossing the wire. A counter spanning graphs destroys that — assignment becomes
+dependent on which stores an image opens and in what order, so a hub and a device holding
+different subsets diverge and a node materialises as the wrong class on the receiver.
+
+So the global registry is an **append-only, image-level object in the system directory**,
+beside the clock and lifecycle journal of §6 and §9.1. Hosts read it; none recompute it. New
+assignments are made by the hub, distributed through the type-table the hub **already** ships
+in its auth-ok plist — today a Kotlin/SQLite accommodation, since those peers cannot evaluate
+`schema.lisp`. Under a global space a Lisp device cannot rely on evaluation either, so that
+table becomes the normal path rather than a special case.
+
+**A replication handshake refuses a peer whose registry disagrees (D15)**, naming the
+conflicting symbols. An image with no hub is its own authority — the common case, since peer
+replication is off by default — so two such images can independently assign the same symbol
+different ids. Silent reconciliation would mean a data migration triggered by a network
+handshake; a disagreement between two populated stores is an operator event.
+
 ### 3.5 Runtime schema is metadata, never source
 
 Restart must never `load` code written at runtime. Metadata is diffable, versionable,
