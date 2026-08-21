@@ -80,7 +80,13 @@ SYSTEM-CLOCK-IN-USE if another live process holds LOCATION (GH #182)."
         (opened nil))
     (unwind-protect
          (progn
-           (unless (%posix-flock fd (logior +lock-ex+ +lock-nb+))
+           (unless (handler-case
+                       (%posix-flock fd (logior +lock-ex+ +lock-nb+))
+                     ;; A real failure (EBADF, ENOLCK) reports an fd number and
+                     ;; a raw errno; name the directory it was for.
+                     (error (e)
+                       (error "Cannot lock the system clock at ~A: ~A"
+                              location e)))
              (error 'system-clock-in-use :location location))
            (let* ((ceiling (%read-clock-ceiling location))
                   (clock (%make-system-clock :location location
@@ -94,16 +100,20 @@ SYSTEM-CLOCK-IN-USE if another live process holds LOCATION (GH #182)."
       (unless opened (%posix-close fd)))))
 
 (defun close-system-clock (clock)
-  "Persist the exact counter so a clean reopen wastes no ids."
+  "Persist the exact counter so a clean reopen wastes no ids.  Releases the
+directory lock even if that persist fails: a stranded lock would refuse every
+later open in this image, for the life of the process (GH #182)."
   (with-recursive-lock-held ((system-clock-lock clock))
-    (%write-clock-ceiling clock (system-clock-counter clock))
-    (when (system-clock-journal clock)
-      (close (system-clock-journal clock))
-      (setf (system-clock-journal clock) nil))
-    (when (system-clock-lock-fd clock)
-      ;; Closing the fd is the release; there is no LOCK_UN path.
-      (%posix-close (system-clock-lock-fd clock))
-      (setf (system-clock-lock-fd clock) nil)))
+    (unwind-protect
+         (progn
+           (%write-clock-ceiling clock (system-clock-counter clock))
+           (when (system-clock-journal clock)
+             (close (system-clock-journal clock))
+             (setf (system-clock-journal clock) nil)))
+      (when (system-clock-lock-fd clock)
+        ;; Closing the fd is the release; there is no LOCK_UN path.
+        (%posix-close (system-clock-lock-fd clock))
+        (setf (system-clock-lock-fd clock) nil))))
   clock)
 
 (defun journal-append (clock kind &rest plist)

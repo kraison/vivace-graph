@@ -50,7 +50,8 @@ no consequence, and a stale marker would block **every image in the system**.
 
 ## 4. Mechanism
 
-An advisory `flock(2)` lock on `<clock-dir>/.lock`, acquired `LOCK_EX | LOCK_NB` during
+An advisory `flock(2)` lock on `<clock-dir>/system-clock.lock`, named as a
+visible sibling of `system-clock.dat`, acquired `LOCK_EX | LOCK_NB` during
 `open-system-clock` and held for the clock's lifetime by retaining the fd in the
 `system-clock` struct. `close-system-clock` closes the fd, which releases the lock.
 

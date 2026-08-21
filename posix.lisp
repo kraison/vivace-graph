@@ -117,8 +117,10 @@
   "The current errno, or NIL where this implementation cannot report one.
 NIL is honest: a caller must not mistake an unknown failure for a held lock."
   #+sbcl (sb-alien:get-errno)
+  ;; CCL returns it negated.
+  #+ccl  (- (ccl::%get-errno))
   #+ecl  (ffi:c-inline () () :int "errno" :one-liner t)
-  #-(or sbcl ecl) nil)
+  #-(or sbcl ecl ccl) nil)
 
 (defun %posix-flock (fd operation)
   "flock(2).  Returns T when the lock was taken, NIL when OPERATION included

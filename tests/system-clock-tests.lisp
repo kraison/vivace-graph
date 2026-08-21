@@ -654,7 +654,8 @@ machine, which costs more than it buys (GH #182)."
                           (progn (open-system-clock (namestring dir)) nil)
                         (graph-db:system-clock-in-use (e)
                           (graph-db:system-clock-in-use-location e)))))
-             (is-true loc "the refusal names the directory it refused"))
+             (is (equal (namestring dir) loc)
+                 "the refusal names the directory it refused"))
         (close-system-clock c)))))
 
 (test a-closed-clock-can-be-reopened
