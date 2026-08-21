@@ -314,8 +314,9 @@ always opens one).  MIGRATE-GRAPH's own opens no longer rewrite schema.dat at
 all -- the schema replay is suppressed for both of them (#186) -- but the
 guard open in %READ-V2-GRAPH still does, so the exclusion stays.  Neither is
 data loss; both were confirmed to be the ONLY two things that change, by
-exhaustive diff during the #166 migration work.  Shells out (find + sha256sum), the same portability
-boundary EXTRACT-V1-FIXTURE already accepts by shelling out to tar."
+exhaustive diff during the #166 migration work.  Shells out (find +
+sha256sum), the same portability boundary EXTRACT-V1-FIXTURE already accepts
+by shelling out to tar."
   (uiop:run-program
    (format nil "find ~A -type f -not -name schema.dat -not -path '*/tx/*' ~
 -print0 | sort -z | xargs -0 sha256sum"

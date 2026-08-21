@@ -36,6 +36,14 @@ renumbering migration that follows.")
 (def-vertex ts-delta-thing  () ((label :type string)) :ts-delta)
 (def-vertex ts-shared-thing () ((label :type string)) :ts-delta)
 
+;; Declared against a graph name nothing here ever creates, so no fixture
+;; store holds it.  %WITH-LATE-TYPE splices a copy of its metadata into
+;; another graph's list at RUN time, which is the shape MIGRATE-GRAPH's
+;; source open must not act on (GH #186).
+(eval-when (:load-toplevel :execute)
+  (setf (gethash :ts-unbuilt *schema-node-metadata*) nil))
+(def-vertex ts-late-thing () ((label :type string)) :ts-unbuilt)
+
 (defun %fill-store (graph vertices edge-type extra-types)
   "Put VERTICES TS-SHARED-THINGs in GRAPH, chained by EDGE-TYPE edges when
 one is given, plus one vertex of each of EXTRA-TYPES.  Nodes are made
@@ -55,15 +63,19 @@ they are -- go into the heads."
       (dolist (type extra-types)
         (graph-db::make-vertex type (list (cons :label "x")))))))
 
+(defun %store-sysdir (name root)
+  "The private system directory a legacy fixture store is built under."
+  (namestring (merge-pathnames (format nil "sys-~A/" name) root)))
+
 (defun %build-legacy-store (name root vertices edge-type extra-types)
   "Create the store NAME under ROOT, fill it, close it, return its location.
 
 The store gets its OWN system directory, which is the whole point: that is
 the pre-#186 shape this task exists for, where every store's type-ids count
 from 1 and so the low ids name different classes in different stores.  The
-private directory is left under ROOT and never read again."
-  (let ((sysdir (namestring (merge-pathnames (format nil "sys-~A/" name)
-                                             root)))
+private directory is left under ROOT and read again only by
+%SPLIT-HISTORY-STORE."
+  (let ((sysdir (%store-sysdir name root))
         (location (namestring (merge-pathnames (format nil "~A/" name)
                                                root))))
     (ensure-directories-exist sysdir)
@@ -76,13 +88,70 @@ private directory is left under ROOT and never read again."
     (collect-garbage)
     location))
 
+(defun %add-vertices (graph type n)
+  "Write N vertices of TYPE into GRAPH, under whatever type-id its schema
+currently gives TYPE."
+  (let ((graph-db::*graph* graph))
+    (with-transaction ()
+      (dotimes (i n)
+        (graph-db::make-vertex type
+                               (list (cons :label (format nil "m~D" i))))))))
+
+(defun %move-current-type-id (location name parent new-id)
+  "Rewrite LOCATION's schema.dat so NAME's CURRENT id under PARENT becomes
+NEW-ID, leaving the metadata at the old id in place -- which is how a store
+comes to hold two ids for one name across its history.  Returns the old id."
+  (let* ((file (format nil "~Aschema.dat" (pathname location)))
+         (schema (cl-store:restore file))
+         (sub (gethash parent (graph-db::schema-type-table schema)))
+         (old-id (gethash name sub))
+         (moved (graph-db::copy-node-type (gethash old-id sub))))
+    (setf (graph-db::node-type-id moved) new-id)
+    (setf (gethash new-id sub) moved)
+    (setf (gethash name sub) new-id)
+    (setf (gethash (intern (symbol-name name) :keyword) sub) new-id)
+    (setf (graph-db::schema-class-locks schema) nil)
+    (setf (graph-db::schema-lock schema) nil)
+    (cl-store:store schema file)
+    old-id))
+
+(defun %split-history-store (root before after new-id)
+  "A :TS-DELTA store whose history really does hold TS-DELTA-THING nodes
+under TWO type-ids: BEFORE of them written under the id it was assigned,
+then the schema moved so the type's CURRENT id is NEW-ID, then AFTER more
+written under that one.  Returns (values LOCATION OLD-ID).
+
+Built by writing nodes on both sides of the move rather than by editing
+metadata around nodes that never used the losing id: only then can a
+migration that DROPS the nodes at the losing id be told from one that
+carries them across (§10.1, the case no seeding policy exempts)."
+  (let* ((location (%build-legacy-store :ts-delta root 10 nil nil))
+         (sysdir (%store-sysdir :ts-delta root))
+         (old-id nil))
+    (let ((graph-db::*system-directory* sysdir)
+          (graph-db::*type-registry* nil))
+      (let ((g (open-graph :ts-delta location :buffer-pool-size 1000)))
+        (unwind-protect (%add-vertices g 'ts-delta-thing before)
+          (close-graph g)))
+      (collect-garbage)
+      (setq old-id (%move-current-type-id location 'ts-delta-thing :vertex
+                                          new-id))
+      (let ((g (open-graph :ts-delta location :buffer-pool-size 1000)))
+        (unwind-protect (%add-vertices g 'ts-delta-thing after)
+          (close-graph g)))
+      (collect-garbage))
+    (values location old-id)))
+
 (defmacro with-legacy-stores ((stores root) &body body)
   "Bind ROOT to a scratch directory and STORES to ((:alpha . location) ...)
 for four closed, populated stores whose type-ids all count from 1.
 
-Sizes are chosen to separate the two rankings §10.1 says must not be
-confused: :GAMMA has the most types and the fewest bytes, :ALPHA the most
-bytes.  A seeding policy that counted types would pick :GAMMA."
+Sizes are chosen to separate the three rankings a seeding policy could be
+confusing: :GAMMA has the most types and the fewest bytes, :ALPHA the most
+bytes, and %SEED-LOCATIONS hands them over in an order that is neither.
+A policy that counted types would pick :GAMMA; one that took the first (or
+the last) location given would pick :DELTA (or :ALPHA) for the wrong
+reason."
   `(with-temp-directory (,root)
      (let ((,stores
              (list (cons :alpha (%build-legacy-store
@@ -95,9 +164,39 @@ bytes.  A seeding policy that counted types would pick :GAMMA."
                                  :ts-gamma ,root 3 'ts-gamma-link
                                  '(ts-gamma-a ts-gamma-b ts-gamma-c)))
                    (cons :delta (%build-legacy-store
-                                 :ts-delta ,root 10 nil
+                                 :ts-delta ,root 25 nil
                                  '(ts-delta-thing))))))
        ,@body)))
+
+(defmacro %with-late-type ((graph-name) &body body)
+  "Run BODY with TS-LATE-THING registered as a type of GRAPH-NAME that no
+store on disk has, restoring the metadata list afterwards.
+
+This is the state MIGRATE-GRAPH's SOURCE open has to be inert against: the
+schema replay would otherwise add the type to the source store and mint a
+registry id for it, in a store whose every other id is per-graph (#186).
+A store that simply reopens is supposed to pick the type up -- only the
+migration's two opens are suppressed -- so the registration is undone here
+rather than left for the next test."
+  (let ((saved (gensym "SAVED")) (name (gensym "NAME")))
+    `(let* ((,name ,graph-name)
+            (,saved (gethash ,name *schema-node-metadata*)))
+       (unwind-protect
+            (progn
+              (setf (gethash ,name *schema-node-metadata*)
+                    (append ,saved
+                            (list (graph-db::copy-node-type
+                                   (first (gethash :ts-unbuilt
+                                                   *schema-node-metadata*))))))
+              ,@body)
+         (setf (gethash ,name *schema-node-metadata*) ,saved)))))
+
+(defun %knows-type-p (location name parent)
+  "True when the store at LOCATION's own schema.dat holds NAME."
+  (and (find-if (lambda (entry)
+                  (and (eq (first entry) name) (eq (second entry) parent)))
+                (%store-entries location))
+       t))
 
 (defun %fresh-registry (root &optional (name "system/"))
   "(values REGISTRY SYSDIR) for an empty system directory under ROOT."
@@ -115,7 +214,11 @@ schema.dat."
   (nth-value 1 (%store-entries location)))
 
 (defun %seed-locations (stores)
-  (mapcar #'cdr stores))
+  "The store locations to seed from, deliberately REVERSED -- delta, gamma,
+beta, alpha.  That is neither the by-bytes ranking nor its reverse, so a
+seeding policy that ranked by argument position rather than by size cannot
+produce the expected answer by accident (spec §10.1)."
+  (reverse (mapcar #'cdr stores)))
 
 (defun %store-of (key stores)
   (cdr (assoc key stores)))
@@ -128,23 +231,6 @@ schema.dat."
 (defun %type-id-in (graph name parent)
   (graph-db::node-type-id
    (graph-db::lookup-node-type-by-name name parent :graph graph)))
-
-(defun %stale-type-id (location name parent stale-id)
-  "Leave the store at LOCATION holding a SECOND id for NAME, by writing a
-stale copy of its metadata into schema.dat at STALE-ID.  This is §10.1's
-one case no seeding policy exempts, and the shape a store's own history
-produces -- the measured system had three of them."
-  (let* ((file (format nil "~Aschema.dat" (pathname location)))
-         (schema (cl-store:restore file))
-         (sub (gethash parent (graph-db::schema-type-table schema)))
-         (stale (graph-db::copy-node-type
-                 (gethash (gethash name sub) sub))))
-    (setf (graph-db::node-type-id stale) stale-id)
-    (setf (gethash stale-id sub) stale)
-    (setf (graph-db::schema-class-locks schema) nil)
-    (setf (graph-db::schema-lock schema) nil)
-    (cl-store:store schema file)
-    location))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Seeding
@@ -189,6 +275,15 @@ alpha store, or this test cannot tell the two rankings apart")
         (is (< (cdr (assoc gamma sizes :test #'equal))
                (cdr (assoc alpha sizes :test #'equal)))
             "fixture sanity: the type-richest store must be the smaller one")
+        (is (not (equal (%seed-locations stores) (mapcar #'car sizes)))
+            "fixture sanity: the order the locations were PASSED in must ~
+differ from the ranking, or this test cannot tell size from position")
+        (is (equal (list alpha (%store-of :beta stores)
+                         (%store-of :delta stores) gamma)
+                   (mapcar #'car sizes))
+            "the whole ranking, in order, is by bytes on disk -- not by ~
+type count and not by the order the locations were given: got ~S"
+            (mapcar #'car sizes))
         (is (equal alpha (graph-db::seeding-report-seed report))
             "the largest store on disk is the one the registry adopts")
         (is (not (%renumbered-p alpha report))
@@ -257,10 +352,7 @@ system rather than over a chosen pair."
 one seeded, so it wins every contest and would otherwise be left alone --
 it must still be named, because its two ids have to unify."
   (with-temp-directory (root)
-    (let ((location (%stale-type-id
-                     (%build-legacy-store :ts-delta root 10 nil
-                                          '(ts-delta-thing))
-                     'ts-delta-thing :vertex 9)))
+    (multiple-value-bind (location old-id) (%split-history-store root 4 6 9)
       (multiple-value-bind (registry sysdir) (%fresh-registry root)
         (declare (ignore sysdir))
         (let ((report (graph-db::registry-seed-from-stores
@@ -269,7 +361,7 @@ it must still be named, because its two ids have to unify."
               "fixture sanity: the only store is the seed store")
           (is (null (graph-db::seeding-report-changes report))
               "fixture sanity: nothing contests it, so no id moves")
-          (is (equal (list (list location 'ts-delta-thing :vertex 1 9))
+          (is (equal (list (list location 'ts-delta-thing :vertex old-id 9))
                      (graph-db::seeding-report-duplicates report))
               "the two ids one symbol holds must be reported, both of them")
           (is (%renumbered-p location report)
@@ -311,6 +403,10 @@ what must survive a renumbering, since the id under it does not."
                             graph)
     (sort (alexandria:hash-table-alist counts) #'string< :key #'car)))
 
+(defun %census-count (census class)
+  "How many nodes of CLASS the census counted, 0 if none."
+  (or (cdr (assoc class census)) 0))
+
 (test renumbering-migration-gives-colliding-stores-distinct-ids
   "The unit's payload.  Two stores that both called a type id 1 come out of
 the migration agreeing: the shared symbol has ONE id in both, the two
@@ -340,11 +436,15 @@ still an instance of the class it was."
                               (%type-id-in g 'ts-shared-thing :vertex))
                          "the migrated store's id for the shared symbol is ~
 the registry's, which is the id the seed store already holds")
+                     (is (eql (graph-db::registry-id-for
+                               registry 'ts-beta-thing :vertex)
+                              (%type-id-in g 'ts-beta-thing :vertex))
+                         "the symbol that used to share id 1 with it takes ~
+the registry's id too -- not merely SOME other id")
                      (is (not (eql (%type-id-in g 'ts-beta-thing :vertex)
                                    (graph-db::registry-id-for
                                     registry 'ts-shared-thing :vertex)))
-                         "and the symbol that used to share id 1 with it no ~
-longer does")
+                         "so the two no longer collide")
                      (is (eql (graph-db::registry-id-for
                                registry 'ts-beta-link :edge)
                               (%type-id-in g 'ts-beta-link :edge))
@@ -359,44 +459,71 @@ too"))
               "fixture sanity: the store is not empty"))))))
 
 (test renumbering-migration-unifies-a-symbol-that-held-two-ids
-  "The unification §10.1 requires, and MIGRATE-GRAPH says so in its second
-value rather than picking one id and moving on."
+  "The unification §10.1 requires: the nodes written under BOTH of the
+store's ids for one name come across under the single surviving id, and
+MIGRATE-GRAPH says which name it did that to rather than picking an id and
+moving on.  The fixture wrote 4 nodes under the losing id and 6 under the
+winning one, so an implementation that carried only the current id's nodes
+across loses 4 and fails the census."
   (with-temp-directory (root)
-    (let ((location (%stale-type-id
-                     (%build-legacy-store :ts-delta root 10 nil
-                                          '(ts-delta-thing))
-                     'ts-delta-thing :vertex 9)))
+    (multiple-value-bind (location old-id) (%split-history-store root 4 6 9)
       (multiple-value-bind (registry sysdir) (%fresh-registry root)
         (declare (ignore registry))
-        (let ((graph-db::*system-directory* sysdir)
-              (graph-db::*type-registry* nil))
-          (multiple-value-bind (g unified)
-              (graph-db::migrate-graph
-               :ts-delta location
-               (namestring (merge-pathnames "delta-renumbered/" root))
-               :package :graph-db/test :renumber-p t)
-            (unwind-protect
-                 ;; Both duplicate lists are bound BEFORE the checks rather
-                 ;; than read inside one: FiveAM pulls a check's form apart
-                 ;; to report it, and an NTH-VALUE at the top of one reads
-                 ;; back NIL however many values the call really returned.
-                 (let ((source (%store-duplicates location))
-                       (migrated (nth-value 1 (graph-db::%store-type-entries
-                                               (graph-db::schema g)))))
-                   (is (equal '((ts-delta-thing :vertex (1 9) 1)) unified)
-                       "the migration must name the symbol, both its old ~
-ids and the one they unified to, got ~S" unified)
-                   (is (consp source)
-                       "fixture sanity: the SOURCE store still holds the ~
+        (let ((before nil))
+          (let ((graph-db::*system-directory* sysdir)
+                (graph-db::*type-registry* nil))
+            (let ((old (open-graph :ts-delta location :buffer-pool-p nil
+                                   :gc-heap-p nil)))
+              (unwind-protect (setq before (%class-census old))
+                (close-graph old :snapshot-p nil)))
+            (collect-garbage)
+            (is (equal '(10 . 10) (cons (%census-count before 'ts-delta-thing)
+                                        (%census-count before
+                                                       'ts-shared-thing)))
+                "fixture sanity: the source must hold all 10 TS-DELTA-THINGs ~
+-- 4 under the losing id and 6 under the winning one -- and 10 ~
+TS-SHARED-THINGs, got ~S" before)
+            (multiple-value-bind (g unified)
+                (graph-db::migrate-graph
+                 :ts-delta location
+                 (namestring (merge-pathnames "delta-renumbered/" root))
+                 :package :graph-db/test :renumber-p t)
+              (unwind-protect
+                   ;; The duplicate list is bound BEFORE the checks rather
+                   ;; than read inside one: FiveAM pulls a check's form
+                   ;; apart to report it, and an NTH-VALUE at the top of one
+                   ;; reads back NIL however many values the call returned.
+                   (let ((source (%store-duplicates location))
+                         (migrated (nth-value 1
+                                    (graph-db::%store-type-entries
+                                     (graph-db::schema g))))
+                         (entry (first unified)))
+                     (is (= 1 (length unified))
+                         "exactly one name unified, got ~S" unified)
+                     (is (equal (list 'ts-delta-thing :vertex
+                                      (sort (list old-id 9) #'<))
+                                (list (first entry) (second entry)
+                                      (third entry)))
+                         "the migration must name the symbol and BOTH its ~
+old ids, got ~S" entry)
+                     ;; The unified id is whatever the registry minted, so
+                     ;; assert it against the store rather than a literal --
+                     ;; a fresh registry's assignment order is not fixed.
+                     (is (eql (fourth entry)
+                              (%type-id-in g 'ts-delta-thing :vertex))
+                         "and the id it reports must be the one the ~
+migrated store actually uses")
+                     (is (consp source)
+                         "fixture sanity: the SOURCE store still holds the ~
 duplicate -- MIGRATE-GRAPH does not rewrite it")
-                   (is (null migrated)
-                       "the migrated store holds exactly one id for it, ~
+                     (is (null migrated)
+                         "the migrated store holds exactly one id for it, ~
 holds ~S" migrated)
-                   (is (= 10 (length (graph-db::map-vertices
-                                      #'graph-db::id g :collect-p t
-                                      :vertex-type 'ts-shared-thing)))
-                       "and no node is lost to the unification"))
-              (close-graph g))))))))
+                     (is (equal before (%class-census g))
+                         "every node written under EITHER id comes across, ~
+under the unified one: ~S became ~S" before (%class-census g)))
+                (close-graph g)))
+            (collect-garbage)))))))
 
 (test migrating-without-renumbering-leaves-the-registry-untouched
   "MIGRATE-GRAPH's default preserves the source's per-graph type-ids, so it
@@ -481,3 +608,103 @@ the schema replay, so the file is not touched at all."
                  (with-open-file (s file :element-type '(unsigned-byte 8))
                    (file-length s)))
             "nor changed in size")))))
+
+(test migration-does-not-add-a-late-type-to-the-source
+  "The SOURCE half of the suppression, which the two tests above cannot
+reach: they declare only types the source already holds, so the schema
+replay takes its already-known branch and never mints anything.  Register a
+type the source has NEVER seen against its graph name, and an unsuppressed
+source open would both write it into the source's schema.dat and take a
+registry id for it -- into a store whose every other id is per-graph, and
+into a registry the :RENUMBER-P NIL migration is supposed to leave alone
+(GH #186)."
+  (with-temp-directory (root)
+    (let ((location (%build-legacy-store :ts-delta root 10 nil
+                                         '(ts-delta-thing))))
+      (multiple-value-bind (registry sysdir) (%fresh-registry root)
+        (declare (ignore registry))
+        (is (not (%knows-type-p location 'ts-late-thing :vertex))
+            "fixture sanity: the source must not already know the type")
+        (%with-late-type (:ts-delta)
+          (let ((graph-db::*system-directory* sysdir)
+                (graph-db::*type-registry* nil))
+            (close-graph
+             (graph-db::migrate-graph
+              :ts-delta location
+              (namestring (merge-pathnames "delta-late/" root))
+              :package :graph-db/test)))
+          (collect-garbage))
+        (is (not (%knows-type-p location 'ts-late-thing :vertex))
+            "the migration must not add the type to the SOURCE store")
+        (is (null (graph-db::registry-entries
+                   (graph-db::open-type-registry sysdir)))
+            "nor take a registry id for it: the registry holds ~S"
+            (graph-db::registry-entries
+             (graph-db::open-type-registry sysdir)))))))
+
+;;; ---------------------------------------------------------------------------
+;;; The renumbering mode against a LEGACY source.  Everything above builds its
+;;; stores in this image and in the current format; this is the combination
+;;; the unit is named for -- #166's head-shim replay plus RENUMBER-SCHEMA over
+;;; a schema cl-store'd by a pre-widening build.  Reuses the v2 fixture and
+;;; its readers from tests/type-id-width-tests.lisp, whose own migration test
+;;; pins the opposite mode.
+;;; ---------------------------------------------------------------------------
+
+(test renumbering-migration-carries-a-v2-source-to-registry-ids
+  "A v2 (31-byte head, 2-byte type-id) source migrated with :RENUMBER-P T
+keeps every node, revision, slot value and edge endpoint -- and takes its
+type-ids from the registry, which is the exact reverse of what
+MIGRATE-V2-GRAPH-TO-V3-WITHOUT-RENUMBERING pins.  The registry is primed
+with one filler name per parent first, so NO source id can survive by
+coincidence and 'the id moved' is a real observation rather than a lucky
+draw."
+  #+ecl
+  (skip "v2 fixture was cl-store'd by SBCL; ECL's cl-store cannot restore it ~
+(graph on-disk dirs are not portable across Lisp implementations).")
+  #-ecl
+  (with-temp-directory (root)
+    (let ((old-dir (extract-v2-fixture (merge-pathnames "v2/" root)))
+          (new-dir (namestring (merge-pathnames "v3-renumbered/" root))))
+      (multiple-value-bind (registry sysdir) (%fresh-registry root)
+        (let ((graph-db::*system-directory* sysdir)
+              (graph-db::*type-registry* nil))
+          (graph-db::registry-intern registry 'ts-filler-vertex :vertex)
+          (graph-db::registry-intern registry 'ts-filler-edge :edge)
+          (let ((source-ids (%store-entries old-dir)))
+            (multiple-value-bind (expected-v expected-k expected-l)
+                (%read-v2-graph old-dir)
+              (is (= 12 (length expected-v))
+                  "fixture sanity: 12 people expected before migration")
+              (let ((g (graph-db::migrate-graph
+                        :ti-migration-fixture old-dir new-dir
+                        :package :graph-db/test :renumber-p t
+                        :snapshot-file
+                        (namestring
+                         (merge-pathnames "migrate.snapshot" root)))))
+                (unwind-protect
+                     ;; Re-read the registry from disk: MIGRATE-GRAPH interns
+                     ;; through ENSURE-TYPE-REGISTRY's own object, so the one
+                     ;; opened above has no idea what it just assigned.
+                     (let ((graph-db::*graph* g)
+                           (registry (graph-db::open-type-registry sysdir)))
+                       (is (equalp expected-v (%fixture-vertices g))
+                           "vertices survive a renumbering intact")
+                       (is (equalp expected-k
+                                   (%fixture-edges g 'ti-mig-knows))
+                           "knows edges survive a renumbering intact")
+                       (is (equalp expected-l
+                                   (%fixture-edges g 'ti-mig-likes))
+                           "likes edges survive a renumbering intact")
+                       (dolist (entry source-ids)
+                         (destructuring-bind (symbol parent id) entry
+                           (is (eql (graph-db::registry-id-for
+                                     registry symbol parent)
+                                    (%type-id-in g symbol parent))
+                               "~A must take the registry's id, got ~A"
+                               symbol (%type-id-in g symbol parent))
+                           (is (not (eql id (%type-id-in g symbol parent)))
+                               "~A's legacy id ~A must NOT survive a ~
+:RENUMBER-P T migration" symbol id))))
+                  (close-graph g))
+                (collect-garbage)))))))))
