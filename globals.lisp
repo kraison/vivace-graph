@@ -75,7 +75,13 @@ application's own config; graph-db does not read an ini file itself.")
 (alexandria:define-constant +data-file+ "data.dat" :test 'equal)
 
 (defvar *schema-node-metadata* (make-hash-table :test 'equal))
-(alexandria:define-constant +max-node-types+ 65536)
+;; The type-id READ-PATH ceiling (schema.lisp's LOOKUP-NODE-TYPE-BY-ID
+;; assert), not an allocation size -- TYPE-INDEX no longer preallocates by
+;; this (#166; see +TYPE-INDEX-INITIAL-TYPES+ below).  Matches the type-id
+;; field's full width: (UNSIGNED-BYTE 32), widened by #166's Task 1, so the
+;; counter (GET-NEXT-TYPE-ID) can never issue an id the read path then
+;; refuses.
+(alexandria:define-constant +max-node-types+ (expt 2 32))
 
 ;; v2 (2026): MVCC node head grew 15 -> 31 bytes (commit-epoch + prev-pointer).
 ;; v3 (#166): type-id widened 16 -> 32 bits, head grew 31 -> 33 bytes, ve-key
@@ -240,6 +246,16 @@ strictly-safe pre-durability abort.")
 
 ;; index-lists
 (alexandria:define-constant +index-list-bytes+ 17)
+
+;; Type-index lock striping (GH #166).  One mutex per type-id cost 65,536 of
+;; them per index per store; two types sharing a stripe now serialise, which
+;; is a push or a remove on one index-list.
+(alexandria:define-constant +type-index-lock-stripes+ 256)
+
+;; Initial type-index capacity in TYPES, not the id ceiling.  The file grows
+;; on demand; type-ids are assigned sequentially so the used range stays
+;; dense.
+(alexandria:define-constant +type-index-initial-types+ 4096)
 
 ;; ve-key / ve-index
 (alexandria:define-constant +ve-key-bytes+ 20)

@@ -62,9 +62,11 @@ Invoked by (asdf:test-system :graph-db)."
        (uiop:delete-directory-tree ,var :validate t :if-does-not-exist :ignore))))
 
 (defun collect-garbage ()
-  "Force a full GC.  Each graph / type-index preallocates 65536 index-lists
-per type table, so without reclaiming between tests a whole suite run in one
-image exhausts the default heap."
+  "Force a full GC.  Each graph creates several mmap'd structures per test;
+without reclaiming between tests, a whole suite run in one image exhausts the
+default heap.  (Before #166, a type-index alone preallocated 65536 index-list
+structs per type table -- no longer true, but many tests per image still
+adds up.)"
   #+sbcl (sb-ext:gc :full t)
   #+ccl (ccl:gc)
   #+lispworks (hcl:gc-all)
