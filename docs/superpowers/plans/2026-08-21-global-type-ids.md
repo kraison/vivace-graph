@@ -61,7 +61,9 @@ may read the registry concurrently; only assignment serialises.
   - `(registry-intern registry symbol parent)` → integer; **assigns if absent**, under lock.
   - `(registry-entries registry)` → list of `(symbol parent id)`, oldest first.
   - `(close-type-registry registry)`.
-  - Condition `type-registry-conflict` with reader `type-registry-conflict-entries`.
+  - Condition `type-registry-busy` with reader `type-registry-busy-location`,
+    signalled when the append lock is held elsewhere. (The *disagreement*
+    condition D15 needs is Task 4's, not this one's — do not add it here.)
 - Consumes: `%posix-flock`, `%posix-open`, `%posix-close`, `+lock-ex+`, `+lock-nb+` (#182).
 
 **Context the brief cannot give you:** the file is `type-registry.log`, a sibling of
@@ -283,29 +285,52 @@ is already a blocker on #167.
 
 - [ ] **Step 1: Write the failing tests**
 
+`with-test-graph` (`tests/suite.lisp:137`) takes only `(g)` and hardcodes
+`*integration-graph-name*`, so it **cannot** open the two graphs these tests need.
+Write a two-graph helper first:
+
 ```lisp
+(defmacro with-two-test-graphs ((g1 g2 sysdir) &body body)
+  "Two stores in ONE image, sharing SYSDIR as their system directory.  The
+existing WITH-TEST-GRAPH binds a single hardcoded graph name and cannot express
+this, which is why #186 needs its own helper."
+  (let ((d1 (gensym)) (d2 (gensym)))
+    `(with-temp-directory (,sysdir)
+       (with-temp-directory (,d1)
+         (with-temp-directory (,d2)
+           (let ((graph-db::*system-directory* (namestring ,sysdir)))
+             (let ((,g1 (make-graph :reg-store-1 (namestring ,d1)
+                                    :buffer-pool-size 1000))
+                   (,g2 (make-graph :reg-store-2 (namestring ,d2)
+                                    :buffer-pool-size 1000)))
+               (unwind-protect (progn ,@body)
+                 (ignore-errors (close-graph ,g1))
+                 (ignore-errors (close-graph ,g2))))))))))
+```
+
+There is no `lookup-node-type-id`; the id comes from the metadata:
+
+```lisp
+(defun %type-id-of (sym parent graph)
+  (graph-db::node-type-id
+   (graph-db::lookup-node-type-by-name sym parent :graph graph)))
+
 (test two-graphs-in-one-image-share-a-symbol-s-type-id
   "The unit's entire purpose.  Before #186 each graph counted from 1, so the
 same symbol got different ids in different stores and different symbols
 collided on one id."
-  (with-temp-directory (dir)
-    (let ((graph-db::*system-directory* (namestring dir)))
-      (with-test-graph (g1 :name :reg-share-1)
-        (with-test-graph (g2 :name :reg-share-2)
-          (is (= (graph-db::lookup-node-type-id 'shared-type :vertex :graph g1)
-                 (graph-db::lookup-node-type-id 'shared-type :vertex :graph g2))
-              "one symbol, one id, both stores"))))))
+  (with-two-test-graphs (g1 g2 sysdir)
+    (declare (ignore sysdir))
+    (is (= (%type-id-of 'shared-type :vertex g1)
+           (%type-id-of 'shared-type :vertex g2))
+        "one symbol, one id, both stores")))
 
 (test distinct-symbols-never-collide-across-graphs
-  (with-temp-directory (dir)
-    (let ((graph-db::*system-directory* (namestring dir)))
-      (with-test-graph (g1 :name :reg-coll-1)
-        (with-test-graph (g2 :name :reg-coll-2)
-          (is (/= (graph-db::lookup-node-type-id
-                   'type-in-one :vertex :graph g1)
-                  (graph-db::lookup-node-type-id
-                   'type-in-two :vertex :graph g2))
-              "two symbols never share an id, even in different stores"))))))
+  (with-two-test-graphs (g1 g2 sysdir)
+    (declare (ignore sysdir))
+    (is (/= (%type-id-of 'type-in-one :vertex g1)
+            (%type-id-of 'type-in-two :vertex g2))
+        "two symbols never share an id, even in different stores")))
 
 (test opening-a-graph-without-a-system-directory-signals
   "The directory is mandatory as of #186: the registry has nowhere to live
@@ -321,13 +346,13 @@ counters -- a silent fallback is how two id regimes diverge unnoticed."
   "Closes cl-llm#20.  %CHECK-NODE-CLASS-GRAPH-UNIQUE refused this and existed
 only because ids were per-graph."
   (with-temp-directory (dir)
-    (let ((graph-db::*system-directory* (namestring dir)))
-      (with-test-graph (g1 :name :reg-dual-1)
-        (with-test-graph (g2 :name :reg-dual-2)
-          (is-true (graph-db::lookup-node-type-by-name
-                    'dual-type :vertex :graph g1))
-          (is-true (graph-db::lookup-node-type-by-name
-                    'dual-type :vertex :graph g2)))))))
+    (declare (ignore dir))
+    (with-two-test-graphs (g1 g2 sysdir)
+      (declare (ignore sysdir))
+      (is-true (graph-db::lookup-node-type-by-name
+                'dual-type :vertex :graph g1))
+      (is-true (graph-db::lookup-node-type-by-name
+                'dual-type :vertex :graph g2)))))
 ```
 
 - [ ] **Step 2: Run and watch them fail.** The first two must fail because the ids
