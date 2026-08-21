@@ -280,6 +280,12 @@ than restore from a snapshot.  It is NOT byte-for-byte identical, though:
 snapshotting requires OPENing it, and that OPEN unconditionally rewrites
 schema.dat (via UPDATE-SCHEMA/SAVE-SCHEMA -- same content, re-serialized, so
 type-ids are unaffected) and creates one new, empty tx/replication-*.log file.
+This assumes OLD-LOCATION was closed cleanly and still has its index
+sidecars: OPEN-GRAPH rebuilds a spatial, unique, or secondary index from a
+live-node scan whenever its sidecar is absent (graph.lisp's
+RESTORE-*-INDEX-ROOTS -> REBUILD-*-INDEXES), and REBUILD-UNIQUE-INDEXES
+writes via UIX-PUT per node -- so a crashed source, or one from before its
+sidecar existed, is modified further by this open.
 NEW-LOCATION must not already hold a graph.  The CLOS classes for the graph's
 node types must already be defined in this image (load your DEF-VERTEX /
 DEF-EDGE forms first).  :INCLUDE-DELETED-P carries tombstoned nodes across

@@ -457,6 +457,14 @@ reader is never at risk of dereferencing a pointer the grow just moved out
 from under it. Because type-ids are assigned sequentially from 1, ordinary
 schemas never grow the index more than once or twice, if at all.
 
+Growth is not unbounded: the index's mmap reserves address space at the 1 GiB
+floor (~*mmap-min-reservation*~), and doubling from 4,096 types reaches 2^25
+(33,554,432) types cleanly but the next doubling would exceed that
+reservation, so ~extend-mapped-file~ signals ("mmap reservation exhausted")
+rather than growing past it. That is a loud failure, not silent corruption,
+and it is unreachable in practice while type-ids stay per-graph and are
+handed out sequentially from 1.
+
 *Lock striping.* Every push/remove against a type's index-list is serialized
 by a lock. Before #166 that was one mutex *per type-id* — 65,536 of them per
 index per store, unconditionally, regardless of how many types a graph
@@ -2154,6 +2162,14 @@ open unconditionally rewrites ~schema.dat~ (the same content, re-serialized
 was verified by building a real, unmodified old-version engine (no shim) and
 reopening a post-migration source directory with it: every vertex and edge
 present, every type-id identical to before the migration.
+
+This guarantee assumes the source was *closed cleanly and still has its
+index sidecars*. ~open-graph~ rebuilds a spatial, unique, or secondary index
+from a live-node scan whenever its sidecar is missing, and rebuilding a
+unique index writes (~rebuild-unique-indexes~ calls ~uix-put~ per node). A
+source that crashed, or one written by a build that predates a sidecar
+version, has that index rebuilt — and written — by the ~open-graph~ that
+migration's snapshot step performs, so it is not left untouched either.
 
 This is a materially better rollback story than some earlier on-disk format
 changes, whose rollback needs replaying a full snapshot rather than a plain

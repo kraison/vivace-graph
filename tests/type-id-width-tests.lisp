@@ -272,8 +272,8 @@
 ;;; *RESTORE-OBJECTS-PER-TRANSACTION* (10): a replay that silently drops its
 ;;; last batch loses data a smaller fixture could not expose (the boundary
 ;;; falls mid-vertex-list, so a dropped batch loses both vertices AND every
-;;; edge).  Mirrors tests/mvcc-tests.lisp's v1 -> v2 fixture and test shape
-;;; (see MIGRATE-V1-GRAPH-TO-V2, :175); the heap is a 1 GB sparse file, so it
+;;; edge).  Mirrors tests/mvcc-tests.lisp's v1 -> v3 fixture and test shape
+;;; (see MIGRATE-V1-GRAPH-TO-V3); the heap is a 1 GB sparse file, so it
 ;;; ships tar+gzipped.
 ;;; ---------------------------------------------------------------------------
 

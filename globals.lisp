@@ -86,8 +86,8 @@ application's own config; graph-db does not read an ini file itself.")
 ;; v2 (2026): MVCC node head grew 15 -> 31 bytes (commit-epoch + prev-pointer).
 ;; v3 (#166): type-id widened 16 -> 32 bits, head grew 31 -> 33 bytes, ve-key
 ;; 18 -> 20, vev-key 34 -> 36.  Old (v1/v2) graphs must be migrated via
-;; MIGRATE-GRAPH (snapshot + replay) -- Task 3 of #166 adds the v2 -> v3 path;
-;; until then a v2 graph is refused at OPEN-GRAPH, not silently misread.
+;; MIGRATE-GRAPH (snapshot + replay); a v1 or v2 graph is refused at
+;; OPEN-GRAPH, not silently misread.
 (alexandria:define-constant +storage-version+     #x03)
 (alexandria:define-constant +fixed-integer-64+    #x01)
 (alexandria:define-constant +data-magic-byte+     #x17)
