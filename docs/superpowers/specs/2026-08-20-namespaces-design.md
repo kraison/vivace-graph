@@ -331,11 +331,11 @@ system property; one store's routine maintenance must not shorten it.
 
 Three migrations, each chosen for a reversible failure mode.
 
-| What | Mechanism | Rewrites data? |
-|---|---|---|
-| 32-bit `type-id` | new head-codec version; `migrate-graph` reads the old and replays | logical replay |
-| Global epoch | watermark above every store's counter | no |
-| Tagged store id | v8 for new ids, v5 fallback for old | no |
+| What | Mechanism | Rewrites data? | Status |
+|---|---|---|---|
+| 32-bit `type-id` | new head-codec version; `migrate-graph` reads the old and replays | logical replay | **Implemented** (#166, unit 1a) |
+| Global epoch | watermark above every store's counter | no | not built |
+| Tagged store id | v8 for new ids, v5 fallback for old | no | not built |
 
 The type-id widening is the **only on-disk format change** in this design, and it has a
 proven precedent: `*node-head-reader*` is already a dispatch variable and
@@ -343,6 +343,14 @@ proven precedent: `*node-head-reader*` is already a dispatch variable and
 back up and replay a v1 graph. Widening adds a v3 reader the same way. The head goes 31 → 33
 bytes (flags 1, type-id 2→**4**, revision 4, data-pointer 8, commit-epoch 8, prev-pointer 8)
 and `ve-key` goes 18 → 20; both are rebuilt by the replay.
+
+**Implemented as of #166, unit 1a** (widen `type-id` to 32 bits, sparse type-index, v3
+head codec, migration — ids stay per-graph): the head is 33 bytes and `ve-key`/`vev-key`
+are 20/36 bytes exactly as designed above, storage format is `+storage-version+` `#x03`,
+and `migrate-graph` carries a v1 *or* v2 source to v3 through one version-detecting path
+(it reads the source's own stamped version rather than being told). This row is done; the
+other two rows in this table, and §3.4's global type registry, are not — those are unit
+1b (#186) and later units, unaffected by this change.
 
 **Deployment gate.** A type-id migration lands on hosts that may be behind the current
 engine. Every consumer's version floor and each deployed engine version must be checked
