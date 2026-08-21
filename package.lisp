@@ -21,7 +21,25 @@
   #+ccl (:shadowing-import-from "CLOSER-MOP" "COMPUTE-EFFECTIVE-METHOD")
   #+ccl (:shadowing-import-from "CLOSER-MOP" "METHOD-FUNCTION")
   #+ccl (:shadowing-import-from "CLOSER-MOP" "MAKE-METHOD-LAMBDA")
-  (:export #:make-graph
+  (:export
+           ;; image-level epoch clock (GH #168)
+           #:*system-clock*
+           #:system-clock
+           #:open-system-clock
+           #:close-system-clock
+           #:clock-next-epoch
+           #:clock-current-epoch
+           #:clock-peek-epoch
+           #:clock-observe-epoch
+           #:clock-lease-epochs
+           #:journal-append
+           #:journal-records
+           #:graph-system-clock
+           #:attach-to-system-clock
+           #:tm-next-epoch
+           #:tm-current-epoch
+           #:tm-peek-epoch
+           #:make-graph
            #:*default-heap-size*
            #:*default-index-size*
            #:*index-backend*
@@ -117,6 +135,7 @@
            #:*read-snapshots*
            #:read-transaction
            #:no-transaction-in-progress
+           #:attach-with-active-transactions
            #:mutating-unregistered-node
            #:copying-uncommitted-node
 

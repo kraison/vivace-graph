@@ -129,6 +129,18 @@ per graph and may compose; read-write transactions are not (GH #53).")
 
 (define-condition no-transaction-in-progress (error) ())
 
+(define-condition attach-with-active-transactions (error)
+  ;; Attaching mid-transaction poisons the overlap window (GH #168 review):
+  ;; a transaction already holding a low START-TX-ID would get a raised
+  ;; FINISH-TX-ID, so OVERLAPPING-TRANSACTIONS spuriously returns every
+  ;; committed transaction and VALIDATE conflicts on all of them.
+  ((graph :initarg :graph :reader attach-with-active-transactions-graph))
+  (:report (lambda (condition stream)
+             (format stream "Cannot attach ~A to a system clock: it has ~
+in-flight transactions. Attach only a quiescent store."
+                     (graph-name (attach-with-active-transactions-graph
+                                  condition))))))
+
 (define-condition no-transaction-in-progress-warning (warning) ()
   (:report
    (lambda (condition stream)
@@ -639,9 +651,9 @@ vertices (the normal case for ingested source records) are unaffected."
 
 (defun pin-read-epoch (transaction-manager)
   "Register a read pin at the current epoch; return its token (for UNPIN)."
-  ;; Racy read of tx-id-counter is fine: it is monotonic, and a slightly stale
+  ;; Racy read of the epoch is fine: it is monotonic, and a slightly stale
   ;; (smaller) value only makes the reaper MORE conservative, never less.
-  (let ((epoch (tx-id-counter transaction-manager)))
+  (let ((epoch (tm-peek-epoch transaction-manager)))
     (with-recursive-lock-held ((read-pins-lock transaction-manager))
       (let ((token (incf (read-pin-counter transaction-manager))))
         (setf (gethash token (read-pins transaction-manager)) epoch)
@@ -2411,20 +2423,32 @@ mint).  Persists if it moved.  A NIL/zero RECEIVED is a no-op."
   graph)
 
 (defun peer-observe-epoch (graph epoch)
-  "Advance GRAPH's TX-ID-COUNTER so it STRICTLY EXCEEDS EPOCH -- the MVCC commit
-epoch of an op this peer just APPLIED from a remote origin (a pulled node carries the
-HUB's epoch).  A device seeds its counter from its OWN feed-seq; without this the
-counter can sit at or below the epochs it applied, so a subsequent LOCAL edit
-transaction starts at a START-TX-ID that MVCC-hides the very node it means to edit
-(the node is invisible until the counter passes its epoch).  Under the tm lock, so it
-composes with CREATE-TRANSACTION; idempotent + monotonic; a NIL/zero EPOCH is a no-op.
-The durable side is the pull-cursor, which the barrier advances to the pull frontier T
-(>= every applied epoch) and which TX-ID-COUNTER is re-seeded from on open."
+  "Advance GRAPH's epoch source so it STRICTLY EXCEEDS EPOCH -- the MVCC
+commit epoch of an op this peer just APPLIED from a remote origin (a pulled
+node carries the HUB's epoch).  A device seeds its counter from its OWN
+feed-seq; without this the counter can sit at or below the epochs it
+applied, so a subsequent LOCAL edit transaction starts at a START-TX-ID that
+MVCC-hides the very node it means to edit (the node is invisible until the
+counter passes its epoch).  With an image clock bound (GH #168), TX-ID-
+COUNTER is dead -- TM-NEXT-EPOCH/TM-CURRENT-EPOCH/TM-PEEK-EPOCH all route
+around it -- so the observation goes to CLOCK-OBSERVE-EPOCH instead,
+taking only the clock's lock, not the tm lock.  That is safe only because
+this function runs solely on the device's peer-writer thread -- WP-8 funnels
+every local write through the same thread (see PEER-WRITER-LOOP and
+PEER-ENQUEUE-WRITE, peer-streaming.lisp) -- so it can never interleave with
+a local CREATE-TRANSACTION on this store.  Without a clock it falls back to
+the manager's own counter under its lock.  Idempotent + monotonic; a
+NIL/zero EPOCH is a no-op.  The durable side is the pull-cursor, which the
+barrier advances to the pull frontier T (>= every applied epoch) and which
+TX-ID-COUNTER is re-seeded from on open."
   (when (and epoch (> epoch 0) (typep graph 'peer-graph))
-    (let ((tm (transaction-manager graph)))
-      (with-recursive-lock-held ((lock tm))
-        (when (>= epoch (tx-id-counter tm))
-          (setf (tx-id-counter tm) (1+ epoch))))))
+    (let* ((tm (transaction-manager graph))
+           (clock (tm-clock tm)))
+      (if clock
+          (clock-observe-epoch clock epoch)
+          (with-recursive-lock-held ((lock tm))
+            (when (>= epoch (tx-id-counter tm))
+              (setf (tx-id-counter tm) (1+ epoch)))))))
   graph)
 
 (defun serialize-peer-meta (origin-id op-id lamport op-class)
@@ -2925,6 +2949,58 @@ stops appearing in queries.  MARK-DELETED is the usual entry point.")
         (when (< (transaction-id tx) min-id)
           (remove-transaction tx transaction-manager))))))
 
+(defun tm-clock (transaction-manager)
+  "TRANSACTION-MANAGER's image clock, or NIL for its own counter (GH #168).
+A transaction-manager always has a graph -- INITIALIZE-INSTANCE :AFTER
+dereferences it immediately, so a NIL graph dies there first."
+  (graph-system-clock (graph transaction-manager)))
+
+(defun tm-next-epoch (transaction-manager)
+  "Allocate a fresh epoch: from the image clock when the graph has one,
+otherwise from this manager's own counter (pre-#168 behaviour)."
+  (let ((clock (tm-clock transaction-manager)))
+    (if clock
+        (clock-next-epoch clock)
+        (prog1 (tx-id-counter transaction-manager)
+          (incf (tx-id-counter transaction-manager))))))
+
+(defun tm-current-epoch (transaction-manager)
+  "The next epoch TM-NEXT-EPOCH would return."
+  (let ((clock (tm-clock transaction-manager)))
+    (if clock
+        (clock-current-epoch clock)
+        (tx-id-counter transaction-manager))))
+
+(defun tm-peek-epoch (transaction-manager)
+  "Like TM-CURRENT-EPOCH but lock-free under a clock -- see
+CLOCK-PEEK-EPOCH.  For PIN-READ-EPOCH, where a racy read is fine."
+  (let ((clock (tm-clock transaction-manager)))
+    (if clock
+        (clock-peek-epoch clock)
+        (tx-id-counter transaction-manager))))
+
+(defun attach-to-system-clock (graph clock)
+  "Raise CLOCK above GRAPH's persisted history and record the attach --
+the spec §6 watermark, applied per store at attach rather than as a
+separate migration pass.  Mirrors TRANSACTION-MANAGER's own counter-
+seeding rule: a peer-graph's pull cursor is a distinct number space from
+its local highest id (see PEER-OBSERVE-EPOCH's docstring), so both are
+watermarked, not just the local one.  Refuses -- signals
+ATTACH-WITH-ACTIVE-TRANSACTIONS -- while GRAPH has any in-flight
+transaction; see that condition for why."
+  (let ((tm (transaction-manager graph)))
+    (with-transaction-manager-lock (tm)
+      (when (minimum-start-transaction-id tm)
+        (error 'attach-with-active-transactions :graph graph))
+      (let ((watermark (max (load-highest-transaction-id graph)
+                            (if (peer-graph-p graph)
+                                (load-peer-pull-cursor graph)
+                                0))))
+        (clock-observe-epoch clock watermark)
+        (journal-append clock :attach :store (graph-name graph))
+        (setf (graph-system-clock graph) clock))))
+  graph)
+
 (defgeneric remove-transaction (transaction transaction-manager)
   (:method (transaction transaction-manager)
     (remhash (sequence-number transaction)
@@ -2939,9 +3015,10 @@ stops appearing in queries.  MARK-DELETED is the usual entry point.")
     (let* ((sequence-number (next-sequence-number transaction-manager))
            (graph (graph transaction-manager))
            (cache (cache graph))
+           (start-tx-id (tm-current-epoch transaction-manager))
            (tx (make-instance 'tx
                               :sequence-number sequence-number
-                              :start-tx-id (tx-id-counter transaction-manager)
+                              :start-tx-id start-tx-id
                               :finish-tx-id nil
                               :tx-id nil
                               :transaction-manager transaction-manager
@@ -2981,7 +3058,15 @@ The snapshot is recorded in *READ-SNAPSHOTS* under GRAPH rather than bound to
 one snapshot per participating graph, each internally consistent, with
 deliberately no single instant across them (GH #53).  An enclosing snapshot of
 the SAME graph is inherited, as is a read-write transaction on it.  A no-op
-(THUNK runs directly) when GRAPH has no transaction manager yet."
+(THUNK runs directly) when GRAPH has no transaction manager yet.
+
+Also takes a read-epoch pin on GRAPH's own manager for the extent (GH #168):
+under a shared image clock, a cross-store composition holds one such pin per
+participating store, so store B's reaper cannot free a version store A's
+snapshot could still dereference.  Nesting composes this for free -- each
+graph's own CALL-WITH-READ-SNAPSHOT pins only its own manager, and the named
+cost (spec sec.6) is that a long cross-store query delays reaping in every
+store it touched."
   (let ((tm (and graph
                  (slot-boundp graph 'transaction-manager)
                  (transaction-manager graph))))
@@ -2994,7 +3079,8 @@ the SAME graph is inherited, as is a read-write transaction on it.  A no-op
       ((and *read-snapshots* (gethash graph *read-snapshots*)) (funcall thunk))
       (t
        (let ((txn (create-transaction tm))
-             (table (or *read-snapshots* (make-hash-table :test 'eq))))
+             (table (or *read-snapshots* (make-hash-table :test 'eq)))
+             (pin (pin-read-epoch tm)))
          (unwind-protect
               (let ((*read-snapshots* table))
                 (setf (gethash graph table) txn)
@@ -3002,7 +3088,8 @@ the SAME graph is inherited, as is a read-write transaction on it.  A no-op
            ;; the entry must not outlive the extent: a stale snapshot pins the
            ;; reaper's floor and retains versions forever (GH #53)
            (remhash graph table)
-           (remove-transaction txn tm)))))))
+           (remove-transaction txn tm)
+           (unpin-read-epoch tm pin)))))))
 
 (defmacro with-read-snapshot ((&optional (graph '*graph*)) &body body)
   "Evaluate BODY with reads of GRAPH pinned to a single consistent MVCC snapshot.
@@ -3041,12 +3128,10 @@ See CALL-WITH-READ-SNAPSHOT."
              ;; non-replicated graph).
              (setf tmp (prepare-tx-persistence tx))
              (with-transaction-manager-lock (tm)
-               ;; finish-tx-id must be set inside the manager lock so the overlap
-               ;; window computed by validate is consistent with tx-id-counter.
-               ;; Setting it outside would let concurrent commits advance the
-               ;; counter between the read and the lock acquisition, making lost
-               ;; updates invisible.
-               (setf (finish-tx-id tx) (tx-id-counter tm))
+               ;; finish-tx-id is read under the manager lock so no commit of
+               ;; THIS store can allocate an epoch between the read and VALIDATE
+               ;; (GH #168 for the shared-clock case).
+               (setf (finish-tx-id tx) (tm-current-epoch tm))
                (unless (validate tx)
                  (error 'validation-conflict :transaction tx))
                ;; Unique constraints (issue #6): a pre-durability check under the same
@@ -3072,8 +3157,7 @@ See CALL-WITH-READ-SNAPSHOT."
                ;; exactly what that leaves reachable and why it is benign while
                ;; relocation is on.
                (ensure-vector-segment-capacity tx (graph tx))
-               (setf (transaction-id tx) (tx-id-counter tm))
-               (incf (tx-id-counter tm))
+               (setf (transaction-id tx) (tm-next-epoch tm))
                (prune-committed-transactions tm)
                ;; Cheap under the lock: rename temp to its final id-keyed name
                ;; (+ append replication log in commit order for masters).  Must
