@@ -638,10 +638,15 @@ single property the clock provides."
              (open-system-clock (namestring dir)))
         (close-system-clock c)))))
 
-(test a-held-clock-refuses-without-blocking
-  "LOCK_NB is deliberate: blocking would present as a startup hang with no
-diagnostic.  Proven by the refusal returning at all -- a blocking flock here
-would never reach the assertion."
+(test a-refusal-names-the-directory-it-refused
+  "The operator needs to know WHICH system directory is held.
+
+Named for what it asserts.  It does not measure timing: LOCK_NB is what stops
+a second open blocking forever, and that is proven by this suite terminating
+at all -- a blocking flock would hang here rather than fail.  What is NOT
+test-enforced is *immediate* versus merely bounded: a short retry loop would
+still pass.  Catching that needs a bound tight enough to be flaky on a loaded
+machine, which costs more than it buys (GH #182)."
   (with-temp-directory (dir)
     (let ((c (open-system-clock (namestring dir))))
       (unwind-protect
