@@ -95,6 +95,23 @@ unique, unlike today's enforced-by-convention global class name.
 keyed structure. This also retires the `(make-array +max-node-types+)` of **65,536 mutexes**
 allocated per index per store today regardless of type count.
 
+**As built (#166), this is a growable array rather than a keyed structure.** It starts at
+4,096 types and doubles in place via `extend-mapped-file`, which never relocates the base
+address, so a concurrent reader is never left holding a moved pointer. That satisfies the
+requirement above — nothing is allocated for type-ids not in use — by a different mechanism
+than the text anticipated. Two consequences the design did not state: growth is bounded by
+the 1 GiB mmap reservation, so the first type-id at or above 2²⁵ signals rather than growing
+(loud, and unreachable while ids are per-graph); and locking became **256 fixed stripes** by
+`(mod type-id 256)`, so two type-ids sharing a stripe now serialize against each other.
+
+**The consequence analysis above missed one narrowing, and the omission is instructive.** It
+enumerated the type-index and stopped at structures whose *size* scales with
+`+max-node-types+`. It did not ask the different question — *where else is a type-id
+serialised at a fixed width?* — which would have found `memory-graph.lisp`'s VG-native image
+packing it at 2 bytes with no range check (#187, fixed: format v8, readers fork on version,
+`ni-type-id` signals rather than truncating). Unit 1b should ask that second question
+explicitly of every remaining wire and file format before assuming this class is closed.
+
 **Known residual:** widening moves the hard ceiling out of reach and leaves a soft one at
 CLOS class count — 100k runtime types means 100k finalized classes with interned accessors.
 If genuinely high-cardinality runtime types are ever wanted, the alternative (types sharing
@@ -222,7 +239,12 @@ wrong derived data whose provenance does not record the skew.
 
 - **The clock is image-level, not store-level.** A *system* — a directory of N stores —
   owns one clock. Opening any subset opens the system, so a store opened alone still
-  allocates from the shared counter. A store's WAL remains self-contained.
+  allocates from the shared counter. A store's WAL remains self-contained. **This holds
+  only while one process owns the directory, which #168 did not enforce** — two images both
+  read the ceiling, both reserved, and both issued, silently. Closed by #182: an advisory
+  `flock` held for the clock's lifetime, kernel-released on process death, refusing
+  immediately and by name. Scope there is exclusion only; the counter needed no recovery
+  path, because the ceiling is persisted a block ahead of issuance.
 - **Detach takes an epoch lease.** A detaching store is granted `[E1, E2)` and allocates
   inside it while offline; the global clock skips past `E2`. One handshake at detach, one at
   reattach, no coordination in between — which is what keeps a separate-process bulk load
@@ -372,8 +394,10 @@ Three migrations, each chosen for a reversible failure mode.
 | Global epoch | watermark above every store's counter | no | not built |
 | Tagged store id | v8 for new ids, v5 fallback for old | no | not built |
 
-The type-id widening is the **only on-disk format change** in this design, and it has a
-proven precedent: `*node-head-reader*` is already a dispatch variable and
+The type-id widening is the only change to the **graph's** on-disk format in this design.
+It is no longer the only durable-format change: #187 bumped the memory-graph native image
+(`VGMI`) to v8 for the same widening, reading v5-v8 so no image is orphaned. That was not
+foreseen here — see §3.4. The widening has a proven precedent: `*node-head-reader*` is already a dispatch variable and
 `deserialize-node-head-v1` already reads the pre-MVCC 15-byte head so `migrate-graph` can
 back up and replay a v1 graph. Widening adds a v3 reader the same way. The head goes 31 → 33
 bytes (flags 1, type-id 2→**4**, revision 4, data-pointer 8, commit-epoch 8, prev-pointer 8)
@@ -393,16 +417,22 @@ before this ships. That is a release gate, not a design gate.
 
 ## 11. Units
 
-| # | Unit | Depends on |
-|---|---|---|
-| 1a | Widen `type-id` to 32 bits, sparse type-index, v3 head codec, migration — **ids stay per-graph** | — |
-| 1b | Global type-ids: canonical registry (D14), distribution, handshake guard (D15), delete the uniqueness check | 1a |
-| 2 | Packages as namespaces; store/namespace decoupling; placement defaults | **1b** |
-| 3 | Image-level clock, system journal, epoch leases | — |
-| 4 | Tagged UUIDv8 store field, resolver, detached-read marker | 3 |
-| 5 | Detach quiescence protocol and shadow bulk load | 3, 4 |
-| 6 | Restore: retention policy, algorithm, manifest, cascade | 5 |
-| 7 | Runtime schema from persisted metadata | 1b, 2 |
+| # | Unit | Issue | Depends on | Status |
+|---|---|---|---|---|
+| 1a | Widen `type-id` to 32 bits, sparse type-index, v3 head codec, migration — **ids stay per-graph** | #166 | — | **Done** |
+| 1b | Global type-ids: canonical registry (D14), distribution, handshake guard (D15), delete the uniqueness check | #186 | 1a | In progress |
+| 2 | Packages as namespaces; store/namespace decoupling; placement defaults | #167 | **1b**, #190 | Blocked |
+| 3 | Image-level clock, system journal, epoch leases | #168 | — | **Done** |
+| 4 | Tagged UUIDv8 store field, resolver, detached-read marker | #169 | 3 | Not started |
+| 5 | Detach quiescence protocol and shadow bulk load | #170 | 3, 4, #191 | Blocked |
+| 6 | Restore: retention policy, algorithm, manifest, cascade | #171 | 5, #191 | Blocked |
+| 7 | Runtime schema from persisted metadata | #172 | 1b, 2 | Blocked |
+
+Defects found while building the units above, which gate later ones: #187 (memory-image
+narrowing, **done**), #182 (clock had no cross-process exclusion, **done**), #190
+(package-blind type alias, gates unit 2), #191 (a torn record makes the whole lifecycle
+journal unreadable, gates units 5 and 6), #193 (whether `flock` should replace `.dirty`
+generally — exploration, not scheduled).
 
 Units 1a and 3 have no dependencies and may start in parallel. Unit 1 was split:
 1a is the only on-disk format change in this design, and a migration failure should be
@@ -453,3 +483,5 @@ because its migration debt accrues daily (§6).
 | D11 32-bit type-id | 3.4, 10 |
 | D12 shadow bulk load | 8 |
 | D13 restore interaction | 9 |
+| D14 registry persisted and distributed | 3.4 |
+| D15 handshake refuses on registry disagreement | 3.4 |
