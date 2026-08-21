@@ -57,6 +57,9 @@
                ;; The image-level epoch clock (GH #168).  No graph dependency,
                ;; so it loads early and tests without one.
                (:file "system-clock" :depends-on ("serialize" "utilities"))
+               ;; The image-level type-id registry (GH #186).  Same shape as
+               ;; system-clock: no graph dependency, loads early.
+               (:file "type-registry" :depends-on ("serialize" "utilities"))
                (:file "geometry" :depends-on ("serialize"))
                (:file "geometry-ops" :depends-on ("geometry"))
                (:file "geohash" :depends-on ("package"))
@@ -511,6 +514,7 @@ cl-temporal-extent."
                (:file "backup-tests")
                (:file "mvcc-tests")
                (:file "system-clock-tests")       ; GH #168
+               (:file "type-registry-tests")      ; GH #186
                (:file "posix-tests")              ; GH #182
                (:file "rest-tests")
                (:file "rest-http-tests")

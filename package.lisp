@@ -38,6 +38,15 @@
            #:journal-records
            #:graph-system-clock
            #:attach-to-system-clock
+           ;; image-level type-id registry (GH #186)
+           #:type-registry
+           #:open-type-registry
+           #:close-type-registry
+           #:type-registry-busy
+           #:type-registry-busy-location
+           #:registry-id-for
+           #:registry-intern
+           #:registry-entries
            #:tm-next-epoch
            #:tm-current-epoch
            #:tm-peek-epoch
