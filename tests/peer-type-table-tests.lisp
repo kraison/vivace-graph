@@ -1,58 +1,89 @@
 ;;;; The peer type table: (kind, type-id, name, supers) shipped to devices.
 ;;;;
-;;;; A type-id is meaningless on its own.  Ids are handed out by DEF-VERTEX/DEF-EDGE
-;;;; evaluation order (GET-NEXT-TYPE-ID), persisted per graph, and NO type NAME ever
-;;;; crosses the wire -- a receiver resolves the raw uint16 against its OWN schema.  A
-;;;; Lisp device gets away with that only because it evaluates the same schema.lisp; a
-;;;; non-Lisp peer (the Kotlin/SQLite device) cannot.  So the hub ships the mapping.
+;;;; A type-id is meaningless on its own.  Ids come from the IMAGE's type
+;;;; registry (GH #186; before that, per-graph counters), and NO type NAME ever
+;;;; crosses the wire -- a receiver resolves the raw id against its OWN schema.
+;;;; A Lisp device gets away with that only because it evaluates the same
+;;;; schema.lisp; a non-Lisp peer (the Kotlin/SQLite device) cannot.  So the hub
+;;;; ships the mapping.
 ;;;;
 ;;;; The load-bearing details these tests pin down:
 ;;;;
-;;;;   - NEXT-VERTEX-ID and NEXT-EDGE-ID are SEPARATE counters that BOTH start at 1, so
-;;;;     a vertex type and an edge type routinely share a numeric id.  Any consumer
-;;;;     keying on the id ALONE silently confuses them.
-;;;;   - DEF-NODE-TYPE does not ENFORCE single inheritance -- it splices PARENT-TYPES
-;;;;     straight into DEFCLASS -- so multiple inheritance really works on the hub.  The
-;;;;     supers field is therefore a LIST, not a scalar; dropping the second parent
-;;;;     would make a device's subclass closure silently disagree with the hub's.
-;;;;   - The format is a FROZEN EXTERNAL CONTRACT (a Kotlin/SQLite device parses it), so
-;;;;     the encoder validates what it emits and the reference parser is strict: both
-;;;;     are the spec.
+;;;;   - The registry's vertex and edge counters are SEPARATE and BOTH start at
+;;;;     1, so a vertex type and an edge type routinely share a numeric id.  Any
+;;;;     consumer keying on the id ALONE silently confuses them.
+;;;;   - DEF-NODE-TYPE does not ENFORCE single inheritance -- it splices
+;;;;     PARENT-TYPES straight into DEFCLASS -- so multiple inheritance really
+;;;;     works on the hub.  The supers field is therefore a LIST, not a scalar;
+;;;;     dropping the second parent would make a device's subclass closure
+;;;;     silently disagree with the hub's.
+;;;;   - The format is a FROZEN EXTERNAL CONTRACT (a Kotlin/SQLite device parses
+;;;;     it), so the encoder validates what it emits and the reference parser is
+;;;;     strict: both are the spec.
+;;;;   - The table is the IMAGE's registry, so the hub's own graph does not
+;;;;     bound it, and the handshake refuses a peer whose registry disagrees
+;;;;     (D15).
 
 (in-package #:graph-db/test)
 
 (def-suite peer-type-table-suite
-  :description "The (kind,id,name,supers) type table shipped in the peer auth-ok plist."
+  :description
+  "The (kind,id,name,supers) type table shipped in the peer auth-ok plist."
   :in graph-db-suite)
 
 (in-suite peer-type-table-suite)
 
-;;; The happy-path tests need no new schema: the g-* schema from graph-tests (loaded
-;;; earlier in the system) is exactly the shape they need -- two vertex types where
-;;; G-EMPLOYEE subclasses G-PERSON, and two edge types.  Both id spaces therefore start
-;;; at 1, which is what makes the collision assertion below meaningful.  WITH-TEST-GRAPH
-;;; (suite.lisp:113) builds a graph of *INTEGRATION-GRAPH-NAME* carrying it.
-;;;
-;;; The multiple-inheritance and encoder-rejection tests each need their OWN graph name:
-;;; the type table is graph-WIDE, and *INTEGRATION-GRAPH-NAME*'s schema is shared with
-;;; every other suite -- a deliberately unrepresentable type added there would break them
-;;; all.  Hence the dedicated schemas below, and WITH-NAMED-TEST-GRAPH.
+;;; Every test here needs its OWN system directory, and that is not tidiness.
+;;; The table is the IMAGE's registry (GH #186) while RUN-TESTS gives the whole
+;;; suite ONE system directory, so against the shared registry these tests would
+;;; encode every type any other file has ever declared -- including this file's
+;;; deliberately unrepresentable ones, which would then make every test here
+;;; signal.  WITH-OWN-REGISTRY* is what keeps each test's table its own.
 
-(defmacro with-named-test-graph ((g name) &body body)
-  "Like WITH-TEST-GRAPH but for a graph of a name OTHER than *INTEGRATION-GRAPH-NAME*."
-  (let ((dir (gensym "DIR")))
+(defmacro with-ptt-registry ((registry) &body body)
+  "Run BODY under a system directory -- hence a type registry -- of its own,
+with REGISTRY bound to that registry."
+  (let ((dir (gensym "SYSDIR")))
     `(with-temp-directory (,dir)
-       (let ((,g (make-graph ,name (namestring ,dir) :buffer-pool-size 1000)))
-         (unwind-protect
-              (let ((*graph* ,g))
-                ,@body)
-           (ignore-errors (close-graph ,g :snapshot-p nil))
-           (collect-garbage))))))
+       (let* ((graph-db::*system-directory* (namestring ,dir))
+              (graph-db::*type-registry* nil)
+              (,registry (graph-db::ensure-type-registry)))
+         (declare (ignorable ,registry))
+         ,@body))))
 
-;;; --- A multiple-inheritance schema. --------------------------------------------
-;;; M-UAV is both an M-HAZARD and an M-ASSET.  The hub agrees: (typep uav 'm-asset) is
-;;; true, and "all m-assets" includes it.  A wire format carrying only the FIRST parent
-;;; would make the device disagree.
+(defmacro with-ptt-registry-graph ((g name &optional (registry (gensym "R")))
+                                   &body body)
+  "A graph of NAME in its own scratch directory AND its own system directory,
+so REGISTRY holds NAME's types and nothing else."
+  (let ((dir (gensym "DIR")))
+    `(with-ptt-registry (,registry)
+       (with-temp-directory (,dir)
+         (let ((,g (make-graph ,name (namestring ,dir) :buffer-pool-size 1000)))
+           (unwind-protect
+                (let ((*graph* ,g))
+                  ,@body)
+             (ignore-errors (close-graph ,g :snapshot-p nil))
+             (collect-garbage)))))))
+
+(defun %ptt-adopt (registry symbol parent id)
+  "Record SYMBOL at exactly ID in REGISTRY, no graph involved.  The tests below
+need registries holding ids and symbols DEF-VERTEX cannot produce -- an id
+above the wire's range, two packages' same-named symbols -- and a store's
+history can produce all of them."
+  (graph-db::with-registry-append-lock (registry)
+    (graph-db::%registry-adopt registry symbol parent id)))
+
+(defun %ptt-refusal-text (thunk)
+  "The report of the PEER-TYPE-REGISTRY-CONFLICT-ERROR THUNK signals, or NIL if
+it signals none.  NIL is the ablated implementation's answer, so every caller
+asserts STRINGP first."
+  (handler-case (progn (funcall thunk) nil)
+    (graph-db::peer-type-registry-conflict-error (c) (princ-to-string c))))
+
+;;; --- A multiple-inheritance schema. ------------------------------------
+;;; M-UAV is both an M-HAZARD and an M-ASSET.  The hub agrees:
+;;; (typep uav 'm-asset) is true, and "all m-assets" includes it.  A wire
+;;; format carrying only the FIRST parent would make the device disagree.
 
 (eval-when (:load-toplevel :execute)
   (setf (gethash :peer-type-table-mi-test *schema-node-metadata*) nil))
@@ -73,10 +104,10 @@
   ()
   :peer-type-table-mi-test)
 
-;;; --- A schema no wire format can represent: a name containing a delimiter. -------
-;;; CL symbol names may contain ANY character via |escaped| syntax, and DEF-VERTEX
-;;; constrains nothing.  The ENCODER is the only possible defense: a table corrupted at
-;;; the source is unrecoverable on the Kotlin side.
+;;; --- A schema no wire format can represent: a name with a delimiter. -----
+;;; CL symbol names may contain ANY character via |escaped| syntax, and
+;;; DEF-VERTEX constrains nothing.  The ENCODER is the only possible defense:
+;;; a table corrupted at the source is unrecoverable on the Kotlin side.
 
 (eval-when (:load-toplevel :execute)
   (setf (gethash :peer-type-table-badname-test *schema-node-metadata*) nil))
@@ -85,7 +116,7 @@
   ()
   :peer-type-table-badname-test)
 
-;;; --- A schema whose names COLLIDE once downcased. --------------------------------
+;;; --- A schema whose names COLLIDE once downcased. ------------------------
 ;;; STRING-DOWNCASE is not injective.
 
 (eval-when (:load-toplevel :execute)
@@ -105,8 +136,9 @@
 
 (test type-table-round-trips
   "PEER-PARSE-TYPE-TABLE inverts PEER-TYPE-TABLE-STRING."
-  (with-test-graph (g)
-    (let* ((s (graph-db::peer-type-table-string g))
+  (with-ptt-registry-graph (g *integration-graph-name*)
+    (declare (ignorable g))
+    (let* ((s (graph-db::peer-type-table-string))
            (parsed (graph-db::peer-parse-type-table s)))
       (is (stringp s))
       (is (plusp (length parsed)))
@@ -119,24 +151,36 @@
         (is (every #'stringp (fourth row)))))))
 
 (test type-table-carries-kind-because-ids-collide
-  "REGRESSION GUARD.  NEXT-VERTEX-ID and NEXT-EDGE-ID both start at 1 (schema.lisp:15-16),
-so a vertex type and an edge type share a numeric id.  The table must therefore be keyed
-on (KIND . ID).  If this ever fails because the ids no longer collide, the KIND field is
-STILL required -- do not 'simplify' it away."
-  (with-test-graph (g)
-    (let* ((parsed (graph-db::peer-parse-type-table (graph-db::peer-type-table-string g)))
-           (vertex-ids (loop for row in parsed when (eq (first row) :vertex) collect (second row)))
-           (edge-ids (loop for row in parsed when (eq (first row) :edge) collect (second row))))
+  "REGRESSION GUARD.  The registry's vertex and edge counters both start at 1
+(type-registry.lisp), so a vertex type and an edge type share a numeric id. The
+table must therefore be keyed on (KIND . ID).  If this ever fails because the
+ids no longer collide, the KIND field is STILL required -- do not 'simplify' it
+away."
+  (with-ptt-registry-graph (g *integration-graph-name*)
+    (declare (ignorable g))
+    (let* ((parsed (graph-db::peer-parse-type-table
+                    (graph-db::peer-type-table-string)))
+           (vertex-ids (loop for row in parsed
+                             when (eq (first row) :vertex)
+                               collect (second row)))
+           (edge-ids (loop for row in parsed
+                           when (eq (first row) :edge)
+                             collect (second row))))
       (is (plusp (length vertex-ids)))
       (is (plusp (length edge-ids)))
       (is (intersection vertex-ids edge-ids))
-      (let ((keys (loop for row in parsed collect (cons (first row) (second row)))))
-        (is (= (length keys) (length (remove-duplicates keys :test #'equal))))))))
+      (let ((keys (loop for row in parsed
+                        collect (cons (first row) (second row)))))
+        (is (= (length keys)
+               (length (remove-duplicates keys :test #'equal))))))))
 
 (test type-table-reports-direct-superclasses-only
-  "A subclass reports its DIRECT parents; a root type reports NIL (not VERTEX/EDGE)."
-  (with-test-graph (g)
-    (let ((parsed (graph-db::peer-parse-type-table (graph-db::peer-type-table-string g))))
+  "A subclass reports its DIRECT parents; a root type reports NIL (not
+VERTEX/EDGE)."
+  (with-ptt-registry-graph (g *integration-graph-name*)
+    (declare (ignorable g))
+    (let ((parsed (graph-db::peer-parse-type-table
+                   (graph-db::peer-type-table-string))))
       (flet ((supers-of (name)
                (fourth (find name parsed :key #'third :test #'string=))))
         (is (equal '("g-person") (supers-of "g-employee")))
@@ -146,8 +190,9 @@ STILL required -- do not 'simplify' it away."
 (test type-table-survives-the-plist-channel
   "The whole point of encoding the table as a STRING: a nested list would trip
 PLIST-TOO-FANCY-ERROR.  Serialize the actual auth-ok plist and read it back."
-  (with-test-graph (g)
-    (let* ((table (graph-db::peer-type-table-string g))
+  (with-ptt-registry-graph (g *integration-graph-name*)
+    (declare (ignorable g))
+    (let* ((table (graph-db::peer-type-table-string))
            (plist (list :peer-control :auth-ok :type-table table))
            (bytes (graph-db::serialize-packet-plist plist))
            (back (graph-db::deserialize-packet-plist bytes)))
@@ -157,25 +202,73 @@ PLIST-TOO-FANCY-ERROR.  Serialize the actual auth-ok plist and read it back."
                  (graph-db::peer-parse-type-table (getf back :type-table)))))))
 
 (test type-table-absent-parses-to-nil
-  "An OLD hub sends no :type-table.  (getf plist :type-table) -> NIL must parse to NIL,
-not signal -- that is the device's back-compat fallback path."
+  "An OLD hub sends no :type-table.  (getf plist :type-table) -> NIL must parse
+to NIL, not signal -- that is the device's back-compat fallback path."
   (is (null (graph-db::peer-parse-type-table nil)))
   (is (null (graph-db::peer-parse-type-table ""))))
+
+;;; ---------------------------------------------------------------------------
+;;; The table is the IMAGE's registry, not one graph's schema (D14)
+;;; ---------------------------------------------------------------------------
+
+(test type-table-is-the-image-registry-not-one-graph-s-schema
+  "Two stores, ONE image, ONE table.  Under the per-graph schema the table
+could only ever name the hub graph's own types; under the registry it names
+every type the SYSTEM has assigned, because a device may be sent an id from any
+of them.
+
+Non-vacuous by construction: each store's schema is asserted NOT to know the
+other's type, so no single SCHEMA-TYPE-TABLE could produce this table -- an
+implementation that still read (SCHEMA GRAPH) fails here whichever graph it
+read."
+  (with-ptt-registry (r)
+    (with-temp-directory (d1)
+      (with-temp-directory (d2)
+        (let ((g1 (make-graph *integration-graph-name* (namestring d1)
+                              :buffer-pool-size 1000))
+              (g2 (make-graph :peer-type-table-mi-test (namestring d2)
+                              :buffer-pool-size 1000)))
+          (unwind-protect
+               (let* ((parsed (graph-db::peer-parse-type-table
+                               (graph-db::peer-type-table-string r))))
+                 (flet ((row (name)
+                          (find name parsed :key #'third :test #'string=))
+                        (knows-p (g sym parent)
+                          (and (graph-db::lookup-node-type-by-name
+                                sym parent :graph g)
+                               t)))
+                   (is (row "g-person")
+                       "the first store's type is in the table")
+                   (is (row "m-uav") "and so is the second store's")
+                   (is (not (knows-p g1 'm-uav :vertex))
+                       "store 1's schema does not know M-UAV")
+                   (is (not (knows-p g2 'g-person :vertex))
+                       "store 2's schema does not know G-PERSON")
+                   ;; The ids are the registry's, not either store's counter.
+                   (is (eql (second (row "m-uav"))
+                            (graph-db::registry-id-for r 'm-uav :vertex)))
+                   (is (eql (second (row "g-knows"))
+                            (graph-db::registry-id-for r 'g-knows :edge)))))
+            (ignore-errors (close-graph g1 :snapshot-p nil))
+            (ignore-errors (close-graph g2 :snapshot-p nil))
+            (collect-garbage)))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Multiple inheritance: the supers field is a LIST
 ;;; ---------------------------------------------------------------------------
 
 (test type-table-carries-every-super-of-a-multiple-inheritance-type
-  "DEF-NODE-TYPE's docstring claims single inheritance but does NOT enforce it -- it
-splices PARENT-TYPES straight into DEFCLASS.  So M-UAV really IS both an M-HAZARD and an
-M-ASSET on the hub.  Emitting only the FIRST parent would silently drop M-UAV from a
-device's \"all m-assets\" closure while the hub kept it: per-peer divergent wrong answers.
-The supers field is therefore a SPACE-SEPARATED LIST."
-  (with-named-test-graph (g :peer-type-table-mi-test)
+  "DEF-NODE-TYPE's docstring claims single inheritance but does NOT enforce it
+-- it splices PARENT-TYPES straight into DEFCLASS.  So M-UAV really IS both an
+M-HAZARD and an M-ASSET on the hub.  Emitting only the FIRST parent would
+silently drop M-UAV from a device's \"all m-assets\" closure while the hub kept
+it: per-peer divergent wrong answers. The supers field is therefore a SPACE-
+SEPARATED LIST."
+  (with-ptt-registry-graph (g :peer-type-table-mi-test)
+    (declare (ignorable g))
     ;; The hub genuinely believes in the second parent.
     (is (subtypep 'm-uav 'm-asset))
-    (let* ((s (graph-db::peer-type-table-string g))
+    (let* ((s (graph-db::peer-type-table-string))
            (parsed (graph-db::peer-parse-type-table s)))
       (is (search ",m-uav,m-hazard m-asset" s))
       (flet ((supers-of (name)
@@ -190,28 +283,173 @@ The supers field is therefore a SPACE-SEPARATED LIST."
 ;;; ---------------------------------------------------------------------------
 
 (test type-table-encoder-rejects-a-name-carrying-a-delimiter
-  "|odd,name| is a legal CL symbol and a legal DEF-VERTEX name, but it cannot be
-represented on the wire: the comma splits it into two fields.  (A |semi;colon| is worse
--- it splits into two RECORDS, the first of which parses SILENTLY.)  The encoder must
-refuse, naming the type, rather than ship a corrupt table to a device that cannot
-possibly recover from it."
-  (with-named-test-graph (g :peer-type-table-badname-test)
-    (signals error (graph-db::peer-type-table-string g))))
+  "|odd,name| is a legal CL symbol and a legal DEF-VERTEX name, but it cannot
+be represented on the wire: the comma splits it into two fields.  (A
+|semi;colon| is worse -- it splits into two RECORDS, the first of which parses
+SILENTLY.)  The encoder must refuse, naming the type, rather than ship a
+corrupt table to a device that cannot possibly recover from it."
+  (with-ptt-registry-graph (g :peer-type-table-badname-test)
+    (declare (ignorable g))
+    (signals error (graph-db::peer-type-table-string))))
 
 (test type-table-encoder-rejects-names-that-collide-when-downcased
-  "STRING-DOWNCASE is not injective: P-PERSON and |P-Person| are distinct CLOS classes
-that emit the SAME name.  A device would resolve one type-id's name to the other type."
-  (with-named-test-graph (g :peer-type-table-dupname-test)
-    (signals error (graph-db::peer-type-table-string g))))
+  "STRING-DOWNCASE is not injective: P-PERSON and |P-Person| are distinct CLOS
+classes that emit the SAME name.  A device would resolve one type-id's name to
+the other type."
+  (with-ptt-registry-graph (g :peer-type-table-dupname-test)
+    (declare (ignorable g))
+    (signals error (graph-db::peer-type-table-string))))
+
+(test type-table-collision-error-names-the-packages
+  "The collision the image-level registry made ordinary: two symbols with the
+SAME name in DIFFERENT packages, registered from different stores (GH #186).
+DEF-VERTEX cannot build this case -- a schema file defines its types in one
+package -- so it is registered directly.
+
+The message must print both symbols PACKAGE-QUALIFIED.  Bare ~S omits the
+package whenever the symbol is accessible in the ambient *PACKAGE*, and an
+error naming PTT-TWIN twice tells an operator with two stores nothing at all.
+It must also stop advising a rename as if both types were in one schema."
+  (with-ptt-registry (r)
+    (let* ((p1 (or (find-package "PTT-PKG-ONE") (make-package "PTT-PKG-ONE")))
+           (p2 (or (find-package "PTT-PKG-TWO") (make-package "PTT-PKG-TWO")))
+           (s1 (intern "PTT-TWIN" p1))
+           (s2 (intern "PTT-TWIN" p2)))
+      (%ptt-adopt r s1 :vertex 1)
+      (%ptt-adopt r s2 :vertex 2)
+      (let ((text (handler-case
+                      (progn (graph-db::peer-type-table-string r) nil)
+                    (error (c) (princ-to-string c)))))
+        (is (stringp text) "the encoder must refuse the collision")
+        (is (search "PTT-PKG-ONE::PTT-TWIN" text)
+            "the first type must be named package-qualified")
+        (is (search "PTT-PKG-TWO::PTT-TWIN" text)
+            "and so must the second")))))
+
+(test type-table-encoder-rejects-an-id-the-wire-cannot-carry
+  "The registry assigns 32-bit type-ids; the wire's ID field is frozen at
+(UNSIGNED-BYTE 16).  Before this the ENCODER emitted the row anyway and only
+the reference PARSER refused, so the failure landed on the device rather than
+on the hub that produced it.  The check is on PEER-TYPE-TABLE-STRING alone
+here, so a parser-only implementation cannot pass: nothing in this test parses
+anything.  Widening the field is GH #199."
+  (with-ptt-registry (r)
+    (%ptt-adopt r 'ptt-too-wide :vertex 70000)
+    (let ((text (handler-case
+                    (progn (graph-db::peer-type-table-string r) nil)
+                  (error (c) (princ-to-string c)))))
+      (is (stringp text) "the encoder must refuse an out-of-range type-id")
+      (is (search "70000" text) "naming the id")
+      (is (search "PTT-TOO-WIDE" text) "and the type"))))
+
+;;; ---------------------------------------------------------------------------
+;;; D15: the handshake refuses a peer whose registry disagrees
+;;; ---------------------------------------------------------------------------
+
+(test handshake-accepts-a-hub-whose-registry-agrees
+  "The control for the two refusal tests below: an implementation that refused
+everything would pass those and fail this one."
+  (with-ptt-registry (r)
+    (%ptt-adopt r 'ptt-agree-a :vertex 1)
+    (%ptt-adopt r 'ptt-agree-b :edge 1)
+    (let* ((table (graph-db::peer-type-table-string r))
+           (rows (graph-db::peer-device-accept-auth-ok
+                  (list :peer-control :auth-ok :type-table table) r)))
+      (is (equal (graph-db::peer-parse-type-table table) rows)
+          "an agreeing table is accepted and returned parsed"))))
+
+(test handshake-refuses-a-hub-that-gives-one-symbol-another-id
+  "D15.  An image with no hub is its own authority, so two of them can hand the
+same symbol different ids; a node arriving under the hub's id would then
+materialise as the wrong class here.  Refuse, and NAME the symbol -- an
+operator has to find it in two stores, so the package has to be in the message.
+
+Reconciling instead would mean rewriting every node of that type because a
+network handshake said so, which is why this is a refusal and not a merge."
+  (with-ptt-registry (r)
+    (%ptt-adopt r 'ptt-conflict-type :vertex 7)
+    (let ((text (%ptt-refusal-text
+                 (lambda ()
+                   (graph-db::peer-device-accept-auth-ok
+                    (list :peer-control :auth-ok
+                          :type-table "v,4,ptt-conflict-type,")
+                    r)))))
+      (is (stringp text) "the handshake must REFUSE a disagreeing registry")
+      (is (search "GRAPH-DB/TEST::PTT-CONFLICT-TYPE" text)
+          "naming the conflicting symbol, package-qualified")
+      (is (search "7" text) "and both ids it is caught between")
+      (is (search "4" text)))))
+
+(test handshake-refuses-a-hub-whose-id-means-another-type-here
+  "The direction a name-keyed comparison MISSES.  The hub's type is unknown in
+this image, so there is no shared name to compare -- but its id already means a
+local type, and a node arriving under it materialises as that local type.  An
+implementation checking only name -> id passes the test above and fails this
+one."
+  (with-ptt-registry (r)
+    (%ptt-adopt r 'ptt-local-only :vertex 3)
+    (let ((text (%ptt-refusal-text
+                 (lambda ()
+                   (graph-db::peer-device-accept-auth-ok
+                    (list :peer-control :auth-ok
+                          :type-table "v,3,ptt-hub-only,")
+                    r)))))
+      (is (stringp text) "an id meaning two types must be refused")
+      (is (search "GRAPH-DB/TEST::PTT-LOCAL-ONLY" text)
+          "naming what the id means HERE")
+      (is (search "ptt-hub-only" text)
+          "and what the hub says it means"))))
+
+(test handshake-refuses-a-conflict-carried-over-the-real-wire
+  "The same refusal, but the table is the one the HUB actually builds (PEER-
+TYPE-TABLE-STRING) and it crosses the real plist codec on the way.  Covers hub
+encode + wire + device refusal in one; only the socket itself is stubbed."
+  (let (hub-table)
+    ;; The hub's image: one symbol, its own registry, its own ids.
+    (with-ptt-registry (hub)
+      (%ptt-adopt hub 'ptt-wire-type :vertex 11)
+      (setf hub-table (graph-db::peer-type-table-string hub)))
+    ;; The device's image: the same symbol, a different id.
+    (with-ptt-registry (device)
+      (%ptt-adopt device 'ptt-wire-type :vertex 12)
+      (let* ((bytes (graph-db::serialize-packet-plist
+                     (list :peer-control :auth-ok :type-table hub-table)))
+             (ctrl (graph-db::deserialize-packet-plist bytes))
+             (text (%ptt-refusal-text
+                    (lambda ()
+                      (graph-db::peer-device-accept-auth-ok ctrl device)))))
+        (is (stringp text)
+            "a conflict that crosses the real wire must still be refused")
+        (is (search "GRAPH-DB/TEST::PTT-WIRE-TYPE" text))))))
+
+(test handshake-still-accepts-a-hub-too-old-to-ship-a-table
+  "The one hole in the guard, kept deliberately and recorded here so it is not
+mistaken for coverage: a hub that ships no :type-table cannot be compared at
+all, so it is trusted.  Removing this back-compat path would break every
+pre-#186 hub."
+  (with-ptt-registry (r)
+    (%ptt-adopt r 'ptt-oldhub-type :vertex 1)
+    (is (null (graph-db::peer-device-accept-auth-ok
+               (list :peer-control :auth-ok) r)))
+    (is (null (graph-db::peer-device-accept-auth-ok
+               (list :peer-control :auth-ok :type-table "") r)))))
+
+(test handshake-still-refuses-an-auth-rejection
+  "The check D15 was added alongside must not have been displaced by it."
+  (with-ptt-registry (r)
+    (signals error
+      (graph-db::peer-device-accept-auth-ok
+       (list :peer-control :auth-failed) r))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; The reference parser IS the spec: it must be strict
 ;;; ---------------------------------------------------------------------------
 
 (test type-table-parser-rejects-malformed-records
-  "Every laxness here is a place the Kotlin parser will silently diverge.  A record has
-EXACTLY 4 fields; KIND is exactly \"v\" or \"e\" (anything else used to become an EDGE);
-ID is an integer in 0..65535 (type-ids are (UNSIGNED-BYTE 16)); no record may be empty."
+  "Every laxness here is a place the Kotlin parser will silently diverge.  A
+record has EXACTLY 4 fields; KIND is exactly \"v\" or \"e\" (anything else used
+to become an EDGE); ID is an integer in 0..65535 (type-ids are (UNSIGNED-BYTE
+16)); no record may be empty."
   ;; Wrong arity.
   (signals error (graph-db::peer-parse-type-table "v,1,foo"))
   (signals error (graph-db::peer-parse-type-table "v,1,foo,,extra"))
@@ -236,11 +474,12 @@ ID is an integer in 0..65535 (type-ids are (UNSIGNED-BYTE 16)); no record may be
              (graph-db::peer-parse-type-table "e,0,foo,bar baz"))))
 
 (test type-table-tolerates-forward-references
-  "Type-ids are STABLE across schema evolution, so the table is sorted by ID, NOT
-topologically.  Adding a superclass ABOVE an existing type therefore produces a FORWARD
-reference -- T-B (id 1) names T-A (id 2).  Parsing must not depend on declaration order;
-consumers MUST two-pass (read all rows, then resolve names).  A single-pass consumer that
-resolves supers as it reads breaks on the first hierarchy refactor."
+  "Type-ids are STABLE across schema evolution, so the table is sorted by ID,
+NOT topologically.  Adding a superclass ABOVE an existing type therefore
+produces a FORWARD reference -- T-B (id 1) names T-A (id 2).  Parsing must not
+depend on declaration order; consumers MUST two-pass (read all rows, then
+resolve names).  A single-pass consumer that resolves supers as it reads breaks
+on the first hierarchy refactor."
   (let ((parsed (graph-db::peer-parse-type-table "v,1,t-b,t-a;v,2,t-a,")))
     (is (= 2 (length parsed)))
     (is (equal '(:vertex 1 "t-b" ("t-a")) (first parsed)))

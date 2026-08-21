@@ -169,6 +169,34 @@ distributed to peers."
                          (mapcar #'car sizes)))
     report))
 
+(defun %symbol-home-package-name (symbol)
+  "SYMBOL's home package name, or \"\" when it is uninterned.  Uninterned
+symbols cannot round-trip through the registry file anyway (GH #186 task 1),
+so they only have to sort somewhere stable."
+  (let ((package (symbol-package symbol)))
+    (if package (package-name package) "")))
+
+(defun %registry-mint-order (table)
+  "TABLE's symbol keys ordered by package name, then symbol name.
+
+MAPHASH order is unspecified and a fresh registry mints ids in the order it
+is asked, so without this two images renumbering ONE store into two EMPTY
+registries assign different ids -- which the replication handshake then
+refuses (D15).  A sort is nearly free and a migration that is not
+reproducible cannot be verified by re-running it.
+
+This buys reproducibility of a SINGLE migration.  It is NOT a substitute for
+distributing the registry (D14): two images that opened different stores, or
+the same stores in a different order, still disagree, and that disagreement
+is the operator event D15 exists to name.  GH #186."
+  (sort (loop for name being the hash-keys in table collect name)
+        (lambda (a b)
+          (let ((pa (%symbol-home-package-name a))
+                (pb (%symbol-home-package-name b)))
+            (if (string= pa pb)
+                (and (string< (symbol-name a) (symbol-name b)) t)
+                (and (string< pa pb) t))))))
+
 (defun renumber-schema (schema registry)
   "Replace every type-id in SCHEMA with the one REGISTRY holds for that
 type's NAME, minting where it holds none.  Returns (values SCHEMA UNIFIED).
@@ -196,18 +224,20 @@ from the source store, which is closed by then and does not own it."
                      (setf (gethash name survivors) meta)))))
              sub)
             (clrhash sub)
-            (maphash
-             (lambda (name meta)
-               (let ((new (registry-intern registry name parent))
-                     (ids (sort (gethash name old-ids) #'<)))
-                 (when (rest ids)
-                   (push (list name parent ids new) unified))
-                 (setf (node-type-id meta) new)
-                 (setf (gethash new sub) meta)
-                 (setf (gethash name sub) new)
-                 ;; The keyword alias UPDATE-NODE-TYPE also writes; it is
-                 ;; package-blind, which is #190, not this task's to fix.
-                 (setf (gethash (intern (symbol-name name) :keyword) sub)
-                       new)))
-             survivors)))))
+            ;; %REGISTRY-MINT-ORDER, not MAPHASH: minting order decides the
+            ;; ids a fresh registry hands out, and it must not vary between
+            ;; images.  See that function (GH #186).
+            (dolist (name (%registry-mint-order survivors))
+              (let ((meta (gethash name survivors))
+                    (new (registry-intern registry name parent))
+                    (ids (sort (gethash name old-ids) #'<)))
+                (when (rest ids)
+                  (push (list name parent ids new) unified))
+                (setf (node-type-id meta) new)
+                (setf (gethash new sub) meta)
+                (setf (gethash name sub) new)
+                ;; The keyword alias UPDATE-NODE-TYPE also writes; it is
+                ;; package-blind, which is #190, not this task's to fix.
+                (setf (gethash (intern (symbol-name name) :keyword) sub)
+                      new)))))))
     (values schema (nreverse unified))))

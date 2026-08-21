@@ -13,6 +13,29 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Added
 
+- **A replication handshake refuses a peer whose type registry disagrees**
+  (#186). After `:auth-ok`, a device compares the hub's type table against
+  this image's registry and signals
+  `graph-db::peer-type-registry-conflict-error`, closing the session and
+  naming every conflicting symbol package-qualified. Both directions are
+  checked, because neither subsumes the other: *one name at two ids* (a node
+  arriving under the hub's id would materialise as some other class here) and
+  *one id at two names* (the hub's type is unknown in this image and its id
+  already means a local type). This is deliberately not a reconciliation —
+  agreeing at a handshake would mean rewriting every node of the losing type
+  because a network event said so. A hub too old to ship a table sends no
+  `:type-table` key and cannot be compared, so it is still trusted; that path
+  is kept for pre-#186 hubs. See docs/vivace-graph-v3-doc.org, Chapter 16,
+  "Type-ids on the wire, and the handshake that refuses a disagreeing peer".
+
+- **The peer type-table encoder refuses a type-id the wire cannot carry**
+  (#186). The registry assigns 32-bit type-ids while the table's `id` field
+  is frozen at `(unsigned-byte 16)`. Previously only the reference *parser*
+  enforced that, so a hub emitted a row its own parser could not read and the
+  failure landed on the device. The encoder now signals at the hub, naming
+  the type and the id. Widening the field is a change to a frozen external
+  contract and is tracked separately as #199.
+
 - **Adopting global type-ids on an existing system** (#186).
   `registry-seed-from-stores` seeds the type registry from stores that were
   each numbered from 1, and reports which of them must now be rewritten. It
@@ -521,6 +544,39 @@ between releases; cutting a release renames it to the new version and dates it.
   so explicitly.
 
 ### Changed
+
+- **The peer type table is the image's type registry, not one graph's
+  schema** (#186). The `:type-table` string the hub ships in its `:auth-ok`
+  plist now names every type this system has assigned an id, because type-ids
+  are image-level and a device may be sent an id belonging to any store.
+  `peer-type-table-string` takes a registry (defaulting to this image's)
+  rather than a graph. The wire *grammar* is unchanged — it is a frozen
+  external contract parsed by non-Lisp peers — only what fills it. Two
+  consequences, both intended: a type the hub's own graph does not
+  instantiate still appears in the table, and a type name that cannot be
+  encoded now fails every device connection in the image rather than only
+  sessions for the store that declared it. A third consequence is not
+  intended and is tracked as #200: a registry entry whose class this image
+  never loaded emits an empty `supers` field, which the wire cannot tell
+  apart from a type that genuinely roots at `vertex`/`edge`.
+
+- **The downcased-name collision error names the packages, and no longer
+  advises a rename** (#186). Pooling every store's types into one table
+  widened that collision surface: two types that never shared a schema now
+  share one namespace, and same-named symbols from two packages are no longer
+  exotic. The error prints both symbols package-qualified — the package is
+  the only thing that distinguishes them — and says the fix is a retirement
+  or rename, which for a type with nodes on disk is a store migration rather
+  than an edit.
+
+- **The renumbering migration mints in a deterministic order** (#186).
+  `renumber-schema` iterated survivors with `maphash`, so two images
+  renumbering one store into two empty registries could assign different ids
+  — a disagreement the new handshake guard would then refuse, though nothing
+  about the two systems actually differed. It now mints in package-name then
+  symbol-name order. This makes a single migration reproducible (and so
+  verifiable by re-running it); it is *not* a substitute for distributing the
+  registry, and images that opened different stores still disagree.
 
 - **BREAKING: type-ids are assigned system-wide, and a system directory is
   now mandatory** (#186). `graph-db:*system-directory*` names the directory

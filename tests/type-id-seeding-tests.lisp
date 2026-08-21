@@ -213,6 +213,25 @@ schema.dat."
   "The symbols the store at LOCATION holds more than one id for."
   (nth-value 1 (%store-entries location)))
 
+(defun %prime-registry-past (registry entries)
+  "Intern filler names into REGISTRY until its next free id under each parent
+is above every id ENTRIES uses.
+
+RENUMBER-SCHEMA mints in a deterministic order since GH #186 task 4, so a
+legacy id surviving is no longer a lucky draw -- it is systematic, and a test
+asserting \"the id moved\" has to make every legacy id unreachable rather than
+merely unlikely.  One filler per parent used to be enough only because MAPHASH
+order was arbitrary."
+  (dolist (parent '(:vertex :edge))
+    (let ((high (loop for (nil p id) in entries
+                      when (eq p parent) maximize id into m
+                      finally (return (or m 0)))))
+      (dotimes (i high)
+        (graph-db::registry-intern
+         registry
+         (intern (format nil "TS-PRIME-~:@(~A~)-~D" parent i) :graph-db/test)
+         parent)))))
+
 (defun %seed-locations (stores)
   "The store locations to seed from, deliberately REVERSED -- delta, gamma,
 beta, alpha.  That is neither the by-bytes ranking nor its reverse, so a
@@ -655,10 +674,9 @@ into a registry the :RENUMBER-P NIL migration is supposed to leave alone
   "A v2 (31-byte head, 2-byte type-id) source migrated with :RENUMBER-P T
 keeps every node, revision, slot value and edge endpoint -- and takes its
 type-ids from the registry, which is the exact reverse of what
-MIGRATE-V2-GRAPH-TO-V3-WITHOUT-RENUMBERING pins.  The registry is primed
-with one filler name per parent first, so NO source id can survive by
-coincidence and 'the id moved' is a real observation rather than a lucky
-draw."
+MIGRATE-V2-GRAPH-TO-V3-WITHOUT-RENUMBERING pins.  The registry is primed past
+the source's highest id under each parent first, so NO legacy id is reachable
+at all and 'the id moved' is a real observation rather than a lucky draw."
   #+ecl
   (skip "v2 fixture was cl-store'd by SBCL; ECL's cl-store cannot restore it ~
 (graph on-disk dirs are not portable across Lisp implementations).")
@@ -669,9 +687,8 @@ draw."
       (multiple-value-bind (registry sysdir) (%fresh-registry root)
         (let ((graph-db::*system-directory* sysdir)
               (graph-db::*type-registry* nil))
-          (graph-db::registry-intern registry 'ts-filler-vertex :vertex)
-          (graph-db::registry-intern registry 'ts-filler-edge :edge)
           (let ((source-ids (%store-entries old-dir)))
+            (%prime-registry-past registry source-ids)
             (multiple-value-bind (expected-v expected-k expected-l)
                 (%read-v2-graph old-dir)
               (is (= 12 (length expected-v))
@@ -708,3 +725,72 @@ draw."
 :RENUMBER-P T migration" symbol id))))
                   (close-graph g))
                 (collect-garbage)))))))))
+
+;;; ---------------------------------------------------------------------------
+;;; Minting order (GH #186, task 4)
+;;;
+;;; RENUMBER-SCHEMA used to iterate survivors with MAPHASH, whose order is
+;;; unspecified.  A fresh registry mints in the order it is asked, so two
+;;; images renumbering ONE store into two EMPTY registries could assign
+;;; different ids -- a disagreement the replication handshake then refuses
+;;; (D15) even though nothing about the two systems actually differed.
+;;; ---------------------------------------------------------------------------
+
+(defun %ts-schema-of (names parent)
+  "A bare SCHEMA holding one node-type per NAME under PARENT, numbered 1..N in
+the order given.  Triple-keyed like UPDATE-NODE-TYPE writes it (id -> meta,
+symbol -> id, keyword -> id), which is what RENUMBER-SCHEMA reads."
+  (let ((schema (graph-db::make-schema))
+        (sub (make-hash-table :test 'eql)))
+    (loop for name in names
+          for id from 1
+          do (let ((meta (graph-db::make-node-type
+                          :name name :parent-type parent :id id)))
+               (setf (gethash id sub) meta)
+               (setf (gethash name sub) id)
+               (setf (gethash (intern (symbol-name name) :keyword) sub) id)))
+    (setf (gethash parent (graph-db::schema-type-table schema)) sub)
+    schema))
+
+(test renumbering-mints-in-one-order-whatever-the-image
+  "Two images renumbering the same store into two EMPTY registries must reach
+the same answer, so the minting order cannot be a hash table's.
+
+The ten names are given to the schema SCRAMBLED and numbered 1..10 in that
+scrambled order, so neither 'keep the source id' nor 'follow the table' can
+produce the expected result -- only sorting can.  Against MAPHASH order this
+fails unless SBCL's EQ-table order happens to be alphabetical for these ten
+symbols."
+  (with-temp-directory (sysdir)
+    (let* ((graph-db::*system-directory* (namestring sysdir))
+           (graph-db::*type-registry* nil)
+           (registry (graph-db::ensure-type-registry))
+           (names '(ts-order-h ts-order-c ts-order-a ts-order-j ts-order-e
+                    ts-order-b ts-order-i ts-order-d ts-order-g ts-order-f))
+           (sorted (sort (copy-list names) #'string< :key #'symbol-name)))
+      (graph-db::renumber-schema (%ts-schema-of names :vertex) registry)
+      (is (equal (loop for i from 1 to (length names) collect i)
+                 (mapcar (lambda (n)
+                           (graph-db::registry-id-for registry n :vertex))
+                         sorted))
+          "a fresh registry must mint in name order, not hash order")
+      ;; The scrambled input really is not already sorted, so the check above
+      ;; is not satisfiable by leaving the order alone.
+      (is (not (equal names sorted))))))
+
+(test minting-order-breaks-ties-on-the-package
+  "Two packages' same-named symbols are exactly what the image-level registry
+made ordinary (GH #186), and a sort on SYMBOL-NAME alone leaves their order to
+the hash table.  The home package is the tie-break."
+  (let* ((p1 (or (find-package "TS-ORD-PKG-A") (make-package "TS-ORD-PKG-A")))
+         (p2 (or (find-package "TS-ORD-PKG-B") (make-package "TS-ORD-PKG-B")))
+         (s1 (intern "TS-ORD-TWIN" p1))
+         (s2 (intern "TS-ORD-TWIN" p2))
+         (table (make-hash-table :test 'eq)))
+    ;; Inserted B first, so "insertion order" is not the expected answer.
+    (setf (gethash s2 table) t)
+    (setf (gethash s1 table) t)
+    (is (equal (list s1 s2) (graph-db::%registry-mint-order table))
+        "same name, different packages: order by package")
+    (is (string= "TS-ORD-TWIN" (symbol-name s1)))
+    (is (string= "TS-ORD-TWIN" (symbol-name s2)))))

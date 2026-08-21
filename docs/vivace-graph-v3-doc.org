@@ -2785,6 +2785,83 @@ A device is constructed with a hub-minted ~:origin-id~ (an opaque 16-byte id) an
 
 As with master/slave, a *minor* schema drift (same major version) still syncs, degraded-safe; a *major* mismatch is rejected before any data moves.
 
+*** Type-ids on the wire, and the handshake that refuses a disagreeing peer
+
+A ~type-id~ crosses the peer wire as an opaque integer; no type *name* ever
+does. A Lisp device gets away with that because it evaluates the same
+~schema.lisp~ the hub does. A non-Lisp peer (a Kotlin/SQLite field device)
+cannot, so after authenticating, the hub ships a *type table* in its
+~:auth-ok~ control plist: one delimited string of ~kind,id,name,supers~
+records, sorted by id.
+
+That string's grammar is a *frozen external contract*. It is parsed by
+implementations this repository does not build,
+~graph-db::peer-parse-type-table~ is the reference parser, and its strictness
+is part of the specification — an ~id~ is decimal digits only in 0..65535, a
+record has exactly four fields, ~kind~ is exactly ~"v"~ or ~"e"~, and a
+consumer must read *all* rows before resolving superclass names, because the
+table is sorted by id and may carry forward references.
+
+**What the table contains changed with GH #186: it is the IMAGE's type
+registry, not the hub graph's schema.** Type-ids are image-level now
+(Chapter 17), so a device may be sent an id belonging to any store in the
+system, and the hub therefore ships the whole mapping. Two consequences
+follow, both intended:
+
+- a type the hub's own graph does not instantiate still appears in the table;
+- a type name that cannot be encoded fails *every* device connection in the
+  image, not only sessions for the store that declared it.
+
+The encoder refuses rather than emit something a device cannot recover from.
+It signals, naming the offending type package-qualified, when a name is empty
+or carries a delimiter (a comma splits the record into two fields; a
+semicolon splits it into two *records*, the first of which parses silently as
+a bogus type), when two types' names collide once downcased, or when a
+type-id will not fit the wire's 16-bit ~id~ field (issue #199 tracks widening
+it; the registry itself assigns 32-bit ids).
+
+One thing the encoder cannot refuse, because it cannot see it: a row's
+~supers~ field is derived from CLOS, so a registry entry whose ~def-vertex~
+this image never loaded emits an *empty* field — indistinguishable on the
+wire from a type that really does root at ~vertex~/~edge~. A consumer places
+it at the root and drops it from its parent's closure. This became ordinary
+when the table became image-wide (an image holding store A's schema but not
+store B's still ships B's names); it is tracked as issue #200, with #195 as
+the same absence one level down.
+
+The downcased-name collision deserves a note, because pooling every store's
+types into one table *widened* it: two types that never shared a schema now
+share this namespace, and same-named symbols from two packages are no longer
+exotic. The error prints both symbols with their packages, since the package
+is the only thing that tells them apart. Resolving it is a *retirement or a
+rename*, and for a type with nodes on disk that is a store migration, not an
+edit.
+
+**The device refuses a hub whose registry disagrees with its own.** An image
+with no hub is its own authority — the ordinary case, since peer replication
+is off by default — so two such images can independently give one symbol two
+ids, or one id two symbols. Comparing the hub's table against the local
+registry at the handshake, the device signals
+~graph-db::peer-type-registry-conflict-error~ and closes the session, naming
+every conflicting symbol package-qualified. Both directions are checked and
+reported:
+
+- *one name, two ids* — a node arriving under the hub's id would materialise
+  as some other class here;
+- *one id, two names* — the hub's type is unknown in this image and its id
+  already means a local type, which is the same corruption with no shared
+  name to key on.
+
+This is deliberately *not* a reconciliation. Agreeing at a handshake would
+mean rewriting every node of the losing type because a network event said so.
+A disagreement between two populated stores is an operator event: reconcile
+the registries out of band (Chapter 17, "Adopting global type-ids on an
+existing system"), then reconnect.
+
+One gap is kept on purpose: a hub too old to ship a type table at all sends
+no ~:type-table~ key, and such a hub cannot be compared, so it is trusted.
+Removing that path would break every pre-#186 hub.
+
 *** Peer replication over the in-memory backend
 
 The storage backend is orthogonal to the replication role: ~make-memory-graph~ accepts the very same peer arguments, yielding an *in-memory peer device* — the intended mobile/ECL configuration. Combined with ~:lazy t~ and a post-sync ~checkpoint-memory-graph~, such a device gets a near-instant open plus fault-on-access reads of its synced subgraph (Chapter 15).
@@ -2988,6 +3065,17 @@ Plan the run: each renumbering is a ~migrate-graph~, so the transient disk
 and the deployment gate described in Chapter 12 apply to every store in the
 list, and each store is written to a *new* location, leaving the source
 rollback-able.
+
+**Renumber once, then distribute — do not renumber twice and hope.** The
+registry is persisted and *distributed*, not recomputed: hosts read it, none
+rebuild it. Within a single migration the ids are reproducible (the
+renumbering mints in package-then-symbol-name order, so re-running it on the
+same input gives the same answer), but that is a debugging aid, not a
+synchronisation mechanism. Two images that opened different stores, or the
+same stores in a different order, will still disagree — and a replication
+handshake between them is *refused*, naming the conflicting symbols, rather
+than silently reconciled. See Chapter 16, "Type-ids on the wire, and the
+handshake that refuses a disagreeing peer".
 
 *** The image-level system clock (optional)
 
@@ -4121,6 +4209,15 @@ This chapter provides a categorized reference for the most important exported sy
 
 - ~registry-seed-from-stores (registry locations)~ ::
   Seeds ~registry~ from the stores at ~locations~ (no graph is opened), adopting the largest store's type-ids and returning a ~seeding-report~ naming the stores that must now be migrated with ~:renumber-p t~. See Chapter 17, "Adopting global type-ids on an existing system".
+
+- ~peer-type-table-string (&optional registry)~ ::
+  Encodes the image's type registry as the delimited ~kind,id,name,supers~ string the hub ships in its ~:auth-ok~ plist. Signals, naming the type, rather than emit a table a device cannot recover from. The grammar is a frozen external contract — see Chapter 16, "Type-ids on the wire".
+
+- ~peer-parse-type-table (string)~ ::
+  The reference parser for that contract, and part of the specification: strict by design, since every laxness here is a place a non-Lisp implementation will silently diverge. ~nil~ or ~""~ (an old hub that ships no table) parses to ~nil~.
+
+- ~peer-check-type-registry-agreement (table &optional registry)~ ::
+  Signals ~peer-type-registry-conflict-error~, naming every conflicting symbol, unless the hub's ~table~ agrees with this image's registry about every type-id the two share. Run by ~peer-sync~ at the handshake; a disagreement is an operator event, not something a handshake may reconcile.
 
 **** MVCC / Versioning
 
