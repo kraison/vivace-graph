@@ -391,6 +391,7 @@ Three migrations, each chosen for a reversible failure mode.
 | What | Mechanism | Rewrites data? | Status |
 |---|---|---|---|
 | 32-bit `type-id` | new head-codec version; `migrate-graph` reads the old and replays | logical replay | **Implemented** (#166, unit 1a) |
+| **Global type-ids** | **renumbering replay against the seeded registry — see §10.1** | **logical replay** | **not built (unit 1b)** |
 | Global epoch | watermark above every store's counter | no | not built |
 | Tagged store id | v8 for new ids, v5 fallback for old | no | not built |
 
@@ -410,6 +411,45 @@ and `migrate-graph` carries a v1 *or* v2 source to v3 through one version-detect
 (it reads the source's own stamped version rather than being told). This row is done; the
 other two rows in this table, and §3.4's global type registry, are not — those are unit
 1b (#186) and later units, unaffected by this change.
+
+### 10.1 Adopting global ids on an existing system
+
+**This row was missing from the table above until unit 1b measured it.** The design
+described the steady state — registry, distribution, handshake refusal — and never said how
+a populated system reaches it.
+
+**Why a migration is unavoidable.** `schema-next-vertex-id` and `schema-next-edge-id` both
+start at **1** in every store. So in any system with more than one store, low type-ids name
+different classes in different stores. Under one space at most one store keeps a contested
+id and the rest must be renumbered — and `type-id` is written into the node head, `ve-key`,
+`vev-key` and the type-index, so renumbering a store means rewriting it.
+
+**Measured, not assumed.** On a five-store system read directly from `schema.dat` (no store
+opened): **66 vertex symbols competing for 36 distinct ids**, 11 of those ids claimed by
+more than one symbol — the lowest ids contested by nearly every store. Edges: 29 symbols,
+23 ids, 3 contested. The collision is close to total at the low end, which is what
+"every schema counts from 1" predicts.
+
+**The cost is bounded by bytes, not by type count.** Since the low ids are contested
+system-wide, all but one store is renumbered whichever store is favoured. Favour the store
+that is **largest on disk**, not the one with the most types: on the measured system that
+was the difference between replaying ~1.1 GB and replaying ~4.9 GB, and the store with the
+most types (59 of the 95) was one of the smallest. Seeding policy is therefore: **the
+registry adopts the assignment of the largest store, and every other store renumbers.**
+
+**One case no seeding policy exempts.** A symbol may already hold *two different ids* in one
+store's history — the measured system had three. Those must unify regardless of which store
+wins, so a store containing one is always in the migration set.
+
+**Mechanism.** A renumbering mode on `migrate-graph`, which already performs the logical
+snapshot-and-replay #166 built. It satisfies §12's requirement that no record be rewritten
+except by logical replay.
+
+**Consequence for #166's guarantee.** `migrate-graph` currently *preserves* `type-id` and
+its tests assert so ("must survive migration unchanged"). That was correct when the field
+widened but ids stayed per-graph. Under 1b the guarantee becomes **mode-dependent**, and
+those tests must say which mode they pin — otherwise the renumbering path silently inherits
+tests asserting the opposite of what it does.
 
 **Deployment gate.** A type-id migration lands on hosts that may be behind the current
 engine. Every consumer's version floor and each deployed engine version must be checked
