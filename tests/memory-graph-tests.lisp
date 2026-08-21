@@ -756,24 +756,24 @@ is the same call sequence as today's writer."
     (let ((vt (graph-db::mem-table-data (graph-db::vertex-table graph)))
           (et (graph-db::mem-table-data (graph-db::edge-table graph))))
       (graph-db::ni-uint buf (hash-table-count vt) 4)
-      (maphash (lambda (id x) (graph-db::ni-node buf id x nil)) vt)
+      (maphash (lambda (id x) (graph-db::ni-node buf id x nil 2)) vt)
       (graph-db::ni-uint buf (hash-table-count et) 4)
-      (maphash (lambda (id x) (graph-db::ni-node buf id x t)) et))
+      (maphash (lambda (id x) (graph-db::ni-node buf id x t 2)) et))
     (graph-db::ni-index buf (graph-db::%dump-mem-index
                               (graph-db::mem-type-index-data (graph-db::vertex-index graph)))
-                         #'graph-db::ni-key-type)
+                         (lambda (b k) (graph-db::ni-key-type b k 2)))
     (graph-db::ni-index buf (graph-db::%dump-mem-index
                               (graph-db::mem-type-index-data (graph-db::edge-index graph)))
-                         #'graph-db::ni-key-type)
+                         (lambda (b k) (graph-db::ni-key-type b k 2)))
     (graph-db::ni-index buf (graph-db::%dump-mem-index
                               (graph-db::mem-ve-index-data (graph-db::ve-index-in graph)))
-                         #'graph-db::ni-key-ve)
+                         (lambda (b k) (graph-db::ni-key-ve b k 2)))
     (graph-db::ni-index buf (graph-db::%dump-mem-index
                               (graph-db::mem-ve-index-data (graph-db::ve-index-out graph)))
-                         #'graph-db::ni-key-ve)
+                         (lambda (b k) (graph-db::ni-key-ve b k 2)))
     (graph-db::ni-index buf (graph-db::%dump-mem-index
                               (graph-db::mem-vev-index-data (graph-db::vev-index graph)))
-                         #'graph-db::ni-key-vev)
+                         (lambda (b k) (graph-db::ni-key-vev b k 2)))
     (graph-db::ni-pairs buf '())          ; v5's flat spatial section: always empty
     (graph-db::ni-views buf graph)
     (graph-db::ni-val buf (graph-db::%dump-unique-indexes graph))
@@ -924,5 +924,195 @@ empty, and deleting the image discards the ONLY durable copy of the graph
         (when msg
           (is (search "v5" msg))
           (is (search "v6" msg))
+          (is (search "v8" msg)
+              "the message names the version this build writes")
           (is (not (search "Delete" msg)))
           (is (not (search "delete" msg))))))))
+
+;;; ---------------------------------------------------------------------------
+;;; GH #187: the native image packed type-id at 2 bytes and truncated silently.
+;;;
+;;; NI-UINT writes with LDB, so a type-id above 65535 lost its high bits with no
+;;; signal -- 70000 (#x11170) came back as 4464 (#x1170).  Unreachable while
+;;; type-ids were per-graph and handed out from 1, but #166 widened the on-disk
+;;; field to 32 bits and #186 makes ids global, so the image is now the only
+;;; 16-bit narrowing left.  v8 widens it; v5/v6/v7 stay readable, because the
+;;; image is the ONLY durable copy of a cleanly-closed memory graph.
+;;; ---------------------------------------------------------------------------
+
+(defun %mem-image-big-type-id-lznode ()
+  (graph-db::make-lznode :type-id 70000 :revision 3 :commit-epoch 9
+                         :data-blob (graph-db::serialize '(:a 1))))
+
+(test memory-image-node-record-round-trips-a-type-id-above-16-bits
+  "A vertex record's type-id survives NI-NODE -> RI-NODE.  At 2 bytes it did
+not: 70000 restored as 4464, silently."
+  (let ((buf (graph-db::ni-mkbuf))
+        (id (graph-db::gen-vertex-id)))
+    (graph-db::ni-node buf id (%mem-image-big-type-id-lznode) nil)
+    (multiple-value-bind (rid lz)
+        (graph-db::ri-node (graph-db::ni-ric buf) nil)
+      (is (equalp id rid) "id round-trips")
+      (is (= 70000 (graph-db::lznode-type-id lz))
+          "type-id round-trips; 4464 means it was truncated to 2 bytes")
+      (is (= 3 (graph-db::lznode-revision lz)) "revision still lands")
+      (is (= 9 (graph-db::lznode-commit-epoch lz))
+          "commit-epoch still lands -- a mis-sized type-id shifts every
+field after it, so these pin the whole record layout, not just the type-id"))))
+
+(test memory-image-edge-record-round-trips-a-type-id-above-16-bits
+  "The edge arm writes its own type-id and carries from/to/weight after the
+head, so a mis-sized type-id corrupts those too."
+  (let* ((buf (graph-db::ni-mkbuf))
+         (id (graph-db::gen-edge-id))
+         (from (graph-db::gen-vertex-id))
+         (to (graph-db::gen-vertex-id))
+         (lz (%mem-image-big-type-id-lznode)))
+    (setf (graph-db::lznode-from lz) from
+          (graph-db::lznode-to lz) to
+          (graph-db::lznode-weight lz) 2.5)
+    (graph-db::ni-node buf id lz t)
+    (multiple-value-bind (rid rlz)
+        (graph-db::ri-node (graph-db::ni-ric buf) t)
+      (is (equalp id rid))
+      (is (= 70000 (graph-db::lznode-type-id rlz)))
+      (is (equalp from (graph-db::lznode-from rlz)))
+      (is (equalp to (graph-db::lznode-to rlz)))
+      (is (= 2.5 (graph-db::lznode-weight rlz))))))
+
+(test memory-image-type-key-round-trips-a-type-id-above-16-bits
+  "The type index's key IS a bare type-id."
+  (let ((buf (graph-db::ni-mkbuf)))
+    (graph-db::ni-key-type buf 70000)
+    (is (= 70000 (graph-db::ri-key-type (graph-db::ni-ric buf))))))
+
+(test memory-image-ve-key-round-trips-a-type-id-above-16-bits
+  (let ((buf (graph-db::ni-mkbuf))
+        (k (graph-db::make-ve-key :id (graph-db::gen-vertex-id)
+                                  :type-id 70000)))
+    (graph-db::ni-key-ve buf k)
+    (let ((back (graph-db::ri-key-ve (graph-db::ni-ric buf))))
+      (is (equalp (graph-db::ve-key-id k) (graph-db::ve-key-id back)))
+      (is (= 70000 (graph-db::ve-key-type-id back))))))
+
+(test memory-image-vev-key-round-trips-a-type-id-above-16-bits
+  (let ((buf (graph-db::ni-mkbuf))
+        (k (graph-db::make-vev-key :out-id (graph-db::gen-vertex-id)
+                                   :in-id (graph-db::gen-vertex-id)
+                                   :type-id 70000)))
+    (graph-db::ni-key-vev buf k)
+    (let ((back (graph-db::ri-key-vev (graph-db::ni-ric buf))))
+      (is (equalp (graph-db::vev-key-out-id k) (graph-db::vev-key-out-id back)))
+      (is (equalp (graph-db::vev-key-in-id k) (graph-db::vev-key-in-id back)))
+      (is (= 70000 (graph-db::vev-key-type-id back))))))
+
+(test memory-image-writer-refuses-a-type-id-it-cannot-represent
+  "The v5/v6/v7 writers are still reachable (the old-image test helpers use
+them).  Handing one a type-id too wide for its field must SIGNAL rather than
+drop the high bits -- silence is what made #187 invisible.  A dedicated
+condition, so an arity or type error cannot satisfy this by accident."
+  (let ((buf (graph-db::ni-mkbuf)))
+    (signals graph-db::memory-image-type-id-too-wide
+      (graph-db::ni-node buf (graph-db::gen-vertex-id)
+                         (%mem-image-big-type-id-lznode) nil 2))
+    (signals graph-db::memory-image-type-id-too-wide
+      (graph-db::ni-key-type buf 70000 2))
+    (signals graph-db::memory-image-type-id-too-wide
+      (graph-db::ni-key-ve buf (graph-db::make-ve-key
+                                :id (graph-db::gen-vertex-id) :type-id 70000)
+                           2))
+    (signals graph-db::memory-image-type-id-too-wide
+      (graph-db::ni-key-vev buf (graph-db::make-vev-key
+                                 :out-id (graph-db::gen-vertex-id)
+                                 :in-id (graph-db::gen-vertex-id)
+                                 :type-id 70000)
+                            2))))
+
+(defun %write-v7-test-image (graph)
+  "Write GRAPH as a v7 native image: byte-identical to today's v8 writer except
+the version stamp and the 2-byte type-id fields.  Clears the journal afterward,
+like a real checkpoint, so the reopen exercises the image and not a replay."
+  (let ((buf (graph-db::ni-mkbuf)))
+    (graph-db::ni-bytes buf graph-db::*native-image-magic*)
+    (graph-db::ni-uint buf 7 4)
+    (graph-db::ni-uint buf (graph-db::load-highest-transaction-id graph) 8)
+    (let ((vt (graph-db::mem-table-data (graph-db::vertex-table graph)))
+          (et (graph-db::mem-table-data (graph-db::edge-table graph))))
+      (graph-db::ni-uint buf (hash-table-count vt) 4)
+      (maphash (lambda (id x) (graph-db::ni-node buf id x nil 2)) vt)
+      (graph-db::ni-uint buf (hash-table-count et) 4)
+      (maphash (lambda (id x) (graph-db::ni-node buf id x t 2)) et))
+    (graph-db::ni-index buf (graph-db::%dump-mem-index
+                             (graph-db::mem-type-index-data
+                              (graph-db::vertex-index graph)))
+                        (lambda (b k) (graph-db::ni-key-type b k 2)))
+    (graph-db::ni-index buf (graph-db::%dump-mem-index
+                             (graph-db::mem-type-index-data
+                              (graph-db::edge-index graph)))
+                        (lambda (b k) (graph-db::ni-key-type b k 2)))
+    (graph-db::ni-index buf (graph-db::%dump-mem-index
+                             (graph-db::mem-ve-index-data
+                              (graph-db::ve-index-in graph)))
+                        (lambda (b k) (graph-db::ni-key-ve b k 2)))
+    (graph-db::ni-index buf (graph-db::%dump-mem-index
+                             (graph-db::mem-ve-index-data
+                              (graph-db::ve-index-out graph)))
+                        (lambda (b k) (graph-db::ni-key-ve b k 2)))
+    (graph-db::ni-index buf (graph-db::%dump-mem-index
+                             (graph-db::mem-vev-index-data
+                              (graph-db::vev-index graph)))
+                        (lambda (b k) (graph-db::ni-key-vev b k 2)))
+    (graph-db::ni-spatial buf graph)
+    (graph-db::ni-views buf graph)
+    (graph-db::ni-val buf (graph-db::%dump-unique-indexes graph))
+    (with-open-file (s (graph-db::memory-image-file
+                        (graph-db::location graph))
+                       :direction :output :element-type '(unsigned-byte 8)
+                       :if-exists :supersede :if-does-not-exist :create)
+      (write-sequence buf s))
+    (graph-db::clear-memory-journal graph)))
+
+(test v7-memory-image-still-opens-on-the-v8-build
+  "The image is the ONLY durable copy of a cleanly-closed memory graph, so
+widening type-id must not orphan images written before #187.  A real v7 image
+-- 2-byte type-ids throughout, including every index key -- restores whole.
+
+This is the half of #187 that a writer-only fix would break: reading a v7
+image with v8's 4-byte parse shifts every field after the type-id, so the
+version fork in %READ-MEMORY-IMAGE is what this pins."
+  (reset-mem-view-registry)
+  (with-temp-directory (dir)
+    (let ((loc (namestring dir))
+          person-id place-id knows-id)
+      (let ((g (graph-db::make-memory-graph *mem-test-graph-name* loc)))
+        (let ((*graph* g))
+          (with-transaction ()
+            (let ((a (make-m-person :name "alice" :age 30))
+                  (b (make-m-person :name "bob" :age 40)))
+              (setq person-id (id a))
+              (setq knows-id (id (make-m-knows :from (id a) :to (id b))))
+              (setq place-id
+                    (id (make-m-place
+                         :label "kharkiv"
+                         :geom (graph-db::make-point 36.3d0 50.0d0)))))))
+        (%write-v7-test-image g)
+        (close-graph g :snapshot-p nil))
+      (let ((g2 (graph-db::open-memory-graph *mem-test-graph-name* loc)))
+        (unwind-protect
+             (let ((*graph* g2))
+               (is (= 3 (graph-db::mem-table-count
+                         (graph-db::vertex-table g2)))
+                   "all three vertices survived the v7 read")
+               (is (string= "alice" (slot-value (lookup-vertex person-id)
+                                                'name))
+                   "a v7 node's data blob is still found at the right offset")
+               (is (string= "kharkiv" (slot-value (lookup-vertex place-id)
+                                                  'label)))
+               ;; The ve/vev index keys carry their own type-id, so a
+               ;; mis-parsed key silently loses adjacency rather than erroring.
+               (is-true (lookup-edge knows-id) "the edge record survived")
+               (is (= 1 (length (graph-db::map-edges #'identity g2
+                                                    :collect-p t)))
+                   "exactly one edge, so no key was dropped or duplicated"))
+          (ignore-errors (close-graph g2 :snapshot-p nil))
+          (collect-garbage))))))

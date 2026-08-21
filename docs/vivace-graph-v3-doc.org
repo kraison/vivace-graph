@@ -2631,6 +2631,28 @@ A lazy graph loads each node as a compact *blob* (its parsed head plus its still
 
 Caveats: a *full* scan (e.g. ~map-vertices~ over everything) still materializes everything — lazy wins for *partial* working sets, which is the field case. A lazy graph uses the VG-native image format (written automatically on checkpoint/close), so run one checkpoint on it before relying on the fast open. ~:lazy~ composes with the peer device — it is purely a storage-mode flag.
 
+**The native image's format version.** The VG-native image (magic ~VGMI~)
+carries its own format version, independent of ~+storage-version+~ — they
+version different things, and a graph can be current on one and stale on the
+other. This build writes **v8** and reads v5 through v8.
+
+Backward compatibility is not optional here. A memory graph's image is the
+*only* durable record of a cleanly-closed graph: the retained journal is
+cleared on every checkpoint, so an image the build cannot read is a graph that
+is gone. An unknown version is therefore refused with a message naming the
+remedy (open with a build that reads it, or migrate), never by deleting and
+"recovering" onto an empty graph.
+
+v8 widened ~type-id~ from 2 to 4 bytes (GH #187), matching the 32-bit on-disk
+field #166 introduced. Before it, ~ni-uint~ — which writes with ~ldb~ — dropped
+the high bits of any id above 65535 without signalling, so a ~type-id~ of 70000
+came back as 4464. Records and index keys are parsed *positionally*, so
+~%read-memory-image~ picks the width from the version and threads it through
+the record reader and the three index-key readers; reading a v7 image at v8's
+width would shift every field after the type-id. Writers always emit 4 bytes,
+and ~ni-type-id~ signals ~memory-image-type-id-too-wide~ rather than
+truncating.
+
 | | Eager (default) | Lazy (~:lazy t~) |
 |---|---|---|
 | Open latency | Builds every node (~O(nodes)~) | Near-instant (~O(1)~) |

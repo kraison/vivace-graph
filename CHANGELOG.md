@@ -224,6 +224,33 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Fixed
 
+- **The memory-graph native image (`VGMI`) packed `type-id` at 2 bytes and
+  truncated silently; format bumped to v8** (#187). `ni-uint` writes with
+  `ldb`, so a `type-id` above 65535 lost its high bits with no signal — 70000
+  was restored as 4464, yielding either a node built against the **wrong
+  class** or a `NIL` type lookup. Six sites were affected: the node record
+  (both the live-node and `LZNODE` arms, plus its reader) and all three index
+  key codecs (`type`, `ve`, `vev`).
+
+  Unreachable while type-ids were per-graph and handed out from 1, but #166
+  widened the on-disk field to 32 bits and #186 makes ids global, so this was
+  the last 16-bit narrowing on the path. It mattered more than the equivalent
+  assumption on the replication wire (`peer-streaming.lisp`), which validates
+  and **signals**: this one failed silently, and a memory graph's image is its
+  **only** durable copy — the journal is cleared on every checkpoint.
+
+  **v5, v6 and v7 images still open.** Record and key layouts are parsed
+  positionally, so `%read-memory-image` selects the type-id width from the
+  version and threads it through the record reader and all three key readers;
+  reading a v7 image at v8's width would shift every field after the type-id.
+  Writers always emit 4 bytes. The width is a defaulted parameter on each
+  codec rather than a duplicated set of `*-v7` functions.
+
+  `ni-type-id` replaces the bare `ni-uint` on every type-id write and
+  **signals `memory-image-type-id-too-wide`** rather than truncating, so the
+  silent-narrowing class of bug is gone and not merely this instance of it.
+
+
 - **`recreate-graph` (restore/replay) minted ids from a per-store scalar,
   bypassing both the transaction manager and any bound system clock**
   (#168). Reached via `replay` (snapshot and backup restore) and
