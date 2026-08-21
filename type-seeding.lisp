@@ -63,8 +63,9 @@ whichever store wins."
       (let ((sub (gethash parent (schema-type-table schema)))
             (by-name (make-hash-table :test 'eq)))
         (when sub
-          ;; Integer keys map to the metadata; the symbol and keyword keys
-          ;; are aliases onto the current id (see UPDATE-NODE-TYPE).
+          ;; Integer keys map to the metadata; the symbol key is an alias
+          ;; onto the current id.  A keyword key can only be pre-#190
+          ;; residue -- UPDATE-NODE-TYPE no longer writes one (GH #190).
           (maphash (lambda (key meta)
                      (when (and (integerp key) (node-type-p meta))
                        (push key (gethash (node-type-name meta) by-name))))
@@ -244,9 +245,5 @@ from the source store, which is closed by then and does not own it."
                   (push (list name parent ids new) unified))
                 (setf (node-type-id meta) new)
                 (setf (gethash new sub) meta)
-                (setf (gethash name sub) new)
-                ;; The keyword alias UPDATE-NODE-TYPE also writes; it is
-                ;; package-blind, which is #190, not this task's to fix.
-                (setf (gethash (intern (symbol-name name) :keyword) sub)
-                      new)))))))
+                (setf (gethash name sub) new)))))))
     (values schema (nreverse unified))))

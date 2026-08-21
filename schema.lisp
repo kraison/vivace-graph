@@ -250,6 +250,9 @@ schema.dat written before #190 and can point at a clobbered id."
   (let ((sub (gethash parent (schema-type-table (schema graph))))
         (matches nil))
     (when sub
+      ;; Unlocked MAPHASH, like ALL-NODE-TYPES / SCHEMA-DIGEST: a schema
+      ;; mutation racing this scan can transiently miss or double-see an
+      ;; entry.  Accepted exposure, not a bug (GH #190).
       (maphash (lambda (key value)
                  (when (and (symbolp key) (not (keywordp key))
                             (integerp value)

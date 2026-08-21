@@ -793,6 +793,32 @@ symbols."
       ;; is not satisfiable by leaving the order alone.
       (is (not (equal names sorted))))))
 
+(test renumber-schema-writes-no-keyword-alias
+  "GH #190: RENUMBER-SCHEMA must not persist the package-blind keyword
+alias UPDATE-NODE-TYPE stopped writing.  %TS-SCHEMA-OF's fixture is
+triple-keyed the OLD way (id/symbol/keyword), matching what a pre-#190
+schema.dat looks like on disk; after renumbering, only id and symbol
+keys may remain.  Nearest wrong implementation: restoring the
+'(SETF (GETHASH (INTERN (SYMBOL-NAME NAME) :KEYWORD) SUB) NEW)' line
+RENUMBER-SCHEMA used to end with -- this test fails immediately if
+that line comes back."
+  (with-temp-directory (sysdir)
+    (let* ((graph-db::*system-directory* (namestring sysdir))
+           (graph-db::*type-registry* nil)
+           (registry (graph-db::ensure-type-registry))
+           (names '(ts-nokw-a ts-nokw-b ts-nokw-c))
+           (schema (%ts-schema-of names :vertex)))
+      (graph-db::renumber-schema schema registry)
+      (let ((sub (gethash :vertex (graph-db::schema-type-table schema)))
+            (saw-keyword nil))
+        (maphash (lambda (key value)
+                   (declare (ignore value))
+                   (when (keywordp key) (setq saw-keyword key)))
+                 sub)
+        (is (null saw-keyword)
+            "sub-table must hold no keyword keys after renumbering, ~
+found ~S" saw-keyword)))))
+
 (test minting-order-breaks-ties-on-the-package
   "Two packages' same-named symbols are exactly what the image-level registry
 made ordinary (GH #186), and a sort on SYMBOL-NAME alone leaves their order to
