@@ -92,6 +92,8 @@ taking `LOCK_SH` would add a second code path plus a mode check on every mutatin
 point, to serve a consumer that does not exist. Anything wanting to inspect a live system
 reads the files directly, outside the API and at its own risk.
 
+The obvious objection — that this strands #170's lease-holder — does not hold. See §8.1.
+
 ### 5.2 errno must be read
 
 `flock` returning −1 must distinguish `EWOULDBLOCK`/`EAGAIN` — held, the expected case —
@@ -133,13 +135,51 @@ guard test that passes with the guard removed proves nothing.
 - **#191, the torn journal tail.** Same file, unrelated failure: #182 is two live
   processes, #191 is one process losing power. Folding them together would put an
   exclusion bug and a durability bug in one diff.
-- **The lease escape hatch for #170.** The contract is that a lease-holding process never
-  opens the clock directory at all. That is #170's to honour; this unit makes violating it
-  loud. **Open question flagged for #170:** if a lease-holder ever needs to read the
-  lifecycle journal, this design blocks it, and #170 must then either take the journal
-  through the owning image or revisit §5.1.
+- **#170's detach protocol.** This unit makes a violation of its contract loud; it does not
+  implement it. See §8.1 — the contract is not merely compatible with exclusive-only
+  locking, it is forced by it.
 - **Global type registry placement (#186).** The registry lands in this directory and
   inherits this protection; it is not designed here.
+
+### 8.1 Why exclusive-only does not constrain #170
+
+Recorded because it looks like a conflict and is not, and the reasoning is otherwise
+re-derived every time someone reads §5.1.
+
+A lease-holder does **not** need the clock directory, and cannot be given it. What
+`clock-lease-epochs` hands out is a range `[start, end)` that the owning clock has
+**already skipped past** — so no coordination with the clock is possible or required for
+the lifetime of the lease. That is the whole mechanism. The holder needs a number range and
+a directory to write a shadow generation into; both are handed to it at detach.
+
+Journal access is already gated on holding the directory, by construction rather than by
+convention: `journal-append` takes a `clock` as its first argument, and a `system-clock`
+struct is produced only by `open-system-clock`. The sole in-tree caller
+(`transactions.lisp:3000`) sits inside `attach-to-system-clock`, in the owning image.
+
+The case that appears to break this is **who records `:SWAP`**. The holder cannot: §8 of
+the namespaces design defines reattach as an atomic swap *plus a brief quiesce*, and
+quiescing means refusing new pins and draining in-flight ones against live node objects,
+buffer-pool pages and mmap handles held **by the owning image**. Only the owner can do
+that, so the swap is necessarily an owning-image operation and records its own journal
+entry. The holder signals "shadow ready" out of band.
+
+Two adjacent cases, for completeness:
+
+- **The holder crashes mid-load.** Nobody needs to know how many epochs it consumed: the
+  owning clock skipped the entire range at lease time. Unused epochs are wasted, which at
+  64 bits is free. No journal read is required to reconcile.
+- **The holder outlives an owning-image restart.** The restarted image must learn a lease
+  is outstanding, so it reads the journal *while holding the lock*. Sequential access, not
+  concurrent.
+
+Note also that the namespaces design's §8 makes **in-process** detach the primary case —
+*"In-process detach becomes viable for the first time... The epoch lease still accommodates
+out-of-process later without redesign."* In-process, the holder **is** the owning image and
+no exclusion question arises at all.
+
+**Left to #170:** an out-of-process holder should persist its lease range in its own shadow
+directory, so the range survives the holder's own restart without consulting the clock.
 
 ## 9. Acceptance
 
