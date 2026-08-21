@@ -47,6 +47,10 @@
            #:registry-id-for
            #:registry-intern
            #:registry-entries
+           #:*system-directory*
+           #:*type-registry*
+           #:system-directory-required
+           #:system-directory-required-operation
            #:tm-next-epoch
            #:tm-current-epoch
            #:tm-peek-epoch

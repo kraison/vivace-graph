@@ -479,11 +479,12 @@ past the call and often outside any *GRAPH* binding."
 against THAT graph's schema, even when the ambient *GRAPH* is a different graph
 whose schema maps the same type-id to a different class.
 
-Type-ids are per-graph -- assigned by class-registration order -- so the SAME
-integer names different classes in different graphs.  MG-PLAIN is the only user
-class in :MG-ALPHA and MG-TEXT the only one in :MG-BETA, so both are type-id 1
-(the test asserts that collision as a precondition, so a future registration-order
-change reports itself rather than silently no longer exercising the bug).
+Type-ids are system-wide as of #186, so MG-PLAIN and MG-TEXT can no longer
+collide on one integer -- the original collision this test reproduced is gone
+by construction, and the assertion below pins that.  What remains, and is what
+the test now guards, is that the id is resolved against the graph the caller
+NAMED: gb's schema has no entry for ga's id at all, so a read that consults
+the ambient graph materializes nothing or the wrong thing.
 
 This is the reachable form of the wrong-graph materialization class in issue #53.
 It was demonstrated in production: a forensics ACLED-EVENT (type-id 3) read while
@@ -503,18 +504,19 @@ cached with its correct class, so only a from-disk read exercises the deserializ
              (progn
                (let ((*graph* ga))
                  (with-transaction () (setf id (id (make-mg-plain :label "a1")))))
-               ;; precondition: one type-id, two different classes across the graphs
                (setf tid (graph-db::node-type-id
                           (graph-db::lookup-node-type-by-name 'mg-plain :vertex :graph ga)))
                (is (eq 'mg-plain (graph-db::node-type-name
                                   (graph-db::lookup-node-type-by-id tid :vertex :graph ga)))
-                   "precondition: type-id ~D must be MG-PLAIN in ga" tid)
-               (is (eq 'mg-text (graph-db::node-type-name
-                                 (graph-db::lookup-node-type-by-id tid :vertex :graph gb)))
-                   "PRECONDITION FAILED: type-id ~D is not MG-TEXT in gb (~S); registration ~
-                    order changed and this test no longer collides"
-                   tid (let ((m (graph-db::lookup-node-type-by-id tid :vertex :graph gb)))
-                         (and m (graph-db::node-type-name m))))
+                   "type-id ~D must be MG-PLAIN in ga" tid)
+               ;; #186: one id, one class, system-wide -- gb cannot name a
+               ;; different class with ga's id, and here names none at all.
+               (is (not (eq 'mg-text
+                            (let ((m (graph-db::lookup-node-type-by-id
+                                      tid :vertex :graph gb)))
+                              (and m (graph-db::node-type-name m)))))
+                   "type-id ~D must not be MG-TEXT in gb: type-ids are ~
+                    system-wide since #186" tid)
                ;; force a from-disk read so the cache can't hand back the correctly
                ;; classed object written above
                (close-graph ga :snapshot-p t)

@@ -515,6 +515,7 @@ cl-temporal-extent."
                (:file "mvcc-tests")
                (:file "system-clock-tests")       ; GH #168
                (:file "type-registry-tests")      ; GH #186
+               (:file "global-type-id-tests")     ; GH #186
                (:file "posix-tests")              ; GH #182
                (:file "rest-tests")
                (:file "rest-http-tests")

@@ -479,6 +479,45 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Changed
 
+- **BREAKING: type-ids are assigned system-wide, and a system directory is
+  now mandatory** (#186). `graph-db:*system-directory*` names the directory
+  holding this system's shared state; type-ids are assigned there, in an
+  append-only registry (`type-registry.log`) keyed on the package-qualified
+  type name, in place of each graph's own counter. One type name therefore
+  means one id in every store of the system, and no two names share an id.
+  Vertices and edges remain separate id spaces.
+
+  **The special has no default and is required.** `make-graph` and
+  `open-graph` signal the new `graph-db:system-directory-required` when it is
+  `nil`. There is deliberately no per-graph fallback: two id regimes drifting
+  apart unnoticed is the failure the registry exists to prevent, and a
+  fallback would make the divergence invisible. Set it once, from your
+  application's configuration, before opening anything:
+  `(setf graph-db:*system-directory* "/var/lib/my-system/")`.
+
+  Existing stores keep the ids already written into their nodes — reopening
+  one replays its persisted schema and does not renumber. Adopting the
+  registry for a system whose stores were numbered independently is a
+  separate migration (still #186) and is not done by this change.
+
+  A store's type-ids are now **sparse**: it holds the ids of its own types,
+  wherever those landed in the system's numbering, not a dense run from 1.
+  Code that enumerated types by counting from 0 to the schema's `next-*-id`
+  must enumerate the schema's actual ids instead; `gc.lisp`'s mark phase did
+  exactly that and now uses `list-vertex-types`/`list-edge-types`. The type
+  index is sized by the highest id a store holds rather than by how many
+  types it has.
+
+- **BREAKING: a node class may now be defined for more than one graph**
+  (#186). The cross-graph name check existed only because type-ids were
+  per-graph; with a system-wide id space it has no job, so it and its call
+  are gone. `duplicate-node-class-error` is no longer signalled by anything.
+  The condition remains exported so existing handlers still compile. Note
+  that both definitions define the *same* CLOS class, so the last one loaded
+  determines its slots — keep them identical, or use different type names.
+  See the manual, Chapter 17, "Class names are global, and one class may
+  serve several stores".
+
 - **The temporal algebra now lives in its own library**,
   [cl-temporal-extent](https://github.com/kraison/cl-temporal-extent) (#159).
   Bounds, extents, the Allen relations and the standing vocabulary never

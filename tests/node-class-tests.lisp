@@ -260,18 +260,10 @@ made this test fail on ECL against perfectly correct code."
         (graph-db::node-vector-index-slots (find-class name)))))
 
 ;;; One CL class namespace, per-graph schemas (GH #53): DEF-VERTEX/DEF-EDGE
-;;; share the CL class namespace across graphs, so a second graph reusing a
-;;; name used to silently clobber the first class's slots.
-
-(test duplicate-class-name-across-graphs-errors
-  "One CL class namespace, per-graph schemas: a second graph reusing a name
-silently clobbered the first class's slots (GH #53)."
-  (eval '(def-vertex dupchk-thing () ((alpha :type string)) :dupchk-one))
-  (signals duplicate-node-class-error
-    (eval '(def-vertex dupchk-thing () ((beta)) :dupchk-two)))
-  (is (member 'alpha (mapcar #'graph-db::slot-definition-name
-                             (graph-db::class-slots (find-class 'dupchk-thing))))
-      "the original class must be untouched -- the guard runs before DEFCLASS"))
+;;; share the CL class namespace across graphs.  The cross-graph name check
+;;; that used to refuse this is gone as of #186 -- it existed only because
+;;; type-ids were per-graph -- so a class may now be defined for more than
+;;; one store; see GLOBAL-TYPE-ID-SUITE.
 
 (test same-graph-redefinition-still-allowed
   "Runtime schema evolution must keep working; the check is on graph-name
@@ -322,15 +314,15 @@ duplicates costs an instantiation per historical version, forever (GH #53)."
       "and the surviving entry must be the NEWEST definition"))
 
 (test redefinition-keeps-type-id-stable
-  "Registry position drives type-id assignment: UPDATE-SCHEMA replays the list in
-order on graph open and INSTANTIATE-NODE-TYPE hands out ids in that order, so a
-redefined type that moved would get a DIFFERENT type-id on a fresh graph -- and
-type-ids travel on the peer wire (GH #53)."
+  "A redefinition must not renumber the type: its id is already written into
+every node of that type on disk, and it travels on the peer wire (GH #53).
+Since #186 the id is the system registry's id for the type's NAME, so this
+asserts against the registry rather than against a per-graph counter -- and
+covers INSTANTIATE-NODE-TYPE's redefinition branch, which must keep the id
+the store already holds instead of re-interning."
   (setf (gethash :tidchk-graph *schema-node-metadata*) nil)
   (eval '(def-vertex tidchk-a () ((x)) :tidchk-graph))
   (eval '(def-vertex tidchk-b () ((y)) :tidchk-graph))
-  ;; Redefine the FIRST-declared type last; it must not drift to the end.
-  (eval '(def-vertex tidchk-a () ((x) (z)) :tidchk-graph))
   (with-temp-directory (dir)
     (let ((g (make-graph :tidchk-graph (namestring dir) :buffer-pool-size 1000)))
       (unwind-protect
@@ -339,11 +331,22 @@ type-ids travel on the peer wire (GH #53)."
                                                             :graph g)))
                  (id-b (graph-db::node-type-id
                         (graph-db::lookup-node-type-by-name 'tidchk-b :vertex
-                                                            :graph g))))
-             (is (= 1 id-a)
-                 "the first-declared type keeps type-id 1 across a redefinition, got ~a"
-                 id-a)
-             (is (= 2 id-b) "the second-declared type keeps type-id 2, got ~a" id-b))
+                                                            :graph g)))
+                 (r (graph-db::ensure-type-registry)))
+             (is (= id-a (graph-db::registry-id-for r 'tidchk-a :vertex))
+                 "the store's id for TIDCHK-A is the registry's, got ~a" id-a)
+             (is (/= id-a id-b) "two types never share an id")
+             ;; Redefine with the graph OPEN, so the redefinition branch runs
+             ;; against a store that already has an id for this type.
+             (eval '(def-vertex tidchk-a () ((x) (z)) :tidchk-graph))
+             (is (= id-a (graph-db::node-type-id
+                          (graph-db::lookup-node-type-by-name 'tidchk-a :vertex
+                                                              :graph g)))
+                 "a redefinition must not change the type-id, was ~a" id-a)
+             (is (= id-b (graph-db::node-type-id
+                          (graph-db::lookup-node-type-by-name 'tidchk-b :vertex
+                                                              :graph g)))
+                 "and must not disturb its neighbour's"))
         (ignore-errors (close-graph g :snapshot-p nil))
         (collect-garbage)))))
 

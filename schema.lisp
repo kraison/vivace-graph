@@ -146,17 +146,22 @@ persisted type-ids (unlike re-running INIT-SCHEMA from scratch)."
     (setf (schema-class-locks schema) locks)
     schema))
 
-(defmethod get-next-type-id ((schema schema) parent)
-  (with-recursive-lock-held ((schema-lock schema))
-    (cond ((or (eql parent :edge) (eql parent 'edge))
-           (prog1
-               (schema-next-edge-id schema)
-             (incf (schema-next-edge-id schema))))
-          ((or (eql parent :vertex) (eql parent 'vertex))
-           (prog1
-               (schema-next-vertex-id schema)
-             (incf (schema-next-vertex-id schema))))
-          (t (error "Unknown parent type ~S" parent)))))
+(defun %normalize-parent-type (parent)
+  (cond ((or (eql parent :edge) (eql parent 'edge)) :edge)
+        ((or (eql parent :vertex) (eql parent 'vertex)) :vertex)
+        (t (error "Unknown parent type ~S" parent))))
+
+(defun assign-type-id (name parent)
+  "The type-id for NAME under PARENT, minted if this system has not seen it
+before.  Ids come from the image-level registry, not the per-graph counters
+this replaced, so one symbol names one id in every store of the system and no
+two symbols share one (GH #186).  Keyed on the package-qualified symbol.
+
+REGISTRY-INTERN, never REGISTRY-ID-FOR: the latter is lock-free, so its NIL
+is a hint, not proof of absence, and only INTERN re-reads under the lock.
+Signals SYSTEM-DIRECTORY-REQUIRED when *SYSTEM-DIRECTORY* is NIL."
+  (registry-intern (ensure-type-registry) name
+                   (%normalize-parent-type parent)))
 
 (defmethod schema-string-representation ((schema schema))
   "Return a string representation of SCHEMA. Two schemas with the same
@@ -231,17 +236,6 @@ replication for a quick schema compatibility check."
   (finalize-inheritance (find-class (node-type-name meta)))
   (save-schema (schema graph) graph))
 
-(defun %check-node-class-graph-unique (name graph-name)
-  "Signal if NAME is registered under a graph other than GRAPH-NAME. Keys on
-graph-name identity, not presence: a same-graph redefinition legitimately
-re-registers under the same key (GH #53)."
-  (maphash (lambda (gname metas)
-             (unless (equal gname graph-name)
-               (when (find name metas :key #'node-type-name)
-                 (error 'duplicate-node-class-error
-                        :name name :existing-graph gname :new-graph graph-name))))
-           *schema-node-metadata*))
-
 (defmacro def-node-type (name parent-types slot-specs graph-name &key keep-revisions)
   "Define a persistent node type NAME for the graph named GRAPH-NAME.  This is
 the machinery behind DEF-VERTEX and DEF-EDGE; you normally use those instead.
@@ -273,7 +267,8 @@ be defined before or after the graph is created."
                             (append s1 (list :initarg (intern (symbol-name (first s1)) :keyword))))))
                     slot-specs))
       `(progn
-         (%check-node-class-graph-unique ',name ',graph-name)
+         ;; No cross-graph uniqueness check: type-ids are system-wide as of
+         ;; #186, so one class may be instantiated in more than one store.
          (defclass ,name (,@parent-types)
            (,@slot-specs)
            (:metaclass node-class))
@@ -507,8 +502,14 @@ Example:
       (when (typep cl 'node-class) (%invalidate-node-class-caches cl)))
     ;; Check if this type exists and if it differs from old spec
     (log:debug "Looking up ~A: ~A ~A" meta (node-type-name meta) (node-type-parent-type meta))
+    ;; :GRAPH GRAPH, not the ambient *GRAPH*: this branch decides whether the
+    ;; type is new TO THIS STORE, and since #186 that decides whether it takes
+    ;; the store's existing id or asks the registry for one.  *GRAPH* is bound
+    ;; to GRAPH on the open/create paths but is NIL (or another store) when a
+    ;; DEF-VERTEX is evaluated at runtime against an already-open graph.
     (let ((old-meta (lookup-node-type-by-name (node-type-name meta)
-                                              (node-type-parent-type meta))))
+                                              (node-type-parent-type meta)
+                                              :graph graph)))
       (if (node-type-p old-meta)
           (multiple-value-bind (changes-p new-slots removed-slots)
               (node-type-diff old-meta meta)
@@ -522,14 +523,21 @@ Example:
                              (node-type-name meta) new-slots)
                   (update-node-type meta graph))
                 old-meta))
-          ;; Else if new, assign node-type-id
+          ;; Else new TO THIS STORE: the id comes from the system-wide
+          ;; registry, keyed on the type's NAME (GH #186).  Assigned here and
+          ;; not in UPDATE-NODE-TYPE because only this branch knows the store
+          ;; has no id of its own yet -- the redefinition branch above must
+          ;; keep the one already written into every node of that type.
+          ;; Unconditional: META is the object in *SCHEMA-NODE-METADATA*,
+          ;; shared by every store that defines this type, so any id already
+          ;; on it belongs to whichever store instantiated it first.
           (progn
             (setf (gethash (node-type-name meta)
                            (schema-class-locks (schema graph)))
                   (make-rw-lock))
             (setf (node-type-id meta)
-                  (get-next-type-id (schema graph)
-                                    (node-type-parent-type meta)))
+                  (assign-type-id (node-type-name meta)
+                                  (node-type-parent-type meta)))
             (update-node-type meta graph))))))
 
 

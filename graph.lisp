@@ -365,8 +365,18 @@ Keyword arguments:
                           Attaching raises the clock above this store's
                           persisted highest id.
 
+GRAPH-DB:*SYSTEM-DIRECTORY* must be set before calling this: type-ids are
+assigned from the registry that lives there, so that one symbol names one id
+in every store of the system (GH #186).  SYSTEM-DIRECTORY-REQUIRED is
+signalled when it is NIL -- there is deliberately no per-graph fallback.
+
 A .dirty marker file is written on creation; always CLOSE-GRAPH to flush data
 to disk and remove it."
+  ;; Type-ids come from the system's registry, which lives in
+  ;; *SYSTEM-DIRECTORY*; refuse rather than mint ids no peer agrees with
+  ;; (GH #186).
+  (unless *system-directory*
+    (error 'system-directory-required :operation 'make-graph))
   (when (and replay-txn-dir (not slave-p))
     (error ":REPLAY-TXN-DIR is only for slave graphs"))
   (when (and (or slave-p master-p) (not replication-port))
@@ -530,7 +540,12 @@ the backup/recovery chapter).  By default the heap is garbage-collected
 (:GC-HEAP-P) and outstanding transactions are recovered on open.  Views are
 reconciled against their declarative definitions and kept as-is unless changed
 (see DEF-VIEW); pass :REGENERATE-VIEWS T to force-rebuild every view on open.
-Always CLOSE-GRAPH when finished."
+Always CLOSE-GRAPH when finished.
+
+*SYSTEM-DIRECTORY* must be set: reopening replays the schema and may assign
+ids to types added since (GH #186)."
+  (unless *system-directory*
+    (error 'system-directory-required :operation 'open-graph))
   (when (and peer-role (or master-p slave-p))
     (error ":PEER-ROLE is mutually exclusive with :MASTER-P / :SLAVE-P"))
   (when (and peer-role (not (member peer-role '(:hub :device))))

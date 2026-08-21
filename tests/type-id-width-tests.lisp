@@ -176,11 +176,27 @@
                (is (= 30 offset))))
         (graph-db::munmap-file mf)))))
 
-(test schema-can-assign-a-type-id-above-16-bits
-  (let ((s (graph-db::make-schema)))
-    (setf (graph-db::schema-next-vertex-id s) 70000)
-    (is (= 70000 (graph-db::get-next-type-id s :vertex)))
-    (is (= 70001 (graph-db::schema-next-vertex-id s)))))
+(test the-registry-can-assign-a-type-id-above-16-bits
+  "Assignment moved from the per-graph counter to the system registry (#186);
+the id it hands out must still span the full 32-bit type-id field."
+  (with-temp-directory (dir)
+    ;; Seed through the FILE, not the struct slot: REGISTRY-INTERN re-reads
+    ;; under its lock and recomputes the next id from what is on disk, so a
+    ;; slot poked in memory would be discarded before the assignment.
+    (with-open-file (out (merge-pathnames "type-registry.log" dir)
+                         :direction :output :if-does-not-exist :create)
+      (let ((*package* (find-package :keyword))
+            (*print-pretty* nil))
+        (format out "~S~%" (list :symbol 'tiw-seed :parent :vertex
+                                 :id 69999))))
+    (let ((r (graph-db::open-type-registry (namestring dir))))
+      (unwind-protect
+           (progn
+             (is (= 69999 (graph-db::registry-id-for r 'tiw-seed :vertex))
+                 "a persisted id above 16 bits reads back intact")
+             (is (= 70000 (graph-db::registry-intern r 'tiw-wide :vertex))
+                 "and assignment continues above it"))
+        (graph-db::close-type-registry r)))))
 
 (test prev-pointer-offset-lands-on-prev-pointer
   ;; The reaper patches this window in place; a wrong offset is invisible for

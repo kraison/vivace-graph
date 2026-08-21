@@ -55,6 +55,19 @@ is single-graph; use one transaction per graph."
 cannot redefine it for ~A. Class names are global; remove the old definition ~
 to re-home it." name existing-graph new-graph)))))
 
+(define-condition system-directory-required (error)
+  ;; *SYSTEM-DIRECTORY* is where the type-id registry lives; a store opened
+  ;; without one would mint ids no other store in the system agrees with
+  ;; (GH #186).
+  ((operation :initarg :operation :initform nil
+              :reader system-directory-required-operation))
+  (:report (lambda (error stream)
+             (format stream "~@[~A: ~]GRAPH-DB:*SYSTEM-DIRECTORY* is NIL. ~
+Type-ids are assigned from the system-wide registry that lives there, so a ~
+store cannot be created or opened without it.  Bind or SETF ~
+*SYSTEM-DIRECTORY* to your system's directory (GH #186)."
+                     (system-directory-required-operation error)))))
+
 (define-condition stale-revision-error (error)
   ((instance :initarg :instance)
    (current-revision :initarg :current-revision))

@@ -76,10 +76,12 @@
     idx))
 
 (defun %ti-ensure-capacity (idx type-id)
-  "Grow IDX's table so TYPE-ID has a slot.  Type-ids are assigned sequentially
-from 1 (schema.lisp), so most stores never call this: the table is sized at
-open for the types actually in use (+TYPE-INDEX-INITIAL-TYPES+), not the id
-ceiling.  Doubles the capacity until TYPE-ID fits and extends the mmap in
+  "Grow IDX's table so TYPE-ID has a slot.  Type-ids come from the system-wide
+registry (schema.lisp's ASSIGN-TYPE-ID, #186), so a store's ids are SPARSE:
+the table is sized for the highest id it holds, not the count of its types,
+and never for the id ceiling.  Most stores still never call this -- the
+initial +TYPE-INDEX-INITIAL-TYPES+ slots cover a system with that many types.
+Doubles the capacity until TYPE-ID fits and extends the mmap in
 place via EXTEND-MAPPED-FILE (mmap.lisp) -- the same primitive
 GROW-MEMORY/ACQUIRE-OVERFLOW-BUCKET use for the heap and the linear hash, not
 the vector-segment's relocating grow: that one moves the mapping's base

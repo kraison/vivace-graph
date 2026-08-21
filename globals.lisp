@@ -75,11 +75,24 @@ application's own config; graph-db does not read an ini file itself.")
 (alexandria:define-constant +data-file+ "data.dat" :test 'equal)
 
 (defvar *schema-node-metadata* (make-hash-table :test 'equal))
+
+(defvar *system-directory* nil
+  "Directory holding this SYSTEM's image-level state: the type-id registry
+(GH #186), a sibling of the optional system clock's files (#182).  It has no
+default and is MANDATORY -- MAKE-GRAPH and OPEN-GRAPH signal
+SYSTEM-DIRECTORY-REQUIRED when it is NIL rather than fall back to per-graph
+type-id counters, because two id regimes that diverge unnoticed is exactly
+what #186 exists to prevent.  Set it from your application's own config.")
+
+(defvar *type-registry* nil
+  "The open TYPE-REGISTRY for this image, opened from *SYSTEM-DIRECTORY* on
+first use by ENSURE-TYPE-REGISTRY and reopened whenever that changes.  Bind
+*SYSTEM-DIRECTORY*, not this.")
 ;; The type-id READ-PATH ceiling (schema.lisp's LOOKUP-NODE-TYPE-BY-ID
 ;; assert), not an allocation size -- TYPE-INDEX no longer preallocates by
 ;; this (#166; see +TYPE-INDEX-INITIAL-TYPES+ below).  Matches the type-id
 ;; field's full width: (UNSIGNED-BYTE 32), widened by #166's Task 1, so the
-;; counter (GET-NEXT-TYPE-ID) can never issue an id the read path then
+;; registry (ASSIGN-TYPE-ID, #186) can never issue an id the read path then
 ;; refuses.
 (alexandria:define-constant +max-node-types+ (expt 2 32))
 

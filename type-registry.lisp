@@ -190,3 +190,21 @@ would otherwise assign it different ids, or one id to two symbols (#186)."
                  (or (registry-id-for registry symbol parent)
                      (%registry-assign registry symbol parent)))
             (%posix-close fd))))))
+
+(defvar *registry-open-lock* (make-lock "type registry open"))
+
+(defun ensure-type-registry ()
+  "The type registry for this image, opened from *SYSTEM-DIRECTORY* on first
+use and reopened whenever that changes (tests rebind it per store).  Signals
+SYSTEM-DIRECTORY-REQUIRED when it is NIL: assignment has nowhere authoritative
+to go, and a per-graph fallback would silently reintroduce the divergence #186
+removes."
+  (let ((dir *system-directory*))
+    (unless dir
+      (error 'system-directory-required :operation 'ensure-type-registry))
+    (with-lock-held (*registry-open-lock*)
+      (unless (and *type-registry*
+                   (equal (pathname (type-registry-location *type-registry*))
+                          (pathname dir)))
+        (setf *type-registry* (open-type-registry dir)))
+      *type-registry*)))

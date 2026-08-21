@@ -211,8 +211,14 @@ With our schema defined, we can connect to the database. We will store our graph
 
 The global special variable ~*graph*~ must be bound to the active graph instance. A common pattern is to check if the database exists and either create a new one or open the existing one.
 
+Before opening any graph, point ~*system-directory*~ at the directory holding
+this system's shared state — the type-id registry lives there, and graph-db
+refuses to create or open a store without it (see Chapter 17, "The system
+directory is mandatory").
+
 #+BEGIN_SRC lisp
   (defvar *my-graph-path* "/var/tmp/social-app/")
+  (setf graph-db:*system-directory* "/var/tmp/social-app-system/")
   
   (defun connect-to-database ()
     "Creates a new graph or opens an existing one."
@@ -425,14 +431,16 @@ For these primary node tables, the *key* is the node's 16-byte UUID, and the *va
 
 ~type-id~ widened from 2 to 4 bytes in v3, which breaks the byte-for-byte prefix the v1 and v2 heads used to share (both had ~flags(1) type-id(2) ...~); a v2 head must be read with ~deserialize-node-head-v2~, not reinterpreted against the v3 layout in place. ~data-pointer~ is the all-important offset to the node's data in the heap file; ~commit-epoch~ and ~prev-pointer~ drive the versioning machinery described in Chapter 12, "MVCC: Immutable Versioned Nodes". The on-disk storage version is recorded in each memory-mapped region; opening a v1 *or v2* graph with a v3 build signals an error directing you to ~migrate-graph~ (see "Migrating an older graph to v3" in Chapter 12).
 
-*A wider ceiling, still per graph.* The 4-byte field raises the number of
-distinct node types one graph can register from 65,536 to 4,294,967,295 — in
-practice unreachable, since each registered type is also a finalized CLOS
-class. This is *not* a global type-id space: ids are still assigned
-independently by each graph's own schema, starting from 1, so the same
-numeric type-id can (and typically does) mean a different class in two
-different graphs. A future change to make type-ids global and distributed is
-tracked separately (GH #186) and has not landed.
+*A wider ceiling, and now a system-wide one.* The 4-byte field raises the
+number of distinct node types a system can register from 65,536 to
+4,294,967,295 — in practice unreachable, since each registered type is also a
+finalized CLOS class. As of GH #186 the id space is *system-wide*, not per
+graph: ids are assigned by the registry in ~*system-directory*~, keyed on the
+package-qualified type name, so one name means one id in every store of the
+system and no two names ever share an id. Vertices and edges remain separate
+id spaces, as they were per graph. Before #186 each graph counted from 1
+independently, so the same integer typically named a different class in two
+graphs; see Chapter 17, "The system directory is mandatory".
 
 *** The Type Index (~type-index.lisp~): finding nodes by type
 
@@ -454,16 +462,20 @@ and grows by doubling, in place, the first time a type-id past its current
 capacity is touched. "In place" is the operative property — growth extends
 the memory-mapped file and never relocates its base address, so a concurrent
 reader is never at risk of dereferencing a pointer the grow just moved out
-from under it. Because type-ids are assigned sequentially from 1, ordinary
-schemas never grow the index more than once or twice, if at all.
+from under it. Since #186 a store's type-ids are *sparse* — they come from
+the system-wide registry, so a store holds the ids of its own types, not a
+dense run from 1 — and the index is sized by the highest id it holds rather
+than by how many types it has. The initial 4,096 slots therefore cover a
+*system* of that many types; a store in a larger system grows its index once
+or twice, which costs one in-place extension each.
 
 Growth is not unbounded: the index's mmap reserves address space at the 1 GiB
 floor (~*mmap-min-reservation*~), and doubling from 4,096 types reaches 2^25
 (33,554,432) types cleanly but the next doubling would exceed that
 reservation, so ~extend-mapped-file~ signals ("mmap reservation exhausted")
 rather than growing past it. That is a loud failure, not silent corruption,
-and it is unreachable in practice while type-ids stay per-graph and are
-handed out sequentially from 1.
+and it is unreachable in practice: reaching it needs a system that has
+registered 2^25 distinct type names.
 
 *Lock striping.* Every push/remove against a type's index-list is serialized
 by a lock. Before #166 that was one mutex *per type-id* — 65,536 of them per
@@ -2829,32 +2841,78 @@ One consequence worth knowing: a node retained past its graph's ~close-graph~ no
 dereferences an unmapped heap rather than silently decoding whatever lies at that offset
 in another graph's file. Do not hold nodes across a close.
 
-*** Class names are global
+*** Class names are global, and one class may serve several stores
 
-Common Lisp has one class namespace, so a node class name must be unique across *all*
-graph schemas. Defining the same name for a second graph signals
-~duplicate-node-class-error~. Redefining a type under the *same* graph name remains
-legal — that is ordinary schema evolution and works at runtime.
+Common Lisp has one class namespace, so a node class name names one class
+across *all* graph schemas. Since GH #186 that class may be defined for more
+than one graph — ~(def-vertex user () (...) :store-a)~ and ~(def-vertex user ()
+(...) :store-b)~ — and both stores hold the same type-id for it, because the id
+comes from the system registry rather than each store's own counter. Redefining
+a type under the same graph name remains legal: ordinary schema evolution, at
+runtime.
 
-Previously a second definition silently replaced the first class's slots, leaving the
-first graph's stored data unreachable through the API while still on disk.
+Both definitions define the *same CLOS class*, so the last one loaded
+determines its slots; declaring different slot sets for the two stores is how
+you get a class whose accessors return ~NIL~ against one of them. Keep the
+definitions identical, or give the two stores different type names.
+
+Before #186 the second definition signalled ~duplicate-node-class-error~,
+because the two stores would otherwise have disagreed about what their type-ids
+meant. That check is gone and the condition is no longer signalled (the symbol
+remains exported, so existing handlers still compile). Before that check
+existed, the second definition silently replaced the first class's slots,
+leaving the first graph's stored data unreachable through the API while still
+on disk.
 
 *** ~*transaction*~ is NIL inside a read-only snapshot
 
-~with-read-snapshot~ (and ~select~/~do-query~ with ~:snapshot t~) records its snapshot per
-graph in ~*read-snapshots*~ rather than binding ~*transaction*~, so code that reads
-~*transaction*~ to tell whether it is inside a query sees ~NIL~ there. Call
-~(read-transaction &optional graph)~ instead: it returns the read-write ~*transaction*~ when
-one is active and covers ~graph~, else ~graph~'s read snapshot from ~*read-snapshots*~, else
-~NIL~. This has second-order effects inside a snapshot: ~copy~ now signals
+~with-read-snapshot~ (and ~select~/~do-query~ with ~:snapshot t~) records its
+snapshot per graph in ~*read-snapshots*~ rather than binding ~*transaction*~,
+so code that reads ~*transaction*~ to tell whether it is inside a query sees
+~NIL~ there. Call ~(read-transaction &optional graph)~ instead: it returns the
+read-write ~*transaction*~ when one is active and covers ~graph~, else
+~graph~'s read snapshot from ~*read-snapshots*~, else ~NIL~. This has
+second-order effects inside a snapshot: ~copy~ now signals
 ~no-transaction-in-progress-warning~, ~commit~/~rollback~ now signal
-~no-transaction-in-progress~, and ~make-<type>~/~mark-deleted~ now auto-wrap their own real,
-committing transaction instead of silently joining a snapshot that was never going to
-commit.
+~no-transaction-in-progress~, and ~make-<type>~/~mark-deleted~ now auto-wrap
+their own real, committing transaction instead of silently joining a snapshot
+that was never going to commit.
 
-Also note: ~graph~ is now a *reserved* slot name on node classes — it backs the ~:META~
-home-graph tracking slot described above. A user-defined slot named ~graph~ shadows it and
-silently disables home-graph tracking for that class; do not use it as a slot name.
+Also note: ~graph~ is now a *reserved* slot name on node classes — it backs the
+~:META~ home-graph tracking slot described above. A user-defined slot named
+~graph~ shadows it and silently disables home-graph tracking for that class; do
+not use it as a slot name.
+
+*** The system directory is mandatory
+
+Type-ids are assigned from an append-only *registry* shared by every store in a
+system, so that one type name means one id everywhere (GH #186). The registry
+lives in ~type-registry.log~ under the directory named by
+~graph-db:*system-directory*~, beside the optional system clock's files.
+
+That special has *no default*, and ~make-graph~/~open-graph~ signal
+~graph-db:system-directory-required~ when it is ~NIL~. This is deliberate: a
+store opened outside a system would have to mint ids from a private counter,
+and two id regimes drifting apart unnoticed is exactly what the registry exists
+to prevent. Set it from your application's own configuration, once, before
+opening anything:
+
+#+BEGIN_SRC lisp
+  (setf graph-db:*system-directory* "/var/lib/my-system/")
+#+END_SRC
+
+The registry is opened lazily on first use and reopened if you change the
+special. Assignment takes a short exclusive ~flock~ across its
+read-decide-append — only *assignment* serialises, so any number of images may
+read the registry concurrently, and ~type-registry-busy~ is signalled if
+another image holds the append lock. Reads of an already-assigned id take no
+lock at all.
+
+Two consequences worth knowing. A store's type-ids are *sparse*: it holds the
+ids of the types it defines, wherever those landed in the system's numbering,
+not a dense run from 1. And ids are never reused or renumbered — the registry
+is append-only, and reopening a store keeps the ids already written into its
+nodes.
 
 *** The image-level system clock (optional)
 
