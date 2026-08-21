@@ -3011,13 +3011,51 @@ nodes.
 
 *** Adopting global type-ids on an existing system
 
-A system whose stores predate the registry has a problem the registry cannot
-solve on its own: every store's schema counted type-ids from 1, so in any
-system with more than one store the low ids name *different* classes in
-different stores. Under one shared id space at most one store can keep a
-contested id, and the rest must be renumbered — and since ~type-id~ is
-written into the node head, the ~ve-key~, the ~vev-key~ and the type-index,
-renumbering a store means rewriting it.
+**One store, and nothing to do.** Opening a store reconciles its persisted
+type-ids with the registry before anything else happens. A type the registry
+has never seen, at an id no other type has claimed, is **adopted**: the
+registry records the id the store already uses. So a single-store deployment
+upgrading past #186 — set ~*system-directory*~ to a fresh directory, open —
+adopts its own ids on the first open and needs none of the procedure below.
+
+That reconciliation is not a nicety. Without it the registry would stay empty
+while the store kept its persisted ids, and the next release that adds one
+~def-vertex~ would mint an id the store already uses — silently overwriting
+one type's schema entry with another's, so every persisted node of the first
+type materialises as the second. It is also what makes the peer type table
+honest: the table is the registry while the wire carries store ids, and they
+agree only because this runs.
+
+**When the two cannot be reconciled, the open is refused.** If the registry
+gives the type a *different* id, or gives that id to a *different* type,
+~open-graph~ signals ~graph-db:store-registry-conflict~, naming both sides.
+That is not a retryable error and there is nothing an open may do about it:
+the losing id is already written into every node of its type. It means this
+store must be adopted deliberately, which is what the rest of this section is
+for.
+
+To *read* such a store meanwhile — a class census, a backup, the
+before-and-after of an adoption run — wrap the open in
+~graph-db:with-schema-frozen~, which opens the store exactly as it stands on
+disk, replaying no schema and checking no ids. Writes made through a frozen
+open go out under the *store's* ids, which is right for a legacy store and
+wrong for one you intend to keep in this system.
+
+#+BEGIN_SRC lisp
+  (let ((g (graph-db:with-schema-frozen ()
+             (graph-db:open-graph :my-app "/var/db/store-b/"))))
+    (unwind-protect (census g)
+      (graph-db:close-graph g :snapshot-p nil)))
+#+END_SRC
+
+**Several stores is the case that needs a decision.** A system whose stores
+predate the registry has a problem the registry cannot solve on its own: every
+store's schema counted type-ids from 1, so in any system with more than one
+store the low ids name *different* classes in different stores.
+Under one shared id space at most one store can keep a contested id, and the
+rest must be renumbered — and since ~type-id~ is written into the node head,
+the ~ve-key~, the ~vev-key~ and the type-index, renumbering a store means
+rewriting it.
 
 This is measured, not assumed. On a five-store system read straight off disk:
 66 vertex type names competing for 36 distinct ids, 11 of those ids claimed
@@ -3065,6 +3103,11 @@ Plan the run: each renumbering is a ~migrate-graph~, so the transient disk
 and the deployment gate described in Chapter 12 apply to every store in the
 list, and each store is written to a *new* location, leaving the source
 rollback-able.
+
+Until a store in the renumber list has been migrated, opening it under the
+seeded registry is refused — deliberately: its ids no longer mean what the
+system says they mean. Read it with ~with-schema-frozen~ if you need to, and
+migrate it when you are ready.
 
 **Renumber once, then distribute — do not renumber twice and hope.** The
 registry is persisted and *distributed*, not recomputed: hosts read it, none
@@ -4206,6 +4249,12 @@ This chapter provides a categorized reference for the most important exported sy
 
 - ~migrate-graph (name old-location new-location &key package include-deleted-p renumber-p)~ ::
   Migrates a v1 or v2 graph at ~old-location~ to the current (v3) format at ~new-location~, returning ~(values new-graph unified)~. A logical snapshot-and-replay; the original is left untouched. ~:renumber-p nil~ (default) preserves the source's type-ids; ~:renumber-p t~ takes them from the system registry instead and returns the names whose several ids it unified. See Chapter 12.
+
+- ~with-schema-frozen (() &body body)~ ::
+  Run BODY with schema replay and type-id reconciliation suppressed, so a store opens exactly as it stands on disk. The supported way to READ a store whose ids the registry contradicts — a census, a backup, the before-and-after of an adoption run. Writes made through a frozen open go out under the store's own ids. See Chapter 17.
+
+- ~store-registry-conflict~ (condition) ::
+  Signalled by ~open-graph~/~make-graph~ when a store's persisted type-id for a type is not the one the registry holds, or when the registry gives that id to another type. Not retryable: the losing id is already in every node head of its type. Readers: ~store-registry-conflict-location~, ~-type-name~, ~-parent~, ~-store-id~, ~-registry-id~, ~-holder~. The remedy is ~registry-seed-from-stores~ plus ~migrate-graph :renumber-p t~.
 
 - ~registry-seed-from-stores (registry locations)~ ::
   Seeds ~registry~ from the stores at ~locations~ (no graph is opened), adopting the largest store's type-ids and returning a ~seeding-report~ naming the stores that must now be migrated with ~:renumber-p t~. See Chapter 17, "Adopting global type-ids on an existing system".

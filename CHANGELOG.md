@@ -13,6 +13,29 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Added
 
+- **A store's persisted type-ids are reconciled with the registry at open,
+  or the open is refused** (#186). This is the invariant the rest of the unit
+  assumed and nothing established. `instantiate-node-type` keeps a persisted
+  id without telling the registry and mints a new one from a counter that has
+  never seen that store's ids, so the ordinary upgrade — open an existing
+  store under a fresh system directory, then ship one more `def-vertex` —
+  minted an id the store already used and `update-node-type` overwrote it:
+  every persisted node of the first type then materialised as the second,
+  silently. `reconcile-schema-with-registry` now runs before the schema
+  replay on every open. A type the registry has never seen, at an id nothing
+  else claims, is **adopted** (a single-store deployment therefore needs no
+  operator action at all); a type the registry gives a different id, or an id
+  it gives to a different type, signals the new
+  `graph-db:store-registry-conflict`, naming both sides and pointing at
+  `registry-seed-from-stores`. It is also what makes the peer type table
+  honest — the table is the registry while the wire carries store ids.
+
+- **`graph-db:with-schema-frozen`** (#186) opens a store exactly as it stands
+  on disk, replaying no schema and checking no ids. The supported way to
+  *read* a store the registry contradicts — a class census, a backup, the
+  before-and-after of an adoption run — which an ordinary open now refuses.
+  Writes made through a frozen open go out under the store's own ids.
+
 - **A replication handshake refuses a peer whose type registry disagrees**
   (#186). After `:auth-ok`, a device compares the hub's type table against
   this image's registry and signals
@@ -544,6 +567,30 @@ between releases; cutting a release renames it to the new version and dates it.
   so explicitly.
 
 ### Changed
+
+- **The hub resolves its type registry on the thread that starts
+  replication** (#186). A hub serves each device connection on a new thread,
+  and a new thread does not inherit dynamic bindings, so a session calling
+  `ensure-type-registry` read the *global* `*system-directory*` — `nil`, so
+  auth-ok failed on every connection and the device saw a closed socket, or
+  worse, another system's directory. `start-replication` now captures it on
+  the caller's thread (`peer-type-registry` on the graph).
+
+- **Seeding breaks a size tie on the store location** (#186).
+  `registry-seed-from-stores` ranked stores by heap high-water mark with a
+  `sort` that is not required to be stable, and equal marks are ordinary
+  (fresh or empty stores), so two images could rank one store set differently
+  and seed two different registries.
+
+- **The out-of-process harnesses set a system directory** (#186). Every
+  script under `tests/replication/`, `tests/peer-replication*/`, the
+  profiling modules and the `example.lisp` / `test.lisp` / `test-mop.lisp`
+  scratch files called `make-graph` without one and had been failing
+  outright since a system directory became mandatory; none of them is in the
+  FiveAM suite, so its green hid this. Each peer harness process now takes
+  its *own* system directory under `REPL_WORK`, which is what makes them
+  faithful: hub and device are separate images with separate registries that
+  agree because both evaluate one `schema.lisp`.
 
 - **The peer type table is the image's type registry, not one graph's
   schema** (#186). The `:type-table` string the hub ships in its `:auth-ok`

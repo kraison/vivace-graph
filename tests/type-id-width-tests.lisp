@@ -310,11 +310,12 @@ tables -- used to assert MIGRATE-GRAPH leaves OLD-LOCATION's DATA untouched.
 Excludes schema.dat and tx/: an ordinary open rewrites schema.dat
 (UPDATE-SCHEMA calls SAVE-SCHEMA on every open; same content, re-serialized)
 and creates a new empty tx/replication-*.log file (the transaction manager
-always opens one).  MIGRATE-GRAPH's own opens no longer rewrite schema.dat at
-all -- the schema replay is suppressed for both of them (#186) -- but the
-guard open in %READ-V2-GRAPH still does, so the exclusion stays.  Neither is
-data loss; both were confirmed to be the ONLY two things that change, by
-exhaustive diff during the #166 migration work.  Shells out (find +
+always opens one).  No open in these tests rewrites schema.dat any more --
+MIGRATE-GRAPH suppresses the replay for both of its own, and %READ-V2-GRAPH's
+guard open is frozen (#186) -- but the exclusion stays: it names what an
+ORDINARY open does, which is what the assertion is defending against.
+Neither is data loss; both were confirmed to be the ONLY two things that
+change, by exhaustive diff during the #166 migration work.  Shells out (find +
 sha256sum), the same portability boundary EXTRACT-V1-FIXTURE already accepts
 by shelling out to tar."
   (uiop:run-program
@@ -328,11 +329,17 @@ by shelling out to tar."
 uses) and return (values vertices knows likes) via %FIXTURE-VERTICES /
 %FIXTURE-EDGES.  Used both to capture MIGRATE-GRAPH's expected input and to
 confirm, post-migration, that OLD-LOCATION still opens at v2 and still holds
-every node -- the guarantee that actually backs the rollback story."
+every node -- the guarantee that actually backs the rollback story.
+
+FROZEN: a v2 store's ids are its own and this system's registry has no
+opinion on them, so an ordinary open would reconcile -- and refuse as soon as
+a caller has primed the registry (GH #186).  Reading a store the registry
+disagrees with is exactly what WITH-SCHEMA-FROZEN is for."
   (let ((graph-db::*node-head-reader* 'graph-db::deserialize-node-head-v2))
-    (let ((g (graph-db:open-graph :ti-mig-guard dir
-                                  :accept-versions '(2)
-                                  :gc-heap-p nil :buffer-pool-p nil)))
+    (let ((g (graph-db:with-schema-frozen ()
+               (graph-db:open-graph :ti-mig-guard dir
+                                    :accept-versions '(2)
+                                    :gc-heap-p nil :buffer-pool-p nil))))
       (unwind-protect
            (let ((graph-db::*graph* g))
              (values (%fixture-vertices g)
@@ -397,10 +404,14 @@ counterpart tests."
           (let (expected-type-ids)
             (let ((graph-db::*node-head-reader*
                    'graph-db::deserialize-node-head-v2))
-              (let ((old (graph-db:open-graph :ti-mig-guard old-dir
-                                              :accept-versions '(2)
-                                              :gc-heap-p nil
-                                              :buffer-pool-p nil)))
+              ;; FROZEN, like %READ-V2-GRAPH: reading a v2 source's own
+              ;; type-ids is exactly the read an ordinary open refuses once
+              ;; the registry has an opinion about those ids (GH #186).
+              (let ((old (graph-db:with-schema-frozen ()
+                           (graph-db:open-graph :ti-mig-guard old-dir
+                                                :accept-versions '(2)
+                                                :gc-heap-p nil
+                                                :buffer-pool-p nil))))
                 (unwind-protect
                      (setq expected-type-ids
                            (mapcar

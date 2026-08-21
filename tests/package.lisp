@@ -220,6 +220,10 @@
                 #:make-graph
                 #:open-graph
                 #:close-graph
+                ;; GH #186: the store/registry type-id agreement guard and
+                ;; the frozen open that reads a store it refuses.
+                #:store-registry-conflict
+                #:with-schema-frozen
                 #:with-transaction
                 #:*transaction*
                 #:transaction-id

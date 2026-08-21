@@ -189,6 +189,28 @@ lock of its own: %REGISTRY-LOAD's table swap (not a lock here) is what
 keeps this safe to call from any thread at any time."
   (gethash symbol (%registry-table registry parent)))
 
+(defun registry-ids-table (registry parent)
+  "A fresh id -> symbol table for PARENT.  %REGISTRY-ADOPT's precondition is
+that no OTHER symbol already holds the id, and REGISTRY-ID-FOR only answers
+the other direction; building this once beats rescanning the entries per
+type."
+  (let ((table (make-hash-table :test 'eql)))
+    (dolist (entry (type-registry-entries registry) table)
+      (destructuring-bind (symbol entry-parent id) entry
+        (when (eq entry-parent parent)
+          (setf (gethash id table) symbol))))))
+
+(defun registry-highest-id (registry parent)
+  "The highest id REGISTRY has ever handed out under PARENT, or 0.
+
+Derived from the counter, not from a scan: %REGISTRY-ASSIGN only ever hands
+out the counter's value, so nothing at or below this can be minted later,
+and an id ABOVE it is still free for the taking.  That is what makes it the
+test for whether an id a store occupies is safe (GH #186)."
+  (1- (ecase parent
+        (:vertex (type-registry-next-vertex registry))
+        (:edge   (type-registry-next-edge registry)))))
+
 (defun registry-entries (registry)
   "Every (SYMBOL PARENT ID) in REGISTRY, oldest first."
   (type-registry-entries registry))

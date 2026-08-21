@@ -253,6 +253,16 @@
                    :documentation "Branch B: surfaced field conflicts retained for the
                    app review surface (a list of PEER-CONFLICT for now; B3 makes it a
                    durable enumeration API + MVCC loser retention).")
+   (peer-type-registry :accessor peer-type-registry :initarg :peer-type-registry
+                       :initform nil
+                       :documentation "The image type registry, resolved on the thread
+                       that started replication.  A hub serves each connection on a NEW
+                       thread, which does not inherit dynamic bindings, so a session
+                       calling ENSURE-TYPE-REGISTRY would read the GLOBAL
+                       *SYSTEM-DIRECTORY* -- NIL (auth-ok then fails on every
+                       connection) or, worse, another system's directory.  Resolved once
+                       in START-REPLICATION instead (GH #186).  NIL falls back to
+                       ENSURE-TYPE-REGISTRY.")
    (peer-conflicts-lock :accessor peer-conflicts-lock :initform (make-recursive-lock "peer-conflicts"))
    (applied-op-ids :accessor applied-op-ids :initarg :applied-op-ids :initform nil
                    :documentation "Durable OP-ID -> lamport dedup index (WP-3), checked

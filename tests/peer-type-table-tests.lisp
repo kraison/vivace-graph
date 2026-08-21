@@ -484,3 +484,102 @@ on the first hierarchy refactor."
     (is (= 2 (length parsed)))
     (is (equal '(:vertex 1 "t-b" ("t-a")) (first parsed)))
     (is (equal '(:vertex 2 "t-a" nil) (second parsed)))))
+
+;;; ---------------------------------------------------------------------------
+;;; The call site, over a real socket
+;;;
+;;; Everything above drives PEER-DEVICE-ACCEPT-AUTH-OK directly, which cannot
+;;; tell whether PEER-SYNC still calls it.  The peer harnesses that would --
+;;; tests/peer-replication*/ -- are separate OS processes and are not in this
+;;; suite, so deleting that one line would cost nothing anywhere.
+;;;
+;;; A full hub cannot run in this image (it would share *GRAPHS*, the schema
+;;; registry and *GRAPH* with the device; see run-peer-test.sh).  Nothing here
+;;; needs one: the refusal happens at auth-ok, before a single node moves, so
+;;; a socket that speaks the three plists up to that point is a faithful hub
+;;; for exactly this question.
+;;; ---------------------------------------------------------------------------
+
+(defparameter *ptt-sync-origin*
+  (make-array 16 :element-type '(unsigned-byte 8) :initial-element 23))
+
+(defun %ptt-serve-auth-ok (listener table version)
+  "Accept ONE connection on LISTENER and play hub as far as auth-ok: the
+handshake plist (VERSION is the device's own, so the same-major gate passes),
+read the device's auth, answer :AUTH-OK carrying TABLE.  Then close, which is
+what the device sees if it gets past the guard."
+  (bordeaux-threads:make-thread
+   (lambda ()
+     (ignore-errors
+      (unwind-protect
+           (when (usocket:wait-for-input listener :timeout 20 :ready-only t)
+             (let ((socket (usocket:socket-accept
+                            listener :element-type '(unsigned-byte 8))))
+               (unwind-protect
+                    (progn
+                      (graph-db::peer-write-plist
+                       (list :peer-protocol-version
+                             graph-db::*peer-protocol-version*
+                             :name "PTT-FAKE-HUB"
+                             :schema-major (first version)
+                             :schema-minor (second version)
+                             :schema-digest 0)
+                       socket)
+                      (graph-db::read-plist-packet socket)
+                      (graph-db::peer-write-plist
+                       (list :peer-control :auth-ok :type-table table)
+                       socket))
+                 (ignore-errors (usocket:socket-close socket)))))
+        (ignore-errors (usocket:socket-close listener)))))
+   :name "ptt fake hub"))
+
+(defmacro with-ptt-device ((g registry) &body body)
+  "A device peer-graph under its own system directory, with REGISTRY bound to
+that directory's registry -- the one PEER-SYNC will compare the hub's table
+against."
+  (let ((dir (gensym "DIR")))
+    `(with-ptt-registry (,registry)
+       (with-temp-directory (,dir)
+         (let ((,g (make-graph *integration-graph-name* (namestring ,dir)
+                               :peer-role :device
+                               :origin-id *ptt-sync-origin*
+                               :peer-host "127.0.0.1" :replication-port 0
+                               :buffer-pool-size 1000)))
+           (unwind-protect (let ((*graph* ,g)) ,@body)
+             (ignore-errors (close-graph ,g :snapshot-p nil))
+             (collect-garbage)))))))
+
+(defun %ptt-sync-against (g table)
+  "Point device G at a fake hub answering auth-ok with TABLE, run PEER-SYNC,
+and return the condition it signalled (never NIL: the fake hub closes right
+after auth-ok, so a device that gets past the guard fails on the pull)."
+  (let ((listener (usocket:socket-listen "127.0.0.1" 0 :reuse-address t
+                                         :element-type '(unsigned-byte 8))))
+    (setf (graph-db::replication-port g) (usocket:get-local-port listener))
+    (%ptt-serve-auth-ok listener table (graph-db::peer-schema-version g))
+    (handler-case (progn (graph-db::peer-sync g :attempts 20) nil)
+      (error (c) c))))
+
+(test peer-sync-refuses-a-hub-whose-registry-disagrees
+  "PEER-SYNC itself must run the guard, over a real socket.  The three tests
+above call PEER-DEVICE-ACCEPT-AUTH-OK directly and would all still pass if
+PEER-SYNC stopped calling it."
+  (with-ptt-device (g r)
+    (let* ((mine (graph-db::registry-id-for r 'g-person :vertex))
+           (c (%ptt-sync-against
+               g (format nil "v,~D,g-person," (+ 100 mine)))))
+      (is (typep c 'graph-db::peer-type-registry-conflict-error)
+          "PEER-SYNC must refuse at auth-ok; it signalled ~S" c)
+      (when (typep c 'graph-db::peer-type-registry-conflict-error)
+        (is (search "G-PERSON" (princ-to-string c))
+            "naming the conflicting symbol")))))
+
+(test peer-sync-does-not-refuse-a-hub-whose-registry-agrees
+  "The control: the same socket, the same fake hub, a table built from the
+device's OWN registry.  PEER-SYNC still fails -- the fake hub closes after
+auth-ok and the pull never comes -- but NOT with a registry conflict.  Without
+this, a guard that refused every table would pass the test above."
+  (with-ptt-device (g r)
+    (let ((c (%ptt-sync-against g (graph-db::peer-type-table-string r))))
+      (is (not (typep c 'graph-db::peer-type-registry-conflict-error))
+          "an agreeing table must get past the guard; it signalled ~S" c))))

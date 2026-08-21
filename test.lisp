@@ -80,6 +80,9 @@
   (defvar *edges* nil)
 
   (defun test-create ()
+    ;; A store needs a system directory to take type-ids from (GH #186).
+    (setf *system-directory*
+          (namestring (ensure-directories-exist "/var/tmp/graph-system/")))
     (setq *graph* (make-graph :test "/var/tmp/graph/"))
 #|
     (setq *v1* (make-vertex :generic

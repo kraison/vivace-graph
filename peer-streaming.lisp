@@ -714,6 +714,15 @@ MAX."
 ;;; Hub: handshake + authority-scoped pull.
 ;;; ---------------------------------------------------------------------------
 
+(defun %peer-registry (graph)
+  "GRAPH's captured type registry, or this image's.  A hub session runs on a
+thread START-REPLICATION spawned, and a new thread does NOT inherit dynamic
+bindings, so ENSURE-TYPE-REGISTRY there reads the GLOBAL *SYSTEM-DIRECTORY* --
+NIL, or another system's.  START-REPLICATION captures it on the caller's
+thread; the fallback covers a graph made before that (GH #186)."
+  (or (and (typep graph 'peer-graph) (peer-type-registry graph))
+      (ensure-type-registry)))
+
 (defun peer-hub-handshake-plist (graph)
   "What the hub announces on a new connection (schema-version split into plist-
 safe integers; schema-digest carried as a within-major integrity signal)."
@@ -836,9 +845,11 @@ DEF-VERTEX/DEF-EDGE evaluation order and no name crosses the wire."
                    ;; schema.  Additive and back-compatible -- every peer-path plist
                    ;; read on both sides is a bare GETF, so an old device simply never
                    ;; asks for this key, and a new device against an old hub gets NIL.
-                   (peer-write-plist (list :peer-control :auth-ok
-                                           :type-table (peer-type-table-string))
-                                     socket)
+                   (peer-write-plist
+                    (list :peer-control :auth-ok
+                          :type-table (peer-type-table-string
+                                       (%peer-registry graph)))
+                    socket)
                    (peer-pull-phase graph socket device
                                     :full-resync-p (and (getf auth :full-resync) t)
                                     :min-cursor (or (getf auth :pull-cursor) 0))
@@ -1433,7 +1444,8 @@ re-ship.  Returns the ack result plist (:created / :purged id lists)."
                  (error 'peer-schema-incompatible-error
                         :hub-version hub-version :device-version my-version))))
            (peer-write-plist (peer-device-auth-plist graph :full-resync full-resync) socket)
-           (peer-device-accept-auth-ok (read-plist-packet socket))
+           (peer-device-accept-auth-ok (read-plist-packet socket)
+                                       (%peer-registry graph))
            (let* ((mailbox (peer-writer-mailbox graph))
                   ;; Drain the pull until the pull-end control plist (carries T).
                   (end (loop for r = (peer-read-and-enqueue socket graph mailbox)
@@ -1468,6 +1480,9 @@ re-ship.  Returns the ack result plist (:created / :purged id lists)."
 (defmethod start-replication ((graph peer-graph) &key package)
   (declare (ignore package))
   (setf (stop-replication-p graph) nil)
+  ;; On THIS thread, while the caller's *SYSTEM-DIRECTORY* binding is still
+  ;; visible: the hub's session threads cannot see it (GH #186).
+  (setf (peer-type-registry graph) (ensure-type-registry))
   (ecase (peer-role graph)
     (:hub
      (setf (peer-thread graph)

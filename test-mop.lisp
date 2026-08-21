@@ -1,6 +1,9 @@
 (in-package :graph-db)
 
 (cl-fad:delete-directory-and-files "/var/tmp/graph/")
+;; A store needs a system directory to take type-ids from (GH #186).
+(setf *system-directory*
+      (namestring (ensure-directories-exist "/var/tmp/graph-system/")))
 (setq *graph* (make-graph :test "/var/tmp/graph/"))
 (def-vertex tv ()
   ((ts1 :type string) (ts2 :type integer))

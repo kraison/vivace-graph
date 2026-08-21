@@ -27,6 +27,24 @@
   (let ((*standard-output* s) (*error-output* s))
     (ql:quickload :graph-db :silent t)))
 (in-package :graph-db)
+
+;;; Type-ids come from the image-level registry in *SYSTEM-DIRECTORY* (GH
+;;; #186), so this process needs one before it opens anything.  Its OWN,
+;;; under REPL_WORK: this harness exists because master and slave are
+;;; separate IMAGES, and a shared registry would quietly undo that.  Both
+;;; ends evaluate one schema.lisp in one order, so they agree on every
+;;; type-id -- which is what lets a raw id cross the wire.
+;;;
+;;; SETF, not a LET around the body: replication runs on threads that do
+;;; not inherit dynamic bindings.
+(setf *system-directory*
+      (namestring
+       (ensure-directories-exist
+        (merge-pathnames
+         "system-master/"
+         ;; Trailing slash: REPL_WORK has none, and MERGE-PATHNAMES
+         ;; would otherwise treat its last component as a file name.
+         (format nil "~A/" (or (uiop:getenv "REPL_WORK") "/tmp"))))))
 (log:config :error)
 
 (defun mflag (name) (format nil "~A/~A" (uiop:getenv "REPL_WORK") name))

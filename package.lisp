@@ -51,6 +51,18 @@
            #:*type-registry*
            #:system-directory-required
            #:system-directory-required-operation
+           ;; GH #186: a store's persisted type-ids disagree with the
+           ;; image registry.  Operator-facing -- the remedy is a seeding
+           ;; run plus a renumbering migration, not a retry.
+           #:store-registry-conflict
+           #:store-registry-conflict-location
+           #:store-registry-conflict-type-name
+           #:store-registry-conflict-parent
+           #:store-registry-conflict-store-id
+           #:store-registry-conflict-registry-id
+           #:store-registry-conflict-holder
+           ;; Open a store the registry disagrees with, to read it.
+           #:with-schema-frozen
            #:tm-next-epoch
            #:tm-current-epoch
            #:tm-peek-epoch

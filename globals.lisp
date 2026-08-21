@@ -90,11 +90,17 @@ first use by ENSURE-TYPE-REGISTRY and reopened whenever that changes.  Bind
 *SYSTEM-DIRECTORY*, not this.")
 
 (defvar *schema-update-suppressed* nil
-  "When true, UPDATE-SCHEMA is a no-op.  Bound by MIGRATE-GRAPH only, around
-the opens whose schema it then installs by hand: minting registry type-ids
-for a schema discarded on the next form leaves the registry holding ids no
-store uses (GH #186).  Nothing else should bind it -- a store opened with the
-schema replay skipped does not learn the types declared since it was closed.")
+  "When true, UPDATE-SCHEMA is a no-op -- including its
+RECONCILE-SCHEMA-WITH-REGISTRY pass.  Bound by MIGRATE-GRAPH around the opens
+whose schema it then installs by hand: minting registry type-ids for a schema
+discarded on the next form leaves the registry holding ids no store uses
+(GH #186), and adopting them would be the same mistake in the other
+direction.
+
+Bind it elsewhere only for a store deliberately held inconsistent with its
+own registry -- a fixture, or a rescue open.  A store opened with the replay
+skipped does not learn the types declared since it was closed, and its ids
+are not checked against the registry.")
 
 ;; The type-id READ-PATH ceiling (schema.lisp's LOOKUP-NODE-TYPE-BY-ID
 ;; assert), not an allocation size -- TYPE-INDEX no longer preallocates by

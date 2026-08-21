@@ -136,7 +136,13 @@ carries them across (§10.1, the case no seeding policy exempts)."
       (collect-garbage)
       (setq old-id (%move-current-type-id location 'ts-delta-thing :vertex
                                           new-id))
-      (let ((g (open-graph :ts-delta location :buffer-pool-size 1000)))
+      ;; FROZEN, and the store is why WITH-SCHEMA-FROZEN exists: the move
+      ;; just made this store's current id disagree with the registry that
+      ;; assigned it, which an ordinary open refuses (GH #186).  That is the
+      ;; whole point of the fixture -- a store §10.1 says must be renumbered
+      ;; -- and the nodes below have to be written under the MOVED id.
+      (let ((g (with-schema-frozen ()
+                 (open-graph :ts-delta location :buffer-pool-size 1000))))
         (unwind-protect (%add-vertices g 'ts-delta-thing after)
           (close-graph g)))
       (collect-garbage))
@@ -439,8 +445,13 @@ still an instance of the class it was."
         (let ((before nil) (after nil))
           (let ((graph-db::*system-directory* sysdir)
                 (graph-db::*type-registry* nil))
-            (let ((old (open-graph :ts-beta beta :buffer-pool-p nil
-                                   :gc-heap-p nil)))
+            ;; FROZEN: seeding put :TS-BETA in the renumber set, so its ids
+            ;; and the registry's disagree by construction and an ordinary
+            ;; open refuses.  Censusing it before the migration is precisely
+            ;; the read WITH-SCHEMA-FROZEN is for (GH #186).
+            (let ((old (with-schema-frozen ()
+                         (open-graph :ts-beta beta :buffer-pool-p nil
+                                     :gc-heap-p nil))))
               (unwind-protect (setq before (%class-census old))
                 (close-graph old :snapshot-p nil)))
             (let ((g (graph-db::migrate-graph
@@ -491,8 +502,12 @@ across loses 4 and fails the census."
         (let ((before nil))
           (let ((graph-db::*system-directory* sysdir)
                 (graph-db::*type-registry* nil))
-            (let ((old (open-graph :ts-delta location :buffer-pool-p nil
-                                   :gc-heap-p nil)))
+            ;; FROZEN: this is the fixture whose current id no longer
+            ;; matches the registry that assigned it, so an ordinary open
+            ;; refuses (GH #186).  See %SPLIT-HISTORY-STORE.
+            (let ((old (with-schema-frozen ()
+                         (open-graph :ts-delta location :buffer-pool-p nil
+                                     :gc-heap-p nil))))
               (unwind-protect (setq before (%class-census old))
                 (close-graph old :snapshot-p nil)))
             (collect-garbage)
@@ -794,3 +809,36 @@ the hash table.  The home package is the tie-break."
         "same name, different packages: order by package")
     (is (string= "TS-ORD-TWIN" (symbol-name s1)))
     (is (string= "TS-ORD-TWIN" (symbol-name s2)))))
+
+(test a-stale-id-above-the-registry-s-reach-is-refused
+  "The third shape of disagreement, and the one adoption cannot fix.  A store
+whose history left metadata at an id its own name lookup no longer reaches
+still has NODES at that id.  If it sits above every id the registry has
+assigned, the registry's next mint takes it -- and the registry cannot be told
+to hold it back, because it records symbols, not holes.  Refuse instead.
+
+The fixture moves the current id up to 9 and then back to 1, so the store
+answers to 1 (which a fresh registry adopts, leaving its high-water mark at 1)
+while metadata sits at 9.  The stale id is therefore ABOVE the mark, which is
+the whole condition -- %SPLIT-HISTORY-STORE's stale id is BELOW it and opens
+without complaint."
+  (with-temp-directory (root)
+    (let ((location (%build-legacy-store :ts-delta root 4 nil
+                                         '(ts-delta-thing))))
+      (%move-current-type-id location 'ts-delta-thing :vertex 9)
+      (%move-current-type-id location 'ts-delta-thing :vertex 1)
+      (multiple-value-bind (registry sysdir) (%fresh-registry root "stale/")
+        (declare (ignore registry))
+        (let ((graph-db::*system-directory* sysdir)
+              (graph-db::*type-registry* nil))
+          (signals store-registry-conflict
+            (open-graph :ts-delta location :buffer-pool-size 1000))
+          ;; ...and the store is still readable, which is the whole point of
+          ;; refusing rather than corrupting.
+          (let ((g (with-schema-frozen ()
+                     (open-graph :ts-delta location :buffer-pool-size 1000))))
+            (unwind-protect
+                 (is (eql 1 (%type-id-in g 'ts-delta-thing :vertex))
+                     "a frozen open still sees the store's current id")
+              (close-graph g :snapshot-p nil))
+            (collect-garbage)))))))

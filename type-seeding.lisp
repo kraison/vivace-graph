@@ -124,7 +124,16 @@ distributed to peers."
                                 (let ((l (%seeding-location location)))
                                   (cons l (%store-heap-bytes l))))
                               locations)
-                      #'> :key #'cdr))
+                      ;; Ties broken on the location, because SORT is not
+                      ;; required to be stable and equal high-water marks are
+                      ;; ordinary (fresh or empty stores).  Two images ranking
+                      ;; one store set differently would seed two different
+                      ;; registries -- the hole %REGISTRY-MINT-ORDER closes a
+                      ;; level up (GH #186).
+                      (lambda (a b)
+                        (if (= (cdr a) (cdr b))
+                            (and (string< (car a) (car b)) t)
+                            (> (cdr a) (cdr b))))))
          (report (make-seeding-report :sizes sizes
                                       :seed (car (first sizes)))))
     (with-registry-append-lock (registry)
