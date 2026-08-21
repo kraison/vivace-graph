@@ -483,6 +483,68 @@ between releases; cutting a release renames it to the new version and dates it.
   unbound on a memory graph. That gap is out of scope for #135 and is
   getting its own spec.
 
+- **`type-id` widened from 16 to 32 bits; on-disk storage format bumped to
+  v3** (#166, unit 1a, task 1). Every place `type-id` was written or typed
+  widens together (no useful intermediate state): the node head (2 -> 4
+  bytes; head grows 31 -> 33, edge head 71 -> 73), `ve-key` (18 -> 20
+  bytes) and `vev-key` (34 -> 36 bytes), the CLOS `type-id` slot, and the
+  schema's `next-vertex-id` / `next-edge-id` counters. Type-ids remain
+  **per-graph** — no global registry, no distribution change; that is a
+  separate issue (#186).
+  A v1 or v2 graph cannot be opened directly by this build — `open-graph`
+  signals, naming the version found and the version expected and pointing
+  at `migrate-graph`, rather than silently misreading a 2-byte type-id as
+  4 (which would otherwise corrupt every subsequent field in the head,
+  and every adjacent record via the widened `ve-key`/`vev-key`).
+  `deserialize-node-head-v2` (a byte-for-byte copy of the prior 31-byte
+  reader) lets `migrate-graph` read a v2 source; see the next two entries
+  for the type-index sizing this widening required and the migration
+  path itself.
+
+- **The type-index no longer pre-allocates a slot for every possible
+  type-id** (#166, unit 1a, task 2). At the old 16-bit ceiling that cost
+  ~1.1 MB per index per store; at the widened 32-bit ceiling the same
+  scheme would cost ~73 GB. A type-index now starts sized for 4,096
+  types and grows by doubling, in place — the mapping's base address
+  never moves, so a concurrent reader is never at risk from a grow.
+  Locking changed too: one mutex per type-id (65,536 of them per index
+  per store, regardless of how many types were in use) is now 256 fixed
+  stripes selected by `(mod type-id 256)`. **This is a real behaviour
+  change, not a pure optimization** — two type-ids that land on the same
+  stripe now serialize their pushes and removes against each other,
+  where before they never contended.
+  Fixed in passing: `gc.lisp`'s mark phase read the type-index's cache
+  directly, which was only safe while that cache was eagerly populated
+  at open. Under the new lazy population this marked nothing for a type
+  not yet touched this session, and `gc-heap`'s sweep then reclaimed
+  those nodes as garbage on the very first reopen after this change —
+  caught before release by a dedicated close/reopen/gc test, not by any
+  pre-existing coverage.
+
+- **`migrate-graph` now carries a v1 *or* v2 graph to v3 through one
+  version-detecting path** (#166, unit 1a, task 3). It reads the source's
+  own stamped storage-version byte and opens it with the matching head
+  reader, so the same call handles either source version — no second,
+  parallel migration function.
+  **Corrected a false claim in `migrate-graph`'s own docstring**: the
+  source directory is not left byte-for-byte untouched. Producing the
+  snapshot requires opening the source, and that open unconditionally
+  rewrites `schema.dat` (same content, re-serialized — type-ids
+  unaffected) and creates one new, empty `tx/replication-*.log` file.
+  Those are the only two files that change; the source's data — its heap
+  and every vertex/edge/index table — is untouched, and a pre-#166
+  engine can reopen the source directly afterward and read every node
+  with its type-ids intact. That is the actual rollback story
+  (repointing at the old directory, not restoring from a snapshot), and
+  it was verified by reopening a post-migration source with a genuine,
+  unmodified old-version engine rather than assumed from the (now-fixed)
+  docstring.
+  A migration needs roughly 2x the source graph's disk space while it
+  runs (source + intermediate snapshot + new graph), and every engine
+  that will subsequently open the migrated graph — not just the one
+  performing the migration — must already be built from a #166-or-later
+  checkout.
+
 ## [3.0.0] - 2026-08-09
 
 > **MAJOR.** Per this file's SemVer preamble, MAJOR is mandatory here on two

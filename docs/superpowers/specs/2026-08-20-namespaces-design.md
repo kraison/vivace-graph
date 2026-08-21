@@ -104,6 +104,26 @@ a type-id and discriminating on a slot) returns. This buys time, not infinity.
 `(intern (symbol-name (node-type-name meta)) :keyword)`. That alias is package-blind, so
 `:SPECIES` from two packages collides in a shared type table.
 
+**The registry is persisted and distributed, not recomputed (D14).** Today's determinism is
+free: `*schema-node-metadata*` is keyed per graph and populated in source order, so two hosts
+loading the same `schema.lisp` assign identical ids and replication can ship a raw `uint16`
+with no name crossing the wire. A counter spanning graphs destroys that — assignment becomes
+dependent on which stores an image opens and in what order, so a hub and a device holding
+different subsets diverge and a node materialises as the wrong class on the receiver.
+
+So the global registry is an **append-only, image-level object in the system directory**,
+beside the clock and lifecycle journal of §6 and §9.1. Hosts read it; none recompute it. New
+assignments are made by the hub, distributed through the type-table the hub **already** ships
+in its auth-ok plist — today a Kotlin/SQLite accommodation, since those peers cannot evaluate
+`schema.lisp`. Under a global space a Lisp device cannot rely on evaluation either, so that
+table becomes the normal path rather than a special case.
+
+**A replication handshake refuses a peer whose registry disagrees (D15)**, naming the
+conflicting symbols. An image with no hub is its own authority — the common case, since peer
+replication is off by default — so two such images can independently assign the same symbol
+different ids. Silent reconciliation would mean a data migration triggered by a network
+handshake; a disagreement between two populated stores is an operator event.
+
 ### 3.5 Runtime schema is metadata, never source
 
 Restart must never `load` code written at runtime. Metadata is diffable, versionable,
@@ -346,11 +366,11 @@ system property; one store's routine maintenance must not shorten it.
 
 Three migrations, each chosen for a reversible failure mode.
 
-| What | Mechanism | Rewrites data? |
-|---|---|---|
-| 32-bit `type-id` | new head-codec version; `migrate-graph` reads the old and replays | logical replay |
-| Global epoch | watermark above every store's counter | no |
-| Tagged store id | v8 for new ids, v5 fallback for old | no |
+| What | Mechanism | Rewrites data? | Status |
+|---|---|---|---|
+| 32-bit `type-id` | new head-codec version; `migrate-graph` reads the old and replays | logical replay | **Implemented** (#166, unit 1a) |
+| Global epoch | watermark above every store's counter | no | not built |
+| Tagged store id | v8 for new ids, v5 fallback for old | no | not built |
 
 The type-id widening is the **only on-disk format change** in this design, and it has a
 proven precedent: `*node-head-reader*` is already a dispatch variable and
@@ -358,6 +378,14 @@ proven precedent: `*node-head-reader*` is already a dispatch variable and
 back up and replay a v1 graph. Widening adds a v3 reader the same way. The head goes 31 → 33
 bytes (flags 1, type-id 2→**4**, revision 4, data-pointer 8, commit-epoch 8, prev-pointer 8)
 and `ve-key` goes 18 → 20; both are rebuilt by the replay.
+
+**Implemented as of #166, unit 1a** (widen `type-id` to 32 bits, sparse type-index, v3
+head codec, migration — ids stay per-graph): the head is 33 bytes and `ve-key`/`vev-key`
+are 20/36 bytes exactly as designed above, storage format is `+storage-version+` `#x03`,
+and `migrate-graph` carries a v1 *or* v2 source to v3 through one version-detecting path
+(it reads the source's own stamped version rather than being told). This row is done; the
+other two rows in this table, and §3.4's global type registry, are not — those are unit
+1b (#186) and later units, unaffected by this change.
 
 **Deployment gate.** A type-id migration lands on hosts that may be behind the current
 engine. Every consumer's version floor and each deployed engine version must be checked
@@ -367,15 +395,19 @@ before this ships. That is a release gate, not a design gate.
 
 | # | Unit | Depends on |
 |---|---|---|
-| 1 | Global type-id space, sparse type-index, 32-bit widening, v3 head codec, migration | — |
-| 2 | Packages as namespaces; store/namespace decoupling; placement defaults; delete the uniqueness check | 1 |
+| 1a | Widen `type-id` to 32 bits, sparse type-index, v3 head codec, migration — **ids stay per-graph** | — |
+| 1b | Global type-ids: canonical registry (D14), distribution, handshake guard (D15), delete the uniqueness check | 1a |
+| 2 | Packages as namespaces; store/namespace decoupling; placement defaults | **1b** |
 | 3 | Image-level clock, system journal, epoch leases | — |
 | 4 | Tagged UUIDv8 store field, resolver, detached-read marker | 3 |
 | 5 | Detach quiescence protocol and shadow bulk load | 3, 4 |
 | 6 | Restore: retention policy, algorithm, manifest, cascade | 5 |
-| 7 | Runtime schema from persisted metadata | 1, 2 |
+| 7 | Runtime schema from persisted metadata | 1b, 2 |
 
-Units 1 and 3 have no dependencies and may start in parallel. Unit 3 should start early
+Units 1a and 3 have no dependencies and may start in parallel. Unit 1 was split:
+1a is the only on-disk format change in this design, and a migration failure should be
+unambiguous rather than tangled with a semantic one. 1a is verifiable on its own terms —
+same data, same behaviour, wider field. Unit 3 should start early
 because its migration debt accrues daily (§6).
 
 ## 12. Acceptance

@@ -364,7 +364,7 @@ is preserved."
   ((id :accessor id :initform +null-key+ :initarg :id :meta t
        :type (simple-array (unsigned-byte 8) (16)) :persistent nil)
    (type-id :accessor type-id :initform 1 :initarg :type-id :meta t
-            :type (unsigned-byte 16) :persistent nil)
+            :type (unsigned-byte 32) :persistent nil)
    (revision :accessor revision :initform 0 :initarg :revision :meta t
              :type (unsigned-byte 32) :persistent nil)
    (%revision-table :accessor %revision-table :initform (make-hash-table :test 'eq)

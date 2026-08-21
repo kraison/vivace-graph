@@ -1,16 +1,17 @@
 (in-package :graph-db)
 
-;; v2 head (MVCC): flags(1) type-id(2) revision(4) data-pointer(8)
-;;                 commit-epoch(8) prev-pointer(8) = 31.
-;; The first 15 bytes are byte-identical to the v1 head (append-only), so a v1
-;; reader is just "stop after data-pointer".  +edge-header-size+ derives from this.
-(alexandria:define-constant +node-header-size+ 31)
+;; v3 head: flags(1) type-id(4) revision(4) data-pointer(8) commit-epoch(8)
+;; prev-pointer(8) = 33.  type-id widened 2 -> 4 bytes (#166); the v2 (31-byte,
+;; 2-byte type-id) layout stays readable via DESERIALIZE-NODE-HEAD-V2, for
+;; MIGRATE-GRAPH.  +edge-header-size+ derives from this.
+(alexandria:define-constant +node-header-size+ 33)
 
-;; Byte offset of the prev-pointer field WITHIN a head (after flags(1) type-id(2)
-;; revision(4) data-pointer(8) commit-epoch(8) = 23).  The reaper patches this
-;; field in place (in the lhash live head or an archived heap head) to sever a
-;; reclaimed version chain.
-(alexandria:define-constant +node-prev-pointer-offset+ 23)
+;; Byte offset of the prev-pointer field WITHIN a head (after flags(1)
+;; type-id(4) revision(4) data-pointer(8) commit-epoch(8) = 25).  The reaper
+;; patches this field in place (in the lhash live head or an archived heap
+;; head) to sever a reclaimed version chain.  Shifted 23 -> 25 with the v3
+;; type-id width (#166); missing this moves the patch into commit-epoch's tail.
+(alexandria:define-constant +node-prev-pointer-offset+ 25)
 
 (defgeneric node-p (thing)
   (:method ((thing node)) t)
@@ -62,7 +63,7 @@
 (defun pack-node-head (vec i n)
   "Fill the node head of N into VEC starting at index I; return the next index."
   (setf (aref vec i) (flags-as-int n))
-  (setq i (pack-uint vec (1+ i) (type-id n)      2))
+  (setq i (pack-uint vec (1+ i) (type-id n)      4))
   (setq i (pack-uint vec i       (revision n)     4))
   (setq i (pack-uint vec i       (data-pointer n) 8))
   (setq i (pack-uint vec i       (commit-epoch n) 8))   ;; MVCC v2
@@ -78,6 +79,58 @@
     (+ offset (1- +node-header-size+))))
 
 (defun deserialize-node-head (mf offset)
+  (let ((flags (get-byte mf offset)))
+    (values
+     (ldb-test (byte 1 0) flags) ;; deleted-p
+     (ldb-test (byte 1 1) flags) ;; written-p
+     (ldb-test (byte 1 2) flags) ;; heap-written-p
+     (ldb-test (byte 1 3) flags) ;; type-idx-written-p
+     (ldb-test (byte 1 4) flags) ;; views-written-p
+     (ldb-test (byte 1 5) flags) ;; ve-written-p
+     (ldb-test (byte 1 6) flags) ;; vev-written-p
+     (let ((int 0)) ;; type-id
+       (declare (type (integer 0 4294967295) int))
+       (dotimes (i 4)
+         (setq int (dpb (get-byte mf (incf offset))
+                        (byte 8 (* i 8)) int)))
+       int)
+     (let ((int 0)) ;; revision
+       (declare (type (integer 0 4294967295) int))
+       (dotimes (i 4)
+         (setq int (dpb (get-byte mf (incf offset))
+                        (byte 8 (* i 8)) int)))
+       int)
+     (let ((int 0)) ;; data-pointer
+       #+sbcl (declare (type sb-ext:word int))
+       (dotimes (i 8)
+         (setq int (dpb (get-byte mf (incf offset))
+                        (byte 8 (* i 8)) int)))
+       int)
+     (let ((int 0)) ;; commit-epoch (MVCC v2)
+       #+sbcl (declare (type sb-ext:word int))
+       (dotimes (i 8)
+         (setq int (dpb (get-byte mf (incf offset))
+                        (byte 8 (* i 8)) int)))
+       int)
+     (let ((int 0)) ;; prev-pointer (MVCC v2)
+       #+sbcl (declare (type sb-ext:word int))
+       (dotimes (i 8)
+         (setq int (dpb (get-byte mf (incf offset))
+                        (byte 8 (* i 8)) int)))
+       int)
+     offset)))
+
+;; The head reader the vertex/edge codecs dispatch through.  Normally the v3
+;; (33-byte) reader; MIGRATE-GRAPH rebinds it to DESERIALIZE-NODE-HEAD-V1 or
+;; DESERIALIZE-NODE-HEAD-V2 to read an older graph so its data can be logically
+;; backed up + replayed.
+(defvar *node-head-reader* 'deserialize-node-head)
+
+(defun deserialize-node-head-v2 (mf offset)
+  "Read a pre-widening (v2) 31-byte node head: flags(1) type-id(2) revision(4)
+data-pointer(8) commit-epoch(8) prev-pointer(8).  Byte-for-byte the same reader
+as DESERIALIZE-NODE-HEAD before type-id widened to 4 bytes (#166).  Kept for
+MIGRATE-GRAPH so a pre-#166 graph stays readable; not on any live read path."
   (let ((flags (get-byte mf offset)))
     (values
      (ldb-test (byte 1 0) flags) ;; deleted-p
@@ -118,11 +171,6 @@
                         (byte 8 (* i 8)) int)))
        int)
      offset)))
-
-;; The head reader the vertex/edge codecs dispatch through.  Normally the v2
-;; (31-byte) reader; MIGRATE-GRAPH rebinds it to DESERIALIZE-NODE-HEAD-V1 to read
-;; a pre-MVCC (v1, 15-byte) graph so its data can be logically backed up + replayed.
-(defvar *node-head-reader* 'deserialize-node-head)
 
 (defun deserialize-node-head-v1 (mf offset)
   "Read a pre-MVCC (v1) 15-byte node head: flags(1) type-id(2) revision(4)

@@ -447,6 +447,14 @@ cl-temporal-extent."
                ;; graph, no schema registration), so it has no ordering
                ;; constraint against the graph-level files below.
                (:file "node-class-tests")
+               ;; Mostly a throwaway MAKE-SCHEMA and raw mmap'd byte layouts
+               ;; (#166), but it ALSO declares its own graph (:ti-gc-reopen-
+               ;; test, for the GC-marking regression test) -- distinct from
+               ;; *integration-graph-name*, so it is not exposed to the
+               ;; graph-tests reload hazard noted below, same reasoning as
+               ;; multi-graph-tests.  Still no ordering constraint against
+               ;; the graph-level files below.
+               (:file "type-id-width-tests")
                (:file "geometry-tests")
                (:file "geometry-ops-tests")
                (:file "geohash-tests")

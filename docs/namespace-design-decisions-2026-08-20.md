@@ -409,6 +409,93 @@ atomic and writes its history forward as new transactions. Since D12 requires th
 anyway, the marginal cost of using shadow for restore too is zero. Left open rather than
 folded in.
 
+### D14 — The global type-id registry is persisted and distributed, never recomputed
+
+**The problem the spec did not name.** Globalising the type-id space costs a property that
+is free today. Currently `*schema-node-metadata*` is keyed **per graph** and populated in
+**source order**, and `update-schema` walks it in that order — `def-node-type` carries a
+comment saying so explicitly, citing GH #53. So two hosts loading the same `schema.lisp`
+assign identical ids for a given graph, and peer replication can ship a raw `uint16`
+type-id on the wire with no name ever crossing.
+
+Draw ids from one counter **spanning** graphs and that determinism evaporates: assignment
+becomes dependent on which graphs an image opens and in what order. A hub running five
+stores and a device running a subset would diverge, and a node shipped with type-id 7 would
+materialise as a different class on the receiver. Silent cross-host corruption, invisible to
+every test that runs in one image.
+
+**Decision: the registry is a persisted, append-only, image-level object that hosts read
+rather than recompute, with the hub authoritative for new assignments.**
+
+It lives in the **system directory** beside D9's clock and lifecycle journal — the same kind
+of object (small, durable, image-scoped), and the same directory #182 will guard with an
+exclusion marker.
+
+**Distribution reuses the mechanism that already exists.** The hub already ships a type-table
+in the auth-ok plist, today as a Kotlin/SQLite accommodation because those peers cannot
+evaluate `schema.lisp` (`peer-streaming.lisp`: *"A TYPE-ID is an opaque uint16 on the wire
+and NO type NAME ever crosses it … a Lisp device gets away with that only because it
+evaluates the same schema.lisp; a Kotlin/SQLite peer cannot"*). Under globalisation a **Lisp
+device cannot rely on evaluation either**, so that table stops being a special case and
+becomes the normal path.
+
+**Rejected — derive the id by hashing the package-qualified symbol.** Attractive because it
+needs no coordination at all and a runtime-defined type would get its id everywhere at once,
+which is what D6 wants. Killed by arithmetic: the birthday bound in a 32-bit space is
+~2^16 ≈ 65,000 types, precisely the ceiling D11 widens away from. Collision resolution
+reintroduces coordination, so it buys nothing and adds a subtle failure. Viable only at 64
+bits, which doubles the node header and `ve-key` again.
+
+**Rejected — a version-controlled registry file shipped with the deployment.** Simple,
+auditable and diffable, but adding a type becomes a code change plus a deploy, which kills
+runtime schema creation on a device. D6 is why the namespaces design exists; a mechanism
+that forecloses it is not a candidate.
+
+### D15 — A replication handshake fails loudly when registries disagree
+
+D14 needs an assignment authority for new types. A hub provides one. But an image with no
+replication configured is its own authority — and that is the common case, since
+`*peer-hub-enabled*` defaults to NIL. Two such images that independently define the same
+type will assign it different ids.
+
+Harmless while they never meet. Silent corruption the moment one replicates to the other.
+
+**Decision: compare registries at the handshake and refuse the connection when they
+disagree**, naming the conflicting symbols. Do not reconcile silently.
+
+Rejected: making the registry mergeable by keying on symbol and reassigning on conflict.
+That needs a rewrite path for already-persisted nodes — a data migration triggered by a
+network handshake, which is precisely the kind of thing that should never happen
+automatically. A type-id disagreement between two populated stores is an operator event.
+
+### Spike record — what these decisions rest on
+
+Run 2026-08-20 before any of #166 was planned. Answered by reading; nothing executed.
+
+- **Renumbering falls out of migration for free.** `backup` writes `(type-of v)` — the CLOS
+  class *name* — for both vertices and edges; snapshots contain no type-ids. The schema copy
+  in `migrate-graph` is four isolated lines commented *"adopt the v1 schema (preserving
+  type-ids)"*. Drop them and replay resolves names against the target's own registry.
+  `make-vertex` already accepts either an integer id or a name.
+- **The cheaper alternative was examined and rejected on its failure mode, not its cost.**
+  Keeping per-store ids and fixing resolution (`deserialize-vertex-head` resolves against
+  ambient `*graph*`, not the node's home graph) would close #53 at the bug site and remove
+  `%check-node-class-graph-unique`'s reason to exist — with no format change and no
+  migration. `lookup-node-type-by-id` already takes `:graph`; seven of twelve call sites
+  thread it and five do not.
+  Rejected because it is the *same shape as #53 itself*: a keyword defaulting to `*graph*`
+  is right most of the time, so when it is wrong the bug is latent and unreproducible — #53
+  was filed as *"a latent inconsistency, not a demonstrated bug"* after **two reproduction
+  attempts failed**. Threading context is a permanent tax paid at every future call site,
+  and forgetting fails silently. Global ids make resolution **context-free**, which is what
+  the parked design meant by "structural fix rather than a patch."
+- **Structured `(namespace-id | type-index)` ids were proposed and withdrawn.** They would
+  make replication determinism fall out of source order, but they encode namespace membership
+  as a permanent on-disk property — hardening precisely what D1 keeps soft (*"packages
+  express; they do not enforce"*) and abandoning the rename-freedom D5 deliberately bought
+  for stores. Moving a type between packages would become a data migration rather than an
+  edit.
+
 ## Newly identified constraints
 
 - **Two global monotonic id spaces with no reclamation.** Retired type-ids cannot be

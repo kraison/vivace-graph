@@ -16,8 +16,8 @@
    #+ecl (make-hash-table :test 'eql
                           #+graph-db-ecl-sync-hash :synchronized
                           #+graph-db-ecl-sync-hash t))
-  (next-edge-id 1 :type (unsigned-byte 16))
-  (next-vertex-id 1 :type (unsigned-byte 16))
+  (next-edge-id 1 :type (unsigned-byte 32))
+  (next-vertex-id 1 :type (unsigned-byte 32))
   ;; MVCC: graph-wide default number of prior node versions the reaper retains
   ;; regardless of epoch safety (0 = keep none beyond what active readers need).
   ;; Appended last so cl-store can still restore pre-MVCC schema.dat.

@@ -417,13 +417,64 @@ A linear hash table is designed for graceful, incremental growth, which is essen
 - *Splitting:* When a bucket overflows with too many entries, the table does not resize all at once. Instead, it maintains a `next-split` pointer. It "splits" the single bucket at this pointer into two, re-distributing its contents. The pointer then advances to the next bucket. This ensures that the work of growing the hash table is spread out over time.
 - *Overflow:* If a bucket overflows before it is scheduled to be split, any additional items are placed in a separate ~overflow.dat~ file and chained together.
 
-For these primary node tables, the *key* is the node's 16-byte UUID, and the *value* is a compact, serialized representation of the node's core metadata — its *head*. As of storage format *v2* (the MVCC release) the head is 31 bytes for a vertex (71 for an edge, which appends its ~from~/~to~/~weight~) and is laid out append-only as:
+For these primary node tables, the *key* is the node's 16-byte UUID, and the *value* is a compact, serialized representation of the node's core metadata — its *head*. As of storage format *v3* (the type-id widening, GH #166) the head is 33 bytes for a vertex (73 for an edge, which appends its ~from~/~to~/~weight~) and is laid out append-only as:
 
 #+BEGIN_EXAMPLE
-  flags(1)  type-id(2)  revision(4)  data-pointer(8)  commit-epoch(8)  prev-pointer(8)
+  flags(1)  type-id(4)  revision(4)  data-pointer(8)  commit-epoch(8)  prev-pointer(8)
 #+END_EXAMPLE
 
-The first 15 bytes are byte-for-byte identical to the original (v1) head; ~commit-epoch~ and ~prev-pointer~ were *appended*, which is what makes the v1→v2 migration a simple matter (see Chapter 12, "MVCC: Immutable Versioned Nodes"). ~data-pointer~ is the all-important offset to the node's data in the heap file; ~commit-epoch~ and ~prev-pointer~ drive the versioning machinery described in that chapter. The on-disk storage version is recorded in each memory-mapped region; opening a v1 graph with a v2 build signals an error directing you to ~migrate-graph~.
+~type-id~ widened from 2 to 4 bytes in v3, which breaks the byte-for-byte prefix the v1 and v2 heads used to share (both had ~flags(1) type-id(2) ...~); a v2 head must be read with ~deserialize-node-head-v2~, not reinterpreted against the v3 layout in place. ~data-pointer~ is the all-important offset to the node's data in the heap file; ~commit-epoch~ and ~prev-pointer~ drive the versioning machinery described in Chapter 12, "MVCC: Immutable Versioned Nodes". The on-disk storage version is recorded in each memory-mapped region; opening a v1 *or v2* graph with a v3 build signals an error directing you to ~migrate-graph~ (see "Migrating an older graph to v3" in Chapter 12).
+
+*A wider ceiling, still per graph.* The 4-byte field raises the number of
+distinct node types one graph can register from 65,536 to 4,294,967,295 — in
+practice unreachable, since each registered type is also a finalized CLOS
+class. This is *not* a global type-id space: ids are still assigned
+independently by each graph's own schema, starting from 1, so the same
+numeric type-id can (and typically does) mean a different class in two
+different graphs. A future change to make type-ids global and distributed is
+tracked separately (GH #186) and has not landed.
+
+*** The Type Index (~type-index.lisp~): finding nodes by type
+
+A typed scan — ~(map-vertices fn g :vertex-type 'user)~, ~(map-edges fn g
+:edge-type 'follows)~, the ~is-a/2~ Prolog functor — does not walk the whole
+primary table looking for matches. Each graph keeps a *type index*: one
+on-disk slot per type-id holding a linked list of that type's live node
+UUIDs, consulted via ~get-type-index-list~ and kept current by every
+insert/delete going through ~type-index-push~/~type-index-remove~. This is
+what lets a typed scan touch only the nodes of the requested type (and, per
+Chapter 12's note on scans, resolve each one through the snapshot-consistent
+lookup path).
+
+*Sizing (GH #166).* Before #166, the index pre-allocated one slot for every
+possible type-id up front — harmless at the old 16-bit ceiling (~1.1 MB), but
+a ~73 GB pre-allocation at the widened 32-bit ceiling if it had kept that
+scheme. It no longer does: a fresh type index starts sized for 4,096 types
+and grows by doubling, in place, the first time a type-id past its current
+capacity is touched. "In place" is the operative property — growth extends
+the memory-mapped file and never relocates its base address, so a concurrent
+reader is never at risk of dereferencing a pointer the grow just moved out
+from under it. Because type-ids are assigned sequentially from 1, ordinary
+schemas never grow the index more than once or twice, if at all.
+
+Growth is not unbounded: the index's mmap reserves address space at the 1 GiB
+floor (~*mmap-min-reservation*~), and doubling from 4,096 types reaches 2^25
+(33,554,432) types cleanly but the next doubling would exceed that
+reservation, so ~extend-mapped-file~ signals ("mmap reservation exhausted")
+rather than growing past it. That is a loud failure, not silent corruption,
+and it is unreachable in practice while type-ids stay per-graph and are
+handed out sequentially from 1.
+
+*Lock striping.* Every push/remove against a type's index-list is serialized
+by a lock. Before #166 that was one mutex *per type-id* — 65,536 of them per
+index per store, unconditionally, regardless of how many types a graph
+actually used. It is now 256 fixed stripes, chosen by ~(mod type-id 256)~.
+This is a real trade-off, not a free optimization: two type-ids that happen
+to land on the same stripe now serialize their pushes and removes against
+each other, where before they never contended. In practice this costs little
+— the critical section is a single push or remove on one index-list — but it
+means two busy, colliding types can now see lock contention that a pre-#166
+graph would not have.
 
 *** Ordered indexes and pluggable backends (~indexes.dat~)
 
@@ -1985,9 +2036,15 @@ Here is a complete, end-to-end example.
       (close-graph restored-graph)))
 #+END_SRC
 
-*** Migrating a pre-MVCC graph (~migrate-graph~)
+*** Migrating an older graph (~migrate-graph~)
 
-Graphs created before the MVCC release use storage format *v1* (a 15-byte node head). A v2 build cannot open them directly — ~open-graph~ will signal an error telling you to migrate. The ~migrate-graph~ function does this for you; it is a logical snapshot-and-replay and is described in Chapter 12, "MVCC: Immutable Versioned Nodes."
+A graph written by an older build — storage format *v1* (pre-MVCC, a 15-byte
+node head) or *v2* (pre-#166, a 31-byte head with a 16-bit type-id) — cannot
+be opened directly by the current (*v3*) build: ~open-graph~ signals an error
+naming the version found and pointing at ~migrate-graph~. The ~migrate-graph~
+function carries either source straight to v3 in one call; it is a logical
+snapshot-and-replay, described in full in Chapter 12, "MVCC: Immutable
+Versioned Nodes," under "Migrating an older graph to v3."
 
 ** Chapter 12: MVCC — Immutable Versioned Nodes
 
@@ -2057,23 +2114,82 @@ Inside a transaction, a point ~lookup~ (e.g. ~lookup-vertex~, ~lookup-edge~, or 
 
 *A note on scans.* This isolation applies to *lookups* (and to *typed* scans such as ~(map-vertices fn g :vertex-type 'user)~, which resolve each node through the lookup path). An *untyped*, whole-graph scan — ~(map-vertices fn g)~ with no ~:vertex-type~ — still reads each node's *live* version. This is a deliberate, documented limitation: making whole-graph scans snapshot-consistent would require versioning the indexes themselves (membership history), which is out of scope. In practice untyped scans are used for read-only maintenance and analytics, where this is harmless; when you need a consistent view, use a point lookup or a typed scan. Crucially, none of this affects *data integrity*: writes remain serializable via the engine's optimistic concurrency control regardless of how reads are resolved.
 
-*** Migrating a v1 graph to v2 (~migrate-graph~)
+*** Migrating an older graph to v3 (~migrate-graph~)
 
-The MVCC head grew from 15 to 31 bytes, so a v2 build cannot open a v1 graph directly. ~migrate-graph~ brings one across without touching the original:
+The MVCC head grew from 15 to 31 bytes in v2 (commit-epoch, prev-pointer),
+then from 31 to 33 bytes in v3 when ~type-id~ widened from 16 to 32 bits
+(GH #166; see Chapter 3). A v3 build refuses to open a v1 or v2 graph
+directly — loudly, naming both versions and pointing at ~migrate-graph~:
+
+#+BEGIN_EXAMPLE
+  ~A is storage format v~D but this build expects v~D. Older graphs must be
+  migrated first -- see MIGRATE-GRAPH (snapshot + replay).
+#+END_EXAMPLE
+
+~migrate-graph~ brings either a v1 *or* a v2 source across to v3 through the
+same call — it reads the version byte stamped in the source and picks the
+matching head reader itself, so you never tell it which version you have:
 
 #+BEGIN_SRC lisp
   ;; Load the schema (def-vertex / def-edge forms) for the graph first, then:
   (let ((g (migrate-graph :my-app
-                          "/var/db/my-app-v1/"    ; existing v1 graph (untouched)
-                          "/var/db/my-app-v2/"    ; fresh v2 graph to create
+                          "/var/db/my-app-old/"   ; existing v1 or v2 graph
+                          "/var/db/my-app-v3/"    ; fresh v3 graph to create
                           :package :my-app)))
-    ;; g is the new, open v2 graph.
+    ;; g is the new, open v3 graph.
     ...)
 #+END_SRC
 
-Internally it is a *logical* snapshot-and-replay, the same format-independent mechanism used for backups: the v1 graph is opened read-only through a 15-byte-head shim, every live node is written to a pointer-free snapshot, and a fresh v2 graph is created and the snapshot replayed through the normal ~make-vertex~ / ~make-edge~ path. The original directory is left byte-for-byte untouched. (This mirrors the migration advice given for the 2016 hashing change — snapshot and replay — now packaged as a single call.)
+Internally it is a *logical* snapshot-and-replay, the same format-independent
+mechanism used for backups: the old graph is opened read-only through the
+head shim matching *its own* stamped version, every live node is written to
+a pointer-free snapshot, and a fresh v3 graph is created and the snapshot
+replayed through the normal ~make-vertex~ / ~make-edge~ path. The old
+graph's schema (its type-id registry) is copied across unchanged, so
+type-ids are preserved, not renumbered. (This mirrors the migration advice
+given for the 2016 hashing change — snapshot and replay — now packaged as a
+single call, and extended here to detect its own source version.)
 
-Note that, because the on-disk format uses ~cl-store~ for some structures, graph *directories* are not portable across Lisp implementations; migrate (and snapshot/replay) on the same implementation that wrote the graph.
+*The rollback guarantee, precisely.* The source graph's *data* — its heap
+and every vertex/edge/index table — is untouched, and it remains fully
+usable: a pre-#166 engine can reopen it directly and read every node with
+its type-ids intact. Rollback is therefore *repointing at the old
+directory*, not restoring from a snapshot. It is not, however, byte-for-byte
+identical: producing the snapshot requires *opening* the source, and that
+open unconditionally rewrites ~schema.dat~ (the same content, re-serialized
+— type-ids are unaffected) and creates one new, empty
+~tx/replication-*.log~ file. Those are the only two files that change. This
+was verified by building a real, unmodified old-version engine (no shim) and
+reopening a post-migration source directory with it: every vertex and edge
+present, every type-id identical to before the migration.
+
+This guarantee assumes the source was *closed cleanly and still has its
+index sidecars*. ~open-graph~ rebuilds a spatial, unique, or secondary index
+from a live-node scan whenever its sidecar is missing, and rebuilding a
+unique index writes (~rebuild-unique-indexes~ calls ~uix-put~ per node). A
+source that crashed, or one written by a build that predates a sidecar
+version, has that index rebuilt — and written — by the ~open-graph~ that
+migration's snapshot step performs, so it is not left untouched either.
+
+This is a materially better rollback story than some earlier on-disk format
+changes, whose rollback needs replaying a full snapshot rather than a plain
+repoint at the old directory.
+
+*Plan for 2x transient disk.* While a migration runs, you have the source
+graph, the intermediate snapshot file, and the new v3 graph's data all on
+disk at once — roughly twice the source graph's size, freed once the
+snapshot is deleted (the default; see ~:delete-snapshot-p~).
+
+*Deployment gate.* Only the engine performing the migration needs to be
+built from a #166-or-later checkout — but so does *every other* engine that
+will subsequently open the resulting v3 graph: replicas, downstream
+consumers, anything replicating from it. A v3 graph is exactly as closed to
+a pre-#166 engine as a v2 graph is to this one. Confirm every reader is
+upgraded before migrating, not after.
+
+Note that, because the on-disk format uses ~cl-store~ for some structures,
+graph *directories* are not portable across Lisp implementations; migrate
+(and snapshot/replay) on the same implementation that wrote the graph.
 
 ** Chapter 13: Spatial Queries
 
