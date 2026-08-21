@@ -38,11 +38,24 @@ REGISTRY-INTERN.  Retry once the holder's assignment completes (GH #186)."
     (:vertex (type-registry-vertex registry))
     (:edge   (type-registry-edge registry))))
 
+;; Printing/reading always happens with *PACKAGE* bound to KEYWORD -- a
+;; package nothing is ever accessible in -- so every non-keyword symbol
+;; prints fully package-qualified regardless of what package happens to be
+;; ambient at the call site.  Without this, CL's printer omits the package
+;; prefix whenever the symbol is accessible in the CURRENT *package*, which
+;; is the ordinary case for a caller registering its own type: the record
+;; would round-trip correctly only by accident of which package is current
+;; at read time.  That is the same defect #190 records for the per-graph
+;; keyword alias, just one level up.  Round-trip review, GH #186 task 1.
+(defun %registry-print-package ()
+  (load-time-value (find-package "KEYWORD")))
+
 (defun %parse-registry-record (line)
   "Read LINE as a (:SYMBOL :PARENT :ID) plist.  Signals on anything else --
 trailing garbage, an unbalanced form, or a missing/wrong-typed key.
 *READ-EVAL* is NIL: the file is data and must never execute."
-  (let ((*read-eval* nil))
+  (let ((*read-eval* nil)
+        (*package* (%registry-print-package)))
     (multiple-value-bind (form pos) (read-from-string line)
       (unless (= pos (length line))
         (error "trailing garbage in type registry record: ~S" line))
@@ -57,40 +70,52 @@ trailing garbage, an unbalanced form, or a missing/wrong-typed key.
   "Rebuild REGISTRY's in-memory state from disk, oldest record first.
 Tolerates a truncated FINAL record (logs and stops); signals on a malformed
 record anywhere earlier -- GH #191 is the defect this must not repeat, since
-the registry is the only record of what a type-id means."
+the registry is the only record of what a type-id means.
+
+Builds fresh hash tables and swaps them into REGISTRY only once fully
+populated, rather than CLRHASH-ing the live ones in place: a concurrent
+REGISTRY-ID-FOR (deliberately lock-free -- see its docstring) must always
+see either the old, complete table or the new one, never a window where
+both are empty and every symbol reads back a spurious NIL."
   (with-recursive-lock-held ((type-registry-lock registry))
-    (clrhash (type-registry-vertex registry))
-    (clrhash (type-registry-edge registry))
     (let ((file (%registry-file (type-registry-location registry)))
+          (vertex (make-hash-table :test 'eq))
+          (edge   (make-hash-table :test 'eq))
           (max-vertex 0)
           (max-edge 0)
           (entries nil))
-      (when (probe-file file)
-        (with-open-file (s file :direction :input)
-          (loop
-            (multiple-value-bind (line missing-newline-p)
-                (read-line s nil :eof)
-              (when (eq line :eof) (return))
-              (let ((parsed
-                      (handler-case (%parse-registry-record line)
-                        (error (e)
-                          (if missing-newline-p
-                              (progn
-                                (log:warn "type registry: dropping torn ~
+      (flet ((table-for (parent)
+               (ecase parent
+                 (:vertex vertex)
+                 (:edge   edge))))
+        (when (probe-file file)
+          (with-open-file (s file :direction :input)
+            (loop
+              (multiple-value-bind (line missing-newline-p)
+                  (read-line s nil :eof)
+                (when (eq line :eof) (return))
+                (let ((parsed
+                        (handler-case (%parse-registry-record line)
+                          (error (e)
+                            (if missing-newline-p
+                                (progn
+                                  (log:warn "type registry: dropping torn ~
 final record in ~A: ~A" file e)
-                                (return))
-                              (error "malformed type registry record in ~
+                                  (return))
+                                (error "malformed type registry record in ~
 ~A: ~A" file e))))))
-                (destructuring-bind (symbol parent id) parsed
-                  (setf (gethash symbol (%registry-table registry parent))
-                        id)
-                  (push (list symbol parent id) entries)
-                  (ecase parent
-                    (:vertex (setf max-vertex (max max-vertex id)))
-                    (:edge   (setf max-edge (max max-edge id))))))))))
+                  (destructuring-bind (symbol parent id) parsed
+                    (setf (gethash symbol (table-for parent)) id)
+                    (push (list symbol parent id) entries)
+                    (ecase parent
+                      (:vertex (setf max-vertex (max max-vertex id)))
+                      (:edge   (setf max-edge (max max-edge id)))))))))))
       (setf (type-registry-entries registry) (nreverse entries))
       (setf (type-registry-next-vertex registry) (1+ max-vertex))
-      (setf (type-registry-next-edge registry) (1+ max-edge))))
+      (setf (type-registry-next-edge registry) (1+ max-edge))
+      ;; The swap: readers see VERTEX/EDGE either fully old or fully new.
+      (setf (type-registry-vertex registry) vertex)
+      (setf (type-registry-edge registry) edge)))
   registry)
 
 (defun %registry-append (registry record)
@@ -100,7 +125,9 @@ append lock."
     (with-open-file (s file :direction :output
                             :if-exists :append
                             :if-does-not-exist :create)
-      (let ((*print-readably* nil) (*print-pretty* nil))
+      (let ((*print-readably* nil)
+            (*print-pretty* nil)
+            (*package* (%registry-print-package)))
         (format s "~S~%" record))
       (finish-output s))))
 
@@ -135,7 +162,9 @@ for the registry's lifetime (contrast the system clock, #182)."
 
 (defun registry-id-for (registry symbol parent)
   "The id for SYMBOL under PARENT, or NIL.  A pure read of in-memory
-state -- never touches disk or the append lock."
+state -- never touches disk or the append lock, and deliberately takes no
+lock of its own: %REGISTRY-LOAD's table swap (not a lock here) is what
+keeps this safe to call from any thread at any time."
   (gethash symbol (%registry-table registry parent)))
 
 (defun registry-entries (registry)
