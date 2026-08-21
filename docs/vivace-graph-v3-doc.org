@@ -2912,6 +2912,39 @@ watermark observation is then a no-op, leaving the restored store
 holding epochs the clock already issued to other stores. See
 vivace-graph#180.
 
+*** Cross-process exclusion
+
+Only one image may hold a given clock directory open at a time. A second
+process opening a directory another process already holds gets an
+immediate refusal, not a hang: ~open-system-clock~ signals
+~system-clock-in-use~, whose ~system-clock-in-use-location~ reader names
+the directory that was refused. This exists because #168's watermark
+protects against a *store* being attached twice, but not against a
+second *image* independently opening the same clock directory and
+issuing its own overlapping epochs — silently violating the one
+guarantee the clock exists to provide (GH #182).
+
+The lock is a plain, non-blocking ~flock(2)~ on ~system-clock.lock~, a
+sibling of ~system-clock.dat~ and ~system-journal.log~ in the clock
+directory, held open for the lifetime of the ~system-clock~ struct and
+released by ~close-system-clock~ closing the descriptor — there is no
+~LOCK_UN~ call. A process that dies while holding the clock needs no
+operator action: the kernel releases ~flock~ locks automatically when
+the holding process exits, so the next opener simply succeeds. No
+"unclean shutdown" marker is written or checked, because none is
+needed — see "Restore's watermark now matches the rest of the engine"
+above for why the ceiling protocol already makes a crashed clock safe
+to reopen without recovery.
+
+Two caveats worth stating plainly. First, ~flock~ semantics are
+unreliable over NFS on many kernels; this design assumes the clock
+directory lives on local storage, one host at a time, matching how
+every other file this engine memory-maps is treated. Second, the guard
+is advisory, not mandatory: it only stops a second call to
+~open-system-clock~ on the same directory. A process that reads or
+writes ~system-clock.dat~ directly, bypassing this API, is not stopped
+by the lock.
+
 *** Epoch leases for a detached store
 
 ~clock-lease-epochs~ reserves a contiguous range on the clock for a store

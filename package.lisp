@@ -27,6 +27,8 @@
            #:system-clock
            #:open-system-clock
            #:close-system-clock
+           #:system-clock-in-use
+           #:system-clock-in-use-location
            #:clock-next-epoch
            #:clock-current-epoch
            #:clock-peek-epoch

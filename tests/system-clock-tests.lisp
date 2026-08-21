@@ -49,6 +49,13 @@
              (is (> (clock-next-epoch c2) last))
           (close-system-clock c2))))))
 
+(defun %simulate-crash (clock)
+  "Release CLOCK's flock without persisting anything, mirroring what the
+kernel does when a process dies mid-flight (GH #182).  Lets crash tests
+open a second clock on the same directory without CLOSE-SYSTEM-CLOCK's
+clean write masking what's actually durable."
+  (graph-db::%posix-close (graph-db::system-clock-lock-fd clock)))
+
 (test clock-survives-crash-without-reissuing
   ;; No CLOSE-SYSTEM-CLOCK: simulates a crash after ids were handed out.  The
   ;; block reservation on disk must already dominate every issued id.
@@ -56,6 +63,7 @@
     (let* ((c (open-system-clock (namestring dir) :block-size 8))
            (issued (loop repeat 5 collect (clock-next-epoch c)))
            (highest (reduce #'max issued)))
+      (%simulate-crash c)
       (let ((c2 (open-system-clock (namestring dir) :block-size 8)))
         (unwind-protect
              (is (> (clock-next-epoch c2) highest))
@@ -71,6 +79,7 @@
     (let* ((c (open-system-clock (namestring dir) :block-size 8))
            (issued (loop repeat 20 collect (clock-next-epoch c)))
            (highest (reduce #'max issued)))
+      (%simulate-crash c)
       (let ((c2 (open-system-clock (namestring dir) :block-size 8)))
         (unwind-protect
              (is (> (clock-next-epoch c2) highest))
@@ -86,6 +95,7 @@
     (let* ((c (open-system-clock (namestring dir) :block-size 8))
            (observed 999999))
       (clock-observe-epoch c observed)
+      (%simulate-crash c)
       (let ((c2 (open-system-clock (namestring dir) :block-size 8)))
         (unwind-protect
              (is (> (clock-next-epoch c2) observed))
@@ -611,3 +621,61 @@
                    (close-graph ga)
                    (close-graph gb)))))
         (close-system-clock clock)))))
+
+;;; GH #182: two images on one clock directory both issued epochs, silently.
+
+(test second-open-of-a-held-clock-signals
+  "The whole point: a second allocator on one system directory destroys the
+single property the clock provides."
+  (with-temp-directory (dir)
+    (let ((c (open-system-clock (namestring dir))))
+      (unwind-protect
+           (signals graph-db:system-clock-in-use
+             (open-system-clock (namestring dir)))
+        (close-system-clock c)))))
+
+(test a-held-clock-refuses-without-blocking
+  "LOCK_NB is deliberate: blocking would present as a startup hang with no
+diagnostic.  Proven by the refusal returning at all -- a blocking flock here
+would never reach the assertion."
+  (with-temp-directory (dir)
+    (let ((c (open-system-clock (namestring dir))))
+      (unwind-protect
+           (let ((loc (handler-case
+                          (progn (open-system-clock (namestring dir)) nil)
+                        (graph-db:system-clock-in-use (e)
+                          (graph-db:system-clock-in-use-location e)))))
+             (is-true loc "the refusal names the directory it refused"))
+        (close-system-clock c)))))
+
+(test a-closed-clock-can-be-reopened
+  (with-temp-directory (dir)
+    (let ((c (open-system-clock (namestring dir))))
+      (close-system-clock c))
+    (let ((c2 (open-system-clock (namestring dir))))
+      (unwind-protect (is-true c2 "the lock was released by the clean close")
+        (close-system-clock c2)))))
+
+(test leasing-works-while-the-lock-is-held
+  "A lease-holder is inside the owning image (spec §8.1), so the guard must not
+break the #170 path."
+  (with-temp-directory (dir)
+    (let ((c (open-system-clock (namestring dir))))
+      (unwind-protect
+           (multiple-value-bind (start end) (clock-lease-epochs c 100)
+             (is (= 100 (- end start)))
+             (is (>= (clock-current-epoch c) end)
+                 "the clock skipped past the leased range"))
+        (close-system-clock c)))))
+
+(test epochs-stay-monotonic-across-a-close-and-reopen
+  "The lock must not disturb the ceiling protocol."
+  (with-temp-directory (dir)
+    (let* ((c (open-system-clock (namestring dir)))
+           (a (clock-next-epoch c)))
+      (close-system-clock c)
+      (let ((c2 (open-system-clock (namestring dir))))
+        (unwind-protect
+             (is (> (clock-next-epoch c2) a)
+                 "a reopened clock never reissues")
+          (close-system-clock c2))))))
