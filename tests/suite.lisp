@@ -62,11 +62,13 @@ Invoked by (asdf:test-system :graph-db)."
        (uiop:delete-directory-tree ,var :validate t :if-does-not-exist :ignore))))
 
 (defun collect-garbage ()
-  "Force a full GC.  Each graph creates several mmap'd structures per test;
-without reclaiming between tests, a whole suite run in one image exhausts the
-default heap.  (Before #166, a type-index alone preallocated 65536 index-list
-structs per type table -- no longer true, but many tests per image still
-adds up.)"
+  "Force a full GC.  This reclaims Lisp-heap objects only -- index-list
+structs, buffer-pool entries, node instances -- not mmap'd regions (those
+are freed by MUNMAP-FILE, not GC).  Each graph creates plenty of the former
+per test; without reclaiming between tests, a whole suite run in one image
+exhausts the default heap.  (Before #166, a type-index alone preallocated
+65536 index-list structs per type table -- no longer true, but many tests
+per image still adds up.)"
   #+sbcl (sb-ext:gc :full t)
   #+ccl (ccl:gc)
   #+lispworks (hcl:gc-all)

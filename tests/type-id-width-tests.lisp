@@ -17,8 +17,17 @@
 
 ;; Declared once at load time, its own graph name -- this file loads before
 ;; graph-tests.lisp (see graph-db.asd), so it cannot depend on
-;; *INTEGRATION-GRAPH-NAME*'s schema.
-(def-vertex ti-gc-thing () ((label :type string)) :ti-gc-reopen-test)
+;; *INTEGRATION-GRAPH-NAME*'s schema.  Two vertex types (so a mark that skips
+;; every OTHER type-id would still be caught) plus one edge type (the
+;; edge-index half of the GC fix, gc.lisp's MAP-IDX call on EDGE-INDEX, is
+;; otherwise untested).  Start from a clean slate so reloading this file
+;; doesn't register the type metadata more than once (graph-tests.lisp:13
+;; and mvcc-tests.lisp:19 do the same for their own graph names).
+(eval-when (:load-toplevel :execute)
+  (setf (gethash :ti-gc-reopen-test *schema-node-metadata*) nil))
+(def-vertex ti-gc-thing-a () ((label :type string)) :ti-gc-reopen-test)
+(def-vertex ti-gc-thing-b () ((label :type string)) :ti-gc-reopen-test)
+(def-edge ti-gc-link () () :ti-gc-reopen-test)
 
 (test node-head-is-33-bytes
   (is (= 33 graph-db::+node-header-size+)))
@@ -232,27 +241,32 @@
   (with-temp-directory (dir)
     (let* ((path (namestring (merge-pathnames "ti.dat" dir)))
            (heap (graph-db::create-memory
-                  (namestring (merge-pathnames "h.dat" dir)) (* 1024 1024)))
-           (idx (graph-db::make-type-index path heap)))
+                  (namestring (merge-pathnames "h.dat" dir)) (* 1024 1024))))
       (unwind-protect
-           (is (< (with-open-file (s path :element-type '(unsigned-byte 8))
-                    (file-length s))
-                  (* 1024 1024)))          ; well under the old ~1.1 MB
-        (graph-db::close-type-index idx)))))
+           (let ((idx (graph-db::make-type-index path heap)))
+             (unwind-protect
+                  (is (< (with-open-file (s path :element-type
+                                               '(unsigned-byte 8))
+                           (file-length s))
+                         (* 1024 1024)))   ; well under the old ~1.1 MB
+               (graph-db::close-type-index idx)))
+        (graph-db::close-memory heap)))))
 
 (test type-index-grows-for-a-large-type-id
   (with-temp-directory (dir)
     (let* ((path (namestring (merge-pathnames "ti2.dat" dir)))
            (heap (graph-db::create-memory
                   (namestring (merge-pathnames "h2.dat" dir)) (* 1024 1024)))
-           (idx (graph-db::make-type-index path heap))
            (id (graph-db::gen-vertex-id)))
       (unwind-protect
-           (progn
-             (graph-db::type-index-push id 70000 idx)
-             (is (graph-db::index-list-member-p
-                  id (graph-db::get-type-index-list idx 70000))))
-        (graph-db::close-type-index idx)))))
+           (let ((idx (graph-db::make-type-index path heap)))
+             (unwind-protect
+                  (progn
+                    (graph-db::type-index-push id 70000 idx)
+                    (is (graph-db::index-list-member-p
+                         id (graph-db::get-type-index-list idx 70000))))
+               (graph-db::close-type-index idx)))
+        (graph-db::close-memory heap)))))
 
 (test type-index-locks-are-bounded
   (is (<= graph-db::+type-index-lock-stripes+ 1024)))
@@ -275,14 +289,17 @@
            (heap (graph-db::create-memory
                   (namestring (merge-pathnames "h3.dat" dir)) (* 1024 1024)))
            (id (graph-db::gen-vertex-id)))
-      (let ((idx (graph-db::make-type-index path heap)))
-        (graph-db::type-index-push id 70000 idx)
-        (graph-db::close-type-index idx))
-      (let ((idx (graph-db::open-type-index path heap)))
-        (unwind-protect
-             (is (graph-db::index-list-member-p
-                  id (graph-db::get-type-index-list idx 70000)))
-          (graph-db::close-type-index idx))))))
+      (unwind-protect
+           (progn
+             (let ((idx (graph-db::make-type-index path heap)))
+               (graph-db::type-index-push id 70000 idx)
+               (graph-db::close-type-index idx))
+             (let ((idx (graph-db::open-type-index path heap)))
+               (unwind-protect
+                    (is (graph-db::index-list-member-p
+                         id (graph-db::get-type-index-list idx 70000)))
+                 (graph-db::close-type-index idx))))
+        (graph-db::close-memory heap)))))
 
 (test ti-gc-thing-survives-a-gc-on-reopen
   ;; #166 regression: OPEN-GRAPH's default :GC-HEAP-P T runs a mark-and-sweep
@@ -295,19 +312,36 @@
   ;; so GC-HEAP swept that type's still-live node data as garbage.  A
   ;; type-index-only round-trip (the test above) cannot see this: it never
   ;; calls GC-HEAP.  This is the one that actually caught the regression.
+  ;;
+  ;; TWO vertex types plus ONE edge type, one instance each: a single type
+  ;; would not catch "enumerates most types but misses one" (e.g. a mark
+  ;; skipping every even type-id), and gc.lisp's MAP-IDX runs once for
+  ;; EDGE-INDEX and once for VERTEX-INDEX -- an edge-blind fix would leave
+  ;; TI-GC-LINK's data silently swept while every vertex test stayed green.
   (with-temp-directory (dir)
     (let ((g (make-graph :ti-gc-reopen-test (namestring dir)
                          :buffer-pool-size 1000)))
       (let ((*graph* g))
-        (with-transaction () (make-ti-gc-thing :label "SURVIVED")))
+        (with-transaction ()
+          (let ((va (make-ti-gc-thing-a :label "A-SURVIVED"))
+                (vb (make-ti-gc-thing-b :label "B-SURVIVED")))
+            (make-ti-gc-link :from va :to vb))))
       (close-graph g :snapshot-p nil))
     (let ((g (open-graph :ti-gc-reopen-test (namestring dir))))
       (unwind-protect
-           (let ((seen '()))
-             (map-vertices (lambda (v) (push (slot-value v 'label) seen))
-                           g :vertex-type 'ti-gc-thing)
-             (is (equal '("SURVIVED") seen)
-                 "a vertex must survive OPEN-GRAPH's default GC-HEAP-P T scan"))
+           (let ((seen-a '()) (seen-b '()) (seen-links '()))
+             (map-vertices (lambda (v) (push (slot-value v 'label) seen-a))
+                           g :vertex-type 'ti-gc-thing-a)
+             (map-vertices (lambda (v) (push (slot-value v 'label) seen-b))
+                           g :vertex-type 'ti-gc-thing-b)
+             (map-edges (lambda (e) (push (id e) seen-links))
+                       g :edge-type 'ti-gc-link)
+             (is (equal '("A-SURVIVED") seen-a)
+                 "type A's vertex must survive the default GC-HEAP-P T scan")
+             (is (equal '("B-SURVIVED") seen-b)
+                 "type B's vertex must survive the default GC-HEAP-P T scan")
+             (is (= 1 (length seen-links))
+                 "the edge must survive the default GC-HEAP-P T scan"))
         (close-graph g :snapshot-p nil)
         (collect-garbage)))))
 
@@ -332,36 +366,42 @@
       (is-false (key-in-list-p a (get-type-index-list idx type-b)))
       (is-false (key-in-list-p b (get-type-index-list idx type-a))))))
 
-(test type-index-concurrent-push-to-colliding-stripe-types
-  ;; Correctness under concurrency, not just under a single thread: two
-  ;; type-ids sharing a stripe are pushed to from two threads at once.  A
-  ;; stripe computed wrongly enough to under-serialize one of these types
-  ;; (e.g. a bug that only sometimes maps a type-id to its stripe) would lose
-  ;; pushes to a lost-update race on that type's index-list head; a stripe
-  ;; computed wrongly the OTHER way (aliasing the two types' data, not just
-  ;; their locks) would show up as cross-contamination between the two lists.
+(test type-index-concurrent-push-to-one-type-id-loses-nothing
+  ;; Two threads push DISTINCT ids into the SAME type-id's index-list at
+  ;; once -- the one shared mutable resource TYPE-INDEX-PUSH's lock actually
+  ;; has to protect.  INDEX-LIST-PUSH's head update
+  ;; (index-list.lisp:116-119) is `(sb-ext:cas (index-list-head il)
+  ;; (index-list-head il) address)` -- the "expected" argument is a SECOND
+  ;; read of the same place, so it is an unconditional store, not a real
+  ;; compare-and-swap.  Unserialized, two concurrent pushes race to read the
+  ;; old head, and the loser's write clobbers the winner's: one push is
+  ;; silently dropped.  (An earlier version of this test pushed to two
+  ;; DIFFERENT type-ids sharing a lock stripe -- disjoint index-list objects
+  ;; and disjoint mmap offsets, so it proved nothing about locking at all: a
+  ;; constant stripe function, an off-by-one stripe function, or no lock
+  ;; whatsoever would all have passed it just the same.)
   (with-temp-type-index (idx heap)
     (let* ((n 200)
-           (type-a 1)
-           (type-b (+ 1 graph-db::+type-index-lock-stripes+))
+           (type-id 1)
            (ids-a (loop repeat n collect (gen-id)))
            (ids-b (loop repeat n collect (gen-id)))
            (err nil))
-      (flet ((push-all (ids type-id)
+      (flet ((push-all (ids)
                (lambda ()
                  (handler-case
                      (dolist (id ids) (type-index-push id type-id idx))
                    (error (e) (setf err e))))))
-        (let ((ta (bordeaux-threads:make-thread (push-all ids-a type-a)
-                                                 :name "ti-stripe-a"))
-              (tb (bordeaux-threads:make-thread (push-all ids-b type-b)
-                                                 :name "ti-stripe-b")))
+        (let ((ta (bordeaux-threads:make-thread (push-all ids-a)
+                                                 :name "ti-push-a"))
+              (tb (bordeaux-threads:make-thread (push-all ids-b)
+                                                 :name "ti-push-b")))
           (bordeaux-threads:join-thread ta)
           (bordeaux-threads:join-thread tb)))
       (is (null err) "a pushing thread signaled: ~A" err)
-      (let ((listed-a (index-list-keys (get-type-index-list idx type-a)))
-            (listed-b (index-list-keys (get-type-index-list idx type-b))))
-        (is (= n (length listed-a)))
-        (is (= n (length listed-b)))
-        (dolist (id ids-a) (is-true (member id listed-a :test #'equalp)))
-        (dolist (id ids-b) (is-true (member id listed-b :test #'equalp)))))))
+      (let ((listed (index-list-keys (get-type-index-list idx type-id))))
+        (is (= (* 2 n) (length listed))
+            "expected ~D ids (~D dropped by a lost-update race), got ~D"
+            (* 2 n) (- (* 2 n) (length listed)) (length listed))
+        (is (null (set-exclusive-or (append ids-a ids-b) listed
+                                    :test #'equalp))
+            "the pushed ids and the surviving ids must be the same set")))))

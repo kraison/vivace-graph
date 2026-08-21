@@ -36,9 +36,14 @@
   ;; Number of type-id slots TABLE currently has room for.  Grown on demand by
   ;; %TI-ENSURE-CAPACITY, which also extends TABLE itself; guarded by
   ;; GROW-LOCK, a lock distinct from the per-type stripe locks above because a
-  ;; grow touches the whole mapping, not one type's slot.  Set from the actual
-  ;; file size at both MAKE-TYPE-INDEX and OPEN-TYPE-INDEX, so a grow that ran
-  ;; in a prior session is picked up correctly on reopen (#166).
+  ;; grow touches the whole mapping, not one type's slot.  MAKE-TYPE-INDEX
+  ;; sets this to +TYPE-INDEX-INITIAL-TYPES+ directly (the mmap it just
+  ;; created is exactly that size).  OPEN-TYPE-INDEX instead derives it from
+  ;; the reopened file's ACTUAL length -- (FLOOR (MAPPED-FILE-LENGTH TABLE)
+  ;; +INDEX-LIST-BYTES+) -- so a grow that ran in a prior session is picked
+  ;; up correctly rather than assumed away; the two paths only ever agree
+  ;; numerically because %POSIX-EXTEND-FILE-BACKING does no rounding and
+  ;; +TYPE-INDEX-INITIAL-TYPES+ * +INDEX-LIST-BYTES+ is exact (#166).
   (capacity 0 :type (integer 0))
   (grow-lock #+ccl (make-lock)
              #+lispworks (mp:make-lock)
