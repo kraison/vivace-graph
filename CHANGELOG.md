@@ -224,6 +224,29 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Fixed
 
+- **`open-system-clock` let two processes both allocate epochs for the same
+  system directory, silently** (#182). The image-level clock (#168) had no
+  cross-process exclusion: two images opening one clock directory both read
+  the persisted ceiling, both reserved a block, and both started issuing
+  epochs from overlapping ranges — destroying the one property the clock
+  exists to provide, that no two transactions in the system share an epoch.
+  `open-system-clock` now takes an exclusive, non-blocking `flock(2)` on
+  `system-clock.lock` (a sibling of `system-clock.dat` and
+  `system-journal.log`) before touching the ceiling file, and signals
+  `system-clock-in-use` (with a `system-clock-in-use-location` reader) when
+  the lock is already held. Non-blocking is deliberate: a blocking wait
+  would present as a startup hang with no diagnostic. `close-system-clock`
+  releases by closing the fd — there is no `LOCK_UN` path — and the kernel
+  releases the lock automatically if the holder dies, so a crashed process
+  leaves no residue for the next opener to clean up.
+
+  **No recovery step, deliberately.** The counter is already crash-safe:
+  `%write-clock-ceiling` persists `ceiling + block-size` before any id in
+  that block is issued, so a crashed process's successor simply resumes
+  above the persisted ceiling and never reissues. A `.dirty`-style marker
+  or other recovery path would force manual intervention for a condition
+  the ceiling protocol already handles correctly, so none was added.
+
 - **The memory-graph native image (`VGMI`) packed `type-id` at 2 bytes and
   truncated silently; format bumped to v8** (#187). `ni-uint` writes with
   `ldb`, so a `type-id` above 65535 lost its high bits with no signal — 70000

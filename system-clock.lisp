@@ -18,7 +18,23 @@ transaction-id counter, which is the pre-#168 behaviour and the default.")
   (ceiling 0 :type (unsigned-byte 64))
   (block-size 4096 :type (unsigned-byte 32))
   (lock (make-recursive-lock "system clock"))
-  (journal nil))
+  (journal nil)
+  ;; Held open for the clock's lifetime; the kernel releases it on process
+  ;; death, so a stale lock cannot happen (GH #182).
+  (lock-fd nil))
+
+(define-condition system-clock-in-use (error)
+  ((location :initarg :location :reader system-clock-in-use-location))
+  (:report
+   (lambda (c s)
+     (format s "The system clock at ~A is held by another process.  Only one ~
+image may allocate epochs for a system; a second would issue epochs colliding ~
+with the holder's (GH #182).  A lease-holding process must not open the clock ~
+directory -- see the design's §8.1."
+             (system-clock-in-use-location c)))))
+
+(defun %clock-lock-file (location)
+  (make-pathname :name "system-clock" :type "lock" :defaults location))
 
 (defun %clock-counter-file (location)
   (make-pathname :name "system-clock" :type "dat" :defaults location))
@@ -56,23 +72,48 @@ mid-write can't leave it short or absent (cf. transactions.lisp:939)."
 
 (defun open-system-clock (location &key (block-size 4096))
   "Open or create the system clock in directory LOCATION.  Ids resume above
-the persisted ceiling, so a crash never reissues one."
+the persisted ceiling, so a crash never reissues one.  Signals
+SYSTEM-CLOCK-IN-USE if another live process holds LOCATION (GH #182)."
   (ensure-directories-exist location)
-  (let* ((ceiling (%read-clock-ceiling location))
-         (clock (%make-system-clock :location location
-                                    :counter ceiling
-                                    :ceiling ceiling
-                                    :block-size block-size)))
-    (%write-clock-ceiling clock (+ ceiling block-size))
-    clock))
+  (let ((fd (%posix-open (%clock-lock-file location)
+                         (logior +o-creat+ +o-rdwr+)))
+        (opened nil))
+    (unwind-protect
+         (progn
+           (unless (handler-case
+                       (%posix-flock fd (logior +lock-ex+ +lock-nb+))
+                     ;; A real failure (EBADF, ENOLCK) reports an fd number and
+                     ;; a raw errno; name the directory it was for.
+                     (error (e)
+                       (error "Cannot lock the system clock at ~A: ~A"
+                              location e)))
+             (error 'system-clock-in-use :location location))
+           (let* ((ceiling (%read-clock-ceiling location))
+                  (clock (%make-system-clock :location location
+                                             :counter ceiling
+                                             :ceiling ceiling
+                                             :block-size block-size
+                                             :lock-fd fd)))
+             (%write-clock-ceiling clock (+ ceiling block-size))
+             (setf opened t)
+             clock))
+      (unless opened (%posix-close fd)))))
 
 (defun close-system-clock (clock)
-  "Persist the exact counter so a clean reopen wastes no ids."
+  "Persist the exact counter so a clean reopen wastes no ids.  Releases the
+directory lock even if that persist fails: a stranded lock would refuse every
+later open in this image, for the life of the process (GH #182)."
   (with-recursive-lock-held ((system-clock-lock clock))
-    (%write-clock-ceiling clock (system-clock-counter clock))
-    (when (system-clock-journal clock)
-      (close (system-clock-journal clock))
-      (setf (system-clock-journal clock) nil)))
+    (unwind-protect
+         (progn
+           (%write-clock-ceiling clock (system-clock-counter clock))
+           (when (system-clock-journal clock)
+             (close (system-clock-journal clock))
+             (setf (system-clock-journal clock) nil)))
+      (when (system-clock-lock-fd clock)
+        ;; Closing the fd is the release; there is no LOCK_UN path.
+        (%posix-close (system-clock-lock-fd clock))
+        (setf (system-clock-lock-fd clock) nil))))
   clock)
 
 (defun journal-append (clock kind &rest plist)

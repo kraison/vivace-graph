@@ -37,6 +37,15 @@
 (defconstant +seek-set+ 0)
 (defconstant +seek-end+ 2)
 
+;;; flock(2).  Same values on Linux and Darwin, so unlike the mmap and open
+;;; flags above these need no platform conditional.  No +LOCK-UN+: the clock
+;;; releases by closing the fd (GH #182).
+(defconstant +lock-ex+ 2)
+(defconstant +lock-nb+ 4)
+
+;;; EWOULDBLOCK == EAGAIN on both targets, but the value differs.
+(defconstant +eagain+ #+graph-db-posix-linux 11 #-graph-db-posix-linux 35)
+
 (defconstant +prot-none+  0)
 (defconstant +prot-read+  1)
 (defconstant +prot-write+ 2)
@@ -97,6 +106,32 @@
     (when (minusp fd)
       (error "posix open failed for ~A (flags ~D)" path flags))
     fd))
+
+;; ECL's C output has no implicit <errno.h>; without this CLINES, the bare
+;; `errno` reference in %ERRNO below fails to compile ("errno undeclared"),
+;; not merely misreports -- verified against ECL 26.5.5.
+#+ecl
+(ffi:clines "#include <errno.h>")
+
+(defun %errno ()
+  "The current errno, or NIL where this implementation cannot report one.
+NIL is honest: a caller must not mistake an unknown failure for a held lock."
+  #+sbcl (sb-alien:get-errno)
+  ;; CCL returns it negated.
+  #+ccl  (- (ccl::%get-errno))
+  #+ecl  (ffi:c-inline () () :int "errno" :one-liner t)
+  #-(or sbcl ecl ccl) nil)
+
+(defun %posix-flock (fd operation)
+  "flock(2).  Returns T when the lock was taken, NIL when OPERATION included
++LOCK-NB+ and the lock is held elsewhere.  Signals on any other failure: a
+caller must not report 'another process holds this' for EBADF or ENOLCK."
+  (let* ((r (cffi:foreign-funcall "flock" :int fd :int operation :int))
+         (e (unless (zerop r) (%errno))))
+    (cond ((zerop r) t)
+          ((eql e +eagain+) nil)
+          (t (error "posix flock failed for fd ~D (operation ~D, errno ~A)"
+                    fd operation e)))))
 
 (defun %posix-close (fd)
   (cffi:foreign-funcall "close" :int fd :int))
