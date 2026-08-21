@@ -1,6 +1,15 @@
 ;;;; Combined Profiling Harness for VivaceGraph Profiler
 (in-package #:graph-db/profiler)
 
+;;; Every module here opens its own throwaway store, and since GH #186 a store
+;;; cannot be opened without a system directory to take type-ids from.  One for
+;;; the whole profiler image, which is the shape a real system has: many
+;;; stores, one registry.  SETF at load time, so a module run from any thread
+;;; sees it.
+(setf graph-db:*system-directory*
+      (namestring
+       (ensure-directories-exist #p"/tmp/vg-profiler-system/")))
+
 (defstruct profiler-run-result
   (name "Profile Run" :type string)
   (subsystems '() :type list)

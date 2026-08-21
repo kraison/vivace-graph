@@ -3,6 +3,10 @@
 
 (defvar *graph-name* :test-graph)
 (defvar *graph-path* "/var/tmp/test-graph/")
+;; Type-ids come from the registry in *SYSTEM-DIRECTORY*; a store cannot be
+;; opened without one (GH #186).
+(setf *system-directory*
+      (namestring (ensure-directories-exist "/var/tmp/test-graph-system/")))
 (log:config :all :sane :d :nopretty :thread :daily "/var/tmp/graph.log")
 
 ;;; Types

@@ -211,8 +211,14 @@ With our schema defined, we can connect to the database. We will store our graph
 
 The global special variable ~*graph*~ must be bound to the active graph instance. A common pattern is to check if the database exists and either create a new one or open the existing one.
 
+Before opening any graph, point ~*system-directory*~ at the directory holding
+this system's shared state — the type-id registry lives there, and graph-db
+refuses to create or open a store without it (see Chapter 17, "The system
+directory is mandatory").
+
 #+BEGIN_SRC lisp
   (defvar *my-graph-path* "/var/tmp/social-app/")
+  (setf graph-db:*system-directory* "/var/tmp/social-app-system/")
   
   (defun connect-to-database ()
     "Creates a new graph or opens an existing one."
@@ -425,14 +431,16 @@ For these primary node tables, the *key* is the node's 16-byte UUID, and the *va
 
 ~type-id~ widened from 2 to 4 bytes in v3, which breaks the byte-for-byte prefix the v1 and v2 heads used to share (both had ~flags(1) type-id(2) ...~); a v2 head must be read with ~deserialize-node-head-v2~, not reinterpreted against the v3 layout in place. ~data-pointer~ is the all-important offset to the node's data in the heap file; ~commit-epoch~ and ~prev-pointer~ drive the versioning machinery described in Chapter 12, "MVCC: Immutable Versioned Nodes". The on-disk storage version is recorded in each memory-mapped region; opening a v1 *or v2* graph with a v3 build signals an error directing you to ~migrate-graph~ (see "Migrating an older graph to v3" in Chapter 12).
 
-*A wider ceiling, still per graph.* The 4-byte field raises the number of
-distinct node types one graph can register from 65,536 to 4,294,967,295 — in
-practice unreachable, since each registered type is also a finalized CLOS
-class. This is *not* a global type-id space: ids are still assigned
-independently by each graph's own schema, starting from 1, so the same
-numeric type-id can (and typically does) mean a different class in two
-different graphs. A future change to make type-ids global and distributed is
-tracked separately (GH #186) and has not landed.
+*A wider ceiling, and now a system-wide one.* The 4-byte field raises the
+number of distinct node types a system can register from 65,536 to
+4,294,967,295 — in practice unreachable, since each registered type is also a
+finalized CLOS class. As of GH #186 the id space is *system-wide*, not per
+graph: ids are assigned by the registry in ~*system-directory*~, keyed on the
+package-qualified type name, so one name means one id in every store of the
+system and no two names ever share an id. Vertices and edges remain separate
+id spaces, as they were per graph. Before #186 each graph counted from 1
+independently, so the same integer typically named a different class in two
+graphs; see Chapter 17, "The system directory is mandatory".
 
 *** The Type Index (~type-index.lisp~): finding nodes by type
 
@@ -454,16 +462,20 @@ and grows by doubling, in place, the first time a type-id past its current
 capacity is touched. "In place" is the operative property — growth extends
 the memory-mapped file and never relocates its base address, so a concurrent
 reader is never at risk of dereferencing a pointer the grow just moved out
-from under it. Because type-ids are assigned sequentially from 1, ordinary
-schemas never grow the index more than once or twice, if at all.
+from under it. Since #186 a store's type-ids are *sparse* — they come from
+the system-wide registry, so a store holds the ids of its own types, not a
+dense run from 1 — and the index is sized by the highest id it holds rather
+than by how many types it has. The initial 4,096 slots therefore cover a
+*system* of that many types; a store in a larger system grows its index once
+or twice, which costs one in-place extension each.
 
 Growth is not unbounded: the index's mmap reserves address space at the 1 GiB
 floor (~*mmap-min-reservation*~), and doubling from 4,096 types reaches 2^25
 (33,554,432) types cleanly but the next doubling would exceed that
 reservation, so ~extend-mapped-file~ signals ("mmap reservation exhausted")
 rather than growing past it. That is a loud failure, not silent corruption,
-and it is unreachable in practice while type-ids stay per-graph and are
-handed out sequentially from 1.
+and it is unreachable in practice: reaching it needs a system that has
+registered 2^25 distinct type names.
 
 *Lock striping.* Every push/remove against a type's index-list is serialized
 by a lock. Before #166 that was one mutex *per type-id* — 65,536 of them per
@@ -2144,11 +2156,27 @@ Internally it is a *logical* snapshot-and-replay, the same format-independent
 mechanism used for backups: the old graph is opened read-only through the
 head shim matching *its own* stamped version, every live node is written to
 a pointer-free snapshot, and a fresh v3 graph is created and the snapshot
-replayed through the normal ~make-vertex~ / ~make-edge~ path. The old
-graph's schema (its type-id registry) is copied across unchanged, so
-type-ids are preserved, not renumbered. (This mirrors the migration advice
-given for the 2016 hashing change — snapshot and replay — now packaged as a
-single call, and extended here to detect its own source version.)
+replayed through the normal ~make-vertex~ / ~make-edge~ path. (This mirrors
+the migration advice given for the 2016 hashing change — snapshot and replay
+— now packaged as a single call, and extended here to detect its own source
+version.)
+
+*Which type-ids the new graph gets is the one mode-dependent thing here*, and
+~:renumber-p~ chooses:
+
+- ~:renumber-p nil~ (the default) copies the old graph's schema across
+  unchanged, so every type-id is preserved. This is the #166 format
+  migration and nothing else. The new store's ids are the *source's*
+  per-graph ids, not the system registry's, so the migration deliberately
+  leaves the registry alone rather than claim ids for names it did not
+  renumber.
+- ~:renumber-p t~ takes every type-id from the system registry instead, so
+  the new store's ids mean the same thing in every other store of the
+  system. This is how a populated system adopts global ids; see "Adopting
+  global type-ids on an existing system" in Chapter 17 for the procedure,
+  which starts with seeding the registry rather than with this call. A
+  symbol the source's history left holding two ids unifies under one here,
+  and ~migrate-graph~ names it in its *second return value*.
 
 *The rollback guarantee, precisely.* The source graph's *data* — its heap
 and every vertex/edge/index table — is untouched, and it remains fully
@@ -2156,12 +2184,14 @@ usable: a pre-#166 engine can reopen it directly and read every node with
 its type-ids intact. Rollback is therefore *repointing at the old
 directory*, not restoring from a snapshot. It is not, however, byte-for-byte
 identical: producing the snapshot requires *opening* the source, and that
-open unconditionally rewrites ~schema.dat~ (the same content, re-serialized
-— type-ids are unaffected) and creates one new, empty
-~tx/replication-*.log~ file. Those are the only two files that change. This
-was verified by building a real, unmodified old-version engine (no shim) and
-reopening a post-migration source directory with it: every vertex and edge
-present, every type-id identical to before the migration.
+open creates one new, empty ~tx/replication-*.log~ file. That is the only
+file that changes. (It also rewrote ~schema.dat~ before #186 — same content,
+re-serialized. ~migrate-graph~ now suppresses the schema replay for both of
+its opens, so a type declared in your image but absent from the source is no
+longer written into the source at all.) This was verified by building a
+real, unmodified old-version engine (no shim) and reopening a
+post-migration source directory with it: every vertex and edge present,
+every type-id identical to before the migration.
 
 This guarantee assumes the source was *closed cleanly and still has its
 index sidecars*. ~open-graph~ rebuilds a spatial, unique, or secondary index
@@ -2316,7 +2346,7 @@ Every query takes a *scope* as its first argument: a node-class name, a list of 
 
 *** Subset replication (field devices)
 
-A replication *slave* can hold only a subset of the master's data — useful for a field device that needs just its area of operations, not the whole dataset. Give the slave a ~:replication-filter~: a predicate ~(node) -> boolean~ that decides, per replicated write, whether the slave applies it. Each transaction still advances the slave's high-water mark, so filtered transactions are not re-requested.
+A replication *slave* can hold only a subset of the master's data — useful for a field device that needs just its own region, not the whole dataset. Give the slave a ~:replication-filter~: a predicate ~(node) -> boolean~ that decides, per replicated write, whether the slave applies it. Each transaction still advances the slave's high-water mark, so filtered transactions are not re-requested.
 
 ~make-spatial-replication-filter~ builds a filter from an area geometry. It accepts a node when it has /no/ geometry (so schema and reference data replicate in full) or when its geometry lies in the area:
 
@@ -2755,6 +2785,83 @@ A device is constructed with a hub-minted ~:origin-id~ (an opaque 16-byte id) an
 
 As with master/slave, a *minor* schema drift (same major version) still syncs, degraded-safe; a *major* mismatch is rejected before any data moves.
 
+*** Type-ids on the wire, and the handshake that refuses a disagreeing peer
+
+A ~type-id~ crosses the peer wire as an opaque integer; no type *name* ever
+does. A Lisp device gets away with that because it evaluates the same
+~schema.lisp~ the hub does. A non-Lisp peer (a Kotlin/SQLite field device)
+cannot, so after authenticating, the hub ships a *type table* in its
+~:auth-ok~ control plist: one delimited string of ~kind,id,name,supers~
+records, sorted by id.
+
+That string's grammar is a *frozen external contract*. It is parsed by
+implementations this repository does not build,
+~graph-db::peer-parse-type-table~ is the reference parser, and its strictness
+is part of the specification — an ~id~ is decimal digits only in 0..65535, a
+record has exactly four fields, ~kind~ is exactly ~"v"~ or ~"e"~, and a
+consumer must read *all* rows before resolving superclass names, because the
+table is sorted by id and may carry forward references.
+
+**What the table contains changed with GH #186: it is the IMAGE's type
+registry, not the hub graph's schema.** Type-ids are image-level now
+(Chapter 17), so a device may be sent an id belonging to any store in the
+system, and the hub therefore ships the whole mapping. Two consequences
+follow, both intended:
+
+- a type the hub's own graph does not instantiate still appears in the table;
+- a type name that cannot be encoded fails *every* device connection in the
+  image, not only sessions for the store that declared it.
+
+The encoder refuses rather than emit something a device cannot recover from.
+It signals, naming the offending type package-qualified, when a name is empty
+or carries a delimiter (a comma splits the record into two fields; a
+semicolon splits it into two *records*, the first of which parses silently as
+a bogus type), when two types' names collide once downcased, or when a
+type-id will not fit the wire's 16-bit ~id~ field (issue #199 tracks widening
+it; the registry itself assigns 32-bit ids).
+
+One thing the encoder cannot refuse, because it cannot see it: a row's
+~supers~ field is derived from CLOS, so a registry entry whose ~def-vertex~
+this image never loaded emits an *empty* field — indistinguishable on the
+wire from a type that really does root at ~vertex~/~edge~. A consumer places
+it at the root and drops it from its parent's closure. This became ordinary
+when the table became image-wide (an image holding store A's schema but not
+store B's still ships B's names); it is tracked as issue #200, with #195 as
+the same absence one level down.
+
+The downcased-name collision deserves a note, because pooling every store's
+types into one table *widened* it: two types that never shared a schema now
+share this namespace, and same-named symbols from two packages are no longer
+exotic. The error prints both symbols with their packages, since the package
+is the only thing that tells them apart. Resolving it is a *retirement or a
+rename*, and for a type with nodes on disk that is a store migration, not an
+edit.
+
+**The device refuses a hub whose registry disagrees with its own.** An image
+with no hub is its own authority — the ordinary case, since peer replication
+is off by default — so two such images can independently give one symbol two
+ids, or one id two symbols. Comparing the hub's table against the local
+registry at the handshake, the device signals
+~graph-db::peer-type-registry-conflict-error~ and closes the session, naming
+every conflicting symbol package-qualified. Both directions are checked and
+reported:
+
+- *one name, two ids* — a node arriving under the hub's id would materialise
+  as some other class here;
+- *one id, two names* — the hub's type is unknown in this image and its id
+  already means a local type, which is the same corruption with no shared
+  name to key on.
+
+This is deliberately *not* a reconciliation. Agreeing at a handshake would
+mean rewriting every node of the losing type because a network event said so.
+A disagreement between two populated stores is an operator event: reconcile
+the registries out of band (Chapter 17, "Adopting global type-ids on an
+existing system"), then reconnect.
+
+One gap is kept on purpose: a hub too old to ship a type table at all sends
+no ~:type-table~ key, and such a hub cannot be compared, so it is trusted.
+Removing that path would break every pre-#186 hub.
+
 *** Peer replication over the in-memory backend
 
 The storage backend is orthogonal to the replication role: ~make-memory-graph~ accepts the very same peer arguments, yielding an *in-memory peer device* — the intended mobile/ECL configuration. Combined with ~:lazy t~ and a post-sync ~checkpoint-memory-graph~, such a device gets a near-instant open plus fault-on-access reads of its synced subgraph (Chapter 15).
@@ -2829,32 +2936,202 @@ One consequence worth knowing: a node retained past its graph's ~close-graph~ no
 dereferences an unmapped heap rather than silently decoding whatever lies at that offset
 in another graph's file. Do not hold nodes across a close.
 
-*** Class names are global
+*** Class names are global, and one class may serve several stores
 
-Common Lisp has one class namespace, so a node class name must be unique across *all*
-graph schemas. Defining the same name for a second graph signals
-~duplicate-node-class-error~. Redefining a type under the *same* graph name remains
-legal — that is ordinary schema evolution and works at runtime.
+Common Lisp has one class namespace, so a node class name names one class
+across *all* graph schemas. Since GH #186 that class may be defined for more
+than one graph — ~(def-vertex user () (...) :store-a)~ and ~(def-vertex user ()
+(...) :store-b)~ — and both stores hold the same type-id for it, because the id
+comes from the system registry rather than each store's own counter. Redefining
+a type under the same graph name remains legal: ordinary schema evolution, at
+runtime.
 
-Previously a second definition silently replaced the first class's slots, leaving the
-first graph's stored data unreachable through the API while still on disk.
+Both definitions define the *same CLOS class*, so the last one loaded
+determines its slots; declaring different slot sets for the two stores is how
+you get a class whose accessors return ~NIL~ against one of them. Keep the
+definitions identical, or give the two stores different type names.
+
+Before #186 the second definition signalled ~duplicate-node-class-error~,
+because the two stores would otherwise have disagreed about what their type-ids
+meant. That check is gone and the condition is no longer signalled (the symbol
+remains exported, so existing handlers still compile). Before that check
+existed, the second definition silently replaced the first class's slots,
+leaving the first graph's stored data unreachable through the API while still
+on disk.
 
 *** ~*transaction*~ is NIL inside a read-only snapshot
 
-~with-read-snapshot~ (and ~select~/~do-query~ with ~:snapshot t~) records its snapshot per
-graph in ~*read-snapshots*~ rather than binding ~*transaction*~, so code that reads
-~*transaction*~ to tell whether it is inside a query sees ~NIL~ there. Call
-~(read-transaction &optional graph)~ instead: it returns the read-write ~*transaction*~ when
-one is active and covers ~graph~, else ~graph~'s read snapshot from ~*read-snapshots*~, else
-~NIL~. This has second-order effects inside a snapshot: ~copy~ now signals
+~with-read-snapshot~ (and ~select~/~do-query~ with ~:snapshot t~) records its
+snapshot per graph in ~*read-snapshots*~ rather than binding ~*transaction*~,
+so code that reads ~*transaction*~ to tell whether it is inside a query sees
+~NIL~ there. Call ~(read-transaction &optional graph)~ instead: it returns the
+read-write ~*transaction*~ when one is active and covers ~graph~, else
+~graph~'s read snapshot from ~*read-snapshots*~, else ~NIL~. This has
+second-order effects inside a snapshot: ~copy~ now signals
 ~no-transaction-in-progress-warning~, ~commit~/~rollback~ now signal
-~no-transaction-in-progress~, and ~make-<type>~/~mark-deleted~ now auto-wrap their own real,
-committing transaction instead of silently joining a snapshot that was never going to
-commit.
+~no-transaction-in-progress~, and ~make-<type>~/~mark-deleted~ now auto-wrap
+their own real, committing transaction instead of silently joining a snapshot
+that was never going to commit.
 
-Also note: ~graph~ is now a *reserved* slot name on node classes — it backs the ~:META~
-home-graph tracking slot described above. A user-defined slot named ~graph~ shadows it and
-silently disables home-graph tracking for that class; do not use it as a slot name.
+Also note: ~graph~ is now a *reserved* slot name on node classes — it backs the
+~:META~ home-graph tracking slot described above. A user-defined slot named
+~graph~ shadows it and silently disables home-graph tracking for that class; do
+not use it as a slot name.
+
+*** The system directory is mandatory
+
+Type-ids are assigned from an append-only *registry* shared by every store in a
+system, so that one type name means one id everywhere (GH #186). The registry
+lives in ~type-registry.log~ under the directory named by
+~graph-db:*system-directory*~, beside the optional system clock's files.
+
+That special has *no default*, and ~make-graph~/~open-graph~ signal
+~graph-db:system-directory-required~ when it is ~NIL~. This is deliberate: a
+store opened outside a system would have to mint ids from a private counter,
+and two id regimes drifting apart unnoticed is exactly what the registry exists
+to prevent. Set it from your application's own configuration, once, before
+opening anything:
+
+#+BEGIN_SRC lisp
+  (setf graph-db:*system-directory* "/var/lib/my-system/")
+#+END_SRC
+
+The registry is opened lazily on first use and reopened if you change the
+special. Assignment takes a short exclusive ~flock~ across its
+read-decide-append — only *assignment* serialises, so any number of images may
+read the registry concurrently, and ~type-registry-busy~ is signalled if
+another image holds the append lock. Reads of an already-assigned id take no
+lock at all.
+
+Two consequences worth knowing. A store's type-ids are *sparse*: it holds the
+ids of the types it defines, wherever those landed in the system's numbering,
+not a dense run from 1. And ids are never reused or renumbered — the registry
+is append-only, and reopening a store keeps the ids already written into its
+nodes.
+
+*** Adopting global type-ids on an existing system
+
+**One store, and nothing to do.** Opening a store reconciles its persisted
+type-ids with the registry before anything else happens. A type the registry
+has never seen, at an id no other type has claimed, is **adopted**: the
+registry records the id the store already uses. So a single-store deployment
+upgrading past #186 — set ~*system-directory*~ to a fresh directory, open —
+adopts its own ids on the first open and needs none of the procedure below.
+
+That reconciliation is not a nicety. Without it the registry would stay empty
+while the store kept its persisted ids, and the next release that adds one
+~def-vertex~ would mint an id the store already uses — silently overwriting
+one type's schema entry with another's, so every persisted node of the first
+type materialises as the second. It is also what makes the peer type table
+honest: the table is the registry while the wire carries store ids, and they
+agree only because this runs.
+
+**When the two cannot be reconciled, the open is refused.** If the registry
+gives the type a *different* id, or gives that id to a *different* type,
+~open-graph~ signals ~graph-db:store-registry-conflict~, naming both sides.
+That is not a retryable error and there is nothing an open may do about it:
+the losing id is already written into every node of its type. It means this
+store must be adopted deliberately, which is what the rest of this section is
+for.
+
+To *read* such a store meanwhile — a class census, a backup, the
+before-and-after of an adoption run — wrap the open in
+~graph-db:with-schema-frozen~, which opens the store exactly as it stands on
+disk, replaying no schema and checking no ids. Writes made through a frozen
+open go out under the *store's* ids, which is right for a legacy store and
+wrong for one you intend to keep in this system.
+
+#+BEGIN_SRC lisp
+  (let ((g (graph-db:with-schema-frozen ()
+             (graph-db:open-graph :my-app "/var/db/store-b/"))))
+    (unwind-protect (census g)
+      (graph-db:close-graph g :snapshot-p nil)))
+#+END_SRC
+
+**A frozen open may read such a store; it may not serve one.** Starting
+replication on a graph opened this way signals
+~graph-db:frozen-graph-cannot-replicate~ — for a master, a slave or a peer.
+The hatch skips the id check, and every replication transport puts a store's
+raw type-ids on the wire: a hub would ship a type table built from the
+*registry* while its node heads carried the store's contradicted ids, and the
+damage would land on a remote peer where no local guard can see it. Reconcile
+the store and open it normally before replicating it.
+
+Note also what a frozen open leaves behind in the registry: **nothing**. It
+adopts no ids, so a store read this way is exactly as unreconciled afterwards
+as before.
+
+**Several stores is the case that needs a decision.** A system whose stores
+predate the registry has a problem the registry cannot solve on its own: every
+store's schema counted type-ids from 1, so in any system with more than one
+store the low ids name *different* classes in different stores.
+Under one shared id space at most one store can keep a contested id, and the
+rest must be renumbered — and since ~type-id~ is written into the node head,
+the ~ve-key~, the ~vev-key~ and the type-index, renumbering a store means
+rewriting it.
+
+This is measured, not assumed. On a five-store system read straight off disk:
+66 vertex type names competing for 36 distinct ids, 11 of those ids claimed
+by more than one name, and the lowest ids contested by nearly every store.
+
+**Seed from the largest store on disk, not the one with the most types.**
+Every store but one is renumbered whichever store is favoured, so the cost is
+*bytes replayed*. On that same system the store holding 59 of the 95 types
+was among the smallest: seeding from it would have replayed roughly 4.9 GB
+instead of 1.1 GB.
+
+~registry-seed-from-stores~ applies that policy for you. It opens no graph —
+it reads each store's ~schema.dat~ and the allocation high-water mark in its
+~heap.dat~ header — and it tells you which stores must now be renumbered:
+
+#+BEGIN_SRC lisp
+  (let* ((registry (graph-db::ensure-type-registry))
+         (report (graph-db::registry-seed-from-stores
+                  registry '("/var/db/store-a/" "/var/db/store-b/"
+                             "/var/db/store-c/"))))
+    (graph-db::seeding-report-seed report)        ; the store adopted verbatim
+    (graph-db::seeding-report-sizes report)       ; ((location . bytes) ...)
+    (graph-db::seeding-report-changes report)     ; every id that moves
+    (graph-db::seeding-report-duplicates report)  ; see below
+    (dolist (location (graph-db::seeding-report-renumber report))
+      (graph-db::migrate-graph :my-app location (new-location-for location)
+                               :renumber-p t)))
+#+END_SRC
+
+Stores are offered their ids largest first, and each keeps every id it can: a
+name the registry has not seen, at an id no other name has claimed, is
+adopted verbatim. So the store that costs most to rewrite wins every contest.
+The registry need not be empty — entries already in it outrank every store,
+including the largest, because the registry is the authority and may already
+have been distributed to peers.
+
+**One case no seeding policy exempts.** A single store's history may already
+hold *two different ids for one name* (the measured system had three). Those
+must unify whichever store wins, so such a store is always in the migration
+set even if nothing else contests it. Seeding reports it in
+~seeding-report-duplicates~, and the renumbering migration reports the
+unification in its second return value rather than picking one id silently.
+
+Plan the run: each renumbering is a ~migrate-graph~, so the transient disk
+and the deployment gate described in Chapter 12 apply to every store in the
+list, and each store is written to a *new* location, leaving the source
+rollback-able.
+
+Until a store in the renumber list has been migrated, opening it under the
+seeded registry is refused — deliberately: its ids no longer mean what the
+system says they mean. Read it with ~with-schema-frozen~ if you need to, and
+migrate it when you are ready.
+
+**Renumber once, then distribute — do not renumber twice and hope.** The
+registry is persisted and *distributed*, not recomputed: hosts read it, none
+rebuild it. Within a single migration the ids are reproducible (the
+renumbering mints in package-then-symbol-name order, so re-running it on the
+same input gives the same answer), but that is a debugging aid, not a
+synchronisation mechanism. Two images that opened different stores, or the
+same stores in a different order, will still disagree — and a replication
+handshake between them is *refused*, naming the conflicting symbols, rather
+than silently reconciled. See Chapter 16, "Type-ids on the wire, and the
+handshake that refuses a disagreeing peer".
 
 *** The image-level system clock (optional)
 
@@ -3983,8 +4260,29 @@ This chapter provides a categorized reference for the most important exported sy
 - ~replay (graph snapshot-dir &key package-name)~ ::
   Restores a graph from snapshot files located in ~snapshot-dir~ into a new, empty graph. Automatically finds the latest snapshot and rebuilds all views.
 
-- ~migrate-graph (name old-location new-location &key package include-deleted-p)~ ::
-  Migrates a pre-MVCC (storage v1) graph at ~old-location~ to the current (v2) format at ~new-location~, returning the new open graph. A logical snapshot-and-replay; the original is left untouched. See Chapter 12.
+- ~migrate-graph (name old-location new-location &key package include-deleted-p renumber-p)~ ::
+  Migrates a v1 or v2 graph at ~old-location~ to the current (v3) format at ~new-location~, returning ~(values new-graph unified)~. A logical snapshot-and-replay; the original is left untouched. ~:renumber-p nil~ (default) preserves the source's type-ids; ~:renumber-p t~ takes them from the system registry instead and returns the names whose several ids it unified. See Chapter 12.
+
+- ~with-schema-frozen (() &body body)~ ::
+  Run BODY with schema replay and type-id reconciliation suppressed, so a store opens exactly as it stands on disk. The supported way to READ a store whose ids the registry contradicts — a census, a backup, the before-and-after of an adoption run. Writes made through a frozen open go out under the store's own ids, and starting replication on one signals ~frozen-graph-cannot-replicate~. See Chapter 17.
+
+- ~frozen-graph-cannot-replicate~ (condition) ::
+  Signalled by ~start-replication~ for a master, slave or peer graph opened inside ~with-schema-frozen~. Its type-ids were never checked against the registry, and every transport puts raw type-ids on the wire, so serving it would corrupt a remote peer. Readers: ~frozen-graph-cannot-replicate-graph-name~, ~-location~.
+
+- ~store-registry-conflict~ (condition) ::
+  Signalled by ~open-graph~/~make-graph~ when a store's persisted type-id for a type is not the one the registry holds, or when the registry gives that id to another type. Not retryable: the losing id is already in every node head of its type. Readers: ~store-registry-conflict-location~, ~-type-name~, ~-parent~, ~-store-id~, ~-registry-id~, ~-holder~. The remedy is ~registry-seed-from-stores~ plus ~migrate-graph :renumber-p t~.
+
+- ~registry-seed-from-stores (registry locations)~ ::
+  Seeds ~registry~ from the stores at ~locations~ (no graph is opened), adopting the largest store's type-ids and returning a ~seeding-report~ naming the stores that must now be migrated with ~:renumber-p t~. See Chapter 17, "Adopting global type-ids on an existing system".
+
+- ~peer-type-table-string (&optional registry)~ ::
+  Encodes the image's type registry as the delimited ~kind,id,name,supers~ string the hub ships in its ~:auth-ok~ plist. Signals, naming the type, rather than emit a table a device cannot recover from. The grammar is a frozen external contract — see Chapter 16, "Type-ids on the wire".
+
+- ~peer-parse-type-table (string)~ ::
+  The reference parser for that contract, and part of the specification: strict by design, since every laxness here is a place a non-Lisp implementation will silently diverge. ~nil~ or ~""~ (an old hub that ships no table) parses to ~nil~.
+
+- ~peer-check-type-registry-agreement (table &optional registry)~ ::
+  Signals ~peer-type-registry-conflict-error~, naming every conflicting symbol, unless the hub's ~table~ agrees with this image's registry about every type-id the two share. Run by ~peer-sync~ at the handshake; a disagreement is an operator event, not something a handshake may reconcile.
 
 **** MVCC / Versioning
 
@@ -4070,7 +4368,7 @@ This chapter provides a categorized reference for the most important exported sy
 - ~make-spatial-replication-filter (area)~ ::
   Build a slave-graph ~:replication-filter~ predicate from ~area~ (a ~:polygon~ /
   ~:multipolygon~): the slave applies non-spatial nodes plus spatial nodes inside
-  ~area~, so it holds only its area of operations. See "Subset replication" above.
+  ~area~, so it holds only its own region. See "Subset replication" above.
 
 **** REST API
 - ~start-rest ( &optional port)~ ::

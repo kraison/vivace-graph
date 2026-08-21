@@ -1,9 +1,9 @@
 ;;;; Multi-graph coexistence: three graphs, one image.
 ;;;;
-;;;; mine-action runs an ops graph, a knowledge graph and a forensics graph in a
-;;;; single Lisp image, each with its own vertex classes, vector segments and
-;;;; lifecycle.  These tests pin the properties that arrangement depends on.
-;;;; They are engine-level and have no mine-action dependency.
+;;;; An application may run several stores in one Lisp image, each with its
+;;;; own vertex classes, vector segments and lifecycle.  These tests pin the
+;;;; properties that arrangement depends on.  They are engine-level and depend
+;;;; on no application.
 (in-package #:graph-db/test)
 
 (def-suite multi-graph-suite :in graph-db-suite
@@ -12,10 +12,10 @@
 
 ;; Declared once at load time, like the other integration schema in this
 ;; file's neighbours.  Three graph names -- :MG-ALPHA / :MG-BETA / :MG-GAMMA --
-;; stand in for mine-action's ops / knowledge / forensics graphs.  MG-BOTH and
-;; MG-GEO sharing :MG-GAMMA is deliberate: it is the same "text-indexed and
-;; geo-indexed mixins compose, and a geo-only class contributes no vector
-;; segment" property the forensics-graph design rests on (ACLED vs FIRMS).
+;; stand in for an application's three stores.  MG-BOTH and MG-GEO sharing
+;; :MG-GAMMA is deliberate: it is the "text-indexed and geo-indexed mixins
+;; compose, and a geo-only class contributes no vector segment" property any
+;; store with mixed index kinds rests on.
 (def-vertex mg-plain () ((label :type string)) :mg-alpha)
 (def-vertex mg-text  () ((label :type string) (embedding :vector-index t)) :mg-beta)
 (def-vertex mg-geo   () ((label :type string) (lat) (lon)) :mg-gamma)
@@ -47,8 +47,8 @@ at once -- which is the whole point of this suite."
 
 (test three-graphs-open-as-distinct-objects
   "Opening all three graphs in one image yields three distinct GRAPH objects
-with three distinct GRAPH-NAMEs -- the property every downstream forensics-
-graph decision (a third graph alongside ops and knowledge) assumes."
+with three distinct GRAPH-NAMEs -- the property any decision to add a third
+store alongside two existing ones assumes."
   (with-three-graphs (ga gb gc)
     (is (not (eq ga gb)) "mg-alpha and mg-beta must not be the same object")
     (is (not (eq gb gc)) "mg-beta and mg-gamma must not be the same object")
@@ -135,13 +135,13 @@ non-indexed (geo-only) class alongside an indexed one must not spill a
 segment onto the non-indexed class.  mg-geo has no :vector-index slot at
 all, so no key with car MG-GEO may ever appear in mg-gamma's
 vector-segments table.  This is the engine-level version of the spike's
-'fx-hotspot got none' observation (ACLED = both mixins; FIRMS = geo mixin
-alone, the negative case)."
+same observation: a class carrying both mixins gets a segment, and a
+geo-only class -- the negative case -- gets none."
   (with-three-graphs (ga gb gc)
     ;; Keep all three graphs genuinely alive and taking writes, not just gc --
     ;; the property under test is about mg-gamma's own composition, but it
-    ;; should hold with the other two graphs open alongside it, exactly as
-    ;; mine-action's three graphs will be.
+    ;; should hold with the other two graphs open alongside it, exactly as an
+    ;; application's several stores are.
     (let ((*graph* ga)) (with-transaction () (make-mg-plain :label "a1")))
     (let ((*graph* gb))
       (with-transaction () (make-mg-text :label "b1" :embedding (%mg-embedding 4 9.0))))
@@ -240,8 +240,8 @@ established vector segments (mg-beta's and mg-gamma's)."
 ;;; ---------------------------------------------------------------------------
 ;;; keep-revisions retention-cost bound
 ;;;
-;;; mine-action's forensics graph adopts KEEP-REVISIONS = 100 on the strength of
-;;; a single measurement (spec 2026-07-22-forensics-graph-design.md, S5):
+;;; An application that adopts KEEP-REVISIONS = 100 does so on the strength of
+;;; a single measurement:
 ;;; REAP-OLD-VERSIONS runs inside the transaction-manager lock, so its cost is
 ;;; paid by every commit in the graph, not only commits touching a deep version
 ;;; chain.  Without a guard, a future engine change could make retention
@@ -264,14 +264,14 @@ the bounded graph's chain (capped at its KEEP-REVISIONS window) reaches and
 holds steady state for the great majority of the run.")
 
 (defparameter *mg-epsilon-keep-revisions* 100
-  "KEEP-REVISIONS for the bounded graph in the test below -- mine-action's
-chosen forensics-graph policy.  Left as a DEFPARAMETER, not inlined, because
+  "KEEP-REVISIONS for the bounded graph in the test below -- a realistic
+audit-retention policy.  Left as a DEFPARAMETER, not inlined, because
 proving the test discriminates (see the task report) means temporarily setting
 this to 4,000,000,000 -- effectively unbounded within the run -- and confirming
 the assertion fails, then restoring it to 100 before committing.")
 
 (defun %mg-commit-latencies-ms (graph vertex-id n)
-  "Update the vertex at VERTEX-ID in GRAPH N times, using the mine-action
+  "Update the vertex at VERTEX-ID in GRAPH N times, using the ordinary
 update idiom -- (COPY -> SETF -> SAVE) inside its own WITH-TRANSACTION -- and
 return a list of N per-commit wall-clock latencies in milliseconds.  Uses
 LOOKUP-VERTEX and SLOT-VALUE rather than a type-specific accessor, so this one
@@ -294,16 +294,16 @@ helper drives both MG-CTL-COUNTER and MG-BND-COUNTER."
 commits touching a deep version chain: REAP-OLD-VERSIONS runs inside the
 transaction-manager lock (see APPLY-TRANSACTION, transactions.lisp).
 
-Measured 2026-07-22 (the number this bound and mine-action's policy both rest
-on): with KEEP-REVISIONS at 4,000,000,000 -- i.e. effectively never reaping --
+Measured 2026-07-22 (the number this bound rests on): with KEEP-REVISIONS at
+4,000,000,000 -- i.e. effectively never reaping --
 2,000 updates to one vertex degraded mean commit latency 0.378ms -> 1.378ms,
 approximately 3.65x, roughly linearly in chain length (about +0.0005ms per
 retained revision), against a flat ~0.31ms/commit control at KEEP-REVISIONS=0.
 
-mine-action's forensics graph adopts KEEP-REVISIONS=100: the degradation is
-linear in chain length, and its chains are short (FIRMS detections are written
-once; ACLED events see a handful of corrections), so a window of 100 gives
-complete audit history at negligible cost. This test pins that a *bounded*
+An audit-trail store adopts KEEP-REVISIONS=100 on this basis: the degradation
+is linear in chain length, and such chains are short (most records are written
+once, a few see a handful of corrections), so a window of 100 gives complete
+audit history at negligible cost. This test pins that a *bounded*
 window of 100 stays cheap relative to a KEEP-REVISIONS=0 control over the same
 number of updates to a single vertex -- so a future regression that made the
 reaper cost scale with total chain length again, rather than with
@@ -391,8 +391,8 @@ keep-revisions=0 control's ~,4Fms mean over ~D updates (observed ratio ~,3Fx)"
 ;;; VERTEX-HISTORY: the public read path over the retained MVCC chain
 ;;;
 ;;; Retention (above) without a read path is storage we pay for and cannot use.
-;;; mine-action's forensics graph adopts KEEP-REVISIONS=100 specifically to keep
-;;; an audit trail -- what a source told us about an event, and when -- so the
+;;; An application adopts KEEP-REVISIONS=100 specifically to keep an audit
+;;; trail -- what a source said about a record, and when -- so the
 ;;; chain-walk that until now existed only as an internal snapshot-isolation
 ;;; mechanism (RESOLVE-VERSION-AT-EPOCH) needs a supported public form.
 ;;; ---------------------------------------------------------------------------
@@ -479,17 +479,19 @@ past the call and often outside any *GRAPH* binding."
 against THAT graph's schema, even when the ambient *GRAPH* is a different graph
 whose schema maps the same type-id to a different class.
 
-Type-ids are per-graph -- assigned by class-registration order -- so the SAME
-integer names different classes in different graphs.  MG-PLAIN is the only user
-class in :MG-ALPHA and MG-TEXT the only one in :MG-BETA, so both are type-id 1
-(the test asserts that collision as a precondition, so a future registration-order
-change reports itself rather than silently no longer exercising the bug).
+Type-ids are system-wide as of #186, so MG-PLAIN and MG-TEXT can no longer
+collide on one integer -- the original collision this test reproduced is gone
+by construction, and the assertion below pins that.  What remains, and is what
+the test now guards, is that the id is resolved against the graph the caller
+NAMED: gb's schema has no entry for ga's id at all, so a read that consults
+the ambient graph materializes nothing or the wrong thing.
 
 This is the reachable form of the wrong-graph materialization class in issue #53.
-It was demonstrated in production: a forensics ACLED-EVENT (type-id 3) read while
-*GRAPH* was the ops graph (type-id 3 = ADMIN-RAION) materialized as ADMIN-RAION,
-its ACLED accessors returning NIL, while the raw type-id and type-index were both
-correct.  MAP-VERTICES already binds *GRAPH* around its scan (edge.lisp / the note
+It was demonstrated in production: a node of the second store's type (type-id
+3) read while *GRAPH* was the first store -- whose own type-id 3 named a
+different class -- materialized as that other class, its accessors returning
+NIL, while the raw type-id and type-index were both correct.  MAP-VERTICES
+already binds *GRAPH* around its scan (edge.lisp / the note
 in MAP-VERTICES) so it was never affected; LOOKUP-OBJECT did not, so a cross-graph
 LOOKUP-VERTEX resolved the type-id against the wrong graph's schema.  The close +
 reopen below forces a fresh disk deserialization: the node written under ga is
@@ -503,18 +505,19 @@ cached with its correct class, so only a from-disk read exercises the deserializ
              (progn
                (let ((*graph* ga))
                  (with-transaction () (setf id (id (make-mg-plain :label "a1")))))
-               ;; precondition: one type-id, two different classes across the graphs
                (setf tid (graph-db::node-type-id
                           (graph-db::lookup-node-type-by-name 'mg-plain :vertex :graph ga)))
                (is (eq 'mg-plain (graph-db::node-type-name
                                   (graph-db::lookup-node-type-by-id tid :vertex :graph ga)))
-                   "precondition: type-id ~D must be MG-PLAIN in ga" tid)
-               (is (eq 'mg-text (graph-db::node-type-name
-                                 (graph-db::lookup-node-type-by-id tid :vertex :graph gb)))
-                   "PRECONDITION FAILED: type-id ~D is not MG-TEXT in gb (~S); registration ~
-                    order changed and this test no longer collides"
-                   tid (let ((m (graph-db::lookup-node-type-by-id tid :vertex :graph gb)))
-                         (and m (graph-db::node-type-name m))))
+                   "type-id ~D must be MG-PLAIN in ga" tid)
+               ;; #186: one id, one class, system-wide -- gb cannot name a
+               ;; different class with ga's id, and here names none at all.
+               (is (not (eq 'mg-text
+                            (let ((m (graph-db::lookup-node-type-by-id
+                                      tid :vertex :graph gb)))
+                              (and m (graph-db::node-type-name m)))))
+                   "type-id ~D must not be MG-TEXT in gb: type-ids are ~
+                    system-wide since #186" tid)
                ;; force a from-disk read so the cache can't hand back the correctly
                ;; classed object written above
                (close-graph ga :snapshot-p t)
@@ -886,11 +889,11 @@ a phantom graph (GH #53)."
 ;; never touches the deserializer, and passes no matter what *GRAPH* is bound
 ;; to.  Reopening forces a genuine disk materialization through
 ;; DESERIALIZE-VERTEX-HEAD's per-graph type-id -> class resolution, the actual
-;; cross-graph hazard (MG-PLAIN and MG-TEXT collide on type-id 1; see
-;; CROSS-GRAPH-LOOKUP-MATERIALIZES-THE-OWNING-GRAPHS-CLASS above).  TYPE-OF is
-;; asserted alongside the slot value because MG-PLAIN and MG-TEXT both declare
-;; a slot named LABEL -- a wrongly-classed node would still return the right
-;; string, so the slot check alone does not discriminate.
+;; cross-graph hazard (before #186 MG-PLAIN and MG-TEXT both held type-id 1;
+;; see CROSS-GRAPH-LOOKUP-MATERIALIZES-THE-OWNING-GRAPHS-CLASS above).
+;; TYPE-OF is asserted alongside the slot value because MG-PLAIN and MG-TEXT
+;; both declare a slot named LABEL -- a wrongly-classed node would still
+;; return the right string, so the slot check alone does not discriminate.
 
 (test slot-reads-resolve-through-the-nodes-own-graph
   "Read a node's slots with *GRAPH* bound to a different graph (GH #53)."

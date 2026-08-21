@@ -176,11 +176,27 @@
                (is (= 30 offset))))
         (graph-db::munmap-file mf)))))
 
-(test schema-can-assign-a-type-id-above-16-bits
-  (let ((s (graph-db::make-schema)))
-    (setf (graph-db::schema-next-vertex-id s) 70000)
-    (is (= 70000 (graph-db::get-next-type-id s :vertex)))
-    (is (= 70001 (graph-db::schema-next-vertex-id s)))))
+(test the-registry-can-assign-a-type-id-above-16-bits
+  "Assignment moved from the per-graph counter to the system registry (#186);
+the id it hands out must still span the full 32-bit type-id field."
+  (with-temp-directory (dir)
+    ;; Seed through the FILE, not the struct slot: REGISTRY-INTERN re-reads
+    ;; under its lock and recomputes the next id from what is on disk, so a
+    ;; slot poked in memory would be discarded before the assignment.
+    (with-open-file (out (merge-pathnames "type-registry.log" dir)
+                         :direction :output :if-does-not-exist :create)
+      (let ((*package* (find-package :keyword))
+            (*print-pretty* nil))
+        (format out "~S~%" (list :symbol 'tiw-seed :parent :vertex
+                                 :id 69999))))
+    (let ((r (graph-db::open-type-registry (namestring dir))))
+      (unwind-protect
+           (progn
+             (is (= 69999 (graph-db::registry-id-for r 'tiw-seed :vertex))
+                 "a persisted id above 16 bits reads back intact")
+             (is (= 70000 (graph-db::registry-intern r 'tiw-wide :vertex))
+                 "and assignment continues above it"))
+        (graph-db::close-type-registry r)))))
 
 (test prev-pointer-offset-lands-on-prev-pointer
   ;; The reaper patches this window in place; a wrong offset is invisible for
@@ -291,15 +307,17 @@ return DEST as a string."
 (defun %data-fingerprint (dir)
   "A sorted SHA256 listing of every file under DIR's heap and node/index
 tables -- used to assert MIGRATE-GRAPH leaves OLD-LOCATION's DATA untouched.
-Excludes schema.dat and tx/: opening a graph at all -- even read-only, even
-to just look -- unconditionally rewrites schema.dat (UPDATE-SCHEMA calls
-SAVE-SCHEMA on every open; same content, re-serialized, so this is not a
-type-id change, see MIGRATE-V2-GRAPH-TO-V3's own type-id assertions) and
-creates a new empty tx/replication-*.log file (the transaction manager always
-opens one).  Neither is data loss; both are confirmed here to be the ONLY
-two things that change, by exhaustive diff during Task 3's development (see
-task-3-report.md).  Shells out (find + sha256sum), the same portability
-boundary EXTRACT-V1-FIXTURE already accepts by shelling out to tar."
+Excludes schema.dat and tx/: an ordinary open rewrites schema.dat
+(UPDATE-SCHEMA calls SAVE-SCHEMA on every open; same content, re-serialized)
+and creates a new empty tx/replication-*.log file (the transaction manager
+always opens one).  No open in these tests rewrites schema.dat any more --
+MIGRATE-GRAPH suppresses the replay for both of its own, and %READ-V2-GRAPH's
+guard open is frozen (#186) -- but the exclusion stays: it names what an
+ORDINARY open does, which is what the assertion is defending against.
+Neither is data loss; both were confirmed to be the ONLY two things that
+change, by exhaustive diff during the #166 migration work.  Shells out (find +
+sha256sum), the same portability boundary EXTRACT-V1-FIXTURE already accepts
+by shelling out to tar."
   (uiop:run-program
    (format nil "find ~A -type f -not -name schema.dat -not -path '*/tx/*' ~
 -print0 | sort -z | xargs -0 sha256sum"
@@ -311,11 +329,17 @@ boundary EXTRACT-V1-FIXTURE already accepts by shelling out to tar."
 uses) and return (values vertices knows likes) via %FIXTURE-VERTICES /
 %FIXTURE-EDGES.  Used both to capture MIGRATE-GRAPH's expected input and to
 confirm, post-migration, that OLD-LOCATION still opens at v2 and still holds
-every node -- the guarantee that actually backs the rollback story."
+every node -- the guarantee that actually backs the rollback story.
+
+FROZEN: a v2 store's ids are its own and this system's registry has no
+opinion on them, so an ordinary open would reconcile -- and refuse as soon as
+a caller has primed the registry (GH #186).  Reading a store the registry
+disagrees with is exactly what WITH-SCHEMA-FROZEN is for."
   (let ((graph-db::*node-head-reader* 'graph-db::deserialize-node-head-v2))
-    (let ((g (graph-db:open-graph :ti-mig-guard dir
-                                  :accept-versions '(2)
-                                  :gc-heap-p nil :buffer-pool-p nil)))
+    (let ((g (graph-db:with-schema-frozen ()
+               (graph-db:open-graph :ti-mig-guard dir
+                                    :accept-versions '(2)
+                                    :gc-heap-p nil :buffer-pool-p nil))))
       (unwind-protect
            (let ((graph-db::*graph* g))
              (values (%fixture-vertices g)
@@ -346,13 +370,19 @@ by SINCE (edges with no SINCE slot -- ti-mig-likes -- sort first)."
          graph :collect-p t :edge-type type)
         #'< :key (lambda (row) (or (fourth row) -1))))
 
-(test migrate-v2-graph-to-v3
+(test migrate-v2-graph-to-v3-without-renumbering
   "A v2 (31-byte head, 2-byte type-id) graph cannot be opened directly by v3
 code but MIGRATE-GRAPH carries it across (logical snapshot + replay),
 preserving every node's id, revision, type, slot values and type-id, and
 leaving OLD-LOCATION's data untouched and the source itself still openable
-at v2 afterward -- see %DATA-FINGERPRINT for the two bookkeeping files
-(schema.dat, tx/*) that DO change and why that is not data loss."
+at v2 afterward -- see %DATA-FINGERPRINT for the bookkeeping file (tx/*)
+that DOES change and why that is not data loss.
+
+Pins the DEFAULT mode, :RENUMBER-P NIL, which is passed explicitly below.
+The type-id half of this guarantee became mode-dependent at #186 (spec
+§10.1): under :RENUMBER-P T every id is taken from the system registry
+instead, which is the exact reverse.  See the seeding suite for that mode's
+counterpart tests."
   #+ecl
   (skip "v2 fixture was cl-store'd by SBCL; ECL's cl-store cannot restore it ~
 (graph on-disk dirs are not portable across Lisp implementations).")
@@ -374,10 +404,14 @@ at v2 afterward -- see %DATA-FINGERPRINT for the two bookkeeping files
           (let (expected-type-ids)
             (let ((graph-db::*node-head-reader*
                    'graph-db::deserialize-node-head-v2))
-              (let ((old (graph-db:open-graph :ti-mig-guard old-dir
-                                              :accept-versions '(2)
-                                              :gc-heap-p nil
-                                              :buffer-pool-p nil)))
+              ;; FROZEN, like %READ-V2-GRAPH: reading a v2 source's own
+              ;; type-ids is exactly the read an ordinary open refuses once
+              ;; the registry has an opinion about those ids (GH #186).
+              (let ((old (graph-db:with-schema-frozen ()
+                           (graph-db:open-graph :ti-mig-guard old-dir
+                                                :accept-versions '(2)
+                                                :gc-heap-p nil
+                                                :buffer-pool-p nil))))
                 (unwind-protect
                      (setq expected-type-ids
                            (mapcar
@@ -403,6 +437,7 @@ at v2 afterward -- see %DATA-FINGERPRINT for the two bookkeeping files
             (let ((g (graph-db::migrate-graph
                       :ti-migration-fixture old-dir new-dir
                       :package :graph-db/test
+                      :renumber-p nil
                       :snapshot-file
                       (namestring
                        (merge-pathnames "migrate.snapshot" root)))))
@@ -426,9 +461,9 @@ exactly")
 exactly")
                      (is (equalp expected-likes (%fixture-edges g likes))
                          "likes edges: from+to+weight must match exactly")
-                     ;; Type-ids preserved, not renumbered (#186 is where
-                     ;; they would be renumbered; this unit must not do
-                     ;; that).
+                     ;; Type-ids preserved, because :RENUMBER-P is NIL.
+                     ;; The other mode is asserted in the seeding suite
+                     ;; (#186, spec §10.1).
                      (dolist (expected expected-type-ids)
                        (let* ((name (car expected))
                               (parent (if (member name '(ti-mig-person
@@ -438,8 +473,9 @@ exactly")
                                        (graph-db::lookup-node-type-by-name
                                         name parent :graph g))))
                          (is (= (cdr expected) actual)
-                             "~A's type-id must survive migration unchanged ~
-(expected ~A, got ~A)" name (cdr expected) actual))))
+                             "~A's type-id must survive a :RENUMBER-P NIL ~
+migration unchanged (expected ~A, got ~A)"
+                             name (cdr expected) actual))))
                 (graph-db:close-graph g)))
             ;; OLD-LOCATION's DATA is untouched -- scoped past schema.dat and
             ;; tx/, the two bookkeeping files any OPEN rewrites/creates (see

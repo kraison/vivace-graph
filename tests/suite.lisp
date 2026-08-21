@@ -16,9 +16,20 @@ Invoked by (asdf:test-system :graph-db)."
   ;; and aborts with EXT:STORAGE-EXHAUSTED.  Raise the ceiling (a limit, not a
   ;; reservation) so the suite fits.  SBCL/CCL grow their heaps automatically.
   #+ecl (ext:set-limit 'ext:heap-size (* 6 1024 1024 1024))
-  (let ((results (run 'graph-db-suite)))
-    (explain! results)
-    (results-status results)))
+  ;; Type-ids come from the system-wide registry, so a system directory is
+  ;; mandatory for every store the suite opens (GH #186).  One directory for
+  ;; the whole run, which is the shape a real system has: many stores, one
+  ;; registry.  Tests that need their own bind GRAPH-DB::*SYSTEM-DIRECTORY*
+  ;; themselves.
+  (let* ((system-dir (make-temp-directory))
+         (graph-db::*system-directory* (namestring system-dir))
+         (graph-db::*type-registry* nil))
+    (unwind-protect
+         (let ((results (run 'graph-db-suite)))
+           (explain! results)
+           (results-status results))
+      (uiop:delete-directory-tree system-dir :validate t
+                                             :if-does-not-exist :ignore))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Temp-file fixtures

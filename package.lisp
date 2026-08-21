@@ -38,6 +38,36 @@
            #:journal-records
            #:graph-system-clock
            #:attach-to-system-clock
+           ;; image-level type-id registry (GH #186)
+           #:type-registry
+           #:open-type-registry
+           #:close-type-registry
+           #:type-registry-busy
+           #:type-registry-busy-location
+           #:registry-id-for
+           #:registry-intern
+           #:registry-entries
+           #:*system-directory*
+           #:*type-registry*
+           #:system-directory-required
+           #:system-directory-required-operation
+           ;; GH #186: a store's persisted type-ids disagree with the
+           ;; image registry.  Operator-facing -- the remedy is a seeding
+           ;; run plus a renumbering migration, not a retry.
+           #:store-registry-conflict
+           #:store-registry-conflict-location
+           #:store-registry-conflict-type-name
+           #:store-registry-conflict-parent
+           #:store-registry-conflict-store-id
+           #:store-registry-conflict-registry-id
+           #:store-registry-conflict-reason
+           #:store-registry-conflict-holder
+           ;; GH #186: replication refuses a graph opened frozen.
+           #:frozen-graph-cannot-replicate
+           #:frozen-graph-cannot-replicate-graph-name
+           #:frozen-graph-cannot-replicate-location
+           ;; Open a store the registry disagrees with, to read it.
+           #:with-schema-frozen
            #:tm-next-epoch
            #:tm-current-epoch
            #:tm-peek-epoch

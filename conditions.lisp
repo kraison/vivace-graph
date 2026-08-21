@@ -55,6 +55,86 @@ is single-graph; use one transaction per graph."
 cannot redefine it for ~A. Class names are global; remove the old definition ~
 to re-home it." name existing-graph new-graph)))))
 
+(define-condition system-directory-required (error)
+  ;; *SYSTEM-DIRECTORY* is where the type-id registry lives; a store opened
+  ;; without one would mint ids no other store in the system agrees with
+  ;; (GH #186).
+  ((operation :initarg :operation :initform nil
+              :reader system-directory-required-operation))
+  (:report (lambda (error stream)
+             (format stream "~@[~A: ~]GRAPH-DB:*SYSTEM-DIRECTORY* is NIL. ~
+Type-ids are assigned from the system-wide registry that lives there, so a ~
+store cannot be created or opened without it.  Bind or SETF ~
+*SYSTEM-DIRECTORY* to your system's directory (GH #186)."
+                     (system-directory-required-operation error)))))
+
+(define-condition store-registry-conflict (error)
+  ;; A store's persisted type-ids and the image registry disagree, and no
+  ;; open, write or handshake may paper over it: the losing id is already in
+  ;; every node head of its type (GH #186, spec §10.1).
+  ((location :initarg :location :initform nil
+             :reader store-registry-conflict-location)
+   ;; :NAME-AT-TWO-IDS, :ID-AT-TWO-NAMES or :STALE-ID -- see the report.
+   (reason :initarg :reason :reader store-registry-conflict-reason)
+   (type-name :initarg :type-name :initform nil
+              :reader store-registry-conflict-type-name)
+   (parent :initarg :parent :reader store-registry-conflict-parent)
+   (store-id :initarg :store-id :reader store-registry-conflict-store-id)
+   (registry-id :initarg :registry-id :initform nil
+                :reader store-registry-conflict-registry-id)
+   (holder :initarg :holder :initform nil
+           :reader store-registry-conflict-holder))
+  (:report
+   (lambda (error stream)
+     (with-slots (location reason type-name parent store-id registry-id
+                  holder)
+         error
+       (format stream "The store~@[ at ~A~] disagrees with this system's ~
+type registry.  " location)
+       (ecase reason
+         (:name-at-two-ids
+          (format stream "~(~A~) type ~S: the store uses id ~D, the registry ~
+says ~D."
+                  parent type-name store-id registry-id))
+         (:id-at-two-names
+          (format stream "~(~A~) id ~D: the store uses it for ~S, the ~
+registry gives it to ~S."
+                  parent store-id type-name holder))
+         (:stale-id
+          (format stream "~(~A~) id ~D is held by orphaned metadata~@[ for ~
+~S~] -- the store's own name lookup no longer returns it -- and it is above ~
+every id the registry has assigned, so the registry would hand that id to ~
+another type while nodes on disk still carry it."
+                  parent store-id type-name)))
+       (format stream "  Neither side may be changed here: the losing id is ~
+already written into every node of its type.  Reconcile out of band -- ~
+GRAPH-DB::REGISTRY-SEED-FROM-STORES to adopt a store's ids, then ~
+GRAPH-DB::MIGRATE-GRAPH with :RENUMBER-P T for the stores it lists.  To ~
+READ this store meanwhile, open it inside GRAPH-DB:WITH-SCHEMA-FROZEN ~
+(GH #186).")))))
+
+(define-condition frozen-graph-cannot-replicate (error)
+  ;; A graph opened inside WITH-SCHEMA-FROZEN never had its persisted
+  ;; type-ids checked against the registry, so it must not serve or stream
+  ;; them: the peer type table describes the REGISTRY while node heads carry
+  ;; the STORE's ids, and a contradicted store would corrupt a remote peer
+  ;; (GH #186).
+  ((graph-name :initarg :graph-name :initform nil
+               :reader frozen-graph-cannot-replicate-graph-name)
+   (location :initarg :location :initform nil
+             :reader frozen-graph-cannot-replicate-location))
+  (:report
+   (lambda (error stream)
+     (format stream "Graph ~S~@[ at ~A~] was opened inside ~
+WITH-SCHEMA-FROZEN, so its type-ids were never reconciled with this system's ~
+registry, and replication may not be started for it.  A frozen open is for ~
+READING a store the registry contradicts; serving one would describe the ~
+registry's ids on the wire while shipping the store's.  Reconcile it first ~
+-- GRAPH-DB::REGISTRY-SEED-FROM-STORES, then GRAPH-DB::MIGRATE-GRAPH with ~
+:RENUMBER-P T -- and open it normally (GH #186)."
+             (frozen-graph-cannot-replicate-graph-name error)
+             (frozen-graph-cannot-replicate-location error)))))
+
 (define-condition stale-revision-error (error)
   ((instance :initarg :instance)
    (current-revision :initarg :current-revision))

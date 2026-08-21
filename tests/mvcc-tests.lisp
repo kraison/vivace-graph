@@ -92,10 +92,14 @@ DEST as a string."
                       :output t :error-output t)
     (namestring dest)))
 
-(test migrate-v1-graph-to-v3
+(test migrate-v1-graph-to-v3-without-renumbering
   "A pre-MVCC (v1, 15-byte head) graph cannot be opened directly by v3 code but
 MIGRATE-GRAPH carries it across (logical snapshot + replay), preserving every
-node, its slot data, the subclass, and the edge topology."
+node, its slot data, the subclass, and the edge topology.
+
+Pins the DEFAULT mode, :RENUMBER-P NIL, which is passed explicitly below: the
+type-id guarantee became mode-dependent at #186 (spec §10.1), and :RENUMBER-P T
+is the exact reverse of what this test asserts."
   ;; The committed v1 fixture's struct.dat/schema.dat were cl-store'd by SBCL.
   ;; cl-store's struct encoding is not portable across implementations, so ECL
   ;; cannot restore an SBCL-written graph (a pre-existing property of the on-disk
@@ -116,6 +120,7 @@ node, its slot data, the subclass, and the edge topology."
       ;; run leaves nothing behind in the system temp directory.
       (let ((g (graph-db::migrate-graph :graph-db-mvcc-migration old-dir new-dir
                                         :package :graph-db/test
+                                        :renumber-p nil
                                         :snapshot-file
                                         (namestring
                                          (merge-pathnames "migrate.snapshot" root)))))

@@ -120,6 +120,15 @@ want only the direct parents so the consumer can rebuild the closure itself."
                            '(vertex edge primitive-node node standard-object t))
               collect (string-downcase (symbol-name (class-name super)))))))
 
+(defun %peer-type-label (type)
+  "TYPE printed package-qualified, for an error an operator has to act on.  ~S
+alone omits the package whenever the symbol is accessible in the ambient
+*PACKAGE*, and under the image-level registry the types named in one of these
+errors routinely come from different packages and different stores -- the
+package is the whole discriminator (GH #186)."
+  (let ((*package* (%registry-print-package)))
+    (format nil "~S" type)))
+
 (defun %peer-check-wire-name (name type what)
   "Signal unless NAME -- a name about to be emitted into the type table -- is
 representable on the peer wire.  TYPE is the node-type SYMBOL whose row it came from and
@@ -130,69 +139,111 @@ The encoder is the ONLY possible defense.  A #\\, in a name splits it into two F
 SILENTLY as a bogus type.  Either way the table reaching a Kotlin/SQLite device is
 corrupt and unrecoverable there, so a loud error on the hub is strictly better."
   (when (zerop (length name))
-    (error "Node type ~S is UNREPRESENTABLE on the peer wire: its ~A is the empty string.  ~
-The peer type table cannot encode it; rename the type."
-           type what))
+    (error "Node type ~A is UNREPRESENTABLE on the peer wire: its ~A is the ~
+empty string.  The peer type table cannot encode it; rename the type."
+           (%peer-type-label type) what))
   (let ((bad (find-if (lambda (c) (member c *peer-type-name-reserved-chars*)) name)))
     (when bad
-      (error "Node type ~S is UNREPRESENTABLE on the peer wire: its ~A ~S contains the ~
-reserved character ~S.  The peer type table is a delimited external contract (see ~
-PEER-TYPE-TABLE-STRING); a name may not contain a comma, a semicolon, a space, a double ~
-quote, a backslash, a newline or a tab.  Rename the type."
-             type what name bad))))
+      (error "Node type ~A is UNREPRESENTABLE on the peer wire: its ~A ~S ~
+contains the reserved character ~S.  The peer type table is a delimited ~
+external contract (see PEER-TYPE-TABLE-STRING); a name may not contain a ~
+comma, a semicolon, a space, a double quote, a backslash, a newline or a ~
+tab.  Rename the type."
+             (%peer-type-label type) what name bad))))
 
-(defun %peer-type-table-rows (graph)
-  "GRAPH's node types as a list of (KIND-STRING ID NAME SUPERS TYPE): vertex types then
-edge types, each sorted by type-id.  SUPERS is a list of downcased names; TYPE is the
-node-type symbol, carried only so a validation error can name the type the developer
-actually wrote (the emitted NAME is downcased and may be the very thing at fault).
+(defun %peer-check-wire-id (id type)
+  "Signal unless ID fits the type table's ID field.  The registry assigns
+(UNSIGNED-BYTE 32) type-ids; the wire's ID field is (UNSIGNED-BYTE 16) and its
+grammar is frozen (PEER-TYPE-TABLE-STRING), so this is the one place a
+type-id is still narrowed.  The ENCODER must refuse -- emitting a row the
+reference parser cannot read puts the failure on the device rather than on
+the hub that produced it.  Widening the field is GH #199."
+  (unless (typep id '(unsigned-byte 16))
+    (error "Node type ~A is UNREPRESENTABLE on the peer wire: its type-id ~D ~
+is outside 0..65535.  The peer type table's ID field is a frozen external ~
+contract (see PEER-TYPE-TABLE-STRING) while the image registry assigns ~
+32-bit ids, so a system with more than 65536 types of one parent kind cannot ~
+replicate until the field is widened (GH #199)."
+           (%peer-type-label type) id)))
 
-The schema sub-tables are triple-keyed (id -> meta, symbol -> id, keyword -> id; see
-UPDATE-NODE-TYPE in schema.lisp), hence the (INTEGERP K) filter -- without it every type
-appears three times."
-  (loop for kind in '(:vertex :edge)
-        for kind-string in '("v" "e")
-        append (let ((sub (gethash kind (schema-type-table (schema graph)))))
-                 (when sub
-                   (loop for id in (sort (loop for k being the hash-keys in sub
-                                               when (integerp k) collect k)
-                                         #'<)
-                         for meta = (gethash id sub)
-                         when (node-type-p meta)
-                           collect (let ((type (node-type-name meta)))
-                                     (list kind-string
-                                           id
-                                           (string-downcase (symbol-name type))
-                                           (%peer-type-direct-supers type)
-                                           type)))))))
+(defun %peer-type-table-rows (registry)
+  "REGISTRY's types as a list of (KIND-STRING ID NAME SUPERS TYPE): vertex
+types then edge types, each sorted by type-id.  SUPERS is a list of downcased
+names; TYPE is the node-type symbol, carried only so a validation error can
+name the type the developer actually wrote (the emitted NAME is downcased and
+may be the very thing at fault).
+
+The rows are the IMAGE's type registry, not one graph's schema (D14, GH #186).
+A type-id means one thing across every store in the system, so the hub ships
+the whole mapping and a device can resolve any id it may ever be sent.  Two
+consequences, both intended: a type the hub's own graph does not hold is still
+emitted, and ONE unrepresentable type name anywhere in the image fails every
+device connection rather than only the store holding it -- see
+%PEER-VALIDATE-TYPE-TABLE-ROWS.
+
+SUPERS comes from CLOS, so a registered symbol whose class this image has not
+loaded emits an EMPTY supers field -- indistinguishable on the wire from a
+type that really does root at VERTEX/EDGE, so the device places it at the root
+and drops it from its parent's closure.  GH #200; GH #195 is the same absence
+one level down."
+  (flet ((rows-for (parent kind-string)
+           ;; LOOP COLLECT, not REMOVE-IF-NOT: the latter may return the
+           ;; registry's own list, which SORT would then destroy.
+           (let ((entries (loop for e in (registry-entries registry)
+                                when (eq parent (second e)) collect e)))
+             (loop for (type nil id) in (sort entries #'< :key #'third)
+                   collect (list kind-string
+                                 id
+                                 (string-downcase (symbol-name type))
+                                 (%peer-type-direct-supers type)
+                                 type)))))
+    (append (rows-for :vertex "v") (rows-for :edge "e"))))
 
 (defun %peer-validate-type-table-rows (rows)
-  "Signal if ROWS cannot be encoded unambiguously: a name carrying a reserved character
-or empty, or two types emitting the SAME name.  Returns ROWS.
+  "Signal if ROWS cannot be encoded unambiguously: an id outside the wire's
+range, a name carrying a reserved character or empty, or two types emitting
+the SAME name.  Returns ROWS.
 
-Names are otherwise globally unique (each is a CLOS class name), but STRING-DOWNCASE is
-NOT injective -- P-PERSON and |P-Person| are distinct classes that emit one name, as can
-same-named symbols from different packages.  A device would then resolve one type-id's
-name to the other type's row."
+STRING-DOWNCASE is NOT injective -- P-PERSON and |P-Person| are distinct
+classes that emit one name, as are same-named symbols from different
+packages.  A device would then resolve one type-id's name to the other
+type's row.
+
+This matters MORE under the image-level registry, not less (GH #186).  ROWS
+pool every store's types into one table, so two types that never shared a
+schema now share this namespace, and the same-named-symbols-in-two-packages
+case stops being exotic.  Hence %PEER-TYPE-LABEL: the error has to print the
+package or an operator cannot tell the two apart, let alone find them."
   (let ((seen (make-hash-table :test 'equal)))
     (dolist (row rows rows)
       (destructuring-bind (kind id name supers type) row
-        (declare (ignore kind id))
+        (declare (ignore kind))
+        (%peer-check-wire-id id type)
         (%peer-check-wire-name name type "name")
         (dolist (super supers)
           (%peer-check-wire-name super type "superclass name"))
         (let ((other (gethash name seen)))
           (when other
-            (error "Node types ~S and ~S are UNREPRESENTABLE together on the peer wire: ~
-both emit the name ~S (STRING-DOWNCASE is not injective).  The peer type table maps ~
-type-id -> name and a device cannot tell them apart; rename one."
-                   other type name))
+            (error "Node types ~A and ~A are UNREPRESENTABLE together on the ~
+peer wire: both emit the name ~S (STRING-DOWNCASE is not injective).  The peer ~
+type table maps type-id -> name and a device cannot tell them apart.  The ~
+table is the IMAGE's registry (GH #186), so these two need not share a schema ~
+or even a store -- the packages above are what tells them apart.  Retire or ~
+rename one; for a type with nodes on disk that is a store migration, not an ~
+edit."
+                   (%peer-type-label other) (%peer-type-label type) name))
           (setf (gethash name seen) type))))))
 
-(defun peer-type-table-string (&optional (graph *graph*))
-  "Encode GRAPH's node-type registry as ONE delimited string, for the plist control
-channel.  A nested list would trip PLIST-TOO-FANCY-ERROR, so the table rides as a
-single string -- the same dodge as PEER-IDS->STRING.
+(defun peer-type-table-string (&optional (registry (ensure-type-registry)))
+  "Encode this IMAGE's type registry as ONE delimited string, for the plist
+control channel.  A nested list would trip PLIST-TOO-FANCY-ERROR, so the table
+rides as a single string -- the same dodge as PEER-IDS->STRING.
+
+REGISTRY, not a graph (D14, GH #186): type-ids are image-level, so the table
+names every type this system has assigned, not the subset one store happens to
+instantiate.  Signals SYSTEM-DIRECTORY-REQUIRED when *SYSTEM-DIRECTORY* is
+NIL, which no graph-owning image can be -- MAKE-GRAPH and OPEN-GRAPH both
+refuse without one.
 
 *** THIS FORMAT IS A FROZEN EXTERNAL CONTRACT. *** It is parsed by non-Lisp peers (the
 Kotlin/SQLite device).  PEER-PARSE-TYPE-TABLE is the reference implementation and its
@@ -232,17 +283,22 @@ STRICT PARSE RULES (the contract; PEER-PARSE-TYPE-TABLE enforces all of them):
   - no record is empty -- no leading, trailing or doubled #\\; -- and no super is empty;
   - the WHOLE table may be empty (\"\", or the key absent): an old hub sends no table.
 
-Both KIND and ID are required: NEXT-VERTEX-ID and NEXT-EDGE-ID are separate counters
-that BOTH start at 1 (schema.lisp), so a vertex type and an edge type routinely share a
-numeric id.  A consumer must key on (KIND . ID), never ID alone.
+Both KIND and ID are required: the registry's vertex and edge counters are
+separate and BOTH start at 1 (type-registry.lisp; before GH #186, schema.lisp's
+per-graph pair), so a vertex type and an edge type routinely share a numeric
+id.  A consumer must key on (KIND . ID), never ID alone.
 
-Signals an error if the schema cannot be represented -- see
-%PEER-VALIDATE-TYPE-TABLE-ROWS.  That is deliberate: a corrupt table is undebuggable on
-the device, so the failure belongs at the hub.  Note WHERE it lands: this runs on the
-auth-ok path, so an unrepresentable schema fails every device CONNECTION, not the
-offending DEF-VERTEX.  Loud and hub-side either way, but the traceback points at a
-session, not at the schema form that caused it."
-  (let ((rows (%peer-validate-type-table-rows (%peer-type-table-rows graph))))
+Signals an error if the registry cannot be represented -- see
+%PEER-VALIDATE-TYPE-TABLE-ROWS.  That is deliberate: a corrupt table is
+undebuggable on the device, so the failure belongs at the hub.  Note WHERE it
+lands: this runs on the auth-ok path, so an unrepresentable type fails every
+device CONNECTION, not the offending DEF-VERTEX.  Since GH #186 the table is
+the IMAGE's registry, so that one type need not even be in the store being
+replicated -- the blast radius is every peer session in the image.  Loud and
+hub-side either way, but the traceback points at a session, not at the schema
+form that caused it."
+  (let ((rows (%peer-validate-type-table-rows
+               (%peer-type-table-rows registry))))
     (with-output-to-string (s)
       (loop for row in rows
             for firstp = t then nil
@@ -318,6 +374,116 @@ names), because the table is sorted by id and may carry forward references."
   (unless (or (null string) (string= string ""))
     (loop for record in (%peer-split #\; string)
           collect (%peer-parse-type-record record))))
+
+;;; ---------------------------------------------------------------------------
+;;; D15: the handshake refuses a peer whose type registry disagrees.
+;;;
+;;; An image with no hub is its own authority -- the common case, since peer
+;;; replication is off by default -- so two images can independently give one
+;;; symbol two ids, or one id two symbols.  Reconciling here would mean a data
+;;; migration triggered by a network handshake, on stores that may hold millions
+;;; of nodes stamped with the losing id.  Refuse instead, and NAME the symbols:
+;;; a disagreement between two populated stores is an operator event
+;;; (spec §3.4).
+;;; ---------------------------------------------------------------------------
+
+(define-condition peer-type-registry-conflict-error (error)
+  ((conflicts :initarg :conflicts :reader peer-type-registry-conflicts))
+  (:report
+   (lambda (c s)
+     (let ((conflicts (peer-type-registry-conflicts c)))
+       (format s "The hub's type registry disagrees with this image's, so a ~
+type-id on the wire would materialise the WRONG class here.  Refusing the ~
+session (D15, GH #186) -- reconcile the registries out of band; a handshake ~
+may not do it, because the losing id is already written into every node of ~
+its type.  ~D conflict~:P:~{~%  ~A~}"
+               (length conflicts)
+               (mapcar #'%peer-conflict-description conflicts))))))
+
+(defun %peer-conflict-description (conflict)
+  "One line naming CONFLICT's two sides, package-qualified."
+  (destructuring-bind (reason parent key hub local symbol) conflict
+    (ecase reason
+      (:same-name-two-ids
+       (format nil "~(~A~) ~A (~S): hub says id ~D, this image says ~D"
+               parent (%peer-type-label symbol) key hub local))
+      (:same-id-two-names
+       (format nil "~(~A~) id ~D: hub says ~S, this image says ~S (~A)"
+               parent key hub local (%peer-type-label symbol))))))
+
+(defun %peer-registry-conflicts (hub-rows registry)
+  "Every disagreement between HUB-ROWS (PEER-PARSE-TYPE-TABLE output) and
+REGISTRY, as a list of conflict descriptors
+(REASON PARENT KEY HUB-SIDE LOCAL-SIDE LOCAL-SYMBOL).
+
+Compared by DOWNCASED NAME, because that is all the wire carries -- which is
+exactly why %PEER-VALIDATE-TYPE-TABLE-ROWS must go on refusing two types that
+downcase alike.  It is applied to the LOCAL rows here too: if this image's own
+registry is ambiguous the comparison below is unsound, so that has to signal
+rather than silently check one of the two.
+
+BOTH directions are reported and neither subsumes the other.  One name at two
+ids is the case where a node arrives under an id this image reads as some
+other type.  One id at two names is the case where the hub's type is unknown
+here and its id already means a local type -- the same corruption, with no
+shared name to key on."
+  (let ((conflicts nil)
+        (local (%peer-validate-type-table-rows
+                (%peer-type-table-rows registry))))
+    (dolist (parent '(:vertex :edge) (nreverse conflicts))
+      (let ((kind-string (ecase parent (:vertex "v") (:edge "e")))
+            (by-name (make-hash-table :test 'equal))
+            (by-id (make-hash-table :test 'eql)))
+        (dolist (row local)
+          (destructuring-bind (kind id name supers type) row
+            (declare (ignore supers))
+            (when (string= kind kind-string)
+              (setf (gethash name by-name) (cons id type))
+              (setf (gethash id by-id) (cons name type)))))
+        (dolist (row hub-rows)
+          (destructuring-bind (hub-parent hub-id hub-name hub-supers) row
+            (declare (ignore hub-supers))
+            (when (eq hub-parent parent)
+              (let ((named (gethash hub-name by-name))
+                    (numbered (gethash hub-id by-id)))
+                (when (and named (/= hub-id (car named)))
+                  (push (list :same-name-two-ids parent hub-name
+                              hub-id (car named) (cdr named))
+                        conflicts))
+                (when (and numbered (not (string= hub-name (car numbered))))
+                  (push (list :same-id-two-names parent hub-id
+                              hub-name (car numbered) (cdr numbered))
+                        conflicts))))))))))
+
+(defun peer-check-type-registry-agreement (table &optional
+                                                 (registry
+                                                  (ensure-type-registry)))
+  "Signal PEER-TYPE-REGISTRY-CONFLICT-ERROR unless the hub's TABLE -- the
+auth-ok :TYPE-TABLE string -- agrees with REGISTRY about every type-id the two
+share.  Returns the parsed table (PEER-PARSE-TYPE-TABLE).
+
+NIL or \"\" checks nothing and returns NIL.  That is the back-compat path for a
+hub too old to ship a table, and it is the one hole in this guard: such a hub
+cannot be compared at all, so it is trusted."
+  (let ((rows (peer-parse-type-table table)))
+    (when rows
+      (let ((conflicts (%peer-registry-conflicts rows registry)))
+        (when conflicts
+          (error 'peer-type-registry-conflict-error :conflicts conflicts))))
+    rows))
+
+(defun peer-device-accept-auth-ok (ctrl &optional
+                                        (registry (ensure-type-registry)))
+  "The device's half of the auth-ok step: refuse a rejection, then refuse a hub
+whose type registry disagrees with this image's (D15).  Returns the parsed hub
+type table.
+
+Factored out of PEER-SYNC so the refusal is reachable without a socket; the
+socket plumbing around this call is NOT covered by the tests that drive it
+directly."
+  (unless (eq (getf ctrl :peer-control) :auth-ok)
+    (error "peer auth rejected by hub: ~S" ctrl))
+  (peer-check-type-registry-agreement (getf ctrl :type-table) registry))
 
 (defun peer-portable-string (value)
   "Coerce a STRING VALUE to a general (CHARACTER) string; pass non-strings through.
@@ -548,6 +714,15 @@ MAX."
 ;;; Hub: handshake + authority-scoped pull.
 ;;; ---------------------------------------------------------------------------
 
+(defun %peer-registry (graph)
+  "GRAPH's captured type registry, or this image's.  A hub session runs on a
+thread START-REPLICATION spawned, and a new thread does NOT inherit dynamic
+bindings, so ENSURE-TYPE-REGISTRY there reads the GLOBAL *SYSTEM-DIRECTORY* --
+NIL, or another system's.  START-REPLICATION captures it on the caller's
+thread; the fallback covers a graph made before that (GH #186)."
+  (or (and (typep graph 'peer-graph) (peer-type-registry graph))
+      (ensure-type-registry)))
+
 (defun peer-hub-handshake-plist (graph)
   "What the hub announces on a new connection (schema-version split into plist-
 safe integers; schema-digest carried as a within-major integrity signal)."
@@ -670,9 +845,11 @@ DEF-VERTEX/DEF-EDGE evaluation order and no name crosses the wire."
                    ;; schema.  Additive and back-compatible -- every peer-path plist
                    ;; read on both sides is a bare GETF, so an old device simply never
                    ;; asks for this key, and a new device against an old hub gets NIL.
-                   (peer-write-plist (list :peer-control :auth-ok
-                                           :type-table (peer-type-table-string graph))
-                                     socket)
+                   (peer-write-plist
+                    (list :peer-control :auth-ok
+                          :type-table (peer-type-table-string
+                                       (%peer-registry graph)))
+                    socket)
                    (peer-pull-phase graph socket device
                                     :full-resync-p (and (getf auth :full-resync) t)
                                     :min-cursor (or (getf auth :pull-cursor) 0))
@@ -1267,9 +1444,8 @@ re-ship.  Returns the ack result plist (:created / :purged id lists)."
                  (error 'peer-schema-incompatible-error
                         :hub-version hub-version :device-version my-version))))
            (peer-write-plist (peer-device-auth-plist graph :full-resync full-resync) socket)
-           (let ((ctrl (read-plist-packet socket)))
-             (unless (eq (getf ctrl :peer-control) :auth-ok)
-               (error "peer auth rejected by hub: ~S" ctrl)))
+           (peer-device-accept-auth-ok (read-plist-packet socket)
+                                       (%peer-registry graph))
            (let* ((mailbox (peer-writer-mailbox graph))
                   ;; Drain the pull until the pull-end control plist (carries T).
                   (end (loop for r = (peer-read-and-enqueue socket graph mailbox)
@@ -1303,7 +1479,14 @@ re-ship.  Returns the ack result plist (:created / :purged id lists)."
 
 (defmethod start-replication ((graph peer-graph) &key package)
   (declare (ignore package))
+  ;; A frozen open never checked this store's ids against the registry, and
+  ;; the type table a hub ships describes the REGISTRY while its node heads
+  ;; carry the STORE's ids: serving one would corrupt a remote peer (#186).
+  (check-replicable graph)
   (setf (stop-replication-p graph) nil)
+  ;; On THIS thread, while the caller's *SYSTEM-DIRECTORY* binding is still
+  ;; visible: the hub's session threads cannot see it (GH #186).
+  (setf (peer-type-registry graph) (ensure-type-registry))
   (ecase (peer-role graph)
     (:hub
      (setf (peer-thread graph)

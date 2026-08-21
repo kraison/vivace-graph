@@ -459,6 +459,7 @@ retryable network error, retries with an exponential retry timeout."
 ;; without this network-transport file.  Only the master/slave methods remain.
 (defmethod start-replication ((graph master-graph) &key (package :graph-db))
   (declare (ignore package))
+  (check-replicable graph)                      ; GH #186
   (setf (stop-replication-p graph) nil)
   (setf (replication-listener graph)
         (bordeaux-threads:make-thread
@@ -478,6 +479,7 @@ retryable network error, retries with an exponential retry timeout."
 
 (defmethod start-replication ((graph slave-graph) &key package)
   (declare (ignore package))
+  (check-replicable graph)                      ; GH #186
   (setf (stop-replication-p graph) nil)
   (setf (slave-thread graph)
         (bordeaux-threads:make-thread

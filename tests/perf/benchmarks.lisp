@@ -241,7 +241,11 @@ useless here -- we read (memory-pointer (heap g))."
                       (output (report-pathname tag)))
   "Run the full perf suite at SCALE, record results, write a report to OUTPUT.
 Measurement-only; always returns T."
-  (let ((*perf-scale* scale))
+  ;; A system directory for the stores these benchmarks open (GH #186).
+  (let* ((*perf-scale* scale)
+         (system-dir (make-temp-directory))
+         (graph-db::*system-directory* (namestring system-dir))
+         (graph-db::*type-registry* nil))
     (reset-perf-report)
     (format t "~&=== graph-db perf (~A, scale ~A) ===~%" *lisp-impl* scale)
     (finish-output)
@@ -255,7 +259,9 @@ Measurement-only; always returns T."
     (bench-concurrent-rw)
     (bench-disk-growth)
     (bench-snapshot-restore-reopen)
-    (write-perf-report output :tag tag))
+    (write-perf-report output :tag tag)
+    (uiop:delete-directory-tree system-dir :validate t
+                                           :if-does-not-exist :ignore))
   t)
 
 ;; Alias so the headless driver can call (graph-db/perf-test:perf-suite).

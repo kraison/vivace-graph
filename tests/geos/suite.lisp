@@ -10,9 +10,18 @@
 Invoked by (asdf:test-system :graph-db/geos)."
   (log:config :error)
   #+ecl (ext:set-limit 'ext:heap-size (* 6 1024 1024 1024))
-  (let ((results (run 'geos-suite)))
-    (explain! results)
-    (results-status results)))
+  ;; Type-ids come from the system-wide registry, so every store this suite
+  ;; opens needs a system directory (GH #186).  One for the whole run, which
+  ;; is the shape a real system has: many stores, one registry.
+  (let* ((system-dir (make-temp-directory))
+         (graph-db::*system-directory* (namestring system-dir))
+         (graph-db::*type-registry* nil))
+    (unwind-protect
+         (let ((results (run 'geos-suite)))
+           (explain! results)
+           (results-status results))
+      (uiop:delete-directory-tree system-dir :validate t
+                                             :if-does-not-exist :ignore))))
 
 ;;; A handful of tests need to run with GEOS forced unavailable to prove the
 ;;; fallback path.  This binds the flag off for the dynamic extent of BODY.

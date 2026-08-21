@@ -16,6 +16,10 @@
    #+ecl (make-hash-table :test 'eql
                           #+graph-db-ecl-sync-hash :synchronized
                           #+graph-db-ecl-sync-hash t))
+  ;; DEAD since GH #186 moved assignment to the image registry: nothing reads
+  ;; either slot, and RENUMBER-SCHEMA leaves them stale on purpose (the
+  ;; registry's counters are the live ones).  They stay because CL-STORE
+  ;; restores every schema.dat ever written through this struct definition.
   (next-edge-id 1 :type (unsigned-byte 32))
   (next-vertex-id 1 :type (unsigned-byte 32))
   ;; MVCC: graph-wide default number of prior node versions the reaper retains
@@ -146,17 +150,22 @@ persisted type-ids (unlike re-running INIT-SCHEMA from scratch)."
     (setf (schema-class-locks schema) locks)
     schema))
 
-(defmethod get-next-type-id ((schema schema) parent)
-  (with-recursive-lock-held ((schema-lock schema))
-    (cond ((or (eql parent :edge) (eql parent 'edge))
-           (prog1
-               (schema-next-edge-id schema)
-             (incf (schema-next-edge-id schema))))
-          ((or (eql parent :vertex) (eql parent 'vertex))
-           (prog1
-               (schema-next-vertex-id schema)
-             (incf (schema-next-vertex-id schema))))
-          (t (error "Unknown parent type ~S" parent)))))
+(defun %normalize-parent-type (parent)
+  (cond ((or (eql parent :edge) (eql parent 'edge)) :edge)
+        ((or (eql parent :vertex) (eql parent 'vertex)) :vertex)
+        (t (error "Unknown parent type ~S" parent))))
+
+(defun assign-type-id (name parent)
+  "The type-id for NAME under PARENT, minted if this system has not seen it
+before.  Ids come from the image-level registry, not the per-graph counters
+this replaced, so one symbol names one id in every store of the system and no
+two symbols share one (GH #186).  Keyed on the package-qualified symbol.
+
+REGISTRY-INTERN, never REGISTRY-ID-FOR: the latter is lock-free, so its NIL
+is a hint, not proof of absence, and only INTERN re-reads under the lock.
+Signals SYSTEM-DIRECTORY-REQUIRED when *SYSTEM-DIRECTORY* is NIL."
+  (registry-intern (ensure-type-registry) name
+                   (%normalize-parent-type parent)))
 
 (defmethod schema-string-representation ((schema schema))
   "Return a string representation of SCHEMA. Two schemas with the same
@@ -231,17 +240,6 @@ replication for a quick schema compatibility check."
   (finalize-inheritance (find-class (node-type-name meta)))
   (save-schema (schema graph) graph))
 
-(defun %check-node-class-graph-unique (name graph-name)
-  "Signal if NAME is registered under a graph other than GRAPH-NAME. Keys on
-graph-name identity, not presence: a same-graph redefinition legitimately
-re-registers under the same key (GH #53)."
-  (maphash (lambda (gname metas)
-             (unless (equal gname graph-name)
-               (when (find name metas :key #'node-type-name)
-                 (error 'duplicate-node-class-error
-                        :name name :existing-graph gname :new-graph graph-name))))
-           *schema-node-metadata*))
-
 (defmacro def-node-type (name parent-types slot-specs graph-name &key keep-revisions)
   "Define a persistent node type NAME for the graph named GRAPH-NAME.  This is
 the machinery behind DEF-VERTEX and DEF-EDGE; you normally use those instead.
@@ -273,7 +271,8 @@ be defined before or after the graph is created."
                             (append s1 (list :initarg (intern (symbol-name (first s1)) :keyword))))))
                     slot-specs))
       `(progn
-         (%check-node-class-graph-unique ',name ',graph-name)
+         ;; No cross-graph uniqueness check: type-ids are system-wide as of
+         ;; #186, so one class may be instantiated in more than one store.
          (defclass ,name (,@parent-types)
            (,@slot-specs)
            (:metaclass node-class))
@@ -442,10 +441,11 @@ be defined before or after the graph is created."
                                          *graph*
                                          :edge-type ',name)))))
                   )
-           ;; Replace in place, preserving position: UPDATE-SCHEMA applies the
-           ;; list oldest-to-newest and INSTANTIATE-NODE-TYPE assigns type-ids in
-           ;; that order, so moving a redefined type would change its type-id on
-           ;; a fresh graph (GH #53).
+           ;; Replace in place, preserving position.  The type-id reason is
+           ;; historical: ids came from this list's order until #186 moved
+           ;; assignment to the registry, which keys on the name.  Position
+           ;; still governs the order UPDATE-SCHEMA instantiates types in, so
+           ;; a moved entry reorders schema replay (GH #53).
            (let* ((,metas (gethash ',graph-name *schema-node-metadata*))
                   (,pos (position ',name ,metas :key #'node-type-name)))
              (if ,pos
@@ -496,6 +496,145 @@ Example:
                           (node-type-keep-revisions meta2))))
             new-slots removed-slots)))
 
+(defun %store-schema-claims (schema)
+  "(values CLAIMS HIGHEST) for SCHEMA's persisted type table.
+
+CLAIMS is (SYMBOL PARENT ID) for every type the store answers to BY NAME.
+STALE is the same shape for every id the table OCCUPIES that its own name
+lookup no longer returns: a store's history can leave old metadata behind,
+and nodes on disk still carry that id (spec §10.1).  The first says what must
+agree with the registry; the second says which ids must stay out of the
+registry's reach.
+
+The sub-tables are triple-keyed (id -> meta, symbol -> id, keyword -> id;
+see UPDATE-NODE-TYPE), which is what the key discrimination below is for."
+  (let ((claims nil)
+        (stale nil))
+    (dolist (parent '(:vertex :edge) (values (nreverse claims)
+                                             (nreverse stale)))
+      (let ((sub (gethash parent (schema-type-table schema)))
+            (occupied nil))
+        (when sub
+          (maphash
+           (lambda (key value)
+             (cond ((and (integerp key) (node-type-p value))
+                    (push (cons key (node-type-name value)) occupied))
+                   ((and (symbolp key) (not (keywordp key))
+                         (integerp value))
+                    (push (list key parent value) claims))))
+           sub)
+          ;; An occupied id the NAME lookup no longer returns is stale: the
+          ;; metadata is unreachable but node heads still carry the id.
+          (dolist (cell occupied)
+            (unless (eql (car cell) (gethash (cdr cell) sub))
+              (push (list (cdr cell) parent (car cell)) stale))))))))
+
+(defun %reconcile-claims (registry claims stale location)
+  "Adopt or refuse, under REGISTRY's append lock.  See
+RECONCILE-SCHEMA-WITH-REGISTRY for the policy; this is the half that writes."
+  (let ((tables (list (cons :vertex (registry-ids-table registry :vertex))
+                      (cons :edge   (registry-ids-table registry :edge)))))
+    (dolist (claim claims)
+      (destructuring-bind (symbol parent id) claim
+        (let ((known (registry-id-for registry symbol parent))
+              (holder (gethash id (cdr (assoc parent tables)))))
+          (cond ((and known (eql known id)))    ; already agreed
+                (known
+                 (error 'store-registry-conflict
+                        :reason :name-at-two-ids :location location
+                        :type-name symbol :parent parent
+                        :store-id id :registry-id known))
+                ((and holder (not (eq holder symbol)))
+                 (error 'store-registry-conflict
+                        :reason :id-at-two-names :location location
+                        :type-name symbol :parent parent
+                        :store-id id :holder holder))
+                (t
+                 (%registry-adopt registry symbol parent id)
+                 (setf (gethash id (cdr (assoc parent tables))) symbol))))))
+    ;; Stale ids: metadata the name lookup no longer reaches, but node heads
+    ;; still do.  One ABOVE the registry's high-water mark is next in line to
+    ;; be handed to another type and there is no honest way to reserve it --
+    ;; the registry records symbols, not holes -- so refuse.
+    ;;
+    ;; One at or below the mark is TOLERATED, and that is a policy choice
+    ;; about already-orphaned metadata rather than a proof of safety:
+    ;; %REGISTRY-ASSIGN never reaches it, but %REGISTRY-ADOPT takes an
+    ;; arbitrary id and this very function calls it, so a later adopt still
+    ;; can (GH #202).  Such a store owes a renumbering (§10.1); say so.
+    (dolist (entry stale)
+      (destructuring-bind (symbol parent id) entry
+        (if (> id (registry-highest-id registry parent))
+            (error 'store-registry-conflict
+                   :reason :stale-id :location location
+                   :type-name symbol :parent parent :store-id id)
+            (log:warn "~A holds ~(~A~) type ~S at id ~D as well as ~D; ~
+nodes at the older id are only carried across by a renumbering migration ~
+(:RENUMBER-P T, spec §10.1, GH #186)."
+                      location parent symbol id
+                      (registry-id-for registry symbol parent)))))))
+
+(defmacro with-schema-frozen (() &body body)
+  "Run BODY with schema replay AND type-id reconciliation suppressed, so a
+store opens exactly as it stands on disk.
+
+This is how you READ a store the registry does not agree with -- a class
+census, a backup, the before-and-after of an adoption run.  An ordinary open
+refuses such a store, and correctly: it has to be renumbered before this
+system may keep writing through it (GH #186, spec §10.1).
+
+Two things a frozen open does not do: it does not teach the store types
+declared since it was closed, and it does not check its ids against the
+registry.  Writes made through it therefore go out under the STORE's ids,
+which is what a legacy store wants and what a store you intend to keep in
+this system must not have."
+  `(let ((*schema-update-suppressed* t))
+     ,@body))
+
+(defun reconcile-schema-with-registry (graph)
+  "Make GRAPH's persisted type-ids and the image registry agree, or refuse.
+
+The invariant every other part of #186 assumes and none of them establishes:
+a type-id in a store's schema means what the registry says it means.
+INSTANTIATE-NODE-TYPE keeps a persisted id without telling the registry, and
+mints a new one from a counter that has never seen that store's ids, so
+without this an ordinary upgrade -- open an existing store under a fresh
+system directory, then ship one more DEF-VERTEX -- mints an id the store
+already uses and UPDATE-NODE-TYPE overwrites it.  It also makes the peer type
+table honest: the table is the registry and the wire carries store ids.
+
+Per type the store names:
+  - the registry does not know the symbol, and nothing else holds its id:
+    ADOPT the store's id.  Adopting records what is already on disk; it is
+    not recomputation, so D14 stands, and it is the single-store case of
+    REGISTRY-SEED-FROM-STORES;
+  - the registry gives the symbol a DIFFERENT id, or gives that id to another
+    symbol: refuse, naming both sides.  Reconciling here would mean rewriting
+    every node of the losing type because a store was opened.
+
+Adoption raises the registry's counters past every id it takes, so a later
+mint cannot collide.  Runs before UPDATE-SCHEMA instantiates anything, which
+is the only point at which that ordering is guaranteed."
+  (let ((registry (ensure-type-registry)))
+    (multiple-value-bind (claims stale) (%store-schema-claims (schema graph))
+      ;; Read-only pass first: agreement is the overwhelmingly common case and
+      ;; the append flock is system-wide, so taking it on every open would
+      ;; serialise every store's open against every other's.  A store with
+      ;; ANY orphaned id does take it on every open, to reclassify and warn
+      ;; under the post-adoption mark; such a store owes a renumbering and is
+      ;; rare (§10.1).
+      (when (or (some (lambda (claim)
+                        (destructuring-bind (symbol parent id) claim
+                          (not (eql id (registry-id-for registry symbol
+                                                        parent)))))
+                      claims)
+                stale)
+        (with-registry-append-lock (registry)
+          ;; Re-derived under the lock: WITH-REGISTRY-APPEND-LOCK re-reads the
+          ;; file, so the decisions above are hints, not conclusions.
+          (%reconcile-claims registry claims stale
+                             (ignore-errors (location graph))))))))
+
 (defmethod instantiate-node-type ((meta node-type) (graph graph))
   (with-recursive-lock-held ((schema-lock (schema graph)))
     (let ((cl (find-class (node-type-name meta) nil)))
@@ -507,8 +646,14 @@ Example:
       (when (typep cl 'node-class) (%invalidate-node-class-caches cl)))
     ;; Check if this type exists and if it differs from old spec
     (log:debug "Looking up ~A: ~A ~A" meta (node-type-name meta) (node-type-parent-type meta))
+    ;; :GRAPH GRAPH, not the ambient *GRAPH*: this branch decides whether the
+    ;; type is new TO THIS STORE, and since #186 that decides whether it takes
+    ;; the store's existing id or asks the registry for one.  *GRAPH* is bound
+    ;; to GRAPH on the open/create paths but is NIL (or another store) when a
+    ;; DEF-VERTEX is evaluated at runtime against an already-open graph.
     (let ((old-meta (lookup-node-type-by-name (node-type-name meta)
-                                              (node-type-parent-type meta))))
+                                              (node-type-parent-type meta)
+                                              :graph graph)))
       (if (node-type-p old-meta)
           (multiple-value-bind (changes-p new-slots removed-slots)
               (node-type-diff old-meta meta)
@@ -522,14 +667,23 @@ Example:
                              (node-type-name meta) new-slots)
                   (update-node-type meta graph))
                 old-meta))
-          ;; Else if new, assign node-type-id
+          ;; Else new TO THIS STORE: the id comes from the system-wide
+          ;; registry, keyed on the type's NAME (GH #186).  Assigned here and
+          ;; not in UPDATE-NODE-TYPE because only this branch knows the store
+          ;; has no id of its own yet -- the redefinition branch above must
+          ;; keep the one already written into every node of that type.
+          ;; Unconditional, not guarded on (NULL (NODE-TYPE-ID META)):
+          ;; *SCHEMA-NODE-METADATA* holds one META per graph-name, and it
+          ;; outlives the store, so a second, fresh store opened under that
+          ;; name would find the first store's id still on it and adopt it
+          ;; instead of asking the registry.
           (progn
             (setf (gethash (node-type-name meta)
                            (schema-class-locks (schema graph)))
                   (make-rw-lock))
             (setf (node-type-id meta)
-                  (get-next-type-id (schema graph)
-                                    (node-type-parent-type meta)))
+                  (assign-type-id (node-type-name meta)
+                                  (node-type-parent-type meta)))
             (update-node-type meta graph))))))
 
 
@@ -540,9 +694,25 @@ Example:
         (error "Cannot update schema for graph ~A: graph not open!" graph-name))))
 
 (defmethod update-schema ((graph graph))
-  (with-recursive-lock-held ((schema-lock (schema graph)))
-    (let ((node-metadata (gethash (graph-name graph) *schema-node-metadata*)))
-      ;; The list is maintained oldest-first (GH #53); apply in order.
-      (dolist (meta node-metadata)
-        (instantiate-node-type meta graph)))
-    (save-schema (schema graph) graph)))
+  ;; *SCHEMA-UPDATE-SUPPRESSED* is bound by MIGRATE-GRAPH, which installs by
+  ;; hand the schema each of its two opens is to have, and by
+  ;; WITH-SCHEMA-FROZEN (GH #186).  Minting registry ids here for a schema
+  ;; discarded on the next form is how the registry ends up holding ids no
+  ;; store uses; adopting a contradicted store's would be the same mistake
+  ;; the other way.
+  (if *schema-update-suppressed*
+      ;; Remember it: START-REPLICATION refuses a graph whose ids were never
+      ;; checked, because the wire carries them (see CHECK-REPLICABLE).
+      (setf (schema-frozen-p graph) t)
+      (progn
+        ;; BEFORE the replay, not after: the replay is what mints, and a
+        ;; mint is only safe once the registry knows every id this store
+        ;; occupies (#186).
+        (reconcile-schema-with-registry graph)
+        (with-recursive-lock-held ((schema-lock (schema graph)))
+          (let ((node-metadata (gethash (graph-name graph)
+                                        *schema-node-metadata*)))
+            ;; The list is maintained oldest-first (GH #53); apply in order.
+            (dolist (meta node-metadata)
+              (instantiate-node-type meta graph)))
+          (save-schema (schema graph) graph)))))

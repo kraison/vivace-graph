@@ -260,26 +260,44 @@ failure mode this function exists to prevent.  See GH #100."
 
 (defun migrate-graph (name old-location new-location
                       &key (package :graph-db) include-deleted-p
-                           (delete-snapshot-p t)
+                           (delete-snapshot-p t) renumber-p
                            (snapshot-file (%migration-snapshot-file name)))
   "Migrate a pre-current (v1 or v2) graph at OLD-LOCATION to the current (v3)
-on-disk format at NEW-LOCATION, returning the new, open graph.
+on-disk format at NEW-LOCATION, returning (values NEW-GRAPH UNIFIED) -- the
+new, open graph, and (under :RENUMBER-P T) the types whose several ids were
+unified into one.
 
 Migration is a logical snapshot + replay: OLD-LOCATION's own stamped storage
 version is read first, so the old graph is opened read-only with the head
 shim that matches IT (15-byte v1, 31-byte v2), every live node is written to a
 format-independent snapshot file, then a fresh v3 graph is created and the
-snapshot replayed through the normal MAKE-VERTEX / MAKE-EDGE path.  The old
-graph's schema (its type-id registry) is copied to the new graph, so type-ids
-are preserved -- this does not renumber (#186).
+snapshot replayed through the normal MAKE-VERTEX / MAKE-EDGE path.
+
+:RENUMBER-P decides which type-ids the new graph gets, and it is the one
+guarantee here that is mode-dependent (GH #186, spec §10.1):
+
+  NIL (default) -- the old graph's schema is copied across verbatim, so
+    every type-id survives unchanged.  This is #166's format migration.  The
+    new store's ids are then the SOURCE's per-graph ids and NOT this
+    system's registry ids, so the migration deliberately leaves the registry
+    untouched rather than claim ids for names it did not renumber.
+  T -- every type-id is taken from the system registry instead, so the new
+    store's ids mean the same thing in every other store of the system.
+    This is how a populated system adopts global ids; seed the registry
+    first with REGISTRY-SEED-FROM-STORES, which also says which stores need
+    this.  A symbol the source's history left holding two ids unifies under
+    one here, and is named in the second return value.
 
 OLD-LOCATION's DATA -- its heap and its vertex/edge/index tables -- is left
 untouched; it remains fully openable by an engine of its own (pre-migration)
 version afterward, which is the rollback story: repoint at OLD-LOCATION rather
 than restore from a snapshot.  It is NOT byte-for-byte identical, though:
-snapshotting requires OPENing it, and that OPEN unconditionally rewrites
-schema.dat (via UPDATE-SCHEMA/SAVE-SCHEMA -- same content, re-serialized, so
-type-ids are unaffected) and creates one new, empty tx/replication-*.log file.
+snapshotting requires OPENing it, and that OPEN creates one new, empty
+tx/replication-*.log file.  (schema.dat is no longer rewritten at all: the
+schema replay is suppressed for both of this function's opens, so a type
+declared in this image but absent from the source is not added to the source
+either -- it would carry a registry id in a store whose every other id is
+per-graph.  GH #186.)
 This assumes OLD-LOCATION was closed cleanly and still has its index
 sidecars: OPEN-GRAPH rebuilds a spatial, unique, or secondary index from a
 live-node scan whenever its sidecar is absent (graph.lisp's
@@ -312,7 +330,13 @@ an explicit path if you want a predictable one."
            ;;    it logically.  The reader shim applies only to this read; the
            ;;    replay below always writes the current (v3) format.
            (let* ((found (%migration-source-version old-location))
-                  (*node-head-reader* (%migration-source-version-reader found)))
+                  (*node-head-reader* (%migration-source-version-reader found))
+                  ;; Both opens: this function decides both schemas itself
+                  ;; (see :RENUMBER-P above), and UPDATE-SCHEMA running first
+                  ;; would mint registry ids for a schema thrown away on the
+                  ;; next form -- and, on the source, write one into a store
+                  ;; whose every other id is per-graph (GH #186).
+                  (*schema-update-suppressed* t))
              (let ((old (open-graph name old-location
                                     ;; tolerate FOUND so a re-run is harmless
                                     :accept-versions
@@ -325,19 +349,30 @@ an explicit path if you want a predictable one."
                                 found old-location snapshot-file)
                       (backup old snapshot-file :include-deleted-p include-deleted-p))
                  (close-graph old :snapshot-p nil))))
-           ;; 2. Create the v3 graph, adopt the old schema (preserves
-           ;;    type-ids), replay.
-           (let ((new (make-graph name new-location)))
+           ;; 2. Create the v3 graph, install the schema (verbatim, or
+           ;;    renumbered from the registry), replay.
+           (let ((new (let ((*schema-update-suppressed* t))
+                        (make-graph name new-location))))
              (handler-case
-                 (progn
-                   (setf (schema new) old-schema)
+                 (multiple-value-bind (schema unified)
+                     (if renumber-p
+                         (renumber-schema old-schema (ensure-type-registry))
+                         (values old-schema nil))
+                   (setf (schema new) schema)
                    (restore-schema-locks (schema new))
                    (setf (schema-lock (schema new)) (make-recursive-lock))
                    (save-schema (schema new) new)
+                   (when unified
+                     (log:warn "MIGRATE-GRAPH: ~D type~:P in ~A held more ~
+than one type-id; unified: ~S" (length unified) old-location unified))
+                   (unless renumber-p
+                     (log:warn "MIGRATE-GRAPH: ~A keeps ~A's per-graph ~
+type-ids, which are NOT this system's registry ids (:RENUMBER-P NIL, #186)."
+                               new-location old-location))
                    (log:info "MIGRATE-GRAPH: replaying snapshot ~
 into v~D graph ~A" +storage-version+ new-location)
                    (recreate-graph new snapshot-file :package-name package)
-                   new)
+                   (values new unified))
                (error (c)
                  (close-graph new)
                  (error c)))))

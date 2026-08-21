@@ -14,6 +14,11 @@
 (defclass graph ()
   ((graph-name :accessor graph-name :initarg :graph-name)
    (graph-open-p :accessor graph-open-p :initarg :graph-open-p :initform nil)
+   ;; T when this graph was opened inside WITH-SCHEMA-FROZEN, so its
+   ;; persisted type-ids were never checked against the registry.  Set by
+   ;; UPDATE-SCHEMA, read by START-REPLICATION, which refuses (GH #186).
+   (schema-frozen-p :accessor schema-frozen-p :initarg :schema-frozen-p
+                    :initform nil)
    (location :accessor location :initarg :location)
    (txn-log :accessor txn-log :initarg :txn-log)
    (txn-file :accessor txn-file :initarg :txn-file)
@@ -253,6 +258,18 @@
                    :documentation "Branch B: surfaced field conflicts retained for the
                    app review surface (a list of PEER-CONFLICT for now; B3 makes it a
                    durable enumeration API + MVCC loser retention).")
+   (peer-type-registry :accessor peer-type-registry
+                       :initarg :peer-type-registry :initform nil
+                       :documentation "The image type registry, resolved on
+                       the thread that started replication.  A hub serves
+                       each connection on a NEW thread, which does not
+                       inherit dynamic bindings, so a session calling
+                       ENSURE-TYPE-REGISTRY would read the GLOBAL
+                       *SYSTEM-DIRECTORY* -- NIL (auth-ok then fails on
+                       every connection) or, worse, another system's
+                       directory.  Resolved once in START-REPLICATION
+                       instead (GH #186).  NIL falls back to
+                       ENSURE-TYPE-REGISTRY.")
    (peer-conflicts-lock :accessor peer-conflicts-lock :initform (make-recursive-lock "peer-conflicts"))
    (applied-op-ids :accessor applied-op-ids :initarg :applied-op-ids :initform nil
                    :documentation "Durable OP-ID -> lamport dedup index (WP-3), checked
@@ -339,6 +356,15 @@ peer journal its writes (peer-replication WP-2).")
 ;; embeddable engine (graph-db/core) can open a graph without the network
 ;; replication transport.  The real master-graph/slave-graph methods (usocket
 ;; listener/slave threads) are in transaction-streaming.lisp (full graph-db).
+(defun check-replicable (graph)
+  "Signal FROZEN-GRAPH-CANNOT-REPLICATE if GRAPH was opened frozen.  Called
+by every START-REPLICATION method that actually starts a transport; the base
+method below is a no-op, and a plain store has nothing to serve (GH #186)."
+  (when (schema-frozen-p graph)
+    (error 'frozen-graph-cannot-replicate
+           :graph-name (graph-name graph)
+           :location (ignore-errors (location graph)))))
+
 (defmethod start-replication ((graph graph) &key package)
   (declare (ignore package))
   ;; noop
