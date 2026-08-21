@@ -54,7 +54,11 @@
 kernel does when a process dies mid-flight (GH #182).  Lets crash tests
 open a second clock on the same directory without CLOSE-SYSTEM-CLOCK's
 clean write masking what's actually durable."
-  (graph-db::%posix-close (graph-db::system-clock-lock-fd clock)))
+  (graph-db::%posix-close (graph-db::system-clock-lock-fd clock))
+  ;; Clear the slot: CLOSE-SYSTEM-CLOCK guards on it, so a later close of
+  ;; this struct would otherwise double-close -- and close a reused
+  ;; descriptor belonging to something else.
+  (setf (graph-db::system-clock-lock-fd clock) nil))
 
 (test clock-survives-crash-without-reissuing
   ;; No CLOSE-SYSTEM-CLOCK: simulates a crash after ids were handed out.  The
