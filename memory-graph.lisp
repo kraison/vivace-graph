@@ -420,6 +420,22 @@ cells loaded straight from PAIRS -- no node scan, no geohash recompute."
 ;;; ===========================================================================
 
 ;;; ---- write: growable little-endian byte buffer ----
+(define-condition memory-image-type-id-too-wide (error)
+  ((type-id :initarg :type-id :reader mitw-type-id)
+   (nbytes  :initarg :nbytes  :reader mitw-nbytes))
+  (:report
+   (lambda (c s)
+     (format s "type-id ~D does not fit the ~D-byte field this memory-image ~
+version uses.  Refusing rather than truncating (GH #187)."
+             (mitw-type-id c) (mitw-nbytes c)))))
+
+(defun ni-type-id (buf type-id nbytes)
+  "Write TYPE-ID as NBYTES.  NI-UINT truncates via LDB, which is how #187 --
+a type-id of 70000 restored as 4464 -- stayed invisible; refuse instead."
+  (unless (< type-id (ash 1 (* 8 nbytes)))
+    (error 'memory-image-type-id-too-wide :type-id type-id :nbytes nbytes))
+  (ni-uint buf type-id nbytes))
+
 (defun ni-mkbuf () (make-array 65536 :element-type '(unsigned-byte 8)
                                :adjustable t :fill-pointer 0))
 (declaim (inline ni-u8 ni-uint ni-bytes ni-blob ni-lisp))
@@ -456,25 +472,25 @@ cells loaded straight from PAIRS -- no node scan, no geohash recompute."
 ;;; node record = raw head fields + length-prefixed data blob (edges add from/to/
 ;;; weight before data).  Writer handles a live node OR an LZNODE (untouched nodes
 ;;; pass their blob straight through -- no re-serialize on checkpoint).
-(defun ni-node (buf id x edge-p)
+(defun ni-node (buf id x edge-p &optional (w +image-type-id-bytes+))
   (if (lznode-p x)
       (progn
-        (ni-uint buf (lznode-type-id x) 2) (ni-blob buf id)
+        (ni-type-id buf (lznode-type-id x) w) (ni-blob buf id)
         (ni-u8 buf (if (lznode-deleted-p x) 1 0))
         (ni-uint buf (lznode-revision x) 4) (ni-uint buf (lznode-commit-epoch x) 8)
         (when edge-p (ni-blob buf (lznode-from x)) (ni-blob buf (lznode-to x))
               (ni-lisp buf (lznode-weight x)))
         (ni-blob buf (lznode-data-blob x)))
       (progn
-        (ni-uint buf (type-id x) 2) (ni-blob buf id)
+        (ni-type-id buf (type-id x) w) (ni-blob buf id)
         (ni-u8 buf (if (deleted-p x) 1 0))
         (ni-uint buf (revision x) 4) (ni-uint buf (commit-epoch x) 8)
         (when edge-p (ni-blob buf (from x)) (ni-blob buf (to x)) (ni-lisp buf (weight x)))
         (ni-blob buf (serialize (data x))))))
 
-(defun ri-node (rc edge-p)
+(defun ri-node (rc edge-p &optional (w +image-type-id-bytes+))
   "Read one record into (values ID LZNODE) -- head parsed, data blob deferred."
-  (let* ((type-id (ri-uint rc 2)) (id (ri-blob rc)) (del (= 1 (ri-u8 rc)))
+  (let* ((type-id (ri-uint rc w)) (id (ri-blob rc)) (del (= 1 (ri-u8 rc)))
          (rev (ri-uint rc 4)) (ce (ri-uint rc 8))
          (from (when edge-p (ri-blob rc))) (to (when edge-p (ri-blob rc)))
          (weight (if edge-p (ri-lisp rc) 1.0))
@@ -527,14 +543,19 @@ lookups return the live object).  Returns the node."
         (dotimes (j m) (push (ri-blob rc) ids))
         (push (cons key (nreverse ids)) acc)))
     (nreverse acc)))
-(defun ni-key-type (buf k) (ni-uint buf k 2))
-(defun ri-key-type (rc) (ri-uint rc 2))
-(defun ni-key-ve (buf k) (ni-blob buf (ve-key-id k)) (ni-uint buf (ve-key-type-id k) 2))
-(defun ri-key-ve (rc) (let ((id (ri-blob rc)) (ti (ri-uint rc 2))) (make-ve-key :id id :type-id ti)))
-(defun ni-key-vev (buf k)
-  (ni-blob buf (vev-key-out-id k)) (ni-blob buf (vev-key-in-id k)) (ni-uint buf (vev-key-type-id k) 2))
-(defun ri-key-vev (rc)
-  (let ((o (ri-blob rc)) (in (ri-blob rc)) (ti (ri-uint rc 2)))
+(defun ni-key-type (buf k &optional (w +image-type-id-bytes+))
+  (ni-type-id buf k w))
+(defun ri-key-type (rc &optional (w +image-type-id-bytes+)) (ri-uint rc w))
+(defun ni-key-ve (buf k &optional (w +image-type-id-bytes+))
+  (ni-blob buf (ve-key-id k)) (ni-type-id buf (ve-key-type-id k) w))
+(defun ri-key-ve (rc &optional (w +image-type-id-bytes+))
+  (let ((id (ri-blob rc)) (ti (ri-uint rc w)))
+    (make-ve-key :id id :type-id ti)))
+(defun ni-key-vev (buf k &optional (w +image-type-id-bytes+))
+  (ni-blob buf (vev-key-out-id k)) (ni-blob buf (vev-key-in-id k))
+  (ni-type-id buf (vev-key-type-id k) w))
+(defun ri-key-vev (rc &optional (w +image-type-id-bytes+))
+  (let ((o (ri-blob rc)) (in (ri-blob rc)) (ti (ri-uint rc w)))
     (make-vev-key :out-id o :in-id in :type-id ti)))
 ;; Tagged value codec for spatial values / view keys: VG's SERIALIZE cannot
 ;; round-trip a bare (unsigned-byte 8) array (ids/uuids -- the on-disk path always
@@ -616,7 +637,7 @@ lookups return the live object).  Returns the node."
     (nreverse acc)))
 
 (defun write-memory-image-native (graph)
-  "Write GRAPH's full state in the VG-native (v7) format: per-node blob records
+  "Write GRAPH's full state in the VG-native (v8) format: per-node blob records
 plus the same structural derived dumps.  Untouched LZNODEs pass their blob
 through."
   (let ((buf (ni-mkbuf)))
@@ -625,8 +646,10 @@ through."
     ;; v6's LAYOUT exactly (the pair codec always round-tripped values); it
     ;; bumps because a spatial entry's value now carries its type tag, and a v6
     ;; image's NIL values would restore an index no scoped query can filter on
-    ;; (GH #104).
-    (ni-bytes buf *native-image-magic*) (ni-uint buf 7 4)
+    ;; (GH #104).  v8 is v7's layout with type-id widened 2 -> 4 bytes (#187);
+    ;; v5-v7 are still read, so an older image is never orphaned.
+    (ni-bytes buf *native-image-magic*)
+    (ni-uint buf +native-image-version+ 4)
     (ni-uint buf (load-highest-transaction-id graph) 8)
     (let ((vt (mem-table-data (vertex-table graph)))
           (et (mem-table-data (edge-table graph))))
@@ -654,11 +677,11 @@ through."
 journal is cleared on checkpoint (GH #65) -- so the old advice to delete it and
 recover from the journal was actively wrong (it discards the graph and 'succeeds'
 onto an empty one).  Say what remedies actually exist instead."
-  (error "Unsupported memory-image format v~D at ~A (this build reads v5, v6 ~
-and v7, writing v7).  This image is the ONLY durable record of a cleanly-~
+  (error "Unsupported memory-image format v~D at ~A (this build reads v5, v6, ~
+v7 and v8, writing v8).  This image is the ONLY durable record of a cleanly-~
 closed memory graph -- the journal is cleared after every checkpoint, so ~
 deleting the image discards the graph, it does not recover it.  Open it with a ~
-build that reads v~D, or migrate it to v7 first."
+build that reads v~D, or migrate it to v8 first."
          ver file ver))
 
 (defun %custom-node-geometry-classes ()
@@ -753,22 +776,37 @@ was filed for).  Returns :STRUCTURAL and stashes the view dump in
     ;; the spatial section per-(owner . slot); v7 shares v6's layout exactly
     ;; and differs only in what a spatial entry's value holds (GH #104).  Both
     ;; v5 and v6 are migrated below.
-    (unless (member ver '(5 6 7))
+    (unless (member ver '(5 6 7 8))
       (%signal-unsupported-memory-image-version ver file))
     (ri-uint rc 8)                                 ; highest-tx-id
-    (let ((nv (ri-uint rc 4)))
-      (dotimes (i nv)
-        (multiple-value-bind (id lz) (ri-node rc nil)
-          (mem-table-put vtable id (if lazy lz (%lznode->node vtable id lz))))))
-    (let ((ne (ri-uint rc 4)))
-      (dotimes (i ne)
-        (multiple-value-bind (id lz) (ri-node rc t)
-          (mem-table-put etable id (if lazy lz (%lznode->node etable id lz))))))
-    (%load-mem-index (mem-type-index-data (vertex-index graph)) (ri-index rc #'ri-key-type))
-    (%load-mem-index (mem-type-index-data (edge-index graph))   (ri-index rc #'ri-key-type))
-    (%load-mem-index (mem-ve-index-data (ve-index-in graph))    (ri-index rc #'ri-key-ve))
-    (%load-mem-index (mem-ve-index-data (ve-index-out graph))   (ri-index rc #'ri-key-ve))
-    (%load-mem-index (mem-vev-index-data (vev-index graph))     (ri-index rc #'ri-key-vev))
+    ;; v8 widened type-id 2 -> 4 bytes (#187).  Every record and index key
+    ;; before it is parsed POSITIONALLY, so the width has to be selected per
+    ;; version and threaded through -- reading a v7 image at 4 bytes shifts
+    ;; every field after the type-id.
+    (let ((w (if (< ver 8) 2 +image-type-id-bytes+)))
+      (let ((nv (ri-uint rc 4)))
+        (dotimes (i nv)
+          (multiple-value-bind (id lz) (ri-node rc nil w)
+            (mem-table-put vtable id
+                           (if lazy lz (%lznode->node vtable id lz))))))
+      (let ((ne (ri-uint rc 4)))
+        (dotimes (i ne)
+          (multiple-value-bind (id lz) (ri-node rc t w)
+            (mem-table-put etable id
+                           (if lazy lz (%lznode->node etable id lz))))))
+      (flet ((rd-type (rc) (ri-key-type rc w))
+             (rd-ve   (rc) (ri-key-ve rc w))
+             (rd-vev  (rc) (ri-key-vev rc w)))
+        (%load-mem-index (mem-type-index-data (vertex-index graph))
+                         (ri-index rc #'rd-type))
+        (%load-mem-index (mem-type-index-data (edge-index graph))
+                         (ri-index rc #'rd-type))
+        (%load-mem-index (mem-ve-index-data (ve-index-in graph))
+                         (ri-index rc #'rd-ve))
+        (%load-mem-index (mem-ve-index-data (ve-index-out graph))
+                         (ri-index rc #'rd-ve))
+        (%load-mem-index (mem-vev-index-data (vev-index graph))
+                         (ri-index rc #'rd-vev))))
     (if (= ver 5)
         (ri-pairs rc)         ; v5's flat spatial pairs: always empty, discard (GH #65)
         (dolist (rec (ri-spatial rc))
