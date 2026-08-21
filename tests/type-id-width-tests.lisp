@@ -29,6 +29,17 @@
 (def-vertex ti-gc-thing-b () ((label :type string)) :ti-gc-reopen-test)
 (def-edge ti-gc-link () () :ti-gc-reopen-test)
 
+;; Schema for the v2 -> v3 MIGRATE-GRAPH test below.  Same load-order
+;; constraint as TI-GC-*: this file loads before graph-tests.lisp, so the
+;; migration test cannot reuse G-PERSON/G-KNOWS -- it needs its own classes,
+;; matching tests/fixtures/v2-graph.tar.gz (built with these exact names).
+(eval-when (:load-toplevel :execute)
+  (setf (gethash :ti-migration-fixture *schema-node-metadata*) nil))
+(def-vertex ti-mig-person () ((name :type string) (age)) :ti-migration-fixture)
+(def-vertex ti-mig-employee (ti-mig-person) ((title)) :ti-migration-fixture)
+(def-edge ti-mig-knows () ((since)) :ti-migration-fixture)
+(def-edge ti-mig-likes () () :ti-migration-fixture)
+
 (test node-head-is-33-bytes
   (is (= 33 graph-db::+node-header-size+)))
 
@@ -219,6 +230,238 @@
       (signals error
         (graph-db::open-graph :storage-version-gate-test loc
                               :buffer-pool-p nil :gc-heap-p nil)))))
+
+(test v2-refusal-names-versions-and-points-at-migrate-graph
+  ;; The gate signalling is not enough on its own -- an operator meeting this
+  ;; needs to learn what to do from the error alone.  Pin the message content,
+  ;; not just SIGNALS ERROR: it must name the version FOUND (2), the version
+  ;; EXPECTED (3), and point at MIGRATE-GRAPH.
+  (with-temp-directory (dir)
+    (let ((loc (namestring dir)))
+      (graph-db::close-graph
+       (graph-db::make-graph :storage-version-gate-message-test loc
+                             :buffer-pool-p nil)
+       :snapshot-p nil)
+      (let ((mf (graph-db::mmap-file
+                 (namestring (merge-pathnames "heap.dat" dir))
+                 :create-p nil)))
+        (unwind-protect
+             (graph-db::set-byte
+              mf graph-db::+memory-storage-version-offset+ 2)
+          (graph-db::munmap-file mf)))
+      (handler-case
+          (progn
+            (graph-db::open-graph :storage-version-gate-message-test loc
+                                  :buffer-pool-p nil :gc-heap-p nil)
+            (fail "expected OPEN-GRAPH to signal on a v2 graph"))
+        (error (c)
+          (let ((msg (princ-to-string c)))
+            (is (search "v2" msg) "message names the version found: ~A" msg)
+            (is (search "v3" msg) "message names the version expected: ~A" msg)
+            (is (search "MIGRATE-GRAPH" msg)
+                "message points at the fix: ~A" msg)))))))
+
+;;; ---------------------------------------------------------------------------
+;;; v2 -> v3 migration (MIGRATE-GRAPH; type-id widened 2 -> 4 bytes, #166 T3)
+;;;
+;;; tests/fixtures/v2-graph.tar.gz is a pristine v2 graph (storage-version 2,
+;;; 31-byte head, 2-byte type-id) built on 3d0e2b4 -- the commit immediately
+;;; before the widening -- with the TI-MIG-* schema declared above: 12
+;;; vertices (10 TI-MIG-PERSON, 2 TI-MIG-EMPLOYEE) chained by 5 TI-MIG-KNOWS
+;;; edges plus 1 TI-MIG-LIKES = 18 records, deliberately more than
+;;; *RESTORE-OBJECTS-PER-TRANSACTION* (10): a replay that silently drops its
+;;; last batch loses data a smaller fixture could not expose (the boundary
+;;; falls mid-vertex-list, so a dropped batch loses both vertices AND every
+;;; edge).  Mirrors tests/mvcc-tests.lisp's v1 -> v2 fixture and test shape
+;;; (see MIGRATE-V1-GRAPH-TO-V2, :175); the heap is a 1 GB sparse file, so it
+;;; ships tar+gzipped.
+;;; ---------------------------------------------------------------------------
+
+(defun extract-v2-fixture (dest)
+  "Extract the committed v2 graph fixture into DEST (created if needed);
+return DEST as a string."
+  (let ((tarball (asdf:system-relative-pathname
+                  :graph-db/test "tests/fixtures/v2-graph.tar.gz")))
+    (ensure-directories-exist dest)
+    (uiop:run-program (list "tar" "xzf" (namestring tarball)
+                            "-C" (namestring dest))
+                      :output t :error-output t)
+    (namestring dest)))
+
+(defun %data-fingerprint (dir)
+  "A sorted SHA256 listing of every file under DIR's heap and node/index
+tables -- used to assert MIGRATE-GRAPH leaves OLD-LOCATION's DATA untouched.
+Excludes schema.dat and tx/: opening a graph at all -- even read-only, even
+to just look -- unconditionally rewrites schema.dat (UPDATE-SCHEMA calls
+SAVE-SCHEMA on every open; same content, re-serialized, so this is not a
+type-id change, see MIGRATE-V2-GRAPH-TO-V3's own type-id assertions) and
+creates a new empty tx/replication-*.log file (the transaction manager always
+opens one).  Neither is data loss; both are confirmed here to be the ONLY
+two things that change, by exhaustive diff during Task 3's development (see
+task-3-report.md).  Shells out (find + sha256sum), the same portability
+boundary EXTRACT-V1-FIXTURE already accepts by shelling out to tar."
+  (uiop:run-program
+   (format nil "find ~A -type f -not -name schema.dat -not -path '*/tx/*' ~
+-print0 | sort -z | xargs -0 sha256sum"
+           (uiop:escape-sh-token (namestring (truename dir))))
+   :output '(:string :stripped t) :force-shell t))
+
+(defun %read-v2-graph (dir)
+  "Open the v2 graph at DIR read-only (the same head shim MIGRATE-GRAPH
+uses) and return (values vertices knows likes) via %FIXTURE-VERTICES /
+%FIXTURE-EDGES.  Used both to capture MIGRATE-GRAPH's expected input and to
+confirm, post-migration, that OLD-LOCATION still opens at v2 and still holds
+every node -- the guarantee that actually backs the rollback story."
+  (let ((graph-db::*node-head-reader* 'graph-db::deserialize-node-head-v2))
+    (let ((g (graph-db:open-graph :ti-mig-guard dir
+                                  :accept-versions '(2)
+                                  :gc-heap-p nil :buffer-pool-p nil)))
+      (unwind-protect
+           (let ((graph-db::*graph* g))
+             (values (%fixture-vertices g)
+                     (%fixture-edges g 'ti-mig-knows)
+                     (%fixture-edges g 'ti-mig-likes)))
+        (graph-db:close-graph g :snapshot-p nil)))))
+
+(defun %fixture-vertices (graph)
+  "(id revision name age title-or-nil) for every live TI-MIG-PERSON in GRAPH,
+sorted by name -- the pre- and post-migration comparison shape."
+  (sort (graph-db::map-vertices
+         (lambda (v)
+           (list (graph-db::id v) (graph-db::revision v)
+                 (slot-value v 'name) (slot-value v 'age)
+                 (when (typep v 'ti-mig-employee)
+                   (slot-value v 'title))))
+         graph :collect-p t :vertex-type 'ti-mig-person)
+        #'string< :key (lambda (row) (third row))))
+
+(defun %fixture-edges (graph type)
+  "(from to weight since-or-nil) for every live edge of TYPE in GRAPH, sorted
+by SINCE (edges with no SINCE slot -- ti-mig-likes -- sort first)."
+  (sort (graph-db::map-edges
+         (lambda (e)
+           (list (graph-db::from e) (graph-db::to e) (graph-db::weight e)
+                 (when (eq type 'ti-mig-knows)
+                   (slot-value e 'since))))
+         graph :collect-p t :edge-type type)
+        #'< :key (lambda (row) (or (fourth row) -1))))
+
+(test migrate-v2-graph-to-v3
+  "A v2 (31-byte head, 2-byte type-id) graph cannot be opened directly by v3
+code but MIGRATE-GRAPH carries it across (logical snapshot + replay),
+preserving every node's id, revision, type, slot values and type-id, and
+leaving OLD-LOCATION's data untouched and the source itself still openable
+at v2 afterward -- see %DATA-FINGERPRINT for the two bookkeeping files
+(schema.dat, tx/*) that DO change and why that is not data loss."
+  #+ecl
+  (skip "v2 fixture was cl-store'd by SBCL; ECL's cl-store cannot restore it ~
+(graph on-disk dirs are not portable across Lisp implementations).")
+  #-ecl
+  (with-temp-directory (root)
+    (let ((old-dir (extract-v2-fixture (merge-pathnames "v2/" root)))
+          (new-dir (namestring (merge-pathnames "v3/" root)))
+          (knows 'ti-mig-knows)
+          (likes 'ti-mig-likes))
+      ;; v3 code refuses to open the v2 graph directly (the format gate).
+      (signals error (graph-db:open-graph :ti-mig-guard old-dir
+                                          :buffer-pool-p nil :gc-heap-p nil))
+      ;; Read the v2 graph's data directly (same shim MIGRATE-GRAPH uses),
+      ;; WITHOUT migrating through it, so "expected" comes from the source,
+      ;; not from the code under test.
+      (let ((before (%data-fingerprint old-dir)))
+        (multiple-value-bind (expected-vertices expected-knows expected-likes)
+            (%read-v2-graph old-dir)
+          (let (expected-type-ids)
+            (let ((graph-db::*node-head-reader*
+                   'graph-db::deserialize-node-head-v2))
+              (let ((old (graph-db:open-graph :ti-mig-guard old-dir
+                                              :accept-versions '(2)
+                                              :gc-heap-p nil
+                                              :buffer-pool-p nil)))
+                (unwind-protect
+                     (setq expected-type-ids
+                           (mapcar
+                            (lambda (pair)
+                              (cons (car pair)
+                                    (graph-db::node-type-id
+                                     (graph-db::lookup-node-type-by-name
+                                      (car pair) (cdr pair) :graph old))))
+                            '((ti-mig-person . :vertex)
+                              (ti-mig-employee . :vertex)
+                              (ti-mig-knows . :edge)
+                              (ti-mig-likes . :edge))))
+                  (graph-db:close-graph old :snapshot-p nil))))
+            (is (= 12 (length expected-vertices))
+                "fixture sanity: 12 people expected before migration")
+            (is (= 5 (length expected-knows)) "fixture sanity: 5 knows edges")
+            (is (= 1 (length expected-likes)) "fixture sanity: 1 likes edge")
+            (is (< 10 (+ (length expected-vertices) (length expected-knows)
+                        (length expected-likes)))
+                "fixture sanity: 18 records must exceed one replay batch ~
+(10), or a dropped-last-batch bug below would go undetected")
+            ;; ...but MIGRATE-GRAPH brings it forward to v3.
+            (let ((g (graph-db::migrate-graph
+                      :ti-migration-fixture old-dir new-dir
+                      :package :graph-db/test
+                      :snapshot-file
+                      (namestring
+                       (merge-pathnames "migrate.snapshot" root)))))
+              (unwind-protect
+                   (let ((graph-db::*graph* g))
+                     (is (= 3 graph-db::+storage-version+)
+                         "migrated graph is written in the current (v3) ~
+format")
+                     ;; Every node: id, revision, type and every slot value
+                     ;; intact.  (Nearest wrong implementation this rejects:
+                     ;; one that drops the last replay batch -- the length
+                     ;; check fails outright, not silently under-compares two
+                     ;; equally-short lists; and one that preserves ids but
+                     ;; loses a slot -- EQUALP compares NAME/AGE/TITLE
+                     ;; positionally, not just presence.)
+                     (is (equalp expected-vertices (%fixture-vertices g))
+                         "vertices: id+revision+name+age+title must match ~
+exactly")
+                     (is (equalp expected-knows (%fixture-edges g knows))
+                         "knows edges: from+to+weight+since must match ~
+exactly")
+                     (is (equalp expected-likes (%fixture-edges g likes))
+                         "likes edges: from+to+weight must match exactly")
+                     ;; Type-ids preserved, not renumbered (#186 is where
+                     ;; they would be renumbered; this unit must not do
+                     ;; that).
+                     (dolist (expected expected-type-ids)
+                       (let* ((name (car expected))
+                              (parent (if (member name '(ti-mig-person
+                                                         ti-mig-employee))
+                                          :vertex :edge))
+                              (actual (graph-db::node-type-id
+                                       (graph-db::lookup-node-type-by-name
+                                        name parent :graph g))))
+                         (is (= (cdr expected) actual)
+                             "~A's type-id must survive migration unchanged ~
+(expected ~A, got ~A)" name (cdr expected) actual))))
+                (graph-db:close-graph g)))
+            ;; OLD-LOCATION's DATA is untouched -- scoped past schema.dat and
+            ;; tx/, the two bookkeeping files any OPEN rewrites/creates (see
+            ;; %DATA-FINGERPRINT).  (Nearest wrong implementation this
+            ;; rejects: one that "succeeds" by touching nothing, i.e. an
+            ;; empty/no-op migration -- caught above by the literal
+            ;; vertex/edge counts, not by this check alone.)
+            (is (equal before (%data-fingerprint old-dir))
+                "OLD-LOCATION's heap and node/index tables must be ~
+unchanged by MIGRATE-GRAPH")
+            ;; The actual rollback guarantee: the source still opens at v2
+            ;; and still holds every node, after MIGRATE-GRAPH has run.
+            (multiple-value-bind (v k l) (%read-v2-graph old-dir)
+              (is (equalp expected-vertices v)
+                  "OLD-LOCATION must still open at v2 with every vertex ~
+intact after migration")
+              (is (equalp expected-knows k)
+                  "OLD-LOCATION must still open at v2 with every knows ~
+edge intact after migration")
+              (is (equalp expected-likes l)
+                  "OLD-LOCATION must still open at v2 with every likes ~
+edge intact after migration"))))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Task 2 (#166): type-index no longer preallocates the whole id space, and

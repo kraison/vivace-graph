@@ -205,15 +205,44 @@ RECREATE-GRAPH's :PACKAGE-NAME."
       problems)))
 
 ;;; ---------------------------------------------------------------------------
-;;; v1 -> v2 migration (MVCC head growth, storage-version 1 -> 2)
+;;; v1 -> v3 and v2 -> v3 migration (MVCC head growth; type-id widened, #166)
 ;;;
-;;; v2 grew the node head 15 -> 31 bytes (commit-epoch + prev-pointer), so v2
-;;; code cannot open a v1 graph directly.  MIGRATE-GRAPH does a format-agnostic
-;;; LOGICAL snapshot + replay: open the v1 graph read-only with a 15-byte head
-;;; shim, BACKUP every live node to a pointer-free plist file, then MAKE-GRAPH a
-;;; fresh v2 graph and RECREATE-GRAPH (replay) into it.  Precedent: the
-;;; pre-58f87d6 UUID/hash change was migrated the same way (snapshot + replay).
+;;; v2 grew the node head 15 -> 31 bytes (commit-epoch + prev-pointer); v3
+;;; widened type-id 2 -> 4 bytes, growing it again to 33.  Current code cannot
+;;; open a v1 or v2 graph directly.  MIGRATE-GRAPH does a format-agnostic
+;;; LOGICAL snapshot + replay: open the old graph read-only with a head shim
+;;; matched to ITS OWN stamped version, BACKUP every live node to a
+;;; pointer-free plist file, then MAKE-GRAPH a fresh v3 graph and
+;;; RECREATE-GRAPH (replay) into it.  Precedent: the pre-58f87d6 UUID/hash
+;;; change was migrated the same way (snapshot + replay).
 ;;; ---------------------------------------------------------------------------
+
+(defparameter *migration-head-readers*
+  '((1 . deserialize-node-head-v1)
+    (2 . deserialize-node-head-v2))
+  "Maps a pre-current STORAGE-VERSION byte to the *NODE-HEAD-READER*
+MIGRATE-GRAPH must bind while opening a graph stamped with that version.  A
+graph already at +STORAGE-VERSION+ needs no entry -- it reads with the live
+DESERIALIZE-NODE-HEAD.")
+
+(defun %migration-source-version (location)
+  "The STORAGE-VERSION byte stamped in LOCATION's heap.dat, read directly --
+no version gate, so MIGRATE-GRAPH can pick the matching head-reader before
+OPEN-GRAPH's gate would refuse an old graph outright."
+  (let ((mf (mmap-file (format nil "~A/heap.dat" (pathname location))
+                       :create-p nil)))
+    (unwind-protect
+         (get-byte mf +memory-storage-version-offset+)
+      (munmap-file mf))))
+
+(defun %migration-source-version-reader (found)
+  "The *NODE-HEAD-READER* to bind while OPEN-GRAPH reads a graph whose heap.dat
+is stamped FOUND, or an error naming FOUND if this build cannot migrate it."
+  (cond ((= found +storage-version+) 'deserialize-node-head)
+        ((cdr (assoc found *migration-head-readers*)))
+        (t (error "MIGRATE-GRAPH: storage format v~D has no known migration ~
+path in this build (understands v1, v2, and the current v~D)."
+                  found +storage-version+))))
 
 (defun %migration-snapshot-file (name)
   "A per-run path for MIGRATE-GRAPH's intermediate snapshot.  A name-only path is
@@ -233,20 +262,29 @@ failure mode this function exists to prevent.  See GH #100."
                       &key (package :graph-db) include-deleted-p
                            (delete-snapshot-p t)
                            (snapshot-file (%migration-snapshot-file name)))
-  "Migrate a pre-MVCC (v1) graph at OLD-LOCATION to the current (v2) on-disk
-format at NEW-LOCATION, returning the new, open graph.
+  "Migrate a pre-current (v1 or v2) graph at OLD-LOCATION to the current (v3)
+on-disk format at NEW-LOCATION, returning the new, open graph.
 
-Migration is a logical snapshot + replay: the v1 graph is opened read-only with
-a 15-byte head shim, every live node is written to a format-independent snapshot
-file, then a fresh v2 graph is created and the snapshot replayed through the
-normal MAKE-VERTEX / MAKE-EDGE path.  The v1 graph's schema (its type-id
-registry) is copied to the new graph, so type-ids are preserved.
+Migration is a logical snapshot + replay: OLD-LOCATION's own stamped storage
+version is read first, so the old graph is opened read-only with the head
+shim that matches IT (15-byte v1, 31-byte v2), every live node is written to a
+format-independent snapshot file, then a fresh v3 graph is created and the
+snapshot replayed through the normal MAKE-VERTEX / MAKE-EDGE path.  The old
+graph's schema (its type-id registry) is copied to the new graph, so type-ids
+are preserved -- this does not renumber (#186).
 
-OLD-LOCATION is left byte-for-byte untouched; NEW-LOCATION must not already hold
-a graph.  The CLOS classes for the graph's node types must already be defined in
-this image (load your DEF-VERTEX / DEF-EDGE forms first).  :INCLUDE-DELETED-P
-carries tombstoned nodes across too; :DELETE-SNAPSHOT-P (default T) removes the
-intermediate snapshot file on every exit, including a failed migration.
+OLD-LOCATION's DATA -- its heap and its vertex/edge/index tables -- is left
+untouched; it remains fully openable by an engine of its own (pre-migration)
+version afterward, which is the rollback story: repoint at OLD-LOCATION rather
+than restore from a snapshot.  It is NOT byte-for-byte identical, though:
+snapshotting requires OPENing it, and that OPEN unconditionally rewrites
+schema.dat (via UPDATE-SCHEMA/SAVE-SCHEMA -- same content, re-serialized, so
+type-ids are unaffected) and creates one new, empty tx/replication-*.log file.
+NEW-LOCATION must not already hold a graph.  The CLOS classes for the graph's
+node types must already be defined in this image (load your DEF-VERTEX /
+DEF-EDGE forms first).  :INCLUDE-DELETED-P carries tombstoned nodes across
+too; :DELETE-SNAPSHOT-P (default T) removes the intermediate snapshot file on
+every exit, including a failed migration.
 
 :SNAPSHOT-FILE defaults to a PER-RUN path under the temporary directory.  It is
 deliberately not keyed on NAME alone: such a path is constant across runs, users
@@ -264,20 +302,25 @@ an explicit path if you want a predictable one."
     ;; path that leaked file then broke the retry the user reaches for next.
     (unwind-protect
          (progn
-           ;; 1. Open the v1 graph read-only (15-byte heads) and snapshot it logically.
-           (let ((*node-head-reader* 'deserialize-node-head-v1))
+           ;; 1. Open the old graph read-only, at ITS OWN version, and snapshot
+           ;;    it logically.  The reader shim applies only to this read; the
+           ;;    replay below always writes the current (v3) format.
+           (let* ((found (%migration-source-version old-location))
+                  (*node-head-reader* (%migration-source-version-reader found)))
              (let ((old (open-graph name old-location
-                                    ;; tolerate v1 AND v2 so a re-run is harmless
-                                    :accept-versions (list 1 +storage-version+)
+                                    ;; tolerate FOUND so a re-run is harmless
+                                    :accept-versions
+                                    (list found +storage-version+)
                                     :gc-heap-p nil :buffer-pool-p t)))
                (unwind-protect
                     (let ((*graph* old)) ;; map-vertices' all-types branch reads *graph*
                       (setq old-schema (schema old))
-                      (log:info "MIGRATE-GRAPH: snapshotting v1 graph ~A -> ~A"
-                                old-location snapshot-file)
+                      (log:info "MIGRATE-GRAPH: snapshotting v~D graph ~A -> ~A"
+                                found old-location snapshot-file)
                       (backup old snapshot-file :include-deleted-p include-deleted-p))
                  (close-graph old :snapshot-p nil))))
-           ;; 2. Create the v2 graph, adopt the v1 schema (preserving type-ids), replay.
+           ;; 2. Create the v3 graph, adopt the old schema (preserves
+           ;;    type-ids), replay.
            (let ((new (make-graph name new-location)))
              (handler-case
                  (progn
@@ -285,8 +328,8 @@ an explicit path if you want a predictable one."
                    (restore-schema-locks (schema new))
                    (setf (schema-lock (schema new)) (make-recursive-lock))
                    (save-schema (schema new) new)
-                   (log:info "MIGRATE-GRAPH: replaying snapshot into v2 graph ~A"
-                             new-location)
+                   (log:info "MIGRATE-GRAPH: replaying snapshot ~
+into v~D graph ~A" +storage-version+ new-location)
                    (recreate-graph new snapshot-file :package-name package)
                    new)
                (error (c)
