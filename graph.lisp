@@ -356,7 +356,7 @@ Keyword arguments:
                           indexes; existing ones reopen on their persisted tag.
   :REPLICATION-FILTER     (slaves only) a predicate (NODE) -> boolean; the slave
                           applies only replicated writes whose node it accepts,
-                          so it holds just a subset (e.g. its area of operations).
+                          so it holds just a subset (e.g. its own region).
                           See MAKE-SPATIAL-REPLICATION-FILTER.
   :SYSTEM-CLOCK           the image-level epoch clock (GH #168) this
                           store's transactions allocate ids from, or NIL

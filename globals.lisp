@@ -160,7 +160,7 @@ first use by ENSURE-TYPE-REGISTRY and reopened whenever that changes.  Bind
 ;; reservation is PROT_NONE + MAP_NORESERVE anonymous address space, and on
 ;; 64-bit the address space it consumes is irrelevant.  Exception: RLIMIT_AS /
 ;; `ulimit -v` counts reserved address space regardless of MAP_NORESERVE, so a
-;; process capped by one (e.g. a systemd unit's LimitAS=, as on odm) can fail
+;; process capped by one (e.g. a systemd unit's LimitAS=) can fail
 ;; to open a graph outright even though nothing here is actually resident.
 ;;
 ;; At dimension 1024 (4,112 bytes per slot), capacity only ever advances by

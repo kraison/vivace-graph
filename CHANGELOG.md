@@ -695,7 +695,8 @@ between releases; cutting a release renames it to the new version and dates it.
   shared index — separated at query time by the required type filter, not by
   storage — which is narrower than "per class"; a class that overrides
   `node-geometry` is indexed under `(owner . NIL)` and is still scopeable by name.
-  Motivated by the mine-action team's spatial-index change request (CR-1).
+  Motivated by a downstream application team's spatial-index change request
+  (CR-1).
 - **`:spatial-precision` slot option — per-index geohash precision.** A geometry
   slot may declare `(slot :type geometry :index t :spatial-precision N)`; that
   index is built on an `N`-level geohash grid instead of the graph default (7).
@@ -990,7 +991,8 @@ between releases; cutting a release renames it to the new version and dates it.
   filter is what makes a scoped query correct when sibling subclasses share a
   mixin-owned index. A required positional argument makes every stale call site a
   compile-time warning on SBCL and ECL, which is the safest way to land a
-  deliberate break. Requested by the mine-action team (CR-1): they needed to
+  deliberate break. Requested by a downstream application team (CR-1): they
+  needed to
   query one class's geometry without dredging up another's.
   *Known limitation:* a scope resolves the named class's own geometry slots, so
   scoping to a parent does not reach an index a *subclass* declares on an extra

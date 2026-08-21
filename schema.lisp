@@ -437,10 +437,11 @@ be defined before or after the graph is created."
                                          *graph*
                                          :edge-type ',name)))))
                   )
-           ;; Replace in place, preserving position: UPDATE-SCHEMA applies the
-           ;; list oldest-to-newest and INSTANTIATE-NODE-TYPE assigns type-ids in
-           ;; that order, so moving a redefined type would change its type-id on
-           ;; a fresh graph (GH #53).
+           ;; Replace in place, preserving position.  The type-id reason is
+           ;; historical: ids came from this list's order until #186 moved
+           ;; assignment to the registry, which keys on the name.  Position
+           ;; still governs the order UPDATE-SCHEMA instantiates types in, so
+           ;; a moved entry reorders schema replay (GH #53).
            (let* ((,metas (gethash ',graph-name *schema-node-metadata*))
                   (,pos (position ',name ,metas :key #'node-type-name)))
              (if ,pos
@@ -528,9 +529,11 @@ Example:
           ;; not in UPDATE-NODE-TYPE because only this branch knows the store
           ;; has no id of its own yet -- the redefinition branch above must
           ;; keep the one already written into every node of that type.
-          ;; Unconditional: META is the object in *SCHEMA-NODE-METADATA*,
-          ;; shared by every store that defines this type, so any id already
-          ;; on it belongs to whichever store instantiated it first.
+          ;; Unconditional, not guarded on (NULL (NODE-TYPE-ID META)):
+          ;; *SCHEMA-NODE-METADATA* holds one META per graph-name, and it
+          ;; outlives the store, so a second, fresh store opened under that
+          ;; name would find the first store's id still on it and adopt it
+          ;; instead of asking the registry.
           (progn
             (setf (gethash (node-type-name meta)
                            (schema-class-locks (schema graph)))

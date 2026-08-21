@@ -2328,7 +2328,7 @@ Every query takes a *scope* as its first argument: a node-class name, a list of 
 
 *** Subset replication (field devices)
 
-A replication *slave* can hold only a subset of the master's data — useful for a field device that needs just its area of operations, not the whole dataset. Give the slave a ~:replication-filter~: a predicate ~(node) -> boolean~ that decides, per replicated write, whether the slave applies it. Each transaction still advances the slave's high-water mark, so filtered transactions are not re-requested.
+A replication *slave* can hold only a subset of the master's data — useful for a field device that needs just its own region, not the whole dataset. Give the slave a ~:replication-filter~: a predicate ~(node) -> boolean~ that decides, per replicated write, whether the slave applies it. Each transaction still advances the slave's high-water mark, so filtered transactions are not re-requested.
 
 ~make-spatial-replication-filter~ builds a filter from an area geometry. It accepts a node when it has /no/ geometry (so schema and reference data replicate in full) or when its geometry lies in the area:
 
@@ -4128,7 +4128,7 @@ This chapter provides a categorized reference for the most important exported sy
 - ~make-spatial-replication-filter (area)~ ::
   Build a slave-graph ~:replication-filter~ predicate from ~area~ (a ~:polygon~ /
   ~:multipolygon~): the slave applies non-spatial nodes plus spatial nodes inside
-  ~area~, so it holds only its area of operations. See "Subset replication" above.
+  ~area~, so it holds only its own region. See "Subset replication" above.
 
 **** REST API
 - ~start-rest ( &optional port)~ ::

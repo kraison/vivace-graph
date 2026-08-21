@@ -5,14 +5,22 @@
   :description "Type-id assignment through the system-wide registry.")
 (in-suite global-type-id-suite)
 
-;;; Declaration ORDER differs between the two stores on purpose.  Under the
-;;; per-graph counters #186 replaces, SHARED-TYPE would be 1 in one store and
-;;; 2 in the other; declaring it first in both would let the tests below pass
-;;; vacuously against the very implementation they exist to reject.
+;;; Declaration ORDER is chosen so that BOTH tests below fail against the
+;;; per-graph counters #186 replaces -- neither may pass vacuously against
+;;; the implementation it exists to reject.  Under those counters the ids
+;;; would be:
+;;;
+;;;   store 1: SHARED-TYPE 1, TYPE-IN-ONE 2, DUAL-TYPE 3
+;;;   store 2: REG-FILLER 1, TYPE-IN-TWO 2, SHARED-TYPE 3, DUAL-TYPE 4
+;;;
+;;; so SHARED-TYPE differs across the stores (1 vs 3) AND TYPE-IN-ONE collides
+;;; with TYPE-IN-TWO (both 2).  REG-FILLER exists only to offset store 2's
+;;; counter; the two properties cannot both be violated without it.
 (def-vertex shared-type () ((label :type string)) :reg-store-1)
 (def-vertex type-in-one () ((label :type string)) :reg-store-1)
 (def-vertex dual-type   () ((label :type string)) :reg-store-1)
 
+(def-vertex reg-filler  () ((label :type string)) :reg-store-2)
 (def-vertex type-in-two () ((label :type string)) :reg-store-2)
 (def-vertex shared-type () ((label :type string)) :reg-store-2)
 (def-vertex dual-type   () ((label :type string)) :reg-store-2)
@@ -68,6 +76,29 @@ counters -- a silent fallback is how two id regimes diverge unnoticed."
     (let ((graph-db::*system-directory* nil))
       (signals graph-db:system-directory-required
         (make-graph :reg-nodir (namestring dir))))))
+
+(test opening-an-existing-graph-without-a-system-directory-signals
+  "The refusal covers OPEN-GRAPH, not only MAKE-GRAPH: reopening replays the
+schema and assigns ids to any type added since (#186)."
+  (with-temp-directory (sysdir)
+    (with-temp-directory (dir)
+      (let ((graph-db::*system-directory* (namestring sysdir)))
+        (close-graph (make-graph :reg-store-1 (namestring dir)
+                                 :buffer-pool-size 1000)
+                     :snapshot-p nil))
+      (collect-garbage)
+      (let ((graph-db::*system-directory* nil))
+        (signals graph-db:system-directory-required
+          (open-graph :reg-store-1 (namestring dir)))))))
+
+(test ensure-type-registry-signals-without-a-system-directory
+  "The accessor every assignment path funnels through refuses on its own.
+The checks in MAKE-GRAPH/OPEN-GRAPH are early, legible ones; this is what
+makes a silent per-graph fallback impossible rather than merely absent from
+those two entry points."
+  (let ((graph-db::*system-directory* nil))
+    (signals graph-db:system-directory-required
+      (graph-db::ensure-type-registry))))
 
 (test a-class-may-be-instantiated-in-more-than-one-store
   "Closes cl-llm#20.  %CHECK-NODE-CLASS-GRAPH-UNIQUE refused this and existed

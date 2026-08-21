@@ -9,7 +9,7 @@
 ;; This is the target for the offline Android field app (cross-compiled under
 ;; ECL); the app calls in-process, not over HTTP.  The full :graph-db system
 ;; below is core + the two network leaves and stays behaviour-identical for
-;; existing consumers (mine-action, odm).
+;; existing consumers.
 (defsystem graph-db/core
   :name "VivaceGraph (embeddable core)"
   :maintainer "Kevin Raison"
@@ -85,7 +85,10 @@
                       ("ve-index" "vev-index" "type-index" "linear-hash" "allocator"
                        "spatial-index" "posix"))
                (:file "stats" :depends-on ("graph"))
-               (:file "schema" :depends-on ("stats"))
+               ;; "type-registry" for ASSIGN-TYPE-ID / ENSURE-TYPE-REGISTRY
+               ;; (#186); it only built before because that component happens
+               ;; to precede this one in the list.
+               (:file "schema" :depends-on ("stats" "type-registry"))
                (:file "node-class" :depends-on ("schema"))
                (:file "views" :depends-on ("node-class"))
                (:file "primitive-node" :depends-on ("views"))
@@ -145,8 +148,8 @@
 ;; FULL: replication + the HTTP API leaf (rest, clack/ningle).  graph-db/replication
 ;; (and transitively graph-db/core) has already compiled+loaded the engine + transport,
 ;; so rest needs no intra-file :depends-on -- the system-level dependency guarantees
-;; order.  Stays behaviour-identical for existing consumers (mine-action, odm), which
-;; keep depending on :graph-db.
+;; order.  Stays behaviour-identical for existing consumers, which keep
+;; depending on :graph-db.
 (defsystem graph-db
   :name "VivaceGraph"
   :maintainer "Kevin Raison"
