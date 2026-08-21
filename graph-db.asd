@@ -511,6 +511,7 @@ cl-temporal-extent."
                (:file "backup-tests")
                (:file "mvcc-tests")
                (:file "system-clock-tests")       ; GH #168
+               (:file "posix-tests")               ; GH #182
                (:file "rest-tests")
                (:file "rest-http-tests")
                (:file "prolog-stress-tests")
