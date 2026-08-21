@@ -389,6 +389,33 @@ only because ids were per-graph."
 **Context the brief cannot give you:** read **§10.1** of the spec before starting; it
 carries the measurement this task exists because of.
 
+**The registry is already dirty when you arrive, and `migrate-graph` is why.** Found by the
+Task 2 review, deferred here because this task owns the function.
+
+`migrate-graph` (`backup.lisp:330-338`) calls `(make-graph name new-location)`. As of Task 2
+that path runs `update-schema`, which interns **every** one of the graph's types into the
+registry and assigns them real ids. `migrate-graph` then immediately does
+`(setf (schema new) old-schema)` — discarding those ids and installing the legacy per-graph
+ones.
+
+Two consequences you must handle rather than discover:
+
+1. **The migrated store's ids are not the registry's.** That is precisely the two-regime
+   divergence this whole unit exists to prevent, arriving through the migration path.
+2. **The registry permanently holds entries for those names at ids no store uses.** So
+   `registry-seed-from-stores` cannot assume it is seeding into an empty registry, and a
+   naive seed will collide with junk its own migration created.
+
+**This is currently invisible in the suite.** `migrate-v2-graph-to-v3`
+(`tests/type-id-width-tests.lisp:365`) passes *because* the schema swap wins — nothing
+notices that the registry was consulted and overruled. A test that fails for this reason is
+part of this task.
+
+Decide deliberately whether `:renumber-p nil` should still intern into the registry at all.
+Preserving legacy ids and *also* polluting the registry is the worst of both; either the
+non-renumbering path stays out of the registry entirely, or it seeds it consistently with
+what it preserved.
+
 **Seed from the largest store on disk, not the one with the most types.** All but one store
 renumbers whichever is favoured, so the cost is bytes. On the measured system, seeding by
 type count would have picked a store holding 59 of 95 types and among the *smallest*,
