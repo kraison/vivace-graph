@@ -842,3 +842,38 @@ without complaint."
                      "a frozen open still sees the store's current id")
               (close-graph g :snapshot-p nil))
             (collect-garbage)))))))
+
+(test an-orphaned-id-below-the-registry-s-mark-is-tolerated
+  "The other side of the stale-id rule, and the one that must NOT refuse.  A
+legacy store whose history moved a type's id UP leaves the old, lower id
+orphaned -- metadata the name lookup no longer returns, with nodes still on
+disk under it.  Once the registry has adopted the higher id nothing can mint
+onto the lower one, so the open succeeds and only warns; the store still owes
+a renumbering (§10.1, and GH #202 on why the tolerance is a policy choice
+rather than a proof).
+
+Together with A-STALE-ID-ABOVE-THE-REGISTRY-S-REACH-IS-REFUSED this pins both
+sides of the same rule -- an implementation that refused every orphaned id
+would pass that test and fail this one."
+  (with-temp-directory (root)
+    (let ((location (%build-legacy-store :ts-alpha root 4 nil
+                                         '(ts-alpha-thing))))
+      ;; 1 -> 10 leaves the old id orphaned and BELOW the id the registry is
+      ;; about to adopt.
+      (let ((old (%move-current-type-id location 'ts-alpha-thing :vertex 10)))
+        (is (< old 10) "fixture sanity: the orphaned id is the lower one"))
+      (multiple-value-bind (registry sysdir) (%fresh-registry root "tolerate/")
+        (declare (ignore registry))
+        (let ((graph-db::*system-directory* sysdir)
+              (graph-db::*type-registry* nil))
+          (let ((g (open-graph :ts-alpha location :buffer-pool-size 1000)))
+            (unwind-protect
+                 (progn
+                   (is (eql 10 (%type-id-in g 'ts-alpha-thing :vertex))
+                       "the store's current id stands")
+                   (is (eql 10 (graph-db::registry-id-for
+                                (graph-db::ensure-type-registry)
+                                'ts-alpha-thing :vertex))
+                       "and the registry adopted it rather than refusing"))
+              (close-graph g :snapshot-p nil))
+            (collect-garbage)))))))

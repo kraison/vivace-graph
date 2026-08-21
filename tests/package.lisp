@@ -223,6 +223,8 @@
                 ;; GH #186: the store/registry type-id agreement guard and
                 ;; the frozen open that reads a store it refuses.
                 #:store-registry-conflict
+                #:store-registry-conflict-reason
+                #:frozen-graph-cannot-replicate
                 #:with-schema-frozen
                 #:with-transaction
                 #:*transaction*

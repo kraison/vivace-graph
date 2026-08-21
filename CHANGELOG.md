@@ -36,6 +36,13 @@ between releases; cutting a release renames it to the new version and dates it.
   before-and-after of an adoption run — which an ordinary open now refuses.
   Writes made through a frozen open go out under the store's own ids.
 
+  **It may read such a store; it may not serve one.** `start-replication`
+  signals the new `graph-db:frozen-graph-cannot-replicate` for a master,
+  slave or peer graph opened frozen. Every transport puts raw type-ids on the
+  wire, so a frozen hub would ship a type table built from the *registry*
+  while its node heads carried the store's contradicted ids — and the damage
+  would land on a remote peer, where no local guard can see it.
+
 - **A replication handshake refuses a peer whose type registry disagrees**
   (#186). After `:auth-ok`, a device compares the hub's type table against
   this image's registry and signals
@@ -575,6 +582,15 @@ between releases; cutting a release renames it to the new version and dates it.
   auth-ok failed on every connection and the device saw a closed socket, or
   worse, another system's directory. `start-replication` now captures it on
   the caller's thread (`peer-type-registry` on the graph).
+
+- **A store that owes a renumbering says so at open** (#186). An id the
+  store occupies but its own name lookup no longer returns — orphaned
+  metadata, with nodes still on disk under it — is tolerated when it sits at
+  or below the registry's high-water mark, and now emits a `log:warn` naming
+  the type and both ids instead of passing silently. Above the mark it is
+  still refused: the registry would hand that id to another type and there is
+  no way to reserve it. The tolerance is a policy choice about
+  already-orphaned metadata rather than a proof of safety — see #202.
 
 - **Seeding breaks a size tie on the store location** (#186).
   `registry-seed-from-stores` ranked stores by heap high-water mark with a

@@ -3048,6 +3048,19 @@ wrong for one you intend to keep in this system.
       (graph-db:close-graph g :snapshot-p nil)))
 #+END_SRC
 
+**A frozen open may read such a store; it may not serve one.** Starting
+replication on a graph opened this way signals
+~graph-db:frozen-graph-cannot-replicate~ — for a master, a slave or a peer.
+The hatch skips the id check, and every replication transport puts a store's
+raw type-ids on the wire: a hub would ship a type table built from the
+*registry* while its node heads carried the store's contradicted ids, and the
+damage would land on a remote peer where no local guard can see it. Reconcile
+the store and open it normally before replicating it.
+
+Note also what a frozen open leaves behind in the registry: **nothing**. It
+adopts no ids, so a store read this way is exactly as unreconciled afterwards
+as before.
+
 **Several stores is the case that needs a decision.** A system whose stores
 predate the registry has a problem the registry cannot solve on its own: every
 store's schema counted type-ids from 1, so in any system with more than one
@@ -4251,7 +4264,10 @@ This chapter provides a categorized reference for the most important exported sy
   Migrates a v1 or v2 graph at ~old-location~ to the current (v3) format at ~new-location~, returning ~(values new-graph unified)~. A logical snapshot-and-replay; the original is left untouched. ~:renumber-p nil~ (default) preserves the source's type-ids; ~:renumber-p t~ takes them from the system registry instead and returns the names whose several ids it unified. See Chapter 12.
 
 - ~with-schema-frozen (() &body body)~ ::
-  Run BODY with schema replay and type-id reconciliation suppressed, so a store opens exactly as it stands on disk. The supported way to READ a store whose ids the registry contradicts — a census, a backup, the before-and-after of an adoption run. Writes made through a frozen open go out under the store's own ids. See Chapter 17.
+  Run BODY with schema replay and type-id reconciliation suppressed, so a store opens exactly as it stands on disk. The supported way to READ a store whose ids the registry contradicts — a census, a backup, the before-and-after of an adoption run. Writes made through a frozen open go out under the store's own ids, and starting replication on one signals ~frozen-graph-cannot-replicate~. See Chapter 17.
+
+- ~frozen-graph-cannot-replicate~ (condition) ::
+  Signalled by ~start-replication~ for a master, slave or peer graph opened inside ~with-schema-frozen~. Its type-ids were never checked against the registry, and every transport puts raw type-ids on the wire, so serving it would corrupt a remote peer. Readers: ~frozen-graph-cannot-replicate-graph-name~, ~-location~.
 
 - ~store-registry-conflict~ (condition) ::
   Signalled by ~open-graph~/~make-graph~ when a store's persisted type-id for a type is not the one the registry holds, or when the registry gives that id to another type. Not retryable: the losing id is already in every node head of its type. Readers: ~store-registry-conflict-location~, ~-type-name~, ~-parent~, ~-store-id~, ~-registry-id~, ~-holder~. The remedy is ~registry-seed-from-stores~ plus ~migrate-graph :renumber-p t~.

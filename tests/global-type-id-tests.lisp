@@ -293,3 +293,40 @@ names both sides and points at the seeding run; it is not a retryable error."
                      "a frozen open still sees the store's own id")
               (close-graph g :snapshot-p nil))
             (collect-garbage)))))))
+
+(test opening-a-store-whose-symbol-the-registry-numbers-differently
+  "The :NAME-AT-TWO-IDS branch, which the other refusal tests do not reach --
+they hit :ID-AT-TWO-NAMES and :STALE-ID.
+
+The registry is given SHARED-TYPE at 5 and nothing else, so ids 1..4 are FREE.
+That is what makes this test able to fail: delete the branch and the store's
+claim of SHARED-TYPE at 1 falls straight through the holder check into
+%REGISTRY-ADOPT, which its own docstring forbids -- appending a second entry
+for a symbol that already has one and silently rebinding it image-wide.  The
+last check names that harm directly."
+  (with-temp-directory (root)
+    (let ((dir (namestring (merge-pathnames "store/" root))))
+      (with-temp-directory (own)
+        (let ((graph-db::*system-directory* (namestring own))
+              (graph-db::*type-registry* nil))
+          (close-graph (make-graph :reg-store-1 dir :buffer-pool-size 1000)
+                       :snapshot-p nil)
+          (collect-garbage)))
+      (with-temp-directory (sys)
+        (let ((graph-db::*system-directory* (namestring sys))
+              (graph-db::*type-registry* nil))
+          (let ((registry (graph-db::ensure-type-registry)))
+            (graph-db::with-registry-append-lock (registry)
+              (graph-db::%registry-adopt registry 'shared-type :vertex 5))
+            (let ((c (handler-case (progn (open-graph :reg-store-1 dir) nil)
+                       (store-registry-conflict (e) e))))
+              (is (typep c 'store-registry-conflict)
+                  "the open must be refused; it returned ~S" c)
+              (when (typep c 'store-registry-conflict)
+                (is (eq :name-at-two-ids
+                        (store-registry-conflict-reason c))
+                    "and for THIS reason, not another branch"))
+              (is (eql 5 (graph-db::registry-id-for registry 'shared-type
+                                                    :vertex))
+                  "the registry must be untouched: SHARED-TYPE is still ~
+5, not re-bound to the store's id"))))))))

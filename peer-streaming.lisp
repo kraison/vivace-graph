@@ -1479,6 +1479,10 @@ re-ship.  Returns the ack result plist (:created / :purged id lists)."
 
 (defmethod start-replication ((graph peer-graph) &key package)
   (declare (ignore package))
+  ;; A frozen open never checked this store's ids against the registry, and
+  ;; the type table a hub ships describes the REGISTRY while its node heads
+  ;; carry the STORE's ids: serving one would corrupt a remote peer (#186).
+  (check-replicable graph)
   (setf (stop-replication-p graph) nil)
   ;; On THIS thread, while the caller's *SYSTEM-DIRECTORY* binding is still
   ;; visible: the hub's session threads cannot see it (GH #186).

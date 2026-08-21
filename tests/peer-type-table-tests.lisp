@@ -583,3 +583,58 @@ this, a guard that refused every table would pass the test above."
     (let ((c (%ptt-sync-against g (graph-db::peer-type-table-string r))))
       (is (not (typep c 'graph-db::peer-type-registry-conflict-error))
           "an agreeing table must get past the guard; it signalled ~S" c))))
+
+;;; ---------------------------------------------------------------------------
+;;; The escape hatch may READ a contradicted store; it may not SERVE one.
+;;; ---------------------------------------------------------------------------
+
+(test a-frozen-open-refuses-to-start-replication
+  "WITH-SCHEMA-FROZEN exists so an operator can read a store whose ids the
+registry contradicts.  OPEN-GRAPH calls START-REPLICATION unconditionally, so
+without this the same hatch would let them SERVE one -- a hub shipping a type
+table built from the REGISTRY while its node heads carry the STORE's
+contradicted ids.  That corrupts a REMOTE peer, which no local guard sees.
+
+Checked for both peer roles, since a device pushes authored ops to a hub and
+is therefore just as able to send an id that means something else there."
+  (dolist (role '(:hub :device))
+    (with-ptt-registry (r)
+      (with-temp-directory (dir)
+        (let ((c (handler-case
+                     (let ((g (with-schema-frozen ()
+                                (make-graph *integration-graph-name*
+                                            (namestring dir)
+                                            :peer-role role
+                                            :origin-id *ptt-sync-origin*
+                                            :peer-host "127.0.0.1"
+                                            :replication-port 0
+                                            :buffer-pool-size 1000))))
+                       (ignore-errors (close-graph g :snapshot-p nil))
+                       nil)
+                   (frozen-graph-cannot-replicate (e) e))))
+          (is (typep c 'frozen-graph-cannot-replicate)
+              "a frozen ~(~A~) must refuse to start replication; got ~S"
+              role c)
+          (when (typep c 'frozen-graph-cannot-replicate)
+            (is (search "WITH-SCHEMA-FROZEN" (princ-to-string c))
+                "and say why")))
+        (collect-garbage)))))
+
+(test an-ordinary-open-still-starts-replication
+  "The control: the same graph, opened normally, must still come up.  A guard
+that refused every peer-graph would pass the test above."
+  (with-ptt-registry (r)
+    (with-temp-directory (dir)
+      (let ((g (make-graph *integration-graph-name* (namestring dir)
+                           :peer-role :device
+                           :origin-id *ptt-sync-origin*
+                           :peer-host "127.0.0.1" :replication-port 0
+                           :buffer-pool-size 1000)))
+        (unwind-protect
+             (progn
+               (is (not (graph-db::schema-frozen-p g))
+                   "an ordinary open is not frozen")
+               (is (graph-db::peer-writer-mailbox g)
+                   "and its writer funnel is running"))
+          (ignore-errors (close-graph g :snapshot-p nil))))
+      (collect-garbage))))

@@ -60,7 +60,12 @@
            #:store-registry-conflict-parent
            #:store-registry-conflict-store-id
            #:store-registry-conflict-registry-id
+           #:store-registry-conflict-reason
            #:store-registry-conflict-holder
+           ;; GH #186: replication refuses a graph opened frozen.
+           #:frozen-graph-cannot-replicate
+           #:frozen-graph-cannot-replicate-graph-name
+           #:frozen-graph-cannot-replicate-location
            ;; Open a store the registry disagrees with, to read it.
            #:with-schema-frozen
            #:tm-next-epoch

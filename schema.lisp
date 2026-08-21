@@ -500,30 +500,36 @@ Example:
   "(values CLAIMS HIGHEST) for SCHEMA's persisted type table.
 
 CLAIMS is (SYMBOL PARENT ID) for every type the store answers to BY NAME.
-HIGHEST is an alist (PARENT . ID) over EVERY integer key in the table, which
-is not the same set: a store's history can leave old metadata at an id its
-name lookup no longer resolves to, and nodes on disk still carry it (spec
-§10.1).  Both are needed -- the first says what must agree, the second says
-which ids must stay out of the registry's reach.
+STALE is the same shape for every id the table OCCUPIES that its own name
+lookup no longer returns: a store's history can leave old metadata behind,
+and nodes on disk still carry that id (spec §10.1).  The first says what must
+agree with the registry; the second says which ids must stay out of the
+registry's reach.
 
 The sub-tables are triple-keyed (id -> meta, symbol -> id, keyword -> id;
 see UPDATE-NODE-TYPE), which is what the key discrimination below is for."
   (let ((claims nil)
-        (highest (list (cons :vertex 0) (cons :edge 0))))
-    (dolist (parent '(:vertex :edge) (values (nreverse claims) highest))
-      (let ((sub (gethash parent (schema-type-table schema))))
+        (stale nil))
+    (dolist (parent '(:vertex :edge) (values (nreverse claims)
+                                             (nreverse stale)))
+      (let ((sub (gethash parent (schema-type-table schema)))
+            (occupied nil))
         (when sub
           (maphash
            (lambda (key value)
              (cond ((and (integerp key) (node-type-p value))
-                    (let ((cell (assoc parent highest)))
-                      (setf (cdr cell) (max (cdr cell) key))))
+                    (push (cons key (node-type-name value)) occupied))
                    ((and (symbolp key) (not (keywordp key))
                          (integerp value))
                     (push (list key parent value) claims))))
-           sub))))))
+           sub)
+          ;; An occupied id the NAME lookup no longer returns is stale: the
+          ;; metadata is unreachable but node heads still carry the id.
+          (dolist (cell occupied)
+            (unless (eql (car cell) (gethash (cdr cell) sub))
+              (push (list (cdr cell) parent (car cell)) stale))))))))
 
-(defun %reconcile-claims (registry claims highest location)
+(defun %reconcile-claims (registry claims stale location)
   "Adopt or refuse, under REGISTRY's append lock.  See
 RECONCILE-SCHEMA-WITH-REGISTRY for the policy; this is the half that writes."
   (let ((tables (list (cons :vertex (registry-ids-table registry :vertex))
@@ -547,17 +553,26 @@ RECONCILE-SCHEMA-WITH-REGISTRY for the policy; this is the half that writes."
                  (%registry-adopt registry symbol parent id)
                  (setf (gethash id (cdr (assoc parent tables))) symbol))))))
     ;; Stale ids: metadata the name lookup no longer reaches, but node heads
-    ;; still do.  One at or below the registry's high-water mark can never be
-    ;; minted, so it is merely a store that owes a renumbering (§10.1) and is
-    ;; logged.  One ABOVE it is next in line to be handed to some other type,
-    ;; and there is no honest way to reserve it -- the registry records
-    ;; symbols, not holes -- so refuse.
-    (dolist (cell highest)
-      (let ((parent (car cell)) (top (cdr cell)))
-        (when (> top (registry-highest-id registry parent))
-          (error 'store-registry-conflict
-                 :reason :stale-id :location location
-                 :parent parent :store-id top))))))
+    ;; still do.  One ABOVE the registry's high-water mark is next in line to
+    ;; be handed to another type and there is no honest way to reserve it --
+    ;; the registry records symbols, not holes -- so refuse.
+    ;;
+    ;; One at or below the mark is TOLERATED, and that is a policy choice
+    ;; about already-orphaned metadata rather than a proof of safety:
+    ;; %REGISTRY-ASSIGN never reaches it, but %REGISTRY-ADOPT takes an
+    ;; arbitrary id and this very function calls it, so a later adopt still
+    ;; can (GH #202).  Such a store owes a renumbering (§10.1); say so.
+    (dolist (entry stale)
+      (destructuring-bind (symbol parent id) entry
+        (if (> id (registry-highest-id registry parent))
+            (error 'store-registry-conflict
+                   :reason :stale-id :location location
+                   :type-name symbol :parent parent :store-id id)
+            (log:warn "~A holds ~(~A~) type ~S at id ~D as well as ~D; ~
+nodes at the older id are only carried across by a renumbering migration ~
+(:RENUMBER-P T, spec §10.1, GH #186)."
+                      location parent symbol id
+                      (registry-id-for registry symbol parent)))))))
 
 (defmacro with-schema-frozen (() &body body)
   "Run BODY with schema replay AND type-id reconciliation suppressed, so a
@@ -601,23 +616,23 @@ Adoption raises the registry's counters past every id it takes, so a later
 mint cannot collide.  Runs before UPDATE-SCHEMA instantiates anything, which
 is the only point at which that ordering is guaranteed."
   (let ((registry (ensure-type-registry)))
-    (multiple-value-bind (claims highest) (%store-schema-claims (schema graph))
+    (multiple-value-bind (claims stale) (%store-schema-claims (schema graph))
       ;; Read-only pass first: agreement is the overwhelmingly common case and
       ;; the append flock is system-wide, so taking it on every open would
-      ;; serialise every store's open against every other's.
+      ;; serialise every store's open against every other's.  A store with
+      ;; ANY orphaned id does take it on every open, to reclassify and warn
+      ;; under the post-adoption mark; such a store owes a renumbering and is
+      ;; rare (§10.1).
       (when (or (some (lambda (claim)
                         (destructuring-bind (symbol parent id) claim
                           (not (eql id (registry-id-for registry symbol
                                                         parent)))))
                       claims)
-                (some (lambda (cell)
-                        (> (cdr cell) (registry-highest-id registry
-                                                           (car cell))))
-                      highest))
+                stale)
         (with-registry-append-lock (registry)
           ;; Re-derived under the lock: WITH-REGISTRY-APPEND-LOCK re-reads the
           ;; file, so the decisions above are hints, not conclusions.
-          (%reconcile-claims registry claims highest
+          (%reconcile-claims registry claims stale
                              (ignore-errors (location graph))))))))
 
 (defmethod instantiate-node-type ((meta node-type) (graph graph))
@@ -679,18 +694,25 @@ is the only point at which that ordering is guaranteed."
         (error "Cannot update schema for graph ~A: graph not open!" graph-name))))
 
 (defmethod update-schema ((graph graph))
-  ;; *SCHEMA-UPDATE-SUPPRESSED* is bound by MIGRATE-GRAPH alone, which
-  ;; installs by hand the schema each of its two opens is to have: minting
-  ;; registry ids here for a schema discarded on the next form is how the
-  ;; registry ends up holding ids no store uses (GH #186).
-  (unless *schema-update-suppressed*
-    ;; BEFORE the replay, not after: the replay is what mints, and a mint is
-    ;; only safe once the registry knows every id this store occupies (#186).
-    (reconcile-schema-with-registry graph)
-    (with-recursive-lock-held ((schema-lock (schema graph)))
-      (let ((node-metadata (gethash (graph-name graph)
-                                    *schema-node-metadata*)))
-        ;; The list is maintained oldest-first (GH #53); apply in order.
-        (dolist (meta node-metadata)
-          (instantiate-node-type meta graph)))
-      (save-schema (schema graph) graph))))
+  ;; *SCHEMA-UPDATE-SUPPRESSED* is bound by MIGRATE-GRAPH, which installs by
+  ;; hand the schema each of its two opens is to have, and by
+  ;; WITH-SCHEMA-FROZEN (GH #186).  Minting registry ids here for a schema
+  ;; discarded on the next form is how the registry ends up holding ids no
+  ;; store uses; adopting a contradicted store's would be the same mistake
+  ;; the other way.
+  (if *schema-update-suppressed*
+      ;; Remember it: START-REPLICATION refuses a graph whose ids were never
+      ;; checked, because the wire carries them (see CHECK-REPLICABLE).
+      (setf (schema-frozen-p graph) t)
+      (progn
+        ;; BEFORE the replay, not after: the replay is what mints, and a
+        ;; mint is only safe once the registry knows every id this store
+        ;; occupies (#186).
+        (reconcile-schema-with-registry graph)
+        (with-recursive-lock-held ((schema-lock (schema graph)))
+          (let ((node-metadata (gethash (graph-name graph)
+                                        *schema-node-metadata*)))
+            ;; The list is maintained oldest-first (GH #53); apply in order.
+            (dolist (meta node-metadata)
+              (instantiate-node-type meta graph)))
+          (save-schema (schema graph) graph)))))

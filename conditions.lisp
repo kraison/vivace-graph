@@ -101,17 +101,39 @@ says ~D."
 registry gives it to ~S."
                   parent store-id type-name holder))
          (:stale-id
-          (format stream "~(~A~) id ~D is held by metadata this store's own ~
-name lookup no longer reaches, and it is above every id the registry has ~
-assigned -- so the registry would hand that id to some other type while ~
-nodes on disk still carry it."
-                  parent store-id)))
+          (format stream "~(~A~) id ~D is held by orphaned metadata~@[ for ~
+~S~] -- the store's own name lookup no longer returns it -- and it is above ~
+every id the registry has assigned, so the registry would hand that id to ~
+another type while nodes on disk still carry it."
+                  parent store-id type-name)))
        (format stream "  Neither side may be changed here: the losing id is ~
 already written into every node of its type.  Reconcile out of band -- ~
 GRAPH-DB::REGISTRY-SEED-FROM-STORES to adopt a store's ids, then ~
 GRAPH-DB::MIGRATE-GRAPH with :RENUMBER-P T for the stores it lists.  To ~
 READ this store meanwhile, open it inside GRAPH-DB:WITH-SCHEMA-FROZEN ~
 (GH #186).")))))
+
+(define-condition frozen-graph-cannot-replicate (error)
+  ;; A graph opened inside WITH-SCHEMA-FROZEN never had its persisted
+  ;; type-ids checked against the registry, so it must not serve or stream
+  ;; them: the peer type table describes the REGISTRY while node heads carry
+  ;; the STORE's ids, and a contradicted store would corrupt a remote peer
+  ;; (GH #186).
+  ((graph-name :initarg :graph-name :initform nil
+               :reader frozen-graph-cannot-replicate-graph-name)
+   (location :initarg :location :initform nil
+             :reader frozen-graph-cannot-replicate-location))
+  (:report
+   (lambda (error stream)
+     (format stream "Graph ~S~@[ at ~A~] was opened inside ~
+WITH-SCHEMA-FROZEN, so its type-ids were never reconciled with this system's ~
+registry, and replication may not be started for it.  A frozen open is for ~
+READING a store the registry contradicts; serving one would describe the ~
+registry's ids on the wire while shipping the store's.  Reconcile it first ~
+-- GRAPH-DB::REGISTRY-SEED-FROM-STORES, then GRAPH-DB::MIGRATE-GRAPH with ~
+:RENUMBER-P T -- and open it normally (GH #186)."
+             (frozen-graph-cannot-replicate-graph-name error)
+             (frozen-graph-cannot-replicate-location error)))))
 
 (define-condition stale-revision-error (error)
   ((instance :initarg :instance)
