@@ -13,6 +13,35 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Added
 
+- **Adopting global type-ids on an existing system** (#186).
+  `registry-seed-from-stores` seeds the type registry from stores that were
+  each numbered from 1, and reports which of them must now be rewritten. It
+  opens no graph: each store is read from its `schema.dat` and the allocation
+  high-water mark in its `heap.dat` header. Stores are offered their ids
+  **largest on disk first**, and each keeps every id it can, so the store
+  that costs most to rewrite wins every contest — the cost of adoption is
+  bytes replayed, not types moved. (Measured on a five-store system: 66
+  vertex type names competing for 36 ids, and the store holding 59 of the 95
+  types was among the smallest, so seeding by type count would have replayed
+  ~4.9 GB instead of ~1.1 GB.) The returned `seeding-report` names the seed
+  store, every id that moves, the stores to migrate, and any name a single
+  store's history left holding **two** ids — a case no seeding policy
+  exempts, since those must unify whichever store wins. See
+  docs/vivace-graph-v3-doc.org, Chapter 17, "Adopting global type-ids on an
+  existing system".
+
+- **`migrate-graph` gains `:renumber-p`** (#186), default `nil`. `nil`
+  preserves the source's type-ids exactly as #166 built it. `t` takes every
+  type-id from the system registry instead, so a renumbered store's ids mean
+  the same thing in every other store of the system; this is the migration
+  half of the adoption procedure above. `migrate-graph` now returns
+  `(values new-graph unified)`, where `unified` names each type whose several
+  ids collapsed into one. #166's migration tests were renamed to say which
+  mode they pin (`migrate-v1-graph-to-v3-without-renumbering`,
+  `migrate-v2-graph-to-v3-without-renumbering`) — the type-id guarantee is
+  mode-dependent now, and the renumbering path is the exact reverse of what
+  they assert.
+
 - **The image-level system clock** (#168). `open-system-clock` /
   `close-system-clock` open a durable, crash-safe epoch counter shared by
   every store attached to it, in place of each store's own per-graph
@@ -223,6 +252,20 @@ between releases; cutting a release renames it to the new version and dates it.
     indexes and unique constraints".
 
 ### Fixed
+
+- **`migrate-graph` no longer pollutes the type registry** (#186). Creating
+  the destination graph ran `update-schema`, which interned every one of the
+  graph's types and assigned them real ids; `migrate-graph` then installed
+  the source's schema over the top, discarding those ids and leaving the
+  registry permanently holding entries at ids no store uses. Opening the
+  *source* had the same effect for any type declared in the image but absent
+  from that store — and wrote a registry id into a store whose every other id
+  was per-graph. The schema replay is now suppressed for both of
+  `migrate-graph`'s opens, since it installs the schema it wants by hand in
+  either mode; a `:renumber-p nil` migration therefore leaves the registry
+  untouched, which is the only answer consistent with preserving the source's
+  own ids. One consequence for the record: `migrate-graph` no longer rewrites
+  the source's `schema.dat` at all.
 
 - **`open-system-clock` let two processes both allocate epochs for the same
   system directory, silently** (#182). The image-level clock (#168) had no
@@ -497,8 +540,8 @@ between releases; cutting a release renames it to the new version and dates it.
 
   Existing stores keep the ids already written into their nodes — reopening
   one replays its persisted schema and does not renumber. Adopting the
-  registry for a system whose stores were numbered independently is a
-  separate migration (still #186) and is not done by this change.
+  registry for a system whose stores were numbered independently is the
+  seeding-plus-renumbering procedure added below.
 
   A store's type-ids are now **sparse**: it holds the ids of its own types,
   wherever those landed in the system's numbering, not a dense run from 1.

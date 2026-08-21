@@ -2156,11 +2156,27 @@ Internally it is a *logical* snapshot-and-replay, the same format-independent
 mechanism used for backups: the old graph is opened read-only through the
 head shim matching *its own* stamped version, every live node is written to
 a pointer-free snapshot, and a fresh v3 graph is created and the snapshot
-replayed through the normal ~make-vertex~ / ~make-edge~ path. The old
-graph's schema (its type-id registry) is copied across unchanged, so
-type-ids are preserved, not renumbered. (This mirrors the migration advice
-given for the 2016 hashing change — snapshot and replay — now packaged as a
-single call, and extended here to detect its own source version.)
+replayed through the normal ~make-vertex~ / ~make-edge~ path. (This mirrors
+the migration advice given for the 2016 hashing change — snapshot and replay
+— now packaged as a single call, and extended here to detect its own source
+version.)
+
+*Which type-ids the new graph gets is the one mode-dependent thing here*, and
+~:renumber-p~ chooses:
+
+- ~:renumber-p nil~ (the default) copies the old graph's schema across
+  unchanged, so every type-id is preserved. This is the #166 format
+  migration and nothing else. The new store's ids are the *source's*
+  per-graph ids, not the system registry's, so the migration deliberately
+  leaves the registry alone rather than claim ids for names it did not
+  renumber.
+- ~:renumber-p t~ takes every type-id from the system registry instead, so
+  the new store's ids mean the same thing in every other store of the
+  system. This is how a populated system adopts global ids; see "Adopting
+  global type-ids on an existing system" in Chapter 17 for the procedure,
+  which starts with seeding the registry rather than with this call. A
+  symbol the source's history left holding two ids unifies under one here,
+  and ~migrate-graph~ names it in its *second return value*.
 
 *The rollback guarantee, precisely.* The source graph's *data* — its heap
 and every vertex/edge/index table — is untouched, and it remains fully
@@ -2168,12 +2184,14 @@ usable: a pre-#166 engine can reopen it directly and read every node with
 its type-ids intact. Rollback is therefore *repointing at the old
 directory*, not restoring from a snapshot. It is not, however, byte-for-byte
 identical: producing the snapshot requires *opening* the source, and that
-open unconditionally rewrites ~schema.dat~ (the same content, re-serialized
-— type-ids are unaffected) and creates one new, empty
-~tx/replication-*.log~ file. Those are the only two files that change. This
-was verified by building a real, unmodified old-version engine (no shim) and
-reopening a post-migration source directory with it: every vertex and edge
-present, every type-id identical to before the migration.
+open creates one new, empty ~tx/replication-*.log~ file. That is the only
+file that changes. (It also rewrote ~schema.dat~ before #186 — same content,
+re-serialized. ~migrate-graph~ now suppresses the schema replay for both of
+its opens, so a type declared in your image but absent from the source is no
+longer written into the source at all.) This was verified by building a
+real, unmodified old-version engine (no shim) and reopening a
+post-migration source directory with it: every vertex and edge present,
+every type-id identical to before the migration.
 
 This guarantee assumes the source was *closed cleanly and still has its
 index sidecars*. ~open-graph~ rebuilds a spatial, unique, or secondary index
@@ -2913,6 +2931,63 @@ ids of the types it defines, wherever those landed in the system's numbering,
 not a dense run from 1. And ids are never reused or renumbered — the registry
 is append-only, and reopening a store keeps the ids already written into its
 nodes.
+
+*** Adopting global type-ids on an existing system
+
+A system whose stores predate the registry has a problem the registry cannot
+solve on its own: every store's schema counted type-ids from 1, so in any
+system with more than one store the low ids name *different* classes in
+different stores. Under one shared id space at most one store can keep a
+contested id, and the rest must be renumbered — and since ~type-id~ is
+written into the node head, the ~ve-key~, the ~vev-key~ and the type-index,
+renumbering a store means rewriting it.
+
+This is measured, not assumed. On a five-store system read straight off disk:
+66 vertex type names competing for 36 distinct ids, 11 of those ids claimed
+by more than one name, and the lowest ids contested by nearly every store.
+
+**Seed from the largest store on disk, not the one with the most types.**
+Every store but one is renumbered whichever store is favoured, so the cost is
+*bytes replayed*. On that same system the store holding 59 of the 95 types
+was among the smallest: seeding from it would have replayed roughly 4.9 GB
+instead of 1.1 GB.
+
+~registry-seed-from-stores~ applies that policy for you. It opens no graph —
+it reads each store's ~schema.dat~ and the allocation high-water mark in its
+~heap.dat~ header — and it tells you which stores must now be renumbered:
+
+#+BEGIN_SRC lisp
+  (let* ((registry (graph-db::ensure-type-registry))
+         (report (graph-db::registry-seed-from-stores
+                  registry '("/var/db/store-a/" "/var/db/store-b/"
+                             "/var/db/store-c/"))))
+    (graph-db::seeding-report-seed report)        ; the store adopted verbatim
+    (graph-db::seeding-report-sizes report)       ; ((location . bytes) ...)
+    (graph-db::seeding-report-changes report)     ; every id that moves
+    (graph-db::seeding-report-duplicates report)  ; see below
+    (dolist (location (graph-db::seeding-report-renumber report))
+      (graph-db::migrate-graph :my-app location (new-location-for location)
+                               :renumber-p t)))
+#+END_SRC
+
+Stores are offered their ids largest first, and each keeps every id it can: a
+name the registry has not seen, at an id no other name has claimed, is
+adopted verbatim. So the store that costs most to rewrite wins every contest.
+The registry need not be empty — entries already in it outrank every store,
+including the largest, because the registry is the authority and may already
+have been distributed to peers.
+
+**One case no seeding policy exempts.** A single store's history may already
+hold *two different ids for one name* (the measured system had three). Those
+must unify whichever store wins, so such a store is always in the migration
+set even if nothing else contests it. Seeding reports it in
+~seeding-report-duplicates~, and the renumbering migration reports the
+unification in its second return value rather than picking one id silently.
+
+Plan the run: each renumbering is a ~migrate-graph~, so the transient disk
+and the deployment gate described in Chapter 12 apply to every store in the
+list, and each store is written to a *new* location, leaving the source
+rollback-able.
 
 *** The image-level system clock (optional)
 
@@ -4041,8 +4116,11 @@ This chapter provides a categorized reference for the most important exported sy
 - ~replay (graph snapshot-dir &key package-name)~ ::
   Restores a graph from snapshot files located in ~snapshot-dir~ into a new, empty graph. Automatically finds the latest snapshot and rebuilds all views.
 
-- ~migrate-graph (name old-location new-location &key package include-deleted-p)~ ::
-  Migrates a pre-MVCC (storage v1) graph at ~old-location~ to the current (v2) format at ~new-location~, returning the new open graph. A logical snapshot-and-replay; the original is left untouched. See Chapter 12.
+- ~migrate-graph (name old-location new-location &key package include-deleted-p renumber-p)~ ::
+  Migrates a v1 or v2 graph at ~old-location~ to the current (v3) format at ~new-location~, returning ~(values new-graph unified)~. A logical snapshot-and-replay; the original is left untouched. ~:renumber-p nil~ (default) preserves the source's type-ids; ~:renumber-p t~ takes them from the system registry instead and returns the names whose several ids it unified. See Chapter 12.
+
+- ~registry-seed-from-stores (registry locations)~ ::
+  Seeds ~registry~ from the stores at ~locations~ (no graph is opened), adopting the largest store's type-ids and returning a ~seeding-report~ naming the stores that must now be migrated with ~:renumber-p t~. See Chapter 17, "Adopting global type-ids on an existing system".
 
 **** MVCC / Versioning
 

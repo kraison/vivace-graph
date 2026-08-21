@@ -146,6 +146,28 @@ append lock and has already re-checked SYMBOL is absent."
                  (list (list symbol parent id))))
     id))
 
+(defun %registry-adopt (registry symbol parent id)
+  "Record SYMBOL under PARENT at exactly ID, rather than at the next free
+one, and persist it.  This is how a populated store keeps ids it has already
+written into every node of that type -- see REGISTRY-SEED-FROM-STORES and
+spec §10.1.  Caller holds the append lock and has checked that SYMBOL is
+absent AND that no other symbol holds ID under PARENT; adopting over either
+would give one name two ids or one id two names, which is what #186 exists
+to prevent."
+  (%registry-append registry (list :symbol symbol :parent parent :id id))
+  (setf (gethash symbol (%registry-table registry parent)) id)
+  (setf (type-registry-entries registry)
+        (nconc (type-registry-entries registry)
+               (list (list symbol parent id))))
+  ;; Adopted ids are arbitrary, so the next fresh one must clear the highest
+  ;; adopted so far -- %REGISTRY-LOAD derives the counters the same way.
+  (ecase parent
+    (:vertex (setf (type-registry-next-vertex registry)
+                   (max (type-registry-next-vertex registry) (1+ id))))
+    (:edge (setf (type-registry-next-edge registry)
+                 (max (type-registry-next-edge registry) (1+ id)))))
+  id)
+
 (defun open-type-registry (location)
   "Open or create the type-id registry rooted at LOCATION.  Reads the
 current file once; REGISTRY-INTERN's own re-read under lock -- not this
@@ -171,25 +193,40 @@ keeps this safe to call from any thread at any time."
   "Every (SYMBOL PARENT ID) in REGISTRY, oldest first."
   (type-registry-entries registry))
 
+(defmacro with-registry-append-lock ((registry) &body body)
+  "Run BODY holding REGISTRY's exclusive flock, its in-memory state re-read
+from disk first so BODY decides against what is actually on it.  Signals
+TYPE-REGISTRY-BUSY when another image holds the lock.
+
+BODY may call %REGISTRY-ASSIGN and %REGISTRY-ADOPT; it may NOT call
+REGISTRY-INTERN.  flock is per open file description, so intern's own fd on
+the same file is refused by this one -- from this very process -- and the
+call signals TYPE-REGISTRY-BUSY against itself (GH #186)."
+  (let ((r (gensym "REGISTRY")) (file (gensym "FILE")) (fd (gensym "FD")))
+    `(let* ((,r ,registry))
+       (with-recursive-lock-held ((type-registry-lock ,r))
+         (let* ((,file (%registry-file (type-registry-location ,r)))
+                (,fd (%posix-open ,file (logior +o-creat+ +o-rdwr+))))
+           (unwind-protect
+                (progn
+                  (unless (%posix-flock ,fd (logior +lock-ex+ +lock-nb+))
+                    (error 'type-registry-busy
+                           :location (type-registry-location ,r)))
+                  ;; Re-read under the lock: another image may have appended
+                  ;; between our last load and our taking it.
+                  (%registry-load ,r)
+                  ,@body)
+             (%posix-close ,fd)))))))
+
 (defun registry-intern (registry symbol parent)
   "The id for SYMBOL under PARENT, assigning one if absent.  The read-decide-
 append runs under an exclusive flock: two images that both find SYMBOL absent
 would otherwise assign it different ids, or one id to two symbols (#186)."
   (with-recursive-lock-held ((type-registry-lock registry))
     (or (registry-id-for registry symbol parent)
-        (let* ((file (%registry-file (type-registry-location registry)))
-               (fd (%posix-open file (logior +o-creat+ +o-rdwr+))))
-          (unwind-protect
-               (progn
-                 (unless (%posix-flock fd (logior +lock-ex+ +lock-nb+))
-                   (error 'type-registry-busy
-                          :location (type-registry-location registry)))
-                 ;; Re-read under the lock: another image may have assigned
-                 ;; SYMBOL between our miss above and taking the lock.
-                 (%registry-load registry)
-                 (or (registry-id-for registry symbol parent)
-                     (%registry-assign registry symbol parent)))
-            (%posix-close fd))))))
+        (with-registry-append-lock (registry)
+          (or (registry-id-for registry symbol parent)
+              (%registry-assign registry symbol parent))))))
 
 (defvar *registry-open-lock* (make-lock "type registry open"))
 

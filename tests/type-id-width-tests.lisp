@@ -307,14 +307,14 @@ return DEST as a string."
 (defun %data-fingerprint (dir)
   "A sorted SHA256 listing of every file under DIR's heap and node/index
 tables -- used to assert MIGRATE-GRAPH leaves OLD-LOCATION's DATA untouched.
-Excludes schema.dat and tx/: opening a graph at all -- even read-only, even
-to just look -- unconditionally rewrites schema.dat (UPDATE-SCHEMA calls
-SAVE-SCHEMA on every open; same content, re-serialized, so this is not a
-type-id change, see MIGRATE-V2-GRAPH-TO-V3's own type-id assertions) and
-creates a new empty tx/replication-*.log file (the transaction manager always
-opens one).  Neither is data loss; both are confirmed here to be the ONLY
-two things that change, by exhaustive diff during Task 3's development (see
-task-3-report.md).  Shells out (find + sha256sum), the same portability
+Excludes schema.dat and tx/: an ordinary open rewrites schema.dat
+(UPDATE-SCHEMA calls SAVE-SCHEMA on every open; same content, re-serialized)
+and creates a new empty tx/replication-*.log file (the transaction manager
+always opens one).  MIGRATE-GRAPH's own opens no longer rewrite schema.dat at
+all -- the schema replay is suppressed for both of them (#186) -- but the
+guard open in %READ-V2-GRAPH still does, so the exclusion stays.  Neither is
+data loss; both were confirmed to be the ONLY two things that change, by
+exhaustive diff during the #166 migration work.  Shells out (find + sha256sum), the same portability
 boundary EXTRACT-V1-FIXTURE already accepts by shelling out to tar."
   (uiop:run-program
    (format nil "find ~A -type f -not -name schema.dat -not -path '*/tx/*' ~
@@ -362,13 +362,19 @@ by SINCE (edges with no SINCE slot -- ti-mig-likes -- sort first)."
          graph :collect-p t :edge-type type)
         #'< :key (lambda (row) (or (fourth row) -1))))
 
-(test migrate-v2-graph-to-v3
+(test migrate-v2-graph-to-v3-without-renumbering
   "A v2 (31-byte head, 2-byte type-id) graph cannot be opened directly by v3
 code but MIGRATE-GRAPH carries it across (logical snapshot + replay),
 preserving every node's id, revision, type, slot values and type-id, and
 leaving OLD-LOCATION's data untouched and the source itself still openable
-at v2 afterward -- see %DATA-FINGERPRINT for the two bookkeeping files
-(schema.dat, tx/*) that DO change and why that is not data loss."
+at v2 afterward -- see %DATA-FINGERPRINT for the bookkeeping file (tx/*)
+that DOES change and why that is not data loss.
+
+Pins the DEFAULT mode, :RENUMBER-P NIL, which is passed explicitly below.
+The type-id half of this guarantee became mode-dependent at #186 (spec
+§10.1): under :RENUMBER-P T every id is taken from the system registry
+instead, which is the exact reverse.  See the seeding suite for that mode's
+counterpart tests."
   #+ecl
   (skip "v2 fixture was cl-store'd by SBCL; ECL's cl-store cannot restore it ~
 (graph on-disk dirs are not portable across Lisp implementations).")
@@ -419,6 +425,7 @@ at v2 afterward -- see %DATA-FINGERPRINT for the two bookkeeping files
             (let ((g (graph-db::migrate-graph
                       :ti-migration-fixture old-dir new-dir
                       :package :graph-db/test
+                      :renumber-p nil
                       :snapshot-file
                       (namestring
                        (merge-pathnames "migrate.snapshot" root)))))
@@ -442,9 +449,9 @@ exactly")
 exactly")
                      (is (equalp expected-likes (%fixture-edges g likes))
                          "likes edges: from+to+weight must match exactly")
-                     ;; Type-ids preserved, not renumbered (#186 is where
-                     ;; they would be renumbered; this unit must not do
-                     ;; that).
+                     ;; Type-ids preserved, because :RENUMBER-P is NIL.
+                     ;; The other mode is asserted in the seeding suite
+                     ;; (#186, spec §10.1).
                      (dolist (expected expected-type-ids)
                        (let* ((name (car expected))
                               (parent (if (member name '(ti-mig-person
@@ -454,8 +461,9 @@ exactly")
                                        (graph-db::lookup-node-type-by-name
                                         name parent :graph g))))
                          (is (= (cdr expected) actual)
-                             "~A's type-id must survive migration unchanged ~
-(expected ~A, got ~A)" name (cdr expected) actual))))
+                             "~A's type-id must survive a :RENUMBER-P NIL ~
+migration unchanged (expected ~A, got ~A)"
+                             name (cdr expected) actual))))
                 (graph-db:close-graph g)))
             ;; OLD-LOCATION's DATA is untouched -- scoped past schema.dat and
             ;; tx/, the two bookkeeping files any OPEN rewrites/creates (see

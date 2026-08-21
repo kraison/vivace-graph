@@ -551,9 +551,15 @@ Example:
         (error "Cannot update schema for graph ~A: graph not open!" graph-name))))
 
 (defmethod update-schema ((graph graph))
-  (with-recursive-lock-held ((schema-lock (schema graph)))
-    (let ((node-metadata (gethash (graph-name graph) *schema-node-metadata*)))
-      ;; The list is maintained oldest-first (GH #53); apply in order.
-      (dolist (meta node-metadata)
-        (instantiate-node-type meta graph)))
-    (save-schema (schema graph) graph)))
+  ;; *SCHEMA-UPDATE-SUPPRESSED* is bound by MIGRATE-GRAPH alone, which
+  ;; installs by hand the schema each of its two opens is to have: minting
+  ;; registry ids here for a schema discarded on the next form is how the
+  ;; registry ends up holding ids no store uses (GH #186).
+  (unless *schema-update-suppressed*
+    (with-recursive-lock-held ((schema-lock (schema graph)))
+      (let ((node-metadata (gethash (graph-name graph)
+                                    *schema-node-metadata*)))
+        ;; The list is maintained oldest-first (GH #53); apply in order.
+        (dolist (meta node-metadata)
+          (instantiate-node-type meta graph)))
+      (save-schema (schema graph) graph))))

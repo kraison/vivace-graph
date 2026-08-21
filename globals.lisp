@@ -88,6 +88,14 @@ what #186 exists to prevent.  Set it from your application's own config.")
   "The open TYPE-REGISTRY for this image, opened from *SYSTEM-DIRECTORY* on
 first use by ENSURE-TYPE-REGISTRY and reopened whenever that changes.  Bind
 *SYSTEM-DIRECTORY*, not this.")
+
+(defvar *schema-update-suppressed* nil
+  "When true, UPDATE-SCHEMA is a no-op.  Bound by MIGRATE-GRAPH only, around
+the opens whose schema it then installs by hand: minting registry type-ids
+for a schema discarded on the next form leaves the registry holding ids no
+store uses (GH #186).  Nothing else should bind it -- a store opened with the
+schema replay skipped does not learn the types declared since it was closed.")
+
 ;; The type-id READ-PATH ceiling (schema.lisp's LOOKUP-NODE-TYPE-BY-ID
 ;; assert), not an allocation size -- TYPE-INDEX no longer preallocates by
 ;; this (#166; see +TYPE-INDEX-INITIAL-TYPES+ below).  Matches the type-id

@@ -89,6 +89,10 @@
                ;; (#186); it only built before because that component happens
                ;; to precede this one in the list.
                (:file "schema" :depends-on ("stats" "type-registry"))
+               ;; Reads a store's schema.dat and heap header, so it cannot
+               ;; live in "type-registry" -- "schema" depends on THAT (#186).
+               (:file "type-seeding"
+                :depends-on ("schema" "allocator" "mmap"))
                (:file "node-class" :depends-on ("schema"))
                (:file "views" :depends-on ("node-class"))
                (:file "primitive-node" :depends-on ("views"))
@@ -98,7 +102,7 @@
                (:file "transactions" :depends-on ("graph-class" "type-index" "vev-index" "ve-index" "edge" "vertex" "gc" "spatial-index" "posix" "system-clock"))
                (:file "transaction-restore" :depends-on ("transactions"))
                (:file "transaction-log-streaming" :depends-on ("transactions"))
-               (:file "backup" :depends-on ("edge"))
+               (:file "backup" :depends-on ("edge" "type-seeding"))
                (:file "replication" :depends-on ("backup"))
                (:file "txn-log" :depends-on ("replication"))
                (:file "functor" :depends-on ("vertex" "edge" "views" "schema"))
@@ -519,6 +523,7 @@ cl-temporal-extent."
                (:file "system-clock-tests")       ; GH #168
                (:file "type-registry-tests")      ; GH #186
                (:file "global-type-id-tests")     ; GH #186
+               (:file "type-id-seeding-tests")    ; GH #186
                (:file "posix-tests")              ; GH #182
                (:file "rest-tests")
                (:file "rest-http-tests")
