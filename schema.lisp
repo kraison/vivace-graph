@@ -219,21 +219,72 @@ replication for a quick schema compatibility check."
   (let ((meta (gethash id (gethash parent (schema-type-table (schema graph))))))
     meta))
 
+(define-condition ambiguous-node-type-name (error)
+  ((name :initarg :name :reader ambiguous-type-name)
+   (parent :initarg :parent :reader ambiguous-type-parent)
+   (candidates :initarg :candidates :reader ambiguous-type-candidates))
+  (:report
+   (lambda (c s)
+     (format s "The bare type name ~S names ~D registered ~(~A~) types: ~
+~{~A~^, ~}.  A bare name resolves only when unique; use the ~
+package-qualified symbol (GH #190)."
+             (ambiguous-type-name c)
+             (length (ambiguous-type-candidates c))
+             (ambiguous-type-parent c)
+             (mapcar #'%qualified-type-name-string
+                     (ambiguous-type-candidates c))))))
+
+(defun %qualified-type-name-string (symbol)
+  "SYMBOL printed package-qualified regardless of the ambient *PACKAGE* --
+the package is the discriminator in every message that uses this (GH #190)."
+  (let ((*package* (find-package :keyword)))
+    (prin1-to-string symbol)))
+
+(defun %resolve-bare-type-name (name parent graph)
+  "The unique registered PARENT-kind type whose SYMBOL-NAME matches bare
+NAME, as the schema's real (package-qualified) key.  NIL when none match;
+AMBIGUOUS-NODE-TYPE-NAME when more than one does -- resolving a genuinely
+ambiguous name by definition order is the wrong-class read GH #190 exists
+to forbid.  Scans only symbol->id entries: keyword keys may survive in a
+schema.dat written before #190 and can point at a clobbered id."
+  (let ((sub (gethash parent (schema-type-table (schema graph))))
+        (matches nil))
+    (when sub
+      (maphash (lambda (key value)
+                 (when (and (symbolp key) (not (keywordp key))
+                            (integerp value)
+                            (string= (symbol-name key) (symbol-name name)))
+                   (push key matches)))
+               sub))
+    (cond ((null matches) nil)
+          ((null (cdr matches)) (first matches))
+          (t (error 'ambiguous-node-type-name
+                    :name name :parent parent
+                    :candidates (sort matches #'string<
+                                      :key #'%qualified-type-name-string))))))
+
 (defun lookup-node-type-by-name (name parent &key (graph *graph*))
-  (let ((id (gethash name (gethash parent (schema-type-table (schema graph))))))
-    (when id
-      (lookup-node-type-by-id id parent :graph graph))))
+  "The NODE-TYPE metadata NAME names among GRAPH's PARENT (:VERTEX/:EDGE)
+types, or NIL.  A keyword NAME is a bare-name designator: it resolves to
+the unique matching type or signals AMBIGUOUS-NODE-TYPE-NAME (GH #190).  A
+non-keyword symbol is the type's identity and is looked up directly."
+  (let ((key (if (keywordp name)
+                 (%resolve-bare-type-name name parent graph)
+                 name)))
+    (when key
+      (let ((id (gethash key (gethash parent
+                                      (schema-type-table (schema graph))))))
+        (when id
+          (lookup-node-type-by-id id parent :graph graph))))))
 
 (defmethod update-node-type ((meta node-type) (graph graph))
+  ;; Two keys, not three: the keyword alias this also wrote was
+  ;; package-blind -- two same-named types clobbered one entry (GH #190).
   (setf (gethash (node-type-id meta)
                  (gethash (node-type-parent-type meta)
                           (schema-type-table (schema graph))))
         meta)
   (setf (gethash (node-type-name meta)
-                 (gethash (node-type-parent-type meta)
-                          (schema-type-table (schema graph))))
-        (node-type-id meta))
-  (setf (gethash (intern (symbol-name (node-type-name meta)) :keyword)
                  (gethash (node-type-parent-type meta)
                           (schema-type-table (schema graph))))
         (node-type-id meta))
@@ -506,8 +557,9 @@ and nodes on disk still carry that id (spec §10.1).  The first says what must
 agree with the registry; the second says which ids must stay out of the
 registry's reach.
 
-The sub-tables are triple-keyed (id -> meta, symbol -> id, keyword -> id;
-see UPDATE-NODE-TYPE), which is what the key discrimination below is for."
+The sub-tables are double-keyed (id -> meta, symbol -> id); schemas written
+before GH #190 may also carry stale keyword aliases, which the key
+discrimination below skips."
   (let ((claims nil)
         (stale nil))
     (dolist (parent '(:vertex :edge) (values (nreverse claims)

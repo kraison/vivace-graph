@@ -306,7 +306,10 @@ always performed, here factored out so MAP-EDGES can share it.
 
 Designators that resolve to no registered type of KIND are skipped (so the 0
 sentinel and cross-graph subclasses simply drop out).  Order of first appearance
-is preserved."
+is preserved.
+
+An AMBIGUOUS bare (keyword) designator is not skipped: it signals
+AMBIGUOUS-NODE-TYPE-NAME (GH #190)."
   (let ((seen (make-hash-table))
         (ids nil))
     (labels ((add-id (id)
