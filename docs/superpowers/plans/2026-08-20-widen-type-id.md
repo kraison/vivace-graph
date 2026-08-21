@@ -414,11 +414,24 @@ while proving nothing; a green migration test is not evidence.
 Docs travel with the code here and a `PreToolUse` hook enforces it on push.
 
 Cover: that `type-id` is now 32 bits and what that means for the ceiling; that the type-index
-no longer pre-allocates and what the lock-striping trade is; **the migration procedure**, and
-prominently that **`migrate-graph` leaves the source directory untouched, so rollback is
-repointing at the old directory rather than a restore** — unlike the packed-coordinate change
-(#79), whose rollback needs snapshot replay. An operator reading this at the wrong hour needs
-that sentence.
+no longer pre-allocates and what the lock-striping trade is; and **the migration procedure**.
+
+⚠ **Correction — the earlier version of this instruction was wrong.** It said `migrate-graph`
+"leaves the source directory untouched." It does not, and Task 3 proved it: snapshotting the
+source requires **opening** it, and that open rewrites `schema.dat` (same content,
+re-serialised, type-ids unaffected) and creates one empty `tx/replication-*.log`. The claim
+came from `migrate-graph`'s own docstring, which was false and is now corrected.
+
+**Document the guarantee that is actually true**, because it is still the thing an operator
+needs at a bad hour: *the source graph's data is untouched and it remains fully usable — a
+pre-#166 engine reopens it and reads every node with type-ids intact — so rollback is
+repointing at the old directory rather than restoring from a snapshot.* Name the two files
+that do change. That is still better than the packed-coordinate change (#79), whose rollback
+needs snapshot replay — but state it precisely rather than as "byte-for-byte."
+
+Task 3 verified this by building a genuine v2 engine with no shim and reopening the
+post-migration source: 12 vertices, type-ids `person=1 employee=2 knows=1 likes=2`. Cite that
+if it helps.
 
 Note the deployment gate: production is below two engine floors already
 (kraison/mine-action#117), so this migration lands on a host that needs a code bump first.
