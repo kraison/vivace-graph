@@ -559,6 +559,77 @@ propagates."
             (uiop:ensure-directory-pathname retired)
             :validate t :if-does-not-exist :ignore)))))))
 
+;;; Fix round 2 / GH #212: completion is the SECOND RENAME, not the
+;;; :SWAP journal record after it -- a JOURNAL-APPEND failure must still
+;;; be classified as a completed swap.
+
+(test swap-in-shadow-1-progress-survives-a-journal-append-failure
+  "No reliable way was found to make the REAL system clock's
+JOURNAL-APPEND fail on just this one call without ALSO breaking the
+recovery path's own :ATTACH journal-append -- both go through the same
+CLOCK object, and ATTACH-TO-SYSTEM-CLOCK unconditionally re-journals on
+every call, so any injection that breaks one breaks the other, turning
+the intended \"recovered, warn, return\" case into a
+SHADOW-RECOVERY-FAILED case instead.  Concretely: by the time
+SWAP-IN-SHADOW runs in these tests, the clock's journal stream is
+ALREADY open (WITH-CLOCKED-STORE's MAKE-GRAPH triggers an initial
+:ATTACH record), so CHMOD'ing the clock's directory does nothing --
+POSIX permission checks happen at OPEN, not at each WRITE to an
+already-open descriptor -- and closing that shared stream directly
+leaves it broken for the recovery call too, not just the one under
+test.  So, per the coordinator's authorized fallback, this seam-tests
+%SWAP-IN-SHADOW-1 directly with a MOCK clock: a real SYSTEM-CLOCK
+struct (%MAKE-SYSTEM-CLOCK) whose LOCATION is a directory that does not
+exist, so JOURNAL-APPEND's internal OPEN fails deterministically the
+instant it tries to create the journal file there -- verified below to
+actually signal.  PROGRESS must already be complete when that
+propagates.  ABLATION: reverting the SETF to run AFTER JOURNAL-APPEND
+(the pre-fix-round-2 placement) makes this test fail, since PROGRESS
+would still be unset when the error propagates."
+  (with-clocked-store (g clock sys)
+    clock sys
+    (with-transaction ((graph-db::transaction-manager g))
+      (graph-db:make-vertex :generic nil :graph g))
+    (let ((name (graph-db:graph-name g))
+          (location (graph-db::location g))
+          (retired nil)
+          (mock-clock (graph-db::%make-system-clock
+                       :location "/nonexistent-dir-for-gh-170-212/"
+                       :counter 1)))
+      (unwind-protect
+           (progn
+             (let ((graph-db:*graph* g))
+               (close-graph g :snapshot-p nil))
+             (with-temp-directory (shadow-dir)
+               (let ((sg (make-graph name (namestring shadow-dir)
+                                    :buffer-pool-size 1000)))
+                 (with-transaction ((graph-db::transaction-manager sg))
+                   (graph-db:make-vertex :generic nil :graph sg))
+                 (let ((graph-db:*graph* sg))
+                   (close-graph sg :snapshot-p nil)))
+               (let ((progress (vector nil nil)))
+                 (signals error
+                   (graph-db::%swap-in-shadow-1
+                    name location shadow-dir mock-clock progress))
+                 (is-true (aref progress 0)
+                          "PROGRESS must be complete: both renames landed")
+                 (is-true (aref progress 1))
+                 (setq retired (aref progress 1))
+                 (is-true (probe-file retired)
+                          "the retired dir proves the first rename ran")
+                 ;; The renames really did land: the shadow's data is now
+                 ;; AT LOCATION, proving JOURNAL-APPEND -- not an earlier
+                 ;; step -- is what failed.
+                 (is-true (probe-file (merge-pathnames
+                                       "schema.dat"
+                                       (uiop:ensure-directory-pathname
+                                        location)))))))
+        (when (and retired (probe-file retired))
+          (ignore-errors
+           (uiop:delete-directory-tree
+            (uiop:ensure-directory-pathname retired)
+            :validate t :if-does-not-exist :ignore)))))))
+
 (test killed-loader-leaves-live-byte-identical
   "ABANDON-SHADOW is the discard path exercised here; it must also
 restore write service.  Nearest wrong implementation: the loader writes

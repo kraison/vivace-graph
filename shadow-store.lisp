@@ -241,35 +241,46 @@ themselves, not \"dir/\" (GH #170)."
                                       location))))
 
 (define-condition swap-recovered-warning (warning)
-  ;; The renames + :SWAP journal record were durably complete before
-  ;; the follow-up OPEN-GRAPH/ATTACH-TO-SYSTEM-CLOCK failed -- the swap
-  ;; itself SUCCEEDED.  Recovering by reopening the NEW generation and
-  ;; returning it normally is correct; this warning exists so the
-  ;; caller can still notice the reopen hiccup (GH #170, fix round 1).
+  ;; Both renames were durably complete before something after them
+  ;; failed -- the swap itself SUCCEEDED.  Recovering by reopening the
+  ;; NEW generation and returning it normally is correct; this warning
+  ;; exists so the caller can still notice the hiccup.  If ORIGINAL came
+  ;; from JOURNAL-APPEND itself, the :SWAP record may be missing from
+  ;; the clock's journal even though the swap happened -- #212/#171
+  ;; territory (GH #170, fix rounds 1-2).
   ((original :initarg :original :reader swap-recovered-warning-original))
   (:report (lambda (c s)
-             (format s "SWAP-IN-SHADOW's renames and :SWAP journal ~
-record completed, but the follow-up reopen failed (~A); recovered by ~
-reopening the NEW generation instead -- the swap itself succeeded."
+             (format s "SWAP-IN-SHADOW's renames completed, but ~
+something after them failed (~A); recovered by reopening the NEW ~
+generation instead -- the swap itself succeeded, though its :SWAP ~
+journal record may be missing (GH #212) if that is what failed."
                      (swap-recovered-warning-original c)))))
 
 (defun %swap-completed-p (progress)
-  "True when PROGRESS (see %SWAP-IN-SHADOW-1) marks the renames and
-:SWAP journal record already durably complete.  Pulled out as its own
-predicate so the discrimination SWAP-IN-SHADOW's failure handler makes
--- recover onto the OLD store and resignal, vs. recover onto the NEW
-one and return -- is unit-testable on its own (GH #170, fix round 1)."
+  "True when PROGRESS (see %SWAP-IN-SHADOW-1) marks BOTH RENAMES
+already durably complete -- NOT the :SWAP journal record, which is
+best-effort and can fail after the renames without undoing them (GH
+#170 fix round 2, #212).  Pulled out as its own predicate so the
+discrimination SWAP-IN-SHADOW's failure handler makes -- recover onto
+the OLD store and resignal, vs. recover onto the NEW one and return --
+is unit-testable on its own."
   (and (aref progress 0) t))
 
 (defun %swap-in-shadow-1 (name location shadow-location clock progress)
   "The risky middle of SWAP-IN-SHADOW, run after the live store is
 already closed: rename live away, rename shadow in, journal, reopen.
 PROGRESS is a 2-element vector; element 0 is set true and element 1 set
-to RETIRED-PATH the instant both renames and the journal record are
-durably complete -- the caller's HANDLER-CASE uses it to discriminate a
-pre-completion failure (recover the OLD store) from a post-completion
-one (recover the NEW store; the swap already happened) (GH #170, fix
-round 1).  Split out so that HANDLER-CASE reads cleanly."
+to RETIRED-PATH the instant BOTH RENAMES are durably complete -- that,
+not the journal record, is what \"the swap happened\" means (GH #170,
+fix round 2 / #212): the data is only ever un-findable under its old OR
+new name during the renames themselves, and once the second rename
+lands, the live location holds the new generation no matter what
+happens next.  JOURNAL-APPEND runs AFTER the flip and is therefore
+best-effort: a failure there still means the swap succeeded, just
+possibly without a :SWAP record (see SWAP-IN-SHADOW's docstring).  The
+caller's HANDLER-CASE uses PROGRESS to discriminate a pre-completion
+failure (recover the OLD store) from a post-completion one (recover the
+NEW store).  Split out so that HANDLER-CASE reads cleanly."
   (let* ((live (%trimmed-namestring location))
          (shadow (%trimmed-namestring shadow-location))
          (retired-path (format nil "~A-retired-~D" live
@@ -279,8 +290,9 @@ round 1).  Split out so that HANDLER-CASE reads cleanly."
     ;; docstring) -- not recovered here.
     (%posix-rename live retired-path)
     (%posix-rename shadow live)
-    (journal-append clock :swap :store name :retired retired-path)
+    ;; Completion is THIS point, not the journal record below (#212).
     (setf (aref progress 0) t (aref progress 1) retired-path)
+    (journal-append clock :swap :store name :retired retired-path)
     (let ((new-graph (open-graph name live :system-clock nil)))
       (attach-to-system-clock new-graph clock)
       (values new-graph retired-path))))
@@ -305,22 +317,26 @@ cost a read-and-write outage, only a PROBE-FILE and an immediate
 signal -- GRAPH is untouched, ACCEPTING-P never leaves T (GH #170, fix
 round 1).
 
-Two further failure outcomes, discriminated by whether both renames
-and the :SWAP journal record had already completed (see
-%SWAP-IN-SHADOW-1's PROGRESS argument):
+Two further failure outcomes, discriminated by whether BOTH RENAMES
+had already completed (see %SWAP-IN-SHADOW-1's PROGRESS argument) --
+completion is the second rename, NOT the :SWAP journal record after it
+(GH #170, fix round 2 / #212):
 
-- NOT YET COMPLETE (the copy/rename/journal step itself failed): the
-  swap did not happen.  Reopen the OLD store, restore ACCEPTING-P to
-  T, and re-signal the original error, mirroring SHADOW-STORE's
-  copy-failure recovery.
-- ALREADY COMPLETE (only the follow-up OPEN-GRAPH/ATTACH-TO-SYSTEM-
-  CLOCK failed): the swap SUCCEEDED -- the live location already holds
-  the new generation's files.  Resignalling here would be a lie: the
-  caller would conclude the swap didn't happen and could, e.g., retry
-  it against a shadow location that no longer exists.  Instead: reopen
-  the NEW generation, signal SWAP-RECOVERED-WARNING (a WARNING, not an
-  ERROR) carrying the original condition, and RETURN (values NEW-GRAPH
-  RETIRED-PATH) normally (GH #170, fix round 1).
+- NOT YET COMPLETE (a rename itself failed): the swap did not happen.
+  Reopen the OLD store, restore ACCEPTING-P to T, and re-signal the
+  original error, mirroring SHADOW-STORE's copy-failure recovery.
+- ALREADY COMPLETE (the renames landed; JOURNAL-APPEND, OPEN-GRAPH, or
+  ATTACH-TO-SYSTEM-CLOCK failed after them): the swap SUCCEEDED -- the
+  live location already holds the new generation's files.  Resignalling
+  here would be a lie: the caller would conclude the swap didn't happen
+  and could, e.g., retry it against a shadow location that no longer
+  exists.  Instead: reopen the NEW generation, signal
+  SWAP-RECOVERED-WARNING (a WARNING, not an ERROR) carrying the original
+  condition, and RETURN (values NEW-GRAPH RETIRED-PATH) normally.  The
+  :SWAP journal record itself is therefore best-effort once the renames
+  land: if JOURNAL-APPEND is what failed, the swap still succeeded but
+  its journal record may be missing -- a gap for a human or #171's
+  future recovery tooling to notice, tracked as #212.
 
 Either recovery reopen itself failing is unchanged: SHADOW-RECOVERY-
 FAILED, carrying both conditions.
