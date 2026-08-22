@@ -39,6 +39,30 @@ safety story for DISCARD-SHADOW, which deletes trees (GH #170)."
     (and (>= (length trimmed) 7)
          (string= "-shadow" trimmed :start2 (- (length trimmed) 7)))))
 
+(define-condition shadow-recovery-failed (error)
+  ;; The copy step failed AND the post-close recovery reopen also
+  ;; failed: the store may be stuck closed and needs a manual
+  ;; OPEN-GRAPH.  Both conditions are carried so neither is lost
+  ;; (GH #170, fix round 1).
+  ((original :initarg :original :reader shadow-recovery-failed-original)
+   (recovery :initarg :recovery :reader shadow-recovery-failed-recovery))
+  (:report (lambda (c s)
+             (format s "SHADOW-STORE failed (~A) and the recovery ~
+reopen ALSO failed (~A) -- the store is left closed; a manual ~
+OPEN-GRAPH is required."
+                     (shadow-recovery-failed-original c)
+                     (shadow-recovery-failed-recovery c)))))
+
+(defun %reopen-and-resume (name location clock reason)
+  "OPEN-GRAPH + ATTACH-TO-SYSTEM-CLOCK + %SET-ACCEPTING-P REASON --
+the resume sequence shared by SHADOW-STORE's happy path and its
+copy-failure recovery path (GH #170)."
+  (let ((reopened (open-graph name (namestring location)
+                              :system-clock nil)))
+    (attach-to-system-clock reopened clock)
+    (%set-accepting-p (transaction-manager reopened) reason)
+    reopened))
+
 (defun shadow-store (graph &key (timeout 60))
   "Take a consistent shadow copy of GRAPH's store: quiesce (reason
 :SWAPPING, TIMEOUT seconds to drain) -> CLOSE-GRAPH -> recursive file
@@ -52,10 +76,18 @@ Requires GRAPH be attached to a system clock -- the reopen needs it to
 resume service and the shadow's own lease (see OPEN-SHADOW-GRAPH) is
 drawn from the same clock.
 
-Returns (values SHADOW-LOCATION REOPENED-GRAPH).  The live store is
-fully unavailable only for close+copy+reopen -- seconds -- and
-write-unavailable until a caller swaps it in or calls ABANDON-SHADOW
-(GH #170)."
+Once CLOSE-GRAPH has run, the live store is durably closed; ANY error
+from the copy or the happy-path reopen itself triggers a recovery
+reopen (ACCEPTING-P restored to T, full service) BEFORE the original
+error is re-signalled -- a failed shadow attempt must not leave the
+live store stranded closed.  If recovery ALSO fails, SHADOW-RECOVERY-
+FAILED is signalled instead, carrying both conditions (GH #170, fix
+round 1).
+
+Returns (values SHADOW-LOCATION REOPENED-GRAPH) on success.  The live
+store is fully unavailable only for close+copy+reopen -- seconds --
+and write-unavailable until a caller swaps it in or calls
+ABANDON-SHADOW."
   (let* ((tm (transaction-manager graph))
          (name (graph-name graph))
          (location (location graph))
@@ -69,12 +101,19 @@ via ATTACH-TO-SYSTEM-CLOCK, which needs one."))
           (*quiesced-store-closing-p* t))
       (close-graph graph :snapshot-p t))
     (let ((shadow-location (%shadow-location location)))
-      (%copy-directory-tree location shadow-location)
-      (let ((reopened (open-graph name (namestring location)
-                                  :system-clock nil)))
-        (attach-to-system-clock reopened clock)
-        (%set-accepting-p (transaction-manager reopened) :read-only)
-        (values shadow-location reopened)))))
+      (handler-case
+          (progn
+            (%copy-directory-tree location shadow-location)
+            (let ((reopened (%reopen-and-resume name location clock
+                                                :read-only)))
+              (values shadow-location reopened)))
+        (error (original)
+          (handler-case
+              (%reopen-and-resume name location clock t)
+            (error (recovery)
+              (error 'shadow-recovery-failed
+                     :original original :recovery recovery)))
+          (error original))))))
 
 (defun abandon-shadow (graph shadow-location)
   "The lifecycle exit that is not a swap: DISCARD-SHADOW the directory
@@ -89,7 +128,11 @@ and restore GRAPH's ACCEPTING-P to T (full service) (GH #170)."
 
 (defun %persist-lease (shadow-location start end)
   "Write (:LEASE-START START :LEASE-END END) readably to lease.dat, so
-the lease survives outside this process (GH #170)."
+the RANGE survives outside this process.  Never NEXT -- see
+OPEN-SHADOW-GRAPH's resume story: the cursor is derived from the
+shadow's own durable highest-transaction-id on every open, not
+persisted here, so this file never needs an fsync on the per-write hot
+path (GH #170, fix round 1)."
   (with-open-file (out (%lease-file shadow-location)
                        :direction :output :if-exists :supersede
                        :if-does-not-exist :create)
@@ -117,12 +160,21 @@ therefore still resolves them to the live graph.
 
 LEASE is (START . END) -- from the STORE-DETACHMENT SHADOW-STORE's
 caller holds, or from a direct CLOCK-LEASE-EPOCHS call when there was no
-DETACH-STORE.  Installed as the graph's EPOCH-LEASE, so every
-transaction id minted against the returned graph comes from the lease,
-never the clock or a per-store counter (see TM-NEXT-EPOCH).  Persisted
-as lease.dat in SHADOW-LOCATION so it survives a crash/restart of this
-process; when LEASE is not given, the persisted lease.dat is read back
-instead (needed to reopen a shadow across a restart).
+DETACH-STORE.  The RANGE is persisted as lease.dat in SHADOW-LOCATION so
+it survives a crash/restart of this process; when LEASE is not given,
+the persisted lease.dat supplies it instead (needed to reopen a shadow
+across a restart).
+
+The CURSOR (where allocation resumes) is never taken from LEASE or from
+lease.dat -- it is derived fresh on every open from the shadow's own
+durable state: NEXT = (MAX START (1+ LOAD-HIGHEST-TRANSACTION-ID)).  The
+shadow's own committed transaction ids are the truth about what it has
+already allocated; persisting a separate mutable cursor would need an
+fsync on the bulk-load hot path AND would go stale the moment a crash
+lost the last update.  If the derived NEXT is already past END, the
+lease was fully consumed before this open -- EPOCH-LEASE-EXHAUSTED is
+signalled immediately rather than quietly wrapping or reusing an id
+(GH #170, fix round 1).
 
 FAST-LOAD and EXPECTED-VECTORS are Task 4/5 hooks: accepted here, but
 using either signals a clear \"arrives in a later task\" error rather
@@ -148,8 +200,15 @@ not implemented yet (GH #170)."))
         (unless (and start end)
           (error "OPEN-SHADOW-GRAPH needs :LEASE (start . end); none was ~
 given and ~A has no lease.dat." location))
-        (setf (graph-epoch-lease graph)
-              (make-epoch-lease :start start :next start :end end))
+        ;; Resume cursor: derived from the shadow's OWN durable state, not
+        ;; persisted -- see the docstring and %PERSIST-LEASE (GH #170, fix
+        ;; round 1).  LOAD-HIGHEST-TRANSACTION-ID is 0 on a shadow that has
+        ;; never committed a write, so NEXT starts at START there.
+        (let ((next (max start (1+ (load-highest-transaction-id graph)))))
+          (when (> next end)
+            (error 'epoch-lease-exhausted :name graph-name :end end))
+          (setf (graph-epoch-lease graph)
+                (make-epoch-lease :start start :next next :end end)))
         (%persist-lease location start end))
       graph)))
 

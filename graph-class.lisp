@@ -229,9 +229,12 @@ received an UNRESOLVED-NODE marker instead (GH #169, D8)."
    ;; never starts replication.  EPOCH-LEASE: an EPOCH-LEASE struct
    ;; (below) when this store mints txn ids from a leased range instead
    ;; of its clock/counter; NIL is the default (pre-#170 behaviour).
-   (shadow-p :accessor graph-shadow-p :initarg :shadow-p :initform nil)
-   (epoch-lease :accessor graph-epoch-lease :initarg :epoch-lease
-               :initform nil)))
+   ;; Both are always set post-construction via SETF (OPEN-GRAPH,
+   ;; OPEN-SHADOW-GRAPH) rather than at MAKE-INSTANCE, so neither takes
+   ;; an :INITARG -- one would be dead weight the constructor never
+   ;; receives.
+   (shadow-p :accessor graph-shadow-p :initform nil)
+   (epoch-lease :accessor graph-epoch-lease :initform nil)))
 
 (defstruct epoch-lease
   "A shadow store's leased txn-id range [START, END) (GH #170).  NEXT is

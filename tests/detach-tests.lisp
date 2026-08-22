@@ -365,3 +365,86 @@ safety story."
     clock sys
     (signals error (graph-db:discard-shadow (graph-db::location g)))
     (is-true (probe-file (graph-db::location g)))))
+
+;;; Fix round 1 (GH #170): lease resume-from-watermark, copy-failure
+;;; recovery.
+
+(test shadow-lease-resumes-from-its-own-watermark
+  "RULED FIX: the resume cursor comes from the shadow's own durable
+highest-transaction-id, never a persisted NEXT.  Write 2 nodes, close
+the shadow, re-open it WITHOUT :lease (lease.dat path) and confirm the
+next write's id is strictly past the pre-close ids and still within the
+leased range.  Nearest wrong implementation: NEXT reset to START on
+every open, re-minting an id already committed in the shadow."
+  (with-clocked-store (g clock sys)
+    sys
+    (with-transaction ((graph-db::transaction-manager g))
+      (graph-db:make-vertex :generic nil :graph g))
+    (multiple-value-bind (shadow-location g2) (graph-db:shadow-store g)
+      (unwind-protect
+           (multiple-value-bind (start end)
+               (graph-db:clock-lease-epochs clock 1000)
+             (let ((sg (graph-db:open-shadow-graph
+                        shadow-location :detach-store-1
+                        :lease (cons start end)))
+                   (max-id 0))
+               (dotimes (i 2)
+                 ;; COMMIT-EPOCH is stamped when the transaction commits,
+                 ;; at the END of the WITH-TRANSACTION body -- read it
+                 ;; only AFTER the block, or it is still the pre-commit
+                 ;; default (0).
+                 (let (v)
+                   (with-transaction ((graph-db::transaction-manager sg))
+                     (setq v (graph-db:make-vertex :generic nil :graph sg)))
+                   (setq max-id (max max-id (graph-db::commit-epoch v)))))
+               (let ((graph-db:*graph* sg))
+                 (close-graph sg :snapshot-p nil))
+               (let ((sg2 (graph-db:open-shadow-graph
+                           shadow-location :detach-store-1)))
+                 (unwind-protect
+                      (let (v new-id)
+                        (with-transaction
+                            ((graph-db::transaction-manager sg2))
+                          (setq v (graph-db:make-vertex
+                                  :generic nil :graph sg2)))
+                        (setq new-id (graph-db::commit-epoch v))
+                        (is (> new-id max-id))
+                        (is (<= start new-id))
+                        (is (< new-id end)))
+                   (let ((graph-db:*graph* sg2))
+                     (ignore-errors
+                      (close-graph sg2 :snapshot-p nil)))))))
+        (let ((graph-db:*graph* g2))
+          (ignore-errors (close-graph g2 :snapshot-p nil)))))))
+
+(test shadow-store-recovers-service-on-copy-failure
+  "RULED FIX: a mid-copy failure must not leave the live store stranded
+closed.  Deterministic failure: pre-create the shadow target as a plain
+FILE (not a directory), so %COPY-DIRECTORY-TREE's
+ENSURE-DIRECTORIES-EXIST signals.  SHADOW-STORE must re-signal that
+error, but only after reopening the live store and restoring full
+service (reads AND writes)."
+  (with-clocked-store (g clock sys)
+    clock sys
+    (with-transaction ((graph-db::transaction-manager g))
+      (graph-db:make-vertex :generic nil :graph g))
+    (let* ((name (graph-db:graph-name g))
+           (shadow-dir (graph-db::%shadow-location (graph-db:location g)))
+           (bare-shadow (string-right-trim "/" (namestring shadow-dir))))
+      (with-open-file (out bare-shadow :direction :output
+                          :if-exists :supersede :if-does-not-exist :create)
+        (write-string "not a directory" out))
+      (unwind-protect
+           (progn
+             (signals error (graph-db:shadow-store g))
+             (let* ((g2 (graph-db:lookup-graph name))
+                    (tm2 (graph-db::transaction-manager g2)))
+               (is-true g2)
+               (is (graph-db::graph-open-p g2))
+               (is (eq t (graph-db:accepting-p tm2)))
+               (let ((pin (graph-db:pin-read-epoch tm2)))
+                 (graph-db:unpin-read-epoch tm2 pin))
+               (with-transaction (tm2)
+                 (graph-db:make-vertex :generic nil :graph g2))
+               (setq g g2)))
+        (ignore-errors (delete-file bare-shadow))))))
