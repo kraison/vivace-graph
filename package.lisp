@@ -67,6 +67,8 @@
            #:store-id
            #:+store-tag-bits+
            #:+max-store-tag+
+           #:uuid-v8-p
+           #:id-store-tag
            ;; GH #186: a store's persisted type-ids disagree with the
            ;; image registry.  Operator-facing -- the remedy is a seeding
            ;; run plus a renumbering migration, not a retry.

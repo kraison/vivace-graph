@@ -69,3 +69,48 @@ returned for a closed store)."
           (is (null (svref graph-db::*store-id->graph* sid)))
           (is (= sid (store-registry-id-for :sr-open-store))
               "the assignment outlives the open"))))))
+
+(test v8-ids-carry-the-store-tag
+  "Layout pin: version nibble 8, RFC variant, and the tag readable back
+from bytes 14-15.  Nearest wrong implementation: tag written but
+version left 5 (ID-STORE-TAG must return NIL for it)."
+  (let ((id (graph-db::gen-v8-uuid 2749)))
+    (is (= 16 (length id)))
+    (is (graph-db:uuid-v8-p id))
+    (is (= #b10 (ldb (byte 2 6) (aref id 8))) "RFC 9562 variant")
+    (is (= 2749 (graph-db:id-store-tag id)))))
+
+(test v5-ids-have-no-store-tag
+  "Legacy ids answer NIL, never a garbage tag read out of hash bytes."
+  (let ((id (graph-db::gen-v5-uuid graph-db::*vertex-namespace*)))
+    (is (not (graph-db:uuid-v8-p id)))
+    (is (null (graph-db:id-store-tag id)))))
+
+(test gen-ids-fall-back-to-v5-without-a-tag
+  "GEN-VERTEX-ID/GEN-EDGE-ID with no (or nil) tag are byte-layout v5 --
+the memory-graph/legacy path is unchanged (GH #169)."
+  (is (not (graph-db:uuid-v8-p (graph-db::gen-vertex-id))))
+  (is (not (graph-db:uuid-v8-p (graph-db::gen-edge-id nil)))))
+
+(test new-nodes-in-a-store-get-tagged-ids
+  "End to end: a vertex and an edge created in an open store carry ids
+whose tag is that store's id.  Nearest wrong implementation: generation
+still v5 everywhere (the whole point of the unit)."
+  (with-temp-directory (sys)
+    (with-temp-directory (dir)
+      (let ((graph-db::*system-directory* (namestring sys))
+            (graph-db::*store-registry* nil))
+        (let ((g (make-graph :sr-tagged-store (namestring dir)
+                             :buffer-pool-size 1000)))
+          (unwind-protect
+               (let (v1 v2 e)
+                 (with-transaction ((graph-db::transaction-manager g))
+                   (setq v1 (graph-db:make-vertex :generic nil :graph g))
+                   (setq v2 (graph-db:make-vertex :generic nil :graph g))
+                   (setq e (graph-db:make-edge :generic (id v1) (id v2) 1.0 nil
+                                               :graph g)))
+                 (is (= (graph-db::store-id g)
+                        (graph-db:id-store-tag (id v1))))
+                 (is (= (graph-db::store-id g)
+                        (graph-db:id-store-tag (id e)))))
+            (close-graph g :snapshot-p nil)))))))

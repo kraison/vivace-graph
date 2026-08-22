@@ -28,14 +28,21 @@
 (defun %make-edge (&key id type-id revision deleted-p data-pointer data bytes from
                      to weight written-p heap-written-p type-idx-written-p
                      ve-written-p vev-written-p views-written-p
-                     commit-epoch prev-pointer (class 'edge))
+                     commit-epoch prev-pointer (class 'edge) graph)
   ;; ECL ONLY: construct the target CLASS directly (ECL's CHANGE-CLASS leaks per
   ;; call -- #47), giving up the node buffer pool on ECL.  SBCL/CCL/LispWorks
   ;; keep the pooled base EDGE + CHANGE-CLASS path (no leak, pool is a perf win).
   (let ((edge #+ecl (let ((*initializing-node* t)) (make-instance class))
               #-ecl (get-edge-buffer)))
+    ;; GET-EDGE-BUFFER may hand back a pool-warmed instance that already
+    ;; carries an untagged v5 id (MAKE-EDGE-BUFFER has no graph to tag
+    ;; with) -- the +NULL-KEY+ check alone would never fire and every
+    ;; tagged store would silently get untagged ids.  A known store tag
+    ;; always wins and mints fresh, even over a pooled id (GH #169).
     (cond (id
            (setf (id edge) id))
+          ((and graph (store-id graph))
+           (setf (id edge) (gen-edge-id (store-id graph))))
           ((equalp +null-key+ (id edge))
            (setf (id edge) (gen-edge-id))))
     (when from (setf (from edge) from))
@@ -236,7 +243,8 @@ regenerates the id on a duplicate-key collision."
                    :to to
                    :weight weight
                    :bytes bytes
-                   :data data)))
+                   :data data
+                   :graph graph)))
           (setf (bytes e) bytes)
           ;; Stamped from birth: the edge is live for the whole creating
           ;; transaction, long before commit stamps it (GH #53).
@@ -249,7 +257,7 @@ regenerates the id on a duplicate-key collision."
                     (log:error "EDGE: Duplicate key error: ~A. Retrying MAKE-EDGE"
                                (id e))
                     (make-edge type from to weight data
-                               :id (gen-edge-id)
+                               :id (gen-edge-id (and graph (store-id graph)))
                                :revision revision
                                :deleted-p deleted-p :graph graph))
                   (error c)))))
