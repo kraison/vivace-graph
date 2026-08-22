@@ -181,3 +181,46 @@ CORRECTED (task-4), controller notes:
                                       (equalp (id e) (getf (cddr f) :id))))
                                forms)
                       "the dangling edge is IN the backup")))))))
+
+(test clean-backups-never-warn-dangling
+  "No-false-positive canary for DANGLING-EDGE-WARNING (review fix,
+GH #169): one graph, no cross-store edges anywhere -- a live-live
+edge, and an edge whose far endpoint is soft-deleted (but still in
+THIS graph's own vertex table) -- must never warn.  Pins the exact
+regression the risk names: filtering an endpoint out by DELETED-P, or
+treating ANY RESOLVE-NODE-GRAPH miss as dangling instead of only
+:DETACHED / :RESOLVED-elsewhere, would both turn this green.  Collects
+DANGLING-EDGE-WARNING specifically, not WARNING generally -- other
+machinery (e.g. spatial-index coarsening) may legitimately warn during
+backup."
+  (with-temp-directory (sys)
+    (with-temp-directory (d)
+      (with-temp-directory (bdir)
+        (let ((graph-db::*system-directory* (namestring sys))
+              (graph-db::*store-registry* nil))
+          (let ((g (make-graph :rsv-store-1 (namestring d)
+                                :buffer-pool-size 1000)))
+            (unwind-protect
+                 (let (v1 v2 v3)
+                   (with-transaction ((graph-db::transaction-manager g))
+                     (setq v1 (graph-db:make-vertex :generic nil :graph g))
+                     (setq v2 (graph-db:make-vertex :generic nil :graph g))
+                     (setq v3 (graph-db:make-vertex :generic nil :graph g))
+                     (graph-db:make-edge :generic (id v1) (id v2) 1.0 nil
+                                          :graph g)
+                     (graph-db:make-edge :generic (id v1) (id v3) 1.0 nil
+                                          :graph g))
+                   (with-transaction ((graph-db::transaction-manager g))
+                     (mark-deleted (lookup-vertex (id v3) :graph g)))
+                   (let ((file (merge-pathnames "clean.backup" bdir))
+                         (seen nil))
+                     (handler-bind ((graph-db:dangling-edge-warning
+                                      (lambda (w)
+                                        (push w seen)
+                                        (muffle-warning w))))
+                       (graph-db::backup g (namestring file)
+                                         :include-deleted-p t))
+                     (is (null seen)
+                         "a clean single-store backup must never warn")))
+              (ignore-errors (close-graph g :snapshot-p nil))
+              (collect-garbage))))))))
