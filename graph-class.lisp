@@ -34,6 +34,24 @@ ids are never reused (GH #169)."
     (when (and sid (eq graph (svref *store-id->graph* sid)))
       (setf (svref *store-id->graph* sid) nil))))
 
+(defstruct (unresolved-node (:constructor make-unresolved-node
+                                          (id store-id store-name)))
+  "The honest answer for a read that reaches into a detached store:
+there IS a node here, its store is known, and the store is offline
+(GH #169, D8).  Never a raw NIL -- that is indistinguishable from 'no
+such node' -- and never an error from mid-traversal."
+  id store-id store-name)
+
+(define-condition store-detached-error (error)
+  ((name :initarg :name :reader store-detached-name)
+   (id :initarg :id :reader store-detached-id))
+  (:report
+   (lambda (c s)
+     (format s "Store ~S (id ~D) is registered but not open -- ~
+detached.  Explicit access signals; incidental traversal would have ~
+received an UNRESOLVED-NODE marker instead (GH #169, D8)."
+             (store-detached-name c) (store-detached-id c)))))
+
 (defclass graph ()
   ((graph-name :accessor graph-name :initarg :graph-name)
    ;; Stable numeric id from the store registry; rides in every v8 node

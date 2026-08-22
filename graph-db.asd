@@ -529,6 +529,7 @@ cl-temporal-extent."
                (:file "type-id-seeding-tests")    ; GH #186
                (:file "keyword-alias-tests")      ; GH #190
                (:file "store-registry-tests")     ; GH #169
+               (:file "store-resolver-tests")     ; GH #169
                (:file "posix-tests")              ; GH #182
                (:file "rest-tests")
                (:file "rest-http-tests")

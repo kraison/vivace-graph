@@ -291,16 +291,35 @@ regenerates the id on a duplicate-key collision."
            :node edge))
   (delete-node edge graph))
 
+(defun %active-endpoint-status (id graph)
+  "(values VERTEX-OR-NIL STATUS) for edge endpoint ID against GRAPH, for
+ACTIVE-EDGE-P.  :FOUND when GRAPH's own table (or, for a definitely
+cross-store v8 id, LOOKUP-VERTEX-ANYWHERE) resolves a live vertex;
+:MISSING for a same-store/untagged miss -- unchanged pre-#169 semantics,
+an edge with a genuinely absent endpoint is inactive; :UNKNOWN for a
+cross-store id whose store is detached or unregistered -- can't disprove
+liveness, so it must not silently kill the edge (D8; GH #169).
+LOOKUP-VERTEX-ANYWHERE is defined in interface.lisp, loaded after this
+file; resolved at runtime like PIN-READ-EPOCH in graph-class.lisp."
+  (let ((v (lookup-vertex id :graph graph)))
+    (cond
+      (v (values v :found))
+      (t (let ((tag (id-store-tag id)))
+           (if (and tag (not (eql tag (store-id graph))))
+               (let ((r (lookup-vertex-anywhere id)))
+                 (if (vertex-p r) (values r :found) (values nil :unknown)))
+               (values nil :missing)))))))
+
 (defmethod active-edge-p ((edge edge) &key (graph *graph*))
-  (and (not (deleted-p edge))
-       (let ((from (lookup-vertex (from edge) :graph graph)))
-         (if (vertex-p from)
-             (not (deleted-p from))
-             nil))
-       (let ((to (lookup-vertex (to edge) :graph graph)))
-         (if (vertex-p to)
-             (not (deleted-p to))
-             nil))))
+  (flet ((endpoint-active-p (id)
+           (multiple-value-bind (v status) (%active-endpoint-status id graph)
+             (ecase status
+               (:found (not (deleted-p v)))
+               (:unknown t)
+               (:missing nil)))))
+    (and (not (deleted-p edge))
+         (endpoint-active-p (from edge))
+         (endpoint-active-p (to edge)))))
 
 (defmethod edge-exists-p (edge-type (vertex1 vertex) (vertex2 vertex)
                           &key (graph *graph*))

@@ -69,6 +69,17 @@
            #:+max-store-tag+
            #:uuid-v8-p
            #:id-store-tag
+           ;; GH #169: the tagged-id resolver and detached-read markers.
+           #:resolve-node-graph
+           #:lookup-vertex-anywhere
+           #:unresolved-node
+           #:unresolved-node-p
+           #:unresolved-node-id
+           #:unresolved-node-store-id
+           #:unresolved-node-store-name
+           #:store-detached-error
+           #:store-detached-name
+           #:store-detached-id
            ;; GH #186: a store's persisted type-ids disagree with the
            ;; image registry.  Operator-facing -- the remedy is a seeding
            ;; run plus a renumbering migration, not a retry.
