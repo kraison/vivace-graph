@@ -133,18 +133,120 @@ later open in this image, for the life of the process (GH #182)."
         (finish-output s)))
     record))
 
+(define-condition system-journal-corrupt (error)
+  ((file :initarg :file :reader journal-corrupt-file)
+   (position :initarg :position :reader journal-corrupt-position)
+   (cause :initarg :cause :reader journal-corrupt-cause))
+  (:report
+   (lambda (c s)
+     (format s "System journal ~A is unreadable at byte ~D, and intact ~
+records FOLLOW the damage, so this is not a torn tail from a power loss ~
+-- the file is corrupt and no record can be trusted (GH #191).  ~
+Underlying reader condition: ~A"
+             (journal-corrupt-file c)
+             (journal-corrupt-position c)
+             (journal-corrupt-cause c)))))
+
+(define-condition system-journal-torn-tail (warning)
+  ((file :initarg :file :reader journal-torn-file)
+   (position :initarg :position :reader journal-torn-position))
+  (:report
+   (lambda (c s)
+     (format s "System journal ~A ends in a torn record at byte ~D -- ~
+one lifecycle event was in flight during a power loss.  Dropping the ~
+tail; the preceding history is intact (GH #191)."
+             (journal-torn-file c)
+             (journal-torn-position c)))))
+
+(defun %journal-later-record-p (file pos)
+  "True when FILE holds a complete readable record after the failed read
+at byte POS -- corruption mid-file, not a torn tail.  Skips forward a
+line at a time and retries; a torn TAIL by definition has nothing
+readable after it.  Stream position after a failed READ is unspecified,
+so the next READ-LINE may re-skip part of the bad text -- harmless: the
+scan only has to find ONE later record or reach EOF (GH #191).  If the
+damage destroys the newline so the last GOOD record shares a line with
+leading garbage, the line-at-a-time scan skips both and truncation drops
+that good record too -- outside #191's power-loss model, where a torn
+append is always a strict suffix with the prior newline intact."
+  (with-open-file (s file :direction :input)
+    (file-position s pos)
+    (let ((*read-eval* nil))
+      (loop
+        (unless (read-line s nil) (return nil))
+        (handler-case
+            (let ((r (read s nil :eof)))
+              (return (not (eq r :eof))))
+          (error () nil))))))
+
+(defun %journal-truncate-to (clock file pos)
+  "Drop everything at and after byte POS: write the good prefix to a temp
+file and RENAME-FILE over the original, so a crash here cannot lose the
+intact history too.  Closes the append stream first -- after the rename
+it would still reference the OLD inode and later appends would vanish.
+Caller holds the clock lock AND the directory flock (SYSTEM-CLOCK-LOCK-FD
+non-nil) -- a stale CLOCK whose lock was released by CLOSE-SYSTEM-CLOCK
+must never call this: another process may hold the real lock and be
+mid-append, and renaming out from under it silently loses every record
+appended after the rename (GH #182, #191).  POS is octets: SBCL's
+FILE-POSITION on character streams reports octet offsets, which the
+multibyte test pins (GH #191)."
+  (when (system-clock-journal clock)
+    (close (system-clock-journal clock))
+    (setf (system-clock-journal clock) nil))
+  (let ((tmp (make-pathname :type "tmp" :defaults file))
+        (buf (make-byte-vector pos)))
+    (with-open-file (in file :direction :input
+                             :element-type '(unsigned-byte 8))
+      (unless (= pos (read-sequence buf in))
+        (error "Short read rewriting ~A" file)))
+    (with-open-file (out tmp :direction :output
+                             :element-type '(unsigned-byte 8)
+                             :if-exists :supersede)
+      (write-sequence buf out)
+      (finish-output out))
+    ;; Replaces the target (POSIX rename semantics on SBCL).
+    (rename-file tmp file)))
+
 (defun journal-records (clock)
-  "Every lifecycle record, oldest first.  Read with evaluation disabled --
-the journal is data and must never execute."
+  "Every lifecycle record, oldest first, as (values RECORDS TORN-P).
+Read with evaluation disabled -- the journal is data and must never
+execute.  A torn FINAL record (power loss mid-append) is dropped: the
+tail is truncated, SYSTEM-JOURNAL-TORN-TAIL is warned, and the intact
+history is returned with TORN-P true.  Damage anywhere ELSE signals
+SYSTEM-JOURNAL-CORRUPT and touches nothing (GH #191).
+
+Truncation only runs while CLOCK holds the directory flock
+(SYSTEM-CLOCK-LOCK-FD non-nil) -- after CLOSE-SYSTEM-CLOCK the lock is
+released and another process may own the file and be mid-append; an
+unowned CLOCK still warns and returns TORN-P true but leaves the file
+untouched, so it re-warns on every read until an owning reader truncates
+it.  That repeated warning is the accepted cost (GH #182, #191)."
   (let ((file (%clock-journal-file (system-clock-location clock))))
-    (when (system-clock-journal clock)
-      (finish-output (system-clock-journal clock)))
-    (when (probe-file file)
-      (with-open-file (s file :direction :input)
-        (let ((*read-eval* nil))
-          (loop for r = (read s nil :eof)
-                until (eq r :eof)
-                collect r))))))
+    (with-recursive-lock-held ((system-clock-lock clock))
+      (when (system-clock-journal clock)
+        (finish-output (system-clock-journal clock)))
+      (when (probe-file file)
+        (with-open-file (s file :direction :input)
+          (let ((*read-eval* nil)
+                (records nil)
+                (torn-p nil))
+            (loop
+              (let* ((pos (file-position s))
+                     (r (handler-case (read s nil :eof)
+                          (error (e)
+                            (when (%journal-later-record-p file pos)
+                              (error 'system-journal-corrupt
+                                     :file file :position pos :cause e))
+                            (when (system-clock-lock-fd clock)
+                              (%journal-truncate-to clock file pos))
+                            (setq torn-p t)
+                            (warn 'system-journal-torn-tail
+                                  :file file :position pos)
+                            :eof))))
+                (when (eq r :eof)
+                  (return (values (nreverse records) torn-p)))
+                (push r records)))))))))
 
 (defun %clock-reserve (clock needed)
   "Raise the durable ceiling so COUNTER + NEEDED stays below it.  Caller

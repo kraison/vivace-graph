@@ -294,6 +294,10 @@ wrong derived data whose provenance does not record the skew.
   *devices* — separate images — and **stays per-graph**; and the per-node 32-bit `revision`,
   untouched. Stated so nobody globalises the lamport counter by analogy.
 
+**Hardened (#191):** the journal reader tolerates a torn final record
+(truncate + `system-journal-torn-tail` warning, history preserved);
+mid-file damage signals `system-journal-corrupt`.
+
 **Sequencing:** the debt is monotonic. Every write before the migration lands below the
 watermark permanently. This does not block other units, but its cost accrues daily.
 

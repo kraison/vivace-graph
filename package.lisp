@@ -36,6 +36,13 @@
            #:clock-lease-epochs
            #:journal-append
            #:journal-records
+           #:system-journal-corrupt
+           #:journal-corrupt-file
+           #:journal-corrupt-position
+           #:journal-corrupt-cause
+           #:system-journal-torn-tail
+           #:journal-torn-file
+           #:journal-torn-position
            #:graph-system-clock
            #:attach-to-system-clock
            ;; image-level type-id registry (GH #186)
