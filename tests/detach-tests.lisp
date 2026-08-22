@@ -466,9 +466,17 @@ write; the retired dir exists; the journal carries :SWAP and :ATTACH."
           :validate t :if-does-not-exist :ignore))))))
 
 (test swap-failure-before-rename-restores-service
-  "A nonexistent shadow location fails SWAP-IN-SHADOW before the first
-rename; the live store is reopened (or was never closed) and still
-serves reads and writes."
+  "A nonexistent shadow location fails SWAP-IN-SHADOW before ANYTHING
+touches the live store (fix round 1): the precondition check runs
+before the quiesce, so there is no outage at all, not merely a
+recovered one.  Asserted by OBJECT IDENTITY, not just service: the
+SAME graph object G stays the one LOOKUP-GRAPH returns, ACCEPTING-P
+never leaves T, and a write succeeds immediately with no reopen in
+between.  ABLATION: reverting SWAP-IN-SHADOW to validate AFTER
+quiesce+close (the pre-fix ordering) makes the (EQ G ...) assertion
+fail, because that ordering closes G and recovers onto a NEW graph
+object -- a real, if brief, outage -- even though it also eventually
+restores service."
   (with-clocked-store (g clock sys)
     clock sys
     (with-transaction ((graph-db::transaction-manager g))
@@ -476,19 +484,80 @@ serves reads and writes."
     (let ((nonexistent (merge-pathnames
                         "nope-shadow/"
                         (uiop:ensure-directory-pathname
-                         (graph-db::location g)))))
+                         (graph-db::location g))))
+          (tm (graph-db::transaction-manager g)))
       (signals error (graph-db:swap-in-shadow g nonexistent))
-      (let* ((name (graph-db:graph-name g))
-             (g2 (graph-db:lookup-graph name))
-             (tm2 (graph-db::transaction-manager g2)))
-        (is-true g2)
-        (is (graph-db::graph-open-p g2))
-        (is (eq t (graph-db:accepting-p tm2)))
-        (let ((pin (graph-db:pin-read-epoch tm2)))
-          (graph-db:unpin-read-epoch tm2 pin))
-        (with-transaction (tm2)
-          (graph-db:make-vertex :generic nil :graph g2))
-        (setq g g2)))))
+      (is (eq t (graph-db:accepting-p tm)))
+      (is (eq g (graph-db:lookup-graph (graph-db:graph-name g))))
+      (is (graph-db::graph-open-p g))
+      (let ((pin (graph-db:pin-read-epoch tm)))
+        (graph-db:unpin-read-epoch tm pin))
+      (with-transaction (tm)
+        (graph-db:make-vertex :generic nil :graph g)))))
+
+;;; Fix round 1 (GH #170): a swap that completed its renames+journal but
+;;; then fails on the follow-up reopen must be reported as a SUCCESS
+;;; (recovered onto the new generation), not resignalled as a failure.
+
+(test swap-completed-p-discriminates-progress
+  "Pure unit test for the discrimination predicate itself: unset
+PROGRESS means \"not yet complete, recover the OLD store and
+resignal\"; PROGRESS marked complete means \"already succeeded,
+recover the NEW one and return\"."
+  (is (not (graph-db::%swap-completed-p (vector nil nil))))
+  (is-true (graph-db::%swap-completed-p (vector t "/some/retired/path"))))
+
+(test swap-in-shadow-1-progress-survives-a-post-rename-failure
+  "%SWAP-IN-SHADOW-1 must mark PROGRESS complete BEFORE attempting the
+follow-up OPEN-GRAPH, so a failure there is distinguishable from a
+failure in the renames/journal themselves.  There is no clean way to
+make SWAP-IN-SHADOW's own reopen fail once and then succeed on the
+recovery retry without a purpose-built test hook in production code
+(judged too invasive -- the same call the review flagged for
+*SYSTEM-CLOCK*-unbinding): a corrupted file fails identically on every
+subsequent open attempt, which only reproduces the already-tested
+SHADOW-RECOVERY-FAILED path, never the \"recovered onto the new
+generation\" happy path.  So this tests %SWAP-IN-SHADOW-1 directly
+instead (honestly, per the review's own fallback): renames + journal
+succeed, then the follow-up OPEN-GRAPH fails on a corrupted
+schema.dat, and PROGRESS must already show completion when the error
+propagates."
+  (with-clocked-store (g clock sys)
+    sys
+    (with-transaction ((graph-db::transaction-manager g))
+      (graph-db:make-vertex :generic nil :graph g))
+    (let ((name (graph-db:graph-name g))
+          (location (graph-db::location g))
+          (retired nil))
+      (unwind-protect
+           (progn
+             (let ((graph-db:*graph* g))
+               (close-graph g :snapshot-p nil))
+             (with-temp-directory (shadow-dir)
+               (let ((sg (make-graph name (namestring shadow-dir)
+                                    :buffer-pool-size 1000)))
+                 (with-transaction ((graph-db::transaction-manager sg))
+                   (graph-db:make-vertex :generic nil :graph sg))
+                 (let ((graph-db:*graph* sg))
+                   (close-graph sg :snapshot-p nil)))
+               ;; Corrupt the shadow's schema.dat: the reopen -- which
+               ;; only runs AFTER both renames -- fails deterministically.
+               (with-open-file (out (merge-pathnames "schema.dat" shadow-dir)
+                                    :direction :output :if-exists :supersede)
+                 (write-string "not a valid cl-store payload" out))
+               (let ((progress (vector nil nil)))
+                 (signals error
+                   (graph-db::%swap-in-shadow-1
+                    name location shadow-dir clock progress))
+                 (is-true (aref progress 0))
+                 (is-true (aref progress 1))
+                 (setq retired (aref progress 1))
+                 (is-true (probe-file retired)))))
+        (when (and retired (probe-file retired))
+          (ignore-errors
+           (uiop:delete-directory-tree
+            (uiop:ensure-directory-pathname retired)
+            :validate t :if-does-not-exist :ignore)))))))
 
 (test killed-loader-leaves-live-byte-identical
   "ABANDON-SHADOW is the discard path exercised here; it must also

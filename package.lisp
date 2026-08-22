@@ -69,6 +69,8 @@
            #:open-shadow-graph
            #:discard-shadow
            #:swap-in-shadow
+           #:swap-recovered-warning
+           #:swap-recovered-warning-original
            #:graph-shadow-p
            #:graph-epoch-lease
            #:epoch-lease
