@@ -2961,7 +2961,10 @@ runtime.
 Both definitions define the *same CLOS class*, so the last one loaded
 determines its slots; declaring different slot sets for the two stores is how
 you get a class whose accessors return ~NIL~ against one of them. Keep the
-definitions identical, or give the two stores different type names.
+definitions identical, or give the two stores different type names. Since
+GH #196, declaring different slot sets across stores signals
+~divergent-node-type-redefinition~, a ~style-warning~ naming both stores;
+identical slot sets stay silent.
 
 Before #186 the second definition signalled ~duplicate-node-class-error~,
 because the two stores would otherwise have disagreed about what their type-ids

@@ -82,6 +82,9 @@ carry their home graph.
 `*schema-node-metadata*` stops being keyed by graph-name. The registry becomes global; each
 store instantiates the types it holds.
 
+**Guarded (#196):** divergent slot sets across stores now signal
+`divergent-node-type-redefinition`; identical sets stay silent.
+
 ### 3.4 The global type registry
 
 One type-id space across the image, keyed by package-qualified symbol — structurally

@@ -13,6 +13,13 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Added
 
+- Defining one class name in two stores with *different* slot sets now
+  signals `divergent-node-type-redefinition` (a `style-warning`): both
+  definitions name one CLOS class, so the last one loaded determines the
+  slots and the earlier store's data becomes unreachable through the API
+  (the GH #53 failure). Identical slot sets — the multi-store feature —
+  stay silent. (#196)
+
 - **A store's persisted type-ids are reconciled with the registry at open,
   or the open is refused** (#186). This is the invariant the rest of the unit
   assumed and nothing established. `instantiate-node-type` keeps a persisted

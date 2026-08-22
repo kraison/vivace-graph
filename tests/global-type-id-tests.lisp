@@ -330,3 +330,45 @@ last check names that harm directly."
                                                     :vertex))
                   "the registry must be untouched: SHARED-TYPE is still ~
 5, not re-bound to the store's id"))))))))
+
+;;; -----------------------------------------------------------------------
+;;; Divergent slot sets across stores warn; identical ones stay silent
+;;; (GH #196, re-guarding GH #53's failure mode after
+;;; %CHECK-NODE-CLASS-GRAPH-UNIQUE was correctly deleted by #186).
+;;;
+;;; The DEF-VERTEX forms are EVAL'd inside the tests, not written at
+;;; toplevel: the divergent pair would otherwise warn at load time of
+;;; this file, polluting every suite run's output.  No graph is opened
+;;; and no system directory is needed -- the check is metadata-level.
+;;; -----------------------------------------------------------------------
+
+(test divergent-slot-sets-across-stores-warn
+  "Same class symbol, two stores, DIFFERENT slots: the second definition
+must signal.  Nearest wrong implementation: never warn (the guard
+deleted by #186 with nothing in its place)."
+  (handler-bind ((warning #'muffle-warning))
+    (eval '(def-vertex gdiv-probe () ((div-a :type string))
+             :gdiv-store-a)))
+  (signals graph-db:divergent-node-type-redefinition
+    (eval '(def-vertex gdiv-probe () ((div-b :type string))
+             :gdiv-store-b))))
+
+(test identical-slot-sets-across-stores-stay-silent
+  "Same class symbol, two stores, SAME slots: the feature, and it must
+stay silent.  Nearest wrong implementation: warn on any cross-store
+redefinition regardless of the slots."
+  (handler-bind ((warning #'muffle-warning))
+    (eval '(def-vertex gdiv-same () ((div-c :type string))
+             :gdiv-store-c)))
+  (is-true
+   (handler-case
+       (progn (eval '(def-vertex gdiv-same () ((div-c :type string))
+                       :gdiv-store-d))
+              t)
+     (graph-db:divergent-node-type-redefinition () nil))))
+
+(test divergence-warning-is-a-style-warning
+  "STYLE-WARNING, not a bare WARNING: the design deliberately permits the
+redefinition (GH #196), so it must be muffleable by severity class."
+  (is (subtypep 'graph-db:divergent-node-type-redefinition
+                'style-warning)))

@@ -294,6 +294,48 @@ non-keyword symbol is the type's identity and is looked up directly."
   (finalize-inheritance (find-class (node-type-name meta)))
   (save-schema (schema graph) graph))
 
+(define-condition divergent-node-type-redefinition (style-warning)
+  ((name :initarg :name :reader divergent-type-name)
+   (graph-name :initarg :graph-name :reader divergent-type-graph-name)
+   (other-graphs :initarg :other-graphs
+                 :reader divergent-type-other-graphs))
+  (:report
+   (lambda (c s)
+     (format s "Node type ~S is being defined for ~S with a slot set ~
+that differs from its definition for ~{~S~^, ~}.  All of these name ONE ~
+CLOS class, so the last definition loaded determines the slots; data ~
+stored under the other slot set stays on disk but becomes unreachable ~
+through the API (GH #196, GH #53).  Keep the slot sets identical, or ~
+use different type names."
+             (divergent-type-name c)
+             (divergent-type-graph-name c)
+             (divergent-type-other-graphs c)))))
+
+(defun %warn-if-divergent-across-stores (meta)
+  "STYLE-WARNING when META's class symbol is already registered under a
+DIFFERENT graph-name with a non-EQUAL slot list.  Identical slots are the
+multi-store feature and stay silent; a same-store redefinition is schema
+evolution and is not this guard's business (GH #196)."
+  (let ((divergent nil))
+    (maphash
+     (lambda (graph-name metas)
+       ;; EQUAL, not EQ: GRAPH-NAME may be a string (GH #53's
+       ;; strchk-one fixture), and EQ would misdiagnose a same-store
+       ;; redefinition as cross-store divergence (GH #196).
+       (unless (equal graph-name (node-type-graph-name meta))
+         (let ((other (find (node-type-name meta) metas
+                            :key #'node-type-name)))
+           (when (and other
+                      (not (equal (node-type-slots other)
+                                  (node-type-slots meta))))
+             (push graph-name divergent)))))
+     *schema-node-metadata*)
+    (when divergent
+      (warn 'divergent-node-type-redefinition
+            :name (node-type-name meta)
+            :graph-name (node-type-graph-name meta)
+            :other-graphs (nreverse divergent)))))
+
 (defmacro def-node-type (name parent-types slot-specs graph-name &key keep-revisions)
   "Define a persistent node type NAME for the graph named GRAPH-NAME.  This is
 the machinery behind DEF-VERTEX and DEF-EDGE; you normally use those instead.
@@ -327,6 +369,7 @@ be defined before or after the graph is created."
       `(progn
          ;; No cross-graph uniqueness check: type-ids are system-wide as of
          ;; #186, so one class may be instantiated in more than one store.
+         ;; Divergent slot sets across stores warn instead (GH #196).
          (defclass ,name (,@parent-types)
            (,@slot-specs)
            (:metaclass node-class))
@@ -340,6 +383,7 @@ be defined before or after the graph is created."
                   :package (package-name *package*)
                   :constructor ',constructor
                   :keep-revisions ,keep-revisions)))
+           (%warn-if-divergent-across-stores ,meta)
            ;; FIXME: why is this necessary when inheriting from another node subclass?
            ;;(unless (class-finalized-p (find-class ',name))
            (finalize-inheritance (find-class ',name))

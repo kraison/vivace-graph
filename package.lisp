@@ -180,6 +180,10 @@
            #:ambiguous-type-name
            #:ambiguous-type-parent
            #:ambiguous-type-candidates
+           #:divergent-node-type-redefinition
+           #:divergent-type-name
+           #:divergent-type-graph-name
+           #:divergent-type-other-graphs
            #:instantiate-node-type
            #:*schema-node-metadata*
            #:with-write-locked-class
