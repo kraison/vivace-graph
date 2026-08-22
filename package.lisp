@@ -80,6 +80,13 @@
            #:epoch-lease-exhausted
            #:epoch-lease-exhausted-name
            #:epoch-lease-exhausted-end
+           ;; Recovery policy + WAL-suppressed fast path (GH #170 Task 4).
+           #:store-recovery-policy
+           #:set-store-recovery-policy
+           #:fast-load-requires-derivable
+           #:fast-load-requires-derivable-location
+           #:fast-load-requires-derivable-policy
+           #:wal-suppressed-p
            ;; image-level type-id registry (GH #186)
            #:type-registry
            #:open-type-registry

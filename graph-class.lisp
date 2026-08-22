@@ -234,7 +234,14 @@ received an UNRESOLVED-NODE marker instead (GH #169, D8)."
    ;; an :INITARG -- one would be dead weight the constructor never
    ;; receives.
    (shadow-p :accessor graph-shadow-p :initform nil)
-   (epoch-lease :accessor graph-epoch-lease :initform nil)))
+   (epoch-lease :accessor graph-epoch-lease :initform nil)
+   ;; WAL-suppressed fast path (GH #170 Task 4).  T only on a shadow opened
+   ;; via OPEN-SHADOW-GRAPH :FAST-LOAD T against a :DERIVABLE-policy source;
+   ;; PERSIST-TRANSACTION's callers skip the .txn file and replication log
+   ;; entirely when this is set.  Per-graph slot, not a dynamic variable --
+   ;; a special would leak suppression to any OTHER graph committing on the
+   ;; same thread.  NIL by default: an ordinary graph is never suppressed.
+   (wal-suppressed-p :accessor wal-suppressed-p :initform nil)))
 
 (defstruct epoch-lease
   "A shadow store's leased txn-id range [START, END) (GH #170).  NEXT is

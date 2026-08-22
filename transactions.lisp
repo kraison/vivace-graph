@@ -2299,17 +2299,24 @@ left in the stream."
                    :defaults (transaction-pathname transaction))))
 
 (defgeneric persist-transaction (transaction)
+  (:documentation
+   "Legacy single-shot persistence path -- superseded on the commit hot
+path by the PREPARE-TX-PERSISTENCE / FINALIZE-TX-PERSISTENCE split (GH
+#135), which this generic has no callers left in this system; kept
+current for any external caller and honors the same WAL-suppressed
+no-op as FINALIZE-TX-PERSISTENCE (GH #170 Task 4).")
   (:method (transaction)
-    (persist-tx transaction
-                (transaction-temporary-pathname transaction)
-                (transaction-pathname transaction))
-    (let* ((transaction-manager (transaction-manager transaction))
-           (stream (replication-log transaction-manager))
-           (lock (replication-log-lock transaction-manager)))
-      (with-recursive-lock-held (lock)
-        (write-sequence (bytes transaction)
-                        (replication-log (transaction-manager transaction)))
-        (finish-output stream)))))
+    (unless (wal-suppressed-p (graph transaction))
+      (persist-tx transaction
+                  (transaction-temporary-pathname transaction)
+                  (transaction-pathname transaction))
+      (let* ((transaction-manager (transaction-manager transaction))
+             (stream (replication-log transaction-manager))
+             (lock (replication-log-lock transaction-manager)))
+        (with-recursive-lock-held (lock)
+          (write-sequence (bytes transaction)
+                          (replication-log (transaction-manager transaction)))
+          (finish-output stream))))))
 
 (defun transaction-prepare-pathname (transaction)
   "A unique per-attempt temp pathname, keyed by SEQUENCE-NUMBER (the
@@ -2555,16 +2562,25 @@ the transaction-manager lock, so the bulk serialization + disk write (and the
 flush at close) are off the serialized commit path.  The header id is written as
 the placeholder 0 — the real id is encoded in the final FILENAME by the rename in
 FINALIZE-TX-PERSISTENCE, and recovery reads it from there.  Returns the temp
-pathname."
+pathname.
+
+WAL-suppressed (GH #170 Task 4): when (GRAPH TRANSACTION)'s WAL-SUPPRESSED-P
+is set, no temp file is written and BYTES is left unpopulated -- FINALIZE-TX-
+PERSISTENCE checks the same slot and skips both the rename and the
+replication-log write, so nothing here would ever be read.  REFRESH-CREATE-
+SET-BYTES still runs unconditionally: it refreshes each node's own BYTES from
+DATA, which APPLY-TRANSACTION's heap allocation depends on regardless of WAL
+suppression (GH #135)."
   (refresh-create-set-bytes transaction)
   (let ((tmp (transaction-prepare-pathname transaction)))
-    (with-open-file (stream tmp :direction :output
-                            :if-exists :supersede
-                            :if-does-not-exist :create
-                            :element-type '(unsigned-byte 8))
-      (write-tx-header-to-stream transaction stream 0)
-      (write-tx-writes-to-stream transaction stream))
-    (initialize-bytes-from-components transaction)
+    (unless (wal-suppressed-p (graph transaction))
+      (with-open-file (stream tmp :direction :output
+                              :if-exists :supersede
+                              :if-does-not-exist :create
+                              :element-type '(unsigned-byte 8))
+        (write-tx-header-to-stream transaction stream 0)
+        (write-tx-writes-to-stream transaction stream))
+      (initialize-bytes-from-components transaction))
     tmp))
 
 (defun finalize-tx-persistence (transaction tmp)
@@ -2577,57 +2593,73 @@ lock).  Recovery reads the id from this filename, so the file's header id stays
 at its placeholder 0.  Master graphs additionally patch the real id into the
 in-memory bytes and append them to the replication log in commit order for
 downstream slaves (the replication path is the only consumer of the header id,
-and it reads these patched bytes, never the .txn files)."
-  ;; Use POSIX rename(2) (atomic; replaces an existing target) rather than
-  ;; cl:rename-file.  SBCL/ECL's rename-file already overwrites per POSIX, but
-  ;; CCL's signals "File exists" when the target exists — which intermittently
-  ;; crashed concurrent-stress on CCL.  %posix-rename gives portable, atomic,
-  ;; overwrite-on-rename behavior across all implementations.
-  (%posix-rename (namestring tmp)
-                 (namestring (transaction-pathname transaction)))
-  (let ((tm (transaction-manager transaction)))
-    ;; peer-replication WP-2: generalized from MASTER-GRAPH-P so a peer-graph also
-    ;; journals its own committed writes (a device's push feed / a hub's pull feed).
-    ;; The patched-in transaction-id is the per-origin feed sequence (design §3 #3).
-    (when (journals-own-feed-p (graph tm))
-      (serialize-uint64 (bytes transaction)
-                        (transaction-id transaction)
-                        +tx-header-id-offset+)
-      (let ((repl-stream (replication-log tm))
-            (lock (replication-log-lock tm))
-            (gr (graph tm)))
-        (with-recursive-lock-held (lock)
-          ;; peer-replication WP-0: a peer-graph prefixes the feed entry with a
-          ;; peer-meta packet (op identity + lamport), then records that it has
-          ;; applied its own authored op so a re-homed bounce-back is deduped
-          ;; (design §6).  A master journals plain tx bytes, unchanged.
-          (when (peer-graph-p gr)
-            (if *peer-rehome-op*
-                ;; B2d-2: a hub re-home preserves the ORIGINAL op's identity on the
-                ;; feed entry (design §5) so device E pulls it as the author's op and
-                ;; the author dedups its own bounce-back; the re-home caller applies
-                ;; the merge's per-field stamps, so finalize does not stamp here.
-                (destructuring-bind (rop-id rorigin rlamport) *peer-rehome-op*
-                  (write-sequence
-                   (serialize-peer-meta rorigin rop-id rlamport +peer-op-authored+)
-                   repl-stream)
-                  (record-applied-op gr rop-id rlamport))
-                (let ((op-id (gen-op-id))
-                      (lamport (peer-next-lamport gr))
-                      (origin (or (origin-id gr) +peer-null-origin+)))
-                  (write-sequence
-                   (serialize-peer-meta origin op-id lamport +peer-op-authored+)
-                   repl-stream)
-                  (record-applied-op gr op-id lamport)
-                  ;; B2b: stamp every field this locally-authored op changed with
-                  ;; (lamport . origin) -- the LWW basis a later concurrent edit
-                  ;; from another replica compares against.
-                  (dolist (w (writes transaction))
-                    (let ((nid (id (node w))))
-                      (dolist (slot (authored-changed-slots w))
-                        (set-node-field-stamp gr nid slot lamport origin)))))))
-          (write-sequence (bytes transaction) repl-stream)
-          (finish-output repl-stream))))))
+and it reads these patched bytes, never the .txn files).
+
+WAL-suppressed (GH #170 Task 4): when (GRAPH TRANSACTION)'s WAL-SUPPRESSED-P
+is set, this whole body is skipped -- no rename (PREPARE-TX-PERSISTENCE wrote
+no TMP file to rename), no replication-log entry.  Checked on the transaction's
+own GRAPH, a per-graph slot, never a dynamic variable -- a special would leak
+suppression onto any OTHER graph committing on the same thread."
+  (unless (wal-suppressed-p (graph transaction))
+    ;; Use POSIX rename(2) (atomic; replaces an existing target) rather
+    ;; than cl:rename-file.  SBCL/ECL's rename-file already overwrites
+    ;; per POSIX, but CCL's signals "File exists" when the target
+    ;; exists — which intermittently crashed concurrent-stress on CCL.
+    ;; %posix-rename gives portable, atomic, overwrite-on-rename
+    ;; behavior across all implementations.
+    (%posix-rename (namestring tmp)
+                   (namestring (transaction-pathname transaction)))
+    (let ((tm (transaction-manager transaction)))
+      ;; peer-replication WP-2: generalized from MASTER-GRAPH-P so a
+      ;; peer-graph also journals its own committed writes (a device's
+      ;; push feed / a hub's pull feed).  The patched-in transaction-id
+      ;; is the per-origin feed sequence (design §3 #3).
+      (when (journals-own-feed-p (graph tm))
+        (serialize-uint64 (bytes transaction)
+                          (transaction-id transaction)
+                          +tx-header-id-offset+)
+        (let ((repl-stream (replication-log tm))
+              (lock (replication-log-lock tm))
+              (gr (graph tm)))
+          (with-recursive-lock-held (lock)
+            ;; peer-replication WP-0: a peer-graph prefixes the feed
+            ;; entry with a peer-meta packet (op identity + lamport),
+            ;; then records that it has applied its own authored op so
+            ;; a re-homed bounce-back is deduped (design §6).  A master
+            ;; journals plain tx bytes, unchanged.
+            (when (peer-graph-p gr)
+              (if *peer-rehome-op*
+                  ;; B2d-2: a hub re-home preserves the ORIGINAL op's
+                  ;; identity on the feed entry (design §5) so device E
+                  ;; pulls it as the author's op and the author dedups
+                  ;; its own bounce-back; the re-home caller applies
+                  ;; the merge's per-field stamps, so finalize does not
+                  ;; stamp here.
+                  (destructuring-bind (rop-id rorigin rlamport) *peer-rehome-op*
+                    (write-sequence
+                     (serialize-peer-meta
+                      rorigin rop-id rlamport +peer-op-authored+)
+                     repl-stream)
+                    (record-applied-op gr rop-id rlamport))
+                  (let ((op-id (gen-op-id))
+                        (lamport (peer-next-lamport gr))
+                        (origin (or (origin-id gr) +peer-null-origin+)))
+                    (write-sequence
+                     (serialize-peer-meta
+                      origin op-id lamport +peer-op-authored+)
+                     repl-stream)
+                    (record-applied-op gr op-id lamport)
+                    ;; B2b: stamp every field this locally-authored op
+                    ;; changed with (lamport . origin) -- the LWW basis
+                    ;; a later concurrent edit from another replica
+                    ;; compares against.
+                    (dolist (w (writes transaction))
+                      (let ((nid (id (node w))))
+                        (dolist (slot (authored-changed-slots w))
+                          (set-node-field-stamp
+                           gr nid slot lamport origin)))))))
+            (write-sequence (bytes transaction) repl-stream)
+            (finish-output repl-stream)))))))
 
 ;;; Locking for object sets
 
@@ -3294,7 +3326,12 @@ image / snapshot at each clean close) is its only durable record.")
 (defmethod cleanup-transaction ((tx tx))
   (let ((transaction-manager (transaction-manager tx)))
     (if (eql (state tx) :committed)
-        (unless (retain-committed-transaction-p (graph tx))
+        ;; WAL-suppressed (GH #170 Task 4): FINALIZE-TX-PERSISTENCE never
+        ;; renamed a .txn file into place for this commit, so there is
+        ;; nothing here for MARK-AS-COMMITTED to delete/rename -- calling
+        ;; it anyway would RENAME-FILE a path that was never created.
+        (unless (or (wal-suppressed-p (graph tx))
+                    (retain-committed-transaction-p (graph tx)))
           (mark-as-committed (transaction-pathname tx)))
         (remove-transaction tx transaction-manager))))
 

@@ -8,11 +8,13 @@
   :description "Quiescence, DETACH-STORE, and REATTACH-STORE.")
 (in-suite detach-suite)
 
-(defmacro with-clocked-store ((g clock sys) &body body)
+(defmacro with-clocked-store ((g clock sys &key recovery-policy) &body body)
   "One disk store, under a fresh *SYSTEM-DIRECTORY*, attached to its own
 system clock -- the fixture DETACH-STORE / REATTACH-STORE need, adapted
 from TESTS/SYSTEM-CLOCK-TESTS.LISP's
-TWO-STORES-ON-ONE-CLOCK-GET-DISJOINT-ORDERED-EPOCHS."
+TWO-STORES-ON-ONE-CLOCK-GET-DISJOINT-ORDERED-EPOCHS.  :RECOVERY-POLICY
+(GH #170 Task 4) is passed through to MAKE-GRAPH; NIL (default) persists
+nothing, matching every pre-Task-4 use of this fixture."
   (let ((cdir (gensym)) (ddir (gensym)))
     `(with-temp-directory (,sys)
        (with-temp-directory (,cdir)
@@ -24,7 +26,8 @@ TWO-STORES-ON-ONE-CLOCK-GET-DISJOINT-ORDERED-EPOCHS."
                     (let ((,g (make-graph :detach-store-1
                                           (namestring ,ddir)
                                           :buffer-pool-size 1000
-                                          :system-clock ,clock)))
+                                          :system-clock ,clock
+                                          :recovery-policy ,recovery-policy)))
                       (unwind-protect (progn ,@body)
                         (when (graph-db::graph-open-p ,g)
                           (let ((graph-db:*graph* ,g))
@@ -643,14 +646,21 @@ cross-compilation) and this build's SB-POSIX:STAT has no ST_BLOCKS
 accessor either -- so this uses SBCL's own SB-UNIX:UNIX-STAT, whose
 14th value is ST-BLOCKS (confirmed against sbcl/src/code/unix.lisp's
 %EXTRACT-STAT-RESULTS field order: dev ino mode nlink uid gid rdev size
-atime mtime ctime blksize blocks) (GH #170)."
+atime mtime ctime blksize blocks) (GH #170).  SBCL-only:
+SB-UNIX:UNIX-STAT is a bare SBCL symbol, so the whole body is #+SBCL --
+otherwise it is a read-time package error on ECL/CCL (fold-in from Task
+3's re-review; see tests/geometry-tests.lisp for the same #+sbcl idiom)."
+  #+sbcl
   (multiple-value-bind (ok dev ino mode nlink uid gid rdev size
                         atime mtime ctime blksize blocks)
       (sb-unix:unix-stat (namestring path))
     (declare (ignore dev ino mode nlink uid gid rdev size
                      atime mtime ctime blksize))
     (unless ok (error "SB-UNIX:UNIX-STAT failed for ~A" path))
-    (* 512 blocks)))
+    (* 512 blocks))
+  #-sbcl
+  (error "%FILE-REAL-BYTES (sparse-file real-usage check) is SBCL-only; ~
+no portable ST_BLOCKS accessor is wired up for this implementation."))
 
 (defun %directory-usage (dir)
   "(values APPARENT-SIZES REAL-BYTES) for every regular file under DIR:
@@ -947,3 +957,124 @@ later."
                   shadow-location :detach-store-1))))
         (let ((graph-db:*graph* g2))
           (ignore-errors (close-graph g2 :snapshot-p nil)))))))
+
+;;; Recovery policy + the WAL-suppressed fast path (GH #170 Task 4).
+
+(defun %txn-file-count (graph)
+  "Count of *.txn files in GRAPH's persistent transaction directory
+(GH #170)."
+  (length (directory
+           (merge-pathnames
+            "*.txn"
+            (graph-db::persistent-transaction-directory graph)))))
+
+(test recovery-policy-round-trips-through-make-graph
+  "MAKE-GRAPH :RECOVERY-POLICY :DERIVABLE persists policy.dat, and
+STORE-RECOVERY-POLICY reads it back; a store made without the keyword
+has no policy.dat and reads back :AUTHORED (the documented absent-file
+default)."
+  (with-clocked-store (g clock sys :recovery-policy :derivable)
+    clock sys
+    (is (eq :derivable
+            (graph-db:store-recovery-policy (graph-db::location g)))))
+  (with-clocked-store (g clock sys)
+    clock sys
+    (is (eq :authored
+            (graph-db:store-recovery-policy (graph-db::location g))))))
+
+(test recovery-policy-file-rejects-garbage
+  "A policy.dat that holds neither :DERIVABLE nor :AUTHORED is a hard
+error, not a silent fall back to :AUTHORED -- a corrupt gate input for
+:FAST-LOAD must never pass unnoticed.  SET-STORE-RECOVERY-POLICY itself
+also refuses a bad value outright."
+  (with-clocked-store (g clock sys)
+    clock sys
+    (signals error
+      (graph-db:set-store-recovery-policy (graph-db::location g) :bogus))
+    (with-open-file (out (merge-pathnames
+                          "policy.dat"
+                          (uiop:ensure-directory-pathname
+                           (graph-db::location g)))
+                        :direction :output :if-exists :supersede
+                        :if-does-not-exist :create)
+      (prin1 :bogus out))
+    (signals error
+      (graph-db:store-recovery-policy (graph-db::location g)))))
+
+(test fast-load-on-authored-store-signals
+  "OPEN-SHADOW-GRAPH :FAST-LOAD T against a shadow whose source store's
+recovery policy is :AUTHORED (the default -- no :RECOVERY-POLICY was
+ever given) signals FAST-LOAD-REQUIRES-DERIVABLE rather than silently
+dropping the WAL.  ABLATION (recorded, not re-run here): remove the
+gate in OPEN-SHADOW-GRAPH and this test is the one that fails."
+  (with-clocked-store (g clock sys)
+    sys
+    (with-transaction ((graph-db::transaction-manager g))
+      (graph-db:make-vertex :generic nil :graph g))
+    (multiple-value-bind (shadow-location g2) (graph-db:shadow-store g)
+      (unwind-protect
+           (multiple-value-bind (start end)
+               (graph-db:clock-lease-epochs clock 1000)
+             (signals graph-db:fast-load-requires-derivable
+               (graph-db:open-shadow-graph
+                shadow-location :detach-store-1
+                :lease (cons start end) :fast-load t)))
+        (let ((graph-db:*graph* g2))
+          (ignore-errors (close-graph g2 :snapshot-p nil)))))))
+
+(test fast-load-writes-no-txn-files-and-data-survives-reopen
+  "OPEN-SHADOW-GRAPH :FAST-LOAD T against a :DERIVABLE source: writes
+into the shadow leave its transaction directory EMPTY of .txn files
+(PERSIST-TRANSACTION's WAL-suppressed no-op), yet the data reads back
+after CLOSE-GRAPH + a plain reopen -- durability comes from the
+heap/index writes themselves, which is what licenses discard-on-crash
+for a shadow (the spec's whole premise for this path)."
+  (with-clocked-store (g clock sys :recovery-policy :derivable)
+    sys
+    (with-transaction ((graph-db::transaction-manager g))
+      (graph-db:make-vertex :generic nil :graph g))
+    (multiple-value-bind (shadow-location g2) (graph-db:shadow-store g)
+      (unwind-protect
+           (multiple-value-bind (start end)
+               (graph-db:clock-lease-epochs clock 1000)
+             (let ((sg (graph-db:open-shadow-graph
+                        shadow-location :detach-store-1
+                        :lease (cons start end) :fast-load t)))
+               (is-true (graph-db::wal-suppressed-p sg))
+               (dotimes (i 3)
+                 (with-transaction ((graph-db::transaction-manager sg))
+                   (graph-db:make-vertex :generic nil :graph sg)))
+               (is (zerop (%txn-file-count sg)))
+               (let ((graph-db:*graph* sg))
+                 (close-graph sg :snapshot-p nil))
+               (let ((sg2 (graph-db:open-shadow-graph
+                           shadow-location :detach-store-1)))
+                 (unwind-protect
+                      (is (= 4 (length (graph-db:map-vertices
+                                       #'identity sg2 :collect-p t))))
+                   (let ((graph-db:*graph* sg2))
+                     (ignore-errors
+                      (close-graph sg2 :snapshot-p nil)))))))
+        (let ((graph-db:*graph* g2))
+          (ignore-errors (close-graph g2 :snapshot-p nil)))))))
+
+(test normal-graph-still-writes-txn-files
+  "The no-leak pin: an ordinary (non-shadow) graph's commit really does
+rename a .txn file into place -- CLEANUP-TRANSACTION deletes it right
+after (the default *DELETE-COMMITTED-TRANSACTION-FILES* T), so bind
+that NIL and look for the renamed *.committed file instead, proof that
+FINALIZE-TX-PERSISTENCE's rename actually ran.  Nearest wrong
+implementation: WAL suppression via a dynamic variable, which -- unlike
+the per-graph WAL-SUPPRESSED-P slot this checks indirectly by observing
+its effect -- would leak onto whatever graph happens to be committing
+on the thread that last set it."
+  (with-clocked-store (g clock sys)
+    clock sys
+    (is (= 0 (%txn-file-count g)))
+    (let ((graph-db::*delete-committed-transaction-files* nil))
+      (with-transaction ((graph-db::transaction-manager g))
+        (graph-db:make-vertex :generic nil :graph g)))
+    (is (= 1 (length (directory
+                      (merge-pathnames
+                       "*.committed"
+                       (graph-db::persistent-transaction-directory g))))))))

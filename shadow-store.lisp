@@ -98,6 +98,62 @@ outright (GH #170)."
           (merge-pathnames (uiop:enough-pathname file source) destination)))))
     destination))
 
+;;; Recovery policy (GH #170 Task 4).  A store's policy.dat records
+;;; whether its state is DERIVABLE (rebuildable from elsewhere -- a
+;;; shadow copied from a live store's data -- so a crash may discard it)
+;;; or AUTHORED (the only durable record of its writes -- the default,
+;;; and what every pre-#170 store implicitly is).  OPEN-SHADOW-GRAPH
+;;; :FAST-LOAD gates on this alone.
+
+(defun %policy-file (location)
+  (merge-pathnames "policy.dat" (uiop:ensure-directory-pathname location)))
+
+(defun store-recovery-policy (location)
+  "Read LOCATION's recovery policy from policy.dat: :DERIVABLE or
+:AUTHORED.  Absent file means :AUTHORED -- a store predating this
+feature, or one nobody ever opted in, must not be treated as
+derivable.  *READ-EVAL* NIL: untrusted input, same reasoning as
+%READ-LEASE.  A file present but not one of the two keywords is a
+hard error -- silently falling back to :AUTHORED would hide a corrupt
+gate input (GH #170)."
+  (let ((file (%policy-file location)))
+    (if (probe-file file)
+        (with-open-file (in file)
+          (let* ((*read-eval* nil)
+                 (value (read in nil nil)))
+            (unless (member value '(:derivable :authored))
+              (error "~A does not hold a valid recovery policy (expected ~
+:DERIVABLE or :AUTHORED, read ~S)." file value))
+            value))
+        :authored)))
+
+(defun set-store-recovery-policy (location policy)
+  "Write POLICY (:DERIVABLE or :AUTHORED) readably to LOCATION's
+policy.dat.  Errors on any other value -- this file is the sole gate
+input for OPEN-SHADOW-GRAPH's :FAST-LOAD, so a bad value must not
+silently authorize the WAL-free path (GH #170)."
+  (unless (member policy '(:derivable :authored))
+    (error "SET-STORE-RECOVERY-POLICY: POLICY must be :DERIVABLE or ~
+:AUTHORED, got ~S." policy))
+  (with-open-file (out (%policy-file location)
+                       :direction :output :if-exists :supersede
+                       :if-does-not-exist :create)
+    (let ((*print-readably* nil) (*print-pretty* nil))
+      (prin1 policy out)))
+  policy)
+
+(define-condition fast-load-requires-derivable (error)
+  ;; The whole safety story for :FAST-LOAD: an :AUTHORED store's shadow
+  ;; is the only durable record of anything written into it, so skipping
+  ;; the WAL there would silently discard data on a crash (GH #170).
+  ((location :initarg :location :reader fast-load-requires-derivable-location)
+   (policy :initarg :policy :reader fast-load-requires-derivable-policy))
+  (:report (lambda (c s)
+             (format s "OPEN-SHADOW-GRAPH :FAST-LOAD T requires the ~
+source store's recovery policy to be :DERIVABLE; ~A carries ~S."
+                     (fast-load-requires-derivable-location c)
+                     (fast-load-requires-derivable-policy c)))))
+
 (defun %shadow-suffix-p (path)
   "True when PATH's directory name ends in \"-shadow\" -- the entire
 safety story for DISCARD-SHADOW, which deletes trees (GH #170)."
@@ -245,15 +301,27 @@ this open -- EPOCH-LEASE-EXHAUSTED is signalled immediately rather than
 quietly wrapping, reusing an id, or deferring the failure to the first
 write (GH #170, fix round 2).
 
-FAST-LOAD and EXPECTED-VECTORS are Task 4/5 hooks: accepted here, but
-using either signals a clear \"arrives in a later task\" error rather
-than silently doing nothing."
-  (when fast-load
-    (error "OPEN-SHADOW-GRAPH :FAST-LOAD is a Task 4 hook and is not ~
-implemented yet (GH #170)."))
+FAST-LOAD (GH #170 Task 4): skip the .txn file and replication log for
+every transaction committed against the returned graph -- the shadow's
+heap/index writes are its only durable record until a later SWAP-IN-
+SHADOW or DISCARD-SHADOW, so this is only safe when the SOURCE store's
+recovery policy is :DERIVABLE (checked via STORE-RECOVERY-POLICY on
+SHADOW-LOCATION -- the shadow dir carries the copied policy.dat, so
+that copy is the gate input, not a fresh read of the live store).
+:AUTHORED (including the no-policy-file default) signals
+FAST-LOAD-REQUIRES-DERIVABLE instead of silently keeping the WAL.
+
+EXPECTED-VECTORS is a Task 5 hook: accepted here, but using it signals
+a clear \"arrives in a later task\" error rather than silently doing
+nothing."
   (when expected-vectors
     (error "OPEN-SHADOW-GRAPH :EXPECTED-VECTORS is a Task 5 hook and is ~
 not implemented yet (GH #170)."))
+  (when fast-load
+    (let ((policy (store-recovery-policy shadow-location)))
+      (unless (eq policy :derivable)
+        (error 'fast-load-requires-derivable
+               :location shadow-location :policy policy))))
   (let* ((location
           (uiop:ensure-directory-pathname shadow-location))
          (open-args (list graph-name (namestring location)
@@ -263,6 +331,8 @@ not implemented yet (GH #170)."))
                             (append open-args
                                    (list :buffer-pool-size buffer-pool-size))
                             open-args))))
+      (when fast-load
+        (setf (wal-suppressed-p graph) t))
       (let* ((persisted (and (null lease) (%read-lease location)))
              (start (if lease (car lease) (getf persisted :lease-start)))
              (end (if lease (cdr lease) (getf persisted :lease-end))))

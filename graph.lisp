@@ -307,7 +307,8 @@ debugging an unexpectedly empty result, check the declaration before the data."
                                    reference-classes (peer-schema-version '(1 0))
                                    (index-backend *index-backend*)
                                    spatial-index-backend
-                                   (system-clock *system-clock*))
+                                   (system-clock *system-clock*)
+                                   recovery-policy)
   "Create a brand-new graph named NAME with its on-disk files under the
 directory LOCATION, register it (so LOOKUP-GRAPH and *GRAPH* can find it), and
 return it.  The directory is created if necessary and must not already contain
@@ -364,6 +365,12 @@ Keyword arguments:
                           store's own counter -- the pre-#168 behaviour.
                           Attaching raises the clock above this store's
                           persisted highest id.
+  :RECOVERY-POLICY       :DERIVABLE or :AUTHORED, persisted to policy.dat
+                          (GH #170); NIL (default) writes nothing, so an
+                          absent file -- STORE-RECOVERY-POLICY's :AUTHORED
+                          default -- is what a plain MAKE-GRAPH call gets.
+                          OPEN-SHADOW-GRAPH :FAST-LOAD gates on this via the
+                          shadow's copied policy.dat.
 
 GRAPH-DB:*SYSTEM-DIRECTORY* must be set before calling this: type-ids are
 assigned from the registry that lives there, so that one symbol names one id
@@ -395,6 +402,10 @@ to disk and remove it."
          (dirty-file (format nil "~A/.dirty" location)))
     (unless (probe-file path)
       (error "Unable to open graph location ~A" path))
+    ;; GH #170 Task 4: persisted once, at create, before anything else
+    ;; touches LOCATION -- SET-STORE-RECOVERY-POLICY validates the value.
+    (when recovery-policy
+      (set-store-recovery-policy path recovery-policy))
     (when buffer-pool-p
       (ensure-buffer-pool buffer-pool-size))
     (let* ((heap (create-memory
@@ -529,7 +540,7 @@ to disk and remove it."
                    (spatial-precision 7)
                    (spatial-max-cells +spatial-insert-max-cells+)
                    (system-clock *system-clock*)
-                   shadow-p)
+                   shadow-p recovery-policy)
   "Open the existing graph named NAME whose files live under directory
 LOCATION, register it, and return it.  Use this to reopen a graph created
 earlier with MAKE-GRAPH; the keyword arguments mirror MAKE-GRAPH's, including
@@ -552,7 +563,17 @@ OPEN-SHADOW-GRAPH): the graph is never placed in *GRAPHS*, never
 published to the open-store vector (%REGISTER-OPEN-STORE is skipped;
 STORE-ID is still interned from the registry, directly, so v8 ids
 minted here carry the live store's tag), and replication is never
-started."
+started.
+
+:RECOVERY-POLICY (GH #170) is only a HINT here, unlike MAKE-GRAPH: if
+LOCATION already carries a policy.dat, that file is authoritative --
+this keyword is ignored (a value that disagrees with the file WARNs,
+but the file wins) rather than silently rewritten out from under
+whatever wrote it.  It is persisted only when LOCATION is being
+created-on-open (no schema.dat yet, the same condition INIT-SCHEMA
+below branches on) -- a genuine reopen of an existing graph with no
+policy.dat leaves it absent (STORE-RECOVERY-POLICY's :AUTHORED
+default), it does not retroactively opt that graph in."
   (unless *system-directory*
     (error 'system-directory-required :operation 'open-graph))
   (when (and peer-role (or master-p slave-p))
@@ -616,15 +637,28 @@ started."
               (open-type-index (format nil "~A/edge-index.dat" path) heap))
         ;; (MVCC: no lhash value-finalizer; read paths materialize node bytes
         ;; under a read pin -- see ENSURE-NODE-BYTES.)
-        (if (probe-file schema-file)
-            (progn
-              (setf (schema graph)
-                    (cl-store:restore schema-file))
-              ;; Locks aren't persisted; rebuild the per-class rw-locks for the
-              ;; restored types (otherwise schema-class-locks is nil and
-              ;; def-vertex/def-edge and with-*-locked-class fail -- issue #32).
-              (restore-schema-locks (schema graph)))
-            (init-schema graph))
+        (let ((creating-on-open-p (not (probe-file schema-file))))
+          (if creating-on-open-p
+              (init-schema graph)
+              (progn
+                (setf (schema graph)
+                      (cl-store:restore schema-file))
+                ;; Locks aren't persisted; rebuild the per-class rw-locks for
+                ;; the restored types (otherwise schema-class-locks is nil and
+                ;; def-vertex/def-edge and with-*-locked-class fail -- #32).
+                (restore-schema-locks (schema graph))))
+          ;; GH #170 Task 4: policy.dat is authoritative once it exists --
+          ;; a supplied :RECOVERY-POLICY that disagrees only WARNS, never
+          ;; overwrites it.  Absent, it is persisted only on the same
+          ;; creating-on-open branch MAKE-GRAPH's create path corresponds
+          ;; to; a genuine reopen with no file leaves it absent (:AUTHORED).
+          (if (probe-file (%policy-file path))
+              (let ((on-disk (store-recovery-policy path)))
+                (when (and recovery-policy (not (eq recovery-policy on-disk)))
+                  (warn "OPEN-GRAPH ~A: :RECOVERY-POLICY ~S disagrees with ~
+policy.dat's ~S; the file wins." path recovery-policy on-disk)))
+              (when (and recovery-policy creating-on-open-p)
+                (set-store-recovery-policy path recovery-policy))))
         (setf (schema-lock (schema graph)) (make-recursive-lock))
         ;; MVCC: optional override of the persisted graph-wide keep-revisions.
         (when keep-revisions
