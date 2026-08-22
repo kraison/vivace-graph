@@ -588,6 +588,14 @@ between releases; cutting a release renames it to the new version and dates it.
   written, and stale aliases in old `schema.dat` files are ignored.
   (#190)
 
+- A torn final record in the system-clock journal (a power loss
+  mid-append) made every record unreadable, since the reader signalled
+  on the incomplete form. The reader now drops a torn tail — truncating
+  it atomically and signalling the `system-journal-torn-tail` warning —
+  and returns the intact history; damage anywhere other than the tail
+  still signals, as `system-journal-corrupt`. The writer is unchanged:
+  per-record fsync was considered and rejected in the issue. (#191)
+
 ### Changed
 
 - **The hub resolves its type registry on the thread that starts

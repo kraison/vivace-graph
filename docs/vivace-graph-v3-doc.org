@@ -3274,6 +3274,17 @@ is never evaluated.** This is load-bearing, not a stylistic default —
 without re-checking them, so a record must never be able to execute code
 just by being read back.
 
+**Hardened (#191):** ~journal-records~ returns two values, the record
+list and a torn-tail flag. A torn final record — the shape left by power
+loss mid-append — is dropped: the file is truncated atomically to the
+last complete record and the ~system-journal-torn-tail~ warning is
+signalled, with the intact history still returned. Damage anywhere
+other than the tail is left untouched and signals
+~system-journal-corrupt~ instead, whose ~journal-corrupt-file~,
+~journal-corrupt-position~ and ~journal-corrupt-cause~ readers name
+what was found. The writer is unchanged; per-record fsync was
+considered and rejected in GH #191.
+
 *** Cross-image effects: a peer sync can advance the clock
 
 A pulled node carries the *hub's* commit epoch, and ~peer-observe-epoch~
