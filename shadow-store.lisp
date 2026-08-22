@@ -12,11 +12,78 @@
          (trimmed (string-right-trim "/" (namestring dir))))
     (uiop:ensure-directory-pathname (concatenate 'string trimmed "-shadow"))))
 
+(defparameter *sparse-copy-chunk-size* (* 1024 1024)
+  "Octets per read/write in %COPY-FILE-SPARSE.  1MB: big enough that the
+per-chunk overhead is negligible, small enough that a single dirty
+region near the end of an otherwise-empty multi-GB reservation doesn't
+force writing the whole file (GH #170).")
+
+(defun %all-zero-p (buffer count zero-buffer)
+  "True when the first COUNT octets of BUFFER are all zero, compared
+against a same-sized, once-allocated ZERO-BUFFER (GH #170)."
+  (not (mismatch buffer zero-buffer :end1 count :end2 count)))
+
+(defun %copy-file-sparse (source destination)
+  "Copy SOURCE to DESTINATION preserving holes: read in
+*SPARSE-COPY-CHUNK-SIZE* octet chunks; an all-zero chunk is never
+WRITE-SEQUENCEd, only skipped over via FILE-POSITION on the (freshly
+created, hence already-zero) output -- seeking past unwritten bytes on
+a fresh file leaves a hole instead of materializing them, which is the
+entire point (see %COPY-DIRECTORY-TREE's docstring for why this
+matters).  A bare seek never extends a file's on-disk length by itself
+though (that needs an actual write at or past the target offset), so if
+the copy ends in a skipped region DESTINATION would come up short --
+handled by writing SOURCE's final byte whenever the last chunk
+processed was skipped, which is a no-op when the last chunk was
+written (the write already reached the true end) and otherwise pins
+DESTINATION to SOURCE's exact length with one extra byte written (GH
+#170)."
+  (let* ((chunk-size *sparse-copy-chunk-size*)
+         (buffer (make-array chunk-size :element-type '(unsigned-byte 8)))
+         (zero-buffer (make-array chunk-size :element-type '(unsigned-byte 8)
+                                  :initial-element 0))
+         (length 0)
+         (last-chunk-skipped-p nil))
+    (with-open-file (in source :element-type '(unsigned-byte 8))
+      (setf length (file-length in))
+      (with-open-file (out destination :direction :output
+                           :element-type '(unsigned-byte 8)
+                           :if-exists :supersede :if-does-not-exist :create)
+        (loop
+          (let ((n (read-sequence buffer in)))
+            (when (zerop n) (return))
+            (cond
+              ((%all-zero-p buffer n zero-buffer)
+               ;; FILE-POSITION is a FUNCTION, not a SETF place: call it
+               ;; with the new position as a second argument.
+               (file-position out (+ (file-position out) n))
+               (setf last-chunk-skipped-p t))
+              (t
+               (write-sequence buffer out :end n)
+               (setf last-chunk-skipped-p nil)))))
+        ;; Pin the apparent LENGTH (see docstring): only needed when the
+        ;; copy ends in a hole -- if the last chunk was written, the
+        ;; write itself already put OUT at LENGTH.
+        (when (and last-chunk-skipped-p (plusp length))
+          (file-position out (1- length))
+          (write-byte 0 out))))
+    destination))
+
 (defun %copy-directory-tree (source destination)
-  "Plain recursive file copy, SOURCE to DESTINATION.  Called only while
-the store is closed, so there are no mmap hazards.  NO shell-outs --
-UIOP:COLLECT-SUB*DIRECTORIES walks SOURCE and UIOP:COPY-FILE moves each
-file (GH #170)."
+  "Recursive file copy, SOURCE to DESTINATION, preserving sparse holes
+via %COPY-FILE-SPARSE.  Called only while the store is closed, so there
+are no mmap hazards.  NO shell-outs -- UIOP:COLLECT-SUB*DIRECTORIES
+walks SOURCE.
+
+Load-bearing, not an optimization: a fresh, empty store already reserves
+twelve ~1000MB mmap regions (heap.dat, indexes.dat, and a table.dat +
+overflow.dat pair in each of the 5 lhash directories) that are almost
+entirely unwritten zero bytes -- ~12GB apparent for ~0MB of real data. A
+byte-for-byte copy (the previous UIOP:COPY-FILE implementation)
+materializes every one of those holes, writing the full 12GB to disk per
+shadow of an EMPTY store, worse for a store with real data in it. That
+breaks the spec's \"copies in seconds\" premise and can exhaust disk
+outright (GH #170)."
   (let ((source (uiop:ensure-directory-pathname source))
         (destination (uiop:ensure-directory-pathname destination)))
     (ensure-directories-exist destination)
@@ -26,7 +93,7 @@ file (GH #170)."
        (ensure-directories-exist
         (merge-pathnames (uiop:enough-pathname dir source) destination))
        (dolist (file (uiop:directory-files dir))
-         (uiop:copy-file
+         (%copy-file-sparse
           file
           (merge-pathnames (uiop:enough-pathname file source) destination)))))
     destination))

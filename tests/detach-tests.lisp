@@ -630,6 +630,107 @@ would still be unset when the error propagates."
             (uiop:ensure-directory-pathname retired)
             :validate t :if-does-not-exist :ignore)))))))
 
+;;; Fix round 3 (GH #170): %COPY-DIRECTORY-TREE must preserve sparse
+;;; holes -- a fresh store reserves ~12GB of mostly-zero mmap regions,
+;;; and a byte-for-byte copy materializes every one of them.
+
+(defun %file-real-bytes (path)
+  "REAL on-disk bytes for the file at PATH: STAT(2)'s ST_BLOCKS * 512,
+the standard sparse-file idiom.  OSICAT is NOT a dependency of this
+system (POSIX.LISP's own header explains why: it replaces OSICAT with
+hand-rolled CFFI to avoid OSICAT's C grovel/wrapper, notably for ECL
+cross-compilation) and this build's SB-POSIX:STAT has no ST_BLOCKS
+accessor either -- so this uses SBCL's own SB-UNIX:UNIX-STAT, whose
+14th value is ST-BLOCKS (confirmed against sbcl/src/code/unix.lisp's
+%EXTRACT-STAT-RESULTS field order: dev ino mode nlink uid gid rdev size
+atime mtime ctime blksize blocks) (GH #170)."
+  (multiple-value-bind (ok dev ino mode nlink uid gid rdev size
+                        atime mtime ctime blksize blocks)
+      (sb-unix:unix-stat (namestring path))
+    (declare (ignore dev ino mode nlink uid gid rdev size
+                     atime mtime ctime blksize))
+    (unless ok (error "SB-UNIX:UNIX-STAT failed for ~A" path))
+    (* 512 blocks)))
+
+(defun %directory-usage (dir)
+  "(values APPARENT-SIZES REAL-BYTES) for every regular file under DIR:
+APPARENT-SIZES is a relpath -> byte-length hash table (the logical
+FILE-LENGTH); REAL-BYTES is the sum of %FILE-REAL-BYTES over every file
+(GH #170)."
+  (let ((root (uiop:ensure-directory-pathname dir))
+        (sizes (make-hash-table :test 'equal))
+        (real 0))
+    (uiop:collect-sub*directories
+     root t t
+     (lambda (subdir)
+       (dolist (file (uiop:directory-files subdir))
+         (setf (gethash (namestring (uiop:enough-pathname file root)) sizes)
+               (with-open-file (in file :element-type '(unsigned-byte 8))
+                 (file-length in)))
+         (incf real (%file-real-bytes file)))))
+    (values sizes real)))
+
+(test shadow-store-copy-preserves-sparseness
+  "%COPY-DIRECTORY-TREE must not materialize a fresh store's reserved
+mmap holes: a near-empty store's shadow should use a SMALL FRACTION of
+its apparent size on disk (< 1/100 here), while every file's apparent
+LENGTH matches the source exactly -- MAPPED-FILE-LENGTH (mmap.lisp)
+reads the file's actual on-disk length to size the initial mapping, so
+a short file breaks remapping; this is confirmed by reading the code,
+not merely assumed.  Also confirms sparseness doesn't corrupt: the
+shadow still OPENS (OPEN-SHADOW-GRAPH) and reads the live data back."
+  (with-clocked-store (g clock sys)
+    sys
+    (with-transaction ((graph-db::transaction-manager g))
+      (graph-db:make-vertex :generic nil :graph g))
+    (multiple-value-bind (source-sizes source-real)
+        (%directory-usage (graph-db::location g))
+      (declare (ignore source-real))
+      ;; .dirty exists only while G is OPEN (as it is here, pre-
+      ;; SHADOW-STORE) and is gone by the time SHADOW-STORE's internal
+      ;; CLOSE-GRAPH runs the copy -- not part of what the copy is
+      ;; supposed to reproduce, so exclude it from the comparison
+      ;; (same idiom as KILLED-LOADER-LEAVES-LIVE-BYTE-IDENTICAL's
+      ;; measured exclusion list).
+      (remhash ".dirty" source-sizes)
+      (multiple-value-bind (shadow-location g2) (graph-db:shadow-store g)
+        (unwind-protect
+             (progn
+               (multiple-value-bind (shadow-sizes shadow-real)
+                   (%directory-usage shadow-location)
+                 ;; Every SOURCE file must have landed in the shadow at
+                 ;; the exact same apparent size.  Not asserted the
+                 ;; other way around: SHADOW-STORE's internal
+                 ;; CLOSE-GRAPH :SNAPSHOT-P T takes a backup under
+                 ;; txn-log/ as part of the close that PRECEDES the
+                 ;; copy, so the shadow legitimately gains one file
+                 ;; SOURCE-SIZES (measured before that close) never
+                 ;; had -- same shape as the .dirty exclusion above.
+                 (maphash (lambda (path size)
+                            (is (eql size (gethash path shadow-sizes))
+                                "~A: apparent size must match the source ~
+exactly" path))
+                          source-sizes)
+                 (let ((apparent (loop for v being the hash-values
+                                            of shadow-sizes
+                                       sum v)))
+                   (is (plusp apparent))
+                   (is (< shadow-real (/ apparent 100))
+                       "real ~A bytes should be a small fraction of ~
+apparent ~A bytes" shadow-real apparent)))
+               (multiple-value-bind (start end)
+                   (graph-db:clock-lease-epochs clock 1000)
+                 (let ((sg (graph-db:open-shadow-graph
+                           shadow-location :detach-store-1
+                           :lease (cons start end))))
+                   (unwind-protect
+                        (is (= 1 (length (graph-db:map-vertices
+                                         #'identity sg :collect-p t))))
+                     (let ((graph-db:*graph* sg))
+                       (ignore-errors (close-graph sg :snapshot-p nil)))))))
+          (let ((graph-db:*graph* g2))
+            (ignore-errors (close-graph g2 :snapshot-p nil))))))))
+
 (test killed-loader-leaves-live-byte-identical
   "ABANDON-SHADOW is the discard path exercised here; it must also
 restore write service.  Nearest wrong implementation: the loader writes
