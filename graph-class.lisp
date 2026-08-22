@@ -11,8 +11,35 @@
   (make-hash-table :test 'equal #+graph-db-ecl-sync-hash :synchronized
                     #+graph-db-ecl-sync-hash t))
 
+(defvar *store-id->graph*
+  (make-array (1+ +max-store-tag+) :initial-element nil)
+  "Open-store vector: store-id -> open GRAPH, nil when not open.  The v8
+resolver's O(1) step (GH #169).  Slot 0 unused (0 is never assigned).
+Writes only under *GRAPHS*' registration points; readers are lock-free
+-- a stale nil costs a fallback, never a wrong graph.")
+
+(defun %register-open-store (graph)
+  "Give GRAPH its registry store-id and publish it in the open-store
+vector.  Outside a system (*SYSTEM-DIRECTORY* nil) the graph stays
+untagged -- ids remain v5 -- rather than failing the open (GH #169)."
+  (when *system-directory*
+    (setf (store-id graph) (store-registry-intern (graph-name graph)))
+    (setf (svref *store-id->graph* (store-id graph)) graph))
+  graph)
+
+(defun %unregister-open-store (graph)
+  "Retract GRAPH from the open-store vector.  The registry entry stays:
+ids are never reused (GH #169)."
+  (let ((sid (store-id graph)))
+    (when (and sid (eq graph (svref *store-id->graph* sid)))
+      (setf (svref *store-id->graph* sid) nil))))
+
 (defclass graph ()
   ((graph-name :accessor graph-name :initarg :graph-name)
+   ;; Stable numeric id from the store registry; rides in every v8 node
+   ;; id minted for this store.  NIL = untagged (no system directory,
+   ;; e.g. a memory graph outside a system): ids stay v5 (GH #169).
+   (store-id :accessor store-id :initarg :store-id :initform nil)
    (graph-open-p :accessor graph-open-p :initarg :graph-open-p :initform nil)
    ;; T when this graph was opened inside WITH-SCHEMA-FROZEN, so its
    ;; persisted type-ids were never checked against the registry.  Set by

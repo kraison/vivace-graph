@@ -58,6 +58,15 @@
            #:*type-registry*
            #:system-directory-required
            #:system-directory-required-operation
+           ;; image-level store-id registry (GH #169)
+           #:ensure-store-registry
+           #:store-registry-intern
+           #:store-registry-id-for
+           #:store-registry-name-for
+           #:store-registry-full
+           #:store-id
+           #:+store-tag-bits+
+           #:+max-store-tag+
            ;; GH #186: a store's persisted type-ids disagree with the
            ;; image registry.  Operator-facing -- the remedy is a seeding
            ;; run plus a renumbering migration, not a retry.

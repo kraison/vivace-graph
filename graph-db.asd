@@ -60,13 +60,16 @@
                ;; The image-level type-id registry (GH #186).  Same shape as
                ;; system-clock: no graph dependency, loads early.
                (:file "type-registry" :depends-on ("serialize" "utilities"))
+               ;; The image-level store-id registry (GH #169).  Same shape
+               ;; as type-registry; graph-class references +MAX-STORE-TAG+.
+               (:file "store-registry" :depends-on ("type-registry"))
                (:file "geometry" :depends-on ("serialize"))
                (:file "geometry-ops" :depends-on ("geometry"))
                (:file "geohash" :depends-on ("package"))
                (:file "linear-hash" :depends-on ("serialize"))
                (:file "allocator" :depends-on ("serialize"))
                (:file "segment" :depends-on ("allocator" "mmap"))
-               (:file "graph-class" :depends-on ("globals"))
+               (:file "graph-class" :depends-on ("globals" "store-registry"))
                (:file "cursors" :depends-on ("package"))
                (:file "skip-list" :depends-on ("allocator" "linear-hash"))
                (:file "skip-list-cursors" :depends-on ("skip-list" "cursors"))
@@ -525,6 +528,7 @@ cl-temporal-extent."
                (:file "global-type-id-tests")     ; GH #186
                (:file "type-id-seeding-tests")    ; GH #186
                (:file "keyword-alias-tests")      ; GH #190
+               (:file "store-registry-tests")     ; GH #169
                (:file "posix-tests")              ; GH #182
                (:file "rest-tests")
                (:file "rest-http-tests")

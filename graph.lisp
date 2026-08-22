@@ -458,7 +458,8 @@ to disk and remove it."
         (rebuild-spatial-indexes graph)
         (with-open-file (out dirty-file :direction :output)
           (format out "~S" (get-universal-time)))
-        (setf (gethash name *graphs*) graph))
+        (setf (gethash name *graphs*) graph)
+        (%register-open-store graph))
       (when slave-p
         (setf (master-host graph) master-host)
         ;; Set the subset filter before replay/replication so the slave applies
@@ -666,6 +667,7 @@ ids to types added since (GH #186)."
         (with-open-file (out dirty-file :direction :output)
           (format out "~S" (get-universal-time)))
         (setf (gethash name *graphs*) graph)
+        (%register-open-store graph)
         (when gc-heap-p
           (gc-heap graph))
         ;; A non-empty WAL tail means this open is a CRASH RECOVERY: the .txn files
@@ -754,6 +756,7 @@ a snapshot failure does NOT abort the close (GH #120)."
     (when (graph-open-p graph)
       (stop-replication graph)
       (remhash (graph-name graph) *graphs*)
+      (%unregister-open-store graph)
       ;; Unique constraints (#6): persist the on-disk unique skip-lists' roots
       ;; while the heap is still open, so OPEN can reopen them without a scan.
       ;; No-op on a memory graph.

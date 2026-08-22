@@ -261,7 +261,8 @@ Registers the graph and returns it."
       (init-schema graph)
       (update-schema graph)
       (%write-dirty-marker path)
-      (setf (gethash name *graphs*) graph))
+      (setf (gethash name *graphs*) graph)
+      (%register-open-store graph))
     (when peer-role
       (%init-memory-peer-slots graph :make path peer-role origin-id peer-host
                                export-predicate device-registry merge-policy
@@ -989,6 +990,7 @@ as deferred blobs and materialize on first touch (needs a VG-native image)."
       (update-schema graph)
       (%write-dirty-marker path)
       (setf (gethash name *graphs*) graph)
+      (%register-open-store graph)
       ;; Restore the checkpoint, then replay the journal tail committed after it.
       ;; Recovery runs BEFORE the transaction-manager is installed (the reaper
       ;; tolerates the unbound slot); the retain hook keeps the journal.

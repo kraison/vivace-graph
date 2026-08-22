@@ -226,6 +226,10 @@
                 #:store-registry-conflict
                 #:store-registry-conflict-reason
                 #:frozen-graph-cannot-replicate
+                ;; store-id registry (GH #169)
+                #:store-registry-intern
+                #:store-registry-id-for
+                #:store-registry-name-for
                 #:with-schema-frozen
                 #:with-transaction
                 #:*transaction*
