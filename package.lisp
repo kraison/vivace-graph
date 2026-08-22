@@ -80,6 +80,11 @@
            #:store-detached-error
            #:store-detached-name
            #:store-detached-id
+           ;; GH #169: BACKUP warns on a dangling cross-store edge.
+           #:dangling-edge-warning
+           #:dangling-edge-id
+           #:dangling-edge-endpoint-id
+           #:dangling-edge-store-id
            ;; GH #186: a store's persisted type-ids disagree with the
            ;; image registry.  Operator-facing -- the remedy is a seeding
            ;; run plus a renumbering migration, not a retry.

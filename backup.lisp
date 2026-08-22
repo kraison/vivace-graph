@@ -155,6 +155,34 @@ RECREATE-GRAPH's :PACKAGE-NAME."
                :deleted-p (deleted-p e))))
     (write-backup-plist plist stream)))
 
+(define-condition dangling-edge-warning (warning)
+  ((edge-id :initarg :edge-id :reader dangling-edge-id)
+   (endpoint-id :initarg :endpoint-id :reader dangling-edge-endpoint-id)
+   (store-id :initarg :store-id :reader dangling-edge-store-id))
+  (:report
+   (lambda (c s)
+     (format s "Backup includes edge ~A whose endpoint ~A lives in ~
+store ~A, which is not open -- the edge is written, connectivity is ~
+preserved, and restoring it before that store is attached leaves it ~
+dangling (GH #169, spec sec.7)."
+             (dangling-edge-id c) (dangling-edge-endpoint-id c)
+             (dangling-edge-store-id c)))))
+
+(defun %warn-if-dangling-endpoint (edge endpoint-id graph)
+  "Signal DANGLING-EDGE-WARNING for ENDPOINT-ID when it is absent from
+GRAPH's own table and either detached (registered, not open) or
+resolved to a DIFFERENT open graph -- both cases leave it absent from
+this backup file (GH #169, spec sec.7).  EDGE is still written either
+way; this only reports the gap."
+  (unless (lookup-vertex endpoint-id :graph graph)
+    (multiple-value-bind (endpoint-graph status store-id)
+        (resolve-node-graph endpoint-id)
+      (when (or (eq status :detached)
+                (and (eq status :resolved) (not (eq endpoint-graph graph))))
+        (warn 'dangling-edge-warning
+              :edge-id (id edge) :endpoint-id endpoint-id
+              :store-id store-id)))))
+
 (defmethod backup ((graph graph) location &key include-deleted-p)
   (ensure-directories-exist location)
   (let ((count 0))
@@ -172,7 +200,9 @@ RECREATE-GRAPH's :PACKAGE-NAME."
       (map-edges (lambda (e)
                    (maybe-init-node-data e :graph graph)
                    (incf count)
-                   (backup e out))
+                   (backup e out)
+                   (%warn-if-dangling-endpoint e (from e) graph)
+                   (%warn-if-dangling-endpoint e (to e) graph))
                  graph :include-deleted-p include-deleted-p)
       (values count location))))
 

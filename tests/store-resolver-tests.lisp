@@ -138,3 +138,46 @@ CORRECTED (task-3), two brief defects:
                                     (graph-db:unresolved-node-id r))))
                      results)
             "closed far store: the marker is in the results")))))
+
+(test backup-includes-and-warns-on-a-dangling-cross-store-edge
+  "D12/sec.7: BACKUP writes the edge (connectivity survives) and signals
+DANGLING-EDGE-WARNING naming the offline endpoint.  Nearest wrong
+implementations: omit the edge silently, or refuse the backup.
+
+CORRECTED (task-4), controller notes:
+1. WITH-TRANSACTION takes the transaction manager, not :GRAPH.
+2. The substring-search assertion from the brief is replaced by
+   reading the backup file's forms back and matching a :E record's
+   :ID against E's id with EQUALP -- stronger than a printed-token
+   search, and avoids depending on STRING-ID's exact format."
+  (with-two-stores (g1 g2 sys)
+    (with-temp-directory (bdir)
+      (let (v1 v2 e)
+        (with-transaction ((graph-db::transaction-manager g1))
+          (setq v1 (graph-db:make-vertex :generic nil :graph g1)))
+        (with-transaction ((graph-db::transaction-manager g2))
+          (setq v2 (graph-db:make-vertex :generic nil :graph g2)))
+        (with-transaction ((graph-db::transaction-manager g1))
+          (setq e (graph-db:make-edge :generic (id v1) (id v2) 1.0 nil
+                                       :graph g1)))
+        (close-graph g2 :snapshot-p nil)
+        (let ((file (merge-pathnames "dangle.backup" bdir))
+              (warned nil))
+          (handler-bind ((graph-db:dangling-edge-warning
+                           (lambda (w)
+                             (setq warned w)
+                             (muffle-warning w))))
+            (graph-db::backup g1 (namestring file)))
+          (is-true warned "the backup must warn")
+          (is (equalp (id e) (graph-db:dangling-edge-id warned)))
+          (is-true (probe-file file))
+          (let* ((*readtable* graph-db::*restore-readtable*)
+                 (forms (with-open-file (in file)
+                          (loop for form = (read in nil :eof)
+                                until (eq form :eof)
+                                collect form))))
+            (is-true (find-if (lambda (f)
+                                 (and (eq :e (first f))
+                                      (equalp (id e) (getf (cddr f) :id))))
+                               forms)
+                      "the dangling edge is IN the backup")))))))
