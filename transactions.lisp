@@ -9,6 +9,12 @@
                 validate-value-constraints))
 
 (defvar *transaction* nil)
+(defvar *quiesced-store-closing-p* nil
+  "Bound T only in the detaching thread's dynamic extent, while
+DETACH-STORE's own CLOSE-GRAPH runs its post-quiesce snapshot scan.  Lets
+that one internal read through despite ACCEPTING-P being non-T, without
+opening the door to any other caller -- the binding is thread-local, so
+a concurrent thread still sees the refusal (GH #170).")
 (defvar *read-snapshots* nil
   "Graph -> read-only snapshot transaction, or NIL.  Read-only snapshots are
 per graph and may compose; read-write transactions are not (GH #53).")
@@ -141,6 +147,29 @@ in-flight transactions. Attach only a quiescent store."
                      (graph-name (attach-with-active-transactions-graph
                                   condition))))))
 
+(define-condition store-not-accepting-error (error)
+  ;; ACCEPTING-P states: T (all), :READ-ONLY (pins/reads yes, txns no),
+  ;; :DETACHING/:SWAPPING (nothing new).  REASON mirrors the flag, except
+  ;; :READ-ONLY reports as :SHADOW-LOAD -- the human-facing name for the
+  ;; state Task 2's shadow window puts the store in (GH #170).
+  ((name :initarg :name :reader store-not-accepting-name)
+   (reason :initarg :reason :reader store-not-accepting-reason))
+  (:report (lambda (condition stream)
+             (format stream "Store ~S is not accepting new work (~S)."
+                     (store-not-accepting-name condition)
+                     (store-not-accepting-reason condition)))))
+
+(define-condition detach-drain-timeout (error)
+  ;; ACCEPTING-P is restored to T before this is signalled -- a failed
+  ;; detach must not strand the store half-dead (GH #170).
+  ((name :initarg :name :reader detach-timeout-name)
+   (seconds :initarg :seconds :reader detach-timeout-seconds))
+  (:report (lambda (condition stream)
+             (format stream "Store ~S did not drain within ~D second~:P; ~
+detach aborted and the store resumes accepting new work."
+                     (detach-timeout-name condition)
+                     (detach-timeout-seconds condition)))))
+
 (define-condition no-transaction-in-progress-warning (warning) ()
   (:report
    (lambda (condition stream)
@@ -185,7 +214,7 @@ in-flight transactions. Attach only a quiescent store."
              (copying-uncommitted-node-node condition)))))
 
 ;;; Transaction manager
-(defgeneric create-transaction (transaction-manager))
+(defgeneric create-transaction (transaction-manager &key allow-read-only))
 (defgeneric cleanup-transaction (transaction))
 
 (defgeneric graph (object)
@@ -650,7 +679,15 @@ vertices (the normal case for ingested source records) are unaffected."
 ;;; cannot be reclaimed out from under the reader.
 
 (defun pin-read-epoch (transaction-manager)
-  "Register a read pin at the current epoch; return its token (for UNPIN)."
+  "Register a read pin at the current epoch; return its token (for UNPIN).
+Refused -- STORE-NOT-ACCEPTING-ERROR -- only under FULL quiescence
+(:DETACHING / :SWAPPING); :READ-ONLY admits new pins (GH #170)."
+  (let ((state (accepting-p transaction-manager)))
+    (unless (or (eq state t) (eq state :read-only)
+                *quiesced-store-closing-p*)
+      (error 'store-not-accepting-error
+             :name (graph-name (graph transaction-manager))
+             :reason state)))
   ;; Racy read of the epoch is fine: it is monotonic, and a slightly stale
   ;; (smaller) value only makes the reaper MORE conservative, never less.
   (let ((epoch (tm-peek-epoch transaction-manager)))
@@ -2801,7 +2838,13 @@ stops appearing in queries.  MARK-DELETED is the usual entry point.")
     :initform (make-recursive-lock "read-pins lock"))
    (read-pin-counter
     :accessor read-pin-counter
-    :initform 0)))
+    :initform 0)
+   ;; Detach quiescence (GH #170).  T = accepting everything.  :READ-ONLY =
+   ;; pins/reads yes, new transactions no (Task 2's shadow window).
+   ;; :DETACHING / :SWAPPING = nothing new -- a full drain is in progress.
+   (accepting-p
+    :accessor accepting-p
+    :initform t)))
 
 (defmethod print-object ((transaction-manager transaction-manager) stream)
   (print-unreadable-object (transaction-manager stream :type t)
@@ -3010,8 +3053,19 @@ transaction; see that condition for why."
   (:method (transaction-manager)
     (incf (sequence-number transaction-manager))))
 
-(defmethod create-transaction (transaction-manager)
+(defmethod create-transaction (transaction-manager &key allow-read-only)
+  ;; ALLOW-READ-ONLY is CALL-WITH-READ-SNAPSHOT's escape hatch: its
+  ;; bookkeeping TX is never committed, so it follows the read-pin
+  ;; rule (admitted under :READ-ONLY) rather than the write rule
+  ;; (refused under any non-T state) -- see PIN-READ-EPOCH (GH #170).
   (with-recursive-lock-held ((lock transaction-manager))
+    (let ((state (accepting-p transaction-manager)))
+      (unless (or (eq state t)
+                  (and allow-read-only (eq state :read-only))
+                  *quiesced-store-closing-p*)
+        (error 'store-not-accepting-error
+               :name (graph-name (graph transaction-manager))
+               :reason (if (eq state :read-only) :shadow-load state))))
     (let* ((sequence-number (next-sequence-number transaction-manager))
            (graph (graph transaction-manager))
            (cache (cache graph))
@@ -3078,7 +3132,7 @@ store it touched."
       ;; already snapshotted this graph -> inherit
       ((and *read-snapshots* (gethash graph *read-snapshots*)) (funcall thunk))
       (t
-       (let ((txn (create-transaction tm))
+       (let ((txn (create-transaction tm :allow-read-only t))
              (table (or *read-snapshots* (make-hash-table :test 'eq)))
              (pin (pin-read-epoch tm)))
          (unwind-protect
@@ -3274,3 +3328,90 @@ Signals NO-TRANSACTION-IN-PROGRESS if none is active."
     :reader graph))
   (:default-initargs
    :writes nil))
+
+;;; Detach quiescence (GH #170).  A store hands its epoch range to its
+;;; system clock and closes durably, so it can move (media swap, cold
+;;; storage) and reopen later without colliding with epochs the clock
+;;; issued elsewhere meanwhile.  See docs/superpowers/specs/
+;;; 2026-08-20-namespaces-design.md.
+
+(defparameter *quiesce-poll-interval* 0.05
+  "Seconds between REAP-SAFE-FLOOR polls in %QUIESCE-TRANSACTION-MANAGER.")
+
+(defun %quiesce-transaction-manager (transaction-manager reason timeout)
+  "Flip TRANSACTION-MANAGER's ACCEPTING-P to REASON (a keyword) and wait,
+in short sleeps, for REAP-SAFE-FLOOR to go NIL -- no active transaction and
+no read pin left that could observe a version underneath the coming close.
+On TIMEOUT seconds elapsed with no drain: restore ACCEPTING-P to T (a
+failed detach must not strand the store half-dead) and signal
+DETACH-DRAIN-TIMEOUT.  On success return T with ACCEPTING-P left at
+REASON (GH #170)."
+  (with-transaction-manager-lock (transaction-manager)
+    (setf (accepting-p transaction-manager) reason))
+  (let ((deadline (+ (get-internal-real-time)
+                     (round (* timeout internal-time-units-per-second)))))
+    (loop
+      (when (null (reap-safe-floor transaction-manager))
+        (return t))
+      (when (> (get-internal-real-time) deadline)
+        (setf (accepting-p transaction-manager) t)
+        (error 'detach-drain-timeout
+               :name (graph-name (graph transaction-manager))
+               :seconds timeout))
+      (sleep *quiesce-poll-interval*))))
+
+(defstruct store-detachment
+  "A detached store's handle: everything REATTACH-STORE needs to reopen it
+and rejoin its system clock (GH #170)."
+  graph-name location store-id lease-start lease-end)
+
+(defun detach-store (graph &key (lease-epochs 1000000) (timeout 60))
+  "Quiesce GRAPH (no new transactions or read pins), lease it
+LEASE-EPOCHS of its system clock's epoch space, journal the handoff, and
+CLOSE-GRAPH it durably.  Returns a STORE-DETACHMENT for REATTACH-STORE.
+
+Requires (GRAPH-SYSTEM-CLOCK GRAPH) non-NIL: detach without an image
+clock has no lease to hand over.  Propagates DETACH-DRAIN-TIMEOUT
+unchanged if the quiesce wave cannot drain in TIMEOUT seconds -- GRAPH
+is left open and accepting again (GH #170)."
+  (let ((clock (graph-system-clock graph)))
+    (unless clock
+      (error "DETACH-STORE requires GRAPH to be attached to a system ~
+clock (GRAPH-SYSTEM-CLOCK is NIL) -- detach without one has no lease to ~
+hand over."))
+    (let ((tm (transaction-manager graph))
+          (name (graph-name graph))
+          (location (location graph))
+          (store-id (store-id graph)))
+      (%quiesce-transaction-manager tm :detaching timeout)
+      (multiple-value-bind (start end) (clock-lease-epochs clock lease-epochs)
+        (journal-append clock :detach
+                        :store name :lease-start start :lease-end end)
+        ;; CLOSE-GRAPH's own snapshot scans the graph via WITH-READ-PIN;
+        ;; ACCEPTING-P is already :DETACHING, so it needs the one bypass
+        ;; above -- see *QUIESCED-STORE-CLOSING-P*'s docstring.
+        (let ((*graph* graph)
+              (*quiesced-store-closing-p* t))
+          (close-graph graph :snapshot-p t))
+        (make-store-detachment :graph-name name
+                               :location location
+                               :store-id store-id
+                               :lease-start start
+                               :lease-end end)))))
+
+(defun reattach-store (detachment &key (buffer-pool-size nil bps-p))
+  "Reopen the store DETACHMENT names at its recorded location and rejoin
+it to the image clock (*SYSTEM-CLOCK*).  Composes OPEN-GRAPH with
+ATTACH-TO-SYSTEM-CLOCK -- which already refuses active transactions and
+journals :ATTACH -- rather than reimplementing either.  Returns the new
+GRAPH (GH #170)."
+  (let* ((open-args (list (store-detachment-graph-name detachment)
+                          (namestring (store-detachment-location detachment))
+                          :system-clock nil))
+        (graph (apply #'open-graph
+                      (if bps-p
+                          (append open-args
+                                 (list :buffer-pool-size buffer-pool-size))
+                          open-args))))
+    (attach-to-system-clock graph *system-clock*)
+    graph))

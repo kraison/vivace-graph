@@ -530,6 +530,7 @@ cl-temporal-extent."
                (:file "keyword-alias-tests")      ; GH #190
                (:file "store-registry-tests")     ; GH #169
                (:file "store-resolver-tests")     ; GH #169
+               (:file "detach-tests")             ; GH #170
                (:file "posix-tests")              ; GH #182
                (:file "rest-tests")
                (:file "rest-http-tests")

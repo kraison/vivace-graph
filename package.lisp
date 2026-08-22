@@ -45,6 +45,24 @@
            #:journal-torn-position
            #:graph-system-clock
            #:attach-to-system-clock
+           ;; Detach quiescence protocol (GH #170).
+           #:accepting-p
+           #:store-not-accepting-error
+           #:store-not-accepting-name
+           #:store-not-accepting-reason
+           #:detach-drain-timeout
+           #:detach-timeout-name
+           #:detach-timeout-seconds
+           #:store-detachment
+           #:store-detachment-graph-name
+           #:store-detachment-location
+           #:store-detachment-store-id
+           #:store-detachment-lease-start
+           #:store-detachment-lease-end
+           #:detach-store
+           #:reattach-store
+           #:pin-read-epoch
+           #:unpin-read-epoch
            ;; image-level type-id registry (GH #186)
            #:type-registry
            #:open-type-registry
