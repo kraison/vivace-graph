@@ -171,10 +171,12 @@ durable state: NEXT = (MAX START (1+ LOAD-HIGHEST-TRANSACTION-ID)).  The
 shadow's own committed transaction ids are the truth about what it has
 already allocated; persisting a separate mutable cursor would need an
 fsync on the bulk-load hot path AND would go stale the moment a crash
-lost the last update.  If the derived NEXT is already past END, the
-lease was fully consumed before this open -- EPOCH-LEASE-EXHAUSTED is
-signalled immediately rather than quietly wrapping or reusing an id
-(GH #170, fix round 1).
+lost the last update.  If the derived NEXT is already AT OR PAST END
+(the range is half-open [START,END), so NEXT = END means fully
+consumed, not merely at the boundary), the lease was used up before
+this open -- EPOCH-LEASE-EXHAUSTED is signalled immediately rather than
+quietly wrapping, reusing an id, or deferring the failure to the first
+write (GH #170, fix round 2).
 
 FAST-LOAD and EXPECTED-VECTORS are Task 4/5 hooks: accepted here, but
 using either signals a clear \"arrives in a later task\" error rather
@@ -205,7 +207,10 @@ given and ~A has no lease.dat." location))
         ;; round 1).  LOAD-HIGHEST-TRANSACTION-ID is 0 on a shadow that has
         ;; never committed a write, so NEXT starts at START there.
         (let ((next (max start (1+ (load-highest-transaction-id graph)))))
-          (when (> next end)
+          ;; Half-open [start,end): NEXT == END means fully consumed, not
+          ;; just "at the boundary" -- TM-NEXT-EPOCH's own runtime check
+          ;; uses >= for the same reason (GH #170, fix round 2).
+          (when (>= next end)
             (error 'epoch-lease-exhausted :name graph-name :end end))
           (setf (graph-epoch-lease graph)
                 (make-epoch-lease :start start :next next :end end)))

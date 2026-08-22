@@ -448,3 +448,33 @@ service (reads AND writes)."
                  (graph-db:make-vertex :generic nil :graph g2))
                (setq g g2)))
         (ignore-errors (delete-file bare-shadow))))))
+
+(test shadow-lease-consumed-exactly-to-its-boundary-exhausts-at-open
+  "Fix round 2 (GH #170): the range is half-open [start,end) --
+NEXT == END means fully consumed, not merely at the boundary.  Consume
+a 2-epoch lease [n, n+2) with exactly 2 writes, close, and re-open from
+lease.dat WITHOUT :lease: EPOCH-LEASE-EXHAUSTED must signal AT OPEN, not
+be deferred to the first write.  Nearest wrong implementation: a
+strict > check that lets NEXT == END silently reopen and only fails
+later."
+  (with-clocked-store (g clock sys)
+    sys
+    (with-transaction ((graph-db::transaction-manager g))
+      (graph-db:make-vertex :generic nil :graph g))
+    (multiple-value-bind (shadow-location g2) (graph-db:shadow-store g)
+      (unwind-protect
+           (multiple-value-bind (start end)
+               (graph-db:clock-lease-epochs clock 2)
+             (let ((sg (graph-db:open-shadow-graph
+                        shadow-location :detach-store-1
+                        :lease (cons start end))))
+               (dotimes (i 2)
+                 (with-transaction ((graph-db::transaction-manager sg))
+                   (graph-db:make-vertex :generic nil :graph sg)))
+               (let ((graph-db:*graph* sg))
+                 (close-graph sg :snapshot-p nil))
+               (signals graph-db:epoch-lease-exhausted
+                 (graph-db:open-shadow-graph
+                  shadow-location :detach-store-1))))
+        (let ((graph-db:*graph* g2))
+          (ignore-errors (close-graph g2 :snapshot-p nil)))))))
