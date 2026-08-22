@@ -143,20 +143,126 @@ clean write masking what's actually durable."
         (close-system-clock c2)))))
 
 (test journal-refuses-to-evaluate-on-read
-  ;; A journal is data.  Reading it must never evaluate.  Must assert the
-  ;; condition TYPE: bare `signals error' passes under *READ-EVAL* T too
-  ;; (the crafted form's own ERROR call also signals an ERROR), so it
-  ;; proves nothing.  READER-ERROR only comes from the reader refusing.
+  ;; A journal is data.  Reading it must never evaluate.  The #. bomb sits
+  ;; MID-FILE (a good record follows) because a torn TAIL is now dropped,
+  ;; not signalled (GH #191).  Must assert the wrapped condition's CAUSE
+  ;; is a READER-ERROR: under *READ-EVAL* T the bomb's own ERROR call
+  ;; would be caught and wrapped too, so asserting only the wrapper
+  ;; proves nothing -- the cause type is what distinguishes the reader
+  ;; REFUSING from the form EVALUATING.
   (with-temp-directory (dir)
     (let ((c (open-system-clock (namestring dir))))
       (close-system-clock c))
     (with-open-file (s (merge-pathnames "system-journal.log" dir)
                        :direction :output :if-exists :append
                        :if-does-not-exist :create)
-      (format s "(:kind :bogus :value #.(error \"evaluated\"))~%"))
+      (format s "(:kind :bogus :value #.(error \"evaluated\"))~%")
+      (format s "(:kind :attach :epoch 3 :store :after-bomb)~%"))
     (let ((c2 (open-system-clock (namestring dir))))
       (unwind-protect
-           (signals reader-error (journal-records c2))
+           (let ((condition
+                   (handler-case (progn (journal-records c2) nil)
+                     (graph-db:system-journal-corrupt (e) e))))
+             (is-true condition
+                      "mid-file unreadable record must signal")
+             (is (typep (graph-db:journal-corrupt-cause condition)
+                        'reader-error)
+                 "the cause must be the READER refusing, not evaluation"))
+        (close-system-clock c2)))))
+
+(test torn-final-record-is-dropped-with-a-warning
+  "Power loss mid-append tears the LAST record; the intact history must
+survive (GH #191).  Nearest wrong implementation: signal on any reader
+error (the pre-#191 behaviour).  The non-ASCII store name pins
+byte-accurate truncation; the append-after-recovery check pins that the
+truncation reopened the writer (a stale stream would append to the old,
+renamed-away inode and the record would vanish)."
+  (with-temp-directory (dir)
+    (let ((c (open-system-clock (namestring dir))))
+      (journal-append c :create :store :alpha)
+      (journal-append c :detach :store "café-store")
+      (journal-append c :attach :store :alpha)
+      (close-system-clock c))
+    (with-open-file (s (merge-pathnames "system-journal.log" dir)
+                       :direction :output :if-exists :append)
+      ;; No closing paren, no newline: a torn tail.
+      (write-string "(:kind :retire :epoch 9 :store" s))
+    (let ((c2 (open-system-clock (namestring dir))))
+      (unwind-protect
+           (progn
+             (signals graph-db:system-journal-torn-tail
+               (journal-records c2))
+             ;; The truncation is durable: a second read is clean.
+             (let ((rs nil))
+               (is-true (handler-case (progn (setq rs (journal-records c2))
+                                             t)
+                          (graph-db:system-journal-torn-tail () nil))
+                        "second read must not warn -- tail was truncated")
+               (is (= 3 (length rs)))
+               (is (equal '(:create :detach :attach)
+                          (mapcar (lambda (r) (getf r :kind)) rs)))
+               (is (equal "café-store" (getf (second rs) :store))
+                   "byte-accurate truncation: multibyte record intact"))
+             (journal-append c2 :retire :store :alpha)
+             (is (= 4 (length (journal-records c2)))
+                 "append after recovery must land in the LIVE file"))
+        (close-system-clock c2)))))
+
+(test mid-file-corruption-still-signals
+  "A bad record with good records AFTER it is not a torn tail -- it is
+corruption of a different kind and must signal, and the reader must not
+truncate anything (GH #191).  Nearest wrong implementation: treat every
+reader error as a torn tail and truncate."
+  (with-temp-directory (dir)
+    (let ((c (open-system-clock (namestring dir))))
+      (journal-append c :create :store :alpha)
+      (close-system-clock c))
+    (with-open-file (s (merge-pathnames "system-journal.log" dir)
+                       :direction :output :if-exists :append)
+      ;; A lone close-paren is a genuine reader error (unmatched close);
+      ;; unlike "%%% not a lisp form %%%" -- which the brief originally
+      ;; specified but which READs cleanly as bare symbols under CL's
+      ;; standard readtable (`%' is symbol-constituent) and so never
+      ;; signals at all.  Fixed here; see task-1-report.md (GH #191).
+      (format s ")~%")
+      (format s "(:kind :attach :epoch 5 :store :alpha)~%"))
+    (let ((before (alexandria:read-file-into-string
+                   (merge-pathnames "system-journal.log" dir))))
+      (let ((c2 (open-system-clock (namestring dir))))
+        (unwind-protect
+             (progn
+               (signals graph-db:system-journal-corrupt
+                 (journal-records c2))
+               (is (equal before
+                          (alexandria:read-file-into-string
+                           (merge-pathnames "system-journal.log" dir)))
+                   "mid-file corruption must not be truncated away"))
+          (close-system-clock c2))))))
+
+(defvar *journal-eval-sentinel* nil)
+
+(test tail-read-eval-form-is-dropped-not-evaluated
+  "A #. form AT the tail is dropped like any torn tail -- but it must be
+dropped WITHOUT evaluating (GH #191).  The sentinel proves it: under
+*READ-EVAL* T the form would set it before the reader error paths could
+classify anything."
+  (setq *journal-eval-sentinel* nil)
+  (with-temp-directory (dir)
+    (let ((c (open-system-clock (namestring dir))))
+      (journal-append c :create :store :alpha)
+      (close-system-clock c))
+    (with-open-file (s (merge-pathnames "system-journal.log" dir)
+                       :direction :output :if-exists :append)
+      (format s "(:kind :bogus :value ~
+#.(setq graph-db/test::*journal-eval-sentinel* t))~%"))
+    (let ((c2 (open-system-clock (namestring dir))))
+      (unwind-protect
+           (progn
+             (signals graph-db:system-journal-torn-tail
+               (journal-records c2))
+             (is (null *journal-eval-sentinel*)
+                 "the #. form must never evaluate")
+             (is (= 1 (length (journal-records c2)))))
         (close-system-clock c2)))))
 
 ;;; Routing epoch allocation through the clock (GH #168 task 3).
