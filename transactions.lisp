@@ -173,6 +173,18 @@ detach aborted and the store resumes accepting new work."
                      (detach-timeout-name condition)
                      (detach-timeout-seconds condition)))))
 
+(define-condition epoch-lease-exhausted (error)
+  ;; A shadow store's leased range is [START, END) -- see EPOCH-LEASE in
+  ;; graph-class.lisp.  Signalled instead of silently falling through to
+  ;; the clock/counter, which would collide with the live store's ids
+  ;; (GH #170).
+  ((name :initarg :name :reader epoch-lease-exhausted-name)
+   (end :initarg :end :reader epoch-lease-exhausted-end))
+  (:report (lambda (condition stream)
+             (format stream "Store ~S exhausted its leased epoch range ~
+(end ~D)." (epoch-lease-exhausted-name condition)
+                     (epoch-lease-exhausted-end condition)))))
+
 (define-condition no-transaction-in-progress-warning (warning) ()
   (:report
    (lambda (condition stream)
@@ -3013,29 +3025,53 @@ A transaction-manager always has a graph -- INITIALIZE-INSTANCE :AFTER
 dereferences it immediately, so a NIL graph dies there first."
   (graph-system-clock (graph transaction-manager)))
 
+(defun tm-lease (transaction-manager)
+  "TRANSACTION-MANAGER's leased epoch range, or NIL -- shadow stores
+only (GH #170).  Checked BEFORE both the clock and the per-store
+counter in TM-NEXT-EPOCH/TM-CURRENT-EPOCH/TM-PEEK-EPOCH: a shadow's
+transaction ids must come from its lease, never from either."
+  (graph-epoch-lease (graph transaction-manager)))
+
 (defun tm-next-epoch (transaction-manager)
-  "Allocate a fresh epoch: from the image clock when the graph has one,
-otherwise from this manager's own counter (pre-#168 behaviour)."
-  (let ((clock (tm-clock transaction-manager)))
-    (if clock
-        (clock-next-epoch clock)
-        (prog1 (tx-id-counter transaction-manager)
-          (incf (tx-id-counter transaction-manager))))))
+  "Allocate a fresh epoch: from the lease when TRANSACTION-MANAGER's
+graph has one (shadow stores, GH #170), else from the image clock when
+the graph has one, otherwise from this manager's own counter (pre-#168
+behaviour)."
+  (let ((lease (tm-lease transaction-manager)))
+    (if lease
+        (let ((next (epoch-lease-next lease)))
+          (when (>= next (epoch-lease-end lease))
+            (error 'epoch-lease-exhausted
+                   :name (graph-name (graph transaction-manager))
+                   :end (epoch-lease-end lease)))
+          (setf (epoch-lease-next lease) (1+ next))
+          next)
+        (let ((clock (tm-clock transaction-manager)))
+          (if clock
+              (clock-next-epoch clock)
+              (prog1 (tx-id-counter transaction-manager)
+                (incf (tx-id-counter transaction-manager))))))))
 
 (defun tm-current-epoch (transaction-manager)
   "The next epoch TM-NEXT-EPOCH would return."
-  (let ((clock (tm-clock transaction-manager)))
-    (if clock
-        (clock-current-epoch clock)
-        (tx-id-counter transaction-manager))))
+  (let ((lease (tm-lease transaction-manager)))
+    (if lease
+        (epoch-lease-next lease)
+        (let ((clock (tm-clock transaction-manager)))
+          (if clock
+              (clock-current-epoch clock)
+              (tx-id-counter transaction-manager))))))
 
 (defun tm-peek-epoch (transaction-manager)
   "Like TM-CURRENT-EPOCH but lock-free under a clock -- see
 CLOCK-PEEK-EPOCH.  For PIN-READ-EPOCH, where a racy read is fine."
-  (let ((clock (tm-clock transaction-manager)))
-    (if clock
-        (clock-peek-epoch clock)
-        (tx-id-counter transaction-manager))))
+  (let ((lease (tm-lease transaction-manager)))
+    (if lease
+        (epoch-lease-next lease)
+        (let ((clock (tm-clock transaction-manager)))
+          (if clock
+              (clock-peek-epoch clock)
+              (tx-id-counter transaction-manager))))))
 
 (defun attach-to-system-clock (graph clock)
   "Raise CLOCK above GRAPH's persisted history and record the attach --

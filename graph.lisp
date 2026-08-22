@@ -528,7 +528,8 @@ to disk and remove it."
                    ;; for a pre-v3 graph, the ones its migration re-derives.
                    (spatial-precision 7)
                    (spatial-max-cells +spatial-insert-max-cells+)
-                   (system-clock *system-clock*))
+                   (system-clock *system-clock*)
+                   shadow-p)
   "Open the existing graph named NAME whose files live under directory
 LOCATION, register it, and return it.  Use this to reopen a graph created
 earlier with MAKE-GRAPH; the keyword arguments mirror MAKE-GRAPH's, including
@@ -544,7 +545,14 @@ reconciled against their declarative definitions and kept as-is unless changed
 Always CLOSE-GRAPH when finished.
 
 *SYSTEM-DIRECTORY* must be set: reopening replays the schema and may assign
-ids to types added since (GH #186)."
+ids to types added since (GH #186).
+
+:SHADOW-P T opens an unregistered shadow generation (GH #170,
+OPEN-SHADOW-GRAPH): the graph is never placed in *GRAPHS*, never
+published to the open-store vector (%REGISTER-OPEN-STORE is skipped;
+STORE-ID is still interned from the registry, directly, so v8 ids
+minted here carry the live store's tag), and replication is never
+started."
   (unless *system-directory*
     (error 'system-directory-required :operation 'open-graph))
   (when (and peer-role (or master-p slave-p))
@@ -666,8 +674,17 @@ ids to types added since (GH #186)."
         (restore-vector-segments graph)
         (with-open-file (out dirty-file :direction :output)
           (format out "~S" (get-universal-time)))
-        (setf (gethash name *graphs*) graph)
-        (%register-open-store graph)
+        (setf (graph-shadow-p graph) shadow-p)
+        (if shadow-p
+            ;; Unregistered: STORE-ID still comes from the registry (v8 ids
+            ;; minted here must carry the live store's tag) but never
+            ;; publishes to the open-store vector -- RESOLVE-NODE-GRAPH must
+            ;; keep resolving that tag to the LIVE graph (GH #170).
+            (when *system-directory*
+              (setf (store-id graph) (store-registry-intern name)))
+            (progn
+              (setf (gethash name *graphs*) graph)
+              (%register-open-store graph)))
         (when gc-heap-p
           (gc-heap graph))
         ;; A non-empty WAL tail means this open is a CRASH RECOVERY: the .txn files
@@ -736,7 +753,8 @@ ids to types added since (GH #186)."
         (attach-to-system-clock graph system-clock))
       (ensure-directories-exist (persistent-transaction-directory graph))
       (init-replication-log graph)
-      (start-replication graph :package package)
+      (unless shadow-p
+        (start-replication graph :package package))
       (setf (graph-open-p graph) t)
       graph)))
 
@@ -755,7 +773,11 @@ a snapshot failure does NOT abort the close (GH #120)."
   (let ((snapshot-problem nil))
     (when (graph-open-p graph)
       (stop-replication graph)
-      (remhash (graph-name graph) *graphs*)
+      ;; Guard by identity, not name alone: a shadow (GH #170) shares its
+      ;; live store's GRAPH-NAME but was never the one *GRAPHS* maps that
+      ;; name to, so closing it must not evict the live graph's entry.
+      (when (eq graph (gethash (graph-name graph) *graphs*))
+        (remhash (graph-name graph) *graphs*))
       (%unregister-open-store graph)
       ;; Unique constraints (#6): persist the on-disk unique skip-lists' roots
       ;; while the heap is still open, so OPEN can reopen them without a scan.

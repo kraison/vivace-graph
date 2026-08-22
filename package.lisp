@@ -63,6 +63,20 @@
            #:reattach-store
            #:pin-read-epoch
            #:unpin-read-epoch
+           ;; Shadow generations (GH #170).
+           #:shadow-store
+           #:abandon-shadow
+           #:open-shadow-graph
+           #:discard-shadow
+           #:graph-shadow-p
+           #:graph-epoch-lease
+           #:epoch-lease
+           #:epoch-lease-start
+           #:epoch-lease-next
+           #:epoch-lease-end
+           #:epoch-lease-exhausted
+           #:epoch-lease-exhausted-name
+           #:epoch-lease-exhausted-end
            ;; image-level type-id registry (GH #186)
            #:type-registry
            #:open-type-registry

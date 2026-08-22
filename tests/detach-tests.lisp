@@ -199,3 +199,169 @@ what guarantees its absence on every run."
       (is (plusp refusals) "the hammer thread must see the refusal")
       (is (zerop (hash-table-count (graph-db::read-pins tm)))
           "no straggler pin admitted after drain success"))))
+
+;;; Shadow generations (GH #170 Task 2).
+
+(test shadow-copy-is-consistent-and-reads-resume
+  "SHADOW-STORE makes a consistent copy while the live store resumes
+serving reads once it reopens; OPEN-SHADOW-GRAPH sees the same data."
+  (with-clocked-store (g clock sys)
+    sys
+    (with-transaction ((graph-db::transaction-manager g))
+      (graph-db:make-vertex :generic nil :graph g)
+      (graph-db:make-vertex :generic nil :graph g)
+      (graph-db:make-vertex :generic nil :graph g))
+    (multiple-value-bind (shadow-location g2) (graph-db:shadow-store g)
+      (unwind-protect
+           (progn
+             (is-true (probe-file shadow-location))
+             (let* ((tm2 (graph-db::transaction-manager g2))
+                    (pin (graph-db:pin-read-epoch tm2))
+                    (count nil))
+               (unwind-protect
+                    (setq count (length (graph-db:map-vertices
+                                         #'identity g2 :collect-p t)))
+                 (graph-db:unpin-read-epoch tm2 pin))
+               (is (= 3 count)))
+             (multiple-value-bind (start end)
+                 (graph-db:clock-lease-epochs clock 1000)
+               (let ((sg (graph-db:open-shadow-graph
+                          shadow-location :detach-store-1
+                          :lease (cons start end))))
+                 (unwind-protect
+                      (is (= 3 (length (graph-db:map-vertices
+                                       #'identity sg :collect-p t))))
+                   (let ((graph-db:*graph* sg))
+                     (ignore-errors (close-graph sg :snapshot-p nil)))))))
+        (let ((graph-db:*graph* g2))
+          (ignore-errors (close-graph g2 :snapshot-p nil)))))))
+
+(test live-store-is-read-only-during-the-shadow-window
+  "Kevin's ruling: after SHADOW-STORE a new write on the live graph
+signals STORE-NOT-ACCEPTING-ERROR reason :SHADOW-LOAD while
+PIN-READ-EPOCH keeps succeeding; ABANDON-SHADOW restores writes."
+  (with-clocked-store (g clock sys)
+    clock sys
+    (with-transaction ((graph-db::transaction-manager g))
+      (graph-db:make-vertex :generic nil :graph g))
+    (multiple-value-bind (shadow-location g2) (graph-db:shadow-store g)
+      (unwind-protect
+           (let ((tm2 (graph-db::transaction-manager g2)))
+             (handler-case
+                 (progn
+                   (with-transaction (tm2)
+                     (graph-db:make-vertex :generic nil :graph g2))
+                   (fail "write must be refused during the shadow window"))
+               (graph-db:store-not-accepting-error (c)
+                 (is (eq :shadow-load
+                         (graph-db:store-not-accepting-reason c)))))
+             (let ((pin (graph-db:pin-read-epoch tm2)))
+               (graph-db:unpin-read-epoch tm2 pin))
+             (graph-db:abandon-shadow g2 shadow-location)
+             (is (not (probe-file shadow-location)))
+             (with-transaction (tm2)
+               (graph-db:make-vertex :generic nil :graph g2)))
+        (let ((graph-db:*graph* g2))
+          (ignore-errors (close-graph g2 :snapshot-p nil)))))))
+
+(test shadow-is-unregistered
+  "While a shadow is open: *GRAPHS* has no second entry, the open-store
+vector still maps the store-id to the LIVE graph, and RESOLVE-NODE-GRAPH
+on a shadow-minted id resolves to the LIVE graph."
+  (with-clocked-store (g clock sys)
+    sys
+    (with-transaction ((graph-db::transaction-manager g))
+      (graph-db:make-vertex :generic nil :graph g))
+    (multiple-value-bind (shadow-location g2) (graph-db:shadow-store g)
+      (unwind-protect
+           (multiple-value-bind (start end)
+               (graph-db:clock-lease-epochs clock 1000)
+             (let ((sg (graph-db:open-shadow-graph
+                        shadow-location :detach-store-1
+                        :lease (cons start end))))
+               (unwind-protect
+                    (progn
+                      (is (= 1 (hash-table-count graph-db::*graphs*)))
+                      (is (eq g2 (gethash :detach-store-1 graph-db::*graphs*)))
+                      (is (eq g2 (svref graph-db::*store-id->graph*
+                                       (graph-db::store-id g2))))
+                      (let (vid)
+                        (with-transaction ((graph-db::transaction-manager sg))
+                          (setq vid (id (graph-db:make-vertex
+                                        :generic nil :graph sg))))
+                        (is (eq g2 (graph-db:resolve-node-graph vid)))))
+                 (let ((graph-db:*graph* sg))
+                   (ignore-errors (close-graph sg :snapshot-p nil))))))
+        (let ((graph-db:*graph* g2))
+          (ignore-errors (close-graph g2 :snapshot-p nil)))))))
+
+(test shadow-writes-draw-from-the-lease
+  "A node written in the shadow gets a transaction id within
+[lease-start, lease-end); exhausting a tiny lease signals
+EPOCH-LEASE-EXHAUSTED. Nearest wrong implementation: shadow ids from
+the store's own counter -- colliding with the live store's writes."
+  (with-clocked-store (g clock sys)
+    sys
+    (with-transaction ((graph-db::transaction-manager g))
+      (graph-db:make-vertex :generic nil :graph g))
+    (multiple-value-bind (shadow-location g2) (graph-db:shadow-store g)
+      (unwind-protect
+           (multiple-value-bind (start end)
+               (graph-db:clock-lease-epochs clock 3)
+             (let ((sg (graph-db:open-shadow-graph
+                        shadow-location :detach-store-1
+                        :lease (cons start end))))
+               (unwind-protect
+                    (progn
+                      (let (v)
+                        (with-transaction ((graph-db::transaction-manager sg))
+                          (setq v (graph-db:make-vertex
+                                  :generic nil :graph sg)))
+                        (is (<= start (graph-db::commit-epoch v)))
+                        (is (< (graph-db::commit-epoch v) end)))
+                      (signals graph-db:epoch-lease-exhausted
+                        (dotimes (i 5)
+                          (with-transaction ((graph-db::transaction-manager sg))
+                            (graph-db:make-vertex :generic nil :graph sg)))))
+                 (let ((graph-db:*graph* sg))
+                   (ignore-errors (close-graph sg :snapshot-p nil))))))
+        (let ((graph-db:*graph* g2))
+          (ignore-errors (close-graph g2 :snapshot-p nil)))))))
+
+(test lease-survives-in-the-shadow-directory
+  "lease.dat exists in the shadow dir and reads back the exact range --
+the out-of-process survival requirement (GH #170 comment)."
+  (with-clocked-store (g clock sys)
+    sys
+    (with-transaction ((graph-db::transaction-manager g))
+      (graph-db:make-vertex :generic nil :graph g))
+    (multiple-value-bind (shadow-location g2) (graph-db:shadow-store g)
+      (unwind-protect
+           (multiple-value-bind (start end)
+               (graph-db:clock-lease-epochs clock 1000)
+             (let ((sg (graph-db:open-shadow-graph
+                        shadow-location :detach-store-1
+                        :lease (cons start end))))
+               (let ((graph-db:*graph* sg))
+                 (ignore-errors (close-graph sg :snapshot-p nil))))
+             (let ((file (merge-pathnames
+                          "lease.dat"
+                          (uiop:ensure-directory-pathname shadow-location))))
+               (is-true (probe-file file))
+               (let (form)
+                 (with-open-file (in file)
+                   (let ((*read-eval* nil))
+                     (setq form (read in))))
+                 (is (= start (getf form :lease-start)))
+                 (is (= end (getf form :lease-end))))))
+        (let ((graph-db:*graph* g2))
+          (ignore-errors (close-graph g2 :snapshot-p nil)))))))
+
+(test discard-shadow-refuses-non-shadow-paths
+  "THE deletion-safety test: DISCARD-SHADOW refuses any path that does
+not end in \"-shadow\" -- it deletes trees, and this guard is the whole
+safety story."
+  (with-clocked-store (g clock sys)
+    clock sys
+    (signals error (graph-db:discard-shadow (graph-db::location g)))
+    (is-true (probe-file (graph-db::location g)))))

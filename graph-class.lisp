@@ -223,7 +223,21 @@ received an UNRESOLVED-NODE marker instead (GH #169, D8)."
    ;; The image-level epoch clock (GH #168), or NIL for this store's own
    ;; counter.  NIL is the pre-#168 behaviour and the default.
    (system-clock :accessor graph-system-clock :initarg :system-clock
-                 :initform nil)))
+                 :initform nil)
+   ;; Shadow generations (GH #170).  SHADOW-P: T on a graph opened via
+   ;; OPEN-SHADOW-GRAPH -- never registered in *GRAPHS*/open-store vector,
+   ;; never starts replication.  EPOCH-LEASE: an EPOCH-LEASE struct
+   ;; (below) when this store mints txn ids from a leased range instead
+   ;; of its clock/counter; NIL is the default (pre-#170 behaviour).
+   (shadow-p :accessor graph-shadow-p :initarg :shadow-p :initform nil)
+   (epoch-lease :accessor graph-epoch-lease :initarg :epoch-lease
+               :initform nil)))
+
+(defstruct epoch-lease
+  "A shadow store's leased txn-id range [START, END) (GH #170).  NEXT is
+the next id to hand out; ids past END are refused -- see
+EPOCH-LEASE-EXHAUSTED in transactions.lisp."
+  start next end)
 
 (defmethod print-object ((graph graph) stream)
   (print-unreadable-object (graph stream :type t :identity t)
