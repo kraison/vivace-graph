@@ -357,6 +357,234 @@ the out-of-process survival requirement (GH #170 comment)."
         (let ((graph-db:*graph* g2))
           (ignore-errors (close-graph g2 :snapshot-p nil)))))))
 
+;;; Swap (GH #170 Task 3).
+
+(defun %directory-file-hashes (dir)
+  "Map of relative-path-string -> sha256 digest, every regular file
+under DIR.  Test-only byte-identity tool (GH #170)."
+  (let ((root (uiop:ensure-directory-pathname dir))
+        (table (make-hash-table :test 'equal)))
+    (uiop:collect-sub*directories
+     root t t
+     (lambda (subdir)
+       (dolist (file (uiop:directory-files subdir))
+         (setf (gethash (namestring (uiop:enough-pathname file root)) table)
+               (ironclad:digest-file :sha256 file)))))
+    table))
+
+(defun %directory-diff (before after)
+  "(values ONLY-BEFORE ONLY-AFTER CHANGED), relative-path lists, comparing
+two %DIRECTORY-FILE-HASHES tables (GH #170)."
+  (let (only-before only-after changed)
+    (maphash (lambda (k v)
+               (multiple-value-bind (v2 present) (gethash k after)
+                 (cond ((not present) (push k only-before))
+                       ((not (equalp v v2)) (push k changed)))))
+             before)
+    (maphash (lambda (k v)
+               (declare (ignore v))
+               (unless (nth-value 1 (gethash k before))
+                 (push k only-after)))
+             after)
+    (values only-before only-after changed)))
+
+(defun %measured-exclusions (before after)
+  "Derive an exclusion set for a REPEAT of the SAME round trip from a
+%DIRECTORY-DIFF of one sample round trip.  A bare top-level file (no
+\"/\") is excluded by its exact name (e.g. \".dirty\"); a file inside a
+subdirectory is excluded by DIRECTORY PREFIX instead of its literal
+name, because SNAPSHOT mints a fresh UUID'd filename under txn-log/ on
+every close -- an exact-name exclusion would never match twice (GH
+#170)."
+  (let (exclusions)
+    (multiple-value-bind (ob oa ch) (%directory-diff before after)
+      (dolist (path (append ob oa ch))
+        (let ((slash (position #\/ path :from-end t)))
+          (pushnew (if slash (subseq path 0 (1+ slash)) path)
+                   exclusions :test #'equal))))
+    exclusions))
+
+(defun %excluded-p (path exclusions)
+  "True when PATH is covered by EXCLUSIONS: an exact match for a
+top-level exclusion, or a prefix match for a directory exclusion (one
+ending in \"/\") (GH #170)."
+  (some (lambda (ex)
+          (if (find #\/ ex)
+              (and (<= (length ex) (length path))
+                   (string= ex path :end2 (length ex)))
+              (string= ex path)))
+        exclusions))
+
+(test swap-in-shadow-end-to-end
+  "THE acceptance scenario: data A on the live store; SHADOW-STORE;
+OPEN-SHADOW-GRAPH; write data B into the shadow; MEANWHILE the live
+store serves a read and refuses a write reason :SHADOW-LOAD; close the
+shadow; SWAP-IN-SHADOW; the new graph serves A+B and accepts a fresh
+write; the retired dir exists; the journal carries :SWAP and :ATTACH."
+  (with-clocked-store (g clock sys)
+    sys
+    (with-transaction ((graph-db::transaction-manager g))
+      (graph-db:make-vertex :generic nil :graph g))
+    (multiple-value-bind (shadow-location g2) (graph-db:shadow-store g)
+      (multiple-value-bind (start end)
+          (graph-db:clock-lease-epochs clock 1000)
+        (let ((sg (graph-db:open-shadow-graph
+                   shadow-location :detach-store-1
+                   :lease (cons start end))))
+          (with-transaction ((graph-db::transaction-manager sg))
+            (graph-db:make-vertex :generic nil :graph sg))
+          (with-transaction ((graph-db::transaction-manager sg))
+            (graph-db:make-vertex :generic nil :graph sg))
+          ;; DURING the load: live serves a read, refuses a write.
+          (let ((tm2 (graph-db::transaction-manager g2)))
+            (let ((pin (graph-db:pin-read-epoch tm2)))
+              (graph-db:unpin-read-epoch tm2 pin))
+            (handler-case
+                (progn
+                  (with-transaction (tm2)
+                    (graph-db:make-vertex :generic nil :graph g2))
+                  (fail "write must be refused during the shadow window"))
+              (graph-db:store-not-accepting-error (c)
+                (is (eq :shadow-load (graph-db:store-not-accepting-reason c))))))
+          (let ((graph-db:*graph* sg))
+            (close-graph sg :snapshot-p nil))))
+      (multiple-value-bind (new-graph retired-path)
+          (graph-db:swap-in-shadow g2 shadow-location)
+        (setq g new-graph)
+        (is-true (probe-file retired-path))
+        (is (= 3 (length (graph-db:map-vertices
+                          #'identity new-graph :collect-p t))))
+        (with-transaction ((graph-db::transaction-manager new-graph))
+          (graph-db:make-vertex :generic nil :graph new-graph))
+        (let* ((records (journal-records clock))
+               (kinds (mapcar (lambda (r) (getf r :kind)) records)))
+          (is-true (member :swap kinds))
+          (is-true (member :attach kinds)))
+        (ignore-errors
+         (uiop:delete-directory-tree
+          (uiop:ensure-directory-pathname retired-path)
+          :validate t :if-does-not-exist :ignore))))))
+
+(test swap-failure-before-rename-restores-service
+  "A nonexistent shadow location fails SWAP-IN-SHADOW before the first
+rename; the live store is reopened (or was never closed) and still
+serves reads and writes."
+  (with-clocked-store (g clock sys)
+    clock sys
+    (with-transaction ((graph-db::transaction-manager g))
+      (graph-db:make-vertex :generic nil :graph g))
+    (let ((nonexistent (merge-pathnames
+                        "nope-shadow/"
+                        (uiop:ensure-directory-pathname
+                         (graph-db::location g)))))
+      (signals error (graph-db:swap-in-shadow g nonexistent))
+      (let* ((name (graph-db:graph-name g))
+             (g2 (graph-db:lookup-graph name))
+             (tm2 (graph-db::transaction-manager g2)))
+        (is-true g2)
+        (is (graph-db::graph-open-p g2))
+        (is (eq t (graph-db:accepting-p tm2)))
+        (let ((pin (graph-db:pin-read-epoch tm2)))
+          (graph-db:unpin-read-epoch tm2 pin))
+        (with-transaction (tm2)
+          (graph-db:make-vertex :generic nil :graph g2))
+        (setq g g2)))))
+
+(test killed-loader-leaves-live-byte-identical
+  "ABANDON-SHADOW is the discard path exercised here; it must also
+restore write service.  Nearest wrong implementation: the loader writes
+into the live mmaps -- heap.dat diverges.  The exclusion list (files a
+bare round trip legitimately touches, e.g. .dirty) is MEASURED here
+first, from a bare SHADOW-STORE/ABANDON-SHADOW round trip on this same
+store, not asserted."
+  (with-clocked-store (g clock sys)
+    sys
+    (with-transaction ((graph-db::transaction-manager g))
+      (graph-db:make-vertex :generic nil :graph g))
+    (let* ((location (graph-db::location g))
+           (snap0 (%directory-file-hashes location)))
+      ;; Measure: a bare round trip, no write into the shadow, so any
+      ;; diff on the live dir is purely the close+reopen the live store
+      ;; itself goes through.
+      (multiple-value-bind (shadow1 g1) (graph-db:shadow-store g)
+        (graph-db:abandon-shadow g1 shadow1)
+        (setq g g1))
+      (let* ((snap1 (%directory-file-hashes location))
+             (exclusions (%measured-exclusions snap0 snap1)))
+        (is (member ".dirty" exclusions :test #'equal)
+            "the bare round trip is expected to touch .dirty")
+        ;; Real scenario: shadow, write garbage, kill the loader (never
+        ;; close its handle), ABANDON-SHADOW.
+        (multiple-value-bind (shadow2 g2) (graph-db:shadow-store g)
+          (multiple-value-bind (start end)
+              (graph-db:clock-lease-epochs clock 1000)
+            (let ((sg (graph-db:open-shadow-graph
+                       shadow2 :detach-store-1 :lease (cons start end))))
+              (with-transaction ((graph-db::transaction-manager sg))
+                (graph-db:make-vertex :generic nil :graph sg))))
+          (graph-db:abandon-shadow g2 shadow2)
+          (setq g g2)
+          (is (not (probe-file shadow2)))
+          (let ((snap2 (%directory-file-hashes location)))
+            (multiple-value-bind (ob oa ch) (%directory-diff snap1 snap2)
+              (flet ((uncovered (paths)
+                       (remove-if (lambda (p) (%excluded-p p exclusions))
+                                  paths)))
+                (is (null (uncovered ob))
+                    "files disappeared beyond the measured exclusion list")
+                (is (null (uncovered oa))
+                    "files appeared beyond the measured exclusion list")
+                (is (null (uncovered ch))
+                    "file content changed beyond the measured exclusion list"))))
+          (with-transaction ((graph-db::transaction-manager g2))
+            (graph-db:make-vertex :generic nil :graph g2)))))))
+
+(test swap-in-shadow-drains-in-flight-readers-first
+  "A pin held on the LIVE store across SWAP-IN-SHADOW delays it, same
+drain mechanism as DETACH-DRAINS-IN-FLIGHT-READERS-FIRST -- confirms
+SWAP-IN-SHADOW really quiesces rather than closing straight away."
+  (with-clocked-store (g clock sys)
+    sys
+    (with-transaction ((graph-db::transaction-manager g))
+      (graph-db:make-vertex :generic nil :graph g))
+    (multiple-value-bind (shadow-location g2) (graph-db:shadow-store g)
+      (multiple-value-bind (start end)
+          (graph-db:clock-lease-epochs clock 1000)
+        (let ((sg (graph-db:open-shadow-graph
+                   shadow-location :detach-store-1
+                   :lease (cons start end))))
+          (let ((graph-db:*graph* sg))
+            (close-graph sg :snapshot-p nil))))
+      (let* ((tm2 (graph-db::transaction-manager g2))
+             (pin (graph-db:pin-read-epoch tm2))
+             (done nil)
+             (result nil)
+             ;; SWAP-IN-SHADOW reopens (OPEN-GRAPH), which needs
+             ;; *SYSTEM-DIRECTORY*/*STORE-REGISTRY* -- dynamic bindings
+             ;; from WITH-CLOCKED-STORE's LET do not cross to a new
+             ;; thread, so re-bind explicitly here (GH #170).
+             (sysdir graph-db::*system-directory*)
+             (registry graph-db::*store-registry*)
+             (thread (bt:make-thread
+                      (lambda ()
+                        (let ((graph-db::*system-directory* sysdir)
+                              (graph-db::*store-registry* registry))
+                          (setq result (graph-db:swap-in-shadow
+                                       g2 shadow-location))
+                          (setq done t))))))
+        (unwind-protect
+             (progn
+               (sleep 0.3)
+               (is (not done)
+                   "swap-in-shadow must not complete while a live pin holds")
+               (graph-db:unpin-read-epoch tm2 pin)
+               (bt:join-thread thread)
+               (is-true done)
+               (with-transaction ((graph-db::transaction-manager result))
+                 (graph-db:make-vertex :generic nil :graph result))
+               (setq g result))
+          (ignore-errors (bt:join-thread thread)))))))
+
 (test discard-shadow-refuses-non-shadow-paths
   "THE deletion-safety test: DISCARD-SHADOW refuses any path that does
 not end in \"-shadow\" -- it deletes trees, and this guard is the whole

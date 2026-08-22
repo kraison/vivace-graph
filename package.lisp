@@ -68,6 +68,7 @@
            #:abandon-shadow
            #:open-shadow-graph
            #:discard-shadow
+           #:swap-in-shadow
            #:graph-shadow-p
            #:graph-epoch-lease
            #:epoch-lease

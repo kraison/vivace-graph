@@ -217,6 +217,91 @@ given and ~A has no lease.dat." location))
         (%persist-lease location start end))
       graph)))
 
+(defun %require-closed-shadow (shadow-location)
+  "Signal a clear error unless SHADOW-LOCATION exists and carries no
+.dirty marker -- SWAP-IN-SHADOW requires the shadow be CLOSE-GRAPH'd
+before promotion (the contract: caller closes it, not this function).
+Renaming a directory a graph still has mmapped open would corrupt
+whatever ends up living at that name (GH #170)."
+  (let ((dir (uiop:ensure-directory-pathname shadow-location)))
+    (unless (probe-file dir)
+      (error "SWAP-IN-SHADOW: shadow location ~A does not exist." dir))
+    (when (probe-file (merge-pathnames ".dirty" dir))
+      (error "SWAP-IN-SHADOW: ~A still carries .dirty -- close the ~
+shadow (CLOSE-GRAPH) before swapping it in." dir))))
+
+(defun %trimmed-namestring (location)
+  "LOCATION (string or pathname) as a namestring with no trailing
+slash -- %POSIX-RENAME's two arguments must name the directories
+themselves, not \"dir/\" (GH #170)."
+  (string-right-trim "/" (namestring (uiop:ensure-directory-pathname
+                                      location))))
+
+(defun %swap-in-shadow-1 (name location shadow-location clock)
+  "The risky middle of SWAP-IN-SHADOW, run after the live store is
+already closed: validate, rename live away, rename shadow in, journal,
+reopen.  Split out so the caller's HANDLER-CASE recovery wrap reads
+cleanly (GH #170)."
+  (%require-closed-shadow shadow-location)
+  (let* ((live (%trimmed-namestring location))
+         (shadow (%trimmed-namestring shadow-location))
+         (retired-path (format nil "~A-retired-~D" live
+                               (clock-current-epoch clock))))
+    ;; Live renamed away FIRST: the data always exists under some name.
+    ;; A crash between these two renames is #171's territory (see the
+    ;; docstring) -- not recovered here.
+    (%posix-rename live retired-path)
+    (%posix-rename shadow live)
+    (journal-append clock :swap :store name :retired retired-path)
+    (let ((new-graph (open-graph name live :system-clock nil)))
+      (attach-to-system-clock new-graph clock)
+      (values new-graph retired-path))))
+
+(defun swap-in-shadow (graph shadow-location &key (timeout 60))
+  "Promote SHADOW-LOCATION into GRAPH's place: quiesce GRAPH (reason
+:SWAPPING, TIMEOUT seconds to drain) -> CLOSE-GRAPH -> rename the live
+directory to \"<location>-retired-<epoch>\" (EPOCH from
+CLOCK-CURRENT-EPOCH) -> rename SHADOW-LOCATION to the live location ->
+JOURNAL-APPEND :SWAP (:store name :retired retired-path) -> OPEN-GRAPH
+at the live location + ATTACH-TO-SYSTEM-CLOCK.  Returns (values
+NEW-GRAPH RETIRED-PATH); the retired directory is kept, not deleted.
+
+SHADOW-LOCATION must already be a CLOSED shadow (no .dirty marker) --
+this function does not close an open shadow handle for you.  That is
+the safer contract: a handle this function closes on your behalf is
+one more place a caller's pins/pending writes could be silently
+dropped, whereas requiring pre-closed just means CLOSE-GRAPH the
+shadow yourself first (GH #170).
+
+Requires GRAPH be attached to a system clock, same as SHADOW-STORE.
+Any failure BEFORE the first rename -- including SHADOW-LOCATION not
+existing or not being cleanly closed -- reopens the live store,
+restores ACCEPTING-P to T, and re-signals, mirroring SHADOW-STORE's
+copy-failure recovery (GH #170, fix round 1).  A failure BETWEEN the
+two renames is NOT recovered here: the live data sits at the retired
+path and the live location may be missing or half-replaced; manual
+recovery is required.  That crash window is GH #171's territory."
+  (let* ((tm (transaction-manager graph))
+         (name (graph-name graph))
+         (location (location graph))
+         (clock (graph-system-clock graph)))
+    (unless clock
+      (error "SWAP-IN-SHADOW requires GRAPH to be attached to a system ~
+clock (GRAPH-SYSTEM-CLOCK is NIL)."))
+    (%quiesce-transaction-manager tm :swapping timeout)
+    (let ((*graph* graph)
+          (*quiesced-store-closing-p* t))
+      (close-graph graph :snapshot-p t))
+    (handler-case
+        (%swap-in-shadow-1 name location shadow-location clock)
+      (error (original)
+        (handler-case
+            (%reopen-and-resume name location clock t)
+          (error (recovery)
+            (error 'shadow-recovery-failed
+                   :original original :recovery recovery)))
+        (error original)))))
+
 (defun discard-shadow (shadow-location)
   "Delete SHADOW-LOCATION's tree.  A shadow never registers (*GRAPHS*,
 open-store vector), so there is nothing to close first -- just delete.
