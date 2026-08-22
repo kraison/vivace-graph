@@ -80,6 +80,12 @@
            #:store-detached-error
            #:store-detached-name
            #:store-detached-id
+           #:store-id-collision-error
+           #:store-id-collision-id
+           #:store-id-collision-existing-name
+           #:store-id-collision-existing-location
+           #:store-id-collision-new-name
+           #:store-id-collision-new-location
            ;; GH #169: BACKUP warns on a dangling cross-store edge.
            #:dangling-edge-warning
            #:dangling-edge-id

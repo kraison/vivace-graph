@@ -18,27 +18,52 @@ resolver's O(1) step (GH #169).  Slot 0 unused (0 is never assigned).
 Writes only under *GRAPHS*' registration points; readers are lock-free
 -- a stale nil costs a fallback, never a wrong graph.")
 
+(define-condition store-id-collision-error (error)
+  ((id :initarg :id :reader store-id-collision-id)
+   (existing-name :initarg :existing-name :reader store-id-collision-existing-name)
+   (existing-location :initarg :existing-location
+                      :reader store-id-collision-existing-location)
+   (new-name :initarg :new-name :reader store-id-collision-new-name)
+   (new-location :initarg :new-location :reader store-id-collision-new-location))
+  (:report
+   (lambda (c s)
+     (format s "Store id ~D is already held by open graph ~S at ~S; ~
+cannot also register ~S at ~S -- one system directory per image ~
+(GH #169, #209)."
+             (store-id-collision-id c)
+             (store-id-collision-existing-name c)
+             (store-id-collision-existing-location c)
+             (store-id-collision-new-name c)
+             (store-id-collision-new-location c)))))
+
 (defun %register-open-store (graph)
   "Give GRAPH its registry store-id and publish it in the open-store
 vector.  Outside a system (*SYSTEM-DIRECTORY* nil) the graph stays
 untagged -- ids remain v5 -- rather than failing the open (GH #169).
-Signals if the slot already holds an open graph of a DIFFERENT NAME:
-one registry (hence one name<->id mapping) per image is the invariant,
-and two names sharing a slot means two DIFFERENT system directories
-handed out the same id -- silently overwriting would make
-RESOLVE-NODE-GRAPH answer with the wrong store.  Same name, same id is
+
+Signals STORE-ID-COLLISION-ERROR if the slot already holds a DIFFERENT
+open graph whose NAME or LOCATION disagrees with GRAPH's: one system
+directory per image is the invariant, and two system directories can
+each mint id 1 for their own first store -- if those stores happen to
+share a NAME too, comparing name alone would miss the collision.
+LOCATION is what distinguishes them, since two directories can never
+be the same path.  Same name AND same location reusing the slot is
 always fine (e.g. a crash-simulating test that re-registers a store by
-name without going through %UNREGISTER-OPEN-STORE first) (GH #169,
-#209)."
+name, at the same location, without going through
+%UNREGISTER-OPEN-STORE first) (GH #169, #209)."
   (when *system-directory*
     (setf (store-id graph) (store-registry-intern (graph-name graph)))
     (let* ((id (store-id graph))
            (existing (svref *store-id->graph* id)))
       (when (and existing (not (eq existing graph)) (graph-open-p existing)
-                 (not (equal (graph-name existing) (graph-name graph))))
-        (error "Store id ~D is already held by open graph ~S; cannot ~
-also register ~S -- one system directory per image (GH #169, #209)."
-               id (graph-name existing) (graph-name graph)))
+                 (or (not (equal (graph-name existing) (graph-name graph)))
+                     (not (equal (location existing) (location graph)))))
+        (error 'store-id-collision-error
+               :id id
+               :existing-name (graph-name existing)
+               :existing-location (location existing)
+               :new-name (graph-name graph)
+               :new-location (location graph)))
       (setf (svref *store-id->graph* id) graph)))
   graph)
 

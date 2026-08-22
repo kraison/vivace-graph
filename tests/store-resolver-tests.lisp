@@ -238,9 +238,10 @@ in the fix-wave report)."
 (test register-open-store-signals-on-slot-collision
   "%REGISTER-OPEN-STORE must not silently overwrite an occupied
 open-store-vector slot: two system directories opened in the same image
-can each mint id 1 for their own first store.  Nearest wrong
-implementation: the pre-#209 unconditional (SETF SVREF ...), which would
-make RESOLVE-NODE-GRAPH answer id 1 with the wrong graph from then on."
+can each mint id 1 for their own first store, and DIFFER by both name
+and location here.  Nearest wrong implementation: the pre-#209
+unconditional (SETF SVREF ...), which would make RESOLVE-NODE-GRAPH
+answer id 1 with the wrong graph from then on."
   (with-temp-directory (sys1)
     (with-temp-directory (d1)
       (let ((graph-db::*system-directory* (namestring sys1))
@@ -249,14 +250,49 @@ make RESOLVE-NODE-GRAPH answer id 1 with the wrong graph from then on."
                               :buffer-pool-size 1000)))
           (unwind-protect
                (with-temp-directory (sys2)
-                 (let ((graph-db::*system-directory* (namestring sys2))
-                       (graph-db::*store-registry* nil))
-                   ;; A hand-built second GRAPH avoids driving a full
-                   ;; MAKE-GRAPH into the collision mid-open (which would
-                   ;; leave heap/lhash files open with no clean unwind path).
-                   (let ((g2 (make-instance 'graph-db::graph
-                                           :graph-name :rsv-collide-2)))
-                     (signals error (graph-db::%register-open-store g2)))))
+                 (with-temp-directory (d2)
+                   (let ((graph-db::*system-directory* (namestring sys2))
+                         (graph-db::*store-registry* nil))
+                     ;; A hand-built second GRAPH avoids driving a full
+                     ;; MAKE-GRAPH into the collision mid-open (which would
+                     ;; leave heap/lhash files open with no clean unwind
+                     ;; path).  :LOCATION must be bound -- LOCATION is
+                     ;; unboundp otherwise, and reading an unbound slot
+                     ;; inside the guard would raise UNBOUND-SLOT instead
+                     ;; of the intended collision error.
+                     (let ((g2 (make-instance 'graph-db::graph
+                                             :graph-name :rsv-collide-2
+                                             :location d2)))
+                       (signals graph-db:store-id-collision-error
+                         (graph-db::%register-open-store g2))))))
+            (ignore-errors (close-graph g1 :snapshot-p nil))
+            (collect-garbage)))))))
+
+(test register-open-store-signals-on-same-name-different-location
+  "The hole the re-review found: comparing NAME ALONE is not enough --
+two DIFFERENT system directories whose first stores happen to share a
+NAME both mint id 1, and a name-only guard stays silent because the
+names match, so the slot is silently handed to the wrong-location
+store.  LOCATION is what actually distinguishes two stores that share a
+name (GH #169, #209)."
+  (with-temp-directory (sys1)
+    (with-temp-directory (d1)
+      (let ((graph-db::*system-directory* (namestring sys1))
+            (graph-db::*store-registry* nil))
+        (let ((g1 (make-graph :rsv-collide-same-name (namestring d1)
+                              :buffer-pool-size 1000)))
+          (unwind-protect
+               (with-temp-directory (sys2)
+                 (with-temp-directory (d2)
+                   (let ((graph-db::*system-directory* (namestring sys2))
+                         (graph-db::*store-registry* nil))
+                     ;; SAME name as G1, but a DIFFERENT location and a
+                     ;; different (fresh) registry -- also mints id 1.
+                     (let ((g2 (make-instance 'graph-db::graph
+                                             :graph-name :rsv-collide-same-name
+                                             :location d2)))
+                       (signals graph-db:store-id-collision-error
+                         (graph-db::%register-open-store g2))))))
             (ignore-errors (close-graph g1 :snapshot-p nil))
             (collect-garbage)))))))
 
