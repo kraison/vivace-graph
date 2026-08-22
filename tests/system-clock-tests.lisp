@@ -298,6 +298,79 @@ classify anything."
              (is (= 1 (length (journal-records c2)))))
         (close-system-clock c2)))))
 
+(test torn-tail-second-value-reports-torn-p
+  "TORN-P is FiveAM-blind: every torn-tail test above uses SIGNALS, which
+exits non-locally before JOURNAL-RECORDS returns any values, so none of
+them ever observed the second value.  Pin it directly on an OWNED clock:
+true on the read that truncates, nil on the clean read after (GH #191)."
+  (with-temp-directory (dir)
+    (let ((c (open-system-clock (namestring dir))))
+      (journal-append c :create :store :alpha)
+      (close-system-clock c))
+    (with-open-file (s (merge-pathnames "system-journal.log" dir)
+                       :direction :output :if-exists :append)
+      (write-string "(:kind :retire :epoch 9 :store" s))
+    (let ((c2 (open-system-clock (namestring dir))))
+      (unwind-protect
+           (progn
+             (multiple-value-bind (rs torn-p)
+                 (handler-bind
+                     ((graph-db:system-journal-torn-tail #'muffle-warning))
+                   (journal-records c2))
+               (is-true torn-p "first (owned) read must report torn-p")
+               (is (= 1 (length rs))))
+             (multiple-value-bind (rs2 torn-p2)
+                 (journal-records c2)
+               (declare (ignore rs2))
+               (is (null torn-p2)
+                   "second read after truncation must report torn-p nil")))
+        (close-system-clock c2)))))
+
+(test stale-clock-does-not-truncate-a-torn-tail
+  "After CLOSE-SYSTEM-CLOCK the directory flock is released
+(SYSTEM-CLOCK-LOCK-FD nil), but the struct survives.  JOURNAL-RECORDS on
+that stale struct must not rename-truncate the file: another process may
+hold the real lock and be mid-append, and truncating out from under it
+would silently drop every record it appends after the rename (GH #182,
+#191).  An unowned read still warns and reports TORN-P true, but leaves
+the bytes alone -- it re-warns on every read until an OWNING clock
+truncates it.  Ablation: removing the lock-fd guard in JOURNAL-RECORDS
+makes the file-unchanged assertion below fail (see fix-wave-report.md)."
+  (with-temp-directory (dir)
+    (let ((c (open-system-clock (namestring dir))))
+      (journal-append c :create :store :alpha)
+      (close-system-clock c))
+    (with-open-file (s (merge-pathnames "system-journal.log" dir)
+                       :direction :output :if-exists :append)
+      (write-string "(:kind :retire :epoch 9 :store" s))
+    (let ((before (alexandria:read-file-into-string
+                   (merge-pathnames "system-journal.log" dir)))
+          (stale (open-system-clock (namestring dir))))
+      (close-system-clock stale)
+      ;; STALE's lock-fd is now nil -- exactly the post-close shape the
+      ;; ownership check must catch.
+      (multiple-value-bind (rs torn-p)
+          (handler-bind
+              ((graph-db:system-journal-torn-tail #'muffle-warning))
+            (journal-records stale))
+        (is-true torn-p "an unowned read must still report torn-p")
+        (is (= 1 (length rs))))
+      (is (equal before
+                 (alexandria:read-file-into-string
+                  (merge-pathnames "system-journal.log" dir)))
+          "an unowned read must leave the torn bytes untouched")
+      ;; A fresh, OWNING clock can still recover it.
+      (let ((owner (open-system-clock (namestring dir))))
+        (unwind-protect
+             (progn
+               (signals graph-db:system-journal-torn-tail
+                 (journal-records owner))
+               (is-true
+                (handler-case (progn (journal-records owner) t)
+                  (graph-db:system-journal-torn-tail () nil))
+                "an owning read truncates -- the second read stays clean"))
+          (close-system-clock owner))))))
+
 ;;; Routing epoch allocation through the clock (GH #168 task 3).
 
 (test two-stores-on-one-clock-get-disjoint-ordered-epochs

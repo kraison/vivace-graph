@@ -164,7 +164,11 @@ at byte POS -- corruption mid-file, not a torn tail.  Skips forward a
 line at a time and retries; a torn TAIL by definition has nothing
 readable after it.  Stream position after a failed READ is unspecified,
 so the next READ-LINE may re-skip part of the bad text -- harmless: the
-scan only has to find ONE later record or reach EOF (GH #191)."
+scan only has to find ONE later record or reach EOF (GH #191).  If the
+damage destroys the newline so the last GOOD record shares a line with
+leading garbage, the line-at-a-time scan skips both and truncation drops
+that good record too -- outside #191's power-loss model, where a torn
+append is always a strict suffix with the prior newline intact."
   (with-open-file (s file :direction :input)
     (file-position s pos)
     (let ((*read-eval* nil))
@@ -180,9 +184,13 @@ scan only has to find ONE later record or reach EOF (GH #191)."
 file and RENAME-FILE over the original, so a crash here cannot lose the
 intact history too.  Closes the append stream first -- after the rename
 it would still reference the OLD inode and later appends would vanish.
-Caller holds the clock lock.  POS is octets: SBCL's FILE-POSITION on
-character streams reports octet offsets, which the multibyte test pins
-(GH #191)."
+Caller holds the clock lock AND the directory flock (SYSTEM-CLOCK-LOCK-FD
+non-nil) -- a stale CLOCK whose lock was released by CLOSE-SYSTEM-CLOCK
+must never call this: another process may hold the real lock and be
+mid-append, and renaming out from under it silently loses every record
+appended after the rename (GH #182, #191).  POS is octets: SBCL's
+FILE-POSITION on character streams reports octet offsets, which the
+multibyte test pins (GH #191)."
   (when (system-clock-journal clock)
     (close (system-clock-journal clock))
     (setf (system-clock-journal clock) nil))
@@ -206,7 +214,14 @@ Read with evaluation disabled -- the journal is data and must never
 execute.  A torn FINAL record (power loss mid-append) is dropped: the
 tail is truncated, SYSTEM-JOURNAL-TORN-TAIL is warned, and the intact
 history is returned with TORN-P true.  Damage anywhere ELSE signals
-SYSTEM-JOURNAL-CORRUPT and touches nothing (GH #191)."
+SYSTEM-JOURNAL-CORRUPT and touches nothing (GH #191).
+
+Truncation only runs while CLOCK holds the directory flock
+(SYSTEM-CLOCK-LOCK-FD non-nil) -- after CLOSE-SYSTEM-CLOCK the lock is
+released and another process may own the file and be mid-append; an
+unowned CLOCK still warns and returns TORN-P true but leaves the file
+untouched, so it re-warns on every read until an owning reader truncates
+it.  That repeated warning is the accepted cost (GH #182, #191)."
   (let ((file (%clock-journal-file (system-clock-location clock))))
     (with-recursive-lock-held ((system-clock-lock clock))
       (when (system-clock-journal clock)
@@ -223,7 +238,8 @@ SYSTEM-JOURNAL-CORRUPT and touches nothing (GH #191)."
                             (when (%journal-later-record-p file pos)
                               (error 'system-journal-corrupt
                                      :file file :position pos :cause e))
-                            (%journal-truncate-to clock file pos)
+                            (when (system-clock-lock-fd clock)
+                              (%journal-truncate-to clock file pos))
                             (setq torn-p t)
                             (warn 'system-journal-torn-tail
                                   :file file :position pos)

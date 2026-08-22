@@ -3283,7 +3283,11 @@ other than the tail is left untouched and signals
 ~system-journal-corrupt~ instead, whose ~journal-corrupt-file~,
 ~journal-corrupt-position~ and ~journal-corrupt-cause~ readers name
 what was found. The writer is unchanged; per-record fsync was
-considered and rejected in GH #191.
+considered and rejected in GH #191. **Truncation only happens while the
+clock holds the directory lock;** a stale/closed clock's read stays
+tolerant (warns, returns the torn-tail flag) but leaves the file
+untouched, so the next reader that owns the lock is the one that
+truncates it (GH #182, #191).
 
 *** Cross-image effects: a peer sync can advance the clock
 
