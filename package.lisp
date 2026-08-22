@@ -176,6 +176,10 @@
            #:def-edge
            #:edge-exists-p
            #:lookup-node-type-by-name
+           #:ambiguous-node-type-name
+           #:ambiguous-type-name
+           #:ambiguous-type-parent
+           #:ambiguous-type-candidates
            #:instantiate-node-type
            #:*schema-node-metadata*
            #:with-write-locked-class

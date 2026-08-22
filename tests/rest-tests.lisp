@@ -509,3 +509,28 @@ application/x-ndjson content type."
                 (graph-db::call-rest-query "noSuchQuery" (rest-params)))))
         (is (= 404 (rest-status)))
         (is-true (assoc :error j))))))
+
+(test dsl-ambiguous-type-name-is-a-query-param-error
+  "An ambiguous bare type name from a REST client must come back as the
+DSL's own client-error surface, not a raw internal condition.  Nearest
+wrong implementation: let AMBIGUOUS-NODE-TYPE-NAME propagate raw (the
+test would then see the wrong condition class)."
+  (with-alias-test-graph (g :alias-two-store)
+    (signals graph-db::query-param-error
+      (graph-db::%dsl-resolve-type "aliasSpecies" :vertex g))))
+
+(test rest-post-type-resolution-reports-ambiguity
+  "The POST vertex/edge path returns (values NIL message) for an ambiguous
+name and (values meta NIL) for a unique one."
+  (with-alias-test-graph (g :alias-two-store)
+    (let ((graph-db::*graph* g))
+      (multiple-value-bind (meta msg)
+          (graph-db::%rest-resolve-post-type "aliasSpecies" :vertex)
+        (is (null meta))
+        (is (search "mbiguous" msg)))))
+  (with-alias-test-graph (g :alias-solo-store)
+    (let ((graph-db::*graph* g))
+      (multiple-value-bind (meta msg)
+          (graph-db::%rest-resolve-post-type "aliasUnique" :vertex)
+        (is (graph-db::node-type-p meta))
+        (is (null msg))))))

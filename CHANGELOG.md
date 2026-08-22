@@ -573,6 +573,14 @@ between releases; cutting a release renames it to the new version and dates it.
   earlier in the component list; `graph-db/core`'s `:depends-on` now says
   so explicitly.
 
+- The schema's bare (keyword) type-name lookup was package-blind: two
+  same-named types in different packages silently clobbered one alias
+  entry, and REST/DSL callers got whichever class was defined last. A bare
+  name now resolves only when unique and signals
+  `ambiguous-node-type-name` otherwise; the alias key is no longer
+  written, and stale aliases in old `schema.dat` files are ignored.
+  (#190)
+
 ### Changed
 
 - **The hub resolves its type registry on the thread that starts

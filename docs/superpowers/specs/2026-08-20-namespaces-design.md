@@ -121,6 +121,10 @@ a type-id and discriminating on a slot) returns. This buys time, not infinity.
 `(intern (symbol-name (node-type-name meta)) :keyword)`. That alias is package-blind, so
 `:SPECIES` from two packages collides in a shared type table.
 
+**Fixed (#190):** the alias key is no longer written; a bare keyword name
+now resolves by scanning registered package-qualified symbols and signals
+`ambiguous-node-type-name` on a collision instead of silently colliding.
+
 **The registry is persisted and distributed, not recomputed (D14).** Today's determinism is
 free: `*schema-node-metadata*` is keyed per graph and populated in source order, so two hosts
 loading the same `schema.lisp` assign identical ids and replication can ship a raw `uint16`

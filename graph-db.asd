@@ -524,6 +524,7 @@ cl-temporal-extent."
                (:file "type-registry-tests")      ; GH #186
                (:file "global-type-id-tests")     ; GH #186
                (:file "type-id-seeding-tests")    ; GH #186
+               (:file "keyword-alias-tests")      ; GH #190
                (:file "posix-tests")              ; GH #182
                (:file "rest-tests")
                (:file "rest-http-tests")

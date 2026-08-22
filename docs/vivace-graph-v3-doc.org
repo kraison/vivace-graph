@@ -1757,6 +1757,18 @@ The API is organized RESTfully around graph resources. All endpoints are prefixe
 | *DELETE* | ~/:graph-name/edge/:id~                     | Delete an edge.                                       |
 | *GET*    | ~/:graph-name/vertex/:id/edges~             | Get all edges (incoming and outgoing) for a vertex.   |
 
+*Resolving the ~:type~ in a POST.* The `:type` path segment above (and any
+other bare type designator accepted by the DSL, e.g. `make-<type>`) is
+looked up as a *keyword*, by symbol name, against every registered
+node-type across all loaded packages. If exactly one registered type has
+that name, it resolves. If none does, you get an unknown-type error. If
+*more than one* package defines a type of that name, the lookup cannot
+guess and signals ~ambiguous-node-type-name~ instead of silently picking
+whichever was defined last; over REST this comes back as an `:error`
+JSON response naming the package-qualified candidates (e.g.
+`app.a:widget` vs. `app.b:widget`), and the caller must disambiguate by
+using the fully package-qualified symbol.
+
 **** Vertex Examples
 
 Let's assume our graph `:social-app` is running.

@@ -488,12 +488,42 @@ schema (PARENT is :vertex or :edge).  Returns (values symbol schema-package).
 Signals QUERY-PARAM-ERROR for an unknown type."
   (unless (stringp name)
     (error 'query-param-error :reason (format nil "~(~A~) type must be a string" parent)))
-  (let ((meta (lookup-node-type-by-name (%dsl-keyword name) parent :graph graph)))
+  (let ((meta (handler-case
+                  (lookup-node-type-by-name (%dsl-keyword name) parent
+                                            :graph graph)
+                (ambiguous-node-type-name (c)
+                  (error 'query-param-error
+                         :reason (format nil "ambiguous ~(~A~) type '~A': ~
+one of ~{~A~^, ~}"
+                                         parent name
+                                         (mapcar
+                                          #'%qualified-type-name-string
+                                          (ambiguous-type-candidates
+                                           c))))))))
     (unless meta
       (error 'query-param-error
              :reason (format nil "unknown ~(~A~) type '~A'" parent name)))
     (values (node-type-name meta)
             (or (find-package (node-type-package meta)) (find-package :graph-db)))))
+
+(defun %rest-resolve-post-type (type-name parent)
+  "TYPE-NAME (a client camelCase string) resolved to a node-type of PARENT
+in *GRAPH*.  (values META ERROR-STRING), exactly one non-NIL: the POST
+handlers turn ERROR-STRING into their :error JSON (GH #190)."
+  (handler-case
+      (let ((meta (lookup-node-type-by-name
+                   (intern (json:camel-case-to-lisp type-name) :keyword)
+                   parent :graph *graph*)))
+        (if meta
+            (values meta nil)
+            (values nil (format nil "Unknown ~(~A~) type ~A"
+                                parent type-name))))
+    (ambiguous-node-type-name (c)
+      (values nil
+              (format nil "Ambiguous ~(~A~) type ~A: one of ~{~A~^, ~}"
+                      parent type-name
+                      (mapcar #'%qualified-type-name-string
+                              (ambiguous-type-candidates c)))))))
 
 (defparameter *dsl-compare-ops*
   '(("<" . <) (">" . >) ("<=" . <=) (">=" . >=) ("=" . =) ("==" . ==) ("/=" . /=))
@@ -636,32 +666,29 @@ A malformed query or a resource-bound breach is a 400, a forbidden effect a 403.
 (defun rest-post-vertex (params)
   (with-rest-auth ((get-param params "username") (get-param params "password"))
     (with-rest-graph ((get-param params :graph-name))
-      (let* ((type-name (get-param params :type))
-             (type (lookup-node-type-by-name
-                    (intern (json:camel-case-to-lisp type-name) :keyword)
-                    :vertex
-                    :graph *graph*)))
-        (if type
-            (let* ((class (find-class (node-type-name type)))
-                   (slots (mapcar (lambda (slot)
-                                    (intern (symbol-name slot) :keyword))
-                                  (data-slots class)))
-                   (constructor (node-type-constructor type))
-                   ;; MAPCAN (not FLATTEN): FLATTEN drops nil slot values,
-                   ;; leaving an odd-length plist -> "odd number of &KEY args".
-                   (slot-args (mapcan (lambda (slot)
-                                        (list slot
-                                              (cdr (assoc (json:lisp-to-camel-case
-                                                           (symbol-name slot))
-                                                          params
-                                                          :test 'string-equal))))
-                                      slots))
-                   (node (apply constructor slot-args)))
-              (json-encode node))
-            (json:encode-json-to-string
-             (list
-              (cons :error
-                    (format nil "Unknown vertex type ~A" type-name)))))))))
+      (let ((type-name (get-param params :type)))
+        (multiple-value-bind (type error-string)
+            (%rest-resolve-post-type type-name :vertex)
+          (if type
+              (let* ((class (find-class (node-type-name type)))
+                     (slots (mapcar (lambda (slot)
+                                      (intern (symbol-name slot) :keyword))
+                                    (data-slots class)))
+                     (constructor (node-type-constructor type))
+                     ;; MAPCAN (not FLATTEN): FLATTEN drops nil slot values,
+                     ;; leaving an odd plist -> "odd number of &KEY args".
+                     (slot-args
+                       (mapcan (lambda (slot)
+                                 (list slot
+                                       (cdr (assoc (json:lisp-to-camel-case
+                                                    (symbol-name slot))
+                                                   params
+                                                   :test 'string-equal))))
+                               slots))
+                     (node (apply constructor slot-args)))
+                (json-encode node))
+              (json:encode-json-to-string
+               (list (cons :error error-string)))))))))
 
 (defun rest-put-vertex (params)
   (with-rest-auth ((get-param params "username") (get-param params "password"))
@@ -695,39 +722,39 @@ A malformed query or a resource-bound breach is a 400, a forbidden effect a 403.
 (defun rest-post-edge (params)
   (with-rest-auth ((get-param params "username") (get-param params "password"))
     (with-rest-graph ((get-param params :graph-name))
-      (let* ((type-name (get-param params :type))
-             (type (lookup-node-type-by-name
-                    (intern (json:camel-case-to-lisp type-name) :keyword)
-                    :edge
-                    :graph *graph*)))
-        (if type
-            (let* ((class (find-class (node-type-name type)))
-                   (slots (mapcar (lambda (slot)
-                                    (intern (symbol-name slot) :keyword))
-                                  (data-slots class)))
-                   (constructor (node-type-constructor type))
-                   (from (lookup-vertex (cdr (assoc "from" params :test 'string-equal))))
-                   (to (lookup-vertex (cdr (assoc "to" params :test 'string-equal))))
-                   ;; MAPCAN (not FLATTEN): FLATTEN drops nil slot values,
-                   ;; leaving an odd-length plist -> "odd number of &KEY args".
-                   (slot-args (mapcan (lambda (slot)
-                                        (list slot
-                                              (cdr (assoc (json:lisp-to-camel-case
-                                                           (symbol-name slot))
-                                                          params
-                                                          :test 'string-equal))))
-                                      slots)))
-              (if (and from to)
-                  (let ((node (apply constructor :from from :to to slot-args)))
-                    (json-encode node))
-                  (json:encode-json-to-string
-                   (list
-                    (cons :error
-                          "You must provide both FROM and TO vertices")))))
-            (json:encode-json-to-string
-             (list
-              (cons :error
-                    (format nil "Unknown edge type ~A" type-name)))))))))
+      (let ((type-name (get-param params :type)))
+        (multiple-value-bind (type error-string)
+            (%rest-resolve-post-type type-name :edge)
+          (if type
+              (let* ((class (find-class (node-type-name type)))
+                     (slots (mapcar (lambda (slot)
+                                      (intern (symbol-name slot) :keyword))
+                                    (data-slots class)))
+                     (constructor (node-type-constructor type))
+                     (from (lookup-vertex
+                            (cdr (assoc "from" params :test 'string-equal))))
+                     (to (lookup-vertex
+                          (cdr (assoc "to" params :test 'string-equal))))
+                     ;; MAPCAN (not FLATTEN): FLATTEN drops nil slot values,
+                     ;; leaving an odd plist -> "odd number of &KEY args".
+                     (slot-args
+                       (mapcan (lambda (slot)
+                                 (list slot
+                                       (cdr (assoc (json:lisp-to-camel-case
+                                                    (symbol-name slot))
+                                                   params
+                                                   :test 'string-equal))))
+                               slots)))
+                (if (and from to)
+                    (let ((node (apply constructor :from from :to to
+                                       slot-args)))
+                      (json-encode node))
+                    (json:encode-json-to-string
+                     (list
+                      (cons :error
+                            "You must provide both FROM and TO vertices")))))
+              (json:encode-json-to-string
+               (list (cons :error error-string)))))))))
 
 (defun rest-put-edge (params)
   (with-rest-auth ((get-param params "username") (get-param params "password"))
