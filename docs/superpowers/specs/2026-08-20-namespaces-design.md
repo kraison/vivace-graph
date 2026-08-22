@@ -218,6 +218,17 @@ the vertex table, both ve-indexes, the vev-index and the type-index. "Move a nod
 store" is copy-and-delete with a new id. Re-homing a *class* does not re-home existing
 *nodes*.
 
+**Built (#169):** 12-bit tag, at the wide end of the 8–12 bit range.
+`gen-v8-uuid` stamps it plus version/variant; `uuid-v8-p`/`id-store-tag`
+read it back, never trusting a v5 id's corresponding bytes (SHA1
+output, not a tag). The registry is an append-only
+`store-registry.log` under the system directory, one line per
+graph-name, ids 1..4095 and never reused; `store-registry-intern`
+mints under the same read-decide-append-under-`flock` discipline as
+the type registry. `resolve-node-graph` is the resolver: O(1)
+open-store-vector index for v8, per-open-store scan for v5, exactly as
+designed above.
+
 ### 5.4 Inbound and outbound cross-store lookup
 
 Indexes live in stores, and stores stay few, so an unhinted sweep is a handful of lookups.
@@ -320,6 +331,18 @@ report "not found anywhere" and could not distinguish an absent store from a mis
 **Explicit versus incidental access.** A call naming a detached store **signals**
 (`store-detached-error`) — the caller asked for something specific. Incidental traversal
 into one yields the marker — that caller merely walked there.
+
+**Built (#169):** `backup` writes the edge and warns via
+`dangling-edge-warning` (edge, endpoint, store) for a detached or
+different-open-store endpoint; a clean backup stays silent.
+`lookup-vertex-anywhere` returns an `unresolved-node` marker by
+default and signals `store-detached-error` for `:if-detached :error`,
+matching the explicit/incidental split above. `traverse` is the
+incidental caller: a cross-store endpoint or marker lands in the
+result but is not walked past — full cross-store continuation is
+#170+. `active-edge-p` resolves cross-store endpoints for liveness,
+with two scoped gaps tracked as #208 (no v5 cross-store scan; an
+unregistered tag counts as live).
 
 ## 8. Bulk load and detach
 

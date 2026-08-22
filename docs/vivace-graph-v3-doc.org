@@ -574,7 +574,12 @@ VivaceGraph's most distinctive feature is its deep integration with the Common L
 
 At the top of the hierarchy is the ~node~ class, defined in ~clos.lisp~ and ~node-class.lisp~. It is the abstract superclass for anything that can exist in the graph. Every ~node~ instance has a set of core, built-in properties that are essential for the database's internal management:
 
-- ~id~ :: A 16-byte UUID that uniquely identifies the node across the entire database.
+- ~id~ :: A 16-byte UUID that uniquely identifies the node across the
+  entire database. An older id is v5 (SHA1-based, no store information
+  in its bytes); since GH #169 a store attached to a system directory
+  mints v8 ids instead, each carrying a 12-bit store tag used for O(1)
+  cross-store resolution -- see Chapter 17, "Tagged node ids: the
+  store registry and UUIDv8".
 - ~revision~ :: An integer that increments with every update, used for optimistic concurrency control.
 - ~%deleted-p~ :: A boolean flag indicating whether the node has been marked for deletion.
 - ~%data-pointer~ :: A 64-bit integer pointing to the location of the node's serialized data in the heap file.
@@ -1960,6 +1965,15 @@ The resulting file contains a series of Lisp s-expressions, one for each node in
 **** The ~backup~ Function
 
 The ~backup~ function is the underlying worker called by ~snapshot~. It handles the process of iterating through all nodes and writing their serialized representations to a Lisp stream. While you can call it directly, it does not provide the safety guarantees (locking and integrity checks) of `snapshot`, so its direct use is discouraged for production backups.
+
+**Cross-store edges (GH #169).** An edge whose endpoint lives in
+another store is written to the backup file as-is -- connectivity is
+never dropped. If that endpoint's store is *detached* (registered but
+not open) or is a *different* open store than the one being backed up,
+~backup~ also signals ~dangling-edge-warning~, naming the edge, the
+missing endpoint and its store: restoring this file before that other
+store is attached would leave the edge dangling. A backup with no such
+gaps never warns.
 
 *** Restoring a Graph from a Snapshot (~replay~)
 
@@ -3347,6 +3361,70 @@ price of giving a cross-store query a genuine shared instant (spec §6);
 without it, one store's reaper could free a version a snapshot on another
 store still depends on.
 
+*** Tagged node ids: the store registry and UUIDv8
+
+Every node id is already global -- a node's store is where you find
+it, not part of what it is -- but a v5 id carries no way to find that
+store short of asking every open one. As of GH #169, a store attached
+to a system directory mints ids as *UUIDv8* (RFC 9562's vendor layout)
+instead: 110 bits of random fill, version and variant stamped, and a
+12-bit *store tag* in the low nibble of byte 14 plus byte 15. A store
+opened with no ~*system-directory*~ bound stays untagged and keeps
+minting v5 ids exactly as before -- there is no flag day.
+
+The tag is a stable numeric *store-id*, assigned from a second,
+separate registry -- distinct from the type registry earlier in this
+chapter, and from that registry's own ~store-registry-conflict~
+condition, which is about type-id disagreement, not this id. This one
+lives in ~store-registry.log~, a sibling of ~type-registry.log~ under
+~*system-directory*~, one line per graph-name the system has ever
+opened, 1 through 4095. Ids are never reused: a store-id rides inside
+every v8 node id that store mints, so reusing one would silently rebind
+existing ids to the wrong store. Assignment is
+~store-registry-intern~, which serialises through the same
+read-decide-append-under-~flock~ discipline as the type registry;
+plain lookups (~store-registry-id-for~, ~store-registry-name-for~) take
+no lock. A system that has assigned all 4095 ids signals
+~store-registry-full~ -- widening the tag is a format change, not a
+runtime one.
+
+~uuid-v8-p~ tests the version nibble and ~id-store-tag~ reads the tag
+(NIL for a v5 id -- never read a v5 id's byte 14/15 as a tag, since
+that is SHA1 output and would name a random store). ~resolve-node-graph~
+is the reader built on top: for a v8 id it indexes the open-store
+vector directly, O(1); for a v5 id it falls back to asking each open
+store's own vertex table, same cost as before #169. It returns three
+values -- the graph (or NIL), a status of ~:resolved~, ~:detached~ (the
+registry knows the tag but no open graph currently carries it) or
+~:unknown~ (an unregistered tag, or a v5 id no open store holds), and
+the store-id when one is known.
+
+*** Cross-store reads: markers, detached stores, and traversal
+
+~lookup-vertex-anywhere~ wraps ~resolve-node-graph~ for the common case
+of reading a node whose store you cannot assume. A resolved id reads
+normally; an unknown one returns NIL, same as an ordinary miss. A
+*detached* store -- registered, but not currently open -- is the new
+case: by default it returns an ~unresolved-node~ marker struct (id,
+store-id, store-name), never a bare NIL, because NIL there would be
+indistinguishable from "no such node." Passing ~:if-detached :error~
+instead signals ~store-detached-error~, for callers that named a
+specific node and want to know its store is offline rather than
+silently walking around it.
+
+That split -- marker for incidental access, error for explicit access
+-- is deliberate (spec sec.7). ~traverse~ takes the incidental side: an
+edge whose endpoint resolves to a *different* open store, or to a
+detached one, still lands in the traversal's results (the vertex
+object, or the ~unresolved-node~ marker), but the walk does not
+continue past it into the other store's own adjacency -- following a
+cross-store edge across the boundary is left to a later unit. Likewise
+~active-edge-p~ resolves a cross-store endpoint to decide whether an
+edge is still live, with two narrow, accepted gaps documented at the
+call site and tracked as GH #208: an untagged v5 endpoint gets no
+cross-store scan on this hot path, and an unregistered tag is treated
+as live rather than proven dead, since it cannot be disproved.
+
 ** Chapter 18: Temporal Extents — graph-db/spacetime (optional)
 
 Every timestamp a real system records comes with some story about how sure
@@ -4264,7 +4342,32 @@ This chapter provides a categorized reference for the most important exported sy
   As ~outgoing-edges~, for incoming edges.
 
 - ~traverse (vertex &key ... )~ ::
-  Performs a breadth-first search traversal starting from a given vertex.
+  Performs a breadth-first search traversal starting from a given
+  vertex. A cross-store endpoint or a detached-store marker (see
+  below) appears in the results but is not walked past (GH #169; see
+  Chapter 17).
+
+- ~resolve-node-graph (id)~ ::
+  Returns ~(values graph status store-id)~ for a node id: the open
+  graph holding it (or NIL) and a status of ~:resolved~, ~:detached~
+  (registered store, not open) or ~:unknown~. O(1) for a v8 id, a
+  per-open-store scan for a v5 id. See Chapter 17.
+
+- ~lookup-vertex-anywhere (id &key if-detached)~ ::
+  Reads ID's vertex from whichever open store holds it. Returns an
+  ~unresolved-node~ marker (default, ~:if-detached :marker~) or
+  signals ~store-detached-error~ (~:if-detached :error~) when ID's
+  store is registered but not open; NIL when ID is unknown to the
+  system.
+
+- ~unresolved-node~ (struct) ::
+  Marks a read that reached a real node in a detached store.
+  Readers: ~unresolved-node-id~, ~-store-id~, ~-store-name~.
+
+- ~store-detached-error~ (condition) ::
+  Signalled by ~lookup-vertex-anywhere :if-detached :error~ for a node
+  whose store is registered but not currently open. Readers:
+  ~store-detached-name~, ~store-detached-id~.
 
 **** Replication
 - ~start-replication (graph &key ... )~ ::
