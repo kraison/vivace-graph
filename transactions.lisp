@@ -12,9 +12,12 @@
 (defvar *quiesced-store-closing-p* nil
   "Bound T only in the detaching thread's dynamic extent, while
 DETACH-STORE's own CLOSE-GRAPH runs its post-quiesce snapshot scan.  Lets
-that one internal read through despite ACCEPTING-P being non-T, without
-opening the door to any other caller -- the binding is thread-local, so
-a concurrent thread still sees the refusal (GH #170).")
+that one internal PIN-READ-EPOCH through despite ACCEPTING-P being
+non-T, without opening the door to any other caller -- the binding is
+thread-local, so a concurrent thread still sees the refusal.  Checked
+only by PIN-READ-EPOCH: CLOSE-GRAPH's snapshot path (BACKUP via
+MAP-VERTICES/MAP-EDGES) takes read pins, never a transaction, so
+CREATE-TRANSACTION has no matching bypass (GH #170).")
 (defvar *read-snapshots* nil
   "Graph -> read-only snapshot transaction, or NIL.  Read-only snapshots are
 per graph and may compose; read-write transactions are not (GH #53).")
@@ -681,20 +684,32 @@ vertices (the normal case for ingested source records) are unaffected."
 (defun pin-read-epoch (transaction-manager)
   "Register a read pin at the current epoch; return its token (for UNPIN).
 Refused -- STORE-NOT-ACCEPTING-ERROR -- only under FULL quiescence
-(:DETACHING / :SWAPPING); :READ-ONLY admits new pins (GH #170)."
-  (let ((state (accepting-p transaction-manager)))
-    (unless (or (eq state t) (eq state :read-only)
-                *quiesced-store-closing-p*)
-      (error 'store-not-accepting-error
-             :name (graph-name (graph transaction-manager))
-             :reason state)))
-  ;; Racy read of the epoch is fine: it is monotonic, and a slightly stale
-  ;; (smaller) value only makes the reaper MORE conservative, never less.
-  (let ((epoch (tm-peek-epoch transaction-manager)))
-    (with-recursive-lock-held ((read-pins-lock transaction-manager))
-      (let ((token (incf (read-pin-counter transaction-manager))))
-        (setf (gethash token (read-pins transaction-manager)) epoch)
-        token))))
+(:DETACHING / :SWAPPING); :READ-ONLY admits new pins.
+
+The accepting-p CHECK and the pin REGISTRATION run as one critical
+section under READ-PINS-LOCK -- the same lock
+%QUIESCE-TRANSACTION-MANAGER's flip takes (after TM-LOCK; see its
+docstring for the lock-ordering argument).  Without this, the check
+here and the HASH-TABLE write below ran under two different locks, so a
+racing caller could observe ACCEPTING-P as T, then have the flip and
+the full drain both complete, and only THEN land its pin -- a straggler
+admitted after DETACH-STORE had already reported success and begun
+tearing down mmaps (GH #170, fix round 1)."
+  (with-recursive-lock-held ((read-pins-lock transaction-manager))
+    (let ((state (accepting-p transaction-manager)))
+      (unless (or (eq state t) (eq state :read-only)
+                  *quiesced-store-closing-p*)
+        (error 'store-not-accepting-error
+               :name (graph-name (graph transaction-manager))
+               :reason state)))
+    ;; Racy read of the epoch is fine: it is monotonic, and a slightly
+    ;; stale (smaller) value only makes the reaper MORE conservative,
+    ;; never less.  Reading it inside the lock now (rather than before
+    ;; it) costs nothing -- TM-PEEK-EPOCH is itself lock-free.
+    (let* ((epoch (tm-peek-epoch transaction-manager))
+           (token (incf (read-pin-counter transaction-manager))))
+      (setf (gethash token (read-pins transaction-manager)) epoch)
+      token)))
 
 (defun unpin-read-epoch (transaction-manager token)
   (with-recursive-lock-held ((read-pins-lock transaction-manager))
@@ -3061,8 +3076,7 @@ transaction; see that condition for why."
   (with-recursive-lock-held ((lock transaction-manager))
     (let ((state (accepting-p transaction-manager)))
       (unless (or (eq state t)
-                  (and allow-read-only (eq state :read-only))
-                  *quiesced-store-closing-p*)
+                  (and allow-read-only (eq state :read-only)))
         (error 'store-not-accepting-error
                :name (graph-name (graph transaction-manager))
                :reason (if (eq state :read-only) :shadow-load state))))
@@ -3338,6 +3352,22 @@ Signals NO-TRANSACTION-IN-PROGRESS if none is active."
 (defparameter *quiesce-poll-interval* 0.05
   "Seconds between REAP-SAFE-FLOOR polls in %QUIESCE-TRANSACTION-MANAGER.")
 
+(defun %set-accepting-p (transaction-manager reason)
+  "Set ACCEPTING-P while holding TM-LOCK, then READ-PINS-LOCK, in that
+fixed order -- the same order every caller of this function uses, and
+the order PIN-READ-EPOCH is compatible with because it only ever takes
+READ-PINS-LOCK alone (never TM-LOCK), so this can never deadlock against
+it.  Grepped every existing site that takes both locks
+(CREATE-TRANSACTION: TM-LOCK only; PIN-READ-EPOCH/UNPIN-READ-EPOCH/
+MINIMUM-READ-PIN: READ-PINS-LOCK only) and found no path that nests them
+in the opposite order.  Holding READ-PINS-LOCK across the SETF is what
+makes the flip atomic with PIN-READ-EPOCH's own check-then-register
+critical section: once this returns, no pin admitted after it can have
+missed seeing REASON (GH #170, fix round 1)."
+  (with-transaction-manager-lock (transaction-manager)
+    (with-recursive-lock-held ((read-pins-lock transaction-manager))
+      (setf (accepting-p transaction-manager) reason))))
+
 (defun %quiesce-transaction-manager (transaction-manager reason timeout)
   "Flip TRANSACTION-MANAGER's ACCEPTING-P to REASON (a keyword) and wait,
 in short sleeps, for REAP-SAFE-FLOOR to go NIL -- no active transaction and
@@ -3346,15 +3376,14 @@ On TIMEOUT seconds elapsed with no drain: restore ACCEPTING-P to T (a
 failed detach must not strand the store half-dead) and signal
 DETACH-DRAIN-TIMEOUT.  On success return T with ACCEPTING-P left at
 REASON (GH #170)."
-  (with-transaction-manager-lock (transaction-manager)
-    (setf (accepting-p transaction-manager) reason))
+  (%set-accepting-p transaction-manager reason)
   (let ((deadline (+ (get-internal-real-time)
                      (round (* timeout internal-time-units-per-second)))))
     (loop
       (when (null (reap-safe-floor transaction-manager))
         (return t))
       (when (> (get-internal-real-time) deadline)
-        (setf (accepting-p transaction-manager) t)
+        (%set-accepting-p transaction-manager t)
         (error 'detach-drain-timeout
                :name (graph-name (graph transaction-manager))
                :seconds timeout))
@@ -3401,10 +3430,15 @@ hand over."))
 
 (defun reattach-store (detachment &key (buffer-pool-size nil bps-p))
   "Reopen the store DETACHMENT names at its recorded location and rejoin
-it to the image clock (*SYSTEM-CLOCK*).  Composes OPEN-GRAPH with
-ATTACH-TO-SYSTEM-CLOCK -- which already refuses active transactions and
-journals :ATTACH -- rather than reimplementing either.  Returns the new
-GRAPH (GH #170)."
+it to the image clock.  REQUIRES *SYSTEM-CLOCK* to already be bound to
+that clock in the caller's dynamic extent -- this function takes no
+clock argument (the contract fixes its lambda list), so it reads the
+ambient *SYSTEM-CLOCK* the same way MAKE-GRAPH/OPEN-GRAPH's own
+:SYSTEM-CLOCK default does.  Passes :SYSTEM-CLOCK NIL to OPEN-GRAPH
+itself (to avoid OPEN-GRAPH attaching a second time from its own
+default) and then calls ATTACH-TO-SYSTEM-CLOCK explicitly -- which
+already refuses active transactions and journals :ATTACH -- rather than
+reimplementing either.  Returns the new GRAPH (GH #170)."
   (let* ((open-args (list (store-detachment-graph-name detachment)
                           (namestring (store-detachment-location detachment))
                           :system-clock nil))

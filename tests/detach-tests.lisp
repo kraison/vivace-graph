@@ -153,3 +153,49 @@ one."
                    (is (< detach-pos attach-pos))))
             (let ((graph-db:*graph* g2))
               (ignore-errors (close-graph g2 :snapshot-p nil)))))))))
+
+(test pin-admission-is-atomic-with-quiesce
+  "Fix round 1, GH #170: PIN-READ-EPOCH's accepting-p check and
+%QUIESCE-TRANSACTION-MANAGER's flip must be one atomic operation --
+otherwise a racing PIN-READ-EPOCH can slip a registration in AFTER the
+drain has already reported success (i.e. after DETACH-STORE has begun
+tearing down mmaps).  One thread hammers PIN-READ-EPOCH/UNPIN-READ-EPOCH
+in a tight loop for the whole duration of a concurrent DETACH-STORE;
+after DETACH-STORE returns, the read-pins table must be EMPTY (no
+straggler survived the drain) and the hammer thread must have seen at
+least one refusal.
+
+This is a BEST-EFFORT race canary, not the proof -- the proof is the
+LOCK DISCIPLINE: %QUIESCE-TRANSACTION-MANAGER's flip takes TM-LOCK then
+READ-PINS-LOCK (see %SET-ACCEPTING-P); PIN-READ-EPOCH's check-and-
+register runs as one critical section under READ-PINS-LOCK alone.  No
+existing caller nests these two locks in the opposite order (see
+%SET-ACCEPTING-P's docstring), so the flip and a pin attempt can never
+interleave: either PIN-READ-EPOCH's critical section runs first (and
+registers before REASON is visible, correctly holding the drain open),
+or the flip's critical section runs first (and PIN-READ-EPOCH sees
+REASON and refuses) -- never a check that reads T followed by a
+registration that lands after the flip.  This test can only ever
+demonstrate the ABSENCE of the race on this run; the lock discipline is
+what guarantees its absence on every run."
+  (with-clocked-store (g clock sys)
+    clock sys
+    (with-transaction ((graph-db::transaction-manager g))
+      (graph-db:make-vertex :generic nil :graph g))
+    (let* ((tm (graph-db::transaction-manager g))
+           (stop nil)
+           (refusals 0)
+           (hammer (bt:make-thread
+                    (lambda ()
+                      (loop until stop do
+                        (handler-case
+                            (let ((tok (graph-db:pin-read-epoch tm)))
+                              (graph-db:unpin-read-epoch tm tok))
+                          (graph-db:store-not-accepting-error ()
+                            (incf refusals))))))))
+      (graph-db:detach-store g)
+      (setq stop t)
+      (bt:join-thread hammer)
+      (is (plusp refusals) "the hammer thread must see the refusal")
+      (is (zerop (hash-table-count (graph-db::read-pins tm)))
+          "no straggler pin admitted after drain success"))))
