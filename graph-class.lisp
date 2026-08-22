@@ -21,10 +21,25 @@ Writes only under *GRAPHS*' registration points; readers are lock-free
 (defun %register-open-store (graph)
   "Give GRAPH its registry store-id and publish it in the open-store
 vector.  Outside a system (*SYSTEM-DIRECTORY* nil) the graph stays
-untagged -- ids remain v5 -- rather than failing the open (GH #169)."
+untagged -- ids remain v5 -- rather than failing the open (GH #169).
+Signals if the slot already holds an open graph of a DIFFERENT NAME:
+one registry (hence one name<->id mapping) per image is the invariant,
+and two names sharing a slot means two DIFFERENT system directories
+handed out the same id -- silently overwriting would make
+RESOLVE-NODE-GRAPH answer with the wrong store.  Same name, same id is
+always fine (e.g. a crash-simulating test that re-registers a store by
+name without going through %UNREGISTER-OPEN-STORE first) (GH #169,
+#209)."
   (when *system-directory*
     (setf (store-id graph) (store-registry-intern (graph-name graph)))
-    (setf (svref *store-id->graph* (store-id graph)) graph))
+    (let* ((id (store-id graph))
+           (existing (svref *store-id->graph* id)))
+      (when (and existing (not (eq existing graph)) (graph-open-p existing)
+                 (not (equal (graph-name existing) (graph-name graph))))
+        (error "Store id ~D is already held by open graph ~S; cannot ~
+also register ~S -- one system directory per image (GH #169, #209)."
+               id (graph-name existing) (graph-name graph)))
+      (setf (svref *store-id->graph* id) graph)))
   graph)
 
 (defun %unregister-open-store (graph)

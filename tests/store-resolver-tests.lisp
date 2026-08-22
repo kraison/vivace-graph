@@ -182,6 +182,121 @@ CORRECTED (task-4), controller notes:
                                forms)
                       "the dangling edge is IN the backup")))))))
 
+(test traverse-gate-is-node-graph-not-tag
+  "TRAVERSE's same-store enqueue gate must trust NODE-GRAPH (stamped by
+every read), not a tag-vs-STORE-ID comparison: a store reopened under a
+DIFFERENT system directory gets a different registry id than the one
+baked into its own already-minted v8 ids, so the tag mismatches even
+though every vertex IS local.  The tag-based gate (pre-#209) truncates
+BFS after depth 1 here; the fix walks the whole chain.  Nearest wrong
+implementation: the reverted tag-equality gate (see the ablation notes
+in the fix-wave report)."
+  (with-temp-directory (sys1)
+    (with-temp-directory (d)
+      (let (v1id v2id v3id)
+        (let ((graph-db::*system-directory* (namestring sys1))
+              (graph-db::*store-registry* nil))
+          (let ((g (make-graph :rsv-store-1 (namestring d)
+                                :buffer-pool-size 1000)))
+            (unwind-protect
+                 (let (v1 v2 v3)
+                   (with-transaction ((graph-db::transaction-manager g))
+                     (setq v1 (graph-db:make-vertex :generic nil :graph g))
+                     (setq v2 (graph-db:make-vertex :generic nil :graph g))
+                     (setq v3 (graph-db:make-vertex :generic nil :graph g))
+                     (make-rsv-edge :from v1 :to v2 :graph g)
+                     (make-rsv-edge :from v2 :to v3 :graph g))
+                   (setq v1id (id v1) v2id (id v2) v3id (id v3)))
+              (ignore-errors (close-graph g :snapshot-p nil))
+              (collect-garbage))))
+        ;; Reopen under a DIFFERENT, otherwise-unrelated system directory.
+        ;; Consume id 1 with a dummy name first so :RSV-STORE-1 mints id 2
+        ;; here -- deliberately mismatching the tag (1) already baked into
+        ;; v1id/v2id/v3id, rather than relying on both registries handing
+        ;; out 1 by coincidence.
+        (with-temp-directory (sys2)
+          (let ((graph-db::*system-directory* (namestring sys2))
+                (graph-db::*store-registry* nil))
+            (graph-db::store-registry-intern "rsv-dummy-consumer")
+            (let ((g2 (open-graph :rsv-store-1 (namestring d)
+                                  :buffer-pool-size 1000)))
+              (unwind-protect
+                   (let* ((v1 (lookup-vertex v1id :graph g2))
+                          (results (traverse v1 :graph g2 :direction :out
+                                             :edge-type 'rsv-edge)))
+                     (is (find-if (lambda (r) (and (graph-db::vertex-p r)
+                                                    (equalp v2id (id r))))
+                                  results)
+                         "depth 1 (v2) is reached")
+                     (is (find-if (lambda (r) (and (graph-db::vertex-p r)
+                                                    (equalp v3id (id r))))
+                                  results)
+                         "depth 2 (v3) is reached -- fails under the tag gate"))
+                (ignore-errors (close-graph g2 :snapshot-p nil))
+                (collect-garbage)))))))))
+
+(test register-open-store-signals-on-slot-collision
+  "%REGISTER-OPEN-STORE must not silently overwrite an occupied
+open-store-vector slot: two system directories opened in the same image
+can each mint id 1 for their own first store.  Nearest wrong
+implementation: the pre-#209 unconditional (SETF SVREF ...), which would
+make RESOLVE-NODE-GRAPH answer id 1 with the wrong graph from then on."
+  (with-temp-directory (sys1)
+    (with-temp-directory (d1)
+      (let ((graph-db::*system-directory* (namestring sys1))
+            (graph-db::*store-registry* nil))
+        (let ((g1 (make-graph :rsv-collide-1 (namestring d1)
+                              :buffer-pool-size 1000)))
+          (unwind-protect
+               (with-temp-directory (sys2)
+                 (let ((graph-db::*system-directory* (namestring sys2))
+                       (graph-db::*store-registry* nil))
+                   ;; A hand-built second GRAPH avoids driving a full
+                   ;; MAKE-GRAPH into the collision mid-open (which would
+                   ;; leave heap/lhash files open with no clean unwind path).
+                   (let ((g2 (make-instance 'graph-db::graph
+                                           :graph-name :rsv-collide-2)))
+                     (signals error (graph-db::%register-open-store g2)))))
+            (ignore-errors (close-graph g1 :snapshot-p nil))
+            (collect-garbage)))))))
+
+(test resolve-node-graph-accepts-a-string-id
+  "RESOLVE-NODE-GRAPH accepts a 32-hex-digit string id, like LOOKUP-VERTEX
+does, and resolves it the same as the raw array (GH #209)."
+  (with-two-stores (g1 g2 sys)
+    g1
+    (let (v)
+      (with-transaction ((graph-db::transaction-manager g2))
+        (setq v (graph-db:make-vertex :generic nil :graph g2)))
+      (multiple-value-bind (graph status)
+          (graph-db:resolve-node-graph (string-id (id v)))
+        (is (eq g2 graph))
+        (is (eq :resolved status))))))
+
+(test reattach-after-reopen-resolves-to-the-new-graph
+  "The detached->reattached transition: once the store is OPEN again
+(a fresh GRAPH object, same directory), RESOLVE-NODE-GRAPH must answer
+:RESOLVED with the NEW graph, and LOOKUP-VERTEX-ANYWHERE must return the
+live vertex again -- not a marker, not the old (now-closed) graph."
+  (with-two-stores (g1 g2 sys)
+    g1
+    (let (v vid loc)
+      (with-transaction ((graph-db::transaction-manager g2))
+        (setq v (graph-db:make-vertex :generic nil :graph g2)))
+      (setq vid (id v))
+      (setq loc (namestring (graph-db::location g2)))
+      (close-graph g2 :snapshot-p nil)
+      (is (eq :detached (nth-value 1 (graph-db:resolve-node-graph vid))))
+      (let ((g2b (open-graph :rsv-store-2 loc :buffer-pool-size 1000)))
+        (unwind-protect
+             (multiple-value-bind (graph status)
+                 (graph-db:resolve-node-graph vid)
+               (is (eq :resolved status))
+               (is (eq g2b graph))
+               (is-true (graph-db::vertex-p
+                         (graph-db:lookup-vertex-anywhere vid))))
+          (ignore-errors (close-graph g2b :snapshot-p nil)))))))
+
 (test clean-backups-never-warn-dangling
   "No-false-positive canary for DANGLING-EDGE-WARNING (review fix,
 GH #169): one graph, no cross-store edges anywhere -- a live-live

@@ -68,12 +68,15 @@
                               ;; below, but its adjacency lives in another
                               ;; store's MAP-EDGES -- cross-store
                               ;; continuation is future work (GH #169 ->
-                              ;; #170+).
+                              ;; #170+). Gate on NODE-GRAPH (stamped by every
+                              ;; read, LOOKUP-VERTEX or LOOKUP-VERTEX-ANYWHERE
+                              ;; alike), not the id's tag: an untagged-reopen
+                              ;; graph's own vertices and a peer's tagged ids
+                              ;; landing in OUR table both have tags that
+                              ;; disagree with STORE-ID, and both must still
+                              ;; be walked (GH #169, #209).
                               (when (and to-vertex (vertex-p to-vertex)
-                                         (let ((tag (id-store-tag
-                                                     (id to-vertex))))
-                                           (or (null tag)
-                                               (eql tag (store-id graph)))))
+                                         (eq (node-graph to-vertex) graph))
                                 (unless (gethash to-vertex memory)
                                   (setf (gethash to-vertex memory) t)
                                   (enqueue queue new-traversal)))
@@ -92,12 +95,10 @@
                                     (update-traversal traversal
                                                       from-vertex
                                                       edge)))
-                              ;; See the :OUT branch above (GH #169 -> #170+).
+                              ;; See the :OUT branch above (GH #169, #209 ->
+                              ;; #170+).
                               (when (and from-vertex (vertex-p from-vertex)
-                                         (let ((tag (id-store-tag
-                                                     (id from-vertex))))
-                                           (or (null tag)
-                                               (eql tag (store-id graph)))))
+                                         (eq (node-graph from-vertex) graph))
                                 (unless (gethash from-vertex memory)
                                   (setf (gethash from-vertex memory) t)
                                   (enqueue queue new-traversal)))

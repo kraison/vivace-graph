@@ -10,7 +10,13 @@ STATUS one of :RESOLVED, :DETACHED (registry knows the tag, no open
 graph carries it) or :UNKNOWN.  A v8 id indexes the open-store vector,
 O(1); a v5 id is tried against each open store's vertex table -- the
 no-flag-day fallback (GH #169, D5).  For a v5 id STORE-ID is the
-holding store's id (or NIL when untagged/unknown)."
+holding store's id (or NIL when untagged/unknown).  ID may be a
+32-hex-digit string, coerced like LOOKUP-VERTEX (GH #209).  A tag whose
+store the registry once knew but *SYSTEM-DIRECTORY* is unbound at
+query time also reports :UNKNOWN, not :DETACHED -- :DETACHED requires
+a live registry to confirm the tag (GH #169, #209)."
+  (when (stringp id)
+    (setq id (read-id-array-from-string id)))
   (let ((tag (id-store-tag id)))
     (if tag
         (let ((graph (svref *store-id->graph* tag)))
