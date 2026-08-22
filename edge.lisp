@@ -300,7 +300,17 @@ an edge with a genuinely absent endpoint is inactive; :UNKNOWN for a
 cross-store id whose store is detached or unregistered -- can't disprove
 liveness, so it must not silently kill the edge (D8; GH #169).
 LOOKUP-VERTEX-ANYWHERE is defined in interface.lisp, loaded after this
-file; resolved at runtime like PIN-READ-EPOCH in graph-class.lisp."
+file; resolved at runtime like PIN-READ-EPOCH in graph-class.lisp.
+
+Two accepted scoped gaps here, not full parity with the resolver
+(GH #208): (1) an untagged v5 id gets NO cross-store scan -- a same-
+store miss is :MISSING/inactive even if the vertex lives in another
+open store, unlike LOOKUP-VERTEX-ANYWHERE's own v5 fallback; a
+deliberate hot-path tradeoff, this runs on every MAP-EDGES emit.
+(2) an unregistered v8 tag (:UNKNOWN) counts as active -- we cannot
+disprove liveness -- so a compacting/GC pass over edges will never
+collect such an edge, where pre-#169 it eventually would have; a
+conservative choice, not a bug."
   (let ((v (lookup-vertex id :graph graph)))
     (cond
       (v (values v :found))
