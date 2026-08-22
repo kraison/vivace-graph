@@ -208,6 +208,39 @@ renamed-away inode and the record would vanish)."
                  "append after recovery must land in the LIVE file"))
         (close-system-clock c2)))))
 
+(test torn-tail-recovery-with-a-live-writer
+  "The torn-tail path is usually hit by a FRESH clock reopening after a
+crash, but it can also be hit by the SAME clock that still holds its own
+append stream open -- e.g. another writer tore the tail while this
+process kept running.  That is the case %JOURNAL-TRUNCATE-TO's
+close-the-append-stream step exists for (GH #191).  Nearest wrong
+implementation: skip that close -- the post-recovery append below then
+lands on the renamed-away (unlinked) inode and silently vanishes."
+  (with-temp-directory (dir)
+    (let ((c (open-system-clock (namestring dir))))
+      (unwind-protect
+           (progn
+             ;; This APPEND opens and leaves open C's own stream on the
+             ;; journal file -- unlike the fresh-reopen tests above.
+             (journal-append c :create :store :alpha)
+             ;; Tear the tail out-of-band, through a second stream, while
+             ;; C's stream is still open on the same file -- the
+             ;; power-loss shape: a write in flight, not a fresh process
+             ;; discovering old damage.
+             (with-open-file (s (merge-pathnames "system-journal.log" dir)
+                                :direction :output :if-exists :append)
+               (write-string "(:kind :retire :epoch 9 :store" s))
+             (signals graph-db:system-journal-torn-tail
+               (journal-records c))
+             (journal-append c :attach :store :beta)
+             (let ((rs (journal-records c)))
+               (is (= 2 (length rs))
+                   "post-recovery append must land in the LIVE file, ~
+not the renamed-away inode")
+               (is (equal '(:create :attach)
+                          (mapcar (lambda (r) (getf r :kind)) rs)))))
+        (close-system-clock c)))))
+
 (test mid-file-corruption-still-signals
   "A bad record with good records AFTER it is not a torn tail -- it is
 corruption of a different kind and must signal, and the reader must not
