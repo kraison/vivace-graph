@@ -15,7 +15,7 @@
 
 (defun %make-vertex (&key id type-id revision deleted-p data-pointer data bytes
                      written-p heap-written-p type-idx-written-p views-written-p
-                     commit-epoch prev-pointer (class 'vertex))
+                     commit-epoch prev-pointer (class 'vertex) graph)
   ;; ECL ONLY: construct the target CLASS directly, because ECL's CHANGE-CLASS
   ;; retains memory on every call -- a base+change-class per node read leaked
   ;; ~unboundedly (#47).  This gives up the node buffer pool on ECL (a perf
@@ -26,8 +26,15 @@
   ;; persistent-slot init leaves the (empty) data alist alone.
   (let ((vertex #+ecl (let ((*initializing-node* t)) (make-instance class))
                 #-ecl (get-vertex-buffer)))
+    ;; GET-VERTEX-BUFFER may hand back a pool-warmed instance that already
+    ;; carries an untagged v5 id (MAKE-VERTEX-BUFFER has no graph to tag
+    ;; with) -- the +NULL-KEY+ check alone would never fire and every
+    ;; tagged store would silently get untagged ids.  A known store tag
+    ;; always wins and mints fresh, even over a pooled id (GH #169).
     (cond (id
            (setf (id vertex) id))
+          ((and graph (store-id graph))
+           (setf (id vertex) (gen-vertex-id (store-id graph))))
           ((equalp +null-key+ (id vertex))
            (setf (id vertex) (gen-vertex-id))))
     (when type-id (setf (type-id vertex) type-id))
@@ -143,7 +150,8 @@ the id on a duplicate-key collision."
                                 :deleted-p deleted-p
                                 :written-p nil
                                 :bytes bytes
-                                :data data)))
+                                :data data
+                                :graph graph)))
           (setf (bytes v) bytes)
           ;; Stamped from birth: the node is live for the whole creating
           ;; transaction, long before commit stamps it (GH #53).
@@ -155,7 +163,8 @@ the id on a duplicate-key collision."
                   (let ((*print-pretty* nil))
                     (log:error "VERTEX: Duplicate key error: ~A. Retrying MAKE-VERTEX" (id v))
                     (make-vertex type-id data
-                                 :id (gen-vertex-id)
+                                 :id (gen-vertex-id
+                                      (and graph (store-id graph)))
                                  :revision revision
                                  :deleted-p deleted-p :graph graph))
                   (error c)))))

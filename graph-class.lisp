@@ -11,8 +11,93 @@
   (make-hash-table :test 'equal #+graph-db-ecl-sync-hash :synchronized
                     #+graph-db-ecl-sync-hash t))
 
+(defvar *store-id->graph*
+  (make-array (1+ +max-store-tag+) :initial-element nil)
+  "Open-store vector: store-id -> open GRAPH, nil when not open.  The v8
+resolver's O(1) step (GH #169).  Slot 0 unused (0 is never assigned).
+Writes only under *GRAPHS*' registration points; readers are lock-free
+-- a stale nil costs a fallback, never a wrong graph.")
+
+(define-condition store-id-collision-error (error)
+  ((id :initarg :id :reader store-id-collision-id)
+   (existing-name :initarg :existing-name :reader store-id-collision-existing-name)
+   (existing-location :initarg :existing-location
+                      :reader store-id-collision-existing-location)
+   (new-name :initarg :new-name :reader store-id-collision-new-name)
+   (new-location :initarg :new-location :reader store-id-collision-new-location))
+  (:report
+   (lambda (c s)
+     (format s "Store id ~D is already held by open graph ~S at ~S; ~
+cannot also register ~S at ~S -- one system directory per image ~
+(GH #169, #209)."
+             (store-id-collision-id c)
+             (store-id-collision-existing-name c)
+             (store-id-collision-existing-location c)
+             (store-id-collision-new-name c)
+             (store-id-collision-new-location c)))))
+
+(defun %register-open-store (graph)
+  "Give GRAPH its registry store-id and publish it in the open-store
+vector.  Outside a system (*SYSTEM-DIRECTORY* nil) the graph stays
+untagged -- ids remain v5 -- rather than failing the open (GH #169).
+
+Signals STORE-ID-COLLISION-ERROR if the slot already holds a DIFFERENT
+open graph whose NAME or LOCATION disagrees with GRAPH's: one system
+directory per image is the invariant, and two system directories can
+each mint id 1 for their own first store -- if those stores happen to
+share a NAME too, comparing name alone would miss the collision.
+LOCATION is what distinguishes them, since two directories can never
+be the same path.  Same name AND same location reusing the slot is
+always fine (e.g. a crash-simulating test that re-registers a store by
+name, at the same location, without going through
+%UNREGISTER-OPEN-STORE first) (GH #169, #209)."
+  (when *system-directory*
+    (setf (store-id graph) (store-registry-intern (graph-name graph)))
+    (let* ((id (store-id graph))
+           (existing (svref *store-id->graph* id)))
+      (when (and existing (not (eq existing graph)) (graph-open-p existing)
+                 (or (not (equal (graph-name existing) (graph-name graph)))
+                     (not (equal (location existing) (location graph)))))
+        (error 'store-id-collision-error
+               :id id
+               :existing-name (graph-name existing)
+               :existing-location (location existing)
+               :new-name (graph-name graph)
+               :new-location (location graph)))
+      (setf (svref *store-id->graph* id) graph)))
+  graph)
+
+(defun %unregister-open-store (graph)
+  "Retract GRAPH from the open-store vector.  The registry entry stays:
+ids are never reused (GH #169)."
+  (let ((sid (store-id graph)))
+    (when (and sid (eq graph (svref *store-id->graph* sid)))
+      (setf (svref *store-id->graph* sid) nil))))
+
+(defstruct (unresolved-node (:constructor make-unresolved-node
+                                          (id store-id store-name)))
+  "The honest answer for a read that reaches into a detached store:
+there IS a node here, its store is known, and the store is offline
+(GH #169, D8).  Never a raw NIL -- that is indistinguishable from 'no
+such node' -- and never an error from mid-traversal."
+  id store-id store-name)
+
+(define-condition store-detached-error (error)
+  ((name :initarg :name :reader store-detached-name)
+   (id :initarg :id :reader store-detached-id))
+  (:report
+   (lambda (c s)
+     (format s "Store ~S (id ~D) is registered but not open -- ~
+detached.  Explicit access signals; incidental traversal would have ~
+received an UNRESOLVED-NODE marker instead (GH #169, D8)."
+             (store-detached-name c) (store-detached-id c)))))
+
 (defclass graph ()
   ((graph-name :accessor graph-name :initarg :graph-name)
+   ;; Stable numeric id from the store registry; rides in every v8 node
+   ;; id minted for this store.  NIL = untagged (no system directory,
+   ;; e.g. a memory graph outside a system): ids stay v5 (GH #169).
+   (store-id :accessor store-id :initarg :store-id :initform nil)
    (graph-open-p :accessor graph-open-p :initarg :graph-open-p :initform nil)
    ;; T when this graph was opened inside WITH-SCHEMA-FROZEN, so its
    ;; persisted type-ids were never checked against the registry.  Set by

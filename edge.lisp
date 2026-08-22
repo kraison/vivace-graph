@@ -28,14 +28,21 @@
 (defun %make-edge (&key id type-id revision deleted-p data-pointer data bytes from
                      to weight written-p heap-written-p type-idx-written-p
                      ve-written-p vev-written-p views-written-p
-                     commit-epoch prev-pointer (class 'edge))
+                     commit-epoch prev-pointer (class 'edge) graph)
   ;; ECL ONLY: construct the target CLASS directly (ECL's CHANGE-CLASS leaks per
   ;; call -- #47), giving up the node buffer pool on ECL.  SBCL/CCL/LispWorks
   ;; keep the pooled base EDGE + CHANGE-CLASS path (no leak, pool is a perf win).
   (let ((edge #+ecl (let ((*initializing-node* t)) (make-instance class))
               #-ecl (get-edge-buffer)))
+    ;; GET-EDGE-BUFFER may hand back a pool-warmed instance that already
+    ;; carries an untagged v5 id (MAKE-EDGE-BUFFER has no graph to tag
+    ;; with) -- the +NULL-KEY+ check alone would never fire and every
+    ;; tagged store would silently get untagged ids.  A known store tag
+    ;; always wins and mints fresh, even over a pooled id (GH #169).
     (cond (id
            (setf (id edge) id))
+          ((and graph (store-id graph))
+           (setf (id edge) (gen-edge-id (store-id graph))))
           ((equalp +null-key+ (id edge))
            (setf (id edge) (gen-edge-id))))
     (when from (setf (from edge) from))
@@ -236,7 +243,8 @@ regenerates the id on a duplicate-key collision."
                    :to to
                    :weight weight
                    :bytes bytes
-                   :data data)))
+                   :data data
+                   :graph graph)))
           (setf (bytes e) bytes)
           ;; Stamped from birth: the edge is live for the whole creating
           ;; transaction, long before commit stamps it (GH #53).
@@ -249,7 +257,7 @@ regenerates the id on a duplicate-key collision."
                     (log:error "EDGE: Duplicate key error: ~A. Retrying MAKE-EDGE"
                                (id e))
                     (make-edge type from to weight data
-                               :id (gen-edge-id)
+                               :id (gen-edge-id (and graph (store-id graph)))
                                :revision revision
                                :deleted-p deleted-p :graph graph))
                   (error c)))))
@@ -283,16 +291,45 @@ regenerates the id on a duplicate-key collision."
            :node edge))
   (delete-node edge graph))
 
+(defun %active-endpoint-status (id graph)
+  "(values VERTEX-OR-NIL STATUS) for edge endpoint ID against GRAPH, for
+ACTIVE-EDGE-P.  :FOUND when GRAPH's own table (or, for a definitely
+cross-store v8 id, LOOKUP-VERTEX-ANYWHERE) resolves a live vertex;
+:MISSING for a same-store/untagged miss -- unchanged pre-#169 semantics,
+an edge with a genuinely absent endpoint is inactive; :UNKNOWN for a
+cross-store id whose store is detached or unregistered -- can't disprove
+liveness, so it must not silently kill the edge (D8; GH #169).
+LOOKUP-VERTEX-ANYWHERE is defined in interface.lisp, loaded after this
+file; resolved at runtime like PIN-READ-EPOCH in graph-class.lisp.
+
+Two accepted scoped gaps here, not full parity with the resolver
+(GH #208): (1) an untagged v5 id gets NO cross-store scan -- a same-
+store miss is :MISSING/inactive even if the vertex lives in another
+open store, unlike LOOKUP-VERTEX-ANYWHERE's own v5 fallback; a
+deliberate hot-path tradeoff, this runs on every MAP-EDGES emit.
+(2) an unregistered v8 tag (:UNKNOWN) counts as active -- we cannot
+disprove liveness -- so a compacting/GC pass over edges will never
+collect such an edge, where pre-#169 it eventually would have; a
+conservative choice, not a bug."
+  (let ((v (lookup-vertex id :graph graph)))
+    (cond
+      (v (values v :found))
+      (t (let ((tag (id-store-tag id)))
+           (if (and tag (not (eql tag (store-id graph))))
+               (let ((r (lookup-vertex-anywhere id)))
+                 (if (vertex-p r) (values r :found) (values nil :unknown)))
+               (values nil :missing)))))))
+
 (defmethod active-edge-p ((edge edge) &key (graph *graph*))
-  (and (not (deleted-p edge))
-       (let ((from (lookup-vertex (from edge) :graph graph)))
-         (if (vertex-p from)
-             (not (deleted-p from))
-             nil))
-       (let ((to (lookup-vertex (to edge) :graph graph)))
-         (if (vertex-p to)
-             (not (deleted-p to))
-             nil))))
+  (flet ((endpoint-active-p (id)
+           (multiple-value-bind (v status) (%active-endpoint-status id graph)
+             (ecase status
+               (:found (not (deleted-p v)))
+               (:unknown t)
+               (:missing nil)))))
+    (and (not (deleted-p edge))
+         (endpoint-active-p (from edge))
+         (endpoint-active-p (to edge)))))
 
 (defmethod edge-exists-p (edge-type (vertex1 vertex) (vertex2 vertex)
                           &key (graph *graph*))

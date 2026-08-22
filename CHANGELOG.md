@@ -13,6 +13,25 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Added
 
+- **New node ids are tagged UUIDv8, carrying a 12-bit store field** for
+  O(1) cross-store resolution; existing v5 ids are unchanged and a v5
+  id still resolves via a per-open-store scan, so there is no flag
+  day. The tag is a stable numeric id from a new append-only
+  `store-registry.log` in the system directory (one entry per
+  graph-name, never reused). `resolve-node-graph` reports
+  `:resolved`/`:detached`/`:unknown`; `lookup-vertex-anywhere` returns
+  the vertex, an `unresolved-node` marker for a registered-but-closed
+  store, or (with `:if-detached :error`) signals
+  `store-detached-error`. `traverse` surfaces a cross-store endpoint or
+  a detached-store marker in its results without walking past it —
+  continuing across stores is left to a follow-on. `active-edge-p`
+  resolves cross-store endpoints too, with two narrow, documented gaps
+  (no cross-store scan for an untagged v5 endpoint; an unregistered tag
+  counts as live) tracked as #208. `backup` now includes a dangling
+  cross-store edge rather than dropping it, and warns with
+  `dangling-edge-warning` naming the edge, the missing endpoint and its
+  store; a backup with no cross-store gaps never warns. (#169)
+
 - Defining one class name in two stores with *different* slot sets now
   signals `divergent-node-type-redefinition` (a `style-warning`): both
   definitions name one CLOS class, so the last one loaded determines the

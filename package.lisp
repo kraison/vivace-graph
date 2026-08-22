@@ -58,6 +58,39 @@
            #:*type-registry*
            #:system-directory-required
            #:system-directory-required-operation
+           ;; image-level store-id registry (GH #169)
+           #:ensure-store-registry
+           #:store-registry-intern
+           #:store-registry-id-for
+           #:store-registry-name-for
+           #:store-registry-full
+           #:store-id
+           #:+store-tag-bits+
+           #:+max-store-tag+
+           #:uuid-v8-p
+           #:id-store-tag
+           ;; GH #169: the tagged-id resolver and detached-read markers.
+           #:resolve-node-graph
+           #:lookup-vertex-anywhere
+           #:unresolved-node
+           #:unresolved-node-p
+           #:unresolved-node-id
+           #:unresolved-node-store-id
+           #:unresolved-node-store-name
+           #:store-detached-error
+           #:store-detached-name
+           #:store-detached-id
+           #:store-id-collision-error
+           #:store-id-collision-id
+           #:store-id-collision-existing-name
+           #:store-id-collision-existing-location
+           #:store-id-collision-new-name
+           #:store-id-collision-new-location
+           ;; GH #169: BACKUP warns on a dangling cross-store edge.
+           #:dangling-edge-warning
+           #:dangling-edge-id
+           #:dangling-edge-endpoint-id
+           #:dangling-edge-store-id
            ;; GH #186: a store's persisted type-ids disagree with the
            ;; image registry.  Operator-facing -- the remedy is a seeding
            ;; run plus a renumbering migration, not a retry.

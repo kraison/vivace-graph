@@ -28,7 +28,23 @@
               (incf offset)))
           (loop for i from offset below total-bytes do
                (setf (aref vec i) (random 256 (nth (random 2) random-states))))
-          vec))))
+          vec)))
+
+  (defun gen-v8-uuid (store-tag)
+    "A UUIDv8 (RFC 9562 vendor layout) node id: 110 random bits, the
+12-bit STORE-TAG in the low nibble of byte 14 plus byte 15, version and
+variant stamped.  The tag is the O(1) resolver's index (GH #169)."
+    (declare (optimize (speed 3) (safety 0))
+             (type (unsigned-byte 12) store-tag))
+    (let ((id (make-array 16 :element-type '(unsigned-byte 8))))
+      (dotimes (i 16)
+        (setf (aref id i) (random 256 (nth (random 2) random-states))))
+      (setf (aref id 6) (dpb #x8 (byte 4 4) (aref id 6)))
+      (setf (aref id 8) (dpb #b10 (byte 2 6) (aref id 8)))
+      (setf (aref id 14) (dpb (ldb (byte 4 8) store-tag) (byte 4 0)
+                              (aref id 14)))
+      (setf (aref id 15) (ldb (byte 8 0) store-tag))
+      id)))
 
 (defun gen-v5-uuid (namespace)
   "Generates a version 5 (name based SHA1) uuid.  Code stolen from the UUID library."
@@ -51,10 +67,22 @@
                 (dpb #b10 (byte 2 6) (aref hash 8)))
           id)))))
 
+(defun uuid-v8-p (id)
+  "True when ID's version nibble says v8 -- our tagged layout.  Legacy
+ids are v5 (GH #169)."
+  (= #x8 (ldb (byte 4 4) (aref id 6))))
+
+(defun id-store-tag (id)
+  "ID's 12-bit store tag, or NIL for a non-v8 id.  Never read the tag
+bytes of a v5 id: they are SHA1 output and would name a random store."
+  (when (uuid-v8-p id)
+    (logior (ash (ldb (byte 4 0) (aref id 14)) 8)
+            (aref id 15))))
+
 (declaim (inline gen-edge-id))
-(defun gen-edge-id ()
-  (gen-v5-uuid *edge-namespace*))
+(defun gen-edge-id (&optional store-tag)
+  (if store-tag (gen-v8-uuid store-tag) (gen-v5-uuid *edge-namespace*)))
 
 (declaim (inline gen-vertex-id))
-(defun gen-vertex-id ()
-  (gen-v5-uuid *vertex-namespace*))
+(defun gen-vertex-id (&optional store-tag)
+  (if store-tag (gen-v8-uuid store-tag) (gen-v5-uuid *vertex-namespace*)))
