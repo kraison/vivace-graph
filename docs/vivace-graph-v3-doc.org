@@ -3559,9 +3559,10 @@ clock (Chapter 17's ~*system-clock*~/~attach-to-system-clock~):
 - ~(retired-generations clock)~ — every retired generation the
   filesystem and the journal together know about, as ~generation~
   structs (~generation-store~, ~-location~, ~-retired~, ~-swap-epoch~,
-  ~-eras~, ~-journaled-p~, ~-present-p~, ~-policy~). The filesystem is
-  authoritative (spec R4): a directory with no joining ~:swap~ or
-  ~:retire-live~ record is still listed, ~journaled-p~ ~nil~, with
+  ~-live-from~, ~-eras~, ~-journaled-p~, ~-present-p~, ~-policy~).
+  The filesystem is authoritative (spec R4): a directory with no
+  joining ~:swap~ or ~:retire-live~ record is still listed,
+  ~journaled-p~ ~nil~, with
   ~swap-record-missing-warning~ signalled (the #212 shape); a record
   naming a directory that no longer exists is listed ~present-p~
   ~nil~ — *lost*. A generation a deliberate prune or a later restore
@@ -3604,12 +3605,13 @@ to ~<clock-dir>/restore-<Enow>.manifest~:
 #+BEGIN_SRC lisp
   (:restore t :requested 4000 :at 4108 :clock "/data/system/"
    :stores
-   ((:store "orders"  :action :rewound  :state-at 3982 :exact t
-     :from "/data/orders-retired-3982"
-     :retired-live "/data/orders-retired-4102")
-    (:store "catalog" :action :rebuilt  :state-at 4108 :exact nil
+   ((:store "shipping" :action :rewound  :state-at 3982 :exact t
+     :from "/data/shipping-retired-3982"
+     :retired-live "/data/shipping-retired-4102")
+    (:store "orders"   :action :rebuilt  :state-at 4108 :exact nil)
+    (:store "catalog"  :action :rebuilt  :state-at 4108 :exact nil
      :cascade-from "orders")
-    (:store "audit"   :action :unchanged :dangling 17)))
+    (:store "audit"    :action :unchanged :dangling 17)))
 #+END_SRC
 
 ~:action~ is one of ~:rewound~, ~:rebuilt~, ~:unchanged~, or (in a

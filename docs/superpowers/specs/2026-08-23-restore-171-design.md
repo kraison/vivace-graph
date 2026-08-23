@@ -164,13 +164,14 @@ manifest as `:action :unchanged`.
 One plist per store, plus a header; printed readably, no evaluation:
 
 ```
-(:restore :requested T :at Enow :clock LOCATION
+(:restore t :requested T :at Enow :clock LOCATION
  :stores
- ((:store "orders"  :action :rewound  :state-at E0 :exact t
+ ((:store "shipping" :action :rewound  :state-at E0 :exact t
    :from "<loc>-retired-1234" :retired-live "<loc>-retired-5678")
-  (:store "catalog" :action :rebuilt  :state-at Enow :exact nil
+  (:store "orders"   :action :rebuilt  :state-at Enow :exact nil)
+  (:store "catalog"  :action :rebuilt  :state-at Enow :exact nil
    :cascade-from "orders")
-  (:store "audit"   :action :unchanged :dangling 17)
+  (:store "audit"    :action :unchanged :dangling 17)
   ...))
 ```
 
