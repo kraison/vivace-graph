@@ -6,7 +6,7 @@
 ;;; docs/superpowers/specs/2026-08-23-restore-171-design.md
 
 (defstruct (generation (:constructor %make-generation))
-  store location retired swap-epoch journaled-p present-p policy)
+  store location retired swap-epoch live-from journaled-p present-p policy)
 
 (define-condition swap-record-missing-warning (warning)
   ;; The #212 shape: renames landed, JOURNAL-APPEND did not.  Tolerated,
@@ -133,22 +133,40 @@ RESTORE-SYSTEM call has since consumed by promoting it back to live
                                           :retired dir :swap-epoch epoch
                                           :journaled-p nil :present-p t))))
      locations)
-    (let ((gens nil))
+    (let ((all nil))
       (maphash (lambda (k gen)
-                 (unless (gethash k pruned)
-                   (setf (generation-policy gen)
-                         (if (generation-present-p gen)
-                             (store-recovery-policy (generation-retired gen))
-                             (store-recovery-policy (generation-location gen))))
-                   (push gen gens)))
+                 (declare (ignore k))
+                 (setf (generation-policy gen)
+                       (if (generation-present-p gen)
+                           (store-recovery-policy (generation-retired gen))
+                           (store-recovery-policy (generation-location gen))))
+                 (push gen all))
                by-retired)
-      (sort gens (lambda (a b)
-                   (let ((sa (princ-to-string (generation-store a)))
-                         (sb (princ-to-string (generation-store b))))
-                     (or (string< sa sb)
-                         (and (string= sa sb)
-                              (< (generation-swap-epoch a)
-                                 (generation-swap-epoch b))))))))))
+      (setf all
+            (sort all
+                  (lambda (a b)
+                    (let ((sa (princ-to-string (generation-store a)))
+                          (sb (princ-to-string (generation-store b))))
+                      (or (string< sa sb)
+                          (and (string= sa sb)
+                               (< (generation-swap-epoch a)
+                                  (generation-swap-epoch b))))))))
+      ;; LIVE-FROM spans the FULL per-store event order, including a
+      ;; generation a RESTORE has since consumed or PRUNE-RETIRED-
+      ;; GENERATIONS has deleted -- dropping such a generation from the
+      ;; returned list below must not erase what it taught its
+      ;; successor about when ITS OWN live interval began (GH #171,
+      ;; fix round 2; see %GENERATION-LIVE-AT).
+      (let ((prev-store nil) (prev-epoch nil))
+        (dolist (g all)
+          (setf (generation-live-from g)
+                (if (equal (generation-store g) prev-store)
+                    prev-epoch
+                    0))
+          (setf prev-store (generation-store g)
+                prev-epoch (generation-swap-epoch g))))
+      (remove-if (lambda (g) (gethash (generation-retired g) pruned))
+                 all))))
 
 (define-condition retention-required-error (error)
   ;; Authored data is never silently discarded inside the restore
@@ -227,10 +245,18 @@ returns what would go and touches nothing.  Each deletion journals
         0)))
 
 (defun %generation-live-at (gens epoch)
-  "Among GENS (one store, ascending SWAP-EPOCH), the generation that was
-live at EPOCH: the earliest with SWAP-EPOCH > EPOCH, or NIL when the
-current generation already was."
-  (find-if (lambda (g) (> (generation-swap-epoch g) epoch)) gens))
+  "Among GENS (one store), the generation whose live interval
+[LIVE-FROM, SWAP-EPOCH) contains EPOCH, or NIL when EPOCH is covered by
+the CURRENT generation instead (:UNCHANGED).  LIVE-FROM is the epoch
+the PREVIOUS retiring event for this store ended at -- 0 when there was
+none -- so this is interval containment, not just "earliest retired
+generation with SWAP-EPOCH > EPOCH": for a monotone swap chain the two
+rules agree exactly, but a RESTORE can promote an OLDER generation back
+to live, breaking monotonicity -- interval containment is what still
+gets it right (GH #171, fix round 2)."
+  (find-if (lambda (g) (and (<= (generation-live-from g) epoch)
+                            (< epoch (generation-swap-epoch g))))
+           gens))
 
 (defun %open-store-for-clock (name clock)
   "The graph registered as NAME if it is attached to CLOCK -- matched by

@@ -486,16 +486,14 @@ multi-store restore."
 (test plan-after-a-restore-does-not-see-the-consumed-generation
   "Restore to T once; planning to the SAME T again must not refuse
 :AUTHORED-GENERATION-MISSING against a ghost entry for the generation
-the restore just consumed (I4).  Without the fix, the consumed
-generation's now-vanished directory still shows up (via its stale
-:SWAP record) as a PRESENT-P NIL :AUTHORED generation and the plan
-refuses.  With the fix that ghost entry is gone, but the remaining
-retired generation (the pre-restore live content, now :RETIRE-LIVE'd)
-still has a swap-epoch after T, so the plan comes back :REWOUND rather
-than :UNCHANGED -- this is a known scope limit (no generation-chain
-reasoning yet to recognize the CURRENT live directory as covering T);
-the test pins the actual behavior and, above all, the absence of the
-wrong refusal."
+the restore just consumed (I4), AND must come back :UNCHANGED, not
+:REWOUND (fix round 2): LIVE-FROM/%GENERATION-LIVE-AT's interval rule
+recognizes that the remaining retired generation's live interval
+starts AFTER T (at the original swap epoch), so it does not contain T
+-- the CURRENT live directory is what covers T now, exactly as it
+should after a completed restore.  Executing a :REWOUND plan here
+would have been a real regression: it would revert the just-completed
+restore back to the pre-restore (2-vertex) content."
   (with-restore-system (g clock sys)
     sys
     (let ((e0 (%rs-write g)))
@@ -517,8 +515,39 @@ wrong refusal."
                       nil))))
           (is-false refused)
           (when m
-            (is (eq :rewound
+            (is (eq :unchanged
                     (getf (%rs-entry m :restore-store-1) :action)))))))))
+
+(test plan-after-a-restore-selects-the-post-swap-generation-by-interval
+  "After restoring to T=e0, planning to an epoch INSIDE the retired
+post-swap generation's live interval selects THAT generation: :REWOUND
+with :FROM its path.  MID is a further write committed to the swapped-
+in generation AFTER the swap and BEFORE the restore -- a concrete
+epoch strictly between the swap's own epoch and the restore's later
+:RETIRE-LIVE epoch, unlike the epoch read immediately after the swap
+completes, which (nothing else advancing the clock in between) can
+land EXACTLY ON the :RETIRE-LIVE epoch -- the half-open interval's
+excluded upper boundary, which the companion test above already
+covers by landing there and getting :UNCHANGED."
+  (with-restore-system (g clock sys)
+    sys
+    (let ((e0 (%rs-write g)))
+      (multiple-value-bind (ng r1) (%rs-swap g clock)
+        (declare (ignore r1))
+        (setq g ng)
+        (let ((mid (%rs-write g)))
+          (let ((m0 (handler-bind
+                        ((graph-db:restore-inexact-warning
+                           #'muffle-warning))
+                      (graph-db:restore-system clock e0))))
+            (setq g (graph-db:lookup-graph :restore-store-1))
+            (let* ((post-swap-path
+                     (getf (%rs-entry m0 :restore-store-1) :retired-live))
+                   (e (%rs-entry (graph-db:plan-system-restore clock mid)
+                                 :restore-store-1)))
+              (is-true post-swap-path)
+              (is (eq :rewound (getf e :action)))
+              (is (string= post-swap-path (getf e :from))))))))))
 
 (defmacro with-posix-rename-failing-when ((old-var new-var test-form)
                                           &body body)

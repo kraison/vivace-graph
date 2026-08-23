@@ -101,7 +101,8 @@
            #:retired-generations #:swap-record-missing-warning
            #:swap-record-missing-path
            #:generation-store #:generation-location #:generation-retired
-           #:generation-swap-epoch #:generation-journaled-p
+           #:generation-swap-epoch #:generation-live-from
+           #:generation-journaled-p
            #:generation-present-p #:generation-policy
            #:prune-retired-generations #:retention-required-error
            #:retention-required-generations
