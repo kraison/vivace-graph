@@ -97,6 +97,20 @@
            #:recovery-policy-mismatch-warning-location
            #:recovery-policy-mismatch-warning-requested
            #:recovery-policy-mismatch-warning-on-disk
+           ;; whole-system restore (GH #171)
+           #:retired-generations #:swap-record-missing-warning
+           #:swap-record-missing-path
+           #:generation-store #:generation-location #:generation-retired
+           #:generation-swap-epoch #:generation-live-from #:generation-eras
+           #:generation-journaled-p
+           #:generation-present-p #:generation-policy
+           #:prune-retired-generations #:retention-required-error
+           #:retention-required-generations
+           #:plan-system-restore #:restore-refused-error
+           #:restore-refused-reasons #:restore-refused-epoch
+           #:restore-system #:restore-inexact-warning
+           #:restore-inexact-manifest #:read-restore-manifest
+           #:repair-interrupted-swap
            ;; image-level type-id registry (GH #186)
            #:type-registry
            #:open-type-registry

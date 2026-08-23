@@ -110,6 +110,7 @@
                ;; just before BACKUP, which it does not depend on -- it needs
                ;; only the graph and transaction layers.
                (:file "shadow-store" :depends-on ("graph" "transactions"))
+               (:file "system-restore" :depends-on ("shadow-store"))
                (:file "backup" :depends-on ("edge" "type-seeding"))
                (:file "replication" :depends-on ("backup"))
                (:file "txn-log" :depends-on ("replication"))
@@ -537,6 +538,7 @@ cl-temporal-extent."
                (:file "store-registry-tests")     ; GH #169
                (:file "store-resolver-tests")     ; GH #169
                (:file "detach-tests")             ; GH #170
+               (:file "system-restore-tests")     ; GH #171
                (:file "posix-tests")              ; GH #182
                (:file "rest-tests")
                (:file "rest-http-tests")

@@ -3159,7 +3159,13 @@ seeding rule: a peer-graph's pull cursor is a distinct number space from
 its local highest id (see PEER-OBSERVE-EPOCH's docstring), so both are
 watermarked, not just the local one.  Refuses -- signals
 ATTACH-WITH-ACTIVE-TRANSACTIONS -- while GRAPH has any in-flight
-transaction; see that condition for why."
+transaction; see that condition for why.
+
+The :ATTACH record also carries :LOCATION (a namestring): a swap-in-
+shadow crash between its two renames leaves no :SWAP record at all, so
+:ATTACH is the only surviving trace REPAIR-INTERRUPTED-SWAP's pre-check
+can use to find the store's live directory once the graph itself is no
+longer open (GH #171, spec R6)."
   (let ((tm (transaction-manager graph)))
     (with-transaction-manager-lock (tm)
       (when (minimum-start-transaction-id tm)
@@ -3169,7 +3175,8 @@ transaction; see that condition for why."
                                 (load-peer-pull-cursor graph)
                                 0))))
         (clock-observe-epoch clock watermark)
-        (journal-append clock :attach :store (graph-name graph))
+        (journal-append clock :attach :store (graph-name graph)
+                        :location (namestring (location graph)))
         (setf (graph-system-clock graph) clock))))
   graph)
 

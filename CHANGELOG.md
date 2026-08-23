@@ -113,6 +113,48 @@ between releases; cutting a release renames it to the new version and dates it.
   epoch lease already shaped to carry that later without a redesign.
   (#170)
 
+- **Whole-system restore across a shadow swap.** `retired-generations`
+  lists every `<location>-retired-<epoch>` directory a system's clock
+  knows about, joined to its journal record where one exists (a
+  directory with none is reported `:journaled nil` and warns
+  `swap-record-missing-warning`, the #212 shape; a record with no
+  directory is `:present nil`). Each generation carries its ERAS — the
+  half-open `[from, to)` intervals of content it actually held, which
+  keeps working across a restore-then-swap chain where a promoted
+  directory is later retired again under a new name.
+  `prune-retired-generations (clock floor &key discard-derivable
+  dry-run)` deletes generations at or before `floor`; an `:authored`
+  generation still inside the window is refused by name
+  (`retention-required-error`) rather than silently discarded, and a
+  `:derivable` one is kept unless `:discard-derivable t`.
+  `plan-system-restore` / `restore-system (clock epoch &key
+  require-exact rebuild timeout)` restore every affected store to the
+  generation live at `epoch`, at generation granularity — the swap is
+  the *generation* mechanism, and `snapshot`/`replay` remains the sole
+  mechanism for content *inside* a generation (this does **not**
+  supersede it; point-in-time rewind inside a generation is a separate
+  follow-up). A retained generation frozen at or before `epoch` is
+  exact; one frozen later is used anyway and reported `:exact nil`
+  unless `:require-exact t` refuses instead. A `:derivable` store with
+  no retained generation is rebuilt by a caller-supplied `(lambda (name
+  graph) ...)`, cascading to any `:derivable` dependent whose edges
+  point into the rebuilt store's tag (an `:authored` dependent is left
+  alone and reported `:dangling n`). Every refusal — an authored
+  generation gone, no rebuild callback, the store not open, a
+  replicated/peer graph (v1 is plain-graph-only), an inexact result
+  under `:require-exact`, or a stranded interrupted swap — surfaces as
+  one `restore-refused-error` naming every `(store . reason)` before
+  any rename happens, `:authored-generation-missing`
+  `:no-rebuild` `:not-open` `:unsupported-graph` `:inexact`
+  `:interrupted-swap`. A manifest (`(:restore t :requested ... :at ...
+  :clock ... :stores (...))`) is written to `restore-<epoch>.manifest`
+  and returned; `read-restore-manifest` reads it back with
+  `*read-eval*` nil. `repair-interrupted-swap (clock name location)`
+  fixes the one window `swap-in-shadow` (#170) cannot recover from
+  itself — a crash between its two renames — by renaming the stranded
+  generation back and journaling `:swap-aborted`; restore refuses to
+  start against a store in that state and names the tool. (#171)
+
 - Defining one class name in two stores with *different* slot sets now
   signals `divergent-node-type-redefinition` (a `style-warning`): both
   definitions name one CLOS class, so the last one loaded determines the
