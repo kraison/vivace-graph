@@ -1001,6 +1001,51 @@ also refuses a bad value outright."
     (signals error
       (graph-db:store-recovery-policy (graph-db::location g)))))
 
+(test recovery-policy-mismatch-warns-but-file-wins
+  "Fix round 1 (GH #170 Task 4 review): OPEN-GRAPH's :RECOVERY-POLICY is
+only a HINT once policy.dat exists.  MAKE-GRAPH a store :DERIVABLE,
+close it, then OPEN-GRAPH the same location with a disagreeing
+:AUTHORED: RECOVERY-POLICY-MISMATCH-WARNING must fire (caught here via
+HANDLER-BIND + MUFFLE-WARNING rather than FIVEAM:SIGNALS, because
+SIGNALS' HANDLER-CASE would unwind OUT of OPEN-GRAPH mid-call instead of
+letting it finish and return the graph), and the effective policy stays
+the FILE's :DERIVABLE -- STORE-RECOVERY-POLICY reads :DERIVABLE
+afterward, not the disagreeing :AUTHORED that was passed.  There is no
+further graph-side observable: the graph object caches no policy slot
+of its own -- OPEN-SHADOW-GRAPH re-reads policy.dat fresh on every
+:FAST-LOAD call -- so the file check above IS the behavioral check.
+ABLATION (recorded, not re-run here): drop the WARN call in OPEN-GRAPH
+and FIRED stays NIL."
+  (with-temp-directory (sys)
+    (with-temp-directory (dir)
+      (let ((graph-db::*system-directory* (namestring sys))
+            (graph-db::*store-registry* nil))
+        (let ((g (make-graph :detach-store-1 (namestring dir)
+                             :buffer-pool-size 1000
+                             :recovery-policy :derivable)))
+          (let ((graph-db:*graph* g))
+            (close-graph g :snapshot-p nil)))
+        (let (g2 fired)
+          (unwind-protect
+               (progn
+                 (handler-bind
+                     ((graph-db:recovery-policy-mismatch-warning
+                        (lambda (c) (setq fired c) (muffle-warning c))))
+                   (setq g2 (open-graph :detach-store-1 (namestring dir)
+                                        :buffer-pool-size 1000
+                                        :recovery-policy :authored)))
+                 (is-true fired
+                          "OPEN-GRAPH must warn on a disagreeing ~
+:RECOVERY-POLICY")
+                 (is (eq :derivable
+                         (graph-db:store-recovery-policy (namestring dir)))
+                     "the FILE's policy must remain in effect, not the ~
+disagreeing keyword")
+                 (is-true (graph-db::graph-open-p g2)))
+            (when g2
+              (let ((graph-db:*graph* g2))
+                (ignore-errors (close-graph g2 :snapshot-p nil))))))))))
+
 (test fast-load-on-authored-store-signals
   "OPEN-SHADOW-GRAPH :FAST-LOAD T against a shadow whose source store's
 recovery policy is :AUTHORED (the default -- no :RECOVERY-POLICY was

@@ -522,6 +522,23 @@ to disk and remove it."
         (install-unique-tuple-constraints graph))
       graph)))
 
+(define-condition recovery-policy-mismatch-warning (warning)
+  ;; A named class rather than a bare STRING WARN, so a caller (or a test)
+  ;; can HANDLER-BIND on it specifically instead of on every CL:WARNING
+  ;; OPEN-GRAPH might ever signal (GH #170 Task 4, fix round 1).
+  ((location :initarg :location
+             :reader recovery-policy-mismatch-warning-location)
+   (requested :initarg :requested
+              :reader recovery-policy-mismatch-warning-requested)
+   (on-disk :initarg :on-disk
+            :reader recovery-policy-mismatch-warning-on-disk))
+  (:report (lambda (c s)
+             (format s "OPEN-GRAPH ~A: :RECOVERY-POLICY ~S disagrees with ~
+policy.dat's ~S; the file wins."
+                     (recovery-policy-mismatch-warning-location c)
+                     (recovery-policy-mismatch-warning-requested c)
+                     (recovery-policy-mismatch-warning-on-disk c)))))
+
 (defun open-graph (name location &key master-p slave-p master-host replication-port
                    replication-key package (buffer-pool-p t) (gc-heap-p t)
                    (buffer-pool-size 100000)
@@ -567,9 +584,10 @@ started.
 
 :RECOVERY-POLICY (GH #170) is only a HINT here, unlike MAKE-GRAPH: if
 LOCATION already carries a policy.dat, that file is authoritative --
-this keyword is ignored (a value that disagrees with the file WARNs,
-but the file wins) rather than silently rewritten out from under
-whatever wrote it.  It is persisted only when LOCATION is being
+this keyword is ignored (a value that disagrees with the file signals
+RECOVERY-POLICY-MISMATCH-WARNING, a WARNING, but the file still wins)
+rather than silently rewritten out from under whatever wrote it.  It
+is persisted only when LOCATION is being
 created-on-open (no schema.dat yet, the same condition INIT-SCHEMA
 below branches on) -- a genuine reopen of an existing graph with no
 policy.dat leaves it absent (STORE-RECOVERY-POLICY's :AUTHORED
@@ -655,8 +673,9 @@ default), it does not retroactively opt that graph in."
           (if (probe-file (%policy-file path))
               (let ((on-disk (store-recovery-policy path)))
                 (when (and recovery-policy (not (eq recovery-policy on-disk)))
-                  (warn "OPEN-GRAPH ~A: :RECOVERY-POLICY ~S disagrees with ~
-policy.dat's ~S; the file wins." path recovery-policy on-disk)))
+                  (warn 'recovery-policy-mismatch-warning
+                        :location path :requested recovery-policy
+                        :on-disk on-disk)))
               (when (and recovery-policy creating-on-open-p)
                 (set-store-recovery-policy path recovery-policy))))
         (setf (schema-lock (schema graph)) (make-recursive-lock))

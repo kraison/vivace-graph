@@ -87,6 +87,10 @@
            #:fast-load-requires-derivable-location
            #:fast-load-requires-derivable-policy
            #:wal-suppressed-p
+           #:recovery-policy-mismatch-warning
+           #:recovery-policy-mismatch-warning-location
+           #:recovery-policy-mismatch-warning-requested
+           #:recovery-policy-mismatch-warning-on-disk
            ;; image-level type-id registry (GH #186)
            #:type-registry
            #:open-type-registry
