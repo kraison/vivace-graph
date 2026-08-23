@@ -216,10 +216,32 @@ one level down."
                                  type)))))
     (append (rows-for :vertex "v") (rows-for :edge "e"))))
 
+(defun %peer-graph-scoped-rows (rows graph)
+  "ROWS (%PEER-TYPE-TABLE-ROWS output) filtered to the types actually
+registered in GRAPH's own schema: a row survives iff LOOKUP-NODE-TYPE-BY-NAME
+finds its TYPE symbol under its KIND (:VERTEX/:EDGE) in GRAPH.  The row's
+TYPE is already the type's real (non-keyword) symbol, so this is the direct
+identity lookup, never bare-name resolution -- there is no ambiguity to
+reintroduce here (GH #190)."
+  (remove-if-not
+   (lambda (row)
+     (destructuring-bind (kind id name supers type) row
+       (declare (ignore id name supers))
+       (lookup-node-type-by-name
+        type (if (string= kind "v") :vertex :edge) :graph graph)))
+   rows))
+
 (defun %peer-validate-type-table-rows (rows)
   "Signal if ROWS cannot be encoded unambiguously: an id outside the wire's
 range, a name carrying a reserved character or empty, or two types emitting
 the SAME name.  Returns ROWS.
+
+Called on the SCOPED rows on the hub's auth-ok path (PEER-TYPE-TABLE-STRING
+with a GRAPH argument): an unrepresentable type living in a store unrelated
+to the session's graph no longer fails this connection at all, since it is
+filtered out before this check ever sees it -- narrowing the blast radius
+from every peer session in the image (GH #186) to sessions on stores that
+actually hold the offending type.
 
 STRING-DOWNCASE is NOT injective -- P-PERSON and |P-Person| are distinct
 classes that would emit one name if only the symbol-name were on the wire.
@@ -252,7 +274,8 @@ edit."
                    (%peer-type-label other) (%peer-type-label type) name))
           (setf (gethash name seen) type))))))
 
-(defun peer-type-table-string (&optional (registry (ensure-type-registry)))
+(defun peer-type-table-string (&optional (registry (ensure-type-registry))
+                                graph)
   "Encode this IMAGE's type registry as ONE delimited string, for the plist
 control channel.  A nested list would trip PLIST-TOO-FANCY-ERROR, so the table
 rides as a single string -- the same dodge as PEER-IDS->STRING.
@@ -262,6 +285,14 @@ names every type this system has assigned, not the subset one store happens to
 instantiate.  Signals SYSTEM-DIRECTORY-REQUIRED when *SYSTEM-DIRECTORY* is
 NIL, which no graph-owning image can be -- MAKE-GRAPH and OPEN-GRAPH both
 refuse without one.
+
+Optional GRAPH scopes the table to the types actually registered in that
+GRAPH's own schema (%PEER-GRAPH-SCOPED-ROWS), dropping every row for a type
+that graph does not instantiate.  Omitted, the table stays whole-image (every
+existing direct caller keeps its prior behaviour); the hub's auth-ok call site
+passes the session's graph so an unrelated store's type -- including one that
+is unrepresentable on the wire -- no longer affects this session at all
+(GH #206).
 
 *** THIS FORMAT IS A FROZEN EXTERNAL CONTRACT. *** It is parsed by non-Lisp peers (the
 Kotlin/SQLite device).  PEER-PARSE-TYPE-TABLE is the reference implementation and its
@@ -322,8 +353,9 @@ the IMAGE's registry, so that one type need not even be in the store being
 replicated -- the blast radius is every peer session in the image.  Loud and
 hub-side either way, but the traceback points at a session, not at the schema
 form that caused it."
-  (let ((rows (%peer-validate-type-table-rows
-               (%peer-type-table-rows registry))))
+  (let* ((rows (%peer-type-table-rows registry))
+         (rows (if graph (%peer-graph-scoped-rows rows graph) rows))
+         (rows (%peer-validate-type-table-rows rows)))
     (with-output-to-string (s)
       (loop for row in rows
             for firstp = t then nil
@@ -875,9 +907,14 @@ authenticate, ship the schema type table, serve one pull, then RECEIVE the devic
 push and re-home it, close.  Models MAKE-SLAVE-SESSION-HANDLER but stays distinct
 from it.
 
-The auth-ok plist carries :TYPE-TABLE (PEER-TYPE-TABLE-STRING) so a non-Lisp peer can
-resolve a raw type-id to a type NAME.  It is not otherwise recoverable: ids come from
-DEF-VERTEX/DEF-EDGE evaluation order and no name crosses the wire."
+The auth-ok plist carries :TYPE-TABLE (PEER-TYPE-TABLE-STRING, scoped to
+GRAPH) so a non-Lisp peer can resolve a raw type-id to a type NAME.  It is
+not otherwise recoverable: ids come from DEF-VERTEX/DEF-EDGE evaluation order
+and no name crosses the wire.  Scoping to GRAPH's own schema (GH #206) means
+a type registered only in some unrelated store never appears in this
+session's table -- and, since %PEER-VALIDATE-TYPE-TABLE-ROWS runs on the
+scoped rows, an unrepresentable name in that unrelated store no longer fails
+this connection either."
   (lambda ()
     (let ((*graph* graph))
       (handler-case
@@ -894,7 +931,7 @@ DEF-VERTEX/DEF-EDGE evaluation order and no name crosses the wire."
                    (peer-write-plist
                     (list :peer-control :auth-ok
                           :type-table (peer-type-table-string
-                                       (%peer-registry graph)))
+                                       (%peer-registry graph) graph))
                     socket)
                    (peer-pull-phase graph socket device
                                     :full-resync-p (and (getf auth :full-resync) t)

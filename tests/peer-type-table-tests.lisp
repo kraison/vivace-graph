@@ -110,6 +110,32 @@ asserts STRINGP first."
   ()
   :peer-type-table-mi-test)
 
+;;; --- Two stores, disjoint types plus one shared type (Task 3, GH #206). --
+;;; PTS-A-ONLY lives only in store A's schema, PTS-B-ONLY only in store B's,
+;;; and PTS-SHARED is registered under BOTH graph-names -- the same symbol,
+;;; identical slots, so %WARN-IF-DIVERGENT-ACROSS-STORES stays silent (that
+;;; is the documented multi-store feature, not a redefinition warning).
+
+(eval-when (:load-toplevel :execute)
+  (setf (gethash :peer-type-table-scope-a *schema-node-metadata*) nil)
+  (setf (gethash :peer-type-table-scope-b *schema-node-metadata*) nil))
+
+(def-vertex pts-a-only ()
+  ()
+  :peer-type-table-scope-a)
+
+(def-vertex pts-b-only ()
+  ()
+  :peer-type-table-scope-b)
+
+(def-vertex pts-shared ()
+  ()
+  :peer-type-table-scope-a)
+
+(def-vertex pts-shared ()
+  ()
+  :peer-type-table-scope-b)
+
 ;;; --- A schema no wire format can represent: a name with a delimiter. -----
 ;;; CL symbol names may contain ANY character via |escaped| syntax, and
 ;;; DEF-VERTEX constrains nothing.  The ENCODER is the only possible defense:
@@ -718,3 +744,139 @@ that refused every peer-graph would pass the test above."
                    "and its writer funnel is running"))
           (ignore-errors (close-graph g :snapshot-p nil))))
       (collect-garbage))))
+
+;;; ---------------------------------------------------------------------------
+;;; Task 3 (GH #206): store-scoped table.  PEER-TYPE-TABLE-STRING's optional
+;;; GRAPH filters rows to types actually registered in GRAPH's own schema
+;;; (LOOKUP-NODE-TYPE-BY-NAME, direct symbol path, GH #190) -- the hub's
+;;; auth-ok call site passes the session's graph so a device only ever learns
+;;; about the store it is actually replicating.
+;;; ---------------------------------------------------------------------------
+
+(defmacro with-ptt-two-stores ((r ga gb) &body body)
+  "One registry R, two stores under it: GA is
+:PEER-TYPE-TABLE-SCOPE-A (PTS-A-ONLY, PTS-SHARED), GB is
+:PEER-TYPE-TABLE-SCOPE-B (PTS-B-ONLY, PTS-SHARED)."
+  (let ((da (gensym "DA")) (db (gensym "DB")))
+    `(with-ptt-registry (,r)
+       (with-temp-directory (,da)
+         (with-temp-directory (,db)
+           (let ((,ga (make-graph :peer-type-table-scope-a (namestring ,da)
+                                  :buffer-pool-size 1000))
+                 (,gb (make-graph :peer-type-table-scope-b (namestring ,db)
+                                  :buffer-pool-size 1000)))
+             (unwind-protect (let () ,@body)
+               (ignore-errors (close-graph ,ga :snapshot-p nil))
+               (ignore-errors (close-graph ,gb :snapshot-p nil))
+               (collect-garbage))))))))
+
+(test type-table-scoped-to-graph-excludes-the-other-store-s-type
+  "THE DISCLOSURE PIN.  Store A's session table contains A's own type and the
+SHARED type, and explicitly does NOT contain B-only's row.  Ablation: an
+implementation that drops the GRAPH filter (the nearest wrong
+implementation is calling PEER-TYPE-TABLE-STRING with no GRAPH, i.e. the
+whole-image table) makes the absence assertion below fail, because the
+whole-image control table (asserted first) DOES carry all three."
+  (with-ptt-two-stores (r ga gb)
+    (declare (ignorable gb))
+    (let* ((whole-image (graph-db::peer-parse-type-table
+                         (graph-db::peer-type-table-string r)))
+           (scoped-a (graph-db::peer-parse-type-table
+                      (graph-db::peer-type-table-string r ga))))
+      (flet ((row (parsed name)
+               (find name parsed :key #'third :test #'string=)))
+        ;; Control: the unscoped table is the whole image, so it is NOT
+        ;; vacuously missing B-only -- proving the absence below is the
+        ;; filter's doing, not an empty registry.
+        (is (row whole-image (%ptt-qname 'pts-a-only)))
+        (is (row whole-image (%ptt-qname 'pts-b-only)))
+        (is (row whole-image (%ptt-qname 'pts-shared)))
+        ;; The scoped table for store A.
+        (is (row scoped-a (%ptt-qname 'pts-a-only))
+            "A's own type is in A's session table")
+        (is (row scoped-a (%ptt-qname 'pts-shared))
+            "the shared type is in A's session table too")
+        (is (not (row scoped-a (%ptt-qname 'pts-b-only)))
+            "B-only's row must NOT be disclosed to a session scoped to A")))))
+
+(test type-table-scoped-to-graph-is-symmetric
+  "The mirror of the pin above: B's session table carries B's own type and the
+shared type, and not A-only's."
+  (with-ptt-two-stores (r ga gb)
+    (declare (ignorable ga))
+    (let* ((scoped-b (graph-db::peer-parse-type-table
+                      (graph-db::peer-type-table-string r gb))))
+      (flet ((row (name) (find name scoped-b :key #'third :test #'string=)))
+        (is (row (%ptt-qname 'pts-b-only)))
+        (is (row (%ptt-qname 'pts-shared)))
+        (is (not (row (%ptt-qname 'pts-a-only))))))))
+
+(test type-table-no-graph-argument-stays-whole-image
+  "Every existing direct caller (and the tests above this section) calls
+PEER-TYPE-TABLE-STRING with no GRAPH and must keep seeing every type in the
+registry -- the opt-in is additive, not a behaviour change for callers that
+do not pass one."
+  (with-ptt-two-stores (r ga gb)
+    (declare (ignorable ga gb))
+    (let ((parsed (graph-db::peer-parse-type-table
+                   (graph-db::peer-type-table-string r))))
+      (dolist (name (list 'pts-a-only 'pts-b-only 'pts-shared))
+        (is (find (%ptt-qname name) parsed :key #'third :test #'string=)
+            "no GRAPH argument must still disclose ~A" name)))))
+
+(test type-table-scoped-still-round-trips
+  "The scoped table is still exactly what PEER-PARSE-TYPE-TABLE expects: same
+grammar, fewer rows."
+  (with-ptt-two-stores (r ga gb)
+    (declare (ignorable gb))
+    (let* ((s (graph-db::peer-type-table-string r ga))
+           (parsed (graph-db::peer-parse-type-table s)))
+      (is (stringp s))
+      (is (plusp (length parsed)))
+      (dolist (row parsed)
+        (is (member (first row) '(:vertex :edge)))
+        (is (integerp (second row)))
+        (is (stringp (third row)))
+        (is (listp (fourth row)))))))
+
+(test type-table-scoped-graph-survives-an-unrepresentable-type-elsewhere
+  "The blast-radius improvement %PEER-VALIDATE-TYPE-TABLE-ROWS's docstring now
+documents: an unrepresentable type living in a store UNRELATED to the
+session's graph used to fail every device connection in the image (GH #186);
+scoped to a graph that does not instantiate that type, the session's table
+encodes cleanly."
+  (with-ptt-registry (r)
+    (with-temp-directory (da)
+      (with-temp-directory (dbad)
+        (let ((ga (make-graph :peer-type-table-scope-a (namestring da)
+                              :buffer-pool-size 1000))
+              (gbad (make-graph :peer-type-table-badname-test
+                                (namestring dbad) :buffer-pool-size 1000)))
+          (unwind-protect
+               (progn
+                 ;; The whole-image table still fails: |odd,name| is
+                 ;; unrepresentable and it IS in the registry.
+                 (signals error (graph-db::peer-type-table-string r))
+                 ;; But A's session, which does not instantiate |odd,name|,
+                 ;; is unaffected.
+                 (is (stringp (graph-db::peer-type-table-string r ga))))
+            (ignore-errors (close-graph ga :snapshot-p nil))
+            (ignore-errors (close-graph gbad :snapshot-p nil))
+            (collect-garbage)))))))
+
+(test d15-scoped-hub-table-is-a-subset-the-device-does-not-conflict-on
+  "D15 restated for a scoped table: a device whose OWN registry knows MORE
+types than the hub's (scoped) table -- because the hub only disclosed one
+store's worth -- must NOT see that as a conflict.  %PEER-REGISTRY-CONFLICTS
+keys conflicts on HUB rows, so a row present locally but absent from
+HUB-ROWS is silently not-a-conflict; this pins that behaviour rather than
+changing the function."
+  (with-ptt-two-stores (r ga gb)
+    (declare (ignorable gb))
+    (let ((hub-table (graph-db::peer-type-table-string r ga)))
+      ;; The device's own registry (R) knows PTS-B-ONLY too -- strictly more
+      ;; than the scoped hub table -- and must still be accepted.
+      (is (equal (graph-db::peer-parse-type-table hub-table)
+                 (graph-db::peer-check-type-registry-agreement hub-table r))
+          "a scoped table that is a subset of the device's own registry's
+world must be accepted, not refused"))))
