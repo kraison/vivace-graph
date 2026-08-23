@@ -117,8 +117,8 @@ later open in this image, for the life of the process (GH #182)."
   clock)
 
 (defun journal-append (clock kind &rest plist)
-  "Append one lifecycle record.  KIND is :CREATE :DETACH :SWAP :ATTACH or
-:RETIRE.  Consumed by #170 and #171."
+  "Append one lifecycle record.  KIND is :CREATE :DETACH :SWAP :ATTACH
+:RETIRE :RETIRE-LIVE :RESTORE or :SWAP-ABORTED (the last four: GH #171)."
   (let ((record (list* :kind kind :epoch (clock-current-epoch clock) plist)))
     (with-recursive-lock-held ((system-clock-lock clock))
       (unless (system-clock-journal clock)
