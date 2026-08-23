@@ -763,6 +763,24 @@ opens are immediately fully accepting, as before)."
         ;; applied.  Capture that BEFORE the replay marks/consumes them.
         (let ((crash-recovery-p (and (recovery-transaction-files graph) t)))
           (recover-transactions graph)
+          ;; RE-SEED: the TM was constructed (GH #170, I4) BEFORE this
+          ;; replay ran, so its TX-ID-COUNTER was seeded from the
+          ;; PRE-recovery highest-transaction-id.  Each replayed write
+          ;; goes through APPLY-TRANSACTION, which persists a higher
+          ;; watermark to disk for every recovered .txn file -- but never
+          ;; touches TX-ID-COUNTER itself (recovery ids come from the
+          ;; .txn filename, not the counter).  Without this, the first
+          ;; post-open transaction mints an id from the stale counter,
+          ;; colliding with an id a replayed transaction already used.
+          ;; Reproduces TRANSACTION-MANAGER's own INITIALIZE-INSTANCE
+          ;; :AFTER formula verbatim; safe mid-open, no concurrency yet
+          ;; (GH #170, review round 2).
+          (when crash-recovery-p
+            (setf (tx-id-counter (transaction-manager graph))
+                  (1+ (max (load-highest-transaction-id graph)
+                           (if (peer-graph-p graph)
+                               (load-peer-pull-cursor graph)
+                               0)))))
           ;; The spatial index restored above came from a sidecar written at the
           ;; last CLEAN close -- it predates the writes just replayed, and its
           ;; histogram cannot be repaired by replay, because replay's idempotent

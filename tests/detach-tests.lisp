@@ -1449,3 +1449,84 @@ meaning once the location is a plain, non-shadow live store."
          (uiop:delete-directory-tree
           (uiop:ensure-directory-pathname retired-path)
           :validate t :if-does-not-exist :ignore))))))
+
+;;; Round 2 (GH #170 re-review): I4's TM-before-registration reorder
+;;; introduced a NEW critical -- the fresh TX-ID-COUNTER is seeded from
+;;; LOAD-HIGHEST-TRANSACTION-ID before RECOVER-TRANSACTIONS runs, but
+;;; recovery's APPLY-TRANSACTION persists a HIGHER watermark to disk
+;;; without ever touching TX-ID-COUNTER.  Engine-wide (any plain,
+;;; non-clocked store with a crash-recovery WAL tail), and invisible to
+;;; the gate before this: there was no crash-recovery test at all.
+
+(test crash-recovery-reseeds-the-tx-id-watermark
+  "A plain (non-clocked) on-disk graph: commit two transactions, the
+second with *DELETE-COMMITTED-TRANSACTION-FILES* NIL so its .txn file
+survives as .committed instead of being deleted, then close cleanly.
+Fabricate a crash: rename the survived .committed file back to .txn (a
+WAL tail RECOVER-TRANSACTIONS will replay -- idempotent via
+*ADD-TO-INDEXES-UNLESS-PRESENT-P*, the flag documented for exactly this
+case), and REWIND transaction-id.dat (via the same
+PERSIST-HIGHEST-TRANSACTION-ID writer) to the FIRST transaction's id --
+simulating a crash between FINALIZE-TX-PERSISTENCE (durable .txn) and
+APPLY-TRANSACTION (which would have advanced the persisted watermark).
+Plant then clear .dirty, mirroring RECOVERY-FROM-DIRTY-MARKER, and
+reopen (recovery runs). A transaction committed after that open must
+mint an id STRICTLY GREATER than the replayed transaction's id, not
+just past the stale pre-recovery watermark.
+
+ABLATION (recorded, not re-run here): removing OPEN-GRAPH's re-seed
+after RECOVER-TRANSACTIONS makes the final (> new-id id-b) assertion
+fail -- the new transaction mints ID-A+1, which is <= ID-B."
+  (with-temp-directory (sys)
+    (with-temp-directory (dir)
+      (let ((graph-db::*system-directory* (namestring sys))
+            (graph-db::*store-registry* nil)
+            (path (namestring dir))
+            id-a id-b)
+        (let ((g (make-graph :gh-170-round2-recovery path
+                             :buffer-pool-size 1000))
+              va vb)
+          ;; COMMIT-EPOCH is stamped at the END of the WITH-TRANSACTION
+          ;; body, not when the node is created -- read it only AFTER the
+          ;; block (same idiom as SHADOW-LEASE-RESUMES-FROM-ITS-OWN-
+          ;; WATERMARK above), or it is still the pre-commit default 0.
+          (with-transaction ((graph-db::transaction-manager g))
+            (setq va (graph-db:make-vertex :generic nil :graph g)))
+          (setq id-a (graph-db::commit-epoch va))
+          (let ((graph-db::*delete-committed-transaction-files* nil))
+            (with-transaction ((graph-db::transaction-manager g))
+              (setq vb (graph-db:make-vertex :generic nil :graph g)))
+            (setq id-b (graph-db::commit-epoch vb)))
+          (let ((graph-db:*graph* g))
+            (close-graph g :snapshot-p nil))
+          ;; Fabricate the crash shape.
+          (let* ((tx-dir (graph-db::persistent-transaction-directory g))
+                 (committed-files
+                  (directory (merge-pathnames "*.committed" tx-dir)))
+                 (dirty (format nil "~A/.dirty" path)))
+            (is (= 1 (length committed-files))
+                "sanity: exactly the second commit's .txn survived as ~
+.committed")
+            (rename-file (first committed-files)
+                         (make-pathname :type "txn"
+                                        :defaults (first committed-files)))
+            (graph-db::persist-highest-transaction-id id-a g)
+            (is (= id-a (graph-db::load-highest-transaction-id g))
+                "sanity: the watermark file is now stale")
+            (with-open-file (out dirty :direction :output
+                                :if-exists :supersede
+                                :if-does-not-exist :create)
+              (format out "~S" (get-universal-time)))
+            (delete-file dirty)))
+        (let ((g2 (open-graph :gh-170-round2-recovery path)))
+          (unwind-protect
+               (let (id-c vc)
+                 (with-transaction ((graph-db::transaction-manager g2))
+                   (setq vc (graph-db:make-vertex :generic nil :graph g2)))
+                 (setq id-c (graph-db::commit-epoch vc))
+                 (is (> id-c id-b)
+                     "a post-recovery transaction must mint an id past ~
+every replayed id, not just the pre-recovery watermark (got ~D, ~
+replayed id was ~D)" id-c id-b))
+            (let ((graph-db:*graph* g2))
+              (ignore-errors (close-graph g2 :snapshot-p nil)))))))))
