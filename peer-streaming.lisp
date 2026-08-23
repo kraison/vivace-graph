@@ -39,8 +39,12 @@
 ;;; connection.
 ;;; ===========================================================================
 
-(defvar *peer-protocol-version* 1
-  "Peer wire protocol version, independent of *REPLICATION-PROTOCOL-VERSION*.")
+(defvar *peer-protocol-version* 2
+  "Peer wire protocol version, independent of *REPLICATION-PROTOCOL-VERSION*.
+
+The wire-v2 contract, stated once: protocol 2 = v3 node heads +
+package-qualified type-table names + store-scoped table +
+:PEER-PROTOCOL-VERSION required in the device auth plist.  (GH #206)")
 
 ;;; ---------------------------------------------------------------------------
 ;;; Small encodings: ids on the plist channel, and the purge packet.
@@ -732,13 +736,29 @@ safe integers; schema-digest carried as a within-major integrity signal)."
         :schema-minor (second (peer-schema-version graph))
         :schema-digest (schema-digest (schema graph))))
 
+(define-condition peer-protocol-mismatch-error (error)
+  ((hub-version    :initarg :hub-version    :reader peer-protocol-mismatch-hub)
+   (device-version :initarg :device-version :reader peer-protocol-mismatch-device))
+  (:report (lambda (c s)
+             (format s "Peer protocol version mismatch: hub ~S, device ~S (absent ~
+means a v1 device -- refused, not misparsed; GH #206)"
+                     (peer-protocol-mismatch-hub c)
+                     (peer-protocol-mismatch-device c)))))
+
 (defun peer-authenticate-device (graph auth)
-  "Validate a device AUTH plist against GRAPH (the hub): the same-major schema gate
-(WP-6/PT-6), a known origin in the device registry, and the replication key.  The key
-checked is the device's OWN key when it has one (per-device provisioning), else the hub's
+  "Validate a device AUTH plist against GRAPH (the hub): the protocol gate FIRST
+(:PEER-PROTOCOL-VERSION absent or /= *PEER-PROTOCOL-VERSION* signals
+PEER-PROTOCOL-MISMATCH-ERROR -- absent means a v1 device, refused rather than
+misparsed, GH #206), then the same-major schema gate (WP-6/PT-6), a known origin
+in the device registry, and the replication key.  The key checked is the
+device's OWN key when it has one (per-device provisioning), else the hub's
 shared REPLICATION-KEY (back-compat for un-keyed devices).  The device is looked up FIRST
 so its key is known before the key check.  Returns the PEER-DEVICE, or signals.  Records the
 device's last-pushed schema version for the drain-and-update barrier signal (§14)."
+  (let ((dev-protocol (getf auth :peer-protocol-version)))
+    (unless (eql dev-protocol *peer-protocol-version*)
+      (error 'peer-protocol-mismatch-error
+             :hub-version *peer-protocol-version* :device-version dev-protocol)))
   (let ((hub-version (peer-schema-version graph))
         (dev-version (list (getf auth :schema-major) (getf auth :schema-minor))))
     (unless (peer-schema-compatible-p hub-version dev-version)
@@ -1349,12 +1369,14 @@ the writer (WP-8)."
 
 (defun peer-device-auth-plist (graph &key full-resync)
   "What a device sends to authenticate + drive a pull: origin, its PULL-CURSOR
-(the op-stream lower bound), the same-major schema gate inputs, and optionally
+(the op-stream lower bound), :PEER-PROTOCOL-VERSION (checked by the hub BEFORE
+anything else, GH #206), the same-major schema gate inputs, and optionally
 :FULL-RESYNC to ask the hub to re-ship the whole scope (seed/recovery)."
   (list :origin-id (peer-id->hex (origin-id graph))
         :pull-cursor (load-peer-pull-cursor graph)
         :push-ack 0
         :full-resync (and full-resync t)
+        :peer-protocol-version *peer-protocol-version*
         :schema-major (first (peer-schema-version graph))
         :schema-minor (second (peer-schema-version graph))
         :replication-key (replication-key graph)))

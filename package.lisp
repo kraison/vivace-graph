@@ -179,6 +179,11 @@
            #:read-last-txn-id
            #:start-replication
            #:stop-replication
+           ;; peer replication: the wire-v2 protocol gate (GH #206)
+           #:*peer-protocol-version*
+           #:peer-protocol-mismatch-error
+           #:peer-protocol-mismatch-hub
+           #:peer-protocol-mismatch-device
            #:stop-buffer-pool
            #:set-buffer-pool-size
            #:*buffer-pool-size*
