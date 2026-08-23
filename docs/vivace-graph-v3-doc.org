@@ -3316,10 +3316,17 @@ existed only to stop a live server from holding the store's mmaps open,
 and the epoch lease is already shaped to support that pattern later
 without a redesign, should it be needed.
 
-**A store accepts work in one of four states,** tracked by its
+**A store accepts work in one of five states,** tracked by its
 transaction manager's ~accepting-p~: ~t~ (everything — the normal
 case), ~:read-only~ (reads and pins flow, a new transaction signals
-~store-not-accepting-error~ with reason ~:shadow-load~), or
+~store-not-accepting-error~ with reason ~:shadow-load~), ~:opening~
+(the same admit-pins/refuse-transactions shape as ~:read-only~, but for
+~open-graph~'s own mid-open window — GH #170 review round 3: every
+transaction manager starts here, before the graph is published to
+~*graphs*~, so a racing name-lookup writer gets a loud
+~store-not-accepting-error~ reason ~:opening~ instead of colliding with
+a still-running rebuild or crash recovery; ~open-graph~ flips to the
+caller's requested end state only once fully open), or
 ~:detaching~/~:swapping~ (nothing new — a full drain is in progress).
 Every transition goes through the same quiesce-and-wait: flip the
 flag, then poll ~reap-safe-floor~ until no transaction and no read pin
@@ -4401,7 +4408,7 @@ This chapter provides a categorized reference for the most important exported sy
   Creates a new, empty graph database at the specified ~location~. The ~name~ must be a keyword and should match the graph name used in your schema definitions. ~:index-backend~ (~:skip-list~, the default, or ~:bplus-tree~) selects the ordered-index engine for this graph's views/unique/spatial indexes; it defaults to the global ~*index-backend*~. Returns a `graph` object. See Chapter 3, "Ordered indexes and pluggable backends."
 
 - ~open-graph (name location &key index-backend initial-accepting-state ... )~ ::
-  Opens an existing graph database from ~location~. Fails if the database was not closed cleanly (i.e., if the ~.dirty~ file exists). ~:index-backend~ governs only *new* indexes created after open; each existing index reopens on the backend it was written with (its persisted tag). ~:initial-accepting-state~ (default ~t~, GH #170) sets the fresh transaction manager's ~accepting-p~ at construction, before the graph is registered anywhere — used by ~shadow-store~'s reopen to come up ~:read-only~ from the start rather than briefly writable then flipped. Returns a `graph` object.
+  Opens an existing graph database from ~location~. Fails if the database was not closed cleanly (i.e., if the ~.dirty~ file exists). ~:index-backend~ governs only *new* indexes created after open; each existing index reopens on the backend it was written with (its persisted tag). ~:initial-accepting-state~ (default ~t~, GH #170) is the state the graph is left in once this call returns — used by ~shadow-store~'s reopen to come back ~:read-only~. The transaction manager itself always starts at ~:opening~ (review round 3), before the graph is registered anywhere, for the duration of ~open-graph~'s own internal rebuild/recovery steps; it flips to ~:initial-accepting-state~ only at the very end, once the graph is fully open. Returns a `graph` object.
 
 - ~make-memory-graph (name location &key lazy peer-role origin-id peer-host ... )~ ::
   Like ~make-graph~, but constructs an *in-memory* graph (Chapter 15): the graph lives as live Lisp objects in RAM, with the same schema/transaction/query API. ~location~ still holds the durable journal, checkpoint image, schema and peer state. Pass ~:lazy t~ for fault-on-access materialization (near-instant open); accepts the same peer arguments as ~make-graph~ for an in-memory peer device.
@@ -4641,7 +4648,7 @@ This chapter provides a categorized reference for the most important exported sy
   Grows ~segment~ under its write lock until its capacity is at least ~n~; a no-op if already there. Turns a mid-apply ~vector-segment-capacity-exhausted~ failure into an upfront one for a load that knows its row count ahead of time.
 
 - ~store-not-accepting-error~ (condition) ::
-  Signalled by a new transaction or pin against a store whose ~accepting-p~ is not ~t~. Readers: ~store-not-accepting-name~, ~-reason~ — ~:read-only~ reports as ~:shadow-load~; ~:detaching~/~:swapping~ report as themselves.
+  Signalled by a new transaction or pin against a store whose ~accepting-p~ is not ~t~. Readers: ~store-not-accepting-name~, ~-reason~ — ~:read-only~ reports as ~:shadow-load~; ~:opening~ (~open-graph~'s own mid-open window, GH #170 review round 3) and ~:detaching~/~:swapping~ report as themselves.
 
 - ~detach-drain-timeout~ (condition) ::
   Signalled by ~detach-store~/~shadow-store~/~swap-in-shadow~'s quiesce when the in-flight transactions and pins do not drain within their timeout. ~accepting-p~ is restored to whatever it was *before* the quiesce call, not hardcoded ~t~ — a timeout during ~shadow-store~'s ~:read-only~ window leaves the store ~:read-only~ (GH #170, review finding C1). Readers: ~detach-timeout-name~, ~-seconds~.

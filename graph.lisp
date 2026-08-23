@@ -503,6 +503,13 @@ to disk and remove it."
               (applied-op-ids graph)
               (make-lhash :location (format nil "~A/applied-ops/" path)
                           :buckets 8)))
+      ;; Unlike OPEN-GRAPH, this TM does not need :OPENING (review round
+      ;; 3): MAKE-GRAPH's *GRAPHS* registration above already runs before
+      ;; this construction, same as before I4, and there is no RECOVER-
+      ;; TRANSACTIONS/rebuild step here for a racing writer to collide
+      ;; with -- a write against the still-unbound TRANSACTION-MANAGER
+      ;; slot in that window signals a loud unbound-slot error, the same
+      ;; acceptable pre-#170 behaviour (GH #170).
       (setf (transaction-manager graph)
             (make-instance 'transaction-manager
                            :graph graph))
@@ -594,13 +601,18 @@ below branches on) -- a genuine reopen of an existing graph with no
 policy.dat leaves it absent (STORE-RECOVERY-POLICY's :AUTHORED
 default), it does not retroactively opt that graph in.
 
-:INITIAL-ACCEPTING-STATE (GH #170, review finding I4) sets the fresh
-TRANSACTION-MANAGER's ACCEPTING-P at construction, BEFORE the graph is
-registered in *GRAPHS* -- so a caller that wants the reopened graph to
-come up in a non-accepting window (e.g. SHADOW-STORE's :READ-ONLY) never
-publishes it writable-then-flips, which would let a racing writer land a
-commit in the doomed generation during the gap.  Defaults to T (ordinary
-opens are immediately fully accepting, as before)."
+:INITIAL-ACCEPTING-STATE (GH #170, review finding I4) is the state this
+call leaves the graph in once it returns -- e.g. SHADOW-STORE's reopen
+passes :READ-ONLY so the returned graph never briefly comes up fully
+writable.  The fresh TRANSACTION-MANAGER itself always starts at
+:OPENING (review round 3), not this value directly: :OPENING is what is
+in force, before the graph is registered in *GRAPHS*, for every
+rebuild/recovery step this call runs internally, refusing a racing
+external writer with STORE-NOT-ACCEPTING-ERROR reason :OPENING while
+still admitting the read pins those internal steps themselves take.
+Only once GRAPH-OPEN-P is T, at the very end, does ACCEPTING-P flip to
+INITIAL-ACCEPTING-STATE.  Defaults to T (ordinary opens end up fully
+accepting, as before)."
   (unless *system-directory*
     (error 'system-directory-required :operation 'open-graph))
   (when (and peer-role (or master-p slave-p))
@@ -736,15 +748,24 @@ opens are immediately fully accepting, as before)."
         (restore-vector-segments graph)
         (with-open-file (out dirty-file :direction :output)
           (format out "~S" (get-universal-time)))
-        ;; The TM must exist -- with ACCEPTING-P already at its final
-        ;; INITIAL-ACCEPTING-STATE -- BEFORE this graph is published to
-        ;; *GRAPHS*/the open-store vector below: publishing writable then
-        ;; flipping after would let a racing writer land a commit in a
-        ;; generation meant to come up non-accepting (GH #170, I4).
+        ;; The TM must exist BEFORE this graph is published to *GRAPHS*/
+        ;; the open-store vector below (GH #170, I4) -- but it starts at
+        ;; :OPENING, not INITIAL-ACCEPTING-STATE directly (review round
+        ;; 3): publication happens before RECOVER-TRANSACTIONS and every
+        ;; rebuild step below it, so a racing name-lookup writer could
+        ;; otherwise pin AND commit against a mid-recovery graph.
+        ;; :OPENING admits pins (every rebuild/recovery scan below runs
+        ;; under WITH-READ-PIN) but refuses new transactions with reason
+        ;; :OPENING -- RECOVER-TRANSACTIONS itself creates none: it
+        ;; applies RECOVERY-TRANSACTION instances directly via APPLY-
+        ;; TRANSACTION, bypassing CREATE-TRANSACTION entirely, and its
+        ;; CALL-WITH-TRANSACTION-LOCK method is a no-op ("No locking
+        ;; during recovery").  The flip to INITIAL-ACCEPTING-STATE runs
+        ;; at the very end of this function, once GRAPH-OPEN-P is T.
         (setf (transaction-manager graph)
               (make-instance 'transaction-manager
                              :graph graph
-                             :accepting-p initial-accepting-state))
+                             :accepting-p :opening))
         (setf (graph-shadow-p graph) shadow-p)
         (if shadow-p
             ;; Unregistered: STORE-ID still comes from the registry (v8 ids
@@ -775,12 +796,29 @@ opens are immediately fully accepting, as before)."
           ;; Reproduces TRANSACTION-MANAGER's own INITIALIZE-INSTANCE
           ;; :AFTER formula verbatim; safe mid-open, no concurrency yet
           ;; (GH #170, review round 2).
+          ;;
+          ;; The SAME :AFTER method also derives REPLICATION-LOG-FILE
+          ;; from that (then pre-recovery) counter value -- re-seeding
+          ;; TX-ID-COUNTER alone left the log file's own NAME advertising
+          ;; the stale, lower minimum id it would actually contain, a
+          ;; range gap for APPLICABLE-REPLICATION-LOGS (transaction-log-
+          ;; streaming.lisp derives ranges from filenames) on every
+          ;; master/peer crash-recovery open.  Re-derive it too, from the
+          ;; now-current counter, with the exact same expression (GH
+          ;; #170, review round 3).
           (when crash-recovery-p
-            (setf (tx-id-counter (transaction-manager graph))
-                  (1+ (max (load-highest-transaction-id graph)
-                           (if (peer-graph-p graph)
-                               (load-peer-pull-cursor graph)
-                               0)))))
+            (let ((tm (transaction-manager graph)))
+              (setf (tx-id-counter tm)
+                    (1+ (max (load-highest-transaction-id graph)
+                             (if (peer-graph-p graph)
+                                 (load-peer-pull-cursor graph)
+                                 0))))
+              (setf (replication-log-file tm)
+                    (make-pathname :name (format nil "replication-~16,'0X"
+                                                 (tx-id-counter tm))
+                                   :type "log"
+                                   :defaults
+                                   (persistent-transaction-directory graph)))))
           ;; The spatial index restored above came from a sidecar written at the
           ;; last CLEAN close -- it predates the writes just replayed, and its
           ;; histogram cannot be repaired by replay, because replay's idempotent
@@ -844,6 +882,11 @@ opens are immediately fully accepting, as before)."
       (unless shadow-p
         (start-replication graph :package package))
       (setf (graph-open-p graph) t)
+      ;; Flip from :OPENING to the caller's requested state now that
+      ;; GRAPH-OPEN-P is T and every rebuild/recovery step above has run
+      ;; -- the mid-open window closes here, last, not at construction
+      ;; (GH #170, review round 3).
+      (%set-accepting-p (transaction-manager graph) initial-accepting-state)
       graph)))
 
 (defmethod close-graph ((graph graph) &key (snapshot-p t))

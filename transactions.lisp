@@ -152,9 +152,11 @@ in-flight transactions. Attach only a quiescent store."
 
 (define-condition store-not-accepting-error (error)
   ;; ACCEPTING-P states: T (all), :READ-ONLY (pins/reads yes, txns no),
-  ;; :DETACHING/:SWAPPING (nothing new).  REASON mirrors the flag, except
-  ;; :READ-ONLY reports as :SHADOW-LOAD -- the human-facing name for the
-  ;; state Task 2's shadow window puts the store in (GH #170).
+  ;; :OPENING (same admit-pins/refuse-txns shape, for OPEN-GRAPH's own
+  ;; mid-open window -- GH #170 review round 3), :DETACHING/:SWAPPING
+  ;; (nothing new).  REASON mirrors the flag, except :READ-ONLY reports
+  ;; as :SHADOW-LOAD -- the human-facing name for the state Task 2's
+  ;; shadow window puts the store in (GH #170).
   ((name :initarg :name :reader store-not-accepting-name)
    (reason :initarg :reason :reader store-not-accepting-reason))
   (:report (lambda (condition stream)
@@ -698,7 +700,11 @@ vertices (the normal case for ingested source records) are unaffected."
 (defun pin-read-epoch (transaction-manager)
   "Register a read pin at the current epoch; return its token (for UNPIN).
 Refused -- STORE-NOT-ACCEPTING-ERROR -- only under FULL quiescence
-(:DETACHING / :SWAPPING); :READ-ONLY admits new pins.
+(:DETACHING / :SWAPPING); :READ-ONLY and :OPENING (OPEN-GRAPH's own
+mid-open window, GH #170 review round 3) both admit new pins -- OPEN-
+GRAPH's own rebuild/recovery scans run under WITH-READ-PIN and must not
+be refused by the very state that protects them from a concurrent
+writer.
 
 The accepting-p CHECK and the pin REGISTRATION run as one critical
 section under READ-PINS-LOCK -- the same lock
@@ -711,7 +717,7 @@ admitted after DETACH-STORE had already reported success and begun
 tearing down mmaps (GH #170, fix round 1)."
   (with-recursive-lock-held ((read-pins-lock transaction-manager))
     (let ((state (accepting-p transaction-manager)))
-      (unless (or (eq state t) (eq state :read-only)
+      (unless (or (eq state t) (eq state :read-only) (eq state :opening)
                   *quiesced-store-closing-p*)
         (error 'store-not-accepting-error
                :name (graph-name (graph transaction-manager))
@@ -2902,9 +2908,14 @@ stops appearing in queries.  MARK-DELETED is the usual entry point.")
     :initform 0)
    ;; Detach quiescence (GH #170).  T = accepting everything.  :READ-ONLY =
    ;; pins/reads yes, new transactions no (Task 2's shadow window).
-   ;; :DETACHING / :SWAPPING = nothing new -- a full drain is in progress.
-   ;; :INITARG so OPEN-GRAPH's :INITIAL-ACCEPTING-STATE can set this at
-   ;; construction, before the graph is published anywhere (GH #170, I4).
+   ;; :OPENING = same admit-pins/refuse-transactions shape as :READ-ONLY,
+   ;; but for OPEN-GRAPH's own mid-open window (review round 3): every
+   ;; construction site starts here, before the graph is published to
+   ;; *GRAPHS* -- a name-lookup writer racing the open now gets a loud
+   ;; STORE-NOT-ACCEPTING-ERROR reason :OPENING instead of colliding with
+   ;; a still-running rebuild/recovery.  :DETACHING / :SWAPPING = nothing
+   ;; new -- a full drain is in progress.  :INITARG so OPEN-GRAPH can set
+   ;; this at construction (GH #170, I4/round 3).
    (accepting-p
     :accessor accepting-p
     :initarg :accepting-p

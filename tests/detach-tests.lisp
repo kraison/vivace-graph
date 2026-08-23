@@ -1474,9 +1474,20 @@ reopen (recovery runs). A transaction committed after that open must
 mint an id STRICTLY GREATER than the replayed transaction's id, not
 just past the stale pre-recovery watermark.
 
+Also asserts the re-opened graph's REPLICATION-LOG-FILE name (parsed via
+the same PARSE-REPLICATION-LOG-NAME the replication streaming code uses)
+encodes the RE-SEEDED counter, not the rewound one -- round 3's fix: the
+constructor's INITIALIZE-INSTANCE :AFTER derives that filename from the
+SAME (then pre-recovery) counter value TX-ID-COUNTER was seeded from, so
+re-seeding TX-ID-COUNTER alone would still leave the file's name
+advertising a stale, lower minimum id than it will actually hold.
+
 ABLATION (recorded, not re-run here): removing OPEN-GRAPH's re-seed
 after RECOVER-TRANSACTIONS makes the final (> new-id id-b) assertion
-fail -- the new transaction mints ID-A+1, which is <= ID-B."
+fail -- the new transaction mints ID-A+1, which is <= ID-B.  ABLATION 2
+(recorded, not re-run here): keeping the TX-ID-COUNTER re-seed but
+dropping the REPLICATION-LOG-FILE re-derivation makes the filename
+assertion fail -- it would still encode ID-A+1."
   (with-temp-directory (sys)
     (with-temp-directory (dir)
       (let ((graph-db::*system-directory* (namestring sys))
@@ -1521,6 +1532,12 @@ fail -- the new transaction mints ID-A+1, which is <= ID-B."
         (let ((g2 (open-graph :gh-170-round2-recovery path)))
           (unwind-protect
                (let (id-c vc)
+                 (is (= (1+ id-b)
+                        (graph-db::parse-replication-log-name
+                         (graph-db::replication-log-file
+                          (graph-db::transaction-manager g2))))
+                     "the reopened graph's replication-log-file must ~
+encode the RE-SEEDED counter (~D), not the rewound one" (1+ id-b))
                  (with-transaction ((graph-db::transaction-manager g2))
                    (setq vc (graph-db:make-vertex :generic nil :graph g2)))
                  (setq id-c (graph-db::commit-epoch vc))
@@ -1530,3 +1547,55 @@ every replayed id, not just the pre-recovery watermark (got ~D, ~
 replayed id was ~D)" id-c id-b))
             (let ((graph-db:*graph* g2))
               (ignore-errors (close-graph g2 :snapshot-p nil)))))))))
+
+;;; Round 3 (GH #170 re-review): the publication window.  *GRAPHS*/
+;;; %REGISTER-OPEN-STORE registration happens BEFORE RECOVER-TRANSACTIONS
+;;; and every rebuild step in OPEN-GRAPH; a racing name-lookup writer
+;;; could otherwise pin AND commit against a mid-recovery graph.  Fixed
+;;; by starting every fresh transaction manager at :OPENING (admits
+;;; pins, refuses new transactions with reason :OPENING) and flipping to
+;;; the caller's requested :INITIAL-ACCEPTING-STATE only at the very end
+;;; of OPEN-GRAPH, once GRAPH-OPEN-P is T.
+
+(test open-graph-ends-fully-accepting-and-opening-refuses-transactions
+  "Two-part unit probe (a true concurrent race against OPEN-GRAPH's own
+internal window is disproportionate to test directly -- see the source-
+order comment below instead, which is the actual proof):
+
+1. An ordinary OPEN-GRAPH call ends with ACCEPTING-P T -- the :OPENING
+   window is entirely internal to OPEN-GRAPH and never observable by a
+   caller holding the returned graph.
+2. CREATE-TRANSACTION against a transaction manager hand-set to
+   :OPENING (the exact state every fresh TM starts OPEN-GRAPH in) signals
+   STORE-NOT-ACCEPTING-ERROR reason :OPENING -- the same generic
+   REASON-mirrors-the-flag behavior :DETACHING/:SWAPPING already get.
+3. PIN-READ-EPOCH under that SAME :OPENING state succeeds -- OPEN-
+   GRAPH's own rebuild/recovery scans run under WITH-READ-PIN and must
+   not be refused by the very state meant to protect them.
+
+The ORDERING PIN (the actual guarantee, not re-tested by a race here):
+in OPEN-GRAPH's source (graph.lisp), the TRANSACTION-MANAGER is
+constructed with :ACCEPTING-P :OPENING BEFORE the (SETF (GETHASH NAME
+*GRAPHS*) GRAPH) / %REGISTER-OPEN-STORE call, and %SET-ACCEPTING-P to
+INITIAL-ACCEPTING-STATE is the LAST form before OPEN-GRAPH returns,
+after (SETF (GRAPH-OPEN-P GRAPH) T) -- so no window exists where the
+graph is both externally reachable (via *GRAPHS*/LOOKUP-GRAPH) and
+willing to accept a new transaction before every rebuild/recovery step
+has completed."
+  (with-clocked-store (g clock sys)
+    clock sys
+    (is (eq t (graph-db:accepting-p (graph-db::transaction-manager g))))
+    (let ((tm (graph-db::transaction-manager g)))
+      (graph-db::%set-accepting-p tm :opening)
+      (unwind-protect
+           (progn
+             (handler-case
+                 (progn
+                   (with-transaction (tm)
+                     (graph-db:make-vertex :generic nil :graph g))
+                   (fail "a transaction under :OPENING must be refused"))
+               (graph-db:store-not-accepting-error (c)
+                 (is (eq :opening (graph-db:store-not-accepting-reason c)))))
+             (let ((pin (graph-db:pin-read-epoch tm)))
+               (graph-db:unpin-read-epoch tm pin)))
+        (graph-db::%set-accepting-p tm t)))))
