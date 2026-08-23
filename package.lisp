@@ -293,6 +293,11 @@
            #:divergent-type-name
            #:divergent-type-graph-name
            #:divergent-type-other-graphs
+
+           ;; packages as namespaces (GH #167)
+           #:default-store-not-open-error
+           #:default-store-not-open-class
+           #:default-store-not-open-store
            #:instantiate-node-type
            #:*schema-node-metadata*
            #:with-write-locked-class

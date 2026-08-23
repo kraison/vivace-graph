@@ -336,6 +336,28 @@ evolution and is not this guard's business (GH #196)."
             :graph-name (node-type-graph-name meta)
             :other-graphs (nreverse divergent)))))
 
+(define-condition default-store-not-open-error (error)
+  ;; R1: the spec REJECTED silently writing to *GRAPH* when the class's
+  ;; declared store is not open -- placement determines recovery policy,
+  ;; so a silent fallback quietly changes durability (GH #167).
+  ((class-name :initarg :class-name
+               :reader default-store-not-open-class)
+   (store :initarg :store :reader default-store-not-open-store))
+  (:report (lambda (c s)
+             (format s "MAKE-~A: no :GRAPH argument and the class's ~
+default store ~S is not open.  Open it, or pass :GRAPH explicitly ~
+(GH #167)."
+                     (default-store-not-open-class c)
+                     (default-store-not-open-store c)))))
+
+(defun %default-store-graph (class-name store-name explicit)
+  "R1 resolution: EXPLICIT graph if given, else the OPEN graph named
+STORE-NAME, else refuse -- never *GRAPH* (GH #167)."
+  (or explicit
+      (lookup-graph store-name)
+      (error 'default-store-not-open-error
+             :class-name class-name :store store-name)))
+
 (defmacro def-node-type (name parent-types slot-specs graph-name &key keep-revisions)
   "Define a persistent node type NAME for the graph named GRAPH-NAME.  This is
 the machinery behind DEF-VERTEX and DEF-EDGE; you normally use those instead.
@@ -400,11 +422,13 @@ be defined before or after the graph is created."
                  thing)))
            ,(let ((args (if (eql (last1 parent-types) 'edge)
                             '(&rest make-args
-                              &key (graph *graph*) id deleted-p revision from to weight &allow-other-keys)
+                              &key (graph nil) id deleted-p revision from to weight &allow-other-keys)
                             '(&rest make-args
-                              &key (graph *graph*) id deleted-p revision &allow-other-keys))))
+                              &key (graph nil) id deleted-p revision &allow-other-keys))))
                  `(defun ,constructor ,args
-                    (let ((slots (remove-if
+                    (let ((graph (%default-store-graph
+                                  ',name ',graph-name graph))
+                          (slots (remove-if
                                   'null
                                   (mapcar
                                    (lambda (slot-name)
