@@ -736,6 +736,8 @@ safe integers; schema-digest carried as a within-major integrity signal)."
         :schema-minor (second (peer-schema-version graph))
         :schema-digest (schema-digest (schema graph))))
 
+;; Deliberately internal, like sibling PEER-SCHEMA-INCOMPATIBLE-ERROR above --
+;; no peer symbol is exported (review ruling, GH #206 fix round 1).
 (define-condition peer-protocol-mismatch-error (error)
   ((hub-version    :initarg :hub-version    :reader peer-protocol-mismatch-hub)
    (device-version :initarg :device-version :reader peer-protocol-mismatch-device))
