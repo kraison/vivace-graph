@@ -378,7 +378,14 @@ accepting, no new journal records."
                        (graph-db::system-clock-location clock)))))
           (is-true warned)
           (is-true (probe-file file))
-          (is (equal m (graph-db:read-restore-manifest file))))))))
+          (is (equal m (graph-db:read-restore-manifest file)))
+          ;; *PACKAGE* must stay COMMON-LISP while writing, not KEYWORD
+          ;; -- otherwise :RESTORE prints as the bare, colon-less symbol
+          ;; RESTORE (GH #171).
+          (with-open-file (in file)
+            (let ((text (make-string (file-length in))))
+              (read-sequence text in)
+              (is-true (search ":RESTORE" text)))))))))
 
 (test restore-rebuilds-a-derivable-store-through-the-callback
   "Generation pruned, :REBUILD supplied: the callback runs against a fresh
@@ -974,6 +981,44 @@ genuinely gone, so the plan must still refuse :INTERRUPTED-SWAP (not
       (setq g (open-graph :restore-store-1 (concatenate 'string live "/")
                           :system-clock clock))
       (is (= 1 (%rs-count g))))))
+
+(test retry-after-a-retire-live-abort-mints-a-fresh-retired-path
+  "Round-trip of the #212 alias hazard: a rolled-back :RETIRE-LIVE-
+ABORTED already names <live>-retired-<E>, the CURRENT epoch; a retry's
+own :RETIRE-LIVE must not reuse E -- reusing it would let a genuinely
+stranded retry masquerade as the OLD abort's already-settled path, so
+REPAIR-INTERRUPTED-SWAP would wrongly answer :NOTHING-TO-DO instead of
+:REPAIRED (GH #171)."
+  (with-restore-system (g clock sys)
+    sys
+    (%rs-write g)
+    (let* ((live (graph-db::%trimmed-namestring (graph-db::location g)))
+           (now (graph-db:clock-current-epoch clock))
+           (aliased (format nil "~A-retired-~D" live now)))
+      ;; Simulate the aborted first attempt: rollback already journaled
+      ;; a :RETIRE-LIVE-ABORTED naming the epoch a fresh mint would
+      ;; otherwise reuse -- no directory exists at ALIASED at all.
+      (journal-append clock :retire-live-aborted :store :restore-store-1
+                       :retired aliased)
+      ;; The retry: %RETIRED-PATH-FOR must skip the aliased name even
+      ;; though no directory occupies it.
+      (let ((minted (graph-db::%retired-path-for clock live)))
+        (is (string/= aliased minted))
+        ;; Simulate a hard crash between the retry's own two renames:
+        ;; live really moved to MINTED, :RETIRE-LIVE journaled, nothing
+        ;; else -- the shape a genuinely interrupted swap leaves.
+        (let ((graph-db:*graph* g)) (close-graph g :snapshot-p nil))
+        (graph-db::%posix-rename live minted)
+        (journal-append clock :retire-live :store :restore-store-1
+                         :retired minted)
+        (is (eq :repaired (graph-db:repair-interrupted-swap
+                           clock :restore-store-1 live)))
+        (is-true (probe-file (uiop:ensure-directory-pathname live)))
+        (is-false (probe-file (uiop:ensure-directory-pathname minted)))
+        (setq g (open-graph :restore-store-1
+                            (concatenate 'string live "/")
+                            :system-clock clock))
+        (is (= 1 (%rs-count g)))))))
 
 (test dangling-into-is-scoped-to-the-clock-and-guards-a-nil-tag
   "%DANGLING-INTO's two guards (C2, M3), unit-tested: a store attached to

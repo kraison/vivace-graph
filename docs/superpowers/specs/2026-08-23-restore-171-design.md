@@ -106,8 +106,8 @@ rebuilds) do not collide. *Cost if wrong:* eras are derived from the
 journal on every read, so a corrected rule needs no on-disk migration.
 
 **R6 — The interrupted-swap window is repaired by an explicit,
-idempotent tool, not inside restore.** `repair-interrupted-swap (name
-location)` handles the only shape #170 cannot: live missing (or a
+idempotent tool, not inside restore.** `repair-interrupted-swap (clock
+name location)` handles the only shape #170 cannot: live missing (or a
 half-moved shadow) while exactly one `<location>-retired-<E3>` is newer
 than any `:swap` record. It renames the retired generation back and
 appends `(:kind :swap-aborted ...)`. Restore refuses to start while a
@@ -145,7 +145,7 @@ the `.asd`), exported from `package.lisp`.
     The manifest is also written to <clock-dir>/restore-<Enow>.manifest
     readably, *read-eval* nil on read — same discipline as the journal.
 
-(repair-interrupted-swap name location) → :repaired | :nothing-to-do
+(repair-interrupted-swap clock name location) → :repaired | :nothing-to-do
 ```
 
 `restore-system` uses `plan-system-restore` first and executes only a
@@ -175,8 +175,11 @@ One plist per store, plus a header; printed readably, no evaluation:
   ...))
 ```
 
-`:action` ∈ `:rewound | :rebuilt | :unchanged | :refused` (refused only
-in a plan). `:dangling` appears on an `:authored` dependent of a
+`:action` ∈ `:rewound | :rebuilt | :unchanged | :refused` — but
+`plan-system-restore` raises `restore-refused-error` as soon as any
+refusal exists, so a caller never actually receives a manifest
+containing `:refused`; the reasons instead ride on the error's own
+`reasons` slot. `:dangling` appears on an `:authored` dependent of a
 rebuilt store. A manifest in which any store is `:rebuilt` or
 `:exact nil` is exactly the "inconsistent instant" §9 wants *recorded*;
 `restore-system` also signals `restore-inexact-warning` summarising

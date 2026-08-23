@@ -441,7 +441,11 @@ generation to track."
 
 (defun %restore-plan-entries (clock epoch rebuild)
   "One manifest entry per store CLOCK knows about, plus the refusal list
-for PLAN-SYSTEM-RESTORE to raise.  Returns (values ENTRIES REASONS).
+for PLAN-SYSTEM-RESTORE to raise.  Returns (values ENTRIES REASONS);
+REASONS is in reverse encounter order -- PUSH-accumulated, NOT
+NREVERSEd here -- so a caller adding more reasons (e.g. :INEXACT) can
+PUSH onto it and NREVERSE exactly once for a single deterministic order
+(GH #171).
 
 A store that needs a rename (:REWOUND or :REBUILT) but is not open
 under CLOCK right now is refused :NOT-OPEN -- RESTORE-SYSTEM can only
@@ -520,7 +524,7 @@ lands in the same RESTORE-REFUSED-ERROR as every other refusal."
                         :state-at (clock-current-epoch clock))
                   entries)))))
      by-store)
-    (values (nreverse entries) (nreverse reasons))))
+    (values (nreverse entries) reasons)))
 
 (defun plan-system-restore (clock epoch &key require-exact rebuild)
   "The manifest RESTORE-SYSTEM would act on for EPOCH, with no side
@@ -575,18 +579,20 @@ R1/R2)."
   (with-open-file (out (%manifest-file clock (getf manifest :at))
                        :direction :output :if-exists :supersede
                        :if-does-not-exist :create)
-    ;; *PACKAGE* KEYWORD: a store named by a non-keyword symbol still
-    ;; PRIN1s readably; *PRINT-READABLY* stays NIL, as the journal's
-    ;; own records already do (GH #171).
+    ;; *PACKAGE* COMMON-LISP, not KEYWORD: keywords keep their printed
+    ;; colon only when *package* is NOT the keyword package itself, and
+    ;; a bare T/NIL in an entry stays unqualified since CL is its home
+    ;; package; *PRINT-READABLY* stays NIL, as the journal's own
+    ;; records already do (GH #171).
     (let ((*print-readably* nil) (*print-pretty* nil)
-          (*package* (find-package :keyword)))
+          (*package* (find-package :common-lisp)))
       (prin1 manifest out)))
   manifest)
 
 (defun read-restore-manifest (path)
   "PATH's manifest plist.  *READ-EVAL* NIL: data, never code (GH #171)."
   (with-open-file (in path)
-    (let ((*read-eval* nil) (*package* (find-package :keyword)))
+    (let ((*read-eval* nil) (*package* (find-package :common-lisp)))
       (read in))))
 
 (defun %entry-with (entry &rest kvs)
@@ -601,18 +607,34 @@ holds elsewhere -- it never mutates the manifest (GH #171)."
                   unless (member k keys)
                     append (list k v)))))
 
+(defun %journal-named-paths (clock)
+  "EQUAL-hash set of every path a :RETIRED, :RETIRED-LIVE,
+:RESTORED-FROM or :FROM key names in any journal record -- including a
+rolled-back :RETIRE-LIVE-ABORTED's own path, which names no live
+directory but must still never be re-minted (GH #171)."
+  (let ((set (make-hash-table :test 'equal)))
+    (dolist (r (journal-records clock))
+      (dolist (key '(:retired :retired-live :restored-from :from))
+        (let ((v (getf r key)))
+          (when v (setf (gethash (%trimmed-namestring v) set) t)))))
+    set))
+
 (defun %retired-path-for (clock live)
-  "<LIVE>-retired-<E> for an E no directory already uses.  Two retiring
-events with no commit between them -- two RESTORE-SYSTEM calls in a row,
-or a rewind the cascade then rebuilds -- otherwise compute the SAME name
-and the second rename fails on the non-empty directory: consume epochs
-until the name is free, so the journal record's own :EPOCH still matches
-the name (GH #171)."
-  (loop for path = (format nil "~A-retired-~D" live
-                           (clock-current-epoch clock))
-        while (probe-file (uiop:ensure-directory-pathname path))
-        do (clock-next-epoch clock)
-        finally (return path)))
+  "<LIVE>-retired-<E> for an E no directory already uses AND no journal
+record already names.  Two retiring events with no commit between them
+-- two RESTORE-SYSTEM calls in a row, or a rewind the cascade then
+rebuilds -- otherwise compute the SAME name and the second rename fails
+on the non-empty directory: consume epochs until the name is free.  The
+journal check alone matters too: a rolled-back retry's aborted rename
+names a path with no directory at all, and re-minting it would alias a
+live :RETIRE-LIVE-ABORTED record onto a fresh attempt (GH #171)."
+  (let ((named (%journal-named-paths clock)))
+    (loop for path = (format nil "~A-retired-~D" live
+                             (clock-current-epoch clock))
+          while (or (probe-file (uiop:ensure-directory-pathname path))
+                    (gethash path named))
+          do (clock-next-epoch clock)
+          finally (return path))))
 
 (defun %close-quiesced (graph timeout)
   "SWAP-IN-SHADOW's close sequence: quiesce as :RESTORING, close with
@@ -799,8 +821,13 @@ Returns the manifest (GH #171, spec S3-S4)."
                                :state-at (clock-current-epoch clock)
                                :cascade-from source
                                :retired-live (getf extra :retired-live))))
+                      ;; Accumulate: a second rebuilt source dangling
+                      ;; into the same authored store must not erase
+                      ;; the first's count (GH #171).
                       (setf (nth pos entries)
-                            (%entry-with entry :dangling n))))))))))
+                            (%entry-with entry :dangling
+                                        (+ n (or (getf entry :dangling)
+                                                 0))))))))))))
     (setf (getf manifest :at) (clock-current-epoch clock))
     (%write-manifest clock manifest)
     (when (some (lambda (e) (or (eq (getf e :action) :rebuilt)

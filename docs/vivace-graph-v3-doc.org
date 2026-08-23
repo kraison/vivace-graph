@@ -3614,9 +3614,12 @@ to ~<clock-dir>/restore-<Enow>.manifest~:
     (:store "audit"    :action :unchanged :dangling 17)))
 #+END_SRC
 
-~:action~ is one of ~:rewound~, ~:rebuilt~, ~:unchanged~, or (in a
-*plan*, not an executed restore) ~:refused~. A store untouched by any
-swap with ~swap-epoch > epoch~ is simply ~:unchanged~. Any store
+~:action~ is one of ~:rewound~, ~:rebuilt~, ~:unchanged~, or
+~:refused~ — but ~plan-system-restore~ raises
+~restore-refused-error~ the moment any refusal exists, so a caller
+never actually receives a manifest containing ~:refused~; the reasons
+instead ride on the error's own ~reasons~ slot. A store untouched by
+any swap with ~swap-epoch > epoch~ is simply ~:unchanged~. Any store
 ~:rebuilt~, or ~:rewound~ with ~:exact nil~, means the restored instant
 is not perfectly consistent across the system — exactly the case §9
 requires to be *recorded*, never faked — and ~restore-system~ signals
