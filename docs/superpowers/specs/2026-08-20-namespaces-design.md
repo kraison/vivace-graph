@@ -148,6 +148,21 @@ replication is off by default — so two such images can independently assign th
 different ids. Silent reconciliation would mean a data migration triggered by a network
 handshake; a disagreement between two populated stores is an operator event.
 
+**Built (#206/#201):** the type-table's `name` and `supers` fields flipped
+to downcased, package-qualified names (`package:symbol`), so two
+same-named types from different packages no longer collide on the wire —
+the collision check now fires only on residual ambiguity after
+downcasing. The hub's `:auth-ok` table is scoped to the session's own
+graph plus the transitive `supers`-closure of that set (D14 still holds:
+type-ids stay image-level; only what one session's table *lists*
+narrowed), which also narrows an unrepresentable-name failure from every
+peer session in the image to sessions on stores that actually hold the
+offending type. The peer wire protocol version gate (`*peer-protocol-
+version*`, now 2) is a *new*, independent axis — it refuses a device
+whose `:peer-protocol-version` is absent or mismatched before D15's
+registry-agreement check ever runs, since a v1 device cannot parse the
+qualified-name table or the v3 node heads this protocol carries.
+
 ### 3.5 Runtime schema is metadata, never source
 
 Restart must never `load` code written at runtime. Metadata is diffable, versionable,
