@@ -3254,7 +3254,7 @@ by the lock.
 *** Epoch leases for a detached store
 
 ~clock-lease-epochs~ reserves a contiguous range on the clock for a store
-that is about to go offline (a detach, per spec §8 — not yet built; see
+that is about to go offline (a detach, per spec §8; see
 ~docs/superpowers/specs/2026-08-20-namespaces-design.md~ §6): the range
 is skipped so the clock never hands the same epochs to anyone else, and
 the detached store can allocate from its own leased range with no further
@@ -3267,9 +3267,10 @@ coordination while it is disconnected.
 #+END_SRC
 
 Epoch ids are 64-bit, so a lease large enough for any realistic bulk load
-still leaves exhaustion unreachable. As of GH #168, this is a primitive
-with no caller yet — #170's shadow-generation swap is the first thing
-that will call it, to hand a detached bulk load its own private range.
+still leaves exhaustion unreachable. **Built (#170):** ~detach-store~ and
+the shadow-generation bulk-load-and-swap both call this, to hand a
+detached store, or a shadow copy opened for loading, its own private
+range. See "Detach, shadow load, and the swap" below.
 
 *** The lifecycle journal
 
@@ -3279,13 +3280,14 @@ directory. ~journal-append~ writes one record — kind ~:create~, ~:detach~
 (with its lease range), ~:swap~, ~:attach~, or ~:retire~, plus whatever
 else the caller supplies — and ~journal-records~ reads every record back,
 oldest first. ~attach-to-system-clock~ already appends an ~:attach~
-record on every attach; the other four kinds are for #170 and #171 to
-write as they build detach, swap and restore on top of this.
+record on every attach; **built (#170):** ~detach-store~ appends
+~:detach~ and ~swap-in-shadow~ appends ~:swap~; ~:retire~ is left for
+#171's restore work.
 
 **The journal is read with ~*read-eval*~ bound to ~nil~: it is data, and
 is never evaluated.** This is load-bearing, not a stylistic default —
-#170's shadow swap and #171's restore both plan to trust journal contents
-without re-checking them, so a record must never be able to execute code
+#170's shadow swap trusts journal contents without re-checking them, and
+#171's restore plans to as well, so a record must never be able to execute code
 just by being read back.
 
 **Hardened (#191):** ~journal-records~ returns two values, the record
@@ -3302,6 +3304,200 @@ clock holds the directory lock;** a stale/closed clock's read stays
 tolerant (warns, returns the torn-tail flag) but leaves the file
 untouched, so the next reader that owns the lock is the one that
 truncates it (GH #182, #191).
+
+*** Detach, shadow load, and the swap
+
+GH #170 turns the primitives above — quiescence, epoch leases, the
+lifecycle journal — into three complete operations: detaching a store
+cleanly, bulk-loading a consistent copy of it while it keeps serving
+reads, and swapping that copy in. All three run *in the same process*
+as the live store; the separate-loader-process pattern this replaces
+existed only to stop a live server from holding the store's mmaps open,
+and the epoch lease is already shaped to support that pattern later
+without a redesign, should it be needed.
+
+**A store accepts work in one of five states,** tracked by its
+transaction manager's ~accepting-p~: ~t~ (everything — the normal
+case), ~:read-only~ (reads and pins flow, a new transaction signals
+~store-not-accepting-error~ with reason ~:shadow-load~), ~:opening~
+(the same admit-pins/refuse-transactions shape as ~:read-only~, but for
+~open-graph~'s own mid-open window — GH #170 review round 3: every
+transaction manager starts here, before the graph is published to
+~*graphs*~, so a racing name-lookup writer gets a loud
+~store-not-accepting-error~ reason ~:opening~ instead of colliding with
+a still-running rebuild or crash recovery; ~open-graph~ flips to the
+caller's requested end state only once fully open), or
+~:detaching~/~:swapping~ (nothing new — a full drain is in progress).
+Every transition goes through the same quiesce-and-wait: flip the
+flag, then poll ~reap-safe-floor~ until no transaction and no read pin
+remains that could observe a version out from under the coming close.
+A quiesce that cannot drain within its timeout restores ~accepting-p~
+to whatever it was *before* this quiesce call — not hardcoded ~t~ —
+and signals ~detach-drain-timeout~: a timeout during ~shadow-store~'s
+~:read-only~ window must leave the store ~:read-only~, not silently
+lift the shadow-window guard and let a write land in the doomed
+generation (GH #170, review finding C1).
+
+**Detaching a store: ~detach-store~ / ~reattach-store~.**
+~detach-store~ quiesces the graph (reason ~:detaching~), leases a range
+of the system clock's epoch space via ~clock-lease-epochs~, journals
+~:detach~, and ~close-graph~'s it durably, returning a
+~store-detachment~ handle (graph name, location, store-id, and the
+leased range). ~reattach-store~ reopens it at its recorded location and
+rejoins it to the image clock — it reads the ambient ~*system-clock*~
+rather than taking one as an argument, the same convention
+~make-graph~/~open-graph~'s own ~:system-clock~ default follows. Both
+require the graph already be attached to a system clock: a detach with
+no lease to hand over has nothing to reattach against.
+
+**Two brief unavailable windows, not one long one.** ~shadow-store~
+takes a consistent copy of a live store *while it keeps serving reads*:
+quiesce (reason ~:swapping~) → ~close-graph~ → a recursive,
+sparse-preserving copy of the store's directory to
+~<location>-shadow/~ → reopen the original store and resume service.
+That close-copy-reopen window is seconds, not the length of the load —
+this is v1's deliberate choice of a **second brief window** over
+copying under a live mmap, which was ruled out as materially riskier
+for a first cut. The reopened store's ~accepting-p~ comes back
+~:read-only~, not ~t~: this is Kevin's explicit ruling (2026-08-22) —
+reads and pins keep flowing, but a write during the shadow window
+signals ~store-not-accepting-error~ rather than being silently
+accepted and then lost at swap time. Service is fully restored only by
+~swap-in-shadow~ or ~abandon-shadow~. If the copy (or the reopen
+itself) fails, the *original* store is reopened and restored to full
+service before the failure is re-signalled — a failed shadow attempt
+must never leave the live store stranded closed; if that recovery
+reopen also fails, ~shadow-recovery-failed~ is signalled instead,
+carrying both conditions.
+
+The copy is sparse-preserving because a fresh store already reserves
+several gigabytes of mostly-zero mmap regions — a byte-for-byte copy
+would materialize every one of those unwritten reservations. The
+copier walks each file in fixed-size chunks and re-creates only the
+holes: an all-zero chunk is skipped via a bare seek on the (already
+zero) destination file rather than written, so an empty multi-gigabyte
+store copies in seconds. This is why "copies in seconds against a load
+measured in tens of minutes" (spec §8) holds in practice, not just in
+principle.
+
+**Loading: ~open-shadow-graph~.** Opens the shadow directory as a
+graph under the *live* store's own name — so its schema metadata
+instantiates identically — but unregistered: it never enters
+~*graphs*~ or the open-store vector, and never replicates. Its
+store-id is interned straight from the live store's registry entry, so
+every node id the load mints resolves back to the live store once
+swapped in. Its epoch range comes from ~:lease (start . end)~ — a
+~store-detachment~'s range if there was a ~detach-store~, or a direct
+~clock-lease-epochs~ call if not — and is persisted to ~lease.dat~ in
+the shadow directory so it survives a crash or restart of the loading
+process. The allocation cursor itself is never taken from that lease
+or file: it is derived fresh on every open as
+~(max lease-start (1+ load-highest-transaction-id))~, because the
+shadow's own committed transactions are the only truth about what it
+has already allocated that cannot go stale. A range already exhausted
+before this open — the derived cursor at or past the lease's end —
+signals ~epoch-lease-exhausted~ immediately, rather than wrapping,
+reusing an id, or deferring the failure to the load's first write.
+
+**The fast path needs an explicit opt-in.** A store's recovery policy
+(~store-recovery-policy~ / ~set-store-recovery-policy~, persisted in
+~policy.dat~, default ~:authored~) records whether a crash mid-load can
+simply be repaired by redoing the load (~:derivable~) or whether the
+load is the only durable record of its own writes (~:authored~, the
+implicit policy of every store predating this feature). Passing
+~open-shadow-graph :fast-load t~ suppresses the ~.txn~ WAL file and
+replication log for every transaction committed against the shadow —
+safe only because a crashed derivable load is simply discarded and
+redone, never recovered from a log that was never written. Requesting
+it against a shadow whose (copied) policy is ~:authored~ signals
+~fast-load-requires-derivable~ instead of silently keeping the WAL
+suppressed and quietly risking data no one intended to make
+disposable.
+
+A store's policy is ordinarily set once, at creation: ~make-graph
+:recovery-policy :derivable~ (or ~:authored~) writes ~policy.dat~
+immediately. ~open-graph~ also accepts ~:recovery-policy~, but there it
+is only a hint — once ~policy.dat~ exists it is authoritative, and an
+~:recovery-policy~ that disagrees with it merely signals
+~recovery-policy-mismatch-warning~ (a warning, not an error) rather
+than rewriting the file out from under whatever set it; ~open-graph~'s
+~:recovery-policy~ is only ever persisted for a location with no
+~policy.dat~ yet (i.e. one being created via ~open-graph~ itself).
+
+**Presizing avoids a mid-load capacity surprise.** A vector-segment
+capacity failure discovered inside an ordinary transaction leaves a
+persisted node with no segment entry — invisible to retrieval, with
+~store-count~ still reporting it as present. ~presize-vector-segment~
+grows a segment up front to at least N entries, so a bulk load that
+knows its row count ahead of time turns that failure into an upfront
+allocation instead. ~open-shadow-graph :expected-vectors n~ applies
+this to *every* vector segment the shadow's graph object already
+carries (populated by ~open-graph~'s own vector-segment restore, which
+runs before ~:expected-vectors~ gets control) — one ~n~ for every
+segment, regardless of how many distinct ~:vector-index~ owner classes
+share the store. This never under-provisions a segment, but on a
+multi-owner store it can over-allocate the smaller ones; there is no
+per-owner sizing knob in v1.
+
+**Swapping the shadow in: ~swap-in-shadow~.** Validates
+~shadow-location~ — it must exist and carry no ~.dirty~ marker, i.e.
+it must already be closed — *before* touching the live store at all: a
+typo'd path or a still-open shadow costs one ~probe-file~, not a
+read-and-write outage. It then quiesces the live store (reason
+~:swapping~), closes it, and performs the promotion as two POSIX
+renames: the live directory is renamed to
+~<location>-retired-<epoch>~ **first**, then the shadow directory is
+renamed into the live location. That second rename — not the ~:swap~
+journal record appended just after it — is what "the swap happened"
+means: the data exists under some name throughout, and once the second
+rename lands, the live location holds the new generation no matter
+what happens next. The journal append is consequently best-effort:
+if it is what fails, the swap still succeeded, and ~swap-in-shadow~
+recovers by reopening the *new* generation and signalling
+~swap-recovered-warning~ (a warning, not an error) rather than
+re-signalling — re-signalling here would wrongly tell the caller the
+swap never happened. A failure *before* both renames complete instead
+reopens the *old* store, restores full service, and re-signals the
+original error, mirroring ~shadow-store~'s own recovery. A crash
+*between* the two renames is not recovered by this function at all —
+the live data sits at the retired path and the live location may be
+missing or half-replaced, needing manual recovery; that window, and
+the possibility of a missing ~:swap~ journal record after a completed
+swap, are tracked as GH #171 and #212. Either recovery reopen itself
+failing signals ~shadow-recovery-failed~, same as ~shadow-store~.
+~swap-in-shadow~ returns ~(values new-graph retired-path)~; the retired
+directory is kept, not deleted, on success.
+
+**Ending the lifecycle without a swap: ~discard-shadow~ /
+~abandon-shadow~.** A shadow never registers anywhere, so there is
+nothing to unregister before deleting it — ~discard-shadow~ just
+removes the tree, hard-gated on the directory name ending in
+~-shadow~ (the entire safety story for a function that deletes
+directory trees). ~abandon-shadow~ is the ordinary way to walk away
+from a shadow that will not be swapped in: it discards the shadow and
+restores the live store's ~accepting-p~ to ~t~ in one call.
+
+**What v1 deliberately does not do.** ~detach-store~, ~shadow-store~
+and ~swap-in-shadow~ all refuse a ~master-graph~/~slave-graph~/
+~peer-graph~ outright, signalling ~detach-unsupported-graph-error~:
+every reopen these three perform uses ~open-graph~'s plain default
+arguments, which would silently drop a replicated or peer graph's
+replication/peer configuration on the reopened generation. Threading
+the full ~open-graph~ argument set through detachment and shadowing is
+follow-on work, not this pass's. Out-of-process detach — a separate
+loader process, rather than this process performing the load itself —
+is deferred too; ~lease.dat~ already carries everything a second
+process would need to resume a shadow's allocation across a restart,
+so nothing here blocks it. Restoring *across* a swap (rewinding a
+retired generation, or rebuilding a derivable one) is GH #171's
+territory, not this one's.
+
+**Do not name a real, non-shadow store with a ~-shadow~ suffix.**
+~shadow-store~ derives its copy's directory name by appending
+~-shadow~ to the live location, and ~discard-shadow~'s entire deletion
+safety story is gating on that same suffix. A real store that happens
+to already end in ~-shadow~ would be indistinguishable from an actual
+shadow to that guard.
 
 *** Cross-image effects: a peer sync can advance the clock
 
@@ -4211,8 +4407,8 @@ This chapter provides a categorized reference for the most important exported sy
 - ~make-graph (name location &key index-backend ... )~ ::
   Creates a new, empty graph database at the specified ~location~. The ~name~ must be a keyword and should match the graph name used in your schema definitions. ~:index-backend~ (~:skip-list~, the default, or ~:bplus-tree~) selects the ordered-index engine for this graph's views/unique/spatial indexes; it defaults to the global ~*index-backend*~. Returns a `graph` object. See Chapter 3, "Ordered indexes and pluggable backends."
 
-- ~open-graph (name location &key index-backend ... )~ ::
-  Opens an existing graph database from ~location~. Fails if the database was not closed cleanly (i.e., if the ~.dirty~ file exists). ~:index-backend~ governs only *new* indexes created after open; each existing index reopens on the backend it was written with (its persisted tag). Returns a `graph` object.
+- ~open-graph (name location &key index-backend initial-accepting-state ... )~ ::
+  Opens an existing graph database from ~location~. Fails if the database was not closed cleanly (i.e., if the ~.dirty~ file exists). ~:index-backend~ governs only *new* indexes created after open; each existing index reopens on the backend it was written with (its persisted tag). ~:initial-accepting-state~ (default ~t~, GH #170) is the state the graph is left in once this call returns — used by ~shadow-store~'s reopen to come back ~:read-only~. The transaction manager itself always starts at ~:opening~ (review round 3), before the graph is registered anywhere, for the duration of ~open-graph~'s own internal rebuild/recovery steps; it flips to ~:initial-accepting-state~ only at the very end, once the graph is fully open. Returns a `graph` object.
 
 - ~make-memory-graph (name location &key lazy peer-role origin-id peer-host ... )~ ::
   Like ~make-graph~, but constructs an *in-memory* graph (Chapter 15): the graph lives as live Lisp objects in RAM, with the same schema/transaction/query API. ~location~ still holds the durable journal, checkpoint image, schema and peer state. Pass ~:lazy t~ for fault-on-access materialization (near-instant open); accepts the same peer arguments as ~make-graph~ for an in-memory peer device.
@@ -4416,6 +4612,61 @@ This chapter provides a categorized reference for the most important exported sy
 
 - ~peer-check-type-registry-agreement (table &optional registry)~ ::
   Signals ~peer-type-registry-conflict-error~, naming every conflicting symbol, unless the hub's ~table~ agrees with this image's registry about every type-id the two share. Run by ~peer-sync~ at the handshake; a disagreement is an operator event, not something a handshake may reconcile.
+
+**** Detach, Shadow Load, and the Swap (see Chapter 17)
+- ~detach-store (graph &key lease-epochs timeout)~ ::
+  Quiesces ~graph~ (no new transactions or read pins), leases ~lease-epochs~ of its system clock's epoch space, journals ~:detach~, and closes it durably. Returns a ~store-detachment~ handle for ~reattach-store~. Requires ~graph~ be attached to a system clock. Propagates ~detach-drain-timeout~ unchanged if the quiesce cannot drain within ~timeout~ seconds, leaving ~graph~ open and accepting again. Refuses a ~master-graph~/~slave-graph~/~peer-graph~ with ~detach-unsupported-graph-error~ (v1 scope). A failure between a successful quiesce and the durable close restores ~accepting-p~ to its pre-quiesce state before re-signalling.
+
+- ~reattach-store (detachment &key buffer-pool-size)~ ::
+  Reopens the store ~detachment~ names at its recorded location and rejoins it to the image clock. Reads the ambient ~*system-clock*~ rather than taking one as an argument. Returns the new graph.
+
+- ~shadow-store (graph &key timeout)~ ::
+  Takes a consistent shadow copy of ~graph~'s store: quiesce, close, sparse-preserving recursive copy to ~<location>-shadow/~, reopen ~graph~'s own store and resume service — left ~:read-only~ (a write signals ~store-not-accepting-error~ with reason ~:shadow-load~) until a caller calls ~swap-in-shadow~ or ~abandon-shadow~. A copy or reopen failure reopens the original store and restores full service before re-signalling; if that recovery also fails, signals ~shadow-recovery-failed~. Returns ~(values shadow-location reopened-graph)~. A pre-existing ~<location>-shadow/~ is discarded before the copy, never merged with. Refuses a ~master-graph~/~slave-graph~/~peer-graph~ with ~detach-unsupported-graph-error~ (v1 scope).
+
+- ~open-shadow-graph (shadow-location graph-name &key lease fast-load expected-vectors buffer-pool-size)~ ::
+  Opens ~shadow-location~ as an *unregistered* graph under ~graph-name~ (the live store's own name), for a bulk load. ~:lease (start . end)~ — from a ~store-detachment~ or a direct ~clock-lease-epochs~ call — is persisted to ~lease.dat~; when omitted, an existing ~lease.dat~ supplies it. The allocation cursor is always derived fresh from the shadow's own highest committed transaction id, never persisted; a range already exhausted signals ~epoch-lease-exhausted~. ~:fast-load t~ suppresses the WAL and replication log for the shadow's transactions, but only when the shadow's copied recovery policy is ~:derivable~ — otherwise signals ~fast-load-requires-derivable~. ~:expected-vectors n~ presizes every vector segment the shadow's graph object carries via ~presize-vector-segment~ (one ~n~ applied uniformly; a no-op when there are no segments yet). The lease and ~:expected-vectors~ are validated before ~open-graph~ runs; every check after it runs under an unwind-protect that closes the graph on error, so a failed open (e.g. an exhausted lease) never leaks an open handle that would make a retry fail on a stale ~.dirty~ marker.
+
+- ~swap-in-shadow (graph shadow-location &key timeout)~ ::
+  Promotes ~shadow-location~ (which must already be a closed shadow) into ~graph~'s place: validate first, quiesce, close, rename the live directory to ~<location>-retired-<epoch>~, rename the shadow into the live location, journal ~:swap~ (best-effort), reopen. Returns ~(values new-graph retired-path)~; the retired directory is kept. A failure before both renames complete reopens the old store and re-signals; a failure after they complete reopens the new generation and signals ~swap-recovered-warning~ instead of re-signalling, since the swap already succeeded. Either recovery reopen itself failing signals ~shadow-recovery-failed~. A crash *between* the two renames is not recovered here (GH #171/#212). The promoted generation's copied-in ~lease.dat~ is deleted right after the second rename. Refuses a ~master-graph~/~slave-graph~/~peer-graph~ with ~detach-unsupported-graph-error~ (v1 scope).
+
+- ~discard-shadow (shadow-location)~ ::
+  Deletes ~shadow-location~'s tree. Hard-gated on the directory name ending in ~-shadow~ — the entire safety story for a function that deletes directory trees.
+
+- ~abandon-shadow (graph shadow-location)~ ::
+  The lifecycle exit that is not a swap: ~discard-shadow~s the directory and restores ~graph~'s ~accepting-p~ to ~t~ (full service).
+
+- ~store-recovery-policy (location)~ / ~set-store-recovery-policy (location policy)~ ::
+  Read/write a store's ~policy.dat~: ~:derivable~ (rebuildable, so a crash may discard it — licenses ~open-shadow-graph~'s ~:fast-load~) or ~:authored~ (the only durable record of its writes — the default, including for a store predating this feature).
+
+- ~make-graph ( ... :recovery-policy policy)~ / ~open-graph ( ... :recovery-policy policy)~ ::
+  ~make-graph~'s ~:recovery-policy~ sets a new store's ~policy.dat~ at creation. ~open-graph~'s ~:recovery-policy~ is only a hint — ~policy.dat~, once present, is authoritative; a disagreeing value signals ~recovery-policy-mismatch-warning~ rather than overwriting the file, and is itself persisted only when ~open-graph~ is the call creating the store (no ~policy.dat~ yet).
+
+- ~recovery-policy-mismatch-warning~ (condition) ::
+  Signalled by ~open-graph~ when its ~:recovery-policy~ argument disagrees with an existing ~policy.dat~; the file wins regardless. Readers: ~recovery-policy-mismatch-warning-location~, ~-requested~, ~-on-disk~.
+
+- ~presize-vector-segment (segment n)~ ::
+  Grows ~segment~ under its write lock until its capacity is at least ~n~; a no-op if already there. Turns a mid-apply ~vector-segment-capacity-exhausted~ failure into an upfront one for a load that knows its row count ahead of time.
+
+- ~store-not-accepting-error~ (condition) ::
+  Signalled by a new transaction or pin against a store whose ~accepting-p~ is not ~t~. Readers: ~store-not-accepting-name~, ~-reason~ — ~:read-only~ reports as ~:shadow-load~; ~:opening~ (~open-graph~'s own mid-open window, GH #170 review round 3) and ~:detaching~/~:swapping~ report as themselves.
+
+- ~detach-drain-timeout~ (condition) ::
+  Signalled by ~detach-store~/~shadow-store~/~swap-in-shadow~'s quiesce when the in-flight transactions and pins do not drain within their timeout. ~accepting-p~ is restored to whatever it was *before* the quiesce call, not hardcoded ~t~ — a timeout during ~shadow-store~'s ~:read-only~ window leaves the store ~:read-only~ (GH #170, review finding C1). Readers: ~detach-timeout-name~, ~-seconds~.
+
+- ~detach-unsupported-graph-error~ (condition) ::
+  Signalled by ~detach-store~/~shadow-store~/~swap-in-shadow~ when ~graph~ is a ~master-graph~, ~slave-graph~ or ~peer-graph~ — v1 scope only covers plain clocked stores, since the reopen paths use ~open-graph~'s plain default arguments and would silently drop replication/peer configuration. Readers: ~detach-unsupported-graph-error-graph~, ~-operation~.
+
+- ~epoch-lease-exhausted~ (condition) ::
+  Signalled by ~open-shadow-graph~ when the shadow's derived allocation cursor is already at or past its leased range's end. Readers: ~epoch-lease-exhausted-name~, ~-end~.
+
+- ~fast-load-requires-derivable~ (condition) ::
+  Signalled by ~open-shadow-graph :fast-load t~ when the source store's recovery policy is not ~:derivable~. Readers: ~fast-load-requires-derivable-location~, ~-policy~.
+
+- ~swap-recovered-warning~ (warning) ::
+  Signalled by ~swap-in-shadow~ when both renames completed but something after them (typically the ~:swap~ journal append, GH #212) failed; the swap itself succeeded and the new generation is reopened and returned normally. Reader: ~swap-recovered-warning-original~.
+
+- ~shadow-recovery-failed~ (condition) ::
+  Signalled by ~shadow-store~ or ~swap-in-shadow~ when *both* the original operation and its recovery reopen failed — the store may be left closed and needs a manual ~open-graph~. Readers: ~shadow-recovery-failed-original~, ~-recovery~.
 
 **** MVCC / Versioning
 

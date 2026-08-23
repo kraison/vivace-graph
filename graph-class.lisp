@@ -223,7 +223,31 @@ received an UNRESOLVED-NODE marker instead (GH #169, D8)."
    ;; The image-level epoch clock (GH #168), or NIL for this store's own
    ;; counter.  NIL is the pre-#168 behaviour and the default.
    (system-clock :accessor graph-system-clock :initarg :system-clock
-                 :initform nil)))
+                 :initform nil)
+   ;; Shadow generations (GH #170).  SHADOW-P: T on a graph opened via
+   ;; OPEN-SHADOW-GRAPH -- never registered in *GRAPHS*/open-store vector,
+   ;; never starts replication.  EPOCH-LEASE: an EPOCH-LEASE struct
+   ;; (below) when this store mints txn ids from a leased range instead
+   ;; of its clock/counter; NIL is the default (pre-#170 behaviour).
+   ;; Both are always set post-construction via SETF (OPEN-GRAPH,
+   ;; OPEN-SHADOW-GRAPH) rather than at MAKE-INSTANCE, so neither takes
+   ;; an :INITARG -- one would be dead weight the constructor never
+   ;; receives.
+   (shadow-p :accessor graph-shadow-p :initform nil)
+   (epoch-lease :accessor graph-epoch-lease :initform nil)
+   ;; WAL-suppressed fast path (GH #170 Task 4).  T only on a shadow opened
+   ;; via OPEN-SHADOW-GRAPH :FAST-LOAD T against a :DERIVABLE-policy source;
+   ;; PERSIST-TRANSACTION's callers skip the .txn file and replication log
+   ;; entirely when this is set.  Per-graph slot, not a dynamic variable --
+   ;; a special would leak suppression to any OTHER graph committing on the
+   ;; same thread.  NIL by default: an ordinary graph is never suppressed.
+   (wal-suppressed-p :accessor wal-suppressed-p :initform nil)))
+
+(defstruct epoch-lease
+  "A shadow store's leased txn-id range [START, END) (GH #170).  NEXT is
+the next id to hand out; ids past END are refused -- see
+EPOCH-LEASE-EXHAUSTED in transactions.lisp."
+  start next end)
 
 (defmethod print-object ((graph graph) stream)
   (print-unreadable-object (graph stream :type t :identity t)
