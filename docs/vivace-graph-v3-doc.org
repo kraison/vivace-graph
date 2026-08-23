@@ -1981,6 +1981,8 @@ The `replay` function is the counterpart to `snapshot`. It reads a snapshot file
 
 *Important Prerequisite:* The `replay` function must be run on a *new, empty graph*. You cannot replay a snapshot on top of an existing graph with data in it.
 
+*Restoring a whole multi-store system to an epoch, across a shadow swap, is a different mechanism* — ~restore-system~ (Chapter 17, "Restore across a swap") selects which retired generation was live at a given epoch. It does not replace `replay`: `replay` remains the only way to recover content to a point *inside* one generation.
+
 The restoration process is as follows:
 
 1.  *Create a new, empty graph* in a different directory.
@@ -3531,6 +3533,138 @@ territory, not this one's.
 safety story is gating on that same suffix. A real store that happens
 to already end in ~-shadow~ would be indistinguishable from an actual
 shadow to that guard.
+
+*** Restore across a swap
+
+GH #171 answers the question #170 leaves open: once a store has been
+swapped, how does a whole system get back to how it looked at some
+earlier epoch ~T~? **A generation** is one retired directory
+(~<location>-retired-<E3>~, never deleted by a swap) plus the journal
+records that annotate it, plus its ERAS — the half-open ~[from, to)~
+epoch intervals the directory actually held content for. Ordinarily a
+generation's era is just its own live window, but when a
+~restore-system~ call promotes a directory back to live and a later
+swap retires it again under a new name, that directory's own eras
+travel with it — recursively through a chain of restores — so it is
+never attributed to the wrong content just because it changed names.
+The swap is the *generation* mechanism; ~snapshot~/~replay~ (Chapter
+11) remains the *content* mechanism inside one generation. Restore
+does **not** supersede it: there is no physical rewind to an arbitrary
+point inside a generation's own lifetime, only a choice of which whole
+generation was live at ~T~.
+
+**Five entry points**, all exported and all operating on a system
+clock (Chapter 17's ~*system-clock*~/~attach-to-system-clock~):
+
+- ~(retired-generations clock)~ — every retired generation the
+  filesystem and the journal together know about, as ~generation~
+  structs (~generation-store~, ~-location~, ~-retired~, ~-swap-epoch~,
+  ~-eras~, ~-journaled-p~, ~-present-p~, ~-policy~). The filesystem is
+  authoritative (spec R4): a directory with no joining ~:swap~ or
+  ~:retire-live~ record is still listed, ~journaled-p~ ~nil~, with
+  ~swap-record-missing-warning~ signalled (the #212 shape); a record
+  naming a directory that no longer exists is listed ~present-p~
+  ~nil~ — *lost*. A generation a deliberate prune or a later restore
+  has consumed is omitted entirely, not merely marked absent, though
+  its eras still travel forward to whatever inherited its content.
+- ~(prune-retired-generations clock floor &key discard-derivable
+  dry-run)~ — deletes generations with ~swap-epoch <= floor~. Above
+  ~floor~, an ~:authored~ generation is refused *by name*
+  (~retention-required-error~, before anything is deleted — spec R3);
+  a ~:derivable~ one survives unless ~discard-derivable t~. ~dry-run~
+  reports what would go and deletes nothing. Every deletion appends a
+  ~:retire~ journal record. ~floor~ is an epoch, the system's only time
+  axis — no wall-clock is persisted in the journal.
+- ~(plan-system-restore clock epoch &key require-exact rebuild)~ — the
+  manifest ~restore-system~ would act on, with no side effects.
+- ~(restore-system clock epoch &key require-exact rebuild (timeout
+  60))~ — plans, then executes: every refusal in the plan fires before
+  any rename.
+- ~(repair-interrupted-swap clock name location)~ — see below.
+
+**The exactness rule (R2).** A retained generation was frozen at its
+last committed epoch ~E0 <= its swap-epoch~. If ~E0 <= T~, the
+generation's content at ~T~ *is* its content at ~E0~ — reported
+~:exact t~ — and this is exactly what makes a detach window's ~T~
+(~E1 <= T < E2~) resolve cleanly: the store was frozen throughout that
+window anyway. If ~T < E0~, writes in ~(T, E0]~ cannot be undone; the
+manifest instead reports ~:exact nil :state-at E0~ and ~restore-system~
+proceeds — the manifest makes the approximation visible rather than
+silent, which is the whole point. Passing ~:require-exact t~ refuses
+instead of proceeding, surfaced as reason ~:inexact~ in
+~restore-refused-error~. ~:require-exact~ never applies to a
+~:rebuilt~ entry — a rebuild is already an explicit, acknowledged
+approximation (R5), not a candidate for the exactness check.
+
+**The manifest** is a plist, one entry per store plus a header,
+written readably (no ~#.~ or other evaluated forms — ~read-restore-manifest~
+reads it back with ~*read-eval*~ ~nil~, the journal's own discipline)
+to ~<clock-dir>/restore-<Enow>.manifest~:
+
+#+BEGIN_SRC lisp
+  (:restore t :requested 4000 :at 4108 :clock "/data/system/"
+   :stores
+   ((:store "orders"  :action :rewound  :state-at 3982 :exact t
+     :from "/data/orders-retired-3982"
+     :retired-live "/data/orders-retired-4102")
+    (:store "catalog" :action :rebuilt  :state-at 4108 :exact nil
+     :cascade-from "orders")
+    (:store "audit"   :action :unchanged :dangling 17)))
+#+END_SRC
+
+~:action~ is one of ~:rewound~, ~:rebuilt~, ~:unchanged~, or (in a
+*plan*, not an executed restore) ~:refused~. A store untouched by any
+swap with ~swap-epoch > epoch~ is simply ~:unchanged~. Any store
+~:rebuilt~, or ~:rewound~ with ~:exact nil~, means the restored instant
+is not perfectly consistent across the system — exactly the case §9
+requires to be *recorded*, never faked — and ~restore-system~ signals
+~restore-inexact-warning~ summarising every such line so a caller
+cannot silently miss it.
+
+**Rebuild and cascade (R5).** The engine has no way to regenerate a
+~:derivable~ store's content on its own; the operator supplies
+~:rebuild (lambda (name graph) ...)~, called against a fresh, empty
+graph the engine has already created at the live location. Only
+~:recovery-policy~ carries over from the retired generation into that
+fresh ~make-graph~ call — index backend, buffer pool size, spatial
+precision and bucket counts do not, a documented v1 limitation; a
+caller relying on any of those reconfigures the rebuilt store itself
+afterward. A rebuild mints fresh node ids, so any edge in *any other
+open store* whose endpoint carries the rebuilt store's tag now dangles
+(~id-store-tag~, #169). The cascade follows this to a fixpoint: a
+~:derivable~ dependent is rebuilt in turn; an ~:authored~ dependent is
+left untouched — #9 keys authored cross-boundary assertions on
+external identity, not node id — and the manifest instead records its
+dangling-edge count under ~:dangling~. Finding the dangling set is a
+scan of every open store's edges per rebuilt store, bounded by the
+rebuild itself (already a full load), not by graph size independently.
+
+**Restore is v1-scoped to plain graphs**: a ~master-graph~,
+~slave-graph~ or ~peer-graph~ open under the clock is refused
+~:unsupported-graph~, the same boundary ~detach-store~ draws, rather
+than reopening a replicated graph with its configuration silently
+dropped.
+
+**Repairing an interrupted swap: ~repair-interrupted-swap~.** #170's
+~swap-in-shadow~ cannot recover from a crash *between* its two
+renames — the live data sits at a retired path and the live location
+is missing or half-replaced. ~repair-interrupted-swap (clock name
+location)~ is the explicit, idempotent tool for that one shape: when
+exactly one ~<location>-retired-<E>~ is newer than any completing
+~:swap~/~:restore~ record for it, it renames that directory back to
+~location~ and appends ~(:kind :swap-aborted ...)~; called again with
+nothing stranded, it returns ~:nothing-to-do~ rather than erroring.
+~restore-system~ refuses to start at all while a registered store is in
+this state (reason ~:interrupted-swap~), naming the tool rather than
+attempting to reason about which side holds the truth.
+
+**Limitations, stated plainly.** There is no point-in-time rewind
+*inside* a generation — ~snapshot~/~replay~ (Chapter 11) is the only
+mechanism for that, and it restores a snapshot's content into an empty
+graph, not a live store to an arbitrary prior instant. A rebuilt
+store's ~make-graph~ call carries forward only ~:recovery-policy~, no
+other creation option. And restore only ever operates on plain graphs,
+never a replicated or peer one.
 
 *** Cross-image effects: a peer sync can advance the clock
 

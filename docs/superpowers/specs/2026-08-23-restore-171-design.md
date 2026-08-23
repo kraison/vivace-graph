@@ -225,3 +225,24 @@ clock; every guard ablated:
 section after "Detach, shadow load, and the swap", and ch.11 gains a
 pointer; `CHANGELOG.md` Unreleased `### Added`; the namespaces spec §9
 gets a **Built (#171)** note naming R1–R6.
+
+**Built (#171):** all five operations shipped as designed in §3, with
+one shape the design didn't anticipate: a generation's content is
+tracked by ERAS (a list of `[from, to)` intervals, R2a), not a single
+live-window interval, because a restore can promote a retired
+directory back to live and a later swap can retire it again under a
+new name — without inheritance that directory's original content era
+would be attributed to nobody. Two defects surfaced only by
+implementation, not foreseeable from the design: retired-generation
+name collisions (`%retired-path-for` now consumes epochs until an
+unused `<location>-retired-<E>` name is free — two retiring events
+with no commit between them, e.g. two restores in a row, otherwise
+compute the same name), and a `%reopen-and-resume` bug where a
+slashless `location` string misplaced sidecar files in the parent
+directory and froze the transaction-id watermark (worked around here,
+filed as the real defect against `open-graph`/`make-graph` at #222).
+`%known-locations`'s stranded-swap detection also widened past the
+design's two sources (journal `:swap`/`:retire-live` records, open
+`*graphs*`) to a third — an `:attach` record's own `:location` field —
+since that is the only trace left when a crash lands between
+`swap-in-shadow`'s two renames before any `:swap` record exists.

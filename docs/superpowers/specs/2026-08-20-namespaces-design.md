@@ -461,6 +461,26 @@ that generation rewound to `E0`, noted in the manifest.
 truncates the restore window whenever any store is bulk-loaded. The restore window is a
 system property; one store's routine maintenance must not shorten it.
 
+**Built (#171):** implemented in `system-restore.lisp` against what #170 actually
+shipped, at **generation granularity** — a generation is a retired directory
+(`<location>-retired-<epoch>`, never deleted by a swap) plus the journal records that
+annotate it. This answers this section's own open item: **the shadow swap does not
+supersede logical replay** — the swap is the generation mechanism, `snapshot`/`replay`
+remains the sole mechanism for content inside one generation, and true point-in-time
+rewind inside a generation is an explicit, unbuilt follow-up (R1). §9.3 step 3 ("rewind
+physically to T") is realized as *exact-if-frozen-before-T, reported otherwise* (R2):
+a retained generation frozen at `E0 <= T` is exact; frozen later, it is used anyway
+and reported `:exact nil` (`:require-exact t` refuses instead). §9.2's retention split
+is enforced at prune time, not swap time, since swap never deletes
+(`prune-retired-generations`, R3): an `:authored` generation inside the window is
+refused by name, a `:derivable` one is optional. The rebuild-and-cascade of §9.3 steps
+4–6 is a caller-supplied `(lambda (name graph) ...)` plus a fixpoint over `:derivable`
+dependents keyed on the rebuilt store's tag (R5), and the manifest of step 6 is a
+plist written readably to `restore-<epoch>.manifest` (R4/R6 cover the filesystem's
+authority over the journal, and the crash-between-renames window #170 left open,
+respectively). Full design and the two implementation-only defects found along the
+way: `docs/superpowers/specs/2026-08-23-restore-171-design.md`.
+
 ## 10. Migration
 
 Three migrations, each chosen for a reversible failure mode.
@@ -542,7 +562,7 @@ before this ships. That is a release gate, not a design gate.
 | 3 | Image-level clock, system journal, epoch leases | #168 | — | **Done** |
 | 4 | Tagged UUIDv8 store field, resolver, detached-read marker | #169 | 3 | Not started |
 | 5 | Detach quiescence protocol and shadow bulk load | #170 | 3, 4, #191 | Blocked |
-| 6 | Restore: retention policy, algorithm, manifest, cascade | #171 | 5, #191 | Blocked |
+| 6 | Restore: retention policy, algorithm, manifest, cascade | #171 | 5, #191 | **Done** |
 | 7 | Runtime schema from persisted metadata | #172 | 1b, 2 | Blocked |
 
 Defects found while building the units above, which gate later ones: #187 (memory-image
