@@ -197,3 +197,120 @@ deletes the only copy of authored data."
         (is-true (probe-file (uiop:ensure-directory-pathname r1)))
         (is-false (find :retire (journal-records clock)
                         :key (lambda (r) (getf r :kind))))))))
+
+(defun %rs-entry (manifest store)
+  (find store (getf manifest :stores)
+        :key (lambda (e) (getf e :store))))
+
+(test plan-selects-the-retained-generation-exactly
+  "Write at E0, swap at E3 > T >= E0: the plan is :REWOUND :EXACT T with
+:STATE-AT E0 and :FROM the retired path; nothing on disk changes."
+  (with-restore-system (g clock sys)
+    sys
+    (let ((e0 (%rs-write g)))
+      (multiple-value-bind (ng r1) (%rs-swap g clock)
+        (setq g ng)
+        (let* ((tt (1+ e0))
+               (m (graph-db:plan-system-restore clock tt))
+               (e (%rs-entry m :restore-store-1)))
+          (is (= tt (getf m :requested)))
+          (is (eq :rewound (getf e :action)))
+          (is (eq t (getf e :exact)))
+          (is (= e0 (getf e :state-at)))
+          (is (string= (string-right-trim "/" r1) (getf e :from)))
+          (is-true (graph-db::graph-open-p g)))))))
+
+(test plan-marks-inexact-when-writes-follow-t
+  "T before the generation's last commit: :EXACT NIL, :STATE-AT E0.  With
+:REQUIRE-EXACT the plan refuses with reason :INEXACT instead."
+  (with-restore-system (g clock sys)
+    sys
+    (let* ((t0 (%rs-write g))
+           (e0 (%rs-write g)))
+      (multiple-value-bind (ng r1) (%rs-swap g clock)
+        (declare (ignore r1))
+        (setq g ng)
+        (let ((e (%rs-entry (graph-db:plan-system-restore clock t0)
+                            :restore-store-1)))
+          (is (eq :rewound (getf e :action)))
+          (is (null (getf e :exact)))
+          (is (= e0 (getf e :state-at))))
+        (let ((c (handler-case
+                     (progn (graph-db:plan-system-restore clock t0
+                                                          :require-exact t)
+                            nil)
+                   (graph-db:restore-refused-error (c) c))))
+          (is-true c)
+          (when c
+            (is (equal '((:restore-store-1 . :inexact))
+                       (graph-db:restore-refused-reasons c)))))))))
+
+(test plan-leaves-an-unaffected-store-unchanged
+  "T after the swap: :UNCHANGED."
+  (with-restore-system (g clock sys)
+    sys
+    (%rs-write g)
+    (multiple-value-bind (ng r1) (%rs-swap g clock)
+      (declare (ignore r1))
+      (setq g ng)
+      (let* ((now (graph-db:clock-current-epoch clock))
+             (e (%rs-entry (graph-db:plan-system-restore clock now)
+                           :restore-store-1)))
+        (is (eq :unchanged (getf e :action)))))))
+
+(test plan-refuses-when-an-authored-generation-is-gone
+  (with-restore-system (g clock sys)
+    sys
+    (let ((e0 (%rs-write g)))
+      (multiple-value-bind (ng r1) (%rs-swap g clock)
+        (setq g ng)
+        (uiop:delete-directory-tree (uiop:ensure-directory-pathname r1)
+                                    :validate t)
+        (let ((c (handler-case
+                     (progn (graph-db:plan-system-restore clock e0) nil)
+                   (graph-db:restore-refused-error (c) c))))
+          (is-true c)
+          (when c
+            (is (equal '((:restore-store-1 . :authored-generation-missing))
+                       (graph-db:restore-refused-reasons c)))))))))
+
+(test plan-rebuilds-a-derivable-store-whose-generation-is-gone
+  "Derivable, generation pruned: with :REBUILD the plan is :REBUILT :EXACT
+NIL; without it, refused with reason :NO-REBUILD."
+  (with-restore-system (g clock sys :policy :derivable)
+    sys
+    (let ((e0 (%rs-write g)))
+      (multiple-value-bind (ng r1) (%rs-swap g clock)
+        (setq g ng)
+        (uiop:delete-directory-tree (uiop:ensure-directory-pathname r1)
+                                    :validate t)
+        (let ((e (%rs-entry (graph-db:plan-system-restore
+                             clock e0 :rebuild (lambda (name graph)
+                                                 (declare (ignore name graph))))
+                            :restore-store-1)))
+          (is (eq :rebuilt (getf e :action)))
+          (is (null (getf e :exact))))
+        (let ((c (handler-case
+                     (progn (graph-db:plan-system-restore clock e0) nil)
+                   (graph-db:restore-refused-error (c) c))))
+          (is-true c)
+          (when c
+            (is (equal '((:restore-store-1 . :no-rebuild))
+                       (graph-db:restore-refused-reasons c)))))))))
+
+(test plan-handles-two-swaps-by-picking-the-generation-live-at-t
+  "Swap twice.  T between the swaps selects the SECOND retired
+generation (the one live at T), not the first."
+  (with-restore-system (g clock sys)
+    sys
+    (%rs-write g)
+    (multiple-value-bind (ng r1) (%rs-swap g clock)
+      (declare (ignore r1))
+      (setq g ng)
+      (let ((mid (%rs-write g)))
+        (multiple-value-bind (ng2 r2) (%rs-swap g clock)
+          (setq g ng2)
+          (let ((e (%rs-entry (graph-db:plan-system-restore clock mid)
+                              :restore-store-1)))
+            (is (eq :rewound (getf e :action)))
+            (is (string= (string-right-trim "/" r2) (getf e :from)))))))))

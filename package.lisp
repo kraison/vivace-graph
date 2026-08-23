@@ -105,6 +105,8 @@
            #:generation-present-p #:generation-policy
            #:prune-retired-generations #:retention-required-error
            #:retention-required-generations
+           #:plan-system-restore #:restore-refused-error
+           #:restore-refused-reasons #:restore-refused-epoch
            ;; image-level type-id registry (GH #186)
            #:type-registry
            #:open-type-registry

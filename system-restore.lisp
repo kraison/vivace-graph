@@ -182,3 +182,100 @@ returns what would go and touches nothing.  Each deletion journals
     (unless dry-run
       (dolist (g victims) (%delete-generation clock g)))
     victims))
+
+(define-condition restore-refused-error (error)
+  ;; Every refusal fires here, before any rename (spec §3).
+  ((reasons :initarg :reasons :reader restore-refused-reasons)
+   (epoch :initarg :epoch :reader restore-refused-epoch))
+  (:report (lambda (c s)
+             (format s "Restore to epoch ~D refused:~{ ~A~} (GH #171)."
+                     (restore-refused-epoch c)
+                     (mapcar (lambda (r) (format nil "~A=~A" (car r) (cdr r)))
+                             (restore-refused-reasons c))))))
+
+(defun %generation-state-epoch (retired)
+  "The last epoch committed into RETIRED, from its transaction-id.dat;
+0 when absent.  The closed generation's E0 (spec R2)."
+  (let ((file (merge-pathnames "transaction-id.dat"
+                               (uiop:ensure-directory-pathname retired)))
+        (buf (make-byte-vector 8)))
+    (if (probe-file file)
+        (with-open-file (in file :element-type '(unsigned-byte 8))
+          (unless (= 8 (read-sequence buf in))
+            (error "Short read on ~A" file))
+          (deserialize-uint64 buf 0))
+        0)))
+
+(defun %generation-live-at (gens epoch)
+  "Among GENS (one store, ascending SWAP-EPOCH), the generation that was
+live at EPOCH: the earliest with SWAP-EPOCH > EPOCH, or NIL when the
+current generation already was."
+  (find-if (lambda (g) (> (generation-swap-epoch g) epoch)) gens))
+
+(defun %restore-plan-entries (clock epoch rebuild)
+  "One manifest entry per store CLOCK knows about, plus the refusal list
+for PLAN-SYSTEM-RESTORE to raise.  Returns (values ENTRIES REASONS)."
+  (let ((by-store (make-hash-table :test 'equal))
+        (entries nil) (reasons nil))
+    (dolist (g (retired-generations clock))
+      (push g (gethash (generation-store g) by-store)))
+    ;; Open clocked stores with no generations at all are :UNCHANGED.
+    (maphash (lambda (name graph)
+               (when (and (typep graph 'graph)
+                          (graph-system-clock graph)
+                          (string= (%trimmed-namestring
+                                    (system-clock-location
+                                     (graph-system-clock graph)))
+                                   (%trimmed-namestring
+                                    (system-clock-location clock))))
+                 (unless (nth-value 1 (gethash name by-store))
+                   (setf (gethash name by-store) nil))))
+             *graphs*)
+    (maphash
+     (lambda (store gens)
+       (let* ((gens (sort (copy-list gens) #'< :key #'generation-swap-epoch))
+              (target (%generation-live-at gens epoch)))
+         (cond
+           ((null target)
+            (push (list :store store :action :unchanged) entries))
+           ((generation-present-p target)
+            (let ((e0 (%generation-state-epoch (generation-retired target))))
+              (push (list :store store :action :rewound
+                          :state-at e0 :exact (<= e0 epoch)
+                          :from (generation-retired target)
+                          :swap-epoch (generation-swap-epoch target))
+                    entries)))
+           ((eq (generation-policy target) :authored)
+            (push (cons store :authored-generation-missing) reasons)
+            (push (list :store store :action :refused
+                        :reason :authored-generation-missing) entries))
+           ((null rebuild)
+            (push (cons store :no-rebuild) reasons)
+            (push (list :store store :action :refused :reason :no-rebuild)
+                  entries))
+           (t
+            (push (list :store store :action :rebuilt :exact nil
+                        :state-at (clock-current-epoch clock))
+                  entries)))))
+     by-store)
+    (values (nreverse entries) (nreverse reasons))))
+
+(defun plan-system-restore (clock epoch &key require-exact rebuild)
+  "The manifest RESTORE-SYSTEM would act on for EPOCH, with no side
+effects.  Signals RESTORE-REFUSED-ERROR listing every (STORE . REASON):
+:AUTHORED-GENERATION-MISSING, :NO-REBUILD, :INEXACT (only under
+REQUIRE-EXACT), :INTERRUPTED-SWAP (Task 5).  REBUILD is the caller's
+(lambda (name graph)) loader for :DERIVABLE stores (GH #171, spec R1/R2)."
+  (multiple-value-bind (entries reasons)
+      (%restore-plan-entries clock epoch rebuild)
+    (when require-exact
+      (dolist (e entries)
+        (when (and (eq (getf e :action) :rewound) (not (getf e :exact)))
+          (push (cons (getf e :store) :inexact) reasons))))
+    (when reasons
+      (error 'restore-refused-error :reasons (nreverse reasons) :epoch epoch))
+    ;; :RESTORE T marks the manifest kind; without a paired value the
+    ;; list is an odd-length plist and GETF signals malformed (GH #171).
+    (list :restore t :requested epoch :at (clock-current-epoch clock)
+          :clock (namestring (system-clock-location clock))
+          :stores entries)))
