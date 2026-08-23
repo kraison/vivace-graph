@@ -102,6 +102,18 @@ most likely to choke on.  A CL symbol name may contain ANY character (|escaped s
 and DEF-VERTEX constrains nothing, so this is checked at ENCODE time -- see
 PEER-TYPE-TABLE-STRING.")
 
+(defun %peer-qualified-wire-name (symbol)
+  "SYMBOL's wire name: downcased \"<package-name>:<symbol-name>\" (GH #201).
+Package-qualifying is what lets two same-named types from different
+packages share one wire table without colliding -- STRING-DOWNCASE is not
+injective on the bare name alone, but the package is almost never the same
+accident twice.  #\\: is not in *PEER-TYPE-NAME-RESERVED-CHARS*, so this
+cannot itself introduce a delimiter collision (PEER-PARSE-TYPE-TABLE never
+treats #\\: specially either)."
+  (format nil "~(~A:~A~)"
+          (package-name (symbol-package symbol))
+          (symbol-name symbol)))
+
 (defun %peer-type-direct-supers (name)
   "The downcased names of type NAME's direct graph superclasses, as a LIST of strings.
 NIL when NAME roots directly at VERTEX/EDGE.
@@ -122,7 +134,7 @@ want only the direct parents so the consumer can rebuild the closure itself."
       (loop for super in (class-direct-superclasses class)
             unless (member (class-name super)
                            '(vertex edge primitive-node node standard-object t))
-              collect (string-downcase (symbol-name (class-name super)))))))
+              collect (%peer-qualified-wire-name (class-name super))))))
 
 (defun %peer-type-label (type)
   "TYPE printed package-qualified, for an error an operator has to act on.  ~S
@@ -172,10 +184,11 @@ replicate until the field is widened (GH #199)."
 
 (defun %peer-type-table-rows (registry)
   "REGISTRY's types as a list of (KIND-STRING ID NAME SUPERS TYPE): vertex
-types then edge types, each sorted by type-id.  SUPERS is a list of downcased
-names; TYPE is the node-type symbol, carried only so a validation error can
-name the type the developer actually wrote (the emitted NAME is downcased and
-may be the very thing at fault).
+types then edge types, each sorted by type-id.  NAME and every SUPERS entry
+are downcased PACKAGE-QUALIFIED names (%PEER-QUALIFIED-WIRE-NAME, GH #201);
+TYPE is the node-type symbol, carried only so a validation error can name the
+type the developer actually wrote (the emitted NAME is downcased and may be
+the very thing at fault).
 
 The rows are the IMAGE's type registry, not one graph's schema (D14, GH #186).
 A type-id means one thing across every store in the system, so the hub ships
@@ -198,7 +211,7 @@ one level down."
              (loop for (type nil id) in (sort entries #'< :key #'third)
                    collect (list kind-string
                                  id
-                                 (string-downcase (symbol-name type))
+                                 (%peer-qualified-wire-name type)
                                  (%peer-type-direct-supers type)
                                  type)))))
     (append (rows-for :vertex "v") (rows-for :edge "e"))))
@@ -209,15 +222,16 @@ range, a name carrying a reserved character or empty, or two types emitting
 the SAME name.  Returns ROWS.
 
 STRING-DOWNCASE is NOT injective -- P-PERSON and |P-Person| are distinct
-classes that emit one name, as are same-named symbols from different
-packages.  A device would then resolve one type-id's name to the other
-type's row.
-
-This matters MORE under the image-level registry, not less (GH #186).  ROWS
-pool every store's types into one table, so two types that never shared a
-schema now share this namespace, and the same-named-symbols-in-two-packages
-case stops being exotic.  Hence %PEER-TYPE-LABEL: the error has to print the
-package or an operator cannot tell the two apart, let alone find them."
+classes that would emit one name if only the symbol-name were on the wire.
+Since #201 NAME is package-qualified (%PEER-QUALIFIED-WIRE-NAME), so two
+same-named types in DIFFERENT packages now encode fine -- the pooled
+image-level registry (GH #186) makes that the ordinary case, not the
+exotic one.  A collision now fires only on RESIDUAL ambiguity: the full
+qualified string still downcases alike, e.g. same package + P-PERSON /
+|P-Person|, or two packages whose own names downcase alike.  A device would
+then resolve one type-id's name to the other type's row.  Hence
+%PEER-TYPE-LABEL: the error has to print the package or an operator cannot
+tell the two apart, let alone find them."
   (let ((seen (make-hash-table :test 'equal)))
     (dolist (row rows rows)
       (destructuring-bind (kind id name supers type) row
@@ -257,15 +271,22 @@ Format: records separated by #\\; , fields by #\\, :
 
     kind,id,name,supers
 
-KIND is \"v\" or \"e\"; ID is the decimal type-id; NAME is the downcased type name;
-SUPERS is a SPACE-separated list of the downcased DIRECT graph superclass names, EMPTY
-when the type roots directly at VERTEX/EDGE.  Example:
+KIND is \"v\" or \"e\"; ID is the decimal type-id; NAME is the downcased,
+PACKAGE-QUALIFIED type name (\"<package>:<symbol>\", %PEER-QUALIFIED-WIRE-NAME,
+GH #201) -- since two same-named symbols from different packages are ordinary
+under the image-level registry (GH #186) and must not collide on the wire;
+SUPERS is a SPACE-separated list of the downcased, package-qualified DIRECT
+graph superclass names, EMPTY when the type roots directly at VERTEX/EDGE.
+Example:
 
-    v,1,site,;v,2,ord-mine,ordnance-type;v,3,m-uav,m-hazard m-asset;e,1,find-of-type,
+    v,1,graph-db:site,;v,2,graph-db:mine,graph-db:hazard;e,1,graph-db:finds,
 
 SUPERS is a LIST because multiple inheritance WORKS: DEF-NODE-TYPE does not enforce the
 single inheritance its docstring claims (see %PEER-TYPE-DIRECT-SUPERS).  A consumer
-rebuilds the transitive closure itself from the direct edges.
+rebuilds the transitive closure itself from the direct edges.  #\\: is not
+reserved (see *PEER-TYPE-NAME-RESERVED-CHARS*) and PEER-PARSE-TYPE-TABLE never
+special-cases it -- NAME and each SUPERS entry are opaque strings to the
+parser either way.
 
 *** CONSUMERS MUST TWO-PASS. ***  Read ALL rows first, THEN resolve superclass names.
 Type-ids are STABLE across schema evolution, so this table is sorted by ID and is NOT
@@ -420,8 +441,11 @@ its type.  ~D conflict~:P:~{~%  ~A~}"
 REGISTRY, as a list of conflict descriptors
 (REASON PARENT KEY HUB-SIDE LOCAL-SIDE LOCAL-SYMBOL).
 
-Compared by DOWNCASED NAME, because that is all the wire carries -- which is
-exactly why %PEER-VALIDATE-TYPE-TABLE-ROWS must go on refusing two types that
+Compared by DOWNCASED NAME -- since #201 that name is package-qualified, on
+both sides: HUB-ROWS came off the wire from a hub's %PEER-TYPE-TABLE-ROWS and
+LOCAL below is this call's OWN %PEER-TYPE-TABLE-ROWS, so the two are directly
+comparable strings.  That is all the wire carries, which is exactly why
+%PEER-VALIDATE-TYPE-TABLE-ROWS must go on refusing two types that
 downcase alike.  It is applied to the LOCAL rows here too: if this image's own
 registry is ambiguous the comparison below is unsound, so that has to signal
 rather than silently check one of the two.

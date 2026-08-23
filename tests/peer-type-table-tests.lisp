@@ -65,6 +65,12 @@ so REGISTRY holds NAME's types and nothing else."
              (ignore-errors (close-graph ,g :snapshot-p nil))
              (collect-garbage)))))))
 
+(defun %ptt-qname (symbol)
+  "SYMBOL as it now appears in the wire table's NAME/SUPERS fields: downcased
+package-qualified (GH #201).  Tests below assert against this instead of the
+bare symbol-name so they track the encoder's actual contract."
+  (graph-db::%peer-qualified-wire-name symbol))
+
 (defun %ptt-adopt (registry symbol parent id)
   "Record SYMBOL at exactly ID in REGISTRY, no graph involved.  The tests below
 need registries holding ids and symbols DEF-VERTEX cannot produce -- an id
@@ -176,16 +182,18 @@ away."
 
 (test type-table-reports-direct-superclasses-only
   "A subclass reports its DIRECT parents; a root type reports NIL (not
-VERTEX/EDGE)."
+VERTEX/EDGE).  NAME and SUPERS are package-qualified since #201 -- updated
+from the pre-#201 bare-name assertions."
   (with-ptt-registry-graph (g *integration-graph-name*)
     (declare (ignorable g))
     (let ((parsed (graph-db::peer-parse-type-table
                    (graph-db::peer-type-table-string))))
       (flet ((supers-of (name)
                (fourth (find name parsed :key #'third :test #'string=))))
-        (is (equal '("g-person") (supers-of "g-employee")))
-        (is (null (supers-of "g-person")))
-        (is (null (supers-of "g-knows")))))))
+        (is (equal (list (%ptt-qname 'g-person))
+                   (supers-of (%ptt-qname 'g-employee))))
+        (is (null (supers-of (%ptt-qname 'g-person))))
+        (is (null (supers-of (%ptt-qname 'g-knows))))))))
 
 (test type-table-survives-the-plist-channel
   "The whole point of encoding the table as a STRING: a nested list would trip
@@ -220,7 +228,8 @@ of them.
 Non-vacuous by construction: each store's schema is asserted NOT to know the
 other's type, so no single SCHEMA-TYPE-TABLE could produce this table -- an
 implementation that still read (SCHEMA GRAPH) fails here whichever graph it
-read."
+read.  ROW is looked up by the package-qualified name (GH #201) -- updated
+from the pre-#201 bare-name lookup."
   (with-ptt-registry (r)
     (with-temp-directory (d1)
       (with-temp-directory (d2)
@@ -237,17 +246,17 @@ read."
                           (and (graph-db::lookup-node-type-by-name
                                 sym parent :graph g)
                                t)))
-                   (is (row "g-person")
+                   (is (row (%ptt-qname 'g-person))
                        "the first store's type is in the table")
-                   (is (row "m-uav") "and so is the second store's")
+                   (is (row (%ptt-qname 'm-uav)) "and so is the second store's")
                    (is (not (knows-p g1 'm-uav :vertex))
                        "store 1's schema does not know M-UAV")
                    (is (not (knows-p g2 'g-person :vertex))
                        "store 2's schema does not know G-PERSON")
                    ;; The ids are the registry's, not either store's counter.
-                   (is (eql (second (row "m-uav"))
+                   (is (eql (second (row (%ptt-qname 'm-uav)))
                             (graph-db::registry-id-for r 'm-uav :vertex)))
-                   (is (eql (second (row "g-knows"))
+                   (is (eql (second (row (%ptt-qname 'g-knows)))
                             (graph-db::registry-id-for r 'g-knows :edge)))))
             (ignore-errors (close-graph g1 :snapshot-p nil))
             (ignore-errors (close-graph g2 :snapshot-p nil))
@@ -263,20 +272,24 @@ read."
 M-HAZARD and an M-ASSET on the hub.  Emitting only the FIRST parent would
 silently drop M-UAV from a device's \"all m-assets\" closure while the hub kept
 it: per-peer divergent wrong answers. The supers field is therefore a SPACE-
-SEPARATED LIST."
+SEPARATED LIST.  NAME/SUPERS are package-qualified since #201 -- updated from
+the pre-#201 bare-name assertions."
   (with-ptt-registry-graph (g :peer-type-table-mi-test)
     (declare (ignorable g))
     ;; The hub genuinely believes in the second parent.
     (is (subtypep 'm-uav 'm-asset))
     (let* ((s (graph-db::peer-type-table-string))
            (parsed (graph-db::peer-parse-type-table s)))
-      (is (search ",m-uav,m-hazard m-asset" s))
+      (is (search (format nil ",~A,~A ~A" (%ptt-qname 'm-uav)
+                          (%ptt-qname 'm-hazard) (%ptt-qname 'm-asset))
+                  s))
       (flet ((supers-of (name)
                (fourth (find name parsed :key #'third :test #'string=))))
-        (is (equal '("m-hazard" "m-asset") (supers-of "m-uav")))
-        (is (null (supers-of "m-hazard")))
-        (is (null (supers-of "m-asset")))
-        (is (null (supers-of "m-find-of-type")))))))
+        (is (equal (list (%ptt-qname 'm-hazard) (%ptt-qname 'm-asset))
+                   (supers-of (%ptt-qname 'm-uav))))
+        (is (null (supers-of (%ptt-qname 'm-hazard))))
+        (is (null (supers-of (%ptt-qname 'm-asset))))
+        (is (null (supers-of (%ptt-qname 'm-find-of-type))))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Encode-time validation: a loud hub error beats silent device corruption
@@ -293,23 +306,46 @@ corrupt table to a device that cannot possibly recover from it."
     (signals error (graph-db::peer-type-table-string))))
 
 (test type-table-encoder-rejects-names-that-collide-when-downcased
-  "STRING-DOWNCASE is not injective: P-PERSON and |P-Person| are distinct CLOS
-classes that emit the SAME name.  A device would resolve one type-id's name to
-the other type."
+  "A RESIDUAL collision (#201): P-PERSON and |P-Person| are distinct CLOS
+classes in the SAME package, so package-qualifying does not separate them --
+their qualified names still downcase alike.  STRING-DOWNCASE is not
+injective, and a device would resolve one type-id's name to the other type.
+Contrast TYPE-TABLE-ENCODES-TWO-SAME-NAMED-TYPES-FROM-DIFFERENT-PACKAGES,
+where qualifying the DIFFERENT packages is exactly what avoids this."
   (with-ptt-registry-graph (g :peer-type-table-dupname-test)
     (declare (ignorable g))
     (signals error (graph-db::peer-type-table-string))))
 
-(test type-table-collision-error-names-the-packages
-  "The collision the image-level registry made ordinary: two symbols with the
-SAME name in DIFFERENT packages, registered from different stores (GH #186).
-DEF-VERTEX cannot build this case -- a schema file defines its types in one
-package -- so it is registered directly.
+(test type-table-encoder-rejects-packages-that-collide-when-downcased
+  "The OTHER residual-collision shape (#201): two DIFFERENT packages whose
+own names downcase alike -- \"Wv2-Case-Pkg\" and \"WV2-CASE-PKG\" -- each
+holding a symbol of the SAME name.  Package-qualifying does not help here
+because the PACKAGE half of the qualified string is what collides."
+  (with-ptt-registry (r)
+    (let* ((p1 (or (find-package "Wv2-Case-Pkg")
+                   (make-package "Wv2-Case-Pkg")))
+           (p2 (or (find-package "WV2-CASE-PKG") (make-package "WV2-CASE-PKG")))
+           (s1 (intern "TWIN" p1))
+           (s2 (intern "TWIN" p2)))
+      (unwind-protect
+           (progn
+             (%ptt-adopt r s1 :vertex 1)
+             (%ptt-adopt r s2 :vertex 2)
+             (signals error (graph-db::peer-type-table-string r)))
+        (delete-package p1)
+        (delete-package p2)))))
 
-The message must print both symbols PACKAGE-QUALIFIED.  Bare ~S omits the
-package whenever the symbol is accessible in the ambient *PACKAGE*, and an
-error naming PTT-TWIN twice tells an operator with two stores nothing at all.
-It must also stop advising a rename as if both types were in one schema."
+(test type-table-encodes-two-same-named-types-from-different-packages
+  "THE #201 ACCEPTANCE.  Two symbols with the SAME name in DIFFERENT
+packages, registered from different stores (GH #186), used to be
+UNREPRESENTABLE (see the retired TYPE-TABLE-COLLISION-ERROR-NAMES-THE-
+PACKAGES): the pre-#201 encoder emitted the bare symbol-name, so both rows
+collided under STRING-DOWNCASE and PEER-TYPE-TABLE-STRING signalled.  Since
+#201's package-qualified NAME (%PEER-QUALIFIED-WIRE-NAME) the two packages
+themselves disambiguate the rows, so this now encodes cleanly with both
+rows present, present under DISTINCT qualified names, and round-trips.
+DEF-VERTEX cannot build this case -- a schema file defines its types in one
+package -- so it is registered directly."
   (with-ptt-registry (r)
     (let* ((p1 (or (find-package "PTT-PKG-ONE") (make-package "PTT-PKG-ONE")))
            (p2 (or (find-package "PTT-PKG-TWO") (make-package "PTT-PKG-TWO")))
@@ -317,14 +353,42 @@ It must also stop advising a rename as if both types were in one schema."
            (s2 (intern "PTT-TWIN" p2)))
       (%ptt-adopt r s1 :vertex 1)
       (%ptt-adopt r s2 :vertex 2)
-      (let ((text (handler-case
-                      (progn (graph-db::peer-type-table-string r) nil)
-                    (error (c) (princ-to-string c)))))
-        (is (stringp text) "the encoder must refuse the collision")
-        (is (search "PTT-PKG-ONE::PTT-TWIN" text)
-            "the first type must be named package-qualified")
-        (is (search "PTT-PKG-TWO::PTT-TWIN" text)
-            "and so must the second")))))
+      (let* ((table (graph-db::peer-type-table-string r))
+             (parsed (graph-db::peer-parse-type-table table)))
+        (is (stringp table) "the encoder no longer refuses this pair")
+        (is (search "ptt-pkg-one:ptt-twin" table))
+        (is (search "ptt-pkg-two:ptt-twin" table))
+        (is (find "ptt-pkg-one:ptt-twin" parsed :key #'third :test #'string=)
+            "the first type has its own row")
+        (is (find "ptt-pkg-two:ptt-twin" parsed :key #'third :test #'string=)
+            "and the second, DISTINCT from the first")
+        (is (/= (second (find "ptt-pkg-one:ptt-twin" parsed
+                              :key #'third :test #'string=))
+                (second (find "ptt-pkg-two:ptt-twin" parsed
+                              :key #'third :test #'string=)))
+            "distinct rows carry their own ids")))))
+
+(test type-table-encoder-rejects-a-package-name-carrying-a-reserved-char
+  "Package names are UNCONSTRAINED too (MAKE-PACKAGE takes any string), and
+since #201 the package half is now part of what hits the wire.
+%PEER-CHECK-WIRE-NAME runs on the FULL qualified string, so a package name
+with a space -- the cheapest honest reserved-char case -- must refuse exactly
+as a bad symbol-name would, not just get silently mangled into the SUPERS
+field's own space-separator convention."
+  (with-ptt-registry (r)
+    (let* ((p (or (find-package "PTT BAD PKG") (make-package "PTT BAD PKG")))
+           (s (intern "OK-NAME" p)))
+      (unwind-protect
+           (progn
+             (%ptt-adopt r s :vertex 1)
+             (let ((text (handler-case
+                             (progn (graph-db::peer-type-table-string r) nil)
+                           (error (c) (princ-to-string c)))))
+               (is (stringp text)
+                   "the encoder must refuse a reserved char in the package ~
+name")
+               (is (search "reserved character" text))))
+        (delete-package p)))))
 
 (test type-table-encoder-rejects-an-id-the-wire-cannot-carry
   "The registry assigns 32-bit type-ids; the wire's ID field is frozen at
@@ -365,14 +429,19 @@ materialise as the wrong class here.  Refuse, and NAME the symbol -- an
 operator has to find it in two stores, so the package has to be in the message.
 
 Reconciling instead would mean rewriting every node of that type because a
-network handshake said so, which is why this is a refusal and not a merge."
+network handshake said so, which is why this is a refusal and not a merge.
+
+The hand-built hub table's NAME field is package-qualified (#201) -- updated
+from the pre-#201 bare \"ptt-conflict-type\", which no longer matches this
+image's now-qualified row and so no longer triggers the conflict at all."
   (with-ptt-registry (r)
     (%ptt-adopt r 'ptt-conflict-type :vertex 7)
     (let ((text (%ptt-refusal-text
                  (lambda ()
                    (graph-db::peer-device-accept-auth-ok
                     (list :peer-control :auth-ok
-                          :type-table "v,4,ptt-conflict-type,")
+                          :type-table (format nil "v,4,~A,"
+                                              (%ptt-qname 'ptt-conflict-type)))
                     r)))))
       (is (stringp text) "the handshake must REFUSE a disagreeing registry")
       (is (search "GRAPH-DB/TEST::PTT-CONFLICT-TYPE" text)
@@ -563,11 +632,15 @@ after auth-ok, so a device that gets past the guard fails on the pull)."
 (test peer-sync-refuses-a-hub-whose-registry-disagrees
   "PEER-SYNC itself must run the guard, over a real socket.  The three tests
 above call PEER-DEVICE-ACCEPT-AUTH-OK directly and would all still pass if
-PEER-SYNC stopped calling it."
+PEER-SYNC stopped calling it.
+
+The hand-built hub table's NAME field is package-qualified (#201) -- updated
+from the pre-#201 bare \"g-person\", which would no longer match this
+image's now-qualified row."
   (with-ptt-device (g r)
     (let* ((mine (graph-db::registry-id-for r 'g-person :vertex))
            (c (%ptt-sync-against
-               g (format nil "v,~D,g-person," (+ 100 mine)))))
+               g (format nil "v,~D,~A," (+ 100 mine) (%ptt-qname 'g-person)))))
       (is (typep c 'graph-db::peer-type-registry-conflict-error)
           "PEER-SYNC must refuse at auth-ok; it signalled ~S" c)
       (when (typep c 'graph-db::peer-type-registry-conflict-error)
