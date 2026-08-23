@@ -331,7 +331,14 @@ because the PACKAGE half of the qualified string is what collides."
            (progn
              (%ptt-adopt r s1 :vertex 1)
              (%ptt-adopt r s2 :vertex 2)
-             (signals error (graph-db::peer-type-table-string r)))
+             (let ((text (handler-case
+                             (progn (graph-db::peer-type-table-string r) nil)
+                           (error (c) (princ-to-string c)))))
+               (is (stringp text) "the encoder must refuse the collision")
+               (is (search "Wv2-Case-Pkg" text)
+                   "the first package must be named package-qualified")
+               (is (search "WV2-CASE-PKG::TWIN" text)
+                   "the second type must be named package-qualified")))
         (delete-package p1)
         (delete-package p2)))))
 

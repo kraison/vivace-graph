@@ -115,8 +115,8 @@ treats #\\: specially either)."
           (symbol-name symbol)))
 
 (defun %peer-type-direct-supers (name)
-  "The downcased names of type NAME's direct graph superclasses, as a LIST of strings.
-NIL when NAME roots directly at VERTEX/EDGE.
+  "Downcased package-qualified names of NAME's direct superclasses.
+LIST of strings, NIL when NAME roots directly at VERTEX/EDGE.
 
 A LIST, not a single name: DEF-NODE-TYPE's docstring claims single inheritance but does
 NOT enforce it -- it splices PARENT-TYPES straight into DEFCLASS -- so
