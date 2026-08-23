@@ -136,6 +136,20 @@ asserts STRINGP first."
   ()
   :peer-type-table-scope-b)
 
+;;; --- A CLOS parent registered under a DIFFERENT graph-name (Task 3 fix,
+;;; GH #206).  PTS-CROSS-PARENT lives only in store A; PTS-CROSS-CHILD names
+;;; it as a direct superclass but is registered only in store B.  Scoping B
+;;; naively would keep the child and drop the parent's row -- a dangling
+;;; SUPERS reference.
+
+(def-vertex pts-cross-parent ()
+  ()
+  :peer-type-table-scope-a)
+
+(def-vertex pts-cross-child (pts-cross-parent)
+  ()
+  :peer-type-table-scope-b)
+
 ;;; --- A schema no wire format can represent: a name with a delimiter. -----
 ;;; CL symbol names may contain ANY character via |escaped| syntax, and
 ;;; DEF-VERTEX constrains nothing.  The ENCODER is the only possible defense:
@@ -880,3 +894,63 @@ changing the function."
                  (graph-db::peer-check-type-registry-agreement hub-table r))
           "a scoped table that is a subset of the device's own registry's
 world must be accepted, not refused"))))
+
+;;; ---------------------------------------------------------------------------
+;;; Fix round (GH #206): scoping closure-completes SUPERS across stores.
+;;; ---------------------------------------------------------------------------
+
+(test type-table-scoped-graph-closure-completes-a-cross-store-parent
+  "PTS-CROSS-PARENT lives only in store A; PTS-CROSS-CHILD names it as a
+direct superclass but is registered only in store B.  B's scoped table must
+carry BOTH rows -- the child (direct) and the parent (closure-completed) --
+and every SUPERS entry in the scoped table must resolve to some row's NAME,
+so a device's closure walk never dangles.  ABLATION: disabling closure
+completion (reverting %PEER-GRAPH-SCOPED-ROWS to the direct-only filter)
+makes the \"parent row present\" assertion below fail -- the parent is
+dropped while the child's SUPERS still names it."
+  (with-ptt-two-stores (r ga gb)
+    (declare (ignorable ga))
+    (let* ((scoped-b (graph-db::peer-parse-type-table
+                      (graph-db::peer-type-table-string r gb))))
+      (flet ((row (name) (find name scoped-b :key #'third :test #'string=)))
+        (is (row (%ptt-qname 'pts-cross-child))
+            "the direct type is in B's session table")
+        (is (row (%ptt-qname 'pts-cross-parent))
+            "the cross-store parent must be closure-completed into B's table")
+        (dolist (row scoped-b)
+          (dolist (super (fourth row))
+            (is (find super scoped-b :key #'third :test #'string=)
+                "SUPERS entry ~S must resolve within the scoped table" super))))
+      (is (equal (graph-db::peer-parse-type-table
+                  (graph-db::peer-type-table-string r gb))
+                 scoped-b)
+          "the closure-completed scoped table still round-trips"))))
+
+(test type-table-scoped-to-graph-excludes-the-other-store-s-type-still-holds
+  "The original disclosure pin must not be weakened by closure completion:
+B-only's row (PTS-B-ONLY, no one's parent) is still excluded from A's
+scoped table."
+  (with-ptt-two-stores (r ga gb)
+    (declare (ignorable gb))
+    (let* ((scoped-a (graph-db::peer-parse-type-table
+                      (graph-db::peer-type-table-string r ga))))
+      (is (not (find (%ptt-qname 'pts-b-only) scoped-a
+                     :key #'third :test #'string=))
+          "B-only is no one's parent, so closure completion must not pull
+it in"))))
+
+(test type-table-validate-rows-signals-on-dangling-super
+  "%PEER-VALIDATE-TYPE-TABLE-ROWS's closure-integrity check: a synthetic row
+set with a SUPERS entry naming no row must signal.  ABLATION: removing this
+check makes this test fail, since %PEER-GRAPH-SCOPED-ROWS's own closure
+completion can never produce a dangling reference on its own."
+  (let ((dangling (list (list "v" 1 "pkg:child" '("pkg:missing-parent")
+                              'pts-a-only))))
+    (signals error (graph-db::%peer-validate-type-table-rows dangling))))
+
+(test type-table-validate-rows-does-not-false-positive-on-empty-supers
+  "A top-level type (empty SUPERS, rooted at VERTEX/EDGE) must not trip the
+closure-integrity check, and neither must a whole-image table."
+  (with-ptt-registry-graph (g *integration-graph-name*)
+    (declare (ignorable g))
+    (is (stringp (graph-db::peer-type-table-string)))))

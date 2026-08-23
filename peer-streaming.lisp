@@ -218,18 +218,36 @@ one level down."
 
 (defun %peer-graph-scoped-rows (rows graph)
   "ROWS (%PEER-TYPE-TABLE-ROWS output) filtered to the types actually
-registered in GRAPH's own schema: a row survives iff LOOKUP-NODE-TYPE-BY-NAME
-finds its TYPE symbol under its KIND (:VERTEX/:EDGE) in GRAPH.  The row's
-TYPE is already the type's real (non-keyword) symbol, so this is the direct
-identity lookup, never bare-name resolution -- there is no ambiguity to
-reintroduce here (GH #190)."
-  (remove-if-not
-   (lambda (row)
-     (destructuring-bind (kind id name supers type) row
-       (declare (ignore id name supers))
-       (lookup-node-type-by-name
-        type (if (string= kind "v") :vertex :edge) :graph graph)))
-   rows))
+registered in GRAPH's own schema, PLUS the transitive SUPERS-closure of that
+set: a row is DIRECT iff LOOKUP-NODE-TYPE-BY-NAME finds its TYPE symbol under
+its KIND (:VERTEX/:EDGE) in GRAPH; a row is kept if it is direct or its NAME
+is referenced (directly or transitively) by some kept row's SUPERS.  The
+row's TYPE is already the type's real (non-keyword) symbol, so DIRECT-ness is
+the identity lookup, never bare-name resolution (GH #190).
+
+DEF-NODE-TYPE never requires a type's CLOS parent to be registered under the
+same graph-name, so a child registered in graph B whose parent lives only in
+graph A would otherwise survive scoping while the parent's row is dropped --
+a dangling SUPERS reference the device's closure walk cannot resolve (GH
+#206).  Closure completion fixes that.  It adds no meaningful disclosure: a
+kept child's SUPERS already names its parents' qualified names, so shipping
+the parent rows too tells a device nothing it could not already see."
+  (let ((keep (make-hash-table :test 'equal)))
+    (dolist (row rows)
+      (destructuring-bind (kind id name supers type) row
+        (declare (ignore id name supers))
+        (when (lookup-node-type-by-name
+               type (if (string= kind "v") :vertex :edge) :graph graph)
+          (setf (gethash (third row) keep) t))))
+    (loop for added = nil
+          do (dolist (row rows)
+               (when (gethash (third row) keep)
+                 (dolist (super (fourth row))
+                   (unless (gethash super keep)
+                     (setf (gethash super keep) t)
+                     (setf added t)))))
+          while added)
+    (remove-if-not (lambda (row) (gethash (third row) keep)) rows)))
 
 (defun %peer-validate-type-table-rows (rows)
   "Signal if ROWS cannot be encoded unambiguously: an id outside the wire's
@@ -253,9 +271,15 @@ qualified string still downcases alike, e.g. same package + P-PERSON /
 |P-Person|, or two packages whose own names downcase alike.  A device would
 then resolve one type-id's name to the other type's row.  Hence
 %PEER-TYPE-LABEL: the error has to print the package or an operator cannot
-tell the two apart, let alone find them."
+tell the two apart, let alone find them.
+
+Also signals if any row's SUPERS entry names no row in ROWS: a dangling
+reference the device's closure walk cannot resolve.  After
+%PEER-GRAPH-SCOPED-ROWS closure-completes (GH #206) this cannot fire from
+scoping alone -- it is defense in depth against registry corruption (a
+super pointing at a type this image never registered)."
   (let ((seen (make-hash-table :test 'equal)))
-    (dolist (row rows rows)
+    (dolist (row rows)
       (destructuring-bind (kind id name supers type) row
         (declare (ignore kind))
         (%peer-check-wire-id id type)
@@ -272,7 +296,18 @@ or even a store -- the packages above are what tells them apart.  Retire or ~
 rename one; for a type with nodes on disk that is a store migration, not an ~
 edit."
                    (%peer-type-label other) (%peer-type-label type) name))
-          (setf (gethash name seen) type))))))
+          (setf (gethash name seen) type))))
+    (dolist (row rows rows)
+      (destructuring-bind (kind id name supers type) row
+        (declare (ignore kind id))
+        (dolist (super supers)
+          (unless (gethash super seen)
+            (error "Node type ~A's SUPERS entry ~S names no row in this ~
+type table: a dangling reference the device's closure walk cannot resolve.  ~
+Row ~S is the referencing type; ~S is the missing parent.  This should be ~
+unreachable after %PEER-GRAPH-SCOPED-ROWS closure-completion (GH #206) -- ~
+it signals only on registry corruption."
+                   (%peer-type-label type) super name super)))))))
 
 (defun peer-type-table-string (&optional (registry (ensure-type-registry))
                                 graph)
@@ -287,12 +322,14 @@ NIL, which no graph-owning image can be -- MAKE-GRAPH and OPEN-GRAPH both
 refuse without one.
 
 Optional GRAPH scopes the table to the types actually registered in that
-GRAPH's own schema (%PEER-GRAPH-SCOPED-ROWS), dropping every row for a type
-that graph does not instantiate.  Omitted, the table stays whole-image (every
-existing direct caller keeps its prior behaviour); the hub's auth-ok call site
-passes the session's graph so an unrelated store's type -- including one that
-is unrepresentable on the wire -- no longer affects this session at all
-(GH #206).
+GRAPH's own schema, PLUS the transitive SUPERS-closure of that set
+(%PEER-GRAPH-SCOPED-ROWS) -- a type's CLOS parent need not be registered
+under the same graph-name, so the closure keeps the table resolvable even
+when a kept child's parent lives only in a different store.  Omitted, the
+table stays whole-image (every existing direct caller keeps its prior
+behaviour); the hub's auth-ok call site passes the session's graph so an
+unrelated store's type -- including one that is unrepresentable on the wire
+-- no longer affects this session at all (GH #206).
 
 *** THIS FORMAT IS A FROZEN EXTERNAL CONTRACT. *** It is parsed by non-Lisp peers (the
 Kotlin/SQLite device).  PEER-PARSE-TYPE-TABLE is the reference implementation and its
