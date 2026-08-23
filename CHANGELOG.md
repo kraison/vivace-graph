@@ -70,12 +70,17 @@ between releases; cutting a release renames it to the new version and dates it.
   `policy.dat` (`store-recovery-policy` / `set-store-recovery-policy`,
   default `:authored`) records whether a crash mid-load can simply be
   repaired by redoing it (`:derivable`) or whether its writes are the
-  only durable record (`:authored`). `open-shadow-graph :fast-load t`
-  suppresses the `.txn` file and replication log for the shadow's
-  transactions, but only when the shadow's copied policy says
-  `:derivable`; otherwise it signals `fast-load-requires-derivable`
-  rather than silently keeping the store's only record on an
-  unsuppressed WAL. **`presize-vector-segment`** turns a bulk load's
+  only durable record (`:authored`). `make-graph :recovery-policy`
+  writes `policy.dat` at creation; `open-graph :recovery-policy` is
+  only a hint once the file exists — a disagreeing value signals
+  `recovery-policy-mismatch-warning` (naming the location, the
+  requested policy and the on-disk one) rather than overwriting it.
+  `open-shadow-graph :fast-load t` suppresses the `.txn` file and
+  replication log for the shadow's transactions, but only when the
+  shadow's copied policy says `:derivable`; otherwise it signals
+  `fast-load-requires-derivable` rather than silently keeping the
+  store's only record on an unsuppressed WAL.
+  **`presize-vector-segment`** turns a bulk load's
   vector-segment capacity hazard into an upfront allocation instead of a
   mid-apply failure discovered after some writes are already durable;
   `open-shadow-graph :expected-vectors n` applies it to every segment

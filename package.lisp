@@ -71,6 +71,9 @@
            #:swap-in-shadow
            #:swap-recovered-warning
            #:swap-recovered-warning-original
+           #:shadow-recovery-failed
+           #:shadow-recovery-failed-original
+           #:shadow-recovery-failed-recovery
            #:graph-shadow-p
            #:graph-epoch-lease
            #:epoch-lease

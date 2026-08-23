@@ -3404,6 +3404,16 @@ it against a shadow whose (copied) policy is ~:authored~ signals
 suppressed and quietly risking data no one intended to make
 disposable.
 
+A store's policy is ordinarily set once, at creation: ~make-graph
+:recovery-policy :derivable~ (or ~:authored~) writes ~policy.dat~
+immediately. ~open-graph~ also accepts ~:recovery-policy~, but there it
+is only a hint — once ~policy.dat~ exists it is authoritative, and an
+~:recovery-policy~ that disagrees with it merely signals
+~recovery-policy-mismatch-warning~ (a warning, not an error) rather
+than rewriting the file out from under whatever set it; ~open-graph~'s
+~:recovery-policy~ is only ever persisted for a location with no
+~policy.dat~ yet (i.e. one being created via ~open-graph~ itself).
+
 **Presizing avoids a mid-load capacity surprise.** A vector-segment
 capacity failure discovered inside an ordinary transaction leaves a
 persisted node with no segment entry — invisible to retrieval, with
@@ -4603,6 +4613,12 @@ This chapter provides a categorized reference for the most important exported sy
 
 - ~store-recovery-policy (location)~ / ~set-store-recovery-policy (location policy)~ ::
   Read/write a store's ~policy.dat~: ~:derivable~ (rebuildable, so a crash may discard it — licenses ~open-shadow-graph~'s ~:fast-load~) or ~:authored~ (the only durable record of its writes — the default, including for a store predating this feature).
+
+- ~make-graph ( ... :recovery-policy policy)~ / ~open-graph ( ... :recovery-policy policy)~ ::
+  ~make-graph~'s ~:recovery-policy~ sets a new store's ~policy.dat~ at creation. ~open-graph~'s ~:recovery-policy~ is only a hint — ~policy.dat~, once present, is authoritative; a disagreeing value signals ~recovery-policy-mismatch-warning~ rather than overwriting the file, and is itself persisted only when ~open-graph~ is the call creating the store (no ~policy.dat~ yet).
+
+- ~recovery-policy-mismatch-warning~ (condition) ::
+  Signalled by ~open-graph~ when its ~:recovery-policy~ argument disagrees with an existing ~policy.dat~; the file wins regardless. Readers: ~recovery-policy-mismatch-warning-location~, ~-requested~, ~-on-disk~.
 
 - ~presize-vector-segment (segment n)~ ::
   Grows ~segment~ under its write lock until its capacity is at least ~n~; a no-op if already there. Turns a mid-apply ~vector-segment-capacity-exhausted~ failure into an upfront one for a load that knows its row count ahead of time.
