@@ -163,13 +163,15 @@ in-flight transactions. Attach only a quiescent store."
                      (store-not-accepting-reason condition)))))
 
 (define-condition detach-drain-timeout (error)
-  ;; ACCEPTING-P is restored to T before this is signalled -- a failed
-  ;; detach must not strand the store half-dead (GH #170).
+  ;; ACCEPTING-P is restored to whatever it was BEFORE this quiesce call,
+  ;; not hardcoded T -- a timeout during an already-non-accepting window
+  ;; (e.g. SHADOW-STORE's :READ-ONLY) must not silently lift it (GH #170,
+  ;; review finding C1).
   ((name :initarg :name :reader detach-timeout-name)
    (seconds :initarg :seconds :reader detach-timeout-seconds))
   (:report (lambda (condition stream)
              (format stream "Store ~S did not drain within ~D second~:P; ~
-detach aborted and the store resumes accepting new work."
+detach aborted and the store resumes its prior accepting state."
                      (detach-timeout-name condition)
                      (detach-timeout-seconds condition)))))
 
@@ -2901,8 +2903,11 @@ stops appearing in queries.  MARK-DELETED is the usual entry point.")
    ;; Detach quiescence (GH #170).  T = accepting everything.  :READ-ONLY =
    ;; pins/reads yes, new transactions no (Task 2's shadow window).
    ;; :DETACHING / :SWAPPING = nothing new -- a full drain is in progress.
+   ;; :INITARG so OPEN-GRAPH's :INITIAL-ACCEPTING-STATE can set this at
+   ;; construction, before the graph is published anywhere (GH #170, I4).
    (accepting-p
     :accessor accepting-p
+    :initarg :accepting-p
     :initform t)))
 
 (defmethod print-object ((transaction-manager transaction-manager) stream)
@@ -3422,6 +3427,34 @@ Signals NO-TRANSACTION-IN-PROGRESS if none is active."
 ;;; issued elsewhere meanwhile.  See docs/superpowers/specs/
 ;;; 2026-08-20-namespaces-design.md.
 
+(define-condition detach-unsupported-graph-error (error)
+  ;; v1 scope (GH #170 review, finding I1): DETACH-STORE / SHADOW-STORE /
+  ;; SWAP-IN-SHADOW all reopen with OPEN-GRAPH's plain default args, which
+  ;; would silently drop a MASTER-GRAPH/SLAVE-GRAPH/PEER-GRAPH's
+  ;; replication/peer configuration on the reopened generation.  Threading
+  ;; the FULL open-args set (master-p, replication-key, peer-role, etc.)
+  ;; through detachment/shadowing is deferred follow-on work -- see the
+  ;; review thread on GH #170.
+  ((graph :initarg :graph :reader detach-unsupported-graph-error-graph)
+   (operation :initarg :operation
+              :reader detach-unsupported-graph-error-operation))
+  (:report (lambda (c s)
+             (format s "~S does not support ~S: it is a ~S, and v1 of ~
+detach/shadow covers only plain clocked stores.  Reopening a replicated ~
+or peer graph with default OPEN-GRAPH args would silently strip its ~
+replication/peer configuration (GH #170)."
+                     (graph-name (detach-unsupported-graph-error-graph c))
+                     (detach-unsupported-graph-error-operation c)
+                     (class-name
+                      (class-of (detach-unsupported-graph-error-graph c)))))))
+
+(defun %check-detach-supported (graph operation)
+  "Signal DETACH-UNSUPPORTED-GRAPH-ERROR unless GRAPH is a plain clocked
+store -- MASTER-GRAPH, SLAVE-GRAPH and PEER-GRAPH are refused by all
+three v1 entry points (GH #170, review finding I1)."
+  (when (typep graph '(or master-graph slave-graph peer-graph))
+    (error 'detach-unsupported-graph-error :graph graph :operation operation)))
+
 (defparameter *quiesce-poll-interval* 0.05
   "Seconds between REAP-SAFE-FLOOR polls in %QUIESCE-TRANSACTION-MANAGER.")
 
@@ -3445,22 +3478,25 @@ missed seeing REASON (GH #170, fix round 1)."
   "Flip TRANSACTION-MANAGER's ACCEPTING-P to REASON (a keyword) and wait,
 in short sleeps, for REAP-SAFE-FLOOR to go NIL -- no active transaction and
 no read pin left that could observe a version underneath the coming close.
-On TIMEOUT seconds elapsed with no drain: restore ACCEPTING-P to T (a
-failed detach must not strand the store half-dead) and signal
-DETACH-DRAIN-TIMEOUT.  On success return T with ACCEPTING-P left at
-REASON (GH #170)."
-  (%set-accepting-p transaction-manager reason)
-  (let ((deadline (+ (get-internal-real-time)
-                     (round (* timeout internal-time-units-per-second)))))
-    (loop
-      (when (null (reap-safe-floor transaction-manager))
-        (return t))
-      (when (> (get-internal-real-time) deadline)
-        (%set-accepting-p transaction-manager t)
-        (error 'detach-drain-timeout
-               :name (graph-name (graph transaction-manager))
-               :seconds timeout))
-      (sleep *quiesce-poll-interval*))))
+On TIMEOUT seconds elapsed with no drain: restore ACCEPTING-P to whatever
+it was PRIOR to this call (captured before the flip) and signal
+DETACH-DRAIN-TIMEOUT -- NOT hardcoded T, which would silently lift an
+already-in-force window (e.g. SHADOW-STORE's :READ-ONLY) that this call
+did not open and has no business closing (GH #170, review finding C1).
+On success return T with ACCEPTING-P left at REASON (GH #170)."
+  (let ((prior (accepting-p transaction-manager)))
+    (%set-accepting-p transaction-manager reason)
+    (let ((deadline (+ (get-internal-real-time)
+                       (round (* timeout internal-time-units-per-second)))))
+      (loop
+        (when (null (reap-safe-floor transaction-manager))
+          (return t))
+        (when (> (get-internal-real-time) deadline)
+          (%set-accepting-p transaction-manager prior)
+          (error 'detach-drain-timeout
+                 :name (graph-name (graph transaction-manager))
+                 :seconds timeout))
+        (sleep *quiesce-poll-interval*)))))
 
 (defstruct store-detachment
   "A detached store's handle: everything REATTACH-STORE needs to reopen it
@@ -3472,34 +3508,51 @@ and rejoin its system clock (GH #170)."
 LEASE-EPOCHS of its system clock's epoch space, journal the handoff, and
 CLOSE-GRAPH it durably.  Returns a STORE-DETACHMENT for REATTACH-STORE.
 
+Refuses a MASTER-GRAPH/SLAVE-GRAPH/PEER-GRAPH with
+DETACH-UNSUPPORTED-GRAPH-ERROR -- v1 scope, see that condition's
+docstring (GH #170).
+
 Requires (GRAPH-SYSTEM-CLOCK GRAPH) non-NIL: detach without an image
 clock has no lease to hand over.  Propagates DETACH-DRAIN-TIMEOUT
 unchanged if the quiesce wave cannot drain in TIMEOUT seconds -- GRAPH
-is left open and accepting again (GH #170)."
+is left open and accepting again (GH #170).
+
+Between a successful quiesce and the durable CLOSE-GRAPH, CLOCK-LEASE-
+EPOCHS or JOURNAL-APPEND can still fail; that span is wrapped so an
+error there restores ACCEPTING-P to its pre-quiesce state (not left
+stranded at :DETACHING) before re-signalling (GH #170, review finding
+I3)."
+  (%check-detach-supported graph 'detach-store)
   (let ((clock (graph-system-clock graph)))
     (unless clock
       (error "DETACH-STORE requires GRAPH to be attached to a system ~
 clock (GRAPH-SYSTEM-CLOCK is NIL) -- detach without one has no lease to ~
 hand over."))
-    (let ((tm (transaction-manager graph))
-          (name (graph-name graph))
-          (location (location graph))
-          (store-id (store-id graph)))
+    (let* ((tm (transaction-manager graph))
+           (name (graph-name graph))
+           (location (location graph))
+           (store-id (store-id graph))
+           (prior (accepting-p tm)))
       (%quiesce-transaction-manager tm :detaching timeout)
-      (multiple-value-bind (start end) (clock-lease-epochs clock lease-epochs)
-        (journal-append clock :detach
-                        :store name :lease-start start :lease-end end)
-        ;; CLOSE-GRAPH's own snapshot scans the graph via WITH-READ-PIN;
-        ;; ACCEPTING-P is already :DETACHING, so it needs the one bypass
-        ;; above -- see *QUIESCED-STORE-CLOSING-P*'s docstring.
-        (let ((*graph* graph)
-              (*quiesced-store-closing-p* t))
-          (close-graph graph :snapshot-p t))
-        (make-store-detachment :graph-name name
-                               :location location
-                               :store-id store-id
-                               :lease-start start
-                               :lease-end end)))))
+      (handler-case
+          (multiple-value-bind (start end)
+              (clock-lease-epochs clock lease-epochs)
+            (journal-append clock :detach
+                            :store name :lease-start start :lease-end end)
+            ;; CLOSE-GRAPH's own snapshot scans the graph via WITH-READ-PIN;
+            ;; ACCEPTING-P is already :DETACHING, so it needs the one bypass
+            ;; above -- see *QUIESCED-STORE-CLOSING-P*'s docstring.
+            (let ((*graph* graph)
+                  (*quiesced-store-closing-p* t))
+              (close-graph graph :snapshot-p t))
+            (make-store-detachment :graph-name name
+                                   :location location
+                                   :store-id store-id
+                                   :lease-start start
+                                   :lease-end end))
+        (error (c)
+          (%set-accepting-p tm prior)
+          (error c))))))
 
 (defun reattach-store (detachment &key (buffer-pool-size nil bps-p))
   "Reopen the store DETACHMENT names at its recorded location and rejoin

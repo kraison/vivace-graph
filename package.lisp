@@ -63,6 +63,9 @@
            #:reattach-store
            #:pin-read-epoch
            #:unpin-read-epoch
+           #:detach-unsupported-graph-error
+           #:detach-unsupported-graph-error-graph
+           #:detach-unsupported-graph-error-operation
            ;; Shadow generations (GH #170).
            #:shadow-store
            #:abandon-shadow

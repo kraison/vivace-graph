@@ -557,7 +557,8 @@ policy.dat's ~S; the file wins."
                    (spatial-precision 7)
                    (spatial-max-cells +spatial-insert-max-cells+)
                    (system-clock *system-clock*)
-                   shadow-p recovery-policy)
+                   shadow-p recovery-policy
+                   (initial-accepting-state t))
   "Open the existing graph named NAME whose files live under directory
 LOCATION, register it, and return it.  Use this to reopen a graph created
 earlier with MAKE-GRAPH; the keyword arguments mirror MAKE-GRAPH's, including
@@ -591,7 +592,15 @@ is persisted only when LOCATION is being
 created-on-open (no schema.dat yet, the same condition INIT-SCHEMA
 below branches on) -- a genuine reopen of an existing graph with no
 policy.dat leaves it absent (STORE-RECOVERY-POLICY's :AUTHORED
-default), it does not retroactively opt that graph in."
+default), it does not retroactively opt that graph in.
+
+:INITIAL-ACCEPTING-STATE (GH #170, review finding I4) sets the fresh
+TRANSACTION-MANAGER's ACCEPTING-P at construction, BEFORE the graph is
+registered in *GRAPHS* -- so a caller that wants the reopened graph to
+come up in a non-accepting window (e.g. SHADOW-STORE's :READ-ONLY) never
+publishes it writable-then-flips, which would let a racing writer land a
+commit in the doomed generation during the gap.  Defaults to T (ordinary
+opens are immediately fully accepting, as before)."
   (unless *system-directory*
     (error 'system-directory-required :operation 'open-graph))
   (when (and peer-role (or master-p slave-p))
@@ -727,6 +736,15 @@ default), it does not retroactively opt that graph in."
         (restore-vector-segments graph)
         (with-open-file (out dirty-file :direction :output)
           (format out "~S" (get-universal-time)))
+        ;; The TM must exist -- with ACCEPTING-P already at its final
+        ;; INITIAL-ACCEPTING-STATE -- BEFORE this graph is published to
+        ;; *GRAPHS*/the open-store vector below: publishing writable then
+        ;; flipping after would let a racing writer land a commit in a
+        ;; generation meant to come up non-accepting (GH #170, I4).
+        (setf (transaction-manager graph)
+              (make-instance 'transaction-manager
+                             :graph graph
+                             :accepting-p initial-accepting-state))
         (setf (graph-shadow-p graph) shadow-p)
         (if shadow-p
             ;; Unregistered: STORE-ID still comes from the registry (v8 ids
@@ -799,9 +817,8 @@ default), it does not retroactively opt that graph in."
                 (if (probe-file (format nil "~Astruct.dat" loc))
                     (open-lhash loc)
                     (make-lhash :location loc :buckets 8)))))
-      (setf (transaction-manager graph)
-            (make-instance 'transaction-manager
-                           :graph graph))
+      ;; TRANSACTION-MANAGER is already installed -- see above, before the
+      ;; *GRAPHS* registration (GH #170, I4).
       (when system-clock
         (attach-to-system-clock graph system-clock))
       (ensure-directories-exist (persistent-transaction-directory graph))

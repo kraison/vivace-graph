@@ -186,13 +186,17 @@ OPEN-GRAPH is required."
                      (shadow-recovery-failed-recovery c)))))
 
 (defun %reopen-and-resume (name location clock reason)
-  "OPEN-GRAPH + ATTACH-TO-SYSTEM-CLOCK + %SET-ACCEPTING-P REASON --
+  "OPEN-GRAPH :INITIAL-ACCEPTING-STATE REASON + ATTACH-TO-SYSTEM-CLOCK --
 the resume sequence shared by SHADOW-STORE's happy path and its
-copy-failure recovery path (GH #170)."
+copy-failure recovery path.  REASON is applied to the fresh transaction
+manager BEFORE the graph publishes to *GRAPHS*, not flipped after open
+-- a post-open flip would leave a window where the just-reopened graph
+is fully accepting and a racing writer could land a commit that belongs
+in the doomed generation (GH #170, review finding I4)."
   (let ((reopened (open-graph name (namestring location)
-                              :system-clock nil)))
+                              :system-clock nil
+                              :initial-accepting-state reason)))
     (attach-to-system-clock reopened clock)
-    (%set-accepting-p (transaction-manager reopened) reason)
     reopened))
 
 (defun shadow-store (graph &key (timeout 60))
@@ -219,7 +223,12 @@ round 1).
 Returns (values SHADOW-LOCATION REOPENED-GRAPH) on success.  The live
 store is fully unavailable only for close+copy+reopen -- seconds --
 and write-unavailable until a caller swaps it in or calls
-ABANDON-SHADOW."
+ABANDON-SHADOW.
+
+Refuses a MASTER-GRAPH/SLAVE-GRAPH/PEER-GRAPH with
+DETACH-UNSUPPORTED-GRAPH-ERROR -- v1 scope, see that condition's
+docstring (GH #170)."
+  (%check-detach-supported graph 'shadow-store)
   (let* ((tm (transaction-manager graph))
          (name (graph-name graph))
          (location (location graph))
@@ -235,6 +244,15 @@ via ATTACH-TO-SYSTEM-CLOCK, which needs one."))
     (let ((shadow-location (%shadow-location location)))
       (handler-case
           (progn
+            ;; A stale "<location>-shadow/" from a previous, never-cleaned
+            ;; SHADOW-STORE would otherwise MERGE (%COPY-DIRECTORY-TREE's
+            ;; per-file :SUPERSEDE never clears the destination first) --
+            ;; leftover .txn files there would then be replayed into the
+            ;; fresh shadow on its next open.  Deleted via the same
+            ;; %SHADOW-SUFFIX-P-validated path DISCARD-SHADOW uses (GH
+            ;; #170, review finding I2).
+            (when (probe-file shadow-location)
+              (discard-shadow shadow-location))
             (%copy-directory-tree location shadow-location)
             (let ((reopened (%reopen-and-resume name location clock
                                                 :read-only)))
@@ -331,52 +349,69 @@ whose owners have no live nodes yet, has an EMPTY vector-segments table
 nothing to presize, which is not a failure of the hook.  Any allocation
 failure inside PRESIZE-VECTOR-SEGMENT (VECTOR-SEGMENT-CAPACITY-
 EXHAUSTED) propagates unchanged, before OPEN-SHADOW-GRAPH sets up the
-epoch lease below."
+epoch lease below.
+
+The lease (LEASE or lease.dat) and EXPECTED-VECTORS are validated
+BEFORE OPEN-GRAPH runs, and every check made AFTER it (epoch-lease
+exhaustion, PRESIZE-VECTOR-SEGMENT) runs under an UNWIND-PROTECT that
+CLOSE-GRAPHs on any error -- an error exit used to leave the freshly
+opened graph's mmaps held and its .dirty marker set, which made a
+retried OPEN-SHADOW-GRAPH fail on \"not closed properly\" instead of
+just re-raising the original problem (GH #170, review finding M1)."
   (when fast-load
     (let ((policy (store-recovery-policy shadow-location)))
       (unless (eq policy :derivable)
         (error 'fast-load-requires-derivable
                :location shadow-location :policy policy))))
-  (let* ((location
-          (uiop:ensure-directory-pathname shadow-location))
-         (open-args (list graph-name (namestring location)
-                          :shadow-p t :system-clock nil)))
-    (let ((graph (apply #'open-graph
+  (when expected-vectors
+    (check-type expected-vectors (integer 0)))
+  (let* ((location (uiop:ensure-directory-pathname shadow-location))
+         (persisted (and (null lease) (%read-lease location)))
+         (start (if lease (car lease) (getf persisted :lease-start)))
+         (end (if lease (cdr lease) (getf persisted :lease-end))))
+    (unless (and start end)
+      (error "OPEN-SHADOW-GRAPH needs :LEASE (start . end); none was ~
+given and ~A has no lease.dat." location))
+    (let* ((open-args (list graph-name (namestring location)
+                            :shadow-p t :system-clock nil))
+           (graph (apply #'open-graph
                         (if buffer-pool-size
                             (append open-args
                                    (list :buffer-pool-size buffer-pool-size))
-                            open-args))))
-      (when fast-load
-        (setf (wal-suppressed-p graph) t))
-      ;; Presize whatever segments this shadow actually carries (GH #170 Task
-      ;; 5).  An empty VECTOR-SEGMENTS table (no :VECTOR-INDEX owner has data
-      ;; yet) makes this loop a no-op, by design -- see the docstring.
-      (when expected-vectors
-        (check-type expected-vectors (integer 0))
-        (maphash (lambda (key segment)
-                   (declare (ignore key))
-                   (presize-vector-segment segment expected-vectors))
-                 (vector-segments graph)))
-      (let* ((persisted (and (null lease) (%read-lease location)))
-             (start (if lease (car lease) (getf persisted :lease-start)))
-             (end (if lease (cdr lease) (getf persisted :lease-end))))
-        (unless (and start end)
-          (error "OPEN-SHADOW-GRAPH needs :LEASE (start . end); none was ~
-given and ~A has no lease.dat." location))
-        ;; Resume cursor: derived from the shadow's OWN durable state, not
-        ;; persisted -- see the docstring and %PERSIST-LEASE (GH #170, fix
-        ;; round 1).  LOAD-HIGHEST-TRANSACTION-ID is 0 on a shadow that has
-        ;; never committed a write, so NEXT starts at START there.
-        (let ((next (max start (1+ (load-highest-transaction-id graph)))))
-          ;; Half-open [start,end): NEXT == END means fully consumed, not
-          ;; just "at the boundary" -- TM-NEXT-EPOCH's own runtime check
-          ;; uses >= for the same reason (GH #170, fix round 2).
-          (when (>= next end)
-            (error 'epoch-lease-exhausted :name graph-name :end end))
-          (setf (graph-epoch-lease graph)
-                (make-epoch-lease :start start :next next :end end)))
-        (%persist-lease location start end))
-      graph)))
+                            open-args)))
+           (ok nil))
+      (unwind-protect
+          (progn
+            (when fast-load
+              (setf (wal-suppressed-p graph) t))
+            ;; Presize whatever segments this shadow actually carries (GH
+            ;; #170 Task 5).  An empty VECTOR-SEGMENTS table (no
+            ;; :VECTOR-INDEX owner has data yet) makes this loop a no-op,
+            ;; by design -- see the docstring.
+            (when expected-vectors
+              (maphash (lambda (key segment)
+                         (declare (ignore key))
+                         (presize-vector-segment segment expected-vectors))
+                       (vector-segments graph)))
+            ;; Resume cursor: derived from the shadow's OWN durable state,
+            ;; not persisted -- see the docstring and %PERSIST-LEASE (GH
+            ;; #170, fix round 1).  LOAD-HIGHEST-TRANSACTION-ID is 0 on a
+            ;; shadow that has never committed a write, so NEXT starts at
+            ;; START there.
+            (let ((next (max start (1+ (load-highest-transaction-id graph)))))
+              ;; Half-open [start,end): NEXT == END means fully consumed,
+              ;; not just "at the boundary" -- TM-NEXT-EPOCH's own runtime
+              ;; check uses >= for the same reason (GH #170, fix round 2).
+              (when (>= next end)
+                (error 'epoch-lease-exhausted :name graph-name :end end))
+              (setf (graph-epoch-lease graph)
+                    (make-epoch-lease :start start :next next :end end)))
+            (%persist-lease location start end)
+            (setf ok t)
+            graph)
+        (unless ok
+          (let ((*graph* graph))
+            (ignore-errors (close-graph graph :snapshot-p nil))))))))
 
 (defun %require-closed-shadow (shadow-location)
   "Signal a clear error unless SHADOW-LOCATION exists and carries no
@@ -453,6 +488,13 @@ NEW store).  Split out so that HANDLER-CASE reads cleanly."
     (%posix-rename shadow live)
     ;; Completion is THIS point, not the journal record below (#212).
     (setf (aref progress 0) t (aref progress 1) retired-path)
+    ;; The promoted generation's lease.dat (copied in from the shadow) has
+    ;; no meaning once this location is a plain, non-shadow live store --
+    ;; delete it so it cannot be mistaken for a live lease later (GH #170,
+    ;; review finding M2).
+    (ignore-errors
+     (delete-file (merge-pathnames "lease.dat"
+                                   (uiop:ensure-directory-pathname live))))
     (journal-append clock :swap :store name :retired retired-path)
     (let ((new-graph (open-graph name live :system-clock nil)))
       (attach-to-system-clock new-graph clock)
@@ -505,7 +547,12 @@ FAILED, carrying both conditions.
 A failure BETWEEN the two renames is NOT recovered here: the live data
 sits at the retired path and the live location may be missing or
 half-replaced; manual recovery is required.  That crash window is GH
-#171's territory."
+#171's territory.
+
+Refuses a MASTER-GRAPH/SLAVE-GRAPH/PEER-GRAPH with
+DETACH-UNSUPPORTED-GRAPH-ERROR -- v1 scope, see that condition's
+docstring (GH #170)."
+  (%check-detach-supported graph 'swap-in-shadow)
   (let* ((tm (transaction-manager graph))
          (name (graph-name graph))
          (location (location graph))
@@ -524,7 +571,8 @@ clock (GRAPH-SYSTEM-CLOCK is NIL)."))
           (%swap-in-shadow-1 name location shadow-location clock progress)
         (error (original)
           (if (%swap-completed-p progress)
-              ;; Renames + journal already durable: the swap SUCCEEDED.
+              ;; Renames already durable: the swap SUCCEEDED (the :SWAP
+              ;; journal record itself is best-effort, see above).
               ;; Recover onto the NEW generation and return normally.
               (handler-case
                   (let ((recovered (%reopen-and-resume name location clock t)))

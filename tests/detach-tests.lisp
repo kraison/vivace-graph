@@ -1211,3 +1211,241 @@ on the thread that last set it."
                       (merge-pathnames
                        "*.committed"
                        (graph-db::persistent-transaction-directory g))))))))
+
+;;; Whole-branch review fixes (GH #170, 2026-08-22).
+
+(test detach-drain-timeout-restores-read-only-not-t
+  "C1 (GH #170 review): a drain timeout during SHADOW-STORE's :READ-ONLY
+window must restore ACCEPTING-P to :READ-ONLY, not hardcoded T --
+hardcoded T would silently lift the shadow-window guard and let a write
+land in the doomed generation.  Mechanism: shadow the store (G2 comes
+back :READ-ONLY), open+close a shadow so SWAP-IN-SHADOW's precondition
+is satisfiable, hold a read pin on G2 across a SWAP-IN-SHADOW call with
+a 1-second timeout so its quiesce cannot drain, and confirm G2 is
+STILL :READ-ONLY afterward -- a write still signals reason
+:SHADOW-LOAD, not fully open again.  ABLATION (recorded, not re-run
+here): reverting %QUIESCE-TRANSACTION-MANAGER's timeout branch to
+\(%SET-ACCEPTING-P TRANSACTION-MANAGER T) makes the :READ-ONLY assertion
+below fail."
+  (with-clocked-store (g clock sys)
+    sys
+    (with-transaction ((graph-db::transaction-manager g))
+      (graph-db:make-vertex :generic nil :graph g))
+    (multiple-value-bind (shadow-location g2) (graph-db:shadow-store g)
+      (unwind-protect
+           (let ((tm2 (graph-db::transaction-manager g2)))
+             (multiple-value-bind (start end)
+                 (graph-db:clock-lease-epochs clock 1000)
+               (let ((sg (graph-db:open-shadow-graph
+                          shadow-location :detach-store-1
+                          :lease (cons start end))))
+                 (let ((graph-db:*graph* sg))
+                   (close-graph sg :snapshot-p nil))))
+             (let ((pin (graph-db:pin-read-epoch tm2)))
+               (unwind-protect
+                    (progn
+                      (signals graph-db:detach-drain-timeout
+                        (graph-db:swap-in-shadow
+                         g2 shadow-location :timeout 1))
+                      (is (eq :read-only (graph-db:accepting-p tm2))))
+                 (graph-db:unpin-read-epoch tm2 pin)))
+             (handler-case
+                 (progn
+                   (with-transaction (tm2)
+                     (graph-db:make-vertex :generic nil :graph g2))
+                   (fail "write must still be refused after the timeout"))
+               (graph-db:store-not-accepting-error (c)
+                 (is (eq :shadow-load
+                         (graph-db:store-not-accepting-reason c)))))
+             (graph-db:abandon-shadow g2 shadow-location)
+             (with-transaction (tm2)
+               (graph-db:make-vertex :generic nil :graph g2)))
+        (let ((graph-db:*graph* g2))
+          (ignore-errors (close-graph g2 :snapshot-p nil)))))))
+
+(test detach-refuses-replicated-graphs
+  "I1 (GH #170 review): DETACH-STORE / SHADOW-STORE / SWAP-IN-SHADOW all
+refuse a MASTER-GRAPH/SLAVE-GRAPH/PEER-GRAPH with
+DETACH-UNSUPPORTED-GRAPH-ERROR -- their reopen paths use OPEN-GRAPH's
+plain default arguments, which would silently strip replication/peer
+configuration.  A bare MAKE-INSTANCE shell is enough: the check is a
+TYPEP on the graph object made before anything else runs, so it never
+touches any slot the shell leaves unbound."
+  (dolist (g (list (make-instance 'graph-db::master-graph
+                                  :graph-name :fake-master)
+                   (make-instance 'graph-db::slave-graph
+                                  :graph-name :fake-slave)
+                   (make-instance 'graph-db::peer-graph
+                                  :graph-name :fake-peer)))
+    (signals graph-db:detach-unsupported-graph-error
+      (graph-db:detach-store g))
+    (signals graph-db:detach-unsupported-graph-error
+      (graph-db:shadow-store g))
+    (signals graph-db:detach-unsupported-graph-error
+      (graph-db:swap-in-shadow g "/nonexistent-shadow/"))))
+
+(test shadow-store-clears-stale-shadow-directory
+  "I2 (GH #170 review): a pre-existing <location>-shadow/ from a
+previous, never-cleaned SHADOW-STORE must be DISCARDED before the copy,
+not merged with -- %COPY-DIRECTORY-TREE's per-file :SUPERSEDE never
+clears the destination, so a stale .txn file left over there would be
+replayed into the fresh shadow on its next open.  Pre-create the shadow
+dir with a junk file, run SHADOW-STORE, and confirm the junk file is
+gone."
+  (with-clocked-store (g clock sys)
+    clock sys
+    (with-transaction ((graph-db::transaction-manager g))
+      (graph-db:make-vertex :generic nil :graph g))
+    (let* ((shadow-dir (graph-db::%shadow-location (graph-db:location g)))
+           (junk (merge-pathnames "junk.txt" shadow-dir)))
+      (ensure-directories-exist shadow-dir)
+      (with-open-file (out junk :direction :output :if-exists :supersede
+                          :if-does-not-exist :create)
+        (write-string "stale" out))
+      (multiple-value-bind (shadow-location g2) (graph-db:shadow-store g)
+        (unwind-protect
+             (progn
+               (is (not (probe-file junk)))
+               (is-true (probe-file shadow-location)))
+          (let ((graph-db:*graph* g2))
+            (ignore-errors (close-graph g2 :snapshot-p nil))))))))
+
+(test detach-store-failure-between-quiesce-and-close-restores-service
+  "I3 (GH #170 review): a failure AFTER a successful quiesce but BEFORE
+the durable close (CLOCK-LEASE-EPOCHS / JOURNAL-APPEND) must not strand
+ACCEPTING-P at :DETACHING.  Mechanism: swap G's system clock for a mock
+clock (same %MAKE-SYSTEM-CLOCK-with-invalid-location technique as
+SWAP-IN-SHADOW-1-PROGRESS-SURVIVES-A-JOURNAL-APPEND-FAILURE) whose
+%CLOCK-RESERVE write fails deterministically, so DETACH-STORE's
+CLOCK-LEASE-EPOCHS call fails after the quiesce has already succeeded.
+DETACH-STORE must re-signal AND leave the store fully accepting again,
+still open."
+  (with-clocked-store (g clock sys)
+    clock sys
+    (with-transaction ((graph-db::transaction-manager g))
+      (graph-db:make-vertex :generic nil :graph g))
+    (let ((tm (graph-db::transaction-manager g))
+          (mock-clock (graph-db::%make-system-clock
+                       :location "/nonexistent-dir-for-gh-170-i3/"
+                       :counter 1)))
+      (setf (graph-db:graph-system-clock g) mock-clock)
+      (unwind-protect
+           (signals error (graph-db:detach-store g))
+        ;; Restore the real clock so the fixture's own teardown can close
+        ;; G normally regardless of this test's outcome.
+        (setf (graph-db:graph-system-clock g) clock))
+      (is (eq t (graph-db:accepting-p tm)))
+      (is (graph-db::graph-open-p g))
+      (with-transaction (tm)
+        (graph-db:make-vertex :generic nil :graph g)))))
+
+(test open-graph-initial-accepting-state-refuses-write-immediately
+  "I4 (GH #170 review): OPEN-GRAPH's :INITIAL-ACCEPTING-STATE sets the
+fresh transaction manager's ACCEPTING-P at construction, before the
+graph is registered in *GRAPHS* -- not published writable then flipped
+after, which would leave a window for a racing writer to land a commit
+in a generation meant to come up non-accepting.  A true race is not
+practical to test at the unit level; the ordering itself is the proof
+(the transaction manager did not even exist yet at registration time
+under the pre-fix code path).  This checks the observable contract
+instead: a graph opened with :INITIAL-ACCEPTING-STATE :READ-ONLY
+refuses a write the INSTANT OPEN-GRAPH returns."
+  (with-temp-directory (sys)
+    (with-temp-directory (dir)
+      (let ((graph-db::*system-directory* (namestring sys))
+            (graph-db::*store-registry* nil))
+        (let ((g (make-graph :detach-store-1 (namestring dir)
+                             :buffer-pool-size 1000)))
+          (let ((graph-db:*graph* g))
+            (close-graph g :snapshot-p nil)))
+        (let ((g2 (open-graph :detach-store-1 (namestring dir)
+                              :buffer-pool-size 1000
+                              :initial-accepting-state :read-only)))
+          (unwind-protect
+               (progn
+                 (is (eq :read-only
+                         (graph-db:accepting-p
+                          (graph-db::transaction-manager g2))))
+                 (handler-case
+                     (progn
+                       (with-transaction
+                           ((graph-db::transaction-manager g2))
+                         (graph-db:make-vertex :generic nil :graph g2))
+                       (fail "write must be refused immediately"))
+                   (graph-db:store-not-accepting-error (c)
+                     (is (eq :shadow-load
+                             (graph-db:store-not-accepting-reason c))))))
+            (let ((graph-db:*graph* g2))
+              (ignore-errors (close-graph g2 :snapshot-p nil)))))))))
+
+(test open-shadow-graph-failed-open-closes-cleanly-for-retry
+  "M1 (GH #170 review): an error AFTER OPEN-GRAPH inside OPEN-SHADOW-
+GRAPH (lease exhaustion here) must not leak the opened graph -- an mmap
+left open plus a set .dirty marker would make a RETRY open fail on \"not
+closed properly\" instead of just re-raising the exhaustion.  Exhaust a
+2-epoch lease, close, confirm EPOCH-LEASE-EXHAUSTED at open (same shape
+as SHADOW-LEASE-CONSUMED-EXACTLY-TO-ITS-BOUNDARY-EXHAUSTS-AT-OPEN), then
+re-open the SAME shadow location with a FRESH lease and confirm it
+succeeds cleanly (no .dirty refusal), with the data intact."
+  (with-clocked-store (g clock sys)
+    sys
+    (with-transaction ((graph-db::transaction-manager g))
+      (graph-db:make-vertex :generic nil :graph g))
+    (multiple-value-bind (shadow-location g2) (graph-db:shadow-store g)
+      (unwind-protect
+           (progn
+             (multiple-value-bind (start end)
+                 (graph-db:clock-lease-epochs clock 2)
+               (let ((sg (graph-db:open-shadow-graph
+                          shadow-location :detach-store-1
+                          :lease (cons start end))))
+                 (dotimes (i 2)
+                   (with-transaction ((graph-db::transaction-manager sg))
+                     (graph-db:make-vertex :generic nil :graph sg)))
+                 (let ((graph-db:*graph* sg))
+                   (close-graph sg :snapshot-p nil))
+                 (signals graph-db:epoch-lease-exhausted
+                   (graph-db:open-shadow-graph
+                    shadow-location :detach-store-1))))
+             (multiple-value-bind (start2 end2)
+                 (graph-db:clock-lease-epochs clock 1000)
+               (let ((sg2 (graph-db:open-shadow-graph
+                          shadow-location :detach-store-1
+                          :lease (cons start2 end2))))
+                 (unwind-protect
+                      (is (= 3 (length (graph-db:map-vertices
+                                       #'identity sg2 :collect-p t))))
+                   (let ((graph-db:*graph* sg2))
+                     (ignore-errors (close-graph sg2 :snapshot-p nil)))))))
+        (let ((graph-db:*graph* g2))
+          (ignore-errors (close-graph g2 :snapshot-p nil)))))))
+
+(test swap-in-shadow-deletes-the-promoted-lease-file
+  "M2 (GH #170 review): the promoted generation's lease.dat (copied in
+from the shadow) is deleted right after the second rename -- it has no
+meaning once the location is a plain, non-shadow live store."
+  (with-clocked-store (g clock sys)
+    sys
+    (with-transaction ((graph-db::transaction-manager g))
+      (graph-db:make-vertex :generic nil :graph g))
+    (multiple-value-bind (shadow-location g2) (graph-db:shadow-store g)
+      (multiple-value-bind (start end)
+          (graph-db:clock-lease-epochs clock 1000)
+        (let ((sg (graph-db:open-shadow-graph
+                   shadow-location :detach-store-1
+                   :lease (cons start end))))
+          (let ((graph-db:*graph* sg))
+            (close-graph sg :snapshot-p nil))))
+      (multiple-value-bind (new-graph retired-path)
+          (graph-db:swap-in-shadow g2 shadow-location)
+        (is (not (probe-file
+                  (merge-pathnames
+                   "lease.dat"
+                   (uiop:ensure-directory-pathname
+                    (graph-db::location new-graph))))))
+        (let ((graph-db:*graph* new-graph))
+          (ignore-errors (close-graph new-graph :snapshot-p nil)))
+        (ignore-errors
+         (uiop:delete-directory-tree
+          (uiop:ensure-directory-pathname retired-path)
+          :validate t :if-does-not-exist :ignore))))))
