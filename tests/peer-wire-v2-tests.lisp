@@ -112,3 +112,103 @@ and fail the existing schema gate -- the new check does not swallow it."
                (error (e) e))))
       (is (typep c 'graph-db::peer-schema-incompatible-error)
           "bad schema + good protocol must surface the SCHEMA error, got ~S" c))))
+
+;;; ---------------------------------------------------------------------------
+;;; #206 gap 2: the envelope's own header-size byte is checked against this
+;;; image's current head layout, BEFORE any head byte is interpreted.  The
+;;; protocol/schema gates above are the primary contract; this is defense in
+;;; depth for a gate bypass (or a stale on-disk .txn file predating a head-size
+;;; change) so it is refused, not misparsed. See DESERIALIZE-TRANSACTION-NODE-
+;;; VECTOR in transactions.lisp.
+;;; ---------------------------------------------------------------------------
+
+(defun %wv2-fake-node-vector (kind header-size)
+  "A hand-built transaction-node-vector envelope: KIND (:VERTEX or :EDGE), a
+HEADER-SIZE byte, and exactly HEADER-SIZE zero bytes of 'head' -- no data.
+Enough to drive DESERIALIZE-TRANSACTION-NODE-VECTOR's own size check without a
+real node.  A vector this short cannot hold a current-size head, so a skipped
+check would run GET-BYTE past the array end, not just decode wrong fields --
+that is the ablation evidence for GH #206."
+  (let* ((type-code (ecase kind
+                      (:vertex graph-db::+transaction-node-vertex-code+)
+                      (:edge   graph-db::+transaction-node-edge-code+)))
+         (total (+ graph-db::+transaction-node-base-header-size+ header-size))
+         (vec (make-array total :element-type '(unsigned-byte 8)
+                          :initial-element 0)))
+    (graph-db::serialize-uint64 vec total 0)
+    (setf (aref vec 9) type-code)
+    (setf (aref vec 26) header-size)
+    vec))
+
+(test hub-refuses-old-vertex-head-size
+  "A hand-built envelope carrying the OLD (31-byte) vertex head size is
+refused with NODE-HEAD-SIZE-MISMATCH-ERROR before any head byte is read."
+  (let ((c (handler-case
+               (progn (graph-db::deserialize-transaction-node-vector
+                       (%wv2-fake-node-vector :vertex 31))
+                      nil)
+             (error (e) e))))
+    (is (typep c 'graph-db::node-head-size-mismatch-error)
+        "expected NODE-HEAD-SIZE-MISMATCH-ERROR, got ~S" c)
+    (when (typep c 'graph-db::node-head-size-mismatch-error)
+      (is (eql graph-db::+node-header-size+
+               (graph-db::node-head-size-mismatch-expected c)))
+      (is (eql 31 (graph-db::node-head-size-mismatch-actual c)))
+      (is (eq :vertex (graph-db::node-head-size-mismatch-kind c))))))
+
+(test hub-refuses-old-edge-head-size
+  "Same check, edge side: the OLD (71-byte) edge head size is refused."
+  (let ((c (handler-case
+               (progn (graph-db::deserialize-transaction-node-vector
+                       (%wv2-fake-node-vector :edge 71))
+                      nil)
+             (error (e) e))))
+    (is (typep c 'graph-db::node-head-size-mismatch-error)
+        "expected NODE-HEAD-SIZE-MISMATCH-ERROR, got ~S" c)
+    (when (typep c 'graph-db::node-head-size-mismatch-error)
+      (is (eql graph-db::+edge-header-size+
+               (graph-db::node-head-size-mismatch-expected c)))
+      (is (eql 71 (graph-db::node-head-size-mismatch-actual c)))
+      (is (eq :edge (graph-db::node-head-size-mismatch-kind c))))))
+
+(test hub-refuses-before-reading-any-head-byte
+  "Ordering pin: the fake vertex envelope has zero bytes past its declared
+(old) header -- if the size check ran AFTER any head interpretation started
+(or not at all), reading the current 33-byte head layout from a 31-byte
+buffer would run GET-BYTE off the end of the array, not signal our named
+condition. It must be OUR condition, not an array-bounds error."
+  (let ((c (handler-case
+               (progn (graph-db::deserialize-transaction-node-vector
+                       (%wv2-fake-node-vector :vertex 31))
+                      nil)
+             (error (e) e))))
+    (is (typep c 'graph-db::node-head-size-mismatch-error)
+        "check must fire before any head byte is read; got ~S" c)))
+
+(test hub-applies-current-size-vertex-vector
+  "Control: a REAL vertex, freshly loaded from disk (so BYTES reflects the
+image's current head layout), round-trips through DESERIALIZE-TRANSACTION-
+NODE-VECTOR untouched -- the new check does not refuse legitimate current
+traffic."
+  (with-test-graph (g)
+    (let (id)
+      (with-transaction ((graph-db::transaction-manager g))
+        (setq id (id (make-g-person :name "X"))))
+      (let* ((node (lookup-vertex id))
+             (vector (graph-db::transaction-node-vector node))
+             (decoded (graph-db::deserialize-transaction-node-vector vector)))
+        (is (equalp id (id decoded)))))))
+
+(test hub-applies-current-size-edge-vector
+  "Control, edge side: a REAL edge round-trips through DESERIALIZE-
+TRANSACTION-NODE-VECTOR untouched."
+  (with-test-graph (g)
+    (let (a b eid)
+      (with-transaction ((graph-db::transaction-manager g))
+        (setq a (id (make-g-person :name "A")))
+        (setq b (id (make-g-person :name "B")))
+        (setq eid (id (make-g-knows :from a :to b))))
+      (let* ((edge (lookup-edge eid))
+             (vector (graph-db::transaction-node-vector edge))
+             (decoded (graph-db::deserialize-transaction-node-vector vector)))
+        (is (equalp eid (id decoded)))))))

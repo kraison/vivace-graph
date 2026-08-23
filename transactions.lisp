@@ -2014,6 +2014,23 @@ With no FILTER, returns WRITES unchanged."
         (setf (data vertex) nil))
     vertex))
 
+;; Envelope's header-size byte MUST match this image's current head layout
+;; before any head byte is interpreted -- a version-gate bypass (or a stale
+;; on-disk txn-log predating a head-size change) would otherwise misparse
+;; head fields as data, not fail loudly. Defense in depth for GH #206 gap 2;
+;; the version/schema gates (peer-streaming.lisp) are the primary contract.
+(define-condition node-head-size-mismatch-error (error)
+  ((expected :initarg :expected :reader node-head-size-mismatch-expected)
+   (actual   :initarg :actual   :reader node-head-size-mismatch-actual)
+   (kind     :initarg :kind     :reader node-head-size-mismatch-kind))
+  (:report (lambda (c s)
+             (format s "Node head size mismatch for ~A: expected ~A byte~:P, ~
+got ~A (old-format or corrupt wire data, refused rather than misparsed; ~
+GH #206)"
+                     (node-head-size-mismatch-kind c)
+                     (node-head-size-mismatch-expected c)
+                     (node-head-size-mismatch-actual c)))))
+
 (defun deserialize-transaction-node-vector (vector &optional (offset 0))
   "Return the edge or vertex represented by VECTOR."
   (let (size uuid type header-size end)
@@ -2028,6 +2045,19 @@ With no FILTER, returns WRITES unchanged."
     (incf offset 16)
     (setf header-size (get-byte vector offset))
     (incf offset)
+    ;; Validate BEFORE any head byte is interpreted (below).
+    (let ((expected (cond ((eql type +transaction-node-edge-code+)
+                           +edge-header-size+)
+                          ((eql type +transaction-node-vertex-code+)
+                           +node-header-size+)
+                          (t
+                           (error "Unknown transaction node type ~S" type)))))
+      (unless (= header-size expected)
+        (error 'node-head-size-mismatch-error
+               :expected expected :actual header-size
+               :kind (if (eql type +transaction-node-edge-code+)
+                         :edge
+                         :vertex))))
     (let* ((header-offset offset)
            (data-offset (+ offset header-size))
            (node
