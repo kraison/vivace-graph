@@ -9,6 +9,15 @@
                 validate-value-constraints))
 
 (defvar *transaction* nil)
+(defvar *quiesced-store-closing-p* nil
+  "Bound T only in the detaching thread's dynamic extent, while
+DETACH-STORE's own CLOSE-GRAPH runs its post-quiesce snapshot scan.  Lets
+that one internal PIN-READ-EPOCH through despite ACCEPTING-P being
+non-T, without opening the door to any other caller -- the binding is
+thread-local, so a concurrent thread still sees the refusal.  Checked
+only by PIN-READ-EPOCH: CLOSE-GRAPH's snapshot path (BACKUP via
+MAP-VERTICES/MAP-EDGES) takes read pins, never a transaction, so
+CREATE-TRANSACTION has no matching bypass (GH #170).")
 (defvar *read-snapshots* nil
   "Graph -> read-only snapshot transaction, or NIL.  Read-only snapshots are
 per graph and may compose; read-write transactions are not (GH #53).")
@@ -141,6 +150,45 @@ in-flight transactions. Attach only a quiescent store."
                      (graph-name (attach-with-active-transactions-graph
                                   condition))))))
 
+(define-condition store-not-accepting-error (error)
+  ;; ACCEPTING-P states: T (all), :READ-ONLY (pins/reads yes, txns no),
+  ;; :OPENING (same admit-pins/refuse-txns shape, for OPEN-GRAPH's own
+  ;; mid-open window -- GH #170 review round 3), :DETACHING/:SWAPPING
+  ;; (nothing new).  REASON mirrors the flag, except :READ-ONLY reports
+  ;; as :SHADOW-LOAD -- the human-facing name for the state Task 2's
+  ;; shadow window puts the store in (GH #170).
+  ((name :initarg :name :reader store-not-accepting-name)
+   (reason :initarg :reason :reader store-not-accepting-reason))
+  (:report (lambda (condition stream)
+             (format stream "Store ~S is not accepting new work (~S)."
+                     (store-not-accepting-name condition)
+                     (store-not-accepting-reason condition)))))
+
+(define-condition detach-drain-timeout (error)
+  ;; ACCEPTING-P is restored to whatever it was BEFORE this quiesce call,
+  ;; not hardcoded T -- a timeout during an already-non-accepting window
+  ;; (e.g. SHADOW-STORE's :READ-ONLY) must not silently lift it (GH #170,
+  ;; review finding C1).
+  ((name :initarg :name :reader detach-timeout-name)
+   (seconds :initarg :seconds :reader detach-timeout-seconds))
+  (:report (lambda (condition stream)
+             (format stream "Store ~S did not drain within ~D second~:P; ~
+detach aborted and the store resumes its prior accepting state."
+                     (detach-timeout-name condition)
+                     (detach-timeout-seconds condition)))))
+
+(define-condition epoch-lease-exhausted (error)
+  ;; A shadow store's leased range is [START, END) -- see EPOCH-LEASE in
+  ;; graph-class.lisp.  Signalled instead of silently falling through to
+  ;; the clock/counter, which would collide with the live store's ids
+  ;; (GH #170).
+  ((name :initarg :name :reader epoch-lease-exhausted-name)
+   (end :initarg :end :reader epoch-lease-exhausted-end))
+  (:report (lambda (condition stream)
+             (format stream "Store ~S exhausted its leased epoch range ~
+(end ~D)." (epoch-lease-exhausted-name condition)
+                     (epoch-lease-exhausted-end condition)))))
+
 (define-condition no-transaction-in-progress-warning (warning) ()
   (:report
    (lambda (condition stream)
@@ -185,7 +233,7 @@ in-flight transactions. Attach only a quiescent store."
              (copying-uncommitted-node-node condition)))))
 
 ;;; Transaction manager
-(defgeneric create-transaction (transaction-manager))
+(defgeneric create-transaction (transaction-manager &key allow-read-only))
 (defgeneric cleanup-transaction (transaction))
 
 (defgeneric graph (object)
@@ -650,14 +698,38 @@ vertices (the normal case for ingested source records) are unaffected."
 ;;; cannot be reclaimed out from under the reader.
 
 (defun pin-read-epoch (transaction-manager)
-  "Register a read pin at the current epoch; return its token (for UNPIN)."
-  ;; Racy read of the epoch is fine: it is monotonic, and a slightly stale
-  ;; (smaller) value only makes the reaper MORE conservative, never less.
-  (let ((epoch (tm-peek-epoch transaction-manager)))
-    (with-recursive-lock-held ((read-pins-lock transaction-manager))
-      (let ((token (incf (read-pin-counter transaction-manager))))
-        (setf (gethash token (read-pins transaction-manager)) epoch)
-        token))))
+  "Register a read pin at the current epoch; return its token (for UNPIN).
+Refused -- STORE-NOT-ACCEPTING-ERROR -- only under FULL quiescence
+(:DETACHING / :SWAPPING); :READ-ONLY and :OPENING (OPEN-GRAPH's own
+mid-open window, GH #170 review round 3) both admit new pins -- OPEN-
+GRAPH's own rebuild/recovery scans run under WITH-READ-PIN and must not
+be refused by the very state that protects them from a concurrent
+writer.
+
+The accepting-p CHECK and the pin REGISTRATION run as one critical
+section under READ-PINS-LOCK -- the same lock
+%QUIESCE-TRANSACTION-MANAGER's flip takes (after TM-LOCK; see its
+docstring for the lock-ordering argument).  Without this, the check
+here and the HASH-TABLE write below ran under two different locks, so a
+racing caller could observe ACCEPTING-P as T, then have the flip and
+the full drain both complete, and only THEN land its pin -- a straggler
+admitted after DETACH-STORE had already reported success and begun
+tearing down mmaps (GH #170, fix round 1)."
+  (with-recursive-lock-held ((read-pins-lock transaction-manager))
+    (let ((state (accepting-p transaction-manager)))
+      (unless (or (eq state t) (eq state :read-only) (eq state :opening)
+                  *quiesced-store-closing-p*)
+        (error 'store-not-accepting-error
+               :name (graph-name (graph transaction-manager))
+               :reason state)))
+    ;; Racy read of the epoch is fine: it is monotonic, and a slightly
+    ;; stale (smaller) value only makes the reaper MORE conservative,
+    ;; never less.  Reading it inside the lock now (rather than before
+    ;; it) costs nothing -- TM-PEEK-EPOCH is itself lock-free.
+    (let* ((epoch (tm-peek-epoch transaction-manager))
+           (token (incf (read-pin-counter transaction-manager))))
+      (setf (gethash token (read-pins transaction-manager)) epoch)
+      token)))
 
 (defun unpin-read-epoch (transaction-manager token)
   (with-recursive-lock-held ((read-pins-lock transaction-manager))
@@ -2265,17 +2337,24 @@ left in the stream."
                    :defaults (transaction-pathname transaction))))
 
 (defgeneric persist-transaction (transaction)
+  (:documentation
+   "Legacy single-shot persistence path -- superseded on the commit hot
+path by the PREPARE-TX-PERSISTENCE / FINALIZE-TX-PERSISTENCE split (GH
+#135), which this generic has no callers left in this system; kept
+current for any external caller and honors the same WAL-suppressed
+no-op as FINALIZE-TX-PERSISTENCE (GH #170 Task 4).")
   (:method (transaction)
-    (persist-tx transaction
-                (transaction-temporary-pathname transaction)
-                (transaction-pathname transaction))
-    (let* ((transaction-manager (transaction-manager transaction))
-           (stream (replication-log transaction-manager))
-           (lock (replication-log-lock transaction-manager)))
-      (with-recursive-lock-held (lock)
-        (write-sequence (bytes transaction)
-                        (replication-log (transaction-manager transaction)))
-        (finish-output stream)))))
+    (unless (wal-suppressed-p (graph transaction))
+      (persist-tx transaction
+                  (transaction-temporary-pathname transaction)
+                  (transaction-pathname transaction))
+      (let* ((transaction-manager (transaction-manager transaction))
+             (stream (replication-log transaction-manager))
+             (lock (replication-log-lock transaction-manager)))
+        (with-recursive-lock-held (lock)
+          (write-sequence (bytes transaction)
+                          (replication-log (transaction-manager transaction)))
+          (finish-output stream))))))
 
 (defun transaction-prepare-pathname (transaction)
   "A unique per-attempt temp pathname, keyed by SEQUENCE-NUMBER (the
@@ -2521,16 +2600,25 @@ the transaction-manager lock, so the bulk serialization + disk write (and the
 flush at close) are off the serialized commit path.  The header id is written as
 the placeholder 0 — the real id is encoded in the final FILENAME by the rename in
 FINALIZE-TX-PERSISTENCE, and recovery reads it from there.  Returns the temp
-pathname."
+pathname.
+
+WAL-suppressed (GH #170 Task 4): when (GRAPH TRANSACTION)'s WAL-SUPPRESSED-P
+is set, no temp file is written and BYTES is left unpopulated -- FINALIZE-TX-
+PERSISTENCE checks the same slot and skips both the rename and the
+replication-log write, so nothing here would ever be read.  REFRESH-CREATE-
+SET-BYTES still runs unconditionally: it refreshes each node's own BYTES from
+DATA, which APPLY-TRANSACTION's heap allocation depends on regardless of WAL
+suppression (GH #135)."
   (refresh-create-set-bytes transaction)
   (let ((tmp (transaction-prepare-pathname transaction)))
-    (with-open-file (stream tmp :direction :output
-                            :if-exists :supersede
-                            :if-does-not-exist :create
-                            :element-type '(unsigned-byte 8))
-      (write-tx-header-to-stream transaction stream 0)
-      (write-tx-writes-to-stream transaction stream))
-    (initialize-bytes-from-components transaction)
+    (unless (wal-suppressed-p (graph transaction))
+      (with-open-file (stream tmp :direction :output
+                              :if-exists :supersede
+                              :if-does-not-exist :create
+                              :element-type '(unsigned-byte 8))
+        (write-tx-header-to-stream transaction stream 0)
+        (write-tx-writes-to-stream transaction stream))
+      (initialize-bytes-from-components transaction))
     tmp))
 
 (defun finalize-tx-persistence (transaction tmp)
@@ -2543,57 +2631,73 @@ lock).  Recovery reads the id from this filename, so the file's header id stays
 at its placeholder 0.  Master graphs additionally patch the real id into the
 in-memory bytes and append them to the replication log in commit order for
 downstream slaves (the replication path is the only consumer of the header id,
-and it reads these patched bytes, never the .txn files)."
-  ;; Use POSIX rename(2) (atomic; replaces an existing target) rather than
-  ;; cl:rename-file.  SBCL/ECL's rename-file already overwrites per POSIX, but
-  ;; CCL's signals "File exists" when the target exists — which intermittently
-  ;; crashed concurrent-stress on CCL.  %posix-rename gives portable, atomic,
-  ;; overwrite-on-rename behavior across all implementations.
-  (%posix-rename (namestring tmp)
-                 (namestring (transaction-pathname transaction)))
-  (let ((tm (transaction-manager transaction)))
-    ;; peer-replication WP-2: generalized from MASTER-GRAPH-P so a peer-graph also
-    ;; journals its own committed writes (a device's push feed / a hub's pull feed).
-    ;; The patched-in transaction-id is the per-origin feed sequence (design §3 #3).
-    (when (journals-own-feed-p (graph tm))
-      (serialize-uint64 (bytes transaction)
-                        (transaction-id transaction)
-                        +tx-header-id-offset+)
-      (let ((repl-stream (replication-log tm))
-            (lock (replication-log-lock tm))
-            (gr (graph tm)))
-        (with-recursive-lock-held (lock)
-          ;; peer-replication WP-0: a peer-graph prefixes the feed entry with a
-          ;; peer-meta packet (op identity + lamport), then records that it has
-          ;; applied its own authored op so a re-homed bounce-back is deduped
-          ;; (design §6).  A master journals plain tx bytes, unchanged.
-          (when (peer-graph-p gr)
-            (if *peer-rehome-op*
-                ;; B2d-2: a hub re-home preserves the ORIGINAL op's identity on the
-                ;; feed entry (design §5) so device E pulls it as the author's op and
-                ;; the author dedups its own bounce-back; the re-home caller applies
-                ;; the merge's per-field stamps, so finalize does not stamp here.
-                (destructuring-bind (rop-id rorigin rlamport) *peer-rehome-op*
-                  (write-sequence
-                   (serialize-peer-meta rorigin rop-id rlamport +peer-op-authored+)
-                   repl-stream)
-                  (record-applied-op gr rop-id rlamport))
-                (let ((op-id (gen-op-id))
-                      (lamport (peer-next-lamport gr))
-                      (origin (or (origin-id gr) +peer-null-origin+)))
-                  (write-sequence
-                   (serialize-peer-meta origin op-id lamport +peer-op-authored+)
-                   repl-stream)
-                  (record-applied-op gr op-id lamport)
-                  ;; B2b: stamp every field this locally-authored op changed with
-                  ;; (lamport . origin) -- the LWW basis a later concurrent edit
-                  ;; from another replica compares against.
-                  (dolist (w (writes transaction))
-                    (let ((nid (id (node w))))
-                      (dolist (slot (authored-changed-slots w))
-                        (set-node-field-stamp gr nid slot lamport origin)))))))
-          (write-sequence (bytes transaction) repl-stream)
-          (finish-output repl-stream))))))
+and it reads these patched bytes, never the .txn files).
+
+WAL-suppressed (GH #170 Task 4): when (GRAPH TRANSACTION)'s WAL-SUPPRESSED-P
+is set, this whole body is skipped -- no rename (PREPARE-TX-PERSISTENCE wrote
+no TMP file to rename), no replication-log entry.  Checked on the transaction's
+own GRAPH, a per-graph slot, never a dynamic variable -- a special would leak
+suppression onto any OTHER graph committing on the same thread."
+  (unless (wal-suppressed-p (graph transaction))
+    ;; Use POSIX rename(2) (atomic; replaces an existing target) rather
+    ;; than cl:rename-file.  SBCL/ECL's rename-file already overwrites
+    ;; per POSIX, but CCL's signals "File exists" when the target
+    ;; exists — which intermittently crashed concurrent-stress on CCL.
+    ;; %posix-rename gives portable, atomic, overwrite-on-rename
+    ;; behavior across all implementations.
+    (%posix-rename (namestring tmp)
+                   (namestring (transaction-pathname transaction)))
+    (let ((tm (transaction-manager transaction)))
+      ;; peer-replication WP-2: generalized from MASTER-GRAPH-P so a
+      ;; peer-graph also journals its own committed writes (a device's
+      ;; push feed / a hub's pull feed).  The patched-in transaction-id
+      ;; is the per-origin feed sequence (design §3 #3).
+      (when (journals-own-feed-p (graph tm))
+        (serialize-uint64 (bytes transaction)
+                          (transaction-id transaction)
+                          +tx-header-id-offset+)
+        (let ((repl-stream (replication-log tm))
+              (lock (replication-log-lock tm))
+              (gr (graph tm)))
+          (with-recursive-lock-held (lock)
+            ;; peer-replication WP-0: a peer-graph prefixes the feed
+            ;; entry with a peer-meta packet (op identity + lamport),
+            ;; then records that it has applied its own authored op so
+            ;; a re-homed bounce-back is deduped (design §6).  A master
+            ;; journals plain tx bytes, unchanged.
+            (when (peer-graph-p gr)
+              (if *peer-rehome-op*
+                  ;; B2d-2: a hub re-home preserves the ORIGINAL op's
+                  ;; identity on the feed entry (design §5) so device E
+                  ;; pulls it as the author's op and the author dedups
+                  ;; its own bounce-back; the re-home caller applies
+                  ;; the merge's per-field stamps, so finalize does not
+                  ;; stamp here.
+                  (destructuring-bind (rop-id rorigin rlamport) *peer-rehome-op*
+                    (write-sequence
+                     (serialize-peer-meta
+                      rorigin rop-id rlamport +peer-op-authored+)
+                     repl-stream)
+                    (record-applied-op gr rop-id rlamport))
+                  (let ((op-id (gen-op-id))
+                        (lamport (peer-next-lamport gr))
+                        (origin (or (origin-id gr) +peer-null-origin+)))
+                    (write-sequence
+                     (serialize-peer-meta
+                      origin op-id lamport +peer-op-authored+)
+                     repl-stream)
+                    (record-applied-op gr op-id lamport)
+                    ;; B2b: stamp every field this locally-authored op
+                    ;; changed with (lamport . origin) -- the LWW basis
+                    ;; a later concurrent edit from another replica
+                    ;; compares against.
+                    (dolist (w (writes transaction))
+                      (let ((nid (id (node w))))
+                        (dolist (slot (authored-changed-slots w))
+                          (set-node-field-stamp
+                           gr nid slot lamport origin)))))))
+            (write-sequence (bytes transaction) repl-stream)
+            (finish-output repl-stream)))))))
 
 ;;; Locking for object sets
 
@@ -2831,7 +2935,21 @@ stops appearing in queries.  MARK-DELETED is the usual entry point.")
     :initform (make-recursive-lock "read-pins lock"))
    (read-pin-counter
     :accessor read-pin-counter
-    :initform 0)))
+    :initform 0)
+   ;; Detach quiescence (GH #170).  T = accepting everything.  :READ-ONLY =
+   ;; pins/reads yes, new transactions no (Task 2's shadow window).
+   ;; :OPENING = same admit-pins/refuse-transactions shape as :READ-ONLY,
+   ;; but for OPEN-GRAPH's own mid-open window (review round 3): every
+   ;; construction site starts here, before the graph is published to
+   ;; *GRAPHS* -- a name-lookup writer racing the open now gets a loud
+   ;; STORE-NOT-ACCEPTING-ERROR reason :OPENING instead of colliding with
+   ;; a still-running rebuild/recovery.  :DETACHING / :SWAPPING = nothing
+   ;; new -- a full drain is in progress.  :INITARG so OPEN-GRAPH can set
+   ;; this at construction (GH #170, I4/round 3).
+   (accepting-p
+    :accessor accepting-p
+    :initarg :accepting-p
+    :initform t)))
 
 (defmethod print-object ((transaction-manager transaction-manager) stream)
   (print-unreadable-object (transaction-manager stream :type t)
@@ -2985,29 +3103,53 @@ A transaction-manager always has a graph -- INITIALIZE-INSTANCE :AFTER
 dereferences it immediately, so a NIL graph dies there first."
   (graph-system-clock (graph transaction-manager)))
 
+(defun tm-lease (transaction-manager)
+  "TRANSACTION-MANAGER's leased epoch range, or NIL -- shadow stores
+only (GH #170).  Checked BEFORE both the clock and the per-store
+counter in TM-NEXT-EPOCH/TM-CURRENT-EPOCH/TM-PEEK-EPOCH: a shadow's
+transaction ids must come from its lease, never from either."
+  (graph-epoch-lease (graph transaction-manager)))
+
 (defun tm-next-epoch (transaction-manager)
-  "Allocate a fresh epoch: from the image clock when the graph has one,
-otherwise from this manager's own counter (pre-#168 behaviour)."
-  (let ((clock (tm-clock transaction-manager)))
-    (if clock
-        (clock-next-epoch clock)
-        (prog1 (tx-id-counter transaction-manager)
-          (incf (tx-id-counter transaction-manager))))))
+  "Allocate a fresh epoch: from the lease when TRANSACTION-MANAGER's
+graph has one (shadow stores, GH #170), else from the image clock when
+the graph has one, otherwise from this manager's own counter (pre-#168
+behaviour)."
+  (let ((lease (tm-lease transaction-manager)))
+    (if lease
+        (let ((next (epoch-lease-next lease)))
+          (when (>= next (epoch-lease-end lease))
+            (error 'epoch-lease-exhausted
+                   :name (graph-name (graph transaction-manager))
+                   :end (epoch-lease-end lease)))
+          (setf (epoch-lease-next lease) (1+ next))
+          next)
+        (let ((clock (tm-clock transaction-manager)))
+          (if clock
+              (clock-next-epoch clock)
+              (prog1 (tx-id-counter transaction-manager)
+                (incf (tx-id-counter transaction-manager))))))))
 
 (defun tm-current-epoch (transaction-manager)
   "The next epoch TM-NEXT-EPOCH would return."
-  (let ((clock (tm-clock transaction-manager)))
-    (if clock
-        (clock-current-epoch clock)
-        (tx-id-counter transaction-manager))))
+  (let ((lease (tm-lease transaction-manager)))
+    (if lease
+        (epoch-lease-next lease)
+        (let ((clock (tm-clock transaction-manager)))
+          (if clock
+              (clock-current-epoch clock)
+              (tx-id-counter transaction-manager))))))
 
 (defun tm-peek-epoch (transaction-manager)
   "Like TM-CURRENT-EPOCH but lock-free under a clock -- see
 CLOCK-PEEK-EPOCH.  For PIN-READ-EPOCH, where a racy read is fine."
-  (let ((clock (tm-clock transaction-manager)))
-    (if clock
-        (clock-peek-epoch clock)
-        (tx-id-counter transaction-manager))))
+  (let ((lease (tm-lease transaction-manager)))
+    (if lease
+        (epoch-lease-next lease)
+        (let ((clock (tm-clock transaction-manager)))
+          (if clock
+              (clock-peek-epoch clock)
+              (tx-id-counter transaction-manager))))))
 
 (defun attach-to-system-clock (graph clock)
   "Raise CLOCK above GRAPH's persisted history and record the attach --
@@ -3040,8 +3182,18 @@ transaction; see that condition for why."
   (:method (transaction-manager)
     (incf (sequence-number transaction-manager))))
 
-(defmethod create-transaction (transaction-manager)
+(defmethod create-transaction (transaction-manager &key allow-read-only)
+  ;; ALLOW-READ-ONLY is CALL-WITH-READ-SNAPSHOT's escape hatch: its
+  ;; bookkeeping TX is never committed, so it follows the read-pin
+  ;; rule (admitted under :READ-ONLY) rather than the write rule
+  ;; (refused under any non-T state) -- see PIN-READ-EPOCH (GH #170).
   (with-recursive-lock-held ((lock transaction-manager))
+    (let ((state (accepting-p transaction-manager)))
+      (unless (or (eq state t)
+                  (and allow-read-only (eq state :read-only)))
+        (error 'store-not-accepting-error
+               :name (graph-name (graph transaction-manager))
+               :reason (if (eq state :read-only) :shadow-load state))))
     (let* ((sequence-number (next-sequence-number transaction-manager))
            (graph (graph transaction-manager))
            (cache (cache graph))
@@ -3108,7 +3260,7 @@ store it touched."
       ;; already snapshotted this graph -> inherit
       ((and *read-snapshots* (gethash graph *read-snapshots*)) (funcall thunk))
       (t
-       (let ((txn (create-transaction tm))
+       (let ((txn (create-transaction tm :allow-read-only t))
              (table (or *read-snapshots* (make-hash-table :test 'eq)))
              (pin (pin-read-epoch tm)))
          (unwind-protect
@@ -3220,7 +3372,12 @@ image / snapshot at each clean close) is its only durable record.")
 (defmethod cleanup-transaction ((tx tx))
   (let ((transaction-manager (transaction-manager tx)))
     (if (eql (state tx) :committed)
-        (unless (retain-committed-transaction-p (graph tx))
+        ;; WAL-suppressed (GH #170 Task 4): FINALIZE-TX-PERSISTENCE never
+        ;; renamed a .txn file into place for this commit, so there is
+        ;; nothing here for MARK-AS-COMMITTED to delete/rename -- calling
+        ;; it anyway would RENAME-FILE a path that was never created.
+        (unless (or (wal-suppressed-p (graph tx))
+                    (retain-committed-transaction-p (graph tx)))
           (mark-as-committed (transaction-pathname tx)))
         (remove-transaction tx transaction-manager))))
 
@@ -3304,3 +3461,158 @@ Signals NO-TRANSACTION-IN-PROGRESS if none is active."
     :reader graph))
   (:default-initargs
    :writes nil))
+
+;;; Detach quiescence (GH #170).  A store hands its epoch range to its
+;;; system clock and closes durably, so it can move (media swap, cold
+;;; storage) and reopen later without colliding with epochs the clock
+;;; issued elsewhere meanwhile.  See docs/superpowers/specs/
+;;; 2026-08-20-namespaces-design.md.
+
+(define-condition detach-unsupported-graph-error (error)
+  ;; v1 scope (GH #170 review, finding I1): DETACH-STORE / SHADOW-STORE /
+  ;; SWAP-IN-SHADOW all reopen with OPEN-GRAPH's plain default args, which
+  ;; would silently drop a MASTER-GRAPH/SLAVE-GRAPH/PEER-GRAPH's
+  ;; replication/peer configuration on the reopened generation.  Threading
+  ;; the FULL open-args set (master-p, replication-key, peer-role, etc.)
+  ;; through detachment/shadowing is deferred follow-on work -- see the
+  ;; review thread on GH #170.
+  ((graph :initarg :graph :reader detach-unsupported-graph-error-graph)
+   (operation :initarg :operation
+              :reader detach-unsupported-graph-error-operation))
+  (:report (lambda (c s)
+             (format s "~S does not support ~S: it is a ~S, and v1 of ~
+detach/shadow covers only plain clocked stores.  Reopening a replicated ~
+or peer graph with default OPEN-GRAPH args would silently strip its ~
+replication/peer configuration (GH #170)."
+                     (graph-name (detach-unsupported-graph-error-graph c))
+                     (detach-unsupported-graph-error-operation c)
+                     (class-name
+                      (class-of (detach-unsupported-graph-error-graph c)))))))
+
+(defun %check-detach-supported (graph operation)
+  "Signal DETACH-UNSUPPORTED-GRAPH-ERROR unless GRAPH is a plain clocked
+store -- MASTER-GRAPH, SLAVE-GRAPH and PEER-GRAPH are refused by all
+three v1 entry points (GH #170, review finding I1)."
+  (when (typep graph '(or master-graph slave-graph peer-graph))
+    (error 'detach-unsupported-graph-error :graph graph :operation operation)))
+
+(defparameter *quiesce-poll-interval* 0.05
+  "Seconds between REAP-SAFE-FLOOR polls in %QUIESCE-TRANSACTION-MANAGER.")
+
+(defun %set-accepting-p (transaction-manager reason)
+  "Set ACCEPTING-P while holding TM-LOCK, then READ-PINS-LOCK, in that
+fixed order -- the same order every caller of this function uses, and
+the order PIN-READ-EPOCH is compatible with because it only ever takes
+READ-PINS-LOCK alone (never TM-LOCK), so this can never deadlock against
+it.  Grepped every existing site that takes both locks
+(CREATE-TRANSACTION: TM-LOCK only; PIN-READ-EPOCH/UNPIN-READ-EPOCH/
+MINIMUM-READ-PIN: READ-PINS-LOCK only) and found no path that nests them
+in the opposite order.  Holding READ-PINS-LOCK across the SETF is what
+makes the flip atomic with PIN-READ-EPOCH's own check-then-register
+critical section: once this returns, no pin admitted after it can have
+missed seeing REASON (GH #170, fix round 1)."
+  (with-transaction-manager-lock (transaction-manager)
+    (with-recursive-lock-held ((read-pins-lock transaction-manager))
+      (setf (accepting-p transaction-manager) reason))))
+
+(defun %quiesce-transaction-manager (transaction-manager reason timeout)
+  "Flip TRANSACTION-MANAGER's ACCEPTING-P to REASON (a keyword) and wait,
+in short sleeps, for REAP-SAFE-FLOOR to go NIL -- no active transaction and
+no read pin left that could observe a version underneath the coming close.
+On TIMEOUT seconds elapsed with no drain: restore ACCEPTING-P to whatever
+it was PRIOR to this call (captured before the flip) and signal
+DETACH-DRAIN-TIMEOUT -- NOT hardcoded T, which would silently lift an
+already-in-force window (e.g. SHADOW-STORE's :READ-ONLY) that this call
+did not open and has no business closing (GH #170, review finding C1).
+On success return T with ACCEPTING-P left at REASON (GH #170)."
+  (let ((prior (accepting-p transaction-manager)))
+    (%set-accepting-p transaction-manager reason)
+    (let ((deadline (+ (get-internal-real-time)
+                       (round (* timeout internal-time-units-per-second)))))
+      (loop
+        (when (null (reap-safe-floor transaction-manager))
+          (return t))
+        (when (> (get-internal-real-time) deadline)
+          (%set-accepting-p transaction-manager prior)
+          (error 'detach-drain-timeout
+                 :name (graph-name (graph transaction-manager))
+                 :seconds timeout))
+        (sleep *quiesce-poll-interval*)))))
+
+(defstruct store-detachment
+  "A detached store's handle: everything REATTACH-STORE needs to reopen it
+and rejoin its system clock (GH #170)."
+  graph-name location store-id lease-start lease-end)
+
+(defun detach-store (graph &key (lease-epochs 1000000) (timeout 60))
+  "Quiesce GRAPH (no new transactions or read pins), lease it
+LEASE-EPOCHS of its system clock's epoch space, journal the handoff, and
+CLOSE-GRAPH it durably.  Returns a STORE-DETACHMENT for REATTACH-STORE.
+
+Refuses a MASTER-GRAPH/SLAVE-GRAPH/PEER-GRAPH with
+DETACH-UNSUPPORTED-GRAPH-ERROR -- v1 scope, see that condition's
+docstring (GH #170).
+
+Requires (GRAPH-SYSTEM-CLOCK GRAPH) non-NIL: detach without an image
+clock has no lease to hand over.  Propagates DETACH-DRAIN-TIMEOUT
+unchanged if the quiesce wave cannot drain in TIMEOUT seconds -- GRAPH
+is left open and accepting again (GH #170).
+
+Between a successful quiesce and the durable CLOSE-GRAPH, CLOCK-LEASE-
+EPOCHS or JOURNAL-APPEND can still fail; that span is wrapped so an
+error there restores ACCEPTING-P to its pre-quiesce state (not left
+stranded at :DETACHING) before re-signalling (GH #170, review finding
+I3)."
+  (%check-detach-supported graph 'detach-store)
+  (let ((clock (graph-system-clock graph)))
+    (unless clock
+      (error "DETACH-STORE requires GRAPH to be attached to a system ~
+clock (GRAPH-SYSTEM-CLOCK is NIL) -- detach without one has no lease to ~
+hand over."))
+    (let* ((tm (transaction-manager graph))
+           (name (graph-name graph))
+           (location (location graph))
+           (store-id (store-id graph))
+           (prior (accepting-p tm)))
+      (%quiesce-transaction-manager tm :detaching timeout)
+      (handler-case
+          (multiple-value-bind (start end)
+              (clock-lease-epochs clock lease-epochs)
+            (journal-append clock :detach
+                            :store name :lease-start start :lease-end end)
+            ;; CLOSE-GRAPH's own snapshot scans the graph via WITH-READ-PIN;
+            ;; ACCEPTING-P is already :DETACHING, so it needs the one bypass
+            ;; above -- see *QUIESCED-STORE-CLOSING-P*'s docstring.
+            (let ((*graph* graph)
+                  (*quiesced-store-closing-p* t))
+              (close-graph graph :snapshot-p t))
+            (make-store-detachment :graph-name name
+                                   :location location
+                                   :store-id store-id
+                                   :lease-start start
+                                   :lease-end end))
+        (error (c)
+          (%set-accepting-p tm prior)
+          (error c))))))
+
+(defun reattach-store (detachment &key (buffer-pool-size nil bps-p))
+  "Reopen the store DETACHMENT names at its recorded location and rejoin
+it to the image clock.  REQUIRES *SYSTEM-CLOCK* to already be bound to
+that clock in the caller's dynamic extent -- this function takes no
+clock argument (the contract fixes its lambda list), so it reads the
+ambient *SYSTEM-CLOCK* the same way MAKE-GRAPH/OPEN-GRAPH's own
+:SYSTEM-CLOCK default does.  Passes :SYSTEM-CLOCK NIL to OPEN-GRAPH
+itself (to avoid OPEN-GRAPH attaching a second time from its own
+default) and then calls ATTACH-TO-SYSTEM-CLOCK explicitly -- which
+already refuses active transactions and journals :ATTACH -- rather than
+reimplementing either.  Returns the new GRAPH (GH #170)."
+  (let* ((open-args (list (store-detachment-graph-name detachment)
+                          (namestring (store-detachment-location detachment))
+                          :system-clock nil))
+        (graph (apply #'open-graph
+                      (if bps-p
+                          (append open-args
+                                 (list :buffer-pool-size buffer-pool-size))
+                          open-args))))
+    (attach-to-system-clock graph *system-clock*)
+    graph))

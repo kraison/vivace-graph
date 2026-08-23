@@ -45,6 +45,58 @@
            #:journal-torn-position
            #:graph-system-clock
            #:attach-to-system-clock
+           ;; Detach quiescence protocol (GH #170).
+           #:accepting-p
+           #:store-not-accepting-error
+           #:store-not-accepting-name
+           #:store-not-accepting-reason
+           #:detach-drain-timeout
+           #:detach-timeout-name
+           #:detach-timeout-seconds
+           #:store-detachment
+           #:store-detachment-graph-name
+           #:store-detachment-location
+           #:store-detachment-store-id
+           #:store-detachment-lease-start
+           #:store-detachment-lease-end
+           #:detach-store
+           #:reattach-store
+           #:pin-read-epoch
+           #:unpin-read-epoch
+           #:detach-unsupported-graph-error
+           #:detach-unsupported-graph-error-graph
+           #:detach-unsupported-graph-error-operation
+           ;; Shadow generations (GH #170).
+           #:shadow-store
+           #:abandon-shadow
+           #:open-shadow-graph
+           #:discard-shadow
+           #:swap-in-shadow
+           #:swap-recovered-warning
+           #:swap-recovered-warning-original
+           #:shadow-recovery-failed
+           #:shadow-recovery-failed-original
+           #:shadow-recovery-failed-recovery
+           #:graph-shadow-p
+           #:graph-epoch-lease
+           #:epoch-lease
+           #:epoch-lease-start
+           #:epoch-lease-next
+           #:epoch-lease-end
+           #:epoch-lease-exhausted
+           #:epoch-lease-exhausted-name
+           #:epoch-lease-exhausted-end
+           ;; Recovery policy + WAL-suppressed fast path (GH #170 Task 4).
+           #:store-recovery-policy
+           #:set-store-recovery-policy
+           #:fast-load-requires-derivable
+           #:fast-load-requires-derivable-location
+           #:fast-load-requires-derivable-policy
+           #:wal-suppressed-p
+           #:recovery-policy-mismatch-warning
+           #:recovery-policy-mismatch-warning-location
+           #:recovery-policy-mismatch-warning-requested
+           #:recovery-policy-mismatch-warning-on-disk
            ;; image-level type-id registry (GH #186)
            #:type-registry
            #:open-type-registry
@@ -130,6 +182,9 @@
            #:rebuild-vector-segment-batched
            #:segment-scan
            #:segment-score-subset
+           ;; Presize a segment's capacity up front (GH #170 Task 5) -- turns
+           ;; a mid-apply VECTOR-SEGMENT-CAPACITY-EXHAUSTED into an upfront one.
+           #:presize-vector-segment
            ;; Signalled pre-durability when a commit would grow a segment past
            ;; its mmap reservation.  Exported so a caller can tell "reopen the
            ;; graph / raise the reservation and retry" apart from a genuine data

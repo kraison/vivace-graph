@@ -307,7 +307,8 @@ debugging an unexpectedly empty result, check the declaration before the data."
                                    reference-classes (peer-schema-version '(1 0))
                                    (index-backend *index-backend*)
                                    spatial-index-backend
-                                   (system-clock *system-clock*))
+                                   (system-clock *system-clock*)
+                                   recovery-policy)
   "Create a brand-new graph named NAME with its on-disk files under the
 directory LOCATION, register it (so LOOKUP-GRAPH and *GRAPH* can find it), and
 return it.  The directory is created if necessary and must not already contain
@@ -364,6 +365,12 @@ Keyword arguments:
                           store's own counter -- the pre-#168 behaviour.
                           Attaching raises the clock above this store's
                           persisted highest id.
+  :RECOVERY-POLICY       :DERIVABLE or :AUTHORED, persisted to policy.dat
+                          (GH #170); NIL (default) writes nothing, so an
+                          absent file -- STORE-RECOVERY-POLICY's :AUTHORED
+                          default -- is what a plain MAKE-GRAPH call gets.
+                          OPEN-SHADOW-GRAPH :FAST-LOAD gates on this via the
+                          shadow's copied policy.dat.
 
 GRAPH-DB:*SYSTEM-DIRECTORY* must be set before calling this: type-ids are
 assigned from the registry that lives there, so that one symbol names one id
@@ -395,6 +402,10 @@ to disk and remove it."
          (dirty-file (format nil "~A/.dirty" location)))
     (unless (probe-file path)
       (error "Unable to open graph location ~A" path))
+    ;; GH #170 Task 4: persisted once, at create, before anything else
+    ;; touches LOCATION -- SET-STORE-RECOVERY-POLICY validates the value.
+    (when recovery-policy
+      (set-store-recovery-policy path recovery-policy))
     (when buffer-pool-p
       (ensure-buffer-pool buffer-pool-size))
     (let* ((heap (create-memory
@@ -492,6 +503,13 @@ to disk and remove it."
               (applied-op-ids graph)
               (make-lhash :location (format nil "~A/applied-ops/" path)
                           :buckets 8)))
+      ;; Unlike OPEN-GRAPH, this TM does not need :OPENING (review round
+      ;; 3): MAKE-GRAPH's *GRAPHS* registration above already runs before
+      ;; this construction, same as before I4, and there is no RECOVER-
+      ;; TRANSACTIONS/rebuild step here for a racing writer to collide
+      ;; with -- a write against the still-unbound TRANSACTION-MANAGER
+      ;; slot in that window signals a loud unbound-slot error, the same
+      ;; acceptable pre-#170 behaviour (GH #170).
       (setf (transaction-manager graph)
             (make-instance 'transaction-manager
                            :graph graph))
@@ -511,6 +529,23 @@ to disk and remove it."
         (install-unique-tuple-constraints graph))
       graph)))
 
+(define-condition recovery-policy-mismatch-warning (warning)
+  ;; A named class rather than a bare STRING WARN, so a caller (or a test)
+  ;; can HANDLER-BIND on it specifically instead of on every CL:WARNING
+  ;; OPEN-GRAPH might ever signal (GH #170 Task 4, fix round 1).
+  ((location :initarg :location
+             :reader recovery-policy-mismatch-warning-location)
+   (requested :initarg :requested
+              :reader recovery-policy-mismatch-warning-requested)
+   (on-disk :initarg :on-disk
+            :reader recovery-policy-mismatch-warning-on-disk))
+  (:report (lambda (c s)
+             (format s "OPEN-GRAPH ~A: :RECOVERY-POLICY ~S disagrees with ~
+policy.dat's ~S; the file wins."
+                     (recovery-policy-mismatch-warning-location c)
+                     (recovery-policy-mismatch-warning-requested c)
+                     (recovery-policy-mismatch-warning-on-disk c)))))
+
 (defun open-graph (name location &key master-p slave-p master-host replication-port
                    replication-key package (buffer-pool-p t) (gc-heap-p t)
                    (buffer-pool-size 100000)
@@ -528,7 +563,9 @@ to disk and remove it."
                    ;; for a pre-v3 graph, the ones its migration re-derives.
                    (spatial-precision 7)
                    (spatial-max-cells +spatial-insert-max-cells+)
-                   (system-clock *system-clock*))
+                   (system-clock *system-clock*)
+                   shadow-p recovery-policy
+                   (initial-accepting-state t))
   "Open the existing graph named NAME whose files live under directory
 LOCATION, register it, and return it.  Use this to reopen a graph created
 earlier with MAKE-GRAPH; the keyword arguments mirror MAKE-GRAPH's, including
@@ -544,7 +581,38 @@ reconciled against their declarative definitions and kept as-is unless changed
 Always CLOSE-GRAPH when finished.
 
 *SYSTEM-DIRECTORY* must be set: reopening replays the schema and may assign
-ids to types added since (GH #186)."
+ids to types added since (GH #186).
+
+:SHADOW-P T opens an unregistered shadow generation (GH #170,
+OPEN-SHADOW-GRAPH): the graph is never placed in *GRAPHS*, never
+published to the open-store vector (%REGISTER-OPEN-STORE is skipped;
+STORE-ID is still interned from the registry, directly, so v8 ids
+minted here carry the live store's tag), and replication is never
+started.
+
+:RECOVERY-POLICY (GH #170) is only a HINT here, unlike MAKE-GRAPH: if
+LOCATION already carries a policy.dat, that file is authoritative --
+this keyword is ignored (a value that disagrees with the file signals
+RECOVERY-POLICY-MISMATCH-WARNING, a WARNING, but the file still wins)
+rather than silently rewritten out from under whatever wrote it.  It
+is persisted only when LOCATION is being
+created-on-open (no schema.dat yet, the same condition INIT-SCHEMA
+below branches on) -- a genuine reopen of an existing graph with no
+policy.dat leaves it absent (STORE-RECOVERY-POLICY's :AUTHORED
+default), it does not retroactively opt that graph in.
+
+:INITIAL-ACCEPTING-STATE (GH #170, review finding I4) is the state this
+call leaves the graph in once it returns -- e.g. SHADOW-STORE's reopen
+passes :READ-ONLY so the returned graph never briefly comes up fully
+writable.  The fresh TRANSACTION-MANAGER itself always starts at
+:OPENING (review round 3), not this value directly: :OPENING is what is
+in force, before the graph is registered in *GRAPHS*, for every
+rebuild/recovery step this call runs internally, refusing a racing
+external writer with STORE-NOT-ACCEPTING-ERROR reason :OPENING while
+still admitting the read pins those internal steps themselves take.
+Only once GRAPH-OPEN-P is T, at the very end, does ACCEPTING-P flip to
+INITIAL-ACCEPTING-STATE.  Defaults to T (ordinary opens end up fully
+accepting, as before)."
   (unless *system-directory*
     (error 'system-directory-required :operation 'open-graph))
   (when (and peer-role (or master-p slave-p))
@@ -608,15 +676,29 @@ ids to types added since (GH #186)."
               (open-type-index (format nil "~A/edge-index.dat" path) heap))
         ;; (MVCC: no lhash value-finalizer; read paths materialize node bytes
         ;; under a read pin -- see ENSURE-NODE-BYTES.)
-        (if (probe-file schema-file)
-            (progn
-              (setf (schema graph)
-                    (cl-store:restore schema-file))
-              ;; Locks aren't persisted; rebuild the per-class rw-locks for the
-              ;; restored types (otherwise schema-class-locks is nil and
-              ;; def-vertex/def-edge and with-*-locked-class fail -- issue #32).
-              (restore-schema-locks (schema graph)))
-            (init-schema graph))
+        (let ((creating-on-open-p (not (probe-file schema-file))))
+          (if creating-on-open-p
+              (init-schema graph)
+              (progn
+                (setf (schema graph)
+                      (cl-store:restore schema-file))
+                ;; Locks aren't persisted; rebuild the per-class rw-locks for
+                ;; the restored types (otherwise schema-class-locks is nil and
+                ;; def-vertex/def-edge and with-*-locked-class fail -- #32).
+                (restore-schema-locks (schema graph))))
+          ;; GH #170 Task 4: policy.dat is authoritative once it exists --
+          ;; a supplied :RECOVERY-POLICY that disagrees only WARNS, never
+          ;; overwrites it.  Absent, it is persisted only on the same
+          ;; creating-on-open branch MAKE-GRAPH's create path corresponds
+          ;; to; a genuine reopen with no file leaves it absent (:AUTHORED).
+          (if (probe-file (%policy-file path))
+              (let ((on-disk (store-recovery-policy path)))
+                (when (and recovery-policy (not (eq recovery-policy on-disk)))
+                  (warn 'recovery-policy-mismatch-warning
+                        :location path :requested recovery-policy
+                        :on-disk on-disk)))
+              (when (and recovery-policy creating-on-open-p)
+                (set-store-recovery-policy path recovery-policy))))
         (setf (schema-lock (schema graph)) (make-recursive-lock))
         ;; MVCC: optional override of the persisted graph-wide keep-revisions.
         (when keep-revisions
@@ -666,8 +748,35 @@ ids to types added since (GH #186)."
         (restore-vector-segments graph)
         (with-open-file (out dirty-file :direction :output)
           (format out "~S" (get-universal-time)))
-        (setf (gethash name *graphs*) graph)
-        (%register-open-store graph)
+        ;; The TM must exist BEFORE this graph is published to *GRAPHS*/
+        ;; the open-store vector below (GH #170, I4) -- but it starts at
+        ;; :OPENING, not INITIAL-ACCEPTING-STATE directly (review round
+        ;; 3): publication happens before RECOVER-TRANSACTIONS and every
+        ;; rebuild step below it, so a racing name-lookup writer could
+        ;; otherwise pin AND commit against a mid-recovery graph.
+        ;; :OPENING admits pins (every rebuild/recovery scan below runs
+        ;; under WITH-READ-PIN) but refuses new transactions with reason
+        ;; :OPENING -- RECOVER-TRANSACTIONS itself creates none: it
+        ;; applies RECOVERY-TRANSACTION instances directly via APPLY-
+        ;; TRANSACTION, bypassing CREATE-TRANSACTION entirely, and its
+        ;; CALL-WITH-TRANSACTION-LOCK method is a no-op ("No locking
+        ;; during recovery").  The flip to INITIAL-ACCEPTING-STATE runs
+        ;; at the very end of this function, once GRAPH-OPEN-P is T.
+        (setf (transaction-manager graph)
+              (make-instance 'transaction-manager
+                             :graph graph
+                             :accepting-p :opening))
+        (setf (graph-shadow-p graph) shadow-p)
+        (if shadow-p
+            ;; Unregistered: STORE-ID still comes from the registry (v8 ids
+            ;; minted here must carry the live store's tag) but never
+            ;; publishes to the open-store vector -- RESOLVE-NODE-GRAPH must
+            ;; keep resolving that tag to the LIVE graph (GH #170).
+            (when *system-directory*
+              (setf (store-id graph) (store-registry-intern name)))
+            (progn
+              (setf (gethash name *graphs*) graph)
+              (%register-open-store graph)))
         (when gc-heap-p
           (gc-heap graph))
         ;; A non-empty WAL tail means this open is a CRASH RECOVERY: the .txn files
@@ -675,6 +784,41 @@ ids to types added since (GH #186)."
         ;; applied.  Capture that BEFORE the replay marks/consumes them.
         (let ((crash-recovery-p (and (recovery-transaction-files graph) t)))
           (recover-transactions graph)
+          ;; RE-SEED: the TM was constructed (GH #170, I4) BEFORE this
+          ;; replay ran, so its TX-ID-COUNTER was seeded from the
+          ;; PRE-recovery highest-transaction-id.  Each replayed write
+          ;; goes through APPLY-TRANSACTION, which persists a higher
+          ;; watermark to disk for every recovered .txn file -- but never
+          ;; touches TX-ID-COUNTER itself (recovery ids come from the
+          ;; .txn filename, not the counter).  Without this, the first
+          ;; post-open transaction mints an id from the stale counter,
+          ;; colliding with an id a replayed transaction already used.
+          ;; Reproduces TRANSACTION-MANAGER's own INITIALIZE-INSTANCE
+          ;; :AFTER formula verbatim; safe mid-open, no concurrency yet
+          ;; (GH #170, review round 2).
+          ;;
+          ;; The SAME :AFTER method also derives REPLICATION-LOG-FILE
+          ;; from that (then pre-recovery) counter value -- re-seeding
+          ;; TX-ID-COUNTER alone left the log file's own NAME advertising
+          ;; the stale, lower minimum id it would actually contain, a
+          ;; range gap for APPLICABLE-REPLICATION-LOGS (transaction-log-
+          ;; streaming.lisp derives ranges from filenames) on every
+          ;; master/peer crash-recovery open.  Re-derive it too, from the
+          ;; now-current counter, with the exact same expression (GH
+          ;; #170, review round 3).
+          (when crash-recovery-p
+            (let ((tm (transaction-manager graph)))
+              (setf (tx-id-counter tm)
+                    (1+ (max (load-highest-transaction-id graph)
+                             (if (peer-graph-p graph)
+                                 (load-peer-pull-cursor graph)
+                                 0))))
+              (setf (replication-log-file tm)
+                    (make-pathname :name (format nil "replication-~16,'0X"
+                                                 (tx-id-counter tm))
+                                   :type "log"
+                                   :defaults
+                                   (persistent-transaction-directory graph)))))
           ;; The spatial index restored above came from a sidecar written at the
           ;; last CLEAN close -- it predates the writes just replayed, and its
           ;; histogram cannot be repaired by replay, because replay's idempotent
@@ -729,15 +873,20 @@ ids to types added since (GH #186)."
                 (if (probe-file (format nil "~Astruct.dat" loc))
                     (open-lhash loc)
                     (make-lhash :location loc :buckets 8)))))
-      (setf (transaction-manager graph)
-            (make-instance 'transaction-manager
-                           :graph graph))
+      ;; TRANSACTION-MANAGER is already installed -- see above, before the
+      ;; *GRAPHS* registration (GH #170, I4).
       (when system-clock
         (attach-to-system-clock graph system-clock))
       (ensure-directories-exist (persistent-transaction-directory graph))
       (init-replication-log graph)
-      (start-replication graph :package package)
+      (unless shadow-p
+        (start-replication graph :package package))
       (setf (graph-open-p graph) t)
+      ;; Flip from :OPENING to the caller's requested state now that
+      ;; GRAPH-OPEN-P is T and every rebuild/recovery step above has run
+      ;; -- the mid-open window closes here, last, not at construction
+      ;; (GH #170, review round 3).
+      (%set-accepting-p (transaction-manager graph) initial-accepting-state)
       graph)))
 
 (defmethod close-graph ((graph graph) &key (snapshot-p t))
@@ -755,7 +904,11 @@ a snapshot failure does NOT abort the close (GH #120)."
   (let ((snapshot-problem nil))
     (when (graph-open-p graph)
       (stop-replication graph)
-      (remhash (graph-name graph) *graphs*)
+      ;; Guard by identity, not name alone: a shadow (GH #170) shares its
+      ;; live store's GRAPH-NAME but was never the one *GRAPHS* maps that
+      ;; name to, so closing it must not evict the live graph's entry.
+      (when (eq graph (gethash (graph-name graph) *graphs*))
+        (remhash (graph-name graph) *graphs*))
       (%unregister-open-store graph)
       ;; Unique constraints (#6): persist the on-disk unique skip-lists' roots
       ;; while the heap is still open, so OPEN can reopen them without a scan.

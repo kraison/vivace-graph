@@ -17,7 +17,7 @@ This is an ASDF system loaded through Quicklisp; there is no separate build step
 (in-package :graph-db)
 ```
 
-Dependencies (bordeaux-threads, alexandria, cffi, osicat, uuid, cl-store, hunchentoot, ningle, clack, log4cl, usocket, etc.) must be resolvable by Quicklisp/ASDF. `osicat` and `cffi` mean a working C toolchain is required (the mmap layer binds `mmap`/`munmap`).
+Dependencies (bordeaux-threads, alexandria, cffi, uuid, cl-store, hunchentoot, ningle, clack, log4cl, usocket, etc.) must be resolvable by Quicklisp/ASDF. `cffi` means a working C toolchain is required (the mmap layer binds `mmap`/`munmap`). `posix.lisp` hand-rolls the POSIX calls the embeddable core needs via raw CFFI, replacing an earlier `osicat` dependency there — `osicat` ships a C grovel/wrapper that complicated cross-compilation, so it survives only in the ad-hoc `test-lhash.lisp` REPL exercise, not the loaded system.
 
 **Component load order matters.** `graph-db.asd` encodes a strict dependency chain from the storage primitives up to the query/REST layers; if you add a file, place it in the right position and declare its `:depends-on`.
 
@@ -69,7 +69,7 @@ Tests write scratch databases under `/var/tmp/`; clean those up between runs if 
 
 The system is layered. Lower layers know nothing of graph semantics; higher layers build on them.
 
-1. **Storage primitives** — `mmap.lisp` (CFFI/osicat memory-mapped files, with SEGV-retry `:around` methods on `set-byte`/`get-byte`), `allocator.lisp` (binned heap allocator over an mmap'd region), `buffer-pool.lisp`, `serialize.lisp` (custom binary (de)serialization; type tag bytes are defined in `globals.lisp`), `pcons.lisp`/`pmem.lisp` (persistent cons cells).
+1. **Storage primitives** — `mmap.lisp` (CFFI memory-mapped files, with SEGV-retry `:around` methods on `set-byte`/`get-byte`), `posix.lisp` (hand-rolled CFFI bindings for the POSIX calls the embeddable core needs, replacing `osicat` there), `allocator.lisp` (binned heap allocator over an mmap'd region), `buffer-pool.lisp`, `serialize.lisp` (custom binary (de)serialization; type tag bytes are defined in `globals.lisp`), `pcons.lisp`/`pmem.lisp` (persistent cons cells).
 2. **On-disk collections** — `linear-hash.lisp` (linear hashing, the main key→offset table), `skip-list.lisp` + `skip-list-cursors.lisp`, `index-list.lisp`.
 3. **Graph indexes** — `ve-index.lisp` (vertex↔edge adjacency, in/out), `vev-index.lisp` (vertex-edge-vertex), `type-index.lisp` (nodes by type). A graph keeps separate `ve-index-in`, `ve-index-out`, and `vev-index` instances.
 4. **Graph model** — `graph-class.lisp`/`graph.lisp` (the `graph`/`master-graph`/`slave-graph` classes and `make-graph`/`open-graph`/`close-graph`), `schema.lisp` (node-type registry, per-class rw-locks), `node-class.lisp` + `primitive-node.lisp` + `vertex.lisp` + `edge.lisp` (the MOP-based persistent object model), `views.lisp` (map/map-reduce indexes), `gc.lisp`.

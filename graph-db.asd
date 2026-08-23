@@ -105,6 +105,11 @@
                (:file "transactions" :depends-on ("graph-class" "type-index" "vev-index" "ve-index" "edge" "vertex" "gc" "spatial-index" "posix" "system-clock"))
                (:file "transaction-restore" :depends-on ("transactions"))
                (:file "transaction-log-streaming" :depends-on ("transactions"))
+               ;; Shadow generations (GH #170): quiesce/copy/reopen a store
+               ;; (GRAPH) under a leased epoch range (TRANSACTIONS).  Placed
+               ;; just before BACKUP, which it does not depend on -- it needs
+               ;; only the graph and transaction layers.
+               (:file "shadow-store" :depends-on ("graph" "transactions"))
                (:file "backup" :depends-on ("edge" "type-seeding"))
                (:file "replication" :depends-on ("backup"))
                (:file "txn-log" :depends-on ("replication"))
@@ -531,6 +536,7 @@ cl-temporal-extent."
                (:file "keyword-alias-tests")      ; GH #190
                (:file "store-registry-tests")     ; GH #169
                (:file "store-resolver-tests")     ; GH #169
+               (:file "detach-tests")             ; GH #170
                (:file "posix-tests")              ; GH #182
                (:file "rest-tests")
                (:file "rest-http-tests")
