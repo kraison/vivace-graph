@@ -368,13 +368,19 @@ clock right now."
 
 (defun %retire-live-completed-p (clock retired)
   "True when RETIRED (a :RETIRE-LIVE record's :RETIRED path) has a
-paired completion: a later :RESTORE naming it as :RETIRED-LIVE, or a
-:RETIRE-LIVE-ABORTED naming it as :RETIRED after a rollback.  A
-:RETIRE-LIVE with NEITHER is exactly RESTORE-SYSTEM's own rename-pair
-crash window, the same shape SWAP-IN-SHADOW's crash leaves but one
-step later (GH #171, spec R6)."
+paired completion: a later, non-:FAILED :RESTORE naming it as
+:RETIRED-LIVE, or a :RETIRE-LIVE-ABORTED naming it as :RETIRED after a
+rollback.  A :RESTORE :FAILED T is excluded even though it names
+:RETIRED-LIVE: %REBUILD-ONE-STORE journals it when MAKE-GRAPH itself
+never got far enough to create anything at the live location, so
+nothing is actually there -- the retired directory is exactly as
+stranded as if no :RESTORE record existed at all.  A :RETIRE-LIVE with
+neither a completing :RESTORE nor a rollback is RESTORE-SYSTEM's own
+rename-pair crash window, the same shape SWAP-IN-SHADOW's crash leaves
+but one step later (GH #171, spec R6, review fix round 1)."
   (some (lambda (r)
           (or (and (eq (getf r :kind) :restore)
+                   (not (getf r :failed))
                    (getf r :retired-live)
                    (string= (%trimmed-namestring (getf r :retired-live))
                             retired))

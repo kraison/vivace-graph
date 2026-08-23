@@ -940,6 +940,41 @@ to NOW is :UNCHANGED, not a refusal and not a phantom rewind."
                           :restore-store-1)))
         (is (eq :unchanged (getf e :action)))))))
 
+(test restore-refuses-when-a-failed-rebuild-left-the-live-directory-gone
+  "Review fix round 1: a :RETIRE-LIVE followed by a :RESTORE :FAILED T
+record naming that same path as :RETIRED-LIVE -- %REBUILD-ONE-STORE's
+own journal shape when MAKE-GRAPH itself never got far enough to
+create anything live.  The :RESTORE record's mere presence must NOT
+make %RETIRE-LIVE-COMPLETED-P call this settled: the live directory is
+genuinely gone, so the plan must still refuse :INTERRUPTED-SWAP (not
+:NOT-OPEN) and the repair tool must still find something to fix."
+  (with-restore-system (g clock sys)
+    sys
+    (%rs-write g)
+    (let* ((live (graph-db::%trimmed-namestring (graph-db::location g)))
+           (now (graph-db:clock-current-epoch clock))
+           (retired (format nil "~A-retired-~D" live (+ now 50))))
+      (let ((graph-db:*graph* g)) (close-graph g :snapshot-p nil))
+      (graph-db::%posix-rename live retired)
+      (journal-append clock :retire-live :store :restore-store-1
+                       :retired retired)
+      (journal-append clock :restore :store :restore-store-1
+                       :mode :rebuilt :failed t :retired-live retired)
+      (let ((c (handler-case
+                   (progn (graph-db:plan-system-restore clock now) nil)
+                 (graph-db:restore-refused-error (c) c))))
+        (is-true c)
+        (when c
+          (is (equal '((:restore-store-1 . :interrupted-swap))
+                     (graph-db:restore-refused-reasons c)))))
+      (is (eq :repaired (graph-db:repair-interrupted-swap
+                         clock :restore-store-1 live)))
+      (is-true (probe-file (uiop:ensure-directory-pathname live)))
+      (is-false (probe-file (uiop:ensure-directory-pathname retired)))
+      (setq g (open-graph :restore-store-1 (concatenate 'string live "/")
+                          :system-clock clock))
+      (is (= 1 (%rs-count g))))))
+
 (test dangling-into-is-scoped-to-the-clock-and-guards-a-nil-tag
   "%DANGLING-INTO's two guards (C2, M3), unit-tested: a store attached to
 a DIFFERENT clock holding an edge into store A is invisible to a scan
