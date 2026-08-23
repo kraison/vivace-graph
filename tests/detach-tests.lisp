@@ -360,6 +360,91 @@ the out-of-process survival requirement (GH #170 comment)."
         (let ((graph-db:*graph* g2))
           (ignore-errors (close-graph g2 :snapshot-p nil)))))))
 
+;;; Vector-segment presize (GH #170 Task 5).
+;;;
+;;; A vertex on the DETACH-STORE-1 schema (same graph name WITH-CLOCKED-STORE
+;;; uses everywhere else in this file) carrying one :VECTOR-INDEX slot, so
+;;; OPEN-SHADOW-GRAPH's :EXPECTED-VECTORS wiring has a real segment to
+;;; presize.  Declared once at load time, like SI-DOC in
+;;; segment-integration-tests.lisp.
+(def-vertex ds-vec-doc ()
+  ((embedding :vector-index t))
+  :detach-store-1)
+
+(defun %ds-vec (dim base)
+  (let ((v (make-array dim :element-type 'single-float)))
+    (dotimes (i dim v)
+      (setf (aref v i) (coerce (+ base (* 0.01 i)) 'single-float)))))
+
+(test open-shadow-graph-expected-vectors-presizes-the-segment
+  "OPEN-SHADOW-GRAPH :EXPECTED-VECTORS presizes every vector segment the
+shadow's graph object carries: capacity is already >= the requested N right
+after open, and a subsequent burst of vector-bearing writes on the shadow
+does not grow the segment again.  Exercises the wiring end to end: a live
+write creates the segment, SHADOW-STORE copies its file, and RESTORE-VECTOR-
+SEGMENTS (inside OPEN-GRAPH, before :EXPECTED-VECTORS runs) is what
+populates VECTOR-SEGMENTS for this hook to iterate."
+  (with-clocked-store (g clock sys)
+    sys
+    (with-transaction ((graph-db::transaction-manager g))
+      (make-ds-vec-doc :embedding (%ds-vec 8 1.0) :graph g))
+    (multiple-value-bind (shadow-location g2) (graph-db:shadow-store g)
+      (unwind-protect
+           (multiple-value-bind (start end)
+               (graph-db:clock-lease-epochs clock 10000)
+             (let ((sg (graph-db:open-shadow-graph
+                        shadow-location :detach-store-1
+                        :lease (cons start end)
+                        :expected-vectors 10000)))
+               (unwind-protect
+                    (let ((seg (gethash (cons 'ds-vec-doc 'embedding)
+                                        (graph-db::vector-segments sg))))
+                      (is (not (null seg))
+                          "the ds-vec-doc/embedding segment was not carried ~
+                           into the open shadow")
+                      (is (>= (graph-db::segment-capacity seg) 10000))
+                      (let ((cap-before (graph-db::segment-capacity seg)))
+                        (with-transaction ((graph-db::transaction-manager sg))
+                          (dotimes (i 500)
+                            (make-ds-vec-doc
+                             :embedding (%ds-vec 8 (float i 1.0)) :graph sg)))
+                        (is (= cap-before (graph-db::segment-capacity seg))
+                            "a burst within the presized headroom must not ~
+                             grow the shadow's segment again (before ~D, ~
+                             after ~D)"
+                            cap-before (graph-db::segment-capacity seg))))
+                 (let ((graph-db:*graph* sg))
+                   (ignore-errors (close-graph sg :snapshot-p nil))))))
+        (let ((graph-db:*graph* g2))
+          (ignore-errors (close-graph g2 :snapshot-p nil)))))))
+
+(test open-shadow-graph-expected-vectors-is-a-no-op-with-no-segments
+  "A shadow whose graph declares :VECTOR-INDEX nowhere used (only :GENERIC
+nodes) has an EMPTY vector-segments table.  :EXPECTED-VECTORS must be a
+clean no-op there, not an error -- OPEN-SHADOW-GRAPH must still return
+normally with a usable graph."
+  (with-clocked-store (g clock sys)
+    sys
+    (with-transaction ((graph-db::transaction-manager g))
+      (graph-db:make-vertex :generic nil :graph g))
+    (multiple-value-bind (shadow-location g2) (graph-db:shadow-store g)
+      (unwind-protect
+           (multiple-value-bind (start end)
+               (graph-db:clock-lease-epochs clock 1000)
+             (let ((sg (graph-db:open-shadow-graph
+                        shadow-location :detach-store-1
+                        :lease (cons start end)
+                        :expected-vectors 10000)))
+               (unwind-protect
+                    (progn
+                      (is (= 0 (hash-table-count (graph-db::vector-segments sg))))
+                      (is (= 1 (length (graph-db:map-vertices
+                                        #'identity sg :collect-p t)))))
+                 (let ((graph-db:*graph* sg))
+                   (ignore-errors (close-graph sg :snapshot-p nil))))))
+        (let ((graph-db:*graph* g2))
+          (ignore-errors (close-graph g2 :snapshot-p nil)))))))
+
 ;;; Swap (GH #170 Task 3).
 
 (defun %directory-file-hashes (dir)

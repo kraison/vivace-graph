@@ -176,6 +176,9 @@
            #:rebuild-vector-segment-batched
            #:segment-scan
            #:segment-score-subset
+           ;; Presize a segment's capacity up front (GH #170 Task 5) -- turns
+           ;; a mid-apply VECTOR-SEGMENT-CAPACITY-EXHAUSTED into an upfront one.
+           #:presize-vector-segment
            ;; Signalled pre-durability when a commit would grow a segment past
            ;; its mmap reservation.  Exported so a caller can tell "reopen the
            ;; graph / raise the reservation and retry" apart from a genuine data

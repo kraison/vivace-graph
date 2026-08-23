@@ -311,12 +311,18 @@ that copy is the gate input, not a fresh read of the live store).
 :AUTHORED (including the no-policy-file default) signals
 FAST-LOAD-REQUIRES-DERIVABLE instead of silently keeping the WAL.
 
-EXPECTED-VECTORS is a Task 5 hook: accepted here, but using it signals
-a clear \"arrives in a later task\" error rather than silently doing
-nothing."
-  (when expected-vectors
-    (error "OPEN-SHADOW-GRAPH :EXPECTED-VECTORS is a Task 5 hook and is ~
-not implemented yet (GH #170)."))
+EXPECTED-VECTORS (GH #170 Task 5), when given, presizes every vector
+segment the shadow's graph object carries -- PRESIZE-VECTOR-SEGMENT on
+each value of (VECTOR-SEGMENTS GRAPH), which OPEN-GRAPH has already
+populated (RESTORE-VECTOR-SEGMENTS runs inside it, before this function
+gets control) by opening or rebuilding whatever segment files the copy
+carries.  A shadow whose graph declares no :VECTOR-INDEX slot, or one
+whose owners have no live nodes yet, has an EMPTY vector-segments table
+-- :EXPECTED-VECTORS is then a clean no-op, not an error: there is
+nothing to presize, which is not a failure of the hook.  Any allocation
+failure inside PRESIZE-VECTOR-SEGMENT (VECTOR-SEGMENT-CAPACITY-
+EXHAUSTED) propagates unchanged, before OPEN-SHADOW-GRAPH sets up the
+epoch lease below."
   (when fast-load
     (let ((policy (store-recovery-policy shadow-location)))
       (unless (eq policy :derivable)
@@ -333,6 +339,15 @@ not implemented yet (GH #170)."))
                             open-args))))
       (when fast-load
         (setf (wal-suppressed-p graph) t))
+      ;; Presize whatever segments this shadow actually carries (GH #170 Task
+      ;; 5).  An empty VECTOR-SEGMENTS table (no :VECTOR-INDEX owner has data
+      ;; yet) makes this loop a no-op, by design -- see the docstring.
+      (when expected-vectors
+        (check-type expected-vectors (integer 0))
+        (maphash (lambda (key segment)
+                   (declare (ignore key))
+                   (presize-vector-segment segment expected-vectors))
+                 (vector-segments graph)))
       (let* ((persisted (and (null lease) (%read-lease location)))
              (start (if lease (car lease) (getf persisted :lease-start)))
              (end (if lease (cdr lease) (getf persisted :lease-end))))

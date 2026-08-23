@@ -1310,6 +1310,82 @@ must fail (EBADF); succeeding would mean MMAP-FILE leaked it."
       (setf (fdefinition 'truename) orig-truename)
       (ignore-errors (delete-file path)))))
 
+;;; ---------------------------------------------------------------------------
+;;; PRESIZE-VECTOR-SEGMENT (GH #170 Task 5): turn a mid-apply capacity failure
+;;; into an upfront one.
+;;; ---------------------------------------------------------------------------
+
+(test presize-grows-once-then-a-burst-does-not-grow-again
+  "PRESIZE-VECTOR-SEGMENT to N gives capacity >= N up front; a subsequent
+burst of SEGMENT-PUTs that stays within that headroom triggers NO further
+growth.  Ablation: a no-op PRESIZE-VECTOR-SEGMENT would leave capacity at the
+tiny initial value, and the burst below would grow the segment repeatedly --
+this assertion is exactly what would then fail."
+  (let ((path (%seg-path)))
+    (unwind-protect
+         (let ((s (create-vector-segment path 32 :initial-capacity 8)))
+           (unwind-protect
+                (progn
+                  (graph-db:presize-vector-segment s 10000)
+                  (is (>= (segment-capacity s) 10000))
+                  (let ((cap-before (segment-capacity s)))
+                    (dotimes (i 5000)
+                      (segment-put s (%id i) (%vec 32 (float i 1.0))))
+                    (is (= cap-before (segment-capacity s))
+                        "a burst within the presized headroom must not grow ~
+                         the segment again (before ~D, after ~D)"
+                        cap-before (segment-capacity s))))
+             (close-vector-segment s)))
+      (ignore-errors (delete-file path)))))
+
+(test presize-is-a-no-op-when-already-big-enough
+  "PRESIZE-VECTOR-SEGMENT to N <= the current capacity changes nothing."
+  (let ((path (%seg-path)))
+    (unwind-protect
+         (let ((s (create-vector-segment path 32 :initial-capacity 64)))
+           (unwind-protect
+                (progn
+                  (graph-db:presize-vector-segment s 10)
+                  (is (= 64 (segment-capacity s)))
+                  (graph-db:presize-vector-segment s 64)
+                  (is (= 64 (segment-capacity s))))
+             (close-vector-segment s)))
+      (ignore-errors (delete-file path)))))
+
+(test presize-failure-signals-before-writing-anything
+  "A presize that cannot be satisfied signals VECTOR-SEGMENT-CAPACITY-
+EXHAUSTED -- the same condition %SEG-GROW always signals on reservation
+failure, surfaced unchanged -- and leaves the segment exactly as it was:
+capacity and live-count unchanged, still usable afterward.
+
+SIMULATION NOTE: the brief's suggested \"an absurd N\" is not reliably
+simulable here -- %SEG-GROW's doubling+relocate loop does O(capacity) work
+per doubling (it memcpys the whole vector block), so an N large enough to
+exhaust real reservation would first spend unbounded time growing toward it.
+Substituted the SAME deterministic technique
+SEGMENT-RELOCATION-CAN-BE-SWITCHED-OFF already uses two tests up: a tiny
+reservation (WITH-TINY-SEGMENT-RESERVATION) with both growth mechanisms
+switched off, so the very first doubling this presize needs has nowhere to
+go and %SEG-ENSURE-RESERVATION signals for real."
+  (with-adjacent-extension-disabled
+    (let ((path (%seg-path)))
+      (unwind-protect
+           (let ((s (with-tiny-segment-reservation
+                      (create-vector-segment path 64 :initial-capacity 8))))
+             (unwind-protect
+                  (let ((graph-db::*segment-relocate-on-exhaustion* nil))
+                    (signals graph-db::vector-segment-capacity-exhausted
+                      (graph-db:presize-vector-segment s 9))
+                    (is (= 8 (segment-capacity s))
+                        "a failed presize must not have changed capacity")
+                    (is (= 0 (segment-live-count s))
+                        "a failed presize must not have written anything")
+                    ;; The segment must still be fully usable afterward.
+                    (segment-put s (%id 0) (%vec 64 1.0))
+                    (is (every #'= (%vec 64 1.0) (segment-get s (%id 0)))))
+               (close-vector-segment s)))
+        (ignore-errors (delete-file path))))))
+
 
 
 
