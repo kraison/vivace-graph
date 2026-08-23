@@ -103,6 +103,8 @@
            #:generation-store #:generation-location #:generation-retired
            #:generation-swap-epoch #:generation-journaled-p
            #:generation-present-p #:generation-policy
+           #:prune-retired-generations #:retention-required-error
+           #:retention-required-generations
            ;; image-level type-id registry (GH #186)
            #:type-registry
            #:open-type-registry

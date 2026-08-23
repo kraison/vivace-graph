@@ -125,3 +125,75 @@ the journal alone lists nothing."
         (is (= 1 (length gens)))
         (is-false (graph-db:generation-present-p (first gens)))
         (is-true (graph-db:generation-journaled-p (first gens)))))))
+
+(defun %rs-gen-epochs (clock)
+  (mapcar #'graph-db:generation-swap-epoch
+          (graph-db:retired-generations clock)))
+
+(test prune-deletes-generations-at-or-below-the-floor
+  "Two swaps; floor = first swap's epoch: the first generation goes, the
+second stays; a :RETIRE record names the deleted path."
+  (with-restore-system (g clock sys)
+    sys
+    (%rs-write g)
+    (multiple-value-bind (ng r1) (%rs-swap g clock)
+      (setq g ng)
+      (multiple-value-bind (ng2 r2) (%rs-swap g clock)
+        (setq g ng2)
+        (destructuring-bind (e1 e2) (%rs-gen-epochs clock)
+          (let ((gone (graph-db:prune-retired-generations clock e1)))
+            (is (= 1 (length gone)))
+            (is (= e1 (graph-db:generation-swap-epoch (first gone))))
+            (is-false (probe-file (uiop:ensure-directory-pathname r1)))
+            (is-true (probe-file (uiop:ensure-directory-pathname r2)))
+            (is (equal (list e2) (%rs-gen-epochs clock)))
+            (let ((retire (find :retire (journal-records clock)
+                                :key (lambda (r) (getf r :kind)))))
+              (is (string= (string-right-trim "/" r1)
+                           (getf retire :retired)))
+              (is (= e1 (getf retire :swap-epoch))))))))))
+
+(test prune-refuses-an-authored-generation-inside-the-window
+  "Floor below the swap epoch on an :AUTHORED store: RETENTION-REQUIRED-
+ERROR naming the generation, directory untouched.  Ablation: no guard
+deletes the only copy of authored data."
+  (with-restore-system (g clock sys)
+    sys
+    (%rs-write g)
+    (multiple-value-bind (ng r1) (%rs-swap g clock)
+      (setq g ng)
+      (let* ((e1 (first (%rs-gen-epochs clock)))
+             (c (handler-case
+                    (progn (graph-db:prune-retired-generations clock (1- e1))
+                           nil)
+                  (graph-db:retention-required-error (c) c))))
+        (is-true c)
+        (when c
+          (is (= 1 (length (graph-db:retention-required-generations c)))))
+        (is-true (probe-file (uiop:ensure-directory-pathname r1)))))))
+
+(test prune-deletes-a-derivable-generation-only-when-told
+  (with-restore-system (g clock sys :policy :derivable)
+    sys
+    (%rs-write g)
+    (multiple-value-bind (ng r1) (%rs-swap g clock)
+      (setq g ng)
+      (let ((e1 (first (%rs-gen-epochs clock))))
+        (is (null (graph-db:prune-retired-generations clock (1- e1))))
+        (is-true (probe-file (uiop:ensure-directory-pathname r1)))
+        (is (= 1 (length (graph-db:prune-retired-generations
+                          clock (1- e1) :discard-derivable t))))
+        (is-false (probe-file (uiop:ensure-directory-pathname r1)))))))
+
+(test prune-dry-run-deletes-nothing
+  (with-restore-system (g clock sys)
+    sys
+    (%rs-write g)
+    (multiple-value-bind (ng r1) (%rs-swap g clock)
+      (setq g ng)
+      (let ((e1 (first (%rs-gen-epochs clock))))
+        (is (= 1 (length (graph-db:prune-retired-generations
+                          clock e1 :dry-run t))))
+        (is-true (probe-file (uiop:ensure-directory-pathname r1)))
+        (is-false (find :retire (journal-records clock)
+                        :key (lambda (r) (getf r :kind))))))))
