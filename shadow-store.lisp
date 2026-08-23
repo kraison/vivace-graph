@@ -553,8 +553,7 @@ FAILED, carrying both conditions.
 
 A failure BETWEEN the two renames is NOT recovered here: the live data
 sits at the retired path and the live location may be missing or
-half-replaced; manual recovery is required.  That crash window is GH
-#171's territory.
+half-replaced; manual recovery is REPAIR-INTERRUPTED-SWAP (GH #171).
 
 Refuses a MASTER-GRAPH/SLAVE-GRAPH/PEER-GRAPH with
 DETACH-UNSUPPORTED-GRAPH-ERROR -- v1 scope, see that condition's

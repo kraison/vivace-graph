@@ -881,6 +881,65 @@ reader the store is an exact instant when it is a rebuild."
                 (is (null (getf eb :exact)))
                 (is (eq :restore-store-1 (getf eb :cascade-from)))))))))))
 
+;;; Task 5 (GH #171): repair-interrupted-swap and the restore pre-check.
+
+(test restore-refuses-while-a-swap-is-interrupted
+  "Construct the between-renames layout by hand: live renamed away,
+nothing at the live location, and no journal record at all -- the
+shape a hard crash inside SWAP-IN-SHADOW's own rename pair leaves,
+since it journals nothing until AFTER both renames land.  The plan
+refuses with :INTERRUPTED-SWAP; the repair tool renames the stranded
+directory back, returns :REPAIRED, journals :SWAP-ABORTED, and is
+idempotent (:NOTHING-TO-DO on a second call)."
+  (with-restore-system (g clock sys)
+    sys
+    (%rs-write g)
+    (let* ((live (graph-db::%trimmed-namestring (graph-db::location g)))
+           (now (graph-db:clock-current-epoch clock))
+           (stranded (format nil "~A-retired-~D" live (+ now 50))))
+      (let ((graph-db:*graph* g)) (close-graph g :snapshot-p nil))
+      (graph-db::%posix-rename live stranded)
+      (let ((c (handler-case
+                   (progn (graph-db:plan-system-restore clock now) nil)
+                 (graph-db:restore-refused-error (c) c))))
+        (is-true c)
+        (when c
+          (is (equal '((:restore-store-1 . :interrupted-swap))
+                     (graph-db:restore-refused-reasons c)))))
+      (is (eq :repaired (graph-db:repair-interrupted-swap
+                         clock :restore-store-1 live)))
+      (is-true (probe-file (uiop:ensure-directory-pathname live)))
+      (is-false (probe-file (uiop:ensure-directory-pathname stranded)))
+      (is-true (find :swap-aborted (journal-records clock)
+                     :key (lambda (r) (getf r :kind))))
+      (is (eq :nothing-to-do (graph-db:repair-interrupted-swap
+                              clock :restore-store-1 live)))
+      (setq g (open-graph :restore-store-1 (concatenate 'string live "/")
+                          :system-clock clock))
+      (is (= 1 (%rs-count g))))))
+
+(test plan-and-retired-generations-are-sane-after-a-repair
+  "After REPAIR-INTERRUPTED-SWAP, the store is an ordinary open store
+again: RETIRED-GENERATIONS lists no generation for it (the repair
+retired nothing -- :SWAP-ABORTED names no :RETIRED path), and planning
+to NOW is :UNCHANGED, not a refusal and not a phantom rewind."
+  (with-restore-system (g clock sys)
+    sys
+    (%rs-write g)
+    (let* ((live (graph-db::%trimmed-namestring (graph-db::location g)))
+           (now (graph-db:clock-current-epoch clock))
+           (stranded (format nil "~A-retired-~D" live (+ now 50))))
+      (let ((graph-db:*graph* g)) (close-graph g :snapshot-p nil))
+      (graph-db::%posix-rename live stranded)
+      (graph-db:repair-interrupted-swap clock :restore-store-1 live)
+      (setq g (open-graph :restore-store-1 (concatenate 'string live "/")
+                          :system-clock clock))
+      (is (null (graph-db:retired-generations clock)))
+      (let ((e (%rs-entry (graph-db:plan-system-restore
+                           clock (graph-db:clock-current-epoch clock))
+                          :restore-store-1)))
+        (is (eq :unchanged (getf e :action)))))))
+
 (test dangling-into-is-scoped-to-the-clock-and-guards-a-nil-tag
   "%DANGLING-INTO's two guards (C2, M3), unit-tested: a store attached to
 a DIFFERENT clock holding an edge into store A is invisible to a scan

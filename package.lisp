@@ -110,6 +110,7 @@
            #:restore-refused-reasons #:restore-refused-epoch
            #:restore-system #:restore-inexact-warning
            #:restore-inexact-manifest #:read-restore-manifest
+           #:repair-interrupted-swap
            ;; image-level type-id registry (GH #186)
            #:type-registry
            #:open-type-registry

@@ -221,8 +221,18 @@ inside the restore window:~{ ~A~} (GH #171)."
                              (retention-required-generations c))))))
 
 (defun %retired-suffix-p (path)
-  "The deletion gate for retired generations, mirroring %SHADOW-SUFFIX-P."
-  (and (search "-retired-" (%trimmed-namestring path)) t))
+  "The deletion gate for retired generations, mirroring %SHADOW-SUFFIX-P
+(shadow-store.lisp:166-172): the LAST path component must itself end in
+-retired-<digits>, not merely contain the substring anywhere -- an
+unanchored SEARCH would also pass a live store literally named
+.../foo-retired-bar-baz/ (GH #171, deferred Task 2 minor)."
+  (let* ((name (car (last (pathname-directory
+                           (uiop:ensure-directory-pathname
+                            (%trimmed-namestring path))))))
+         (pos (and name (search "-retired-" name :from-end t))))
+    (and pos
+         (> (length name) (+ pos (length "-retired-")))
+         (every #'digit-char-p (subseq name (+ pos (length "-retired-")))))))
 
 (defun %delete-generation (clock gen)
   (uiop:delete-directory-tree
@@ -321,6 +331,108 @@ STORE/SWAP-IN-SHADOW (GH #171)."
       (progn (%check-detach-supported graph 'plan-system-restore) t)
     (detach-unsupported-graph-error () nil)))
 
+(defun %known-locations (clock)
+  "EQUAL hash LOCATION (trimmed namestring) -> STORE for every store
+CLOCK's journal or *GRAPHS* names, used by %INTERRUPTED-SWAP-P's
+pre-check so it can run even against a store that is currently closed.
+Three sources, since none alone survives every crash shape: an
+:ATTACH record's own :LOCATION (added GH #171 -- the only trace left
+when a swap-in-shadow crash lands between its two renames, before any
+:SWAP record exists); a :SWAP/:RETIRE-LIVE record's :RETIRED path,
+reversed to its live location (older journals predating :ATTACH's
+:LOCATION field); and any graph *GRAPHS* still holds open under this
+clock right now."
+  (let ((acc (make-hash-table :test 'equal)))
+    (dolist (r (journal-records clock))
+      (when (eq (getf r :kind) :attach)
+        (let ((loc (getf r :location)))
+          (when loc
+            (setf (gethash (%trimmed-namestring loc) acc) (getf r :store))))))
+    (dolist (r (%retired-directory-records clock))
+      (setf (gethash (%live-location-of-retired
+                      (%trimmed-namestring (getf r :retired)))
+                     acc)
+            (getf r :store)))
+    (maphash (lambda (name graph)
+               (when (and (typep graph 'graph)
+                          (graph-system-clock graph)
+                          (string= (%trimmed-namestring
+                                    (system-clock-location
+                                     (graph-system-clock graph)))
+                                   (%trimmed-namestring
+                                    (system-clock-location clock))))
+                 (setf (gethash (%trimmed-namestring (location graph)) acc)
+                       name)))
+             *graphs*)
+    acc))
+
+(defun %retire-live-completed-p (clock retired)
+  "True when RETIRED (a :RETIRE-LIVE record's :RETIRED path) has a
+paired completion: a later :RESTORE naming it as :RETIRED-LIVE, or a
+:RETIRE-LIVE-ABORTED naming it as :RETIRED after a rollback.  A
+:RETIRE-LIVE with NEITHER is exactly RESTORE-SYSTEM's own rename-pair
+crash window, the same shape SWAP-IN-SHADOW's crash leaves but one
+step later (GH #171, spec R6)."
+  (some (lambda (r)
+          (or (and (eq (getf r :kind) :restore)
+                   (getf r :retired-live)
+                   (string= (%trimmed-namestring (getf r :retired-live))
+                            retired))
+              (and (eq (getf r :kind) :retire-live-aborted)
+                   (string= (%trimmed-namestring (getf r :retired))
+                            retired))))
+        (journal-records clock)))
+
+(defun %interrupted-swap-p (clock location)
+  "The retired path stranded between the two renames of a completed-
+looking swap or restore attempt for LOCATION, or NIL when nothing is
+stranded.  Fires only when LOCATION has no live directory -- pruning
+never removes a live directory, and DETACH-STORE leaves one in place,
+so a missing live directory for a store the journal or *GRAPHS* still
+knows about is otherwise unexplained.
+
+A retired directory for LOCATION counts as accounted for (not
+stranded) when either: it is named by a :SWAP record (JOURNAL-APPEND
+there runs only AFTER both renames land, so a :SWAP record IS
+completion -- see %SWAP-IN-SHADOW-1); or it is named by a :RETIRE-LIVE
+record that %RETIRE-LIVE-COMPLETED-P confirms was paired with a
+:RESTORE or rolled back via :RETIRE-LIVE-ABORTED.  Anything else --
+including a directory with NO journal record at all, the shape a hard
+crash between SWAP-IN-SHADOW's renames leaves, since it journals
+nothing until after both complete -- is stranded (GH #171, spec R6)."
+  (let ((live (%trimmed-namestring location)))
+    (unless (probe-file (uiop:ensure-directory-pathname live))
+      (let ((accounted
+              (loop for r in (journal-records clock)
+                    for retired = (and (getf r :retired)
+                                       (%trimmed-namestring (getf r :retired)))
+                    when (and retired
+                              (member (getf r :kind) '(:swap :retire-live))
+                              (string= (%live-location-of-retired retired)
+                                       live)
+                              (or (eq (getf r :kind) :swap)
+                                  (%retire-live-completed-p clock retired)))
+                      collect retired)))
+        (loop for (nil . dir) in (reverse (%retired-dirs-for live))
+              unless (member dir accounted :test #'string=)
+                return dir)))))
+
+(defun repair-interrupted-swap (clock name location)
+  "Rename a stranded pre-swap/pre-restore generation back to LOCATION
+and journal :SWAP-ABORTED :STORE NAME :RESTORED-FROM the stranded path.
+Returns :REPAIRED, or :NOTHING-TO-DO when %INTERRUPTED-SWAP-P finds
+nothing to fix -- idempotent, and never touches a live directory
+(GH #171, spec R6).  :SWAP-ABORTED names no :RETIRED path of its own,
+so it retires nothing and is invisible to RETIRED-GENERATIONS and
+%PRUNED-RETIRED-PATHS -- the directory it moved is live again, not a
+generation to track."
+  (let ((stranded (%interrupted-swap-p clock location)))
+    (cond ((null stranded) :nothing-to-do)
+          (t (%posix-rename stranded (%trimmed-namestring location))
+             (journal-append clock :swap-aborted :store name
+                             :restored-from stranded)
+             :repaired))))
+
 (defun %restore-plan-entries (clock epoch rebuild)
   "One manifest entry per store CLOCK knows about, plus the refusal list
 for PLAN-SYSTEM-RESTORE to raise.  Returns (values ENTRIES REASONS).
@@ -338,6 +450,19 @@ lands in the same RESTORE-REFUSED-ERROR as every other refusal."
         (entries nil) (reasons nil))
     (dolist (g (retired-generations clock))
       (push g (gethash (generation-store g) by-store)))
+    ;; An interrupted swap wins over every other refusal for its store
+    ;; and is checked first: the store's live directory is missing, so
+    ;; without this it would otherwise fall through to :NOT-OPEN below
+    ;; -- true, but not the actionable diagnosis (GH #171, spec R6).
+    ;; %KNOWN-LOCATIONS finds the store even when it is closed, so this
+    ;; runs whether or not it ever reached BY-STORE above.
+    (maphash (lambda (loc store)
+               (when (%interrupted-swap-p clock loc)
+                 (push (cons store :interrupted-swap) reasons)
+                 (push (list :store store :action :refused
+                             :reason :interrupted-swap) entries)
+                 (remhash store by-store)))
+             (%known-locations clock))
     ;; Open clocked stores with no generations at all are :UNCHANGED.
     ;; The supported check runs on EVERY open clocked store, not only on
     ;; the ones this EPOCH plans to touch: the cascade can rebuild a
@@ -397,8 +522,10 @@ effects.  Signals RESTORE-REFUSED-ERROR listing every (STORE . REASON):
 :AUTHORED-GENERATION-MISSING, :NO-REBUILD, :NOT-OPEN (a store needing a
 rename is not open under CLOCK), :UNSUPPORTED-GRAPH (a MASTER-GRAPH/
 SLAVE-GRAPH/PEER-GRAPH target), :INEXACT (only under REQUIRE-EXACT),
-:INTERRUPTED-SWAP (Task 5).  REBUILD is the caller's (lambda (name
-graph)) loader for :DERIVABLE stores (GH #171, spec R1/R2)."
+:INTERRUPTED-SWAP (a stranded rename pair; repair with
+REPAIR-INTERRUPTED-SWAP before retrying).  REBUILD is the caller's
+(lambda (name graph)) loader for :DERIVABLE stores (GH #171, spec
+R1/R2)."
   (multiple-value-bind (entries reasons)
       (%restore-plan-entries clock epoch rebuild)
     (when require-exact
