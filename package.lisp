@@ -107,6 +107,8 @@
            #:retention-required-generations
            #:plan-system-restore #:restore-refused-error
            #:restore-refused-reasons #:restore-refused-epoch
+           #:restore-system #:restore-inexact-warning
+           #:restore-inexact-manifest #:read-restore-manifest
            ;; image-level type-id registry (GH #186)
            #:type-registry
            #:open-type-registry

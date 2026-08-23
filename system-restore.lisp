@@ -279,3 +279,183 @@ REQUIRE-EXACT), :INTERRUPTED-SWAP (Task 5).  REBUILD is the caller's
     (list :restore t :requested epoch :at (clock-current-epoch clock)
           :clock (namestring (system-clock-location clock))
           :stores entries)))
+
+;;; Execution (Task 4): rename-based generation swap per store, a
+;;; caller-supplied REBUILD callback for derivable stores, cascade via
+;;; store tags, and a readable manifest file (spec S3/S4).
+
+(define-condition restore-inexact-warning (warning)
+  ;; Spec S4: a mixed manifest is the inconsistent instant S9 exists to
+  ;; record; this makes it impossible to miss.
+  ((manifest :initarg :manifest :reader restore-inexact-manifest))
+  (:report (lambda (c s)
+             (format s "Restore to ~D is not an exact instant:~{ ~A~} ~
+(GH #171)."
+                     (getf (restore-inexact-manifest c) :requested)
+                     (loop for e in (getf (restore-inexact-manifest c)
+                                          :stores)
+                           when (or (eq (getf e :action) :rebuilt)
+                                    (and (eq (getf e :action) :rewound)
+                                         (not (getf e :exact))))
+                             collect (format nil "~A=~A" (getf e :store)
+                                             (getf e :action)))))))
+
+(defun %manifest-file (clock epoch)
+  (merge-pathnames (format nil "restore-~D.manifest" epoch)
+                   (uiop:ensure-directory-pathname
+                    (system-clock-location clock))))
+
+(defun %write-manifest (clock manifest)
+  (with-open-file (out (%manifest-file clock (getf manifest :at))
+                       :direction :output :if-exists :supersede
+                       :if-does-not-exist :create)
+    (let ((*print-readably* nil) (*print-pretty* nil))
+      (prin1 manifest out)))
+  manifest)
+
+(defun read-restore-manifest (path)
+  "PATH's manifest plist.  *READ-EVAL* NIL: data, never code (GH #171)."
+  (with-open-file (in path)
+    (let ((*read-eval* nil)) (read in))))
+
+(defun %close-quiesced (graph timeout)
+  "SWAP-IN-SHADOW's close sequence: quiesce as :RESTORING, close with
+snapshot, no writer can land in the doomed generation."
+  (%quiesce-transaction-manager (transaction-manager graph) :restoring
+                                timeout)
+  (let ((*graph* graph) (*quiesced-store-closing-p* t))
+    (close-graph graph :snapshot-p t)))
+
+(defun %restore-one-store (clock name entry timeout)
+  "Rename live -> <loc>-retired-<Enow> (:RETIRE-LIVE), retained -> live
+(:RESTORE), reopen + attach.  Commit point is the second rename, as in
+%SWAP-IN-SHADOW-1: failure before it renames back and resignals; after
+it, reopens the restored generation and warns (GH #171)."
+  (let* ((graph (lookup-graph name))
+         (live (%trimmed-namestring (location graph)))
+         (from (getf entry :from))
+         (retired (format nil "~A-retired-~D" live
+                          (clock-current-epoch clock)))
+         (done nil))
+    (%close-quiesced graph timeout)
+    (handler-case
+        (progn
+          (%posix-rename live retired)
+          (journal-append clock :retire-live :store name :retired retired)
+          (%posix-rename from live)
+          (setq done t)
+          (journal-append clock :restore :store name :from from
+                          :retired-live retired
+                          :requested-epoch (getf entry :requested)
+                          :state-at (getf entry :state-at)
+                          :exact (getf entry :exact))
+          (%reopen-and-resume name live clock t))
+      (error (original)
+        (unless done
+          (ignore-errors (%posix-rename retired live)))
+        (handler-case (%reopen-and-resume name live clock t)
+          (error (recovery)
+            (error 'shadow-recovery-failed :original original
+                                           :recovery recovery)))
+        (if done
+            (warn 'swap-recovered-warning :original original)
+            (error original))))
+    (list :retired-live retired)))
+
+(defun %rebuild-one-store (clock name rebuild timeout)
+  "Retire the live generation (:RETIRE-LIVE), MAKE-GRAPH a fresh one at
+the same location with the same policy, run REBUILD on it, journal
+:RESTORE :mode :rebuilt."
+  (let* ((graph (lookup-graph name))
+         (live (%trimmed-namestring (location graph)))
+         (policy (store-recovery-policy live))
+         (retired (format nil "~A-retired-~D" live
+                          (clock-current-epoch clock))))
+    (%close-quiesced graph timeout)
+    (%posix-rename live retired)
+    (journal-append clock :retire-live :store name :retired retired)
+    (let ((fresh (make-graph name (concatenate 'string live "/")
+                             :system-clock clock :recovery-policy policy)))
+      (funcall rebuild name fresh)
+      (journal-append clock :restore :store name :mode :rebuilt
+                      :retired-live retired)
+      (list :retired-live retired))))
+
+(defun %dangling-into (store-id exclude)
+  "((STORE-NAME . COUNT) ...) of edges in open clocked stores other than
+EXCLUDE whose FROM or TO carries STORE-ID's tag (spec R5)."
+  (let ((result nil))
+    (maphash
+     (lambda (name graph)
+       (when (and (typep graph 'graph) (graph-system-clock graph)
+                  (not (member name exclude)))
+         (let ((n 0))
+           (map-edges (lambda (e)
+                        (when (or (eql (id-store-tag (from e)) store-id)
+                                  (eql (id-store-tag (to e)) store-id))
+                          (incf n)))
+                      graph)
+           (when (> n 0) (push (cons name n) result)))))
+     *graphs*)
+    result))
+
+(defun restore-system (clock epoch &key require-exact rebuild (timeout 60))
+  "Execute PLAN-SYSTEM-RESTORE's manifest for EPOCH: every refusal fires
+before any rename.  Rewinds first, then rebuilds, then cascades: a
+:DERIVABLE store holding edges into a rebuilt store is rebuilt in turn
+(fixpoint); an :AUTHORED one is left alone and reported :DANGLING N.
+Writes <clock-dir>/restore-<Enow>.manifest and signals RESTORE-INEXACT-
+WARNING when any store is rebuilt or inexact.  Returns the manifest
+(GH #171, spec S3-S4)."
+  (let* ((manifest (plan-system-restore clock epoch
+                                        :require-exact require-exact
+                                        :rebuild rebuild))
+         (entries (getf manifest :stores))
+         (rebuilt nil))
+    ;; NOTE: (SETF (GETF entry :NEW-KEY) v) on a key ENTRIES's element
+    ;; does not already carry rebinds the local loop/FIND variable, not
+    ;; the cons ENTRIES holds -- it never mutates the manifest.  Every
+    ;; branch below therefore replaces the element positionally via
+    ;; (SETF (NTH pos entries) ...) instead (GH #171).
+    (dolist (e entries)
+      (when (eq (getf e :action) :rewound)
+        (let* ((pos (position (getf e :store) entries
+                              :key (lambda (x) (getf x :store))))
+               (extra (%restore-one-store
+                      clock (getf e :store)
+                      (list* :requested epoch e) timeout)))
+          (setf (nth pos entries)
+                (list* :retired-live (getf extra :retired-live) e)))))
+    (dolist (e entries)
+      (when (eq (getf e :action) :rebuilt)
+        (%rebuild-one-store clock (getf e :store) rebuild timeout)
+        (push (getf e :store) rebuilt)))
+    ;; Cascade to a fixpoint over derivable dependents.
+    (let ((queue (copy-list rebuilt)))
+      (loop while queue do
+        (let* ((source (pop queue))
+               (tag (store-registry-id-for source)))
+          (loop for (name . n) in (%dangling-into tag rebuilt) do
+            (let* ((pos (position name entries
+                                  :key (lambda (x) (getf x :store))))
+                   (entry (nth pos entries)))
+              (if (eq (store-recovery-policy
+                       (location (lookup-graph name)))
+                      :derivable)
+                  (progn
+                    (%rebuild-one-store clock name rebuild timeout)
+                    (push name rebuilt) (push name queue)
+                    (setf (nth pos entries)
+                          (list* :action :rebuilt :exact nil
+                                 :state-at (clock-current-epoch clock)
+                                 :cascade-from source entry)))
+                  (setf (nth pos entries)
+                        (list* :dangling n entry))))))))
+    (setf (getf manifest :at) (clock-current-epoch clock))
+    (%write-manifest clock manifest)
+    (when (some (lambda (e) (or (eq (getf e :action) :rebuilt)
+                                (and (eq (getf e :action) :rewound)
+                                     (not (getf e :exact)))))
+                entries)
+      (warn 'restore-inexact-warning :manifest manifest))
+    manifest))

@@ -25,10 +25,17 @@ SWAP-IN-SHADOW / RESTORE-SYSTEM return."
                                           :system-clock ,clock
                                           :recovery-policy ,policy)))
                       (unwind-protect (progn ,@body)
-                        (when (graph-db::graph-open-p ,g)
-                          (let ((graph-db:*graph* ,g))
-                            (ignore-errors
-                             (close-graph ,g :snapshot-p nil))))
+                        ;; Close whatever is actually registered, not the
+                        ;; stale local G -- a test that never re-SETQs G
+                        ;; after RESTORE-SYSTEM/SWAP-IN-SHADOW reopens a
+                        ;; new object under the same name, and closing the
+                        ;; old one is a no-op that leaks the store-id
+                        ;; across tests (GH #171).
+                        (let ((live (graph-db:lookup-graph :restore-store-1)))
+                          (when (and live (graph-db::graph-open-p live))
+                            (let ((graph-db:*graph* live))
+                              (ignore-errors
+                               (close-graph live :snapshot-p nil)))))
                         (collect-garbage)))
                  (close-system-clock ,clock)))))))))
 
@@ -297,6 +304,161 @@ NIL; without it, refused with reason :NO-REBUILD."
           (when c
             (is (equal '((:restore-store-1 . :no-rebuild))
                        (graph-db:restore-refused-reasons c)))))))))
+
+(test restore-puts-the-retained-generation-back-and-round-trips
+  "1 vertex, swap (+1), restore to before the swap: 1 vertex readable,
+store open and accepting; journal carries :RETIRE-LIVE then :RESTORE; the
+post-swap generation is itself retained, and a restore to NOW-1 of that
+state puts the 2-vertex generation back."
+  (with-restore-system (g clock sys)
+    sys
+    (let ((e0 (%rs-write g)))
+      (multiple-value-bind (ng r1) (%rs-swap g clock)
+        (declare (ignore r1))
+        (setq g ng)
+        (is (= 2 (%rs-count g)))
+        (let ((after-swap (graph-db:clock-current-epoch clock)))
+          (let ((m (graph-db:restore-system clock e0)))
+            (setq g (graph-db:lookup-graph :restore-store-1))
+            (is (eq :rewound (getf (%rs-entry m :restore-store-1) :action)))
+            (is (= 1 (%rs-count g)))
+            (with-transaction ((graph-db::transaction-manager g))
+              (graph-db:make-vertex :generic nil :graph g))
+            (let ((kinds (mapcar (lambda (r) (getf r :kind))
+                                 (journal-records clock))))
+              (is-true (member :retire-live kinds))
+              (is-true (member :restore kinds))
+              (is (< (position :retire-live kinds)
+                     (position :restore kinds)))))
+          ;; Round trip: the 2-vertex generation was retired, not lost.
+          (graph-db:restore-system clock after-swap)
+          (setq g (graph-db:lookup-graph :restore-store-1))
+          (is (= 2 (%rs-count g))))))))
+
+(test restore-refuses-before-any-rename
+  ":REQUIRE-EXACT on an inexact plan: nothing moved, graph still open and
+accepting, no new journal records."
+  (with-restore-system (g clock sys)
+    sys
+    (let ((t0 (%rs-write g)))
+      (%rs-write g)
+      (multiple-value-bind (ng r1) (%rs-swap g clock)
+        (setq g ng)
+        (let ((n (length (journal-records clock))))
+          (signals graph-db:restore-refused-error
+            (graph-db:restore-system clock t0 :require-exact t))
+          (is (= n (length (journal-records clock))))
+          (is-true (probe-file (uiop:ensure-directory-pathname r1)))
+          (is-true (graph-db::graph-open-p g))
+          (with-transaction ((graph-db::transaction-manager g))
+            (graph-db:make-vertex :generic nil :graph g)))))))
+
+(test restore-writes-a-readable-manifest-and-warns-when-inexact
+  (with-restore-system (g clock sys)
+    sys
+    (let ((t0 (%rs-write g)))
+      (%rs-write g)
+      (multiple-value-bind (ng r1) (%rs-swap g clock)
+        (declare (ignore r1))
+        (setq g ng)
+        (let* ((warned nil)
+               (m (handler-bind
+                      ((graph-db:restore-inexact-warning
+                         (lambda (w) (setq warned t) (muffle-warning w))))
+                    (graph-db:restore-system clock t0)))
+               (file (merge-pathnames
+                      (format nil "restore-~D.manifest" (getf m :at))
+                      (uiop:ensure-directory-pathname
+                       (graph-db::system-clock-location clock)))))
+          (is-true warned)
+          (is-true (probe-file file))
+          (is (equal m (graph-db:read-restore-manifest file))))))))
+
+(test restore-rebuilds-a-derivable-store-through-the-callback
+  "Generation pruned, :REBUILD supplied: the callback runs against a fresh
+empty graph at the live location; its writes are what the store holds
+afterwards; manifest :REBUILT."
+  (with-restore-system (g clock sys :policy :derivable)
+    sys
+    (let ((e0 (%rs-write g)))
+      (multiple-value-bind (ng r1) (%rs-swap g clock)
+        (setq g ng)
+        (uiop:delete-directory-tree (uiop:ensure-directory-pathname r1)
+                                    :validate t)
+        (let* ((seen nil)
+               (m (handler-bind
+                      ((graph-db:restore-inexact-warning #'muffle-warning))
+                    (graph-db:restore-system
+                     clock e0
+                     :rebuild (lambda (name graph)
+                                (setq seen name)
+                                (is (= 0 (%rs-count graph)))
+                                (dotimes (i 3)
+                                  (with-transaction
+                                      ((graph-db::transaction-manager graph))
+                                    (graph-db:make-vertex :generic nil
+                                                          :graph graph))))))))
+          (setq g (graph-db:lookup-graph :restore-store-1))
+          (is (eq :restore-store-1 seen))
+          (is (eq :rebuilt (getf (%rs-entry m :restore-store-1) :action)))
+          (is (= 3 (%rs-count g)))
+          (is (eq :derivable (graph-db:store-recovery-policy
+                              (graph-db::location g)))))))))
+
+(defmacro with-second-store ((g2 clock name dir-var &key (policy :derivable))
+                             &body body)
+  `(with-temp-directory (,dir-var)
+     (let ((,g2 (make-graph ,name (namestring ,dir-var)
+                            :buffer-pool-size 1000 :system-clock ,clock
+                            :recovery-policy ,policy)))
+       (unwind-protect (progn ,@body)
+         (let ((live (graph-db:lookup-graph ,name)))
+           (when (and live (graph-db::graph-open-p live))
+             (let ((graph-db:*graph* live))
+               (ignore-errors (close-graph live :snapshot-p nil)))))))))
+
+(test restore-cascades-to-a-derivable-dependent-and-reports-an-authored-one
+  "Store A (derivable) is rebuilt.  Store B (derivable) holds an edge into
+A: B is rebuilt too (callback sees both names, A first).  Store C
+(authored) holds an edge into A: untouched, manifest :DANGLING 1."
+  (with-restore-system (ga clock sys :policy :derivable)
+    sys
+    (with-second-store (gb clock :restore-store-b bdir :policy :derivable)
+      (with-second-store (gc clock :restore-store-c cdir :policy :authored)
+        (let (a-id)
+          (with-transaction ((graph-db::transaction-manager ga))
+            (setq a-id (graph-db:id (graph-db:make-vertex :generic nil
+                                                           :graph ga))))
+          (dolist (gx (list gb gc))
+            (with-transaction ((graph-db::transaction-manager gx))
+              (let ((v (graph-db:make-vertex :generic nil :graph gx)))
+                (graph-db:make-edge :generic (graph-db:id v) a-id nil nil
+                                    :graph gx))))
+          (let ((e0 (graph-db:clock-current-epoch clock)))
+            (multiple-value-bind (ng r1) (%rs-swap ga clock)
+              (setq ga ng)
+              (uiop:delete-directory-tree
+               (uiop:ensure-directory-pathname r1) :validate t)
+              (let* ((order nil)
+                     (m (handler-bind
+                            ((graph-db:restore-inexact-warning
+                               #'muffle-warning))
+                          (graph-db:restore-system
+                           clock e0
+                           :rebuild (lambda (name graph)
+                                      (declare (ignore graph))
+                                      (push name order))))))
+                (is (equal '(:restore-store-1 :restore-store-b)
+                           (reverse order)))
+                (is (eq :rebuilt (getf (%rs-entry m :restore-store-b)
+                                       :action)))
+                (is (eq :restore-store-1
+                        (getf (%rs-entry m :restore-store-b)
+                              :cascade-from)))
+                (is (eq :unchanged (getf (%rs-entry m :restore-store-c)
+                                         :action)))
+                (is (= 1 (getf (%rs-entry m :restore-store-c)
+                               :dangling)))))))))))
 
 (test plan-handles-two-swaps-by-picking-the-generation-live-at-t
   "Swap twice.  T between the swaps selects the SECOND retired
