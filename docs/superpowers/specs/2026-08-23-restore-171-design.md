@@ -89,6 +89,22 @@ count under `:dangling`. *Cost if wrong:* a scan of every open store's
 edges per rebuild; bounded by the rebuild itself, which is already a
 full load.
 
+**R2a (fix round 3) — A generation's content era is not always its own
+last live window.** Selection of "the generation live at T" runs over
+each generation's ERAS: a list of half-open `[from, to)` intervals made
+of its own live window plus, when a `:restore` record promoted a
+directory into the window this generation later closed, that directory's
+eras as well — recursively through chains of restores. Ties go to the
+matching era with the latest `from`. Without inheritance the sequence
+swap (retires r1) → restore-to-T (promotes r1, retires r2) → swap
+(retires the promoted directory as r3) leaves T's content in r3 while
+the plan for T reports `:unchanged` — the generation is still on disk
+but unreachable. Retiring also consumes epochs until the
+`<location>-retired-<E>` name is free, so two retiring events with no
+commit between them (two restores in a row, or a rewind the cascade then
+rebuilds) do not collide. *Cost if wrong:* eras are derived from the
+journal on every read, so a corrected rule needs no on-disk migration.
+
 **R6 — The interrupted-swap window is repaired by an explicit,
 idempotent tool, not inside restore.** `repair-interrupted-swap (name
 location)` handles the only shape #170 cannot: live missing (or a

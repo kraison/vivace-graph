@@ -6,7 +6,8 @@
 ;;; docs/superpowers/specs/2026-08-23-restore-171-design.md
 
 (defstruct (generation (:constructor %make-generation))
-  store location retired swap-epoch live-from journaled-p present-p policy)
+  store location retired swap-epoch live-from eras journaled-p present-p
+  policy)
 
 (define-condition swap-record-missing-warning (warning)
   ;; The #212 shape: renames landed, JOURNAL-APPEND did not.  Tolerated,
@@ -79,6 +80,44 @@ same way (GH #171)."
            (setf (gethash (%trimmed-namestring (getf r :from)) set) t)))))
     set))
 
+(defun %restore-promotions (clock)
+  "EQUAL hash STORE -> ((EPOCH . FROM-PATH) ...) ascending, one entry per
+:RESTORE record that promoted a retired directory back to live.  A
+:MODE :REBUILT restore carries no :FROM and makes no entry: its content
+is fresh, so it inherits nothing (GH #171)."
+  (let ((by-store (make-hash-table :test 'equal)))
+    (dolist (r (journal-records clock))
+      (when (and (eq (getf r :kind) :restore) (getf r :from))
+        (push (cons (getf r :epoch)
+                    (%trimmed-namestring (getf r :from)))
+              (gethash (getf r :store) by-store))))
+    (maphash (lambda (store prs)
+               (setf (gethash store by-store) (sort prs #'< :key #'car)))
+             by-store)
+    by-store))
+
+(defun %assign-generation-eras (gens promotions)
+  "Fill ERAS and LIVE-FROM for GENS -- one store, ascending SWAP-EPOCH,
+UNFILTERED.  A generation's ERAS is ((FROM . TO) ...): its own live
+window, plus, when a :RESTORE promoted a directory into the window that
+generation then closed, that directory's eras as well -- recursively
+through chains of restores.  Without inheritance a directory promoted by
+one restore and retired again by a later swap would have its original
+content era attributed to nobody (GH #171, fix round 3)."
+  (let ((by-path (make-hash-table :test 'equal))
+        (prev 0))
+    (dolist (g gens)
+      (let* ((to (generation-swap-epoch g))
+             (promo (find-if (lambda (p) (and (<= prev (car p))
+                                              (< (car p) to)))
+                             promotions))
+             (eras (cons (cons (if promo (car promo) prev) to)
+                         (and promo (gethash (cdr promo) by-path)))))
+        (setf (generation-eras g) eras
+              (generation-live-from g) (car (first (last eras)))
+              (gethash (generation-retired g) by-path) eras
+              prev to)))))
+
 (defun retired-generations (clock)
   "Every retired generation known to CLOCK's system, as GENERATION
 structs sorted by store then SWAP-EPOCH.  Filesystem is authoritative:
@@ -87,7 +126,9 @@ JOURNALED-P NIL and warned (SWAP-RECORD-MISSING-WARNING); a record
 without a directory is listed PRESENT-P NIL (GH #171, spec R4).  A
 generation PRUNE-RETIRED-GENERATIONS has deleted (:RETIRE) or a
 RESTORE-SYSTEM call has since consumed by promoting it back to live
-(:RESTORE :FROM) is omitted entirely, not merely marked absent."
+(:RESTORE :FROM) is omitted entirely, not merely marked absent -- but
+such a generation still contributes its ERAS to whichever generation
+inherited its content (see %ASSIGN-GENERATION-ERAS)."
   (let ((by-retired (make-hash-table :test 'equal))
         (locations (make-hash-table :test 'equal))
         (pruned (%pruned-retired-paths clock)))
@@ -151,20 +192,19 @@ RESTORE-SYSTEM call has since consumed by promoting it back to live
                           (and (string= sa sb)
                                (< (generation-swap-epoch a)
                                   (generation-swap-epoch b))))))))
-      ;; LIVE-FROM spans the FULL per-store event order, including a
+      ;; ERAS spans the FULL per-store event order, including a
       ;; generation a RESTORE has since consumed or PRUNE-RETIRED-
       ;; GENERATIONS has deleted -- dropping such a generation from the
       ;; returned list below must not erase what it taught its
-      ;; successor about when ITS OWN live interval began (GH #171,
-      ;; fix round 2; see %GENERATION-LIVE-AT).
-      (let ((prev-store nil) (prev-epoch nil))
-        (dolist (g all)
-          (setf (generation-live-from g)
-                (if (equal (generation-store g) prev-store)
-                    prev-epoch
-                    0))
-          (setf prev-store (generation-store g)
-                prev-epoch (generation-swap-epoch g))))
+      ;; successor about which eras that successor now covers (GH #171,
+      ;; fix rounds 2 and 3; see %GENERATION-LIVE-AT).
+      (let ((promotions (%restore-promotions clock))
+            (per-store (make-hash-table :test 'equal)))
+        (dolist (g all) (push g (gethash (generation-store g) per-store)))
+        (maphash (lambda (store gens)
+                   (%assign-generation-eras
+                    (nreverse gens) (gethash store promotions)))
+                 per-store))
       (remove-if (lambda (g) (gethash (generation-retired g) pruned))
                  all))))
 
@@ -245,18 +285,22 @@ returns what would go and touches nothing.  Each deletion journals
         0)))
 
 (defun %generation-live-at (gens epoch)
-  "Among GENS (one store), the generation whose live interval
-[LIVE-FROM, SWAP-EPOCH) contains EPOCH, or NIL when EPOCH is covered by
-the CURRENT generation instead (:UNCHANGED).  LIVE-FROM is the epoch
-the PREVIOUS retiring event for this store ended at -- 0 when there was
-none -- so this is interval containment, not just "earliest retired
-generation with SWAP-EPOCH > EPOCH": for a monotone swap chain the two
-rules agree exactly, but a RESTORE can promote an OLDER generation back
-to live, breaking monotonicity -- interval containment is what still
-gets it right (GH #171, fix round 2)."
-  (find-if (lambda (g) (and (<= (generation-live-from g) epoch)
-                            (< epoch (generation-swap-epoch g))))
-           gens))
+  "Among GENS (one store), the generation with a half-open era
+[FROM, TO) containing EPOCH, or NIL when EPOCH is covered by the
+CURRENT generation instead (:UNCHANGED).  Ties -- possible only while
+an ancestor a restore promoted is still listed -- go to the matching
+era with the LATEST FROM, i.e. the most recent directory holding that
+content.  Era containment, not merely the earliest generation whose
+SWAP-EPOCH exceeds EPOCH: those agree on a monotone swap chain, but a
+RESTORE promotes an OLDER generation back to live and a later swap
+retires it again, so a directory's content era is not always its own
+last live window (GH #171, fix rounds 2 and 3)."
+  (let ((best nil) (best-from nil))
+    (dolist (g gens best)
+      (dolist (era (generation-eras g))
+        (when (and (<= (car era) epoch) (< epoch (cdr era))
+                   (or (null best-from) (> (car era) best-from)))
+          (setq best g best-from (car era)))))))
 
 (defun %open-store-for-clock (name clock)
   "The graph registered as NAME if it is attached to CLOCK -- matched by
@@ -285,20 +329,28 @@ A store that needs a rename (:REWOUND or :REBUILT) but is not open
 under CLOCK right now is refused :NOT-OPEN -- RESTORE-SYSTEM can only
 quiesce and rename a live, attached graph, and this must be caught
 before ANY store is renamed, not partway through a multi-store restore
-(GH #171).  Likewise a MASTER-GRAPH/SLAVE-GRAPH/PEER-GRAPH target is
-refused :UNSUPPORTED-GRAPH rather than propagating
-DETACH-UNSUPPORTED-GRAPH-ERROR bare, so it lands in the same
-RESTORE-REFUSED-ERROR as every other refusal."
+(GH #171).  Likewise ANY open clocked MASTER-GRAPH/SLAVE-GRAPH/PEER-
+GRAPH is refused :UNSUPPORTED-GRAPH -- whatever this EPOCH would do to
+it -- rather than propagating DETACH-UNSUPPORTED-GRAPH-ERROR bare, so it
+lands in the same RESTORE-REFUSED-ERROR as every other refusal."
   (let ((by-store (make-hash-table :test 'equal))
+        (unsupported (make-hash-table :test 'equal))
         (entries nil) (reasons nil))
     (dolist (g (retired-generations clock))
       (push g (gethash (generation-store g) by-store)))
     ;; Open clocked stores with no generations at all are :UNCHANGED.
+    ;; The supported check runs on EVERY open clocked store, not only on
+    ;; the ones this EPOCH plans to touch: the cascade can rebuild a
+    ;; store the plan called :UNCHANGED, and that rebuild reopens it the
+    ;; same way a rewind would (GH #171).
     (maphash (lambda (name graph)
                (declare (ignore graph))
-               (when (%open-store-for-clock name clock)
-                 (unless (nth-value 1 (gethash name by-store))
-                   (setf (gethash name by-store) nil))))
+               (let ((open-graph (%open-store-for-clock name clock)))
+                 (when open-graph
+                   (unless (nth-value 1 (gethash name by-store))
+                     (setf (gethash name by-store) nil))
+                   (unless (%supported-for-restore-p open-graph)
+                     (setf (gethash name unsupported) t)))))
              *graphs*)
     (maphash
      (lambda (store gens)
@@ -306,16 +358,16 @@ RESTORE-REFUSED-ERROR as every other refusal."
               (target (%generation-live-at gens epoch))
               (open-graph (and target (%open-store-for-clock store clock))))
          (cond
+           ((gethash store unsupported)
+            (push (cons store :unsupported-graph) reasons)
+            (push (list :store store :action :refused
+                        :reason :unsupported-graph)
+                  entries))
            ((null target)
             (push (list :store store :action :unchanged) entries))
            ((null open-graph)
             (push (cons store :not-open) reasons)
             (push (list :store store :action :refused :reason :not-open)
-                  entries))
-           ((not (%supported-for-restore-p open-graph))
-            (push (cons store :unsupported-graph) reasons)
-            (push (list :store store :action :refused
-                        :reason :unsupported-graph)
                   entries))
            ((generation-present-p target)
             (let ((e0 (%generation-state-epoch (generation-retired target))))
@@ -416,6 +468,19 @@ holds elsewhere -- it never mutates the manifest (GH #171)."
                   unless (member k keys)
                     append (list k v)))))
 
+(defun %retired-path-for (clock live)
+  "<LIVE>-retired-<E> for an E no directory already uses.  Two retiring
+events with no commit between them -- two RESTORE-SYSTEM calls in a row,
+or a rewind the cascade then rebuilds -- otherwise compute the SAME name
+and the second rename fails on the non-empty directory: consume epochs
+until the name is free, so the journal record's own :EPOCH still matches
+the name (GH #171)."
+  (loop for path = (format nil "~A-retired-~D" live
+                           (clock-current-epoch clock))
+        while (probe-file (uiop:ensure-directory-pathname path))
+        do (clock-next-epoch clock)
+        finally (return path)))
+
 (defun %close-quiesced (graph timeout)
   "SWAP-IN-SHADOW's close sequence: quiesce as :RESTORING, close with
 snapshot, no writer can land in the doomed generation."
@@ -439,8 +504,7 @@ rename-back itself succeeds, a :RETIRE-LIVE-ABORTED record cancels it
   (let* ((graph (lookup-graph name))
          (live (%trimmed-namestring (location graph)))
          (from (getf entry :from))
-         (retired (format nil "~A-retired-~D" live
-                          (clock-current-epoch clock)))
+         (retired (%retired-path-for clock live))
          (done nil) (retire-live-ok nil))
     (%close-quiesced graph timeout)
     (handler-case
@@ -493,8 +557,7 @@ journal says what actually happened (GH #171)."
   (let* ((graph (lookup-graph name))
          (live (%trimmed-namestring (location graph)))
          (policy (store-recovery-policy live))
-         (retired (format nil "~A-retired-~D" live
-                          (clock-current-epoch clock))))
+         (retired (%retired-path-for clock live)))
     (%close-quiesced graph timeout)
     (handler-case
         (progn

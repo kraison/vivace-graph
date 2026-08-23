@@ -48,13 +48,19 @@ SWAP-IN-SHADOW / RESTORE-SYSTEM return."
 (defun %rs-count (g)
   (length (graph-db:map-vertices #'identity g :collect-p t)))
 
-(defun %rs-swap (g clock &key (shadow-writes 1))
+(defun %rs-key-count (plist key)
+  "How many times KEY appears as an indicator in PLIST -- 1 is what a
+%ENTRY-WITH replacement must leave behind, 2 means a stale shadowed
+value survived (GH #171)."
+  (loop for (k nil) on plist by #'cddr count (eq k key)))
+
+(defun %rs-swap (g clock &key (shadow-writes 1) (name :restore-store-1))
   "Shadow G, write SHADOW-WRITES vertices into the shadow, swap it in.
 Returns (values NEW-GRAPH RETIRED-PATH)."
   (multiple-value-bind (shadow-location g2) (graph-db:shadow-store g)
     (multiple-value-bind (start end) (graph-db:clock-lease-epochs clock 1000)
       (let ((sg (graph-db:open-shadow-graph
-                 shadow-location :restore-store-1 :lease (cons start end))))
+                 shadow-location name :lease (cons start end))))
         (dotimes (i shadow-writes)
           (with-transaction ((graph-db::transaction-manager sg))
             (graph-db:make-vertex :generic nil :graph sg)))
@@ -662,3 +668,243 @@ generation (the one live at T), not the first."
                               :restore-store-1)))
             (is (eq :rewound (getf e :action)))
             (is (string= (string-right-trim "/" r2) (getf e :from)))))))))
+
+;;; Fix round 3 (GH #171): the ERAS model, and the guards round 2 left
+;;; unexercised.
+
+(test plan-selects-a-generation-by-an-inherited-era
+  "Three events: swap@E1 retires r1, restore-to-E0@E2 promotes r1 and
+retires r2, swap@E3 retires the promoted directory as r3.  E0's content
+now sits in r3, not in r1 (consumed) and not in r2 (a later era), so
+planning to E0 must be :REWOUND :FROM r3 -- the single-window model
+answered :UNCHANGED here and lost the generation.  :EXACT is NIL because
+the promoted generation took a further write after E2, which no rewind
+to r3 can undo (spec R2).  :STATE-AT is that write's own epoch, which
+also pins %REOPEN-AND-RESUME's location normalisation: unnormalised, the
+restored store wrote transaction-id.dat into its PARENT directory and
+the generation still reported the pre-restore watermark."
+  (with-restore-system (g clock sys)
+    sys
+    (let ((e0 (%rs-write g)))
+      (multiple-value-bind (ng r1) (%rs-swap g clock)
+        (declare (ignore r1))
+        (setq g ng)
+        (handler-bind ((graph-db:restore-inexact-warning #'muffle-warning))
+          (graph-db:restore-system clock e0))
+        (setq g (graph-db:lookup-graph :restore-store-1))
+        (is (= 1 (%rs-count g)))
+        (let ((post (%rs-write g)))
+          (multiple-value-bind (ng2 r3) (%rs-swap g clock)
+            (setq g ng2)
+            (let ((e (%rs-entry (graph-db:plan-system-restore clock e0)
+                                :restore-store-1)))
+              (is (eq :rewound (getf e :action)))
+              (is (string= (string-right-trim "/" r3) (getf e :from)))
+              (is (= post (getf e :state-at)))
+              (is (null (getf e :exact))))))))))
+
+(test plan-follows-a-chain-of-two-restores
+  "Two consecutive restores: restore-to-E0 promotes r1 (retiring r2),
+then restore-to-MID promotes r2 back (retiring r1's content as r3).  E0's
+era is inherited through the chain, so planning to E0 selects r3, and
+executing that plan yields the 1-vertex content again; MID is covered by
+what is live now, so it plans :UNCHANGED."
+  (with-restore-system (g clock sys)
+    sys
+    (let ((e0 (%rs-write g)))
+      (multiple-value-bind (ng r1) (%rs-swap g clock)
+        (declare (ignore r1))
+        (setq g ng)
+        (let ((mid (%rs-write g)))
+          (is (= 3 (%rs-count g)))
+          (handler-bind ((graph-db:restore-inexact-warning #'muffle-warning))
+            (graph-db:restore-system clock e0))
+          (setq g (graph-db:lookup-graph :restore-store-1))
+          (is (= 1 (%rs-count g)))
+          (let ((m2 (handler-bind
+                        ((graph-db:restore-inexact-warning #'muffle-warning))
+                      (graph-db:restore-system clock mid))))
+            (setq g (graph-db:lookup-graph :restore-store-1))
+            (is (= 3 (%rs-count g)))
+            (let ((r3 (getf (%rs-entry m2 :restore-store-1) :retired-live))
+                  (e (%rs-entry (graph-db:plan-system-restore clock e0)
+                                :restore-store-1)))
+              (is-true r3)
+              (is (eq :rewound (getf e :action)))
+              (is (string= r3 (getf e :from)))
+              (is (eq :unchanged
+                      (getf (%rs-entry (graph-db:plan-system-restore clock mid)
+                                       :restore-store-1)
+                            :action)))
+              (handler-bind
+                  ((graph-db:restore-inexact-warning #'muffle-warning))
+                (graph-db:restore-system clock e0))
+              (setq g (graph-db:lookup-graph :restore-store-1))
+              (is (= 1 (%rs-count g))))))))))
+
+(test plan-refuses-a-replicated-graph-as-unsupported
+  "I5's refusal, exercised: a MASTER-GRAPH registered under the store's
+name is refused :UNSUPPORTED-GRAPH inside RESTORE-REFUSED-ERROR, not by
+a bare DETACH-UNSUPPORTED-GRAPH-ERROR.  Refused for an epoch this store
+would otherwise leave :UNCHANGED too -- the check runs on every open
+clocked store, because the cascade can rebuild one the plan did not
+name.  A bare MAKE-INSTANCE shell is enough (see DETACH-REFUSES-
+REPLICATED-GRAPHS): the check is a TYPEP."
+  (with-restore-system (g clock sys)
+    sys
+    (let ((e0 (%rs-write g)))
+      (multiple-value-bind (ng r1) (%rs-swap g clock)
+        (declare (ignore r1))
+        (setq g ng)
+        (let ((shell (make-instance 'graph-db::master-graph
+                                    :graph-name :restore-store-1
+                                    :location (graph-db::location g)
+                                    :system-clock clock)))
+          (unwind-protect
+               (progn
+                 (setf (gethash :restore-store-1 graph-db::*graphs*) shell)
+                 (dolist (epoch (list e0 (graph-db:clock-current-epoch clock)))
+                   (let ((c (handler-case
+                                (progn (graph-db:plan-system-restore
+                                        clock epoch)
+                                       nil)
+                              (graph-db:restore-refused-error (c) c))))
+                     (is-true c)
+                     (when c
+                       (is (equal '((:restore-store-1 . :unsupported-graph))
+                                  (graph-db:restore-refused-reasons c)))))))
+            (setf (gethash :restore-store-1 graph-db::*graphs*) g)))))))
+
+(test rebuild-rolls-back-a-failed-retire-rename
+  "%REBUILD-ONE-STORE's PRE-MAKE-GRAPH branch: the retire rename fails,
+so nothing changed -- the live directory is renamed back and reopened
+fully accepting, the REBUILD callback never runs, and the original error
+is resignalled (I1)."
+  (with-restore-system (g clock sys :policy :derivable)
+    sys
+    (let ((e0 (%rs-write g)))
+      (multiple-value-bind (ng r1) (%rs-swap g clock)
+        (setq g ng)
+        (uiop:delete-directory-tree (uiop:ensure-directory-pathname r1)
+                                    :validate t)
+        (let ((live (graph-db::%trimmed-namestring (graph-db::location g)))
+              (ran nil))
+          (with-posix-rename-failing-when
+              (old new (string= (graph-db::%trimmed-namestring old) live))
+            (signals error
+              (graph-db:restore-system
+               clock e0
+               :rebuild (lambda (name graph)
+                          (declare (ignore name graph))
+                          (setq ran t)))))
+          (is-false ran))
+        (setq g (graph-db:lookup-graph :restore-store-1))
+        (is-true (graph-db::graph-open-p g))
+        (is (eq t (graph-db:accepting-p (graph-db::transaction-manager g))))
+        (is (= 2 (%rs-count g)))
+        (with-transaction ((graph-db::transaction-manager g))
+          (graph-db:make-vertex :generic nil :graph g))))))
+
+(test rebuild-journals-a-failed-callback
+  "%REBUILD-ONE-STORE's POST-MAKE-GRAPH branch: the callback signals, so
+the fresh (possibly half-populated) generation stays live by design and
+a :RESTORE :MODE :REBUILT :FAILED T record names it and its retired
+predecessor before the error propagates out of RESTORE-SYSTEM (I1)."
+  (with-restore-system (g clock sys :policy :derivable)
+    sys
+    (let ((e0 (%rs-write g)))
+      (multiple-value-bind (ng r1) (%rs-swap g clock)
+        (setq g ng)
+        (uiop:delete-directory-tree (uiop:ensure-directory-pathname r1)
+                                    :validate t)
+        (signals error
+          (graph-db:restore-system
+           clock e0
+           :rebuild (lambda (name graph)
+                      (declare (ignore name graph))
+                      (error "injected rebuild-callback failure"))))
+        (let ((r (find-if (lambda (r) (and (eq (getf r :kind) :restore)
+                                           (getf r :failed)))
+                          (journal-records clock))))
+          (is-true r)
+          (when r
+            (is (eq :rebuilt (getf r :mode)))
+            (is-true (getf r :retired-live))))
+        (setq g (graph-db:lookup-graph :restore-store-1))
+        (is-true (graph-db::graph-open-p g))
+        (is (= 0 (%rs-count g)))))))
+
+(test cascade-replaces-the-action-key-on-a-rewound-entry
+  "%ENTRY-WITH must REPLACE, not shadow: store B plans :REWOUND :EXACT T,
+then the cascade rebuilds it because it holds an edge into rebuilt store
+A.  Its manifest entry must carry exactly one :ACTION (:REBUILT) and one
+:EXACT (NIL) -- a shadowed :EXACT T behind the new one would tell a
+reader the store is an exact instant when it is a rebuild."
+  (with-restore-system (ga clock sys :policy :derivable)
+    sys
+    (with-second-store (gb clock :restore-store-b bdir :policy :derivable)
+      (let (a-id)
+        (with-transaction ((graph-db::transaction-manager ga))
+          (setq a-id (graph-db:id (graph-db:make-vertex :generic nil
+                                                        :graph ga))))
+        (with-transaction ((graph-db::transaction-manager gb))
+          (let ((v (graph-db:make-vertex :generic nil :graph gb)))
+            (graph-db:make-edge :generic (graph-db:id v) a-id nil nil
+                                :graph gb)))
+        (let ((e0 (graph-db:clock-current-epoch clock)))
+          (multiple-value-bind (ngb rb1) (%rs-swap gb clock
+                                                   :name :restore-store-b)
+            (declare (ignore rb1))
+            (setq gb ngb)
+            (let ((eb (%rs-entry (graph-db:plan-system-restore
+                                  clock e0
+                                  :rebuild (lambda (n g)
+                                             (declare (ignore n g))))
+                                 :restore-store-b)))
+              (is (eq :rewound (getf eb :action)))
+              (is (eq t (getf eb :exact))))
+            (multiple-value-bind (nga ra1) (%rs-swap ga clock)
+              (setq ga nga)
+              (uiop:delete-directory-tree
+               (uiop:ensure-directory-pathname ra1) :validate t)
+              (let* ((m (handler-bind
+                            ((graph-db:restore-inexact-warning
+                               #'muffle-warning))
+                          (graph-db:restore-system
+                           clock e0
+                           :rebuild (lambda (name graph)
+                                      (declare (ignore name graph))))))
+                     (eb (%rs-entry m :restore-store-b)))
+                (is (= 1 (%rs-key-count eb :action)))
+                (is (eq :rebuilt (getf eb :action)))
+                (is (= 1 (%rs-key-count eb :exact)))
+                (is (null (getf eb :exact)))
+                (is (eq :restore-store-1 (getf eb :cascade-from)))))))))))
+
+(test dangling-into-is-scoped-to-the-clock-and-guards-a-nil-tag
+  "%DANGLING-INTO's two guards (C2, M3), unit-tested: a store attached to
+a DIFFERENT clock holding an edge into store A is invisible to a scan
+scoped to A's clock and visible to a scan scoped to its own; and a NIL
+store tag matches nothing rather than every untagged legacy id."
+  (with-restore-system (ga clock sys)
+    sys
+    (with-temp-directory (cdir2)
+      (let ((clock2 (open-system-clock (namestring cdir2))))
+        (unwind-protect
+             (with-second-store (gb clock2 :restore-store-b bdir)
+               (let (a-id)
+                 (with-transaction ((graph-db::transaction-manager ga))
+                   (setq a-id (graph-db:id (graph-db:make-vertex
+                                            :generic nil :graph ga))))
+                 (with-transaction ((graph-db::transaction-manager gb))
+                   (let ((v (graph-db:make-vertex :generic nil :graph gb)))
+                     (graph-db:make-edge :generic (graph-db:id v) a-id nil nil
+                                         :graph gb)))
+                 (let ((tag (graph-db:store-registry-id-for
+                             :restore-store-1)))
+                   (is-true tag)
+                   (is (null (graph-db::%dangling-into clock tag nil)))
+                   (is (equal '((:restore-store-b . 1))
+                              (graph-db::%dangling-into clock2 tag nil)))
+                   (is (null (graph-db::%dangling-into clock2 nil nil))))))
+          (close-system-clock clock2))))))

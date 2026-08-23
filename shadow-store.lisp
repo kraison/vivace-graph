@@ -192,8 +192,15 @@ copy-failure recovery path.  REASON is applied to the fresh transaction
 manager BEFORE the graph publishes to *GRAPHS*, not flipped after open
 -- a post-open flip would leave a window where the just-reopened graph
 is fully accepting and a racing writer could land a commit that belongs
-in the doomed generation (GH #170, review finding I4)."
-  (let ((reopened (open-graph name (namestring location)
+in the doomed generation (GH #170, review finding I4).
+
+LOCATION is normalised to a DIRECTORY pathname first: OPEN-GRAPH keeps
+whatever it is handed, and a slashless string makes every
+(MAKE-PATHNAME :defaults (LOCATION GRAPH)) sidecar -- transaction-id.dat
+above all -- land in the store's PARENT directory (GH #171)."
+  (let ((reopened (open-graph name (namestring
+                                    (uiop:ensure-directory-pathname
+                                     location))
                               :system-clock nil
                               :initial-accepting-state reason)))
     (attach-to-system-clock reopened clock)
