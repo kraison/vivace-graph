@@ -97,12 +97,26 @@
                  %posix-msync))
 
 (defun %posix-open (path flags &optional (mode #o640))
-  "open(2).  PATH is a Lisp pathname/string.  Returns the fd, signals on error."
-  (let ((fd (cffi:foreign-funcall "open"
-                                  :string (namestring path)
-                                  :int flags
-                                  :unsigned-int mode
-                                  :int)))
+  "open(2).  PATH is a Lisp pathname/string.  Returns the fd, signals on error.
+
+MODE rides CFFI's VARARGS path, not a plain FOREIGN-FUNCALL.  open(2) is
+`int open(const char *, int, ...)`, and Apple arm64 passes a variadic argument
+differently from a fixed one, so a fixed-argument MODE is read from somewhere
+the callee never wrote: the file is created with an arbitrary mode, and a
+different one each run (0140 and 0200 both observed for this 0640 default).
+When that mode omits owner read/write the next ordinary OPEN of the path fails
+EACCES -- which is every graph in the image, since the type registry (#186) and
+the system clock (#182) both create their files here.  GH #218.
+
+Only the SBCL/Darwin/arm64 backend actually needs the distinction -- CFFI emits
+SBCL's `&optional` variadic marker under `#+(and darwin arm64)` alone -- but
+routing every caller through the correct form is what keeps the next port from
+inheriting the bug."
+  (let ((fd (cffi:foreign-funcall-varargs
+             "open"
+             (:string (namestring path) :int flags)
+             :unsigned-int mode
+             :int)))
     (when (minusp fd)
       (error "posix open failed for ~A (flags ~D)" path flags))
     fd))
