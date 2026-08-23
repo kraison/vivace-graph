@@ -191,12 +191,12 @@ type the developer actually wrote (the emitted NAME is downcased and may be
 the very thing at fault).
 
 The rows are the IMAGE's type registry, not one graph's schema (D14, GH #186).
-A type-id means one thing across every store in the system, so the hub ships
-the whole mapping and a device can resolve any id it may ever be sent.  Two
-consequences, both intended: a type the hub's own graph does not hold is still
-emitted, and ONE unrepresentable type name anywhere in the image fails every
-device connection rather than only the store holding it -- see
-%PEER-VALIDATE-TYPE-TABLE-ROWS.
+A type-id means one thing across every store in the system, so the ids are
+globally meaningful and a device can resolve any id it may ever be sent.
+Callers that hold a graph narrow the rows to that store's schema
+(%PEER-GRAPH-SCOPED-ROWS -- the auth-ok path does, GH #206), so an
+unrepresentable type name elsewhere in the image fails only unscoped
+callers -- see %PEER-VALIDATE-TYPE-TABLE-ROWS.
 
 SUPERS comes from CLOS, so a registered symbol whose class this image has not
 loaded emits an EMPTY supers field -- indistinguishable on the wire from a
@@ -384,12 +384,12 @@ id.  A consumer must key on (KIND . ID), never ID alone.
 Signals an error if the registry cannot be represented -- see
 %PEER-VALIDATE-TYPE-TABLE-ROWS.  That is deliberate: a corrupt table is
 undebuggable on the device, so the failure belongs at the hub.  Note WHERE it
-lands: this runs on the auth-ok path, so an unrepresentable type fails every
-device CONNECTION, not the offending DEF-VERTEX.  Since GH #186 the table is
-the IMAGE's registry, so that one type need not even be in the store being
-replicated -- the blast radius is every peer session in the image.  Loud and
-hub-side either way, but the traceback points at a session, not at the schema
-form that caused it."
+lands: this runs on the auth-ok path, so an unrepresentable type fails the
+device CONNECTION, not the offending DEF-VERTEX.  With GRAPH the blast radius
+is that store's sessions only (the auth-ok path passes it, GH #206); only
+unscoped calls still expose the whole image's registry.  Loud and hub-side
+either way, but the traceback points at a session, not at the schema form
+that caused it."
   (let* ((rows (%peer-type-table-rows registry))
          (rows (if graph (%peer-graph-scoped-rows rows graph) rows))
          (rows (%peer-validate-type-table-rows rows)))
@@ -832,11 +832,13 @@ safe integers; schema-digest carried as a within-major integrity signal)."
 ;; Deliberately internal, like sibling PEER-SCHEMA-INCOMPATIBLE-ERROR above --
 ;; no peer symbol is exported (review ruling, GH #206 fix round 1).
 (define-condition peer-protocol-mismatch-error (error)
-  ((hub-version    :initarg :hub-version    :reader peer-protocol-mismatch-hub)
-   (device-version :initarg :device-version :reader peer-protocol-mismatch-device))
+  ((hub-version    :initarg :hub-version
+                   :reader peer-protocol-mismatch-hub)
+   (device-version :initarg :device-version
+                   :reader peer-protocol-mismatch-device))
   (:report (lambda (c s)
-             (format s "Peer protocol version mismatch: hub ~S, device ~S (absent ~
-means a v1 device -- refused, not misparsed; GH #206)"
+             (format s "Peer protocol version mismatch: hub ~S, device ~S ~
+(absent means a v1 device -- refused, not misparsed; GH #206)"
                      (peer-protocol-mismatch-hub c)
                      (peer-protocol-mismatch-device c)))))
 
@@ -853,7 +855,8 @@ device's last-pushed schema version for the drain-and-update barrier signal (§1
   (let ((dev-protocol (getf auth :peer-protocol-version)))
     (unless (eql dev-protocol *peer-protocol-version*)
       (error 'peer-protocol-mismatch-error
-             :hub-version *peer-protocol-version* :device-version dev-protocol)))
+             :hub-version *peer-protocol-version*
+             :device-version dev-protocol)))
   (let ((hub-version (peer-schema-version graph))
         (dev-version (list (getf auth :schema-major) (getf auth :schema-minor))))
     (unless (peer-schema-compatible-p hub-version dev-version)

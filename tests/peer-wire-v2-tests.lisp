@@ -37,14 +37,15 @@ at *WV2-DEV-ORIGIN* (no per-device key, so it falls back to the hub's)."
               ,@body)
          (close-graph ,g :snapshot-p nil)))))
 
-(defun %wv2-plist (g &key (protocol graph-db::*peer-protocol-version* protocol-p)
-                        (omit-protocol nil)
-                        (schema-major (first (graph-db::peer-schema-version g)))
-                        (schema-minor (second (graph-db::peer-schema-version g))))
+(defun %wv2-plist (g &key (protocol graph-db::*peer-protocol-version*)
+                       (omit-protocol nil)
+                       (schema-major
+                        (first (graph-db::peer-schema-version g)))
+                       (schema-minor
+                        (second (graph-db::peer-schema-version g))))
   "A device auth plist against hub G: good by default (matches *PEER-PROTOCOL-
 VERSION* and G's own schema version); callers pass OMIT-PROTOCOL or PROTOCOL
 to build the bad variants under test."
-  (declare (ignore protocol-p))
   (append
    (list :origin-id (graph-db::peer-id->hex *wv2-dev-origin*)
          :replication-key "k"
@@ -99,7 +100,8 @@ error, not a schema error -- proving the protocol check runs first."
                         nil)
                (error (e) e))))
       (is (typep c 'graph-db::peer-protocol-mismatch-error)
-          "bad protocol + good schema must surface the PROTOCOL error, got ~S" c))))
+          "bad protocol + good schema must surface the PROTOCOL error, got ~S"
+          c))))
 
 (test hub-still-runs-schema-gate-behind-a-good-protocol
   "Ordering's other half: a GOOD protocol + a BAD schema major must still reach
@@ -111,7 +113,8 @@ and fail the existing schema gate -- the new check does not swallow it."
                         nil)
                (error (e) e))))
       (is (typep c 'graph-db::peer-schema-incompatible-error)
-          "bad schema + good protocol must surface the SCHEMA error, got ~S" c))))
+          "bad schema + good protocol must surface the SCHEMA error, got ~S"
+          c))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; #206 gap 2: the envelope's own header-size byte is checked against this
