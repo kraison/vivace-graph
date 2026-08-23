@@ -9,6 +9,52 @@
   (graph-db::%posix-open path (logior graph-db::+o-creat+
                                       graph-db::+o-rdwr+)))
 
+;;; ---------------------------------------------------------------------------
+;;; GH #218.  open(2) is variadic; MODE must go through CFFI's varargs path.
+;;;
+;;; Every test above this point asserts only that the fd is valid, which is
+;;; why the defect shipped: a file created with a garbage mode still yields a
+;;; perfectly good descriptor to the process that created it.  The mode is the
+;;; thing to assert.
+;;; ---------------------------------------------------------------------------
+
+#+sbcl
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (require :sb-posix))
+
+#+sbcl
+(test posix-open-creates-with-exactly-the-requested-mode
+  "Apple arm64 passes variadic arguments differently from fixed ones, so a
+MODE handed to open(2) as a fixed argument is read from where the callee never
+wrote.  Observed 0140 and 0200 on consecutive runs for a requested 0640 --
+arbitrary, and different each time, which is why an equality assertion is the
+only honest one.  Ablate by restoring the plain FOREIGN-FUNCALL in
+%POSIX-OPEN: this goes red on Darwin/arm64.  It cannot fail on x86_64, where
+the two conventions coincide -- that platform split is the whole of GH #218."
+  (with-temp-directory (dir)
+    (let* ((path (namestring (merge-pathnames "modeprobe" dir)))
+           (fd (graph-db::%posix-open path (logior graph-db::+o-creat+
+                                                   graph-db::+o-rdwr+)
+                                      #o640)))
+      (graph-db::%posix-close fd)
+      (is (= #o640 (logand #o777 (sb-posix:stat-mode (sb-posix:stat path))))
+          "created with the requested mode, not an arbitrary one"))))
+
+(test posix-open-creates-a-file-its-own-image-can-reopen
+  "The consequence the mode bug actually had: %REGISTRY-APPEND (#186) reopens
+the path it just created with an ordinary WITH-OPEN-FILE, and a mode without
+owner read/write fails it EACCES -- after which no graph in the image opens at
+all.  Weaker than the mode assertion above (a too-permissive mode passes) but
+implementation-independent, so it holds where SB-POSIX is unavailable."
+  (with-temp-directory (dir)
+    (let* ((path (namestring (merge-pathnames "reopenme" dir)))
+           (fd (%open-rw path)))
+      (graph-db::%posix-close fd)
+      (finishes
+        (with-open-file (s path :direction :io :if-exists :append
+                                :if-does-not-exist :error)
+          (declare (ignorable s)))))))
+
 (test flock-denies-a-second-open-file-description
   "flock locks attach to the open file description, not the process, so two
 OPEN(2) calls in one image contend exactly as two processes would.  That is
