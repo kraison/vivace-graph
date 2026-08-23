@@ -18,10 +18,21 @@ per-chunk overhead is negligible, small enough that a single dirty
 region near the end of an otherwise-empty multi-GB reservation doesn't
 force writing the whole file (GH #170).")
 
-(defun %all-zero-p (buffer count zero-buffer)
-  "True when the first COUNT octets of BUFFER are all zero, compared
-against a same-sized, once-allocated ZERO-BUFFER (GH #170)."
-  (not (mismatch buffer zero-buffer :end1 count :end2 count)))
+(defun %all-zero-p (buffer count)
+  "True when the first COUNT octets of BUFFER are all zero.
+
+A typed loop, not CL:MISMATCH -- MISMATCH has no fast-path transform for
+(SIMPLE-ARRAY (UNSIGNED-BYTE 8) (*)) in SBCL and falls back to boxed,
+per-element generic dispatch (~16ms/MB measured).  Each store reserves
+~12GB of mostly-zero mmap regions (see %COPY-DIRECTORY-TREE), so every
+shadow paid ~3+ minutes of pure CPU here -- the whole detach-suite's
+'hang' (GH #170).  This typed DOTIMES compiles to a tight bounds-checked
+loop (~0.8ms/MB measured, ~20x)."
+  (declare (type (simple-array (unsigned-byte 8) (*)) buffer)
+           (type fixnum count)
+           (optimize (speed 3)))
+  (dotimes (i count t)
+    (unless (zerop (aref buffer i)) (return nil))))
 
 (defun %copy-file-sparse (source destination)
   "Copy SOURCE to DESTINATION preserving holes: read in
@@ -40,8 +51,6 @@ DESTINATION to SOURCE's exact length with one extra byte written (GH
 #170)."
   (let* ((chunk-size *sparse-copy-chunk-size*)
          (buffer (make-array chunk-size :element-type '(unsigned-byte 8)))
-         (zero-buffer (make-array chunk-size :element-type '(unsigned-byte 8)
-                                  :initial-element 0))
          (length 0)
          (last-chunk-skipped-p nil))
     (with-open-file (in source :element-type '(unsigned-byte 8))
@@ -53,7 +62,7 @@ DESTINATION to SOURCE's exact length with one extra byte written (GH
           (let ((n (read-sequence buffer in)))
             (when (zerop n) (return))
             (cond
-              ((%all-zero-p buffer n zero-buffer)
+              ((%all-zero-p buffer n)
                ;; FILE-POSITION is a FUNCTION, not a SETF place: call it
                ;; with the new position as a second argument.
                (file-position out (+ (file-position out) n))
