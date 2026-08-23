@@ -13,8 +13,8 @@
   ;; like #191's torn tail -- the directory name carries the epoch.
   ((path :initarg :path :reader swap-record-missing-path))
   (:report (lambda (c s)
-             (format s "Retired generation ~A has no :SWAP journal ~
-record (GH #212); its epoch is taken from the directory name."
+             (format s "Retired generation ~A has no :SWAP or :RETIRE-LIVE ~
+journal record (GH #212); its epoch is taken from the directory name."
                      (swap-record-missing-path c)))))
 
 (defun %retired-suffix-epoch (name live-name)
@@ -46,33 +46,53 @@ record (GH #212); its epoch is taken from the directory name."
          (pos (search "-retired-" s :from-end t)))
     (if pos (subseq s 0 pos) s)))
 
-(defun %swap-records (clock)
-  (remove :swap (journal-records clock)
-          :key (lambda (r) (getf r :kind)) :test-not #'eq))
+(defun %retired-directory-records (clock)
+  "Journal records that name a still-standing <live>-retired-<E> dir:
+:SWAP (a completed shadow promotion) and :RETIRE-LIVE (RESTORE-SYSTEM
+retiring the live generation before a rewind/rebuild) -- both carry
+:STORE/:RETIRED/:EPOCH.  A :RETIRE-LIVE whose second rename then failed
+was rolled back and is excluded via its :RETIRE-LIVE-ABORTED record
+(GH #171)."
+  (let ((aborted (make-hash-table :test 'equal)))
+    (dolist (r (journal-records clock))
+      (when (eq (getf r :kind) :retire-live-aborted)
+        (setf (gethash (%trimmed-namestring (getf r :retired)) aborted) t)))
+    (remove-if (lambda (r)
+                 (or (not (member (getf r :kind) '(:swap :retire-live)))
+                     (gethash (%trimmed-namestring (getf r :retired))
+                              aborted)))
+               (journal-records clock))))
 
 (defun %pruned-retired-paths (clock)
-  "Paths PRUNE-RETIRED-GENERATIONS has already deleted and journaled
-:RETIRE for -- distinct from a :SWAP record whose directory vanished
-some other way, which stays listed PRESENT-P NIL per spec R4 (GH #171)."
+  "Paths omitted from RETIRED-GENERATIONS entirely, not merely marked
+absent: ones PRUNE-RETIRED-GENERATIONS deleted (:RETIRE), and ones a
+RESTORE-SYSTEM call has since CONSUMED by promoting them back to live
+(:RESTORE :FROM) -- both leave the pool of restorable generations the
+same way (GH #171)."
   (let ((set (make-hash-table :test 'equal)))
     (dolist (r (journal-records clock))
-      (when (eq (getf r :kind) :retire)
-        (setf (gethash (%trimmed-namestring (getf r :retired)) set) t)))
+      (case (getf r :kind)
+        (:retire
+         (setf (gethash (%trimmed-namestring (getf r :retired)) set) t))
+        (:restore
+         (when (getf r :from)
+           (setf (gethash (%trimmed-namestring (getf r :from)) set) t)))))
     set))
 
 (defun retired-generations (clock)
   "Every retired generation known to CLOCK's system, as GENERATION
 structs sorted by store then SWAP-EPOCH.  Filesystem is authoritative:
-a directory without a :SWAP record is listed JOURNALED-P NIL and
-warned (SWAP-RECORD-MISSING-WARNING); a record without a directory is
-listed PRESENT-P NIL (GH #171, spec R4).  A generation PRUNE-RETIRED-
-GENERATIONS has already deleted (journaled :RETIRE) is omitted
-entirely, not merely marked absent."
+a directory without a joining :SWAP/:RETIRE-LIVE record is listed
+JOURNALED-P NIL and warned (SWAP-RECORD-MISSING-WARNING); a record
+without a directory is listed PRESENT-P NIL (GH #171, spec R4).  A
+generation PRUNE-RETIRED-GENERATIONS has deleted (:RETIRE) or a
+RESTORE-SYSTEM call has since consumed by promoting it back to live
+(:RESTORE :FROM) is omitted entirely, not merely marked absent."
   (let ((by-retired (make-hash-table :test 'equal))
         (locations (make-hash-table :test 'equal))
         (pruned (%pruned-retired-paths clock)))
     ;; Journal first: records name the live locations to scan.
-    (dolist (r (%swap-records clock))
+    (dolist (r (%retired-directory-records clock))
       (let ((retired (%trimmed-namestring (getf r :retired))))
         (setf (gethash (%live-location-of-retired retired) locations)
               (getf r :store))
@@ -212,32 +232,65 @@ live at EPOCH: the earliest with SWAP-EPOCH > EPOCH, or NIL when the
 current generation already was."
   (find-if (lambda (g) (> (generation-swap-epoch g) epoch)) gens))
 
+(defun %open-store-for-clock (name clock)
+  "The graph registered as NAME if it is attached to CLOCK -- matched by
+SYSTEM-CLOCK-LOCATION string, the comparison every scan in this file
+uses -- else NIL (GH #171)."
+  (let ((graph (lookup-graph name)))
+    (when (and graph (typep graph 'graph) (graph-system-clock graph)
+               (string= (%trimmed-namestring
+                         (system-clock-location (graph-system-clock graph)))
+                        (%trimmed-namestring (system-clock-location clock))))
+      graph)))
+
+(defun %supported-for-restore-p (graph)
+  "NIL when GRAPH is a MASTER-GRAPH/SLAVE-GRAPH/PEER-GRAPH -- v1 scope,
+same refusal %CHECK-DETACH-SUPPORTED enforces for DETACH-STORE/SHADOW-
+STORE/SWAP-IN-SHADOW (GH #171)."
+  (handler-case
+      (progn (%check-detach-supported graph 'plan-system-restore) t)
+    (detach-unsupported-graph-error () nil)))
+
 (defun %restore-plan-entries (clock epoch rebuild)
   "One manifest entry per store CLOCK knows about, plus the refusal list
-for PLAN-SYSTEM-RESTORE to raise.  Returns (values ENTRIES REASONS)."
+for PLAN-SYSTEM-RESTORE to raise.  Returns (values ENTRIES REASONS).
+
+A store that needs a rename (:REWOUND or :REBUILT) but is not open
+under CLOCK right now is refused :NOT-OPEN -- RESTORE-SYSTEM can only
+quiesce and rename a live, attached graph, and this must be caught
+before ANY store is renamed, not partway through a multi-store restore
+(GH #171).  Likewise a MASTER-GRAPH/SLAVE-GRAPH/PEER-GRAPH target is
+refused :UNSUPPORTED-GRAPH rather than propagating
+DETACH-UNSUPPORTED-GRAPH-ERROR bare, so it lands in the same
+RESTORE-REFUSED-ERROR as every other refusal."
   (let ((by-store (make-hash-table :test 'equal))
         (entries nil) (reasons nil))
     (dolist (g (retired-generations clock))
       (push g (gethash (generation-store g) by-store)))
     ;; Open clocked stores with no generations at all are :UNCHANGED.
     (maphash (lambda (name graph)
-               (when (and (typep graph 'graph)
-                          (graph-system-clock graph)
-                          (string= (%trimmed-namestring
-                                    (system-clock-location
-                                     (graph-system-clock graph)))
-                                   (%trimmed-namestring
-                                    (system-clock-location clock))))
+               (declare (ignore graph))
+               (when (%open-store-for-clock name clock)
                  (unless (nth-value 1 (gethash name by-store))
                    (setf (gethash name by-store) nil))))
              *graphs*)
     (maphash
      (lambda (store gens)
        (let* ((gens (sort (copy-list gens) #'< :key #'generation-swap-epoch))
-              (target (%generation-live-at gens epoch)))
+              (target (%generation-live-at gens epoch))
+              (open-graph (and target (%open-store-for-clock store clock))))
          (cond
            ((null target)
             (push (list :store store :action :unchanged) entries))
+           ((null open-graph)
+            (push (cons store :not-open) reasons)
+            (push (list :store store :action :refused :reason :not-open)
+                  entries))
+           ((not (%supported-for-restore-p open-graph))
+            (push (cons store :unsupported-graph) reasons)
+            (push (list :store store :action :refused
+                        :reason :unsupported-graph)
+                  entries))
            ((generation-present-p target)
             (let ((e0 (%generation-state-epoch (generation-retired target))))
               (push (list :store store :action :rewound
@@ -263,9 +316,11 @@ for PLAN-SYSTEM-RESTORE to raise.  Returns (values ENTRIES REASONS)."
 (defun plan-system-restore (clock epoch &key require-exact rebuild)
   "The manifest RESTORE-SYSTEM would act on for EPOCH, with no side
 effects.  Signals RESTORE-REFUSED-ERROR listing every (STORE . REASON):
-:AUTHORED-GENERATION-MISSING, :NO-REBUILD, :INEXACT (only under
-REQUIRE-EXACT), :INTERRUPTED-SWAP (Task 5).  REBUILD is the caller's
-(lambda (name graph)) loader for :DERIVABLE stores (GH #171, spec R1/R2)."
+:AUTHORED-GENERATION-MISSING, :NO-REBUILD, :NOT-OPEN (a store needing a
+rename is not open under CLOCK), :UNSUPPORTED-GRAPH (a MASTER-GRAPH/
+SLAVE-GRAPH/PEER-GRAPH target), :INEXACT (only under REQUIRE-EXACT),
+:INTERRUPTED-SWAP (Task 5).  REBUILD is the caller's (lambda (name
+graph)) loader for :DERIVABLE stores (GH #171, spec R1/R2)."
   (multiple-value-bind (entries reasons)
       (%restore-plan-entries clock epoch rebuild)
     (when require-exact
@@ -309,14 +364,31 @@ REQUIRE-EXACT), :INTERRUPTED-SWAP (Task 5).  REBUILD is the caller's
   (with-open-file (out (%manifest-file clock (getf manifest :at))
                        :direction :output :if-exists :supersede
                        :if-does-not-exist :create)
-    (let ((*print-readably* nil) (*print-pretty* nil))
+    ;; *PACKAGE* KEYWORD: a store named by a non-keyword symbol still
+    ;; PRIN1s readably; *PRINT-READABLY* stays NIL, as the journal's
+    ;; own records already do (GH #171).
+    (let ((*print-readably* nil) (*print-pretty* nil)
+          (*package* (find-package :keyword)))
       (prin1 manifest out)))
   manifest)
 
 (defun read-restore-manifest (path)
   "PATH's manifest plist.  *READ-EVAL* NIL: data, never code (GH #171)."
   (with-open-file (in path)
-    (let ((*read-eval* nil)) (read in))))
+    (let ((*read-eval* nil) (*package* (find-package :keyword)))
+      (read in))))
+
+(defun %entry-with (entry &rest kvs)
+  "ENTRY with each key in KVS applied, REPLACING (not shadowing) any
+existing value: keys in KVS are stripped from ENTRY first, then KVS is
+prepended.  Plain (SETF (GETF entry key) v) on a key ENTRY doesn't
+already carry rebinds the local variable, not the cons ENTRIES still
+holds elsewhere -- it never mutates the manifest (GH #171)."
+  (let ((keys (loop for (k nil) on kvs by #'cddr collect k)))
+    (append kvs
+            (loop for (k v) on entry by #'cddr
+                  unless (member k keys)
+                    append (list k v)))))
 
 (defun %close-quiesced (graph timeout)
   "SWAP-IN-SHADOW's close sequence: quiesce as :RESTORING, close with
@@ -330,18 +402,26 @@ snapshot, no writer can land in the doomed generation."
   "Rename live -> <loc>-retired-<Enow> (:RETIRE-LIVE), retained -> live
 (:RESTORE), reopen + attach.  Commit point is the second rename, as in
 %SWAP-IN-SHADOW-1: failure before it renames back and resignals; after
-it, reopens the restored generation and warns (GH #171)."
+it, reopens the restored generation and warns (GH #171).
+
+If :RETIRE-LIVE was already journaled when the SECOND rename fails, the
+rename-back is not enough on its own -- the journal still claims the
+live generation moved to RETIRED, which it no longer has.  Once the
+rename-back itself succeeds, a :RETIRE-LIVE-ABORTED record cancels it
+(RETIRED-GENERATIONS' journal-join excludes any path a
+:RETIRE-LIVE-ABORTED names)."
   (let* ((graph (lookup-graph name))
          (live (%trimmed-namestring (location graph)))
          (from (getf entry :from))
          (retired (format nil "~A-retired-~D" live
                           (clock-current-epoch clock)))
-         (done nil))
+         (done nil) (retire-live-ok nil))
     (%close-quiesced graph timeout)
     (handler-case
         (progn
           (%posix-rename live retired)
           (journal-append clock :retire-live :store name :retired retired)
+          (setq retire-live-ok t)
           (%posix-rename from live)
           (setq done t)
           (journal-append clock :restore :store name :from from
@@ -352,7 +432,12 @@ it, reopens the restored generation and warns (GH #171)."
           (%reopen-and-resume name live clock t))
       (error (original)
         (unless done
-          (ignore-errors (%posix-rename retired live)))
+          (let ((rolled-back
+                  (ignore-errors (%posix-rename retired live) t)))
+            (when (and retire-live-ok rolled-back)
+              (ignore-errors
+               (journal-append clock :retire-live-aborted
+                               :store name :retired retired)))))
         (handler-case (%reopen-and-resume name live clock t)
           (error (recovery)
             (error 'shadow-recovery-failed :original original
@@ -364,39 +449,71 @@ it, reopens the restored generation and warns (GH #171)."
 
 (defun %rebuild-one-store (clock name rebuild timeout)
   "Retire the live generation (:RETIRE-LIVE), MAKE-GRAPH a fresh one at
-the same location with the same policy, run REBUILD on it, journal
-:RESTORE :mode :rebuilt."
+the same location, run REBUILD on it, journal :RESTORE :MODE :REBUILT.
+
+Only :RECOVERY-POLICY carries over to the fresh MAKE-GRAPH call (v1
+scope) -- :INDEX-BACKEND, :BUFFER-POOL-SIZE, spatial precision and
+bucket counts do NOT; a caller relying on any of those must reopen and
+reconfigure the rebuilt store itself afterward.
+
+A failure in the rename or the :RETIRE-LIVE journal record itself is
+rolled back: the live directory is renamed back and reopened fully
+accepting before the original error is resignalled -- nothing changed.
+A failure inside MAKE-GRAPH or REBUILD is NOT rolled back: the fresh,
+possibly half-populated generation is left live, its predecessor
+retired at :RETIRED-LIVE -- a :RESTORE :MODE :REBUILT :FAILED T journal
+record names both before the original error is resignalled, so the
+journal says what actually happened (GH #171)."
   (let* ((graph (lookup-graph name))
          (live (%trimmed-namestring (location graph)))
          (policy (store-recovery-policy live))
          (retired (format nil "~A-retired-~D" live
                           (clock-current-epoch clock))))
     (%close-quiesced graph timeout)
-    (%posix-rename live retired)
-    (journal-append clock :retire-live :store name :retired retired)
-    (let ((fresh (make-graph name (concatenate 'string live "/")
-                             :system-clock clock :recovery-policy policy)))
-      (funcall rebuild name fresh)
-      (journal-append clock :restore :store name :mode :rebuilt
-                      :retired-live retired)
-      (list :retired-live retired))))
+    (handler-case
+        (progn
+          (%posix-rename live retired)
+          (journal-append clock :retire-live :store name :retired retired))
+      (error (original)
+        (ignore-errors (%posix-rename retired live))
+        (handler-case (%reopen-and-resume name live clock t)
+          (error (recovery)
+            (error 'shadow-recovery-failed :original original
+                                           :recovery recovery)))
+        (error original)))
+    (handler-case
+        (let ((fresh (make-graph name (concatenate 'string live "/")
+                                 :system-clock clock
+                                 :recovery-policy policy)))
+          (funcall rebuild name fresh)
+          (journal-append clock :restore :store name :mode :rebuilt
+                          :retired-live retired)
+          (list :retired-live retired))
+      (error (original)
+        (ignore-errors
+         (journal-append clock :restore :store name :mode :rebuilt
+                         :failed t :retired-live retired))
+        (error original)))))
 
-(defun %dangling-into (store-id exclude)
-  "((STORE-NAME . COUNT) ...) of edges in open clocked stores other than
-EXCLUDE whose FROM or TO carries STORE-ID's tag (spec R5)."
+(defun %dangling-into (clock store-id exclude)
+  "((STORE-NAME . COUNT) ...) of edges in stores open under CLOCK, other
+than EXCLUDE, whose FROM or TO carries STORE-ID's tag (spec R5).  A NIL
+STORE-ID (a name STORE-REGISTRY-ID-FOR has never interned) matches
+nothing, rather than every legacy v5 id (GH #171)."
   (let ((result nil))
-    (maphash
-     (lambda (name graph)
-       (when (and (typep graph 'graph) (graph-system-clock graph)
-                  (not (member name exclude)))
-         (let ((n 0))
-           (map-edges (lambda (e)
-                        (when (or (eql (id-store-tag (from e)) store-id)
-                                  (eql (id-store-tag (to e)) store-id))
-                          (incf n)))
-                      graph)
-           (when (> n 0) (push (cons name n) result)))))
-     *graphs*)
+    (when store-id
+      (maphash
+       (lambda (name graph)
+         (when (and (not (member name exclude))
+                    (%open-store-for-clock name clock))
+           (let ((n 0))
+             (map-edges (lambda (e)
+                          (when (or (eql (id-store-tag (from e)) store-id)
+                                    (eql (id-store-tag (to e)) store-id))
+                            (incf n)))
+                        graph)
+             (when (> n 0) (push (cons name n) result)))))
+       *graphs*))
     result))
 
 (defun restore-system (clock epoch &key require-exact rebuild (timeout 60))
@@ -404,19 +521,16 @@ EXCLUDE whose FROM or TO carries STORE-ID's tag (spec R5)."
 before any rename.  Rewinds first, then rebuilds, then cascades: a
 :DERIVABLE store holding edges into a rebuilt store is rebuilt in turn
 (fixpoint); an :AUTHORED one is left alone and reported :DANGLING N.
-Writes <clock-dir>/restore-<Enow>.manifest and signals RESTORE-INEXACT-
-WARNING when any store is rebuilt or inexact.  Returns the manifest
-(GH #171, spec S3-S4)."
+:RECOVERY-POLICY is the only option %REBUILD-ONE-STORE's MAKE-GRAPH call
+carries forward for a rebuilt store (v1 scope; see its docstring for
+what does not survive).  Writes <clock-dir>/restore-<Enow>.manifest and
+signals RESTORE-INEXACT-WARNING when any store is rebuilt or inexact.
+Returns the manifest (GH #171, spec S3-S4)."
   (let* ((manifest (plan-system-restore clock epoch
                                         :require-exact require-exact
                                         :rebuild rebuild))
          (entries (getf manifest :stores))
          (rebuilt nil))
-    ;; NOTE: (SETF (GETF entry :NEW-KEY) v) on a key ENTRIES's element
-    ;; does not already carry rebinds the local loop/FIND variable, not
-    ;; the cons ENTRIES holds -- it never mutates the manifest.  Every
-    ;; branch below therefore replaces the element positionally via
-    ;; (SETF (NTH pos entries) ...) instead (GH #171).
     (dolist (e entries)
       (when (eq (getf e :action) :rewound)
         (let* ((pos (position (getf e :store) entries
@@ -425,32 +539,46 @@ WARNING when any store is rebuilt or inexact.  Returns the manifest
                       clock (getf e :store)
                       (list* :requested epoch e) timeout)))
           (setf (nth pos entries)
-                (list* :retired-live (getf extra :retired-live) e)))))
+                (%entry-with e :retired-live (getf extra :retired-live))))))
     (dolist (e entries)
       (when (eq (getf e :action) :rebuilt)
-        (%rebuild-one-store clock (getf e :store) rebuild timeout)
-        (push (getf e :store) rebuilt)))
-    ;; Cascade to a fixpoint over derivable dependents.
+        (let* ((pos (position (getf e :store) entries
+                              :key (lambda (x) (getf x :store))))
+               (extra (%rebuild-one-store
+                      clock (getf e :store) rebuild timeout)))
+          (setf (nth pos entries)
+                (%entry-with e :retired-live (getf extra :retired-live)))
+          (push (getf e :store) rebuilt))))
+    ;; Cascade to a fixpoint over derivable dependents.  A store already
+    ;; handled as :REWOUND above can still land here and get REBUILT: its
+    ;; rewound generation may hold edges into a store that was just
+    ;; rebuilt, whose pre-rebuild content no longer exists -- R5 treats
+    ;; that as dangling regardless of how THIS store was restored, so
+    ;; overwriting its action is correct, not a bug (GH #171).
     (let ((queue (copy-list rebuilt)))
       (loop while queue do
         (let* ((source (pop queue))
                (tag (store-registry-id-for source)))
-          (loop for (name . n) in (%dangling-into tag rebuilt) do
-            (let* ((pos (position name entries
-                                  :key (lambda (x) (getf x :store))))
-                   (entry (nth pos entries)))
-              (if (eq (store-recovery-policy
-                       (location (lookup-graph name)))
-                      :derivable)
-                  (progn
-                    (%rebuild-one-store clock name rebuild timeout)
-                    (push name rebuilt) (push name queue)
-                    (setf (nth pos entries)
-                          (list* :action :rebuilt :exact nil
-                                 :state-at (clock-current-epoch clock)
-                                 :cascade-from source entry)))
-                  (setf (nth pos entries)
-                        (list* :dangling n entry))))))))
+          (loop for (name . n) in (%dangling-into clock tag rebuilt) do
+            (let ((pos (position name entries
+                                 :key (lambda (x) (getf x :store)))))
+              (when pos
+                (let ((entry (nth pos entries)))
+                  (if (eq (store-recovery-policy
+                           (location (lookup-graph name)))
+                          :derivable)
+                      (let ((extra (%rebuild-one-store
+                                    clock name rebuild timeout)))
+                        (push name rebuilt) (push name queue)
+                        (setf (nth pos entries)
+                              (%entry-with
+                               entry
+                               :action :rebuilt :exact nil
+                               :state-at (clock-current-epoch clock)
+                               :cascade-from source
+                               :retired-live (getf extra :retired-live))))
+                      (setf (nth pos entries)
+                            (%entry-with entry :dangling n))))))))))
     (setf (getf manifest :at) (clock-current-epoch clock))
     (%write-manifest clock manifest)
     (when (some (lambda (e) (or (eq (getf e :action) :rebuilt)

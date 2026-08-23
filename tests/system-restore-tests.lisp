@@ -460,6 +460,163 @@ A: B is rebuilt too (callback sees both names, A first).  Store C
                 (is (= 1 (getf (%rs-entry m :restore-store-c)
                                :dangling)))))))))))
 
+;;; Fix round 1 (GH #171): C1, C2, I4, I6.
+
+(test plan-refuses-a-store-that-is-not-open
+  "The target generation exists and would normally be REWOUND, but the
+store itself was closed (not detached): C1 refuses :NOT-OPEN before any
+rename -- not a LOCATION error on a NIL graph partway through a
+multi-store restore."
+  (with-restore-system (g clock sys)
+    sys
+    (let ((e0 (%rs-write g)))
+      (multiple-value-bind (ng r1) (%rs-swap g clock)
+        (declare (ignore r1))
+        (setq g ng)
+        (let ((graph-db:*graph* g))
+          (close-graph g :snapshot-p nil))
+        (let ((c (handler-case
+                     (progn (graph-db:plan-system-restore clock e0) nil)
+                   (graph-db:restore-refused-error (c) c))))
+          (is-true c)
+          (when c
+            (is (equal '((:restore-store-1 . :not-open))
+                       (graph-db:restore-refused-reasons c)))))))))
+
+(test plan-after-a-restore-does-not-see-the-consumed-generation
+  "Restore to T once; planning to the SAME T again must not refuse
+:AUTHORED-GENERATION-MISSING against a ghost entry for the generation
+the restore just consumed (I4).  Without the fix, the consumed
+generation's now-vanished directory still shows up (via its stale
+:SWAP record) as a PRESENT-P NIL :AUTHORED generation and the plan
+refuses.  With the fix that ghost entry is gone, but the remaining
+retired generation (the pre-restore live content, now :RETIRE-LIVE'd)
+still has a swap-epoch after T, so the plan comes back :REWOUND rather
+than :UNCHANGED -- this is a known scope limit (no generation-chain
+reasoning yet to recognize the CURRENT live directory as covering T);
+the test pins the actual behavior and, above all, the absence of the
+wrong refusal."
+  (with-restore-system (g clock sys)
+    sys
+    (let ((e0 (%rs-write g)))
+      (multiple-value-bind (ng r1) (%rs-swap g clock)
+        (declare (ignore r1))
+        (setq g ng)
+        (handler-bind
+            ((graph-db:restore-inexact-warning #'muffle-warning))
+          (graph-db:restore-system clock e0))
+        (setq g (graph-db:lookup-graph :restore-store-1))
+        (is (= 1 (%rs-count g)))
+        (let* ((refused nil)
+               (m (handler-case
+                      (handler-bind
+                          ((graph-db:restore-inexact-warning
+                             #'muffle-warning))
+                        (graph-db:plan-system-restore clock e0))
+                    (graph-db:restore-refused-error (c) (setq refused c)
+                      nil))))
+          (is-false refused)
+          (when m
+            (is (eq :rewound
+                    (getf (%rs-entry m :restore-store-1) :action)))))))))
+
+(defmacro with-posix-rename-failing-when ((old-var new-var test-form)
+                                          &body body)
+  "Install a wrapper on GRAPH-DB::%POSIX-RENAME for BODY's dynamic
+extent that signals an error the FIRST time (OLD-VAR NEW-VAR) satisfies
+TEST-FORM and delegates every other call -- including later ones -- to
+the original.  Matched by PATH, not a raw call count: CLOSE-GRAPH's own
+snapshot promotes sidecar .tmp files via this same primitive, and a
+naive Nth-call counter would fail the WRONG rename depending on how
+many sidecars a graph happens to carry (I6's fault-injection mechanism,
+mirroring the FDEFINITION-swap idiom used throughout tests/, e.g.
+SEGMENT-TESTS' %POSIX-MMAP wrapper) (GH #171)."
+  (let ((orig (gensym "ORIG")) (fired (gensym "FIRED")))
+    `(let ((,orig (fdefinition 'graph-db::%posix-rename))
+           (,fired nil))
+       (unwind-protect
+            (progn
+              (setf (fdefinition 'graph-db::%posix-rename)
+                    (lambda (,old-var ,new-var)
+                      (declare (ignorable ,old-var ,new-var))
+                      (if (and (not ,fired) ,test-form)
+                          (progn
+                            (setq ,fired t)
+                            (error "injected rename failure for the ~
+test"))
+                          (funcall ,orig ,old-var ,new-var))))
+              ,@body)
+         (setf (fdefinition 'graph-db::%posix-rename) ,orig)))))
+
+(defmacro with-reopen-failing-once (&body body)
+  "Install a wrapper on GRAPH-DB::%REOPEN-AND-RESUME that fails its
+FIRST call and delegates every later call to the original (GH #171)."
+  (let ((orig (gensym "ORIG")) (fired (gensym "FIRED")))
+    `(let ((,orig (fdefinition 'graph-db::%reopen-and-resume))
+           (,fired nil))
+       (unwind-protect
+            (progn
+              (setf (fdefinition 'graph-db::%reopen-and-resume)
+                    (lambda (name location clock reason)
+                      (if ,fired
+                          (funcall ,orig name location clock reason)
+                          (progn
+                            (setq ,fired t)
+                            (error "injected reopen failure for the test")))))
+              ,@body)
+         (setf (fdefinition 'graph-db::%reopen-and-resume) ,orig)))))
+
+(test restore-second-rename-failure-restores-service
+  "The second rename (retained generation -> live) fails: the original
+error is resignalled, the live directory is renamed back, the store
+ends up open and accepting again, and the journal carries :RETIRE-LIVE
+followed by :RETIRE-LIVE-ABORTED (I3a, I6)."
+  (with-restore-system (g clock sys)
+    sys
+    (let ((e0 (%rs-write g)))
+      (multiple-value-bind (ng r1) (%rs-swap g clock)
+        (declare (ignore r1))
+        (setq g ng)
+        (let ((live (graph-db::%trimmed-namestring
+                     (graph-db::location g))))
+          (with-posix-rename-failing-when
+              (old new (string= (graph-db::%trimmed-namestring new) live))
+            (signals error (graph-db:restore-system clock e0))))
+        (setq g (graph-db:lookup-graph :restore-store-1))
+        (is-true (graph-db::graph-open-p g))
+        (is (eq t (graph-db:accepting-p
+                   (graph-db::transaction-manager g))))
+        (is (= 2 (%rs-count g)))
+        (with-transaction ((graph-db::transaction-manager g))
+          (graph-db:make-vertex :generic nil :graph g))
+        (let ((kinds (mapcar (lambda (r) (getf r :kind))
+                             (journal-records clock))))
+          (is-true (member :retire-live kinds))
+          (is-true (member :retire-live-aborted kinds))
+          (is (< (position :retire-live kinds)
+                 (position :retire-live-aborted kinds))))))))
+
+(test restore-recovers-onto-the-new-generation-after-a-reopen-failure
+  "Both renames land; the follow-up reopen fails once: SWAP-RECOVERED-
+WARNING is signalled (not a resignalled error), and the RESTORED
+generation ends up live (I6)."
+  (with-restore-system (g clock sys)
+    sys
+    (let ((e0 (%rs-write g)))
+      (multiple-value-bind (ng r1) (%rs-swap g clock)
+        (declare (ignore r1))
+        (setq g ng)
+        (let ((warned nil))
+          (with-reopen-failing-once
+            (handler-bind
+                ((graph-db:swap-recovered-warning
+                   (lambda (w) (setq warned t) (muffle-warning w))))
+              (graph-db:restore-system clock e0)))
+          (is-true warned))
+        (setq g (graph-db:lookup-graph :restore-store-1))
+        (is-true (graph-db::graph-open-p g))
+        (is (= 1 (%rs-count g)))))))
+
 (test plan-handles-two-swaps-by-picking-the-generation-live-at-t
   "Swap twice.  T between the swaps selects the SECOND retired
 generation (the one live at T), not the first."
