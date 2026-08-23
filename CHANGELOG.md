@@ -11,6 +11,29 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`%POSIX-OPEN` created files with an arbitrary permission mode on Apple
+  arm64** (#218). `open(2)` is `int open(const char *, int, ...)`, and the
+  `mode` argument was passed through a plain `CFFI:FOREIGN-FUNCALL` — as a
+  *fixed* argument. On Darwin/arm64 variadic arguments use a different
+  convention, so the callee read `mode` from where nothing had written it:
+  `0140` and `0200` were both observed for a requested `0640`, on consecutive
+  runs. When the resulting mode omitted owner read/write, the next ordinary
+  `WITH-OPEN-FILE` on that path failed `EACCES` — and since the type registry
+  (#186) and the system clock (#182) both create their files this way, **no
+  graph in the image could be opened at all**, with a zero-byte file left
+  behind that reproduced the failure on every subsequent run. Now routed
+  through `CFFI:FOREIGN-FUNCALL-VARARGS`, which emits SBCL's variadic marker.
+  x86_64 was never affected (the two conventions coincide there), which is why
+  this reached a release: it presented as a broken developer machine rather
+  than a defect. `open` was the only variadic call in `posix.lisp`; the rest
+  (`flock`, `close`, `lseek`, `write`, `fchmod`, `rename`, `mmap`, `munmap`,
+  `msync`, `getpagesize`, `gettimeofday`) have fixed signatures and are
+  correct as written. Regression test asserts the created file's **mode** —
+  every previous test asserted only that the fd was valid, which is exactly
+  what a garbage mode still yields to its creator.
+
 ### Added
 
 - **New node ids are tagged UUIDv8, carrying a 12-bit store field** for
