@@ -70,7 +70,9 @@ joins them to `:swap` records. A directory with no record (the #212
 shape) is kept, reported with `:journaled nil`, and warned about
 (`swap-record-missing-warning`) — the same tolerance the torn-tail
 reader chose in #191. A record with no directory is reported as
-`:present nil` (pruned or lost). *Cost if wrong:* none foreseeable;
+`:present nil` — *lost*, since a deliberate prune leaves a `:retire`
+record and `retired-generations` omits such generations entirely (Task 2
+ruling: pruned is bookkeeping, lost is a finding). *Cost if wrong:* none foreseeable;
 this strictly adds information.
 
 **R5 — Rebuild is a caller-supplied function; cascade is found by
