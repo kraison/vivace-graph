@@ -374,6 +374,34 @@ failure into an upfront allocation.
 existed to stop a live server holding the store. The epoch lease still accommodates
 out-of-process later without redesign.
 
+**Built (#170):** `detach-store`/`reattach-store` (quiesce, lease via
+`clock-lease-epochs`, journal `:detach`, close/reopen against the
+ambient system clock) and `shadow-store`/`open-shadow-graph`/
+`swap-in-shadow`/`discard-shadow`/`abandon-shadow` for the bulk-load
+generation. V1's consistent copy is **two brief windows, not one**:
+close-copy-reopen for the shadow (a sparse-preserving directory copy,
+seconds not minutes) and a second close-rename-rename-reopen for the
+swap — chosen over copying under a live mmap as materially safer for a
+first cut, at the cost of a second short outage instead of zero. The
+live store is deliberately left **read-only, not fully unavailable**,
+between shadow and swap: reads and pins keep flowing and a write
+signals `store-not-accepting-error` (Kevin's ruling, 2026-08-22) — no
+write is ever silently dropped at swap time. Out-of-process detach
+stays deferred, as anticipated above; `lease.dat` already persists
+everything a second process would need to resume a shadow's
+allocation, so nothing built here blocks it later. Swap completion is
+defined as the second of the two renames, not the best-effort `:swap`
+journal record after it, which surfaced its own gap: recovering a
+post-completion failure must reopen the *new* generation and warn
+(`swap-recovered-warning`) rather than re-signal, or the caller would
+wrongly conclude the swap never happened. A crash between the two
+renames, and a swap that lands without its journal record, are not
+handled here — filed as #171 and #212 respectively. `:expected-vectors`
+presizing applies one N uniformly to every vector segment a shadow
+carries: never under-provisions, but can over-allocate on a store with
+several `:vector-index` owner classes of different sizes — no per-owner
+knob in v1.
+
 ## 9. Restore
 
 ### 9.1 The system journal

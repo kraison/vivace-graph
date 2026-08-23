@@ -32,6 +32,59 @@ between releases; cutting a release renames it to the new version and dates it.
   `dangling-edge-warning` naming the edge, the missing endpoint and its
   store; a backup with no cross-store gaps never warns. (#169)
 
+- **Detach a store, bulk-load a shadow copy, and swap it in — all in-process,
+  with only two brief unavailable windows.** `detach-store` quiesces a
+  graph (refuses new transactions and read pins, drains in-flight ones),
+  leases a range of its system clock's epoch space via
+  `clock-lease-epochs`, journals `:detach`, closes it durably, and
+  returns a `store-detachment` handle; `reattach-store` reopens it and
+  rejoins the ambient `*system-clock*`. `shadow-store` takes a
+  consistent copy for a bulk load while the store keeps serving reads:
+  quiesce, close, recursive sparse-preserving copy to
+  `<location>-shadow/` (reservations are unwritten holes, so an empty
+  multi-gigabyte store copies in seconds, not by materializing every
+  reserved byte), reopen the live store and resume service — left
+  **read-only** (Kevin's ruling: a write during the shadow window signals
+  `store-not-accepting-error` with reason `:shadow-load` rather than
+  being silently dropped) until the caller calls `swap-in-shadow` or
+  `abandon-shadow`. A copy failure reopens the original store and
+  restores full service before re-signalling. `open-shadow-graph` opens
+  the copy as an unregistered graph, under the live store's own name and
+  store-id (so ids minted there resolve back to the live store), against
+  a leased `(start . end)` epoch range persisted in `lease.dat`; its
+  allocation cursor is always derived fresh from the shadow's own
+  highest committed transaction id, never from a separately persisted
+  cursor, and an already-exhausted range signals
+  `epoch-lease-exhausted` immediately rather than wrapping or
+  colliding. `swap-in-shadow` promotes the shadow: quiesce, close,
+  rename the live directory to `<location>-retired-<epoch>` **first**,
+  then rename the shadow into the live location — that second rename,
+  not the best-effort `:swap` journal record after it, is what "the
+  swap happened" means (a crash between the two renames is out of scope
+  here, tracked as #171/#212) — and reopens the new generation.
+  `discard-shadow` deletes a shadow tree (hard-gated on a `-shadow`
+  suffix) and `abandon-shadow` combines that with restoring the live
+  store to full service.
+
+  **Recovery policy licenses a fast, non-transactional load.** A store's
+  `policy.dat` (`store-recovery-policy` / `set-store-recovery-policy`,
+  default `:authored`) records whether a crash mid-load can simply be
+  repaired by redoing it (`:derivable`) or whether its writes are the
+  only durable record (`:authored`). `open-shadow-graph :fast-load t`
+  suppresses the `.txn` file and replication log for the shadow's
+  transactions, but only when the shadow's copied policy says
+  `:derivable`; otherwise it signals `fast-load-requires-derivable`
+  rather than silently keeping the store's only record on an
+  unsuppressed WAL. **`presize-vector-segment`** turns a bulk load's
+  vector-segment capacity hazard into an upfront allocation instead of a
+  mid-apply failure discovered after some writes are already durable;
+  `open-shadow-graph :expected-vectors n` applies it to every segment
+  the shadow's graph object carries.
+
+  V1 ships in-process only — no separate loader process — with the
+  epoch lease already shaped to carry that later without a redesign.
+  (#170)
+
 - Defining one class name in two stores with *different* slot sets now
   signals `divergent-node-type-redefinition` (a `style-warning`): both
   definitions name one CLOS class, so the last one loaded determines the

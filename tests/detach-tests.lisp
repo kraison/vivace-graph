@@ -437,7 +437,8 @@ normally with a usable graph."
                         :expected-vectors 10000)))
                (unwind-protect
                     (progn
-                      (is (= 0 (hash-table-count (graph-db::vector-segments sg))))
+                      (is (= 0 (hash-table-count
+                                (graph-db::vector-segments sg))))
                       (is (= 1 (length (graph-db:map-vertices
                                         #'identity sg :collect-p t)))))
                  (let ((graph-db:*graph* sg))
@@ -533,7 +534,8 @@ write; the retired dir exists; the journal carries :SWAP and :ATTACH."
                     (graph-db:make-vertex :generic nil :graph g2))
                   (fail "write must be refused during the shadow window"))
               (graph-db:store-not-accepting-error (c)
-                (is (eq :shadow-load (graph-db:store-not-accepting-reason c))))))
+                (is (eq :shadow-load
+                        (graph-db:store-not-accepting-reason c))))))
           (let ((graph-db:*graph* sg))
             (close-graph sg :snapshot-p nil))))
       (multiple-value-bind (new-graph retired-path)
@@ -871,7 +873,8 @@ store, not asserted."
                 (is (null (uncovered oa))
                     "files appeared beyond the measured exclusion list")
                 (is (null (uncovered ch))
-                    "file content changed beyond the measured exclusion list"))))
+                    "file content changed beyond the measured ~
+exclusion list"))))
           (with-transaction ((graph-db::transaction-manager g2))
             (graph-db:make-vertex :generic nil :graph g2)))))))
 
