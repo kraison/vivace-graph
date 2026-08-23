@@ -2811,6 +2811,24 @@ A device is constructed with a hub-minted ~:origin-id~ (an opaque 16-byte id) an
 
 As with master/slave, a *minor* schema drift (same major version) still syncs, degraded-safe; a *major* mismatch is rejected before any data moves.
 
+**** The peer wire protocol version gate
+
+Independently of schema versioning, the peer wire itself carries a
+protocol version (~*peer-protocol-version*~, currently 2), gating the
+byte-level framing rather than the graph's schema. The device's auth
+plist must carry a matching ~:peer-protocol-version~; the hub checks
+it *before* the schema-compatibility gate and before any mutation.
+Absent (a pre-v2 device) or mismatched, the hub refuses the connection
+with ~peer-protocol-mismatch-error~ rather than attempt to parse a wire
+it does not speak. Protocol 2 is a wire-generation break from 1: it
+carries the v3 (33/73-byte) node heads, package-qualified type-table
+names, and a store-scoped type table (all described below), none of
+which a v1 parser can read — refusing a v1 device is deliberate, not a
+gap. As defense in depth below the version gate, a node envelope whose
+header-size byte does not match this image's current head layout is
+likewise refused (~node-head-size-mismatch-error~) rather than
+misparsed.
+
 *** Type-ids on the wire, and the handshake that refuses a disagreeing peer
 
 A ~type-id~ crosses the peer wire as an opaque integer; no type *name* ever
@@ -2826,17 +2844,32 @@ implementations this repository does not build,
 is part of the specification — an ~id~ is decimal digits only in 0..65535, a
 record has exactly four fields, ~kind~ is exactly ~"v"~ or ~"e"~, and a
 consumer must read *all* rows before resolving superclass names, because the
-table is sorted by id and may carry forward references.
+table is sorted by id and may carry forward references. Since protocol 2
+(GH #201) ~name~ and every ~supers~ entry are *downcased,
+package-qualified* names, ~"package:symbol"~ — e.g. ~"graph-db:site"~ —
+rather than the bare symbol name; ~:~ is not a reserved character, so a
+consumer treats the whole field as one opaque string. Qualifying by
+package is what lets two same-named types from two different packages
+share one wire table without colliding.
 
 **What the table contains changed with GH #186: it is the IMAGE's type
-registry, not the hub graph's schema.** Type-ids are image-level now
-(Chapter 17), so a device may be sent an id belonging to any store in the
-system, and the hub therefore ships the whole mapping. Two consequences
-follow, both intended:
+registry, not the hub graph's schema — narrowed again to the hub's own
+store by GH #206.** Type-ids are image-level (Chapter 17), so in
+principle a device could be sent an id belonging to any store in the
+system; since #206, though, the hub's ~:auth-ok~ table is *scoped* to
+the types actually registered in the session's own graph, plus the
+transitive ~supers~-closure of that set (so no kept row's superclass
+reference ever dangles). A device may know of more types than the
+table lists — that is not itself a conflict, only the handshake
+disagreement check further below is — but the table itself now names
+only what the replicated store can actually produce.
+Two consequences follow, both intended:
 
-- a type the hub's own graph does not instantiate still appears in the table;
-- a type name that cannot be encoded fails *every* device connection in the
-  image, not only sessions for the store that declared it.
+- a type registered only in some *other*, unrelated store no longer appears
+  in this session's table at all;
+- a type name that cannot be encoded now fails only sessions for stores that
+  actually hold the offending type, not every device connection in the
+  image.
 
 The encoder refuses rather than emit something a device cannot recover from.
 It signals, naming the offending type package-qualified, when a name is empty

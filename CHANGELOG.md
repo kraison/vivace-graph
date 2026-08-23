@@ -675,6 +675,27 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Changed
 
+- **BREAKING: peer wire protocol bumped 1 -> 2; a v1 device is now
+  refused, not misparsed** (#206, #201). This is a wire-generation
+  change — every peer device and hub must move together. The v2
+  contract, in four points: (1) the peer wire now carries v3 node
+  heads (33-byte vertex / 73-byte edge, #166's on-disk format) instead
+  of the old v1 layout; (2) the type table's `name` and `supers`
+  fields are downcased, **package-qualified** names
+  (`package:symbol`), so two same-named types from different packages
+  no longer collide on the wire (#201); (3) the type table the hub
+  ships in `:auth-ok` is now **scoped to the replicated store's own
+  schema**, closure-completed over `supers` so no row's superclass
+  reference dangles; (4) the device auth plist **must** carry
+  `:peer-protocol-version` — absent (a v1 device) or mismatched
+  refuses the connection with `peer-protocol-mismatch-error`, checked
+  hub-side before the schema-compatibility gate and before any
+  mutation. A stale-but-present node-head size is refused too
+  (`node-head-size-mismatch-error` in `transactions.lisp`), as defense
+  in depth below the version gate. The wire *grammar* (4-field
+  `kind,id,name,supers` type-table rows; `:` still unreserved) is
+  unchanged. Coordinates with mine-action-android#29.
+
 - **The hub resolves its type registry on the thread that starts
   replication** (#186). A hub serves each device connection on a new thread,
   and a new thread does not inherit dynamic bindings, so a session calling
