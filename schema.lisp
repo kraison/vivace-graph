@@ -388,8 +388,11 @@ STORE-NAME, else refuse -- never *GRAPH* (GH #167)."
              :class-name class-name :store store-name)))
 
 (defmacro def-node-type (name parent-types slot-specs graph-name &key keep-revisions)
-  "Define a persistent node type NAME for the graph named GRAPH-NAME.  This is
-the machinery behind DEF-VERTEX and DEF-EDGE; you normally use those instead.
+  "Define a persistent node type NAME whose default store is GRAPH-NAME.  This
+is the machinery behind DEF-VERTEX and DEF-EDGE; you normally use those
+instead.  NAME's package comes from the ambient *PACKAGE* at macroexpansion
+time, not from this form -- namespace and default store are independent axes
+(GH #167).
 
 PARENT-TYPES is a single-inheritance superclass list ending in VERTEX or EDGE.
 SLOT-SPECS are CLOS-style slot definitions (a bare symbol, or (name :type ...)
@@ -399,8 +402,12 @@ Expands to a (defclass ... (:metaclass node-class)) plus generated helpers:
 MAKE-<NAME> (constructor), LOOKUP-<NAME> (id -> node, skipping deleted unless
 :include-deleted-p), and <NAME>-P (predicate).  For edges it also defines the
 Prolog functors <NAME>/2 and <NAME>/3.  The type metadata is registered under
-GRAPH-NAME and instantiated into the graph if it already exists, so a type may
-be defined before or after the graph is created."
+GRAPH-NAME and instantiated into that store if it is already open, so a type
+may be defined before or after its default store is created.  MAKE-<NAME>
+places a new node in GRAPH-NAME when :GRAPH is omitted (open, or else
+DEFAULT-STORE-NOT-OPEN-ERROR); an explicit :GRAPH always overrides the
+default and adopts the type into that store lazily on first write if it is
+not already known there (GH #167, R1/R3)."
   (with-gensyms (meta graph metas pos)
     (let* ((constructor (intern (format nil "MAKE-~A" name)))
            (predicate (intern (format nil "~A-P" name)))
@@ -619,25 +626,29 @@ be defined before or after the graph is created."
            )))))
 
 (defmacro def-vertex (name parent-types slot-specs graph-name &key keep-revisions)
-  "Define a vertex (node) type NAME for the graph named GRAPH-NAME.
+  "Define a vertex (node) type NAME whose default store is GRAPH-NAME.
 
 PARENT-TYPES is a list of other vertex types to inherit from (often empty);
 VERTEX is appended automatically.  SLOT-SPECS are CLOS-style typed slots.
 Generates MAKE-NAME / LOOKUP-NAME / NAME-P and slot accessors.  Example:
   (def-vertex user () ((username :type string)) :social-app)
-:KEEP-REVISIONS N overrides, for this type, how many prior MVCC versions the
-reaper retains (NIL = inherit the graph default).
+MAKE-NAME places a new vertex in GRAPH-NAME when :GRAPH is omitted (it must
+be open), or in an explicit :GRAPH, adopting the type there lazily on first
+write (GH #167).  :KEEP-REVISIONS N overrides, for this type, how many prior
+MVCC versions the reaper retains (NIL = inherit the graph default).
 See DEF-NODE-TYPE for full details and DEF-EDGE for relationships."
   `(def-node-type ,name (,@parent-types vertex) ,slot-specs ,graph-name
      :keep-revisions ,keep-revisions))
 
 (defmacro def-edge (name parent-types slot-specs graph-name &key keep-revisions)
-  "Define an edge (relationship) type NAME for the graph named GRAPH-NAME.
+  "Define an edge (relationship) type NAME whose default store is GRAPH-NAME.
 
 Like DEF-VERTEX but the type inherits from EDGE, so its constructor also takes
 :FROM, :TO and :WEIGHT.  Generates MAKE-NAME / LOOKUP-NAME / NAME-P, slot
-accessors, and the Prolog query functors NAME/2 and NAME/3.  :KEEP-REVISIONS N
-overrides this type's retained-version count (NIL = inherit the graph default).
+accessors, and the Prolog query functors NAME/2 and NAME/3.  An edge is
+placed by its own class default exactly like a vertex, independent of which
+store its endpoints live in (GH #167).  :KEEP-REVISIONS N overrides this
+type's retained-version count (NIL = inherit the graph default).
 Example:
   (def-edge follows () () :social-app)
   ... (make-follows :from alice :to bob)"

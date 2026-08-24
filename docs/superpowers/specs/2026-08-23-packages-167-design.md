@@ -130,6 +130,23 @@ share a transaction domain by construction (§2).
 6. Full suite green on SBCL (ECL demoted). Closes vivace-graph#167 and
    cl-llm#20 (a class instantiable in more than one store).
 
+**Built (#167):** Shipped as designed — R1-R5 landed unchanged, R6's
+scope guard held (no placement-rule function, no per-namespace default,
+no query rewiring). Two additions surfaced by review that the design
+above did not anticipate: (1) `def-node-type`'s registration-list
+maintenance now **moves** a redeclared class's meta to its new default
+store instead of leaving a stale copy under the old store name — without
+this, `%find-registered-node-type`'s cross-store scan would find two
+entries for one class symbol and pick whichever `maphash` visited first;
+see the `redeclaring-a-class-moves-its-meta-to-the-new-store` test. (2)
+`%note-edge-occupancy`'s sidecar append is now guarded by
+`handler-case`/`ignore-errors` around the file write, not just around the
+initial `%edge-occupancy-file` lookup — a disk-full or permission failure
+on the append must degrade to in-image-only for the session, never
+propagate into the caller's real edge write; see
+`edge-occupancy-append-failure-does-not-abort-the-write`. Full suite
+green on SBCL (ECL demoted per standing directive).
+
 ## 4. Acceptance mapping
 
 | Issue acceptance | Where |

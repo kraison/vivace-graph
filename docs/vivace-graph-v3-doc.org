@@ -3023,6 +3023,119 @@ existed, the second definition silently replaced the first class's slots,
 leaving the first graph's stored data unreachable through the API while still
 on disk.
 
+*** A namespace is a package; a store is files (GH #167)
+
+A *namespace* is a Lisp package: a set of symbols, and the unit of naming and
+ontological scoping. A *store* is a set of files — the unit of durability,
+snapshot, backup and detach. The two are independent axes. ~def-vertex~ and
+~def-edge~ never grew a namespace argument because they did not need one: the
+package comes from the ambient ~in-package~, exactly as for any other Lisp
+form, and the trailing argument you already pass is a store name. As of #167
+that trailing argument is documented precisely as the class's **default
+store** — where a node of that class lands when nothing says otherwise —
+rather than "the graph this type belongs to." A class does not belong to a
+store; it merely defaults to one.
+
+**Placement: explicit ~:graph~, else the default store, else refuse.**
+~make-<type>~ used to default a missing ~:graph~ to the ambient ~*graph*~,
+which meant omitting the argument silently placed the node in whatever graph
+happened to be bound at the call site — not necessarily the one the class was
+declared against. As of #167 that default is gone. Placement now follows one
+rule:
+
+1. An explicit ~:graph~ argument always wins.
+2. Otherwise, the class's declared default store, *if it is open*.
+3. Otherwise, refuse: signal ~default-store-not-open-error~, naming the class
+   and the store it wanted.
+
+~*graph*~ is never consulted by this decision. That is deliberate, not an
+oversight: placement determines recovery policy — which store's WAL, which
+store's backup schedule, which store's detach boundary a node falls under —
+and a rule that quietly substitutes whatever graph is ambient would change a
+node's durability story without saying so at the call site. An error that
+names the class and the missing store is recoverable in a way a silent wrong
+answer is not: open the store, or pass ~:graph~ explicitly, and proceed.
+
+One-to-one code — a single package, a single store, ~:graph~ never passed —
+is completely unaffected: there, ~*graph*~ *is* the declared store, by
+construction, on every call. The behaviour change is visible only to code
+that deliberately writes a class into a graph other than the one it was
+declared against, without saying so via ~:graph~.
+
+**One namespace, several stores.** Decoupling naming from placement is
+obtained by writing a second ~in-package~, never by accident:
+
+#+BEGIN_SRC lisp
+  (in-package :fish)
+  (def-vertex species () ((latin-name :type string)) :taxonomy)
+#+END_SRC
+
+~fish::species~ and a same-named ~primate::species~ defined the same way are
+distinct CLOS classes that happen to share a symbol-name — see "Class names
+are global" above for what happens if you instead want *one* class shared
+across stores. A single namespace may equally *span* several stores: a
+package's authored nodes can default to a durable store and its derived
+nodes to a disposable one, without splitting the ontology across packages.
+Nothing about namespace membership constrains which store a node of that
+namespace ends up in; only the class's own default, and any explicit
+~:graph~, does that.
+
+**A store adopts a foreign class lazily, at first write.** Writing a node of
+a class whose default store is *not* the target graph — via explicit
+~:graph~ — no longer requires the class to have been declared against that
+store in advance. The first such write finds the class's registered metadata,
+instantiates it into the target store under its own schema lock, and saves
+that store's ~schema.dat~. From then on the type is durably part of that
+store: it survives a close and reopen exactly like a type declared there from
+the start, because it now *is* one, on disk. A ~make-<type>~ call that names
+a store with no registered metadata for that class anywhere in the image
+still errors, as before — adoption finds an existing declaration, it does
+not invent one.
+
+**Edges place by their own class default, not by an endpoint's store.** An
+edge is a node, so §4's rule covers it with no special case: a cross-store
+edge — endpoints living in two different stores, neither necessarily the
+edge's own — is placed by the edge class's declared default, the same as any
+vertex. This is a policy point, not an accident of implementation: a derived
+relationship can default to a disposable store while an authored one defaults
+to a durable one, independent of where its endpoints happen to live.
+
+**The store-occupancy hint, and why it is allowed to be wrong.** Sweeping
+every open store to find which one holds a given edge class is wasteful once
+a system has more than a couple of stores, so each edge class keeps an
+image-level occupancy hint, updated the moment it is instantiated into a
+store — declared-store instantiation and lazy adoption both go through the
+same path, so both update it:
+
+#+BEGIN_SRC lisp
+  (graph-db:edge-type-stores 'follows)
+  ;; => (:social-app :archive)   or NIL for "no hint, sweep everything"
+#+END_SRC
+
+The hint is durable — appended to ~edge-occupancy.dat~ beside the type
+registry under ~*system-directory*~ — and *fails safe*: a missing directory,
+an unreadable or torn file, or a class this image has never written all
+answer ~NIL~. Nothing here is a source of truth; a stale or absent hint costs
+one wasted lookup by a consumer, never a wrong answer. When no system
+directory is configured at all, the hint lives in-image only for the
+session, with the same fail-safe shape. Nothing in this unit *consumes* the
+hint for query routing — that is for the ontology/cross-store query work — it
+only maintains it and exposes ~edge-type-stores~ for a future or external
+consumer to read.
+
+**Packages express ontological separation; they do not enforce it.** Two
+namespaces sharing a store are already in one transaction domain at one
+clock — co-locating things that share an invariant is how you give them
+transactional consistency, and separating them into distinct packages when
+they should not be able to reach into each other is how you make that
+lexically visible. But ~::~ bypasses a package, and nothing stops a node
+holding a foreign class's id: the engine does not refuse a cross-namespace
+reference, it only makes one obvious at the call site. Semantic
+*enforcement* of namespace boundaries — refusing a reference that crosses an
+ontological line, not merely a lexical one — is the opt-in ontology subsystem
+(GH #109 and its units), layered on top of, and not part of, what packages
+give you here.
+
 *** ~*transaction*~ is NIL inside a read-only snapshot
 
 ~with-read-snapshot~ (and ~select~/~do-query~ with ~:snapshot t~) records its
