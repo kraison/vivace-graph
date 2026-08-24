@@ -82,14 +82,20 @@ hint lives in-image only for this session (R4 fallback)."
       (push store (gethash name *edge-occupancy*))
       (let ((file (%edge-occupancy-file)))
         (when file
-          (with-open-file (s file :direction :output
-                                  :if-exists :append
-                                  :if-does-not-exist :create)
-            (let ((*print-readably* nil)
-                  (*print-pretty* nil)
-                  (*package* (%edge-occupancy-print-package)))
-              (format s "~S~%" (list name store)))
-            (finish-output s))))))
+          ;; The in-image PUSH above already stands; a failed append (disk
+          ;; full, permissions, fd exhaustion) must not propagate into the
+          ;; caller's real edge write -- it only means the hint stays
+          ;; in-image-only for this session (GH #167, R4, review round 1).
+          (handler-case
+              (with-open-file (s file :direction :output
+                                      :if-exists :append
+                                      :if-does-not-exist :create)
+                (let ((*print-readably* nil)
+                      (*print-pretty* nil)
+                      (*package* (%edge-occupancy-print-package)))
+                  (format s "~S~%" (list name store)))
+                (finish-output s))
+            (error () nil))))))
   (values))
 
 (defun edge-type-stores (name)

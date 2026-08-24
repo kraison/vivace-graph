@@ -229,3 +229,39 @@ from edge-occupancy.dat; a torn final line is dropped, not an error."
         (graph-db::%clear-edge-occupancy-cache)
         (is (member :pn-store-b
                     (graph-db:edge-type-stores 'pn-link)))))))
+
+(test edge-occupancy-append-failure-does-not-abort-the-write
+  "A failed sidecar append (disk full, permissions, fd exhaustion) must
+degrade to in-image-only, never abort the caller's real edge write --
+R4's fail-safe applies to the WRITE side too, not only reads (GH #167,
+review round 1).  PN-LINK's declared store (:PN-STORE-B) is already
+instantiated by the time this test's body runs (MAKE-GRAPH eagerly
+instantiates a store's OWN declared types), so the failure is injected
+around the lazy ADOPTION into :PN-STORE-A instead -- that is the write
+path that actually reaches %NOTE-EDGE-OCCUPANCY after this test starts."
+  (with-pn-stores (ga gb)
+    (let (v1 v2 (orig (fdefinition 'graph-db::%edge-occupancy-file)))
+      (with-transaction ((graph-db::transaction-manager ga))
+        (setq v1 (make-pn-item :label "v1")
+              v2 (make-pn-item :label "v2")))
+      (unwind-protect
+           (progn
+             ;; %EDGE-OCCUPANCY-FILE now names a path under a directory
+             ;; that does not exist, so the append inside
+             ;; %NOTE-EDGE-OCCUPANCY signals a file error.
+             (setf (fdefinition 'graph-db::%edge-occupancy-file)
+                   (lambda ()
+                     (merge-pathnames
+                      "edge-occupancy.dat"
+                      #P"/nonexistent-167-review-round-1/")))
+             (is (eq :made
+                     (with-transaction ((graph-db::transaction-manager ga))
+                       (make-pn-link :from (graph-db:id v1)
+                                     :to (graph-db:id v2)
+                                     :graph ga)
+                       :made)))
+             ;; Still answers from the in-image cache the PUSH populated
+             ;; before the append failed -- checked while the swap is
+             ;; still in effect, so no reload masks a real regression.
+             (is (member :pn-store-a (graph-db:edge-type-stores 'pn-link))))
+        (setf (fdefinition 'graph-db::%edge-occupancy-file) orig)))))
