@@ -161,3 +161,25 @@ type replicates like any other once instantiated in a store).
 5. Docs: manual section (developer workflow = the example's three
    sessions), CHANGELOG, example file updated to match shipped
    signatures, epic spec §3.5 Built note + §11 unit 7 → Done.
+
+**Built (#172):** All of R1–R7 shipped, on `experiment`, in the order
+above; `tests/runtime-schema-tests.lisp` is the acceptance evidence.
+Review rounds added three things this spec did not originally name:
+`materialize-unresolved-parents` (a row whose parent neither exists
+nor is being built in the same call is refused, not built as a
+`forward-referenced-class` stub that would poison every later
+materialization — R3, review round 1, I-2); `*record-manifest-rows*`
+binding `materialize-schema`'s own install calls to skip the manifest
+append entirely, since every row it builds already came FROM the
+manifest, so replaying it must not grow the file (M-1); and
+`:skipped-existing` in the summary plist, counting rows left alone
+because the class was already present. `export-schema-source` gained
+mid-build hardening beyond the R6 sketch: every symbol foreign to the
+exported namespace prints package-qualified (not only the type and
+slot names — a `:check` name registered in some other package is the
+concrete case that forced this), and an unreachable-in-practice
+uninterned symbol warns and falls back to a bare token rather than
+signalling, so export never errors on live data. `ensure-namespace`
+shipped a `:record-p` keyword (default `T`) purely for
+`materialize-schema`'s own replay — an ordinary caller never passes
+it. The docs deliverable is Task 5, covered separately.

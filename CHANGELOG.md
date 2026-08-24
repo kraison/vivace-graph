@@ -54,6 +54,80 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Added
 
+- **A node type can now be defined at runtime, from data, and survive a
+  restart as a live class instead of only as metadata** (#172, unit 7 of
+  the namespaces epic, #110). `ENSURE-NAMESPACE` (name &key nicknames)
+  creates a package -- no files, no store -- as the functional twin of
+  writing a new `IN-PACKAGE`; `CREATE-VERTEX-TYPE` / `CREATE-EDGE-TYPE`
+  (name slot-specs &key parents default-store keep-revisions) are the
+  runtime twins of `DEF-VERTEX`/`DEF-EDGE`, building a class from a data
+  slot-spec list through the same `%INSTALL-NODE-TYPE` path a macro
+  expansion uses, so a runtime type is indistinguishable from a
+  source-defined one once built (redefining an existing name, runtime-
+  or source-defined, is ordinary CLOS redefinition, with the existing
+  #196 divergence warning on slot disagreement). `DEFAULT-STORE`
+  defaults to `NIL` -- "no default store" -- so a runtime type need not
+  commit to placement at creation; its generated constructor then
+  requires an explicit `:GRAPH`.
+
+  A system-level manifest, `schema-manifest.dat` beside the type
+  registry, records every namespace and type -- appended by both the
+  source and runtime installation paths, so it describes the WHOLE
+  schema, fail-safe like the #167 occupancy sidecar (no system
+  directory, or a torn/damaged file, degrades to in-image-only rather
+  than aborting a definition). `MATERIALIZE-SCHEMA` (dir &key
+  namespaces) is the load-order answer this manifest exists for: a
+  macro carrying its own `EVAL-WHEN`, placed in its own file between
+  the static schema and any file with methods on a runtime type, that
+  rebuilds every runtime-defined package and class from the manifest
+  before those methods compile -- the twenty-year blocker on this
+  feature. It is idempotent and **source wins**: a type whose class
+  already exists is left alone, with the #196 warning on divergence.
+  Nothing is evaluated -- the input is plists, the output is MOP
+  calls -- and it fails fast, before building anything, naming every
+  offender in one condition each: `MATERIALIZE-UNRESOLVED-FUNCTIONS`
+  for a `:CHECK` name the image does not provide, and
+  `MATERIALIZE-UNRESOLVED-PARENTS` for a row whose parent neither
+  exists nor is itself being built in this call (a half-built
+  materialization would otherwise leave stub classes that poison every
+  later attempt). Returns `(:NAMESPACES n :MATERIALIZED n
+  :SKIPPED-EXISTING n)`.
+
+  Behaviour is the one thing that never crosses the metadata boundary:
+  a closure does not serialize, so a runtime type that wants a
+  constraint names a function the image registers by code,
+  `REGISTER-SCHEMA-FUNCTION` (name fn) / `FIND-SCHEMA-FUNCTION` (name),
+  and the metadata stores only that name. The sole v1 consumer is a new
+  `:CHECK FN-NAME` slot option (accepted by `DEF-VERTEX`/`DEF-EDGE`
+  slot-specs too, for parity), enforced where value constraints already
+  are, NULL-exempt, violating with the existing condition's `:reason
+  :CHECK-FAILED`; presence is verified at `CREATE-*-TYPE` time and again
+  at `MATERIALIZE-SCHEMA` time, resolution happens at each check so a
+  re-registration takes effect immediately. Restart never evaluates
+  data -- this is the invariant the whole unit is built to hold.
+
+  Two read-only visibility tools close the opacity gap a runtime type
+  otherwise opens (a class with no source file, ungreppable): `DESCRIBE-
+  SCHEMA` (&key namespace store since stream) is a plain-text dump,
+  joining the manifest with live metas, grouped by namespace, one line
+  per type (kind, default store, a `[source]`/`[runtime YYYY-MM-DD]`
+  provenance tag) and one line per slot (name, type, `:CHECK` name);
+  `:SINCE` filters by record time, so the dump doubles as a change log.
+  `EXPORT-SCHEMA-SOURCE` (path &key namespace store) writes a generated-
+  header comment plus literal `DEFPACKAGE`/`DEF-VERTEX`/`DEF-EDGE` forms
+  reconstructed from the metadata -- a symbol foreign to the exported
+  namespace prints package-qualified so it re-reads to the SAME symbol
+  rather than interning a new one under the freshly created package,
+  which would silently break an EQ-keyed lookup like a `:CHECK` name.
+  This is the promotion path: loading the generated file is the
+  ordinary source path, idempotent (same names, same registry ids), and
+  turns a runtime type into a source-defined one for good. Export never
+  runs implicitly and the engine never reads the file back.
+
+  Not in this unit, deliberately: runtime type deletion/retraction,
+  runtime `DEF-VIEW`/index/unique definition (those macros stay
+  code-side), and an Emacs mode (the text dump is SLIME-usable as-is).
+
 - **A store adopts a foreign class at first write; lookup of a class
   registered in more than one store is deterministic** (#167). Writing a
   node of a class via an explicit `:graph` that names a store other

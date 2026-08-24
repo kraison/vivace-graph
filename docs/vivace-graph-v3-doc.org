@@ -3136,6 +3136,256 @@ ontological line, not merely a lexical one — is the opt-in ontology subsystem
 (GH #109 and its units), layered on top of, and not part of, what packages
 give you here.
 
+*** Runtime schema: metadata is the durable truth (GH #172)
+
+~def-vertex~/~def-edge~ define a type from a Lisp form the compiler sees.
+Sometimes the type's name and shape only exist at runtime — an ETL that
+discovers a new record shape, an operator adding a type without a deploy —
+and a macro cannot help, because the data is not there yet when the form
+would need to be read. #172 adds a functional twin of the same machinery:
+~ensure-namespace~ and ~create-vertex-type~/~create-edge-type~ build a
+namespace and a class from data, driving the *same* installation path
+(~%install-node-type~) a ~def-vertex~ expansion drives, so a runtime type is
+indistinguishable from a source-defined one once built.
+
+This section is a developer workflow in three sessions — the same shape as
+~docs/runtime-schema-example.lisp~, which stays in the repository as the
+worked example this section summarizes.
+
+**** Session 1: a running system grows a type
+
+A namespace is a package, created cheaply and idempotently, with no files
+and no store allocated:
+
+#+BEGIN_SRC lisp
+  (graph-db:ensure-namespace "TELEMETRY" :nicknames '("TLM"))
+#+END_SRC
+
+~create-vertex-type~/~create-edge-type~ take a name — a symbol, or a
+~"PACKAGE:NAME"~ string, since the caller may only have strings — the same
+slot-spec data ~def-vertex~ takes, and the same trailing store keyword as a
+keyword argument, ~:default-store~ (default ~NIL~, meaning "no default
+store": the generated constructor then requires an explicit ~:graph~, since
+a runtime type need not commit to placement at creation):
+
+#+BEGIN_SRC lisp
+  (graph-db:create-vertex-type "TELEMETRY:READING"
+    '((sensor-id :type string)
+      (value     :type double-float)
+      (taken-at  :type integer))
+    :default-store :support)
+#+END_SRC
+
+Redefining an existing name — runtime- or source-defined — is ordinary CLOS
+class redefinition, with the existing #196 divergence warning when the slot
+sets disagree, exactly like re-evaluating a ~def-vertex~ form.
+
+A closure cannot serialize, so behaviour never crosses into the metadata: a
+runtime type that wants a constraint names a function the image registers
+by code, and the metadata stores only the name:
+
+#+BEGIN_SRC lisp
+  (graph-db:register-schema-function 'telemetry-plausible-p
+    (lambda (v) (< -1d6 v 1d6)))
+
+  (graph-db:create-vertex-type "TELEMETRY:CALIBRATION"
+    '((value :type double-float
+             :check telemetry-plausible-p))   ; a NAME, not a #'
+    :default-store :support)
+#+END_SRC
+
+~:check FN-NAME~ is a slot option accepted by ~def-vertex~/~def-edge~ too,
+for parity. It is enforced wherever value constraints already run
+(~value-constraint.lisp~), NULL-exempt; a violation signals the existing
+~value-constraint-violation~ condition with reason ~:check-failed~.
+Presence — not resolution — of the named function is verified at
+~create-*-type~ time and again at ~materialize-schema~ time below; the
+function itself is looked up at each check, so re-registering it takes
+effect immediately.
+
+From here the runtime type is indistinguishable from a static one: the
+generated constructor exists, placement follows #167's rules, transactions
+and views and indexes see an ordinary ~node-class~.
+
+**** The system manifest
+
+Every namespace and type — installed by ~def-vertex~/~def-edge~ or by
+~create-*-type~ — is appended as one readable line to ~schema-manifest.dat~,
+beside the type registry under ~*system-directory*~, so the full schema is
+enumerable without opening every store. It fails safe like the #167
+occupancy sidecar: no system directory, or a torn or damaged tail, degrades
+to in-image-only for the session rather than aborting a definition; the
+last record for a given name wins on read.
+
+**** Session 2: a fresh Lisp — the load-order problem
+
+A method cannot compile against a class that exists only as persisted
+metadata:
+
+#+BEGIN_SRC lisp
+  (defmethod plot ((r telemetry:reading)) ...)
+#+END_SRC
+
+fails outright in a new image — the ~telemetry~ package does not even exist
+to read the symbol. ~materialize-schema~ is the answer, placed where schema
+has always had to live: before the code that uses it.
+
+#+BEGIN_SRC lisp
+  ;; --- helpdesk.asd ---
+  (defsystem "helpdesk"
+    :depends-on ("graph-db")
+    :components
+    ((:file "package")
+     (:file "schema"         :depends-on ("package"))
+     (:file "runtime-schema" :depends-on ("schema"))
+     (:file "plotting"       :depends-on ("runtime-schema"))))
+
+  ;; --- runtime-schema.lisp ---
+  (in-package :helpdesk)
+
+  ;; Register every function a :CHECK slot names FIRST: materialize
+  ;; fails fast on an unresolved name, by design (see below), so
+  ;; registering it after this form -- e.g. in plotting.lisp, loaded
+  ;; next -- aborts the build.
+  (graph-db:register-schema-function 'telemetry-plausible-p
+    (lambda (v) (< -1d6 v 1d6)))
+
+  (graph-db:materialize-schema "/var/db/helpdesk-system/")
+#+END_SRC
+
+~materialize-schema~ is a macro carrying its own
+~(eval-when (:compile-toplevel :load-toplevel :execute))~, so a caller
+cannot get that part wrong. It reads the manifest at the given directory,
+~ensure-namespace~s every namespace row, and builds a class via the MOP for
+every type row whose class does not already exist. It is idempotent, and
+**source wins**: a type already defined by source earlier in the load (e.g.
+by ~schema.lisp~ above) is left alone, with the #196 divergence warning if
+the manifest's slot set disagrees with the live class. Nothing is
+evaluated — the input is plists, the output is MOP calls — which is what
+makes the restart-never-evaluates-data invariant hold.
+
+It fails fast, before building anything, and names every offender in one
+condition each:
+
+- ~materialize-unresolved-functions~ — a manifest row names a ~:check~
+  function this image does not provide. Register it first, as above.
+- ~materialize-unresolved-parents~ — a row's parent neither exists as a
+  finalized class nor appears among the rows being materialized (building
+  it anyway would leave a forward-referenced-class stub that poisons every
+  later materialization attempt). Widen ~:namespaces~, or load the source
+  that defines the parent first.
+
+A half-built materialization is worse than none, so either condition
+aborts the whole call with nothing built. On success it returns a summary
+plist for the REPL: ~(:namespaces n :materialized n :skipped-existing n)~.
+~:namespaces~ narrows a call to specific packages:
+
+#+BEGIN_SRC lisp
+  (graph-db:materialize-schema "/var/db/helpdesk-system/"
+                               :namespaces '(:telemetry))
+#+END_SRC
+
+Once ~runtime-schema.lisp~ has loaded, ordinary reader syntax works with no
+~intern~/~funcall~ gymnastics, because the package and accessors existed
+before ~plotting.lisp~ was even compiled.
+
+**** Session 3: schema evolution at runtime, still visible
+
+Adding a slot to a live runtime type is ~create-vertex-type~ again — the
+same replace-in-place, same CLOS redefinition semantics as re-evaluating
+~def-vertex~:
+
+#+BEGIN_SRC lisp
+  (graph-db:create-vertex-type "TELEMETRY:READING"
+    '((sensor-id :type string)
+      (value     :type double-float)
+      (taken-at  :type integer)
+      (unit      :type keyword))        ; new slot
+    :default-store :support)
+#+END_SRC
+
+**** Visibility: describe and export
+
+~describe-schema~ is the REPL/SLIME tool — plain text on a stream, grouped
+by namespace, one line per type (kind, default store, and a provenance tag:
+~[source]~ or ~[runtime YYYY-MM-DD]~; a type with no manifest row, from a
+pre-#172 store, always prints ~[source]~), then one line per slot (name,
+type, and its ~:check~ name if any):
+
+#+BEGIN_SRC lisp
+  (graph-db:describe-schema :namespace :telemetry)
+  ;; =>
+  ;; Namespace TELEMETRY
+  ;;   CALIBRATION (vertex) default-store :support   [runtime 2026-08-24]
+  ;;     VALUE  DOUBLE-FLOAT  :check TELEMETRY-PLAUSIBLE-P
+  ;;   READING (vertex) default-store :support   [runtime 2026-08-24]
+  ;;     SENSOR-ID  STRING
+  ;;     VALUE  DOUBLE-FLOAT
+  ;;     TAKEN-AT  INTEGER
+#+END_SRC
+
+~:namespace~ restricts to one namespace; ~:store~ restricts to types
+instantiated in one open store; ~:since~ (a universal time, or a
+~"YYYY-MM-DD"~ string, parsed at local midnight) filters by each row's
+recorded time, so the dump doubles as a change log. Static, source-defined
+types print the same way, tagged ~[source]~, so one tool shows the whole
+schema. ~describe-schema~ never signals on a missing or damaged manifest —
+it degrades to live metadata only.
+
+~export-schema-source~ is the promotion path: it writes literal
+~def-vertex~/~def-edge~ forms, reconstructed from the metadata, to a file:
+
+#+BEGIN_SRC lisp
+  (graph-db:export-schema-source "src/generated-schema.lisp"
+                                 :namespace :telemetry)
+  ;; =>
+  ;;   (defpackage #:telemetry (:use #:cl #:graph-db)
+  ;;     (:nicknames #:tlm)
+  ;;     (:export
+  ;;      #:calibration
+  ;;      #:reading
+  ;;      ))
+  ;;   (in-package #:telemetry)
+  ;;
+  ;;   (def-vertex reading ()
+  ;;       ((sensor-id :type string)
+  ;;        (value     :type double-float)
+  ;;        (taken-at  :type integer))
+  ;;       :support)
+  ;;   ...
+#+END_SRC
+
+A symbol foreign to the namespace being exported — including a ~:check~
+name registered under some other package — prints package-qualified, so it
+re-reads to the *same* symbol at load time rather than interning a new one
+under the freshly (re)created namespace package, which would silently break
+an EQ-keyed lookup like a ~:check~ name against the schema-function
+registry.
+
+Loading the generated file is the ordinary source path, and is idempotent
+(same names, same registry ids): this is how a runtime type earns
+permanence. The developer reviews the file, adds it to the ~.asd~ before
+their method files, and commits — the type is now source-defined, and the
+persisted metadata already agrees with it and stays agreeing (a
+~def-vertex~ re-registration is the existing replace-in-place). Export
+never runs implicitly, and the engine never reads the generated file back;
+it is for the developer's build only.
+
+**** What #172 deliberately does not provide
+
+- No runtime type deletion or retraction — retraction interacts with
+  on-disk instances and stays out of scope, as it does for source types
+  today.
+- No runtime ~def-view~, index, or ~:unique~ definition — those macros stay
+  code-side; a runtime type that needs one is a candidate for the
+  export/promote path above.
+- No Emacs mode — the ~describe-schema~ text dump is SLIME-usable as-is.
+- Functors and helper functions (~make-<name>~, ~lookup-<name>~,
+  ~<name>-p~) intern into the *type's* package, not the caller's. A query
+  or method written in another package must qualify the symbol
+  (~telemetry:reading~) or ~:use~ the namespace, exactly as for a
+  source-defined type in a package you have not ~:use~d.
+
 *** ~*transaction*~ is NIL inside a read-only snapshot
 
 ~with-read-snapshot~ (and ~select~/~do-query~ with ~:snapshot t~) records its
