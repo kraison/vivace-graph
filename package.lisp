@@ -124,6 +124,8 @@
            #:*type-registry*
            #:system-directory-required
            #:system-directory-required-operation
+           ;; edge store-occupancy sidecar (GH #167)
+           #:edge-type-stores
            ;; image-level store-id registry (GH #169)
            #:ensure-store-registry
            #:store-registry-intern
@@ -293,6 +295,11 @@
            #:divergent-type-name
            #:divergent-type-graph-name
            #:divergent-type-other-graphs
+
+           ;; packages as namespaces (GH #167)
+           #:default-store-not-open-error
+           #:default-store-not-open-class
+           #:default-store-not-open-store
            #:instantiate-node-type
            #:*schema-node-metadata*
            #:with-write-locked-class

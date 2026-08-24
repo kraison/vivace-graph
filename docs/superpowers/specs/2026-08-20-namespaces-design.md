@@ -68,6 +68,12 @@ existing trailing argument keeps its position and becomes the class's **default 
 Existing single-package/single-graph code is unchanged and *is* the one-to-one case.
 Decoupling is additive: obtained by writing a second `in-package`, never by accident.
 
+**Built (#167):** Shipped as designed, no syntax change. The trailing
+argument's documented meaning is now "default store" throughout
+`schema.lisp`'s docstrings and the manual (Chapter 17). A class is
+instantiable in any store from its first write via lazy adoption (§3.3);
+see that entry for how a foreign store learns a type.
+
 ### 3.3 A class is instantiable in any store
 
 Placement is a property of the node, not the class.
@@ -84,6 +90,16 @@ store instantiates the types it holds.
 
 **Guarded (#196):** divergent slot sets across stores now signal
 `divergent-node-type-redefinition`; identical sets stay silent.
+
+**Built (#167):** `*schema-node-metadata*` kept its hash-by-store shape
+(not re-keyed by class symbol — R2 of the unit spec judged the churn not
+worth it); its key's meaning changed from ownership to default store. A
+store adopts a foreign class lazily at first write
+(`%ensure-type-in-store`, under the schema lock, durable via that
+store's own `save-schema`) rather than requiring the type to be declared
+there in advance. Placement itself (which store a write targets when
+`:graph` is omitted) is §4's `default-store-not-open-error` rule, not a
+change to this section's uniqueness/registry mechanics.
 
 ### 3.4 The global type registry
 
@@ -194,6 +210,14 @@ Placement stays visible at the call site.
 store, but by its own class default. This answers "whose store holds a cross-store edge"
 with no special case, and places the relation by *policy*: a derived claim defaults to a
 disposable store while an authored assertion defaults to a durable one.
+
+**Built (#167):** `default-store-not-open-error` (readers: class name,
+store name) plus the R1 default in `def-node-type`'s generated
+`make-<name>`. `*graph*` is never consulted for this decision; an edge's
+own class default covers it with no separate code path, per the
+paragraph above. §5.4's store-occupancy set is also built here, as an
+edge-class sidecar (`edge-type-stores`, fail-safe `NIL`,
+`edge-occupancy.dat`) — see §5.4's own Built note.
 
 ## 5. Identity and resolution
 
@@ -558,7 +582,7 @@ before this ships. That is a release gate, not a design gate.
 |---|---|---|---|---|
 | 1a | Widen `type-id` to 32 bits, sparse type-index, v3 head codec, migration — **ids stay per-graph** | #166 | — | **Done** |
 | 1b | Global type-ids: canonical registry (D14), distribution, handshake guard (D15), delete the uniqueness check | #186 | 1a | In progress |
-| 2 | Packages as namespaces; store/namespace decoupling; placement defaults | #167 | **1b**, #190 | Blocked |
+| 2 | Packages as namespaces; store/namespace decoupling; placement defaults | #167 | **1b**, #190 | **Done** |
 | 3 | Image-level clock, system journal, epoch leases | #168 | — | **Done** |
 | 4 | Tagged UUIDv8 store field, resolver, detached-read marker | #169 | 3 | Not started |
 | 5 | Detach quiescence protocol and shadow bulk load | #170 | 3, 4, #191 | Blocked |

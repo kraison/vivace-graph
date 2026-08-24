@@ -336,9 +336,72 @@ evolution and is not this guard's business (GH #196)."
             :graph-name (node-type-graph-name meta)
             :other-graphs (nreverse divergent)))))
 
+(define-condition default-store-not-open-error (error)
+  ;; R1: the spec REJECTED silently writing to *GRAPH* when the class's
+  ;; declared store is not open -- placement determines recovery policy,
+  ;; so a silent fallback quietly changes durability (GH #167).
+  ((class-name :initarg :class-name
+               :reader default-store-not-open-class)
+   (store :initarg :store :reader default-store-not-open-store))
+  (:report (lambda (c s)
+             (format s "MAKE-~A: no :GRAPH argument and the class's ~
+default store ~S is not open.  Open it, or pass :GRAPH explicitly ~
+(GH #167)."
+                     (default-store-not-open-class c)
+                     (default-store-not-open-store c)))))
+
+(defun %find-registered-node-type (name kind &optional prefer-store)
+  "The registered META whose class symbol is NAME (EQ -- package-aware)
+and parent KIND. A class may be registered under more than one store
+(GH #186); PREFER-STORE's own list is checked first so the choice is
+deterministic, then every store is scanned as a fallback. NIL if
+nowhere (GH #167)."
+  (flet ((scan (metas)
+           (find-if (lambda (m)
+                      (and (eq (node-type-name m) name)
+                           (eq (node-type-parent-type m) kind)))
+                    metas)))
+    (when prefer-store
+      (let ((hit (scan (gethash prefer-store *schema-node-metadata*))))
+        (when hit (return-from %find-registered-node-type hit))))
+    (maphash (lambda (store metas)
+               (declare (ignore store))
+               (let ((hit (scan metas)))
+                 (when hit
+                   (return-from %find-registered-node-type hit))))
+             *schema-node-metadata*)
+    nil))
+
+(defun %ensure-type-in-store (name kind graph)
+  "NAME's meta in GRAPH's schema, adopting it lazily on first write: a
+store learns a foreign class the moment a node of it is written there,
+durably via INSTANTIATE-NODE-TYPE's own SAVE-SCHEMA (GH #167, R3)."
+  (or (lookup-node-type-by-name name kind :graph graph)
+      (let ((meta (%find-registered-node-type
+                   name kind (graph-name graph))))
+        (unless meta
+          (error "Node type ~S (~S) is not registered anywhere."
+                 name kind))
+        (with-recursive-lock-held ((schema-lock (schema graph)))
+          (or (lookup-node-type-by-name name kind :graph graph)
+              (progn (instantiate-node-type meta graph)
+                     (lookup-node-type-by-name name kind
+                                                :graph graph)))))))
+
+(defun %default-store-graph (class-name store-name explicit)
+  "R1 resolution: EXPLICIT graph if given, else the OPEN graph named
+STORE-NAME, else refuse -- never *GRAPH* (GH #167)."
+  (or explicit
+      (lookup-graph store-name)
+      (error 'default-store-not-open-error
+             :class-name class-name :store store-name)))
+
 (defmacro def-node-type (name parent-types slot-specs graph-name &key keep-revisions)
-  "Define a persistent node type NAME for the graph named GRAPH-NAME.  This is
-the machinery behind DEF-VERTEX and DEF-EDGE; you normally use those instead.
+  "Define a persistent node type NAME whose default store is GRAPH-NAME.  This
+is the machinery behind DEF-VERTEX and DEF-EDGE; you normally use those
+instead.  NAME's package comes from the ambient *PACKAGE* at macroexpansion
+time, not from this form -- namespace and default store are independent axes
+(GH #167).
 
 PARENT-TYPES is a single-inheritance superclass list ending in VERTEX or EDGE.
 SLOT-SPECS are CLOS-style slot definitions (a bare symbol, or (name :type ...)
@@ -348,8 +411,12 @@ Expands to a (defclass ... (:metaclass node-class)) plus generated helpers:
 MAKE-<NAME> (constructor), LOOKUP-<NAME> (id -> node, skipping deleted unless
 :include-deleted-p), and <NAME>-P (predicate).  For edges it also defines the
 Prolog functors <NAME>/2 and <NAME>/3.  The type metadata is registered under
-GRAPH-NAME and instantiated into the graph if it already exists, so a type may
-be defined before or after the graph is created."
+GRAPH-NAME and instantiated into that store if it is already open, so a type
+may be defined before or after its default store is created.  MAKE-<NAME>
+places a new node in GRAPH-NAME when :GRAPH is omitted (open, or else
+DEFAULT-STORE-NOT-OPEN-ERROR); an explicit :GRAPH always overrides the
+default and adopts the type into that store lazily on first write if it is
+not already known there (GH #167, R1/R3)."
   (with-gensyms (meta graph metas pos)
     (let* ((constructor (intern (format nil "MAKE-~A" name)))
            (predicate (intern (format nil "~A-P" name)))
@@ -398,13 +465,18 @@ be defined before or after the graph is created."
                           (or include-deleted-p
                               (not (deleted-p thing))))
                  thing)))
-           ,(let ((args (if (eql (last1 parent-types) 'edge)
-                            '(&rest make-args
-                              &key (graph *graph*) id deleted-p revision from to weight &allow-other-keys)
-                            '(&rest make-args
-                              &key (graph *graph*) id deleted-p revision &allow-other-keys))))
+           ,(let ((args
+                   (if (eql (last1 parent-types) 'edge)
+                       '(&rest make-args
+                         &key (graph nil) id deleted-p revision
+                         from to weight &allow-other-keys)
+                       '(&rest make-args
+                         &key (graph nil) id deleted-p revision
+                         &allow-other-keys))))
                  `(defun ,constructor ,args
-                    (let ((slots (remove-if
+                    (let ((graph (%default-store-graph
+                                  ',name ',graph-name graph))
+                          (slots (remove-if
                                   'null
                                   (mapcar
                                    (lambda (slot-name)
@@ -415,15 +487,15 @@ be defined before or after the graph is created."
                                    (data-slots (find-class ',name))))))
                       ,(if (eql (last1 parent-types) 'edge)
                            `(make-edge (node-type-id
-                                        (lookup-node-type-by-name ',name :edge
-                                                                  :graph graph))
+                                        (%ensure-type-in-store ',name :edge
+                                                                graph))
                                        from to weight
                                        slots ;(list ,@slots)
                                        :id id :revision revision :deleted-p deleted-p
                                        :graph graph)
                            `(make-vertex (node-type-id
-                                          (lookup-node-type-by-name ',name :vertex
-                                                                    :graph graph))
+                                          (%ensure-type-in-store ',name :vertex
+                                                                  graph))
                                          slots ;(list ,@slots)
                                          :id id :revision revision :deleted-p deleted-p
                                          :graph graph)))))
@@ -539,6 +611,11 @@ be defined before or after the graph is created."
                                          *graph*
                                          :edge-type ',name)))))
                   )
+           ;; A class may be registered under more than one store (#186);
+           ;; each store keeps its own meta entry independently.  Only
+           ;; GRAPH-NAME's own list is touched here -- %FIND-REGISTERED-
+           ;; NODE-TYPE resolves ambiguity deterministically via its
+           ;; preferred-store argument (GH #167).
            ;; Replace in place, preserving position.  The type-id reason is
            ;; historical: ids came from this list's order until #186 moved
            ;; assignment to the registry, which keys on the name.  Position
@@ -556,25 +633,29 @@ be defined before or after the graph is created."
            )))))
 
 (defmacro def-vertex (name parent-types slot-specs graph-name &key keep-revisions)
-  "Define a vertex (node) type NAME for the graph named GRAPH-NAME.
+  "Define a vertex (node) type NAME whose default store is GRAPH-NAME.
 
 PARENT-TYPES is a list of other vertex types to inherit from (often empty);
 VERTEX is appended automatically.  SLOT-SPECS are CLOS-style typed slots.
 Generates MAKE-NAME / LOOKUP-NAME / NAME-P and slot accessors.  Example:
   (def-vertex user () ((username :type string)) :social-app)
-:KEEP-REVISIONS N overrides, for this type, how many prior MVCC versions the
-reaper retains (NIL = inherit the graph default).
+MAKE-NAME places a new vertex in GRAPH-NAME when :GRAPH is omitted (it must
+be open), or in an explicit :GRAPH, adopting the type there lazily on first
+write (GH #167).  :KEEP-REVISIONS N overrides, for this type, how many prior
+MVCC versions the reaper retains (NIL = inherit the graph default).
 See DEF-NODE-TYPE for full details and DEF-EDGE for relationships."
   `(def-node-type ,name (,@parent-types vertex) ,slot-specs ,graph-name
      :keep-revisions ,keep-revisions))
 
 (defmacro def-edge (name parent-types slot-specs graph-name &key keep-revisions)
-  "Define an edge (relationship) type NAME for the graph named GRAPH-NAME.
+  "Define an edge (relationship) type NAME whose default store is GRAPH-NAME.
 
 Like DEF-VERTEX but the type inherits from EDGE, so its constructor also takes
 :FROM, :TO and :WEIGHT.  Generates MAKE-NAME / LOOKUP-NAME / NAME-P, slot
-accessors, and the Prolog query functors NAME/2 and NAME/3.  :KEEP-REVISIONS N
-overrides this type's retained-version count (NIL = inherit the graph default).
+accessors, and the Prolog query functors NAME/2 and NAME/3.  An edge is
+placed by its own class default exactly like a vertex, independent of which
+store its endpoints live in (GH #167).  :KEEP-REVISIONS N overrides this
+type's retained-version count (NIL = inherit the graph default).
 Example:
   (def-edge follows () () :social-app)
   ... (make-follows :from alice :to bob)"
@@ -735,6 +816,13 @@ is the only point at which that ordering is guaranteed."
                              (ignore-errors (location graph))))))))
 
 (defmethod instantiate-node-type ((meta node-type) (graph graph))
+  ;; R4 (GH #167): edge classes maintain a store-occupancy hint at the
+  ;; moment they are instantiated into a store -- covers both the
+  ;; declared-store path and lazy cross-store adoption, since both flow
+  ;; through here.  Re-instantiation at UPDATE-SCHEMA/reopen is a no-op:
+  ;; %NOTE-EDGE-OCCUPANCY only appends when the (name, store) pair is new.
+  (when (eq (node-type-parent-type meta) :edge)
+    (%note-edge-occupancy (node-type-name meta) (graph-name graph)))
   (with-recursive-lock-held ((schema-lock (schema graph)))
     (let ((cl (find-class (node-type-name meta) nil)))
       ;; Drop EVERY memoized CLASS-SLOTS-derived answer for this class and its

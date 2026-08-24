@@ -36,6 +36,35 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Added
 
+- **A store adopts a foreign class at first write; lookup of a class
+  registered in more than one store is deterministic** (#167). Writing a
+  node of a class via an explicit `:graph` that names a store other
+  than the class's declared default no longer requires that store to
+  have seen the class before: the first such write finds the class's
+  registered metadata, instantiates it into the target store under the
+  schema lock, and saves that store's `schema.dat` — the type is then
+  durably part of that store, surviving close and reopen like any type
+  declared there from the start. This is the mechanism behind "one
+  class, many stores" (cl-llm#20; #186). Because a class can be
+  registered under more than one store simultaneously,
+  `%find-registered-node-type` takes an optional preferred store and
+  checks that store's own registration first before falling back to a
+  full scan, so `:graph`-directed lookups resolve to the calling
+  store's own meta rather than whichever store a hash-table scan
+  happens to visit first.
+  Edge classes additionally maintain a store-occupancy hint,
+  `edge-type-stores` (name) — the list of stores known to hold a given
+  edge class, or `NIL` for "no hint, sweep everything." It is updated
+  at the same instantiation point that adoption uses, so both a
+  class's declared-store write and a lazy cross-store adoption keep it
+  current. The hint is a best-effort, append-only sidecar
+  (`edge-occupancy.dat`, beside the type registry) that fails safe: a
+  missing system directory, an unreadable or torn file, or a never-
+  written class all answer `NIL`, and a failed append degrades to
+  in-image-only for the session rather than aborting the write that
+  triggered it. Nothing in this change consumes the hint for query
+  routing — that is left to the ontology/cross-store query work.
+
 - **New node ids are tagged UUIDv8, carrying a 12-bit store field** for
   O(1) cross-store resolution; existing v5 ids are unchanged and a v5
   id still resolves via a per-open-store scan, so there is no flag
@@ -739,6 +768,25 @@ between releases; cutting a release renames it to the new version and dates it.
   per-record fsync was considered and rejected in the issue. (#191)
 
 ### Changed
+
+- **BREAKING: a `make-<type>` constructor's `:graph` default is now the
+  class's declared store, not the ambient `*graph*`** (#167). The
+  trailing argument to `def-vertex`/`def-edge` is documented from here
+  on as the class's *default store*; omitting `:graph` places the node
+  there, not wherever `*graph*` happens to be bound at the call site.
+  If that default store is not open and no `:graph` was passed, the
+  constructor now signals the new `default-store-not-open-error`
+  (naming the class and the store) rather than silently writing into
+  `*graph*` — placement determines recovery policy (which store's WAL,
+  backup schedule and detach boundary a node falls under), so a quiet
+  substitution would change a node's durability story without saying
+  so. Single-package/single-store code is unaffected: there, `*graph*`
+  already *is* the declared store on every call. The behaviour change
+  reaches only code that relied on `*graph*` differing from a class's
+  declared store to place nodes elsewhere without passing `:graph`.
+  `lookup-<type>` and the generic `make-vertex`/`make-edge` keep their
+  existing `*graph*` behaviour; they take ids or explicit types, not
+  class policy.
 
 - **BREAKING: peer wire protocol bumped 1 -> 2; a v1 device is now
   refused, not misparsed** (#206, #201). This is a wire-generation
