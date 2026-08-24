@@ -290,56 +290,110 @@ debugging an unexpectedly empty result, check the declaration before the data."
     (when segment
       (segment-scan segment query-vector k))))
 
+(defstruct (%graph-open-state (:conc-name %gos-))
+  "Mutable state MAKE-GRAPH/OPEN-GRAPH thread through their private
+%MAKE-GRAPH-1/%OPEN-GRAPH-1 body so an abort mid-open can find what to
+tear down (GH #224).  RAW is every fd-bearing resource opened before
+GRAPH itself existed; GRAPH is the constructed instance once
+MAKE-INSTANCE succeeds (RAW is cleared then -- GRAPH's own slots take
+over).  MUTATED is set just before the first step that can write real
+data against an EXISTING store's heap (recovery/rebuild on OPEN-GRAPH,
+WAL replay on MAKE-GRAPH) -- see %ABORT-GRAPH-OPEN, GH #224 review C1."
+  raw graph mutated)
+
 (defun %close-open-resource (r)
   "Best-effort close of one fd-bearing resource R of unknown runtime
 type (GH #224) -- the exact set MAKE-GRAPH/OPEN-GRAPH ever hand to a
-fresh GRAPH's slots.  Never signals; NIL is silently a no-op."
-  (ignore-errors
-    (cond ((type-index-p r) (close-type-index r))
-          ((vev-index-p r) (close-vev-index r))
-          ((ve-index-p r) (close-ve-index r))
-          ((lhash-p r) (close-lhash r))
-          ((memory-p r) (close-memory r)))))
+fresh GRAPH's slots.  Catches SERIOUS-CONDITION, not just ERROR (the
+CLOSE-GRAPH snapshot precedent, GH #119/#120): a STORAGE-CONDITION mid-
+teardown must not replace the caller's original condition either.
+Never signals; NIL is silently a no-op."
+  (handler-case
+      (cond ((type-index-p r) (close-type-index r))
+            ((vev-index-p r) (close-vev-index r))
+            ((ve-index-p r) (close-ve-index r))
+            ((lhash-p r) (close-lhash r))
+            ((memory-p r) (close-memory r)))
+    (serious-condition () nil)))
 
-(defun %abort-graph-open (raw graph)
+(defun %abort-graph-open (state)
   "Best-effort teardown for a GRAPH construction aborted partway
-through MAKE-GRAPH/OPEN-GRAPH (GH #224).  RAW is every fd-bearing
-resource opened before GRAPH itself existed -- MAKE-INSTANCE evaluates
-its initarg value-forms before it runs, so an error partway through
-that argument list (the original bug report's case) leaves each
-already-opened one reachable from nothing but a local variable, unless
-%MAKE-GRAPH-1/%OPEN-GRAPH-1 push it here as it goes.  GRAPH is the
-constructed instance, or NIL if MAKE-INSTANCE itself never returned.
-Once GRAPH exists it owns everything in RAW via its own slots and the
-caller clears RAW right then, so the two branches below never name the
-same object.  Also deregisters GRAPH from *GRAPHS*/the open-store
-vector if that ran before the failure, and removes a .dirty marker
-this open wrote.  Never signals -- the caller's UNWIND-PROTECT
-re-raises the original condition unchanged."
-  (dolist (r raw) (%close-open-resource r))
-  (when graph
-    (ignore-errors
-      (when (eq graph (gethash (graph-name graph) *graphs*))
-        (remhash (graph-name graph) *graphs*)))
-    (ignore-errors (%unregister-open-store graph))
-    (ignore-errors (%close-open-resource (vertex-index graph)))
-    (ignore-errors (%close-open-resource (edge-index graph)))
-    (ignore-errors (%close-open-resource (vev-index graph)))
-    (ignore-errors (%close-open-resource (ve-index-in graph)))
-    (ignore-errors (%close-open-resource (ve-index-out graph)))
-    (ignore-errors (%close-open-resource (vertex-table graph)))
-    (ignore-errors (%close-open-resource (edge-table graph)))
-    (ignore-errors (%close-open-resource (indexes graph)))
-    (ignore-errors (%close-open-resource (heap graph)))
-    (ignore-errors (close-replication-log graph))
-    (ignore-errors
-      (when (and (slot-exists-p graph 'applied-op-ids)
-                 (slot-boundp graph 'applied-op-ids)
-                 (lhash-p (applied-op-ids graph)))
-        (close-lhash (applied-op-ids graph))))
-    (ignore-errors
-      (let ((dirty-file (format nil "~A/.dirty" (location graph))))
-        (when (probe-file dirty-file) (delete-file dirty-file)))))
+through MAKE-GRAPH/OPEN-GRAPH (GH #224), using STATE
+(%GRAPH-OPEN-STATE) as %MAKE-GRAPH-1/%OPEN-GRAPH-1 left it.
+%GOS-RAW is every fd-bearing resource opened before GRAPH itself
+existed -- MAKE-INSTANCE evaluates its initarg value-forms before it
+runs, so an error partway through that argument list (the original bug
+report's case) leaves each already-opened one reachable from nothing
+but a local variable, unless the caller pushed it onto %GOS-RAW as it
+went.  %GOS-GRAPH is the constructed instance, or NIL if MAKE-INSTANCE
+itself never returned; once it exists it owns everything in %GOS-RAW
+via its own slots and the caller clears %GOS-RAW right then, so the
+two branches below never name the same object twice.
+
+Also: stops replication FIRST (mirrors CLOSE-GRAPH's own ordering) --
+a master's accept-loop thread and listening socket must not survive
+referencing a graph whose mmaps this function is about to close, or a
+retried open on the same port fails EADDRINUSE (GH #224 review I2b);
+closes every open vector segment, the same fd-bearing-and-dirty-flagged
+resource CLOSE-GRAPH's own MAPHASH over VECTOR-SEGMENTS closes (GH #224
+review I2) -- RESTORE-VECTOR-SEGMENTS opens one mmap per (owner . slot)
+and marks each dirty on open, so a failure anywhere after it (the
+STORE-ID-COLLISION-ERROR case #224 was filed for included) leaked
+these and forced a rebuild on the next open; deregisters GRAPH from
+*GRAPHS*/the open-store vector if that ran before the failure.
+
+Finally, removes a .dirty marker this open wrote -- but ONLY when
+%GOS-MUTATED is NIL.  OPEN-GRAPH's recovery/rebuild steps
+(GC-HEAP, RECOVER-TRANSACTIONS, REBUILD-SPATIAL/UNIQUE-INDEXES,
+INSTALL-SECONDARY-INDEXES) and MAKE-GRAPH's WAL replay run AFTER the
+.dirty write and BEFORE CLOSE-GRAPH would ever get to save fresh index
+roots; deleting the sentinel here would let a subsequent OPEN-GRAPH
+adopt the OLD roots against this now-mutated heap with no recovery
+pass to catch the mismatch (CLOSE-GRAPH's own comment on
+SAVE-UNIQUE-INDEX-ROOTS/SAVE-SECONDARY-INDEX-ROOTS names this exact
+hazard).  Leaving .dirty in place when MUTATED is T is correct: the
+store now genuinely requires recovery.  When nothing mutating ran,
+whatever is durable is exactly what a fresh MAKE-GRAPH/an unmodified
+reopen wrote, and .dirty existing at all here means (by each function's
+own upfront invariant) THIS open is the one that wrote it, so deleting
+it is safe (GH #224 review C1).
+
+Never signals -- the caller's UNWIND-PROTECT re-raises the original
+condition unchanged."
+  (let ((raw (%gos-raw state))
+        (graph (%gos-graph state))
+        (mutated (%gos-mutated state)))
+    (dolist (r raw) (%close-open-resource r))
+    (when graph
+      (ignore-errors (stop-replication graph))
+      (ignore-errors
+        (maphash (lambda (k seg)
+                   (declare (ignore k))
+                   (ignore-errors (close-vector-segment seg)))
+                 (vector-segments graph)))
+      (ignore-errors
+        (when (eq graph (gethash (graph-name graph) *graphs*))
+          (remhash (graph-name graph) *graphs*)))
+      (ignore-errors (%unregister-open-store graph))
+      (ignore-errors (%close-open-resource (vertex-index graph)))
+      (ignore-errors (%close-open-resource (edge-index graph)))
+      (ignore-errors (%close-open-resource (vev-index graph)))
+      (ignore-errors (%close-open-resource (ve-index-in graph)))
+      (ignore-errors (%close-open-resource (ve-index-out graph)))
+      (ignore-errors (%close-open-resource (vertex-table graph)))
+      (ignore-errors (%close-open-resource (edge-table graph)))
+      (ignore-errors (%close-open-resource (indexes graph)))
+      (ignore-errors (%close-open-resource (heap graph)))
+      (ignore-errors (close-replication-log graph))
+      (ignore-errors
+        (when (and (slot-exists-p graph 'applied-op-ids)
+                   (slot-boundp graph 'applied-op-ids)
+                   (lhash-p (applied-op-ids graph)))
+          (close-lhash (applied-op-ids graph))))
+      (ignore-errors
+        (unless mutated
+          (let ((dirty-file (format nil "~A/.dirty" (location graph))))
+            (when (probe-file dirty-file) (delete-file dirty-file)))))))
   nil)
 
 (defun %make-graph-1
@@ -380,27 +434,27 @@ re-raises the original condition unchanged."
       ;; is bound, so %ABORT-GRAPH-OPEN can still find and close it.
       (setq heap (create-memory (format nil "~A/heap.dat" path)
                                 heap-size))
-      (push heap (car state))
+      (push heap (%gos-raw state))
       (setq vertex-table (make-vertex-table
                           (format nil "~A/vertex/" path)
                           :base-buckets vertex-buckets))
-      (push vertex-table (car state))
+      (push vertex-table (%gos-raw state))
       (setq edge-table (make-edge-table
                         (format nil "~A/edge/" path)
                         :base-buckets edge-buckets))
-      (push edge-table (car state))
+      (push edge-table (%gos-raw state))
       (setq indexes (create-memory
                      (format nil "~A/indexes.dat" path)
                      index-size))
-      (push indexes (car state))
+      (push indexes (%gos-raw state))
       (setq ve-index-in (make-ve-index
                          (format nil "~A/ve-index-in/" path)))
-      (push ve-index-in (car state))
+      (push ve-index-in (%gos-raw state))
       (setq ve-index-out (make-ve-index
                           (format nil "~A/ve-index-out/" path)))
-      (push ve-index-out (car state))
+      (push ve-index-out (%gos-raw state))
       (setq vev-index (make-vev-index (format nil "~A/vev-index/" path)))
-      (push vev-index (car state))
+      (push vev-index (%gos-raw state))
       (setq graph
             (make-instance
              (cond (slave-p 'slave-graph)
@@ -429,8 +483,13 @@ re-raises the original condition unchanged."
              :ve-index-out ve-index-out
              :vev-index vev-index))
       ;; GRAPH now owns every resource above via its own slots -- hand
-      ;; cleanup off to the GRAPH-based path in %ABORT-GRAPH-OPEN.
-      (setf (car state) nil (cdr state) graph)
+      ;; cleanup off to the GRAPH-based path in %ABORT-GRAPH-OPEN.  Set
+      ;; %GOS-GRAPH BEFORE clearing %GOS-RAW (GH #224 review M2): if an
+      ;; async interrupt lands between the two SETFs, RAW staying non-
+      ;; NIL a moment longer only costs a redundant (IGNORE-ERRORS-
+      ;; wrapped) close, where the other order would drop every
+      ;; resource from STATE entirely.
+      (setf (%gos-graph state) graph (%gos-raw state) nil)
       (setf (vertex-index graph)
             (make-type-index
              (format nil "~A/vertex-index.dat" path) heap))
@@ -462,6 +521,11 @@ re-raises the original condition unchanged."
         (when replication-filter
           (setf (replication-filter graph) replication-filter))
         (when replay-txn-dir
+          ;; GH #224 review C1: REPLAY writes real transaction data
+          ;; into this fresh graph's heap; %ABORT-GRAPH-OPEN must not
+          ;; delete .dirty past this point (see %OPEN-GRAPH-1's mirror
+          ;; of this flag for the reopen case).
+          (setf (%gos-mutated state) t)
           (let ((*graph* graph))
             (replay graph replay-txn-dir package))))
       (when peer-role
@@ -625,10 +689,10 @@ to disk and remove it."
   ;; id.dat above all -- lands in the store's PARENT directory instead
   ;; of inside it.  Normalize once, before any use (GH #222).
   (setq location (namestring (uiop:ensure-directory-pathname location)))
-  ;; GH #224: STATE is a (RAW . GRAPH) cons %MAKE-GRAPH-1 updates as
-  ;; it goes; DONE distinguishes a clean return from a non-local exit.
-  ;; The original condition always propagates unchanged.
-  (let ((state (cons nil nil)) (done nil))
+  ;; GH #224: STATE (%GRAPH-OPEN-STATE) is what %MAKE-GRAPH-1 updates
+  ;; as it goes; DONE distinguishes a clean return from a non-local
+  ;; exit.  The original condition always propagates unchanged.
+  (let ((state (make-%graph-open-state)) (done nil))
     (unwind-protect
         (prog1
             (%make-graph-1 name location state
@@ -661,7 +725,7 @@ to disk and remove it."
                            :system-clock system-clock
                            :recovery-policy recovery-policy)
           (setf done t))
-      (unless done (%abort-graph-open (car state) (cdr state))))))
+      (unless done (%abort-graph-open state)))))
 
 (define-condition recovery-policy-mismatch-warning (warning)
   ;; A named class rather than a bare STRING WARN, so a caller (or a test)
@@ -716,22 +780,22 @@ policy.dat's ~S; the file wins."
       ;; opened resource as soon as it is bound.
       (setq heap (open-memory (format nil "~A/heap.dat" path)
                               :accept-versions accept-versions))
-      (push heap (car state))
+      (push heap (%gos-raw state))
       (setq vertex-table (open-lhash (format nil "~A/vertex/" path)))
-      (push vertex-table (car state))
+      (push vertex-table (%gos-raw state))
       (setq edge-table (open-lhash (format nil "~A/edge/" path)))
-      (push edge-table (car state))
+      (push edge-table (%gos-raw state))
       (setq indexes (open-memory (format nil "~A/indexes.dat" path)
                                  :accept-versions accept-versions))
-      (push indexes (car state))
+      (push indexes (%gos-raw state))
       (setq ve-index-in (open-ve-index
                          (format nil "~A/ve-index-in/" path)))
-      (push ve-index-in (car state))
+      (push ve-index-in (%gos-raw state))
       (setq ve-index-out (open-ve-index
                           (format nil "~A/ve-index-out/" path)))
-      (push ve-index-out (car state))
+      (push ve-index-out (%gos-raw state))
       (setq vev-index (open-vev-index (format nil "~A/vev-index/" path)))
-      (push vev-index (car state))
+      (push vev-index (%gos-raw state))
       (setq graph
             (make-instance
              (cond (slave-p 'slave-graph)
@@ -760,8 +824,13 @@ policy.dat's ~S; the file wins."
              :ve-index-out ve-index-out
              :vev-index vev-index))
       ;; GRAPH now owns every resource above via its own slots -- hand
-      ;; cleanup off to the GRAPH-based path in %ABORT-GRAPH-OPEN.
-      (setf (car state) nil (cdr state) graph)
+      ;; cleanup off to the GRAPH-based path in %ABORT-GRAPH-OPEN.  Set
+      ;; %GOS-GRAPH BEFORE clearing %GOS-RAW (GH #224 review M2): if an
+      ;; async interrupt lands between the two SETFs, RAW staying non-
+      ;; NIL a moment longer only costs a redundant (IGNORE-ERRORS-
+      ;; wrapped) close, where the other order would drop every
+      ;; resource from STATE entirely.
+      (setf (%gos-graph state) graph (%gos-raw state) nil)
       (let ((*graph* graph))
         (setf (vertex-index graph)
               (open-type-index (format nil "~A/vertex-index.dat" path) heap))
@@ -870,6 +939,10 @@ policy.dat's ~S; the file wins."
             (progn
               (setf (gethash name *graphs*) graph)
               (%register-open-store graph)))
+        ;; GH #224 review C1: from here on, recovery/rebuild can write
+        ;; real data against this (possibly pre-existing) store's heap;
+        ;; %ABORT-GRAPH-OPEN must not delete .dirty past this point.
+        (setf (%gos-mutated state) t)
         (when gc-heap-p
           (gc-heap graph))
         ;; A non-empty WAL tail means this open is a CRASH RECOVERY: the .txn files
@@ -1062,10 +1135,10 @@ accepting, as before)."
   ;; id.dat above all -- lands in the store's PARENT directory instead
   ;; of inside it.  Normalize once, before any use (GH #222).
   (setq location (namestring (uiop:ensure-directory-pathname location)))
-  ;; GH #224: STATE is a (RAW . GRAPH) cons %OPEN-GRAPH-1 updates as
-  ;; it goes; DONE distinguishes a clean return from a non-local exit.
-  ;; The original condition always propagates unchanged.
-  (let ((state (cons nil nil)) (done nil))
+  ;; GH #224: STATE (%GRAPH-OPEN-STATE) is what %OPEN-GRAPH-1 updates
+  ;; as it goes; DONE distinguishes a clean return from a non-local
+  ;; exit.  The original condition always propagates unchanged.
+  (let ((state (make-%graph-open-state)) (done nil))
     (unwind-protect
         (prog1
             (%open-graph-1 name location state
@@ -1097,7 +1170,7 @@ accepting, as before)."
                           :recovery-policy recovery-policy
                           :initial-accepting-state initial-accepting-state)
           (setf done t))
-      (unless done (%abort-graph-open (car state) (cdr state))))))
+      (unless done (%abort-graph-open state)))))
 
 (defmethod close-graph ((graph graph) &key (snapshot-p t))
   "Cleanly close GRAPH: stop replication, flush and unmap all on-disk
