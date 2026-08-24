@@ -98,6 +98,9 @@
                ;; ENSURE-NAMESPACE / CREATE-VERTEX-TYPE / CREATE-EDGE-TYPE
                ;; (GH #172, R4): the runtime twins of DEF-VERTEX/DEF-EDGE.
                (:file "runtime-schema" :depends-on ("schema"))
+               ;; DESCRIBE-SCHEMA / EXPORT-SCHEMA-SOURCE (GH #172, R6):
+               ;; read-only visibility tooling over the manifest+metas.
+               (:file "schema-tools" :depends-on ("runtime-schema"))
                ;; Reads a store's schema.dat and heap header, so it cannot
                ;; live in "type-registry" -- "schema" depends on THAT (#186).
                (:file "type-seeding"

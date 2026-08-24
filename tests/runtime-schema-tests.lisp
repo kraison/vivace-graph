@@ -593,3 +593,48 @@ every type it rebuilds."
           (%rs-wipe-runtime-state g)
           (graph-db:materialize-schema graph-db::*system-directory*)
           (is (= before (row-count (intern "BOOTROW" :rs-tlm)))))))))
+
+;;; ---------------------------------------------------------------------
+;;; Task 4 (R6): DESCRIBE-SCHEMA / EXPORT-SCHEMA-SOURCE.
+;;; ---------------------------------------------------------------------
+
+(test describe-schema-shows-provenance-and-slots
+  (with-rs-store (g)
+    g
+    (graph-db:ensure-namespace "RS-TLM")
+    (graph-db:create-vertex-type "RS-TLM:READING"
+                                 '((value :type double-float))
+                                 :default-store :rs-store)
+    (let ((text (with-output-to-string (s)
+                  (graph-db:describe-schema :stream s))))
+      (is (search "RS-TLM" text))
+      (is (search "READING" text))
+      (is (search "[runtime" text))
+      (is (search "RS-STATIC" text :test #'char-equal))
+      (is (search "[source]" text)))))
+
+(test export-schema-source-round-trips
+  "The promotion path: export the runtime namespace, wipe the image
+state, LOAD the exported file (the ordinary source path -- the ENGINE
+never does this, the developer's build does), and the type is back
+with the SAME registry id."
+  (with-rs-store (g)
+    g
+    (graph-db:ensure-namespace "RS-TLM")
+    (graph-db:create-vertex-type "RS-TLM:READING"
+                                 '((value :type double-float))
+                                 :default-store :rs-store)
+    (let ((id-before (graph-db::node-type-id
+                      (graph-db::%find-registered-node-type
+                       (intern "READING" :rs-tlm) :vertex)))
+          (path (merge-pathnames
+                 "exported-schema.lisp"
+                 (uiop:ensure-directory-pathname
+                  graph-db::*system-directory*))))
+      (graph-db:export-schema-source path :namespace :rs-tlm)
+      (%rs-wipe-runtime-state)
+      (load path)
+      (let ((meta (graph-db::%find-registered-node-type
+                   (intern "READING" :rs-tlm) :vertex)))
+        (is-true meta)
+        (is (= id-before (graph-db::node-type-id meta)))))))

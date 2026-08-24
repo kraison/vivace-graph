@@ -315,6 +315,11 @@
            #:unresolved-parent-names
            #:instantiate-node-type
            #:*schema-node-metadata*
+           #:read-schema-manifest
+
+           ;; visibility tooling (GH #172, R6)
+           #:describe-schema
+           #:export-schema-source
            #:with-write-locked-class
            #:with-read-locked-class
            #:schema-class-locks
