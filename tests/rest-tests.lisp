@@ -534,3 +534,58 @@ name and (values meta NIL) for a unique one."
           (graph-db::%rest-resolve-post-type "aliasUnique" :vertex)
         (is (graph-db::node-type-p meta))
         (is (null msg))))))
+
+;;; ---------------------------------------------------------------------------
+;;; POST places the node in the URL's graph, not the class's declared
+;;; default store (GH #167).
+;;; ---------------------------------------------------------------------------
+
+;; Declared default is store A; a POST to store B must still land there.
+(def-vertex rest-dual-item () ((label :type string)) :rest-dual-store-a)
+
+(defmacro with-rest-dual-stores ((ga gb) &body body)
+  "Two open stores, :REST-DUAL-STORE-A (REST-DUAL-ITEM's declared
+default) and :REST-DUAL-STORE-B (foreign to it), under a fresh system
+directory."
+  (let ((sys (gensym)) (da (gensym)) (db (gensym)))
+    `(with-temp-directory (,sys)
+       (with-temp-directory (,da)
+         (with-temp-directory (,db)
+           (let ((graph-db::*system-directory* (namestring ,sys)))
+             (let ((,ga (make-graph :rest-dual-store-a (namestring ,da)
+                                    :buffer-pool-size 1000))
+                   (,gb nil))
+               (unwind-protect
+                    (progn
+                      (setq ,gb (make-graph :rest-dual-store-b
+                                            (namestring ,db)
+                                            :buffer-pool-size 1000))
+                      ,@body)
+                 (ignore-errors (close-graph ,ga :snapshot-p nil))
+                 (when ,gb
+                   (ignore-errors (close-graph ,gb :snapshot-p nil)))
+                 (collect-garbage)))))))))
+
+(test rest-post-vertex-honors-the-url-graph-over-the-class-default
+  "POST to store B for a class whose declared default is store A: the
+node must be created IN B (the URL's graph), not silently redirected
+to A.  %REST-RESOLVE-POST-TYPE only sees types already known to
+*GRAPH*'s own schema, so B first adopts REST-DUAL-ITEM the ordinary
+way (one direct write with an explicit :GRAPH); the REST POST that
+follows is the thing under test (GH #167)."
+  (with-rest-dual-stores (ga gb)
+    (with-transaction ((graph-db::transaction-manager gb))
+      (make-rest-dual-item :label "seed" :graph gb))
+    (with-rest-env ()
+      (let* ((out (graph-db::rest-post-vertex
+                   (list (cons "username" "u") (cons "password" "p")
+                         (cons :graph-name
+                               (json:lisp-to-camel-case
+                                (symbol-name :rest-dual-store-b)))
+                         (cons :type "restDualItem")
+                         (cons "label" "in-b"))))
+             (j (rest-decode out))
+             (id (cdr (assoc :id j))))
+        (is (string= "in-b" (cdr (assoc :label j))))
+        (is-true (lookup-vertex id :graph gb))
+        (is (null (lookup-vertex id :graph ga)))))))

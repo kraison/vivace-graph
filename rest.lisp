@@ -685,7 +685,10 @@ A malformed query or a resource-bound breach is a 400, a forbidden effect a 403.
                                                    params
                                                    :test 'string-equal))))
                                slots))
-                     (node (apply constructor slot-args)))
+                     ;; The URL's graph IS the explicit :graph -- without
+                     ;; it the node lands in the class's declared store,
+                     ;; not the store the request named (GH #167).
+                     (node (apply constructor :graph *graph* slot-args)))
                 (json-encode node))
               (json:encode-json-to-string
                (list (cons :error error-string)))))))))
@@ -746,7 +749,9 @@ A malformed query or a resource-bound breach is a 400, a forbidden effect a 403.
                                                    :test 'string-equal))))
                                slots)))
                 (if (and from to)
-                    (let ((node (apply constructor :from from :to to
+                    ;; :graph *graph* -- see rest-post-vertex (GH #167).
+                    (let ((node (apply constructor :graph *graph*
+                                       :from from :to to
                                        slot-args)))
                       (json-encode node))
                     (json:encode-json-to-string

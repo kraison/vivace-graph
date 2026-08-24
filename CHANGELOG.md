@@ -36,8 +36,8 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Added
 
-- **A store adopts a foreign class at first write; re-declaring a class
-  moves its registration to its new default store** (#167). Writing a
+- **A store adopts a foreign class at first write; lookup of a class
+  registered in more than one store is deterministic** (#167). Writing a
   node of a class via an explicit `:graph` that names a store other
   than the class's declared default no longer requires that store to
   have seen the class before: the first such write finds the class's
@@ -45,11 +45,13 @@ between releases; cutting a release renames it to the new version and dates it.
   schema lock, and saves that store's `schema.dat` — the type is then
   durably part of that store, surviving close and reopen like any type
   declared there from the start. This is the mechanism behind "one
-  class, many stores" (cl-llm#20). A `def-vertex`/`def-edge` form
-  re-evaluated with a different trailing store argument now *moves*
-  the class's registration to the new store rather than leaving a
-  stale entry behind under the old one, matching ordinary CLOS
-  redefinition semantics.
+  class, many stores" (cl-llm#20; #186). Because a class can be
+  registered under more than one store simultaneously,
+  `%find-registered-node-type` takes an optional preferred store and
+  checks that store's own registration first before falling back to a
+  full scan, so `:graph`-directed lookups resolve to the calling
+  store's own meta rather than whichever store a hash-table scan
+  happens to visit first.
   Edge classes additionally maintain a store-occupancy hint,
   `edge-type-stores` (name) — the list of stores known to hold a given
   edge class, or `NIL` for "no hint, sweep everything." It is updated

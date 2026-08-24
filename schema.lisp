@@ -350,26 +350,35 @@ default store ~S is not open.  Open it, or pass :GRAPH explicitly ~
                      (default-store-not-open-class c)
                      (default-store-not-open-store c)))))
 
-(defun %find-registered-node-type (name kind)
+(defun %find-registered-node-type (name kind &optional prefer-store)
   "The registered META whose class symbol is NAME (EQ -- package-aware)
-and parent KIND, from any default store's list, or NIL (GH #167)."
-  (maphash (lambda (store metas)
-             (declare (ignore store))
-             (let ((hit (find-if (lambda (m)
-                                    (and (eq (node-type-name m) name)
-                                         (eq (node-type-parent-type m)
-                                             kind)))
-                                  metas)))
-               (when hit (return-from %find-registered-node-type hit))))
-           *schema-node-metadata*)
-  nil)
+and parent KIND. A class may be registered under more than one store
+(GH #186); PREFER-STORE's own list is checked first so the choice is
+deterministic, then every store is scanned as a fallback. NIL if
+nowhere (GH #167)."
+  (flet ((scan (metas)
+           (find-if (lambda (m)
+                      (and (eq (node-type-name m) name)
+                           (eq (node-type-parent-type m) kind)))
+                    metas)))
+    (when prefer-store
+      (let ((hit (scan (gethash prefer-store *schema-node-metadata*))))
+        (when hit (return-from %find-registered-node-type hit))))
+    (maphash (lambda (store metas)
+               (declare (ignore store))
+               (let ((hit (scan metas)))
+                 (when hit
+                   (return-from %find-registered-node-type hit))))
+             *schema-node-metadata*)
+    nil))
 
 (defun %ensure-type-in-store (name kind graph)
   "NAME's meta in GRAPH's schema, adopting it lazily on first write: a
 store learns a foreign class the moment a node of it is written there,
 durably via INSTANTIATE-NODE-TYPE's own SAVE-SCHEMA (GH #167, R3)."
   (or (lookup-node-type-by-name name kind :graph graph)
-      (let ((meta (%find-registered-node-type name kind)))
+      (let ((meta (%find-registered-node-type
+                   name kind (graph-name graph))))
         (unless meta
           (error "Node type ~S (~S) is not registered anywhere."
                  name kind))
@@ -456,11 +465,14 @@ not already known there (GH #167, R1/R3)."
                           (or include-deleted-p
                               (not (deleted-p thing))))
                  thing)))
-           ,(let ((args (if (eql (last1 parent-types) 'edge)
-                            '(&rest make-args
-                              &key (graph nil) id deleted-p revision from to weight &allow-other-keys)
-                            '(&rest make-args
-                              &key (graph nil) id deleted-p revision &allow-other-keys))))
+           ,(let ((args
+                   (if (eql (last1 parent-types) 'edge)
+                       '(&rest make-args
+                         &key (graph nil) id deleted-p revision
+                         from to weight &allow-other-keys)
+                       '(&rest make-args
+                         &key (graph nil) id deleted-p revision
+                         &allow-other-keys))))
                  `(defun ,constructor ,args
                     (let ((graph (%default-store-graph
                                   ',name ',graph-name graph))
@@ -599,16 +611,11 @@ not already known there (GH #167, R1/R3)."
                                          *graph*
                                          :edge-type ',name)))))
                   )
-           ;; A class has exactly one default store: re-declaring it under a
-           ;; different trailing GRAPH-NAME MOVES the meta, matching CLOS
-           ;; redefinition semantics.  Without this, the old store's list
-           ;; keeps a stale entry and %FIND-REGISTERED-NODE-TYPE's scan over
-           ;; every store picks whichever maphash visits first (GH #167).
-           (maphash (lambda (store metas)
-                      (unless (eq store ',graph-name)
-                        (setf (gethash store *schema-node-metadata*)
-                              (remove ',name metas :key #'node-type-name))))
-                    *schema-node-metadata*)
+           ;; A class may be registered under more than one store (#186);
+           ;; each store keeps its own meta entry independently.  Only
+           ;; GRAPH-NAME's own list is touched here -- %FIND-REGISTERED-
+           ;; NODE-TYPE resolves ambiguity deterministically via its
+           ;; preferred-store argument (GH #167).
            ;; Replace in place, preserving position.  The type-id reason is
            ;; historical: ids came from this list's order until #186 moved
            ;; assignment to the registry, which keys on the name.  Position

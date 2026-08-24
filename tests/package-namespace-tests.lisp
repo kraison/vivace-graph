@@ -14,9 +14,11 @@
 
 (def-vertex pn-item () ((label :type string)) :pn-store-a)
 (def-edge pn-link () () :pn-store-b)
-;; Scratch class for the redeclare-moves-the-meta test below; never
-;; written to, so its own store need not be open.
-(def-vertex pn-redeclared () () :pn-store-a)
+;; Scratch class registered under BOTH stores (#186 pattern) for the
+;; preferred-store-determinism test below; never written to, so
+;; neither store need be open.
+(def-vertex pn-dual () () :pn-store-a)
+(def-vertex pn-dual () () :pn-store-b)
 
 ;; Two scratch packages, same symbol-name TWIN, both declared into
 ;; store A -- DEF-VERTEX interns MAKE-<NAME>/<NAME>-P in *PACKAGE* at
@@ -166,31 +168,30 @@ end, not just at definition."
                       #'identity ga :collect-p t
                       :vertex-type (intern "TWIN" :pn-pkg-two)))))))
 
-(test redeclaring-a-class-moves-its-meta-to-the-new-store
-  "A class has exactly one default store: re-declaring PN-REDECLARED
-with :PN-STORE-B as the trailing argument must MOVE its meta, not
-leave a stale copy under :PN-STORE-A -- else %FIND-REGISTERED-NODE-
-TYPE's cross-store scan is ambiguous (GH #167 review round 1)."
-  (unwind-protect
-       (progn
-         (eval '(def-vertex pn-redeclared () () :pn-store-b))
-         (is (not (find 'pn-redeclared
-                        (gethash :pn-store-a
-                                 graph-db::*schema-node-metadata*)
-                        :key #'graph-db::node-type-name)))
-         (let ((meta (find 'pn-redeclared
-                           (gethash :pn-store-b
-                                    graph-db::*schema-node-metadata*)
-                           :key #'graph-db::node-type-name)))
-           (is-true meta)
-           (when meta
-             (is (eq :pn-store-b (graph-db::node-type-graph-name meta)))
-             (is (eq meta
-                     (graph-db::%find-registered-node-type
-                      'pn-redeclared :vertex))))))
-    ;; Restore the load-time declaration so later tests (and later
-    ;; runs of this suite in the same image) see the original store.
-    (eval '(def-vertex pn-redeclared () () :pn-store-a))))
+(test a-class-registered-in-two-stores-keeps-both-metas
+  "PN-DUAL is declared under both :PN-STORE-A and :PN-STORE-B (#186):
+both metas survive, and %FIND-REGISTERED-NODE-TYPE's PREFER-STORE
+argument deterministically picks the requested store's own meta
+(GH #167 review round 1, reversed)."
+  (let ((meta-a (find 'pn-dual
+                      (gethash :pn-store-a
+                               graph-db::*schema-node-metadata*)
+                      :key #'graph-db::node-type-name))
+        (meta-b (find 'pn-dual
+                      (gethash :pn-store-b
+                               graph-db::*schema-node-metadata*)
+                      :key #'graph-db::node-type-name)))
+    (is-true meta-a)
+    (is-true meta-b)
+    (when (and meta-a meta-b)
+      (is (eq :pn-store-a (graph-db::node-type-graph-name meta-a)))
+      (is (eq :pn-store-b (graph-db::node-type-graph-name meta-b)))
+      (is (eq meta-a
+              (graph-db::%find-registered-node-type
+               'pn-dual :vertex :pn-store-a)))
+      (is (eq meta-b
+              (graph-db::%find-registered-node-type
+               'pn-dual :vertex :pn-store-b))))))
 
 (test edge-occupancy-tracks-stores-and-defaults-to-no-hint
   "PN-LINK instantiated into B (its default) and adopted by A: the
@@ -229,6 +230,23 @@ from edge-occupancy.dat; a torn final line is dropped, not an error."
         (graph-db::%clear-edge-occupancy-cache)
         (is (member :pn-store-b
                     (graph-db:edge-type-stores 'pn-link)))))))
+
+(test edge-occupancy-load-failure-degrades-to-no-hint
+  "%LOAD-EDGE-OCCUPANCY must never signal: point the sidecar path at a
+directory (PROBE-FILE succeeds, WITH-OPEN-FILE :INPUT does not) and
+confirm the lookup still returns cleanly with no hint (GH #167, final
+review I1)."
+  (with-pn-stores (ga gb)
+    ga gb
+    (let ((orig (fdefinition 'graph-db::%edge-occupancy-file)))
+      (unwind-protect
+           (progn
+             (setf (fdefinition 'graph-db::%edge-occupancy-file)
+                   (lambda () (uiop:temporary-directory)))
+             (graph-db::%clear-edge-occupancy-cache)
+             (is (null (graph-db:edge-type-stores 'pn-link))))
+        (setf (fdefinition 'graph-db::%edge-occupancy-file) orig)
+        (graph-db::%clear-edge-occupancy-cache)))))
 
 (test edge-occupancy-append-failure-does-not-abort-the-write
   "A failed sidecar append (disk full, permissions, fd exhaustion) must

@@ -23,12 +23,13 @@ cache would keep answering for whatever directory was current first.")
 
 (defun %edge-occupancy-file ()
   "EDGE-OCCUPANCY.DAT beside the type registry, or NIL when no system
-directory is configured (R4 fallback: in-image only)."
+directory is configured, or any other failure (R4 fallback: in-image
+only -- this must never signal, GH #167)."
   (handler-case
       (make-pathname :name "edge-occupancy" :type "dat"
                      :defaults (type-registry-location
                                 (ensure-type-registry)))
-    (system-directory-required () nil)))
+    (error () nil)))
 
 (defun %edge-occupancy-print-package ()
   ;; COMMON-LISP, not KEYWORD: class symbols must print package-qualified
@@ -50,18 +51,23 @@ lost hint, never an error."
 
 (defun %load-edge-occupancy (file)
   "Populate *EDGE-OCCUPANCY* from FILE, if it exists.  Caller holds
-*EDGE-OCCUPANCY-LOCK*."
+*EDGE-OCCUPANCY-LOCK*.  Any read failure (FILE is a directory, a
+permission error, a race with an external deletion after PROBE-FILE)
+degrades to no-hint, matching R4 -- this must never signal into a real
+write (GH #167)."
   (clrhash *edge-occupancy*)
   (when (and file (probe-file file))
-    (with-open-file (s file :direction :input)
-      (loop
-        (let ((line (read-line s nil :eof)))
-          (when (eq line :eof) (return))
-          (let ((parsed (%parse-edge-occupancy-line line)))
-            (when parsed
-              (destructuring-bind (name store) parsed
-                (pushnew store (gethash name *edge-occupancy*)
-                         :test 'equal))))))))
+    (handler-case
+        (with-open-file (s file :direction :input)
+          (loop
+            (let ((line (read-line s nil :eof)))
+              (when (eq line :eof) (return))
+              (let ((parsed (%parse-edge-occupancy-line line)))
+                (when parsed
+                  (destructuring-bind (name store) parsed
+                    (pushnew store (gethash name *edge-occupancy*)
+                             :test 'equal)))))))
+      (error () (clrhash *edge-occupancy*))))
   (setf *edge-occupancy-loaded-file* file)
   (setf *edge-occupancy-loaded-p* t))
 

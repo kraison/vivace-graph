@@ -133,12 +133,18 @@ share a transaction domain by construction (§2).
 **Built (#167):** Shipped as designed — R1-R5 landed unchanged, R6's
 scope guard held (no placement-rule function, no per-namespace default,
 no query rewiring). Two additions surfaced by review that the design
-above did not anticipate: (1) `def-node-type`'s registration-list
-maintenance now **moves** a redeclared class's meta to its new default
-store instead of leaving a stale copy under the old store name — without
-this, `%find-registered-node-type`'s cross-store scan would find two
-entries for one class symbol and pick whichever `maphash` visited first;
-see the `redeclaring-a-class-moves-its-meta-to-the-new-store` test. (2)
+above did not anticipate: (1) a first attempt made `def-node-type`'s
+registration-list maintenance **move** a redeclared class's meta to its
+new default store; this broke the #186 pattern of one class registered
+in more than one store (a live pattern in `tests/global-type-id-
+tests.lisp`, ~150 cascading test failures + an fd exhaustion crash), so
+the sweep was reverted. `%find-registered-node-type` instead takes an
+optional `prefer-store` argument and checks that store's own list
+first, falling back to a full scan only when unset; `%ensure-type-in-
+store` passes `(graph-name graph)` so ambiguity resolves
+deterministically to the calling store's own meta without disturbing
+any other store's registration. See
+`a-class-registered-in-two-stores-keeps-both-metas`. (2)
 `%note-edge-occupancy`'s sidecar append is now guarded by
 `handler-case`/`ignore-errors` around the file write, not just around the
 initial `%edge-occupancy-file` lookup — a disk-full or permission failure
