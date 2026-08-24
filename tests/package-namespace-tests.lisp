@@ -15,6 +15,17 @@
 (def-vertex pn-item () ((label :type string)) :pn-store-a)
 (def-edge pn-link () () :pn-store-b)
 
+;; Two scratch packages, same symbol-name TWIN, both declared into
+;; store A -- DEF-VERTEX interns MAKE-<NAME>/<NAME>-P in *PACKAGE* at
+;; expansion time, so each package gets its own MAKE-TWIN (GH #167).
+(defpackage #:pn-pkg-one (:use #:cl #:graph-db))
+(defpackage #:pn-pkg-two (:use #:cl #:graph-db))
+(in-package #:pn-pkg-one)
+(graph-db:def-vertex twin () () :pn-store-a)
+(in-package #:pn-pkg-two)
+(graph-db:def-vertex twin () () :pn-store-a)
+(in-package #:graph-db/test)
+
 (defmacro with-pn-stores ((ga gb) &body body)
   "Two open stores :PN-STORE-A / :PN-STORE-B under a fresh system dir.
 Resets both metadata lists' instantiation state by reopening from empty
@@ -56,17 +67,10 @@ PN-ITEM lands in store A (its declared store).  Under the old
                                             :vertex-type 'pn-item))))))
 
 (test constructor-explicit-graph-overrides-the-default
-  ;; Adaptation note (GH #167 task 1): PN-ITEM's type is only auto-
-  ;; instantiated into its DECLARED store (:PN-STORE-A) -- adopting it
-  ;; into a foreign store on first write is Task 3's lazy-adoption work,
-  ;; not this task's.  Instantiate it into GB by hand here so this test
-  ;; isolates R1 (does :GRAPH override the default?) from R3.
+  "R1: :GRAPH overrides the class's declared default store; PN-ITEM's
+type is adopted into GB lazily at this first write (R3)."
   (with-pn-stores (ga gb)
     ga
-    (let ((meta (find 'pn-item
-                       (gethash :pn-store-a graph-db::*schema-node-metadata*)
-                       :key #'graph-db::node-type-name)))
-      (graph-db:instantiate-node-type meta gb))
     (with-transaction ((graph-db::transaction-manager gb))
       (make-pn-item :label "in-b" :graph gb))
     (is (= 1 (length (graph-db:map-vertices #'identity gb :collect-p t
@@ -105,3 +109,56 @@ placed the same way)."
                                            :edge-type 'pn-link))))
       (is (= 0 (length (graph-db:map-edges #'identity ga :collect-p t
                                            :edge-type 'pn-link)))))))
+
+(test class-is-instantiable-in-a-second-store
+  "cl-llm#20's acceptance: PN-ITEM (declared store A) written into B via
+explicit :GRAPH -- B adopts the type at first write, both stores hold
+their own instances, and the type-id is the same system-wide id."
+  (with-pn-stores (ga gb)
+    (with-transaction ((graph-db::transaction-manager ga))
+      (make-pn-item :label "a1"))
+    (with-transaction ((graph-db::transaction-manager gb))
+      (make-pn-item :label "b1" :graph gb))
+    (is (= 1 (length (graph-db:map-vertices #'identity ga :collect-p t
+                                            :vertex-type 'pn-item))))
+    (is (= 1 (length (graph-db:map-vertices #'identity gb :collect-p t
+                                            :vertex-type 'pn-item))))
+    (let ((ma (graph-db:lookup-node-type-by-name 'pn-item :vertex
+                                                 :graph ga))
+          (mb (graph-db:lookup-node-type-by-name 'pn-item :vertex
+                                                 :graph gb)))
+      (is (= (graph-db::node-type-id ma) (graph-db::node-type-id mb))))))
+
+(test adopted-type-survives-reopen
+  "The adoption persisted via the store's own schema.dat: close B,
+reopen it, and the foreign-typed node reads back typed."
+  (with-pn-stores (ga gb)
+    ga
+    (let (id (loc (namestring (graph-db::location gb))))
+      (with-transaction ((graph-db::transaction-manager gb))
+        (setq id (graph-db:id (make-pn-item :label "b1" :graph gb))))
+      (let ((graph-db:*graph* gb)) (close-graph gb :snapshot-p nil))
+      (let ((gb2 (open-graph :pn-store-b loc)))
+        (let ((v (graph-db:lookup-vertex id :graph gb2)))
+          (is (typep v 'pn-item))
+          (is (string= "b1" (label v))))))))
+
+(test two-packages-share-a-symbol-name-without-collision
+  "Distinct packages, same symbol-name, both usable -- pinned end to
+end, not just at definition."
+  (with-pn-stores (ga gb)
+    gb
+    ;; The classes are defined at load time above in two scratch
+    ;; packages; both declare store A.
+    (with-transaction ((graph-db::transaction-manager ga))
+      (funcall (intern "MAKE-TWIN" :pn-pkg-one) :graph ga)
+      (funcall (intern "MAKE-TWIN" :pn-pkg-two) :graph ga))
+    (let ((c1 (find-class (intern "TWIN" :pn-pkg-one)))
+          (c2 (find-class (intern "TWIN" :pn-pkg-two))))
+      (is (not (eq c1 c2))))
+    (is (= 1 (length (graph-db:map-vertices
+                      #'identity ga :collect-p t
+                      :vertex-type (intern "TWIN" :pn-pkg-one)))))
+    (is (= 1 (length (graph-db:map-vertices
+                      #'identity ga :collect-p t
+                      :vertex-type (intern "TWIN" :pn-pkg-two)))))))

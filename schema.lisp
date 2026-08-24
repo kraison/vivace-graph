@@ -350,6 +350,35 @@ default store ~S is not open.  Open it, or pass :GRAPH explicitly ~
                      (default-store-not-open-class c)
                      (default-store-not-open-store c)))))
 
+(defun %find-registered-node-type (name kind)
+  "The registered META whose class symbol is NAME (EQ -- package-aware)
+and parent KIND, from any default store's list, or NIL (GH #167)."
+  (maphash (lambda (store metas)
+             (declare (ignore store))
+             (let ((hit (find-if (lambda (m)
+                                    (and (eq (node-type-name m) name)
+                                         (eq (node-type-parent-type m)
+                                             kind)))
+                                  metas)))
+               (when hit (return-from %find-registered-node-type hit))))
+           *schema-node-metadata*)
+  nil)
+
+(defun %ensure-type-in-store (name kind graph)
+  "NAME's meta in GRAPH's schema, adopting it lazily on first write: a
+store learns a foreign class the moment a node of it is written there,
+durably via INSTANTIATE-NODE-TYPE's own SAVE-SCHEMA (GH #167, R3)."
+  (or (lookup-node-type-by-name name kind :graph graph)
+      (let ((meta (%find-registered-node-type name kind)))
+        (unless meta
+          (error "Node type ~S (~S) is not registered anywhere."
+                 name kind))
+        (with-recursive-lock-held ((schema-lock (schema graph)))
+          (or (lookup-node-type-by-name name kind :graph graph)
+              (progn (instantiate-node-type meta graph)
+                     (lookup-node-type-by-name name kind
+                                                :graph graph)))))))
+
 (defun %default-store-graph (class-name store-name explicit)
   "R1 resolution: EXPLICIT graph if given, else the OPEN graph named
 STORE-NAME, else refuse -- never *GRAPH* (GH #167)."
@@ -439,15 +468,15 @@ be defined before or after the graph is created."
                                    (data-slots (find-class ',name))))))
                       ,(if (eql (last1 parent-types) 'edge)
                            `(make-edge (node-type-id
-                                        (lookup-node-type-by-name ',name :edge
-                                                                  :graph graph))
+                                        (%ensure-type-in-store ',name :edge
+                                                                graph))
                                        from to weight
                                        slots ;(list ,@slots)
                                        :id id :revision revision :deleted-p deleted-p
                                        :graph graph)
                            `(make-vertex (node-type-id
-                                          (lookup-node-type-by-name ',name :vertex
-                                                                    :graph graph))
+                                          (%ensure-type-in-store ',name :vertex
+                                                                  graph))
                                          slots ;(list ,@slots)
                                          :id id :revision revision :deleted-p deleted-p
                                          :graph graph)))))
