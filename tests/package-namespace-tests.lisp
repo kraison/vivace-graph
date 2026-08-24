@@ -14,6 +14,9 @@
 
 (def-vertex pn-item () ((label :type string)) :pn-store-a)
 (def-edge pn-link () () :pn-store-b)
+;; Scratch class for the redeclare-moves-the-meta test below; never
+;; written to, so its own store need not be open.
+(def-vertex pn-redeclared () () :pn-store-a)
 
 ;; Two scratch packages, same symbol-name TWIN, both declared into
 ;; store A -- DEF-VERTEX interns MAKE-<NAME>/<NAME>-P in *PACKAGE* at
@@ -162,3 +165,29 @@ end, not just at definition."
     (is (= 1 (length (graph-db:map-vertices
                       #'identity ga :collect-p t
                       :vertex-type (intern "TWIN" :pn-pkg-two)))))))
+
+(test redeclaring-a-class-moves-its-meta-to-the-new-store
+  "A class has exactly one default store: re-declaring PN-REDECLARED
+with :PN-STORE-B as the trailing argument must MOVE its meta, not
+leave a stale copy under :PN-STORE-A -- else %FIND-REGISTERED-NODE-
+TYPE's cross-store scan is ambiguous (GH #167 review round 1)."
+  (unwind-protect
+       (progn
+         (eval '(def-vertex pn-redeclared () () :pn-store-b))
+         (is (not (find 'pn-redeclared
+                        (gethash :pn-store-a
+                                 graph-db::*schema-node-metadata*)
+                        :key #'graph-db::node-type-name)))
+         (let ((meta (find 'pn-redeclared
+                           (gethash :pn-store-b
+                                    graph-db::*schema-node-metadata*)
+                           :key #'graph-db::node-type-name)))
+           (is-true meta)
+           (when meta
+             (is (eq :pn-store-b (graph-db::node-type-graph-name meta)))
+             (is (eq meta
+                     (graph-db::%find-registered-node-type
+                      'pn-redeclared :vertex))))))
+    ;; Restore the load-time declaration so later tests (and later
+    ;; runs of this suite in the same image) see the original store.
+    (eval '(def-vertex pn-redeclared () () :pn-store-a))))

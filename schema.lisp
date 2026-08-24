@@ -592,6 +592,16 @@ be defined before or after the graph is created."
                                          *graph*
                                          :edge-type ',name)))))
                   )
+           ;; A class has exactly one default store: re-declaring it under a
+           ;; different trailing GRAPH-NAME MOVES the meta, matching CLOS
+           ;; redefinition semantics.  Without this, the old store's list
+           ;; keeps a stale entry and %FIND-REGISTERED-NODE-TYPE's scan over
+           ;; every store picks whichever maphash visits first (GH #167).
+           (maphash (lambda (store metas)
+                      (unless (eq store ',graph-name)
+                        (setf (gethash store *schema-node-metadata*)
+                              (remove ',name metas :key #'node-type-name))))
+                    *schema-node-metadata*)
            ;; Replace in place, preserving position.  The type-id reason is
            ;; historical: ids came from this list's order until #186 moved
            ;; assignment to the registry, which keys on the name.  Position
