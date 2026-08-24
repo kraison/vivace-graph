@@ -344,11 +344,16 @@ evolution and is not this guard's business (GH #196)."
                :reader default-store-not-open-class)
    (store :initarg :store :reader default-store-not-open-store))
   (:report (lambda (c s)
-             (format s "MAKE-~A: no :GRAPH argument and the class's ~
-default store ~S is not open.  Open it, or pass :GRAPH explicitly ~
-(GH #167)."
-                     (default-store-not-open-class c)
-                     (default-store-not-open-store c)))))
+             (let ((store (default-store-not-open-store c)))
+               (if store
+                   (format s "MAKE-~A: no :GRAPH argument and the ~
+class's default store ~S is not open.  Open it, or pass :GRAPH ~
+explicitly (GH #167)."
+                           (default-store-not-open-class c) store)
+                   (format s "MAKE-~A: no :GRAPH argument and the ~
+class has no default store (:DEFAULT-STORE NIL).  Pass :GRAPH ~
+explicitly (GH #172)."
+                           (default-store-not-open-class c)))))))
 
 (defun %find-registered-node-type (name kind &optional prefer-store)
   "The registered META whose class symbol is NAME (EQ -- package-aware)
@@ -406,6 +411,15 @@ STORE-NAME, else refuse -- never *GRAPH* (GH #167)."
 ;; Defined in prolog-functors.lisp: the functor bodies need VAR-DEREF,
 ;; which is a macro there, so they cannot live in this file (GH #172).
 (declaim (ftype (function (symbol) t) %install-edge-functors))
+
+;; Defined in runtime-schema.lisp: manifest I/O lives with READ-SCHEMA-
+;; MANIFEST so both sides of the file agree on record shape (GH #172, R2).
+(declaim (ftype (function (list) t) %append-schema-manifest-record))
+
+(defvar *schema-provenance* :source
+  "Bound to :RUNTIME around CREATE-VERTEX-TYPE/CREATE-EDGE-TYPE so
+%INSTALL-NODE-TYPE's manifest record captures who defined the type;
+DEF-VERTEX/DEF-EDGE leave it at the default (GH #172, R2).")
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
 (defun %normalize-slot-specs (slot-specs)
@@ -488,15 +502,23 @@ GRAPH-NAME (GH #172)."
 
 (defun %install-node-helpers (name kind graph-name)
   "Install <NAME>-P, LOOKUP-<NAME> and MAKE-<NAME> as functions in
-NAME's own package (GH #172)."
+NAME's own package.  Skipped, with a warning naming NAME, when that
+package is COMMON-LISP or KEYWORD -- neither tolerates new symbols
+(GH #172)."
   (let ((pkg (%schema-symbol-package name)))
-    (flet ((helper (string fn)
-             (setf (fdefinition
-                    (intern (format nil string (symbol-name name)) pkg))
-                   fn)))
-      (helper "~A-P" (lambda (thing) (typep thing name)))
-      (helper "LOOKUP-~A" (%make-lookup-closure name kind))
-      (helper "MAKE-~A" (%make-constructor-closure name graph-name kind)))
+    (if (member pkg (list (find-package :common-lisp)
+                          (find-package :keyword)))
+        (warn "Skipping helper install for ~S: its package ~A is ~
+locked (GH #172)." name (package-name pkg))
+        (flet ((helper (string fn)
+                 (setf (fdefinition
+                        (intern (format nil string (symbol-name name))
+                                pkg))
+                       fn)))
+          (helper "~A-P" (lambda (thing) (typep thing name)))
+          (helper "LOOKUP-~A" (%make-lookup-closure name kind))
+          (helper "MAKE-~A"
+                  (%make-constructor-closure name graph-name kind))))
     name))
 
 (defun %register-node-type-meta (meta)
@@ -514,6 +536,31 @@ still governs UPDATE-SCHEMA's instantiation order (GH #53, #167)."
               (append metas (list meta))))
     meta))
 
+(defvar *node-type-provenance* (make-hash-table :test 'eq)
+  "TYPE-NAME -> :SOURCE/:RUNTIME, set by %INSTALL-NODE-TYPE.  Consulted by
+INSTANTIATE-NODE-TYPE, which re-asserts a manifest row under whatever
+*SYSTEM-DIRECTORY* is current every time a store (re)opens with this
+type -- a source type defined once at load time, before any store or
+system directory existed, otherwise could never appear in a manifest
+written later (GH #172, R2).")
+
+(defun %schema-manifest-type-record (meta provenance)
+  "The (:TYPE ...) manifest plist for META, tagged with PROVENANCE
+(GH #172, R2)."
+  (let* ((name (node-type-name meta))
+         (kind (node-type-parent-type meta))
+         (base (ecase kind (:vertex (find-class 'vertex))
+                          (:edge (find-class 'edge)))))
+    (list :type name :kind kind
+          :parents (mapcar #'class-name
+                           (remove base (class-direct-superclasses
+                                         (find-class name))))
+          :slots (node-type-slots meta)
+          :default-store (node-type-graph-name meta)
+          :keep-revisions (node-type-keep-revisions meta)
+          :provenance provenance
+          :time (get-universal-time))))
+
 (defun %install-node-type (meta)
   "Everything DEF-NODE-TYPE's expansion does except the DEFCLASS: warn on
 cross-store divergence, finalize the class, install the generated
@@ -530,6 +577,13 @@ named by META must already exist.  Returns META (GH #172)."
     (when (eq kind :edge)
       (%install-edge-functors name))
     (%register-node-type-meta meta)
+    (setf (gethash name *node-type-provenance*) *schema-provenance*)
+    ;; R2: the manifest describes the WHOLE schema, source and runtime
+    ;; alike -- both paths funnel through here.  A type whose default
+    ;; store is not open (or NIL, R4) still gets this one row; see
+    ;; INSTANTIATE-NODE-TYPE for the re-assertion on store open.
+    (%append-schema-manifest-record
+     (%schema-manifest-type-record meta *schema-provenance*))
     (let ((graph (lookup-graph (node-type-graph-name meta))))
       (when graph
         (instantiate-node-type meta graph)))
@@ -772,6 +826,15 @@ is the only point at which that ordering is guaranteed."
   ;; %NOTE-EDGE-OCCUPANCY only appends when the (name, store) pair is new.
   (when (eq (node-type-parent-type meta) :edge)
     (%note-edge-occupancy (node-type-name meta) (graph-name graph)))
+  ;; R2 (GH #172): a store's own graph-open re-asserts its schema rows
+  ;; into whatever *SYSTEM-DIRECTORY* is current -- the only way a type
+  ;; defined once, before any system directory existed, still shows up
+  ;; in a manifest read later.  Last-record-per-name wins on read, so
+  ;; repeated re-assertion across opens is harmless.
+  (%append-schema-manifest-record
+   (%schema-manifest-type-record
+    meta (or (gethash (node-type-name meta) *node-type-provenance*)
+            :source)))
   (with-recursive-lock-held ((schema-lock (schema graph)))
     (let ((cl (find-class (node-type-name meta) nil)))
       ;; Drop EVERY memoized CLASS-SLOTS-derived answer for this class and its

@@ -49,3 +49,80 @@ The full suite is the broad net; this is the focused canary."
       (is-true (fboundp (intern "RS-KNOWS/2" :graph-db/test)))
       (let ((hits (select (:flat nil) (?x ?y) (rs-knows ?x ?y))))
         (is (= 1 (length hits)))))))
+
+(test ensure-namespace-is-cheap-and-idempotent
+  (with-rs-store (g)
+    g
+    (let ((p1 (graph-db:ensure-namespace "RS-TLM" :nicknames '("RST")))
+          (p2 (graph-db:ensure-namespace "RS-TLM")))
+      (is (eq p1 p2))
+      (is (packagep p1))
+      ;; No files, no store: the store registry did not grow.
+      (is (null (graph-db:lookup-graph :rs-tlm))))))
+
+(test create-vertex-type-yields-a-working-class
+  (with-rs-store (g)
+    (graph-db:ensure-namespace "RS-TLM")
+    (let ((class (graph-db:create-vertex-type
+                  "RS-TLM:READING"
+                  '((sensor-id :type string)
+                    (value :type double-float))
+                  :default-store :rs-store)))
+      (is (typep class 'graph-db::node-class))
+      (with-transaction ((graph-db::transaction-manager g))
+        (funcall (intern "MAKE-READING" :rs-tlm)
+                 :sensor-id "s1" :value 1.5d0))
+      (let* ((sym (intern "READING" :rs-tlm))
+             (hits (graph-db:map-vertices #'identity g :collect-p t
+                                          :vertex-type sym)))
+        (is (= 1 (length hits)))
+        (is (string= "s1"
+                     (funcall (intern "SENSOR-ID" :rs-tlm)
+                              (first hits))))))))
+
+(test create-edge-type-installs-functors-and-places-by-default
+  (with-rs-store (g)
+    (graph-db:ensure-namespace "RS-TLM")
+    (graph-db:create-vertex-type "RS-TLM:READING"
+                                 '((value :type double-float))
+                                 :default-store :rs-store)
+    (graph-db:create-edge-type "RS-TLM:FEEDS" '()
+                               :default-store :rs-store)
+    (let (a b)
+      (with-transaction ((graph-db::transaction-manager g))
+        (setq a (funcall (intern "MAKE-READING" :rs-tlm) :value 1d0)
+              b (funcall (intern "MAKE-READING" :rs-tlm) :value 2d0))
+        (funcall (intern "MAKE-FEEDS" :rs-tlm)
+                 :from (graph-db:id a) :to (graph-db:id b)))
+      (is-true (gethash (intern "FEEDS/2" :rs-tlm)
+                        graph-db::*prolog-global-functors*)))))
+
+(test manifest-records-both-provenances-and-tolerates-damage
+  (with-rs-store (g)
+    g  ; RS-STATIC/RS-KNOWS registered at load time = :source rows
+    (graph-db:ensure-namespace "RS-TLM")
+    (graph-db:create-vertex-type "RS-TLM:READING"
+                                 '((value :type double-float))
+                                 :default-store :rs-store)
+    (multiple-value-bind (ns types)
+        (graph-db::read-schema-manifest graph-db::*system-directory*)
+      (is (find "RS-TLM" ns :key (lambda (r) (getf r :namespace))
+                :test #'string-equal))
+      (let ((row (find (intern "READING" :rs-tlm) types
+                       :key (lambda (r) (getf r :type)))))
+        (is-true row)
+        (is (eq :runtime (getf row :provenance)))
+        (is (eq :rs-store (getf row :default-store))))
+      (is (eq :source
+              (getf (find 'rs-static types
+                          :key (lambda (r) (getf r :type)))
+                    :provenance))))
+    ;; Torn tail: append garbage, read again, intact rows survive.
+    (with-open-file (s (graph-db::%schema-manifest-file)
+                       :direction :output :if-exists :append)
+      (format s "(:type RS-TORN"))
+    (multiple-value-bind (ns types)
+        (graph-db::read-schema-manifest graph-db::*system-directory*)
+      ns
+      (is (find (intern "READING" :rs-tlm) types
+                :key (lambda (r) (getf r :type)))))))

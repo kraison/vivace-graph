@@ -1060,18 +1060,23 @@ the edge weight (GH #172)."
   "Install <NAME>/2 and <NAME>/3 for edge type NAME exactly as
 DEF-GLOBAL-PROLOG-FUNCTOR would: FDEFINITION (the compiler's fallback),
 export, and *PROLOG-GLOBAL-FUNCTORS* (what COMPILE-CALL reads).  The
-symbols are interned in NAME's own package (GH #172)."
+symbols are interned in NAME's own package.  Skipped, with a warning
+naming NAME, when that package is COMMON-LISP or KEYWORD -- neither
+tolerates new symbols (GH #172)."
   (let ((pkg (%schema-symbol-package name)))
-    (flet ((install (suffix fn)
-             (let ((sym (intern (concatenate 'string (symbol-name name)
-                                             suffix)
-                                pkg)))
-               (setf (fdefinition sym) fn)
-               (unless (member pkg (list (find-package :common-lisp)
-                                         (find-package :keyword)))
-                 (export sym pkg))
-               (setf (gethash sym *prolog-global-functors*) fn)
-               sym)))
-      (install "/2" (%edge-functor/2 name))
-      (install "/3" (%edge-functor/3 name))
-      name)))
+    (if (member pkg (list (find-package :common-lisp)
+                          (find-package :keyword)))
+        (warn "Skipping edge functor install for ~S: its package ~A ~
+is locked (GH #172)." name (package-name pkg))
+        (flet ((install (suffix fn)
+                 (let ((sym (intern (concatenate 'string
+                                                 (symbol-name name)
+                                                 suffix)
+                                    pkg)))
+                   (setf (fdefinition sym) fn)
+                   (export sym pkg)
+                   (setf (gethash sym *prolog-global-functors*) fn)
+                   sym)))
+          (install "/2" (%edge-functor/2 name))
+          (install "/3" (%edge-functor/3 name))))
+    name))

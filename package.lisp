@@ -300,6 +300,11 @@
            #:default-store-not-open-error
            #:default-store-not-open-class
            #:default-store-not-open-store
+
+           ;; runtime schema definition API (GH #172)
+           #:ensure-namespace
+           #:create-vertex-type
+           #:create-edge-type
            #:instantiate-node-type
            #:*schema-node-metadata*
            #:with-write-locked-class
