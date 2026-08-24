@@ -264,3 +264,245 @@ poison the cache into skipping it for the rest of the session
         (let ((row (find name types :key (lambda (r) (getf r :type)))))
           (is-true row)
           (is (= 2 (length (getf row :slots)))))))))
+
+;;; ---------------------------------------------------------------------
+;;; Task 3 (R3+R5): MATERIALIZE-SCHEMA, the schema-function registry and
+;;; the :CHECK slot option.
+;;; ---------------------------------------------------------------------
+
+(defun %rs-wipe-runtime-state (&optional graph)
+  "Simulate a fresh image for the RS-TLM namespace: unintern the
+classes, delete the package, drop the metas, and empty GRAPH's node
+cache -- a fresh image has no cached instances either, and a cache hit
+would serve the pre-wipe object of the old class.  A real restart is a
+different process; this is the closest single-image ablation and it
+proves materialize rebuilds everything it needs."
+  (when graph (clrhash (graph-db::cache graph)))
+  (let ((pkg (find-package :rs-tlm)))
+    (when pkg
+      (do-symbols (s pkg)
+        (when (find-class s nil) (setf (find-class s) nil)))
+      (delete-package pkg)))
+  (%rs-drop-orphaned-metas))
+
+(defun %rs-drop-orphaned-metas ()
+  "Drop every registered meta whose class symbol lost its home package
+-- DELETE-PACKAGE uninterns them, and a later UPDATE-SCHEMA would then
+FIND-CLASS a symbol nothing can name."
+  (maphash (lambda (store metas)
+             (setf (gethash store graph-db::*schema-node-metadata*)
+                   (remove-if (lambda (m)
+                                (null (symbol-package
+                                       (graph-db::node-type-name m))))
+                              metas)))
+           graph-db::*schema-node-metadata*))
+
+(test materialize-rebuilds-a-runtime-type-in-a-fresh-image
+  "THE acceptance test: create at runtime, write, wipe the in-image
+state, materialize from the manifest, and both the CLASS and the DATA
+come back -- and a method compiles against the class."
+  (with-rs-store (g)
+    (graph-db:ensure-namespace "RS-TLM")
+    (graph-db:create-vertex-type "RS-TLM:READING"
+                                 '((value :type double-float))
+                                 :default-store :rs-store)
+    (let (id)
+      (with-transaction ((graph-db::transaction-manager g))
+        (setq id (graph-db:id (funcall (intern "MAKE-READING" :rs-tlm)
+                                       :value 3.5d0))))
+      (%rs-wipe-runtime-state g)
+      (is (null (find-package :rs-tlm)))
+      (let ((summary (graph-db:materialize-schema
+                      graph-db::*system-directory*)))
+        (is (plusp (getf summary :materialized))))
+      (let* ((sym (intern "READING" :rs-tlm))
+             (class (find-class sym nil)))
+        (is-true class)
+        ;; A method compiles against the materialized class -- the
+        ;; twenty-year problem, pinned.
+        (let ((m (compile nil `(lambda (r)
+                                 (declare (type ,sym r))
+                                 (funcall ',(intern "VALUE" :rs-tlm)
+                                          r)))))
+          (is (= 3.5d0 (funcall m (graph-db:lookup-vertex
+                                   id :graph g)))))))))
+
+(test materialize-skips-source-defined-classes
+  "Source wins: RS-STATIC is defined by def-vertex in this image; its
+manifest row must be skipped, not rebuilt, and the summary says so."
+  (with-rs-store (g)
+    g
+    (let ((summary (graph-db:materialize-schema
+                    graph-db::*system-directory*)))
+      (is (plusp (getf summary :skipped-source)))
+      (is (typep (make-instance 'rs-static) 'rs-static)))))
+
+(test materialize-warns-when-a-skipped-class-diverges
+  "Source wins, but not silently: a manifest row whose slots disagree
+with the live class must reach the user as the #196 divergence warning
+(GH #172, R3)."
+  (with-rs-store (g)
+    g
+    ;; Rewrite RS-STATIC's row with a slot set the live class lacks.
+    (with-open-file (s (graph-db::%schema-manifest-file)
+                       :direction :output :if-exists :append)
+      (let ((*package* (find-package "COMMON-LISP"))
+            (*print-pretty* nil))
+        (format s "~S~%"
+                (list :type 'rs-static :kind :vertex :parents nil
+                      :slots '((not-a-real-slot :accessor
+                                not-a-real-slot :initarg
+                                :not-a-real-slot))
+                      :default-store :rs-store :keep-revisions nil
+                      :provenance :source :time 0))))
+    (let ((warned nil))
+      (handler-bind ((graph-db:divergent-node-type-redefinition
+                       (lambda (c) (setq warned t) (muffle-warning c))))
+        (graph-db:materialize-schema graph-db::*system-directory*))
+      (is-true warned))))
+
+(test materialize-fails-fast-on-an-unresolved-check-function
+  (with-rs-store (g)
+    g
+    (graph-db:ensure-namespace "RS-TLM")
+    (graph-db:register-schema-function 'rs-plausible-p
+                                       (lambda (v) (< 0 v 100)))
+    (graph-db:create-vertex-type
+     "RS-TLM:CAL" '((value :type double-float :check rs-plausible-p))
+     :default-store :rs-store)
+    (%rs-wipe-runtime-state)
+    ;; Fresh image forgot to register the function:
+    (graph-db::%unregister-schema-function 'rs-plausible-p)
+    (let ((c (handler-case
+                 (progn (graph-db:materialize-schema
+                         graph-db::*system-directory*)
+                        nil)
+               (graph-db:materialize-unresolved-functions (e) e))))
+      (is-true c)
+      (when c
+        (is (member 'rs-plausible-p
+                    (graph-db:unresolved-function-names c))))
+      ;; Fail fast: nothing half-built.
+      (is (null (find-class (and (find-package :rs-tlm)
+                                 (intern "CAL" :rs-tlm))
+                            nil))))))
+
+(test materialize-orders-parents-before-children
+  "A child row that precedes its parent in the manifest still builds:
+the topological pass, not append order, decides (GH #172, R3)."
+  (with-rs-store (g)
+    g
+    (graph-db:ensure-namespace "RS-TLM")
+    (graph-db:create-vertex-type "RS-TLM:BASE" '((a :type string))
+                                 :default-store :rs-store)
+    (graph-db:create-vertex-type "RS-TLM:DERIVED" '((b :type string))
+                                 :parents (list (intern "BASE" :rs-tlm))
+                                 :default-store :rs-store)
+    ;; Re-append BASE's row so it is now LAST: read order would then
+    ;; try DERIVED first.
+    (graph-db:create-vertex-type "RS-TLM:BASE" '((a :type string)
+                                                 (a2 :type string))
+                                 :default-store :rs-store)
+    (%rs-wipe-runtime-state)
+    (graph-db:materialize-schema graph-db::*system-directory*)
+    (let ((derived (find-class (intern "DERIVED" :rs-tlm) nil)))
+      (is-true derived)
+      (is-true (subtypep (intern "DERIVED" :rs-tlm)
+                         (intern "BASE" :rs-tlm))))))
+
+(test materialize-invents-a-package-for-an-orphan-type-row
+  "A hand-trimmed manifest whose type row names a package with no
+namespace record must still materialize -- warn, create the package,
+build the class (GH #172, R3)."
+  (with-rs-store (g)
+    g
+    (graph-db:ensure-namespace "RS-ORPHAN")
+    (graph-db:create-vertex-type "RS-ORPHAN:THING" '((a :type string))
+                                 :default-store :rs-store)
+    ;; Drop the namespace row, keep the type row.
+    (let* ((file (graph-db::%schema-manifest-file))
+           (lines (with-open-file (s file)
+                    (loop for l = (read-line s nil :eof)
+                          until (eq l :eof) collect l))))
+      (with-open-file (s file :direction :output :if-exists :supersede)
+        (dolist (l lines)
+          (unless (search "RS-ORPHAN\"" l) (write-line l s)))))
+    (let ((pkg (find-package :rs-orphan)))
+      (when pkg
+        (do-symbols (s pkg) (when (find-class s nil)
+                              (setf (find-class s) nil)))
+        (delete-package pkg)))
+    (%rs-drop-orphaned-metas)
+    (handler-bind ((warning #'muffle-warning))
+      (graph-db:materialize-schema graph-db::*system-directory*))
+    (is-true (find-package :rs-orphan))
+    (is-true (find-class (intern "THING" :rs-orphan) nil))))
+
+(test schema-function-registry-round-trips
+  (graph-db:register-schema-function 'rs-registry-probe #'evenp)
+  (is (eq #'evenp (graph-db:find-schema-function 'rs-registry-probe)))
+  (graph-db::%unregister-schema-function 'rs-registry-probe)
+  (is (null (graph-db:find-schema-function 'rs-registry-probe))))
+
+(test create-vertex-type-refuses-an-unregistered-check-function
+  (with-rs-store (g)
+    g
+    (graph-db:ensure-namespace "RS-TLM")
+    (graph-db::%unregister-schema-function 'rs-never-registered-p)
+    (signals graph-db:schema-function-unresolved
+      (graph-db:create-vertex-type
+       "RS-TLM:NOFN"
+       '((value :type double-float :check rs-never-registered-p))
+       :default-store :rs-store))))
+
+(test check-constraint-enforces-at-commit
+  (with-rs-store (g)
+    (graph-db:ensure-namespace "RS-TLM")
+    (graph-db:register-schema-function 'rs-plausible-p
+                                       (lambda (v) (< 0 v 100)))
+    (graph-db:create-vertex-type
+     "RS-TLM:CAL" '((value :type double-float :check rs-plausible-p))
+     :default-store :rs-store)
+    (with-transaction ((graph-db::transaction-manager g))
+      (funcall (intern "MAKE-CAL" :rs-tlm) :value 50d0))
+    (signals graph-db:value-constraint-violation
+      (with-transaction ((graph-db::transaction-manager g))
+        (funcall (intern "MAKE-CAL" :rs-tlm) :value 5000d0)))))
+
+(test check-constraint-is-null-exempt-and-inherited
+  "NULL is exempt (the :ONE-OF rule), and a :CHECK on a parent slot is
+enforced on a subclass (GH #172, R5)."
+  (with-rs-store (g)
+    (graph-db:ensure-namespace "RS-TLM")
+    (graph-db:register-schema-function 'rs-plausible-p
+                                       (lambda (v) (< 0 v 100)))
+    (graph-db:create-vertex-type
+     "RS-TLM:CBASE" '((value :type double-float :check rs-plausible-p))
+     :default-store :rs-store)
+    (graph-db:create-vertex-type "RS-TLM:CSUB" '((tag :type string))
+                                 :parents (list (intern "CBASE" :rs-tlm))
+                                 :default-store :rs-store)
+    ;; NIL passes.
+    (with-transaction ((graph-db::transaction-manager g))
+      (funcall (intern "MAKE-CSUB" :rs-tlm) :tag "t"))
+    (signals graph-db:value-constraint-violation
+      (with-transaction ((graph-db::transaction-manager g))
+        (funcall (intern "MAKE-CSUB" :rs-tlm) :tag "t" :value 5000d0)))))
+
+;;; The image provides the behaviour its schema names -- at load time,
+;;; before any manifest row referencing it is materialized (GH #172).
+(graph-db:register-schema-function 'rs-source-plausible-p
+                                   (lambda (v) (< 0 v 100)))
+
+(def-vertex rs-checked () ((value :type double-float
+                                  :check rs-source-plausible-p))
+  :rs-store)
+
+(test def-vertex-accepts-and-enforces-check
+  "Parity: :CHECK is a slot option DEF-VERTEX takes too (GH #172, R5)."
+  (with-rs-store (g)
+    (with-transaction ((graph-db::transaction-manager g))
+      (make-rs-checked :value 10d0))
+    (signals graph-db:value-constraint-violation
+      (with-transaction ((graph-db::transaction-manager g))
+        (make-rs-checked :value 900d0)))))

@@ -21,16 +21,26 @@
    (node-id    :initarg :node-id    :reader vcv-node-id))
   (:report
    (lambda (c s)
-     (if (eq (vcv-reason c) :missing)
-         (format s "Value constraint on ~S.~S violated by node ~A: the ~
-                    slot is required but holds NIL."
-                 (vcv-class-name c) (vcv-slot-name c)
-                 (string-id (vcv-node-id c)))
-         (format s "Value constraint on ~S.~S violated by node ~A: ~
-                    expected one of~{ ~S~}; got ~S."
-                 (vcv-class-name c) (vcv-slot-name c)
-                 (string-id (vcv-node-id c))
-                 (vcv-expected c) (vcv-value c))))))
+     (case (vcv-reason c)
+       (:missing
+        (format s "Value constraint on ~S.~S violated by node ~A: the ~
+                   slot is required but holds NIL."
+                (vcv-class-name c) (vcv-slot-name c)
+                (string-id (vcv-node-id c))))
+       ;; The :CHECK slot option (GH #172, R5): EXPECTED is the name of
+       ;; the schema function that rejected the value.
+       (:check-failed
+        (format s "Value constraint on ~S.~S violated by node ~A: ~S ~
+                   rejected ~S."
+                (vcv-class-name c) (vcv-slot-name c)
+                (string-id (vcv-node-id c))
+                (vcv-expected c) (vcv-value c)))
+       (t
+        (format s "Value constraint on ~S.~S violated by node ~A: ~
+                   expected one of~{ ~S~}; got ~S."
+                (vcv-class-name c) (vcv-slot-name c)
+                (string-id (vcv-node-id c))
+                (vcv-expected c) (vcv-value c)))))))
 
 (defvar *schema-value-constraint-metadata* (make-hash-table)
   "graph-name (symbol) -> list of VALUE-CONSTRAINT-SPECs (newest first).")
@@ -103,6 +113,23 @@ CLASS-UNIQUE-TUPLE-SPECS (unique-constraint.lisp)."
 (defstruct (vc-violation (:constructor %make-vc-violation))
   spec node-id class-name slot actual expected reason)
 
+(defun %check-slot-violations (node class)
+  "Every :CHECK slot of CLASS whose registered function rejects NODE's
+value, as VC-VIOLATION records.  NULL is exempt, exactly as it is for
+:ONE-OF -- \"if present, it must satisfy this\".  The name is resolved
+here, at check time, so a re-registration takes effect immediately;
+presence was verified at definition and at materialize time
+(GH #172, R5)."
+  (loop for (slot . fn-name) in (node-check-slots class)
+        for val = (slot-value node slot)
+        unless (or (null val)
+                   (funcall (%resolve-schema-function fn-name) val))
+        collect (%make-vc-violation
+                 :spec nil :node-id (id node)
+                 :class-name (class-name class) :slot slot
+                 :actual val :expected fn-name
+                 :reason :check-failed)))
+
 (defun %value-constraint-violations (node graph)
   "Every value constraint NODE violates, as VC-VIOLATION records.  The one
 evaluator behind both consumers: the write path signals on the first, the
@@ -128,7 +155,12 @@ EQUAL, not EQL, so a non-keyword enumeration works."
                     :class-name (class-name class) :slot slot
                     :actual val :expected one-of
                     :reason :not-in-vocabulary)))
-            (t nil)))))
+            (t nil))
+          into declared
+          finally
+             (return (nconc declared
+                            (when *schema-check-slots-present-p*
+                              (%check-slot-violations node class)))))))
 
 (defmacro def-value-constraint (owner-class slot graph-name
                                 &key one-of required name)
@@ -165,7 +197,10 @@ name is itself a keyword."
 value constraint.  Called in %COMMIT's manager-locked region, after VALIDATE
 and before durability, so a violation aborts before anything is journaled
 (GH #149)."
-  (when (%registered-value-constraint-specs graph)
+  (when (or (%registered-value-constraint-specs graph)
+            ;; The :CHECK slot option needs no registry entry -- it
+            ;; lives on the class (GH #172, R5).
+            *schema-check-slots-present-p*)
     (dolist (write (writes tx))
       (let ((node (node write)))
         (unless (deleted-p node)      ; a delete claims nothing

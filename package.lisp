@@ -305,6 +305,12 @@
            #:ensure-namespace
            #:create-vertex-type
            #:create-edge-type
+           #:materialize-schema
+           #:register-schema-function
+           #:find-schema-function
+           #:schema-function-unresolved
+           #:materialize-unresolved-functions
+           #:unresolved-function-names
            #:instantiate-node-type
            #:*schema-node-metadata*
            #:with-write-locked-class

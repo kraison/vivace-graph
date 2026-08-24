@@ -119,14 +119,18 @@ skipped, a missing file yields two empty lists (GH #172, R2)."
 ;;; ENSURE-NAMESPACE (R4)
 ;;; ---------------------------------------------------------------------
 
-(defun ensure-namespace (name &key nicknames)
+(defun ensure-namespace (name &key nicknames (record-p t))
   "Ensure a package for a runtime schema namespace, idempotent and
 manifest-logged.  NAME and each of NICKNAMES may be a string or a
 symbol.  Created with MAKE-PACKAGE :USE NIL -- a schema namespace only
 holds the class and accessor symbols CREATE-VERTEX-TYPE/CREATE-EDGE-TYPE
 intern into it, it is not a code package; (:use #:cl #:graph-db) is what
 a hand-written SOURCE package uses, and is what EXPORT-SCHEMA-SOURCE
-emits for one, not what this creates.  Allocates no files and no store
+emits for one, not what this creates.  Allocates no files and no store.
+
+RECORD-P NIL suppresses the manifest append: MATERIALIZE-SCHEMA is
+replaying rows the manifest already holds, and re-appending an
+unchanged namespace row on every load would grow the file forever
 (GH #172, R4)."
   (let* ((pkg-name (string name))
          (nick-strings (mapcar #'string nicknames))
@@ -143,10 +147,94 @@ emits for one, not what this creates.  Allocates no files and no store
         (unless (= (length wanted) (length (package-nicknames pkg)))
           (rename-package pkg pkg-name wanted))
         (setf pkg (make-package pkg-name :nicknames wanted :use nil)))
-    (%append-schema-manifest-record
-     (list :namespace pkg-name :nicknames wanted
-           :time (get-universal-time)))
+    (when record-p
+      (%append-schema-manifest-record
+       (list :namespace pkg-name :nicknames wanted
+             :time (get-universal-time))))
     pkg))
+
+;;; ---------------------------------------------------------------------
+;;; Schema functions and the :CHECK slot option (R5)
+;;;
+;;; Behaviour cannot be data: a closure does not serialize.  A runtime
+;;; type that wants a constraint stores the NAME of a function the image
+;;; provides, and the name is resolved against this registry -- at
+;;; CREATE-*-TYPE time, at MATERIALIZE-SCHEMA time, and again at each
+;;; check.  Enforcement lives beside the other value constraints; see
+;;; %VALUE-CONSTRAINT-VIOLATIONS (value-constraint.lisp).
+;;; ---------------------------------------------------------------------
+
+(defvar *schema-functions* (make-hash-table :test 'eq)
+  "NAME (symbol) -> function, for the :CHECK slot option (GH #172, R5).")
+
+(defvar *schema-functions-lock* (make-lock "schema functions"))
+
+(defvar *schema-check-slots-present-p* nil
+  "T once any class in this image has a :CHECK slot.  Set by
+COMPUTE-EFFECTIVE-SLOT-DEFINITION (node-class.lisp); read by
+VALIDATE-VALUE-CONSTRAINTS so a schema with no :CHECK pays nothing
+(GH #172, R5).")
+
+(define-condition schema-function-unresolved (error)
+  ((names :initarg :names :reader unresolved-function-names))
+  (:report
+   (lambda (c s)
+     (format s "No schema function is registered under~{ ~S~}.  ~
+Behaviour ships in the image, not in the metadata: call ~
+REGISTER-SCHEMA-FUNCTION before the schema that names it is used ~
+(GH #172)."
+             (unresolved-function-names c)))))
+
+(define-condition materialize-unresolved-functions
+    (schema-function-unresolved)
+  ()
+  (:report
+   (lambda (c s)
+     (format s "MATERIALIZE-SCHEMA: the manifest names schema ~
+function(s)~{ ~S~} that this image does not provide.  Nothing was ~
+built.  Register them before materializing (GH #172, R3)."
+             (unresolved-function-names c)))))
+
+(defun register-schema-function (name fn)
+  "Register FN under NAME for the :CHECK slot option.  Returns NAME.
+Re-registering replaces (GH #172, R5)."
+  (check-type name symbol)
+  (with-lock-held (*schema-functions-lock*)
+    (setf (gethash name *schema-functions*) fn))
+  name)
+
+(defun find-schema-function (name)
+  "The function registered under NAME, or NIL (GH #172, R5)."
+  (with-lock-held (*schema-functions-lock*)
+    (values (gethash name *schema-functions*))))
+
+(defun %unregister-schema-function (name)
+  "Withdraw NAME's registration.  T if one was withdrawn.  Exists for
+tests simulating an image that no longer provides it (GH #172)."
+  (with-lock-held (*schema-functions-lock*)
+    (remhash name *schema-functions*)))
+
+(defun %resolve-schema-function (name)
+  "NAME's function, or SCHEMA-FUNCTION-UNRESOLVED.  Resolution is at
+CHECK time so a re-registration takes effect immediately; presence is
+verified far earlier (GH #172, R5)."
+  (or (find-schema-function name)
+      (error 'schema-function-unresolved :names (list name))))
+
+(defun %slot-check-names (slot-specs)
+  "The :CHECK names declared by SLOT-SPECS (normalized or raw)."
+  (loop for spec in slot-specs
+        for name = (and (consp spec) (getf (rest spec) :check))
+        when name collect name))
+
+(defun %unresolved-check-names (slot-spec-lists)
+  "Every :CHECK name in SLOT-SPEC-LISTS with no registered function,
+deduplicated, in order of appearance (GH #172, R5)."
+  (let ((missing nil))
+    (dolist (specs slot-spec-lists (nreverse missing))
+      (dolist (name (%slot-check-names specs))
+        (unless (or (find-schema-function name) (member name missing))
+          (push name missing))))))
 
 ;;; ---------------------------------------------------------------------
 ;;; CREATE-VERTEX-TYPE / CREATE-EDGE-TYPE (R4)
@@ -232,7 +320,7 @@ SLOTS are %NORMALIZE-SLOT-SPECS output; only :TYPE is forwarded to
    (append parents (list (ecase kind (:vertex 'vertex) (:edge 'edge))))
    :direct-slots
    (mapcar (lambda (spec)
-             (destructuring-bind (sname &key accessor initarg type
+             (destructuring-bind (sname &key accessor initarg type check
                                         &allow-other-keys)
                  spec
                (append
@@ -240,7 +328,10 @@ SLOTS are %NORMALIZE-SLOT-SPECS output; only :TYPE is forwarded to
                       :initargs (list initarg)
                       :readers (list accessor)
                       :writers (list (list 'setf accessor)))
-                (when type (list :type type)))))
+                (when type (list :type type))
+                ;; R5: the only other slot option a runtime type may
+                ;; carry.  NODE-CLASS's slot definitions accept it.
+                (when check (list :check check)))))
            normalized-slots)
    :metaclass (find-class 'node-class)))
 
@@ -253,6 +344,12 @@ already exist, since it calls FINALIZE-INHERITANCE (GH #172, R4)."
          (specs (%retarget-slot-specs (%normalize-slot-specs slot-specs)
                                       (symbol-package sym))))
     (%check-schema-name-package sym)
+    ;; Fail fast, like MATERIALIZE-SCHEMA: a :CHECK naming a function
+    ;; this image does not provide is a broken definition, not a
+    ;; surprise at first write (GH #172, R5).
+    (let ((missing (%unresolved-check-names (list specs))))
+      (when missing
+        (error 'schema-function-unresolved :names missing)))
     (%ensure-node-class sym parents kind specs)
     (let ((*schema-provenance* :runtime))
       (%install-node-type
@@ -292,3 +389,197 @@ semantics.  Also installs the NAME/2 and NAME/3 Prolog functors
   (%create-node-type name slot-specs :edge :parents parents
                      :default-store default-store
                      :keep-revisions keep-revisions))
+
+;;; ---------------------------------------------------------------------
+;;; MATERIALIZE-SCHEMA (R3): the load-order answer
+;;; ---------------------------------------------------------------------
+
+(defun %materialize-namespace-filter (namespaces)
+  "NAMESPACES as a list of package-name strings, or NIL for \"all\"."
+  (when namespaces
+    (mapcar (lambda (n) (string-upcase (string n)))
+            (if (listp namespaces) namespaces (list namespaces)))))
+
+(defun %manifest-type-row-package (line)
+  "The package-name prefix of a (:TYPE PKG::NAME ...) manifest line, or
+NIL.  Textual on purpose: READ interns, and interning needs the very
+package this is trying to discover -- a type row whose namespace record
+was hand-trimmed away would otherwise read as a missing-package error
+and vanish (GH #172, R3)."
+  (let ((trimmed (string-left-trim '(#\Space #\Tab) line)))
+    (when (and (> (length trimmed) 6)
+               (string-equal "(:TYPE" (subseq trimmed 0 6)))
+      (let* ((rest (string-left-trim '(#\Space #\Tab) (subseq trimmed 6)))
+             (end (or (position-if
+                       (lambda (c) (member c '(#\Space #\Tab #\)))) rest)
+                      (length rest)))
+             (token (subseq rest 0 end))
+             (colon (position #\: token)))
+        (when (and colon (plusp colon))
+          (subseq token 0 colon))))))
+
+(defun %materialize-orphan-packages (dir filter)
+  "Create a package for every type row in DIR's manifest whose package
+does not exist and has no namespace record.  Warns: a manifest that
+lost its namespace rows still materializes, but not silently
+(GH #172, R3)."
+  (let ((file (ignore-errors (%schema-manifest-path dir))))
+    (when (and file (probe-file file))
+      (handler-case
+          (with-open-file (s file :direction :input)
+            (loop
+              (let ((line (read-line s nil :eof)))
+                (when (eq line :eof) (return))
+                (let ((pkg (%manifest-type-row-package line)))
+                  (when (and pkg
+                             (or (null filter)
+                                 (member pkg filter :test #'string-equal))
+                             (not (find-package pkg)))
+                    (warn "Schema manifest: type row names package ~A ~
+with no namespace record; creating it with no nicknames (GH #172)." pkg)
+                    (ensure-namespace pkg))))))
+        (error () nil)))))
+
+(defun %materialize-row-wanted-p (row filter)
+  "Is ROW a type row this materialization should consider?  A row naming
+a locked package or an unknown kind is skipped with a warning rather
+than crashing: the manifest is data, and may have been hand-edited
+(GH #172, R3)."
+  (let ((name (getf row :type))
+        (kind (getf row :kind)))
+    (cond
+      ((not (and (symbolp name) (symbol-package name))) nil)
+      ((%refused-schema-package-p (symbol-package name))
+       (warn "Schema manifest: ignoring type row ~S in locked package ~
+~A (GH #172)." name (package-name (symbol-package name)))
+       nil)
+      ((not (member kind '(:vertex :edge)))
+       (warn "Schema manifest: ignoring type row ~S with kind ~S ~
+(GH #172)." name kind)
+       nil)
+      (t (or (null filter)
+             (member (package-name (symbol-package name)) filter
+                     :test #'string-equal))))))
+
+(defun %materialize-sort (rows)
+  "ROWS reordered so a row builds after any parent of it that is also
+in ROWS; manifest order is the tiebreak.  Redefinition re-appends a
+row, so append order alone can put a parent after its child.  A cycle
+-- impossible through the API, reachable by hand-editing -- falls back
+to manifest order for what remains (GH #172, R3)."
+  (let ((pending (copy-list rows))
+        (built (make-hash-table :test 'eq))
+        (out nil))
+    (loop while pending do
+      (let ((progressed nil))
+        (dolist (row pending)
+          (when (every (lambda (p)
+                         (or (gethash p built)
+                             (not (find p pending
+                                        :key (lambda (r) (getf r :type))))))
+                       (getf row :parents))
+            (push row out)
+            (setf (gethash (getf row :type) built) t)
+            (setf pending (remove row pending))
+            (setf progressed t)))
+        (unless progressed
+          (dolist (row pending) (push row out))
+          (setf pending nil))))
+    (nreverse out)))
+
+(defun %warn-if-row-diverges (row)
+  "Source wins on the skip path, but not silently.  %WARN-IF-DIVERGENT-
+ACROSS-STORES never runs here -- nothing is installed -- so compare the
+row against the registered meta and signal the #196 condition directly
+(GH #172, R3)."
+  (let* ((name (getf row :type))
+         (meta (%find-registered-node-type name (getf row :kind)
+                                           (getf row :default-store))))
+    (when (and meta (not (equal (node-type-slots meta) (getf row :slots))))
+      (warn 'divergent-node-type-redefinition
+            :name name
+            :graph-name (getf row :default-store)
+            :other-graphs (list (node-type-graph-name meta))))))
+
+(defun %materialize-row (row)
+  "Build ROW's class and install it through the shared path.  ROW's
+slots are already normalized and retargeted (the manifest records what
+%INSTALL-NODE-TYPE registered), so no re-normalization is needed.  No
+evaluation: plists in, MOP calls out (GH #172, R3)."
+  (let ((name (getf row :type))
+        (kind (getf row :kind))
+        (slots (getf row :slots)))
+    (%ensure-node-class name (getf row :parents) kind slots)
+    ;; The row's own provenance, defaulting to :RUNTIME -- never the
+    ;; :SOURCE default of *SCHEMA-PROVENANCE*, which would relabel every
+    ;; materialized runtime type as source-defined (GH #172, R2).
+    (let ((*schema-provenance* (or (getf row :provenance) :runtime)))
+      (%install-node-type
+       (make-node-type
+        :name name
+        :parent-type kind
+        :graph-name (getf row :default-store)
+        :slots slots
+        :package (package-name (symbol-package name))
+        :constructor (intern (format nil "MAKE-~A" (symbol-name name))
+                             (%schema-symbol-package name))
+        :keep-revisions (getf row :keep-revisions))))
+    name))
+
+(defun %materialize-schema (dir &key namespaces)
+  "The functional core of MATERIALIZE-SCHEMA; see that macro.  Use the
+macro in a file: it carries the EVAL-WHEN this needs to run before the
+methods below it compile (GH #172, R3)."
+  (let ((filter (%materialize-namespace-filter namespaces))
+        (namespace-count 0)
+        (materialized 0)
+        (skipped 0))
+    (dolist (rec (read-schema-manifest dir))
+      (let ((name (string (getf rec :namespace))))
+        (when (or (null filter) (member name filter :test #'string-equal))
+          ;; :RECORD-P NIL -- this row is already in the manifest.
+          (ensure-namespace name :nicknames (getf rec :nicknames)
+                                 :record-p nil)
+          (incf namespace-count))))
+    ;; Packages first, and not only from namespace rows: a type row
+    ;; cannot even be READ until its package exists.
+    (%materialize-orphan-packages dir filter)
+    (let ((rows (remove-if-not
+                 (lambda (r) (%materialize-row-wanted-p r filter))
+                 (nth-value 1 (read-schema-manifest dir))))
+          (pending nil))
+      ;; Fail fast, before anything is built: ONE error naming every
+      ;; unresolved :CHECK function (approved point C).
+      (let ((missing (%unresolved-check-names
+                      (mapcar (lambda (r) (getf r :slots)) rows))))
+        (when missing
+          (error 'materialize-unresolved-functions :names missing)))
+      (dolist (row rows)
+        (if (find-class (getf row :type) nil)
+            (progn (%warn-if-row-diverges row) (incf skipped))
+            (push row pending)))
+      (dolist (row (%materialize-sort (nreverse pending)))
+        (%materialize-row row)
+        (incf materialized)))
+    (list :namespaces namespace-count
+          :materialized materialized
+          :skipped-source skipped)))
+
+(defmacro materialize-schema (dir &key namespaces)
+  "Rebuild every runtime-defined package and class recorded in DIR's
+schema manifest, so methods compiled after this form see their classes.
+Put it in its own file, loaded after the static schema and before any
+file with methods on a runtime type; the EVAL-WHEN is carried here so a
+caller cannot get it wrong.
+
+Idempotent, and SOURCE WINS: a type whose class already exists is left
+alone and counted under :SKIPPED-SOURCE, with the #196 divergence
+warning when the manifest's slot set disagrees with the live class.
+:NAMESPACES narrows to the named packages.  Nothing is evaluated --
+the input is plists and the output is MOP calls -- and a :CHECK
+function the image does not provide aborts the whole call before
+anything is built (MATERIALIZE-UNRESOLVED-FUNCTIONS, naming all of
+them).  Returns (:NAMESPACES n :MATERIALIZED n :SKIPPED-SOURCE n)
+(GH #172, R3)."
+  `(eval-when (:compile-toplevel :load-toplevel :execute)
+     (%materialize-schema ,dir :namespaces ,namespaces)))

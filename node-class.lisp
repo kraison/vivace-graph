@@ -36,7 +36,14 @@
    ;; Max cells cap for this geometry slot's spatial index, or NIL for the graph
    ;; default.  Declared via the :SPATIAL-MAX-CELLS slot option.
    (spatial-max-cells :accessor spatial-max-cells-spec :initarg :spatial-max-cells
-                      :initform nil :allocation :instance)))
+                      :initform nil :allocation :instance)
+   ;; Function-backed value constraint (GH #172, R5): the NAME of a
+   ;; function in the schema-function registry (runtime-schema.lisp),
+   ;; resolved and applied at commit by %VALUE-CONSTRAINT-VIOLATIONS.
+   ;; A name, never a closure -- behaviour ships in the image, structure
+   ;; in the data.
+   (check :accessor check-function-name :initarg :check :initform nil
+          :allocation :instance)))
 
 (defmethod persistent-p (slot-def)
   nil)
@@ -57,6 +64,9 @@
   nil)
 
 (defmethod spatial-max-cells-spec (slot-def)
+  nil)
+
+(defmethod check-function-name (slot-def)
   nil)
 
 (defmethod ephemeral-p (slot-def)
@@ -97,18 +107,23 @@
   (persistent-names nil :type list)
   (ephemeral-names nil :type list)
   (meta-names nil :type list)
-  (data-names nil :type list))
+  (data-names nil :type list)
+  ;; (SLOT-NAME . CHECK-FUNCTION-NAME) for every :CHECK slot (GH #172).
+  (check-slots nil :type list))
 
 (defun %compute-node-slot-info (class)
   "Build CLASS's NODE-SLOT-INFO.  Each list is filtered independently, exactly
 as the separate walks it replaces did, so a slot carrying more than one flag
 still appears in each list it qualifies for."
   (let ((keywords (make-hash-table :test 'eq))
-        (persistent '()) (ephemeral '()) (meta '()) (data '()))
+        (persistent '()) (ephemeral '()) (meta '()) (data '())
+        (checks '()))
     (dolist (slot (class-slots class))
       (let ((name (slot-definition-name slot))
             (persistentp (persistent-p slot))
-            (ephemeralp (ephemeral-p slot)))
+            (ephemeralp (ephemeral-p slot))
+            (check (check-function-name slot)))
+        (when check (push (cons name check) checks))
         (when persistentp
           (push name persistent)
           (setf (gethash name keywords) (intern (symbol-name name) :keyword)))
@@ -119,7 +134,8 @@ still appears in each list it qualifies for."
                          :persistent-names (nreverse persistent)
                          :ephemeral-names (nreverse ephemeral)
                          :meta-names (nreverse meta)
-                         :data-names (nreverse data))))
+                         :data-names (nreverse data)
+                         :check-slots (nreverse checks))))
 
 (defun %node-slot-info (class)
   "CLASS's cached slot categorization, computing it on first use.
@@ -258,7 +274,22 @@ test in tests/node-class-tests.lisp."
         (setf (slot-value slot 'spatial-max-cells)
               (or (spatial-max-cells-spec slot)
                   (and smc (spatial-max-cells-spec smc))))))
+    ;; Inherit :CHECK from the declaring direct slot, so a constraint on
+    ;; a parent slot is enforced across its subclasses (GH #172, R5).
+    (let ((ck (find-if #'check-function-name direct-slots)))
+      (when (or (check-function-name slot) ck)
+        (setf (slot-value slot 'check)
+              (or (check-function-name slot)
+                  (and ck (check-function-name ck))))
+        ;; One image-wide flag so VALIDATE-VALUE-CONSTRAINTS' fast path
+        ;; stays free for schemas that use no :CHECK at all (GH #172).
+        (setf *schema-check-slots-present-p* t)))
     slot))
+
+(defun node-check-slots (class)
+  "CLASS's (SLOT-NAME . CHECK-FUNCTION-NAME) pairs, cached with the rest
+of its slot categorization.  Read-only (GH #172, R5)."
+  (%nsi-check-slots (%node-slot-info class)))
 
 (defun %indexed-slot-owner-name (class slot-name)
   "The most-general node-class in CLASS's precedence list that declares SLOT-NAME as
