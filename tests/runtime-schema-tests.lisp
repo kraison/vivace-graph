@@ -224,3 +224,43 @@ round 1)."
            (graph-db::%find-registered-node-type name :vertex :rs-store)
            g)
           (is (= c1 (row-count))))))))
+
+(test manifest-append-retries-after-a-transient-write-failure
+  "Review round 2: %SCHEMA-MANIFEST-APPEND-IF-CHANGED must not cache a
+row as written before the write's outcome is known.  Swap
+%SCHEMA-MANIFEST-FILE to an unwritable location for one instantiate
+(the append degrades to in-image-only), restore it, and instantiate
+again with the same, already-current, changed slots: the manifest must
+gain the row on this retry -- proving the earlier failure did not
+poison the cache into skipping it for the rest of the session
+(GH #172, review round 2)."
+  (with-rs-store (g)
+    (graph-db:ensure-namespace "RS-TLM")
+    (graph-db:create-vertex-type "RS-TLM:RETRYROW" '((x :type string))
+                                 :default-store :rs-store)
+    (let ((name (intern "RETRYROW" :rs-tlm))
+          (orig (fdefinition 'graph-db::%schema-manifest-file)))
+      (unwind-protect
+          (progn
+            (setf (fdefinition 'graph-db::%schema-manifest-file)
+                  (lambda ()
+                    (merge-pathnames
+                     "schema-manifest.dat"
+                     #P"/nonexistent-172-review-round-2/")))
+            ;; The class/meta still change here -- only the manifest
+            ;; write itself fails.
+            (graph-db:create-vertex-type "RS-TLM:RETRYROW"
+                                         '((x :type string)
+                                           (y :type string))
+                                         :default-store :rs-store))
+        (setf (fdefinition 'graph-db::%schema-manifest-file) orig))
+      ;; The retry: same current (2-slot) meta, real location restored.
+      (graph-db::instantiate-node-type
+       (graph-db::%find-registered-node-type name :vertex :rs-store)
+       g)
+      (multiple-value-bind (ns types)
+          (graph-db::read-schema-manifest graph-db::*system-directory*)
+        ns
+        (let ((row (find name types :key (lambda (r) (getf r :type)))))
+          (is-true row)
+          (is (= 2 (length (getf row :slots)))))))))

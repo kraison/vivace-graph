@@ -34,25 +34,40 @@ only (GH #172, mirrors %EDGE-OCCUPANCY-FILE)."
   ;; (the #167 manifest discipline; see %EDGE-OCCUPANCY-PRINT-PACKAGE).
   (load-time-value (find-package "COMMON-LISP")))
 
-(defun %append-schema-manifest-record (plist)
-  "Append PLIST as one ~S-printed, package-qualified line to the schema
-manifest.  Locked; never signals -- a failed append (disk full, no
-system directory, permissions) leaves the definition itself intact and
-the record in-image-only for this session (GH #172, R2)."
-  (with-lock-held (*schema-manifest-lock*)
-    (let ((file (%schema-manifest-file)))
-      (when file
+(defun %write-schema-manifest-record (plist)
+  "The UNLOCKED write: append PLIST as one ~S-printed, package-qualified
+line.  Returns T on a successful write, NIL when it degraded (no file,
+or the write itself failed) -- never signals.  Callers take
+*SCHEMA-MANIFEST-LOCK* themselves; this must not lock on its own, so a
+caller that also needs to update a cache under the same critical
+section (see %SCHEMA-MANIFEST-APPEND-IF-CHANGED, schema.lisp) can take
+the lock exactly once (GH #172, review round 2)."
+  (let ((file (%schema-manifest-file)))
+    (and file
         (handler-case
-            (with-open-file (s file :direction :output
-                                    :if-exists :append
-                                    :if-does-not-exist :create)
-              (let ((*print-readably* nil)
-                    (*print-pretty* nil)
-                    (*package* (%schema-manifest-print-package)))
-                (format s "~S~%" plist))
-              (finish-output s))
+            (progn
+              (with-open-file (s file :direction :output
+                                      :if-exists :append
+                                      :if-does-not-exist :create)
+                (let ((*print-readably* nil)
+                      (*print-pretty* nil)
+                      (*package* (%schema-manifest-print-package)))
+                  (format s "~S~%" plist))
+                (finish-output s))
+              t)
           (error () nil)))))
-  (values))
+
+(defun %append-schema-manifest-record (plist)
+  "Append PLIST to the schema manifest, under *SCHEMA-MANIFEST-LOCK*.
+Never signals.  Returns T on a successful write, NIL when it degraded
+to in-image-only (no system directory, or the write itself failed) --
+GH #172, R2.  The T/NIL contract is what
+%SCHEMA-MANIFEST-APPEND-IF-CHANGED needs: caching a row as written
+before the outcome is known would let one transient failure (disk
+full, unwritable directory) silently drop it for the rest of the
+session (review round 2)."
+  (with-lock-held (*schema-manifest-lock*)
+    (%write-schema-manifest-record plist)))
 
 (defun %parse-schema-manifest-line (line)
   "Read LINE as a plist headed by a keyword.  *READ-EVAL* NIL: the file

@@ -415,6 +415,11 @@ STORE-NAME, else refuse -- never *GRAPH* (GH #167)."
 ;; Defined in runtime-schema.lisp: manifest I/O lives with READ-SCHEMA-
 ;; MANIFEST so both sides of the file agree on record shape (GH #172, R2).
 (declaim (ftype (function (list) t) %append-schema-manifest-record))
+;; The unlocked writer %SCHEMA-MANIFEST-APPEND-IF-CHANGED calls directly,
+;; and the lock it and %APPEND-SCHEMA-MANIFEST-RECORD both take -- taken
+;; exactly once per call, never nested (GH #172, review round 2).
+(declaim (ftype (function (list) t) %write-schema-manifest-record))
+(declaim (special *schema-manifest-lock*))
 
 (defvar *schema-provenance* :source
   "Bound to :RUNTIME around CREATE-VERTEX-TYPE/CREATE-EDGE-TYPE so
@@ -582,12 +587,21 @@ I3).")
   "Append RECORD unless it is EQUAL, ignoring :TIME, to the last row
 this image wrote for NAME under the current *SYSTEM-DIRECTORY* -- a
 reopen storm must not keep growing the manifest (GH #172, review round
-1, I3)."
-  (let* ((key (cons name *system-directory*))
-         (sans-time (%schema-manifest-record-sans-time record)))
-    (unless (equal sans-time (gethash key *schema-manifest-type-cache*))
-      (setf (gethash key *schema-manifest-type-cache*) sans-time)
-      (%append-schema-manifest-record record))))
+1, I3).  The whole check-write-cache sequence runs under
+*SCHEMA-MANIFEST-LOCK*, taken ONCE here (calling
+%WRITE-SCHEMA-MANIFEST-RECORD directly, not %APPEND-SCHEMA-MANIFEST-
+RECORD, which would nest the same non-recursive lock).  The cache is
+updated ONLY when the write actually lands: caching before the outcome
+is known would let one transient failure (disk full, unwritable
+directory) silently drop the row for the rest of the session -- before
+this fix, every reopen kept retrying instead (GH #172, review round
+2)."
+  (with-lock-held (*schema-manifest-lock*)
+    (let* ((key (cons name *system-directory*))
+           (sans-time (%schema-manifest-record-sans-time record)))
+      (unless (equal sans-time (gethash key *schema-manifest-type-cache*))
+        (when (%write-schema-manifest-record record)
+          (setf (gethash key *schema-manifest-type-cache*) sans-time))))))
 
 (defun %install-node-type (meta)
   "Everything DEF-NODE-TYPE's expansion does except the DEFCLASS: warn on
