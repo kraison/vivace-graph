@@ -11,6 +11,24 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ## [Unreleased]
 
+### Changed
+
+- **`DEF-NODE-TYPE` now installs through a shared functional core**
+  (#172). The macro's expansion keeps only the literal `DEFCLASS`; the
+  generated helpers (`MAKE-<N>`, `LOOKUP-<N>`, `<N>-P`), the `<N>/2` and
+  `<N>/3` Prolog functors for edge types, the `*SCHEMA-NODE-METADATA*`
+  registration and the instantiation into an open default store all run
+  in `%INSTALL-NODE-TYPE`, so a later runtime path can build a class
+  from persisted metadata and get exactly the same installation. No
+  behaviour change for source-defined types: the helpers are closures
+  installed with `(SETF FDEFINITION)` instead of compiled `DEFUN`s, and
+  the functor symbols are now interned in the class symbol's own
+  package rather than the expansion-time `*PACKAGE*` — identical for
+  every ordinary `DEF-VERTEX` / `DEF-EDGE`, where the class symbol is
+  read into the defining package. Functors are still installed under
+  both `FDEFINITION` and `*PROLOG-GLOBAL-FUNCTORS*` and exported, as
+  `DEF-GLOBAL-PROLOG-FUNCTOR` did.
+
 ### Fixed
 
 - **`%POSIX-OPEN` created files with an arbitrary permission mode on Apple

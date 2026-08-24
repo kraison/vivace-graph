@@ -21,8 +21,8 @@
 (def-vertex pn-dual () () :pn-store-b)
 
 ;; Two scratch packages, same symbol-name TWIN, both declared into
-;; store A -- DEF-VERTEX interns MAKE-<NAME>/<NAME>-P in *PACKAGE* at
-;; expansion time, so each package gets its own MAKE-TWIN (GH #167).
+;; store A -- DEF-VERTEX interns MAKE-<NAME>/<NAME>-P in the class
+;; symbol's own package, so each gets its own MAKE-TWIN (GH #167, #172).
 (defpackage #:pn-pkg-one (:use #:cl #:graph-db))
 (defpackage #:pn-pkg-two (:use #:cl #:graph-db))
 (in-package #:pn-pkg-one)

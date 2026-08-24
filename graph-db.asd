@@ -543,6 +543,7 @@ cl-temporal-extent."
                (:file "detach-tests")             ; GH #170
                (:file "system-restore-tests")     ; GH #171
                (:file "package-namespace-tests")  ; GH #167
+               (:file "runtime-schema-tests")     ; GH #172
                (:file "posix-tests")              ; GH #182
                (:file "rest-tests")
                (:file "rest-http-tests")
