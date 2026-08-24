@@ -195,6 +195,18 @@ function(s)~{ ~S~} that this image does not provide.  Nothing was ~
 built.  Register them before materializing (GH #172, R3)."
              (unresolved-function-names c)))))
 
+(define-condition materialize-unresolved-parents (error)
+  ((names :initarg :names :reader unresolved-parent-names))
+  (:report
+   (lambda (c s)
+     (format s "MATERIALIZE-SCHEMA: the manifest names parent type(s)~
+~{ ~S~} that neither exist as finalized classes nor appear among the ~
+rows being materialized.  Nothing was built: building them would leave ~
+FORWARD-REFERENCED-CLASSes behind, and every later materialization ~
+would then skip those names as \"already defined\".  Widen ~
+:NAMESPACES, or load the source that defines them first (GH #172, R3)."
+             (unresolved-parent-names c)))))
+
 (defun register-schema-function (name fn)
   "Register FN under NAME for the :CHECK slot option.  Returns NAME.
 Re-registering replaces (GH #172, R5)."
@@ -461,6 +473,31 @@ than crashing: the manifest is data, and may have been hand-edited
              (member (package-name (symbol-package name)) filter
                      :test #'string-equal))))))
 
+(defun %materialized-class-present-p (name)
+  "Does NAME already name a REAL class?  A FORWARD-REFERENCED-CLASS is
+absent, not present: it is the stub ENSURE-CLASS leaves behind for an
+unknown superclass, and treating it as \"source wins\" is exactly how a
+half-built materialization poisons every later one (GH #172, R3,
+review round 1, I-2)."
+  (let ((class (find-class name nil)))
+    (and class (not (typep class 'forward-referenced-class)))))
+
+(defun %unresolved-parent-names (rows)
+  "Every parent named by ROWS that is neither a real class already nor
+a row in ROWS itself, deduplicated in order of appearance.  ROWS is the
+whole build set, skipped rows included: a skipped row's class exists,
+so it is a legitimate parent (GH #172, R3, review round 1, I-2)."
+  (let ((known (make-hash-table :test 'eq))
+        (missing nil))
+    (dolist (row rows)
+      (setf (gethash (getf row :type) known) t))
+    (dolist (row rows (nreverse missing))
+      (dolist (parent (getf row :parents))
+        (unless (or (gethash parent known)
+                    (%materialized-class-present-p parent)
+                    (member parent missing))
+          (push parent missing))))))
+
 (defun %materialize-sort (rows)
   "ROWS reordered so a row builds after any parent of it that is also
 in ROWS; manifest order is the tiebreak.  Redefinition re-appends a
@@ -549,21 +586,30 @@ methods below it compile (GH #172, R3)."
                  (nth-value 1 (read-schema-manifest dir))))
           (pending nil))
       ;; Fail fast, before anything is built: ONE error naming every
-      ;; unresolved :CHECK function (approved point C).
+      ;; unresolved :CHECK function (approved point C), and one naming
+      ;; every unbuildable parent (I-2).  Half a materialization is
+      ;; worse than none: the stub classes it leaves behind make every
+      ;; later attempt skip those names as already defined.
       (let ((missing (%unresolved-check-names
                       (mapcar (lambda (r) (getf r :slots)) rows))))
         (when missing
           (error 'materialize-unresolved-functions :names missing)))
+      (let ((orphans (%unresolved-parent-names rows)))
+        (when orphans
+          (error 'materialize-unresolved-parents :names orphans)))
       (dolist (row rows)
-        (if (find-class (getf row :type) nil)
+        (if (%materialized-class-present-p (getf row :type))
             (progn (%warn-if-row-diverges row) (incf skipped))
             (push row pending)))
-      (dolist (row (%materialize-sort (nreverse pending)))
-        (%materialize-row row)
-        (incf materialized)))
+      ;; Nothing this call installs may touch the manifest: every row
+      ;; came out of it (M-1).
+      (let ((*record-manifest-rows* nil))
+        (dolist (row (%materialize-sort (nreverse pending)))
+          (%materialize-row row)
+          (incf materialized))))
     (list :namespaces namespace-count
           :materialized materialized
-          :skipped-source skipped)))
+          :skipped-existing skipped)))
 
 (defmacro materialize-schema (dir &key namespaces)
   "Rebuild every runtime-defined package and class recorded in DIR's
@@ -573,13 +619,20 @@ file with methods on a runtime type; the EVAL-WHEN is carried here so a
 caller cannot get it wrong.
 
 Idempotent, and SOURCE WINS: a type whose class already exists is left
-alone and counted under :SKIPPED-SOURCE, with the #196 divergence
-warning when the manifest's slot set disagrees with the live class.
+alone, with the #196 divergence warning when the manifest's slot set
+disagrees with the live class.
 :NAMESPACES narrows to the named packages.  Nothing is evaluated --
 the input is plists and the output is MOP calls -- and a :CHECK
 function the image does not provide aborts the whole call before
 anything is built (MATERIALIZE-UNRESOLVED-FUNCTIONS, naming all of
-them).  Returns (:NAMESPACES n :MATERIALIZED n :SKIPPED-SOURCE n)
-(GH #172, R3)."
+them), as does a row whose parent neither exists nor is being built
+(MATERIALIZE-UNRESOLVED-PARENTS).
+
+Returns (:NAMESPACES n :MATERIALIZED n :SKIPPED-EXISTING n).
+:NAMESPACES counts packages ensured, :MATERIALIZED classes built by
+THIS call, and :SKIPPED-EXISTING rows left alone because the class was
+already present -- whatever defined it, source or an earlier
+materialization (under compile-then-load, the load pass sees the
+compile pass's work here) (GH #172, R3)."
   `(eval-when (:compile-toplevel :load-toplevel :execute)
      (%materialize-schema ,dir :namespaces ,namespaces)))

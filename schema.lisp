@@ -583,6 +583,14 @@ I3).")
     (remf copy :time)
     copy))
 
+(defvar *record-manifest-rows* t
+  "NIL suppresses every manifest type-row append.  Bound NIL by
+%MATERIALIZE-SCHEMA: the rows it installs came OUT of the manifest, so
+re-appending them would add one identical row per type on every boot,
+with a fresh :TIME that lies to DESCRIBE-SCHEMA's :SINCE (GH #172,
+review round 1, M-1).  ENSURE-NAMESPACE's :RECORD-P is the same rule
+for namespace rows.")
+
 (defun %schema-manifest-append-if-changed (name record)
   "Append RECORD unless it is EQUAL, ignoring :TIME, to the last row
 this image wrote for NAME under the current *SYSTEM-DIRECTORY* -- a
@@ -595,13 +603,16 @@ updated ONLY when the write actually lands: caching before the outcome
 is known would let one transient failure (disk full, unwritable
 directory) silently drop the row for the rest of the session -- before
 this fix, every reopen kept retrying instead (GH #172, review round
-2)."
-  (with-lock-held (*schema-manifest-lock*)
-    (let* ((key (cons name *system-directory*))
-           (sans-time (%schema-manifest-record-sans-time record)))
-      (unless (equal sans-time (gethash key *schema-manifest-type-cache*))
-        (when (%write-schema-manifest-record record)
-          (setf (gethash key *schema-manifest-type-cache*) sans-time))))))
+2).  *RECORD-MANIFEST-ROWS* NIL skips the append outright (M-1)."
+  (when *record-manifest-rows*
+    (with-lock-held (*schema-manifest-lock*)
+      (let* ((key (cons name *system-directory*))
+             (sans-time (%schema-manifest-record-sans-time record)))
+        (unless (equal sans-time
+                       (gethash key *schema-manifest-type-cache*))
+          (when (%write-schema-manifest-record record)
+            (setf (gethash key *schema-manifest-type-cache*)
+                  sans-time)))))))
 
 (defun %install-node-type (meta)
   "Everything DEF-NODE-TYPE's expansion does except the DEFCLASS: warn on

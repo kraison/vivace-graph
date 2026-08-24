@@ -311,6 +311,8 @@
            #:schema-function-unresolved
            #:materialize-unresolved-functions
            #:unresolved-function-names
+           #:materialize-unresolved-parents
+           #:unresolved-parent-names
            #:instantiate-node-type
            #:*schema-node-metadata*
            #:with-write-locked-class

@@ -286,14 +286,16 @@ proves materialize rebuilds everything it needs."
   (%rs-drop-orphaned-metas))
 
 (defun %rs-drop-orphaned-metas ()
-  "Drop every registered meta whose class symbol lost its home package
--- DELETE-PACKAGE uninterns them, and a later UPDATE-SCHEMA would then
-FIND-CLASS a symbol nothing can name."
+  "Drop every registered meta whose class this ablation removed -- the
+symbol lost its home package (DELETE-PACKAGE uninterns it) or lost its
+class.  A later UPDATE-SCHEMA would otherwise FIND-CLASS something that
+no longer exists."
   (maphash (lambda (store metas)
              (setf (gethash store graph-db::*schema-node-metadata*)
                    (remove-if (lambda (m)
-                                (null (symbol-package
-                                       (graph-db::node-type-name m))))
+                                (let ((n (graph-db::node-type-name m)))
+                                  (or (null (symbol-package n))
+                                      (null (find-class n nil)))))
                               metas)))
            graph-db::*schema-node-metadata*))
 
@@ -334,7 +336,7 @@ manifest row must be skipped, not rebuilt, and the summary says so."
     g
     (let ((summary (graph-db:materialize-schema
                     graph-db::*system-directory*)))
-      (is (plusp (getf summary :skipped-source)))
+      (is (plusp (getf summary :skipped-existing)))
       (is (typep (make-instance 'rs-static) 'rs-static)))))
 
 (test materialize-warns-when-a-skipped-class-diverges
@@ -506,3 +508,88 @@ enforced on a subclass (GH #172, R5)."
     (signals graph-db:value-constraint-violation
       (with-transaction ((graph-db::transaction-manager g))
         (make-rs-checked :value 900d0)))))
+
+;;; ---------------------------------------------------------------------
+;;; Fix round 1 (review of task 3): I-2, M-1.
+;;; ---------------------------------------------------------------------
+
+(test materialize-fails-fast-on-a-parent-outside-the-build-set
+  "I-2: a build set that excludes a parent must abort the whole call --
+ENSURE-CLASS would otherwise leave a FORWARD-REFERENCED-CLASS stub for
+it, which every later materialization would skip as \"already
+defined\", poisoning the image until restart.  So: fail fast, build
+nothing, and let a second call over the whole manifest succeed."
+  (with-rs-store (g)
+    g
+    (graph-db:ensure-namespace "RS-BASE-NS")
+    (graph-db:ensure-namespace "RS-KID-NS")
+    (graph-db:create-vertex-type "RS-BASE-NS:PARENT" '((a :type string))
+                                 :default-store :rs-store)
+    (graph-db:create-vertex-type
+     "RS-KID-NS:CHILD" '((b :type string))
+     :parents (list (intern "PARENT" :rs-base-ns))
+     :default-store :rs-store)
+    ;; Fresh image for the classes; RS-BASE-NS the PACKAGE survives (a
+    ;; source DEFPACKAGE would have created it), so the CHILD row still
+    ;; READS -- its parent simply has no class and no selected row.
+    (dolist (name '(:rs-kid-ns :rs-base-ns))
+      (let ((pkg (find-package name)))
+        (when pkg
+          (do-symbols (sym pkg) (when (find-class sym nil)
+                                  (setf (find-class sym) nil))))))
+    (let ((pkg (find-package :rs-kid-ns)))
+      (when pkg (delete-package pkg)))
+    (%rs-drop-orphaned-metas)
+    (signals graph-db:materialize-unresolved-parents
+      (graph-db:materialize-schema graph-db::*system-directory*
+                                   :namespaces '("RS-KID-NS")))
+    ;; Nothing built, and no stub left behind for PARENT.
+    (is (null (find-class (intern "CHILD" :rs-kid-ns) nil)))
+    (is (null (find-class (intern "PARENT" :rs-base-ns) nil)))
+    ;; Not poisoned: the call over the whole manifest succeeds.
+    (graph-db:materialize-schema graph-db::*system-directory*)
+    (is-true (find-class (intern "PARENT" :rs-base-ns) nil))
+    (is-true (find-class (intern "CHILD" :rs-kid-ns) nil))
+    (is-true (subtypep (intern "CHILD" :rs-kid-ns)
+                       (intern "PARENT" :rs-base-ns)))))
+
+(test a-forward-referenced-class-does-not-count-as-existing
+  "I-2 pin: the skip test is %MATERIALIZED-CLASS-PRESENT-P, not
+FIND-CLASS -- a stub must be rebuilt, not mistaken for source."
+  ;; Portable way to get one: name an undefined superclass.  The MOP
+  ;; leaves a stub for RS-FWD-ABSENT, and FIND-CLASS answers it.
+  (let ((sym (intern "RS-FWD-ABSENT" :graph-db/test)))
+    (unwind-protect
+         (progn
+           (eval `(defclass ,(intern "RS-FWD-CHILD" :graph-db/test)
+                      (,sym) ()))
+           (is-true (find-class sym nil))
+           (is (null (graph-db::%materialized-class-present-p sym))))
+      (setf (find-class (intern "RS-FWD-CHILD" :graph-db/test)) nil)
+      (setf (find-class sym) nil))))
+
+(test materialize-does-not-grow-the-manifest-per-restart
+  "M-1: the rows materialize installs came OUT of the manifest, so a
+second boot must not append an identical row (with a fresh :TIME) for
+every type it rebuilds."
+  (with-rs-store (g)
+    (graph-db:ensure-namespace "RS-TLM")
+    (graph-db:create-vertex-type "RS-TLM:BOOTROW" '((x :type string))
+                                 :default-store :rs-store)
+    (let ((name (intern "BOOTROW" :rs-tlm)))
+      (flet ((row-count (sym)
+               (with-open-file (s (graph-db::%schema-manifest-file))
+                 (loop for line = (read-line s nil :eof)
+                       until (eq line :eof)
+                       count (let ((rec
+                                     (graph-db::%parse-schema-manifest-line
+                                      line)))
+                               (and rec (eq (getf rec :type) sym)))))))
+        (let ((before (row-count name)))
+          (is (plusp before))
+          (%rs-wipe-runtime-state g)
+          (graph-db:materialize-schema graph-db::*system-directory*)
+          (is (= before (row-count (intern "BOOTROW" :rs-tlm))))
+          (%rs-wipe-runtime-state g)
+          (graph-db:materialize-schema graph-db::*system-directory*)
+          (is (= before (row-count (intern "BOOTROW" :rs-tlm)))))))))
