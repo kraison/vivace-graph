@@ -115,15 +115,21 @@ emits for one, not what this creates.  Allocates no files and no store
 (GH #172, R4)."
   (let* ((pkg-name (string name))
          (nick-strings (mapcar #'string nicknames))
-         (pkg (find-package pkg-name)))
+         (pkg (find-package pkg-name))
+         ;; The set actually applied to the package -- review round 1,
+         ;; I1: the manifest row must record THIS, not just this call's
+         ;; own NICK-STRINGS, or a later no-nickname call's last-wins
+         ;; row would drop every nickname a prior call had established.
+         (wanted (if pkg
+                    (union (package-nicknames pkg) nick-strings
+                          :test #'string=)
+                    nick-strings)))
     (if pkg
-        (let ((wanted (union (package-nicknames pkg) nick-strings
-                             :test #'string=)))
-          (unless (= (length wanted) (length (package-nicknames pkg)))
-            (rename-package pkg pkg-name wanted)))
-        (setf pkg (make-package pkg-name :nicknames nick-strings :use nil)))
+        (unless (= (length wanted) (length (package-nicknames pkg)))
+          (rename-package pkg pkg-name wanted))
+        (setf pkg (make-package pkg-name :nicknames wanted :use nil)))
     (%append-schema-manifest-record
-     (list :namespace pkg-name :nicknames nick-strings
+     (list :namespace pkg-name :nicknames wanted
            :time (get-universal-time)))
     pkg))
 
@@ -131,12 +137,28 @@ emits for one, not what this creates.  Allocates no files and no store
 ;;; CREATE-VERTEX-TYPE / CREATE-EDGE-TYPE (R4)
 ;;; ---------------------------------------------------------------------
 
+(defun %refused-schema-package-p (pkg)
+  "COMMON-LISP and KEYWORD tolerate no new symbols; a schema type can
+never be homed in either (GH #172, R4)."
+  (and (member pkg (list (find-package :common-lisp)
+                         (find-package :keyword)))
+       t))
+
+(defun %refuse-schema-package (designator pkg)
+  (error "~A: cannot define a schema type in ~A -- use ~
+ENSURE-NAMESPACE to create a namespace package first (GH #172)."
+         designator (package-name pkg)))
+
 (defun %parse-schema-type-name (name)
   "NAME as a symbol.  A string is split on ':' by hand -- NEVER READ,
 since NAME is untrusted runtime data and *READ-EVAL* NIL alone does not
 rule out reader-macro side effects on an arbitrary token.  Handles both
-NAME:SYM and NAME::SYM.  A missing package errors naming ENSURE-NAMESPACE
-(GH #172, R4)."
+NAME:SYM and NAME::SYM.  A missing package errors naming ENSURE-NAMESPACE.
+The COMMON-LISP/KEYWORD refusal is checked on the PACKAGE NAME here,
+before INTERN -- review round 1, I2: checking only the interned symbol's
+package afterward is too late, since INTERN into COMMON-LISP itself
+signals SBCL's own package-lock error first, and INTERN into KEYWORD
+just silently succeeds (GH #172, R4)."
   (if (symbolp name)
       name
       (let* ((s (string name))
@@ -152,19 +174,21 @@ NAME:SYM and NAME::SYM.  A missing package errors naming ENSURE-NAMESPACE
           (unless pkg
             (error "No package named ~A -- call ENSURE-NAMESPACE first ~
 (GH #172)." pkg-name))
+          (when (%refused-schema-package-p pkg)
+            (%refuse-schema-package s pkg))
           (intern sym-name pkg)))))
 
 (defun %check-schema-name-package (sym)
   "Refuse to define a schema type whose home package is COMMON-LISP or
 KEYWORD -- neither tolerates new symbols; the package-lock guard in
 %INSTALL-NODE-HELPERS/%INSTALL-EDGE-FUNCTORS is the same rule applied to
-the generated helpers (GH #172, R4)."
+the generated helpers.  Covers the SYMBOL-argument path; the
+\"PACKAGE:NAME\" string path is checked earlier, in
+%PARSE-SCHEMA-TYPE-NAME, before the symbol is even interned (GH #172,
+R4)."
   (let ((pkg (symbol-package sym)))
-    (when (member pkg (list (find-package :common-lisp)
-                            (find-package :keyword)))
-      (error "~S: cannot define a schema type in ~A -- use ~
-ENSURE-NAMESPACE to create a namespace package first (GH #172)."
-             sym (package-name pkg)))))
+    (when (%refused-schema-package-p pkg)
+      (%refuse-schema-package sym pkg))))
 
 (defun %retarget-slot-specs (specs pkg)
   "Re-intern each spec's slot NAME and :ACCESSOR into PKG.  Runtime

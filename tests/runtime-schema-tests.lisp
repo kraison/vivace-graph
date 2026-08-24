@@ -126,3 +126,101 @@ The full suite is the broad net; this is the focused canary."
       ns
       (is (find (intern "READING" :rs-tlm) types
                 :key (lambda (r) (getf r :type)))))))
+
+;;; ---------------------------------------------------------------------
+;;; Fix round 1 (review of the first submission): I1, I2, I3.
+;;; ---------------------------------------------------------------------
+
+(test ensure-namespace-manifest-keeps-nicknames-across-calls
+  "I1: a later no-nickname ENSURE-NAMESPACE call must not make the
+manifest's last row for the namespace forget an earlier call's
+nicknames -- the row must record the UNIONED set actually applied to
+the package, not just this call's own :NICKNAMES argument (GH #172,
+review round 1)."
+  (with-rs-store (g)
+    g
+    (graph-db:ensure-namespace "RS-TLM-I1" :nicknames '("RSTI1"))
+    (graph-db:ensure-namespace "RS-TLM-I1")
+    (multiple-value-bind (ns types)
+        (graph-db::read-schema-manifest graph-db::*system-directory*)
+      types
+      (let ((row (find "RS-TLM-I1" ns :key (lambda (r) (getf r :namespace))
+                       :test #'string-equal)))
+        (is-true row)
+        (is (member "RSTI1" (getf row :nicknames) :test #'string=))))))
+
+(test create-vertex-type-refuses-locked-package-strings
+  "I2: \"COMMON-LISP:X\" and \"KEYWORD:X\" must signal GRAPH-DB's own
+refusal (naming ENSURE-NAMESPACE), not SBCL's raw package-lock error or
+a silent KEYWORD intern followed by a later, unrelated failure
+(GH #172, review round 1)."
+  (with-rs-store (g)
+    g
+    (dolist (bad '("COMMON-LISP:RS-I2-PROBE" "KEYWORD:RS-I2-PROBE"))
+      (let ((c (handler-case
+                   (progn (graph-db:create-vertex-type bad '()
+                                                        :default-store
+                                                        :rs-store)
+                          nil)
+                 (error (e) e))))
+        (is-true c "~A should have signaled" bad)
+        (when c
+          (is (search "ENSURE-NAMESPACE" (format nil "~A" c))
+              "~A's condition should name ENSURE-NAMESPACE: ~A" bad c))))))
+
+(test manifest-uses-the-registered-meta-not-a-divergent-stray
+  "I3a: INSTANTIATE-NODE-TYPE's manifest re-append is sourced from the
+REGISTERED meta for the type's own declared store, not whatever META
+object happens to be passed in -- a stray, never-registered meta (as a
+foreign-store adoption or a stale on-disk read might carry) must never
+overwrite the canonical row with divergent slots (GH #172, review
+round 1)."
+  (with-rs-store (g)
+    (graph-db:ensure-namespace "RS-TLM")
+    (graph-db:create-vertex-type "RS-TLM:DIVROW" '((a-slot :type string))
+                                 :default-store :rs-store)
+    (let* ((name (intern "DIVROW" :rs-tlm))
+           (canonical (graph-db::node-type-slots
+                       (graph-db::%find-registered-node-type
+                        name :vertex :rs-store)))
+           ;; A hand-built, never-registered, divergent meta for the
+           ;; same class name -- bypasses %INSTALL-NODE-TYPE entirely.
+           (stray (graph-db::make-node-type
+                   :name name :parent-type :vertex
+                   :graph-name :rs-store-b
+                   :slots '((b-slot :type string :accessor b-slot
+                            :initarg :b-slot)))))
+      (handler-bind ((warning #'muffle-warning))
+        (graph-db::instantiate-node-type stray g))
+      (multiple-value-bind (ns types)
+          (graph-db::read-schema-manifest graph-db::*system-directory*)
+        ns
+        (let ((row (find name types :key (lambda (r) (getf r :type)))))
+          (is-true row)
+          (is (equal canonical (getf row :slots))))))))
+
+(test manifest-row-count-does-not-grow-on-reopen
+  "I3b: repeated INSTANTIATE-NODE-TYPE calls (what a reopen does) for an
+unchanged type must not keep growing the manifest -- the cached last-
+written row makes the second and third calls no-ops (GH #172, review
+round 1)."
+  (with-rs-store (g)
+    (graph-db:ensure-namespace "RS-TLM")
+    (graph-db:create-vertex-type "RS-TLM:COUNTROW" '((c :type string))
+                                 :default-store :rs-store)
+    (let ((name (intern "COUNTROW" :rs-tlm)))
+      (flet ((row-count ()
+               (with-open-file (s (graph-db::%schema-manifest-file))
+                 (loop for line = (read-line s nil :eof)
+                       until (eq line :eof)
+                       count (let ((rec (graph-db::%parse-schema-manifest-line
+                                        line)))
+                               (and rec (eq (getf rec :type) name)))))))
+        (let ((c1 (row-count)))
+          (graph-db::instantiate-node-type
+           (graph-db::%find-registered-node-type name :vertex :rs-store)
+           g)
+          (graph-db::instantiate-node-type
+           (graph-db::%find-registered-node-type name :vertex :rs-store)
+           g)
+          (is (= c1 (row-count))))))))

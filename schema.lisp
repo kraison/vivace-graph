@@ -561,6 +561,34 @@ written later (GH #172, R2).")
           :provenance provenance
           :time (get-universal-time))))
 
+;; Review round 1, I3: keyed on (NAME . *SYSTEM-DIRECTORY*), not just
+;; NAME -- tests (and any image) rebind *SYSTEM-DIRECTORY* per store, and
+;; a cache hit against a PRIOR directory must never suppress the real
+;; write to a new one (mirrors *EDGE-OCCUPANCY-LOADED-FILE*'s reasoning).
+(defvar *schema-manifest-type-cache* (make-hash-table :test 'equal)
+  "(NAME . SYSTEM-DIRECTORY) -> the last %SCHEMA-MANIFEST-TYPE-RECORD
+plist appended for NAME under that directory, WITH :TIME REMOVED (which
+always differs and so must not defeat the comparison).  Lets
+INSTANTIATE-NODE-TYPE's re-append skip a redundant write on repeated
+opens/redefinitions with an unchanged row (GH #172, review round 1,
+I3).")
+
+(defun %schema-manifest-record-sans-time (record)
+  (let ((copy (copy-list record)))
+    (remf copy :time)
+    copy))
+
+(defun %schema-manifest-append-if-changed (name record)
+  "Append RECORD unless it is EQUAL, ignoring :TIME, to the last row
+this image wrote for NAME under the current *SYSTEM-DIRECTORY* -- a
+reopen storm must not keep growing the manifest (GH #172, review round
+1, I3)."
+  (let* ((key (cons name *system-directory*))
+         (sans-time (%schema-manifest-record-sans-time record)))
+    (unless (equal sans-time (gethash key *schema-manifest-type-cache*))
+      (setf (gethash key *schema-manifest-type-cache*) sans-time)
+      (%append-schema-manifest-record record))))
+
 (defun %install-node-type (meta)
   "Everything DEF-NODE-TYPE's expansion does except the DEFCLASS: warn on
 cross-store divergence, finalize the class, install the generated
@@ -582,8 +610,8 @@ named by META must already exist.  Returns META (GH #172)."
     ;; alike -- both paths funnel through here.  A type whose default
     ;; store is not open (or NIL, R4) still gets this one row; see
     ;; INSTANTIATE-NODE-TYPE for the re-assertion on store open.
-    (%append-schema-manifest-record
-     (%schema-manifest-type-record meta *schema-provenance*))
+    (%schema-manifest-append-if-changed
+     name (%schema-manifest-type-record meta *schema-provenance*))
     (let ((graph (lookup-graph (node-type-graph-name meta))))
       (when graph
         (instantiate-node-type meta graph)))
@@ -829,12 +857,24 @@ is the only point at which that ordering is guaranteed."
   ;; R2 (GH #172): a store's own graph-open re-asserts its schema rows
   ;; into whatever *SYSTEM-DIRECTORY* is current -- the only way a type
   ;; defined once, before any system directory existed, still shows up
-  ;; in a manifest read later.  Last-record-per-name wins on read, so
-  ;; repeated re-assertion across opens is harmless.
-  (%append-schema-manifest-record
-   (%schema-manifest-type-record
-    meta (or (gethash (node-type-name meta) *node-type-provenance*)
-            :source)))
+  ;; in a manifest read later.  Sourced from the REGISTERED meta for
+  ;; META's own declared store, not META itself: a #186 cross-store
+  ;; adoption or a stale on-disk read can hand this method a META that
+  ;; was never %REGISTER-NODE-TYPE-META'd under its claimed store, and
+  ;; that stray must never overwrite the canonical row a #196-divergent
+  ;; variant elsewhere would otherwise clobber it with (review round 1,
+  ;; I3).  %SCHEMA-MANIFEST-APPEND-IF-CHANGED then skips the write
+  ;; entirely when it would be a no-op, so a reopen storm does not keep
+  ;; growing the manifest.
+  (let* ((name (node-type-name meta))
+         (registered (or (%find-registered-node-type
+                          name (node-type-parent-type meta)
+                          (node-type-graph-name meta))
+                         meta)))
+    (%schema-manifest-append-if-changed
+     name
+     (%schema-manifest-type-record
+      registered (or (gethash name *node-type-provenance*) :source))))
   (with-recursive-lock-held ((schema-lock (schema graph)))
     (let ((cl (find-class (node-type-name meta) nil)))
       ;; Drop EVERY memoized CLASS-SLOTS-derived answer for this class and its
