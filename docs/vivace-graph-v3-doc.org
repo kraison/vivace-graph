@@ -3199,7 +3199,8 @@ for parity. It is enforced wherever value constraints already run
 (~value-constraint.lisp~), NULL-exempt; a violation signals the existing
 ~value-constraint-violation~ condition with reason ~:check-failed~.
 Presence — not resolution — of the named function is verified at
-~create-*-type~ time and again at ~materialize-schema~ time below; the
+~create-*-type~ time (signalling ~schema-function-unresolved~ if the name
+is not yet registered) and again at ~materialize-schema~ time below; the
 function itself is looked up at each check, so re-registering it takes
 effect immediately.
 

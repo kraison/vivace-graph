@@ -101,10 +101,12 @@ between releases; cutting a release renames it to the new version and dates it.
   `:CHECK FN-NAME` slot option (accepted by `DEF-VERTEX`/`DEF-EDGE`
   slot-specs too, for parity), enforced where value constraints already
   are, NULL-exempt, violating with the existing condition's `:reason
-  :CHECK-FAILED`; presence is verified at `CREATE-*-TYPE` time and again
-  at `MATERIALIZE-SCHEMA` time, resolution happens at each check so a
-  re-registration takes effect immediately. Restart never evaluates
-  data -- this is the invariant the whole unit is built to hold.
+  :CHECK-FAILED`; presence is verified at `CREATE-*-TYPE` time
+  (signalling `SCHEMA-FUNCTION-UNRESOLVED` if the name is not yet
+  registered) and again at `MATERIALIZE-SCHEMA` time, resolution
+  happens at each check so a re-registration takes effect immediately.
+  Restart never evaluates data -- this is the invariant the whole unit
+  is built to hold.
 
   Two read-only visibility tools close the opacity gap a runtime type
   otherwise opens (a class with no source file, ungreppable): `DESCRIBE-

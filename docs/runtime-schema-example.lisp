@@ -178,14 +178,13 @@
 ;;   (in-package #:telemetry)
 ;;
 ;;   (def-vertex calibration ()
-;;       ((value :type double-float
-;;               :check helpdesk::telemetry-plausible-p))
+;;       ((value :type double-float :check helpdesk::telemetry-plausible-p))
 ;;       :support)
 ;;
 ;;   (def-vertex reading ()
 ;;       ((sensor-id :type string)
-;;        (value     :type double-float)
-;;        (taken-at  :type integer))
+;;        (value :type double-float)
+;;        (taken-at :type integer))
 ;;       :support)
 ;;
 ;; Two things worth noticing that only show up once real metadata goes
