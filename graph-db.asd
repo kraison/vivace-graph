@@ -537,6 +537,7 @@ cl-temporal-extent."
                (:file "write-path-tests")
                (:file "slot-mutation-tests")
                (:file "reopen-tests")
+               (:file "map-vertices-untyped-tests") ; GH #219
                (:file "backup-tests")
                (:file "mvcc-tests")
                (:file "system-clock-tests")       ; GH #168
