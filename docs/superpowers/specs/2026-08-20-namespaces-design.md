@@ -197,6 +197,20 @@ Slots, types, indexes, unique constraints and value constraints are data. Functi
 schema options are not — a closure cannot be serialised. A runtime-defined type that needs
 a function **names a pre-registered one**. Invariant: *restart never evaluates data.*
 
+**Built (#172):** `ensure-namespace`/`create-vertex-type`/`create-edge-type` build a
+namespace and a class from data through the same `%install-node-type` path a `def-vertex`
+expansion drives (R1); a system-level `schema-manifest.dat` beside the type registry
+records every namespace and type row, fail-safe like the #167 occupancy sidecar (R2); the
+`materialize-schema` macro is the load-order answer, rebuilding runtime packages and
+classes from the manifest at load time, idempotent, source-wins, and failing fast — before
+building anything — on an unresolved `:check` function name or an unbuildable parent
+(`materialize-unresolved-functions`/`materialize-unresolved-parents`, R3); `:check
+FN-NAME` is the one function-by-name slot option, resolved against
+`register-schema-function`/`find-schema-function` (R5); `describe-schema` and
+`export-schema-source` are the read-only visibility/promotion tools (R6). Full detail and
+the unit's own review-round additions: `docs/superpowers/specs/2026-08-24-runtime-
+schema-172-design.md`.
+
 ## 4. Placement
 
 The class's declared store is a **default**, overridable at any individual write.
@@ -581,13 +595,16 @@ before this ships. That is a release gate, not a design gate.
 | # | Unit | Issue | Depends on | Status |
 |---|---|---|---|---|
 | 1a | Widen `type-id` to 32 bits, sparse type-index, v3 head codec, migration — **ids stay per-graph** | #166 | — | **Done** |
-| 1b | Global type-ids: canonical registry (D14), distribution, handshake guard (D15), delete the uniqueness check | #186 | 1a | In progress |
+| 1b | Global type-ids: canonical registry (D14), distribution, handshake guard (D15), delete the uniqueness check | #186 | 1a | **Done** |
 | 2 | Packages as namespaces; store/namespace decoupling; placement defaults | #167 | **1b**, #190 | **Done** |
 | 3 | Image-level clock, system journal, epoch leases | #168 | — | **Done** |
-| 4 | Tagged UUIDv8 store field, resolver, detached-read marker | #169 | 3 | Not started |
-| 5 | Detach quiescence protocol and shadow bulk load | #170 | 3, 4, #191 | Blocked |
+| 4 | Tagged UUIDv8 store field, resolver, detached-read marker | #169 | 3 | **Done** |
+| 5 | Detach quiescence protocol and shadow bulk load | #170 | 3, 4, #191 | **Done** |
 | 6 | Restore: retention policy, algorithm, manifest, cascade | #171 | 5, #191 | **Done** |
-| 7 | Runtime schema from persisted metadata | #172 | 1b, 2 | Blocked |
+| 7 | Runtime schema from persisted metadata | #172 | 1b, 2 | **Done** |
+
+Every build unit in this table is now **Done** — #172 (unit 7) was the last. Follow-ups
+this epic surfaced along the way stay open as their own issues rather than rows here.
 
 Defects found while building the units above, which gate later ones: #187 (memory-image
 narrowing, **done**), #182 (clock had no cross-process exclusion, **done**), #190

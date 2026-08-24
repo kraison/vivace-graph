@@ -344,11 +344,16 @@ evolution and is not this guard's business (GH #196)."
                :reader default-store-not-open-class)
    (store :initarg :store :reader default-store-not-open-store))
   (:report (lambda (c s)
-             (format s "MAKE-~A: no :GRAPH argument and the class's ~
-default store ~S is not open.  Open it, or pass :GRAPH explicitly ~
-(GH #167)."
-                     (default-store-not-open-class c)
-                     (default-store-not-open-store c)))))
+             (let ((store (default-store-not-open-store c)))
+               (if store
+                   (format s "MAKE-~A: no :GRAPH argument and the ~
+class's default store ~S is not open.  Open it, or pass :GRAPH ~
+explicitly (GH #167)."
+                           (default-store-not-open-class c) store)
+                   (format s "MAKE-~A: no :GRAPH argument and the ~
+class has no default store (:DEFAULT-STORE NIL).  Pass :GRAPH ~
+explicitly (GH #172)."
+                           (default-store-not-open-class c)))))))
 
 (defun %find-registered-node-type (name kind &optional prefer-store)
   "The registered META whose class symbol is NAME (EQ -- package-aware)
@@ -396,12 +401,304 @@ STORE-NAME, else refuse -- never *GRAPH* (GH #167)."
       (error 'default-store-not-open-error
              :class-name class-name :store store-name)))
 
-(defmacro def-node-type (name parent-types slot-specs graph-name &key keep-revisions)
+;;; R1 (GH #172): one installation path for source- and runtime-defined
+;;; types.  DEF-NODE-TYPE's expansion keeps only the literal DEFCLASS and
+;;; hands everything else to %INSTALL-NODE-TYPE, so a class built from
+;;; persisted metadata gets the identical helpers, functors, registration
+;;; and instantiation.  Spec:
+;;; docs/superpowers/specs/2026-08-24-runtime-schema-172-design.md
+
+;; Defined in prolog-functors.lisp: the functor bodies need VAR-DEREF,
+;; which is a macro there, so they cannot live in this file (GH #172).
+(declaim (ftype (function (symbol) t) %install-edge-functors))
+
+;; Defined in runtime-schema.lisp: manifest I/O lives with READ-SCHEMA-
+;; MANIFEST so both sides of the file agree on record shape (GH #172, R2).
+(declaim (ftype (function (list) t) %append-schema-manifest-record))
+;; The unlocked writer %SCHEMA-MANIFEST-APPEND-IF-CHANGED calls directly,
+;; and the lock it and %APPEND-SCHEMA-MANIFEST-RECORD both take -- taken
+;; exactly once per call, never nested (GH #172, review round 2).
+(declaim (ftype (function (list) t) %write-schema-manifest-record))
+(declaim (special *schema-manifest-lock*))
+;; %SEED-SCHEMA-MANIFEST-CACHE (I-1, review round 3) reads the manifest
+;; back through the same file this file also writes.
+(declaim (ftype (function (t) (values list list)) read-schema-manifest))
+
+(defvar *schema-provenance* :source
+  "Bound to :RUNTIME around CREATE-VERTEX-TYPE/CREATE-EDGE-TYPE so
+%INSTALL-NODE-TYPE's manifest record captures who defined the type;
+DEF-VERTEX/DEF-EDGE leave it at the default (GH #172, R2).")
+
+;; Homed here, not runtime-schema.lisp, so NODE-CLASS.LISP's SETF sees a
+;; real DEFVAR: node-class.lisp depends only on "schema" in the .asd
+;; (review round 3, M-4).
+(defvar *schema-check-slots-present-p* nil
+  "T once any class in this image has a :CHECK slot.  Set by
+COMPUTE-EFFECTIVE-SLOT-DEFINITION (node-class.lisp); read by
+VALIDATE-VALUE-CONSTRAINTS so a schema with no :CHECK pays nothing
+(GH #172, R5).")
+
+(eval-when (:compile-toplevel :load-toplevel :execute)
+(defun %normalize-slot-specs (slot-specs)
+  "Supply a default :ACCESSOR and :INITARG for every CLOS-style spec in
+SLOT-SPECS (a bare symbol becomes a one-element list).  Returns the
+normalized specs; both DEF-NODE-TYPE and the runtime path use it so the
+two agree on slot shape (GH #172)."
+  (mapcar
+   (lambda (spec)
+     (let ((s1 (if (listp spec)
+                   (if (find :accessor spec)
+                       spec
+                       (append spec (list :accessor (first spec))))
+                   (list spec :accessor spec))))
+       (if (find :initarg s1)
+           s1
+           (append s1 (list :initarg (intern (symbol-name (first s1))
+                                             :keyword))))))
+   slot-specs))
+
+
+(defun %schema-symbol-package (name)
+  "The package NAME's generated helpers and functors are interned in.
+DEF-NODE-TYPE used to intern them in the expansion-time *PACKAGE*, which
+for source code is the package NAME itself was read into (GH #172)."
+  (or (symbol-package name) *package*))
+) ; eval-when: both are called at DEF-NODE-TYPE expansion time
+
+(defun %collect-constructor-slots (name make-args)
+  "The (:SLOT . value) alist MAKE-<NAME> hands to MAKE-VERTEX/MAKE-EDGE:
+NAME's data slots that appear in MAKE-ARGS.  Read at call time, so a
+redefined class takes effect immediately (GH #172)."
+  (remove-if
+   'null
+   (mapcar (lambda (slot-name)
+             (let* ((key (intern (symbol-name slot-name) :keyword))
+                    (pos (position key make-args)))
+               (when pos
+                 (cons key (nth (1+ pos) make-args)))))
+           (data-slots (find-class name)))))
+
+(defun %make-constructor-closure (name graph-name kind)
+  "The MAKE-<NAME> function for node type NAME of KIND in store
+GRAPH-NAME (GH #172)."
+  (if (eq kind :edge)
+      (lambda (&rest make-args
+               &key (graph nil) id deleted-p revision from to weight
+               &allow-other-keys)
+        (let ((graph (%default-store-graph name graph-name graph)))
+          (make-edge (node-type-id
+                      (%ensure-type-in-store name :edge graph))
+                     from to weight
+                     (%collect-constructor-slots name make-args)
+                     :id id :revision revision :deleted-p deleted-p
+                     :graph graph)))
+      (lambda (&rest make-args
+               &key (graph nil) id deleted-p revision
+               &allow-other-keys)
+        (let ((graph (%default-store-graph name graph-name graph)))
+          (make-vertex (node-type-id
+                        (%ensure-type-in-store name :vertex graph))
+                       (%collect-constructor-slots name make-args)
+                       :id id :revision revision :deleted-p deleted-p
+                       :graph graph)))))
+
+(defun %make-lookup-closure (name kind)
+  "The LOOKUP-<NAME> function: id -> node, skipping deleted nodes unless
+:INCLUDE-DELETED-P (GH #172)."
+  (if (eq kind :edge)
+      (lambda (id &key include-deleted-p)
+        (let ((thing (lookup-edge id)))
+          (when (and (typep thing name)
+                     (or include-deleted-p (not (deleted-p thing))))
+            thing)))
+      (lambda (id &key include-deleted-p)
+        (let ((thing (lookup-vertex id)))
+          (when (and (typep thing name)
+                     (or include-deleted-p (not (deleted-p thing))))
+            thing)))))
+
+(defun %install-node-helpers (name kind graph-name)
+  "Install <NAME>-P, LOOKUP-<NAME> and MAKE-<NAME> as functions in
+NAME's own package.  Skipped, with a warning naming NAME, when that
+package is COMMON-LISP or KEYWORD -- neither tolerates new symbols
+(GH #172)."
+  (let ((pkg (%schema-symbol-package name)))
+    (if (member pkg (list (find-package :common-lisp)
+                          (find-package :keyword)))
+        (warn "Skipping helper install for ~S: its package ~A is ~
+locked (GH #172)." name (package-name pkg))
+        (flet ((helper (string fn)
+                 (setf (fdefinition
+                        (intern (format nil string (symbol-name name))
+                                pkg))
+                       fn)))
+          (helper "~A-P" (lambda (thing) (typep thing name)))
+          (helper "LOOKUP-~A" (%make-lookup-closure name kind))
+          (helper "MAKE-~A"
+                  (%make-constructor-closure name graph-name kind))))
+    name))
+
+(defun %register-node-type-meta (meta)
+  "Put META in *SCHEMA-NODE-METADATA* under its own store, replacing any
+entry for the same class IN PLACE.  A class may be registered under more
+than one store (#186); only this store's list is touched, and position
+still governs UPDATE-SCHEMA's instantiation order (GH #53, #167)."
+  (let* ((graph-name (node-type-graph-name meta))
+         (metas (gethash graph-name *schema-node-metadata*))
+         (pos (position (node-type-name meta) metas
+                        :key #'node-type-name)))
+    (if pos
+        (setf (nth pos metas) meta)
+        (setf (gethash graph-name *schema-node-metadata*)
+              (append metas (list meta))))
+    meta))
+
+(defvar *node-type-provenance* (make-hash-table :test 'eq)
+  "TYPE-NAME -> :SOURCE/:RUNTIME, set by %INSTALL-NODE-TYPE.  Consulted by
+INSTANTIATE-NODE-TYPE, which re-asserts a manifest row under whatever
+*SYSTEM-DIRECTORY* is current every time a store (re)opens with this
+type -- a source type defined once at load time, before any store or
+system directory existed, otherwise could never appear in a manifest
+written later (GH #172, R2).")
+
+(defun %schema-manifest-type-record (meta provenance)
+  "The (:TYPE ...) manifest plist for META, tagged with PROVENANCE
+(GH #172, R2)."
+  (let* ((name (node-type-name meta))
+         (kind (node-type-parent-type meta))
+         (base (ecase kind (:vertex (find-class 'vertex))
+                          (:edge (find-class 'edge)))))
+    (list :type name :kind kind
+          :parents (mapcar #'class-name
+                           (remove base (class-direct-superclasses
+                                         (find-class name))))
+          :slots (node-type-slots meta)
+          :default-store (node-type-graph-name meta)
+          :keep-revisions (node-type-keep-revisions meta)
+          :provenance provenance
+          :time (get-universal-time))))
+
+;; Review round 1, I3: keyed on (NAME . *SYSTEM-DIRECTORY*), not just
+;; NAME -- tests (and any image) rebind *SYSTEM-DIRECTORY* per store, and
+;; a cache hit against a PRIOR directory must never suppress the real
+;; write to a new one (mirrors *EDGE-OCCUPANCY-LOADED-FILE*'s reasoning).
+(defvar *schema-manifest-type-cache* (make-hash-table :test 'equal)
+  "(NAME . SYSTEM-DIRECTORY) -> the last %SCHEMA-MANIFEST-TYPE-RECORD
+plist appended for NAME under that directory, WITH :TIME REMOVED (which
+always differs and so must not defeat the comparison).  Lets
+INSTANTIATE-NODE-TYPE's re-append skip a redundant write on repeated
+opens/redefinitions with an unchanged row (GH #172, review round 1,
+I3).")
+
+(defun %schema-manifest-record-sans-time (record)
+  (let ((copy (copy-list record)))
+    (remf copy :time)
+    copy))
+
+;; I-1 (review round 3): the cache above is per-IMAGE, so a fresh image's
+;; first call for each name always misses -- without this, INSTANTIATE-
+;; NODE-TYPE would re-append every type row on every boot, forever, and
+;; DESCRIBE-SCHEMA's :SINCE would list the whole schema after any reopen.
+(defvar *schema-manifest-seeded-directories* (make-hash-table :test 'equal)
+  "*SYSTEM-DIRECTORY* values whose on-disk rows have already been loaded
+into *SCHEMA-MANIFEST-TYPE-CACHE* this image (GH #172, review round 3,
+I-1).  One %READ-SCHEMA-MANIFEST per directory suffices: seeding fills
+the cache for every name the file already has a row for, so a fresh
+image's first write for each name compares against the FILE, not
+against an empty cache.")
+
+(defun %seed-schema-manifest-cache ()
+  "Populate *SCHEMA-MANIFEST-TYPE-CACHE* from schema-manifest.dat under
+*SYSTEM-DIRECTORY*, once per directory per image.  Caller holds
+*SCHEMA-MANIFEST-LOCK* (GH #172, review round 3, I-1)."
+  (unless (gethash *system-directory* *schema-manifest-seeded-directories*)
+    (dolist (record (nth-value 1 (read-schema-manifest *system-directory*)))
+      (setf (gethash (cons (getf record :type) *system-directory*)
+                     *schema-manifest-type-cache*)
+           (%schema-manifest-record-sans-time record)))
+    (setf (gethash *system-directory* *schema-manifest-seeded-directories*)
+         t)))
+
+(defun %clear-schema-manifest-cache ()
+  "Reset the in-image manifest-dedup cache and its seeded-directory set.
+Tests use this to simulate a fresh image without restarting SBCL
+(GH #172, review round 3, I-1)."
+  (with-lock-held (*schema-manifest-lock*)
+    (clrhash *schema-manifest-type-cache*)
+    (clrhash *schema-manifest-seeded-directories*))
+  (values))
+
+(defvar *record-manifest-rows* t
+  "NIL suppresses every manifest type-row append.  Bound NIL by
+%MATERIALIZE-SCHEMA: the rows it installs came OUT of the manifest, so
+re-appending them would add one identical row per type on every boot,
+with a fresh :TIME that lies to DESCRIBE-SCHEMA's :SINCE (GH #172,
+review round 1, M-1).  ENSURE-NAMESPACE's :RECORD-P is the same rule
+for namespace rows.")
+
+(defun %schema-manifest-append-if-changed (name record)
+  "Append RECORD unless it is EQUAL, ignoring :TIME, to the last row
+this image wrote for NAME under the current *SYSTEM-DIRECTORY* -- a
+reopen storm must not keep growing the manifest (GH #172, review round
+1, I3).  The whole check-write-cache sequence runs under
+*SCHEMA-MANIFEST-LOCK*, taken ONCE here (calling
+%WRITE-SCHEMA-MANIFEST-RECORD directly, not %APPEND-SCHEMA-MANIFEST-
+RECORD, which would nest the same non-recursive lock).  The cache is
+updated ONLY when the write actually lands: caching before the outcome
+is known would let one transient failure (disk full, unwritable
+directory) silently drop the row for the rest of the session -- before
+this fix, every reopen kept retrying instead (GH #172, review round
+2).  *RECORD-MANIFEST-ROWS* NIL skips the append outright (M-1).  A
+directory not yet seen this image is seeded from its on-disk rows
+first, so a fresh image's first call compares against the FILE, not an
+empty cache (review round 3, I-1)."
+  (when *record-manifest-rows*
+    (with-lock-held (*schema-manifest-lock*)
+      (%seed-schema-manifest-cache)
+      (let* ((key (cons name *system-directory*))
+             (sans-time (%schema-manifest-record-sans-time record)))
+        (unless (equal sans-time
+                       (gethash key *schema-manifest-type-cache*))
+          (when (%write-schema-manifest-record record)
+            (setf (gethash key *schema-manifest-type-cache*)
+                  sans-time)))))))
+
+(defun %install-node-type (meta)
+  "Everything DEF-NODE-TYPE's expansion does except the DEFCLASS: warn on
+cross-store divergence, finalize the class, install the generated
+helpers and (for edges) the Prolog functors, register META, and
+instantiate it into its default store if that store is open.  The class
+named by META must already exist.  Returns META (GH #172)."
+  (let* ((name (node-type-name meta))
+         (kind (node-type-parent-type meta)))
+    (%warn-if-divergent-across-stores meta)
+    ;; FIXME: why is this necessary when inheriting from another node
+    ;; subclass?
+    (finalize-inheritance (find-class name))
+    (%install-node-helpers name kind (node-type-graph-name meta))
+    (when (eq kind :edge)
+      (%install-edge-functors name))
+    (%register-node-type-meta meta)
+    (setf (gethash name *node-type-provenance*) *schema-provenance*)
+    ;; R2: the manifest describes the WHOLE schema, source and runtime
+    ;; alike -- both paths funnel through here.  A type whose default
+    ;; store is not open (or NIL, R4) still gets this one row; see
+    ;; INSTANTIATE-NODE-TYPE for the re-assertion on store open.
+    (%schema-manifest-append-if-changed
+     name (%schema-manifest-type-record meta *schema-provenance*))
+    (let ((graph (lookup-graph (node-type-graph-name meta))))
+      (when graph
+        (instantiate-node-type meta graph)))
+    meta))
+
+(defmacro def-node-type (name parent-types slot-specs graph-name
+                         &key keep-revisions)
   "Define a persistent node type NAME whose default store is GRAPH-NAME.  This
 is the machinery behind DEF-VERTEX and DEF-EDGE; you normally use those
 instead.  NAME's package comes from the ambient *PACKAGE* at macroexpansion
 time, not from this form -- namespace and default store are independent axes
-(GH #167).
+(GH #167); the generated helpers and functors are interned in NAME's own
+package (GH #172).
 
 PARENT-TYPES is a single-inheritance superclass list ending in VERTEX or EDGE.
 SLOT-SPECS are CLOS-style slot definitions (a bare symbol, or (name :type ...)
@@ -417,220 +714,28 @@ places a new node in GRAPH-NAME when :GRAPH is omitted (open, or else
 DEFAULT-STORE-NOT-OPEN-ERROR); an explicit :GRAPH always overrides the
 default and adopts the type into that store lazily on first write if it is
 not already known there (GH #167, R1/R3)."
-  (with-gensyms (meta graph metas pos)
-    (let* ((constructor (intern (format nil "MAKE-~A" name)))
-           (predicate (intern (format nil "~A-P" name)))
-           (lookup-fn (intern (format nil "LOOKUP-~A" name))))
-      (setq slot-specs
-            (mapcar (lambda (spec)
-                      (let ((s1
-                             (if (listp spec)
-                                 (if (find :accessor spec)
-                                     spec
-                                     (append spec (list :accessor (first spec))))
-                                 (list spec :accessor spec))))
-                        (if (find :initarg s1)
-                            s1
-                            (append s1 (list :initarg (intern (symbol-name (first s1)) :keyword))))))
-                    slot-specs))
-      `(progn
-         ;; No cross-graph uniqueness check: type-ids are system-wide as of
-         ;; #186, so one class may be instantiated in more than one store.
-         ;; Divergent slot sets across stores warn instead (GH #196).
-         (defclass ,name (,@parent-types)
-           (,@slot-specs)
-           (:metaclass node-class))
-         (let* ((,meta
-                 (make-node-type
-                  :name ',name
-                  :parent-type
-                  ',(intern (symbol-name (last1 parent-types)) :keyword)
-                  :graph-name ',graph-name
-                  :slots ',slot-specs
-                  :package (package-name *package*)
-                  :constructor ',constructor
-                  :keep-revisions ,keep-revisions)))
-           (%warn-if-divergent-across-stores ,meta)
-           ;; FIXME: why is this necessary when inheriting from another node subclass?
-           ;;(unless (class-finalized-p (find-class ',name))
-           (finalize-inheritance (find-class ',name))
-           ;;)
-           (defun ,predicate (thing)
-             (typep thing ',name))
-           (defun ,lookup-fn (id &key include-deleted-p)
-             (let ((thing ,(if (eql (last1 parent-types) 'edge)
-                               `(lookup-edge id)
-                               `(lookup-vertex id))))
-               (when (and (typep thing ',name)
-                          (or include-deleted-p
-                              (not (deleted-p thing))))
-                 thing)))
-           ,(let ((args
-                   (if (eql (last1 parent-types) 'edge)
-                       '(&rest make-args
-                         &key (graph nil) id deleted-p revision
-                         from to weight &allow-other-keys)
-                       '(&rest make-args
-                         &key (graph nil) id deleted-p revision
-                         &allow-other-keys))))
-                 `(defun ,constructor ,args
-                    (let ((graph (%default-store-graph
-                                  ',name ',graph-name graph))
-                          (slots (remove-if
-                                  'null
-                                  (mapcar
-                                   (lambda (slot-name)
-                                     (let ((key (intern (symbol-name slot-name) :keyword)))
-                                       (let ((pos (position key make-args)))
-                                         (when pos
-                                           (cons key (nth (1+ pos) make-args))))))
-                                   (data-slots (find-class ',name))))))
-                      ,(if (eql (last1 parent-types) 'edge)
-                           `(make-edge (node-type-id
-                                        (%ensure-type-in-store ',name :edge
-                                                                graph))
-                                       from to weight
-                                       slots ;(list ,@slots)
-                                       :id id :revision revision :deleted-p deleted-p
-                                       :graph graph)
-                           `(make-vertex (node-type-id
-                                          (%ensure-type-in-store ',name :vertex
-                                                                  graph))
-                                         slots ;(list ,@slots)
-                                         :id id :revision revision :deleted-p deleted-p
-                                         :graph graph)))))
-           ,(when (eql (last1 parent-types) 'edge)
-                  (let ((functor-name (intern (format nil "~A/2" name))))
-                    `(def-global-prolog-functor ,functor-name (from to cont)
-                       (setq from (var-deref from)
-                             to (var-deref to))
-                       (when *prolog-trace*
-                         (format t "TRACE: ~A(~S ~S)~%" ',functor-name from to))
-                       (cond ((and (not (graph-db::var-p from)) (not (graph-db::var-p to)))
-                              (map-edges (lambda (edge)
-                                           (let ((old-trail (fill-pointer *trail*)))
-                                             (let ((v1 (lookup-vertex (from edge))))
-                                               (when (unify from v1)
-                                                 (let ((v2 (lookup-vertex (to edge))))
-                                                   (when (unify to v2)
-                                                     (funcall cont)))))
-                                             (undo-bindings old-trail)))
-                                         *graph*
-                                         :from-vertex from
-                                         :to-vertex to
-                                         :edge-type ',name))
-                             ((not (graph-db::var-p from))
-                              (map-edges (lambda (edge)
-                                           (let ((old-trail (fill-pointer *trail*)))
-                                             (let ((v2 (lookup-vertex (to edge))))
-                                               (when (unify to v2)
-                                                 (funcall cont)))
-                                             (undo-bindings old-trail)))
-                                         *graph*
-                                         :vertex from
-                                         :direction :out
-                                         :edge-type ',name))
-                             ((not (graph-db::var-p to))
-                              (map-edges (lambda (edge)
-                                           (let ((old-trail (fill-pointer *trail*)))
-                                             (let ((v2 (lookup-vertex (from edge))))
-                                               (when (unify from v2)
-                                                 (funcall cont)))
-                                             (undo-bindings old-trail)))
-                                         *graph*
-                                         :vertex to
-                                         :direction :in
-                                         :edge-type ',name))
-                             (t
-                              (map-edges (lambda (edge)
-                                           (let ((old-trail (fill-pointer *trail*)))
-                                             (let ((v1 (lookup-vertex (from edge))))
-                                               (when (unify from v1)
-                                                 (let ((v2 (lookup-vertex (to edge))))
-                                                   (when (unify to v2)
-                                                     (funcall cont)))))
-                                             (undo-bindings old-trail)))
-                                         *graph*
-                                         :edge-type ',name))))))
-           ,(when (eql (last1 parent-types) 'edge)
-                  (let ((functor-name (intern (format nil "~A/3" name))))
-                    `(def-global-prolog-functor ,functor-name (from to weight cont)
-                       (setq from (var-deref from)
-                             to (var-deref to)
-                             weight (var-deref weight))
-                       (when *prolog-trace*
-                         (format t "TRACE: ~A(~S ~S ~S)~%" ',functor-name from to weight))
-                       (cond ((and (not (graph-db::var-p from)) (not (graph-db::var-p to)))
-                              (map-edges (lambda (edge)
-                                           (let ((old-trail (fill-pointer *trail*)))
-                                             (let ((v1 (lookup-vertex (from edge))))
-                                               (when (unify from v1)
-                                                 (let ((v2 (lookup-vertex (to edge))))
-                                                   (when (unify to v2)
-                                                     (when (unify weight (weight edge))
-                                                       (funcall cont))))))
-                                             (undo-bindings old-trail)))
-                                         *graph*
-                                         :from-vertex from
-                                         :to-vertex to
-                                         :edge-type ',name))
-                             ((not (graph-db::var-p from))
-                              (map-edges (lambda (edge)
-                                           (let ((old-trail (fill-pointer *trail*)))
-                                             (let ((v2 (lookup-vertex (to edge))))
-                                               (when (unify to v2)
-                                                 (when (unify weight (weight edge))
-                                                   (funcall cont))))
-                                             (undo-bindings old-trail)))
-                                         *graph*
-                                         :vertex from
-                                         :direction :out
-                                         :edge-type ',name))
-                             ((not (graph-db::var-p to))
-                              (map-edges (lambda (edge)
-                                           (let ((old-trail (fill-pointer *trail*)))
-                                             (let ((v2 (lookup-vertex (from edge))))
-                                               (when (unify from v2)
-                                                 (when (unify weight (weight edge))
-                                                   (funcall cont))))
-                                             (undo-bindings old-trail)))
-                                         *graph*
-                                         :vertex to
-                                         :direction :in
-                                         :edge-type ',name))
-                             (t
-                              (map-edges (lambda (edge)
-                                           (let ((old-trail (fill-pointer *trail*)))
-                                             (let ((v1 (lookup-vertex (from edge))))
-                                               (when (unify from v1)
-                                                 (let ((v2 (lookup-vertex (to edge))))
-                                                   (when (unify to v2)
-                                                     (when (unify weight (weight edge))
-                                                       (funcall cont))))))
-                                             (undo-bindings old-trail)))
-                                         *graph*
-                                         :edge-type ',name)))))
-                  )
-           ;; A class may be registered under more than one store (#186);
-           ;; each store keeps its own meta entry independently.  Only
-           ;; GRAPH-NAME's own list is touched here -- %FIND-REGISTERED-
-           ;; NODE-TYPE resolves ambiguity deterministically via its
-           ;; preferred-store argument (GH #167).
-           ;; Replace in place, preserving position.  The type-id reason is
-           ;; historical: ids came from this list's order until #186 moved
-           ;; assignment to the registry, which keys on the name.  Position
-           ;; still governs the order UPDATE-SCHEMA instantiates types in, so
-           ;; a moved entry reorders schema replay (GH #53).
-           (let* ((,metas (gethash ',graph-name *schema-node-metadata*))
-                  (,pos (position ',name ,metas :key #'node-type-name)))
-             (if ,pos
-                 (setf (nth ,pos ,metas) ,meta)
-                 (setf (gethash ',graph-name *schema-node-metadata*)
-                       (append ,metas (list ,meta)))))
-           (let ((,graph (lookup-graph ',graph-name)))
-             (when ,graph
-               (instantiate-node-type ,meta ,graph)))
-           )))))
+  (let ((specs (%normalize-slot-specs slot-specs))
+        (kind (intern (symbol-name (last1 parent-types)) :keyword)))
+    `(progn
+       ;; No cross-graph uniqueness check: type-ids are system-wide as of
+       ;; #186, so one class may be instantiated in more than one store.
+       ;; Divergent slot sets across stores warn instead (GH #196).
+       (defclass ,name (,@parent-types)
+         (,@specs)
+         (:metaclass node-class))
+       ;; Everything else -- helpers, edge functors, registration,
+       ;; instantiation -- is the shared path the runtime schema builder
+       ;; uses too (GH #172, R1).
+       (%install-node-type
+        (make-node-type
+         :name ',name
+         :parent-type ',kind
+         :graph-name ',graph-name
+         :slots ',specs
+         :package (package-name *package*)
+         :constructor ',(intern (format nil "MAKE-~A" (symbol-name name))
+                                (%schema-symbol-package name))
+         :keep-revisions ,keep-revisions)))))
 
 (defmacro def-vertex (name parent-types slot-specs graph-name &key keep-revisions)
   "Define a vertex (node) type NAME whose default store is GRAPH-NAME.
@@ -823,6 +928,27 @@ is the only point at which that ordering is guaranteed."
   ;; %NOTE-EDGE-OCCUPANCY only appends when the (name, store) pair is new.
   (when (eq (node-type-parent-type meta) :edge)
     (%note-edge-occupancy (node-type-name meta) (graph-name graph)))
+  ;; R2 (GH #172): a store's own graph-open re-asserts its schema rows
+  ;; into whatever *SYSTEM-DIRECTORY* is current -- the only way a type
+  ;; defined once, before any system directory existed, still shows up
+  ;; in a manifest read later.  Sourced from the REGISTERED meta for
+  ;; META's own declared store, not META itself: a #186 cross-store
+  ;; adoption or a stale on-disk read can hand this method a META that
+  ;; was never %REGISTER-NODE-TYPE-META'd under its claimed store, and
+  ;; that stray must never overwrite the canonical row a #196-divergent
+  ;; variant elsewhere would otherwise clobber it with (review round 1,
+  ;; I3).  %SCHEMA-MANIFEST-APPEND-IF-CHANGED then skips the write
+  ;; entirely when it would be a no-op, so a reopen storm does not keep
+  ;; growing the manifest.
+  (let* ((name (node-type-name meta))
+         (registered (or (%find-registered-node-type
+                          name (node-type-parent-type meta)
+                          (node-type-graph-name meta))
+                         meta)))
+    (%schema-manifest-append-if-changed
+     name
+     (%schema-manifest-type-record
+      registered (or (gethash name *node-type-provenance*) :source))))
   (with-recursive-lock-held ((schema-lock (schema graph)))
     (let ((cl (find-class (node-type-name meta) nil)))
       ;; Drop EVERY memoized CLASS-SLOTS-derived answer for this class and its

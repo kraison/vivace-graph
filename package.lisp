@@ -300,8 +300,26 @@
            #:default-store-not-open-error
            #:default-store-not-open-class
            #:default-store-not-open-store
+
+           ;; runtime schema definition API (GH #172)
+           #:ensure-namespace
+           #:create-vertex-type
+           #:create-edge-type
+           #:materialize-schema
+           #:register-schema-function
+           #:find-schema-function
+           #:schema-function-unresolved
+           #:materialize-unresolved-functions
+           #:unresolved-function-names
+           #:materialize-unresolved-parents
+           #:unresolved-parent-names
            #:instantiate-node-type
            #:*schema-node-metadata*
+           #:read-schema-manifest
+
+           ;; visibility tooling (GH #172, R6)
+           #:describe-schema
+           #:export-schema-source
            #:with-write-locked-class
            #:with-read-locked-class
            #:schema-class-locks

@@ -95,6 +95,12 @@
                ;; (#186); it only built before because that component happens
                ;; to precede this one in the list.
                (:file "schema" :depends-on ("stats" "type-registry" "type-occupancy"))
+               ;; ENSURE-NAMESPACE / CREATE-VERTEX-TYPE / CREATE-EDGE-TYPE
+               ;; (GH #172, R4): the runtime twins of DEF-VERTEX/DEF-EDGE.
+               (:file "runtime-schema" :depends-on ("schema"))
+               ;; DESCRIBE-SCHEMA / EXPORT-SCHEMA-SOURCE (GH #172, R6):
+               ;; read-only visibility tooling over the manifest+metas.
+               (:file "schema-tools" :depends-on ("runtime-schema"))
                ;; Reads a store's schema.dat and heap header, so it cannot
                ;; live in "type-registry" -- "schema" depends on THAT (#186).
                (:file "type-seeding"
@@ -543,6 +549,7 @@ cl-temporal-extent."
                (:file "detach-tests")             ; GH #170
                (:file "system-restore-tests")     ; GH #171
                (:file "package-namespace-tests")  ; GH #167
+               (:file "runtime-schema-tests")     ; GH #172
                (:file "posix-tests")              ; GH #182
                (:file "rest-tests")
                (:file "rest-http-tests")
