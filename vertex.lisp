@@ -192,6 +192,11 @@ also matches its subtypes (see RESOLVE-NODE-TYPE-IDS).  Deleted vertices are
 skipped unless :INCLUDE-DELETED-P.  With :COLLECT-P, collect and return FN's
 values as a list; otherwise return NIL.
 
+Per-type walks OVERLAP by default: :INCLUDE-SUBCLASSES-P T expands a parent type
+over its subtypes, so summing parent + subtypes double-counts them.  A per-type
+sum is comparable to the untyped total only with :INCLUDE-SUBCLASSES-P NIL on
+every non-leaf type (GH #219).
+
 NOTE: the fully-untyped scan (no :VERTEX-TYPE and no :INCLUDE-VERTEX-TYPES) walks
 the raw vertex lhash, which reads LIVE node versions and so BYPASSES MVCC
 snapshot isolation.  It is intended for back-end / admin passes (backup, GC,

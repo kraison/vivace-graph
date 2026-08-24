@@ -365,6 +365,11 @@ or to a specific endpoint pair with :FROM-VERTEX and :TO-VERTEX.  Deleted edges
 are skipped unless :INCLUDE-DELETED-P.  With :COLLECT-P, collect and return FN's
 values; otherwise return NIL.  This drives OUTGOING-EDGES / INCOMING-EDGES.
 
+Per-type walks OVERLAP by default: :INCLUDE-SUBCLASSES-P T expands a parent type
+over its subtypes, so summing parent + subtypes double-counts them.  A per-type
+sum is comparable to the untyped total only with :INCLUDE-SUBCLASSES-P NIL on
+every non-leaf type (GH #219).
+
 NOTE: the fully-untyped, non-adjacency scan (no type and no vertex/endpoint)
 walks the raw edge lhash, which reads LIVE edge versions and so BYPASSES MVCC
 snapshot isolation -- intended for back-end / admin passes run while the graph is
