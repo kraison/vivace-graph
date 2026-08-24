@@ -63,6 +63,9 @@
                ;; The image-level store-id registry (GH #169).  Same shape
                ;; as type-registry; graph-class references +MAX-STORE-TAG+.
                (:file "store-registry" :depends-on ("type-registry"))
+               ;; The edge store-occupancy sidecar (GH #167, spec R4):
+               ;; registry-adjacent, no graph dependency of its own.
+               (:file "type-occupancy" :depends-on ("type-registry"))
                (:file "geometry" :depends-on ("serialize"))
                (:file "geometry-ops" :depends-on ("geometry"))
                (:file "geohash" :depends-on ("package"))
@@ -91,7 +94,7 @@
                ;; "type-registry" for ASSIGN-TYPE-ID / ENSURE-TYPE-REGISTRY
                ;; (#186); it only built before because that component happens
                ;; to precede this one in the list.
-               (:file "schema" :depends-on ("stats" "type-registry"))
+               (:file "schema" :depends-on ("stats" "type-registry" "type-occupancy"))
                ;; Reads a store's schema.dat and heap header, so it cannot
                ;; live in "type-registry" -- "schema" depends on THAT (#186).
                (:file "type-seeding"

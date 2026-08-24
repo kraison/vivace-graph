@@ -124,6 +124,8 @@
            #:*type-registry*
            #:system-directory-required
            #:system-directory-required-operation
+           ;; edge store-occupancy sidecar (GH #167)
+           #:edge-type-stores
            ;; image-level store-id registry (GH #169)
            #:ensure-store-registry
            #:store-registry-intern

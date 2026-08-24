@@ -798,6 +798,13 @@ is the only point at which that ordering is guaranteed."
                              (ignore-errors (location graph))))))))
 
 (defmethod instantiate-node-type ((meta node-type) (graph graph))
+  ;; R4 (GH #167): edge classes maintain a store-occupancy hint at the
+  ;; moment they are instantiated into a store -- covers both the
+  ;; declared-store path and lazy cross-store adoption, since both flow
+  ;; through here.  Re-instantiation at UPDATE-SCHEMA/reopen is a no-op:
+  ;; %NOTE-EDGE-OCCUPANCY only appends when the (name, store) pair is new.
+  (when (eq (node-type-parent-type meta) :edge)
+    (%note-edge-occupancy (node-type-name meta) (graph-name graph)))
   (with-recursive-lock-held ((schema-lock (schema graph)))
     (let ((cl (find-class (node-type-name meta) nil)))
       ;; Drop EVERY memoized CLASS-SLOTS-derived answer for this class and its

@@ -191,3 +191,41 @@ TYPE's cross-store scan is ambiguous (GH #167 review round 1)."
     ;; Restore the load-time declaration so later tests (and later
     ;; runs of this suite in the same image) see the original store.
     (eval '(def-vertex pn-redeclared () () :pn-store-a))))
+
+(test edge-occupancy-tracks-stores-and-defaults-to-no-hint
+  "PN-LINK instantiated into B (its default) and adopted by A: the
+occupancy set names both; an undefined class name yields NIL (= sweep,
+the fail-safe)."
+  (with-pn-stores (ga gb)
+    (let (v1 v2)
+      (with-transaction ((graph-db::transaction-manager ga))
+        (setq v1 (make-pn-item :label "v1")
+              v2 (make-pn-item :label "v2")))
+      (with-transaction ((graph-db::transaction-manager gb))
+        (make-pn-link :from (graph-db:id v1) :to (graph-db:id v2)))
+      (with-transaction ((graph-db::transaction-manager ga))
+        (make-pn-link :from (graph-db:id v1) :to (graph-db:id v2)
+                      :graph ga))
+      (is (null (set-difference '(:pn-store-a :pn-store-b)
+                                (graph-db:edge-type-stores 'pn-link))))
+      (is (null (graph-db:edge-type-stores 'pn-no-such-edge))))))
+
+(test edge-occupancy-persists-and-tolerates-a-torn-tail
+  "A fresh image (simulated: clear the in-image cache) reloads the set
+from edge-occupancy.dat; a torn final line is dropped, not an error."
+  (with-pn-stores (ga gb)
+    (let (v1 v2)
+      (with-transaction ((graph-db::transaction-manager ga))
+        (setq v1 (make-pn-item :label "v1")
+              v2 (make-pn-item :label "v2")))
+      (with-transaction ((graph-db::transaction-manager gb))
+        (make-pn-link :from (graph-db:id v1) :to (graph-db:id v2)))
+      (graph-db::%clear-edge-occupancy-cache)
+      (is (member :pn-store-b (graph-db:edge-type-stores 'pn-link)))
+      (let ((file (graph-db::%edge-occupancy-file)))
+        (with-open-file (out file :direction :output
+                             :if-exists :append)
+          (format out "(PN-TORN"))
+        (graph-db::%clear-edge-occupancy-cache)
+        (is (member :pn-store-b
+                    (graph-db:edge-type-stores 'pn-link)))))))
