@@ -31,6 +31,34 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Fixed
 
+- **`MAKE-GRAPH`/`OPEN-GRAPH` accepted a slashless `LOCATION` and scattered
+  its sidecar files into the parent directory** (#222). Every sidecar built
+  with `(MAKE-PATHNAME :defaults (LOCATION GRAPH))` -- `.dirty`, `heap.dat`,
+  `schema.dat`, and the rest -- depends on `LOCATION` being a *directory*
+  pathname; a trimmed namestring kept it as a *file* pathname instead, so
+  those sidecars landed next to the store rather than inside it. Both
+  functions now normalize `LOCATION` once, via `UIOP:ENSURE-DIRECTORY-
+  PATHNAME`, before any use -- the same fix `%REOPEN-AND-RESUME`
+  (`shadow-store.lisp`, #171) already applied locally, generalized to the
+  entry points themselves so every caller gets it for free.
+- **An aborted `MAKE-GRAPH`/`OPEN-GRAPH` leaked every fd it had already
+  opened** (#224). Neither function had any teardown on a non-local exit
+  partway through -- a `STORE-ID-COLLISION-ERROR` or any other failure left
+  the heap, indexes, vertex/edge tables and ve/vev indexes already opened
+  memory-mapped and open, and could leave the graph half-registered in
+  `*GRAPHS*`. `MAKE-INSTANCE` evaluates its initarg value-forms before it
+  runs, so a failure partway through that argument list left the
+  already-opened ones reachable from nothing but a local variable; the
+  open-sequence in both functions now binds each resource to a name and
+  tracks it in a small mutable list *before* handing it to `MAKE-INSTANCE`,
+  so the list has every fd-bearing resource open at the moment of failure
+  regardless of where in the sequence it happens. Both functions now run
+  their body under `UNWIND-PROTECT`, and a new `%ABORT-GRAPH-OPEN` best-
+  effort closes (`IGNORE-ERRORS` per component, tolerating slots still
+  unbound) everything the partial open acquired, and deregisters the graph
+  from `*GRAPHS*`/the open-store vector if that ran before the failure. The
+  signalled condition always propagates unchanged.
+
 - **`%POSIX-OPEN` created files with an arbitrary permission mode on Apple
   arm64** (#218). `open(2)` is `int open(const char *, int, ...)`, and the
   `mode` argument was passed through a plain `CFFI:FOREIGN-FUNCALL` — as a
