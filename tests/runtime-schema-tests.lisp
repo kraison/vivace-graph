@@ -280,8 +280,16 @@ proves materialize rebuilds everything it needs."
   (when graph (clrhash (graph-db::cache graph)))
   (let ((pkg (find-package :rs-tlm)))
     (when pkg
+      ;; DO-SYMBOLS walks INHERITED symbols too -- harmless while RS-TLM
+      ;; is :USE NIL (ENSURE-NAMESPACE's own shape), but EXPORT-SCHEMA-
+      ;; SOURCE's generated DEFPACKAGE legitimately :USEs CL/GRAPH-DB
+      ;; (GH #172, R6), and after that LOAD this loop would otherwise
+      ;; walk COMMON-LISP's own external symbols and try to NIL out a
+      ;; locked class like BUILT-IN-CLASS.  EQ-check the home package so
+      ;; only symbols RS-TLM itself owns are touched (review round 1).
       (do-symbols (s pkg)
-        (when (find-class s nil) (setf (find-class s) nil)))
+        (when (and (eq (symbol-package s) pkg) (find-class s nil))
+          (setf (find-class s) nil)))
       (delete-package pkg)))
   (%rs-drop-orphaned-metas))
 
@@ -638,3 +646,60 @@ with the SAME registry id."
                    (intern "READING" :rs-tlm) :vertex)))
         (is-true meta)
         (is (= id-before (graph-db::node-type-id meta)))))))
+
+;;; ---------------------------------------------------------------------
+;;; Task 4, fix round 1 (review): IMPORTANT + MINOR 1.
+;;; ---------------------------------------------------------------------
+
+(test export-schema-source-qualifies-cross-package-check-names
+  "IMPORTANT, review round 1: a :CHECK name whose home package differs
+from the exported namespace must round-trip identically -- printing it
+BARE would, at load time, intern a NEW symbol under the (re-created)
+namespace package instead of finding the original one, silently
+missing the EQ-keyed *SCHEMA-FUNCTIONS* lookup.  RS-EXPORT-CHECK-P is
+interned in GRAPH-DB/TEST (this file's package) -- a THIRD package,
+neither RS-TLM nor COMMON-LISP/GRAPH-DB -- and survives the wipe
+untouched, exactly like a real image's registered behaviour would."
+  (with-rs-store (g)
+    (graph-db:ensure-namespace "RS-TLM")
+    (graph-db:register-schema-function
+     'rs-export-check-p (lambda (v) (< 0 v 100)))
+    (graph-db:create-vertex-type
+     "RS-TLM:CHK" '((value :type double-float :check rs-export-check-p))
+     :default-store :rs-store)
+    (let ((path (merge-pathnames
+                 "exported-check-schema.lisp"
+                 (uiop:ensure-directory-pathname
+                  graph-db::*system-directory*))))
+      (graph-db:export-schema-source path :namespace :rs-tlm)
+      (%rs-wipe-runtime-state)
+      (load path)
+      (is-true (graph-db:find-schema-function 'rs-export-check-p))
+      (with-transaction ((graph-db::transaction-manager g))
+        (funcall (intern "MAKE-CHK" :rs-tlm) :value 50d0))
+      (signals graph-db:value-constraint-violation
+        (with-transaction ((graph-db::transaction-manager g))
+          (funcall (intern "MAKE-CHK" :rs-tlm) :value 5000d0))))))
+
+(test export-schema-source-wraps-long-lines
+  "MINOR 1, review round 1: with ~10 types in one namespace the
+:EXPORT clause was the known >80-column offender when run together on
+one line -- assert every generated line actually stays within the
+docstring's claimed limit."
+  (with-rs-store (g)
+    g
+    (graph-db:ensure-namespace "RS-WIDE")
+    (dotimes (i 10)
+      (graph-db:create-vertex-type
+       (format nil "RS-WIDE:WIDE-TYPE-NUMBER-~D" i)
+       '((value :type double-float))
+       :default-store :rs-store))
+    (let ((path (merge-pathnames
+                 "exported-wide-schema.lisp"
+                 (uiop:ensure-directory-pathname
+                  graph-db::*system-directory*))))
+      (graph-db:export-schema-source path :namespace :rs-wide)
+      (with-open-file (s path)
+        (loop for line = (read-line s nil :eof)
+              until (eq line :eof)
+              do (is (<= (length line) 80)))))))

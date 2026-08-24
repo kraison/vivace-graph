@@ -23,6 +23,18 @@ ROW's own :PARENTS when the class no longer exists (GH #172, R6)."
                   (remove base (class-direct-superclasses class))))
         (getf row :parents))))
 
+(defun %read-schema-manifest-safe (dir)
+  "(VALUES NAMESPACE-ROWS TYPE-ROWS), like READ-SCHEMA-MANIFEST, but
+never signals: an error (a malformed DIR, an unreadable file despite
+READ-SCHEMA-MANIFEST's own guards) degrades to two empty lists, exactly
+like a missing manifest -- HANDLER-CASE, not IGNORE-ERRORS, because
+IGNORE-ERRORS's error branch returns (VALUES NIL CONDITION), and a
+caller taking this function's SECOND value would get the CONDITION
+object where it expects the type-row list (GH #172, R6, review round
+1)."
+  (handler-case (read-schema-manifest dir)
+    (error () (values nil nil))))
+
 (defun %describe-schema-entries ()
   "Every known node type as one plist: (:NAME :KIND :DEFAULT-STORE
 :SLOTS :PARENTS :KEEP-REVISIONS :PROVENANCE :TIME).  Joins the system
@@ -30,8 +42,7 @@ manifest with every live META across every open store; a type with no
 manifest row (a pre-#172 store) gets :PROVENANCE :SOURCE and :TIME NIL
 -- describe/export must never signal on a missing or damaged manifest,
 so this degrades to live-metas-only rather than erroring (GH #172, R6)."
-  (let ((rows (nth-value 1 (ignore-errors
-                            (read-schema-manifest *system-directory*))))
+  (let ((rows (nth-value 1 (%read-schema-manifest-safe *system-directory*)))
         (seen (make-hash-table :test 'equal))
         (entries nil))
     (flet ((key (name kind) (cons name kind))
@@ -137,26 +148,63 @@ entries within a group sorted by type name -- deterministic output
 ;;; forms).
 ;;; ---------------------------------------------------------------------
 
-(defun %schema-source-token (x)
-  "X as generated-source text: symbols print bare and downcased, with
-no package prefix -- the generated file's own IN-PACKAGE supplies the
-reader context that makes a bare token resolve correctly, so printing
-a home package here would only add noise (GH #172, R6)."
+(defun %schema-symbol-prints-bare-p (sym target-pkg-name)
+  "T when SYM's home package is one the generated file's DEFPACKAGE
+makes a bare token resolve to the SAME symbol under: the namespace
+itself (matched by NAME -- the export-time package and the one the
+generated file's IN-PACKAGE creates at load time are different OBJECTS
+with the same name), or COMMON-LISP/GRAPH-DB, which the generated
+DEFPACKAGE always :USEs.  Any OTHER home package must be qualified:
+printing it bare would, at load time, INTERN A NEW SYMBOL under the
+namespace package instead of finding the original one, silently
+breaking any EQ-keyed lookup on it -- e.g. a :CHECK name against
+*SCHEMA-FUNCTIONS* (GH #172, R6, review round 1)."
+  (let ((home (symbol-package sym)))
+    (and home
+        (or (and target-pkg-name
+                (string-equal (package-name home) target-pkg-name))
+            (eq home (find-package :common-lisp))
+            (eq home (find-package :graph-db))))))
+
+(defun %schema-qualified-symbol (sym)
+  "SYM as PACKAGE:NAME (external) or PACKAGE::NAME (internal), downcased
+(GH #172, R6, review round 1)."
+  (let* ((pkg (symbol-package sym))
+         (external-p (eq :external
+                        (nth-value 1
+                                   (find-symbol (symbol-name sym) pkg)))))
+    (format nil "~(~A~)~:[::~;:~]~(~A~)"
+            (package-name pkg) external-p (symbol-name sym))))
+
+(defun %schema-source-token (x &optional target-pkg-name)
+  "X as generated-source text.  A symbol prints bare and downcased only
+when %SCHEMA-SYMBOL-PRINTS-BARE-P says a bare token will resolve back
+to the SAME symbol under TARGET-PKG-NAME (the namespace the caller is
+printing this form for); otherwise it prints package-qualified.
+TARGET-PKG-NAME NIL (DESCRIBE-SCHEMA's callers, and any keyword/literal
+value) never qualifies -- describe-schema's output is not reloaded
+(GH #172, R6)."
   (cond
     ((null x) "nil")
     ((eq x t) "t")
     ((keywordp x) (format nil ":~(~A~)" (symbol-name x)))
-    ((symbolp x) (string-downcase (symbol-name x)))
+    ((symbolp x)
+     (if (%schema-symbol-prints-bare-p x target-pkg-name)
+         (string-downcase (symbol-name x))
+         (%schema-qualified-symbol x)))
     ((stringp x) (prin1-to-string x))
     ((integerp x) (princ-to-string x))
     (t (string-downcase (princ-to-string x)))))
 
-(defun %schema-source-form (form)
+(defun %schema-source-form (form &optional target-pkg-name)
   "FORM (nested lists of symbols/keywords/literals only, as produced by
-NODE-TYPE-SLOTS) as downcased source text (GH #172, R6)."
+NODE-TYPE-SLOTS) as downcased source text, package-qualifying any
+symbol foreign to TARGET-PKG-NAME (GH #172, R6)."
   (if (consp form)
-      (format nil "(~{~A~^ ~})" (mapcar #'%schema-source-form form))
-      (%schema-source-token form)))
+      (format nil "(~{~A~^ ~})"
+              (mapcar (lambda (f) (%schema-source-form f target-pkg-name))
+                      form))
+      (%schema-source-token form target-pkg-name)))
 
 ;;; ---------------------------------------------------------------------
 ;;; DESCRIBE-SCHEMA
@@ -234,18 +282,24 @@ expanded it (GH #172, R6)."
         (setf rest (list* :initarg initarg rest)))
       (if rest (list* name rest) name))))
 
-(defun %write-schema-def-form (entry stream)
+(defun %write-schema-def-form (entry pkg-name stream)
+  "Write ENTRY's DEF-VERTEX/DEF-EDGE form for the namespace PKG-NAME
+(a string): every symbol not homed in PKG-NAME/COMMON-LISP/GRAPH-DB is
+package-qualified so it re-reads to the SAME symbol later, not a new
+one interned into the freshly (re)created namespace package (GH #172,
+R6, review round 1)."
   (let ((macro (ecase (getf entry :kind)
                 (:vertex "def-vertex") (:edge "def-edge")))
         (slots (mapcar #'%minimize-slot-spec (getf entry :slots))))
     (format stream "(~A ~A (~{~A~^ ~})~%    ("
             macro
-            (%schema-source-token (getf entry :name))
-            (mapcar #'%schema-source-token (getf entry :parents)))
+            (%schema-source-token (getf entry :name) pkg-name)
+            (mapcar (lambda (p) (%schema-source-token p pkg-name))
+                    (getf entry :parents)))
     (loop for spec in slots
           for firstp = t then nil
           do (unless firstp (format stream "~%     "))
-             (write-string (%schema-source-form spec) stream))
+             (write-string (%schema-source-form spec pkg-name) stream))
     (format stream ")~%    ~A"
             (%schema-source-token (getf entry :default-store)))
     (when (getf entry :keep-revisions)
@@ -266,10 +320,15 @@ expanded it (GH #172, R6)."
             pkg-name)
     (when nicks
       (format stream "  (:nicknames~{ #:~(~A~)~})~%" nicks))
-    (format stream "  (:export~{ #:~(~A~)~}))~%"
-            (mapcar (lambda (e) (symbol-name (getf e :name))) entries))
+    ;; One name per line (MINOR 1, review round 1): a ten-plus-type
+    ;; namespace's :EXPORT list is the known >80-column offender when
+    ;; run together on one line.
+    (format stream "  (:export~%")
+    (dolist (e entries)
+      (format stream "   #:~(~A~)~%" (symbol-name (getf e :name))))
+    (format stream "   ))~%")
     (format stream "(in-package #:~(~A~))~%~%" pkg-name)
-    (dolist (e entries) (%write-schema-def-form e stream))))
+    (dolist (e entries) (%write-schema-def-form e pkg-name stream))))
 
 (defun export-schema-source (path &key namespace store)
   "Write PATH: a generated-header comment, one DEFPACKAGE per exported
@@ -287,19 +346,19 @@ the file's truename (GH #172, R6)."
   (let* ((entries (%filter-schema-entries (%describe-schema-entries)
                                           namespace store nil))
          (groups (%group-schema-entries-by-namespace entries))
-         (ns-rows (nth-value 0 (ignore-errors
-                                (read-schema-manifest *system-directory*)))))
+         (ns-rows (nth-value 0
+                             (%read-schema-manifest-safe
+                              *system-directory*))))
     (with-open-file (out path :direction :output
                               :if-exists :supersede
                               :if-does-not-exist :create)
-      (let ((*print-right-margin* 79))
-        (format out ";;; Generated by graph-db:export-schema-source ~A.~%"
-                (%schema-iso-date (get-universal-time)))
-        (format out ";;; Source of truth remains the persisted metadata ~
+      (format out ";;; Generated by graph-db:export-schema-source ~A.~%"
+              (%schema-iso-date (get-universal-time)))
+      (format out ";;; Source of truth remains the persisted metadata ~
 until this~%")
-        (format out ";;; file is loaded as part of the system; loading ~
+      (format out ";;; file is loaded as part of the system; loading ~
 it is~%")
-        (format out ";;; idempotent (same names -> same registry ids).~%~%")
-        (dolist (group groups)
-          (%write-schema-namespace group ns-rows out))))
+      (format out ";;; idempotent (same names -> same registry ids).~%~%")
+      (dolist (group groups)
+        (%write-schema-namespace group ns-rows out)))
     (truename path)))
