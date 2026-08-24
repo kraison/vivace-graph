@@ -119,6 +119,20 @@ skipped, a missing file yields two empty lists (GH #172, R2)."
 ;;; ENSURE-NAMESPACE (R4)
 ;;; ---------------------------------------------------------------------
 
+(defun %refused-schema-package-p (pkg)
+  "COMMON-LISP and KEYWORD tolerate no new symbols and must never be
+RENAME-PACKAGE'd; neither a schema type nor a schema namespace can be
+homed in either (GH #172, R4; review round 3, M-7)."
+  (and (member pkg (list (find-package :common-lisp)
+                         (find-package :keyword)))
+       t))
+
+(defun %refuse-schema-package (designator pkg)
+  (error "~A: refusing to touch ~A -- it is locked and cannot hold ~
+schema symbols; use ENSURE-NAMESPACE to create a namespace package ~
+first (GH #172)."
+         designator (package-name pkg)))
+
 (defun ensure-namespace (name &key nicknames (record-p t))
   "Ensure a package for a runtime schema namespace, idempotent and
 manifest-logged.  NAME and each of NICKNAMES may be a string or a
@@ -131,27 +145,32 @@ emits for one, not what this creates.  Allocates no files and no store.
 RECORD-P NIL suppresses the manifest append: MATERIALIZE-SCHEMA is
 replaying rows the manifest already holds, and re-appending an
 unchanged namespace row on every load would grow the file forever
-(GH #172, R4)."
+(GH #172, R4).  Refuses NAME (or a NICKNAME) that resolves to COMMON-
+LISP or KEYWORD -- without this, :NICKNAMES on either would reach
+RENAME-PACKAGE and hit SBCL's raw package-lock error instead of this
+condition (GH #172, review round 3, M-7)."
   (let* ((pkg-name (string name))
          (nick-strings (mapcar #'string nicknames))
-         (pkg (find-package pkg-name))
-         ;; The set actually applied to the package -- review round 1,
-         ;; I1: the manifest row must record THIS, not just this call's
-         ;; own NICK-STRINGS, or a later no-nickname call's last-wins
-         ;; row would drop every nickname a prior call had established.
-         (wanted (if pkg
-                    (union (package-nicknames pkg) nick-strings
-                          :test #'string=)
-                    nick-strings)))
-    (if pkg
-        (unless (= (length wanted) (length (package-nicknames pkg)))
-          (rename-package pkg pkg-name wanted))
-        (setf pkg (make-package pkg-name :nicknames wanted :use nil)))
-    (when record-p
-      (%append-schema-manifest-record
-       (list :namespace pkg-name :nicknames wanted
-             :time (get-universal-time))))
-    pkg))
+         (pkg (find-package pkg-name)))
+    (when (%refused-schema-package-p pkg)
+      (%refuse-schema-package 'ensure-namespace pkg))
+    ;; The set actually applied to the package -- review round 1, I1:
+    ;; the manifest row must record THIS, not just this call's own
+    ;; NICK-STRINGS, or a later no-nickname call's last-wins row would
+    ;; drop every nickname a prior call had established.
+    (let ((wanted (if pkg
+                      (union (package-nicknames pkg) nick-strings
+                            :test #'string=)
+                      nick-strings)))
+      (if pkg
+          (unless (= (length wanted) (length (package-nicknames pkg)))
+            (rename-package pkg pkg-name wanted))
+          (setf pkg (make-package pkg-name :nicknames wanted :use nil)))
+      (when record-p
+        (%append-schema-manifest-record
+         (list :namespace pkg-name :nicknames wanted
+               :time (get-universal-time))))
+      pkg)))
 
 ;;; ---------------------------------------------------------------------
 ;;; Schema functions and the :CHECK slot option (R5)
@@ -169,11 +188,10 @@ unchanged namespace row on every load would grow the file forever
 
 (defvar *schema-functions-lock* (make-lock "schema functions"))
 
-(defvar *schema-check-slots-present-p* nil
-  "T once any class in this image has a :CHECK slot.  Set by
-COMPUTE-EFFECTIVE-SLOT-DEFINITION (node-class.lisp); read by
-VALIDATE-VALUE-CONSTRAINTS so a schema with no :CHECK pays nothing
-(GH #172, R5).")
+;; *SCHEMA-CHECK-SLOTS-PRESENT-P* moved to schema.lisp (review round 3,
+;; M-4): NODE-CLASS.LISP SETFs it and depends only on "schema" in the
+;; .asd, not "runtime-schema", so it compiled that reference against no
+;; DEFVAR at all before this move.
 
 (define-condition schema-function-unresolved (error)
   ((names :initarg :names :reader unresolved-function-names))
@@ -209,7 +227,11 @@ would then skip those names as \"already defined\".  Widen ~
 
 (defun register-schema-function (name fn)
   "Register FN under NAME for the :CHECK slot option.  Returns NAME.
-Re-registering replaces (GH #172, R5)."
+Re-registering replaces (GH #172, R5).  FN runs inside a transaction's
+OCC validation and MUST BE PURE: a conflict retries the transaction, so
+FN can run several times for one logical write, and must never itself
+mutate state or have other side effects (GH #172, review round 3,
+M-5)."
   (check-type name symbol)
   (with-lock-held (*schema-functions-lock*)
     (setf (gethash name *schema-functions*) fn))
@@ -247,22 +269,6 @@ deduplicated, in order of appearance (GH #172, R5)."
       (dolist (name (%slot-check-names specs))
         (unless (or (find-schema-function name) (member name missing))
           (push name missing))))))
-
-;;; ---------------------------------------------------------------------
-;;; CREATE-VERTEX-TYPE / CREATE-EDGE-TYPE (R4)
-;;; ---------------------------------------------------------------------
-
-(defun %refused-schema-package-p (pkg)
-  "COMMON-LISP and KEYWORD tolerate no new symbols; a schema type can
-never be homed in either (GH #172, R4)."
-  (and (member pkg (list (find-package :common-lisp)
-                         (find-package :keyword)))
-       t))
-
-(defun %refuse-schema-package (designator pkg)
-  (error "~A: cannot define a schema type in ~A -- use ~
-ENSURE-NAMESPACE to create a namespace package first (GH #172)."
-         designator (package-name pkg)))
 
 (defun %parse-schema-type-name (name)
   "NAME as a symbol.  A string is split on ':' by hand -- NEVER READ,
@@ -352,29 +358,34 @@ SLOTS are %NORMALIZE-SLOT-SPECS output; only :TYPE is forwarded to
   "Shared body of CREATE-VERTEX-TYPE/CREATE-EDGE-TYPE.  %ENSURE-NODE-CLASS
 must run before %INSTALL-NODE-TYPE -- the latter requires the class to
 already exist, since it calls FINALIZE-INHERITANCE (GH #172, R4)."
-  (let* ((sym (%parse-schema-type-name name))
-         (specs (%retarget-slot-specs (%normalize-slot-specs slot-specs)
-                                      (symbol-package sym))))
+  (let ((sym (%parse-schema-type-name name)))
+    ;; Before %RETARGET-SLOT-SPECS: the SYMBOL-argument path (a bare CL-
+    ;; homed symbol) skips %PARSE-SCHEMA-TYPE-NAME's own string-path
+    ;; package check, so interning slot names into SYM's package first
+    ;; would hit SBCL's raw package-lock error instead of this refusal
+    ;; (GH #172, review round 3, M-1).
     (%check-schema-name-package sym)
-    ;; Fail fast, like MATERIALIZE-SCHEMA: a :CHECK naming a function
-    ;; this image does not provide is a broken definition, not a
-    ;; surprise at first write (GH #172, R5).
-    (let ((missing (%unresolved-check-names (list specs))))
-      (when missing
-        (error 'schema-function-unresolved :names missing)))
-    (%ensure-node-class sym parents kind specs)
-    (let ((*schema-provenance* :runtime))
-      (%install-node-type
-       (make-node-type
-        :name sym
-        :parent-type kind
-        :graph-name default-store
-        :slots specs
-        :package (package-name (symbol-package sym))
-        :constructor (intern (format nil "MAKE-~A" (symbol-name sym))
-                             (%schema-symbol-package sym))
-        :keep-revisions keep-revisions)))
-    (find-class sym)))
+    (let ((specs (%retarget-slot-specs (%normalize-slot-specs slot-specs)
+                                       (symbol-package sym))))
+      ;; Fail fast, like MATERIALIZE-SCHEMA: a :CHECK naming a function
+      ;; this image does not provide is a broken definition, not a
+      ;; surprise at first write (GH #172, R5).
+      (let ((missing (%unresolved-check-names (list specs))))
+        (when missing
+          (error 'schema-function-unresolved :names missing)))
+      (%ensure-node-class sym parents kind specs)
+      (let ((*schema-provenance* :runtime))
+        (%install-node-type
+         (make-node-type
+          :name sym
+          :parent-type kind
+          :graph-name default-store
+          :slots specs
+          :package (package-name (symbol-package sym))
+          :constructor (intern (format nil "MAKE-~A" (symbol-name sym))
+                               (%schema-symbol-package sym))
+          :keep-revisions keep-revisions)))
+      (find-class sym))))
 
 (defun create-vertex-type (name slot-specs &key parents default-store
                                                 keep-revisions)

@@ -3202,7 +3202,9 @@ Presence — not resolution — of the named function is verified at
 ~create-*-type~ time (signalling ~schema-function-unresolved~ if the name
 is not yet registered) and again at ~materialize-schema~ time below; the
 function itself is looked up at each check, so re-registering it takes
-effect immediately.
+effect immediately. The check function runs inside a transaction's OCC
+validation, so a conflict-triggered retry can run it more than once for
+one logical write; it must be pure and side-effect-free.
 
 From here the runtime type is indistinguishable from a static one: the
 generated constructor exists, placement follows #167's rules, transactions

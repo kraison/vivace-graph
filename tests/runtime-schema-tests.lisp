@@ -270,23 +270,28 @@ poison the cache into skipping it for the rest of the session
 ;;; the :CHECK slot option.
 ;;; ---------------------------------------------------------------------
 
-(defun %rs-wipe-runtime-state (&optional graph)
-  "Simulate a fresh image for the RS-TLM namespace: unintern the
+(defun %rs-wipe-runtime-state (&optional graph (namespace :rs-tlm))
+  "Simulate a fresh image for NAMESPACE (default RS-TLM): unintern the
 classes, delete the package, drop the metas, and empty GRAPH's node
 cache -- a fresh image has no cached instances either, and a cache hit
 would serve the pre-wipe object of the old class.  A real restart is a
 different process; this is the closest single-image ablation and it
-proves materialize rebuilds everything it needs."
+proves materialize rebuilds everything it needs.  NAMESPACE lets a
+test that needs its OWN package (rather than sharing the suite's
+RS-TLM, whose :USE list a prior EXPORT-SCHEMA-SOURCE round trip may
+have already widened to CL/GRAPH-DB) start from a genuinely fresh
+:USE NIL package (GH #172, review round 3, M-2)."
   (when graph (clrhash (graph-db::cache graph)))
-  (let ((pkg (find-package :rs-tlm)))
+  (let ((pkg (find-package namespace)))
     (when pkg
-      ;; DO-SYMBOLS walks INHERITED symbols too -- harmless while RS-TLM
-      ;; is :USE NIL (ENSURE-NAMESPACE's own shape), but EXPORT-SCHEMA-
-      ;; SOURCE's generated DEFPACKAGE legitimately :USEs CL/GRAPH-DB
-      ;; (GH #172, R6), and after that LOAD this loop would otherwise
-      ;; walk COMMON-LISP's own external symbols and try to NIL out a
-      ;; locked class like BUILT-IN-CLASS.  EQ-check the home package so
-      ;; only symbols RS-TLM itself owns are touched (review round 1).
+      ;; DO-SYMBOLS walks INHERITED symbols too -- harmless while the
+      ;; package is :USE NIL (ENSURE-NAMESPACE's own shape), but EXPORT-
+      ;; SCHEMA-SOURCE's generated DEFPACKAGE legitimately :USEs
+      ;; CL/GRAPH-DB (GH #172, R6), and after that LOAD this loop would
+      ;; otherwise walk COMMON-LISP's own external symbols and try to
+      ;; NIL out a locked class like BUILT-IN-CLASS.  EQ-check the home
+      ;; package so only symbols the package itself owns are touched
+      ;; (review round 1).
       (do-symbols (s pkg)
         (when (and (eq (symbol-package s) pkg) (find-class s nil))
           (setf (find-class s) nil)))
@@ -733,3 +738,119 @@ an ERROR, plus still-bare, still-loadable output text."
                   (graph-db::%write-schema-def-form entry "RS-TLM" s)))))
         (is-true warned)
         (is (search "orphan" text))))))
+
+;;; ---------------------------------------------------------------------
+;;; Final whole-branch review, round 3: I-1, M-1, M-2, M-6, M-7.
+;;; ---------------------------------------------------------------------
+
+(test manifest-row-count-does-not-grow-after-cache-wipe
+  "I-1: the dedup cache is per-IMAGE, so a fresh image's first call for
+a name always misses it.  Without seeding the cache from the file on a
+miss, INSTANTIATE-NODE-TYPE would re-append every type row with a
+fresh :TIME on every boot forever, and DESCRIBE-SCHEMA :SINCE would
+list the whole schema after any reopen.  Clearing the cache (not
+restarting SBCL) is the closest single-image simulation of that first
+boot (GH #172, review round 3)."
+  (with-rs-store (g)
+    (graph-db:ensure-namespace "RS-TLM")
+    (graph-db:create-vertex-type "RS-TLM:WIPEROW" '((c :type string))
+                                 :default-store :rs-store)
+    (let ((name (intern "WIPEROW" :rs-tlm)))
+      (flet ((row-count ()
+               (with-open-file (s (graph-db::%schema-manifest-file))
+                 (loop for line = (read-line s nil :eof)
+                       until (eq line :eof)
+                       count (let ((rec (graph-db::%parse-schema-manifest-line
+                                        line)))
+                               (and rec (eq (getf rec :type) name))))))
+             (row-time ()
+               (getf (find name
+                          (nth-value 1
+                           (graph-db::read-schema-manifest
+                            graph-db::*system-directory*))
+                          :key (lambda (r) (getf r :type)))
+                    :time)))
+        (let ((c1 (row-count)) (time1 (row-time)))
+          (graph-db::%clear-schema-manifest-cache)
+          (graph-db::instantiate-node-type
+           (graph-db::%find-registered-node-type name :vertex :rs-store)
+           g)
+          (is (= c1 (row-count)))
+          (is (= time1 (row-time))))))))
+
+(test create-vertex-type-refuses-locked-package-symbol
+  "M-1: the SYMBOL-argument path (a bare CL-homed symbol, no
+\"PACKAGE:NAME\" string) must hit GRAPH-DB's own refusal BEFORE
+%RETARGET-SLOT-SPECS interns a slot name into that locked package and
+hits SBCL's raw package-lock error instead (GH #172, review round 3)."
+  (with-rs-store (g)
+    g
+    (let ((c (handler-case
+                 (progn (graph-db:create-vertex-type
+                         'cl:type '((probe :type string))
+                         :default-store :rs-store)
+                        nil)
+               (error (e) e))))
+      (is-true c "a CL-homed symbol name should have signaled")
+      (when c
+        (is (search "ENSURE-NAMESPACE" (format nil "~A" c))
+            "should name ENSURE-NAMESPACE: ~A" c)))))
+
+(test export-schema-source-qualifies-a-cl-shadowed-slot-name
+  "M-2: a slot literally named TYPE is homed in the exported namespace,
+but \"type\" is also an external COMMON-LISP symbol the generated
+file's (:use #:cl #:graph-db) pulls in.  Neither printing it bare NOR
+package-qualified (NS::TYPE) is enough on its own: INTERN -- what both
+reduce to -- returns the INHERITED CL:TYPE whenever the name is merely
+accessible via :USE, so the generated DEFPACKAGE must also :SHADOW it;
+without that, the class-defining form hits SBCL's COMMON-LISP package
+lock outright (the file never even loads, let alone silently drifting
+identity).  A dedicated namespace, wiped first: a prior round trip in
+this suite (e.g. EXPORT-SCHEMA-SOURCE-ROUND-TRIPS) may have already
+left RS-TLM itself :USEing CL/GRAPH-DB, which would make ORDINARY
+CREATE-VERTEX-TYPE calls on RS-TLM hit this same collision (GH #172,
+review round 3)."
+  (with-rs-store (g)
+    (%rs-wipe-runtime-state nil :rs-shadow)
+    (graph-db:ensure-namespace "RS-SHADOW")
+    (graph-db:create-vertex-type "RS-SHADOW:SHADOWED" '((type :type string))
+                                 :default-store :rs-store)
+    (let ((path (merge-pathnames
+                 "exported-shadow-schema.lisp"
+                 (uiop:ensure-directory-pathname
+                  graph-db::*system-directory*))))
+      (graph-db:export-schema-source path :namespace :rs-shadow)
+      (%rs-wipe-runtime-state nil :rs-shadow)
+      (load path)
+      (let (node)
+        (with-transaction ((graph-db::transaction-manager g))
+          (setq node (funcall (intern "MAKE-SHADOWED" :rs-shadow)
+                              :type "widget")))
+        (is (string= "widget"
+                     (funcall (intern "TYPE" :rs-shadow) node)))))))
+
+(test schema-since-parses-yyyy-mm-dd-at-utc
+  "M-6: \"YYYY-MM-DD\" must parse at UTC (timezone 0), matching
+%SCHEMA-ISO-DATE's own UTC decode of each row's :TIME -- pinned against
+an explicit-timezone ENCODE-UNIVERSAL-TIME so the assertion holds
+regardless of the host's own local zone (GH #172, review round 3)."
+  (is (= (encode-universal-time 0 0 0 24 8 2026 0)
+         (graph-db::%schema-since-universal-time "2026-08-24"))))
+
+(test ensure-namespace-refuses-locked-package-names
+  "M-7: naming COMMON-LISP or KEYWORD (directly, or via the CL
+nickname) must hit GRAPH-DB's own refusal -- CREATE-VERTEX-TYPE already
+gets this via %REFUSED-SCHEMA-PACKAGE-P/%REFUSE-SCHEMA-PACKAGE; without
+it here, :NICKNAMES on either would reach RENAME-PACKAGE and signal
+SBCL's raw package-lock error instead (GH #172, review round 3)."
+  (with-rs-store (g)
+    g
+    (dolist (bad '("COMMON-LISP" "KEYWORD" "CL"))
+      (let ((c (handler-case
+                   (progn (graph-db:ensure-namespace bad :nicknames '("X"))
+                          nil)
+                 (error (e) e))))
+        (is-true c "~A should have signaled" bad)
+        (when c
+          (is (search "ENSURE-NAMESPACE" (format nil "~A" c))
+              "~A's condition should name ENSURE-NAMESPACE: ~A" bad c))))))

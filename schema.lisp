@@ -420,11 +420,23 @@ STORE-NAME, else refuse -- never *GRAPH* (GH #167)."
 ;; exactly once per call, never nested (GH #172, review round 2).
 (declaim (ftype (function (list) t) %write-schema-manifest-record))
 (declaim (special *schema-manifest-lock*))
+;; %SEED-SCHEMA-MANIFEST-CACHE (I-1, review round 3) reads the manifest
+;; back through the same file this file also writes.
+(declaim (ftype (function (t) (values list list)) read-schema-manifest))
 
 (defvar *schema-provenance* :source
   "Bound to :RUNTIME around CREATE-VERTEX-TYPE/CREATE-EDGE-TYPE so
 %INSTALL-NODE-TYPE's manifest record captures who defined the type;
 DEF-VERTEX/DEF-EDGE leave it at the default (GH #172, R2).")
+
+;; Homed here, not runtime-schema.lisp, so NODE-CLASS.LISP's SETF sees a
+;; real DEFVAR: node-class.lisp depends only on "schema" in the .asd
+;; (review round 3, M-4).
+(defvar *schema-check-slots-present-p* nil
+  "T once any class in this image has a :CHECK slot.  Set by
+COMPUTE-EFFECTIVE-SLOT-DEFINITION (node-class.lisp); read by
+VALIDATE-VALUE-CONSTRAINTS so a schema with no :CHECK pays nothing
+(GH #172, R5).")
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
 (defun %normalize-slot-specs (slot-specs)
@@ -583,6 +595,39 @@ I3).")
     (remf copy :time)
     copy))
 
+;; I-1 (review round 3): the cache above is per-IMAGE, so a fresh image's
+;; first call for each name always misses -- without this, INSTANTIATE-
+;; NODE-TYPE would re-append every type row on every boot, forever, and
+;; DESCRIBE-SCHEMA's :SINCE would list the whole schema after any reopen.
+(defvar *schema-manifest-seeded-directories* (make-hash-table :test 'equal)
+  "*SYSTEM-DIRECTORY* values whose on-disk rows have already been loaded
+into *SCHEMA-MANIFEST-TYPE-CACHE* this image (GH #172, review round 3,
+I-1).  One %READ-SCHEMA-MANIFEST per directory suffices: seeding fills
+the cache for every name the file already has a row for, so a fresh
+image's first write for each name compares against the FILE, not
+against an empty cache.")
+
+(defun %seed-schema-manifest-cache ()
+  "Populate *SCHEMA-MANIFEST-TYPE-CACHE* from schema-manifest.dat under
+*SYSTEM-DIRECTORY*, once per directory per image.  Caller holds
+*SCHEMA-MANIFEST-LOCK* (GH #172, review round 3, I-1)."
+  (unless (gethash *system-directory* *schema-manifest-seeded-directories*)
+    (dolist (record (nth-value 1 (read-schema-manifest *system-directory*)))
+      (setf (gethash (cons (getf record :type) *system-directory*)
+                     *schema-manifest-type-cache*)
+           (%schema-manifest-record-sans-time record)))
+    (setf (gethash *system-directory* *schema-manifest-seeded-directories*)
+         t)))
+
+(defun %clear-schema-manifest-cache ()
+  "Reset the in-image manifest-dedup cache and its seeded-directory set.
+Tests use this to simulate a fresh image without restarting SBCL
+(GH #172, review round 3, I-1)."
+  (with-lock-held (*schema-manifest-lock*)
+    (clrhash *schema-manifest-type-cache*)
+    (clrhash *schema-manifest-seeded-directories*))
+  (values))
+
 (defvar *record-manifest-rows* t
   "NIL suppresses every manifest type-row append.  Bound NIL by
 %MATERIALIZE-SCHEMA: the rows it installs came OUT of the manifest, so
@@ -603,9 +648,13 @@ updated ONLY when the write actually lands: caching before the outcome
 is known would let one transient failure (disk full, unwritable
 directory) silently drop the row for the rest of the session -- before
 this fix, every reopen kept retrying instead (GH #172, review round
-2).  *RECORD-MANIFEST-ROWS* NIL skips the append outright (M-1)."
+2).  *RECORD-MANIFEST-ROWS* NIL skips the append outright (M-1).  A
+directory not yet seen this image is seeded from its on-disk rows
+first, so a fresh image's first call compares against the FILE, not an
+empty cache (review round 3, I-1)."
   (when *record-manifest-rows*
     (with-lock-held (*schema-manifest-lock*)
+      (%seed-schema-manifest-cache)
       (let* ((key (cons name *system-directory*))
              (sans-time (%schema-manifest-record-sans-time record)))
         (unless (equal sans-time

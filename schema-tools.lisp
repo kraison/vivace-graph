@@ -99,7 +99,10 @@ so this degrades to live-metas-only rather than erroring (GH #172, R6)."
 
 (defun %schema-since-universal-time (since)
   "SINCE as a universal time: an integer as-is, or a \"YYYY-MM-DD\"
-string parsed at local midnight.  NIL passes through (GH #172, R6)."
+string parsed at UTC midnight -- matching %SCHEMA-ISO-DATE, which
+decodes each row's :TIME at UTC too, so the two agree instead of one
+using the local zone and the other UTC (GH #172, review round 3, M-6).
+NIL passes through."
   (etypecase since
     (null nil)
     (integer since)
@@ -107,7 +110,8 @@ string parsed at local midnight.  NIL passes through (GH #172, R6)."
      (encode-universal-time 0 0 0
                             (parse-integer since :start 8 :end 10)
                             (parse-integer since :start 5 :end 7)
-                            (parse-integer since :start 0 :end 4)))))
+                            (parse-integer since :start 0 :end 4)
+                            0))))
 
 (defun %filter-schema-entries (entries namespace store since)
   "ENTRIES restricted to NAMESPACE's package, to types live in STORE,
@@ -148,12 +152,29 @@ entries within a group sorted by type name -- deterministic output
 ;;; forms).
 ;;; ---------------------------------------------------------------------
 
+(defun %schema-name-shadowed-p (name)
+  "T when NAME (a string) already names an EXTERNAL symbol of COMMON-
+LISP or GRAPH-DB -- the two packages the generated file's DEFPACKAGE
+always :USEs.  A symbol homed in the target namespace but sharing NAME
+with one of these (e.g. a slot named TYPE) needs a :SHADOW clause in
+the generated DEFPACKAGE (%SCHEMA-NAMESPACE-SHADOW-NAMES): INTERN --
+which is what both a bare token AND an explicit NS::NAME qualification
+reduce to -- returns the INHERITED symbol whenever the name is merely
+accessible via :USE, so qualification ALONE cannot recover a distinct
+local symbol; only :SHADOW makes the local one accessible instead
+(GH #172, review round 3, M-2)."
+  (or (eq :external (nth-value 1 (find-symbol name (find-package :cl))))
+      (eq :external (nth-value 1 (find-symbol name (find-package
+                                                     :graph-db))))))
+
 (defun %schema-symbol-prints-bare-p (sym target-pkg-name)
   "T when SYM's home package is one the generated file's DEFPACKAGE
 makes a bare token resolve to the SAME symbol under: the namespace
 itself (matched by NAME -- the export-time package and the one the
 generated file's IN-PACKAGE creates at load time are different OBJECTS
-with the same name), or COMMON-LISP/GRAPH-DB, which the generated
+with the same name; a colliding name is safe to print bare too, since
+%WRITE-SCHEMA-NAMESPACE adds a :SHADOW clause for it -- see
+%SCHEMA-NAME-SHADOWED-P), or COMMON-LISP/GRAPH-DB, which the generated
 DEFPACKAGE always :USEs.  Any OTHER home package must be qualified:
 printing it bare would, at load time, INTERN A NEW SYMBOL under the
 namespace package instead of finding the original one, silently
@@ -262,7 +283,9 @@ NAMESPACE restricts to one namespace's package (a string, symbol, or
 keyword).  STORE restricts to types instantiated in that open store (a
 graph designator or a graph object).  SINCE (a universal time, or a
 \"YYYY-MM-DD\" string) filters by each row's record time, so the dump
-doubles as a change log.  Never signals on a missing or damaged
+doubles as a change log; a \"YYYY-MM-DD\" string is parsed at UTC
+midnight, matching the UTC dates printed in [runtime YYYY-MM-DD] tags
+(GH #172, review round 3, M-6).  Never signals on a missing or damaged
 manifest -- degrades to live metas only, all tagged [source]
 (GH #172, R6)."
   (let ((groups (%group-schema-entries-by-namespace
@@ -333,14 +356,42 @@ R6, review round 1)."
              :test #'string-equal)
         :nicknames))
 
+(defun %schema-namespace-shadow-names (pkg-name entries)
+  "Every symbol NAME (a type name, a parent, or a slot/accessor name --
+any leaf ENTRIES prints) that is homed in PKG-NAME and shares its name
+with an external COMMON-LISP or GRAPH-DB symbol, deduplicated.  The
+generated DEFPACKAGE must :SHADOW these: %SCHEMA-NAME-SHADOWED-P's
+docstring explains why qualification alone cannot recover the local
+symbol once the namespace package itself :USEs CL/GRAPH-DB (GH #172,
+review round 3, M-2)."
+  (let ((pkg-name (string-upcase pkg-name)) (out nil))
+    (labels ((consider (sym)
+               (when (and (symbolp sym) (symbol-package sym)
+                         (string= (package-name (symbol-package sym))
+                                 pkg-name)
+                         (%schema-name-shadowed-p (symbol-name sym))
+                         (not (member (symbol-name sym) out
+                                     :test #'string=)))
+                 (push (symbol-name sym) out)))
+             (walk (x) (if (consp x) (progn (walk (car x)) (walk (cdr x)))
+                          (consider x))))
+      (dolist (e entries)
+        (consider (getf e :name))
+        (mapc #'consider (getf e :parents))
+        (dolist (spec (getf e :slots)) (walk (%minimize-slot-spec spec)))))
+    (nreverse out)))
+
 (defun %write-schema-namespace (group ns-rows stream)
   (let* ((pkg-name (car group))
          (entries (cdr group))
-         (nicks (%schema-namespace-nicknames pkg-name ns-rows)))
+         (nicks (%schema-namespace-nicknames pkg-name ns-rows))
+         (shadows (%schema-namespace-shadow-names pkg-name entries)))
     (format stream "(defpackage #:~(~A~) (:use #:cl #:graph-db)~%"
             pkg-name)
     (when nicks
       (format stream "  (:nicknames~{ #:~(~A~)~})~%" nicks))
+    (when shadows
+      (format stream "  (:shadow~{ #:~(~A~)~})~%" shadows))
     ;; One name per line (MINOR 1, review round 1): a ten-plus-type
     ;; namespace's :EXPORT list is the known >80-column offender when
     ;; run together on one line.

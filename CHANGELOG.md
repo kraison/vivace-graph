@@ -130,6 +130,23 @@ between releases; cutting a release renames it to the new version and dates it.
   runtime `DEF-VIEW`/index/unique definition (those macros stay
   code-side), and an Emacs mode (the text dump is SLIME-usable as-is).
 
+  Final-review fixes (#172, review round 3): the manifest dedup cache
+  is now seeded from the on-disk file on a fresh image's first write,
+  so a reopen no longer re-appends every type row with a new `:time`
+  (previously `DESCRIBE-SCHEMA :SINCE` listed the whole schema after
+  any reopen); `CREATE-VERTEX-TYPE`/`CREATE-EDGE-TYPE`'s symbol-argument
+  path now refuses a CL-homed name before interning any slot into it,
+  instead of hitting SBCL's raw package-lock error; `EXPORT-SCHEMA-
+  SOURCE` now qualifies a bare symbol whose name shadows an external
+  `COMMON-LISP`/`GRAPH-DB` symbol (e.g. a slot named `TYPE`), which
+  previously round-tripped to the wrong symbol silently; `DESCRIBE-
+  SCHEMA`'s `:SINCE` string now parses at UTC, matching the UTC dates
+  it prints; and `ENSURE-NAMESPACE` refuses `COMMON-LISP`/`KEYWORD` (or
+  a nickname of either) the same way `CREATE-*-TYPE` already does.
+  `REGISTER-SCHEMA-FUNCTION`'s docstring and the manual now say
+  explicitly that a `:CHECK` function must be pure: OCC retry can run
+  it more than once per logical write.
+
 - **A store adopts a foreign class at first write; lookup of a class
   registered in more than one store is deterministic** (#167). Writing a
   node of a class via an explicit `:graph` that names a store other
