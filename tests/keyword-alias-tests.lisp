@@ -16,9 +16,11 @@
   (:export #:alias-species))
 
 ;;; Both ALIAS-SPECIES types land in ONE store's schema -- that is the
-;;; collision.  The generated MAKE-/LOOKUP-/-P helpers intern in THIS
-;;; package, so the second definition redefines the first's helpers; the
-;;; tests below use only LOOKUP-NODE-TYPE-BY-NAME, never those helpers.
+;;; collision, and it is a schema-name collision only.  The generated
+;;; MAKE-/LOOKUP-/-P helpers intern in the CLASS SYMBOL's own package
+;;; (GH #172), so each ALIAS-SPECIES keeps its own helpers and neither
+;;; definition clobbers the other's.  The ambiguity surface these tests
+;;; exercise is LOOKUP-NODE-TYPE-BY-NAME; they never call the helpers.
 (def-vertex graph-db-alias-pkg-a:alias-species () ((label :type string))
   :alias-two-store)
 (def-vertex graph-db-alias-pkg-b:alias-species () ((label :type string))
