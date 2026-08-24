@@ -31,6 +31,61 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Fixed
 
+- **`MAKE-GRAPH`/`OPEN-GRAPH` accepted a slashless `LOCATION` and scattered
+  its sidecar files into the parent directory** (#222). Every sidecar built
+  with `(MAKE-PATHNAME :defaults (LOCATION GRAPH))` -- `.dirty`, `heap.dat`,
+  `schema.dat`, and the rest -- depends on `LOCATION` being a *directory*
+  pathname; a trimmed namestring kept it as a *file* pathname instead, so
+  those sidecars landed next to the store rather than inside it. Both
+  functions now normalize `LOCATION` once, via `UIOP:ENSURE-DIRECTORY-
+  PATHNAME`, before any use -- the same fix `%REOPEN-AND-RESUME`
+  (`shadow-store.lisp`, #171) already applied locally, generalized to the
+  entry points themselves so every caller gets it for free.
+
+  ⚠ **Upgrade note.** A store originally *created* through a slashless
+  `LOCATION` has `transaction-id.dat`, `lamport.dat` (peer graphs) and
+  `pull-cursor.dat` (peer devices) -- among others -- sitting in its
+  PARENT directory, not inside the store. After this fix, `OPEN-GRAPH`
+  looks for them inside the store and will not find them: the
+  transaction-id watermark and, on a peer graph, the durable Lamport
+  clock and pull cursor all silently reset to their zero/absent
+  defaults on the next open. Before upgrading a store you know was
+  ever created or reopened with a trailing-slash-free `LOCATION`,
+  manually move any of those files sitting beside the store directory
+  (check the PARENT of `LOCATION` for `.dirty`, `heap.dat`,
+  `schema.dat`, `transaction-id.dat`, `lamport.dat`, `pull-cursor.dat`,
+  `policy.dat`) into the store directory itself first. A store that
+  was always opened with a trailing slash is unaffected.
+- **An aborted `MAKE-GRAPH`/`OPEN-GRAPH` leaked every fd it had already
+  opened** (#224). Neither function had any teardown on a non-local exit
+  partway through -- a `STORE-ID-COLLISION-ERROR` or any other failure left
+  the heap, indexes, vertex/edge tables and ve/vev indexes already opened
+  memory-mapped and open, and could leave the graph half-registered in
+  `*GRAPHS*`. `MAKE-INSTANCE` evaluates its initarg value-forms before it
+  runs, so a failure partway through that argument list left the
+  already-opened ones reachable from nothing but a local variable; the
+  open-sequence in both functions now binds each resource to a name and
+  tracks it in a small mutable list *before* handing it to `MAKE-INSTANCE`,
+  so the list has every fd-bearing resource open at the moment of failure
+  regardless of where in the sequence it happens. Both functions now run
+  their body under `UNWIND-PROTECT`, and a new `%ABORT-GRAPH-OPEN` best-
+  effort closes (`IGNORE-ERRORS` per component, tolerating slots still
+  unbound) everything the partial open acquired, and deregisters the graph
+  from `*GRAPHS*`/the open-store vector if that ran before the failure. The
+  signalled condition always propagates unchanged. The teardown also
+  stops replication before closing anything else (a master's accept
+  thread and listening socket must not outlive the mmaps they
+  reference) and closes every vector segment `RESTORE-VECTOR-SEGMENTS`
+  had already opened (each is marked dirty-on-disk the moment it
+  opens, so leaving one open forces a full rebuild-from-nodes on the
+  next open). One rule needs stating explicitly: the abort deletes a
+  `.dirty` marker only when nothing that can mutate an EXISTING
+  store's heap has run yet (`OPEN-GRAPH`'s recovery/rebuild steps,
+  `MAKE-GRAPH`'s WAL replay for a slave). Once one of those has run,
+  `.dirty` is deliberately left in place -- the store now genuinely
+  needs recovery, and deleting the sentinel would let a later open
+  adopt stale index roots against the now-mutated heap with no
+  recovery pass to catch the mismatch.
 - **`%POSIX-OPEN` created files with an arbitrary permission mode on Apple
   arm64** (#218). `open(2)` is `int open(const char *, int, ...)`, and the
   `mode` argument was passed through a plain `CFFI:FOREIGN-FUNCALL` — as a

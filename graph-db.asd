@@ -562,7 +562,8 @@ cl-temporal-extent."
                (:file "index-prolog-tests")        ; GH #102
                (:file "value-constraint-tests")     ; GH #149
                (:file "peer-unique-tests")
-               (:file "peer-index-tests"))
+               (:file "peer-index-tests")
+               (:file "open-hygiene-tests"))   ; GH #222, #224
   :perform (test-op (op c)
                     (unless (uiop:symbol-call :graph-db/test :run-tests)
                       (error "graph-db test suite failed."))))
