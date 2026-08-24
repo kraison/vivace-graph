@@ -703,3 +703,33 @@ docstring's claimed limit."
         (loop for line = (read-line s nil :eof)
               until (eq line :eof)
               do (is (<= (length line) 80)))))))
+
+;;; ---------------------------------------------------------------------
+;;; Task 4, fix round 2 (review): uninterned symbol never signals.
+;;; ---------------------------------------------------------------------
+
+(test export-schema-source-warns-on-uninterned-symbol
+  "Fix round 2: %SCHEMA-QUALIFIED-SYMBOL cannot name a symbol with no
+home package -- an UNINTERNED symbol, unreachable through the ordinary
+CREATE-*-TYPE/DEF-VERTEX APIs, but EXPORT-SCHEMA-SOURCE's read-only,
+never-signal contract must hold regardless.  Constructs the hazard
+directly (%WRITE-SCHEMA-DEF-FORM, not the public API, since no public
+path can produce an uninterned slot symbol) and asserts a WARNING, not
+an ERROR, plus still-bare, still-loadable output text."
+  (with-rs-store (g)
+    g
+    (graph-db:ensure-namespace "RS-TLM")
+    (let* ((orphan (make-symbol "ORPHAN"))
+           (entry (list :name (intern "GHOST" :rs-tlm) :kind :vertex
+                       :default-store :rs-store
+                       :slots (list (list orphan :accessor orphan
+                                         :initarg :orphan))
+                       :parents nil :keep-revisions nil))
+          (warned nil))
+      (let ((text
+              (handler-bind
+                  ((warning (lambda (c) (setq warned t) (muffle-warning c))))
+                (with-output-to-string (s)
+                  (graph-db::%write-schema-def-form entry "RS-TLM" s)))))
+        (is-true warned)
+        (is (search "orphan" text))))))

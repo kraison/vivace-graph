@@ -176,6 +176,30 @@ breaking any EQ-keyed lookup on it -- e.g. a :CHECK name against
     (format nil "~(~A~)~:[::~;:~]~(~A~)"
             (package-name pkg) external-p (symbol-name sym))))
 
+(defun %schema-source-symbol-token (sym target-pkg-name)
+  "SYM as source text under TARGET-PKG-NAME: bare when
+%SCHEMA-SYMBOL-PRINTS-BARE-P allows it, package-qualified otherwise --
+except an UNINTERNED symbol (no home package at all), which
+%SCHEMA-QUALIFIED-SYMBOL cannot name.  Unreachable through the ordinary
+CREATE-*-TYPE/DEF-VERTEX APIs (their slot data always comes from a real
+interned symbol), but EXPORT-SCHEMA-SOURCE must never signal an ERROR
+regardless: fall back to the bare, downcased name -- the closest-to-
+correct readable text, since it will still intern into whatever package
+the generated file's IN-PACKAGE is active under -- and WARN, so the
+file is flagged for hand review rather than silently wrong (GH #172,
+R6, review round 2)."
+  (if (symbol-package sym)
+      (if (%schema-symbol-prints-bare-p sym target-pkg-name)
+          (string-downcase (symbol-name sym))
+          (%schema-qualified-symbol sym))
+      (progn
+        (warn "EXPORT-SCHEMA-SOURCE: symbol ~S~@[, exporting namespace ~
+~A,~] has no home package (uninterned) -- printing it bare.  The ~
+generated file will intern a NEW symbol under its own IN-PACKAGE; ~
+review this output by hand (GH #172, R6, review round 2)."
+              sym target-pkg-name)
+        (string-downcase (symbol-name sym)))))
+
 (defun %schema-source-token (x &optional target-pkg-name)
   "X as generated-source text.  A symbol prints bare and downcased only
 when %SCHEMA-SYMBOL-PRINTS-BARE-P says a bare token will resolve back
@@ -188,10 +212,7 @@ value) never qualifies -- describe-schema's output is not reloaded
     ((null x) "nil")
     ((eq x t) "t")
     ((keywordp x) (format nil ":~(~A~)" (symbol-name x)))
-    ((symbolp x)
-     (if (%schema-symbol-prints-bare-p x target-pkg-name)
-         (string-downcase (symbol-name x))
-         (%schema-qualified-symbol x)))
+    ((symbolp x) (%schema-source-symbol-token x target-pkg-name))
     ((stringp x) (prin1-to-string x))
     ((integerp x) (princ-to-string x))
     (t (string-downcase (princ-to-string x)))))
