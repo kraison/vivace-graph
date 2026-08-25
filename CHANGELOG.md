@@ -125,6 +125,13 @@ between releases; cutting a release renames it to the new version and dates it.
   every previous test asserted only that the fd was valid, which is exactly
   what a garbage mode still yields to its creator.
 
+- **`SYSTEM-CLOCK-SUITE`'s graph-creating tests never bound
+  `*SYSTEM-DIRECTORY*`** (#220), test-only. They passed under
+  `(ASDF:TEST-SYSTEM :GRAPH-DB)` only because `RUN-TESTS` binds it for the
+  whole run (#186); run standalone (e.g. bare `FIVEAM:RUN!`) 14 of them
+  signalled `SYSTEM-DIRECTORY-REQUIRED`. Added a `WITH-CLOCK-SYSTEM-DIR`
+  fixture, matching `TYPE-REGISTRY-SUITE`/`STORE-REGISTRY-SUITE`'s pattern.
+
 ### Added
 
 - **A node type can now be defined at runtime, from data, and survive a

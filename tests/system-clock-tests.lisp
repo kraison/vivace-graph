@@ -6,6 +6,19 @@
   :description "The image-level epoch clock and its journal.")
 (in-suite system-clock-suite)
 
+(defmacro with-clock-system-dir (() &body body)
+  "RUN-TESTS (tests/suite.lisp) binds *SYSTEM-DIRECTORY* for the whole
+suite run, so these graph-creating tests pass under the harness even
+unbound.  Standalone (e.g. bare FIVEAM:RUN!) they are not covered and
+signal SYSTEM-DIRECTORY-REQUIRED (GH #220) -- bind it here so the suite
+is self-sufficient either way, matching TYPE-REGISTRY-SUITE and
+STORE-REGISTRY-SUITE's fixtures."
+  `(with-temp-directory (%sysdir)
+     (let ((graph-db::*system-directory* (namestring %sysdir))
+           (graph-db::*type-registry* nil)
+           (graph-db::*store-registry* nil))
+       ,@body)))
+
 (test clock-issues-monotonic-epochs
   (with-temp-directory (dir)
     (let ((c (open-system-clock (namestring dir))))
@@ -374,7 +387,8 @@ makes the file-unchanged assertion below fail (see fix-wave-report.md)."
 ;;; Routing epoch allocation through the clock (GH #168 task 3).
 
 (test two-stores-on-one-clock-get-disjoint-ordered-epochs
-  (with-temp-directory (cdir)
+  (with-clock-system-dir ()
+    (with-temp-directory (cdir)
     (let ((clock (open-system-clock (namestring cdir))))
       (unwind-protect
            (with-temp-directory (da)
@@ -402,7 +416,7 @@ makes the file-unchanged assertion below fail (see fix-wave-report.md)."
                                  (length (remove-duplicates sorted))))))
                    (close-graph ga)
                    (close-graph gb)))))
-        (close-system-clock clock)))))
+        (close-system-clock clock))))))
 
 (test no-clock-means-per-store-counters-unchanged
   ;; The backward-compatibility hinge: with *SYSTEM-CLOCK* nil and no
@@ -413,7 +427,8 @@ makes the file-unchanged assertion below fail (see fix-wave-report.md)."
   ;; satisfy (= IA IB) without this.  *SYSTEM-CLOCK* is bound explicitly
   ;; rather than relied on as a lambda-list default, so this test's premise
   ;; does not depend on run order against any test that SETFs the global.
-  (let ((*system-clock* nil))
+  (with-clock-system-dir ()
+    (let ((*system-clock* nil))
     (with-temp-directory (da)
       (with-temp-directory (db)
         (let ((ga (make-graph :sc-gamma (namestring da)
@@ -432,12 +447,13 @@ makes the file-unchanged assertion below fail (see fix-wave-report.md)."
                  (is (= 1 ia ib))
                  (is (= 2 ia2)))
             (close-graph ga)
-            (close-graph gb)))))))
+            (close-graph gb))))))))
 
 (test attaching-a-store-raises-the-clock-above-its-history
   ;; The watermark: a store with existing history must not hand the clock a
   ;; reason to reissue an epoch that store already used.
-  (with-temp-directory (cdir)
+  (with-clock-system-dir ()
+    (with-temp-directory (cdir)
     (with-temp-directory (gdir)
       (let ((g (make-graph :sc-eps (namestring gdir) :buffer-pool-size 1000)))
         (dotimes (i 5)
@@ -463,7 +479,7 @@ makes the file-unchanged assertion below fail (see fix-wave-report.md)."
                                                      *transaction*))
                                    highest))))
                      (close-graph g2)))
-              (close-system-clock clock))))))))
+              (close-system-clock clock)))))))))
 
 (test start-and-finish-tx-id-bracket-the-shared-epoch
   ;; The gap that matters most (reviewer finding): an implementation that
@@ -474,7 +490,8 @@ makes the file-unchanged assertion below fail (see fix-wave-report.md)."
   ;; FINISH)).  Interleave commits across two stores sharing one clock and
   ;; check each transaction's own start/finish bracket its own
   ;; transaction-id -- proving all three come from the same sequence.
-  (with-temp-directory (cdir)
+  (with-clock-system-dir ()
+    (with-temp-directory (cdir)
     (let ((clock (open-system-clock (namestring cdir))))
       (unwind-protect
            (with-temp-directory (da)
@@ -498,7 +515,7 @@ makes the file-unchanged assertion below fail (see fix-wave-report.md)."
                                   (graph-db::finish-tx-id tx)))))
                    (close-graph ga)
                    (close-graph gb)))))
-        (close-system-clock clock)))))
+        (close-system-clock clock))))))
 
 (test attach-watermarks-a-peer-graphs-pull-cursor-too
   ;; Correctness (reviewer fix 1): a peer-graph's pull-cursor and its local
@@ -507,7 +524,8 @@ makes the file-unchanged assertion below fail (see fix-wave-report.md)."
   ;; they diverge).  ATTACH-TO-SYSTEM-CLOCK must watermark past whichever
   ;; is higher, or a node this device pulled at the hub's epoch becomes
   ;; MVCC-invisible to a subsequent local edit once the clock takes over.
-  (with-temp-directory (cdir)
+  (with-clock-system-dir ()
+    (with-temp-directory (cdir)
     (with-temp-directory (gdir)
       (let ((origin (make-array 16 :element-type '(unsigned-byte 8)
                                 :initial-element 7)))
@@ -532,7 +550,7 @@ makes the file-unchanged assertion below fail (see fix-wave-report.md)."
                  (unwind-protect
                       (is (> (clock-current-epoch clock) 42))
                    (close-graph g2 :snapshot-p nil)))
-            (close-system-clock clock)))))))
+            (close-system-clock clock))))))))
 
 (test attach-does-not-half-apply-when-watermark-computation-fails
   ;; Ordering (reviewer fix 2): ATTACH-TO-SYSTEM-CLOCK must compute and
@@ -542,7 +560,8 @@ makes the file-unchanged assertion below fail (see fix-wave-report.md)."
   ;; above its own history -- and already findable via *GRAPHS* by any
   ;; other thread).  Corrupt the persisted highest-id file so
   ;; LOAD-HIGHEST-TRANSACTION-ID signals, and assert the slot never moved.
-  (with-temp-directory (cdir)
+  (with-clock-system-dir ()
+    (with-temp-directory (cdir)
     (with-temp-directory (gdir)
       (let ((g (make-graph :sc-kappa (namestring gdir) :buffer-pool-size 1000)))
         (with-transaction ((graph-db::transaction-manager g)) t)
@@ -559,14 +578,15 @@ makes the file-unchanged assertion below fail (see fix-wave-report.md)."
                       (signals error (attach-to-system-clock g clock))
                       (is (null (graph-system-clock g))))
                  (close-system-clock clock)))
-          (close-graph g :snapshot-p nil))))))
+          (close-graph g :snapshot-p nil)))))))
 
 (test attach-refuses-a-store-with-an-active-transaction
   ;; No coverage before this (GH #168 review): the quiescence guard in
   ;; ATTACH-TO-SYSTEM-CLOCK exists to prevent the FINISH-TX-ID skew
   ;; described in its docstring.  Attach from inside an open transaction
   ;; and confirm both the signal and that the graph is left un-attached.
-  (with-temp-directory (cdir)
+  (with-clock-system-dir ()
+    (with-temp-directory (cdir)
     (let ((clock (open-system-clock (namestring cdir))))
       (unwind-protect
            (with-temp-directory (gdir)
@@ -579,7 +599,7 @@ makes the file-unchanged assertion below fail (see fix-wave-report.md)."
                           (attach-to-system-clock g clock)))
                       (is (null (graph-system-clock g))))
                  (close-graph g :snapshot-p nil))))
-        (close-system-clock clock)))))
+        (close-system-clock clock))))))
 
 (test recreate-graph-allocates-from-the-image-clock
   ;; The audit finding (GH #168): RECREATE-GRAPH minted ids from a per-store
@@ -601,7 +621,8 @@ makes the file-unchanged assertion below fail (see fix-wave-report.md)."
   ;; a TM-CURRENT-EPOCH-for-TM-NEXT-EPOCH substitution peeks the same
   ;; floor without moving the clock, which a floor-only check cannot see
   ;; but an exact advance-by-BATCHES check does.
-  (with-temp-directory (cdir)
+  (with-clock-system-dir ()
+    (with-temp-directory (cdir)
     (let ((clock (open-system-clock (namestring cdir)))
           (record-count 25))
       (unwind-protect
@@ -649,7 +670,7 @@ makes the file-unchanged assertion below fail (see fix-wave-report.md)."
                               (- (clock-current-epoch clock) floor-epoch)))
                        (close-graph dst :snapshot-p nil))))
                  (close-graph other :snapshot-p nil))))
-        (close-system-clock clock)))))
+        (close-system-clock clock))))))
 
 (defparameter *observe-epoch-origin*
   (make-array 16 :element-type '(unsigned-byte 8) :initial-element 9)
@@ -662,7 +683,8 @@ makes the file-unchanged assertion below fail (see fix-wave-report.md)."
   ;; route to the clock (GH #168) -- so the observation must land there too.
   ;; Also pins monotonicity in both directions: a high epoch raises the
   ;; clock, and a later LOWER epoch is a no-op, not a regression.
-  (with-temp-directory (cdir)
+  (with-clock-system-dir ()
+    (with-temp-directory (cdir)
     (let ((clock (open-system-clock (namestring cdir))))
       (unwind-protect
            (with-temp-directory (gdir)
@@ -676,10 +698,11 @@ makes the file-unchanged assertion below fail (see fix-wave-report.md)."
                       (graph-db::peer-observe-epoch g 999999)
                       (is (> (clock-current-epoch clock) 999999)))
                  (close-graph g :snapshot-p nil))))
-        (close-system-clock clock)))))
+        (close-system-clock clock))))))
 
 (test peer-observe-epoch-does-not-drag-the-clock-backwards
-  (with-temp-directory (cdir)
+  (with-clock-system-dir ()
+    (with-temp-directory (cdir)
     (let ((clock (open-system-clock (namestring cdir))))
       (unwind-protect
            (with-temp-directory (gdir)
@@ -695,7 +718,7 @@ makes the file-unchanged assertion below fail (see fix-wave-report.md)."
                         (graph-db::peer-observe-epoch g 5)
                         (is (= raised (clock-current-epoch clock)))))
                  (close-graph g :snapshot-p nil))))
-        (close-system-clock clock)))))
+        (close-system-clock clock))))))
 
 (test peer-observe-epoch-ignores-the-dead-counter
   ;; The nearest wrong implementation: route to the clock but keep the old
@@ -705,7 +728,8 @@ makes the file-unchanged assertion below fail (see fix-wave-report.md)."
   ;; vacuously true) or, once something has left a stale high value in the
   ;; slot, wrongly SKIPS the clock observation.  Force that stale value
   ;; directly and confirm the clock still raises regardless.
-  (with-temp-directory (cdir)
+  (with-clock-system-dir ()
+    (with-temp-directory (cdir)
     (let ((clock (open-system-clock (namestring cdir))))
       (unwind-protect
            (with-temp-directory (gdir)
@@ -722,7 +746,7 @@ makes the file-unchanged assertion below fail (see fix-wave-report.md)."
                       (graph-db::peer-observe-epoch g 999999)
                       (is (> (clock-current-epoch clock) 999999)))
                  (close-graph g :snapshot-p nil))))
-        (close-system-clock clock)))))
+        (close-system-clock clock))))))
 
 ;;; Cross-store read snapshots pin every participating store (GH #168 task 6).
 ;;; See spec sec.6: a long cross-store query delays reaping in EVERY store it
@@ -738,7 +762,8 @@ makes the file-unchanged assertion below fail (see fix-wave-report.md)."
   ;; snapshots' establishment.  A real write on GB before GB's own
   ;; snapshot does exactly that, so GA's and GB's own pin-time epochs
   ;; diverge and a swap becomes visible as a value mismatch.
-  (with-temp-directory (cdir)
+  (with-clock-system-dir ()
+    (with-temp-directory (cdir)
     (let ((clock (open-system-clock (namestring cdir))))
       (unwind-protect
            (with-temp-directory (da)
@@ -777,13 +802,14 @@ makes the file-unchanged assertion below fail (see fix-wave-report.md)."
                                            (pin-values tm-b)))))))
                      (close-graph ga)
                      (close-graph gb))))))
-        (close-system-clock clock)))))
+        (close-system-clock clock))))))
 
 (test cross-store-snapshot-releases-pins-after-normal-return
   ;; A pin taken and never released wedges the reaper forever in the store it
   ;; leaked on -- worse than the visibility bug this unit fixes.  Assert both
   ;; stores' pins are gone once the composed snapshot exits normally.
-  (with-temp-directory (cdir)
+  (with-clock-system-dir ()
+    (with-temp-directory (cdir)
     (let ((clock (open-system-clock (namestring cdir))))
       (unwind-protect
            (with-temp-directory (da)
@@ -806,12 +832,13 @@ makes the file-unchanged assertion below fail (see fix-wave-report.md)."
                                     (graph-db::read-pins tm-b)))))
                    (close-graph ga)
                    (close-graph gb)))))
-        (close-system-clock clock)))))
+        (close-system-clock clock))))))
 
 (test cross-store-snapshot-releases-pins-on-non-local-exit
   ;; Same property, but the body THROWs out instead of returning -- this is
   ;; the whole point of putting the release in UNWIND-PROTECT.
-  (with-temp-directory (cdir)
+  (with-clock-system-dir ()
+    (with-temp-directory (cdir)
     (let ((clock (open-system-clock (namestring cdir))))
       (unwind-protect
            (with-temp-directory (da)
@@ -836,7 +863,7 @@ makes the file-unchanged assertion below fail (see fix-wave-report.md)."
                                     (graph-db::read-pins tm-b)))))
                    (close-graph ga)
                    (close-graph gb)))))
-        (close-system-clock clock)))))
+        (close-system-clock clock))))))
 
 ;;; GH #182: two images on one clock directory both issued epochs, silently.
 
