@@ -3280,8 +3280,13 @@ condition each:
 
 A half-built materialization is worse than none, so either condition
 aborts the whole call with nothing built. On success it returns a summary
-plist for the REPL: ~(:namespaces n :materialized n :skipped-existing n)~.
-~:namespaces~ narrows a call to specific packages:
+plist for the REPL: ~(:namespaces n :materialized n :skipped-existing n
+:skipped-unreadable n)~. ~:skipped-unreadable~ counts manifest rows that
+failed to ~read~ at all — most commonly a type row naming a symbol (e.g.
+a ~:check~ function) in a package this image does not have — and is
+never silent: a nonzero count also signals ~sidecar-records-skipped~
+(file, count, first bad byte position) as a warning, once per read
+(GH #227). ~:namespaces~ narrows a call to specific packages:
 
 #+BEGIN_SRC lisp
   (graph-db:materialize-schema "/var/db/helpdesk-system/"

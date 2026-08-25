@@ -128,7 +128,11 @@ later open in this image, for the life of the process (GH #182)."
                     :if-exists :append
                     :if-does-not-exist :create)))
       (let ((s (system-clock-journal clock)))
-        (let ((*print-readably* nil) (*print-pretty* nil))
+        ;; Full print-control set (GH #226); the #191 corruption/torn-
+        ;; tail machinery below is untouched -- this only closes the
+        ;; gap where an ambient *PRINT-LENGTH*/*PRINT-BASE* etc. could
+        ;; produce a line JOURNAL-RECORDS then can't read back.
+        (with-sidecar-output ()
           (format s "~S~%" record))
         (finish-output s)))
     record))
@@ -228,25 +232,25 @@ it.  That repeated warning is the accepted cost (GH #182, #191)."
         (finish-output (system-clock-journal clock)))
       (when (probe-file file)
         (with-open-file (s file :direction :input)
-          (let ((*read-eval* nil)
-                (records nil)
-                (torn-p nil))
-            (loop
-              (let* ((pos (file-position s))
-                     (r (handler-case (read s nil :eof)
-                          (error (e)
-                            (when (%journal-later-record-p file pos)
-                              (error 'system-journal-corrupt
-                                     :file file :position pos :cause e))
-                            (when (system-clock-lock-fd clock)
-                              (%journal-truncate-to clock file pos))
-                            (setq torn-p t)
-                            (warn 'system-journal-torn-tail
-                                  :file file :position pos)
-                            :eof))))
-                (when (eq r :eof)
-                  (return (values (nreverse records) torn-p)))
-                (push r records)))))))))
+          (with-sidecar-input ()
+            (let ((records nil)
+                  (torn-p nil))
+              (loop
+                (let* ((pos (file-position s))
+                       (r (handler-case (read s nil :eof)
+                            (error (e)
+                              (when (%journal-later-record-p file pos)
+                                (error 'system-journal-corrupt
+                                       :file file :position pos :cause e))
+                              (when (system-clock-lock-fd clock)
+                                (%journal-truncate-to clock file pos))
+                              (setq torn-p t)
+                              (warn 'system-journal-torn-tail
+                                    :file file :position pos)
+                              :eof))))
+                  (when (eq r :eof)
+                    (return (values (nreverse records) torn-p)))
+                  (push r records))))))))))
 
 (defun %clock-reserve (clock needed)
   "Raise the durable ceiling so COUNTER + NEEDED stays below it.  Caller

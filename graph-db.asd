@@ -54,12 +54,16 @@
                (:file "node-id" :depends-on ("package" "posix"))
                (:file "buffer-pool" :depends-on ("pcons" "node-id"))
                (:file "serialize" :depends-on ("conditions" "buffer-pool" "cl-store-ecl"))
+               ;; Shared print/read control-set macros for every line-
+               ;; oriented sidecar file below (GH #226).  Only needs
+               ;; "package"; placed just before its first user.
+               (:file "sidecar-io" :depends-on ("package"))
                ;; The image-level epoch clock (GH #168).  No graph dependency,
                ;; so it loads early and tests without one.
-               (:file "system-clock" :depends-on ("serialize" "utilities"))
+               (:file "system-clock" :depends-on ("serialize" "utilities" "sidecar-io"))
                ;; The image-level type-id registry (GH #186).  Same shape as
                ;; system-clock: no graph dependency, loads early.
-               (:file "type-registry" :depends-on ("serialize" "utilities"))
+               (:file "type-registry" :depends-on ("serialize" "utilities" "sidecar-io"))
                ;; The image-level store-id registry (GH #169).  Same shape
                ;; as type-registry; graph-class references +MAX-STORE-TAG+.
                (:file "store-registry" :depends-on ("type-registry"))
@@ -552,6 +556,7 @@ cl-temporal-extent."
                (:file "system-restore-tests")     ; GH #171
                (:file "package-namespace-tests")  ; GH #167
                (:file "runtime-schema-tests")     ; GH #172
+               (:file "sidecar-io-tests")         ; GH #226, #227
                (:file "posix-tests")              ; GH #182
                (:file "rest-tests")
                (:file "rest-http-tests")

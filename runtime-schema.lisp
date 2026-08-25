@@ -29,10 +29,9 @@ only (GH #172, mirrors %EDGE-OCCUPANCY-FILE)."
       (%schema-manifest-path (type-registry-location (ensure-type-registry)))
     (error () nil)))
 
-(defun %schema-manifest-print-package ()
-  ;; COMMON-LISP, not KEYWORD: class symbols must print package-qualified
-  ;; (the #167 manifest discipline; see %EDGE-OCCUPANCY-PRINT-PACKAGE).
-  (load-time-value (find-package "COMMON-LISP")))
+;; Records print/read in COMMON-LISP, not KEYWORD: class symbols must
+;; print package-qualified (the #167 manifest discipline; see
+;; type-occupancy.lisp).  WITH-SIDECAR-OUTPUT/-INPUT default to it.
 
 (defun %write-schema-manifest-record (plist)
   "The UNLOCKED write: append PLIST as one ~S-printed, package-qualified
@@ -49,9 +48,7 @@ the lock exactly once (GH #172, review round 2)."
               (with-open-file (s file :direction :output
                                       :if-exists :append
                                       :if-does-not-exist :create)
-                (let ((*print-readably* nil)
-                      (*print-pretty* nil)
-                      (*package* (%schema-manifest-print-package)))
+                (with-sidecar-output ()
                   (format s "~S~%" plist))
                 (finish-output s))
               t)
@@ -70,50 +67,67 @@ session (review round 2)."
     (%write-schema-manifest-record plist)))
 
 (defun %parse-schema-manifest-line (line)
-  "Read LINE as a plist headed by a keyword.  *READ-EVAL* NIL: the file
-is data.  Returns NIL on anything malformed -- a torn or corrupt line is
-only a lost record, never an error (GH #172)."
+  "Read LINE as a plist headed by a keyword.  A per-line diagnostic
+helper (tests count rows by scanning line-by-line); READ-SCHEMA-
+MANIFEST itself no longer uses this -- see its docstring for why a
+single line is the wrong unit once a record can legally span several
+(GH #226).  Returns NIL on anything malformed, including a line that is
+only part of a multi-line record: never an error (GH #172)."
   (handler-case
-      (let ((*read-eval* nil)
-            (*package* (%schema-manifest-print-package)))
+      (with-sidecar-input ()
         (multiple-value-bind (form pos) (read-from-string line)
           (when (and (= pos (length line))
                      (consp form) (keywordp (first form)))
             form)))
     (error () nil)))
 
+(defun %valid-schema-manifest-form-p (form)
+  "Shaped like a manifest record: a plist headed by a keyword.  A form
+that reads fine but is shaped wrong is dropped the same as before --
+silently, not counted toward the #227 skipped-record warning, which is
+for records READ itself could not parse (GH #172, #226)."
+  (and (consp form) (keywordp (first form))))
+
 (defun read-schema-manifest (dir)
   "Read schema-manifest.dat under DIR.  Returns (VALUES NAMESPACE-RECORDS
-TYPE-RECORDS); last record per name wins, malformed/torn lines are
-skipped, a missing file yields two empty lists (GH #172, R2)."
+TYPE-RECORDS SKIPPED); last record per name wins, a missing file yields
+two empty lists and SKIPPED 0 (GH #172, R2).
+
+Reads FORMS via READ-SIDECAR-FORMS (GH #226), not lines: a form that
+fails to READ -- a torn tail, corrupt bytes, or (GH #227) a type row
+naming a symbol in a package this image does not have -- is dropped
+and counted in SKIPPED, and READ-SIDECAR-FILE-FORMS signals
+SIDECAR-RECORDS-SKIPPED once for the read when SKIPPED is nonzero, so
+the drop is never silent the way a plain line-parse failure was."
   (let ((file (ignore-errors (%schema-manifest-path dir)))
         (ns-table (make-hash-table :test 'equal))
         (ns-order nil)
         (type-table (make-hash-table :test 'eq))
-        (type-order nil))
-    (when (and file (probe-file file))
+        (type-order nil)
+        (skipped 0))
+    (when file
       (handler-case
-          (with-open-file (s file :direction :input)
-            (loop
-              (let ((line (read-line s nil :eof)))
-                (when (eq line :eof) (return))
-                (let ((rec (%parse-schema-manifest-line line)))
-                  (when rec
-                    (cond
-                      ((getf rec :namespace)
-                       (let ((key (getf rec :namespace)))
-                         (unless (nth-value 1 (gethash key ns-table))
-                           (push key ns-order))
-                         (setf (gethash key ns-table) rec)))
-                      ((getf rec :type)
-                       (let ((key (getf rec :type)))
-                         (unless (nth-value 1 (gethash key type-table))
-                           (push key type-order))
-                         (setf (gethash key type-table) rec)))))))))
+          (multiple-value-bind (forms n)
+              (read-sidecar-file-forms file :package :common-lisp)
+            (setf skipped n)
+            (dolist (rec forms)
+              (when (%valid-schema-manifest-form-p rec)
+                (cond
+                  ((getf rec :namespace)
+                   (let ((key (getf rec :namespace)))
+                     (unless (nth-value 1 (gethash key ns-table))
+                       (push key ns-order))
+                     (setf (gethash key ns-table) rec)))
+                  ((getf rec :type)
+                   (let ((key (getf rec :type)))
+                     (unless (nth-value 1 (gethash key type-table))
+                       (push key type-order))
+                     (setf (gethash key type-table) rec)))))))
         (error () nil)))
     (values (mapcar (lambda (k) (gethash k ns-table)) (nreverse ns-order))
             (mapcar (lambda (k) (gethash k type-table))
-                    (nreverse type-order)))))
+                    (nreverse type-order))
+            skipped)))
 
 ;;; ---------------------------------------------------------------------
 ;;; ENSURE-NAMESPACE (R4)
@@ -581,46 +595,63 @@ methods below it compile (GH #172, R3)."
   (let ((filter (%materialize-namespace-filter namespaces))
         (namespace-count 0)
         (materialized 0)
-        (skipped 0))
-    (dolist (rec (read-schema-manifest dir))
-      (let ((name (string (getf rec :namespace))))
-        (when (or (null filter) (member name filter :test #'string-equal))
-          ;; :RECORD-P NIL -- this row is already in the manifest.
-          (ensure-namespace name :nicknames (getf rec :nicknames)
-                                 :record-p nil)
-          (incf namespace-count))))
+        (skipped 0)
+        (skipped-unreadable 0))
+    ;; Two READ-SCHEMA-MANIFEST passes, same as before #226: a type row
+    ;; can't even READ until its own package exists, and that package
+    ;; may only get created by %MATERIALIZE-ORPHAN-PACKAGES below (a
+    ;; textual pre-scan, unaffected by read failures) -- so the FIRST
+    ;; pass here can find rows unreadable that the SECOND pass, after
+    ;; that package now exists, reads fine.  The first pass's own
+    ;; SIDECAR-RECORDS-SKIPPED is therefore muffled -- it is not yet
+    ;; the real answer -- and the second pass is authoritative for
+    ;; SKIPPED-UNREADABLE: what's still unreadable (e.g. GH #227's
+    ;; interior symbol in a package %MATERIALIZE-ORPHAN-PACKAGES never
+    ;; looks at) after that self-healing has had its chance.
+    (handler-bind ((sidecar-records-skipped #'muffle-warning))
+      (dolist (rec (read-schema-manifest dir))
+        (let ((name (string (getf rec :namespace))))
+          (when (or (null filter) (member name filter :test #'string-equal))
+            ;; :RECORD-P NIL -- this row is already in the manifest.
+            (ensure-namespace name :nicknames (getf rec :nicknames)
+                                   :record-p nil)
+            (incf namespace-count)))))
     ;; Packages first, and not only from namespace rows: a type row
     ;; cannot even be READ until its package exists.
     (%materialize-orphan-packages dir filter)
-    (let ((rows (remove-if-not
-                 (lambda (r) (%materialize-row-wanted-p r filter))
-                 (nth-value 1 (read-schema-manifest dir))))
-          (pending nil))
-      ;; Fail fast, before anything is built: ONE error naming every
-      ;; unresolved :CHECK function (approved point C), and one naming
-      ;; every unbuildable parent (I-2).  Half a materialization is
-      ;; worse than none: the stub classes it leaves behind make every
-      ;; later attempt skip those names as already defined.
-      (let ((missing (%unresolved-check-names
-                      (mapcar (lambda (r) (getf r :slots)) rows))))
-        (when missing
-          (error 'materialize-unresolved-functions :names missing)))
-      (let ((orphans (%unresolved-parent-names rows)))
-        (when orphans
-          (error 'materialize-unresolved-parents :names orphans)))
-      (dolist (row rows)
-        (if (%materialized-class-present-p (getf row :type))
-            (progn (%warn-if-row-diverges row) (incf skipped))
-            (push row pending)))
-      ;; Nothing this call installs may touch the manifest: every row
-      ;; came out of it (M-1).
-      (let ((*record-manifest-rows* nil))
-        (dolist (row (%materialize-sort (nreverse pending)))
-          (%materialize-row row)
-          (incf materialized))))
-    (list :namespaces namespace-count
-          :materialized materialized
-          :skipped-existing skipped)))
+    (multiple-value-bind (ns type-recs skipped-n) (read-schema-manifest dir)
+      ns
+      (setf skipped-unreadable skipped-n)
+      (let ((rows (remove-if-not
+                   (lambda (r) (%materialize-row-wanted-p r filter))
+                   type-recs))
+            (pending nil))
+        ;; Fail fast, before anything is built: ONE error naming every
+        ;; unresolved :CHECK function (approved point C), and one naming
+        ;; every unbuildable parent (I-2).  Half a materialization is
+        ;; worse than none: the stub classes it leaves behind make every
+        ;; later attempt skip those names as already defined.
+        (let ((missing (%unresolved-check-names
+                        (mapcar (lambda (r) (getf r :slots)) rows))))
+          (when missing
+            (error 'materialize-unresolved-functions :names missing)))
+        (let ((orphans (%unresolved-parent-names rows)))
+          (when orphans
+            (error 'materialize-unresolved-parents :names orphans)))
+        (dolist (row rows)
+          (if (%materialized-class-present-p (getf row :type))
+              (progn (%warn-if-row-diverges row) (incf skipped))
+              (push row pending)))
+        ;; Nothing this call installs may touch the manifest: every row
+        ;; came out of it (M-1).
+        (let ((*record-manifest-rows* nil))
+          (dolist (row (%materialize-sort (nreverse pending)))
+            (%materialize-row row)
+            (incf materialized))))
+      (list :namespaces namespace-count
+            :materialized materialized
+            :skipped-existing skipped
+            :skipped-unreadable skipped-unreadable))))
 
 (defmacro materialize-schema (dir &key namespaces)
   "Rebuild every runtime-defined package and class recorded in DIR's
