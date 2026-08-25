@@ -96,7 +96,9 @@ original definition -- even if BODY itself signals."
 schema.dat into the store's parent directory, and a graph created and
 read that way must reopen and read back correctly (GH #222)."
   (with-temp-directory (dir)
-    (let* ((parent (uiop:temporary-directory))
+    ;; The store's actual parent (the #214 run parent), NOT the temp
+    ;; root -- that is where a slashless location would scatter files.
+    (let* ((parent (uiop:pathname-parent-directory-pathname dir))
            (slashless (string-right-trim "/" (namestring dir)))
            id)
       (let ((g (make-graph :oh-graph slashless :buffer-pool-size 1000)))

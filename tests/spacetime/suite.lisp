@@ -19,8 +19,9 @@ Invoked by (asdf:test-system :graph-db/spacetime)."
          (let ((results (run 'spacetime-suite)))
            (explain! results)
            (results-status results))
-      (uiop:delete-directory-tree system-dir :validate t
-                                             :if-does-not-exist :ignore))))
+      ;; system-dir and all test scratch live under the shared per-run
+      ;; parent; drop it whole (GH #214).
+      (graph-db-test-scratch:cleanup-scratch-run))))
 
 (defun exact-interval (s e)
   "An interval extent with exact endpoints.  Three lines, duplicated from
@@ -42,24 +43,9 @@ can accidentally depend on the host timezone (design §3.5)."
 ;;; the same call GRAPH-DB/GEOS-TEST makes (tests/geos/suite.lisp).
 ;;; ---------------------------------------------------------------------------
 
-(defvar *scratch-random-state* nil)
-(defvar *scratch-counter* 0)
-
-(defun scratch-tag ()
-  "A name fragment unique across concurrent processes and across calls."
-  (unless *scratch-random-state*
-    (setf *scratch-random-state* (make-random-state t)))
-  (format nil "~36R-~36R"
-          (random (expt 36 12) *scratch-random-state*)
-          (incf *scratch-counter*)))
-
 (defun make-temp-directory ()
-  "Create and return a fresh, unique scratch directory pathname."
-  (let ((dir (merge-pathnames
-              (format nil "graph-db-spacetime-~A/" (scratch-tag))
-              (uiop:temporary-directory))))
-    (ensure-directories-exist dir)
-    dir))
+  "A fresh scratch dir under the shared per-run parent (GH #214)."
+  (graph-db-test-scratch:make-scratch-directory "graph-db-spacetime"))
 
 (defmacro with-temp-directory ((var) &body body)
   "Bind VAR to a fresh scratch directory, run BODY, then delete the tree."

@@ -63,7 +63,21 @@ To run one, e.g.:
 (test-alloc)
 ```
 
-Tests write scratch databases under `/var/tmp/`; clean those up between runs if state seems stale.
+Scratch locations differ between the two generations of tests:
+
+- **FiveAM suites** put all scratch under one per-run parent,
+  `$TMPDIR/graph-db-test-run-<tag>/` (shared `graph-db/test-scratch` system,
+  GH #214). Each runner deletes its parent on exit, and suite start sweeps the
+  temp root for scratch older than 24 hours (a whitelist of `graph-db-*`,
+  `gda-*`, `vgseg-*`, `vgquery-*` name prefixes; symlinks skipped) — so stale
+  trees from killed runs clean themselves up. Manual cleanup if ever needed —
+  note these globs are broader than the sweep's exact whitelist, so check
+  nothing else of yours matches first:
+  `rm -rf ${TMPDIR:-/tmp}/graph-db-* ${TMPDIR:-/tmp}/gda-*
+  ${TMPDIR:-/tmp}/vgseg-* ${TMPDIR:-/tmp}/vgquery-*`.
+- **The ad-hoc REPL exercises above** write scratch databases under
+  `/var/tmp/` (e.g. `/var/tmp/graph/`); clean those up between runs if state
+  seems stale — nothing sweeps them.
 
 ## Architecture (bottom-up)
 
