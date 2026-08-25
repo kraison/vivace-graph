@@ -217,3 +217,69 @@ store-id registry's own reopen path (%STORE-REGISTRY-LOAD ->
         (setq graph-db::*store-registry* nil)
         (with-hostile-read-env
           (is (eql target-id (store-registry-id-for 'sr-hostile-target))))))))
+
+;;; GH #234: shadow-store's policy.dat / lease.dat and system-restore's
+;;; restore manifest now go through WITH-SIDECAR-OUTPUT/-INPUT instead
+;;; of partial *PRINT-READABLY*/*READ-EVAL* bindings.
+
+(defmacro with-hostile-print-env (&body body)
+  "Every ambient binding a sidecar WRITER must survive: hex *PRINT-BASE*
+(with *PRINT-RADIX* noise), truncating *PRINT-LENGTH*/*PRINT-LEVEL*,
+and -- the #234-specific hazard for the previously package-blind
+shadow-store writers -- *PACKAGE* bound to KEYWORD, under which an
+unfixed PRIN1 drops every keyword's leading colon."
+  `(let ((*print-base* 16) (*print-radix* t)
+         (*print-length* 1) (*print-level* 1)
+         (*print-case* :downcase)
+         (*package* (find-package :keyword)))
+     ,@body))
+
+(test shadow-policy-survives-a-hostile-dynamic-environment
+  "GH #234: SET-STORE-RECOVERY-POLICY under hostile printer bindings
+still writes a line STORE-RECOVERY-POLICY (itself under hostile reader
+bindings) reads back as the same keyword -- pre-fix, *PACKAGE* KEYWORD
+made the policy print colon-less and fail the strict member check."
+  (with-temp-directory (dir)
+    (with-hostile-print-env
+      (graph-db::set-store-recovery-policy dir :derivable))
+    (with-hostile-read-env
+      (is (eq :derivable (graph-db::store-recovery-policy dir))))))
+
+(test shadow-lease-survives-a-hostile-dynamic-environment
+  "GH #234: %PERSIST-LEASE/%READ-LEASE round-trip decimal integers and
+keywords under hostile bindings on both sides -- pre-fix, *PRINT-BASE*
+16 wrote the lease bounds in hex and *PRINT-LENGTH* 1 truncated the
+plist to (:LEASE-START ...)."
+  (with-temp-directory (dir)
+    (with-hostile-print-env
+      (graph-db::%persist-lease dir 100 2000000))
+    (with-hostile-read-env
+      (let ((lease (graph-db::%read-lease dir)))
+        (is (eql 100 (getf lease :lease-start)))
+        (is (eql 2000000 (getf lease :lease-end)))))))
+
+(test restore-manifest-survives-a-hostile-dynamic-environment
+  "GH #234: %WRITE-MANIFEST / READ-RESTORE-MANIFEST under hostile
+bindings on both sides; the decimal :STATE-AT and the keyword actions
+must survive exactly."
+  (with-temp-directory (dir)
+    (let ((clock (graph-db::%make-system-clock
+                  :location (namestring dir)))
+          (manifest (list :restore t :requested 5 :at 100
+                          :clock (namestring dir)
+                          :stores (list (list :store :m234-store
+                                              :action :rewound
+                                              :state-at 100
+                                              :exact t)))))
+      (with-hostile-print-env
+        (graph-db::%write-manifest clock manifest))
+      (with-hostile-read-env
+        (let* ((back (graph-db::read-restore-manifest
+                      (graph-db::%manifest-file clock 100)))
+               (entry (first (getf back :stores))))
+          (is (eql 5 (getf back :requested)))
+          (is (eql 100 (getf back :at)))
+          (is (eq :m234-store (getf entry :store)))
+          (is (eq :rewound (getf entry :action)))
+          (is (eql 100 (getf entry :state-at)))
+          (is (eq t (getf entry :exact))))))))

@@ -673,6 +673,15 @@ to disk and remove it."
     (error 'system-directory-required :operation 'make-graph))
   (when (and replay-txn-dir (not slave-p))
     (error ":REPLAY-TXN-DIR is only for slave graphs"))
+  ;; Replay runs BEFORE the clock attaches, so replayed nodes would get
+  ;; ids from the local counter -- the very audit-class bug #168 exists
+  ;; to prevent.  Refuse before any side effect (GH #180).
+  (when (and slave-p replay-txn-dir system-clock)
+    (error "MAKE-GRAPH: :REPLAY-TXN-DIR cannot be combined with a ~
+:SYSTEM-CLOCK (yours may come implicitly from *SYSTEM-CLOCK*): replay ~
+would mint ids from the store's local counter before the clock ~
+attaches.  Create the clocked graph first, then replay into it once it ~
+is open (GH #180)."))
   (when (and (or slave-p master-p) (not replication-port))
     (error ":REPLICATION-PORT is required for master and slave graphs"))
   (when (and slave-p (not master-host))

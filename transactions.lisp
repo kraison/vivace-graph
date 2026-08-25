@@ -1011,7 +1011,10 @@ APPLY-TRANSACTION)."
                    :type "dat"
                    :defaults (location graph))))
 
-(defgeneric persist-highest-transaction-id (transaction-id graph)
+(defgeneric %write-highest-transaction-id (transaction-id graph)
+  (:documentation "Unconditional raw overwrite of transaction-id.dat --
+no max, no lock.  For crash-fabricating tests; production writers go
+through PERSIST-HIGHEST-TRANSACTION-ID (GH #177).")
   (:method (transaction-id graph)
     (let ((persist-file (highest-transaction-id-file graph))
           (serialized (make-byte-vector 8)))
@@ -1021,9 +1024,21 @@ APPLY-TRANSACTION)."
                               :element-type '(unsigned-byte 8)
                               :if-does-not-exist :create
                               :if-exists :overwrite)
-        (with-recursive-lock-held (*highest-transaction-id-lock*)
-          (write-sequence serialized stream)))
+        (write-sequence serialized stream))
       transaction-id)))
+
+(defgeneric persist-highest-transaction-id (transaction-id graph)
+  (:documentation "Persist TRANSACTION-ID as GRAPH's durable watermark
+unless a higher one is already on disk -- the file only ever moves
+forward.  Returns the id actually on disk after the call (GH #177).")
+  (:method (transaction-id graph)
+    ;; Lock spans read-compare-write: two racing writers must not let
+    ;; the lower id land last (GH #177).
+    (with-recursive-lock-held (*highest-transaction-id-lock*)
+      (let ((current (load-highest-transaction-id graph)))
+        (if (> transaction-id current)
+            (%write-highest-transaction-id transaction-id graph)
+            current)))))
 
 (defgeneric load-highest-transaction-id (graph)
   (:method (graph)
@@ -3174,10 +3189,15 @@ longer open (GH #171, spec R6)."
                             (if (peer-graph-p graph)
                                 (load-peer-pull-cursor graph)
                                 0))))
-        (clock-observe-epoch clock watermark)
-        (journal-append clock :attach :store (graph-name graph)
-                        :location (namestring (location graph)))
-        (setf (graph-system-clock graph) clock))))
+        ;; One clock-lock hold over raise+record, so no allocator slots
+        ;; between them.  Lock ordering invariant: manager -> clock,
+        ;; never the reverse -- every site that holds both takes the TM
+        ;; lock first (GH #184).
+        (with-recursive-lock-held ((system-clock-lock clock))
+          (clock-observe-epoch clock watermark)
+          (journal-append clock :attach :store (graph-name graph)
+                          :location (namestring (location graph)))
+          (setf (%graph-system-clock graph) clock)))))
   graph)
 
 (defgeneric remove-transaction (transaction transaction-manager)
@@ -3597,9 +3617,14 @@ hand over."))
       (%quiesce-transaction-manager tm :detaching timeout)
       (handler-case
           (multiple-value-bind (start end)
-              (clock-lease-epochs clock lease-epochs)
-            (journal-append clock :detach
-                            :store name :lease-start start :lease-end end)
+              ;; One clock-lock hold over lease+record (GH #184); no TM
+              ;; lock is held here, so the manager->clock order holds.
+              (with-recursive-lock-held ((system-clock-lock clock))
+                (multiple-value-bind (start end)
+                    (clock-lease-epochs clock lease-epochs)
+                  (journal-append clock :detach :store name
+                                  :lease-start start :lease-end end)
+                  (values start end)))
             ;; CLOSE-GRAPH's own snapshot scans the graph via WITH-READ-PIN;
             ;; ACCEPTING-P is already :DETACHING, so it needs the one bypass
             ;; above -- see *QUIESCED-STORE-CLOSING-P*'s docstring.

@@ -240,13 +240,16 @@ applied-op-id dedup lhash (opened when MODE is :OPEN and it already exists)."
                           &key package replication-port replication-key
                             peer-role origin-id peer-host lazy
                             export-predicate device-registry merge-policy
-                            reference-classes (peer-schema-version '(1 0)))
+                            reference-classes (peer-schema-version '(1 0))
+                            (system-clock *system-clock*))
   "Create a brand-new in-memory graph named NAME.  LOCATION is used for the
 durable journal, cl-store image and schema (the RAM structures are rebuilt from
 them on OPEN-MEMORY-GRAPH).  With :PEER-ROLE (:HUB or :DEVICE, a :DEVICE also
 needs a hub-minted :ORIGIN-ID) a MEMORY-PEER-GRAPH is built and the peer
 replication path is wired.  With :LAZY, the graph uses the VG-native image format
 and materializes nodes on first touch (fault-on-access) for a near-instant open.
+:SYSTEM-CLOCK (default *SYSTEM-CLOCK*) attaches the graph to the image-level
+epoch clock, exactly as MAKE-GRAPH does (GH #176).
 Registers the graph and returns it."
   (%validate-peer-role peer-role origin-id)
   (ensure-directories-exist location)
@@ -278,6 +281,18 @@ Registers the graph and returns it."
     ;; rather than "brand new" (GH #129).  No nodes yet, so no scan.
     (let ((*graph* graph))
       (install-unique-tuple-constraints graph))
+    ;; Join the image-level clock, as MAKE-GRAPH does (GH #176).  Last,
+    ;; once GRAPH-OPEN-P is set, so a failed attach unwinds through the
+    ;; NORMAL close path (deregister, delete .dirty) instead of leaving
+    ;; a half-registered graph behind (same shape as GH #212).
+    (when system-clock
+      (let ((attached nil))
+        (unwind-protect
+            (progn (attach-to-system-clock graph system-clock)
+                   (setf attached t))
+          (unless attached
+            (let ((*graph* graph))
+              (ignore-errors (close-graph graph :snapshot-p nil)))))))
     graph))
 
 ;;; ---------------------------------------------------------------------------
@@ -962,13 +977,16 @@ and the app re-cold-syncs.  Cheap: ~0.06 s / 0.2 MB for ~800 nodes."
                           &key package replication-port replication-key
                             peer-role origin-id peer-host lazy regenerate-views
                             export-predicate device-registry merge-policy
-                            reference-classes (peer-schema-version '(1 0)))
+                            reference-classes (peer-schema-version '(1 0))
+                            (system-clock *system-clock*))
   "Reopen the in-memory graph NAME from LOCATION: restore the schema, restore the
 image checkpoint (if any), then replay the retained .txn journal tail.  Tolerates a
 .dirty marker (a memory-graph always rebuilds from its durable journal + image, so
 an unclean shutdown is recovered, not an error).  :PEER-ROLE and the peer keys
 mirror MAKE-MEMORY-GRAPH, reopening a MEMORY-PEER-GRAPH.  With :LAZY, nodes restore
-as deferred blobs and materialize on first touch (needs a VG-native image)."
+as deferred blobs and materialize on first touch (needs a VG-native image).
+:SYSTEM-CLOCK (default *SYSTEM-CLOCK*) attaches to the image-level epoch clock,
+as OPEN-GRAPH does (GH #176)."
   (%validate-peer-role peer-role origin-id)
   (ensure-directories-exist location)
   (let* ((path (pathname location))
@@ -1059,6 +1077,16 @@ as deferred blobs and materialize on first touch (needs a VG-native image)."
     (init-replication-log graph)
     (start-replication graph :package package)
     (setf (graph-open-p graph) t)
+    ;; Join the image-level clock, as OPEN-GRAPH does (GH #176).  Last,
+    ;; once GRAPH-OPEN-P is set -- see MAKE-MEMORY-GRAPH's comment.
+    (when system-clock
+      (let ((attached nil))
+        (unwind-protect
+            (progn (attach-to-system-clock graph system-clock)
+                   (setf attached t))
+          (unless attached
+            (let ((*graph* graph))
+              (ignore-errors (close-graph graph :snapshot-p nil)))))))
     graph))
 
 ;; Clean-close checkpoint: write the image, then clear the (now-superseded)
