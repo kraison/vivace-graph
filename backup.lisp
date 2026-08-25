@@ -161,10 +161,11 @@ RECREATE-GRAPH's :PACKAGE-NAME."
    (store-id :initarg :store-id :reader dangling-edge-store-id))
   (:report
    (lambda (c s)
-     (format s "Backup includes edge ~A whose endpoint ~A lives in ~
-store ~A, which is not open -- the edge is written, connectivity is ~
-preserved, and restoring it before that store is attached leaves it ~
-dangling (GH #169, spec sec.7)."
+     (format s "Backup includes edge ~A whose endpoint ~A is absent ~
+here; its tag resolves to store ~A in THIS system's registry -- a ~
+foreign-minted id may name that store unsoundly (GH #209).  The edge ~
+is written, connectivity is preserved, and restoring it before the ~
+endpoint's store is attached leaves it dangling (GH #169, spec sec.7)."
              (dangling-edge-id c) (dangling-edge-endpoint-id c)
              (dangling-edge-store-id c)))))
 
@@ -173,7 +174,9 @@ dangling (GH #169, spec sec.7)."
 GRAPH's own table and either detached (registered, not open) or
 resolved to a DIFFERENT open graph -- both cases leave it absent from
 this backup file (GH #169, spec sec.7).  EDGE is still written either
-way; this only reports the gap."
+way; this only reports the gap.  The named store is per THIS system's
+registry -- a foreign-tagged id resolves unsoundly, so the report
+hedges rather than asserts it (GH #209)."
   (unless (lookup-vertex endpoint-id :graph graph)
     (multiple-value-bind (endpoint-graph status store-id)
         (resolve-node-graph endpoint-id)

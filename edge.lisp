@@ -291,41 +291,72 @@ regenerates the id on a duplicate-key collision."
            :node edge))
   (delete-node edge graph))
 
-(defun %active-endpoint-status (id graph)
-  "(values VERTEX-OR-NIL STATUS) for edge endpoint ID against GRAPH, for
-ACTIVE-EDGE-P.  :FOUND when GRAPH's own table (or, for a definitely
-cross-store v8 id, LOOKUP-VERTEX-ANYWHERE) resolves a live vertex;
-:MISSING for a same-store/untagged miss -- unchanged pre-#169 semantics,
-an edge with a genuinely absent endpoint is inactive; :UNKNOWN for a
-cross-store id whose store is detached or unregistered -- can't disprove
-liveness, so it must not silently kill the edge (D8; GH #169).
-LOOKUP-VERTEX-ANYWHERE is defined in interface.lisp, loaded after this
-file; resolved at runtime like PIN-READ-EPOCH in graph-class.lisp.
+(defun %another-store-open-p (graph)
+  "True when any open graph other than GRAPH is registered in *GRAPHS*.
+Gates the v5 cross-store scan in %ACTIVE-ENDPOINT-STATUS (GH #208)."
+  (maphash (lambda (name g)
+             (declare (ignore name))
+             (when (and (not (eq g graph)) (graph-open-p g))
+               (return-from %another-store-open-p t)))
+           *graphs*)
+  nil)
 
-Two accepted scoped gaps here, not full parity with the resolver
-(GH #208): (1) an untagged v5 id gets NO cross-store scan -- a same-
-store miss is :MISSING/inactive even if the vertex lives in another
-open store, unlike LOOKUP-VERTEX-ANYWHERE's own v5 fallback; a
-deliberate hot-path tradeoff, this runs on every MAP-EDGES emit.
-(2) an unregistered v8 tag (:UNKNOWN) counts as active -- we cannot
-disprove liveness -- so a compacting/GC pass over edges will never
-collect such an edge, where pre-#169 it eventually would have; a
-conservative choice, not a bug."
+(defun %active-endpoint-status (id graph)
+  "(values VERTEX-OR-NIL STATUS) for edge endpoint ID against GRAPH,
+for ACTIVE-EDGE-P and COMPACT-EDGES.  STATUS is one of:
+  :FOUND    -- a live table holds the vertex (GRAPH's own, or another
+     open store's -- including a v5 id found by the all-open-stores
+     scan, which runs on a miss whenever another store is open;
+     measured ~3.5us per open store, affordable here (GH #208)).
+  :MISSING  -- disproved without trusting a tag: a same-store v8
+     miss, or a v5 miss after (or with no stores to) scan -- a
+     completed v5 scan IS disproof, there is no tag to mistrust,
+     though it covers OPEN stores only: a v5 vertex in a detached
+     store is invisible (a tagless id cannot name it) and its edge
+     compacts even under :CONSERVATIVE.
+  :ABSENT-IN-STORE -- the tag resolves to an open store whose own
+     table misses.
+  :DETACHED -- the registry knows the tag; its store is not open.
+  :UNKNOWN  -- this system's registry never assigned the tag.
+Trap (GH #208, #209): a tag indexes THIS system's registry, but ids
+travel -- peer hubs hold device-minted v8 ids verbatim, restores cross
+systems -- so :ABSENT-IN-STORE and :UNKNOWN are disproof only where
+the tag is trusted.  ACTIVE-EDGE-P counts both (and :DETACHED) as
+live; only COMPACT-EDGES' explicit :TRUST-TAGS policy collects them.
+RESOLVE-NODE-GRAPH / LOOKUP-VERTEX-ANYWHERE live in interface.lisp,
+loaded after this file; resolved at runtime like PIN-READ-EPOCH in
+graph-class.lisp."
   (let ((v (lookup-vertex id :graph graph)))
-    (cond
-      (v (values v :found))
-      (t (let ((tag (id-store-tag id)))
-           (if (and tag (not (eql tag (store-id graph))))
-               (let ((r (lookup-vertex-anywhere id)))
-                 (if (vertex-p r) (values r :found) (values nil :unknown)))
-               (values nil :missing)))))))
+    (if v
+        (values v :found)
+        (let ((tag (id-store-tag id)))
+          (cond
+            ((and tag (not (eql tag (store-id graph))))
+             (multiple-value-bind (other status) (resolve-node-graph id)
+               (ecase status
+                 (:resolved
+                  (let ((r (lookup-vertex id :graph other)))
+                    (if r
+                        (values r :found)
+                        (values nil :absent-in-store))))
+                 (:detached (values nil :detached))
+                 (:unknown (values nil :unknown)))))
+            ((and (null tag) (%another-store-open-p graph))
+             (let ((r (lookup-vertex-anywhere id)))
+               (if (vertex-p r)
+                   (values r :found)
+                   (values nil :missing))))
+            (t (values nil :missing)))))))
 
 (defmethod active-edge-p ((edge edge) &key (graph *graph*))
   (flet ((endpoint-active-p (id)
            (multiple-value-bind (v status) (%active-endpoint-status id graph)
              (ecase status
                (:found (not (deleted-p v)))
-               (:unknown t)
+               ;; Not disprovable without trusting the tag -> live
+               ;; (GH #208, #209); COMPACT-EDGES :TRUST-TAGS is the
+               ;; explicit opt-in.
+               ((:detached :unknown :absent-in-store) t)
                (:missing nil)))))
     (and (not (deleted-p edge))
          (endpoint-active-p (from edge))
@@ -405,7 +436,10 @@ typed/adjacency scans skip the 0 sentinel, as they always have.)"
     (with-read-pin (graph) ; retain whatever versions this scan observes
       (flet ((emit (edge)
                (when (and edge (written-p edge)
-                          (or include-deleted-p (active-edge-p edge)))
+                          ;; Explicit :GRAPH, not dynamic *GRAPH* --
+                          ;; the wrong-graph pattern (GH #208 unit).
+                          (or include-deleted-p
+                              (active-edge-p edge :graph graph)))
                  (if collect-p (push (funcall fn edge) result) (funcall fn edge))))
              (keep-type (tid) (and (plusp tid) (not (member tid excluded)))))
         (cond
@@ -447,7 +481,9 @@ typed/adjacency scans skip the 0 sentinel, as they always have.)"
             #'(lambda (pair)
                 (let ((edge (cdr pair)))
                   (when (and edge (written-p edge)
-                             (or include-deleted-p (active-edge-p edge))
+                             ;; Explicit :GRAPH -- see EMIT above.
+                             (or include-deleted-p
+                                 (active-edge-p edge :graph graph))
                              (not (member (type-id edge) excluded)))
                     (setf (id edge) (car pair))
                     ;; The deserializer builds these; a side-effect scan never
@@ -485,13 +521,65 @@ subtypes.  :INCLUDE-DELETED-P includes soft-deleted edges (excluded by default).
              :include-subclasses-p include-subclasses-p :direction :in
              :collect-p t :include-deleted-p include-deleted-p))
 
-(defmethod compact-edges ((graph graph))
-  (map-edges (lambda (edge)
-               (unless (active-edge-p edge)
-                 (unless (deleted-p edge)
-                   (delete-edge edge :graph graph))
-                 (remove-from-type-index edge graph)
-                 (remove-from-ve-index edge graph)
-                 (remove-from-vev-index edge graph)))
-             graph
-             :include-deleted-p t))
+(define-condition compact-trust-tags-on-peer-error (error)
+  ((graph :initarg :graph :reader compact-trust-tags-peer-graph))
+  (:report
+   (lambda (c s)
+     (format s "COMPACT-EDGES :POLICY :TRUST-TAGS refused on peer ~
+graph ~S: peer tables hold foreign-minted v8 ids whose tags index ~
+ANOTHER system's registry, so an unrecognized tag is not disproof of ~
+liveness there (GH #209)."
+             (compact-trust-tags-peer-graph c)))))
+
+(define-condition compact-trust-tags-no-registry-error (error)
+  ((graph :initarg :graph :reader compact-trust-tags-registry-graph))
+  (:report
+   (lambda (c s)
+     (format s "COMPACT-EDGES :POLICY :TRUST-TAGS refused on ~S: no ~
+store registry is loaded (*SYSTEM-DIRECTORY* is NIL), so a ~
+registered-but-detached tag cannot be told apart from an unassigned ~
+one -- :TRUST-TAGS would delete edges to reattachable stores ~
+(GH #208, #209)."
+             (compact-trust-tags-registry-graph c)))))
+
+(defmethod compact-edges ((graph graph) &key (policy :conservative))
+  "Delete and de-index GRAPH's edges whose endpoints are disproved.
+:POLICY :CONSERVATIVE (default) compacts only tag-free disproof --
+a soft-deleted edge's indexes, a :MISSING endpoint, or a :FOUND
+endpoint that is itself deleted.  :POLICY :TRUST-TAGS additionally
+compacts :UNKNOWN and :ABSENT-IN-STORE endpoints, treating this
+system's tag space as authoritative -- refused on a PEER-GRAPH
+(COMPACT-TRUST-TAGS-ON-PEER-ERROR), whose tables hold foreign-tagged
+ids, and with no store registry loaded (*SYSTEM-DIRECTORY* NIL,
+COMPACT-TRUST-TAGS-NO-REGISTRY-ERROR), where :DETACHED cannot be told
+from :UNKNOWN (GH #208, #209).  A :DETACHED endpoint is never
+compacted under either policy: its store may reattach.  Returns NIL.
+Trap: runs the untyped live-lhash scan -- use on a quiescent graph
+only."
+  (ecase policy ((:conservative :trust-tags)))
+  (when (eq policy :trust-tags)
+    (when (typep graph 'peer-graph)
+      (error 'compact-trust-tags-on-peer-error :graph graph))
+    ;; No registry -> :detached is unreachable (RESOLVE-NODE-GRAPH
+    ;; needs *SYSTEM-DIRECTORY* to confirm a tag), so every detached
+    ;; tag would classify :UNKNOWN and be collected (GH #208, #209).
+    (unless *system-directory*
+      (error 'compact-trust-tags-no-registry-error :graph graph)))
+  (flet ((endpoint-dead-p (id)
+           (multiple-value-bind (v status) (%active-endpoint-status id graph)
+             (ecase status
+               (:found (deleted-p v))
+               (:missing t)
+               (:detached nil)
+               ((:unknown :absent-in-store) (eq policy :trust-tags))))))
+    (map-edges (lambda (edge)
+                 (when (or (deleted-p edge)
+                           (endpoint-dead-p (from edge))
+                           (endpoint-dead-p (to edge)))
+                   (unless (deleted-p edge)
+                     (delete-edge edge :graph graph))
+                   (remove-from-type-index edge graph)
+                   (remove-from-ve-index edge graph)
+                   (remove-from-vev-index edge graph)))
+               graph
+               :include-deleted-p t)))

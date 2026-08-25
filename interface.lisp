@@ -14,7 +14,10 @@ holding store's id (or NIL when untagged/unknown).  ID may be a
 32-hex-digit string, coerced like LOOKUP-VERTEX (GH #209).  A tag whose
 store the registry once knew but *SYSTEM-DIRECTORY* is unbound at
 query time also reports :UNKNOWN, not :DETACHED -- :DETACHED requires
-a live registry to confirm the tag (GH #169, #209)."
+a live registry to confirm the tag (GH #169, #209).  Trap: a tag is an
+index into THIS system's registry only; a foreign-minted v8 id (peer
+hub, cross-system restore) whose tag coincides with a local store-id
+resolves to the WRONG graph yet reports :RESOLVED (GH #209)."
   (when (stringp id)
     (setq id (read-id-array-from-string id)))
   (let ((tag (id-store-tag id)))
