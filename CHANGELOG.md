@@ -59,6 +59,22 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Changed
 
+- **Test scratch space is now self-cleaning** (#214). All FiveAM suites
+  route their scratch (per-test directories, loose files, each runner's
+  system directory) through a new shared `GRAPH-DB/TEST-SCRATCH` system:
+  everything lives under one lazily created per-run parent,
+  `$TMPDIR/graph-db-test-run-<tag>/`, which each runner deletes whole in
+  its unwind — a killed or crashed run leaks exactly one tree instead of
+  hundreds of flat `graph-db-test-*` entries. Creating the parent also
+  sweeps the temp root once per run parent for stale scratch (an exact
+  whitelist of `graph-db-*`/`gda-*`/`vgseg-*`/`vgquery-*` name prefixes;
+  symlinks are skipped, never followed) older than 24 hours
+  (`SWEEP-STALE-SCRATCH`), so leaked trees from aborted runs no longer
+  accumulate (1.2 TB was observed once). The age guard keeps concurrent
+  runs on a shared host safe. Manual cleanup:
+  `rm -rf ${TMPDIR:-/tmp}/graph-db-* ${TMPDIR:-/tmp}/gda-*` (plus
+  `vgseg-*`/`vgquery-*` loose files).
+
 - **`DEF-NODE-TYPE` now installs through a shared functional core**
   (#172). The macro's expansion keeps only the literal `DEFCLASS`; the
   generated helpers (`MAKE-<N>`, `LOOKUP-<N>`, `<N>-P`), the `<N>/2` and

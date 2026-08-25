@@ -249,19 +249,22 @@ Measurement-only; always returns T."
     (reset-perf-report)
     (format t "~&=== graph-db perf (~A, scale ~A) ===~%" *lisp-impl* scale)
     (finish-output)
-    (bench-crud)
-    (bench-edges)
-    (bench-view)
-    (bench-unique)
-    (bench-index)
-    (bench-prolog)
-    (bench-commit-overhead)
-    (bench-concurrent-rw)
-    (bench-disk-growth)
-    (bench-snapshot-restore-reopen)
-    (write-perf-report output :tag tag)
-    (uiop:delete-directory-tree system-dir :validate t
-                                           :if-does-not-exist :ignore))
+    (unwind-protect
+         (progn
+           (bench-crud)
+           (bench-edges)
+           (bench-view)
+           (bench-unique)
+           (bench-index)
+           (bench-prolog)
+           (bench-commit-overhead)
+           (bench-concurrent-rw)
+           (bench-disk-growth)
+           (bench-snapshot-restore-reopen)
+           (write-perf-report output :tag tag))
+      ;; system-dir and all bench scratch live under the shared per-run
+      ;; parent; drop it whole (GH #214).
+      (graph-db-test-scratch:cleanup-scratch-run)))
   t)
 
 ;; Alias so the headless driver can call (graph-db/perf-test:perf-suite).

@@ -28,43 +28,26 @@ Invoked by (asdf:test-system :graph-db)."
          (let ((results (run 'graph-db-suite)))
            (explain! results)
            (results-status results))
-      (uiop:delete-directory-tree system-dir :validate t
-                                             :if-does-not-exist :ignore))))
+      ;; Everything this run scratched -- system-dir included -- lives
+      ;; under the shared per-run parent; drop it whole (GH #214).
+      (graph-db-test-scratch:cleanup-scratch-run))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Temp-file fixtures
 ;;;
 ;;; The storage layers all live in mmap'd files, so each test needs a
 ;;; private scratch directory that is reliably torn down afterwards.
+;;; All scratch lives under GRAPH-DB-TEST-SCRATCH's per-run parent, which
+;;; also sweeps stale trees from killed runs (GH #214).
 ;;; ---------------------------------------------------------------------------
-
-;; SBCL's initial *RANDOM-STATE* is a fixed constant, so an unseeded (RANDOM ...)
-;; produces the SAME name sequence in every image: two concurrent suite runs on a
-;; shared host would share -- and delete -- each other's scratch dirs.  Seed from
-;; entropy, lazily so a dumped image reseeds in each new process, and add a
-;; counter so one image can never repeat a name either.
-(defvar *scratch-random-state* nil)
-(defvar *scratch-counter* 0)
-
-(defun scratch-tag ()
-  "A name fragment unique across concurrent processes and across calls."
-  (unless *scratch-random-state*
-    (setf *scratch-random-state* (make-random-state t)))
-  (format nil "~36R-~36R"
-          (random (expt 36 12) *scratch-random-state*)
-          (incf *scratch-counter*)))
 
 (defun make-temp-directory ()
   "Create and return a fresh, unique scratch directory pathname."
-  (let ((dir (merge-pathnames (format nil "graph-db-test-~A/" (scratch-tag))
-                              (uiop:temporary-directory))))
-    (ensure-directories-exist dir)
-    dir))
+  (graph-db-test-scratch:make-scratch-directory "graph-db-test"))
 
 (defun make-temp-file-name (prefix type)
   "A unique, not-yet-created scratch file pathname (PREFIX-<tag>.TYPE)."
-  (merge-pathnames (format nil "~A-~A.~A" prefix (scratch-tag) type)
-                   (uiop:temporary-directory)))
+  (graph-db-test-scratch:make-scratch-file-name prefix type))
 
 (defmacro with-temp-directory ((var) &body body)
   "Bind VAR to a fresh scratch directory, run BODY, then delete the tree."

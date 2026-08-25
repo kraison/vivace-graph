@@ -197,10 +197,16 @@
   :components ((:file "rest"))
   :in-order-to ((test-op (test-op :graph-db/test))))
 
+(defsystem graph-db/test-scratch
+  :name "VivaceGraph shared test scratch-space manager"
+  :description "Per-run scratch parent + stale sweep for all suites (GH #214)."
+  :pathname "tests/"
+  :components ((:file "scratch")))
+
 (defsystem graph-db/concurrency-test
   :name "VivaceGraph concurrency test suite"
   :description "FiveAM thread-safety and concurrency tests for graph-db."
-  :depends-on (:graph-db :fiveam :bordeaux-threads)
+  :depends-on (:graph-db :graph-db/test-scratch :fiveam :bordeaux-threads)
   :pathname "tests/concurrency/"
   :serial t
   :components ((:file "package")
@@ -221,7 +227,7 @@
 
 (defsystem graph-db/acid-test
   :name "VivaceGraph ACID compliance tests"
-  :depends-on (:graph-db :fiveam :bordeaux-threads)
+  :depends-on (:graph-db :graph-db/test-scratch :fiveam :bordeaux-threads)
   :pathname "tests/acid/"
   :serial t
   :components ((:file "package")
@@ -236,7 +242,7 @@
 (defsystem graph-db/stress-test
   :name "VivaceGraph stress test suite"
   :description "Single-threaded scale and correctness stress tests for graph-db."
-  :depends-on (:graph-db :fiveam)
+  :depends-on (:graph-db :graph-db/test-scratch :fiveam)
   :pathname "tests/stress/"
   :serial t
   :components ((:file "package")
@@ -254,7 +260,8 @@
 (defsystem graph-db/concurrent-stress-test
   :name "VivaceGraph concurrent stress test suite"
   :description "Multi-threaded scale and stability tests for graph-db."
-  :depends-on (:graph-db :fiveam :bordeaux-threads)
+  :depends-on (:graph-db :graph-db/test-scratch :fiveam
+               :bordeaux-threads)
   :pathname "tests/concurrent-stress/"
   :serial t
   :components ((:file "package")
@@ -275,7 +282,7 @@
 (defsystem graph-db/perf-test
   :name "VivaceGraph performance benchmark suite"
   :description "SBCL-focused performance benchmarks for graph-db (measurement, not pass/fail)."
-  :depends-on (:graph-db :bordeaux-threads)
+  :depends-on (:graph-db :graph-db/test-scratch :bordeaux-threads)
   :pathname "tests/perf/"
   :serial t
   :components ((:file "package")
@@ -356,7 +363,8 @@
 (defsystem graph-db/algorithms-test
   :name "VivaceGraph graph-algorithms test suite"
   :description "FiveAM tests for graph-db/algorithms."
-  :depends-on (:graph-db/algorithms :graph-db/algorithms-io :fiveam)
+  :depends-on (:graph-db/algorithms :graph-db/algorithms-io
+               :graph-db/test-scratch :fiveam)
   :pathname "tests/algorithms/"
   :serial t
   :components ((:file "package")
@@ -395,7 +403,8 @@
 (defsystem graph-db/geos-test
   :name "VivaceGraph GEOS test suite"
   :description "FiveAM tests for the optional GEOS integration."
-  :depends-on (:graph-db/geos :fiveam :bordeaux-threads)
+  :depends-on (:graph-db/geos :graph-db/test-scratch :fiveam
+               :bordeaux-threads)
   :pathname "tests/geos/"
   :serial t
   :components ((:file "package")
@@ -444,7 +453,8 @@ cl-temporal-extent."
   ;; without the add-on REGISTER-GEOMETRY correctly refuses to answer at
   ;; all (#138, design §6).  The GEOS-dependent test skips when libgeos_c
   ;; is absent, as tests/geos/ does.
-  :depends-on (:graph-db/spacetime :graph-db/core :graph-db/geos :fiveam)
+  :depends-on (:graph-db/spacetime :graph-db/core :graph-db/geos
+               :graph-db/test-scratch :fiveam)
   :pathname "tests/spacetime/"
   :serial t
   :components ((:file "package")
@@ -469,7 +479,7 @@ cl-temporal-extent."
 (defsystem graph-db/test
   :name "VivaceGraph test suite"
   :description "FiveAM unit tests for graph-db."
-  :depends-on (:graph-db :fiveam :drakma)
+  :depends-on (:graph-db :graph-db/test-scratch :fiveam :drakma)
   :pathname "tests/"
   :serial t
   :components ((:file "package")
@@ -569,7 +579,8 @@ cl-temporal-extent."
                (:file "value-constraint-tests")     ; GH #149
                (:file "peer-unique-tests")
                (:file "peer-index-tests")
-               (:file "open-hygiene-tests"))   ; GH #222, #224
+               (:file "open-hygiene-tests")    ; GH #222, #224
+               (:file "scratch-cleanup-tests")) ; GH #214
   :perform (test-op (op c)
                     (unless (uiop:symbol-call :graph-db/test :run-tests)
                       (error "graph-db test suite failed."))))

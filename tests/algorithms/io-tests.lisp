@@ -9,10 +9,8 @@
 (in-suite io-suite)
 
 (defun write-temp-file (content ext)
-  ;; SCRATCH-TAG, not a bare (RANDOM ...): SBCL's default *RANDOM-STATE* is
-  ;; constant, so concurrent runs would pick the same name.
-  (let ((path (merge-pathnames (format nil "gda-io-~A.~A" (scratch-tag) ext)
-                               (uiop:temporary-directory))))
+  (let ((path (graph-db-test-scratch:make-scratch-file-name
+               "gda-io" ext)))
     (with-open-file (out path :direction :output :if-exists :supersede
                               :if-does-not-exist :create)
       (write-string content out))
