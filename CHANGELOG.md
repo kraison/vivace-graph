@@ -31,6 +31,24 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Fixed
 
+- **`CALL-WITH-READ-SNAPSHOT` could leak a registered transaction or a held
+  read-epoch pin, wedging the reaper forever** (#181, #211). It acquired its
+  transaction (`CREATE-TRANSACTION`, which registers the tx) and its read
+  pin (`PIN-READ-EPOCH`) as two separate `LET` bindings *before* entering
+  the `UNWIND-PROTECT` that releases them. A signal from either call left
+  whatever the prior call had already acquired stranded: the tx stayed
+  `:active` in the manager's table forever, so `MINIMUM-START-TRANSACTION-ID`
+  never returned NIL again and the reaper's floor never advanced. #211's
+  concrete trigger is a `%QUIESCE-TRANSACTION-MANAGER` flip (#170) landing
+  in the window between the two calls, making `PIN-READ-EPOCH` signal
+  `STORE-NOT-ACCEPTING-ERROR` after the tx was already registered. Fixed by
+  acquiring progressively inside nested `UNWIND-PROTECT`s, each covering its
+  resource from the instant it succeeds, so a later cleanup signal (e.g. from
+  `REMOVE-TRANSACTION`) cannot skip an earlier one (`UNPIN-READ-EPOCH` no
+  longer depends on `REMOVE-TRANSACTION`'s outcome at all). New suite
+  `read-snapshot-leak-suite` reproduces both leak arms via `FDEFINITION`
+  swaps and asserts the pre-fix failure mode is impossible.
+
 - **`%POSIX-OPEN` created files with an arbitrary permission mode on Apple
   arm64** (#218). `open(2)` is `int open(const char *, int, ...)`, and the
   `mode` argument was passed through a plain `CFFI:FOREIGN-FUNCALL` — as a
