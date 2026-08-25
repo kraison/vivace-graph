@@ -1328,12 +1328,12 @@ still open."
           (mock-clock (graph-db::%make-system-clock
                        :location "/nonexistent-dir-for-gh-170-i3/"
                        :counter 1)))
-      (setf (graph-db:graph-system-clock g) mock-clock)
+      (setf (graph-db::%graph-system-clock g) mock-clock)
       (unwind-protect
            (signals error (graph-db:detach-store g))
         ;; Restore the real clock so the fixture's own teardown can close
         ;; G normally regardless of this test's outcome.
-        (setf (graph-db:graph-system-clock g) clock))
+        (setf (graph-db::%graph-system-clock g) clock))
       (is (eq t (graph-db:accepting-p tm)))
       (is (graph-db::graph-open-p g))
       (with-transaction (tm)
@@ -1521,7 +1521,10 @@ assertion fail -- it would still encode ID-A+1."
             (rename-file (first committed-files)
                          (make-pathname :type "txn"
                                         :defaults (first committed-files)))
-            (graph-db::persist-highest-transaction-id id-a g)
+            ;; Raw writer: PERSIST-HIGHEST-TRANSACTION-ID is monotonic
+            ;; now (GH #177), and this fabricates a crashed, rewound
+            ;; watermark on purpose.
+            (graph-db::%write-highest-transaction-id id-a g)
             (is (= id-a (graph-db::load-highest-transaction-id g))
                 "sanity: the watermark file is now stale")
             (with-open-file (out dirty :direction :output
@@ -1599,3 +1602,150 @@ has completed."
              (let ((pin (graph-db:pin-read-epoch tm)))
                (graph-db:unpin-read-epoch tm pin)))
         (graph-db::%set-accepting-p tm t)))))
+
+;;; Clock/journal hygiene batch (GH #177, #212).
+
+(test persist-highest-transaction-id-is-monotonic
+  "GH #177: PERSIST-HIGHEST-TRANSACTION-ID only moves the durable
+watermark FORWARD -- a racing lower id must not clobber a higher one --
+and returns whatever is on disk after the call.  The raw
+%WRITE-HIGHEST-TRANSACTION-ID stays available for tests that fabricate
+crash states (see CRASH-RECOVERY-RESEEDS-THE-TX-ID-WATERMARK)."
+  (with-temp-directory (sys)
+    (with-temp-directory (dir)
+      (let ((graph-db::*system-directory* (namestring sys))
+            (graph-db::*store-registry* nil))
+        (let ((g (make-graph :gh-177-monotonic (namestring dir)
+                             :buffer-pool-size 1000)))
+          (unwind-protect
+               (progn
+                 (is (= 100 (graph-db::persist-highest-transaction-id
+                             100 g)))
+                 (is (= 100 (graph-db::persist-highest-transaction-id
+                             50 g))
+                     "a lower id returns the standing watermark")
+                 (is (= 100 (load-highest-transaction-id g))
+                     "and must not have rewound the file")
+                 (is (= 150 (graph-db::persist-highest-transaction-id
+                             150 g)))
+                 (is (= 150 (load-highest-transaction-id g)))
+                 ;; The raw writer is the deliberate escape hatch.
+                 (graph-db::%write-highest-transaction-id 10 g)
+                 (is (= 10 (load-highest-transaction-id g))))
+            (let ((graph-db:*graph* g))
+              (ignore-errors (close-graph g :snapshot-p nil)))))))))
+
+(defun %mock-clock-failing-ceiling (journal-file)
+  "A real SYSTEM-CLOCK struct whose JOURNAL-APPEND works (the journal
+stream is pre-opened onto JOURNAL-FILE) but whose ceiling write fails
+deterministically (LOCATION does not exist) -- so ATTACH-TO-SYSTEM-
+CLOCK's CLOCK-OBSERVE-EPOCH is the first thing to die, AFTER any
+:SWAP journal record and AFTER OPEN-GRAPH (GH #212)."
+  (graph-db::%make-system-clock
+   :location "/nonexistent-dir-for-gh-212-attach/"
+   :counter 0
+   :journal (open journal-file :direction :output
+                               :if-exists :append
+                               :if-does-not-exist :create)))
+
+(test swap-in-shadow-1-attach-failure-leaves-the-store-openable
+  "GH #212: in %SWAP-IN-SHADOW-1, an ATTACH-TO-SYSTEM-CLOCK failure
+AFTER its OPEN-GRAPH succeeded used to leave the new generation open
+(registered, mmapped, .dirty on disk), so the recovery handler's
+%REOPEN-AND-RESUME deterministically died on the .dirty marker.  Now
+the just-opened graph is closed before the error propagates: nothing
+stays registered, no .dirty remains, and the live location reopens
+cleanly."
+  (with-clocked-store (g clock sys)
+    clock sys
+    (with-transaction ((graph-db::transaction-manager g))
+      (graph-db:make-vertex :generic nil :graph g))
+    (let ((name (graph-db:graph-name g))
+          (location (graph-db::location g))
+          (retired nil))
+      (unwind-protect
+           (progn
+             (let ((graph-db:*graph* g))
+               (close-graph g :snapshot-p nil))
+             (with-temp-directory (shadow-dir)
+               (let ((sg (make-graph name (namestring shadow-dir)
+                                     :buffer-pool-size 1000)))
+                 (with-transaction ((graph-db::transaction-manager sg))
+                   (graph-db:make-vertex :generic nil :graph sg))
+                 (let ((graph-db:*graph* sg))
+                   (close-graph sg :snapshot-p nil)))
+               (with-temp-directory (jdir)
+                 (let ((mock (%mock-clock-failing-ceiling
+                              (merge-pathnames "mock-journal.log" jdir)))
+                       (progress (vector nil nil)))
+                   (unwind-protect
+                        (progn
+                          (signals error
+                            (graph-db::%swap-in-shadow-1
+                             name location shadow-dir mock progress))
+                          (is-true (aref progress 0)
+                                   "both renames landed before the attach")
+                          (setq retired (aref progress 1))
+                          (is-false (graph-db:lookup-graph name)
+                                    "the failed generation must not stay ~
+registered")
+                          (is-false
+                           (probe-file
+                            (merge-pathnames
+                             ".dirty"
+                             (uiop:ensure-directory-pathname location)))
+                           "no .dirty may survive the attach failure")
+                          ;; The whole point: the live dir opens again.
+                          (let ((g2 (open-graph
+                                     name
+                                     (namestring
+                                      (uiop:ensure-directory-pathname
+                                       location))
+                                     :buffer-pool-size 1000
+                                     :system-clock nil)))
+                            (let ((graph-db:*graph* g2))
+                              (close-graph g2 :snapshot-p nil))))
+                     ;; No handle leak: the mock's pre-opened journal
+                     ;; stream must not outlive the temp dir.
+                     (ignore-errors
+                      (close (graph-db::system-clock-journal mock))))))))
+        (when (and retired (probe-file retired))
+          (ignore-errors
+           (uiop:delete-directory-tree
+            (uiop:ensure-directory-pathname retired)
+            :validate t :if-does-not-exist :ignore)))))))
+
+(test reopen-and-resume-attach-failure-closes-the-reopened-graph
+  "GH #212, the recovery helper itself: %REOPEN-AND-RESUME's attach
+failing after its OPEN-GRAPH succeeded must close the reopened graph
+before propagating, so the caller's next recovery attempt (or a manual
+OPEN-GRAPH) is not refused on .dirty."
+  (with-clocked-store (g clock sys)
+    clock sys
+    (let ((name (graph-db:graph-name g))
+          (location (graph-db::location g)))
+      (let ((graph-db:*graph* g))
+        (close-graph g :snapshot-p nil))
+      (with-temp-directory (jdir)
+        (let ((mock (%mock-clock-failing-ceiling
+                     (merge-pathnames "mock-journal.log" jdir))))
+          (unwind-protect
+               (progn
+                 (signals error
+                   (graph-db::%reopen-and-resume name location mock t))
+                 (is-false (graph-db:lookup-graph name))
+                 (is-false (probe-file
+                            (merge-pathnames
+                             ".dirty"
+                             (uiop:ensure-directory-pathname location))))
+                 (let ((g2 (open-graph
+                            name
+                            (namestring (uiop:ensure-directory-pathname
+                                         location))
+                            :buffer-pool-size 1000
+                            :system-clock nil)))
+                   (let ((graph-db:*graph* g2))
+                     (close-graph g2 :snapshot-p nil))))
+            ;; No handle leak (see the swap test above).
+            (ignore-errors
+             (close (graph-db::system-clock-journal mock)))))))))

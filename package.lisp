@@ -176,9 +176,9 @@
            #:frozen-graph-cannot-replicate-location
            ;; Open a store the registry disagrees with, to read it.
            #:with-schema-frozen
-           #:tm-next-epoch
-           #:tm-current-epoch
-           #:tm-peek-epoch
+           ;; tm-next-epoch/tm-current-epoch/tm-peek-epoch are internal:
+           ;; TRANSACTION-MANAGER itself is unexported, and TM-NEXT-EPOCH
+           ;; burns epochs -- not consumer API (GH #179).
            #:make-graph
            #:*default-heap-size*
            #:*default-index-size*

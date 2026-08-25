@@ -928,3 +928,197 @@ break the #170 path."
              (is (> (clock-next-epoch c2) a)
                  "a reopened clock never reissues")
           (close-system-clock c2))))))
+
+;;; Clock/journal hygiene batch (GH #184, #178, #179, #183, #180, #176).
+
+(test journal-records-stay-in-epoch-order-under-contention
+  "GH #184: JOURNAL-APPEND reads the epoch INSIDE the clock lock, so two
+appenders racing an allocator cannot interleave a later epoch's record
+before an earlier one.  Pre-fix, the epoch was read in a LET outside
+WITH-RECURSIVE-LOCK-HELD, so appender A could read epoch E, the
+allocator could advance past E, appender B could read and append E+k
+first, and A's record then lands after it with the smaller epoch."
+  (with-temp-directory (dir)
+    (let ((c (open-system-clock (namestring dir))))
+      (unwind-protect
+           (let* ((stop nil)
+                  (alloc (bt:make-thread
+                          (lambda ()
+                            (loop until stop
+                                  do (clock-next-epoch c)))))
+                  (appenders
+                    (loop for tag in '(:stress-a :stress-b)
+                          collect
+                          (let ((tag tag))
+                            (bt:make-thread
+                             (lambda ()
+                               (dotimes (i 200)
+                                 (journal-append c :attach
+                                                 :store tag))))))))
+             (mapc #'bt:join-thread appenders)
+             (setq stop t)
+             (bt:join-thread alloc)
+             (let ((epochs (mapcar (lambda (r) (getf r :epoch))
+                                   (journal-records c))))
+               (is (= 400 (length epochs)))
+               (is-true (every #'<= epochs (rest epochs))
+                        "journal file order must match :EPOCH order")))
+        (close-system-clock c)))))
+
+(test attach-and-detach-journal-user-package-store-names-as-keywords
+  "GH #178: journal I/O reads under *PACKAGE* COMMON-LISP, so a graph
+named by a user-package symbol must be journaled as the same-named
+KEYWORD or the record's :STORE would read back as a different symbol.
+Covers the :ATTACH and :DETACH write sites plus %LOOKUP-STORE-BY-KEY,
+the read-side normalization the restore scans use."
+  (with-clock-system-dir ()
+    (with-temp-directory (cdir)
+      (with-temp-directory (gdir)
+        (let ((clock (open-system-clock (namestring cdir))))
+          (unwind-protect
+               (let ((g (make-graph 'graph-db/test::sc-userpkg-store
+                                    (namestring gdir)
+                                    :buffer-pool-size 1000
+                                    :system-clock clock)))
+                 (is (eq g (graph-db::%lookup-store-by-key
+                            :sc-userpkg-store))
+                     "a journal keyword must find the live graph")
+                 (let ((attach (find :attach (journal-records clock)
+                                     :key (lambda (r) (getf r :kind)))))
+                   (is (eq :sc-userpkg-store (getf attach :store)))
+                   (is (keywordp (getf attach :store))))
+                 (graph-db:detach-store g)
+                 (let ((detach (find :detach (journal-records clock)
+                                     :key (lambda (r) (getf r :kind)))))
+                   (is (eq :sc-userpkg-store (getf detach :store)))))
+            (close-system-clock clock)))))))
+
+(test store-name-key-normalizes-symbols-only
+  "GH #178: symbols (of any package) become same-named keywords;
+non-symbols pass through untouched."
+  (is (eq :foo (graph-db::%store-name-key :foo)))
+  (is (eq :sc-nk-sym (graph-db::%store-name-key 'graph-db/test::sc-nk-sym)))
+  (is (equal "a string name" (graph-db::%store-name-key "a string name")))
+  (is (eql 42 (graph-db::%store-name-key 42))))
+
+(test tm-epoch-helpers-are-internal
+  "GH #179: TM-NEXT-EPOCH (which BURNS an epoch), TM-CURRENT-EPOCH and
+TM-PEEK-EPOCH are not consumer API -- TRANSACTION-MANAGER itself is
+unexported -- so none of the three may be external in GRAPH-DB."
+  (dolist (name '("TM-NEXT-EPOCH" "TM-CURRENT-EPOCH" "TM-PEEK-EPOCH"))
+    (multiple-value-bind (sym status) (find-symbol name :graph-db)
+      (is-true sym "~A must still exist" name)
+      (is (eq :internal status)
+          "~A must be internal, was ~S" name status))))
+
+(test graph-system-clock-is-a-reader-only-export
+  "GH #183: GRAPH-SYSTEM-CLOCK stays exported as a READER; the writer is
+the internal %GRAPH-SYSTEM-CLOCK, so ATTACH-TO-SYSTEM-CLOCK (watermark +
+journal) is the only public way to attach."
+  (multiple-value-bind (sym status) (find-symbol "GRAPH-SYSTEM-CLOCK"
+                                                 :graph-db)
+    (is (eq :external status))
+    (is-false (fboundp (list 'setf sym))
+              "(SETF GRAPH-SYSTEM-CLOCK) must not be defined"))
+  (is-true (fboundp '(setf graph-db::%graph-system-clock))))
+
+(test make-graph-refuses-replay-under-a-system-clock
+  "GH #180: MAKE-GRAPH :SLAVE-P :REPLAY-TXN-DIR under a clock (explicit
+or via *SYSTEM-CLOCK*) must refuse BEFORE any side effect -- replay
+would mint ids from the local counter before the clock attaches.  The
+same call without a clock proceeds past this check (it then fails on
+the missing :REPLICATION-PORT, a different, non-#180 error)."
+  (with-clock-system-dir ()
+    (with-temp-directory (cdir)
+      (with-temp-directory (gdir)
+        (with-temp-directory (txn-dir)
+          (let ((clock (open-system-clock (namestring cdir)))
+                (loc (namestring (merge-pathnames "never-created/" gdir))))
+            (unwind-protect
+                 (progn
+                   (let ((msg (handler-case
+                                  (progn
+                                    (make-graph :sc-replay-clocked loc
+                                                :slave-p t
+                                                :replay-txn-dir
+                                                (namestring txn-dir)
+                                                :system-clock clock)
+                                    nil)
+                                (error (e) (format nil "~A" e)))))
+                     (is-true (and msg (search "GH #180" msg))
+                              "must signal the #180 refusal, got: ~A" msg)
+                     (is-false (probe-file loc)
+                               "refusal must precede directory creation"))
+                   ;; Implicit path: *SYSTEM-CLOCK* bound is enough.
+                   (let ((*system-clock* clock))
+                     (is-true
+                      (handler-case
+                          (progn (make-graph :sc-replay-clocked-2 loc
+                                             :slave-p t
+                                             :replay-txn-dir
+                                             (namestring txn-dir))
+                                 nil)
+                        (error (e)
+                          (and (search "GH #180" (format nil "~A" e)) t)))))
+                   ;; No clock: sails past #180, fails later on ports.
+                   (let ((*system-clock* nil))
+                     (is-false
+                      (handler-case
+                          (progn (make-graph :sc-replay-unclocked loc
+                                             :slave-p t
+                                             :replay-txn-dir
+                                             (namestring txn-dir))
+                                 nil)
+                        (error (e)
+                          (and (search "GH #180" (format nil "~A" e))
+                               t))))))
+              (close-system-clock clock))))))))
+
+(test memory-graph-joins-the-image-clock
+  "GH #176: MAKE-MEMORY-GRAPH and OPEN-MEMORY-GRAPH take :SYSTEM-CLOCK
+(default *SYSTEM-CLOCK*) and attach exactly as the disk constructors do
+-- so a memory graph and a disk graph on one clock draw from one epoch
+space and never collide.  Also covers the clean close and the reopen
+re-attach."
+  (with-clock-system-dir ()
+    (with-temp-directory (cdir)
+      (with-temp-directory (mdir)
+        (with-temp-directory (ddir)
+          (let ((clock (open-system-clock (namestring cdir))))
+            (unwind-protect
+                 (let ((mg (graph-db::make-memory-graph
+                            :sc-mem-clocked (namestring mdir)
+                            :system-clock clock))
+                       (dg (make-graph :sc-disk-clocked (namestring ddir)
+                                       :buffer-pool-size 1000
+                                       :system-clock clock)))
+                   (unwind-protect
+                        (let ((ids '()))
+                          (is (eq clock (graph-system-clock mg)))
+                          (dotimes (i 3)
+                            (push (transaction-id
+                                   (with-transaction
+                                       ((graph-db::transaction-manager mg))
+                                     graph-db::*transaction*))
+                                  ids)
+                            (push (transaction-id
+                                   (with-transaction
+                                       ((graph-db::transaction-manager dg))
+                                     graph-db::*transaction*))
+                                  ids))
+                          (is (= (length ids)
+                                 (length (remove-duplicates ids)))
+                              "one epoch space: no id collides"))
+                     (let ((graph-db:*graph* dg))
+                       (close-graph dg :snapshot-p nil))
+                     (let ((graph-db:*graph* mg))
+                       (close-graph mg :snapshot-p nil)))
+                   ;; Reopen re-attaches through the same keyword.
+                   (let ((mg2 (graph-db::open-memory-graph
+                               :sc-mem-clocked (namestring mdir)
+                               :system-clock clock)))
+                     (unwind-protect
+                          (is (eq clock (graph-system-clock mg2)))
+                       (let ((graph-db:*graph* mg2))
+                         (close-graph mg2 :snapshot-p nil)))))
+              (close-system-clock clock))))))))

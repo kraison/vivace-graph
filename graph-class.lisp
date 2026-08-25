@@ -221,9 +221,12 @@ received an UNRESOLVED-NODE marker instead (GH #169, D8)."
                                        #+graph-db-ecl-sync-hash t)
                #+sbcl (make-hash-table :test 'eq :synchronized t))
    ;; The image-level epoch clock (GH #168), or NIL for this store's own
-   ;; counter.  NIL is the pre-#168 behaviour and the default.
-   (system-clock :accessor graph-system-clock :initarg :system-clock
-                 :initform nil)
+   ;; counter.  NIL is the pre-#168 behaviour and the default.  Reader
+   ;; public, writer internal: ATTACH-TO-SYSTEM-CLOCK is the only entry
+   ;; point -- a bare SETF would skip its watermark/journal (GH #183).
+   (system-clock :reader graph-system-clock
+                 :accessor %graph-system-clock
+                 :initarg :system-clock :initform nil)
    ;; Shadow generations (GH #170).  SHADOW-P: T on a graph opened via
    ;; OPEN-SHADOW-GRAPH -- never registered in *GRAPHS*/open-store vector,
    ;; never starts replication.  EPOCH-LEASE: an EPOCH-LEASE struct

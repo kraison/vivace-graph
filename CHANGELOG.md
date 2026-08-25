@@ -11,6 +11,52 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Clock/journal hygiene batch** (#184, #178, #177, #183, #179, #180,
+  #176, #212, #234):
+  - `JOURNAL-APPEND` reads the epoch *inside* the clock lock, and
+    attach (watermark raise + `:ATTACH` record) and detach (lease +
+    `:DETACH` record) each hold the clock lock across both steps, so
+    journal records always land in `:EPOCH` order (#184). Lock
+    ordering is manager → clock, never the reverse.
+  - `JOURNAL-APPEND` normalizes its `:STORE` property to a keyword,
+    and the restore scans normalize both journal-read `:STORE` values
+    (tolerating pre-fix records) and live graph names when comparing —
+    a graph named by a user-package symbol now round-trips through the
+    journal and is found by `RETIRED-GENERATIONS`/`RESTORE-SYSTEM`
+    (#178).
+  - `PERSIST-HIGHEST-TRANSACTION-ID` is monotonic: it locks around the
+    whole read-compare-write and never rewinds `transaction-id.dat`;
+    the raw overwrite survives as the internal
+    `%WRITE-HIGHEST-TRANSACTION-ID` for crash-fabricating tests
+    (#177).
+  - `GRAPH-SYSTEM-CLOCK` is now a reader-only export (writer internal:
+    `%GRAPH-SYSTEM-CLOCK`), so `ATTACH-TO-SYSTEM-CLOCK`'s watermark
+    and journal record cannot be bypassed by `SETF` (#183); the
+    `TM-NEXT-EPOCH`/`TM-CURRENT-EPOCH`/`TM-PEEK-EPOCH` helpers are
+    unexported (#179).
+  - `MAKE-GRAPH :SLAVE-P T :REPLAY-TXN-DIR` under a system clock
+    (explicit or via `*SYSTEM-CLOCK*`) is refused before any side
+    effect — replay would mint ids from the local counter before the
+    clock attaches (#180).
+  - `MAKE-MEMORY-GRAPH`/`OPEN-MEMORY-GRAPH` take `:SYSTEM-CLOCK`
+    (default `*SYSTEM-CLOCK*`) and attach like the disk constructors,
+    so memory graphs no longer silently opt out of the image clock; a
+    failed attach unwinds through the normal `CLOSE-GRAPH` instead of
+    leaving a half-registered graph (#176).
+  - A failed `ATTACH-TO-SYSTEM-CLOCK` after a successful reopen inside
+    `SWAP-IN-SHADOW`/`%REOPEN-AND-RESUME` closes the just-opened graph
+    before propagating, so the recovery path no longer dies on the
+    stranded `.dirty` marker (#212). The other #212 shape — a missing
+    `:SWAP` record after a post-rename journal failure — remains
+    tolerated as warnings on both the write and read sides.
+  - shadow-store's `policy.dat`/`lease.dat` and system-restore's
+    manifest now use the shared `WITH-SIDECAR-OUTPUT`/`-INPUT`
+    discipline instead of partial `*PRINT-READABLY*`/`*READ-EVAL*`
+    bindings, surviving hostile ambient printer/reader bindings
+    (#234).
+
 ### Changed
 
 - **`DEF-NODE-TYPE` now installs through a shared functional core**

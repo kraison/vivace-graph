@@ -116,11 +116,29 @@ later open in this image, for the life of the process (GH #182)."
         (setf (system-clock-lock-fd clock) nil))))
   clock)
 
+(defun %store-name-key (name)
+  "NAME normalized for journal storage/lookup: a symbol becomes the
+same-named keyword, anything else passes through.  Journal I/O reads
+under *PACKAGE* COMMON-LISP, so a user-package symbol would read back
+as a different symbol; keywords are package-independent (GH #178)."
+  (if (symbolp name)
+      (intern (symbol-name name) :keyword)
+      name))
+
 (defun journal-append (clock kind &rest plist)
   "Append one lifecycle record.  KIND is :CREATE :DETACH :SWAP :ATTACH
-:RETIRE :RETIRE-LIVE :RESTORE or :SWAP-ABORTED (the last four: GH #171)."
-  (let ((record (list* :kind kind :epoch (clock-current-epoch clock) plist)))
-    (with-recursive-lock-held ((system-clock-lock clock))
+:RETIRE :RETIRE-LIVE :RESTORE or :SWAP-ABORTED (the last four: GH #171).
+A :STORE property is normalized to a keyword via %STORE-NAME-KEY, so
+the written record always reads back package-independently (GH #178)."
+  ;; Epoch is read INSIDE the lock: outside it, a concurrent allocator
+  ;; could slot between the read and the append, so records could hit
+  ;; the file out of :EPOCH order (GH #184).
+  (with-recursive-lock-held ((system-clock-lock clock))
+    (let ((record (list* :kind kind :epoch (clock-current-epoch clock)
+                         (loop for (k v) on plist by #'cddr
+                               append (list k (if (eq k :store)
+                                                  (%store-name-key v)
+                                                  v))))))
       (unless (system-clock-journal clock)
         (setf (system-clock-journal clock)
               (open (%clock-journal-file (system-clock-location clock))
@@ -134,8 +152,8 @@ later open in this image, for the life of the process (GH #182)."
         ;; produce a line JOURNAL-RECORDS then can't read back.
         (with-sidecar-output ()
           (format s "~S~%" record))
-        (finish-output s)))
-    record))
+        (finish-output s))
+      record)))
 
 (define-condition system-journal-corrupt (error)
   ((file :initarg :file :reader journal-corrupt-file)

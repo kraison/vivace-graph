@@ -88,9 +88,11 @@ is fresh, so it inherits nothing (GH #171)."
   (let ((by-store (make-hash-table :test 'equal)))
     (dolist (r (journal-records clock))
       (when (and (eq (getf r :kind) :restore) (getf r :from))
+        ;; %STORE-NAME-KEY: a PRE-#178 journal may hold a user-package
+        ;; symbol; normalize so it shares a bucket with new records.
         (push (cons (getf r :epoch)
                     (%trimmed-namestring (getf r :from)))
-              (gethash (getf r :store) by-store))))
+              (gethash (%store-name-key (getf r :store)) by-store))))
     (maphash (lambda (store prs)
                (setf (gethash store by-store) (sort prs #'< :key #'car)))
              by-store)
@@ -134,12 +136,15 @@ inherited its content (see %ASSIGN-GENERATION-ERAS)."
         (pruned (%pruned-retired-paths clock)))
     ;; Journal first: records name the live locations to scan.
     (dolist (r (%retired-directory-records clock))
-      (let ((retired (%trimmed-namestring (getf r :retired))))
+      ;; %STORE-NAME-KEY on the record side too: a PRE-#178 journal may
+      ;; hold a user-package symbol (GH #178).
+      (let ((retired (%trimmed-namestring (getf r :retired)))
+            (store (%store-name-key (getf r :store))))
         (setf (gethash (%live-location-of-retired retired) locations)
-              (getf r :store))
+              store)
         (setf (gethash retired by-retired)
               (%make-generation
-               :store (getf r :store)
+               :store store
                :location (%live-location-of-retired retired)
                :retired retired
                :swap-epoch (getf r :epoch)
@@ -160,9 +165,11 @@ inherited its content (see %ASSIGN-GENERATION-ERAS)."
                                      (graph-system-clock graph)))
                                    (%trimmed-namestring
                                     (system-clock-location clock))))
+                 ;; Normalized so it compares against journal :STORE
+                 ;; values, which are always keywords (GH #178).
                  (setf (gethash (%trimmed-namestring (location graph))
                                 locations)
-                       name)))
+                       (%store-name-key name))))
              *graphs*)
     (maphash
      (lambda (location store)
@@ -312,11 +319,25 @@ last live window (GH #171, fix rounds 2 and 3)."
                    (or (null best-from) (> (car era) best-from)))
           (setq best g best-from (car era)))))))
 
+(defun %lookup-store-by-key (name)
+  "LOOKUP-GRAPH tolerant of journal-normalized names: tries NAME
+directly, then scans *GRAPHS* for a key whose %STORE-NAME-KEY matches
+NAME's -- a journal :STORE keyword must find a graph registered under a
+user-package symbol (GH #178)."
+  (or (lookup-graph name)
+      (let ((key (%store-name-key name)))
+        (block scan
+          (maphash (lambda (k graph)
+                     (when (equal (%store-name-key k) key)
+                       (return-from scan graph)))
+                   *graphs*)))))
+
 (defun %open-store-for-clock (name clock)
   "The graph registered as NAME if it is attached to CLOCK -- matched by
 SYSTEM-CLOCK-LOCATION string, the comparison every scan in this file
-uses -- else NIL (GH #171)."
-  (let ((graph (lookup-graph name)))
+uses -- else NIL (GH #171).  NAME may be a journal-normalized keyword
+for a graph registered under another symbol (GH #178)."
+  (let ((graph (%lookup-store-by-key name)))
     (when (and graph (typep graph 'graph) (graph-system-clock graph)
                (string= (%trimmed-namestring
                          (system-clock-location (graph-system-clock graph)))
@@ -343,16 +364,19 @@ reversed to its live location (older journals predating :ATTACH's
 :LOCATION field); and any graph *GRAPHS* still holds open under this
 clock right now."
   (let ((acc (make-hash-table :test 'equal)))
+    ;; %STORE-NAME-KEY on record-side stores: a PRE-#178 journal may
+    ;; hold user-package symbols (GH #178).
     (dolist (r (journal-records clock))
       (when (eq (getf r :kind) :attach)
         (let ((loc (getf r :location)))
           (when loc
-            (setf (gethash (%trimmed-namestring loc) acc) (getf r :store))))))
+            (setf (gethash (%trimmed-namestring loc) acc)
+                  (%store-name-key (getf r :store)))))))
     (dolist (r (%retired-directory-records clock))
       (setf (gethash (%live-location-of-retired
                       (%trimmed-namestring (getf r :retired)))
                      acc)
-            (getf r :store)))
+            (%store-name-key (getf r :store))))
     (maphash (lambda (name graph)
                (when (and (typep graph 'graph)
                           (graph-system-clock graph)
@@ -361,8 +385,9 @@ clock right now."
                                      (graph-system-clock graph)))
                                    (%trimmed-namestring
                                     (system-clock-location clock))))
+                 ;; Normalized, as journal :STORE values are (GH #178).
                  (setf (gethash (%trimmed-namestring (location graph)) acc)
-                       name)))
+                       (%store-name-key name))))
              *graphs*)
     acc))
 
@@ -480,12 +505,15 @@ lands in the same RESTORE-REFUSED-ERROR as every other refusal."
     ;; same way a rewind would (GH #171).
     (maphash (lambda (name graph)
                (declare (ignore graph))
-               (let ((open-graph (%open-store-for-clock name clock)))
+               ;; Hash keys normalized to match journal-derived stores
+               ;; (GH #178).
+               (let ((key (%store-name-key name))
+                     (open-graph (%open-store-for-clock name clock)))
                  (when open-graph
-                   (unless (nth-value 1 (gethash name by-store))
-                     (setf (gethash name by-store) nil))
+                   (unless (nth-value 1 (gethash key by-store))
+                     (setf (gethash key by-store) nil))
                    (unless (%supported-for-restore-p open-graph)
-                     (setf (gethash name unsupported) t)))))
+                     (setf (gethash key unsupported) t)))))
              *graphs*)
     (maphash
      (lambda (store gens)
@@ -583,16 +611,17 @@ R1/R2)."
     ;; colon only when *package* is NOT the keyword package itself, and
     ;; a bare T/NIL in an entry stays unqualified since CL is its home
     ;; package; *PRINT-READABLY* stays NIL, as the journal's own
-    ;; records already do (GH #171).
-    (let ((*print-readably* nil) (*print-pretty* nil)
-          (*package* (find-package :common-lisp)))
+    ;; records already do (GH #171).  Full printer set via the shared
+    ;; macro, whose defaults match both choices (GH #234).
+    (with-sidecar-output ()
       (prin1 manifest out)))
   manifest)
 
 (defun read-restore-manifest (path)
   "PATH's manifest plist.  *READ-EVAL* NIL: data, never code (GH #171)."
   (with-open-file (in path)
-    (let ((*read-eval* nil) (*package* (find-package :common-lisp)))
+    ;; Full reader-control set, not just *READ-EVAL* (GH #234).
+    (with-sidecar-input ()
       (read in))))
 
 (defun %entry-with (entry &rest kvs)
@@ -656,7 +685,10 @@ live generation moved to RETIRED, which it no longer has.  Once the
 rename-back itself succeeds, a :RETIRE-LIVE-ABORTED record cancels it
 (RETIRED-GENERATIONS' journal-join excludes any path a
 :RETIRE-LIVE-ABORTED names)."
-  (let* ((graph (lookup-graph name))
+  (let* ((graph (%lookup-store-by-key name))
+         ;; The live graph's own name, not the journal keyword: reopens
+         ;; must re-register under the caller's key (GH #178).
+         (name (graph-name graph))
          (live (%trimmed-namestring (location graph)))
          (from (getf entry :from))
          (retired (%retired-path-for clock live))
@@ -709,7 +741,10 @@ possibly half-populated generation is left live, its predecessor
 retired at :RETIRED-LIVE -- a :RESTORE :MODE :REBUILT :FAILED T journal
 record names both before the original error is resignalled, so the
 journal says what actually happened (GH #171)."
-  (let* ((graph (lookup-graph name))
+  (let* ((graph (%lookup-store-by-key name))
+         ;; As in %RESTORE-ONE-STORE: rebuild under the live graph's own
+         ;; name, not the journal keyword (GH #178).
+         (name (graph-name graph))
          (live (%trimmed-namestring (location graph)))
          (policy (store-recovery-policy live))
          (retired (%retired-path-for clock live)))
@@ -748,6 +783,8 @@ nothing, rather than every legacy v5 id (GH #171)."
     (when store-id
       (maphash
        (lambda (name graph)
+         ;; EXCLUDE and the result hold journal-normalized keys (GH #178).
+         (setq name (%store-name-key name))
          (when (and (not (member name exclude))
                     (%open-store-for-clock name clock))
            (let ((n 0))
@@ -802,14 +839,19 @@ Returns the manifest (GH #171, spec S3-S4)."
     (let ((queue (copy-list rebuilt)))
       (loop while queue do
         (let* ((source (pop queue))
-               (tag (store-registry-id-for source)))
+               ;; SOURCE is a journal-normalized key; the registry is
+               ;; keyed by the graph's real name (GH #178).
+               (source-graph (%lookup-store-by-key source))
+               (tag (and source-graph
+                         (store-registry-id-for
+                          (graph-name source-graph)))))
           (loop for (name . n) in (%dangling-into clock tag rebuilt) do
             (let ((pos (position name entries
                                  :key (lambda (x) (getf x :store)))))
               (when pos
                 (let ((entry (nth pos entries)))
                   (if (eq (store-recovery-policy
-                           (location (lookup-graph name)))
+                           (location (%lookup-store-by-key name)))
                           :derivable)
                       (let ((extra (%rebuild-one-store
                                     clock name rebuild timeout)))

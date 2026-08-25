@@ -128,12 +128,13 @@ gate input (GH #170)."
   (let ((file (%policy-file location)))
     (if (probe-file file)
         (with-open-file (in file)
-          (let* ((*read-eval* nil)
-                 (value (read in nil nil)))
-            (unless (member value '(:derivable :authored))
-              (error "~A does not hold a valid recovery policy (expected ~
+          ;; Full reader-control set, not just *READ-EVAL* (GH #234).
+          (with-sidecar-input ()
+            (let ((value (read in nil nil)))
+              (unless (member value '(:derivable :authored))
+                (error "~A does not hold a valid recovery policy (expected ~
 :DERIVABLE or :AUTHORED, read ~S)." file value))
-            value))
+              value)))
         :authored)))
 
 (defun set-store-recovery-policy (location policy)
@@ -147,7 +148,8 @@ silently authorize the WAL-free path (GH #170)."
   (with-open-file (out (%policy-file location)
                        :direction :output :if-exists :supersede
                        :if-does-not-exist :create)
-    (let ((*print-readably* nil) (*print-pretty* nil))
+    ;; Full printer-control set (GH #234).
+    (with-sidecar-output ()
       (prin1 policy out)))
   policy)
 
@@ -202,9 +204,19 @@ above all -- land in the store's PARENT directory (GH #171)."
                                     (uiop:ensure-directory-pathname
                                      location))
                               :system-clock nil
-                              :initial-accepting-state reason)))
-    (attach-to-system-clock reopened clock)
-    reopened))
+                              :initial-accepting-state reason))
+        (attached nil))
+    ;; An attach failure must close the just-opened graph before
+    ;; propagating: leaving it open (registered, .dirty on disk) makes
+    ;; the NEXT open-graph here fail on the .dirty marker (GH #212).
+    (unwind-protect
+        (progn
+          (attach-to-system-clock reopened clock)
+          (setf attached t)
+          reopened)
+      (unless attached
+        (let ((*graph* reopened))
+          (ignore-errors (close-graph reopened :snapshot-p nil)))))))
 
 (defun shadow-store (graph &key (timeout 60))
   "Take a consistent shadow copy of GRAPH's store: quiesce (reason
@@ -293,7 +305,8 @@ path (GH #170, fix round 1)."
   (with-open-file (out (%lease-file shadow-location)
                        :direction :output :if-exists :supersede
                        :if-does-not-exist :create)
-    (let ((*print-readably* nil) (*print-pretty* nil))
+    ;; Full printer-control set (GH #234).
+    (with-sidecar-output ()
       (prin1 (list :lease-start start :lease-end end) out))))
 
 (defun %read-lease (shadow-location)
@@ -302,7 +315,8 @@ may have been copied from anywhere and is untrusted input (GH #170)."
   (let ((file (%lease-file shadow-location)))
     (when (probe-file file)
       (with-open-file (in file)
-        (let ((*read-eval* nil))
+        ;; Full reader-control set, not just *READ-EVAL* (GH #234).
+        (with-sidecar-input ()
           (read in nil nil))))))
 
 (defun open-shadow-graph (shadow-location graph-name
@@ -503,8 +517,17 @@ NEW store).  Split out so that HANDLER-CASE reads cleanly."
      (delete-file (merge-pathnames "lease.dat"
                                    (uiop:ensure-directory-pathname live))))
     (journal-append clock :swap :store name :retired retired-path)
-    (let ((new-graph (open-graph name live :system-clock nil)))
-      (attach-to-system-clock new-graph clock)
+    (let ((new-graph (open-graph name live :system-clock nil))
+          (attached nil))
+      ;; Attach failure closes NEW-GRAPH before propagating, or the
+      ;; recovery reopen deterministically dies on .dirty (GH #212).
+      (unwind-protect
+          (progn
+            (attach-to-system-clock new-graph clock)
+            (setf attached t))
+        (unless attached
+          (let ((*graph* new-graph))
+            (ignore-errors (close-graph new-graph :snapshot-p nil)))))
       (values new-graph retired-path))))
 
 (defun swap-in-shadow (graph shadow-location &key (timeout 60))
