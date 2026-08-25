@@ -35,10 +35,10 @@ v8 store tag is ~D bits (GH #169); widening it is a format change."
   (make-pathname :name "store-registry" :type "lock" :defaults location))
 
 (defun %parse-store-registry-record (line)
-  "LINE as (:NAME <symbol-or-string> :ID <int>).  *READ-EVAL* nil: data,
-never code (GH #169)."
-  (let ((*read-eval* nil)
-        (*package* (%registry-print-package)))
+  "LINE as (:NAME <symbol-or-string> :ID <int>).  WITH-SIDECAR-INPUT
+binds the full reader-control set, KEYWORD-packaged (GH #226):
+*READ-EVAL* nil, data never code (GH #169)."
+  (with-sidecar-input (:package :keyword)
     (multiple-value-bind (form pos) (read-from-string line)
       (unless (= pos (length line))
         (error "trailing garbage in store registry record: ~S" line))
@@ -145,9 +145,11 @@ REGISTRY-INTERN's outer WITH-RECURSIVE-LOCK-HELD -- #186)."
                               :direction :output
                               :if-exists :append
                               :if-does-not-exist :create)
-                         (let ((*package* (%registry-print-package))
-                               (*print-pretty* nil)
-                               (*print-readably* t))
+                         ;; :READABLY T preserves this writer's
+                         ;; pre-#226 *PRINT-READABLY* T -- #191
+                         ;; strictness for the id ledger (GH #226).
+                         (with-sidecar-output (:package :keyword
+                                                :readably t)
                            (format s "~S~%" (list :name name :id id)))
                          (finish-output s))
                        (setf (gethash name (store-registry-names registry))

@@ -31,42 +31,33 @@ only -- this must never signal, GH #167)."
                                 (ensure-type-registry)))
     (error () nil)))
 
-(defun %edge-occupancy-print-package ()
-  ;; COMMON-LISP, not KEYWORD: class symbols must print package-qualified
-  ;; (the #171 manifest discipline), and KEYWORD cannot hold them.
-  (load-time-value (find-package "COMMON-LISP")))
+;; Records print/read in COMMON-LISP, not KEYWORD: class symbols must
+;; print package-qualified (the #171 manifest discipline), and KEYWORD
+;; cannot hold them (see WITH-SIDECAR-OUTPUT/-INPUT calls below, GH #226).
 
-(defun %parse-edge-occupancy-line (line)
-  "Read LINE as a (NAME STORE) list.  *READ-EVAL* NIL: the file is data.
-Returns NIL on anything malformed -- a torn or corrupt line is only a
-lost hint, never an error."
-  (handler-case
-      (let ((*read-eval* nil))
-        (multiple-value-bind (form pos) (read-from-string line)
-          (when (and (= pos (length line))
-                     (consp form) (symbolp (first form))
-                     (= (length form) 2))
-            form)))
-    (error () nil)))
+(defun %valid-edge-occupancy-form-p (form)
+  (and (consp form) (symbolp (first form)) (= (length form) 2)))
 
 (defun %load-edge-occupancy (file)
   "Populate *EDGE-OCCUPANCY* from FILE, if it exists.  Caller holds
 *EDGE-OCCUPANCY-LOCK*.  Any read failure (FILE is a directory, a
 permission error, a race with an external deletion after PROBE-FILE)
 degrades to no-hint, matching R4 -- this must never signal into a real
-write (GH #167)."
+write (GH #167).  Reads FORMS, not lines (READ-SIDECAR-FORMS, GH #226):
+a torn or corrupt record is only a lost hint here, so a shaped-but-
+wrong form (wrong length, non-symbol NAME) is likewise just dropped.
+:WARN-P NIL: this sidecar's whole contract is \"a lost hint, never a
+signal\" (GH #167) -- unlike the schema manifest, it must not raise
+SIDECAR-RECORDS-SKIPPED even when records were dropped (GH #227)."
   (clrhash *edge-occupancy*)
   (when (and file (probe-file file))
     (handler-case
-        (with-open-file (s file :direction :input)
-          (loop
-            (let ((line (read-line s nil :eof)))
-              (when (eq line :eof) (return))
-              (let ((parsed (%parse-edge-occupancy-line line)))
-                (when parsed
-                  (destructuring-bind (name store) parsed
-                    (pushnew store (gethash name *edge-occupancy*)
-                             :test 'equal)))))))
+        (dolist (form (read-sidecar-file-forms file :package :common-lisp
+                                                :warn-p nil))
+          (when (%valid-edge-occupancy-form-p form)
+            (destructuring-bind (name store) form
+              (pushnew store (gethash name *edge-occupancy*)
+                       :test 'equal))))
       (error () (clrhash *edge-occupancy*))))
   (setf *edge-occupancy-loaded-file* file)
   (setf *edge-occupancy-loaded-p* t))
@@ -96,9 +87,7 @@ hint lives in-image only for this session (R4 fallback)."
               (with-open-file (s file :direction :output
                                       :if-exists :append
                                       :if-does-not-exist :create)
-                (let ((*print-readably* nil)
-                      (*print-pretty* nil)
-                      (*package* (%edge-occupancy-print-package)))
+                (with-sidecar-output (:package :common-lisp)
                   (format s "~S~%" (list name store)))
                 (finish-output s))
             (error () nil))))))

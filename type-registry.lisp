@@ -53,9 +53,9 @@ REGISTRY-INTERN.  Retry once the holder's assignment completes (GH #186)."
 (defun %parse-registry-record (line)
   "Read LINE as a (:SYMBOL :PARENT :ID) plist.  Signals on anything else --
 trailing garbage, an unbalanced form, or a missing/wrong-typed key.
-*READ-EVAL* is NIL: the file is data and must never execute."
-  (let ((*read-eval* nil)
-        (*package* (%registry-print-package)))
+WITH-SIDECAR-INPUT binds the full reader-control set, KEYWORD-packaged
+(GH #226): *READ-EVAL* is NIL, the file is data and must never execute."
+  (with-sidecar-input (:package :keyword)
     (multiple-value-bind (form pos) (read-from-string line)
       (unless (= pos (length line))
         (error "trailing garbage in type registry record: ~S" line))
@@ -125,9 +125,7 @@ append lock."
     (with-open-file (s file :direction :output
                             :if-exists :append
                             :if-does-not-exist :create)
-      (let ((*print-readably* nil)
-            (*print-pretty* nil)
-            (*package* (%registry-print-package)))
+      (with-sidecar-output (:package :keyword)
         (format s "~S~%" record))
       (finish-output s))))
 

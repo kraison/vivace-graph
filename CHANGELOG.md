@@ -104,6 +104,42 @@ between releases; cutting a release renames it to the new version and dates it.
   needs recovery, and deleting the sentinel would let a later open
   adopt stale index roots against the now-mutated heap with no
   recovery pass to catch the mismatch.
+- **Every line-oriented sidecar file (type registry, store registry,
+  edge-occupancy hint, schema manifest, system journal) now shares one
+  print/read control-set discipline** (#226). The writers previously
+  bound only `*PRINT-READABLY*`/`*PRINT-PRETTY*`/`*PACKAGE*` and the
+  readers only `*READ-EVAL*`, leaving `*PRINT-LENGTH*`, `*PRINT-LEVEL*`,
+  `*PRINT-BASE*`, `*PRINT-RADIX*`, `*PRINT-CIRCLE*`, `*PRINT-CASE*`,
+  `*READ-BASE*` and `*READTABLE*` to whatever a caller had ambient --
+  these writers are reachable from arbitrary application code (e.g.
+  `CREATE-VERTEX-TYPE`), so a caller with any of those rebound could
+  write a truncated, elided, or wrong-radix line the tolerant readers
+  would then silently drop. New `WITH-SIDECAR-OUTPUT`/`WITH-SIDECAR-
+  INPUT` macros (`sidecar-io.lisp`) bind the full set; every named
+  writer/reader in `type-registry.lisp`, `store-registry.lisp`,
+  `type-occupancy.lisp`, `runtime-schema.lisp` and `system-clock.lisp`
+  (`JOURNAL-APPEND`/`JOURNAL-RECORDS`, whose #191 corruption/torn-tail
+  machinery is otherwise untouched) now uses them. Also fixes the
+  multi-line-string hazard the issue named: a legal slot-spec option
+  value (e.g. `:DOCUMENTATION`) containing a newline used to split a
+  manifest record across two lines; the edge-occupancy and schema-
+  manifest readers now read FORMS via `READ` (`READ-SIDECAR-FORMS`),
+  which spans an embedded newline naturally, instead of `READ-LINE`
+  splitting on it, while still tolerating a bad or torn record anywhere
+  in the file by resyncing to the next line boundary.
+- **A schema-manifest row that fails to `READ` -- most commonly a type
+  row naming a symbol in a package this image does not have -- is now
+  reported, not silently dropped** (#227). `READ-SCHEMA-MANIFEST`
+  signals `SIDECAR-RECORDS-SKIPPED` (file, count, first bad byte
+  position) once per read when any record was unreadable, as a
+  warning, never an error -- the existing drop-and-continue tolerance
+  is unchanged. `MATERIALIZE-SCHEMA`'s summary plist gains
+  `:SKIPPED-UNREADABLE`, counted from the read pass that runs after
+  `%MATERIALIZE-ORPHAN-PACKAGES` has had its chance to create a
+  missing *outer* type-symbol package, so the count reflects what is
+  still genuinely unreadable afterward -- e.g. #227's actual scenario,
+  an *interior* symbol (a `:CHECK` function name) in an unrelated
+  missing package, which the orphan-package pre-scan never looks at.
 - **`%POSIX-OPEN` created files with an arbitrary permission mode on Apple
   arm64** (#218). `open(2)` is `int open(const char *, int, ...)`, and the
   `mode` argument was passed through a plain `CFFI:FOREIGN-FUNCALL` — as a
