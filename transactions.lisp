@@ -3267,18 +3267,31 @@ store it touched."
       ;; already snapshotted this graph -> inherit
       ((and *read-snapshots* (gethash graph *read-snapshots*)) (funcall thunk))
       (t
-       (let ((txn (create-transaction tm :allow-read-only t))
-             (table (or *read-snapshots* (make-hash-table :test 'eq)))
-             (pin (pin-read-epoch tm)))
+       (let ((txn nil)
+             (pin nil)
+             (table (or *read-snapshots* (make-hash-table :test 'eq))))
+         ;; Each acquisition is covered by cleanup from the instant it
+         ;; succeeds -- a signal from PIN-READ-EPOCH after CREATE-
+         ;; TRANSACTION already registered TXN must not leak the tx
+         ;; entry (GH #181, #211).  Nested UNWIND-PROTECTs release in
+         ;; reverse acquisition order and isolate each cleanup step, so
+         ;; UNPIN runs regardless of what REMOVE-TRANSACTION later does.
          (unwind-protect
-              (let ((*read-snapshots* table))
-                (setf (gethash graph table) txn)
-                (funcall thunk))
-           ;; the entry must not outlive the extent: a stale snapshot pins the
-           ;; reaper's floor and retains versions forever (GH #53)
-           (remhash graph table)
-           (remove-transaction txn tm)
-           (unpin-read-epoch tm pin)))))))
+              (progn
+                (setq txn (create-transaction tm :allow-read-only t))
+                (unwind-protect
+                     (progn
+                       (setq pin (pin-read-epoch tm))
+                       (let ((*read-snapshots* table))
+                         (setf (gethash graph table) txn)
+                         (funcall thunk)))
+                  (when pin (unpin-read-epoch tm pin))))
+           ;; The entry must not outlive the extent: a stale snapshot
+           ;; pins the reaper's floor and retains versions forever (GH
+           ;; #53).  REMHASH is nested so REMOVE-TRANSACTION still runs
+           ;; even if REMHASH itself signals (GH #181).
+           (unwind-protect (remhash graph table)
+             (when txn (remove-transaction txn tm)))))))))
 
 (defmacro with-read-snapshot ((&optional (graph '*graph*)) &body body)
   "Evaluate BODY with reads of GRAPH pinned to a single consistent MVCC snapshot.

@@ -548,6 +548,7 @@ cl-temporal-extent."
                (:file "store-registry-tests")     ; GH #169
                (:file "store-resolver-tests")     ; GH #169
                (:file "detach-tests")             ; GH #170
+               (:file "read-snapshot-leak-tests") ; GH #181, #211
                (:file "system-restore-tests")     ; GH #171
                (:file "package-namespace-tests")  ; GH #167
                (:file "runtime-schema-tests")     ; GH #172
