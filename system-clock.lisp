@@ -175,7 +175,9 @@ that good record too -- outside #191's power-loss model, where a torn
 append is always a strict suffix with the prior newline intact."
   (with-open-file (s file :direction :input)
     (file-position s pos)
-    (let ((*read-eval* nil))
+    ;; Bindings only (GH #226); the skip-a-line-and-retry recovery
+    ;; loop and its #191 corruption/torn-tail semantics are unchanged.
+    (with-sidecar-input ()
       (loop
         (unless (read-line s nil) (return nil))
         (handler-case

@@ -1,16 +1,35 @@
 ;;;; Shared sidecar print/read discipline (GH #226, #227).  Exercises
 ;;;; WITH-SIDECAR-OUTPUT/-INPUT indirectly through the real writer/reader
 ;;;; entry points (CREATE-VERTEX-TYPE, ENSURE-NAMESPACE, %NOTE-EDGE-
-;;;; OCCUPANCY, READ-SCHEMA-MANIFEST, MATERIALIZE-SCHEMA) rather than the
-;;;; macros directly -- those entry points are exactly what #226 says are
-;;;; reachable from arbitrary caller code with a hostile dynamic
-;;;; environment.  Reuses RUNTIME-SCHEMA-TESTS' WITH-RS-STORE fixture and
-;;;; :RS-STORE type-registry setup; loaded after that file.
+;;;; OCCUPANCY, READ-SCHEMA-MANIFEST, MATERIALIZE-SCHEMA, the type/store
+;;;; registries) rather than the macros directly -- those entry points
+;;;; are exactly what #226 says are reachable from arbitrary caller code
+;;;; with a hostile dynamic environment.  Reuses RUNTIME-SCHEMA-TESTS'
+;;;; WITH-RS-STORE fixture and :RS-STORE type-registry setup; loaded
+;;;; after that file.
 (in-package #:graph-db/test)
 
 (def-suite sidecar-io-suite :in graph-db-suite
   :description "Shared sidecar print/read discipline (GH #226, #227).")
 (in-suite sidecar-io-suite)
+
+(defun %sidecar-hostile-readtable ()
+  "A readtable that would misparse a sidecar record if a reader ever
+used it instead of WITH-SIDECAR-INPUT's own pristine copy: downcasing
+input flips every interned symbol's name-case, so e.g. WIDGET on disk
+would read back as the distinct symbol |widget| (GH #226)."
+  (let ((rt (copy-readtable nil)))
+    (setf (readtable-case rt) :downcase)
+    rt))
+
+(defmacro with-hostile-read-env (&body body)
+  "Every ambient binding a sidecar READER must survive: a *READ-BASE*
+that would misparse a decimal :ID/:TIME integer as hex, and a
+*READTABLE* that would fold case differently.  Reverting WITH-SIDECAR-
+INPUT must fail any test that wraps its assertions in this."
+  `(let ((*read-base* 16)
+         (*readtable* (%sidecar-hostile-readtable)))
+     ,@body))
 
 (test sidecar-io-hostile-dynamic-environment
   "GH #226: CREATE-VERTEX-TYPE/ENSURE-NAMESPACE/%NOTE-EDGE-OCCUPANCY must
@@ -18,7 +37,11 @@ write a record that round-trips even when the caller has *PRINT-LENGTH*,
 *PRINT-LEVEL*, *PRINT-BASE* and *READ-BASE* rebound.  Without the fix: a
 5-slot list truncates to 2 under *PRINT-LENGTH* 2, the nested slot specs
 print as # under *PRINT-LEVEL* 1, and the :TIME integer prints in hex
-under *PRINT-BASE* 16 -- unreadable back at *READ-BASE* 10."
+under *PRINT-BASE* 16 -- unreadable back at *READ-BASE* 10.  The READ
+side is separately hostile (WITH-HOSTILE-READ-ENV) around every actual
+read, including a forced disk reload of the edge-occupancy hint (GH
+#226 review round 2, item 9) so an in-image cache hit can't pass this
+without ever exercising WITH-SIDECAR-INPUT."
   (with-rs-store (g)
     g
     (let ((*print-length* 2) (*print-level* 1) (*print-base* 16)
@@ -30,17 +53,22 @@ under *PRINT-BASE* 16 -- unreadable back at *READ-BASE* 10."
          (d :type string) (e :type string))
        :default-store :rs-store)
       (graph-db::%note-edge-occupancy 'rs-knows "rs-store"))
-    (multiple-value-bind (ns types skipped)
-        (graph-db::read-schema-manifest graph-db::*system-directory*)
-      (is (= 0 skipped))
-      (is-true (find "RS-HOSTILE" ns :key (lambda (r) (getf r :namespace))
-                     :test #'string=))
-      (let ((row (find (intern "WIDGET" :rs-hostile) types
-                       :key (lambda (r) (getf r :type)))))
-        (is-true row)
-        (is (= 5 (length (getf row :slots))))))
-    (is (member "rs-store" (graph-db:edge-type-stores 'rs-knows)
-               :test 'equal))))
+    (with-hostile-read-env
+      (multiple-value-bind (ns types skipped)
+          (graph-db::read-schema-manifest graph-db::*system-directory*)
+        (is (= 0 skipped))
+        (is-true (find "RS-HOSTILE" ns :key (lambda (r) (getf r :namespace))
+                       :test #'string=))
+        (let ((row (find (intern "WIDGET" :rs-hostile) types
+                         :key (lambda (r) (getf r :type)))))
+          (is-true row)
+          (is (= 5 (length (getf row :slots))))))
+      ;; Force a real disk read: the cache from %NOTE-EDGE-OCCUPANCY's
+      ;; own write above would otherwise answer this without ever
+      ;; calling READ-SIDECAR-FORMS.
+      (graph-db::%clear-edge-occupancy-cache)
+      (is (member "rs-store" (graph-db:edge-type-stores 'rs-knows)
+                 :test 'equal)))))
 
 (test sidecar-io-multiline-string-round-trips
   "GH #226: a runtime slot-spec option carrying an embedded newline (a
@@ -130,3 +158,62 @@ record survives."
                           :key (lambda (r) (getf r :namespace))
                           :test #'string=)))))
       (is (eql 1 warned-count)))))
+
+(test sidecar-io-bad-record-before-good-record-survives
+  "GH #226 review round 2: a bad record BEFORE a good one must not
+consume the good one too.  An unterminated string's failed READ leaves
+the stream at EOF (it scans past every following line looking for the
+closing quote), so without repositioning back to where that READ
+started, the resync-by-line recovery has nothing left to resync onto --
+every good record after the bad one is lost, which is worse than the
+old READ-LINE-based parser this replaced."
+  (with-temp-directory (dir)
+    (let ((file (merge-pathnames "raw-sidecar.dat" dir)))
+      (with-open-file (s file :direction :output :if-exists :supersede)
+        (write-line "(:BAD \"unterminated" s)
+        (write-line "(:GOOD 1)" s))
+      (multiple-value-bind (forms skipped first-skip)
+          (graph-db::read-sidecar-file-forms file :warn-p nil)
+        (is (= 1 skipped))
+        (is (eql 0 first-skip))
+        (is (equal '((:good 1)) forms))))))
+
+(test type-registry-hostile-read-base
+  "GH #226 review round 2, item 10: reopening the type registry
+(%REGISTRY-LOAD -> %PARSE-REGISTRY-RECORD) must not misparse an :ID
+under an ambient *READ-BASE* -- \"12\" read at base 16 is 18, not 12.
+WITH-SIDECAR-INPUT pins *READ-BASE* 10 regardless of the caller's own
+binding at reopen time."
+  (with-temp-directory (dir)
+    (let ((r (graph-db::open-type-registry (namestring dir))))
+      (dotimes (i 11)
+        (graph-db::registry-intern
+         r (intern (format nil "TR-HOSTILE-FILLER-~D" i) :graph-db/test)
+         :vertex))
+      (let ((target-id (graph-db::registry-intern r 'tr-hostile-target
+                                                  :vertex)))
+        (is (eql 12 target-id))
+        (graph-db::close-type-registry r)
+        (with-hostile-read-env
+          (let ((r2 (graph-db::open-type-registry (namestring dir))))
+            (unwind-protect
+                 (is (eql target-id
+                          (graph-db::registry-id-for r2 'tr-hostile-target
+                                                     :vertex)))
+              (graph-db::close-type-registry r2))))))))
+
+(test store-registry-hostile-read-base
+  "GH #226 review round 2, item 10: the same misparse hazard, for the
+store-id registry's own reopen path (%STORE-REGISTRY-LOAD ->
+%PARSE-STORE-REGISTRY-RECORD)."
+  (with-temp-directory (sys)
+    (let ((graph-db::*system-directory* (namestring sys))
+          (graph-db::*store-registry* nil))
+      (dotimes (i 11)
+        (store-registry-intern
+         (intern (format nil "SR-HOSTILE-FILLER-~D" i) :graph-db/test)))
+      (let ((target-id (store-registry-intern 'sr-hostile-target)))
+        (is (eql 12 target-id))
+        (setq graph-db::*store-registry* nil)
+        (with-hostile-read-env
+          (is (eql target-id (store-registry-id-for 'sr-hostile-target))))))))

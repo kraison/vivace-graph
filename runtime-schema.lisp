@@ -595,8 +595,7 @@ methods below it compile (GH #172, R3)."
   (let ((filter (%materialize-namespace-filter namespaces))
         (namespace-count 0)
         (materialized 0)
-        (skipped 0)
-        (skipped-unreadable 0))
+        (skipped 0))
     ;; Two READ-SCHEMA-MANIFEST passes, same as before #226: a type row
     ;; can't even READ until its own package exists, and that package
     ;; may only get created by %MATERIALIZE-ORPHAN-PACKAGES below (a
@@ -619,9 +618,12 @@ methods below it compile (GH #172, R3)."
     ;; Packages first, and not only from namespace rows: a type row
     ;; cannot even be READ until its package exists.
     (%materialize-orphan-packages dir filter)
-    (multiple-value-bind (ns type-recs skipped-n) (read-schema-manifest dir)
-      ns
-      (setf skipped-unreadable skipped-n)
+    ;; ONE call for the authoritative pass: re-calling READ-SCHEMA-
+    ;; MANIFEST per value (e.g. via NTH-VALUE) would re-read the file
+    ;; and re-signal SIDECAR-RECORDS-SKIPPED for each value wanted.
+    (multiple-value-bind (namespace-records type-recs skipped-unreadable)
+        (read-schema-manifest dir)
+      (declare (ignore namespace-records))
       (let ((rows (remove-if-not
                    (lambda (r) (%materialize-row-wanted-p r filter))
                    type-recs))

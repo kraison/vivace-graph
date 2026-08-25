@@ -422,7 +422,8 @@ STORE-NAME, else refuse -- never *GRAPH* (GH #167)."
 (declaim (special *schema-manifest-lock*))
 ;; %SEED-SCHEMA-MANIFEST-CACHE (I-1, review round 3) reads the manifest
 ;; back through the same file this file also writes.
-(declaim (ftype (function (t) (values list list)) read-schema-manifest))
+(declaim (ftype (function (t) (values list list &optional unsigned-byte))
+                read-schema-manifest))
 
 (defvar *schema-provenance* :source
   "Bound to :RUNTIME around CREATE-VERTEX-TYPE/CREATE-EDGE-TYPE so

@@ -145,7 +145,11 @@ REGISTRY-INTERN's outer WITH-RECURSIVE-LOCK-HELD -- #186)."
                               :direction :output
                               :if-exists :append
                               :if-does-not-exist :create)
-                         (with-sidecar-output (:package :keyword)
+                         ;; :READABLY T preserves this writer's
+                         ;; pre-#226 *PRINT-READABLY* T -- #191
+                         ;; strictness for the id ledger (GH #226).
+                         (with-sidecar-output (:package :keyword
+                                                :readably t)
                            (format s "~S~%" (list :name name :id id)))
                          (finish-output s))
                        (setf (gethash name (store-registry-names registry))

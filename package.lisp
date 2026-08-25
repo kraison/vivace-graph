@@ -317,6 +317,12 @@
            #:*schema-node-metadata*
            #:read-schema-manifest
 
+           ;; shared sidecar print/read discipline (GH #226, #227)
+           #:sidecar-records-skipped
+           #:sidecar-skipped-file
+           #:sidecar-skipped-count
+           #:sidecar-skipped-first-position
+
            ;; visibility tooling (GH #172, R6)
            #:describe-schema
            #:export-schema-source

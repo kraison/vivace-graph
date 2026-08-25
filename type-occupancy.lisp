@@ -45,13 +45,15 @@ permission error, a race with an external deletion after PROBE-FILE)
 degrades to no-hint, matching R4 -- this must never signal into a real
 write (GH #167).  Reads FORMS, not lines (READ-SIDECAR-FORMS, GH #226):
 a torn or corrupt record is only a lost hint here, so a shaped-but-
-wrong form (wrong length, non-symbol NAME) is likewise just dropped,
-not counted toward the #227 skipped-record warning -- that warning is
-for records READ could not parse at all."
+wrong form (wrong length, non-symbol NAME) is likewise just dropped.
+:WARN-P NIL: this sidecar's whole contract is \"a lost hint, never a
+signal\" (GH #167) -- unlike the schema manifest, it must not raise
+SIDECAR-RECORDS-SKIPPED even when records were dropped (GH #227)."
   (clrhash *edge-occupancy*)
   (when (and file (probe-file file))
     (handler-case
-        (dolist (form (read-sidecar-file-forms file :package :common-lisp))
+        (dolist (form (read-sidecar-file-forms file :package :common-lisp
+                                                :warn-p nil))
           (when (%valid-edge-occupancy-form-p form)
             (destructuring-bind (name store) form
               (pushnew store (gethash name *edge-occupancy*)
