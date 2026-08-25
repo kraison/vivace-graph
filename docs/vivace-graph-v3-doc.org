@@ -2575,7 +2575,7 @@ The generators persist a random topology into a real graph in one transaction. T
 
 *** Importing and visualizing (~graph-db/algorithms-io~)
 
-Import from standard graph file formats and export to Graphviz live in a *separate* optional system, ~graph-db/algorithms-io~, so its parsing dependencies (~yacc~, ~dso-lex~, ~parse-number~) stay out of the core add-on:
+Import from standard graph file formats and export to Graphviz live in a *separate* optional system, ~graph-db/algorithms-io~, so its parsing dependencies (~yacc~, ~parse-number~) stay out of the core add-on (the GML lexer itself is hand-rolled — no lexer-generator dependency):
 
 #+BEGIN_SRC lisp
   (ql:quickload :graph-db/algorithms-io)

@@ -349,12 +349,13 @@
                (:file "prolog")))
 
 ;; OPTIONAL io add-on: GML/Pajek import + Graphviz export.  Kept separate so the
-;; parsing deps (yacc, dso-lex, parse-number) stay out of the core algorithm
-;; add-on and the embeddable core.
+;; parsing deps (yacc, parse-number) stay out of the core algorithm
+;; add-on and the embeddable core.  The GML lexer is hand-rolled here
+;; since dso-lex left Quicklisp (GH #240).
 (defsystem graph-db/algorithms-io
   :name "VivaceGraph graph-algorithms IO"
   :description "Optional GML/Pajek import + Graphviz export for graph-db/algorithms."
-  :depends-on (:graph-db/algorithms :cl-ppcre :yacc :dso-lex :parse-number
+  :depends-on (:graph-db/algorithms :cl-ppcre :yacc :parse-number
                :trivial-shell)
   :pathname "algorithms/"
   :serial t

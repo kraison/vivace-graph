@@ -11,6 +11,17 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ## [Unreleased]
 
+### Removed
+
+- **`dso-lex` dependency** (#240). It was dropped from Quicklisp between
+  the 2025-06-22 and 2026-01-01 dists, which made `graph-db/algorithms-io`
+  (and with it `graph-db/algorithms-test`) unloadable on a current dist —
+  the "Known issues" entry under 3.0.0 below. Its only use, the GML
+  tokenizer `SCAN-GML`, is now a plain hand-rolled function with the same
+  `(values class image remainder)` contract, including the silent-NIL
+  result for an unterminated quoted string. `cl-yacc` (still in the dist)
+  remains the GML parser. New lexer unit tests pin the token stream.
+
 ### Fixed
 
 - **Clock/journal hygiene batch** (#184, #178, #177, #183, #179, #180,
