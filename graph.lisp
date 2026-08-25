@@ -290,6 +290,293 @@ debugging an unexpectedly empty result, check the declaration before the data."
     (when segment
       (segment-scan segment query-vector k))))
 
+(defstruct (%graph-open-state (:conc-name %gos-))
+  "Mutable state MAKE-GRAPH/OPEN-GRAPH thread through their private
+%MAKE-GRAPH-1/%OPEN-GRAPH-1 body so an abort mid-open can find what to
+tear down (GH #224).  RAW is every fd-bearing resource opened before
+GRAPH itself existed; GRAPH is the constructed instance once
+MAKE-INSTANCE succeeds (RAW is cleared then -- GRAPH's own slots take
+over).  MUTATED is set just before the first step that can write real
+data against an EXISTING store's heap (recovery/rebuild on OPEN-GRAPH,
+WAL replay on MAKE-GRAPH) -- see %ABORT-GRAPH-OPEN, GH #224 review C1."
+  raw graph mutated)
+
+(defun %close-open-resource (r)
+  "Best-effort close of one fd-bearing resource R of unknown runtime
+type (GH #224) -- the exact set MAKE-GRAPH/OPEN-GRAPH ever hand to a
+fresh GRAPH's slots.  Catches SERIOUS-CONDITION, not just ERROR (the
+CLOSE-GRAPH snapshot precedent, GH #119/#120): a STORAGE-CONDITION mid-
+teardown must not replace the caller's original condition either.
+Never signals; NIL is silently a no-op."
+  (handler-case
+      (cond ((type-index-p r) (close-type-index r))
+            ((vev-index-p r) (close-vev-index r))
+            ((ve-index-p r) (close-ve-index r))
+            ((lhash-p r) (close-lhash r))
+            ((memory-p r) (close-memory r)))
+    (serious-condition () nil)))
+
+(defun %abort-graph-open (state)
+  "Best-effort teardown for a GRAPH construction aborted partway
+through MAKE-GRAPH/OPEN-GRAPH (GH #224), using STATE
+(%GRAPH-OPEN-STATE) as %MAKE-GRAPH-1/%OPEN-GRAPH-1 left it.
+%GOS-RAW is every fd-bearing resource opened before GRAPH itself
+existed -- MAKE-INSTANCE evaluates its initarg value-forms before it
+runs, so an error partway through that argument list (the original bug
+report's case) leaves each already-opened one reachable from nothing
+but a local variable, unless the caller pushed it onto %GOS-RAW as it
+went.  %GOS-GRAPH is the constructed instance, or NIL if MAKE-INSTANCE
+itself never returned; once it exists it owns everything in %GOS-RAW
+via its own slots and the caller clears %GOS-RAW right then, so the
+two branches below never name the same object twice.
+
+Also: stops replication FIRST (mirrors CLOSE-GRAPH's own ordering) --
+a master's accept-loop thread and listening socket must not survive
+referencing a graph whose mmaps this function is about to close, or a
+retried open on the same port fails EADDRINUSE (GH #224 review I2b);
+closes every open vector segment, the same fd-bearing-and-dirty-flagged
+resource CLOSE-GRAPH's own MAPHASH over VECTOR-SEGMENTS closes (GH #224
+review I2) -- RESTORE-VECTOR-SEGMENTS opens one mmap per (owner . slot)
+and marks each dirty on open, so a failure anywhere after it (the
+STORE-ID-COLLISION-ERROR case #224 was filed for included) leaked
+these and forced a rebuild on the next open; deregisters GRAPH from
+*GRAPHS*/the open-store vector if that ran before the failure.
+
+Finally, removes a .dirty marker this open wrote -- but ONLY when
+%GOS-MUTATED is NIL.  OPEN-GRAPH's recovery/rebuild steps
+(GC-HEAP, RECOVER-TRANSACTIONS, REBUILD-SPATIAL/UNIQUE-INDEXES,
+INSTALL-SECONDARY-INDEXES) and MAKE-GRAPH's WAL replay run AFTER the
+.dirty write and BEFORE CLOSE-GRAPH would ever get to save fresh index
+roots; deleting the sentinel here would let a subsequent OPEN-GRAPH
+adopt the OLD roots against this now-mutated heap with no recovery
+pass to catch the mismatch (CLOSE-GRAPH's own comment on
+SAVE-UNIQUE-INDEX-ROOTS/SAVE-SECONDARY-INDEX-ROOTS names this exact
+hazard).  Leaving .dirty in place when MUTATED is T is correct: the
+store now genuinely requires recovery.  When nothing mutating ran,
+whatever is durable is exactly what a fresh MAKE-GRAPH/an unmodified
+reopen wrote, and .dirty existing at all here means (by each function's
+own upfront invariant) THIS open is the one that wrote it, so deleting
+it is safe (GH #224 review C1).
+
+Never signals -- the caller's UNWIND-PROTECT re-raises the original
+condition unchanged."
+  (let ((raw (%gos-raw state))
+        (graph (%gos-graph state))
+        (mutated (%gos-mutated state)))
+    (dolist (r raw) (%close-open-resource r))
+    (when graph
+      (ignore-errors (stop-replication graph))
+      (ignore-errors
+        (maphash (lambda (k seg)
+                   (declare (ignore k))
+                   (ignore-errors (close-vector-segment seg)))
+                 (vector-segments graph)))
+      (ignore-errors
+        (when (eq graph (gethash (graph-name graph) *graphs*))
+          (remhash (graph-name graph) *graphs*)))
+      (ignore-errors (%unregister-open-store graph))
+      (ignore-errors (%close-open-resource (vertex-index graph)))
+      (ignore-errors (%close-open-resource (edge-index graph)))
+      (ignore-errors (%close-open-resource (vev-index graph)))
+      (ignore-errors (%close-open-resource (ve-index-in graph)))
+      (ignore-errors (%close-open-resource (ve-index-out graph)))
+      (ignore-errors (%close-open-resource (vertex-table graph)))
+      (ignore-errors (%close-open-resource (edge-table graph)))
+      (ignore-errors (%close-open-resource (indexes graph)))
+      (ignore-errors (%close-open-resource (heap graph)))
+      (ignore-errors (close-replication-log graph))
+      (ignore-errors
+        (when (and (slot-exists-p graph 'applied-op-ids)
+                   (slot-boundp graph 'applied-op-ids)
+                   (lhash-p (applied-op-ids graph)))
+          (close-lhash (applied-op-ids graph))))
+      (ignore-errors
+        (unless mutated
+          (let ((dirty-file (format nil "~A/.dirty" (location graph))))
+            (when (probe-file dirty-file) (delete-file dirty-file)))))))
+  nil)
+
+(defun %make-graph-1
+    (name location state &key master-p slave-p master-host
+                              replication-port replication-key package
+                              replay-txn-dir buffer-pool-p buffer-pool-size
+                              vertex-buckets edge-buckets heap-size
+                              index-size keep-revisions spatial-precision
+                              spatial-max-cells replication-filter
+                              peer-role origin-id peer-host export-predicate
+                              device-registry merge-policy reference-classes
+                              peer-schema-version index-backend
+                              spatial-index-backend system-clock
+                              recovery-policy)
+  ;; Private body of MAKE-GRAPH (GH #224): everything that opens an fd
+  ;; or registers the graph lives here, wrapped by MAKE-GRAPH's
+  ;; UNWIND-PROTECT.  STATE is a (RAW . GRAPH) cons this function
+  ;; updates as it goes, so an abort mid-way still knows what to tear
+  ;; down -- see %ABORT-GRAPH-OPEN.
+  (ensure-directories-exist location)
+  (let* ((path (pathname location))
+         (dirty-file (format nil "~A/.dirty" location)))
+    (unless (probe-file path)
+      (error "Unable to open graph location ~A" path))
+    ;; GH #170 Task 4: persisted once, at create, before anything else
+    ;; touches LOCATION -- SET-STORE-RECOVERY-POLICY validates the value.
+    (when recovery-policy
+      (set-store-recovery-policy path recovery-policy))
+    (when buffer-pool-p
+      (ensure-buffer-pool buffer-pool-size))
+    (let (heap vertex-table edge-table indexes ve-index-in ve-index-out
+          vev-index graph)
+      ;; GH #224: MAKE-INSTANCE evaluates its initarg value-forms before
+      ;; it runs, so an error partway through that argument list -- the
+      ;; original bug report's steady-state case -- would otherwise
+      ;; leave every already-opened resource here unreachable from any
+      ;; variable.  Push each one onto STATE's raw list as soon as it
+      ;; is bound, so %ABORT-GRAPH-OPEN can still find and close it.
+      (setq heap (create-memory (format nil "~A/heap.dat" path)
+                                heap-size))
+      (push heap (%gos-raw state))
+      (setq vertex-table (make-vertex-table
+                          (format nil "~A/vertex/" path)
+                          :base-buckets vertex-buckets))
+      (push vertex-table (%gos-raw state))
+      (setq edge-table (make-edge-table
+                        (format nil "~A/edge/" path)
+                        :base-buckets edge-buckets))
+      (push edge-table (%gos-raw state))
+      (setq indexes (create-memory
+                     (format nil "~A/indexes.dat" path)
+                     index-size))
+      (push indexes (%gos-raw state))
+      (setq ve-index-in (make-ve-index
+                         (format nil "~A/ve-index-in/" path)))
+      (push ve-index-in (%gos-raw state))
+      (setq ve-index-out (make-ve-index
+                          (format nil "~A/ve-index-out/" path)))
+      (push ve-index-out (%gos-raw state))
+      (setq vev-index (make-vev-index (format nil "~A/vev-index/" path)))
+      (push vev-index (%gos-raw state))
+      (setq graph
+            (make-instance
+             (cond (slave-p 'slave-graph)
+                   (master-p 'master-graph)
+                   (peer-role 'peer-graph)
+                   (t 'graph))
+             :graph-name name
+             :location path
+             :index-backend index-backend
+             :spatial-index-backend spatial-index-backend
+             :views
+             #+sbcl (make-hash-table :synchronized t)
+             #+ccl (make-hash-table :shared t)
+             #+lispworks (make-hash-table :single-thread nil)
+             #+ecl (make-hash-table #+graph-db-ecl-sync-hash :synchronized
+                                     #+graph-db-ecl-sync-hash t)
+             :cache
+             (make-id-table :synchronized t :weakness :value)
+             :replication-key replication-key
+             :replication-port replication-port
+             :vertex-table vertex-table
+             :edge-table edge-table
+             :heap heap
+             :indexes indexes
+             :ve-index-in ve-index-in
+             :ve-index-out ve-index-out
+             :vev-index vev-index))
+      ;; GRAPH now owns every resource above via its own slots -- hand
+      ;; cleanup off to the GRAPH-based path in %ABORT-GRAPH-OPEN.  Set
+      ;; %GOS-GRAPH BEFORE clearing %GOS-RAW (GH #224 review M2): if an
+      ;; async interrupt lands between the two SETFs, RAW staying non-
+      ;; NIL a moment longer only costs a redundant (IGNORE-ERRORS-
+      ;; wrapped) close, where the other order would drop every
+      ;; resource from STATE entirely.
+      (setf (%gos-graph state) graph (%gos-raw state) nil)
+      (setf (vertex-index graph)
+            (make-type-index
+             (format nil "~A/vertex-index.dat" path) heap))
+      (setf (edge-index graph)
+            (make-type-index
+             (format nil "~A/edge-index.dat" path) heap))
+      ;; (MVCC: the lhash value-finalizer that copied node bytes under the bucket
+      ;; lock is gone; read paths now materialize bytes under a read pin instead.)
+      (let ((*graph* graph))
+        (init-schema graph)
+        ;; MVCC: graph-wide default retained-version count (per-type overrides via
+        ;; def-vertex/def-edge :keep-revisions).  Set before update-schema persists.
+        (setf (schema-keep-revisions (schema graph)) keep-revisions)
+        (update-schema graph)
+        (setf (graph-default-spatial-precision graph) (or spatial-precision 7))
+        (setf (graph-default-spatial-max-cells graph) (or spatial-max-cells +spatial-insert-max-cells+))
+        ;; REBUILD-SPATIAL-INDEXES persists the (empty, on a fresh graph) sidecar
+        ;; itself once it finishes; a trailing save here would just be a redundant
+        ;; duplicate of the exact same state.
+        (rebuild-spatial-indexes graph)
+        (with-open-file (out dirty-file :direction :output)
+          (format out "~S" (get-universal-time)))
+        (setf (gethash name *graphs*) graph)
+        (%register-open-store graph))
+      (when slave-p
+        (setf (master-host graph) master-host)
+        ;; Set the subset filter before replay/replication so the slave applies
+        ;; only its subset from the very first transaction.
+        (when replication-filter
+          (setf (replication-filter graph) replication-filter))
+        (when replay-txn-dir
+          ;; GH #224 review C1: REPLAY writes real transaction data
+          ;; into this fresh graph's heap; %ABORT-GRAPH-OPEN must not
+          ;; delete .dirty past this point (see %OPEN-GRAPH-1's mirror
+          ;; of this flag for the reopen case).
+          (setf (%gos-mutated state) t)
+          (let ((*graph* graph))
+            (replay graph replay-txn-dir package))))
+      (when peer-role
+        (setf (peer-role graph) peer-role
+              (origin-id graph) origin-id
+              (peer-host graph) peer-host
+              (export-predicate graph) export-predicate
+              (merge-policy graph) merge-policy
+              (device-registry graph) device-registry
+              (reference-classes graph) reference-classes
+              (peer-schema-version graph) peer-schema-version
+              ;; B1/PT-8: reload the durable Lamport clock so it never resets on
+              ;; restart (0 for a fresh graph, the persisted value on reopen).
+              (lamport-counter graph) (load-lamport-counter graph)
+              ;; B2b: recover per-field Lamport stamps (v1 in-memory snapshot).
+              (field-stamps graph) (load-field-stamps graph)
+              ;; #6: recover the :ORIGIN-scope per-node origin partitions.
+              (node-origins graph) (load-node-origins graph)
+              ;; B3: recover the durable conflict records for the review surface.
+              (peer-conflicts graph) (load-peer-conflicts graph)
+              ;; WP-3: durable applied-op-id dedup index -- op-id (16-byte uuid key)
+              ;; -> lamport (uint64 value), the make-lhash defaults.
+              (applied-op-ids graph)
+              (make-lhash :location (format nil "~A/applied-ops/" path)
+                          :buckets 8)))
+      ;; Unlike OPEN-GRAPH, this TM does not need :OPENING (review round
+      ;; 3): MAKE-GRAPH's *GRAPHS* registration above already runs before
+      ;; this construction, same as before I4, and there is no RECOVER-
+      ;; TRANSACTIONS/rebuild step here for a racing writer to collide
+      ;; with -- a write against the still-unbound TRANSACTION-MANAGER
+      ;; slot in that window signals a loud unbound-slot error, the same
+      ;; acceptable pre-#170 behaviour (GH #170).
+      (setf (transaction-manager graph)
+            (make-instance 'transaction-manager
+                           :graph graph))
+      (when system-clock
+        (attach-to-system-clock graph system-clock))
+      (ensure-directories-exist (persistent-transaction-directory graph))
+      (init-replication-log graph)
+      (start-replication graph :package package)
+      (setf (graph-open-p graph) t)
+      ;; Build the DEF-UNIQUE constraints registered for this graph, as
+      ;; OPEN-GRAPH does.  A fresh graph has no nodes, so this registers empty
+      ;; indexes rather than scanning -- but registration is what lets an
+      ;; ABSENT index mean "not built yet" instead of "brand new", which the
+      ;; consult-only commit path now relies on (GH #129).  After the slave
+      ;; replay above, so a subset replay is covered.
+      (let ((*graph* graph))
+        (install-unique-tuple-constraints graph))
+      graph)))
+
 (defun make-graph (name location &key master-p slave-p master-host
                                    replication-port replication-key package
                                    replay-txn-dir (buffer-pool-p t)
@@ -397,137 +684,48 @@ to disk and remove it."
     (error ":PEER-ROLE must be :HUB or :DEVICE, got ~S" peer-role))
   (when (and (eq peer-role :device) (null origin-id))
     (error "a :DEVICE peer-graph requires a hub-minted :ORIGIN-ID"))
-  (ensure-directories-exist location)
-  (let* ((path (pathname location))
-         (dirty-file (format nil "~A/.dirty" location)))
-    (unless (probe-file path)
-      (error "Unable to open graph location ~A" path))
-    ;; GH #170 Task 4: persisted once, at create, before anything else
-    ;; touches LOCATION -- SET-STORE-RECOVERY-POLICY validates the value.
-    (when recovery-policy
-      (set-store-recovery-policy path recovery-policy))
-    (when buffer-pool-p
-      (ensure-buffer-pool buffer-pool-size))
-    (let* ((heap (create-memory
-                  (format nil "~A/heap.dat" path)
-                  heap-size))
-           (graph
-            (make-instance
-             (cond (slave-p 'slave-graph)
-                   (master-p 'master-graph)
-                   (peer-role 'peer-graph)
-                   (t 'graph))
-             :graph-name name
-             :location path
-             :index-backend index-backend
-             :spatial-index-backend spatial-index-backend
-             :views
-             #+sbcl (make-hash-table :synchronized t)
-             #+ccl (make-hash-table :shared t)
-             #+lispworks (make-hash-table :single-thread nil)
-             #+ecl (make-hash-table #+graph-db-ecl-sync-hash :synchronized
-                                     #+graph-db-ecl-sync-hash t)
-             :cache
-             (make-id-table :synchronized t :weakness :value)
-             :replication-key replication-key
-             :replication-port replication-port
-             :vertex-table (make-vertex-table
-                            (format nil "~A/vertex/" path)
-                            :base-buckets vertex-buckets)
-             :edge-table (make-edge-table
-                          (format nil "~A/edge/" path)
-                          :base-buckets edge-buckets)
-             :heap heap
-             :indexes (create-memory
-                       (format nil "~A/indexes.dat" path)
-                       index-size)
-             :ve-index-in (make-ve-index
-                           (format nil "~A/ve-index-in/" path))
-             :ve-index-out (make-ve-index
-                            (format nil "~A/ve-index-out/" path))
-             :vev-index (make-vev-index
-                         (format nil "~A/vev-index/" path)))))
-      (setf (vertex-index graph)
-            (make-type-index
-             (format nil "~A/vertex-index.dat" path) heap))
-      (setf (edge-index graph)
-            (make-type-index
-             (format nil "~A/edge-index.dat" path) heap))
-      ;; (MVCC: the lhash value-finalizer that copied node bytes under the bucket
-      ;; lock is gone; read paths now materialize bytes under a read pin instead.)
-      (let ((*graph* graph))
-        (init-schema graph)
-        ;; MVCC: graph-wide default retained-version count (per-type overrides via
-        ;; def-vertex/def-edge :keep-revisions).  Set before update-schema persists.
-        (setf (schema-keep-revisions (schema graph)) keep-revisions)
-        (update-schema graph)
-        (setf (graph-default-spatial-precision graph) (or spatial-precision 7))
-        (setf (graph-default-spatial-max-cells graph) (or spatial-max-cells +spatial-insert-max-cells+))
-        ;; REBUILD-SPATIAL-INDEXES persists the (empty, on a fresh graph) sidecar
-        ;; itself once it finishes; a trailing save here would just be a redundant
-        ;; duplicate of the exact same state.
-        (rebuild-spatial-indexes graph)
-        (with-open-file (out dirty-file :direction :output)
-          (format out "~S" (get-universal-time)))
-        (setf (gethash name *graphs*) graph)
-        (%register-open-store graph))
-      (when slave-p
-        (setf (master-host graph) master-host)
-        ;; Set the subset filter before replay/replication so the slave applies
-        ;; only its subset from the very first transaction.
-        (when replication-filter
-          (setf (replication-filter graph) replication-filter))
-        (when replay-txn-dir
-          (let ((*graph* graph))
-            (replay graph replay-txn-dir package))))
-      (when peer-role
-        (setf (peer-role graph) peer-role
-              (origin-id graph) origin-id
-              (peer-host graph) peer-host
-              (export-predicate graph) export-predicate
-              (merge-policy graph) merge-policy
-              (device-registry graph) device-registry
-              (reference-classes graph) reference-classes
-              (peer-schema-version graph) peer-schema-version
-              ;; B1/PT-8: reload the durable Lamport clock so it never resets on
-              ;; restart (0 for a fresh graph, the persisted value on reopen).
-              (lamport-counter graph) (load-lamport-counter graph)
-              ;; B2b: recover per-field Lamport stamps (v1 in-memory snapshot).
-              (field-stamps graph) (load-field-stamps graph)
-              ;; #6: recover the :ORIGIN-scope per-node origin partitions.
-              (node-origins graph) (load-node-origins graph)
-              ;; B3: recover the durable conflict records for the review surface.
-              (peer-conflicts graph) (load-peer-conflicts graph)
-              ;; WP-3: durable applied-op-id dedup index -- op-id (16-byte uuid key)
-              ;; -> lamport (uint64 value), the make-lhash defaults.
-              (applied-op-ids graph)
-              (make-lhash :location (format nil "~A/applied-ops/" path)
-                          :buckets 8)))
-      ;; Unlike OPEN-GRAPH, this TM does not need :OPENING (review round
-      ;; 3): MAKE-GRAPH's *GRAPHS* registration above already runs before
-      ;; this construction, same as before I4, and there is no RECOVER-
-      ;; TRANSACTIONS/rebuild step here for a racing writer to collide
-      ;; with -- a write against the still-unbound TRANSACTION-MANAGER
-      ;; slot in that window signals a loud unbound-slot error, the same
-      ;; acceptable pre-#170 behaviour (GH #170).
-      (setf (transaction-manager graph)
-            (make-instance 'transaction-manager
-                           :graph graph))
-      (when system-clock
-        (attach-to-system-clock graph system-clock))
-      (ensure-directories-exist (persistent-transaction-directory graph))
-      (init-replication-log graph)
-      (start-replication graph :package package)
-      (setf (graph-open-p graph) t)
-      ;; Build the DEF-UNIQUE constraints registered for this graph, as
-      ;; OPEN-GRAPH does.  A fresh graph has no nodes, so this registers empty
-      ;; indexes rather than scanning -- but registration is what lets an
-      ;; ABSENT index mean "not built yet" instead of "brand new", which the
-      ;; consult-only commit path now relies on (GH #129).  After the slave
-      ;; replay above, so a subset replay is covered.
-      (let ((*graph* graph))
-        (install-unique-tuple-constraints graph))
-      graph)))
+  ;; A slashless namestring keeps LOCATION as a FILE pathname, so every
+  ;; (make-pathname :defaults (location graph)) sidecar -- transaction-
+  ;; id.dat above all -- lands in the store's PARENT directory instead
+  ;; of inside it.  Normalize once, before any use (GH #222).
+  (setq location (namestring (uiop:ensure-directory-pathname location)))
+  ;; GH #224: STATE (%GRAPH-OPEN-STATE) is what %MAKE-GRAPH-1 updates
+  ;; as it goes; DONE distinguishes a clean return from a non-local
+  ;; exit.  The original condition always propagates unchanged.
+  (let ((state (make-%graph-open-state)) (done nil))
+    (unwind-protect
+        (prog1
+            (%make-graph-1 name location state
+                           :master-p master-p :slave-p slave-p
+                           :master-host master-host
+                           :replication-port replication-port
+                           :replication-key replication-key
+                           :package package
+                           :replay-txn-dir replay-txn-dir
+                           :buffer-pool-p buffer-pool-p
+                           :buffer-pool-size buffer-pool-size
+                           :vertex-buckets vertex-buckets
+                           :edge-buckets edge-buckets
+                           :heap-size heap-size
+                           :index-size index-size
+                           :keep-revisions keep-revisions
+                           :spatial-precision spatial-precision
+                           :spatial-max-cells spatial-max-cells
+                           :replication-filter replication-filter
+                           :peer-role peer-role
+                           :origin-id origin-id
+                           :peer-host peer-host
+                           :export-predicate export-predicate
+                           :device-registry device-registry
+                           :merge-policy merge-policy
+                           :reference-classes reference-classes
+                           :peer-schema-version peer-schema-version
+                           :index-backend index-backend
+                           :spatial-index-backend spatial-index-backend
+                           :system-clock system-clock
+                           :recovery-policy recovery-policy)
+          (setf done t))
+      (unless done (%abort-graph-open state)))))
 
 (define-condition recovery-policy-mismatch-warning (warning)
   ;; A named class rather than a bare STRING WARN, so a caller (or a test)
@@ -546,81 +744,23 @@ policy.dat's ~S; the file wins."
                      (recovery-policy-mismatch-warning-requested c)
                      (recovery-policy-mismatch-warning-on-disk c)))))
 
-(defun open-graph (name location &key master-p slave-p master-host replication-port
-                   replication-key package (buffer-pool-p t) (gc-heap-p t)
-                   (buffer-pool-size 100000)
-                   (accept-versions (list +storage-version+))
-                   keep-revisions regenerate-views
-                   peer-role origin-id peer-host
-                   export-predicate device-registry merge-policy
-                   reference-classes (peer-schema-version '(1 0))
-                   (index-backend *index-backend*)
-                   spatial-index-backend
-                   ;; Default geohash precision for spatial indexes CREATED on this
-                   ;; graph (MAKE-GRAPH takes the same keyword).  Existing indexes
-                   ;; reopen at their own persisted precision from the v3 sidecar,
-                   ;; so this governs only indexes created after the open -- and,
-                   ;; for a pre-v3 graph, the ones its migration re-derives.
-                   (spatial-precision 7)
-                   (spatial-max-cells +spatial-insert-max-cells+)
-                   (system-clock *system-clock*)
-                   shadow-p recovery-policy
-                   (initial-accepting-state t))
-  "Open the existing graph named NAME whose files live under directory
-LOCATION, register it, and return it.  Use this to reopen a graph created
-earlier with MAKE-GRAPH; the keyword arguments mirror MAKE-GRAPH's, including
-:SYSTEM-CLOCK -- attaching raises the clock above this store's persisted
-highest id (the spec §6 watermark).
-
-Signals an error if LOCATION holds a .dirty marker, which means the graph was
-not closed cleanly and must be recovered first (see RECOVER-TRANSACTIONS and
-the backup/recovery chapter).  By default the heap is garbage-collected
-(:GC-HEAP-P) and outstanding transactions are recovered on open.  Views are
-reconciled against their declarative definitions and kept as-is unless changed
-(see DEF-VIEW); pass :REGENERATE-VIEWS T to force-rebuild every view on open.
-Always CLOSE-GRAPH when finished.
-
-*SYSTEM-DIRECTORY* must be set: reopening replays the schema and may assign
-ids to types added since (GH #186).
-
-:SHADOW-P T opens an unregistered shadow generation (GH #170,
-OPEN-SHADOW-GRAPH): the graph is never placed in *GRAPHS*, never
-published to the open-store vector (%REGISTER-OPEN-STORE is skipped;
-STORE-ID is still interned from the registry, directly, so v8 ids
-minted here carry the live store's tag), and replication is never
-started.
-
-:RECOVERY-POLICY (GH #170) is only a HINT here, unlike MAKE-GRAPH: if
-LOCATION already carries a policy.dat, that file is authoritative --
-this keyword is ignored (a value that disagrees with the file signals
-RECOVERY-POLICY-MISMATCH-WARNING, a WARNING, but the file still wins)
-rather than silently rewritten out from under whatever wrote it.  It
-is persisted only when LOCATION is being
-created-on-open (no schema.dat yet, the same condition INIT-SCHEMA
-below branches on) -- a genuine reopen of an existing graph with no
-policy.dat leaves it absent (STORE-RECOVERY-POLICY's :AUTHORED
-default), it does not retroactively opt that graph in.
-
-:INITIAL-ACCEPTING-STATE (GH #170, review finding I4) is the state this
-call leaves the graph in once it returns -- e.g. SHADOW-STORE's reopen
-passes :READ-ONLY so the returned graph never briefly comes up fully
-writable.  The fresh TRANSACTION-MANAGER itself always starts at
-:OPENING (review round 3), not this value directly: :OPENING is what is
-in force, before the graph is registered in *GRAPHS*, for every
-rebuild/recovery step this call runs internally, refusing a racing
-external writer with STORE-NOT-ACCEPTING-ERROR reason :OPENING while
-still admitting the read pins those internal steps themselves take.
-Only once GRAPH-OPEN-P is T, at the very end, does ACCEPTING-P flip to
-INITIAL-ACCEPTING-STATE.  Defaults to T (ordinary opens end up fully
-accepting, as before)."
-  (unless *system-directory*
-    (error 'system-directory-required :operation 'open-graph))
-  (when (and peer-role (or master-p slave-p))
-    (error ":PEER-ROLE is mutually exclusive with :MASTER-P / :SLAVE-P"))
-  (when (and peer-role (not (member peer-role '(:hub :device))))
-    (error ":PEER-ROLE must be :HUB or :DEVICE, got ~S" peer-role))
-  (when (and (eq peer-role :device) (null origin-id))
-    (error "a :DEVICE peer-graph requires a hub-minted :ORIGIN-ID"))
+(defun %open-graph-1
+    (name location state &key master-p slave-p master-host
+                              replication-port replication-key package
+                              buffer-pool-p gc-heap-p buffer-pool-size
+                              accept-versions keep-revisions
+                              regenerate-views peer-role origin-id
+                              peer-host export-predicate device-registry
+                              merge-policy reference-classes
+                              peer-schema-version index-backend
+                              spatial-index-backend spatial-precision
+                              spatial-max-cells system-clock shadow-p
+                              recovery-policy initial-accepting-state)
+  ;; Private body of OPEN-GRAPH (GH #224): everything that opens an fd
+  ;; or registers the graph lives here, wrapped by OPEN-GRAPH's
+  ;; UNWIND-PROTECT.  STATE is a (RAW . GRAPH) cons this function
+  ;; updates as it goes, so an abort mid-way still knows what to tear
+  ;; down -- see %ABORT-GRAPH-OPEN.
   (ensure-directories-exist location)
   (let ((path (pathname location))
         (dirty-file (format nil "~A/.dirty" location))
@@ -633,9 +773,30 @@ accepting, as before)."
     (when buffer-pool-p
       (log:info "Initializing buffer pool.")
       (ensure-buffer-pool buffer-pool-size))
-    (let* ((heap (open-memory (format nil "~A/heap.dat" path)
+    (let (heap vertex-table edge-table indexes ve-index-in ve-index-out
+          vev-index graph)
+      ;; GH #224: same STATE-tracking as MAKE-GRAPH -- MAKE-INSTANCE
+      ;; evaluates its initarg value-forms before it runs, so push each
+      ;; opened resource as soon as it is bound.
+      (setq heap (open-memory (format nil "~A/heap.dat" path)
                               :accept-versions accept-versions))
-           (graph
+      (push heap (%gos-raw state))
+      (setq vertex-table (open-lhash (format nil "~A/vertex/" path)))
+      (push vertex-table (%gos-raw state))
+      (setq edge-table (open-lhash (format nil "~A/edge/" path)))
+      (push edge-table (%gos-raw state))
+      (setq indexes (open-memory (format nil "~A/indexes.dat" path)
+                                 :accept-versions accept-versions))
+      (push indexes (%gos-raw state))
+      (setq ve-index-in (open-ve-index
+                         (format nil "~A/ve-index-in/" path)))
+      (push ve-index-in (%gos-raw state))
+      (setq ve-index-out (open-ve-index
+                          (format nil "~A/ve-index-out/" path)))
+      (push ve-index-out (%gos-raw state))
+      (setq vev-index (open-vev-index (format nil "~A/vev-index/" path)))
+      (push vev-index (%gos-raw state))
+      (setq graph
             (make-instance
              (cond (slave-p 'slave-graph)
                    (master-p 'master-graph)
@@ -655,20 +816,21 @@ accepting, as before)."
              (make-id-table :synchronized t :weakness :value)
              :replication-key replication-key
              :replication-port replication-port
-             :vertex-table (open-lhash
-                            (format nil "~A/vertex/" path))
-             :edge-table (open-lhash
-                          (format nil "~A/edge/" path))
+             :vertex-table vertex-table
+             :edge-table edge-table
              :heap heap
-             :indexes (open-memory
-                       (format nil "~A/indexes.dat" path)
-                       :accept-versions accept-versions)
-             :ve-index-in (open-ve-index
-                           (format nil "~A/ve-index-in/" path))
-             :ve-index-out (open-ve-index
-                            (format nil "~A/ve-index-out/" path))
-             :vev-index (open-vev-index
-                         (format nil "~A/vev-index/" path)))))
+             :indexes indexes
+             :ve-index-in ve-index-in
+             :ve-index-out ve-index-out
+             :vev-index vev-index))
+      ;; GRAPH now owns every resource above via its own slots -- hand
+      ;; cleanup off to the GRAPH-based path in %ABORT-GRAPH-OPEN.  Set
+      ;; %GOS-GRAPH BEFORE clearing %GOS-RAW (GH #224 review M2): if an
+      ;; async interrupt lands between the two SETFs, RAW staying non-
+      ;; NIL a moment longer only costs a redundant (IGNORE-ERRORS-
+      ;; wrapped) close, where the other order would drop every
+      ;; resource from STATE entirely.
+      (setf (%gos-graph state) graph (%gos-raw state) nil)
       (let ((*graph* graph))
         (setf (vertex-index graph)
               (open-type-index (format nil "~A/vertex-index.dat" path) heap))
@@ -777,6 +939,10 @@ accepting, as before)."
             (progn
               (setf (gethash name *graphs*) graph)
               (%register-open-store graph)))
+        ;; GH #224 review C1: from here on, recovery/rebuild can write
+        ;; real data against this (possibly pre-existing) store's heap;
+        ;; %ABORT-GRAPH-OPEN must not delete .dirty past this point.
+        (setf (%gos-mutated state) t)
         (when gc-heap-p
           (gc-heap graph))
         ;; A non-empty WAL tail means this open is a CRASH RECOVERY: the .txn files
@@ -888,6 +1054,123 @@ accepting, as before)."
       ;; (GH #170, review round 3).
       (%set-accepting-p (transaction-manager graph) initial-accepting-state)
       graph)))
+
+(defun open-graph (name location &key master-p slave-p master-host replication-port
+                   replication-key package (buffer-pool-p t) (gc-heap-p t)
+                   (buffer-pool-size 100000)
+                   (accept-versions (list +storage-version+))
+                   keep-revisions regenerate-views
+                   peer-role origin-id peer-host
+                   export-predicate device-registry merge-policy
+                   reference-classes (peer-schema-version '(1 0))
+                   (index-backend *index-backend*)
+                   spatial-index-backend
+                   ;; Default geohash precision for spatial indexes CREATED on this
+                   ;; graph (MAKE-GRAPH takes the same keyword).  Existing indexes
+                   ;; reopen at their own persisted precision from the v3 sidecar,
+                   ;; so this governs only indexes created after the open -- and,
+                   ;; for a pre-v3 graph, the ones its migration re-derives.
+                   (spatial-precision 7)
+                   (spatial-max-cells +spatial-insert-max-cells+)
+                   (system-clock *system-clock*)
+                   shadow-p recovery-policy
+                   (initial-accepting-state t))
+  "Open the existing graph named NAME whose files live under directory
+LOCATION, register it, and return it.  Use this to reopen a graph created
+earlier with MAKE-GRAPH; the keyword arguments mirror MAKE-GRAPH's, including
+:SYSTEM-CLOCK -- attaching raises the clock above this store's persisted
+highest id (the spec §6 watermark).
+
+Signals an error if LOCATION holds a .dirty marker, which means the graph was
+not closed cleanly and must be recovered first (see RECOVER-TRANSACTIONS and
+the backup/recovery chapter).  By default the heap is garbage-collected
+(:GC-HEAP-P) and outstanding transactions are recovered on open.  Views are
+reconciled against their declarative definitions and kept as-is unless changed
+(see DEF-VIEW); pass :REGENERATE-VIEWS T to force-rebuild every view on open.
+Always CLOSE-GRAPH when finished.
+
+*SYSTEM-DIRECTORY* must be set: reopening replays the schema and may assign
+ids to types added since (GH #186).
+
+:SHADOW-P T opens an unregistered shadow generation (GH #170,
+OPEN-SHADOW-GRAPH): the graph is never placed in *GRAPHS*, never
+published to the open-store vector (%REGISTER-OPEN-STORE is skipped;
+STORE-ID is still interned from the registry, directly, so v8 ids
+minted here carry the live store's tag), and replication is never
+started.
+
+:RECOVERY-POLICY (GH #170) is only a HINT here, unlike MAKE-GRAPH: if
+LOCATION already carries a policy.dat, that file is authoritative --
+this keyword is ignored (a value that disagrees with the file signals
+RECOVERY-POLICY-MISMATCH-WARNING, a WARNING, but the file still wins)
+rather than silently rewritten out from under whatever wrote it.  It
+is persisted only when LOCATION is being
+created-on-open (no schema.dat yet, the same condition INIT-SCHEMA
+below branches on) -- a genuine reopen of an existing graph with no
+policy.dat leaves it absent (STORE-RECOVERY-POLICY's :AUTHORED
+default), it does not retroactively opt that graph in.
+
+:INITIAL-ACCEPTING-STATE (GH #170, review finding I4) is the state this
+call leaves the graph in once it returns -- e.g. SHADOW-STORE's reopen
+passes :READ-ONLY so the returned graph never briefly comes up fully
+writable.  The fresh TRANSACTION-MANAGER itself always starts at
+:OPENING (review round 3), not this value directly: :OPENING is what is
+in force, before the graph is registered in *GRAPHS*, for every
+rebuild/recovery step this call runs internally, refusing a racing
+external writer with STORE-NOT-ACCEPTING-ERROR reason :OPENING while
+still admitting the read pins those internal steps themselves take.
+Only once GRAPH-OPEN-P is T, at the very end, does ACCEPTING-P flip to
+INITIAL-ACCEPTING-STATE.  Defaults to T (ordinary opens end up fully
+accepting, as before)."
+  (unless *system-directory*
+    (error 'system-directory-required :operation 'open-graph))
+  (when (and peer-role (or master-p slave-p))
+    (error ":PEER-ROLE is mutually exclusive with :MASTER-P / :SLAVE-P"))
+  (when (and peer-role (not (member peer-role '(:hub :device))))
+    (error ":PEER-ROLE must be :HUB or :DEVICE, got ~S" peer-role))
+  (when (and (eq peer-role :device) (null origin-id))
+    (error "a :DEVICE peer-graph requires a hub-minted :ORIGIN-ID"))
+  ;; A slashless namestring keeps LOCATION as a FILE pathname, so every
+  ;; (make-pathname :defaults (location graph)) sidecar -- transaction-
+  ;; id.dat above all -- lands in the store's PARENT directory instead
+  ;; of inside it.  Normalize once, before any use (GH #222).
+  (setq location (namestring (uiop:ensure-directory-pathname location)))
+  ;; GH #224: STATE (%GRAPH-OPEN-STATE) is what %OPEN-GRAPH-1 updates
+  ;; as it goes; DONE distinguishes a clean return from a non-local
+  ;; exit.  The original condition always propagates unchanged.
+  (let ((state (make-%graph-open-state)) (done nil))
+    (unwind-protect
+        (prog1
+            (%open-graph-1 name location state
+                          :master-p master-p :slave-p slave-p
+                          :master-host master-host
+                          :replication-port replication-port
+                          :replication-key replication-key
+                          :package package
+                          :buffer-pool-p buffer-pool-p
+                          :gc-heap-p gc-heap-p
+                          :buffer-pool-size buffer-pool-size
+                          :accept-versions accept-versions
+                          :keep-revisions keep-revisions
+                          :regenerate-views regenerate-views
+                          :peer-role peer-role
+                          :origin-id origin-id
+                          :peer-host peer-host
+                          :export-predicate export-predicate
+                          :device-registry device-registry
+                          :merge-policy merge-policy
+                          :reference-classes reference-classes
+                          :peer-schema-version peer-schema-version
+                          :index-backend index-backend
+                          :spatial-index-backend spatial-index-backend
+                          :spatial-precision spatial-precision
+                          :spatial-max-cells spatial-max-cells
+                          :system-clock system-clock
+                          :shadow-p shadow-p
+                          :recovery-policy recovery-policy
+                          :initial-accepting-state initial-accepting-state)
+          (setf done t))
+      (unless done (%abort-graph-open state)))))
 
 (defmethod close-graph ((graph graph) &key (snapshot-p t))
   "Cleanly close GRAPH: stop replication, flush and unmap all on-disk
