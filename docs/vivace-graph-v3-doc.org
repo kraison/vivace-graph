@@ -4199,10 +4199,48 @@ object, or the ~unresolved-node~ marker), but the walk does not
 continue past it into the other store's own adjacency -- following a
 cross-store edge across the boundary is left to a later unit. Likewise
 ~active-edge-p~ resolves a cross-store endpoint to decide whether an
-edge is still live, with two narrow, accepted gaps documented at the
-call site and tracked as GH #208: an untagged v5 endpoint gets no
-cross-store scan on this hot path, and an unregistered tag is treated
-as live rather than proven dead, since it cannot be disproved.
+edge is still live, from a five-way endpoint classification (GH #208):
+a vertex found in any open store is live, and a same-store miss is
+proven dead. An untagged v5 miss now falls back to the all-open-stores
+scan -- but only when another store is actually open, so the
+single-store hot path keeps its cheap short-circuit (the scan measures
+a few microseconds per open store), and a completed scan counts as
+disproof, since a v5 id has no tag to mistrust. One hedge: the scan
+covers /open/ stores only -- a v5 vertex sitting in a detached store
+is invisible (a tagless id cannot name its store), so its edge is
+treated as dead, and compacts, even under the conservative policy.
+The remaining three
+cases -- a detached store, a tag the registry never assigned
+(~:unknown~), and a tag that resolves to an open store whose table
+misses (~:absent-in-store~) -- all count as live, because disproving
+them requires trusting the tag.
+
+~compact-edges~ turns that classification into reclaimed space: it
+soft-deletes and de-indexes edges whose endpoints are disproved. Its
+~:policy~ keyword defaults to ~:conservative~, which compacts only
+tag-free disproof (a deleted edge, a ~:missing~ or found-but-deleted
+endpoint) -- exactly what it always compacted. ~:policy :trust-tags~
+additionally compacts ~:unknown~ and ~:absent-in-store~ endpoints,
+treating this system's tag space as authoritative; it is refused with
+~compact-trust-tags-on-peer-error~ on a peer graph, whose tables hold
+ids minted by /other/ systems' registries (device-minted v8 ids land
+verbatim on a hub), and with ~compact-trust-tags-no-registry-error~
+when no store registry is loaded (~*system-directory*~ unbound), since
+without one a detached tag cannot be told from an unassigned one. A
+~:detached~ endpoint is never compacted under either policy -- its
+store may reattach.
+
+*Resolver trust boundary* (GH #209): a v8 id's 12-bit store tag is an
+index into /one/ system directory's registry, but ids travel across
+systems -- peer replication preserves device-minted UUIDs on the hub,
+and backups move ids between systems. A foreign tag that happens to
+coincide with a local store-id resolves to the wrong store and still
+reports ~:resolved~. The engine's discipline around this: lookups are
+local-table-first, so a local hit never consults the tag; a backup's
+~dangling-edge-warning~ names the resolved store only as this system's
+registry reading, not as ground truth; and anything that would treat
+a tag as /disproof/ of liveness is either conservative by default or
+an explicit opt-in (~:trust-tags~).
 
 ** Chapter 18: Temporal Extents — graph-db/spacetime (optional)
 

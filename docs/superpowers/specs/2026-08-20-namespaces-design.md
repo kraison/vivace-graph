@@ -397,6 +397,21 @@ result but is not walked past — full cross-store continuation is
 with two scoped gaps tracked as #208 (no v5 cross-store scan; an
 unregistered tag counts as live).
 
+**Built (#208/#209):** both #208 gaps closed. A v5 miss now runs the
+all-open-stores scan whenever another store is open (single-store
+short-circuit kept; a completed scan is disproof — no tag to
+mistrust — though only over open stores: a v5 vertex in a detached
+store stays invisible, and its edge compacts even conservatively).
+The endpoint classification is five-way (`:found`
+`:missing` `:absent-in-store` `:detached` `:unknown`); `active-edge-p`
+still treats the last three as live, and the compaction decision is an
+explicit `compact-edges :policy :trust-tags` knob — refused on a
+peer-graph (`compact-trust-tags-on-peer-error`), since hub tables hold
+device-minted tags foreign to this registry (#209.3); `:detached` is
+never compacted. `resolve-node-graph` and the dangling-edge warning
+now state the trust boundary (#209.2) rather than asserting a foreign
+tag's resolution as ground truth.
+
 ## 8. Bulk load and detach
 
 **Detach is a quiescence protocol over the existing pin machinery:** refuse new pins and

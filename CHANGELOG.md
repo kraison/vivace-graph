@@ -11,6 +11,28 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ## [Unreleased]
 
+### Added
+
+- **`compact-edges` `:policy` keyword** (#208, #209). The default
+  `:conservative` compacts exactly what it always did (soft-deleted
+  edges, provably-missing endpoints); `:policy :trust-tags` additionally
+  compacts endpoints whose v8 tag the registry never assigned
+  (`:unknown`) or whose tag resolves to an open store that lacks the
+  vertex (`:absent-in-store`) — treating this system's tag space as
+  authoritative. It is refused with `compact-trust-tags-on-peer-error`
+  on a peer graph, whose tables hold device-minted foreign tags, and a
+  `:detached` endpoint (registered store, not open) is never compacted
+  under either policy; `:trust-tags` is likewise refused
+  (`compact-trust-tags-no-registry-error`) when no store registry is
+  loaded, since `:detached` is then indistinguishable from `:unknown`.
+  `%active-endpoint-status` now returns the full five-way
+  classification instead of collapsing everything non-provable into
+  one `:unknown` bucket; `active-edge-p`'s visible behavior is
+  unchanged. `compact-edges` (and `map-edges`' emit filters) now
+  resolve endpoint liveness against the explicit graph argument
+  rather than the dynamic `*graph*` — the wrong-graph audit's defect
+  shape, latent here.
+
 ### Removed
 
 - **`dso-lex` dependency** (#240). It was dropped from Quicklisp between
@@ -23,6 +45,24 @@ between releases; cutting a release renames it to the new version and dates it.
   remains the GML parser. New lexer unit tests pin the token stream.
 
 ### Fixed
+
+- **Legacy v5 cross-store edges are no longer filtered as inactive**
+  (#208). `active-edge-p` (and so `map-edges`/`edge-exists-p`) now
+  falls back to the all-open-stores scan for an untagged v5 endpoint
+  that misses the local table — but only when another store is
+  actually open, keeping the single-store hot path's short-circuit
+  (the scan measures ~3.5 µs per open store). `resolve-node-graph`'s
+  docstring and `dangling-edge-warning`'s report now state the
+  resolver trust boundary: a store tag indexes THIS system's registry,
+  so a foreign-minted id resolves unsoundly (#209).
+
+- **`remove-from-index-list` looped forever on a lazily-deleted cell**
+  (#242, found on #208). Deleted pcons cells stay in the chain (removal
+  only flags
+  them), but the walk never advanced past one, so any removal that met
+  an earlier removal's cell spun forever. Latent since the beginning —
+  reachable only through `compact-edges`, which had zero test coverage;
+  exposed by its first tests on this unit.
 
 - **Clock/journal hygiene batch** (#184, #178, #177, #183, #179, #180,
   #176, #212, #234):

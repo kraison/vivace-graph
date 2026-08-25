@@ -375,3 +375,165 @@ backup."
                          "a clean single-store backup must never warn")))
               (ignore-errors (close-graph g :snapshot-p nil))
               (collect-garbage))))))))
+
+;;; --- Resolver trust boundaries (GH #208, #209) ------------------------
+
+(test endpoint-status-decision-table
+  "%ACTIVE-ENDPOINT-STATUS's five-way classification (GH #208, #209).
+The v5-in-another-open-store row is the #208.1 fix and FAILS pre-fix
+(it was :MISSING with no scan); :ABSENT-IN-STORE / :DETACHED /
+:UNKNOWN were all one :UNKNOWN bucket pre-#208.  Nearest wrong
+implementation: trust the tag and call :UNKNOWN or :ABSENT-IN-STORE
+disproof -- they are disproof only inside the system that minted the
+tag."
+  (with-two-stores (g1 g2 sys)
+    (let ((v5id (graph-db::gen-vertex-id))   ; untagged
+          v1 v2)
+      (with-transaction ((graph-db::transaction-manager g1))
+        (setq v1 (graph-db:make-vertex :generic nil :graph g1)))
+      (with-transaction ((graph-db::transaction-manager g2))
+        (setq v2 (graph-db:make-vertex :generic nil :graph g2))
+        (graph-db:make-vertex :generic nil :id v5id :graph g2))
+      (flet ((status (id) (nth-value
+                           1 (graph-db::%active-endpoint-status id g1))))
+        (is (eq :found (status (id v1)))
+            "same-store hit")
+        (is (eq :found (status v5id))
+            "v5 miss here, live in the OTHER open store (#208.1)")
+        (is (eq :found (status (id v2)))
+            "v8 cross-store resolved hit")
+        (is (eq :missing (status (graph-db::gen-vertex-id)))
+            "v5 absent everywhere: a completed scan IS disproof")
+        (is (eq :unknown (status (graph-db::gen-v8-uuid 4000)))
+            "tag this registry never assigned")
+        (is (eq :absent-in-store
+                (status (graph-db::gen-vertex-id
+                         (graph-db::store-id g2))))
+            "tag resolves to open G2, G2's table misses")
+        (close-graph g2 :snapshot-p nil)
+        (is (eq :detached (status (id v2)))
+            "registered tag, store not open")))))
+
+(test v5-miss-with-no-other-store-is-missing
+  "A v5 miss with only this store open stays :MISSING via the cheap
+short-circuit -- no scan to run, same answer as a completed scan
+(GH #208)."
+  (with-temp-directory (sys)
+    (with-temp-directory (d)
+      (let ((graph-db::*system-directory* (namestring sys))
+            (graph-db::*store-registry* nil))
+        (let ((g (make-graph :rsv-store-1 (namestring d)
+                             :buffer-pool-size 1000)))
+          (unwind-protect
+               (is (eq :missing
+                       (nth-value 1 (graph-db::%active-endpoint-status
+                                     (graph-db::gen-vertex-id) g))))
+            (ignore-errors (close-graph g :snapshot-p nil))
+            (collect-garbage)))))))
+
+(test v5-cross-store-edge-is-visible
+  "GH #208.1 end to end: an edge whose far endpoint is a v5 id living
+in ANOTHER open store is live -- EDGE-EXISTS-P finds it and the
+adjacency scan emits it.  Pre-fix, ACTIVE-EDGE-P classified the
+endpoint :MISSING without scanning and filtered the edge as inactive."
+  (with-two-stores (g1 g2 sys)
+    (let ((v5id (graph-db::gen-vertex-id))
+          v1 v2)
+      (with-transaction ((graph-db::transaction-manager g2))
+        (setq v2 (graph-db:make-vertex :generic nil :id v5id :graph g2)))
+      (with-transaction ((graph-db::transaction-manager g1))
+        (setq v1 (graph-db:make-vertex :generic nil :graph g1))
+        (make-rsv-edge :from v1 :to v2 :graph g1))
+      (is-true (graph-db:edge-exists-p 'rsv-edge v1 v2 :graph g1))
+      (is (= 1 (length (graph-db:outgoing-edges
+                        v1 :graph g1 :edge-type 'rsv-edge)))))))
+
+(test compact-edges-policies
+  "First COMPACT-EDGES coverage (GH #208, #209).  :CONSERVATIVE
+compacts only tag-free disproof (soft-deleted edge, :MISSING
+endpoint) and keeps :UNKNOWN / :ABSENT-IN-STORE / :DETACHED;
+:TRUST-TAGS additionally compacts :UNKNOWN and :ABSENT-IN-STORE but
+NEVER :DETACHED (the store may reattach).  Nearest wrong
+implementation: treat every non-:FOUND endpoint as dead (the
+pre-#169 same-store rule applied to travelled ids)."
+  (with-two-stores (g1 g2 sys)
+    (let ((detached-tag (graph-db::store-registry-intern "rsv-offline"))
+          v1 vx v2 e-live e-del e-missing e-unknown e-absent e-detached)
+      (with-transaction ((graph-db::transaction-manager g2))
+        (setq v2 (graph-db:make-vertex :generic nil :graph g2)))
+      (with-transaction ((graph-db::transaction-manager g1))
+        (setq v1 (graph-db:make-vertex :generic nil :graph g1))
+        (setq vx (graph-db:make-vertex :generic nil :graph g1))
+        (flet ((edge-to (to)
+                 (graph-db:make-edge :generic (id v1) to 1.0 nil
+                                     :graph g1)))
+          (setq e-live (edge-to (id vx))
+                e-del (edge-to (id vx))
+                e-missing (edge-to (graph-db::gen-vertex-id))
+                e-unknown (edge-to (graph-db::gen-v8-uuid 4000))
+                e-absent (edge-to (graph-db::gen-vertex-id
+                                   (graph-db::store-id g2)))
+                e-detached (edge-to (graph-db::gen-vertex-id
+                                     detached-tag)))))
+      (with-transaction ((graph-db::transaction-manager g1))
+        (mark-deleted (graph-db:lookup-edge (id e-del) :graph g1)))
+      (graph-db::compact-edges g1)       ; default :conservative
+      (flet ((dead-p (e)
+               (graph-db:deleted-p
+                (graph-db:lookup-edge (id e) :graph g1))))
+        (is-false (dead-p e-live) "live edge survives :conservative")
+        (is-true (dead-p e-del) ":found+deleted-edge case compacted")
+        (is-true (dead-p e-missing) ":missing compacted (as pre-#208)")
+        (is-false (dead-p e-unknown) ":unknown kept by :conservative")
+        (is-false (dead-p e-absent)
+                  ":absent-in-store kept by :conservative")
+        (is-false (dead-p e-detached) ":detached kept by :conservative")
+        (graph-db::compact-edges g1 :policy :trust-tags)
+        (is-false (dead-p e-live) "live edge survives :trust-tags")
+        (is-true (dead-p e-unknown) ":unknown compacted by :trust-tags")
+        (is-true (dead-p e-absent)
+                 ":absent-in-store compacted by :trust-tags")
+        (is-false (dead-p e-detached)
+                  ":detached survives BOTH policies")))))
+
+(test compact-edges-policy-validation
+  ":TRUST-TAGS on a peer graph signals COMPACT-TRUST-TAGS-ON-PEER-ERROR
+-- a hub's tables hold device-minted v8 ids whose tags index the
+DEVICE's registry (GH #209.3) -- while :CONSERVATIVE stays allowed;
+and a mistyped policy signals instead of silently running
+:conservative.  The refusal fires BEFORE any storage access, so a
+hand-built PEER-GRAPH instance suffices (a full MAKE-GRAPH hub starts
+the peer accept-loop thread -- see the collision tests' precedent for
+hand-built instances)."
+  (with-temp-directory (dummy)
+    ;; Refusal precedes storage access: hand-built instance, no store.
+    (let ((pg (make-instance 'graph-db::peer-graph
+                             :graph-name :rsv-peer
+                             :location dummy
+                             :peer-role :hub)))
+      (signals graph-db::compact-trust-tags-on-peer-error
+        (graph-db::compact-edges pg :policy :trust-tags))
+      (signals error
+        (graph-db::compact-edges pg :policy :trust-tgas))))
+  (with-temp-directory (sys)
+    (with-temp-directory (d)
+      (let ((graph-db::*system-directory* (namestring sys))
+            (graph-db::*store-registry* nil))
+        (let ((g (make-graph :rsv-store-1 (namestring d)
+                             :buffer-pool-size 1000)))
+          (unwind-protect
+               (progn
+                 ;; :conservative runs on anything, :trust-tags on a
+                 ;; NON-peer graph too.
+                 (finishes (graph-db::compact-edges g))
+                 (finishes (graph-db::compact-edges
+                            g :policy :trust-tags))
+                 ;; No registry loaded -> :detached is unreachable, so
+                 ;; :trust-tags must refuse; :conservative still runs.
+                 (let ((graph-db::*system-directory* nil))
+                   (signals
+                       graph-db::compact-trust-tags-no-registry-error
+                     (graph-db::compact-edges g :policy :trust-tags))
+                   (finishes (graph-db::compact-edges g))))
+            (ignore-errors (close-graph g :snapshot-p nil))
+            (collect-garbage)))))))
