@@ -100,6 +100,33 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Fixed
 
+- **The memory constructors mirror the disk side's open hygiene**
+  (#230). `make-memory-graph`/`open-memory-graph` now normalize a
+  slashless `location` namestring at the boundary (the #222 shape:
+  a file pathname used to scatter the `tx/` journal and `applied-ops/`
+  sidecars into the store's *parent* directory), and both run under an
+  abort guard (the #224 shape, `%abort-memory-graph-open`): a
+  construction that fails partway closes the replication-log stream, a
+  peer's applied-op-ids table and any restored vector segments,
+  deregisters the graph, and removes the `.dirty` marker — but only
+  when *this* call wrote it; a pre-existing marker (an earlier crash's
+  record) is left in place. Once `graph-open-p` is set the guard
+  unwinds through the normal `close-graph` path instead — which
+  removes the marker regardless of provenance, harmless on a memory
+  graph since opens never gate on it — and subsumes the constructors'
+  previous attach-only unwind.
+
+- **Memory peer-hub: the clock attach now precedes
+  `start-replication`** (#238). Both memory constructors used to start
+  replication before attaching to the system clock, leaving a
+  microseconds-wide window in which a peer hub's live listener could
+  re-home an inbound push with ids minted from the pre-attach local
+  counter (the #180 bug class). The attach now runs between
+  `(setf (graph-open-p ...) t)` and `start-replication`, so the window
+  is gone — and a failed attach never has replication threads to tear
+  down. The disk constructors already attached first and are
+  unchanged.
+
 - **`make-graph` refuses a `.dirty`-carrying location upfront** (#246).
   It used to create `heap.dat`, both linear-hash tables, `indexes.dat`
   and the three adjacency-index directories before dying on a raw
