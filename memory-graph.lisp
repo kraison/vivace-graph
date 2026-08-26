@@ -205,6 +205,52 @@ MEMORY-PEER-GRAPH.  With LAZY, the node tables materialize on first touch."
                                                      :if-exists :supersede)
     (format out "~S" (get-universal-time))))
 
+(defun %abort-memory-graph-open (graph dirty-preexisted)
+  "Best-effort teardown for a MAKE-MEMORY-GRAPH/OPEN-MEMORY-GRAPH
+aborted partway (GH #230) -- the memory analogue of %ABORT-GRAPH-OPEN.
+Once GRAPH-OPEN-P is set the graph is fully wired, so the normal
+CLOSE-GRAPH path (checkpoint skipped) does the whole job; before that,
+close what a partial open can hold: the replication-log stream, a
+peer's applied-op-ids lhash, restored vector segments, and the
+*GRAPHS*/open-store registrations.  No open step mutates the durable
+record (the journal is replayed into RAM, never rewritten), so the disk
+side's MUTATED gate reduces to marker ownership: delete .dirty only
+when THIS call wrote it fresh (DIRTY-PREEXISTED nil) -- a pre-existing
+marker records an earlier crash this abort must not erase.  That rule
+governs only the pre-OPEN-P branch: past OPEN-P, CLOSE-GRAPH removes
+the marker regardless of provenance, which is harmless here -- a
+memory open never gates on it and always replays the journal.  Returns
+NIL; never signals."
+  (handler-case
+      (if (graph-open-p graph)
+          (let ((*graph* graph))
+            (close-graph graph :snapshot-p nil))
+          (progn
+            (ignore-errors (stop-replication graph))
+            (ignore-errors
+              (maphash (lambda (k seg)
+                         (declare (ignore k))
+                         (ignore-errors (close-vector-segment seg)))
+                       (vector-segments graph)))
+            (ignore-errors
+              (when (eq graph (gethash (graph-name graph) *graphs*))
+                (remhash (graph-name graph) *graphs*)))
+            (ignore-errors (%unregister-open-store graph))
+            (ignore-errors
+              (when (slot-boundp graph 'transaction-manager)
+                (close-replication-log graph)))
+            (ignore-errors
+              (when (and (slot-exists-p graph 'applied-op-ids)
+                         (slot-boundp graph 'applied-op-ids)
+                         (lhash-p (applied-op-ids graph)))
+                (close-lhash (applied-op-ids graph))))
+            (ignore-errors
+              (unless dirty-preexisted
+                (let ((f (format nil "~A/.dirty" (location graph))))
+                  (when (probe-file f) (delete-file f)))))))
+    (serious-condition () nil))
+  nil)
+
 (defun %validate-peer-role (peer-role origin-id)
   (when (and peer-role (not (member peer-role '(:hub :device))))
     (error ":PEER-ROLE must be :HUB or :DEVICE, got ~S" peer-role))
@@ -252,48 +298,61 @@ and materializes nodes on first touch (fault-on-access) for a near-instant open.
 epoch clock, exactly as MAKE-GRAPH does (GH #176).
 Registers the graph and returns it."
   (%validate-peer-role peer-role origin-id)
+  ;; A slashless namestring keeps LOCATION a FILE pathname, so every
+  ;; MERGE-PATHNAMES sidecar (tx/, applied-ops/, ...) lands in the
+  ;; store's PARENT directory.  Normalize once, before any use
+  ;; (GH #222/#230).
+  (setq location (namestring (uiop:ensure-directory-pathname location)))
   (ensure-directories-exist location)
   (let* ((path (pathname location))
+         (dirty-preexisted (probe-file (format nil "~A.dirty" location)))
          (graph (%make-empty-memory-graph
                  name path
                  :class (if peer-role 'memory-peer-graph 'memory-graph)
                  :lazy lazy
                  :replication-key replication-key
-                 :replication-port replication-port)))
-    (let ((*graph* graph))
-      (init-schema graph)
-      (update-schema graph)
-      (%write-dirty-marker path)
-      (setf (gethash name *graphs*) graph)
-      (%register-open-store graph))
-    (when peer-role
-      (%init-memory-peer-slots graph :make path peer-role origin-id peer-host
-                               export-predicate device-registry merge-policy
-                               reference-classes peer-schema-version))
-    (setf (transaction-manager graph)
-          (make-instance 'transaction-manager :graph graph))
-    (ensure-directories-exist (persistent-transaction-directory graph))
-    (init-replication-log graph)
-    (start-replication graph :package package)
-    (setf (graph-open-p graph) t)
-    ;; As MAKE-GRAPH and OPEN-MEMORY-GRAPH do: register this graph's
-    ;; DEF-UNIQUE constraints so an ABSENT index means "not built yet"
-    ;; rather than "brand new" (GH #129).  No nodes yet, so no scan.
-    (let ((*graph* graph))
-      (install-unique-tuple-constraints graph))
-    ;; Join the image-level clock, as MAKE-GRAPH does (GH #176).  Last,
-    ;; once GRAPH-OPEN-P is set, so a failed attach unwinds through the
-    ;; NORMAL close path (deregister, delete .dirty) instead of leaving
-    ;; a half-registered graph behind (same shape as GH #212).
-    (when system-clock
-      (let ((attached nil))
-        (unwind-protect
-            (progn (attach-to-system-clock graph system-clock)
-                   (setf attached t))
-          (unless attached
-            (let ((*graph* graph))
-              (ignore-errors (close-graph graph :snapshot-p nil)))))))
-    graph))
+                 :replication-port replication-port))
+         (done nil))
+    ;; GH #230: MAKE-GRAPH's abort-guard shape -- a failure below must
+    ;; not leak streams or leave a half-registered graph behind.
+    (unwind-protect
+        (progn
+          (let ((*graph* graph))
+            (init-schema graph)
+            (update-schema graph)
+            (%write-dirty-marker path)
+            (setf (gethash name *graphs*) graph)
+            (%register-open-store graph))
+          (when peer-role
+            (%init-memory-peer-slots graph :make path peer-role origin-id
+                                     peer-host export-predicate
+                                     device-registry merge-policy
+                                     reference-classes peer-schema-version))
+          (setf (transaction-manager graph)
+                (make-instance 'transaction-manager :graph graph))
+          (ensure-directories-exist
+           (persistent-transaction-directory graph))
+          (init-replication-log graph)
+          (setf (graph-open-p graph) t)
+          ;; As MAKE-GRAPH and OPEN-MEMORY-GRAPH do: register this
+          ;; graph's DEF-UNIQUE constraints so an ABSENT index means
+          ;; "not built yet" rather than "brand new" (GH #129).  No
+          ;; nodes yet, so no scan.
+          (let ((*graph* graph))
+            (install-unique-tuple-constraints graph))
+          ;; Join the image-level clock (GH #176) BEFORE replication
+          ;; starts (GH #238): an inbound push must never mint ids from
+          ;; the pre-attach counter, and a failed attach then has no
+          ;; replication threads to tear down.  GRAPH-OPEN-P is already
+          ;; set, so the abort guard unwinds a failure from here on
+          ;; through the NORMAL close path (same intent as GH #212).
+          (when system-clock
+            (attach-to-system-clock graph system-clock))
+          (start-replication graph :package package)
+          (setf done t)
+          graph)
+      (unless done
+        (%abort-memory-graph-open graph dirty-preexisted)))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Durability (design §7).  Three tiers, all reusing the existing journal:
@@ -973,6 +1032,106 @@ and the app re-cold-syncs.  Cheap: ~0.06 s / 0.2 MB for ~800 nodes."
   (clear-memory-journal graph)
   graph)
 
+(defun %open-memory-graph-1 (graph name path schema-file
+                             &key package peer-role origin-id peer-host
+                               regenerate-views export-predicate
+                               device-registry merge-policy reference-classes
+                               peer-schema-version system-clock)
+  "Private body of OPEN-MEMORY-GRAPH (GH #230): every step that opens a
+stream, registers GRAPH, or starts a thread runs here, inside the
+caller's abort guard.  Returns GRAPH."
+  (let ((*graph* graph) (*memory-image-view-dump* :none)
+        (*memory-image-unique-loaded* nil))
+    (if (probe-file schema-file)
+        (progn
+          (setf (schema graph) (cl-store:restore schema-file))
+          (restore-schema-locks (schema graph)))
+        (init-schema graph))
+    (setf (schema-lock (schema graph)) (make-recursive-lock))
+    (update-schema graph)
+    (%write-dirty-marker path)
+    (setf (gethash name *graphs*) graph)
+    (%register-open-store graph)
+    ;; Restore the checkpoint, then replay the journal tail committed after it.
+    ;; Recovery runs BEFORE the transaction-manager is installed (the reaper
+    ;; tolerates the unbound slot); the retain hook keeps the journal.
+    (let ((image-restore-result (restore-memory-image graph)))
+      ;; Vector segments (GH #58): reopen-or-rebuild BEFORE any journal
+      ;; replay, mirroring OPEN-GRAPH.  RECOVER-TRANSACTIONS replays through
+      ;; the shared APPLY-TRANSACTION, which maintains segments via
+      ;; %ENSURE-SEGMENT -- and an unregistered (owner . slot) there
+      ;; unconditionally CREATE-VECTOR-SEGMENTs over any same-named file
+      ;; already on disk, destroying it.  RESTORE-MEMORY-IMAGE above has
+      ;; already populated the type index (structurally, or via the v1
+      ;; rebuild-from-nodes fallback) for either branch below, so a rebuild
+      ;; here sweeps the right checkpoint-time corpus; replay then updates
+      ;; the segment(s) incrementally, same story as the spatial index.
+      ;; Skipped on a LAZY graph, same reason RESTORE-SECONDARY-INDEXES is
+      ;; skipped below: a rebuild sweep would materialize every LZNODE blob.
+      (unless (lazy-p graph)
+        (restore-vector-segments graph))
+      (if (eq image-restore-result :structural)
+          ;; v2 image: views/indexes/spatial were restored structurally.
+          ;; Create + populate the views from the image dump, THEN replay the
+          ;; journal tail so its authored ops update the already-restored
+          ;; derived structures incrementally (fast open -- no map/reduce
+          ;; regen; #50).
+          (progn (restore-views graph)
+                 (recover-transactions graph))
+          ;; v1 / no image: load the journal tail into the tables first, then
+          ;; rebuild views in-RAM from ALL restored nodes (rebuild-on-open
+          ;; fallback).
+          (progn (recover-transactions graph)
+                 (restore-views graph))))
+    ;; Reconcile the declarative view registry (issue #49) after views are
+    ;; restored AND the journal tail is replayed, so any regenerate sees all
+    ;; nodes.
+    (install-views graph)
+    (when regenerate-views
+      (regenerate-all-views graph))
+    ;; Unique constraints (issue #6): the image restore (structural or
+    ;; cl-store) loads the unique indexes -- so scan-rebuild only when it did
+    ;; NOT (a fresh graph, or a pre-#6 v3 image / crash fallback).  This is
+    ;; the durable path on the memory backend: no open-time scan, no
+    ;; lazy-node materialization.
+    (unless *memory-image-unique-loaded*
+      (rebuild-unique-indexes graph))
+    ;; DEF-UNIQUE constraints the image did not carry (one declared while the
+    ;; graph was closed).  Deliberately NOT lazy-guarded, unlike the ordered
+    ;; indexes below: a missing constraint silently stops ENFORCING, so the
+    ;; scan is worth the materialization -- the same trade REBUILD-UNIQUE-
+    ;; INDEXES above already makes.  A normal reopen restores every constraint
+    ;; from the image, so this is a no-op there.  Scans per owner type, so an
+    ;; unrelated class's blobs stay unmaterialized either way (GH #107).
+    (install-unique-tuple-constraints graph)
+    ;; General ordered indexes: rebuild-on-open on the memory backend (image
+    ;; persistence is a follow-up, mirroring unique's v1).  REBUILD covers the
+    ;; MOP :INDEX slots; INSTALL covers DEF-INDEX declarations.  NOT on a LAZY
+    ;; graph: rebuilding scans every node and would thus MATERIALIZE the
+    ;; LZNODE blobs, defeating fault-on-access (a geometry :INDEX slot alone
+    ;; would trip it).  A lazy graph maintains its indexes in-session via
+    ;; APPLY; persisting them in the checkpoint image (so a lazy reopen needs
+    ;; no scan) is the deferred follow-up.
+    (unless (lazy-p graph)
+      (rebuild-secondary-indexes graph)
+      (install-secondary-indexes graph)))
+  (when peer-role
+    (%init-memory-peer-slots graph :open path peer-role origin-id peer-host
+                             export-predicate device-registry merge-policy
+                             reference-classes peer-schema-version))
+  (setf (transaction-manager graph)
+        (make-instance 'transaction-manager :graph graph))
+  (ensure-directories-exist (persistent-transaction-directory graph))
+  (init-replication-log graph)
+  (setf (graph-open-p graph) t)
+  ;; Join the image-level clock (GH #176) BEFORE replication starts
+  ;; (GH #238), with GRAPH-OPEN-P already set -- see MAKE-MEMORY-GRAPH's
+  ;; comment.
+  (when system-clock
+    (attach-to-system-clock graph system-clock))
+  (start-replication graph :package package)
+  graph)
+
 (defun open-memory-graph (name location
                           &key package replication-port replication-key
                             peer-role origin-id peer-host lazy regenerate-views
@@ -988,106 +1147,38 @@ as deferred blobs and materialize on first touch (needs a VG-native image).
 :SYSTEM-CLOCK (default *SYSTEM-CLOCK*) attaches to the image-level epoch clock,
 as OPEN-GRAPH does (GH #176)."
   (%validate-peer-role peer-role origin-id)
+  ;; Normalize a slashless LOCATION before any use, as MAKE-MEMORY-GRAPH
+  ;; does (GH #222/#230).
+  (setq location (namestring (uiop:ensure-directory-pathname location)))
   (ensure-directories-exist location)
   (let* ((path (pathname location))
          (schema-file (format nil "~A/schema.dat" location))
+         (dirty-preexisted (probe-file (format nil "~A.dirty" location)))
          (graph (%make-empty-memory-graph
                  name path
                  :class (if peer-role 'memory-peer-graph 'memory-graph)
                  :lazy lazy
                  :replication-key replication-key
-                 :replication-port replication-port)))
-    (let ((*graph* graph) (*memory-image-view-dump* :none)
-          (*memory-image-unique-loaded* nil))
-      (if (probe-file schema-file)
-          (progn
-            (setf (schema graph) (cl-store:restore schema-file))
-            (restore-schema-locks (schema graph)))
-          (init-schema graph))
-      (setf (schema-lock (schema graph)) (make-recursive-lock))
-      (update-schema graph)
-      (%write-dirty-marker path)
-      (setf (gethash name *graphs*) graph)
-      (%register-open-store graph)
-      ;; Restore the checkpoint, then replay the journal tail committed after it.
-      ;; Recovery runs BEFORE the transaction-manager is installed (the reaper
-      ;; tolerates the unbound slot); the retain hook keeps the journal.
-      (let ((image-restore-result (restore-memory-image graph)))
-        ;; Vector segments (GH #58): reopen-or-rebuild BEFORE any journal
-        ;; replay, mirroring OPEN-GRAPH.  RECOVER-TRANSACTIONS replays through
-        ;; the shared APPLY-TRANSACTION, which maintains segments via
-        ;; %ENSURE-SEGMENT -- and an unregistered (owner . slot) there
-        ;; unconditionally CREATE-VECTOR-SEGMENTs over any same-named file
-        ;; already on disk, destroying it.  RESTORE-MEMORY-IMAGE above has
-        ;; already populated the type index (structurally, or via the v1
-        ;; rebuild-from-nodes fallback) for either branch below, so a rebuild
-        ;; here sweeps the right checkpoint-time corpus; replay then updates
-        ;; the segment(s) incrementally, same story as the spatial index.
-        ;; Skipped on a LAZY graph, same reason RESTORE-SECONDARY-INDEXES is
-        ;; skipped below: a rebuild sweep would materialize every LZNODE blob.
-        (unless (lazy-p graph)
-          (restore-vector-segments graph))
-        (if (eq image-restore-result :structural)
-            ;; v2 image: views/indexes/spatial were restored structurally.  Create +
-            ;; populate the views from the image dump, THEN replay the journal tail so
-            ;; its authored ops update the already-restored derived structures
-            ;; incrementally (fast open -- no map/reduce regen; #50).
-            (progn (restore-views graph)
-                   (recover-transactions graph))
-            ;; v1 / no image: load the journal tail into the tables first, then
-            ;; rebuild views in-RAM from ALL restored nodes (rebuild-on-open fallback).
-            (progn (recover-transactions graph)
-                   (restore-views graph))))
-      ;; Reconcile the declarative view registry (issue #49) after views are
-      ;; restored AND the journal tail is replayed, so any regenerate sees all nodes.
-      (install-views graph)
-      (when regenerate-views
-        (regenerate-all-views graph))
-      ;; Unique constraints (issue #6): the image restore (structural or cl-store)
-      ;; loads the unique indexes -- so scan-rebuild only when it did NOT (a fresh
-      ;; graph, or a pre-#6 v3 image / crash fallback).  This is the durable path on
-      ;; the memory backend: no open-time scan, no lazy-node materialization.
-      (unless *memory-image-unique-loaded*
-        (rebuild-unique-indexes graph))
-      ;; DEF-UNIQUE constraints the image did not carry (one declared while the
-      ;; graph was closed).  Deliberately NOT lazy-guarded, unlike the ordered
-      ;; indexes below: a missing constraint silently stops ENFORCING, so the
-      ;; scan is worth the materialization -- the same trade REBUILD-UNIQUE-
-      ;; INDEXES above already makes.  A normal reopen restores every constraint
-      ;; from the image, so this is a no-op there.  Scans per owner type, so an
-      ;; unrelated class's blobs stay unmaterialized either way (GH #107).
-      (install-unique-tuple-constraints graph)
-      ;; General ordered indexes: rebuild-on-open on the memory backend (image
-      ;; persistence is a follow-up, mirroring unique's v1).  REBUILD covers the MOP
-      ;; :INDEX slots; INSTALL covers DEF-INDEX declarations.  NOT on a LAZY graph:
-      ;; rebuilding scans every node and would thus MATERIALIZE the LZNODE blobs,
-      ;; defeating fault-on-access (a geometry :INDEX slot alone would trip it).  A
-      ;; lazy graph maintains its indexes in-session via APPLY; persisting them in the
-      ;; checkpoint image (so a lazy reopen needs no scan) is the deferred follow-up.
-      (unless (lazy-p graph)
-        (rebuild-secondary-indexes graph)
-        (install-secondary-indexes graph)))
-    (when peer-role
-      (%init-memory-peer-slots graph :open path peer-role origin-id peer-host
-                               export-predicate device-registry merge-policy
-                               reference-classes peer-schema-version))
-    (setf (transaction-manager graph)
-          (make-instance 'transaction-manager :graph graph))
-    (ensure-directories-exist (persistent-transaction-directory graph))
-    (init-replication-log graph)
-    (start-replication graph :package package)
-    (setf (graph-open-p graph) t)
-    ;; Join the image-level clock, as OPEN-GRAPH does (GH #176).  Last,
-    ;; once GRAPH-OPEN-P is set -- see MAKE-MEMORY-GRAPH's comment.
-    (when system-clock
-      (let ((attached nil))
-        (unwind-protect
-            (progn (attach-to-system-clock graph system-clock)
-                   (setf attached t))
-          (unless attached
-            (let ((*graph* graph))
-              (ignore-errors (close-graph graph :snapshot-p nil)))))))
-    graph))
+                 :replication-port replication-port))
+         (done nil))
+    ;; GH #230: abort guard, as in MAKE-MEMORY-GRAPH.
+    (unwind-protect
+        (prog1
+            (%open-memory-graph-1 graph name path schema-file
+                                  :package package
+                                  :peer-role peer-role
+                                  :origin-id origin-id
+                                  :peer-host peer-host
+                                  :regenerate-views regenerate-views
+                                  :export-predicate export-predicate
+                                  :device-registry device-registry
+                                  :merge-policy merge-policy
+                                  :reference-classes reference-classes
+                                  :peer-schema-version peer-schema-version
+                                  :system-clock system-clock)
+          (setf done t))
+      (unless done
+        (%abort-memory-graph-open graph dirty-preexisted)))))
 
 ;; Clean-close checkpoint: write the image, then clear the (now-superseded)
 ;; journal.  Runs BEFORE the base CLOSE-GRAPH removes .dirty and nils the tables.

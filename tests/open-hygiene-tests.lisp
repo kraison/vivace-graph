@@ -484,3 +484,216 @@ warns, and deregisters the graph (GH #246)."
       (is (null (graph-db:lookup-graph :oh-graph))
           "the close must still deregister the graph")
       (collect-garbage))))
+
+;;; ---------------------------------------------------------------------------
+;;; GH #230: the memory constructors share the #222/#224 exposure.  Same
+;;; shapes as above, against MAKE-MEMORY-GRAPH/OPEN-MEMORY-GRAPH and
+;;; %ABORT-MEMORY-GRAPH-OPEN (memory-graph.lisp).  GH #238's attach-before-
+;;; replication ordering is covered at the end.
+;;; ---------------------------------------------------------------------------
+
+(def-vertex oh-mem-thing () ((label :type string)) :oh-mem-graph)
+
+(test memgraph-slashless-location-keeps-sidecars-inside-the-store
+  "A slashless LOCATION namestring must not scatter the memory graph's
+sidecars (.dirty, schema.dat, graph.img, tx/) into the store's parent
+directory, and the store must reopen and read back through the same
+slashless string (GH #222/#230)."
+  (with-temp-directory (dir)
+    (let* ((parent (uiop:pathname-parent-directory-pathname dir))
+           (inside (uiop:ensure-directory-pathname dir))
+           (slashless (string-right-trim "/" (namestring dir)))
+           id)
+      (let ((g (graph-db::make-memory-graph :oh-mem-graph slashless)))
+        (is (probe-file (%oh-dirty-file slashless))
+            "~A/.dirty must exist while the graph is open" slashless)
+        (is (not (probe-file (merge-pathnames ".dirty" parent)))
+            "no .dirty must leak into the parent directory")
+        (let ((*graph* g))
+          (with-transaction ()
+            (setq id (id (make-oh-mem-thing :label "inside")))))
+        (let ((*graph* g))
+          (close-graph g)))
+      (is (probe-file (merge-pathnames "graph.img" inside))
+          "the image checkpoint must land inside the store directory")
+      (is (not (probe-file (merge-pathnames "graph.img" parent)))
+          "graph.img must not leak into the parent directory")
+      (is (not (probe-file (merge-pathnames "schema.dat" parent)))
+          "schema.dat must not leak into the parent directory")
+      (is (uiop:directory-exists-p (merge-pathnames "tx/" inside))
+          "the journal directory must sit inside the store directory")
+      (is (not (uiop:directory-exists-p (merge-pathnames "tx/" parent)))
+          "the journal directory must not leak into the parent directory")
+      (let ((g2 (graph-db::open-memory-graph :oh-mem-graph slashless)))
+        (unwind-protect
+             (let ((*graph* g2))
+               (is (string= "inside"
+                            (slot-value (lookup-vertex id) 'label))
+                   "data written under the slashless location must ~
+                    survive a reopen through the same slashless string"))
+          (let ((*graph* g2))
+            (close-graph g2 :snapshot-p nil)))))
+    (collect-garbage)))
+
+(test aborted-make-memory-graph-cleans-up
+  "A MAKE-MEMORY-GRAPH aborted at INIT-REPLICATION-LOG -- registered,
+.dirty written, transaction-manager installed, but GRAPH-OPEN-P still
+NIL -- must deregister, delete the marker THIS call wrote, and leave the
+directory reusable: a retried MAKE-MEMORY-GRAPH succeeds (GH #230)."
+  (with-temp-directory (dir)
+    (let ((path (namestring dir)))
+      (%oh-with-injected-failure 'graph-db::init-replication-log
+        (signals error (graph-db::make-memory-graph :oh-mem-graph path)))
+      (is (null (graph-db:lookup-graph :oh-mem-graph))
+          "an aborted make-memory-graph must not leave a half-registered ~
+           graph")
+      (is (not (probe-file (%oh-dirty-file path)))
+          "the marker this aborted call wrote must be gone")
+      (let ((g (graph-db::make-memory-graph :oh-mem-graph path)))
+        (is (graph-db::graph-open-p g) "the retried make must succeed")
+        (let ((*graph* g))
+          (close-graph g :snapshot-p nil))))
+    (collect-garbage)))
+
+(test aborted-make-memory-graph-past-open-p-closes-via-normal-path
+  "A MAKE-MEMORY-GRAPH aborted in START-REPLICATION -- GRAPH-OPEN-P
+already set, journal/replication-log stream open -- must unwind through
+the NORMAL close path: deregistered, marker gone, no fd leaked, and a
+retry succeeds (GH #230)."
+  (%oh-skip-unless-linux
+    (with-temp-directory (dir)
+      (let* ((path (namestring dir))
+             (before (%oh-fd-count)))
+        (%oh-with-injected-failure 'graph-db::start-replication
+          (signals error (graph-db::make-memory-graph :oh-mem-graph path)))
+        (let ((after (%oh-fd-count)))
+          (is (<= after (+ before 3))
+              "fd count grew from ~D to ~D across an aborted ~
+               make-memory-graph (replication-log stream leaked?)"
+              before after))
+        (is (null (graph-db:lookup-graph :oh-mem-graph))
+            "the aborted make must not leave a half-registered graph")
+        (is (not (probe-file (%oh-dirty-file path)))
+            "the normal close path must have removed the marker")
+        (let ((g (graph-db::make-memory-graph :oh-mem-graph path)))
+          (is (graph-db::graph-open-p g) "the retried make must succeed")
+          (let ((*graph* g))
+            (close-graph g :snapshot-p nil))))
+      (collect-garbage))))
+
+(test aborted-open-memory-graph-cleans-up-and-retries
+  "An OPEN-MEMORY-GRAPH aborted at INSTALL-VIEWS -- after the image
+restore and journal replay, before the transaction-manager exists --
+must deregister, delete the marker THIS call wrote (the store was
+cleanly closed, so no marker pre-existed), and leave the store intact:
+an un-injected reopen reads the data back (GH #230)."
+  (with-temp-directory (dir)
+    (let ((path (namestring dir)) id)
+      (let ((g (graph-db::make-memory-graph :oh-mem-graph path)))
+        (let ((*graph* g))
+          (with-transaction ()
+            (setq id (id (make-oh-mem-thing :label "survives"))))
+          (close-graph g)))
+      (%oh-with-injected-failure 'graph-db::install-views
+        (signals error (graph-db::open-memory-graph :oh-mem-graph path)))
+      (is (null (graph-db:lookup-graph :oh-mem-graph))
+          "an aborted open-memory-graph must not leave a half-registered ~
+           graph")
+      (is (not (probe-file (%oh-dirty-file path)))
+          "the marker this aborted open wrote must be gone")
+      (let ((g2 (graph-db::open-memory-graph :oh-mem-graph path)))
+        (unwind-protect
+             (let ((*graph* g2))
+               (is (string= "survives"
+                            (slot-value (lookup-vertex id) 'label))
+                   "the un-injected reopen must still read the data back"))
+          (let ((*graph* g2))
+            (close-graph g2 :snapshot-p nil)))))
+    (collect-garbage)))
+
+(test aborted-open-memory-graph-keeps-preexisting-dirty-marker
+  "An OPEN-MEMORY-GRAPH aborted after superseding a PRE-EXISTING .dirty
+(an earlier crash's record) must leave the marker in place -- the abort
+did not recover anything, so it must not erase the crash evidence.  The
+store still reopens fine: a memory graph tolerates the marker and
+rebuilds from journal + image (GH #230)."
+  (with-temp-directory (dir)
+    (let ((path (namestring dir)) id)
+      (let ((g (graph-db::make-memory-graph :oh-mem-graph path)))
+        (let ((*graph* g))
+          (with-transaction ()
+            (setq id (id (make-oh-mem-thing :label "crashed"))))
+          (close-graph g)))
+      ;; Simulate the crash: re-plant the marker over the clean store.
+      (with-open-file (out (%oh-dirty-file path) :direction :output
+                           :if-does-not-exist :create)
+        (format out "~S" (get-universal-time)))
+      (%oh-with-injected-failure 'graph-db::install-views
+        (signals error (graph-db::open-memory-graph :oh-mem-graph path)))
+      (is (probe-file (%oh-dirty-file path))
+          "a pre-existing crash marker must survive the aborted open")
+      (let ((g2 (graph-db::open-memory-graph :oh-mem-graph path)))
+        (unwind-protect
+             (let ((*graph* g2))
+               (is (string= "crashed"
+                            (slot-value (lookup-vertex id) 'label))
+                   "the dirty store must still reopen and read back"))
+          (let ((*graph* g2))
+            (close-graph g2 :snapshot-p nil)))))
+    (collect-garbage)))
+
+(test memgraph-attach-precedes-replication-start
+  "GH #238: both memory constructors must attach to the system clock
+BEFORE START-REPLICATION runs, so an inbound push can never mint ids
+from the pre-attach counter, and a failed attach has no replication
+threads to tear down.  Traced by call-order spies, as in
+ABORTED-OPEN-GRAPH-STOPS-REPLICATION-BEFORE-OTHER-TEARDOWN."
+  (with-temp-directory (sysdir)
+    (with-temp-directory (cdir)
+      (with-temp-directory (mdir)
+        (let ((graph-db::*system-directory* (namestring sysdir))
+              (graph-db::*type-registry* nil)
+              (graph-db::*store-registry* nil)
+              (make-order nil) (open-order nil))
+          (let ((clock (open-system-clock (namestring cdir)))
+                (orig-attach
+                  (fdefinition 'graph-db::attach-to-system-clock))
+                (orig-start (fdefinition 'graph-db::start-replication))
+                (order nil))
+            (unwind-protect
+                 (progn
+                   (setf (fdefinition 'graph-db::attach-to-system-clock)
+                         (lambda (g c)
+                           (push :attach order)
+                           (funcall orig-attach g c)))
+                   (setf (fdefinition 'graph-db::start-replication)
+                         (lambda (g &rest args)
+                           (push :start-replication order)
+                           (apply orig-start g args)))
+                   (let ((mg (graph-db::make-memory-graph
+                              :oh-mem-clocked (namestring mdir)
+                              :system-clock clock)))
+                     (let ((*graph* mg))
+                       (close-graph mg :snapshot-p nil)))
+                   (setf make-order (nreverse order) order nil)
+                   (let ((mg2 (graph-db::open-memory-graph
+                               :oh-mem-clocked (namestring mdir)
+                               :system-clock clock)))
+                     (let ((*graph* mg2))
+                       (close-graph mg2 :snapshot-p nil)))
+                   (setf open-order (nreverse order)))
+              (setf (fdefinition 'graph-db::attach-to-system-clock)
+                    orig-attach)
+              (setf (fdefinition 'graph-db::start-replication) orig-start)
+              (close-system-clock clock)))
+          (dolist (pair (list (cons "MAKE-MEMORY-GRAPH" make-order)
+                              (cons "OPEN-MEMORY-GRAPH" open-order)))
+            (destructuring-bind (name . order) pair
+              (is (member :attach order)
+                  "~A must attach to the clock" name)
+              (is (member :start-replication order)
+                  "~A must start replication" name)
+              (is (< (position :attach order)
+                     (position :start-replication order))
+                  "~A must attach BEFORE start-replication" name))))))
+    (collect-garbage)))
