@@ -13,6 +13,19 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Added
 
+- **Perf regression detection** (#253). Perf reports are now stamped
+  with a suite generation (`*perf-suite-generation*`) and a sanitized
+  host name; `bless-perf-baseline` copies a `:normal`-scale report to
+  the committed per-host/per-generation baseline
+  (`tests/perf/results/baseline-<host>-g<gen>.report`), and
+  `check-perf` gates a run against it with per-metric-class tolerance
+  bands (15% default, per-label overrides for known-noisy benches;
+  missing labels fail, new labels are reported unbaselined). Comparing
+  across host, generation, or scale is refused. Measurement-only
+  remains the default (`:error-p t` opts into signalling). Ritual in
+  `docs/perf-baselines.md`; first blessed baseline (host `odm`, g4)
+  committed.
+
 - **`store-not-closed-cleanly-error`** (#246). The `.dirty` refusal is
   now a named, exported condition with a `store-not-closed-location`
   reader, signalled by both `open-graph` and `make-graph`; its report

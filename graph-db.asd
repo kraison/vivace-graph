@@ -288,6 +288,8 @@
   :components ((:file "package")
                (:file "suite")
                (:file "benchmarks")
+               ;; baseline blessing + regression gating (GH #253)
+               (:file "check")
                ;; B+ tree vs skip-list side-by-side (in-package :graph-db so it can
                ;; trace both read paths); entry point (graph-db::bplus-bench).
                (:file "bplus-bench"))
@@ -480,7 +482,10 @@ cl-temporal-extent."
 (defsystem graph-db/test
   :name "VivaceGraph test suite"
   :description "FiveAM unit tests for graph-db."
-  :depends-on (:graph-db :graph-db/test-scratch :fiveam :drakma)
+  ;; :graph-db/perf-test is load-only here: perf/check-tests exercises the
+  ;; pure check-perf comparison logic (GH #253); no benchmark ever runs.
+  :depends-on (:graph-db :graph-db/test-scratch :graph-db/perf-test
+               :fiveam :drakma)
   :pathname "tests/"
   :serial t
   :components ((:file "package")
@@ -581,7 +586,8 @@ cl-temporal-extent."
                (:file "peer-unique-tests")
                (:file "peer-index-tests")
                (:file "open-hygiene-tests")    ; GH #222, #224
-               (:file "scratch-cleanup-tests")) ; GH #214
+               (:file "scratch-cleanup-tests")  ; GH #214
+               (:file "perf/check-tests"))      ; GH #253
   :perform (test-op (op c)
                     (unless (uiop:symbol-call :graph-db/test :run-tests)
                       (error "graph-db test suite failed."))))

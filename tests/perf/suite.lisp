@@ -22,6 +22,18 @@
 (defparameter *lisp-impl*
   (format nil "~A ~A" (lisp-implementation-type) (lisp-implementation-version)))
 
+(defparameter *perf-suite-generation* 4
+  "Suite generation for baseline comparability (GH #253).  Bump when any
+change alters an existing bench's work or its labels; adding a new bench
+does not bump.  Generations 1-3 retroactively cover the pre-#252 report
+eras still visible in results/ (2.1.1 / 3.0 A-B / mvcc phase runs).")
+
+(defun perf-host ()
+  "Sanitized (machine-instance): lowercase, [a-z0-9-] only."
+  (string-downcase
+   (substitute-if #\- (lambda (c) (not (or (alphanumericp c) (char= c #\-))))
+                  (machine-instance))))
+
 ;;; ---------------------------------------------------------------------------
 ;;; Report collection
 ;;; ---------------------------------------------------------------------------
@@ -161,11 +173,13 @@ MVCC-relevant signal).  If :DIR is given, bind it to the graph's temp dir."
     (with-open-file (s path :direction :output :if-exists :supersede
                             :if-does-not-exist :create)
       (format s ";;;; graph-db perf report~%")
-      (format s ";;;; tag=~A impl=~A scale=~A~%~%" tag *lisp-impl* *perf-scale*)
+      (format s ";;;; tag=~A impl=~A scale=~A generation=~D host=~A~%~%"
+              tag *lisp-impl* *perf-scale* *perf-suite-generation* (perf-host))
       (dolist (e entries)
         (format s ";; ~38A ~{~A ~A  ~}~%" (car e) (cdr e)))
       (format s "~%~S~%"
               (list :perf-report :tag tag :impl *lisp-impl* :scale *perf-scale*
+                    :generation *perf-suite-generation* :host (perf-host)
                     :entries entries)))
     (format t "~&~%Wrote perf report: ~A~%" path)
     path))
