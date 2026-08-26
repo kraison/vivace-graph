@@ -200,17 +200,21 @@ is rebuilt on reopen."
       (let ((g (graph-db::make-memory-graph *mem-test-graph-name* loc)))
         (let ((*graph* g))
           (with-transaction ()
-            (make-m-place :label "kharkiv" :geom (graph-db::make-point 36.3d0 50.0d0))
-            (make-m-place :label "lviv"    :geom (graph-db::make-point 24.0d0 49.8d0))
+            (make-m-place :label "east-town" :geom (graph-db::make-point 12.3d0
+                                                     45.7d0))
+            (make-m-place :label "west-town"    :geom (graph-db::make-point
+                                                        9.5d0 44.2d0))
             (make-m-place :label "london"  :geom (graph-db::make-point -0.1d0 51.5d0)))
           (let ((hits (graph-db::spatial-index-query-bbox
-                       (graph-db::spatial-index-for g 'm-place 'geom) 22.0d0 48.0d0 40.0d0 51.0d0)))
+                       (graph-db::spatial-index-for g 'm-place 'geom) 8.0d0
+                           41.0d0 14.0d0 47.0d0)))
             (is (= 2 (length hits)))))
         (close-graph g :snapshot-p t))
       (let ((g2 (graph-db::open-memory-graph *mem-test-graph-name* loc)))
         (unwind-protect
              (let ((hits (graph-db::spatial-index-query-bbox
-                          (graph-db::spatial-index-for g2 'm-place 'geom) 22.0d0 48.0d0 40.0d0 51.0d0)))
+                          (graph-db::spatial-index-for g2 'm-place 'geom) 8.0d0
+                              41.0d0 14.0d0 47.0d0)))
                (is (= 2 (length hits))))
           (ignore-errors (close-graph g2 :snapshot-p nil))
           (collect-garbage))))))
@@ -266,11 +270,13 @@ the indexes were loaded from the image, not re-derived by scanning the nodes."
       (let ((g (graph-db::make-memory-graph *mem-test-graph-name* loc)))
         (let ((*graph* g))
           (with-transaction ()
-            (setq place-id (id (make-m-place :label "kharkiv"
-                                             :geom (graph-db::make-point 36.3d0 50.0d0))))
+            (setq place-id (id (make-m-place :label "east-town"
+                                             :geom (graph-db::make-point 12.3d0
+                                                     45.7d0))))
             (setq region-id (id (make-m-region
                                  :label "east"
-                                 :extent (scope-rect 22.1d0 44.4d0 40.2d0 52.4d0)))))
+                                 :extent (scope-rect 8.1d0 40.9d0 14.2d0
+                                           47.4d0)))))
           ;; Canary straight into M-PLACE's index at a corner nothing else occupies.
           (graph-db::spatial-index-insert
            (graph-db::spatial-index-for g 'm-place 'geom)
@@ -286,10 +292,10 @@ the indexes were loaded from the image, not re-derived by scanning the nodes."
                    "the two classes keep their own indexes across a reopen")
                (is (has-p place-id
                           (graph-db::spatial-index-query-bbox
-                           place-ix 36.0d0 49.9d0 36.5d0 50.1d0)))
+                           place-ix 12.0d0 45.5d0 12.5d0 45.9d0)))
                (is (has-p region-id
                           (graph-db::spatial-index-query-bbox
-                           region-ix 30.0d0 48.0d0 31.0d0 49.0d0)))
+                           region-ix 10.0d0 41.0d0 11.0d0 43.0d0)))
                (is (has-p canary
                           (graph-db::spatial-index-query-bbox
                            place-ix 9.0d0 9.0d0 11.0d0 11.0d0))
@@ -358,7 +364,8 @@ still restored and queryable without a scan."
           (let ((*graph* g))
             (with-transaction ()
               (dotimes (i 10) (make-m-tag :label (format nil "t~D" i)))
-              (make-m-place :label "site" :geom (graph-db::make-point 36.3d0 50.0d0))))
+              (make-m-place :label "spot" :geom (graph-db::make-point 12.3d0
+                                                  45.7d0))))
           (close-graph g :snapshot-p t))
         (let ((g2 (graph-db::open-memory-graph *mem-test-graph-name* loc :lazy t)))
           (unwind-protect
@@ -375,7 +382,7 @@ still restored and queryable without a scan."
                  ;; ...and the geometry index came back structurally, queryable.
                  (is (= 1 (length (graph-db::spatial-index-query-bbox
                                    (graph-db::spatial-index-for g2 'm-place 'geom)
-                                   22.0d0 48.0d0 40.0d0 51.0d0)))
+                                   8.0d0 41.0d0 14.0d0 47.0d0)))
                      "the geometry index restored structurally, still findable")
                  ;; And the query did not have to materialize any node either.
                  (is (= 0 (n-materialized g2))
@@ -440,7 +447,7 @@ empty/stale image and the app re-cold-syncs."
 
 (test open-restores-derived-structurally-without-regen
   "A v2 image restores views / indexes / spatial STRUCTURALLY: OPEN-MEMORY-GRAPH does
-NOT call regenerate-all-views (the ~23 s on-device view rebuild, #50 / mine-action
+NOT call regenerate-all-views (the ~23 s on-device view rebuild, #50
 open-bench), yet the reduce view and node tables come back correct.  This is the
 boot-latency fix -- rebuild-on-open is gone for a clean/checkpointed image."
   (with-temp-directory (dir)
@@ -506,7 +513,7 @@ reflect BOTH the image aggregate and the replayed tail."
 (test lazy-restore-plus-journal-tail
   "The LAZY (fault-on-access) crash-recovery path: a stale native-image checkpoint
 plus a journal tail authored after it -- the device's real crash path (checkpoint
-after peer-sync, author record-finds that journal, killed before the next
+after peer-sync, author records that journal, killed before the next
 checkpoint).  On open the image's 10 nodes restore as LZNODE blobs (unmaterialized)
 while recover-transactions replays the 5 journaled nodes as LIVE nodes; the two
 coexist in the table and the reduce view reflects BOTH the image aggregate and the
@@ -551,7 +558,8 @@ replayed tail."
 (test reduce-view-remove-re-reduces
   "Deleting a node from a map-reduce view re-reduces the aggregate via
 GET-NON-AGGREGATE-PAIRS / GET-ALL-AGGREGATE-PAIRS on the mem-skip-list -- the
-maintenance path the on-device eo-find rollup views hit during peer-sync (adding
+maintenance path the on-device aggregate rollup views hit during peer-sync
+    (adding
 never calls them, so the earlier map-reduce test missed this)."
   (with-test-memory-graph (g)
     (declare (ignorable g))
@@ -640,7 +648,8 @@ access."
                   b (id (make-m-person :name "Bo"  :age 31)))
             (make-m-knows :from a :to b))
           (with-transaction ()
-            (make-m-place :label "site" :geom (graph-db::make-point 36.3d0 50.0d0))))
+            (make-m-place :label "spot" :geom (graph-db::make-point 12.3d0
+                                                45.7d0))))
         (close-graph g :snapshot-p t))
       (let ((g2 (graph-db::open-memory-graph *mem-test-graph-name* loc :lazy t)))
         (unwind-protect
@@ -652,7 +661,8 @@ access."
                (is (= 1 (length (incoming-edges (lookup-vertex b)))))
                ;; spatial bbox (restored structurally; hit id -> materialize)
                (is (= 1 (length (graph-db::spatial-index-query-bbox
-                                 (graph-db::spatial-index-for g2 'm-place 'geom) 22.0d0 48.0d0 40.0d0 51.0d0))))
+                                 (graph-db::spatial-index-for g2 'm-place 'geom)
+                                     8.0d0 41.0d0 14.0d0 47.0d0))))
                ;; reduce view (decade 3 = Ann + Bo = 2), no node materialization
                (is (equal '((3 . 2))
                           (map-reduced-view (lambda (k id v) (declare (ignore id)) (cons k v))
@@ -801,11 +811,13 @@ derivable, and whose loss is unrecoverable) comes through the wire untouched."
             (setq person-id (id (make-m-person :name "alice" :age 30)))
             (make-m-person :name "bob" :age 40)
             (setq tag-id (id (make-m-tag :label "urgent")))
-            (setq place-id (id (make-m-place :label "kharkiv"
-                                             :geom (graph-db::make-point 36.3d0 50.0d0))))
+            (setq place-id (id (make-m-place :label "east-town"
+                                             :geom (graph-db::make-point 12.3d0
+                                                     45.7d0))))
             (setq region-id (id (make-m-region
                                  :label "east"
-                                 :extent (scope-rect 22.1d0 44.4d0 40.2d0 52.4d0))))
+                                 :extent (scope-rect 8.1d0 40.9d0 14.2d0
+                                           47.4d0))))
             (make-m-widget :sku "SKU-1")
             (make-m-widget :sku "SKU-2")))
         ;; Write the REAL v5 layout, then close WITHOUT a checkpoint so the clean
@@ -830,10 +842,10 @@ derivable, and whose loss is unrecoverable) comes through the wire untouched."
                      "the two classes still keep their own indexes post-migration")
                  (is (has-p place-id
                             (graph-db::spatial-index-query-bbox
-                             place-ix 36.0d0 49.9d0 36.5d0 50.1d0)))
+                             place-ix 12.0d0 45.5d0 12.5d0 45.9d0)))
                  (is (has-p region-id
                             (graph-db::spatial-index-query-bbox
-                             region-ix 30.0d0 48.0d0 31.0d0 49.0d0))))
+                             region-ix 10.0d0 41.0d0 11.0d0 43.0d0))))
                ;; view
                (is (equal '("alice" "bob")
                           (map-view (lambda (k id v) (declare (ignore id v)) k)
@@ -870,11 +882,13 @@ touched (GH #65)."
             (with-transaction ()
               (dotimes (i 5) (make-m-tag :label (format nil "t~D" i)))
               (dotimes (i 3) (make-m-person :name (format nil "p~D" i) :age (+ 20 i)))
-              (setq place-id (id (make-m-place :label "kharkiv"
-                                               :geom (graph-db::make-point 36.3d0 50.0d0))))
+              (setq place-id (id (make-m-place :label "east-town"
+                                               :geom (graph-db::make-point
+                                                       12.3d0 45.7d0))))
               (setq region-id (id (make-m-region
                                    :label "east"
-                                   :extent (scope-rect 22.1d0 44.4d0 40.2d0 52.4d0))))))
+                                   :extent (scope-rect 8.1d0 40.9d0 14.2d0
+                                             47.4d0))))))
           (%write-v5-test-image g)
           (close-graph g :snapshot-p nil))
         (let ((g2 (graph-db::open-memory-graph *mem-test-graph-name* loc :lazy t)))
@@ -885,11 +899,11 @@ touched (GH #65)."
                  (is (has-p place-id
                             (graph-db::spatial-index-query-bbox
                              (graph-db::spatial-index-for g2 'm-place 'geom)
-                             36.0d0 49.9d0 36.5d0 50.1d0)))
+                             12.0d0 45.5d0 12.5d0 45.9d0)))
                  (is (has-p region-id
                             (graph-db::spatial-index-query-bbox
                              (graph-db::spatial-index-for g2 'm-region 'extent)
-                             30.0d0 48.0d0 31.0d0 49.0d0)))
+                             10.0d0 41.0d0 11.0d0 43.0d0)))
                  ;; the 3 plain M-PERSON nodes (no :INDEX slot at all) are untouched
                  (is (= 3 (n-lznodes g2))
                      "nodes with no :INDEX slot were never touched by the migration")
@@ -1093,8 +1107,8 @@ version fork in %READ-MEMORY-IMAGE is what this pins."
               (setq knows-id (id (make-m-knows :from (id a) :to (id b))))
               (setq place-id
                     (id (make-m-place
-                         :label "kharkiv"
-                         :geom (graph-db::make-point 36.3d0 50.0d0)))))))
+                         :label "east-town"
+                         :geom (graph-db::make-point 12.3d0 45.7d0)))))))
         (%write-v7-test-image g)
         (close-graph g :snapshot-p nil))
       (let ((g2 (graph-db::open-memory-graph *mem-test-graph-name* loc)))
@@ -1106,7 +1120,7 @@ version fork in %READ-MEMORY-IMAGE is what this pins."
                (is (string= "alice" (slot-value (lookup-vertex person-id)
                                                 'name))
                    "a v7 node's data blob is still found at the right offset")
-               (is (string= "kharkiv" (slot-value (lookup-vertex place-id)
+               (is (string= "east-town" (slot-value (lookup-vertex place-id)
                                                   'label)))
                ;; The ve/vev index keys carry their own type-id, so a
                ;; mis-parsed key silently loses adjacency rather than erroring.

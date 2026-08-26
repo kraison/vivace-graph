@@ -135,7 +135,7 @@
    #:profile-realworld-geos-coverage-workload
    #:profile-realworld-large-polygon-materialization-workload
    #:profile-realworld-control-history-workload
-   #:profile-realworld-acled-pin-workload
+   #:profile-realworld-event-pin-workload
    #:profile-realworld-kb-vector-search-workload
    #:run-real-world-profiling-suite
    #:profile-and-generate-realworld-pdf))

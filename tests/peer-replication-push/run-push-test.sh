@@ -2,9 +2,9 @@
 #
 # Two-process peer-replication PUSH conflict test for VivaceGraph (Branch B, B2d-2b).
 #
-# The device pulls a find, edits it locally (releases the hazard DANGER->SAFE +
+# The device pulls a record, edits it locally (releases the alert DANGER->SAFE +
 # rewrites a note), and PUSHES the two authored ops.  The hub RE-HOMES them through
-# the merge resolver: the release is rejected (hazard stays DANGER + a conflict is
+# the merge resolver: the release is rejected (alert stays DANGER + a conflict is
 # surfaced), the :lww note takes the device's value.  BOTH processes must pass -- the
 # hub verifies its merged state (it is the one that re-homes), the device its own.
 #

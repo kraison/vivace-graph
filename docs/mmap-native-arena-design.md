@@ -159,7 +159,8 @@ target before paying for the arena.
 ## See also
 
 - `docs/memory-graph-design.md` — the in-memory backend (GH #50).
-- `docs/memory-graph-handoff.md` — app-side handoff (durability, fast-open).
+- the memory-graph handoff record (in the downstream application's repository) —
+  app-side handoff (durability, fast-open).
 - `serialize.lisp` / `globals.lisp` — the type/tag coverage the promotion pass mirrors.
 - Prior art: Wilson, "Pointer Swizzling at Page Fault Time" (Texas Persistent Store);
   PLOB (Kirschke); AllegroCache; Symbolics Statice.

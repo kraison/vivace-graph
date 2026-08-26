@@ -930,9 +930,9 @@ order of terms with duplicates removed."
 ;;; values -- they carry no domain knowledge and need no spatial index.  Compose
 ;;; them with slot accessors to filter graph nodes by location, e.g.:
 ;;;   (select-flat (?n)
-;;;     (is-a ?n eo-find)
+;;;     (is-a ?n sensor)
 ;;;     (node-slot-value ?n lon ?lon) (node-slot-value ?n lat ?lat)
-;;;     (geo-near ?lat ?lon 49.2 37.17 500.0))
+;;;     (geo-near ?lat ?lon 45.67 12.34 500.0))
 ;;; Index-backed, node-yielding spatial functors come once the write-path hook
 ;;; populates the spatial index (deferred with the MVCC apply-path work).
 ;;; ---------------------------------------------------------------------------

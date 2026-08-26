@@ -301,7 +301,7 @@ EPOCH-LEASE-EXHAUSTED in transactions.lisp."
    (master-txn-id :accessor master-txn-id :initarg :master-txn-id)
    ;; Subset replication: when non-nil, a predicate (NODE) -> generalized boolean.
    ;; Each replicated transaction's writes are filtered through it on apply, so
-   ;; the slave holds only the subset it accepts (e.g. its area of operations).
+   ;; the slave holds only the subset it accepts (e.g. its coverage area).
    ;; See MAKE-SPATIAL-REPLICATION-FILTER for the spatial case.
    (replication-filter :accessor replication-filter :initarg :replication-filter
                        :initform nil)))
@@ -311,8 +311,8 @@ EPOCH-LEASE-EXHAUSTED in transactions.lisp."
 ;; exactly as it is.  A peer-graph is a plain graph with extra peer state; until the
 ;; full-system transport file (peer-streaming.lisp) specializes START-REPLICATION /
 ;; STOP-REPLICATION on it, it inherits the base no-op methods and behaves like an
-;; ordinary embedded graph.  See docs/peer-replication-design.md (design v2) and
-;; docs/peer-replication-branch-a-plan.md (WP-1).
+;; ordinary embedded graph.  The Branch A plan (WP-1) and full design
+;; record (v2) live in the downstream application's repository.
 (defclass peer-graph (graph)
   ((peer-role :accessor peer-role :initarg :peer-role :initform :device
               :documentation "Either :HUB (the system of record many devices sync
@@ -362,8 +362,9 @@ EPOCH-LEASE-EXHAUSTED in transactions.lisp."
                  merge (an incoming edit just overwrites, i.e. Branch A behaviour).")
    (reference-classes :accessor reference-classes :initarg :reference-classes :initform nil
                       :documentation "Hub role: a list of vertex-type names shipped to EVERY
-                      device by CLASS -- global reference data (e.g. the ordnance catalogue)
-                      that is not reachable from any device's site roots.  SCOPE-NODE-SET
+                      device by CLASS -- global reference data (a shared parts
+                      catalogue) not reachable from any device's scope roots.
+                      SCOPE-NODE-SET
                       unions every disclosable vertex of these classes (subclass-inclusive)
                       into the pulled set, independent of the roots walk.")
    (peer-conflicts :accessor peer-conflicts :initarg :peer-conflicts :initform nil

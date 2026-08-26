@@ -3,8 +3,9 @@
 ;;; ===========================================================================
 ;;; Peer replication (WP-5): authority-scoped closed-subgraph export + manifest
 ;;; reconciliation.  Pure graph logic, no network -- the peer transport
-;;; (peer-streaming.lisp) ships what these produce.  See
-;;; docs/peer-replication-design.md §6/§7 and docs/peer-replication-branch-a-plan.md.
+;;; (peer-streaming.lisp) ships what these produce.  The design record
+;;; (§6/§7) and implementation plan live in the downstream application's
+;;; repository.
 ;;;
 ;;; A device's working set is the CLOSED subgraph reachable from its root(s),
 ;;; bounded by edge type, with two fail-closed rules:
@@ -62,11 +63,14 @@ node-id -> node, holding exactly the disclosable closure."
                  ;; traverse OUT of them -- no matter how they were reached.  The reference-set
                  ;; pass below adds them without enqueueing for exactly this reason; making it a
                  ;; property of WHAT the vertex IS (rather than of HOW it was added) closes the
-                 ;; other door.  Otherwise an edge INTO the catalogue -- e.g. FIND-OF-TYPE, which
-                 ;; a device needs so a pulled find carries its ordnance classification -- fans the
-                 ;; walk back out along that vertex's INCOMING edges to every find in the database
-                 ;; that shares the type, paying a DISCLOSABLE-P (and its survey/project traversal)
-                 ;; on each one before rejecting it.  Correct, but O(all finds) per sync.
+                 ;; other door.  Otherwise an edge INTO the catalogue --
+                 ;; e.g. an ITEM-OF-TYPE-style reference edge, which a
+                 ;; device needs so a pulled item carries its type
+                 ;; reference -- fans the walk back out along that vertex's
+                 ;; INCOMING edges to every item in the database that
+                 ;; shares the type, paying a DISCLOSABLE-P (and its
+                 ;; parent-chain traversal) on each one before rejecting
+                 ;; it.  Correct, but O(all items) per sync.
                  (unless (reference-vertex-p v)
                    (push v queue)))))
       (with-read-snapshot (graph)
@@ -88,9 +92,9 @@ node-id -> node, holding exactly the disclosable closure."
         ;; Reference-set (hub role): ship global reference data by CLASS -- every
         ;; disclosable vertex of a REFERENCE-CLASS (subclass-inclusive), independent of
         ;; the roots walk.  Added to VSET but NOT enqueued, so its own edges are never
-        ;; followed -> no walk-back into out-of-scope neighbours.  E.g. the ordnance
-        ;; catalogue: the device gets every ordnance-type so it can classify new finds,
-        ;; while the hub-only ordnance-detail/country neighbours stay behind.
+        ;; followed -> no walk-back into out-of-scope neighbours.  E.g. a shared
+        ;; parts catalogue: the device gets every part-type so it can classify
+        ;; new items, while the hub-only part-detail neighbours stay behind.
         (dolist (class (and (typep graph 'peer-graph) (reference-classes graph)))
           (map-vertices (lambda (v)
                           (when (and (not (gethash (id v) vset)) (disc v))

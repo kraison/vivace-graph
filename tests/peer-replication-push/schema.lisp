@@ -3,19 +3,19 @@
 ;;;; Loaded IDENTICALLY by both the hub and the device (byte-for-byte) so their
 ;;;; schema-digests match and node type-ids line up on the wire.
 ;;;;
-;;;; A single mine-action-shaped find with two mergeable fields:
+;;;; A single field-app-shaped record with two mergeable fields:
 ;;;;   NOTE   -- a plain :lww field (higher (lamport, origin) wins)
-;;;;   HAZARD -- a :safety field: DANGEROUS unless exactly "SAFE".  A release
+;;;;   ALERT -- a :safety field: DANGEROUS unless exactly "SAFE".  A release
 ;;;;             (dangerous local -> safe incoming) is REJECTED (keep local + surface);
 ;;;;             a re-open toward danger auto-applies.
-;;;; The find is its own scope root, so the device's authority scope is just the find.
+;;;; The record is its own scope root; the device's authority scope is just it.
 
 (in-package :graph-db)
 
-(def-vertex pf-find ()
+(def-vertex pf-record ()
   ((name    :type string)
    (note    :type string)
-   (hazard  :type string)
+   (alert  :type string)
    (disclosable :type integer))
   :push-test-app)
 
@@ -30,12 +30,12 @@
   (declare (ignore graph scope))
   (= 1 (slot-value vertex 'disclosable)))
 
-;;; The Branch B conflict contract (app seam): HAZARD is :safety, everything else
+;;; The Branch B conflict contract (app seam): ALERT is :safety, everything else
 ;;; :lww.  Dangerous unless exactly "SAFE"; a release keeps the dangerous value and
 ;;; surfaces, a toward-danger change auto-applies, same-class falls back to LWW.
 (defun push-field-bucket (type slot)
   (declare (ignore type))
-  (case slot (:hazard :safety) (t :lww)))
+  (case slot (:alert :safety) (t :lww)))
 
 (defun push-safety-merge (slot local incoming local-newer-p)
   (declare (ignore slot))

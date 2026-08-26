@@ -1564,8 +1564,8 @@ That is the whole declaration. Maintenance is automatic and lives on the *transa
 #+BEGIN_SRC lisp
   ;; EMBED is your own function; it must return a (simple-array single-float (*)).
   (with-transaction ()
-    (make-document :title "Landmine risk survey"
-                   :embedding (embed "Landmine risk survey")))
+    (make-document :title "Harbor dredging report"
+                   :embedding (embed "Harbor dredging report")))
 #+END_SRC
 
 Creating a node stores its vector; updating one overwrites it (and *removes* it if the new value is no longer a conforming vector); deleting a node removes it. The segment is created *lazily*, on the first conforming write, and is sized to that first vector's length.
@@ -1574,7 +1574,7 @@ Creating a node stores its vector; updating one overwrites it (and *removes* it 
 
 #+BEGIN_SRC lisp
   ;; (vector-search graph class-name slot-name query-vector k)
-  (vector-search *graph* 'document 'embedding (embed "buried ordnance") 10)
+  (vector-search *graph* 'document 'embedding (embed "dredging schedule") 10)
   ;;=> ((0.93 . #<16-byte id>) (0.88 . #<16-byte id>) ...)
 #+END_SRC
 
@@ -2277,10 +2277,10 @@ To put a node type on the map, give it a geometry slot and mark that slot ~:inde
   (def-vertex observation ()
     ((location :type geometry :index t)   ; <- :index t makes it spatial
      (note     :type string))
-    :survey-app)
+    :sensor-app)
 
   (with-transaction ()
-    (make-observation :location (make-point 37.17d0 49.20d0)
+    (make-observation :location (make-point 12.34d0 45.67d0)
                       :note "sighting near the river"))
 #+END_SRC
 
@@ -2305,7 +2305,7 @@ Here is a second spatial type, so the query examples below have two classes to s
   (def-vertex sensor ()
     ((location :type geometry :index t)
      (kind     :type string))
-    :survey-app)
+    :sensor-app)
 #+END_SRC
 
 *Per-index grid precision and max-cells cap.* A geometry slot may set its index's geohash precision with the ~:spatial-precision~ slot option (default 7, ≈150 m cells — set graph default via ~make-graph~'s ~:spatial-precision~) and its max-cells cap with the ~:spatial-max-cells~ slot option (default 16384 — set graph default via ~make-graph~'s ~:spatial-max-cells~). Coarser grids and lower cell caps suit large area geometries, while finer grids suit dense point data. Changing a declared precision re-grids that one index automatically the next time the graph is opened — on the *on-disk* backend. A ~memory-graph~ reopens its index at the *persisted* precision and does not adopt a changed declaration until you rebuild explicitly; it over-covers at the old grid, so results stay correct but a stale precision costs selectivity rather than accuracy (see #66).
@@ -2314,7 +2314,7 @@ Here is a second spatial type, so the query examples below have two classes to s
 #+BEGIN_SRC lisp
   (def-vertex zone ()
     ((extent :type geometry :index t :spatial-precision 3 :spatial-max-cells 64))  ; coarse grid for big polygons
-    :survey-app)
+    :sensor-app)
 #+END_SRC
 
 
@@ -2330,18 +2330,18 @@ Every query takes a *scope* as its first argument: a node-class name, a list of 
 
 #+BEGIN_SRC lisp
   ;; Observations within RADIUS metres of a point, nearest first, as (node . distance):
-  (find-nodes-near 'observation 49.20 37.17 500.0)
+  (find-nodes-near 'observation 45.67 12.34 500.0)
 
   ;; The K observations nearest a point, nearest first (also (node . distance) pairs):
-  (find-nearest-k 'observation 49.20 37.17 5)
+  (find-nearest-k 'observation 45.67 12.34 5)
 
   ;; Observations whose location falls inside a :POLYGON / :MULTIPOLYGON area:
-  (find-nodes-within 'observation my-task-area)
+  (find-nodes-within 'observation my-region)
 
   ;; A list scope unions the named classes (here OBSERVATION and SENSOR);
   ;; :all scans every index in the graph.
-  (find-nodes-within '(observation sensor) my-task-area)
-  (find-nodes-within :all my-task-area)
+  (find-nodes-within '(observation sensor) my-region)
+  (find-nodes-within :all my-region)
 #+END_SRC
 
 ~find-nearest-k~ is bounded by ~:max-radius~ (default 25 km): the geohash index answers a window by enumerating its grid cells, so an unbounded nearest-neighbour search is not supported — it returns the K nearest /within max-radius/ (widen it only if you accept the per-query cost, which grows with the square of the radius).
@@ -2349,15 +2349,15 @@ Every query takes a *scope* as its first argument: a node-class name, a list of 
 *Prolog functors* (these /yield/ matching nodes, so they compose with the rest of a query):
 
 #+BEGIN_SRC lisp
-  ;; All observations within 500 m of (49.20, 37.17):
+  ;; All observations within 500 m of (45.67, 12.34):
   (select-flat (?o)
-    (find-near ?o observation 49.20 37.17 500.0))
+    (find-near ?o observation 45.67 12.34 500.0))
 
-  ;; The 5 observations nearest (49.20, 37.17):
+  ;; The 5 observations nearest (45.67, 12.34):
   (select-flat (?o)
-    (find-nearest ?o observation 49.20 37.17 5))
+    (find-nearest ?o observation 45.67 12.34 5))
 
-  ;; All observations inside a task-area geometry bound to ?area:
+  ;; All observations inside a region geometry bound to ?area:
   (select-flat (?o)
     (find-within ?o observation ?area))
 #+END_SRC
@@ -2408,7 +2408,7 @@ The add-on /upgrades/ a set of generic functions in place (no API change). When 
 
 #+BEGIN_SRC lisp
   ;; nodes whose footprint actually overlaps the area (exact with GEOS):
-  (find-nodes-intersecting 'observation my-task-area)
+  (find-nodes-intersecting 'observation my-region)
 
   ;; repair a self-intersecting polygon before indexing it:
   (let ((clean (geometry-make-valid messy-polygon)))
@@ -2741,7 +2741,7 @@ Reach for the on-disk engine instead when the graph is larger than RAM, when you
 *** See also
 
 - ~docs/memory-graph-design.md~ — the full design and rationale.
-- ~docs/memory-graph-handoff.md~ — a practical operator's guide (durability, the ~:lazy~ flag, on-device benchmarks).
+- the memory-graph handoff record (in the downstream application's repository) — a practical operator's guide (durability, the ~:lazy~ flag, on-device benchmarks).
 - ~docs/mmap-native-arena-design.md~ — deferred R&D toward mmap-backed *native* Lisp heaps (near-native persistence without serialization).
 
 
@@ -2850,7 +2850,7 @@ record has exactly four fields, ~kind~ is exactly ~"v"~ or ~"e"~, and a
 consumer must read *all* rows before resolving superclass names, because the
 table is sorted by id and may carry forward references. Since protocol 2
 (GH #201) ~name~ and every ~supers~ entry are *downcased,
-package-qualified* names, ~"package:symbol"~ — e.g. ~"graph-db:site"~ —
+package-qualified* names, ~"package:symbol"~ — e.g. ~"graph-db:depot"~ —
 rather than the bare symbol name; ~:~ is not a reserved character, so a
 consumer treats the whole field as one opaque string. Qualifying by
 package is what lets two same-named types from two different packages
@@ -2935,9 +2935,8 @@ The storage backend is orthogonal to the replication role: ~make-memory-graph~ a
 
 *** See also
 
-- ~docs/peer-replication-design.md~ — the full Branch A/B protocol design.
-- ~docs/peer-replication-status.md~ — implementation status and test coverage.
-- ~docs/peer-replication-proposal.md~ — the originally approved proposal.
+- the peer-replication design, status, and proposal records — kept in the
+  downstream application's repository.
 
 
 ** Chapter 17: Multiple Graphs in One Image
@@ -4432,9 +4431,9 @@ rather than one that moves depending on where the code happens to run.
 Two exact intervals settle to a single, definite relation:
 
 #+BEGIN_SRC lisp
-  (let ((survey (make-interval (exact-bound jan-1) (exact-bound jan-5)))
-        (clearance (make-interval (exact-bound jan-5) (exact-bound jan-10))))
-    (allen-relation survey clearance))
+  (let ((inspection (make-interval (exact-bound jan-1) (exact-bound jan-5)))
+        (repair (make-interval (exact-bound jan-5) (exact-bound jan-10))))
+    (allen-relation inspection repair))
   ;; => :MEETS
 #+END_SRC
 
@@ -4904,7 +4903,7 @@ node and writes the result as the claim's method; when ~nil~, ~:method~'s
 own string is written, exactly as when ~:method-fn~ did not exist.
 ~:method~ stays required either way: ~method~ is not part of
 ~DEF-UNIQUE~'s identity tuple, so a source whose method varies per
-record — the place spine's ~site~, writing ~"geometry-overlap"~ for an
+record — e.g. a gazetteer source writing ~"geometry-overlap"~ for an
 extent and ~"centroid-within"~ for a bare centroid — cannot say so with
 one static string without silently relabelling deployed claims on
 re-registration. ~:registry-namespace~ is a KEYWORD,

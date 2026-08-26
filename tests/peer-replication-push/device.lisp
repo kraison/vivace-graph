@@ -1,8 +1,9 @@
 ;;;; Peer-replication PUSH conflict test -- DEVICE process (B2d-2b).
 ;;;;
-;;;; Opens an empty device graph, pulls the find, edits it LOCALLY -- releases the
-;;;; hazard (DANGER -> SAFE) and rewrites the note in a second commit (so its note
-;;;; stamp has a higher lamport than the hub's) -- then PEER-SYNCs again, which pulls
+;;;; Opens an empty device graph, pulls the record, edits it LOCALLY --
+;;;; releases the alert (DANGER -> SAFE) and rewrites the note in a second
+;;;; commit (so its note stamp has a higher lamport than the hub's) -- then
+;;;; PEER-SYNCs again, which pulls
 ;;;; (a no-op here) and then PUSHES the two authored ops to the hub.  The device keeps
 ;;;; its own SAFE value (a loser doesn't converge via pull until B3); the hub verifies
 ;;;; that its re-home rejected the release.  Exits 0 iff its local checks pass.
@@ -102,23 +103,27 @@
                                 :merge-policy (push-merge-policy)
                                 :buffer-pool-size 1000))))
         (let ((*graph* g))
-          (flet ((the-find ()
-                   (first (map-vertices #'identity g :collect-p t :vertex-type 'pf-find))))
+          (flet ((the-record ()
+                   (first (map-vertices #'identity g :collect-p t :vertex-type
+                            'pf-record))))
             ;; --- pull the seed ---
             (peer-sync g)
-            (let ((f (the-find)))
-              (check (and f (equal "DANGER" (slot-value f 'hazard)))
-                     "pull: seeded find, hazard DANGER (got ~S)" (and f (slot-value f 'hazard)))
+            (let ((f (the-record)))
+              (check (and f (equal "DANGER" (slot-value f 'alert)))
+                     "pull: seeded record, alert DANGER (got ~S)"
+                     (and f (slot-value f 'alert)))
               (check (and f (equal "hub-note" (slot-value f 'note)))
                      "pull: seeded note hub-note (got ~S)" (and f (slot-value f 'note))))
-            ;; --- edit locally: release the hazard, then rewrite the note ---
+            ;; --- edit locally: release the alert, then rewrite the note ---
             (with-transaction ()
-              (let ((v (copy (the-find)))) (setf (slot-value v 'hazard) "SAFE") (save v)))
+              (let ((v (copy (the-record)))) (setf (slot-value v 'alert) "SAFE")
+                (save v)))
             (with-transaction ()
-              (let ((v (copy (the-find)))) (setf (slot-value v 'note) "device-note") (save v)))
-            (let ((f (the-find)))
-              (check (equal "SAFE" (slot-value f 'hazard))
-                     "local edit applied on the device (hazard SAFE)")
+              (let ((v (copy (the-record)))) (setf (slot-value v 'note)
+                                               "device-note") (save v)))
+            (let ((f (the-record)))
+              (check (equal "SAFE" (slot-value f 'alert))
+                     "local edit applied on the device (alert SAFE)")
               (check (equal "device-note" (slot-value f 'note))
                      "local note edit applied on the device"))
             ;; --- push: peer-sync pulls (no-op) then pushes the two authored ops ---
@@ -126,7 +131,7 @@
             (check (> (load-peer-push-ack g) 0)
                    "push-ack advanced past the pushed ops (got ~D)" (load-peer-push-ack g))
             ;; the loser's own copy stays SAFE (no convergence-via-pull until B3)
-            (check (equal "SAFE" (slot-value (the-find) 'hazard))
+            (check (equal "SAFE" (slot-value (the-record) 'alert))
                    "device keeps its own SAFE value after the push"))
           (write-flag "pushed")
           ;; Let the hub verify its re-homed state before we tear down the socket.
@@ -143,9 +148,10 @@
                                  always (lznode-p v))
                            "lazy: reopen built no live node (fault-on-access)")
                     (let ((f (first (map-vertices #'identity g2 :collect-p t
-                                                          :vertex-type 'pf-find))))
-                      (check (and f (equal "SAFE" (slot-value f 'hazard)))
-                             "lazy: authored hazard SAFE survives reopen + materializes")
+                                                          :vertex-type
+                                                              'pf-record))))
+                      (check (and f (equal "SAFE" (slot-value f 'alert)))
+                     "lazy: authored alert SAFE survives reopen + materializes")
                       (check (and f (equal "device-note" (slot-value f 'note)))
                              "lazy: authored note survives reopen + materializes")))
                   (close-graph g2 :snapshot-p nil)))

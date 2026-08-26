@@ -70,22 +70,22 @@
 
 (test safety-release-keeps-danger-and-surfaces
   (multiple-value-bind (merged stamps conflicts)
-      (merge3 'eo-find '((confidence . "Confirmed")) '((confidence . "SAFE"))
-              '((confidence . "Confirmed")) 20 *o-high* nil)
+      (merge3 'item '((confidence . "Flagged")) '((confidence . "SAFE"))
+              '((confidence . "Flagged")) 20 *o-high* nil)
     (declare (ignore stamps))
-    (is (equal "Confirmed" (cdr (assoc 'confidence merged)))
+    (is (equal "Flagged" (cdr (assoc 'confidence merged)))
         "a release attempt keeps the DANGEROUS local value")
     (is (= 1 (length conflicts)) "and surfaces one conflict")
     (let ((c (first conflicts)))
-      (is (equal "Confirmed" (graph-db::peer-conflict-kept-value c)))
+      (is (equal "Flagged" (graph-db::peer-conflict-kept-value c)))
       (is (equal "SAFE" (graph-db::peer-conflict-loser-value c)))
       (is (eq :safety (graph-db::peer-conflict-bucket c))))))
 
 (test safety-reopen-toward-danger-auto-applies
   (multiple-value-bind (merged stamps conflicts)
-      (merge3 'eo-find '((confidence . "SAFE")) '((confidence . "Confirmed"))
+      (merge3 'item '((confidence . "SAFE")) '((confidence . "Flagged"))
               '((confidence . "SAFE")) 20 *o-high* nil)
-    (is (equal "Confirmed" (cdr (assoc 'confidence merged)))
+    (is (equal "Flagged" (cdr (assoc 'confidence merged)))
         "re-opening toward danger auto-applies (fail-safe)")
     (is (= 20 (car (cdr (assoc 'confidence stamps)))) "and stamps the winner")
     (is (null conflicts) "a toward-danger change never surfaces")))
@@ -93,11 +93,11 @@
 (test safety-same-class-falls-back-to-lww
   ;; two DANGEROUS values -> same class -> LWW (incoming newer here)
   (multiple-value-bind (merged stamps conflicts)
-      (merge3 'eo-find '((confidence . "Suspected")) '((confidence . "Confirmed"))
-              '((confidence . "Suspected")) 30 *o-high*
+      (merge3 'item '((confidence . "Tentative")) '((confidence . "Flagged"))
+              '((confidence . "Tentative")) 30 *o-high*
               (list (cons 'confidence (cons 10 *o-low*))))
     (declare (ignore stamps))
-    (is (equal "Confirmed" (cdr (assoc 'confidence merged)))
+    (is (equal "Flagged" (cdr (assoc 'confidence merged)))
         "same safety class resolves by Lamport")
     (is (null conflicts) "same-class LWW does not surface")))
 
@@ -105,7 +105,8 @@
 
 (test geometry-divergence-surfaces-keeps-local
   (multiple-value-bind (merged stamps conflicts)
-      (merge3 'survey '((geom . "poly-A")) '((geom . "poly-B")) '((geom . "poly-0"))
+      (merge3 'parcel '((geom . "poly-A")) '((geom . "poly-B")) '((geom .
+                                                                    "poly-0"))
               20 *o-high* nil)
     (declare (ignore stamps))
     (is (equal "poly-A" (cdr (assoc 'geom merged))) "concurrent geometry keeps local")
@@ -114,7 +115,8 @@
 
 (test geometry-agree-no-conflict
   (multiple-value-bind (merged stamps conflicts)
-      (merge3 'survey '((geom . "poly-A")) '((geom . "poly-A")) '((geom . "poly-0"))
+      (merge3 'parcel '((geom . "poly-A")) '((geom . "poly-A")) '((geom .
+                                                                    "poly-0"))
               20 *o-high* (list (cons 'geom (cons 5 *o-low*))))
     (is (equal "poly-A" (cdr (assoc 'geom merged))) "identical geometry is not a conflict")
     (is (= 20 (car (cdr (assoc 'geom stamps)))) "the field clock still advances")

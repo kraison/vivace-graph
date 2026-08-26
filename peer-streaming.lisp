@@ -11,9 +11,9 @@
 ;;; (read-packet/write-packet, the 8-byte size framing, read/write-plist-packet,
 ;;; deserialize-tx-header-vector / deserialize-tx-write-vector).
 ;;;
-;;; See docs/peer-replication-design.md (v2) and
-;;; docs/peer-replication-branch-a-plan.md.  PT-n tags point at the §12
-;;; pressure-test invariants.
+;;; The full design record (v2) and the Branch A implementation plan live
+;;; in the downstream application's repository.  PT-n tags point at the
+;;; design's §12 pressure-test invariants.
 ;;;
 ;;; WIRE (peer-protocol v1).  Every entry is a self-size-framed packet; the type
 ;;; byte at offset 9 discriminates:
@@ -123,9 +123,10 @@ name a type with no row (GH #216).
 
 A LIST, not a single name: DEF-NODE-TYPE's docstring claims single
 inheritance but does NOT enforce it -- it splices PARENT-TYPES straight into
-DEFCLASS -- so (DEF-VERTEX M-UAV (M-HAZARD M-ASSET) ...) really does define
-a type that IS an M-ASSET on the hub.  Emitting only the first parent would
-drop M-UAV from a device's \"all m-assets\" closure while the hub kept it:
+DEFCLASS -- so (DEF-VERTEX M-SCANNER (M-SENSOR M-ASSET) ...) really does
+define a type that IS an M-ASSET on the hub.  Emitting only the first parent
+would drop M-SCANNER from a device's \"all m-assets\" closure while the hub
+kept it:
 silent, per-peer divergent wrong answers.
 
 An UNREGISTERED direct superclass -- a plain CLOS mixin DEF-VERTEX/DEF-EDGE
@@ -374,7 +375,7 @@ SUPERS is a SPACE-separated list of the downcased, package-qualified DIRECT
 graph superclass names, EMPTY when the type roots directly at VERTEX/EDGE.
 Example:
 
-    v,1,graph-db:site,;v,2,graph-db:mine,graph-db:hazard;e,1,graph-db:finds,
+    v,1,graph-db:depot,;v,2,graph-db:box,graph-db:crate;e,1,graph-db:stores,
 
 SUPERS is a LIST because multiple inheritance WORKS: DEF-NODE-TYPE does not enforce the
 single inheritance its docstring claims (see %PEER-TYPE-DIRECT-SUPERS).  A consumer
@@ -1173,11 +1174,12 @@ ops."
 ;;; ---------------------------------------------------------------------------
 
 (defun edge-multiplicity-conflicts (graph policy edge origin lamport)
-  "B3-2b: if EDGE is a :safety-surface-edge (find-of-type) whose SOURCE already holds a
-live edge of the same type -- a concurrent reclassification -- surface ONE multiplicity
-conflict (keyed on the source find; both edges are kept, since edges union).  Returns a
-list of 0 or 1 peer-conflict.  Runs at re-home only (the hub is where the reclassifi-
-cations converge); a device just pulls both edges via the union, no per-device surface."
+  "B3-2b: if EDGE is in bucket :safety-surface-edge and its SOURCE already
+holds a live edge of the same type -- a concurrent replacement -- surface ONE
+multiplicity conflict (keyed on the source vertex; both edges are kept, since
+edges union).  Returns a list of 0 or 1 peer-conflict.  Runs at re-home only
+(the hub is where the replacements converge); a device just pulls both edges
+via the union, no per-device surface."
   (when (and policy (typep edge 'edge)
              (eq :safety-surface-edge (merge-policy-edge-bucket policy (type-of edge))))
     (let* ((src (lookup-vertex (from edge) :graph graph))
@@ -1227,7 +1229,7 @@ of (node-id slot lamport origin)."
       ((null local)
        ;; New to the hub -- recreate with the incoming state, stamp every field.  For
        ;; an edge, carry FROM/TO (separate slots, not in DATA) so it indexes correctly.
-       ;; B3-2b: a 2nd concurrent :safety-surface-edge (find-of-type) on the same source
+       ;; B3-2b: a 2nd concurrent :safety-surface-edge edge on the same source
        ;; SURFACES a multiplicity conflict (both edges kept -- edges union).  Check
        ;; BEFORE the create so the incoming edge is not its own sibling.
        ;; *INITIALIZING-NODE* around the internal construction only -- see
