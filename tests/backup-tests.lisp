@@ -393,13 +393,15 @@ write-path hook repopulates the spatial index.  (GEO-PLACE / NODE-GEOMETRY come
 from spatial-hook-tests.)"
   (with-temp-directory (dir1)
     (with-temp-directory (dir2)
-      (let ((p1 (namestring dir1)) (p2 (namestring dir2)) kh-id lv-id)
-        ;; populate the source graph with a Kharkiv and a Lviv place, then snapshot
+      (let ((p1 (namestring dir1)) (p2 (namestring dir2)) near-id far-id)
+        ;; populate the source graph with a near and a far place, then snapshot
         (let ((g (make-graph *integration-graph-name* p1 :buffer-pool-size 1000)))
           (let ((*graph* g))
             (with-transaction ()
-              (setq kh-id (id (make-geo-place :loc (make-point 37.1724d0 49.2020d0)))
-                    lv-id (id (make-geo-place :loc (make-point 23.7183d0 50.0263d0)))))
+              (setq near-id (id (make-geo-place :loc (make-point 12.3424d0
+                                                       45.6720d0)))
+                    far-id (id (make-geo-place :loc (make-point 2.4683d0
+                                                      41.7763d0)))))
             (graph-db:snapshot g))
           (close-graph g :snapshot-p nil))
         ;; replay into a brand-new empty graph
@@ -411,13 +413,18 @@ from spatial-hook-tests.)"
                  (is (null (all-spatial-indexes g2))
                      "fresh graph has no spatial index yet")
                  (graph-db:replay g2 (merge-pathnames "txn-log/" dir1) :graph-db/test)
-                 ;; after replay the Kharkiv place is spatially indexed; Lviv is elsewhere
+                 ;; after replay the near place is spatially indexed; the far
+                 ;; one is elsewhere
                  (let ((cands (spatial-index-query-bbox (spatial-index-for g2 'geo-place nil)
-                                                        37.16d0 49.19d0 37.19d0 49.21d0)))
-                   (is (member kh-id cands :test 'equalp) "Kharkiv place re-indexed by replay")
-                   (is (not (member lv-id cands :test 'equalp)) "Lviv place outside the window"))
+                                                        12.33d0 45.66d0 12.36d0
+                                                            45.68d0)))
+                   (is (member near-id cands :test 'equalp)
+                     "near place re-indexed by replay")
+                   (is (not (member far-id cands :test 'equalp))
+                     "far place outside the window"))
                  ;; and through the high-level query
-                 (is (= 1 (length (find-nodes-near 'geo-place 49.2020d0 37.1724d0 500d0 :graph g2)))))
+                 (is (= 1 (length (find-nodes-near 'geo-place 45.6720d0
+                                    12.3424d0 500d0 :graph g2)))))
             (close-graph g2 :snapshot-p nil)
             (collect-garbage)))))))
 
@@ -543,8 +550,8 @@ snapshots must leave two files."
 
 (defun %bk-polygon ()
   "A one-ring :POLYGON whose ring is a (simple-array double-float (*))."
-  (make-polygon (list (list '(30.0d0 50.0d0) '(31.0d0 50.0d0)
-                            '(31.0d0 51.0d0) '(30.0d0 50.0d0)))))
+  (make-polygon (list (list '(10.0d0 40.0d0) '(11.0d0 40.0d0)
+                            '(11.0d0 41.0d0) '(10.0d0 40.0d0)))))
 
 (defstruct (bk-frozen (:constructor make-bk-frozen (label)))
   (label "" :read-only t))                ; a struct slot with NO setf writer
@@ -594,9 +601,9 @@ wrote: ~A" text)
           ;; makes the bbox four NILs and every caller does arithmetic on NIL.
           (multiple-value-bind (min-lon min-lat max-lon max-lat)
               (geometry-bbox g)
-            (is (equal (list 30.0d0 50.0d0 31.0d0 51.0d0)
+            (is (equal (list 10.0d0 40.0d0 11.0d0 41.0d0)
                        (list min-lon min-lat max-lon max-lat))
-                "restored geometry bbox is ~S, expected (30 50 31 51)"
+                "restored geometry bbox is ~S, expected (10 40 11 41)"
                 (list min-lon min-lat max-lon max-lat))))))))
 
 (test snapshot-replay-preserves-geometry-slot-element-type
@@ -639,9 +646,9 @@ recovery route for graphs with no rebuild path, so this is the recovery gate."
                              (type-of ring))
                          (multiple-value-bind (min-lon min-lat max-lon max-lat)
                              (geometry-bbox geom)
-                           (is (equal (list 30.0d0 50.0d0 31.0d0 51.0d0)
+                           (is (equal (list 10.0d0 40.0d0 11.0d0 41.0d0)
                                       (list min-lon min-lat max-lon max-lat))
-                               "restored bbox is ~S, expected (30 50 31 51)"
+                               "restored bbox is ~S, expected (10 40 11 41)"
                                (list min-lon min-lat max-lon max-lat))))))))
             (close-graph g2 :snapshot-p nil)
             (collect-garbage)))))))

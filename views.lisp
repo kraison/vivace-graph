@@ -443,8 +443,9 @@ otherwise another thread could skip the compile while the functions are stale."
 ;;; make-range-cursor / make-cursor / cursor-next / %sn-key / %sn-value protocol as the
 ;;; on-disk skip-list, so these are the on-disk methods above verbatim with the specializer
 ;;; swapped.  Without them, maintaining a REDUCE (aggregate) view on a memory-graph signals
-;;; "no applicable method for get-non-aggregate-pairs on MEM-SKIP-LIST" -- which is what the
-;;; mine-action app's eo-find rollup views hit during peer-sync.
+;;; "no applicable method for get-non-aggregate-pairs on MEM-SKIP-LIST" -- which
+;;; is what a
+;;; downstream app's aggregate rollup views hit during peer-sync.
 (defmethod get-non-aggregate-pairs ((skip-list mem-skip-list) key)
   (let ((keys nil) (values nil))
     (let ((cursor (make-range-cursor skip-list

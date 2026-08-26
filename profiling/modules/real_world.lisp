@@ -1,36 +1,35 @@
 ;;;; Real-World Cross-Subsystem Profiler Module for Vivace-Graph
 ;;;;
-;;;; These workloads are modeled on MEASURED mine-action production data, taken
-;;;; from the ma hub on 2026-07-28 (481 surveys / 9,699 finds / 467 flights):
+;;;; These workloads are modeled on a MEASURED production dataset of a
+;;;; downstream application team; the counts reflect measured production scale:
 ;;;;
-;;;;   surveys        481   geometry: 451 polygon, 24 multipolygon, 4 point
-;;;;   survey rings         outer-ring vertices: min 5, median 13, p90 38, max 176
-;;;;   eo-finds     9,699   geometry: 100% POINT
-;;;;   finds/survey   ~20   (9,699 / 481)
-;;;;   flights        467
-;;;;   sites          481
-;;;;   indicators   1,503
+;;;;   parcels        481   geometry: 451 polygon, 24 multipolygon, 4 point
+;;;;   parcel rings         outer ring: min 5, median 13, p90 38, max 176
+;;;;   items        9,699   geometry: 100% POINT
+;;;;   items/parcel   ~20   (9,699 / 481)
+;;;;   passes         467
+;;;;   stations       481
+;;;;   markers      1,503
 ;;;;   map payload  ~514 KB GeoJSON for a country-wide viewport query
 ;;;;
 ;;;; Two corrections this data forced on the previous version of this file:
 ;;;;
 ;;;;   1. The old workloads built their data almost entirely from MAKE-POINT.
-;;;;      Production geometry is dominated by POLYGONS, and the app's hot read
+;;;;      Production geometry is dominated by POLYGONS, and that app's hot read
 ;;;;      path walks them via GEOMETRY-COORDINATE-PAIRS to emit GeoJSON.  A
 ;;;;      point-only corpus cannot exercise the packed double-float coordinate
 ;;;;      path at all -- which is precisely the code that issues #79/#81/#82/#83
 ;;;;      rewrote.
 ;;;;
-;;;;   2. mine-action uses the Prolog engine EXACTLY ZERO times (verified by
-;;;;      grep across src/).  The Prolog workload's claim to model "threat
-;;;;      classification and IMAS ordnance assessment" was fiction.  It is kept
-;;;;      here because Prolog is a real graph-db subsystem worth profiling, but
-;;;;      it is now labelled as a synthetic engine workload, not a mine-action
-;;;;      one.
+;;;;   2. The downstream app uses the Prolog engine EXACTLY ZERO times
+;;;;      (verified by grep across its sources).  The Prolog workload's claim
+;;;;      to model domain rule inference was fiction.  It is kept here because
+;;;;      Prolog is a real graph-db subsystem worth profiling, but it is now
+;;;;      labelled as a synthetic engine workload, not an application one.
 ;;;;
 ;;;; Conversely, GEOS topology (make-valid / union / intersection / difference)
-;;;; is used heavily by mine-action -- flight tile clipping, coverage rollups,
-;;;; land-release computation -- and had no workload at all.  Workload 7 adds it.
+;;;; is used heavily by the app -- tile clipping, area rollups, remainder
+;;;; computation -- and had no workload at all.  Workload 7 adds it.
 (in-package #:graph-db/profiler)
 
 (defstruct realworld-workload-result
@@ -44,55 +43,55 @@
 ;;; Measured production shape
 ;;; ---------------------------------------------------------------------------
 
-(defparameter *rw-survey-ring-vertices* 13
-  "Median outer-ring vertex count of a mine-action survey boundary (measured).")
+(defparameter *rw-parcel-ring-vertices* 13
+  "Median outer-ring vertex count of a production parcel boundary (measured).")
 
-(defparameter *rw-survey-ring-p90-vertices* 38
+(defparameter *rw-parcel-ring-p90-vertices* 38
   "p90 outer-ring vertex count -- used for the tail of the generated corpus.")
 
-(defparameter *rw-finds-per-survey* 20
-  "Measured mean EO finds per survey (9,699 / 481).")
+(defparameter *rw-items-per-parcel* 20
+  "Measured mean items per parcel (9,699 / 481).")
 
 (defparameter *rw-large-zone-vertices* 2200
-  "Vertex count of a country-scale control polygon.  mine-action's forensics
-graph holds DeepState zone boundaries at roughly this size; they are the
-documented worst case for whole-record node materialization (issue #50) and the
-reason GEOMETRY-COORDINATE-PAIRS deserialization was optimised in #81/#82.")
+  "Vertex count of a country-scale control polygon.  The downstream app
+holds control-zone boundaries at roughly this size; they are the documented
+worst case for whole-record node materialization (issue #50) and the reason
+GEOMETRY-COORDINATE-PAIRS deserialization was optimised in #81/#82.")
 
-;;; --- Forensics + knowledge-base shape (measured on ma, 2026-07-28) ----------
+;;; --- Event-feed + retrieval-corpus shape (measured in production) -----------
 ;;;
 ;;; These are the SLOWEST paths in the application.  Measured end-to-end against
 ;;; production before these workloads were written:
 ;;;
-;;;   deepstate-control-profile (one pin)   1,125 ms   <-- dominates the page
-;;;   forensics-geo-scope r=5 km             169 ms    (462 events)
-;;;   forensics-geo-scope r=25 km            195 ms    (812 events)
+;;;   zone-history profile (one pin)   1,125 ms   <-- dominates the page
+;;;   geo-scope query r=5 km            169 ms    (462 events)
+;;;   geo-scope query r=25 km           195 ms    (812 events)
 ;;;
-;;; Forensics graph:  286,198 acled-event
-;;;                     6,828 deepstate-zone  (all MULTIPOLYGON;
-;;;                                            median 1,480 vertices, max 4,111)
-;;;                     1,707 deepstate-snapshot  (~4 zones per day)
-;;; Knowledge graph:   23,193 chunk vectors, dimension 1,024, single-float
+;;; Event graph:      286,198 event rows
+;;;                     6,828 control zones  (all MULTIPOLYGON;
+;;;                                           median 1,480 vertices, max 4,111)
+;;;                     1,707 daily snapshots  (~4 zones per day)
+;;; Retrieval corpus:  23,193 chunk vectors, dimension 1,024, single-float
 
-(defparameter *rw-deepstate-zone-vertices* 1480
-  "Median vertex count of a DeepState control zone (measured; max seen 4,111).")
+(defparameter *rw-control-zone-vertices* 1480
+  "Median vertex count of a production control zone (measured; max 4,111).")
 
-(defparameter *rw-deepstate-zones-per-day* 4
-  "Zones in a DeepState daily snapshot (6,828 zones / 1,707 snapshots).")
+(defparameter *rw-control-zones-per-day* 4
+  "Zones in a daily snapshot (6,828 zones / 1,707 snapshots).")
 
 (defparameter *rw-control-window-days* 1500
-  "Days walked by DEEPSTATE-CONTROL-PROFILE for a full-history pin.
+  "Days walked by the app's zone-history profile for a full-history pin.
 
 The walk is DATE-driven, not spatial-index-driven, deliberately: a day holds
 about four country-scale polygons, so an index lookup would add overhead for
 zero selectivity.  Cost is therefore days x zones-per-day node materializations
 plus the same number of point-in-polygon tests.")
 
-(defparameter *rw-acled-pin-radius-m* 5000.0d0
-  "Radius of a dropped-pin ACLED query -- a 10 km diameter circle.")
+(defparameter *rw-pin-radius-m* 5000.0d0
+  "Radius of a dropped-pin event query -- a 10 km diameter circle.")
 
 (defparameter *rw-kb-vector-dim* 1024
-  "Knowledge-base embedding dimension (measured from the segment header).")
+  "Corpus embedding dimension (measured from the segment header).")
 
 ;;; ---------------------------------------------------------------------------
 ;;; Geometry generators
@@ -101,7 +100,7 @@ plus the same number of point-in-polygon tests.")
 (defun %rw-ring (center-lon center-lat radius n)
   "A closed ring of N distinct vertices approximating a circle.
 Returns a list of (lon lat) pairs with the first vertex repeated last, which is
-the shape MAKE-POLYGON expects and what real survey boundaries look like."
+the shape MAKE-POLYGON expects and what real parcel boundaries look like."
   (let ((pts '()))
     (dotimes (i n)
       (let ((theta (* 2.0d0 pi (/ (float i 1.0d0) n))))
@@ -111,43 +110,45 @@ the shape MAKE-POLYGON expects and what real survey boundaries look like."
     (setf pts (nreverse pts))
     (append pts (list (copy-list (first pts))))))
 
-(defun %rw-survey-polygon (i)
-  "A survey boundary polygon at production scale.
-Every 10th survey gets the p90 vertex count so the corpus has a realistic tail
+(defun %rw-parcel-polygon (i)
+  "A parcel boundary polygon at production scale.
+Every 10th parcel gets the p90 vertex count so the corpus has a realistic tail
 rather than a uniform shape."
   (let* ((n (if (zerop (mod i 10))
-                *rw-survey-ring-p90-vertices*
-                *rw-survey-ring-vertices*))
-         (lon (+ 36.0d0 (* 0.01d0 (mod i 100))))
-         (lat (+ 49.0d0 (* 0.01d0 (floor i 100)))))
+                *rw-parcel-ring-p90-vertices*
+                *rw-parcel-ring-vertices*))
+         (lon (+ 11.0d0 (* 0.01d0 (mod i 100))))
+         (lat (+ 45.0d0 (* 0.01d0 (floor i 100)))))
     (graph-db:make-polygon (list (%rw-ring lon lat 0.004d0 n)))))
 
 (defun %rw-large-zone-polygon (i)
   "A country-scale control polygon (~2,200 vertices)."
   (graph-db:make-polygon
-   (list (%rw-ring (+ 30.0d0 (* 0.5d0 i)) 49.0d0 2.5d0 *rw-large-zone-vertices*))))
+   (list (%rw-ring (+ 5.0d0 (* 0.5d0 i)) 45.0d0 2.5d0 *rw-large-zone-vertices*))))
 
-(defun %rw-find-point (i j)
-  "An EO find point inside survey I's footprint.  Production finds are 100% points."
-  (graph-db:make-point (+ 36.0d0 (* 0.01d0 (mod i 100)) (* 0.0002d0 (mod j 17)))
-                       (+ 49.0d0 (* 0.01d0 (floor i 100)) (* 0.0002d0 (mod j 13)))))
+(defun %rw-item-point (i j)
+  "An item point inside parcel I's footprint.
+Production items are 100% points."
+  (graph-db:make-point (+ 11.0d0 (* 0.01d0 (mod i 100)) (* 0.0002d0 (mod j 17)))
+                       (+ 45.0d0 (* 0.01d0 (floor i 100)) (* 0.0002d0 (mod j 13)))))
 
 (defun %rw-ds-zone-multipolygon (i)
-  "A DeepState-scale control zone: a MULTIPOLYGON of two country-scale parts
-totalling roughly *RW-DEEPSTATE-ZONE-VERTICES* vertices, matching the measured
+  "A production-scale control zone: a MULTIPOLYGON of two country-scale parts
+totalling roughly *RW-CONTROL-ZONE-VERTICES* vertices, matching the measured
 production shape (all zones are multipolygons; median 1,480 vertices)."
-  (let ((half (max 4 (floor *rw-deepstate-zone-vertices* 2))))
+  (let ((half (max 4 (floor *rw-control-zone-vertices* 2))))
     (graph-db:make-multipolygon
-     (list (list (%rw-ring (+ 31.0d0 (* 0.35d0 i)) 48.5d0 2.2d0 half))
-           (list (%rw-ring (+ 33.5d0 (* 0.35d0 i)) 49.5d0 1.6d0 half))))))
+     (list (list (%rw-ring (+ 6.0d0 (* 0.35d0 i)) 44.5d0 2.2d0 half))
+           (list (%rw-ring (+ 8.5d0 (* 0.35d0 i)) 45.5d0 1.6d0 half))))))
 
 (defun %rw-ds-date (day)
-  "A YYYY-MM-DD string DAY days after 2022-02-24, without pulling in a date library."
+  "A YYYY-MM-DD string DAY days after an arbitrary epoch, without pulling in a
+date library."
   (multiple-value-bind (y m d)
       ;; Deliberately naive 30-day months: the profile walk only needs distinct,
       ;; ordered, correctly-shaped date keys, not a real calendar.
-      (let* ((total (+ day 54))            ; 2022-02-24 as day-of-year-ish offset
-             (y (+ 2022 (floor total 360)))
+      (let* ((total day)
+             (y (+ 2020 (floor total 360)))
              (rem (mod total 360)))
         (values y (1+ (floor rem 30)) (1+ (mod rem 30))))
     (format nil "~4,'0D-~2,'0D-~2,'0D" y m d)))
@@ -165,12 +166,12 @@ Looked up by name so this file still compiles in an image without the add-on."
     (and s (fboundp s) (ignore-errors (funcall s)) t)))
 
 ;;; ---------------------------------------------------------------------------
-;;; Schema -- mirrors the mine-action ops graph shape
+;;; Schema -- mirrors the downstream app's production graph shape
 ;;; ---------------------------------------------------------------------------
 
 (graph-db:def-vertex rw-node ()
   ((name :type string)
-   (find-key :type string)
+   (item-key :type string)
    (centroid :type geometry :index t)
    (geom :type geometry :index t)
    (value)
@@ -181,38 +182,38 @@ Looked up by name so this file still compiles in an image without the add-on."
   ((label))
   :rw-graph)
 
-;; Survey: an operator-flown area.  BOUNDARY is the polygon the map renders.
+;; Parcel: an operator-flown area.  BOUNDARY is the polygon the map renders.
 ;;
 ;; Both CENTROID and BOUNDARY are declared :INDEX T deliberately, because
-;; mine-action's own SURVEY declares exactly that pair (src/schema.lisp), as does
-;; its SITE (centroid + extent).  The engine indexes only the FIRST
+;; the downstream app's corresponding class declares exactly that pair, as does
+;; its station class (centroid + extent).  The engine indexes only the FIRST
 ;; geometry-valued slot and warns that the rest are INERT, so in production the
-;; spatial index is keyed on survey CENTROIDS, not on boundary polygons.
+;; spatial index is keyed on parcel CENTROIDS, not on boundary polygons.
 ;;
 ;; That is reproduced rather than "fixed" here on purpose: a workload that
 ;; indexed the polygon would measure an index the application does not actually
 ;; have.  When reading Workload 2, remember the bbox stage resolves candidates
 ;; by centroid and the polygon work happens afterwards, during refinement and
 ;; GeoJSON emission.
-(graph-db:def-vertex rw-survey ()
-  ((survey-key :type string)
+(graph-db:def-vertex rw-parcel ()
+  ((parcel-key :type string)
    (name :type string)
-   (survey-date :type string)
+   (parcel-date :type string)
    (source :type string)
    (centroid :type geometry :index t)
    (boundary :type geometry :index t))
   :rw-graph)
 
-;; EO find: always a point in production.
-(graph-db:def-vertex rw-find ()
-  ((find-key :type string)
-   (ordnance-family :type string)
+;; Item: always a point in production.
+(graph-db:def-vertex rw-item ()
+  ((item-key :type string)
+   (item-family :type string)
    (confidence :type string)
    (geom :type geometry :index t))
   :rw-graph)
 
-;; Site: the authored container a survey may be claimed into.
-(graph-db:def-vertex rw-site ()
+;; Station: the authored container a parcel may be claimed into.
+(graph-db:def-vertex rw-station ()
   ((name :type string)
    (source :type string)
    (centroid :type geometry :index t)
@@ -221,7 +222,7 @@ Looked up by name so this file still compiles in an image without the add-on."
 
 ;; Control zone: a country-scale polygon plus one small scalar.
 ;;
-;; BOUNDARY is deliberately NOT :index t.  mine-action's deepstate-zone does the
+;; BOUNDARY is deliberately NOT :index t.  The app's zone class does the
 ;; same thing on purpose -- a country-scale polygon must never become a spatial
 ;; index candidate for point queries.  It also isolates workload 8: the cost
 ;; measured there is whole-record materialization, not spatial indexing.
@@ -231,9 +232,9 @@ Looked up by name so this file still compiles in an image without the add-on."
    (boundary :type geometry))
   :rw-graph)
 
-;; DeepState control zone: a country-scale MULTIPOLYGON plus one small scalar.
+;; Snapshot control zone: a country-scale MULTIPOLYGON plus one small scalar.
 ;;
-;; EXTENT is deliberately NOT :index t, mirroring mine-action's deepstate-zone:
+;; EXTENT is deliberately NOT :index t, mirroring the app's zone class:
 ;; a country-scale polygon must never become a candidate for point queries, and
 ;; the control-profile walk never consults the spatial index anyway.
 (graph-db:def-vertex rw-ds-zone ()
@@ -242,8 +243,8 @@ Looked up by name so this file still compiles in an image without the add-on."
    (extent :type geometry))
   :rw-graph)
 
-;; ACLED event: a point plus the scalars the filters test.
-(graph-db:def-vertex rw-acled-event ()
+;; Event row: a point plus the scalars the filters test.
+(graph-db:def-vertex rw-event ()
   ((event-id :type string)
    (event-date :type string)
    (event-type :type string)
@@ -252,7 +253,7 @@ Looked up by name so this file still compiles in an image without the add-on."
    (geom :type geometry :index t))
   :rw-graph)
 
-;; Knowledge-base chunk: text plus a 1024-dimension embedding in a vector segment.
+;; Corpus chunk: text plus a 1024-dimension embedding in a vector segment.
 (graph-db:def-vertex rw-kb-chunk ()
   ((chunk-text :type string)
    (doc-id :type string)
@@ -293,59 +294,68 @@ measurement, and the graph is discarded immediately afterwards anyway."
          (ignore-errors
           (uiop:delete-directory-tree ,d :validate t :if-does-not-exist :ignore))))))
 
-(defun %rw-populate-surveys (graph n &key (finds-per-survey *rw-finds-per-survey*))
-  "Build N surveys with production-shaped polygon boundaries, each linked to
-FINDS-PER-SURVEY point finds.  Returns the list of survey vertices."
+(defun %rw-populate-parcels
+    (graph n &key (items-per-parcel *rw-items-per-parcel*))
+  "Build N parcels with production-shaped polygon boundaries, each linked to
+ITEMS-PER-PARCEL point items.  Returns the list of parcel vertices."
   (let ((graph-db:*graph* graph)
-        (surveys '()))
+        (parcels '()))
     (graph-db:with-transaction ()
       (dotimes (i n)
-        (let ((sv (make-rw-survey
-                   :survey-key (format nil "sp-~D" i)
-                   :name (format nil "Survey ~D" i)
-                   :survey-date "20241108"
+        (let ((sv (make-rw-parcel
+                   :parcel-key (format nil "sp-~D" i)
+                   :name (format nil "Parcel ~D" i)
+                   :parcel-date "20241108"
                    :source "safepro"
                    :centroid (graph-db:make-point
-                              (+ 36.0d0 (* 0.01d0 (mod i 100)))
-                              (+ 49.0d0 (* 0.01d0 (floor i 100))))
-                   :boundary (%rw-survey-polygon i))))
-          (push sv surveys)
-          (dotimes (j finds-per-survey)
-            (let ((fd (make-rw-find
-                       :find-key (format nil "sp-~D|find-~D" i j)
-                       :ordnance-family (if (evenp j) "APM" "UXO")
+                              (+ 11.0d0 (* 0.01d0 (mod i 100)))
+                              (+ 45.0d0 (* 0.01d0 (floor i 100))))
+                   :boundary (%rw-parcel-polygon i))))
+          (push sv parcels)
+          (dotimes (j items-per-parcel)
+            (let ((fd (make-rw-item
+                       :item-key (format nil "sp-~D|item-~D" i j)
+                       :item-family (if (evenp j) "TYPE-A" "TYPE-B")
                        :confidence (if (zerop (mod j 3)) "Confirmed" "Suspected")
-                       :geom (%rw-find-point i j))))
+                       :geom (%rw-item-point i j))))
               (make-rw-link :from sv :to fd))))))
-    (nreverse surveys)))
+    (nreverse parcels)))
 
-;;; --- Workload 1: Survey + Find Bulk Ingestion Pipeline ---
+;;; --- Workload 1: Parcel/Item Bulk Ingestion Pipeline ---
 (defun profile-realworld-ingestion-workload (&key (scale 1.0) (sprof-mode :cpu) subsystems)
-  "Profile end-to-end bulk ingestion at mine-action's measured survey:find ratio."
+  "Profile end-to-end bulk ingestion at the measured parcel:item ratio."
   (let* ((count (max 1 (floor (* scale 200))))
          (run-res nil)
          (code-sample "(graph-db:with-transaction ()
   (dotimes (i count)
-    (let ((sv (make-rw-survey :survey-key (format nil \"sp-~D\" i)
+    (let ((sv (make-rw-parcel :parcel-key (format nil \"sp-~D\" i)
                               :centroid (graph-db:make-point lon lat)
                               ;; median 13-vertex boundary, p90 38 every 10th
-                              :boundary (%rw-survey-polygon i))))
-      (dotimes (j 20)                       ; measured finds-per-survey
+                              :boundary (%rw-parcel-polygon i))))
+      (dotimes (j 20)                       ; measured items-per-parcel
         (make-rw-link :from sv
-                      :to (make-rw-find :find-key (format nil \"sp-~D|find-~D\" i j)
-                                        :geom (%rw-find-point i j)))))))"))
+                      :to (make-rw-item
+                           :item-key (format nil \"sp-~D|item-~D\" i j)
+                                        :geom (%rw-item-point i j)))))))"))
     (with-rw-graph (graph #P"/tmp/vg-profiler-rw-ingest/")
       (setf run-res
-            (profile-block (:name (format nil "Real-World Workload 1: Survey/Find Bulk Ingestion Pipeline (~:D surveys, ~:D finds)"
-                                          count (* count *rw-finds-per-survey*))
+            (profile-block (:name (format nil "Real-World Workload 1: ~
+                                   Parcel/Item Bulk Ingestion Pipeline ~
+                                   (~:D parcels, ~:D items)"
+                                          count (* count *rw-items-per-parcel*))
                             :subsystems (or subsystems '(:mmap-storage :graph-storage :transactions
                                           :spatial :views :serialization))
                             :sprof-mode sprof-mode
                             :top-n 30)
-              (%rw-populate-surveys graph count))))
+              (%rw-populate-parcels graph count))))
     (make-realworld-workload-result
-     :name "Workload 1: Survey/Find Bulk Ingestion Pipeline"
-     :description "Bulk ingestion at the measured mine-action ratio: each survey carries a production-shaped boundary polygon (median 13 vertices, p90 38) and ~20 point EO finds joined by edges, all inside one ACID transaction with automatic geohash spatial indexing."
+     :name "Workload 1: Parcel/Item Bulk Ingestion Pipeline"
+     :description
+     (concatenate 'string
+      "Bulk ingestion at the measured production ratio: each parcel carries a "
+      "production-shaped boundary polygon (median 13 vertices, p90 38) and ~20 "
+      "point items joined by edges, all inside one ACID transaction with "
+      "automatic geohash spatial indexing.")
      :target-subsystems '(:mmap-storage :graph-storage :transactions :spatial :views :serialization)
      :code-sample code-sample
      :run-result run-res)))
@@ -355,14 +365,16 @@ FINDS-PER-SURVEY point finds.  Returns the list of survey vertices."
   "Profile the map viewport read path: bbox spatial query -> node materialization
 -> polygon coordinate walk for GeoJSON emission.
 
-This mirrors mine-action's SURVEYS-IN-BBOX-JSON, which produces ~514 KB of
-GeoJSON for a country-wide viewport.  The coordinate walk is the part that a
+This mirrors the downstream app's viewport GeoJSON query, which produces
+~514 KB of GeoJSON for a country-wide viewport.  The coordinate walk is
+the part that a
 point-only corpus could never exercise."
   (let* ((count (max 1 (floor (* scale 200))))
          (query-iters (max 1 (floor (* scale 50))))
          (run-res nil)
          (code-sample "(dotimes (k query-iters)
-  (let ((hits (graph-db:find-nodes-intersecting 'rw-survey viewport :graph graph)))
+  (let ((hits (graph-db:find-nodes-intersecting 'rw-parcel viewport
+                                                :graph graph)))
     (dolist (sv hits)
       ;; materialize + walk the packed coordinates, exactly as the GeoJSON
       ;; encoder does
@@ -371,11 +383,11 @@ point-only corpus could never exercise."
       (graph-db:map-edges (lambda (e) (graph-db:lookup-vertex (graph-db:to e) :graph graph))
                           graph :vertex sv :direction :out))))"))
     (with-rw-graph (graph #P"/tmp/vg-profiler-rw-spatial/")
-      (%rw-populate-surveys graph count)
+      (%rw-populate-parcels graph count)
       (let ((viewport (graph-db:make-polygon
-                       (list (list (list 35.9d0 48.9d0) (list 37.6d0 48.9d0)
-                                   (list 37.6d0 50.6d0) (list 35.9d0 50.6d0)
-                                   (list 35.9d0 48.9d0))))))
+                       (list (list (list 10.9d0 44.9d0) (list 12.6d0 44.9d0)
+                                   (list 12.6d0 46.6d0) (list 10.9d0 46.6d0)
+                                   (list 10.9d0 44.9d0))))))
         (setf run-res
               (profile-block (:name (format nil "Real-World Workload 2: Spatial Map Viewport Query (~:D viewport queries)" query-iters)
                               :subsystems (or subsystems '(:spatial :graph-storage :index-backends
@@ -385,21 +397,28 @@ point-only corpus could never exercise."
                 (let ((graph-db:*graph* graph)
                       (vertices 0))
                   (dotimes (k query-iters vertices)
-                    (let ((hits (graph-db:find-nodes-intersecting 'rw-survey viewport
-                                                                  :graph graph)))
+                    (let ((hits (graph-db:find-nodes-intersecting
+                                 'rw-parcel viewport :graph graph)))
                       (dolist (sv hits)
                         ;; The GeoJSON emission path: walk every coordinate pair.
                         (let ((g (ignore-errors (slot-value sv 'boundary))))
                           (when g
                             (dolist (ring (graph-db:geometry-coordinate-pairs g))
                               (incf vertices (length ring)))))
-                        ;; The find-listing path: traverse to this survey's finds.
+                        ;; Item-listing path: traverse to this parcel's items.
                         (graph-db:map-edges
                          (lambda (e) (graph-db:lookup-vertex (graph-db:to e) :graph graph))
                          graph :vertex sv :direction :out)))))))))
     (make-realworld-workload-result
      :name "Workload 2: Spatial Map Viewport Query"
-     :description "The application's hottest read path: a viewport bounding-box query resolves candidate surveys, materializes each one, walks its packed double-float boundary coordinates as the GeoJSON encoder does, and traverses out-edges to its EO finds. Exercises the spatial index, node materialization, the packed-coordinate accessor and edge traversal together."
+     :description
+     (concatenate 'string
+      "The application's hottest read path: a viewport bounding-box query "
+      "resolves candidate parcels, materializes each one, walks its packed "
+      "double-float boundary coordinates as the GeoJSON encoder does, and "
+      "traverses out-edges to its items. Exercises the spatial index, node "
+      "materialization, the packed-coordinate accessor and edge traversal "
+      "together.")
      :target-subsystems '(:spatial :graph-storage :index-backends :serialization :mmap-storage)
      :code-sample code-sample
      :run-result run-res)))
@@ -407,48 +426,59 @@ point-only corpus could never exercise."
 ;;; --- Workload 3: Analytical View Rollup ---
 (defun profile-realworld-view-rollup-workload (&key (scale 1.0) (sprof-mode :cpu) subsystems)
   "Profile secondary-index view materialization and map/reduce analytical rollups.
-mine-action declares 27 views; rollups back the site//survey summary panels."
+The app declares 27 views; rollups back the station and parcel summary panels."
   (let* ((count (max 1 (floor (* scale 500))))
          (run-res nil)
-         (code-sample "(graph-db:def-view rw-find-by-family :lessp (rw-find :rw-graph)
-  (:map (lambda (n) (let ((k (slot-value n 'ordnance-family))) (when k (yield k 1))))))
+         (code-sample "(graph-db:def-view rw-item-by-family :lessp
+    (rw-item :rw-graph)
+  (:map (lambda (n)
+          (let ((k (slot-value n 'item-family))) (when k (yield k 1))))))
 (graph-db:install-views graph)
-(dotimes (_ 10) (graph-db:invoke-graph-view 'rw-find 'rw-find-by-family :graph graph))"))
+(dotimes (_ 10)
+  (graph-db:invoke-graph-view 'rw-item 'rw-item-by-family :graph graph))"))
     (with-rw-graph (graph #P"/tmp/vg-profiler-rw-views/")
       (let ((graph-db:*graph* graph))
         (graph-db:with-transaction ()
           (dotimes (i count)
-            (make-rw-find :find-key (format nil "sp-~D|find-~D" (mod i 50) i)
-                          :ordnance-family (if (evenp i) "APM" "UXO")
+            (make-rw-item :item-key (format nil "sp-~D|item-~D" (mod i 50) i)
+                          :item-family (if (evenp i) "TYPE-A" "TYPE-B")
                           :confidence (if (zerop (mod i 3)) "Confirmed" "Suspected")
-                          :geom (%rw-find-point (mod i 50) i)))))
+                          :geom (%rw-item-point (mod i 50) i)))))
       (setf run-res
-            (profile-block (:name (format nil "Real-World Workload 3: Analytical View Rollup (~:D finds)" count)
+            (profile-block (:name (format nil "Real-World Workload 3: ~
+                                   Analytical View Rollup (~:D items)"
+                                  count)
                             :subsystems (or subsystems '(:views :serialization :index-backends :mmap-storage))
                             :sprof-mode sprof-mode
                             :top-n 30)
               (let ((graph-db:*graph* graph))
-                (graph-db:def-view rw-find-by-family :lessp (rw-find :rw-graph)
+                (graph-db:def-view rw-item-by-family :lessp (rw-item :rw-graph)
                   (:map (lambda (n)
-                          (let ((k (slot-value n 'ordnance-family)))
+                          (let ((k (slot-value n 'item-family)))
                             (when k (graph-db:yield k 1))))))
                 (graph-db:install-views graph)
                 (dotimes (_ 10)
-                  (graph-db:invoke-graph-view 'rw-find 'rw-find-by-family :graph graph))))))
+                  (graph-db:invoke-graph-view 'rw-item 'rw-item-by-family
+                                              :graph graph))))))
     (make-realworld-workload-result
      :name "Workload 3: Analytical View Rollup"
-     :description "Secondary-index view installation, tuple sorting, key (de)serialization and live map/reduce aggregation over EO finds grouped by ordnance family -- the shape behind the site and survey summary panels."
+     :description
+     (concatenate 'string
+      "Secondary-index view installation, tuple sorting, key (de)serialization "
+      "and live map/reduce aggregation over items grouped by item family -- "
+      "the shape behind the station and parcel summary panels.")
      :target-subsystems '(:views :serialization :index-backends :mmap-storage)
      :code-sample code-sample
      :run-result run-res)))
 
-;;; --- Workload 4: Prolog engine (SYNTHETIC -- not a mine-action workload) ---
+;;; --- Workload 4: Prolog engine (SYNTHETIC -- not an application workload) ---
 (defun profile-realworld-prolog-inference-workload (&key (scale 1.0) (sprof-mode :cpu) subsystems)
   "Profile Prolog rule compilation, unification and term dereferencing.
 
-NOT a mine-action workload: mine-action does not use the Prolog engine at all
-(zero call sites across src/).  Retained because Prolog is a genuine graph-db
-subsystem, but do not read its numbers as application-representative."
+NOT an application workload: the downstream app does not use the Prolog engine
+at all (zero call sites in its sources).  Retained because Prolog
+is a genuine graph-db subsystem; do not read its numbers as
+application-representative."
   (let* ((count (max 1 (floor (* scale 3000))))
          (run-res nil)
          (code-sample "(graph-db::unify '(?x 1 2) '(?x 1 2))
@@ -457,7 +487,7 @@ subsystem, but do not read its numbers as application-representative."
     (with-rw-graph (graph #P"/tmp/vg-profiler-rw-prolog/")
       (let ((graph-db:*graph* graph))
         (dotimes (i (max 1 (floor (* scale 500))))
-          (make-rw-node :find-key (format nil "sp-~D|find-1" i))))
+          (make-rw-node :item-key (format nil "sp-~D|item-1" i))))
       (setf run-res
             (profile-block (:name (format nil "Real-World Workload 4: Prolog Engine, synthetic (~:D queries)" count)
                             :subsystems (or subsystems '(:prolog :graph-storage :index-backends))
@@ -473,7 +503,12 @@ subsystem, but do not read its numbers as application-representative."
                     (graph-db::prolog-compile f)))))))
     (make-realworld-workload-result
      :name "Workload 4: Prolog Engine (synthetic)"
-     :description "Prolog predicate unification, term dereferencing and rule compilation. SYNTHETIC: mine-action makes no use of the Prolog engine, so unlike the other workloads this one is not derived from production behaviour and should not be treated as application-representative."
+     :description
+     (concatenate 'string
+      "Prolog predicate unification, term dereferencing and rule compilation. "
+      "SYNTHETIC: the downstream app makes no use of the Prolog engine, so "
+      "unlike the other workloads this one is not derived from production "
+      "behaviour and should not be treated as application-representative.")
      :target-subsystems '(:prolog :graph-storage :index-backends)
      :code-sample code-sample
      :run-result run-res)))
@@ -481,15 +516,15 @@ subsystem, but do not read its numbers as application-representative."
 ;;; --- Workload 5: Concurrent Field-Operator Transactions ---
 (defun profile-realworld-concurrent-transactions-workload (&key (scale 1.0) (sprof-mode :cpu) subsystems)
   "Profile many small write transactions and OCC validation.
-Models field operators claiming surveys and editing site records: many short
+Models field operators claiming parcels and editing station records: many short
 transactions rather than one bulk load."
   (let* ((tx-count (max 1 (floor (* scale 500))))
          (run-res nil)
          (code-sample "(dotimes (i tx-count)
   (graph-db:with-transaction ()
-    (make-rw-site :name (format nil \"Site-~D\" i)
+    (make-rw-station :name (format nil \"Site-~D\" i)
                   :source \"authored\"
-                  :extent (%rw-survey-polygon i))))"))
+                  :extent (%rw-parcel-polygon i))))"))
     (with-rw-graph (graph #P"/tmp/vg-profiler-rw-tx/")
       (setf run-res
             (profile-block (:name (format nil "Real-World Workload 5: Concurrent Field-Operator Transactions (~:D txns)" tx-count)
@@ -500,15 +535,20 @@ transactions rather than one bulk load."
               (let ((graph-db:*graph* graph))
                 (dotimes (i tx-count)
                   (graph-db:with-transaction ()
-                    (make-rw-site :name (format nil "Site-~D" i)
+                    (make-rw-station :name (format nil "Station-~D" i)
                                   :source "authored"
                                   :centroid (graph-db:make-point
-                                             (+ 36.0d0 (* 0.01d0 (mod i 100)))
-                                             (+ 49.0d0 (* 0.01d0 (floor i 100))))
-                                  :extent (%rw-survey-polygon i))))))))
+                                             (+ 11.0d0 (* 0.01d0 (mod i 100)))
+                                             (+ 45.0d0 (* 0.01d0 (floor i 100))))
+                                  :extent (%rw-parcel-polygon i))))))))
     (make-realworld-workload-result
      :name "Workload 5: Concurrent Field-Operator Transactions"
-     :description "Many short write transactions creating authored site records with polygon extents, as field operators do when claiming surveys and editing sites. Exercises OCC read-set/write-set validation, per-transaction log records and index page locking."
+     :description
+     (concatenate 'string
+      "Many short write transactions creating authored station records with "
+      "polygon extents, as field operators do when claiming parcels and "
+      "editing stations. Exercises OCC read-set/write-set validation, "
+      "per-transaction log records and index page locking.")
      :target-subsystems '(:transactions :mmap-storage :graph-storage :index-backends :spatial)
      :code-sample code-sample
      :run-result run-res)))
@@ -516,7 +556,7 @@ transactions rather than one bulk load."
 ;;; --- Workload 6: Complex Node Serialization & Deserialization ---
 (defun profile-realworld-complex-serialization-workload (&key (scale 1.0) (sprof-mode :cpu) subsystems)
   "Profile large complex node creation, binary serialization, mmap writing, and
-cache-bypassed deserialization.  Models a survey report record: long narrative
+cache-bypassed deserialization.  Models a field report record: long narrative
 text plus an embedding vector plus geometry."
   (let* ((count (max 1 (floor (* scale 300))))
          (read-passes 5)
@@ -546,17 +586,18 @@ text plus an embedding vector plus geometry."
                 (graph-db:with-transaction ()
                   (dotimes (i count)
                     (let ((n (make-rw-complex-node
-                              :name (format nil "Complex-Site-~D" i)
+                              :name (format nil "Complex-Station-~D" i)
                               :report-text text-sample
                               :embedding float-vec
                               :float-coords coords-vec
-                              :metadata `((:threat . "CRITICAL") (:sector . ,i)
-                                          (:surveyor . "UNMAS-Unit-4"))
+                              :metadata
+                              `((:priority . "CRITICAL") (:sector . ,i)
+                                          (:inspector . "Unit-9"))
                               :status "ACTIVE"
                               :score (+ 100.0d0 i)
                               :centroid (graph-db:make-point
-                                         (+ 36.0d0 (/ i 100.0d0))
-                                         (+ 49.0d0 (/ i 100.0d0))))))
+                                         (+ 11.0d0 (/ i 100.0d0))
+                                         (+ 45.0d0 (/ i 100.0d0))))))
                       (push (graph-db:id n) node-ids))))
                 (dotimes (_ read-passes)
                   (let ((graph-db::*cache-enabled* nil))
@@ -564,30 +605,38 @@ text plus an embedding vector plus geometry."
                       (graph-db:lookup-vertex id :graph graph))))))))
     (make-realworld-workload-result
      :name "Workload 6: Complex Node Serialization & Deserialization"
-     :description "Large complex vertex creation, multi-slot binary serialization (25KB narrative text, 512-element double-float embedding), mmap heap writing, and cache-bypassed deserialization with CLOS instantiation."
+     :description
+     (concatenate 'string
+      "Large complex vertex creation, multi-slot binary serialization (25KB "
+      "narrative text, 512-element double-float embedding), mmap heap writing, "
+      "and cache-bypassed deserialization with CLOS instantiation.")
      :target-subsystems '(:serialization :graph-core :mmap-storage :transactions)
      :code-sample code-sample
      :run-result run-res)))
 
-;;; --- Workload 7: GEOS Land-Release Coverage (NEW) ---
+;;; --- Workload 7: GEOS Coverage Remainder (NEW) ---
 (defun profile-realworld-geos-coverage-workload (&key (scale 1.0) (sprof-mode :cpu) subsystems)
-  "Profile the GEOS topology path behind coverage and land release.
+  "Profile the GEOS topology path behind coverage analysis.
 
-mine-action calls GEOMETRY-MAKE-VALID, -UNION, -INTERSECTION, -DIFFERENCE and
--CONTAINS across flight tile clipping, coverage rollups and unsurveyed-suspect
+The downstream app calls GEOMETRY-MAKE-VALID, -UNION, -INTERSECTION,
+-DIFFERENCE and -CONTAINS across tile clipping, area rollups and remainder
 computation.  None of it had any profiler coverage before."
   (let* ((count (max 2 (floor (* scale 60))))
          (run-res nil)
-         (code-sample "(let* ((valid (mapcar #'graph-db:geometry-make-valid survey-polys))
+         (code-sample "(let* ((valid (mapcar #'graph-db:geometry-make-valid
+                      parcel-polys))
        (covered (reduce #'graph-db:geometry-union valid))
-       (remaining (graph-db:geometry-difference site-extent covered)))
+       (remaining (graph-db:geometry-difference station-extent covered)))
   (graph-db:geometry-area remaining))"))
     ;; No graph is needed: GEOS topology operates on geometry values directly.
     (when (%rw-geos-available-p)
-      (let ((polys (loop for i from 0 below count collect (%rw-survey-polygon i)))
-            (extent (graph-db:make-polygon (list (%rw-ring 36.5d0 49.5d0 1.2d0 64)))))
+      (let ((polys (loop for i from 0 below count
+                         collect (%rw-parcel-polygon i)))
+            (extent (graph-db:make-polygon (list (%rw-ring 11.5d0 45.5d0 1.2d0 64)))))
         (setf run-res
-              (profile-block (:name (format nil "Real-World Workload 7: GEOS Land-Release Coverage (~:D polygons)" count)
+              (profile-block (:name (format nil "Real-World Workload 7: ~
+                                     GEOS Coverage Remainder (~:D polygons)"
+                                    count)
                               :subsystems (or subsystems '(:geos :spatial :graph-core))
                               :sprof-mode sprof-mode
                               :top-n 30)
@@ -599,23 +648,34 @@ computation.  None of it had any profiler coverage before."
                                         valid))
                        (remaining (ignore-errors
                                    (graph-db:geometry-difference extent covered))))
-                  ;; The land-release answer: how much area is still unsurveyed.
+                  ;; The remainder answer: how much area is still uncovered.
                   (list (ignore-errors (graph-db:geometry-area covered))
                         (and remaining (ignore-errors (graph-db:geometry-area remaining)))
-                        ;; per-tile intersects test, as the flight planner does
+                        ;; per-tile intersects test, as the route planner does
                         (loop for p in valid
                               count (ignore-errors
                                      (graph-db:geometry-intersects-p p extent)))))))))
     (if run-res
         (make-realworld-workload-result
-         :name "Workload 7: GEOS Land-Release Coverage"
-         :description "The GEOS topology path behind IMAS land release: repair every survey polygon with make-valid, union them into a covered area, subtract that from the site extent, and take geodesic areas. Also exercises the per-tile intersects test used by the flight planner. This subsystem is used heavily by the application and previously had no workload."
+         :name "Workload 7: GEOS Coverage Remainder"
+         :description
+         (concatenate 'string
+          "The GEOS topology path behind coverage analysis: repair every "
+          "parcel polygon with make-valid, union them into a covered area, "
+          "subtract that from the station extent, and take geodesic areas. "
+          "Also exercises the per-tile intersects test used by the route "
+          "planner. This subsystem is used heavily by the application and "
+          "previously had no workload.")
          :target-subsystems '(:geos :spatial :graph-core)
          :code-sample code-sample
          :run-result run-res)
         (make-realworld-workload-result
-         :name "Workload 7: GEOS Land-Release Coverage (SKIPPED)"
-         :description "SKIPPED: libgeos_c is not available in this image, so the GEOS topology layer could not be profiled. Load GRAPH-DB/GEOS and ensure libgeos_c is on the library path."
+         :name "Workload 7: GEOS Coverage Remainder (SKIPPED)"
+         :description
+         (concatenate 'string
+          "SKIPPED: libgeos_c is not available in this image, so the GEOS "
+          "topology layer could not be profiled. Load GRAPH-DB/GEOS and ensure "
+          "libgeos_c is on the library path.")
          :target-subsystems '(:geos :spatial)
          :code-sample code-sample
          :run-result nil))))
@@ -626,7 +686,8 @@ computation.  None of it had any profiler coverage before."
   "Profile the documented worst case: materializing a node that carries a
 country-scale polygon in order to read one small scalar slot.
 
-This is the shape of mine-action issue #50.  Node materialization is
+This is the shape of a downstream issue on deserialization cost.
+Node materialization is
 whole-record, so reading a zone's one-word CONTROL string pays full
 deserialization of its ~2,200-vertex boundary every time the node is faulted in.
 It is the workload that justifies the packed-coordinate work in #79/#81/#82 and
@@ -646,7 +707,7 @@ the read-path optimisation in #83, and nothing in the profiler exercised it."
         (graph-db:with-transaction ()
           (dotimes (i zones)
             (let ((z (make-rw-zone :zone-name (format nil "Zone-~D" i)
-                                   :control (if (evenp i) "OCCUPIED" "CONTESTED")
+                                   :control (if (evenp i) "STATE-A" "STATE-B")
                                    :boundary (%rw-large-zone-polygon i))))
               (push (graph-db:id z) ids)))))
       (setf run-res
@@ -667,16 +728,25 @@ the read-path optimisation in #83, and nothing in the profiler exercised it."
                           (incf n))))))))))
     (make-realworld-workload-result
      :name "Workload 8: Large-Polygon Whole-Record Materialization"
-     :description "The mine-action issue #50 shape: repeatedly fault in nodes that carry a country-scale (~2,200 vertex) boundary polygon purely to read a one-word scalar slot. Because materialization is whole-record, the polygon is fully deserialized every time. This isolates deserialization cost from GEOS and from spatial indexing, and is the workload the packed double-float coordinate representation was introduced to improve."
+     :description
+     (concatenate 'string
+      "The downstream deserialization-cost issue in miniature: repeatedly "
+      "fault in nodes that carry a country-scale (~2,200 vertex) boundary "
+      "polygon purely to read a one-word scalar slot. Because materialization "
+      "is whole-record, the polygon is fully deserialized every time. This "
+      "isolates deserialization cost from GEOS and from spatial indexing, and "
+      "is the workload the packed double-float coordinate representation was "
+      "introduced to improve.")
      :target-subsystems '(:serialization :mmap-storage :graph-core :spatial)
      :code-sample code-sample
      :run-result run-res)))
 
-;;; --- Workload 9: DeepState Ground Control History (NEW) ---
+;;; --- Workload 9: Zone Control History (NEW) ---
 (defun profile-realworld-control-history-workload (&key (scale 1.0) (sprof-mode :cpu) subsystems)
-  "Profile ground-control-history generation -- the slowest path in the application.
+  "Profile zone-control-history generation -- the application's slowest
+path.
 
-Mirrors mine-action's DEEPSTATE-CONTROL-PROFILE: for every day in the window,
+Mirrors the downstream app's zone-history profile: for every day in the window,
 fetch that day's handful of country-scale control zones, materialize each one and
 test whether the anchor point falls inside it.  Measured at 1,125 ms per pin on
 production.
@@ -689,11 +759,11 @@ whole-record materializations of ~1,480-vertex multipolygons, plus the same
 number of point-in-polygon tests."
   (let* ((days (max 2 (floor (* scale 90))))
          (walk (max 2 (floor (* scale *rw-control-window-days*))))
-         (per-day *rw-deepstate-zones-per-day*)
+         (per-day *rw-control-zones-per-day*)
          (by-date (make-hash-table :test #'equal))
          (run-res nil)
          (code-sample "(dolist (date dates)                      ; ~1500 days
-  (let ((zones (deepstate-zones-for-date date)))   ; ~4 country-scale zones
+  (let ((zones (control-zones-for-date date)))     ; ~4 country-scale zones
     (dolist (z zones)
       ;; whole-record materialization of a ~1480-vertex multipolygon,
       ;; to answer one point-in-polygon question
@@ -706,22 +776,25 @@ number of point-in-polygon tests."
                   (ids '()))
               (dotimes (k per-day)
                 (let ((z (make-rw-ds-zone
-                          :zone-state (nth k '("occupied" "disputed"
-                                               "occupied-since-2014" "liberated"))
+                          :zone-state (nth k '("state-a" "state-b"
+                                               "state-c" "state-d"))
                           :zone-date date
                           :extent (%rw-ds-zone-multipolygon (+ (* d per-day) k)))))
                   (push (graph-db:id z) ids)))
               (setf (gethash date by-date) (nreverse ids))))))
       (setf run-res
-            (profile-block (:name (format nil "Real-World Workload 9: DeepState Ground Control History (~:D days walked, ~:D zones x ~:D vertices)"
-                                          walk (* days per-day) *rw-deepstate-zone-vertices*)
+            (profile-block (:name (format nil "Real-World Workload 9: ~
+                                   Zone Control History ~
+                                   (~:D days walked, ~:D zones x ~:D vertices)"
+                                  walk (* days per-day)
+                                  *rw-control-zone-vertices*)
                             :subsystems (or subsystems '(:serialization :mmap-storage :graph-core
                                           :spatial :geos))
                             :sprof-mode sprof-mode
                             :top-n 30)
               (let ((graph-db:*graph* graph)
-                    (ref-lon 32.0d0)
-                    (ref-lat 48.6d0)
+                    (ref-lon 7.0d0)
+                    (ref-lat 44.6d0)
                     (hits 0))
                 (dotimes (i walk hits)
                   ;; Dates cycle over the built window, exactly as a real walk
@@ -737,48 +810,60 @@ number of point-in-polygon tests."
                                          ext ref-lon ref-lat)))
                               (incf hits))))))))))))
     (make-realworld-workload-result
-     :name "Workload 9: DeepState Ground Control History"
-     :description "Ground-control-history generation, the application's slowest path (measured 1,125 ms per dropped pin). Walks every day of a ~1,500-day window; each day materializes ~4 country-scale multipolygon control zones (median 1,480 vertices) and runs a point-in-polygon test against the anchor. Deliberately index-free, matching the application, so the measurement isolates whole-record materialization plus containment cost."
+     :name "Workload 9: Zone Control History"
+     :description
+     (concatenate 'string
+      "Zone-control-history generation, the application's slowest path "
+      "(measured 1,125 ms per dropped pin). Walks every day of a ~1,500-day "
+      "window; each day materializes ~4 country-scale multipolygon control "
+      "zones (median 1,480 vertices) and runs a point-in-polygon test against "
+      "the anchor. Deliberately index-free, matching the application, so the "
+      "measurement isolates whole-record materialization plus containment "
+      "cost.")
      :target-subsystems '(:serialization :mmap-storage :graph-core :spatial :geos)
      :code-sample code-sample
      :run-result run-res)))
 
-;;; --- Workload 10: ACLED Dropped-Pin Radius Query (NEW) ---
-(defun profile-realworld-acled-pin-workload (&key (scale 1.0) (sprof-mode :cpu) subsystems)
-  "Profile the ACLED dropped-pin query: a 10 km diameter circle over a large
+;;; --- Workload 10: Event Dropped-Pin Radius Query (NEW) ---
+(defun profile-realworld-event-pin-workload
+    (&key (scale 1.0) (sprof-mode :cpu) subsystems)
+  "Profile the dropped-pin event query: a 10 km diameter circle over a large
 point corpus.
 
-Mirrors mine-action's FORENSICS-GEO-SCOPE: candidates come from the spatial
+Mirrors the downstream app's geo-scope query: candidates come from the spatial
 index (never a full scan -- production holds 286,198 events), then are precisely
 refined by haversine distance and filtered.  Measured at 169 ms for r=5 km
 returning 462 events."
   (let* ((events (max 100 (floor (* scale 20000))))
          (queries (max 1 (floor (* scale 25))))
          (run-res nil)
-         (code-sample "(dolist (pair (graph-db:find-nodes-near 'acled-event ref-lat ref-lon 5000d0))
+         (code-sample "(dolist (pair (graph-db:find-nodes-near 'event
+                                        ref-lat ref-lon 5000d0))
   (let ((ev (car pair)))                     ; spatial-index candidate
     (when (<= (%haversine-m ref-lat ref-lon (lat ev) (lon ev)) radius-m)
       (when (passes-filters-p ev filters)    ; precise refine + filter
         (push (id ev) ids)))))"))
-    (with-rw-graph (graph #P"/tmp/vg-profiler-rw-acled/")
+    (with-rw-graph (graph #P"/tmp/vg-profiler-rw-events/")
       (let ((graph-db:*graph* graph))
         (graph-db:with-transaction ()
           (dotimes (i events)
             ;; Spread over a ~1.5 degree box so a 5 km pin selects a realistic
             ;; minority of the corpus rather than all or nothing.
-            (let ((lon (+ 36.0d0 (* 1.5d0 (/ (mod (* i 7919) 1000) 1000.0d0))))
-                  (lat (+ 47.0d0 (* 1.5d0 (/ (mod (* i 6271) 1000) 1000.0d0)))))
-              (make-rw-acled-event
-               :event-id (format nil "ACLED-~D" i)
+            (let ((lon (+ 11.0d0 (* 1.5d0 (/ (mod (* i 7919) 1000) 1000.0d0))))
+                  (lat (+ 43.0d0 (* 1.5d0 (/ (mod (* i 6271) 1000) 1000.0d0)))))
+              (make-rw-event
+               :event-id (format nil "EV-~D" i)
                :event-date (%rw-ds-date (mod i 900))
-               :event-type (nth (mod i 4) '("Battles" "Explosions/Remote violence"
-                                            "Violence against civilians" "Protests"))
+               :event-type (nth (mod i 4) '("type-a" "type-b"
+                                            "type-c" "type-d"))
                :ev-lat lat :ev-lon lon
                :geom (graph-db:make-point lon lat))))))
       (setf run-res
-            (profile-block (:name (format nil "Real-World Workload 10: ACLED Dropped-Pin Radius Query (~:D events, ~:D pins @ ~,1F km diameter)"
+            (profile-block (:name (format nil "Real-World Workload 10: ~
+                                   Event Dropped-Pin Radius Query ~
+                                   (~:D events, ~:D pins @ ~,1F km diameter)"
                                           events queries
-                                          (/ (* 2 *rw-acled-pin-radius-m*) 1000.0))
+                                          (/ (* 2 *rw-pin-radius-m*) 1000.0))
                             :subsystems (or subsystems '(:spatial :graph-storage :index-backends
                                           :serialization :mmap-storage))
                             :sprof-mode sprof-mode
@@ -786,31 +871,38 @@ returning 462 events."
               (let ((graph-db:*graph* graph)
                     (kept 0))
                 (dotimes (q queries kept)
-                  (let ((ref-lon (+ 36.2d0 (* 0.1d0 (mod q 10))))
-                        (ref-lat (+ 47.2d0 (* 0.1d0 (mod q 7)))))
+                  (let ((ref-lon (+ 11.2d0 (* 0.1d0 (mod q 10))))
+                        (ref-lat (+ 43.2d0 (* 0.1d0 (mod q 7)))))
                     (dolist (pair (graph-db:find-nodes-near
-                                   'rw-acled-event ref-lat ref-lon
-                                   *rw-acled-pin-radius-m* :graph graph))
+                                   'rw-event ref-lat ref-lon
+                                   *rw-pin-radius-m* :graph graph))
                       (let ((ev (car pair)))
                         ;; Refine + filter, as the application does: the index is
                         ;; a cell-granular prefilter, not an answer.
                         (when (and ev
-                                   (<= (or (cdr pair) 0d0) *rw-acled-pin-radius-m*)
+                                   (<= (or (cdr pair) 0d0) *rw-pin-radius-m*)
                                    (string/= (ignore-errors (slot-value ev 'event-type))
-                                             "Protests"))
+                                             "type-d"))
                           (incf kept))))))))))
     (make-realworld-workload-result
-     :name "Workload 10: ACLED Dropped-Pin Radius Query"
-     :description "The dropped-pin forensics query: a 10 km diameter circle resolved against a large ACLED point corpus. Candidates come from the geohash spatial index (never a full scan) and are then precisely refined by distance and filtered by event attributes -- the index is a cell-granular prefilter, not the answer. Measured at 169 ms / 462 events for r=5 km against 286k production events."
+     :name "Workload 10: Event Dropped-Pin Radius Query"
+     :description
+     (concatenate 'string
+      "The dropped-pin event query: a 10 km diameter circle resolved against a "
+      "large point corpus. Candidates come from the geohash spatial index "
+      "(never a full scan) and are then precisely refined by distance and "
+      "filtered by event attributes -- the index is a cell-granular prefilter, "
+      "not the answer. Measured at 169 ms / 462 events for r=5 km against 286k "
+      "production events.")
      :target-subsystems '(:spatial :graph-storage :index-backends :serialization :mmap-storage)
      :code-sample code-sample
      :run-result run-res)))
 
-;;; --- Workload 11: Knowledge-Base Vector Retrieval (NEW) ---
+;;; --- Workload 11: Corpus Vector Retrieval (NEW) ---
 (defun profile-realworld-kb-vector-search-workload (&key (scale 1.0) (sprof-mode :cpu) subsystems)
-  "Profile knowledge-base retrieval: cosine top-K over the chunk vector segment.
+  "Profile corpus retrieval: cosine top-K over the chunk vector segment.
 
-The production knowledge graph holds 23,193 chunk embeddings of dimension 1,024
+The production corpus holds 23,193 chunk embeddings of dimension 1,024
 in a single mmap-backed vector segment.  This profiles the graph-db half of RAG
 retrieval -- segment scan and cosine scoring -- and deliberately excludes query
 embedding, which is a network call to an embedding model, not engine work."
@@ -829,7 +921,9 @@ embedding, which is a network call to an embedding model, not engine work."
                               :doc-id (format nil "doc-~D" (mod i 200))
                               :embedding (%rw-kb-vector i dim)))))
       (setf run-res
-            (profile-block (:name (format nil "Real-World Workload 11: Knowledge-Base Vector Retrieval (~:D chunks x ~:D dims, ~:D queries, top-~D)"
+            (profile-block (:name (format nil "Real-World Workload 11: ~
+                                   Corpus Vector Retrieval ~
+                                   (~:D chunks x ~:D dims, ~:D queries, top-~D)"
                                           chunks dim queries k)
                             :subsystems (or subsystems '(:graph-core :mmap-storage :serialization))
                             :sprof-mode sprof-mode
@@ -843,8 +937,14 @@ embedding, which is a network call to an embedding model, not engine work."
                                 (%rw-kb-vector (+ 100000 q) dim) k))))
                     (incf found (length hits))))))))
     (make-realworld-workload-result
-     :name "Workload 11: Knowledge-Base Vector Retrieval"
-     :description "The graph-db half of RAG retrieval: cosine top-K over an mmap-backed vector segment of 1,024-dimension single-float embeddings (production holds 23,193). Query embedding is excluded on purpose -- it is a network call to an embedding model, not engine work, and including it would swamp the measurement."
+     :name "Workload 11: Corpus Vector Retrieval"
+     :description
+     (concatenate 'string
+      "The graph-db half of RAG retrieval: cosine top-K over an mmap-backed "
+      "vector segment of 1,024-dimension single-float embeddings (production "
+      "holds 23,193). Query embedding is excluded on purpose -- it is a "
+      "network call to an embedding model, not engine work, and including it "
+      "would swamp the measurement.")
      :target-subsystems '(:graph-core :mmap-storage :serialization)
      :code-sample code-sample
      :run-result run-res)))
@@ -856,13 +956,17 @@ REALWORLD-WORKLOAD-RESULT objects."
   (format t "~%========================================================================~%")
   (format t "STARTING VIVACE-GRAPH REAL-WORLD CROSS-SUBSYSTEM SUITE (~A)~%"
           (local-time:format-timestring nil (local-time:now)))
-  (format t "Workloads: Survey/Find Ingestion, Map Viewport Query, View Rollup,~%")
+  (format t "Workloads: Parcel/Item Ingestion, Map Viewport Query, ~
+             View Rollup,~%")
   (format t "           Prolog (synthetic), Concurrent Txns, Complex Serialization,~%")
-  (format t "           GEOS Land-Release Coverage, Large-Polygon Materialization,~%")
-  (format t "           DeepState Control History, ACLED Dropped-Pin, KB Vector Retrieval~%")
+  (format t "           GEOS Coverage Remainder, ~
+             Large-Polygon Materialization,~%")
+  (format t "           Zone Control History, Event Dropped-Pin, ~
+             Corpus Vector Retrieval~%")
   (format t "Scale: ~,1F | SPROF Mode: ~A | Subsystems: ~A~%" scale sprof-mode
           (or subsystems "per-workload defaults"))
-  (format t "Data shape from measured mine-action production (2026-07-28).~%")
+  (format t "Data shape from a downstream application's measured ~
+             production data.~%")
   (format t "========================================================================~%")
 
   (let ((results '()))
@@ -876,7 +980,9 @@ REALWORLD-WORKLOAD-RESULT objects."
     (push (profile-realworld-large-polygon-materialization-workload
            :scale scale :sprof-mode sprof-mode :subsystems subsystems) results)
     (push (profile-realworld-control-history-workload :scale scale :sprof-mode sprof-mode :subsystems subsystems) results)
-    (push (profile-realworld-acled-pin-workload :scale scale :sprof-mode sprof-mode :subsystems subsystems) results)
+    (push (profile-realworld-event-pin-workload
+           :scale scale :sprof-mode sprof-mode :subsystems subsystems)
+          results)
     (push (profile-realworld-kb-vector-search-workload :scale scale :sprof-mode sprof-mode :subsystems subsystems) results)
 
     (let ((final-list (nreverse results)))

@@ -1,11 +1,12 @@
 ;;;; Peer-replication PUSH conflict test -- HUB process (B2d-2b).
 ;;;;
-;;;; Driven by run-push-test.sh.  The hub is the system of record: it commits a find
-;;;; (hazard DANGER, note "hub-note"), the device pulls it, edits it locally (releases
-;;;; the hazard to SAFE + changes the note), and PUSHES the two authored ops.  The hub
-;;;; RE-HOMES them through the merge resolver (§5):
-;;;;   HAZARD: a release (dangerous -> SAFE) is REJECTED -- the hub keeps DANGER and
-;;;;           surfaces a conflict.
+;;;; Driven by run-push-test.sh.  The hub is the system of record: it
+;;;; commits a record (alert DANGER, note "hub-note"), the device pulls it,
+;;;; edits it locally (releases the alert to SAFE + changes the note), and
+;;;; PUSHES the two authored ops.  The hub RE-HOMES them through the merge
+;;;; resolver (§5):
+;;;;   ALERT: a release (dangerous -> SAFE) is REJECTED -- the hub keeps
+;;;;          DANGER and surfaces a conflict.
 ;;;;   NOTE:   :lww -- the device's edit (higher lamport) wins.
 ;;;; The hub then verifies its own merged state (it is the process that re-homes; the
 ;;;; device can't read the hub graph, and the loser's own copy stays SAFE until B3).
@@ -91,14 +92,14 @@
                           :export-predicate #'push-disclosable
                           :merge-policy (push-merge-policy)
                           :buffer-pool-size 1000)))
-      (let ((*graph* g) find)
+      (let ((*graph* g) rec)
         (with-transaction ()
-          (setq find (make-pf-find :name "Find-1" :note "hub-note"
-                                   :hazard "DANGER" :disclosable 1)))
-        (format t "~&HUB: committed Find-1 (hazard DANGER, note hub-note)~%")
+          (setq rec (make-pf-record :name "Rec-1" :note "hub-note"
+                                   :alert "DANGER" :disclosable 1)))
+        (format t "~&HUB: committed Rec-1 (alert DANGER, note hub-note)~%")
         (finish-output)
         (register-peer-device g :origin-id *device-origin*
-                                :roots (list (id find)) :scope :hma)
+                                :roots (list (id rec)) :scope :main)
         (write-flag "ready")
 
         ;; Wait for the device to pull, edit locally, and push.
@@ -106,10 +107,11 @@
           (format t "~&HUB: timed out waiting for the device push~%") (hexit 1))
 
         ;; The push re-homed on the session thread; verify the hub's merged state.
-        (let ((f (first (map-vertices #'identity g :collect-p t :vertex-type 'pf-find))))
-          (check (equal "DANGER" (slot-value f 'hazard))
-                 "re-home REJECTED the release -- hazard stays DANGER (got ~S)"
-                 (slot-value f 'hazard))
+        (let ((f (first (map-vertices #'identity g :collect-p t :vertex-type
+                          'pf-record))))
+          (check (equal "DANGER" (slot-value f 'alert))
+                 "re-home REJECTED the release -- alert stays DANGER (got ~S)"
+                 (slot-value f 'alert))
           (check (equal "device-note" (slot-value f 'note))
                  "re-home took the device's :lww note (got ~S)" (slot-value f 'note))
           (check (>= (length (get-peer-conflicts g)) 1)

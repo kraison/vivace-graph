@@ -7,8 +7,8 @@
 ;;; values may have diverged (the ETL laptop, the hub, and mobile peers all edit
 ;;; the same nodes).  This resolves that divergence field-by-field, dispatching on
 ;;; an app-declared BUCKET.  Domain semantics (which field is which bucket, what a
-;;; SAFE value is) live in the app's conflict policy (mine-action's
-;;; conflict-policy.lisp); the engine supplies the mechanism -- the MERGE-POLICY
+;;; SAFE value is) live in the downstream app's conflict policy; the engine
+;;; supplies the mechanism -- the MERGE-POLICY
 ;;; seam, mirroring the DISCLOSABLE-P/EXPORT-PREDICATE seam.
 ;;;
 ;;; This file is the PURE core (no storage, no network): given the local node's

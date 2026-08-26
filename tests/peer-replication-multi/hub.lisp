@@ -1,14 +1,14 @@
 ;;;; Multi-device peer-replication test -- HUB process.
 ;;;;
 ;;;; Driven by run-multi-peer-test.sh.  Builds the hub graph, registers TWO
-;;;; devices (scopes "alpha" and "bravo", both rooted at the shared site), and
+;;;; devices (scopes "alpha" and "bravo", both rooted at the shared depot), and
 ;;;; drives four phases, coordinating with both devices via flag files:
 ;;;;
 ;;;;   PHASE 1 (seed):   the closed authority-scoped graph (see schema.lisp).
-;;;;   PHASE 2 (update): change the OVERLAP find fs1's status -> both devices
+;;;;   PHASE 2 (update): change the OVERLAP item fs1's status -> both devices
 ;;;;                     re-pull and converge (fan-out, not a conflict).
 ;;;;   PHASE 3 (re-task):fa1 team alpha->bravo: A PURGES it (left A's scope); B
-;;;;                     still cannot see it (its only path is via survey-a,
+;;;;                     still cannot see it (its only path is via inspection-a,
 ;;;;                     which B never traverses) -- per-device purge.
 ;;;;   PHASE 4 (re-enter):fa1 team bravo->alpha: A re-gains it (purge -> re-entry,
 ;;;;                     PT-2); B unchanged.
@@ -83,75 +83,90 @@
                           :replication-key "multi-secret"
                           :export-predicate #'peer-multi-disclosable
                           :buffer-pool-size 1000)))
-      (let ((*graph* g) site)
+      (let ((*graph* g) depot)
         ;; PHASE 1 payload.
         (with-transaction ()
-          (let* ((s   (make-m-site   :name "Site"     :team "both"))
-                 (sa  (make-m-survey :name "Survey-A" :team "alpha"))
-                 (sb  (make-m-survey :name "Survey-B" :team "bravo"))
-                 (ss  (make-m-survey :name "Survey-S" :team "both"))
-                 (fa1 (make-m-find   :name "Find-A1"  :team "alpha" :status "open"))
-                 (fa2 (make-m-find   :name "Find-A2"  :team "alpha" :status "open"))
-                 (fb1 (make-m-find   :name "Find-B1"  :team "bravo" :status "open"))
-                 (fs1 (make-m-find   :name "Find-S1"  :team "both"  :status "open")))
-            (make-m-has-survey :from s  :to sa)
-            (make-m-has-survey :from s  :to sb)
-            (make-m-has-survey :from s  :to ss)
-            (make-m-has-find   :from sa :to fa1)
-            (make-m-has-find   :from sa :to fa2)
-            (make-m-has-find   :from sb :to fb1)
-            (make-m-has-find   :from ss :to fs1)
-            (setq site s)))
+          (let* ((s   (make-m-depot   :name "Depot"     :team "both"))
+                 (sa  (make-m-inspection :name "Inspection-A" :team "alpha"))
+                 (sb  (make-m-inspection :name "Inspection-B" :team "bravo"))
+                 (ss  (make-m-inspection :name "Inspection-S" :team "both"))
+                 (fa1 (make-m-item   :name "Item-A1"  :team "alpha" :status
+                        "open"))
+                 (fa2 (make-m-item   :name "Item-A2"  :team "alpha" :status
+                        "open"))
+                 (fb1 (make-m-item   :name "Item-B1"  :team "bravo" :status
+                        "open"))
+                 (fs1 (make-m-item   :name "Item-S1"  :team "both"  :status
+                        "open")))
+            (make-m-has-inspection :from s  :to sa)
+            (make-m-has-inspection :from s  :to sb)
+            (make-m-has-inspection :from s  :to ss)
+            (make-m-has-item   :from sa :to fa1)
+            (make-m-has-item   :from sa :to fa2)
+            (make-m-has-item   :from sb :to fb1)
+            (make-m-has-item   :from ss :to fs1)
+            (setq depot s)))
         (format t "~&HUB: phase-1 committed~%") (finish-output)
-        (register-peer-device g :origin-id *device-a-origin* :roots (list (id site)) :scope "alpha")
-        (register-peer-device g :origin-id *device-b-origin* :roots (list (id site)) :scope "bravo")
+        (register-peer-device g :origin-id *device-a-origin* :roots (list (id
+                                                         depot)) :scope "alpha")
+        (register-peer-device g :origin-id *device-b-origin* :roots (list (id
+                                                         depot)) :scope "bravo")
         (write-flag "ready")
 
-        (flet ((find-by-name (n)
+        (flet ((vertex-by-name (n)
                  (first (remove-if-not
                          (lambda (x) (string= n (slot-value x 'name)))
-                         (map-vertices #'identity g :collect-p t :vertex-type 'm-find))))
-               (retask (find new-team)
+                         (map-vertices #'identity g :collect-p t :vertex-type
+                           'm-item))))
+               (retask (node new-team)
                  (with-transaction ()
-                   (let ((v (copy find)))
+                   (let ((v (copy node)))
                      (setf (slot-value v 'team) new-team)
                      (save v))))
-               (set-status (find new-status)
+               (set-status (node new-status)
                  (with-transaction ()
-                   (let ((v (copy find)))
+                   (let ((v (copy node)))
                      (setf (slot-value v 'status) new-status)
                      (save v)))))
 
           ;; PHASE 2: update the overlap node fs1.
           (unless (wait-both "p1") (format t "~&HUB: timed out on p1~%") (hexit 1))
-          (set-status (find-by-name "Find-S1") "cleared")
-          (format t "~&HUB: phase-2 committed (Find-S1 -> cleared)~%") (finish-output)
+          (set-status (vertex-by-name "Item-S1") "done")
+          (format t "~&HUB: phase-2 committed (Item-S1 -> done)~%")
+              (finish-output)
           (write-flag "p2-ready")
 
-          ;; PHASE 3: re-task Find-A1 alpha -> bravo.
+          ;; PHASE 3: re-task Item-A1 alpha -> bravo.
           (unless (wait-both "p2") (format t "~&HUB: timed out on p2~%") (hexit 1))
-          (retask (find-by-name "Find-A1") "bravo")
-          (format t "~&HUB: phase-3 committed (Find-A1 -> bravo)~%") (finish-output)
+          (retask (vertex-by-name "Item-A1") "bravo")
+          (format t "~&HUB: phase-3 committed (Item-A1 -> bravo)~%")
+              (finish-output)
           (write-flag "p3-ready")
 
-          ;; PHASE 4: re-task Find-A1 bravo -> alpha (re-entry).
+          ;; PHASE 4: re-task Item-A1 bravo -> alpha (re-entry).
           (unless (wait-both "p3") (format t "~&HUB: timed out on p3~%") (hexit 1))
-          (retask (find-by-name "Find-A1") "alpha")
-          (format t "~&HUB: phase-4 committed (Find-A1 -> alpha)~%") (finish-output)
+          (retask (vertex-by-name "Item-A1") "alpha")
+          (format t "~&HUB: phase-4 committed (Item-A1 -> alpha)~%")
+              (finish-output)
           (write-flag "p4-ready")
 
           ;; PHASE 5: in ONE step, a node ENTERING mid-stream + a SECOND edit to a
-          ;; held node (both devices hold Find-S1; pull-cursor is now non-zero, so
-          ;; this exercises a second op-stream delivery past the advanced cursor).
+          ;; held node (both devices hold Item-S1; pull-cursor is now
+          ;; non-zero, so this exercises a second op-stream delivery past
+          ;; the advanced cursor).
           (unless (wait-both "p4") (format t "~&HUB: timed out on p4~%") (hexit 1))
           (with-transaction ()
             (let ((ss (first (remove-if-not
-                              (lambda (x) (string= "Survey-S" (slot-value x 'name)))
-                              (map-vertices #'identity g :collect-p t :vertex-type 'm-survey))))
-                  (fs2 (make-m-find :name "Find-S2" :team "both" :status "open")))
-              (make-m-has-find :from ss :to fs2)))
-          (set-status (find-by-name "Find-S1") "released")
-          (format t "~&HUB: phase-5 committed (Find-S2 created; Find-S1 -> released)~%")
+                              (lambda (x) (string= "Inspection-S" (slot-value x
+                                                                    'name)))
+                              (map-vertices #'identity g :collect-p t
+                                :vertex-type 'm-inspection))))
+                  (fs2 (make-m-item :name "Item-S2" :team "both" :status
+                         "open")))
+              (make-m-has-item :from ss :to fs2)))
+          (set-status (vertex-by-name "Item-S1") "archived")
+          (format t
+            "~&HUB: phase-5 committed (Item-S2 created; Item-S1 -> archived)~%")
           (finish-output)
           (write-flag "p5-ready")
 

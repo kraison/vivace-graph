@@ -71,20 +71,25 @@
                           :buffer-pool-size 1000)))
       (let ((*graph* g))
         ;; TX1: catch-up payload (committed before the slave exists).  Includes
-        ;; two geometry places -- one in the slave's AO (Kharkiv), one outside it
-        ;; (Lviv) -- so the slave's subset filter + replicated spatial index can
+        ;; two geometry places -- one in the slave's coverage area, one outside
+        ;; it -- so the slave's subset filter + replicated spatial index can
         ;; be checked on the catch-up path.
         (with-transaction ()
           (let ((a (make-r-person :name "Alice" :age 30))
                 (b (make-r-person :name "Bob"   :age 25)))
             (make-r-knows :from a :to b :since "2020"))
-          (make-r-place :label "Kharkiv site" :location (make-point 37.1724d0 49.2020d0))
-          (make-r-place :label "Lviv site"    :location (make-point 23.7183d0 50.0263d0))
-          ;; Two places that will CROSS the slave's AO boundary on a later update:
-          ;; Crosser-out starts IN the AO (slave holds it), Crosser-in starts OUT
-          ;; (slave filters it).  See the live phase below.
-          (make-r-place :label "Crosser-out" :location (make-point 37.1750d0 49.2050d0))
-          (make-r-place :label "Crosser-in"  :location (make-point 23.7000d0 50.0000d0)))
+          (make-r-place :label "near-base" :location (make-point 12.3424d0
+                                                       45.6720d0))
+          (make-r-place :label "far-base"    :location (make-point 2.4683d0
+                                                         41.7763d0))
+          ;; Two places that will CROSS the slave's area boundary on a
+          ;; later update: Crosser-out starts IN the area (slave holds
+          ;; it), Crosser-in starts OUT (slave filters it).  See the live
+          ;; phase below.
+          (make-r-place :label "Crosser-out" :location (make-point 12.3450d0
+                                                         45.6750d0))
+          (make-r-place :label "Crosser-in"  :location (make-point 2.4500d0
+                                                         41.7500d0)))
         (format t "~&MASTER: TX1 committed (2 persons + 1 edge + 2 places)~%") (finish-output)
         (write-flag "ready")
         ;; wait for the slave to connect + verify catch-up
@@ -102,28 +107,34 @@
               (setf (slot-value v 'name) "Alice2")
               (save v)))
           (format t "~&MASTER: TX2 committed (Alice -> Alice2)~%") (finish-output)
-          ;; A LIVE in-AO place (ordered before the age bumps, so once the slave
-          ;; observes the final age=33 state it has also applied this place).
+          ;; A LIVE in-area place (ordered before the age bumps, so once the
+          ;; slave observes the final age=33 state it has also applied this
+          ;; place).
           (with-transaction ()
-            (make-r-place :label "Kharkiv live" :location (make-point 37.1730d0 49.2030d0)))
-          (format t "~&MASTER: live place committed (Kharkiv live)~%") (finish-output)
-          ;; AO-boundary-crossing updates (ordered before the age bumps, so the
-          ;; slave has applied them by the time it observes age=33).  Crosser-out
-          ;; moves OUT of the AO (slave must DELETE it); Crosser-in moves INTO the
-          ;; AO (slave must CREATE it -- it never held it before).
+            (make-r-place :label "near-live" :location (make-point 12.3430d0
+                                                         45.6730d0)))
+          (format t "~&MASTER: live place committed (near-live)~%")
+              (finish-output)
+          ;; area-boundary-crossing updates (ordered before the age
+          ;; bumps, so the slave has applied them by the time it observes
+          ;; age=33).  Crosser-out moves OUT of the area (slave must
+          ;; DELETE it); Crosser-in moves INTO the area (slave must
+          ;; CREATE it -- it never held it before).
           (flet ((by-label (l)
                    (first (remove-if-not
                            (lambda (x) (string= l (slot-value x 'label)))
                            (map-vertices #'identity g :collect-p t :vertex-type 'r-place)))))
             (with-transaction ()
               (let ((v (copy (by-label "Crosser-out"))))
-                (setf (slot-value v 'location) (make-point 23.7183d0 50.0263d0)) ; -> Lviv (out)
+                (setf (slot-value v 'location) (make-point 2.4683d0 41.7763d0))
+                    ; -> far (out)
                 (save v)))
             (with-transaction ()
               (let ((v (copy (by-label "Crosser-in"))))
-                (setf (slot-value v 'location) (make-point 37.1740d0 49.2040d0)) ; -> Kharkiv (in)
+                (setf (slot-value v 'location) (make-point 12.3440d0 45.6740d0))
+                    ; -> near (in)
                 (save v))))
-          (format t "~&MASTER: AO crossers committed (out->Lviv, in->Kharkiv)~%")
+          (format t "~&MASTER: area crossers committed (one out, one in)~%")
           (finish-output)
           ;; MVCC: update Alice2 repeatedly so the slave builds a real multi-
           ;; version prev-pointer chain (the 2nd+ update's old-node carries a

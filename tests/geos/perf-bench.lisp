@@ -26,7 +26,7 @@
                               (list (+ x s) (+ y s)) (list x (+ y s)) (list x y))))))
 
 (defun run-geos-perf (&key (n-points 5000) (n-polygons 500) (batch 500)
-                           (lo-lon 37.0d0) (lo-lat 49.0d0) (span 0.1d0))
+                           (lo-lon 12.0d0) (lo-lat 45.0d0) (span 0.1d0))
   "Benchmark spatial index insert + query at a synthetic scale.  Returns a plist
 of timings (ms) and prints a short report."
   (unless *geos-available-p*

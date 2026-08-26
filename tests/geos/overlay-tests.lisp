@@ -64,8 +64,8 @@ the point."
 (test geodesic-distance-points-equals-haversine
   "For two points, geodesic distance equals the haversine (geometry-distance)."
   (if (not *geos-available-p*) (skip "GEOS not available")
-      (let ((a (make-point 37.10d0 49.10d0))
-            (b (make-point 37.20d0 49.15d0)))
+      (let ((a (make-point 12.10d0 45.10d0))
+            (b (make-point 12.20d0 45.15d0)))
         (is (approx2 (geometry-distance a b)
                      (geometry-geodesic-distance a b)
                      0.5d0)))))                ; within half a metre

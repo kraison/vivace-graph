@@ -408,7 +408,8 @@ otherwise abort report generation with a type error."
                 (typeset:paragraph (:h-align :center :font "Helvetica-Bold" :font-size 19 :color +pdf-accent+ :bottom-margin 3)
                   (typeset:put-string title))
                 (typeset:paragraph (:h-align :center :font "Helvetica" :font-size 8.5 :color +pdf-muted+ :bottom-margin 10)
-                  (typeset:put-string (format nil "~A  |  target: mine-action  |  SBCL ~A (~A)"
+                  (typeset:put-string
+                   (format nil "~A  |  target: downstream app  |  SBCL ~A (~A)"
                                               ts (lisp-implementation-version) (machine-type))))
                 (typeset:hrule :dy 1.2 :color +pdf-accent+)
                 (typeset:vspace 14)
@@ -417,7 +418,13 @@ otherwise abort report generation with a type error."
                 (typeset:paragraph (:font "Helvetica-Bold" :font-size 12.5 :color +pdf-accent+ :bottom-margin 5)
                   "1. Executive Summary")
                 (typeset:paragraph (:h-align :justified :font "Helvetica" :font-size 9 :leading 13.5 :color +pdf-ink+ :bottom-margin 8)
-                  (typeset:put-string (format nil "This report evaluates ~D cross-subsystem workloads whose data shape is taken from measured mine-action production (ma hub, 2026-07-28). Unlike single-subsystem microbenchmarks, each workload exercises several layers at once -- mmap storage, geohash spatial indexing, OCC transactions, view rollups, GEOS topology and vector retrieval -- under representative data pressure."
+                  (typeset:put-string
+                   (format nil "This report evaluates ~D cross-subsystem ~
+    workloads whose data shape is taken from a downstream application's ~
+    measured production data. Unlike single-subsystem microbenchmarks, ~
+    each workload exercises several layers at once -- mmap storage, ~
+    geohash spatial indexing, OCC transactions, view rollups, GEOS ~
+    topology and vector retrieval -- under representative data pressure."
                                               (length rw-results))))
 
                 ;; How to read the numbers.  Stated up front because two of these
@@ -612,19 +619,44 @@ otherwise abort report generation with a type error."
                               ((search "View" (realworld-workload-result-name rw))
                                "Cross-Subsystem Bottleneck Analysis: View index installation and map/reduce execution require serializing keys into temporary octet buffers, then sorting them in the index backend. Consult the SB-PROFILE table above for this run's actual key-sorting share.")
                               ((search "Prolog" (realworld-workload-result-name rw))
-                               "Cross-Subsystem Bottleneck Analysis: Prolog is lightweight on memory; variable binding dereferencing and functor symbol lookups dominate CPU cycles. NOTE: mine-action does not use the Prolog engine, so this workload is synthetic and not application-representative.")
+                               (concatenate 'string
+                               "Cross-Subsystem Bottleneck Analysis: Prolog is "
+                               "lightweight on memory; variable binding "
+                               "dereferencing and functor symbol lookups "
+                               "dominate CPU cycles. NOTE: the downstream app "
+                               "does not use the Prolog engine, so this "
+                               "workload is synthetic and not "
+                               "application-representative."))
                               ((search "Concurrent" (realworld-workload-result-name rw))
                                "Cross-Subsystem Bottleneck Analysis: Many short transactions exercise OCC read-set/write-set validation and per-transaction log record generation. Note this workload is sequential: it measures per-transaction overhead, NOT contention between concurrent writers.")
                               ((search "Coverage" (realworld-workload-result-name rw))
-                               "Cross-Subsystem Bottleneck Analysis: GEOS land-release coverage crosses the CFFI boundary for every operation. Geometry is marshalled to and from GEOS via WKT, so make-valid and union costs include text serialization of every coordinate, not just the topology work itself.")
-                              ((search "DeepState" (realworld-workload-result-name rw))
+                               (concatenate 'string
+                               "Cross-Subsystem Bottleneck Analysis: GEOS "
+                               "coverage-remainder analysis crosses the CFFI "
+                               "boundary for every operation. Geometry is "
+                               "marshalled to and from GEOS via WKT, so "
+                               "make-valid and union costs include text "
+                               "serialization of every coordinate, not just "
+                               "the topology work itself."))
+                              ((search "Zone Control"
+                                       (realworld-workload-result-name rw))
                                "Cross-Subsystem Bottleneck Analysis: This is the application's slowest path (1,125 ms per dropped pin in production). The walk is date-driven and never touches the spatial index -- deliberately, since a day holds only ~4 polygons. Cost is therefore days x zones-per-day whole-record materializations of ~1,480-vertex multipolygons plus the same number of containment tests. Expect deserialization, not containment, to dominate: watch DESERIALIZE-HELP and the consed column.")
-                              ((search "ACLED" (realworld-workload-result-name rw))
+                              ((search "Event Dropped-Pin"
+                                       (realworld-workload-result-name rw))
                                "Cross-Subsystem Bottleneck Analysis: The geohash index is a cell-granular PREFILTER, not an answer, so every candidate it returns must still be distance-refined and attribute-filtered. Cost splits between index cell enumeration and per-candidate materialization; a wider pin raises candidate count far faster than it raises result count.")
-                              ((search "Knowledge-Base" (realworld-workload-result-name rw))
+                              ((search "Corpus Vector"
+                                       (realworld-workload-result-name rw))
                                "Cross-Subsystem Bottleneck Analysis: Vector retrieval is a linear cosine scan of an mmap-backed segment, so cost scales with live vector count times dimension and is dominated by float arithmetic and segment reads rather than by graph traversal. Query embedding is excluded -- it is a network call to an embedding model, not engine work.")
                               ((search "Materialization" (realworld-workload-result-name rw))
-                               "Cross-Subsystem Bottleneck Analysis: Node materialization is whole-record, so reading one small scalar slot from a vertex carrying a country-scale polygon pays full deserialization of that polygon. Expect DESERIALIZE-HELP to dominate both time and allocation; this is the shape of mine-action issue #50.")
+                               (concatenate 'string
+                               "Cross-Subsystem Bottleneck Analysis: Node "
+                               "materialization is whole-record, so reading "
+                               "one small scalar slot from a vertex carrying a "
+                               "country-scale polygon pays full "
+                               "deserialization of that polygon. Expect "
+                               "DESERIALIZE-HELP to dominate both time and "
+                               "allocation; this is the shape of a downstream "
+                               "issue on deserialization cost."))
                               ((search "Complex" (realworld-workload-result-name rw))
                                "Cross-Subsystem Bottleneck Analysis: Bypassing the in-memory node cache forces full mmap byte extraction and binary deserialization for complex multi-slot vertices (25KB text + 512 double-floats). See the SB-PROFILE table above for the actual per-function breakdown.")
                               (t "Cross-Subsystem Bottleneck Analysis: Workload executed cleanly across all target subsystems."))))))))

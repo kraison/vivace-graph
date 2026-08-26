@@ -19,8 +19,8 @@ in `kraison/cl-llm`.
 | S4 | `graph-db/ontology` — declarative formalism + constraint validator | #109 | 3 |
 | S0 | Namespaces — complete the graphs-as-namespaces design | #110 | 3→4 |
 
-S0 is the design already recorded in `namespace-design-discussion.md` and
-`namespace-design-handoff.md` in this directory. **Do not re-derive its agreed shape** —
+S0 is the design already recorded in the namespace design records, which live in
+the downstream application's repository. **Do not re-derive its agreed shape** —
 the open items are the work.
 
 S4's unit 1 — declarative value constraints, `def-value-constraint` — landed on

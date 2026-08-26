@@ -20,8 +20,8 @@ region it crosses -- and AREA otherwise (design §13)."
   "G repaired by GEOMETRY-MAKE-VALID, or G itself when it cannot be.
 
 Only EXTENDED geometry is repaired: a :POINT cannot be invalid, and
-ACLED-scale point registration would otherwise pay a GEOS call per
-record for nothing.
+bulk point-feed registration (many thousands of rows) would otherwise
+pay a GEOS call per record for nothing.
 
 ⚠ THE IGNORE-ERRORS IS WHAT MAKES THE FALLBACK TOTAL, and it is not
 dead code: GEOMETRY-MAKE-VALID signals GEOS-REQUIRED-FOR-OPERATION

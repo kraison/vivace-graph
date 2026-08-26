@@ -324,9 +324,9 @@ Registers the graph and returns it."
 (defun memory-image-file (location)
   (format nil "~A/graph.img" location))
 
-;;; Derived-structure persistence (#50 / mine-action perf): rebuilding the derived
-;;; structures on open -- above all the aggregate (reduce) VIEWS -- is the dominant
-;;; on-device open cost (~23 s for the app's eo-find rollups, paid every open).  So
+;;; Derived-structure persistence (#50, downstream-app perf): rebuilding the
+;;; derived structures on open -- above all the aggregate (reduce) VIEWS --
+;;; dominates on-device open cost (~23 s for that app's rollups, every open). So
 ;;; the image pickles them too, as FLAT dumps (no mem struct with its rw-lock /
 ;;; function refs goes on the wire), and open restores them STRUCTURALLY -- direct
 ;;; skip-list / index inserts, no map / reduce / geohash recompute.

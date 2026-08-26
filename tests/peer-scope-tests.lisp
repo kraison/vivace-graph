@@ -1,18 +1,21 @@
 ;;;; SCOPE-NODE-SET: reference-class vertices are TERMINAL in the walk.
 ;;;;
-;;;; The reference-set ships global reference data BY CLASS (e.g. the whole ordnance
-;;;; catalogue) so a device can classify finds locally, while that data's hub-only
-;;;; neighbours (ordnance-detail, country) stay behind.  It did that by adding those
+;;;; The reference-set ships global reference data BY CLASS (e.g. a whole parts
+;;;; catalogue) so a device can classify items locally, while that data's
+;;;; hub-only neighbours (part-detail) stay behind. It did that by adding those
 ;;;; vertices to the result WITHOUT enqueueing them -- so "don't walk out of the
 ;;;; catalogue" was a property of HOW they were added, not of WHAT they are.
 ;;;;
 ;;;; That distinction is invisible until an edge points INTO the catalogue.  The moment
-;;;; a device's edge-type bound includes one (mine-action's FIND-OF-TYPE, which carries a
-;;;; find's ordnance classification to the field), the walk reaches the catalogue vertex
+;;;; a device's edge-type bound includes one (an ITEM-OF-TYPE-style reference
+;;;; edge,
+;;;; which carries an item's type reference to the field), the walk reaches the
+;;;; catalogue vertex
 ;;;; through the front door, enqueues it, and fans back out along its INCOMING edges --
-;;;; touching EVERY find in the database that shares that ordnance type, paying a
-;;;; DISCLOSABLE-P (and its survey/project traversal) on each before rejecting it.  The
-;;;; result is still correct; it is just O(all finds) per device sync.
+;;;; touching EVERY item in the database that shares that type, paying a
+;;;; DISCLOSABLE-P (and its parent-chain traversal) on each before
+;;;; rejecting it.  The result is still correct; it is just O(all items)
+;;;; per device sync.
 ;;;;
 ;;;; So the rule is now a property of the vertex: a reference-class vertex is shipped and
 ;;;; never traversed out of, however it was reached.  These tests pin that, because

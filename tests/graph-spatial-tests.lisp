@@ -23,33 +23,37 @@ when a geometry value is actually written (lazy creation, §4.1)."
     (is (null (all-spatial-indexes g)))
     (is (null (spatial-index-for g 'gs-place 'geom)))
     (with-transaction ()
-      (make-gs-place :geom (make-point 37.1724d0 49.2020d0)))
+      (make-gs-place :geom (make-point 12.3424d0 45.6720d0)))
     (let ((idx (spatial-index-for g 'gs-place 'geom)))
       (is (spatial-index-p idx))
       (is (= 1 (length (all-spatial-indexes g))))
-      (is (= 1 (length (spatial-index-query-bbox idx 37.16d0 49.19d0 37.19d0 49.21d0)))))))
+      (is (= 1 (length (spatial-index-query-bbox idx 12.33d0 45.66d0 12.36d0
+                         45.68d0)))))))
 
 (test spatial-index-survives-reopen
   "Geometry-bearing nodes committed before CLOSE-GRAPH are spatially queryable
 after OPEN-GRAPH: the registry is repopulated by REBUILD-SPATIAL-INDEXES."
   (with-temp-directory (dir)
-    (let ((path (namestring dir)) kh-id lv-id)
+    (let ((path (namestring dir)) near-id far-id)
       (let ((g (make-graph *integration-graph-name* path :buffer-pool-size 1000)))
         (let ((*graph* g))
           (with-transaction ()
-            (setq kh-id (id (make-gs-place :geom (make-point 37.1724d0 49.2020d0)))
-                  lv-id (id (make-gs-place :geom (make-point 23.7183d0 50.0263d0)))))
+            (setq near-id (id (make-gs-place :geom (make-point 12.3424d0
+                                                     45.6720d0)))
+                  far-id (id (make-gs-place :geom (make-point 2.4683d0
+                                                    41.7763d0)))))
           (close-graph g :snapshot-p nil)))
       (let ((g2 (open-graph *integration-graph-name* path)))
         (unwind-protect
              (let ((*graph* g2))
                (let ((idx (spatial-index-for g2 'gs-place 'geom)))
                  (is (spatial-index-p idx))
-                 (let ((cands (spatial-index-query-bbox idx 37.16d0 49.19d0
-                                                        37.19d0 49.21d0)))
-                   (is (member kh-id cands :test 'equalp) "Kharkiv point restored")
-                   (is (not (member lv-id cands :test 'equalp))
-                       "Lviv point is outside the query window"))))
+                 (let ((cands (spatial-index-query-bbox idx 12.33d0 45.66d0
+                                                        12.36d0 45.68d0)))
+                   (is (member near-id cands :test 'equalp)
+                     "near point restored")
+                   (is (not (member far-id cands :test 'equalp))
+                       "far point is outside the query window"))))
           (close-graph g2 :snapshot-p nil)
           (collect-garbage))))))
 
@@ -92,9 +96,9 @@ first write silently produced one of each."
       (unwind-protect
            (let ((*graph* g))
              (with-transaction ()
-               (make-sb-first :geom (make-point 37.1724d0 49.2020d0)))
+               (make-sb-first :geom (make-point 12.3424d0 45.6720d0)))
              (with-transaction ()
-               (make-sb-second :geom (make-point 37.1800d0 49.2100d0)))
+               (make-sb-second :geom (make-point 12.3500d0 45.6800d0)))
              (let ((backends (mapcar #'graph-db::spatial-index-backend
                                      (mapcar (lambda (x) (if (consp x) (cdr x) x))
                                              (all-spatial-indexes g)))))
@@ -119,7 +123,7 @@ pass only :INDEX-BACKEND, are completely unaffected."
              (is (null (graph-db::graph-spatial-index-backend g))
                  "the new slot must default to NIL")
              (with-transaction ()
-               (make-sb-first :geom (make-point 37.1724d0 49.2020d0)))
+               (make-sb-first :geom (make-point 12.3424d0 45.6720d0)))
              (let ((idx (first (all-spatial-indexes g))))
                (is (eq :bplus-tree
                        (graph-db::spatial-index-backend

@@ -14,10 +14,10 @@
 
 (test point
   "A point round-trips with double-float coordinates."
-  (let ((r (geo-roundtrip (make-point 23.71d0 50.026d0))))
+  (let ((r (geo-roundtrip (make-point 2.46d0 41.776d0))))
     (is (eq :point (geometry-kind r)))
-    (is (= 23.71d0 (geometry-lon r)))
-    (is (= 50.026d0 (geometry-lat r)))
+    (is (= 2.46d0 (geometry-lon r)))
+    (is (= 41.776d0 (geometry-lat r)))
     (is (typep (geometry-lon r) 'double-float))))
 
 (test integer-coordinates-coerced
@@ -55,28 +55,28 @@
 
 (test bbox-point
   (multiple-value-bind (mnx mny mxx mxy)
-      (geometry-bbox (make-point 23.71d0 50.026d0))
-    (is (= 23.71d0 mnx)) (is (= 23.71d0 mxx))
-    (is (= 50.026d0 mny)) (is (= 50.026d0 mxy))))
+      (geometry-bbox (make-point 2.46d0 41.776d0))
+    (is (= 2.46d0 mnx)) (is (= 2.46d0 mxx))
+    (is (= 41.776d0 mny)) (is (= 41.776d0 mxy))))
 
-(test real-world-find-points
-  "Coordinates taken from the demining EO dataset round-trip exactly."
-  (dolist (pt '((37.1724312d0 49.2020584d0)
-                (23.7182919d0 50.0263233d0)
-                (33.1385833d0 47.2014944d0)))
+(test high-precision-points-round-trip
+  "Synthetic high-precision coordinates round-trip exactly."
+  (dolist (pt '((12.3424312d0 45.6720584d0)
+                (2.4682919d0 41.7763233d0)
+                (8.3085833d0 43.6714944d0)))
     (let ((r (geo-roundtrip (make-point (first pt) (second pt)))))
       (is (= (first pt) (geometry-lon r)))
       (is (= (second pt) (geometry-lat r))))))
 
 (test geometry-coordinate-pairs-all-kinds
   "geometry-coordinate-pairs returns pre-6e5e368 (lon lat) double-float nested lists for all four kinds (Issue #84)."
-  (let ((pt (make-point 37.1d0 49.2d0))
+  (let ((pt (make-point 12.3d0 45.7d0))
         (ls (make-linestring '((10 20) (30 40))))
         (poly (make-polygon '(((0 0) (4 0) (4 4) (0 4) (0 0))
                               ((1 1) (2 1) (2 2) (1 2) (1 1)))))
         (mp (make-multipolygon '((((0 0) (1 0) (1 1) (0 0)))
                                  (((5 5) (6 5) (6 6) (5 5)))))))
-    (is (equalp '(37.1d0 49.2d0) (geometry-coordinate-pairs pt)))
+    (is (equalp '(12.3d0 45.7d0) (geometry-coordinate-pairs pt)))
     (is (equalp '((10.0d0 20.0d0) (30.0d0 40.0d0)) (geometry-coordinate-pairs ls)))
     (is (equalp '(((0.0d0 0.0d0) (4.0d0 0.0d0) (4.0d0 4.0d0) (0.0d0 4.0d0) (0.0d0 0.0d0))
                   ((1.0d0 1.0d0) (2.0d0 1.0d0) (2.0d0 2.0d0) (1.0d0 2.0d0) (1.0d0 1.0d0)))
@@ -149,7 +149,7 @@ callers need a predicate instead of testing GEOMETRY-COORDINATES."
   "A geometry with coordinates is never empty -- including a point at the
 origin, which is a real location and not an empty point."
   (dolist (g (list (make-point 0d0 0d0)
-                   (make-point 37.17d0 49.20d0)
+                   (make-point 12.34d0 45.67d0)
                    (make-linestring '((0d0 0d0) (1d0 1d0)))
                    (make-polygon '(((0d0 0d0) (1d0 0d0) (1d0 1d0) (0d0 0d0))))
                    (make-multipolygon

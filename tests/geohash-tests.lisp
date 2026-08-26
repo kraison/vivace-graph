@@ -14,19 +14,19 @@
 
 (test precision-length
   (dolist (p '(1 5 8 12))
-    (is (= p (length (geohash-encode 50.0d0 23.0d0 p))))))
+    (is (= p (length (geohash-encode 41.75d0 2.45d0 p))))))
 
 (test prefix-nesting
   "A coarser geohash is a prefix of a finer one for the same point."
-  (let ((fine (geohash-encode 49.2020584d0 37.1724312d0 12)))
+  (let ((fine (geohash-encode 45.6720584d0 12.3424312d0 12)))
     (dolist (p '(1 4 7 10))
-      (is (string= (geohash-encode 49.2020584d0 37.1724312d0 p)
+      (is (string= (geohash-encode 45.6720584d0 12.3424312d0 p)
                    (subseq fine 0 p))))))
 
 (test bbox-contains-point
   "The decoded cell bounding box contains the original point."
-  (dolist (pt '((49.2020584d0 37.1724312d0)
-                (50.0263233d0 23.7182919d0)
+  (dolist (pt '((45.6720584d0 12.3424312d0)
+                (41.7763233d0 2.4682919d0)
                 (-33.85d0 151.21d0)))
     (let ((lat (first pt)) (lon (second pt)))
       (multiple-value-bind (mnx mny mxx mxy)
@@ -36,7 +36,7 @@
 
 (test decode-center-near-point
   "Decoding returns a center within the cell half-extent of the point."
-  (let* ((lat 49.2020584d0) (lon 37.1724312d0)
+  (let* ((lat 45.6720584d0) (lon 12.3424312d0)
          (h (geohash-encode lat lon 9)))
     (multiple-value-bind (mnx mny mxx mxy) (geohash-bbox h)
       (multiple-value-bind (clat clon) (geohash-decode h)
@@ -51,7 +51,7 @@
 
 (test prefix-range-contains-hash
   "A point's full geohash sorts within the prefix range of any coarser cell."
-  (let* ((full (geohash-encode 49.2020584d0 37.1724312d0 12))
+  (let* ((full (geohash-encode 45.6720584d0 12.3424312d0 12))
          (cell (subseq full 0 6)))
     (multiple-value-bind (start end) (geohash-prefix-range cell)
       (is (and (string>= full start) (string< full end))))))
@@ -59,7 +59,7 @@
 (test covering-intersects-and-includes-center
   "Every covering cell intersects the query box, and the box's center cell is
 included."
-  (let* ((min-lon 37.16d0) (min-lat 49.19d0) (max-lon 37.19d0) (max-lat 49.21d0)
+  (let* ((min-lon 12.33d0) (min-lat 45.66d0) (max-lon 12.36d0) (max-lat 45.68d0)
          (cells (geohash-covering min-lon min-lat max-lon max-lat :max-cells 256))
          (center-cell (let ((p (length (first cells))))
                         (geohash-encode (/ (+ min-lat max-lat) 2)
@@ -74,12 +74,13 @@ included."
 
 (test covering-tiny-box
   "A degenerate (point) box yields at least one covering cell."
-  (is (plusp (length (geohash-covering 37.1724d0 49.2020d0 37.1724d0 49.2020d0)))))
+  (is (plusp (length (geohash-covering 12.3424d0 45.6720d0 12.3424d0
+                       45.6720d0)))))
 
 (test neighbor-is-adjacent-and-distinct
   "The east neighbor of a cell is a different, same-precision cell whose centre
 sits one cell-width to the east."
-  (let* ((cell (geohash-encode 49.2020d0 37.1724d0 7))
+  (let* ((cell (geohash-encode 45.6720d0 12.3424d0 7))
          (east (geohash-neighbor cell 1 0)))
     (is (stringp east))
     (is (= (length cell) (length east)))
@@ -95,7 +96,7 @@ sits one cell-width to the east."
 (test neighbors-are-the-eight-around-center
   "geohash-neighbors returns 8 distinct same-precision cells, none equal to the
 source, and the source's own geohash sorts between its west and east neighbors."
-  (let* ((cell (geohash-encode 49.2020d0 37.1724d0 7))
+  (let* ((cell (geohash-encode 45.6720d0 12.3424d0 7))
          (nbrs (geohash-neighbors cell)))
     (is (= 8 (length nbrs)))
     (is (= 8 (length (remove-duplicates nbrs :test #'string=))))

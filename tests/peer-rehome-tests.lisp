@@ -205,9 +205,10 @@ silently (no surface) -- the still-live gate is what makes it a conflict."
         (is (null (graph-db::get-peer-conflicts g))
             "no surface when the edge is already gone at the hub")))))
 
-;;; --- B3-2b: find-of-type edge multiplicity surfacing (re-home path) -----------
+;;; --- B3-2b: safety-surface edge multiplicity surfacing (re-home path)
+;;; ---------
 ;;;
-;;; g-likes stands in for find-of-type (bucket :safety-surface-edge).  A 2nd concurrent
+;;; g-likes stands in for a :safety-surface-edge-bucketed edge. A 2nd concurrent
 ;;; g-likes edge out of the same source vertex surfaces a multiplicity conflict; both
 ;;; edges are kept (edges union).  Also exercises edge-create re-home (from/to carried).
 
@@ -238,9 +239,11 @@ tests/peer-unique-tests.lisp's PU-AUTHORED-CREATE docstring (GH #135)."
      :kind :authored :op-id (graph-db::gen-op-id) :origin origin :lamport lamport :tx-id 60
      :writes (list (make-instance 'graph-db::tx-create :node e)))))
 
-(test rehome-find-of-type-multiplicity-surfaces
-  "A device's FIRST find-of-type-style edge re-homes with no conflict; a 2nd concurrent
-one out of the same find SURFACES a multiplicity conflict and both edges are kept."
+(test rehome-surface-edge-multiplicity-surfaces
+  "A device's FIRST safety-surface edge re-homes with no conflict; a 2nd
+concurrent
+one out of the same source SURFACES a multiplicity conflict and both edges are
+    kept."
   (with-multiplicity-hub (g)
     (let (aid bid cid)
       (with-transaction ()

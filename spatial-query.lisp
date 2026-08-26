@@ -6,14 +6,14 @@
 ;;; live nodes, and refine with the exact geometry-ops predicates using each
 ;;; node's NODE-GEOMETRY.  A node is matched by its representative point: the
 ;;; point itself for a :POINT geometry, the bounding-box centre otherwise (so
-;;; the EO-find-in-task-area case is exact; extended geometries are approximate).
+;;; the point-in-region case is exact; extended geometries are approximate).
 ;;;
 ;;; Every query takes a required SCOPE as its first argument -- a node-class name,
 ;;; a list of them, or :ALL -- which both selects the indexes scanned and filters
 ;;; the results by type.  Both a Lisp API (FIND-NODES-WITHIN / FIND-NODES-NEAR) and
 ;;; Prolog functors (FIND-WITHIN/3, FIND-NEAR/5) are provided; the functors yield
 ;;; matching nodes so they compose with graph traversal in a query, e.g.:
-;;;   (select-flat (?f) (find-near ?f eo-find 49.20 37.17 500.0))
+;;;   (select-flat (?s) (find-near ?s sensor 45.67 12.34 500.0))
 
 ;; Forward references: the (owner . slot) registry lives in spatial-registry.lisp,
 ;; which loads after this file (it needs the MOP helpers, the graph and the
@@ -251,7 +251,7 @@ REPLICATION-FILTER (see MAKE-GRAPH :replication-filter).  It accepts a node when
 it has no geometry (so non-spatial data -- schema, reference data -- replicates
 in full) or when its geometry's representative point lies within AREA (a
 :polygon / :multipolygon).  A field slave then receives only the nodes for its
-area of operations, plus all non-spatial nodes."
+coverage area, plus all non-spatial nodes."
   (lambda (node)
     (let ((geom (node-geometry node)))
       (or (null geom)

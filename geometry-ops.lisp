@@ -18,7 +18,7 @@
 
 (defun geodesic-distance (lat1 lon1 lat2 lon2)
   "Great-circle distance in metres between two WGS84 points (haversine).
-Accurate to ~0.5% vs the ellipsoid -- ample at minefield scale; a Vincenty or
+Accurate to ~0.5% vs the ellipsoid -- ample at field-survey scale; a Vincenty or
 Karney method can replace this later if sub-metre accuracy over long lines is
 needed."
   (let* ((phi1 (deg->rad lat1))

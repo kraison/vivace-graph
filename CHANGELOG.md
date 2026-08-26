@@ -167,6 +167,11 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Changed
 
+- **Domain-neutral example vocabulary** (#197). Production source, tests,
+  the profiling suite, and the manual now use domain-neutral example
+  vocabulary throughout; eleven dated design documents moved to the
+  downstream application's private repository.
+
 - **Test scratch space is now self-cleaning** (#214). All FiveAM suites
   route their scratch (per-test directories, loose files, each runner's
   system directory) through a new shared `GRAPH-DB/TEST-SCRATCH` system:
@@ -1204,7 +1209,8 @@ between releases; cutting a release renames it to the new version and dates it.
   (`node-head-size-mismatch-error` in `transactions.lisp`), as defense
   in depth below the version gate. The wire *grammar* (4-field
   `kind,id,name,supers` type-table rows; `:` still unreserved) is
-  unchanged. Coordinates with mine-action-android#29.
+  unchanged. Coordinates with a device-contract issue in a
+  private downstream repository.
 
 - **The hub resolves its type registry on the thread that starts
   replication** (#186). A hub serves each device connection on a new thread,

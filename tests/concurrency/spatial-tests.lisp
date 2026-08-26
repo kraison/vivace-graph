@@ -21,7 +21,7 @@
 ;;; ---------------------------------------------------------------------------
 ;;; Geometry layout
 ;;;
-;;; All test points live over Kharkiv Oblast, in two TIGHT clusters A and B.
+;;; All test points live in two TIGHT synthetic clusters A and B.
 ;;; Clusters are kept small on purpose: spatial-index-query-bbox enumerates
 ;;; every geohash cell in the query window, so a wide box is pathologically
 ;;; expensive -- the reader loop below would never finish.  A ~0.01 deg cluster
@@ -33,14 +33,14 @@
 ;;; ---------------------------------------------------------------------------
 
 (defparameter *step* 0.00005d0)
-(defparameter *a-lon* 37.100d0)
-(defparameter *a-lat* 49.100d0)
-(defparameter *b-lon* 37.300d0)
-(defparameter *b-lat* 49.300d0)
+(defparameter *a-lon* 12.100d0)
+(defparameter *a-lat* 45.100d0)
+(defparameter *b-lon* 12.300d0)
+(defparameter *b-lat* 45.300d0)
 
 ;; (min-lon min-lat max-lon max-lat) -- small windows bounding each cluster
-(defparameter *a-box* '(37.095d0 49.095d0 37.115d0 49.115d0))
-(defparameter *b-box* '(37.295d0 49.295d0 37.315d0 49.315d0))
+(defparameter *a-box* '(12.095d0 45.095d0 12.115d0 45.115d0))
+(defparameter *b-box* '(12.295d0 45.295d0 12.315d0 45.315d0))
 
 (defun a-point (k) (make-point (+ *a-lon* (* k *step*)) (+ *a-lat* (* k *step*))))
 (defun b-point (k) (make-point (+ *b-lon* (* k *step*)) (+ *b-lat* (* k *step*))))

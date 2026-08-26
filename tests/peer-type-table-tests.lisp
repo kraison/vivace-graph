@@ -87,14 +87,14 @@ asserts STRINGP first."
     (graph-db::peer-type-registry-conflict-error (c) (princ-to-string c))))
 
 ;;; --- A multiple-inheritance schema. ------------------------------------
-;;; M-UAV is both an M-HAZARD and an M-ASSET.  The hub agrees:
-;;; (typep uav 'm-asset) is true, and "all m-assets" includes it.  A wire
+;;; M-SCANNER is both an M-SENSOR and an M-ASSET.  The hub agrees:
+;;; (typep scanner 'm-asset) is true, and "all m-assets" includes it.  A wire
 ;;; format carrying only the FIRST parent would make the device disagree.
 
 (eval-when (:load-toplevel :execute)
   (setf (gethash :peer-type-table-mi-test *schema-node-metadata*) nil))
 
-(def-vertex m-hazard ()
+(def-vertex m-sensor ()
   ((severity))
   :peer-type-table-mi-test)
 
@@ -102,11 +102,11 @@ asserts STRINGP first."
   ((serial))
   :peer-type-table-mi-test)
 
-(def-vertex m-uav (m-hazard m-asset)
+(def-vertex m-scanner (m-sensor m-asset)
   ((range))
   :peer-type-table-mi-test)
 
-(def-edge m-find-of-type ()
+(def-edge m-item-of-type ()
   ()
   :peer-type-table-mi-test)
 
@@ -333,14 +333,15 @@ from the pre-#201 bare-name lookup."
                                t)))
                    (is (row (%ptt-qname 'g-person))
                        "the first store's type is in the table")
-                   (is (row (%ptt-qname 'm-uav)) "and so is the second store's")
-                   (is (not (knows-p g1 'm-uav :vertex))
-                       "store 1's schema does not know M-UAV")
+                   (is (row (%ptt-qname 'm-scanner))
+                     "and so is the second store's")
+                   (is (not (knows-p g1 'm-scanner :vertex))
+                       "store 1's schema does not know M-SCANNER")
                    (is (not (knows-p g2 'g-person :vertex))
                        "store 2's schema does not know G-PERSON")
                    ;; The ids are the registry's, not either store's counter.
-                   (is (eql (second (row (%ptt-qname 'm-uav)))
-                            (graph-db::registry-id-for r 'm-uav :vertex)))
+                   (is (eql (second (row (%ptt-qname 'm-scanner)))
+                            (graph-db::registry-id-for r 'm-scanner :vertex)))
                    (is (eql (second (row (%ptt-qname 'g-knows)))
                             (graph-db::registry-id-for r 'g-knows :edge)))))
             (ignore-errors (close-graph g1 :snapshot-p nil))
@@ -353,28 +354,29 @@ from the pre-#201 bare-name lookup."
 
 (test type-table-carries-every-super-of-a-multiple-inheritance-type
   "DEF-NODE-TYPE's docstring claims single inheritance but does NOT enforce it
--- it splices PARENT-TYPES straight into DEFCLASS.  So M-UAV really IS both an
-M-HAZARD and an M-ASSET on the hub.  Emitting only the FIRST parent would
-silently drop M-UAV from a device's \"all m-assets\" closure while the hub kept
-it: per-peer divergent wrong answers. The supers field is therefore a SPACE-
+-- it splices PARENT-TYPES straight into DEFCLASS.  So M-SCANNER really IS
+both an M-SENSOR and an M-ASSET on the hub.  Emitting only the FIRST parent
+would silently drop M-SCANNER from a device's \"all m-assets\" closure while
+the hub kept it: per-peer divergent wrong answers.  The supers field is
+therefore a SPACE-
 SEPARATED LIST.  NAME/SUPERS are package-qualified since #201 -- updated from
 the pre-#201 bare-name assertions."
   (with-ptt-registry-graph (g :peer-type-table-mi-test)
     (declare (ignorable g))
     ;; The hub genuinely believes in the second parent.
-    (is (subtypep 'm-uav 'm-asset))
+    (is (subtypep 'm-scanner 'm-asset))
     (let* ((s (graph-db::peer-type-table-string))
            (parsed (graph-db::peer-parse-type-table s)))
-      (is (search (format nil ",~A,~A ~A" (%ptt-qname 'm-uav)
-                          (%ptt-qname 'm-hazard) (%ptt-qname 'm-asset))
+      (is (search (format nil ",~A,~A ~A" (%ptt-qname 'm-scanner)
+                          (%ptt-qname 'm-sensor) (%ptt-qname 'm-asset))
                   s))
       (flet ((supers-of (name)
                (fourth (find name parsed :key #'third :test #'string=))))
-        (is (equal (list (%ptt-qname 'm-hazard) (%ptt-qname 'm-asset))
-                   (supers-of (%ptt-qname 'm-uav))))
-        (is (null (supers-of (%ptt-qname 'm-hazard))))
+        (is (equal (list (%ptt-qname 'm-sensor) (%ptt-qname 'm-asset))
+                   (supers-of (%ptt-qname 'm-scanner))))
+        (is (null (supers-of (%ptt-qname 'm-sensor))))
         (is (null (supers-of (%ptt-qname 'm-asset))))
-        (is (null (supers-of (%ptt-qname 'm-find-of-type))))))))
+        (is (null (supers-of (%ptt-qname 'm-item-of-type))))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Unregistered CLOS mixins carry no wire meaning (GH #216)

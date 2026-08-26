@@ -82,19 +82,20 @@
         (format t "~&SLAVE: master never became ready~%") (sexit 1))
       (let* ((dir  (uiop:getenv "REPL_SLAVE_DIR"))
              (port (parse-integer (uiop:getenv "REPL_PORT")))
-             ;; Subset replication: this slave's area of operations is a box over
-             ;; Kharkiv Oblast.  Non-spatial nodes (r-person, edges) still
-             ;; replicate in full; spatial nodes are filtered to the AO -- so the
-             ;; Kharkiv places arrive and are indexed, the Lviv place does not.
-             (ao (make-polygon '(((37.16 49.19) (37.19 49.19)
-                                  (37.19 49.21) (37.16 49.21) (37.16 49.19)))))
+             ;; Subset replication: this slave's coverage area is a small box.
+             ;; Non-spatial nodes (r-person, edges) still replicate in
+             ;; full; spatial nodes are filtered to the area -- so the
+             ;; near places arrive and are indexed, the far place does not.
+             (area (make-polygon '(((12.33 45.66) (12.36 45.66)
+                                  (12.36 45.68) (12.33 45.68) (12.33 45.66)))))
              ;; :keep-revisions 2 (slave-local reaper config, independent of the
              ;; master) so replicated updates leave a retained version chain we
              ;; can walk to prove the slave built it from LOCAL heap addresses.
              (g (make-graph :repl-test-app dir :slave-p t :master-host "localhost"
                             :replication-port port :replication-key "test-secret"
                             :buffer-pool-size 1000 :keep-revisions 2
-                            :replication-filter (make-spatial-replication-filter ao))))
+                            :replication-filter (make-spatial-replication-filter
+                                                  area))))
         (let ((*graph* g))
           (flet ((live ()  (map-vertices #'identity g :collect-p t :vertex-type 'r-person))
                  (edges () (map-edges #'identity g :collect-p t)))
@@ -112,17 +113,19 @@
                        "catch-up: Alice has 1 outgoing edge (got ~D)"
                        (length (outgoing-edges alice)))))
             ;; --- Subset replication + replicated spatial index (catch-up) ---
-            ;; The in-AO places (Kharkiv site + Crosser-out) replicated and are in
-            ;; the slave's spatial index; the out-of-AO places (Lviv site +
+            ;; The in-area places (near-base + Crosser-out) replicated and are
+            ;; in the slave's spatial index; the out-of-area places (far-base +
             ;; Crosser-in) were filtered out entirely.
-            (let ((kh (find-nodes-near 'r-place 49.2020d0 37.1724d0 2000d0 :graph g))
-                  (lv (find-nodes-near 'r-place 50.0263d0 23.7183d0 2000d0 :graph g)))
-              (check (= 2 (length kh))
-                     "catch-up subset: 2 in-AO places replicated + indexed (got ~D)"
-                     (length kh))
-              (check (= 0 (length lv))
-                     "catch-up subset: out-of-AO places filtered out (got ~D)"
-                     (length lv)))
+            (let ((near-hits (find-nodes-near 'r-place 45.6720d0 12.3424d0
+                               2000d0 :graph g))
+                  (far-hits (find-nodes-near 'r-place 41.7763d0 2.4683d0 2000d0
+                              :graph g)))
+              (check (= 2 (length near-hits))
+               "catch-up subset: 2 in-area places replicated + indexed (got ~D)"
+                     (length near-hits))
+              (check (= 0 (length far-hits))
+                     "catch-up subset: out-of-area places filtered out (got ~D)"
+                     (length far-hits)))
             ;; signal master to send the live update + delete
             (write-flag "connected")
             (unless (wait-flag "phase2done")
@@ -130,10 +133,11 @@
             ;; --- Phase 2: live update(s) + delete ---
             ;; Wait for the FINAL state (name Alice2, age 33 after 3 bumps).
             (wait-until (lambda ()
-                          (let ((lv (live)))
-                            (and (= 1 (length lv))
-                                 (string= "Alice2" (slot-value (first lv) 'name))
-                                 (eql 33 (slot-value (first lv) 'age))))))
+                          (let ((far-hits (live)))
+                            (and (= 1 (length far-hits))
+                                 (string= "Alice2" (slot-value (first far-hits)
+                                                     'name))
+                                 (eql 33 (slot-value (first far-hits) 'age))))))
             (check (= 1 (length (live))) "live: exactly 1 live vertex (got ~D)" (length (live)))
             (let ((v (first (live))))
               (when v
@@ -163,24 +167,27 @@
                   (check ok "live: slave version chain is local + well-formed (depth ~D)" n))))
             (check (= 0 (length (edges)))
                    "live: edge gone after deleting Bob (got ~D)" (length (edges)))
-            ;; --- Replicated spatial index + AO-boundary reconciliation (live) ---
-            ;; After the live phase the Kharkiv area holds: Kharkiv site (catch-up),
-            ;; Kharkiv live, and Crosser-in (entered the AO).  Crosser-out LEFT the
-            ;; AO and was deleted on the slave -> 3 in-AO places near Kharkiv.
-            (let ((kh (find-nodes-near 'r-place 49.2020d0 37.1724d0 2000d0 :graph g)))
-              (check (= 3 (length kh))
-                     "live: 3 in-AO places indexed after live replication (got ~D)"
-                     (length kh)))
-            ;; The boundary crossers, by label: Crosser-out must be GONE (it moved
-            ;; out of the AO -> reconciled to a delete on the slave); Crosser-in
-            ;; must be PRESENT (it moved in -> reconciled to a create on the slave).
+            ;; --- Replicated spatial index + area-boundary reconciliation
+            ;; (live) ---
+            ;; After the live phase the near area holds: near-base (catch-up),
+            ;; near-live, and Crosser-in (entered the area). Crosser-out LEFT
+            ;; the area and was deleted on the slave -> 3 in-area places nearby.
+            (let ((near-hits (find-nodes-near 'r-place 45.6720d0 12.3424d0
+                               2000d0 :graph g)))
+              (check (= 3 (length near-hits))
+                "live: 3 in-area places indexed after live replication (got ~D)"
+                     (length near-hits)))
+            ;; The boundary crossers, by label: Crosser-out must be GONE
+            ;; (it moved out of the area -> reconciled to a delete on the
+            ;; slave); Crosser-in must be PRESENT (it moved in ->
+            ;; reconciled to a create on the slave).
             (let ((labels (mapcar (lambda (p) (slot-value p 'label))
                                   (map-vertices #'identity g :collect-p t
                                                              :vertex-type 'r-place))))
               (check (not (member "Crosser-out" labels :test 'string=))
-                     "live: Crosser-out deleted on slave after LEAVING the AO")
+                    "live: Crosser-out deleted on slave after LEAVING the area")
               (check (member "Crosser-in" labels :test 'string=)
-                     "live: Crosser-in created on slave after ENTERING the AO"))
+                   "live: Crosser-in created on slave after ENTERING the area"))
             ;; Exercise version-aware GC over the replicated chains; must not error.
             (check (handler-case (progn (graph-db::gc-heap g) t)
                      (error (c) (format t "~&  gc-heap error: ~A~%" c) nil))

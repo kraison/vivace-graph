@@ -124,44 +124,44 @@ against a `:subsystems '(:nothing)` baseline, which traces nothing.
 
 ## Real-world workloads
 
-`modules/real_world.lisp` models **measured** mine-action production shape (ma
-hub, 2026-07-28): 481 surveys (451 polygon / 24 multipolygon / 4 point; outer
-ring median 13 vertices, p90 38, max 176), 9,699 EO finds (100% points, ~20 per
-survey), 467 flights, 481 sites.
+`modules/real_world.lisp` models the **measured** production shape of a
+downstream application: 481 parcels (451 polygon / 24 multipolygon / 4 point;
+outer ring median 13 vertices, p90 38, max 176), 9,699 point items (~20 per
+parcel), 467 passes, 481 stations.
 
 | # | Workload | Notes |
 |---|----------|-------|
-| 1 | Survey/Find Bulk Ingestion | polygons + points at the measured ratio |
+| 1 | Parcel/Item Bulk Ingestion | polygons + points at the measured ratio |
 | 2 | Spatial Map Viewport Query | the app's hottest read path |
-| 3 | Analytical View Rollup | finds grouped by ordnance family |
-| 4 | Prolog Engine | **synthetic** — mine-action does not use Prolog |
+| 3 | Analytical View Rollup | items grouped by item family |
+| 4 | Prolog Engine | **synthetic** — the app does not use Prolog |
 | 5 | Concurrent Field-Operator Txns | sequential; measures per-txn cost, not contention |
 | 6 | Complex Node Serialization | 25 KB text + 512 double-floats |
-| 7 | GEOS Land-Release Coverage | **new**; skipped if libgeos_c is absent |
+| 7 | GEOS Coverage Remainder | **new**; skipped if libgeos_c is absent |
 | 8 | Large-Polygon Materialization | **new**; the issue #50 shape |
-| 9 | DeepState Ground Control History | **new**; the app's slowest path (1,125 ms/pin) |
-| 10 | ACLED Dropped-Pin Radius Query | **new**; 10 km diameter over 286k events |
-| 11 | Knowledge-Base Vector Retrieval | **new**; cosine top-K over 1024-dim segment |
+| 9 | Zone Control History | **new**; the app's slowest path (1,125 ms/pin) |
+| 10 | Event Dropped-Pin Radius Query | **new**; 10 km diameter over 286k events |
+| 11 | Corpus Vector Retrieval | **new**; cosine top-K over 1024-dim segment |
 
-Workloads 9–11 model the forensics page and knowledge base — the slowest part of
-the application. Their shape is measured, not assumed (ma, 2026-07-28):
+Workloads 9–11 model the event-history page and the retrieval corpus — the
+slowest part of the application. Their shape is measured, not assumed:
 
 | Path | Production latency | Shape |
 |---|---|---|
-| `deepstate-control-profile` | **1,125 ms** per pin | ~1,500 days × ~4 zones |
-| `forensics-geo-scope` r=5 km | 169 ms (462 events) | of 286,198 ACLED events |
-| `forensics-geo-scope` r=25 km | 195 ms (812 events) | " |
-| KB vector segment | — | 23,193 vectors × 1,024 dims |
+| zone-history profile | **1,125 ms** per pin | ~1,500 days × ~4 zones |
+| geo-scope query r=5 km | 169 ms (462 events) | of 286,198 events |
+| geo-scope query r=25 km | 195 ms (812 events) | " |
+| corpus vector segment | — | 23,193 vectors × 1,024 dims |
 
-DeepState zones are all multipolygons, median 1,480 vertices (max 4,111). The
-control-profile walk is deliberately index-free — a day holds only ~4 polygons,
+Control zones are all multipolygons, median 1,480 vertices (max 4,111). The
+zone-history walk is deliberately index-free — a day holds only ~4 polygons,
 so an index would add overhead for no selectivity — and the workload reproduces
 that rather than "fixing" it.
 
 Two caveats when reading results:
 
-- Workload 4 is **not** application-representative. mine-action makes zero use
-  of the Prolog engine; the workload is retained only because Prolog is a real
-  graph-db subsystem.
+- Workload 4 is **not** application-representative. The downstream app makes
+  zero use of the Prolog engine; the workload is retained only because Prolog
+  is a real graph-db subsystem.
 - Workload 5 is **sequential** despite the name. It measures per-transaction
   overhead, not contention between concurrent writers.
