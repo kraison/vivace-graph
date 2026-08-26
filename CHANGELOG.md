@@ -46,6 +46,18 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Fixed
 
+- **Unregistered CLOS mixin superclasses no longer break the peer type
+  table** (#216). `%peer-type-direct-supers` emitted every non-base
+  direct superclass name, so a plain-CLOS mixin that `def-vertex`/
+  `def-edge` never registered appeared in a row's SUPERS with no row of
+  its own, and `%peer-validate-type-table-rows`' closure check refused
+  to encode the table — on the hub's auth-ok path and the device path
+  alike. Unregistered superclasses are now spliced out of SUPERS,
+  replaced by their nearest *registered* ancestors (a node type may
+  inherit through such a mixin from a registered type, and dropping the
+  mixin outright would sever that chain on the wire). The validator
+  itself stays strict: a dangling SUPERS reference is still a refusal.
+
 - **Legacy v5 cross-store edges are no longer filtered as inactive**
   (#208). `active-edge-p` (and so `map-edges`/`edge-exists-p`) now
   falls back to the all-open-stores scan for an untagged v5 endpoint

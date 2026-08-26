@@ -176,6 +176,51 @@ asserts STRINGP first."
   ()
   :peer-type-table-dupname-test)
 
+;;; --- Unregistered CLOS mixins in the inheritance chain (GH #216). --------
+;;; PTM-MIXIN and PTM-TAGGED are plain DEFCLASS -- never DEF-VERTEXed, so in
+;;; no registry.  PTM-CHILD inherits from registered PTM-BASE THROUGH
+;;; PTM-MIXIN (which needs :METACLASS NODE-CLASS only because it inherits
+;;; FROM a node class -- the default VALIDATE-SUPERCLASS rejects a
+;;; STANDARD-CLASS subclass of a NODE-CLASS; PTM-TAGGED shows plain
+;;; STANDARD-CLASS works fine ABOVE a node type.  DEF-NODE-TYPE checks
+;;; nothing, so both shapes are legal).  PTM-LEAF mixes in PTM-TAGGED, which
+;;; has no registered ancestor at all.  PTM-DIAMOND and PTM-DIRECT-AND-VIA
+;;; pin dedup: two spliced paths to one registered ancestor must emit it
+;;; once.
+
+(eval-when (:load-toplevel :execute)
+  (setf (gethash :peer-type-table-mixin-test *schema-node-metadata*) nil))
+
+(def-vertex ptm-base ()
+  ((label))
+  :peer-type-table-mixin-test)
+
+(defclass ptm-mixin (ptm-base) ()
+  (:metaclass graph-db::node-class))
+
+(defclass ptm-tagged () ())
+
+(def-vertex ptm-child (ptm-mixin)
+  ((extra))
+  :peer-type-table-mixin-test)
+
+(def-vertex ptm-leaf (ptm-tagged)
+  ((leafish))
+  :peer-type-table-mixin-test)
+
+(defclass ptm-mixin-2 (ptm-base) ()
+  (:metaclass graph-db::node-class))
+
+(def-vertex ptm-diamond (ptm-mixin ptm-mixin-2)
+  ()
+  :peer-type-table-mixin-test)
+
+;; PTM-MIXIN precedes PTM-BASE: it is PTM-BASE's subclass, so the other
+;; order is an illegal class precedence list.
+(def-vertex ptm-direct-and-via (ptm-mixin ptm-base)
+  ()
+  :peer-type-table-mixin-test)
+
 ;;; ---------------------------------------------------------------------------
 ;;; Round-trip
 ;;; ---------------------------------------------------------------------------
@@ -330,6 +375,56 @@ the pre-#201 bare-name assertions."
         (is (null (supers-of (%ptt-qname 'm-hazard))))
         (is (null (supers-of (%ptt-qname 'm-asset))))
         (is (null (supers-of (%ptt-qname 'm-find-of-type))))))))
+
+;;; ---------------------------------------------------------------------------
+;;; Unregistered CLOS mixins carry no wire meaning (GH #216)
+;;; ---------------------------------------------------------------------------
+
+(test type-table-splices-out-an-unregistered-mixin
+  "A plain CLOS mixin used as a node type's direct superclass has no row --
+DEF-VERTEX never saw it -- so emitting it into SUPERS made
+%PEER-VALIDATE-TYPE-TABLE-ROWS refuse the whole table (GH #216).  The mixin
+must be filtered out of SUPERS, and a registered ancestor reached THROUGH it
+must be spliced in, or the child would drop out of its ancestor's closure on
+the device while the hub kept it.  The validator itself stays strict (see
+TYPE-TABLE-VALIDATE-ROWS-SIGNALS-ON-DANGLING-SUPER)."
+  (with-ptt-registry-graph (g :peer-type-table-mixin-test r)
+    ;; The hub genuinely believes PTM-CHILD is a PTM-BASE, via the mixin.
+    (is (subtypep 'ptm-child 'ptm-mixin))
+    (is (subtypep 'ptm-child 'ptm-base))
+    (let* ((s (graph-db::peer-type-table-string))
+           (parsed (graph-db::peer-parse-type-table s)))
+      ;; (a) The table encodes at all -- the bug was a refusal here.
+      (is (stringp s))
+      ;; The unregistered mixins appear NOWHERE: no row, no SUPERS entry.
+      (is (not (search "ptm-mixin" s)))
+      (is (not (search "ptm-tagged" s)))
+      (flet ((supers-of (name)
+               (fourth (find name parsed :key #'third :test #'string=))))
+        ;; (b) The registered ancestor reached THROUGH the mixin is spliced
+        ;; into SUPERS in the mixin's place.
+        (is (equal (list (%ptt-qname 'ptm-base))
+                   (supers-of (%ptt-qname 'ptm-child))))
+        ;; A mixin with no registered ancestor simply vanishes.
+        (is (null (supers-of (%ptt-qname 'ptm-leaf))))
+        ;; Dedup pins: two mixins sharing one registered ancestor
+        ;; (diamond), and an ancestor both direct AND via a mixin, each
+        ;; emit it exactly ONCE.  EQUAL against the singleton also pins
+        ;; the order stable.
+        (is (equal (list (%ptt-qname 'ptm-base))
+                   (supers-of (%ptt-qname 'ptm-diamond))))
+        (is (equal (list (%ptt-qname 'ptm-base))
+                   (supers-of (%ptt-qname 'ptm-direct-and-via)))))
+      ;; The hub's auth-ok path scopes to the graph; it must encode too,
+      ;; and the spliced SUPERS keeps its closure resolvable.
+      (let ((scoped (graph-db::peer-parse-type-table
+                     (graph-db::peer-type-table-string r g))))
+        (is (find (%ptt-qname 'ptm-base) scoped
+                  :key #'third :test #'string=))
+        (dolist (row scoped)
+          (dolist (super (fourth row))
+            (is (find super scoped :key #'third :test #'string=)
+                "scoped SUPERS entry ~S must resolve" super)))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Encode-time validation: a loud hub error beats silent device corruption

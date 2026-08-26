@@ -114,27 +114,48 @@ treats #\\: specially either)."
           (package-name (symbol-package symbol))
           (symbol-name symbol)))
 
-(defun %peer-type-direct-supers (name)
-  "Downcased package-qualified names of NAME's direct superclasses.
-LIST of strings, NIL when NAME roots directly at VERTEX/EDGE.
+(defun %peer-type-direct-supers (name registered)
+  "Downcased package-qualified names of NAME's nearest REGISTERED
+superclasses.  LIST of strings, NIL when NAME roots directly at VERTEX/EDGE.
+REGISTERED is an EQ hash-set of the registry's type symbols -- built by the
+caller from the SAME REGISTRY-ENTRIES its rows come from, so SUPERS can never
+name a type with no row (GH #216).
 
-A LIST, not a single name: DEF-NODE-TYPE's docstring claims single inheritance but does
-NOT enforce it -- it splices PARENT-TYPES straight into DEFCLASS -- so
-(DEF-VERTEX M-UAV (M-HAZARD M-ASSET) ...) really does define a type that IS an M-ASSET
-on the hub.  Emitting only the first parent would drop M-UAV from a device's \"all
-m-assets\" closure while the hub kept it: silent, per-peer divergent wrong answers.
+A LIST, not a single name: DEF-NODE-TYPE's docstring claims single
+inheritance but does NOT enforce it -- it splices PARENT-TYPES straight into
+DEFCLASS -- so (DEF-VERTEX M-UAV (M-HAZARD M-ASSET) ...) really does define
+a type that IS an M-ASSET on the hub.  Emitting only the first parent would
+drop M-UAV from a device's \"all m-assets\" closure while the hub kept it:
+silent, per-peer divergent wrong answers.
 
-This CANNOT come from NODE-TYPE-PARENT-TYPE: that slot holds :VERTEX or :EDGE -- the
-KIND, not the superclass (DEF-NODE-TYPE sets it from (LAST1 PARENT-TYPES)).  The
-inheritance graph lives only in CLOS, never in the persisted schema.
-FIND-GRAPH-PARENT-CLASSES is also wrong here: it returns TRANSITIVE ancestors, and we
-want only the direct parents so the consumer can rebuild the closure itself."
-  (let ((class (find-class name nil)))
+An UNREGISTERED direct superclass -- a plain CLOS mixin DEF-VERTEX/DEF-EDGE
+never saw -- carries no wire meaning and is SPLICED OUT, replaced by ITS
+nearest registered ancestors: a node type may inherit THROUGH a mixin from
+a registered type, and dropping the mixin outright would break that chain
+on the wire while %PEER-VALIDATE-TYPE-TABLE-ROWS stays strict (GH #216).
+
+This CANNOT come from NODE-TYPE-PARENT-TYPE: that slot holds :VERTEX or
+:EDGE -- the KIND, not the superclass (DEF-NODE-TYPE sets it from
+(LAST1 PARENT-TYPES)).  The inheritance graph lives only in CLOS, never in
+the persisted schema.  FIND-GRAPH-PARENT-CLASSES is also wrong here: it
+returns TRANSITIVE ancestors, and we want the nearest parents so the
+consumer can rebuild the closure itself."
+  (let ((class (find-class name nil))
+        (out '()))
     (when class
-      (loop for super in (class-direct-superclasses class)
-            unless (member (class-name super)
-                           '(vertex edge primitive-node node standard-object t))
-              collect (%peer-qualified-wire-name (class-name super))))))
+      (labels ((walk (c)
+                 (dolist (super (class-direct-superclasses c))
+                   (let ((sname (class-name super)))
+                     (cond ((member sname '(vertex edge primitive-node node
+                                            standard-object t)))
+                           ((gethash sname registered)
+                            (pushnew (%peer-qualified-wire-name sname) out
+                                     :test #'string=))
+                           ;; Unregistered mixin: splice in its own
+                           ;; registered ancestors (GH #216).
+                           (t (walk super)))))))
+        (walk class))
+      (nreverse out))))
 
 (defun %peer-type-label (type)
   "TYPE printed package-qualified, for an error an operator has to act on.  ~S
@@ -202,19 +223,25 @@ SUPERS comes from CLOS, so a registered symbol whose class this image has not
 loaded emits an EMPTY supers field -- indistinguishable on the wire from a
 type that really does root at VERTEX/EDGE, so the device places it at the root
 and drops it from its parent's closure.  GH #200; GH #195 is the same absence
-one level down."
-  (flet ((rows-for (parent kind-string)
-           ;; LOOP COLLECT, not REMOVE-IF-NOT: the latter may return the
-           ;; registry's own list, which SORT would then destroy.
-           (let ((entries (loop for e in (registry-entries registry)
-                                when (eq parent (second e)) collect e)))
-             (loop for (type nil id) in (sort entries #'< :key #'third)
-                   collect (list kind-string
-                                 id
-                                 (%peer-qualified-wire-name type)
-                                 (%peer-type-direct-supers type)
-                                 type)))))
-    (append (rows-for :vertex "v") (rows-for :edge "e"))))
+one level down.  An UNREGISTERED CLOS mixin in the chain is spliced out of
+SUPERS, its registered ancestors kept (GH #216)."
+  ;; REGISTERED mirrors the rows' own source, so the SUPERS filter in
+  ;; %PEER-TYPE-DIRECT-SUPERS can never disagree with the row set (GH #216).
+  (let ((registered (make-hash-table :test 'eq)))
+    (dolist (e (registry-entries registry))
+      (setf (gethash (first e) registered) t))
+    (flet ((rows-for (parent kind-string)
+             ;; LOOP COLLECT, not REMOVE-IF-NOT: the latter may return the
+             ;; registry's own list, which SORT would then destroy.
+             (let ((entries (loop for e in (registry-entries registry)
+                                  when (eq parent (second e)) collect e)))
+               (loop for (type nil id) in (sort entries #'< :key #'third)
+                     collect (list kind-string
+                                   id
+                                   (%peer-qualified-wire-name type)
+                                   (%peer-type-direct-supers type registered)
+                                   type)))))
+      (append (rows-for :vertex "v") (rows-for :edge "e")))))
 
 (defun %peer-graph-scoped-rows (rows graph)
   "ROWS (%PEER-TYPE-TABLE-ROWS output) filtered to the types actually

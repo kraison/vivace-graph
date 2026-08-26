@@ -2890,7 +2890,11 @@ wire from a type that really does root at ~vertex~/~edge~. A consumer places
 it at the root and drops it from its parent's closure. This became ordinary
 when the table became image-wide (an image holding store A's schema but not
 store B's still ships B's names); it is tracked as issue #200, with #195 as
-the same absence one level down.
+the same absence one level down. Relatedly, a plain CLOS mixin class that was
+never registered via ~def-vertex~/~def-edge~ carries no wire meaning: since
+GH #216 it is spliced out of ~supers~ and replaced by its nearest
+*registered* ancestors, so inheriting *through* a mixin still reaches the
+registered ancestor on the wire and no ~supers~ entry ever dangles.
 
 The downcased-name collision deserves a note, because pooling every store's
 types into one table *widened* it: two types that never shared a schema now
