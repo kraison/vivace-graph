@@ -539,6 +539,64 @@ locked (GH #172)." name (package-name pkg))
                   (%make-constructor-closure name graph-name kind))))
     name))
 
+(defvar *schema-graph-name-registrants* (make-hash-table :test 'equal)
+  "GRAPH-NAME -> alist of (TRUENAME . TYPE-NAMES): which loaded file
+registered which types under each graph name.  Survives the load-time
+(SETF (GETHASH name *SCHEMA-NODE-METADATA*) NIL) clear idiom, which is
+exactly what lets %WARN-IF-CROSS-FILE-CLOBBER see that another file's
+registrations were discarded (GH #198).")
+
+(define-condition schema-graph-name-cross-file-style-warning
+    (style-warning)
+  ((graph-name :initarg :graph-name :reader cross-file-graph-name)
+   (registering-file :initarg :registering-file
+                     :reader cross-file-registering-file)
+   (previous-file :initarg :previous-file
+                  :reader cross-file-previous-file))
+  (:report
+   (lambda (c s)
+     (format s "Graph name ~S is being claimed by ~A, and the types ~A ~
+registered under it earlier are gone -- a load-time clear of the name ~
+discarded them.  Two files claiming one graph name erase each other, ~
+and the failures surface in the OTHER file, the one that did nothing ~
+wrong.  Give each file its own graph name (GH #198)."
+             (cross-file-graph-name c)
+             (cross-file-registering-file c)
+             (cross-file-previous-file c)))))
+
+(defun %warn-if-cross-file-clobber (graph-name type-name)
+  "STYLE-WARNING when the file now registering TYPE-NAME under GRAPH-NAME
+finds that some OTHER file's registrations there have all vanished --
+the two-files-one-graph-name clobber (GH #198).  Silent for same-file
+reloads, REPL/runtime definitions (no load truename), and a second file
+merely ADDING types while the first file's are still present.  Records
+this registration's source file either way.  Accepted false negative:
+the check hangs off registration, so a file that only CLEARS and
+registers nothing never triggers it."
+  (let ((here (or *compile-file-truename* *load-truename*)))
+    (when here
+      (let ((regs (gethash graph-name *schema-graph-name-registrants*))
+            (metas (gethash graph-name *schema-node-metadata*)))
+        (dolist (entry regs)
+          (destructuring-bind (file . names) entry
+            (when (and (not (equal file here))
+                       names
+                       (notany (lambda (n)
+                                 (find n metas :key #'node-type-name))
+                               names))
+              (warn 'schema-graph-name-cross-file-style-warning
+                    :graph-name graph-name
+                    :registering-file here :previous-file file)
+              ;; Warn once per discarded file, not once per type the
+              ;; clobbering file goes on to register.
+              (setf regs (remove entry regs)))))
+        (let ((mine (assoc here regs :test #'equal)))
+          (if mine
+              (pushnew type-name (cdr mine))
+              (push (cons here (list type-name)) regs)))
+        (setf (gethash graph-name *schema-graph-name-registrants*)
+              regs)))))
+
 (defun %register-node-type-meta (meta)
   "Put META in *SCHEMA-NODE-METADATA* under its own store, replacing any
 entry for the same class IN PLACE.  A class may be registered under more
@@ -548,6 +606,7 @@ still governs UPDATE-SCHEMA's instantiation order (GH #53, #167)."
          (metas (gethash graph-name *schema-node-metadata*))
          (pos (position (node-type-name meta) metas
                         :key #'node-type-name)))
+    (%warn-if-cross-file-clobber graph-name (node-type-name meta))
     (if pos
         (setf (nth pos metas) meta)
         (setf (gethash graph-name *schema-node-metadata*)

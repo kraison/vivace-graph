@@ -684,3 +684,134 @@ edge intact after migration"))))))))
         (is (null (set-exclusive-or (append ids-a ids-b) listed
                                     :test #'equalp))
             "the pushed ids and the surviving ids must be the same set")))))
+
+;;; ---------------------------------------------------------------------------
+;;; GC mark-phase type-id enumeration under registry-sparse ids (GH #194)
+;;; ---------------------------------------------------------------------------
+
+;; Its own graph name, same reload discipline as TI-GC-REOPEN-TEST above.
+;; THREE vertex types plus one edge type: dropping any single id from the
+;; enumeration must lose exactly one type's nodes.
+(eval-when (:load-toplevel :execute)
+  (setf (gethash :ti-gc-sparse-test *schema-node-metadata*) nil))
+(def-vertex ti-sparse-a () ((label :type string)) :ti-gc-sparse-test)
+(def-vertex ti-sparse-b () ((label :type string)) :ti-gc-sparse-test)
+(def-vertex ti-sparse-c () ((label :type string)) :ti-gc-sparse-test)
+(def-edge ti-sparse-link () () :ti-gc-sparse-test)
+
+;; The ids this test pins.  Non-contiguous BY CONSTRUCTION -- the shape a
+;; store in a many-store system actually has -- and placed by %REGISTRY-
+;; ADOPT, the same sanctioned write RECONCILE-SCHEMA-WITH-REGISTRY uses to
+;; record a store's pre-existing ids (GH #186, spec 10.1).
+(defparameter *ti-sparse-ids*
+  '((ti-sparse-a    :vertex 4001)
+    (ti-sparse-b    :vertex 4013)
+    (ti-sparse-c    :vertex 4057)
+    (ti-sparse-link :edge   4007)))
+
+(defun %adopt-sparse-test-ids ()
+  "Place *TI-SPARSE-IDS* in the run's registry, idempotently.  Fails loudly
+if some other type already holds one of the ids (would invalidate the
+fixture, and %REGISTRY-ADOPT refuses it by contract)."
+  (let ((r (graph-db::ensure-type-registry)))
+    (graph-db::with-registry-append-lock (r)
+      (loop for (sym parent id) in *ti-sparse-ids*
+            do (let ((known (graph-db::registry-id-for r sym parent))
+                     (holder (gethash id (graph-db::registry-ids-table
+                                          r parent))))
+                 (cond ((eql known id))   ; already placed (re-run)
+                       (known
+                        (error "~S already has id ~D, not ~D" sym known id))
+                       ((and holder (not (eq holder sym)))
+                        (error "id ~D is already held by ~S" id holder))
+                       (t (graph-db::%registry-adopt r sym parent id))))))))
+
+(test gc-mark-enumerates-every-sparse-type-id
+  "GC-HEAP's mark phase must enumerate EVERY assigned type-id; a type-id
+MAP-TYPE-INDEX-LIST-ADDRESSES misses has its nodes swept -- silent, total
+loss of one type.  Broken twice: #166 (enumerated the lazily-populated
+cache, empty on a fresh open) and #186 (DOTIMES against the schema
+counter, missing registry-sparse ids).  Both were caught only by
+incidental tests; this one holds the invariant by name, against a store
+whose ids are sparse and non-contiguous (GH #194).  Trap: the sparse ids
+are adopted into the RUN's shared registry, so they must stay clear of
+ids other tests mint."
+  (%adopt-sparse-test-ids)
+  (with-temp-directory (dir)
+    (let ((node-ids (make-hash-table :test 'eq)))
+      (let ((g (make-graph :ti-gc-sparse-test (namestring dir)
+                           :buffer-pool-size 1000)))
+        ;; The fixture's premise: the store's ids really are the sparse
+        ;; ones, not a dense mint.
+        (loop for (sym parent id) in *ti-sparse-ids*
+              do (is (eql id (graph-db::node-type-id
+                              (graph-db::lookup-node-type-by-name
+                               sym parent :graph g)))
+                     "~S must hold sparse id ~D" sym id))
+        (let ((*graph* g))
+          (with-transaction ()
+            (let ((va (make-ti-sparse-a :label "A-LIVES"))
+                  (vb (make-ti-sparse-b :label "B-LIVES"))
+                  (vc (make-ti-sparse-c :label "C-LIVES")))
+              (setf (gethash 'ti-sparse-a node-ids) (id va)
+                    (gethash 'ti-sparse-b node-ids) (id vb)
+                    (gethash 'ti-sparse-c node-ids) (id vc)
+                    (gethash 'ti-sparse-link node-ids)
+                    (id (make-ti-sparse-link :from va :to vc))))))
+        (close-graph g :snapshot-p nil))
+      ;; Reopen fresh (lazy, unpopulated type-index cache -- the #166
+      ;; shape; :GC-HEAP-P T is the default) and then GC again explicitly.
+      (let ((g (open-graph :ti-gc-sparse-test (namestring dir))))
+        (unwind-protect
+             (let ((*graph* g))
+               (graph-db::gc-heap g)
+               ;; Every node's data block must still be ALLOCATED --
+               ;; checked before touching data, since FREE threads its
+               ;; free-list through the block.
+               (let ((blocks (make-hash-table)))
+                 (graph-db::map-memory
+                  (lambda (addr size free-p)
+                    (declare (ignore size))
+                    (setf (gethash addr blocks) free-p))
+                  (graph-db::heap g) :include-free-p t)
+                 (flet ((alive-p (sym lookup)
+                          (let* ((node (funcall lookup
+                                                (gethash sym node-ids)))
+                                 (dp (and node
+                                          (graph-db::data-pointer node))))
+                            (is-true node "~S: node must still look up"
+                                     sym)
+                            ;; a slotless node (the edge) has no data
+                            ;; block at all -- data-pointer 0
+                            (when (and dp (plusp dp))
+                              (multiple-value-bind (free-p found-p)
+                                  (gethash dp blocks)
+                                (is-true found-p
+                                         "~S: data block ~D must exist"
+                                         sym dp)
+                                (is-false free-p
+                                          "~S: data block ~D was swept"
+                                          sym dp))))))
+                   (alive-p 'ti-sparse-a #'lookup-vertex)
+                   (alive-p 'ti-sparse-b #'lookup-vertex)
+                   (alive-p 'ti-sparse-c #'lookup-vertex)
+                   (alive-p 'ti-sparse-link #'lookup-edge)))
+               ;; And every node of every type is still reachable through
+               ;; its type index, data intact.
+               (flet ((labels-of (type)
+                        (let (seen)
+                          (map-vertices
+                           (lambda (v)
+                             (push (slot-value v 'label) seen))
+                           g :vertex-type type)
+                          seen)))
+                 (is (equal '("A-LIVES") (labels-of 'ti-sparse-a)))
+                 (is (equal '("B-LIVES") (labels-of 'ti-sparse-b)))
+                 (is (equal '("C-LIVES") (labels-of 'ti-sparse-c))))
+               (let (links)
+                 (map-edges (lambda (e) (push (id e) links))
+                            g :edge-type 'ti-sparse-link)
+                 (is (= 1 (length links))
+                     "the edge must survive both GC passes")))
+          (close-graph g :snapshot-p nil)
+          (collect-garbage))))))

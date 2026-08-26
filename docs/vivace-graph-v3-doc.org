@@ -3449,6 +3449,19 @@ read the registry concurrently, and ~type-registry-busy~ is signalled if
 another image holds the append lock. Reads of an already-assigned id take no
 lock at all.
 
+*An image that creates graphs or adds types must have loaded every package
+that contributed a type name anywhere in the system.* Registry records are
+fully package-qualified symbols — that qualification is what makes a type-id
+mean the same thing everywhere — and opening the registry reads the *whole*
+file, so a record naming a package absent from the image cannot be read. In
+that case ~make-graph~ / ~def-vertex~ / ~create-vertex-type~ signal
+~graph-db:type-registry-package-missing-error~, whose report names the
+missing package and this remedy: load the system that defines it before
+creating graphs or adding types in that image (readers:
+~type-registry-package-missing-name~, ~type-registry-package-missing-file~;
+GH #195). A plain reopen of an existing store that defines no new types
+never opens the registry and is unaffected.
+
 Two consequences worth knowing. A store's type-ids are *sparse*: it holds the
 ids of the types it defines, wherever those landed in the system's numbering,
 not a dense run from 1. And ids are never reused or renumbered — the registry
@@ -3557,6 +3570,19 @@ must unify whichever store wins, so such a store is always in the migration
 set even if nothing else contests it. Seeding reports it in
 ~seeding-report-duplicates~, and the renumbering migration reports the
 unification in its second return value rather than picking one id silently.
+
+One tolerance in reconcile-at-open deserves honesty. A store may *occupy* an
+id — written into node heads on disk — that no type it currently answers to
+by name uses (orphaned metadata from its own history). When that id is at or
+below the registry's high-water mark, opening the store is *tolerated with a
+log warning*, and that is a policy choice about already-orphaned metadata,
+not a proof the id is unreachable: ~%registry-assign~ never re-mints it, but
+~%registry-adopt~ (which reconciliation itself uses) can later bind a
+*different* symbol to that id. From then on registry-derived views — the
+peer type table, anything that maps ids through the registry — misread that
+store's on-disk nodes at that id, while the store's own reads stay correct.
+The remedy is the renumbering procedure described here
+(~migrate-graph :renumber-p t~), which such a store owes anyway (GH #202).
 
 Plan the run: each renumbering is a ~migrate-graph~, so the transient disk
 and the deployment gate described in Chapter 12 apply to every store in the

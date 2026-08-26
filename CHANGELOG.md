@@ -13,6 +13,51 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Added
 
+- **`type-registry-package-missing-error`** (#195). A type-registry
+  record naming a package absent from the image used to re-signal as a
+  generic "malformed type registry record" wrapping a reader error, so
+  `make-graph`/`def-vertex` in an image that had not loaded every
+  contributing package failed without naming the actual constraint.
+  `%registry-load` now signals this named condition instead, carrying
+  the missing package name and the registry file, with the remedy in
+  its report (load the system that defines the package first).
+  Torn-final-record tolerance is unchanged — a tail cut mid-symbol is
+  still dropped with a log, whatever error it raises — and genuinely
+  malformed records still signal the malformed-record error. The
+  operational requirement itself is now documented in the manual's
+  type-registry chapter. (Option 2 — lazy per-record interning — is
+  deferred pending a format decision.)
+
+- **`schema-graph-name-cross-file-style-warning`** (#198). Test files
+  isolate reloads by clearing their graph name's entry in
+  `*schema-node-metadata*` at load time; two files claiming one graph
+  name therefore silently erase each other, with the failures landing
+  in the innocent file. Registration now records which loaded file
+  registered which types per graph name, and warns — naming BOTH
+  files — when a registration finds that another file's types under
+  the name have all vanished. Same-file reloads, REPL/runtime
+  definitions, and a second file merely *adding* types stay silent on
+  clean sequential loads; a warm-image reload of the owning file may
+  warn transiently — its own clear discards the adder's types — until
+  the later files reload too.
+
+- **GC mark-phase enumeration regression test** (#194).
+  `map-type-index-list-addresses` has been wrong twice (#166, #186),
+  both times caught only by incidental tests. A new test pins the
+  invariant by name against a store whose type-ids are sparse and
+  non-contiguous (placed via `%registry-adopt`, the registry-assigned
+  shape): every node of every type must survive `gc-heap`, verified
+  down to the allocation table. Dropping any one id from the
+  enumeration fails it.
+
+- **#202 documented as policy.** The manual's renumbering section now
+  states that reconcile-at-open's tolerance of an orphaned occupied id
+  at/below the registry mark is a policy choice, not a reachability
+  proof — a later `%registry-adopt` can bind another symbol to that
+  id, after which registry-derived views (e.g. peer type tables)
+  misread that store at that id; the remedy is the documented
+  renumbering migration.
+
 - **`compact-edges` `:policy` keyword** (#208, #209). The default
   `:conservative` compacts exactly what it always did (soft-deleted
   edges, provably-missing endpoints); `:policy :trust-tags` additionally

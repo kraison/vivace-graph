@@ -854,3 +854,94 @@ SBCL's raw package-lock error instead (GH #172, review round 3)."
         (when c
           (is (search "ENSURE-NAMESPACE" (format nil "~A" c))
               "~A's condition should name ENSURE-NAMESPACE: ~A" bad c))))))
+
+;;; ---------------------------------------------------------------------------
+;;; Cross-file graph-name clobber warning (GH #198)
+;;;
+;;; Exercised on %REGISTER-NODE-TYPE-META directly, with fabricated load
+;;; truenames and both tables rebound -- actually loading two colliding
+;;; files would need scratch files compiled mid-test for no extra proof.
+;;; ---------------------------------------------------------------------------
+
+(defun %xf-meta (name)
+  (graph-db::make-node-type :name name :parent-type :vertex
+                            :graph-name :xf-gh198-test :slots nil))
+
+(defmacro with-xf-tables (&body body)
+  "Fresh metadata + registrant tables, so these tests neither see nor
+pollute the suite's real registrations (GH #198)."
+  `(let ((graph-db::*schema-node-metadata*
+           (make-hash-table :test 'equal))
+         (graph-db::*schema-graph-name-registrants*
+           (make-hash-table :test 'equal)))
+     ,@body))
+
+(defun %xf-register (truename meta)
+  "Register META as if loaded from TRUENAME, returning the cross-file
+warning it signaled, or NIL."
+  (let ((caught nil)
+        (*load-truename* truename)
+        (*compile-file-truename* nil))
+    (handler-bind
+        ((graph-db:schema-graph-name-cross-file-style-warning
+           (lambda (w) (setf caught w) (muffle-warning w))))
+      (graph-db::%register-node-type-meta meta))
+    caught))
+
+(test cross-file-clobber-signals-a-style-warning-naming-both-files
+  "GH #198: file B's load-time clear of a graph name file A populated,
+followed by B's own registration, warns naming BOTH files -- because the
+failures land in file A, which did nothing wrong.  Fires once per
+discarded file, not once per type B registers."
+  (with-xf-tables
+    (is-false (%xf-register #P"/tmp/gh198-file-a.lisp"
+                            (%xf-meta 'xf-a1)))
+    ;; File B isolates itself with the standard load-time clear...
+    (setf (gethash :xf-gh198-test graph-db::*schema-node-metadata*) nil)
+    ;; ...silently discarding file A's registrations.
+    (let ((w (%xf-register #P"/tmp/gh198-file-b.lisp"
+                           (%xf-meta 'xf-b1))))
+      (is-true w "the clobbering registration must warn")
+      (when w
+        (is (eq :xf-gh198-test (graph-db:cross-file-graph-name w)))
+        (is (equal #P"/tmp/gh198-file-b.lisp"
+                   (graph-db:cross-file-registering-file w)))
+        (is (equal #P"/tmp/gh198-file-a.lisp"
+                   (graph-db:cross-file-previous-file w)))))
+    (is-false (%xf-register #P"/tmp/gh198-file-b.lisp"
+                            (%xf-meta 'xf-b2))
+              "warn once per discarded file, not per type")))
+
+(test same-file-reload-clear-stays-silent
+  "The clear idiom exists FOR same-file reloads; those must not warn."
+  (with-xf-tables
+    (is-false (%xf-register #P"/tmp/gh198-file-a.lisp"
+                            (%xf-meta 'xf-a1)))
+    (setf (gethash :xf-gh198-test graph-db::*schema-node-metadata*) nil)
+    (is-false (%xf-register #P"/tmp/gh198-file-a.lisp"
+                            (%xf-meta 'xf-a1))
+              "a file reloading itself is the sanctioned case")))
+
+(test repl-registration-stays-silent
+  "No load truename -- REPL or runtime schema work -- never warns, even
+right after another file's registrations were cleared."
+  (with-xf-tables
+    (is-false (%xf-register #P"/tmp/gh198-file-a.lisp"
+                            (%xf-meta 'xf-a1)))
+    (setf (gethash :xf-gh198-test graph-db::*schema-node-metadata*) nil)
+    (is-false (%xf-register nil (%xf-meta 'xf-b1)))))
+
+(test additive-second-file-stays-silent
+  "A second file ADDING types while the first file's registrations are
+still present is the sanctioned multi-file shape (graph-tests +
+segment-integration-tests share *INTEGRATION-GRAPH-NAME* this way); only
+evidence of a DISCARD warns.  Caveat: a WARM-IMAGE reload of the owning
+file's clear DOES discard the adder's types, so its first
+re-registration warns transiently -- accurately -- until the later file
+reloads too (GH #198)."
+  (with-xf-tables
+    (is-false (%xf-register #P"/tmp/gh198-file-a.lisp"
+                            (%xf-meta 'xf-a1)))
+    (is-false (%xf-register #P"/tmp/gh198-file-b.lisp"
+                            (%xf-meta 'xf-b1))
+              "no clear happened, so no warning")))

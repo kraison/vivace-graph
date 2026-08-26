@@ -117,6 +117,9 @@
            #:close-type-registry
            #:type-registry-busy
            #:type-registry-busy-location
+           #:type-registry-package-missing-error
+           #:type-registry-package-missing-name
+           #:type-registry-package-missing-file
            #:registry-id-for
            #:registry-intern
            #:registry-entries
@@ -295,6 +298,10 @@
            #:divergent-type-name
            #:divergent-type-graph-name
            #:divergent-type-other-graphs
+           #:schema-graph-name-cross-file-style-warning
+           #:cross-file-graph-name
+           #:cross-file-registering-file
+           #:cross-file-previous-file
 
            ;; packages as namespaces (GH #167)
            #:default-store-not-open-error

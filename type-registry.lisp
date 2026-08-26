@@ -30,6 +30,54 @@
 REGISTRY-INTERN.  Retry once the holder's assignment completes (GH #186)."
              (type-registry-busy-location c)))))
 
+(define-condition type-registry-package-missing-error (error)
+  ((package-name :initarg :package-name
+                 :reader type-registry-package-missing-name)
+   (file :initarg :file :reader type-registry-package-missing-file))
+  (:report
+   (lambda (c s)
+     (let ((pkg (type-registry-package-missing-name c)))
+       (format s "The type registry at ~A names a type in package ~S, ~
+which is not loaded in this image.  Registry records are fully ~
+package-qualified type names, so creating a graph or adding a type ~
+needs every package that contributed one.  Load the system that ~
+defines ~S before creating graphs or adding types in this image ~
+(GH #195)."
+               (type-registry-package-missing-file c) pkg pkg)))))
+
+(defun %missing-package-in-line (line)
+  "The first package prefix in LINE naming no package in this image, or
+NIL.  Text fallback for implementations whose reader signals something
+other than a PACKAGE-ERROR on an unknown package (GH #195)."
+  (let ((start 0))
+    (loop
+      (let ((colon (position #\: line :start start)))
+        (unless colon (return nil))
+        (let* ((tok-start
+                 (1+ (or (position-if
+                          (lambda (ch) (member ch '(#\Space #\( #\))))
+                          line :end colon :from-end t)
+                         -1)))
+               (prefix (subseq line tok-start colon)))
+          (when (and (plusp (length prefix))
+                     (not (find-package prefix)))
+            (return prefix))
+          (setf start (1+ colon))
+          (when (and (< start (length line))
+                     (char= #\: (char line start)))
+            (incf start)))))))
+
+(defun %missing-package-name (condition line)
+  "The name of the package CONDITION says is absent, or NIL when
+CONDITION is not about a missing package.  SBCL's reader signals a
+PACKAGE-ERROR whose PACKAGE-ERROR-PACKAGE is the missing NAME (a
+designator, never a package object); elsewhere fall back to scanning
+LINE for a prefix FIND-PACKAGE cannot resolve (GH #195)."
+  (or (and (typep condition 'package-error)
+           (let ((p (package-error-package condition)))
+             (and (not (packagep p)) (string p))))
+      (%missing-package-in-line line)))
+
 (defun %registry-file (location)
   (make-pathname :name "type-registry" :type "log" :defaults location))
 
@@ -97,13 +145,23 @@ both are empty and every symbol reads back a spurious NIL."
                 (let ((parsed
                         (handler-case (%parse-registry-record line)
                           (error (e)
-                            (if missing-newline-p
-                                (progn
-                                  (log:warn "type registry: dropping torn ~
+                            ;; Torn-final tolerance first, for ANY error:
+                            ;; a tail cut mid-symbol can raise the package
+                            ;; error too (GH #191, #195).
+                            (let ((pkg (unless missing-newline-p
+                                         (%missing-package-name e line))))
+                              (cond
+                                (missing-newline-p
+                                 (log:warn "type registry: dropping torn ~
 final record in ~A: ~A" file e)
-                                  (return))
-                                (error "malformed type registry record in ~
-~A: ~A" file e))))))
+                                 (return))
+                                (pkg
+                                 (error
+                                  'type-registry-package-missing-error
+                                  :package-name pkg :file file))
+                                (t
+                                 (error "malformed type registry record ~
+in ~A: ~A" file e))))))))
                   (destructuring-bind (symbol parent id) parsed
                     (setf (gethash symbol (table-for parent)) id)
                     (push (list symbol parent id) entries)
