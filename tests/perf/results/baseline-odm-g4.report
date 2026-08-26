@@ -1,0 +1,108 @@
+;;;; graph-db perf report
+;;;; tag=run1 impl=SBCL 2.6.6 scale=NORMAL generation=4 host=odm
+
+;; insert-vertices                        OPS 20000  SECONDS 3.765  OPS/S 5312  
+;; lookup-by-id                           OPS 20000  SECONDS 0.888  OPS/S 22521  
+;; scan-vertices                          OPS 20000  SECONDS 0.531  OPS/S 37661  
+;; update-vertices                        OPS 20000  SECONDS 1.725  OPS/S 11593  
+;; delete-vertices                        OPS 10000  SECONDS 0.714  OPS/S 14004  
+;; insert-edges                           OPS 20000  SECONDS 6.448  OPS/S 3102  
+;; scan-edges                             OPS 20000  SECONDS 1.699  OPS/S 11771  
+;; view-lookup                            OPS 20000  SECONDS 0.94  OPS/S 21275  
+;; unique-insert                          OPS 20000  SECONDS 4.983  OPS/S 4013  
+;; unique-baseline-plain-insert           OPS 20000  SECONDS 3.473  OPS/S 5758  
+;; indexed-insert                         OPS 20000  SECONDS 4.676  OPS/S 4277  
+;; index-lookup-eq                        OPS 20000  SECONDS 0.867  OPS/S 23066  
+;; index-range-1pct                       OPS 2000  SECONDS 6.655  OPS/S 301  
+;; index-fullscan-eq                      OPS 200  SECONDS 54.822  OPS/S 4  
+;; prolog-is-a-scan                       OPS 10000  SECONDS 0.168  OPS/S 59519  
+;; prolog-edge-join                       OPS 5000  SECONDS 0.383  OPS/S 13054  
+;; commit-batched-1txn                    OPS 5000  SECONDS 0.714  OPS/S 7002  
+;; commit-per-op-Ntxn                     OPS 5000  SECONDS 3.408  OPS/S 1467  
+;; concurrent-rw                          OPS 32000  SECONDS 26.066  OPS/S 1228  
+;; heap-used-after-inserts                BYTES 1601034  PER-OP 80  
+;; heap-used-after-updates                BYTES 3361034  PER-OP 168  
+;; snapshot                               SECONDS 1.746  
+;; restore-replay                         SECONDS 4.189  
+;; reopen                                 SECONDS 5.965  
+;; commit-multigraph-n1                   OPS 1000  SECONDS 0.724  OPS/S 1381  US/COMMIT 724.058  
+;; commit-multigraph-n2                   OPS 2000  SECONDS 0.708  OPS/S 2825  US/COMMIT 708.056  
+;; commit-multigraph-n4                   OPS 4000  SECONDS 1.085  OPS/S 3686  US/COMMIT 1085.085  
+;; commit-multigraph-n8                   OPS 8000  SECONDS 6.216  OPS/S 1287  US/COMMIT 6216.487  
+;; commit-multigraph-n8-rawwm             OPS 8000  SECONDS 0.655  OPS/S 12213  US/COMMIT 655.051  
+;; watermark-persist-warm                 OPS 20000  SECONDS 3.886  OPS/S 5146  
+;; watermark-raw-write-warm               OPS 20000  SECONDS 1.291  OPS/S 15491  
+;; v5scan-f0-s1                           OPS 10000  SECONDS 0.416  OPS/S 24037  US/EDGE 41.603  EMITTED 2000  
+;; v5scan-f0-s2                           OPS 10000  SECONDS 0.425  OPS/S 23528  US/EDGE 42.503  EMITTED 2000  
+;; v5scan-f0-s4                           OPS 10000  SECONDS 0.439  OPS/S 22777  US/EDGE 43.904  EMITTED 2000  
+;; v5scan-f0-s8                           OPS 10000  SECONDS 0.506  OPS/S 19761  US/EDGE 50.604  EMITTED 2000  
+;; v5scan-f10-s1                          OPS 10000  SECONDS 0.412  OPS/S 24270  US/EDGE 41.203  EMITTED 1800  
+;; v5scan-f10-s2                          OPS 10000  SECONDS 0.4  OPS/S 24998  US/EDGE 40.003  EMITTED 1800  
+;; v5scan-f10-s4                          OPS 10000  SECONDS 0.432  OPS/S 23146  US/EDGE 43.203  EMITTED 1800  
+;; v5scan-f10-s8                          OPS 10000  SECONDS 0.43  OPS/S 23254  US/EDGE 43.003  EMITTED 1800  
+;; v5scan-f50-s1                          OPS 10000  SECONDS 0.403  OPS/S 24812  US/EDGE 40.303  EMITTED 1000  
+;; v5scan-f50-s2                          OPS 10000  SECONDS 0.51  OPS/S 19606  US/EDGE 51.004  EMITTED 1000  
+;; v5scan-f50-s4                          OPS 10000  SECONDS 0.518  OPS/S 19304  US/EDGE 51.804  EMITTED 1000  
+;; v5scan-f50-s8                          OPS 10000  SECONDS 0.633  OPS/S 15797  US/EDGE 63.305  EMITTED 1000  
+
+(:PERF-REPORT :TAG "run1" :IMPL "SBCL 2.6.6" :SCALE :NORMAL :GENERATION 4 :HOST
+ "odm" :ENTRIES
+ (("insert-vertices" :OPS 20000 :SECONDS 3.765 :OPS/S 5312)
+  ("lookup-by-id" :OPS 20000 :SECONDS 0.888 :OPS/S 22521)
+  ("scan-vertices" :OPS 20000 :SECONDS 0.531 :OPS/S 37661)
+  ("update-vertices" :OPS 20000 :SECONDS 1.725 :OPS/S 11593)
+  ("delete-vertices" :OPS 10000 :SECONDS 0.714 :OPS/S 14004)
+  ("insert-edges" :OPS 20000 :SECONDS 6.448 :OPS/S 3102)
+  ("scan-edges" :OPS 20000 :SECONDS 1.699 :OPS/S 11771)
+  ("view-lookup" :OPS 20000 :SECONDS 0.94 :OPS/S 21275)
+  ("unique-insert" :OPS 20000 :SECONDS 4.983 :OPS/S 4013)
+  ("unique-baseline-plain-insert" :OPS 20000 :SECONDS 3.473 :OPS/S 5758)
+  ("indexed-insert" :OPS 20000 :SECONDS 4.676 :OPS/S 4277)
+  ("index-lookup-eq" :OPS 20000 :SECONDS 0.867 :OPS/S 23066)
+  ("index-range-1pct" :OPS 2000 :SECONDS 6.655 :OPS/S 301)
+  ("index-fullscan-eq" :OPS 200 :SECONDS 54.822 :OPS/S 4)
+  ("prolog-is-a-scan" :OPS 10000 :SECONDS 0.168 :OPS/S 59519)
+  ("prolog-edge-join" :OPS 5000 :SECONDS 0.383 :OPS/S 13054)
+  ("commit-batched-1txn" :OPS 5000 :SECONDS 0.714 :OPS/S 7002)
+  ("commit-per-op-Ntxn" :OPS 5000 :SECONDS 3.408 :OPS/S 1467)
+  ("concurrent-rw" :OPS 32000 :SECONDS 26.066 :OPS/S 1228)
+  ("heap-used-after-inserts" :BYTES 1601034 :PER-OP 80)
+  ("heap-used-after-updates" :BYTES 3361034 :PER-OP 168)
+  ("snapshot" :SECONDS 1.746) ("restore-replay" :SECONDS 4.189)
+  ("reopen" :SECONDS 5.965)
+  ("commit-multigraph-n1" :OPS 1000 :SECONDS 0.724 :OPS/S 1381 :US/COMMIT
+   724.058)
+  ("commit-multigraph-n2" :OPS 2000 :SECONDS 0.708 :OPS/S 2825 :US/COMMIT
+   708.056)
+  ("commit-multigraph-n4" :OPS 4000 :SECONDS 1.085 :OPS/S 3686 :US/COMMIT
+   1085.085)
+  ("commit-multigraph-n8" :OPS 8000 :SECONDS 6.216 :OPS/S 1287 :US/COMMIT
+   6216.487)
+  ("commit-multigraph-n8-rawwm" :OPS 8000 :SECONDS 0.655 :OPS/S 12213
+   :US/COMMIT 655.051)
+  ("watermark-persist-warm" :OPS 20000 :SECONDS 3.886 :OPS/S 5146)
+  ("watermark-raw-write-warm" :OPS 20000 :SECONDS 1.291 :OPS/S 15491)
+  ("v5scan-f0-s1" :OPS 10000 :SECONDS 0.416 :OPS/S 24037 :US/EDGE 41.603
+   :EMITTED 2000)
+  ("v5scan-f0-s2" :OPS 10000 :SECONDS 0.425 :OPS/S 23528 :US/EDGE 42.503
+   :EMITTED 2000)
+  ("v5scan-f0-s4" :OPS 10000 :SECONDS 0.439 :OPS/S 22777 :US/EDGE 43.904
+   :EMITTED 2000)
+  ("v5scan-f0-s8" :OPS 10000 :SECONDS 0.506 :OPS/S 19761 :US/EDGE 50.604
+   :EMITTED 2000)
+  ("v5scan-f10-s1" :OPS 10000 :SECONDS 0.412 :OPS/S 24270 :US/EDGE 41.203
+   :EMITTED 1800)
+  ("v5scan-f10-s2" :OPS 10000 :SECONDS 0.4 :OPS/S 24998 :US/EDGE 40.003
+   :EMITTED 1800)
+  ("v5scan-f10-s4" :OPS 10000 :SECONDS 0.432 :OPS/S 23146 :US/EDGE 43.203
+   :EMITTED 1800)
+  ("v5scan-f10-s8" :OPS 10000 :SECONDS 0.43 :OPS/S 23254 :US/EDGE 43.003
+   :EMITTED 1800)
+  ("v5scan-f50-s1" :OPS 10000 :SECONDS 0.403 :OPS/S 24812 :US/EDGE 40.303
+   :EMITTED 1000)
+  ("v5scan-f50-s2" :OPS 10000 :SECONDS 0.51 :OPS/S 19606 :US/EDGE 51.004
+   :EMITTED 1000)
+  ("v5scan-f50-s4" :OPS 10000 :SECONDS 0.518 :OPS/S 19304 :US/EDGE 51.804
+   :EMITTED 1000)
+  ("v5scan-f50-s8" :OPS 10000 :SECONDS 0.633 :OPS/S 15797 :US/EDGE 63.305
+   :EMITTED 1000)))
