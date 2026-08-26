@@ -141,3 +141,78 @@ idea of \"next id\" cached at open time."
 not reuse the first's id"))
         (graph-db::close-type-registry r1)
         (graph-db::close-type-registry r2)))))
+
+(test registry-names-the-missing-package-not-a-reader-error
+  "GH #195: a record naming a package this image has not loaded used to
+re-signal as \"malformed type registry record\" -- a reader error naming
+a package instead of a diagnostic naming the constraint.  It must signal
+TYPE-REGISTRY-PACKAGE-MISSING-ERROR carrying the package name and the
+registry file.  The record is written as text: its symbol cannot be
+interned from here, which is the point."
+  (with-temp-directory (dir)
+    (let ((r (graph-db::open-type-registry (namestring dir))))
+      (graph-db::registry-intern r 'reg-pm-keep :vertex)
+      (graph-db::close-type-registry r))
+    (let ((f (merge-pathnames "type-registry.log" dir)))
+      (with-open-file (s f :direction :output :if-exists :append)
+        (format s "(:SYMBOL GH195-NO-SUCH-PKG::WIDGET ~
+:PARENT :VERTEX :ID 90)~%"))
+      (let ((caught nil))
+        (handler-case (graph-db::close-type-registry
+                       (graph-db::open-type-registry (namestring dir)))
+          (graph-db:type-registry-package-missing-error (e)
+            (setf caught e)))
+        (is-true caught "must signal the named condition, not malformed")
+        (when caught
+          (is (string= "GH195-NO-SUCH-PKG"
+                       (string
+                        (graph-db:type-registry-package-missing-name
+                         caught))))
+          (is (equal (namestring (truename f))
+                     (namestring
+                      (truename
+                       (graph-db:type-registry-package-missing-file
+                        caught))))
+              "the report must say WHICH registry file")
+          (is (search "GH195-NO-SUCH-PKG"
+                      (format nil "~A" caught))
+              "the report text names the package"))))))
+
+(test registry-tolerates-a-torn-final-record-naming-a-missing-package
+  "GH #195 must not narrow #191's torn-tail tolerance: a FINAL record cut
+mid-symbol can raise the package error too (the truncation can fall
+inside the package prefix), and it is still dropped with a log, not
+signaled."
+  (with-temp-directory (dir)
+    (let ((r (graph-db::open-type-registry (namestring dir))))
+      (graph-db::registry-intern r 'reg-pm-torn-keep :vertex)
+      (graph-db::close-type-registry r))
+    (let ((f (merge-pathnames "type-registry.log" dir)))
+      (with-open-file (s f :direction :output :if-exists :append)
+        ;; truncated, no newline: a torn tail whose symbol names an
+        ;; absent package
+        (format s "(:SYMBOL GH195-NO-SUCH-PKG::WID"))
+      (let ((r2 (graph-db::open-type-registry (namestring dir))))
+        (unwind-protect
+             (is (= 1 (length (graph-db::registry-entries r2)))
+                 "the intact record survives; the torn tail is dropped")
+          (graph-db::close-type-registry r2))))))
+
+(test registry-still-signals-malformed-for-a-non-package-defect
+  "GH #195 narrows only the missing-package case; a genuinely malformed
+earlier record still signals the malformed-record error, never the
+package-missing condition."
+  (with-temp-directory (dir)
+    (let ((f (merge-pathnames "type-registry.log" dir)))
+      (with-open-file (s f :direction :output :if-does-not-exist :create)
+        (format s "(:SYMBOL 42 :PARENT :VERTEX :ID 7)~%")
+        (format s "(:SYMBOL REG-PM-AFTER :PARENT :VERTEX :ID 8)~%"))
+      (handler-case
+          (progn (graph-db::close-type-registry
+                  (graph-db::open-type-registry (namestring dir)))
+                 (fail "a malformed non-final record must signal"))
+        (graph-db:type-registry-package-missing-error (e)
+          (fail "wrongly classified as package-missing: ~A" e))
+        (error (e)
+          (is (search "malformed type registry record"
+                      (format nil "~A" e))))))))
