@@ -404,3 +404,83 @@ regression fast and independent of networking."
              (position :close-replication-log order))
           "stop-replication must run BEFORE close-replication-log"))
     (collect-garbage)))
+
+;;; ---------------------------------------------------------------------------
+;;; GH #246: .dirty hygiene -- MAKE-GRAPH refuses upfront, the refusal is a
+;;; named condition, and CLOSE-GRAPH tolerates a marker deleted mid-session.
+;;; ---------------------------------------------------------------------------
+
+(test make-graph-refuses-dirty-location-before-side-effects
+  "MAKE-GRAPH on a directory already carrying .dirty must signal
+STORE-NOT-CLOSED-CLEANLY-ERROR before creating ANYTHING -- previously it
+created heap.dat, both lhash tables, indexes.dat and the three index
+directories before dying on a raw FILE-ERROR (GH #246)."
+  (with-temp-directory (dir)
+    (let ((path (namestring dir)))
+      (with-open-file (out (%oh-dirty-file path) :direction :output
+                           :if-does-not-exist :create)
+        (format out "~S" (get-universal-time)))
+      (signals store-not-closed-cleanly-error
+        (make-graph :oh-graph path :buffer-pool-size 1000))
+      (is (null (uiop:subdirectories dir))
+          "the refused MAKE-GRAPH must not have created any directory")
+      (let ((files (uiop:directory-files dir)))
+        (is (and (= 1 (length files))
+                 (string= ".dirty" (file-namestring (first files))))
+            "the refused MAKE-GRAPH must have left only .dirty, got ~S"
+            files))
+      (is (null (graph-db:lookup-graph :oh-graph))
+          "the refused MAKE-GRAPH must not have registered a graph"))))
+
+(test open-graph-dirty-refusal-is-named-with-location
+  "OPEN-GRAPH's .dirty refusal must be STORE-NOT-CLOSED-CLEANLY-ERROR
+whose STORE-NOT-CLOSED-LOCATION names the store (GH #246); the
+documented recovery -- delete the marker and reopen -- still works."
+  (with-temp-directory (dir)
+    (let ((path (namestring dir)))
+      (let ((g (make-graph :oh-graph path :buffer-pool-size 1000)))
+        (close-graph g :snapshot-p nil))
+      (with-open-file (out (%oh-dirty-file path) :direction :output
+                           :if-does-not-exist :create)
+        (format out "~S" (get-universal-time)))
+      (let ((refusal
+              (handler-case
+                  ;; A wrong success must not strand a registered graph
+                  ;; with live mmaps -- close it before failing below.
+                  (let ((g (open-graph :oh-graph path
+                                       :buffer-pool-size 1000)))
+                    (close-graph g :snapshot-p nil)
+                    nil)
+                (store-not-closed-cleanly-error (c) c))))
+        (is-true refusal
+                 "OPEN-GRAPH must refuse the dirty store with the named ~
+                  condition")
+        (when refusal
+          (is (string= (namestring (uiop:ensure-directory-pathname path))
+                       (namestring (store-not-closed-location refusal)))
+              "the condition's LOCATION must name the store")))
+      ;; The documented recovery procedure.
+      (delete-file (%oh-dirty-file path))
+      (let ((g2 (open-graph :oh-graph path :buffer-pool-size 1000)))
+        (close-graph g2 :snapshot-p nil))
+      (collect-garbage))))
+
+(test close-graph-tolerates-missing-dirty-marker
+  "A .dirty marker deleted mid-session must not make CLOSE-GRAPH signal
+FILE-ERROR after its teardown has already succeeded: the close completes,
+warns, and deregisters the graph (GH #246)."
+  (with-temp-directory (dir)
+    (let* ((path (namestring dir))
+           (g (make-graph :oh-graph path :buffer-pool-size 1000))
+           (warned nil))
+      (delete-file (%oh-dirty-file path))
+      (handler-bind ((dirty-marker-already-gone-warning
+                       (lambda (c)
+                         (setq warned t)
+                         (muffle-warning c))))
+        (close-graph g :snapshot-p nil))
+      (is-true warned
+               "CLOSE-GRAPH must warn about the already-missing marker")
+      (is (null (graph-db:lookup-graph :oh-graph))
+          "the close must still deregister the graph")
+      (collect-garbage))))

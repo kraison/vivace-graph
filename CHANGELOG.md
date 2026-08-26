@@ -13,6 +13,15 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Added
 
+- **`store-not-closed-cleanly-error`** (#246). The `.dirty` refusal is
+  now a named, exported condition with a `store-not-closed-location`
+  reader, signalled by both `open-graph` and `make-graph`; its report
+  carries the recovery procedure (delete the marker and reopen —
+  `open-graph` then runs recovery itself). Behavior change for callers
+  that matched the old anonymous `error` by message text ("graph not
+  closed properly"): handle the condition type instead. `handler-case`
+  on plain `error` still catches it.
+
 - **`type-registry-package-missing-error`** (#195). A type-registry
   record naming a package absent from the image used to re-signal as a
   generic "malformed type registry record" wrapping a reader error, so
@@ -90,6 +99,30 @@ between releases; cutting a release renames it to the new version and dates it.
   remains the GML parser. New lexer unit tests pin the token stream.
 
 ### Fixed
+
+- **`make-graph` refuses a `.dirty`-carrying location upfront** (#246).
+  It used to create `heap.dat`, both linear-hash tables, `indexes.dat`
+  and the three adjacency-index directories before dying on a raw
+  `FILE-ERROR` when writing the marker — and that error then unwound
+  into the GH #224 abort path, which deleted the operator's
+  pre-existing `.dirty`, destroying the very evidence that recovery
+  was needed. It now probes right after
+  location normalization — before any side effect — and signals
+  `store-not-closed-cleanly-error`, since a `.dirty` there means either
+  a live holder or a crashed store, and creating over either is wrong.
+  The memory-graph open path is unchanged (it deliberately supersedes
+  the marker; see the manual's in-memory chapter, which now states that
+  cross-process exclusion is the application's responsibility there).
+
+- **`close-graph` no longer signals `FILE-ERROR` after a successful
+  close when the `.dirty` marker is already gone** (#246). The final
+  marker delete was unguarded, so a marker removed mid-session made a
+  fully completed teardown report failure. The delete is now
+  attempt-and-catch (no TOCTOU window): when the marker is absent, the
+  close completes and signals `dirty-marker-already-gone-warning` (a
+  named, exported warning with a `dirty-marker-already-gone-location`
+  reader) — a missing marker at close time is itself a signal something
+  odd happened, but the close did succeed.
 
 - **Unregistered CLOS mixin superclasses no longer break the peer type
   table** (#216). `%peer-type-direct-supers` emitted every non-base

@@ -68,6 +68,30 @@ store cannot be created or opened without it.  Bind or SETF ~
 *SYSTEM-DIRECTORY* to your system's directory (GH #186)."
                      (system-directory-required-operation error)))))
 
+(define-condition store-not-closed-cleanly-error (error)
+  ;; A .dirty marker under LOCATION means a live holder or a crashed
+  ;; store; OPEN-GRAPH and MAKE-GRAPH both refuse on it (GH #246).
+  ((location :initarg :location
+             :reader store-not-closed-location))
+  (:report (lambda (error stream)
+             (let ((dirty (format nil "~A.dirty"
+                                  (store-not-closed-location error))))
+               (format stream "~A exists; graph not closed properly.  ~
+Run recovery -- the procedure is: delete ~A and reopen; OPEN-GRAPH ~
+then runs recovery itself." dirty dirty)))))
+
+(define-condition dirty-marker-already-gone-warning (warning)
+  ;; Named, not a bare string WARN, so a caller or test can HANDLER-BIND
+  ;; on it specifically (GH #246; convention per GH #170's
+  ;; RECOVERY-POLICY-MISMATCH-WARNING).
+  ((location :initarg :location
+             :reader dirty-marker-already-gone-location))
+  (:report (lambda (c s)
+             (format s "CLOSE-GRAPH ~A: the .dirty marker was already ~
+gone (deleted mid-session, or a bug); the close itself completed ~
+(GH #246)."
+                     (dirty-marker-already-gone-location c)))))
+
 (define-condition store-registry-conflict (error)
   ;; A store's persisted type-ids and the image registry disagree, and no
   ;; open, write or handshake may paper over it: the losing id is already in

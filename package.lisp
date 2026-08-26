@@ -127,6 +127,11 @@
            #:*type-registry*
            #:system-directory-required
            #:system-directory-required-operation
+           ;; .dirty refusal (GH #246)
+           #:store-not-closed-cleanly-error
+           #:store-not-closed-location
+           #:dirty-marker-already-gone-warning
+           #:dirty-marker-already-gone-location
            ;; edge store-occupancy sidecar (GH #167)
            #:edge-type-stores
            ;; image-level store-id registry (GH #169)
