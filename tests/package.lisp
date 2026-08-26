@@ -223,6 +223,11 @@
                 ;; GH #186: the store/registry type-id agreement guard and
                 ;; the frozen open that reads a store it refuses.
                 #:lookup-node-type-by-name
+                ;; .dirty refusal (GH #246)
+                #:store-not-closed-cleanly-error
+                #:store-not-closed-location
+                #:dirty-marker-already-gone-warning
+                #:dirty-marker-already-gone-location
                 #:store-registry-conflict
                 #:store-registry-conflict-reason
                 #:frozen-graph-cannot-replicate

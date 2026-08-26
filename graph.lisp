@@ -665,7 +665,9 @@ in every store of the system (GH #186).  SYSTEM-DIRECTORY-REQUIRED is
 signalled when it is NIL -- there is deliberately no per-graph fallback.
 
 A .dirty marker file is written on creation; always CLOSE-GRAPH to flush data
-to disk and remove it."
+to disk and remove it.  If LOCATION already holds a .dirty marker (a live
+holder, or a crashed store), STORE-NOT-CLOSED-CLEANLY-ERROR is signalled
+before anything is created (GH #246)."
   ;; Type-ids come from the system's registry, which lives in
   ;; *SYSTEM-DIRECTORY*; refuse rather than mint ids no peer agrees with
   ;; (GH #186).
@@ -698,6 +700,12 @@ is open (GH #180)."))
   ;; id.dat above all -- lands in the store's PARENT directory instead
   ;; of inside it.  Normalize once, before any use (GH #222).
   (setq location (namestring (uiop:ensure-directory-pathname location)))
+  ;; A .dirty under LOCATION means a live holder or a crashed store --
+  ;; creating over either is wrong.  Refuse before any side effect
+  ;; (GH #246); previously this surfaced as a raw FILE-ERROR after
+  ;; heap/table/index files had already been created.
+  (when (probe-file (format nil "~A.dirty" location))
+    (error 'store-not-closed-cleanly-error :location location))
   ;; GH #224: STATE (%GRAPH-OPEN-STATE) is what %MAKE-GRAPH-1 updates
   ;; as it goes; DONE distinguishes a clean return from a non-local
   ;; exit.  The original condition always propagates unchanged.
@@ -777,7 +785,7 @@ policy.dat's ~S; the file wins."
     (unless (probe-file path)
       (error "Unable to open graph location ~A" path))
     (when (probe-file dirty-file)
-      (error "~A exists;  graph not closed properly.  Run recovery." dirty-file))
+      (error 'store-not-closed-cleanly-error :location location))
     (log:info "Opening graph.")
     (when buffer-pool-p
       (log:info "Initializing buffer pool.")
@@ -1090,9 +1098,11 @@ earlier with MAKE-GRAPH; the keyword arguments mirror MAKE-GRAPH's, including
 :SYSTEM-CLOCK -- attaching raises the clock above this store's persisted
 highest id (the spec §6 watermark).
 
-Signals an error if LOCATION holds a .dirty marker, which means the graph was
-not closed cleanly and must be recovered first (see RECOVER-TRANSACTIONS and
-the backup/recovery chapter).  By default the heap is garbage-collected
+Signals STORE-NOT-CLOSED-CLEANLY-ERROR if LOCATION holds a .dirty marker,
+which means the graph was not closed cleanly and must be recovered first:
+delete the marker and reopen -- OPEN-GRAPH then runs recovery itself (see
+RECOVER-TRANSACTIONS and the backup/recovery chapter).  By default the heap
+is garbage-collected
 (:GC-HEAP-P) and outstanding transactions are recovered on open.  Views are
 reconciled against their declarative definitions and kept as-is unless changed
 (see DEF-VIEW); pass :REGENERATE-VIEWS T to force-rebuild every view on open.
@@ -1284,8 +1294,15 @@ a snapshot failure does NOT abort the close (GH #120)."
       (setf (heap graph) nil
             (vertex-table graph) nil
             (edge-table graph) nil)
+      ;; A marker already gone here means someone deleted it mid-session
+      ;; (or a bug); the close itself succeeded, so warn rather than
+      ;; signal FILE-ERROR after a completed teardown.  Attempt-and-catch,
+      ;; not probe-then-delete, so there is no TOCTOU window (GH #246).
       (let ((dirty-file (format nil "~A/.dirty" (location graph))))
-        (delete-file dirty-file))
+        (handler-case (delete-file dirty-file)
+          (file-error ()
+            (warn 'dirty-marker-already-gone-warning
+                  :location (location graph)))))
       (close-replication-log graph)
       (setf (graph-open-p graph) nil)
       ;; Warn only after the close is COMPLETE, so it cannot be mistaken for
