@@ -5053,6 +5053,99 @@ bounds. Without GEOS, ~register-geometry~ refuses an extended geometry
 outright (above) rather than approximating and then trying to confirm
 the approximation; build that step only if a backend ever needs it.
 
+** Chapter 19: Measuring Performance
+
+The repository carries two performance measurement systems, and they
+answer different questions. Reaching for the wrong one wastes an
+afternoon, so the split is worth stating plainly:
+
+- ~tests/perf/~ (system ~graph-db/perf-test~) measures *throughput
+  trends over time* — "did it get slower?" A fixed set of benchmarks
+  writes a report file; reports are compared against blessed
+  per-host baselines to catch regressions.
+- ~profiling/~ (system ~graph-db/profiler~) measures *where the time
+  goes* — "why is it slow?" Per-subsystem workload modules run under
+  ~sb-sprof~ statistical sampling and ~sb-profile~ deterministic
+  tracing, with console tables and an optional PDF report.
+
+Detect with the perf suite; diagnose with the profiler. Both are
+SBCL-focused.
+
+*** The throughput suite (~tests/perf/~)
+
+Run it in a fresh SBCL with the enlarged heap every suite in this
+repository needs:
+
+#+BEGIN_SRC sh
+  sbcl --dynamic-space-size 16384
+#+END_SRC
+
+#+BEGIN_SRC lisp
+  (ql:quickload :graph-db/perf-test)
+  (graph-db/perf-test:run-perf :tag "my-tag")
+#+END_SRC
+
+~run-perf~ is measurement-only — it always returns ~T~ and never
+fails a build. It runs every benchmark at ~:normal~ scale (pass
+~:scale :small~ for a ~10x-smaller quick loop; only ~:normal~ runs
+are comparable) and writes a report — the path is printed at the
+end — stamped with tag, implementation, scale, host, and the *suite
+generation*, the counter in ~tests/perf/suite.lisp~ that is bumped
+whenever a change alters an existing bench's work or labels.
+
+Regression checking is a separate, deliberate step:
+~check-perf~ compares a report against the blessed baseline for its
+host and generation
+(~tests/perf/results/baseline-<host>-g<gen>.report~, committed);
+~bless-perf-baseline~ adopts a new one. The rule that governs every
+comparison: *never compare reports across suite generations or
+hosts* — ~check-perf~ refuses to, because such a diff is a setup
+mistake, not a perf result. The full ritual — blessing discipline,
+tolerance bands, release gating — lives in [[file:perf-baselines.md]];
+that document, not this chapter, is authoritative.
+
+One case necessarily crosses generations: comparing *releases*, whose
+trees ship different suites. The method there is the intersection: run
+each tag's own suite on one host, interleaved, and compare only labels
+whose bench implementations were first verified identical across the
+trees. ~tests/perf/results/release-comparison-2026-08-27.md~ is the
+worked example, and its preamble is the recipe.
+
+*** The profiler (~profiling/~)
+
+#+BEGIN_SRC lisp
+  (ql:quickload :graph-db/profiler)
+
+  ;; All subsystem workloads, report at the REPL:
+  (graph-db/profiler:run-full-profiling-suite)
+
+  ;; Same, plus a multi-page PDF report:
+  (graph-db/profiler:profile-and-generate-pdf
+   :output-file "/tmp/vg-profiling.pdf" :scale 1.0)
+
+  ;; Production-shaped workloads (measured application shapes):
+  (graph-db/profiler:run-real-world-profiling-suite)
+#+END_SRC
+
+To profile your own code rather than a canned workload, wrap it in
+the harness macro (~profiling/harness.lisp~):
+
+#+BEGIN_SRC lisp
+  (graph-db/profiler:profile-block
+      (:name "my hot path" :subsystems '(:serialization))
+    (my-workload))
+#+END_SRC
+
+Two things to know before trusting a run: call
+~subsystem-coverage-report~ first to see what will actually be traced
+(inlined functions never are; use the sampler for those), and heed
+the ~!~ overhead flag in the output — on functions called millions of
+times, ~sb-profile~'s reported time is mostly the profiler observing
+itself. ~profiling/README.md~ carries these caveats in full and
+describes the workload modules; ~docs/profiler-guide.md~ is the
+complete usage guide. Note ~graph-db/geos~ is a hard dependency of
+the profiler.
+
 ** API Reference
 
 This chapter provides a categorized reference for the most important exported symbols from the ~graph-db~ package. It is not an exhaustive list of every internal function but focuses on the public API you will use most often when building applications.
