@@ -13,6 +13,15 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Added
 
+- **Release-baseline measurement record** (#263). Three-tree perf
+  measurement (v2.1.1 / v3.0.0 / experiment, each running its own
+  suite; comparison over the byte-identical-verified intersection) on
+  one host, medians of three interleaved runs: reads/scans/queries
+  flat-to-better since 3.0.0, commit-heavy cells regressed 14-34% —
+  the #177 watermark cost, corroborating #237's fix. Raw reports and
+  the dated comparison live in `tests/perf/results/release-*` and
+  `release-comparison-2026-08-27.md`.
+
 - **Perf regression detection** (#253). Perf reports are now stamped
   with a suite generation (`*perf-suite-generation*`) and a sanitized
   host name; `bless-perf-baseline` copies a `:normal`-scale report to
