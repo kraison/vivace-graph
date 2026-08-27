@@ -43,6 +43,35 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Added
 
+- **`graph-db/gui`: the explorer frontend** (#271, epic #106). The
+  cockpit's main region is now the Bloom-style neighborhood explorer:
+  clicking a vertex-type row in the stats pane fetches the bounded
+  node sample and shows a pick-list; picking a node seeds the
+  cytoscape canvas. Double-click (or the inspector's Expand button)
+  fetches `/neighborhood/:id` and merges it additively — dedup by id,
+  never a canvas reset — settled by an incremental cose layout that
+  pre-places new nodes around their anchor. Single-click opens the
+  inspector dock (type, full id, slots table, in/out edge counts for
+  vertices; type/from/to/slots for edges), fetched on demand from
+  `/node/:id` with a stale-response guard. Right-click removes an
+  element view-locally (connected edges drop with a node); Clear
+  empties the canvas; switching or closing the selected graph clears
+  canvas + inspector. Node colors derive deterministically from the
+  type name (hash → hue, stable across sessions); edges carry
+  direction arrows and show their type on hover. Server `truncated`
+  flags surface as a status-bar notice naming the limit, beside a
+  live node/edge count. Strictly read-only. The one vendored library
+  is `gui/static/vendor/cytoscape.min.js` (3.34.2, MIT, UMD — loaded
+  by a classic script tag, the sole window-global exception) with
+  `VENDOR.md` recording version/source/license/upgrade; still no
+  build step, no npm, no CDN. gui-test now pins the new assets'
+  paths, content types and the vendored file's size. Also fixes a U1
+  defect the explorer smoke surfaced: `/node/:id` for an edge id
+  500'd once the id-keyed node cache made `lookup-vertex` return the
+  cached edge — `api-graph-node` now branches on the object's class
+  (edge card, not a vertex crash) and an edge id as neighborhood
+  center is a clean 404; both paths gain gui-tests.
+
 - **`graph-db/gui`: the cockpit frame frontend** (#270, epic #106).
   The placeholder page is now the real single-page frame: a roster
   pane (every known store with open/closed badge, recorded location,

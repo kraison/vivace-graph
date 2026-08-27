@@ -1,7 +1,6 @@
 <!DOCTYPE html>
-<!-- VivaceGraph GUI frame (GH #270): roster + stats panes.
-     The explorer canvas and inspector dock land in U3 (GH #271);
-     their regions below are placeholders U3 fills. -->
+<!-- VivaceGraph GUI cockpit: roster + stats frame (GH #270),
+     explorer canvas + inspector dock (GH #271). -->
 <html lang="en">
 <head>
   <meta charset="utf-8">
@@ -38,16 +37,38 @@
       </section>
     </aside>
     <main id="main-canvas" class="main-canvas" aria-label="Explorer">
-      <!-- U3 (GH #271) mounts the explorer canvas here. -->
-      <p class="placeholder">
-        Select a node type to explore &mdash; arrives in U3.
+      <div id="cy" class="cy-host"></div>
+      <p id="canvas-placeholder" class="placeholder">
+        Select a graph, click a vertex type in the stats pane, then
+        pick a node to seed the canvas.
       </p>
+      <div id="canvas-status" class="canvas-status">
+        <span id="canvas-counts"></span>
+        <span id="canvas-notice" class="canvas-notice"></span>
+        <button id="canvas-clear" type="button"
+                title="Empty the canvas (view only)">Clear</button>
+      </div>
+      <div id="pick-list" class="pick-list" hidden>
+        <div class="pick-list-header">
+          <h3 id="pick-list-title"></h3>
+          <button id="pick-list-close" type="button"
+                  aria-label="Close node list">&#215;</button>
+        </div>
+        <p id="pick-list-notice" class="pick-list-notice"></p>
+        <ul id="pick-list-items" class="pick-list-items"></ul>
+      </div>
+      <div id="edge-tooltip" class="edge-tooltip" hidden></div>
     </main>
     <aside id="inspector-dock" class="inspector-dock" hidden
            aria-label="Node inspector">
-      <!-- U3 (GH #271) mounts the node inspector here. -->
+      <!-- inspector.js renders here (GH #271). -->
     </aside>
   </div>
+  <!-- cytoscape's UMD build is not an ES module: classic script tag,
+       loaded before the module entry; explorer.js reads
+       window.cytoscape (the one window-global exception; see
+       vendor/VENDOR.md). -->
+  <script src="/vendor/cytoscape.min.js"></script>
   <script type="module" src="/js/main.js"></script>
 </body>
 </html>
