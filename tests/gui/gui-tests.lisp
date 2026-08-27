@@ -38,6 +38,25 @@ already stopped."
       (is (eql 0 (search "text/html" ctype)))
       (is (search "VivaceGraph GUI" raw)))))
 
+(test static-frame-assets-serve
+  "Every asset the frame page loads serves 200 with the right content
+type -- pins the file layout index.html depends on (GH #270)."
+  (with-gui-server ()
+    (flet ((asset (path ctype)
+             (multiple-value-bind (json status actual)
+                 (gui-request path)
+               (declare (ignore json))
+               (is (= 200 status) "~A did not serve 200" path)
+               (is (eql 0 (search ctype actual))
+                   "~A served content type ~A, wanted ~A"
+                   path actual ctype))))
+      (asset "/" "text/html")
+      (asset "/css/gui.css" "text/css")
+      (asset "/js/api.js" "application/javascript")
+      (asset "/js/roster.js" "application/javascript")
+      (asset "/js/stats.js" "application/javascript")
+      (asset "/js/main.js" "application/javascript"))))
+
 (test static-missing-file-404
   "A missing static path yields 404."
   (with-gui-server ()

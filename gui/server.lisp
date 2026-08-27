@@ -113,9 +113,11 @@ the static tree, with index.html at /."
 
 (defun start-gui (&key (port *gui-port*) (bind "127.0.0.1"))
   "Start the GUI HTTP server on PORT, bound to BIND (loopback by
-default -- localhost is the v1 security boundary).  Returns the clack
-handler.  Idempotent: a second call while running returns the running
-handler unchanged."
+default -- localhost is the v1 security boundary).  A non-loopback
+BIND serves the UNAUTHENTICATED API and open/close verbs to that
+network: bind only interfaces whose peers you trust.  Returns the
+clack handler.  Idempotent: a second call while running returns the
+running handler unchanged."
   (or *gui-handler*
       (let* ((app (%make-gui-app))
              (root (gui-static-root))

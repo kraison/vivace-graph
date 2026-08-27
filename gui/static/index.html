@@ -1,15 +1,53 @@
 <!DOCTYPE html>
-<!-- Placeholder page proving static serving works (GH #269).
-     The real frontend lands in U2/U3 (GH #270, #271). -->
+<!-- VivaceGraph GUI frame (GH #270): roster + stats panes.
+     The explorer canvas and inspector dock land in U3 (GH #271);
+     their regions below are placeholders U3 fills. -->
 <html lang="en">
 <head>
   <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>VivaceGraph GUI</title>
+  <link rel="stylesheet" href="/css/gui.css">
 </head>
 <body>
-  <h1>VivaceGraph GUI</h1>
-  <p>The backend is up. The frontend arrives in a later unit;
-     meanwhile the JSON API lives under <code>/api/</code>
-     (start at <a href="/api/graphs"><code>/api/graphs</code></a>).</p>
+  <div class="app">
+    <aside class="sidebar">
+      <header class="brand">
+        <h1>VivaceGraph</h1>
+      </header>
+      <section class="pane" id="roster-pane" aria-label="Graph roster">
+        <div class="pane-header">
+          <h2>Graphs</h2>
+          <button id="roster-refresh" type="button"
+                  title="Reload the roster from the server">Refresh</button>
+        </div>
+        <div id="error-strip" class="error-strip" hidden>
+          <span id="error-strip-text"></span>
+          <button id="error-strip-dismiss" type="button"
+                  aria-label="Dismiss error">&#215;</button>
+        </div>
+        <ul id="roster-list" class="roster-list"></ul>
+      </section>
+      <section class="pane" id="stats-pane" aria-label="Graph statistics">
+        <div class="pane-header">
+          <h2>Stats</h2>
+        </div>
+        <div id="stats-body" class="stats-body">
+          <p class="placeholder">Select a graph.</p>
+        </div>
+      </section>
+    </aside>
+    <main id="main-canvas" class="main-canvas" aria-label="Explorer">
+      <!-- U3 (GH #271) mounts the explorer canvas here. -->
+      <p class="placeholder">
+        Select a node type to explore &mdash; arrives in U3.
+      </p>
+    </main>
+    <aside id="inspector-dock" class="inspector-dock" hidden
+           aria-label="Node inspector">
+      <!-- U3 (GH #271) mounts the node inspector here. -->
+    </aside>
+  </div>
+  <script type="module" src="/js/main.js"></script>
 </body>
 </html>

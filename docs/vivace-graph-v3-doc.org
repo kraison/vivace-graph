@@ -1851,7 +1851,23 @@ handlers call engine internals directly rather than proxying REST.
 #+END_SRC
 
 Both calls are idempotent. The GUI binds loopback by default —
-localhost is the v1 security boundary. Static assets under
+localhost is the v1 security boundary. Binding a non-loopback address
+via ~:bind~ (e.g. a private VPN/tailnet address such as a Tailscale
+~100.x~ address) serves the *unauthenticated* API — including the
+open/close management verbs — to everything that can reach that
+network: bind only to interfaces whose peers you trust. Auth is a
+later-version item per the design.
+
+The page served at ~/~ (GH #270) is the cockpit frame: a roster pane
+listing every known store (open/closed badge, recorded location) with
+per-graph Open/Close buttons and a manual Refresh — engine errors,
+including the dirty-store 409 report, surface verbatim in a
+dismissible error strip — and a stats pane for the selected graph
+(totals, per-type counts, views, indexes, on-disk size, schema).
+Nothing polls; the panes re-render from each server response. The
+explorer canvas and node inspector arrive in U3 (GH #271).
+
+Static assets under
 ~gui/static/~ are served at ~/~ (resolved via
 ~asdf:system-relative-pathname~); every request path must resolve, by
 ~truename~, to a file *inside* the static root — ~..~, ~~~-expansion
