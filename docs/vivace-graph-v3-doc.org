@@ -1833,6 +1833,53 @@ Let's assume our graph `:social-app` is running.
   #+END_SRC
 
 
+*** The GUI cockpit (~graph-db/gui~, optional)
+
+Alongside the public REST API, the optional ~graph-db/gui~ subsystem
+serves a web cockpit for operators: a store roster with open/close
+management, per-graph stats, and a read-only neighborhood explorer
+(GH #269, epic #106; design:
+~docs/superpowers/specs/2026-08-27-vg-gui-v1-design.md~). It is a
+separate ningle/clack app — ~rest.lisp~ is untouched — and its
+handlers call engine internals directly rather than proxying REST.
+
+#+BEGIN_SRC lisp
+  (ql:quickload :graph-db/gui)
+  (graph-db.gui:start-gui)                  ; port 4270, 127.0.0.1
+  (graph-db.gui:start-gui :port 8090 :bind "127.0.0.1")
+  (graph-db.gui:stop-gui)
+#+END_SRC
+
+Both calls are idempotent. The GUI binds loopback by default —
+localhost is the v1 security boundary. Static assets under
+~gui/static/~ are served at ~/~ (resolved via
+~asdf:system-relative-pathname~); every request path must resolve, by
+~truename~, to a file *inside* the static root — ~..~, ~~~-expansion
+and symlink escapes are refused — and the JSON API lives under
+~/api/~.
+The GUI holds no graph state: every request resolves its graph by
+name at request time, so a graph closed mid-session yields a clean
+404, never a stale handle.
+
+| Endpoint                                   | Method | Purpose                                                          |
+|--------------------------------------------+--------+------------------------------------------------------------------|
+| ~/api/graphs~                              | GET    | Roster: name, location, open/closed (registry + clock journal, falling back to the open-graph table) |
+| ~/api/graphs/:name/open~                   | POST   | Open at the roster's recorded location only; dirty store = 409 with the condition's report |
+| ~/api/graphs/:name/close~                  | POST   | Close; a not-open graph is a 409                                 |
+| ~/api/graphs/:name/stats~                  | GET    | Vertex/edge totals, per-type counts, view + index inventories, on-disk size, schema summary |
+| ~/api/graphs/:name/types~                  | GET    | Vertex/edge type inventory                                       |
+| ~/api/graphs/:name/nodes?type=X&limit=N~   | GET    | Bounded node sample (default limit 50)                           |
+| ~/api/graphs/:name/node/:id~               | GET    | Node inspection: type, slots as a JSON object, in/out edge counts |
+| ~/api/graphs/:name/neighborhood/:id?limit=N~ | GET  | One-round-trip ~{nodes, edges, truncated}~ batch, both directions, under a read snapshot (default limit 100) |
+
+Node ids on the wire are the engine's 32-hex-character ~string-id~
+form; a malformed id is a 400. Every handler answers errors as JSON
+~{error, message}~ — 404 unknown graph/node/type, 409 dirty/conflict,
+400 malformed, 500 with the condition's report — and never a
+backtrace; details go to the log4cl log. The two management verbs
+serialize through one lock. Tests: ~(asdf:test-system
+:graph-db/gui-test)~ drives the whole surface over real HTTP.
+
 ** Chapter 10: Replication and High Availability (~replication.lisp~)
 
 For production environments, relying on a single database instance creates a single point of failure. If the machine hosting the database goes down, your application becomes unavailable. To solve this, VivaceGraph provides a built-in *master-slave replication* system, implemented primarily in ~replication.lisp~ and ~transaction-streaming.lisp~.

@@ -96,6 +96,7 @@ The system is layered. Lower layers know nothing of graph semantics; higher laye
 5. **Transactions** — `transactions.lisp` (ACID with read-set/write-set validation and retry; `*maximum-transaction-attempts*` then exclusive lock), `transaction-restore.lisp`, `transaction-log-streaming.lisp`, `transaction-streaming.lisp`. Replication: `backup.lisp`, `replication.lisp`, `txn-log.lisp`.
 6. **Query** — a full embedded Prolog engine: `functor.lisp`, `prologc.lisp` (compiler), `prolog-functors.lisp` (built-in predicates). `select` / `select-flat` / `select-one` / `do-query` are the query entry points. `interface.lisp` + `traverse.lisp` provide the Lisp-method query API (`map-vertices`, `map-edges`, `traverse`, `outgoing-edges`, etc.).
 7. **REST** — `rest.lisp` exposes the graph over HTTP (hunchentoot/ningle/clack); `start-rest` / `stop-rest` / `def-rest-procedure`.
+8. **GUI** — optional `graph-db/gui` subsystem (`gui/`): the web cockpit backend (`start-gui`/`stop-gui`, roster/stats/explorer JSON API + static assets); separate from `rest.lisp`, tested by `graph-db/gui-test` over real HTTP (GH #269).
 
 ### On-disk layout
 
