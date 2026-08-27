@@ -762,12 +762,15 @@ of a socket: the sockets-free export half."
 (defun %peer-apply-wire-file (dev path)
   "Device-side decode + apply of the state-create packet file at PATH
 into DEV -- PEER-READ-AND-ENQUEUE's decode and the writer-loop's
-:state-create decode+apply work (mailbox hop and manifest accumulation
-excluded -- GH #260), single-threaded.  Returns the op count."
-  ;; Two deliberate exclusions vs the real writer loop: the mailbox
-  ;; hop (connection thread -> writer thread), and the created-manifest
-  ;; PUSHNEW accumulation -- O(ops^2) in production, filed as GH #260.
-  (let ((*graph* dev) (applied 0))
+:state-create decode+apply work including the created-manifest
+accumulation (mailbox hop still excluded), single-threaded.  Returns
+the op count."
+  ;; One deliberate exclusion vs the real writer loop: the mailbox hop
+  ;; (connection thread -> writer thread).  The created-manifest
+  ;; accumulation, excluded while it was an O(ops^2) PUSHNEW list, is
+  ;; measured since it became an id-table insert (GH #260).
+  (let ((*graph* dev) (applied 0)
+        (created (graph-db::make-id-table)))
     (with-open-file (in path :element-type '(unsigned-byte 8))
       (loop
         (let ((meta (graph-db::read-stream-packet in)))
@@ -783,6 +786,8 @@ excluded -- GH #260), single-threaded.  Returns the op count."
                                     (graph-db::read-stream-packet in)))))
               (graph-db::apply-peer-create-writes
                dev (graph-db::transaction-id txh) writes origin)
+              (dolist (w writes)
+                (setf (gethash (id (graph-db::node w)) created) t))
               (incf applied))))))))
 
 (defun bench-peer-replication ()
