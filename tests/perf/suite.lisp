@@ -134,6 +134,12 @@ eras still visible in results/ (2.1.1 / 3.0 A-B / mvcc phase runs).")
    (label))
   :graph-db-perf-test)
 
+;; A :VECTOR-INDEX-slotted type for bench-vector-search (GH #254).
+(def-vertex pv-node ()
+  ((label)
+   (embedding :vector-index t))
+  :graph-db-perf-test)
+
 (defun define-perf-views ()
   "Define the perf view against the current *graph* (call after make-graph)."
   (def-view p-node-by-val :lessp (p-node :graph-db-perf-test)
