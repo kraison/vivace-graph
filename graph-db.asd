@@ -197,6 +197,43 @@
   :components ((:file "rest"))
   :in-order-to ((test-op (test-op :graph-db/test))))
 
+;; OPTIONAL GUI cockpit backend (GH #269, design doc
+;; docs/superpowers/specs/2026-08-27-vg-gui-v1-design.md).  Own subsystem,
+;; NOT an extension of rest.lisp: an operational, private surface
+;; (roster/open/close/stats + the explorer's batch endpoints) on a
+;; different evolution clock than the public REST API.  Static frontend
+;; assets live in gui/static/ and resolve via
+;; asdf:system-relative-pathname.
+(defsystem graph-db/gui
+  :name "VivaceGraph GUI backend"
+  :description "Web cockpit for VivaceGraph: roster, open/close, stats,
+and read-only neighborhood exploration."
+  :maintainer "Kevin Raison"
+  :author "Kevin Raison <last name @ chatsubo dot net>"
+  :version "3.0.0"
+  :depends-on (:graph-db :ningle :clack :cl-json :lack-component)
+  :pathname "gui/"
+  :serial t
+  :components ((:file "package")
+               (:file "api")
+               (:file "server"))
+  :in-order-to ((test-op (test-op :graph-db/gui-test))))
+
+(defsystem graph-db/gui-test
+  :name "VivaceGraph GUI test suite"
+  :description "FiveAM + drakma tests driving the GUI API over real HTTP."
+  :depends-on (:graph-db/gui :graph-db/test-scratch :fiveam :drakma
+               :usocket :flexi-streams :bordeaux-threads)
+  :pathname "tests/gui/"
+  :serial t
+  :components ((:file "package")
+               (:file "suite")
+               (:file "gui-tests"))
+  :perform (test-op (op c)
+                    (unless (uiop:symbol-call :graph-db/gui-test
+                                              :run-gui-tests)
+                      (error "graph-db GUI tests failed."))))
+
 (defsystem graph-db/test-scratch
   :name "VivaceGraph shared test scratch-space manager"
   :description "Per-run scratch parent + stale sweep for all suites (GH #214)."

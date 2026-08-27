@@ -43,6 +43,20 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Added
 
+- **`graph-db/gui`: the web cockpit's backend** (#269, epic #106).
+  A new optional subsystem serving a JSON management/exploration API
+  and static frontend assets over ningle/clack: `start-gui`/`stop-gui`
+  (port 4270, loopback-bound by default), a store roster derived from
+  the store registry + clock-journal `:attach` records (falling back
+  to the open-graph table without a system directory), open/close
+  management verbs (dirty stores answer 409 with the condition's
+  report), per-graph stats, type inventory, bounded node samples, node
+  inspection, and a snapshot-consistent `neighborhood` batch endpoint
+  for the explorer. Reads resolve the graph by name per request — the
+  GUI holds no graph state — and `rest.lisp` is untouched. Tested by
+  the new `graph-db/gui-test` FiveAM suite over real HTTP (drakma).
+  Manual: the "GUI cockpit" section beside Chapter 9.
+
 - **The perf-vs-profiling split is documented** (#255). Chapter 19 of
   the manual (`docs/vivace-graph-v3-doc.org`) now states which
   measurement system answers which question — `tests/perf/`
