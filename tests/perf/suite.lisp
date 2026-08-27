@@ -22,11 +22,13 @@
 (defparameter *lisp-impl*
   (format nil "~A ~A" (lisp-implementation-type) (lisp-implementation-version)))
 
-(defparameter *perf-suite-generation* 4
+(defparameter *perf-suite-generation* 5
   "Suite generation for baseline comparability (GH #253).  Bump when any
 change alters an existing bench's work or its labels; adding a new bench
 does not bump.  Generations 1-3 retroactively cover the pre-#252 report
-eras still visible in results/ (2.1.1 / 3.0 A-B / mvcc phase runs).")
+eras still visible in results/ (2.1.1 / 3.0 A-B / mvcc phase runs).
+g4->g5: peer-apply now includes the created-manifest accumulation its
+#260 exclusion note used to carve out.")
 
 (defun perf-host ()
   "Sanitized (machine-instance): lowercase, [a-z0-9-] only."

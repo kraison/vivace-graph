@@ -46,6 +46,9 @@
   (let ((*standard-output* s) (*error-output* s))
     (ql:quickload :graph-db :silent t)))
 (in-package :graph-db)
+;; Provenance: prove WHICH tree this process loaded (GH #260).
+(format t "~&SOURCE: ~A~%" (asdf:system-source-directory :graph-db))
+(finish-output)
 
 ;;; Type-ids come from the image-level registry in *SYSTEM-DIRECTORY* (GH
 ;;; #186), so this process needs one before it opens anything.  Its OWN,

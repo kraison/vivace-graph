@@ -1394,7 +1394,12 @@ Accumulates the ids it durably holds/removed for the pull ack; a :barrier op
 reports + resets that accumulator, a :shutdown op ends the thread."
   (let ((*graph* graph)
         (mailbox (peer-writer-mailbox graph))
-        (created '())     ; state-create node-ids -> manifest additions this pull
+        ;; state-create node-ids -> manifest additions this pull.  An id table,
+        ;; not a PUSHNEW list: it keeps the ack bounded and duplicate-free
+        ;; across resumes (unacked creates re-ship after a dropped connection,
+        ;; and the accumulator survives it), and a list scan per op made a
+        ;; first sync O(ops^2) (GH #260).
+        (created (make-id-table))
         (purged '()))     ; purge node-ids -> manifest removals this pull
     (loop
       (let ((op (receive-message mailbox :timeout 1)))
@@ -1409,7 +1414,7 @@ reports + resets that accumulator, a :shutdown op ends the thread."
              (apply-peer-create-writes graph (peer-op-tx-id op) (peer-op-writes op)
                                        (peer-op-origin op))
              (dolist (w (peer-op-writes op))
-               (pushnew (id (node w)) created :test #'equalp)))
+               (setf (gethash (id (node w)) created) t)))
             (:authored
              ;; An edit to a node the device already HOLDS: apply (op-id-deduped),
              ;; but membership is unchanged -- it does NOT join CREATED.
@@ -1418,7 +1423,7 @@ reports + resets that accumulator, a :shutdown op ends the thread."
              (apply-peer-purge graph (peer-op-ids op))
              (dolist (pid (peer-op-ids op))
                (push pid purged)
-               (setf created (remove pid created :test #'equalp))))
+               (remhash pid created)))
             (:barrier
              ;; Advance the pull-cursor to the hub's frontier T (carried in TX-ID),
              ;; so it moves even when no authored op touched a held node.  Kept
@@ -1430,10 +1435,14 @@ reports + resets that accumulator, a :shutdown op ends the thread."
                ;; The frontier T dominates every epoch applied this pull; keep the
                ;; live counter above it so local edits can see all pulled nodes.
                (peer-observe-epoch graph frontier))
+             ;; Hub folds the ack into a set (PEER-PULL-PHASE), so the
+             ;; materialized list's order is free.
              (send-message (peer-op-reply op)
-                           (list :created (copy-list created)
+                           (list :created (loop for id being the hash-keys
+                                                  of created collect id)
                                  :purged (copy-list purged)))
-             (setf created '() purged '()))
+             (clrhash created)
+             (setf purged '()))
             (:local-write
              ;; A user/app write funneled here (WP-8) so it runs on the SAME thread as
              ;; the replication apply -- never a second writer contending with this loop

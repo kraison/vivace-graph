@@ -45,9 +45,9 @@ HUB_CODE=$?
 kill "$HPID" 2>/dev/null
 
 echo "--- hub output ---"
-grep -E 'HUB|  ok|  FAIL' "$WORK/hub.out" 2>/dev/null || cat "$WORK/hub.out"
+grep -E 'SOURCE|HUB|  ok|  FAIL' "$WORK/hub.out" 2>/dev/null || cat "$WORK/hub.out"
 echo "--- device output ---"
-grep -E '  ok|  FAIL|DEVICE|ERROR' "$WORK/device.out" 2>/dev/null || cat "$WORK/device.out"
+grep -E 'SOURCE|  ok|  FAIL|DEVICE|ERROR' "$WORK/device.out" 2>/dev/null || cat "$WORK/device.out"
 
 if [ "$DEVICE_CODE" -eq 0 ] && [ "$HUB_CODE" -eq 0 ]; then
   echo "RESULT: PASS"

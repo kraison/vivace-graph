@@ -13,6 +13,18 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Fixed
 
+- **Peer pull manifest accumulation is O(ops), not O(ops²)** (#260).
+  The device writer loop accumulated the created-node manifest with a
+  `pushnew ... :test #'equalp` list — a linear scan of 16-byte id
+  arrays per state-create op, ~N²/2 compares on an N-node first sync.
+  It is now an id-keyed hash table, keeping the ack bounded and
+  duplicate-free across resumes (unacked creates are re-shipped after
+  a dropped connection and the accumulator survives it); the ack list
+  is materialized at the barrier, and its consumer folds it into a
+  set, so semantics are unchanged. The `peer-apply` bench now measures
+  the (now-cheap) accumulation it used to exclude (the #260 carve-out)
+  — suite generation bumps to 5.
+
 - **Watermark persistence no longer convoys commits** (#237). The #177
   monotonic fix made `persist-highest-transaction-id` re-read
   `transaction-id.dat` on every commit under one process-global lock;
