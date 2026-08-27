@@ -45,8 +45,13 @@ scale differ — that is a setup mistake, not a perf result.
 ```
 
 Copies the report to the blessed path above. It refuses a
-wrong-generation or non-`:normal` report. Blessing is deliberate: the
-new baseline file **must be committed via a reviewed diff**, never
+wrong-generation or non-`:normal` report. Before blessing, eyeball the
+candidate against historical norms (`results/` or the outgoing
+baseline): a run whose early cells are anomalously *fast* — an
+unusually idle host — makes a baseline every normal run fails against.
+The g4 re-bless caught exactly this and blessed run 2 of 3 instead.
+
+Blessing is deliberate: the new baseline file **must be committed via a reviewed diff**, never
 automatically — re-blessing after an intentional perf change is part of
 that change's review.
 
