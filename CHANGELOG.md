@@ -43,6 +43,22 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Added
 
+- **`graph-db/gui`: the cockpit frame frontend** (#270, epic #106).
+  The placeholder page is now the real single-page frame: a roster
+  pane (every known store with open/closed badge, recorded location,
+  per-graph Open/Close buttons, manual Refresh — no polling; engine
+  error text, including the dirty-store 409 report, surfaces verbatim
+  in a dismissible error strip) and a stats pane for the selected
+  graph (totals, per-type count table, views, indexes, human-readable
+  on-disk size, schema summary). Plain HTML/CSS/ES modules under
+  `gui/static/` — no build step, no framework, no external assets.
+  The explorer canvas and inspector regions are placeholders U3
+  (#271) fills. A new gui-test check pins each shipped asset's path
+  and content type. The manual's GUI section now describes the served
+  page and warns that a non-loopback `:bind` (e.g. a tailnet address)
+  exposes the unauthenticated API and management verbs to that
+  network; the `start-gui` docstring carries the same caveat.
+
 - **`graph-db/gui`: the web cockpit's backend** (#269, epic #106).
   A new optional subsystem serving a JSON management/exploration API
   and static frontend assets over ningle/clack: `start-gui`/`stop-gui`
