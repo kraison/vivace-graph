@@ -417,6 +417,296 @@ grow linearly in S.  Labels: v5scan-fF-sS with S = TOTAL open stores."
                                           :if-does-not-exist
                                           :ignore))))))))
 
+(defun %clock-commit-cell (label n)
+  "N one-vertex txns on a fresh graph; records LABEL with :us/commit.
+The graph picks up GRAPH-DB:*SYSTEM-CLOCK* via MAKE-GRAPH's default, so
+the caller's binding selects the clocked or local id path (GH #254).
+An untimed warm batch precedes the timed loop (the v5-scan warm-sweep
+idiom): the local-vs-clocked delta is the signal, so cold-start
+asymmetry must stay out of both cells."
+  (with-perf-graph (g)
+    (dotimes (i 50)
+      (with-transaction ()
+        (make-p-node :val -1 :label "w")))
+    (let ((start (get-internal-real-time)))
+      (dotimes (i n)
+        (with-transaction ()
+          (make-p-node :val i :label "k")))
+      (let ((elapsed (/ (- (get-internal-real-time) start)
+                        (float internal-time-units-per-second))))
+        (record label
+                :ops n :seconds (float-3 elapsed)
+                :ops/s (if (zerop elapsed) 0 (round (/ n elapsed)))
+                :us/commit (float-3 (/ (* elapsed 1e6) n)))))))
+
+(defun bench-system-clock ()
+  "System-clock overhead (GH #168, #254): per-commit id-allocation cost
+clocked vs local (fresh cells, same shape, for locality), the raw
+CLOCK-NEXT-EPOCH allocator alone and under 4-thread contention, and
+ATTACH-TO-SYSTEM-CLOCK on a store with a real watermark.  Every clock
+holds a directory flock for its lifetime, so each cell closes its clock
+in an unwind-protect -- a leaked fd would refuse later opens (GH #182)."
+  (let ((n (scale 2000)))
+    ;; Per-commit cost: local per-store counter vs image clock.
+    (let ((graph-db:*system-clock* nil))
+      (%clock-commit-cell "clock-commit-local" n))
+    (with-temp-directory (cdir)
+      (let ((clock (graph-db:open-system-clock (namestring cdir))))
+        (unwind-protect
+             (let ((graph-db:*system-clock* clock))
+               (%clock-commit-cell "clock-commit-clocked" n))
+          (graph-db:close-system-clock clock)))))
+  ;; The epoch allocator in isolation (lock + counter + amortized
+  ;; ceiling write every BLOCK-SIZE ids).
+  (let ((iters (scale 50000)))
+    (with-temp-directory (cdir)
+      (let ((clock (graph-db:open-system-clock (namestring cdir))))
+        (unwind-protect
+             (timed-ops ("clock-epoch-alloc" iters)
+               (dotimes (i iters)
+                 (graph-db:clock-next-epoch clock)))
+          (graph-db:close-system-clock clock)))))
+  ;; Attach cost against a store with committed history (the watermark
+  ;; read is the interesting part), on a reopened clock-less graph.
+  ;; Looped: one attach is sub-millisecond, and a 0.0 :seconds record
+  ;; would be un-comparable at the next re-bless (check-perf skips
+  ;; zero-valued baseline metrics).  Re-attach is permitted with no
+  ;; in-flight transactions and repeats the same watermark-load +
+  ;; journal-append work, so ops/s here IS per-attach cost.
+  (with-temp-directory (d)
+    (let ((graph-db:*system-clock* nil))
+      (let ((g (make-graph *perf-graph-name* (namestring d)
+                           :buffer-pool-size 4000)))
+        (let ((*graph* g))
+          (insert-p-nodes (scale 2000) :batch 1000))
+        (close-graph g :snapshot-p nil))
+      (with-temp-directory (cdir)
+        (let ((clock (graph-db:open-system-clock (namestring cdir)))
+              (attaches (scale 100)))
+          (unwind-protect
+               (let ((g (open-graph *perf-graph-name* (namestring d))))
+                 (unwind-protect
+                      (timed-ops ("clock-attach" attaches)
+                        (dotimes (i attaches)
+                          (graph-db:attach-to-system-clock g clock)))
+                   (close-graph g :snapshot-p nil)))
+            (graph-db:close-system-clock clock))))))
+  ;; Epoch allocation under contention: 4 threads on ONE clock, gated
+  ;; start (thread creation excluded), aggregate ops/s.
+  (let ((threads 4) (per (scale 5000)))
+    (with-temp-directory (cdir)
+      (let ((clock (graph-db:open-system-clock (namestring cdir))))
+        (unwind-protect
+             (let* ((gate (bordeaux-threads:make-semaphore))
+                    (ts (loop repeat threads
+                              collect (bordeaux-threads:make-thread
+                                       (lambda ()
+                                         (bordeaux-threads:wait-on-semaphore
+                                          gate)
+                                         (dotimes (i per)
+                                           (graph-db:clock-next-epoch clock)))
+                                       :name "perf-clock-alloc")))
+                    (start (get-internal-real-time)))
+               (bordeaux-threads:signal-semaphore gate :count threads)
+               (mapc #'bordeaux-threads:join-thread ts)
+               (record-throughput "clock-epoch-alloc-contended"
+                                  (* threads per)
+                                  (/ (- (get-internal-real-time) start)
+                                     (float
+                                      internal-time-units-per-second))))
+          (graph-db:close-system-clock clock)))))
+  (collect-garbage))
+
+(defun %mem-view-total (g)
+  "Sum of the p-mem-sum reduce view's per-key values in G."
+  (let ((sum 0))
+    (graph-db:map-reduced-view
+     (lambda (k id v) (declare (ignore k id)) (incf sum v))
+     'p-node 'p-mem-sum :graph g)
+    sum))
+
+(defun %assert-mem-graph (g n label)
+  "Post-open invariants for BENCH-MEMORY-OPEN: node/edge counts AND the
+reduce view's total match the built graph, so neither cell can time an
+empty restore (GH #254)."
+  (let ((*graph* g))
+    (let ((vc (count-vertices g))
+          (ec (count-edges g))
+          (vt (%mem-view-total g)))
+      (assert (= n vc) () "~A: expected ~D vertices, found ~D" label n vc)
+      (assert (= n ec) () "~A: expected ~D edges, found ~D" label n ec)
+      (assert (= n vt) () "~A: expected view total ~D, got ~D" label n vt))))
+
+(defun bench-memory-open ()
+  "Memory-graph open cost (the GH #50 premise, GH #254): image-restore
+open vs the journal-replay + view-rebuild fallback, plus the checkpoint
+itself, at (SCALE 5000) vertices + edges under an aggregate (reduce)
+view.  Correctness trap: after a CLEAN close the journal is cleared and
+graph.img is the ONLY durable record -- deleting the image would make
+the \"rebuild\" open restore an empty graph.  So the rebuild cell closes
+the builder with :SNAPSHOT-P NIL (no image ever written, journal
+retained) and the restore cell reopens after an explicit checkpoint;
+both cells assert the restored contents."
+  (let ((n (scale 5000)) (batch 1000))
+    (with-temp-directory (dir)
+      (let ((loc (namestring dir)))
+        ;; Isolate the view registry: earlier benches register specs
+        ;; under this graph name, and INSTALL-VIEWS at open would
+        ;; rebuild them all (cf. tests/memory-graph-tests.lisp).
+        (remhash *perf-graph-name* graph-db::*schema-view-metadata*)
+        (unwind-protect
+             (progn
+               ;; Build: nodes + edges + a maintained reduce view, then
+               ;; close WITHOUT checkpoint (journal retained, no image).
+               (let ((g (graph-db::make-memory-graph *perf-graph-name*
+                                                     loc)))
+                 (unwind-protect
+                      (let ((*graph* g))
+                        (def-view p-mem-sum :lessp
+                          (p-node :graph-db-perf-test)
+                          (:map (lambda (v)
+                                  (yield (floor (slot-value v 'val) 100)
+                                         1)))
+                          (:reduce (lambda (keys values)
+                                     (declare (ignore keys))
+                                     (reduce #'+ values))))
+                        (let ((ids (insert-p-nodes n :batch batch))
+                              (i 0))
+                          (loop while (< i n) do
+                            (with-transaction ()
+                              (dotimes (k (min batch (- n i)))
+                                (make-p-knows
+                                 :from (lookup-vertex
+                                        (aref ids (mod i n)))
+                                 :to (lookup-vertex
+                                      (aref ids (mod (1+ i) n))))
+                                (incf i))))))
+                   (close-graph g :snapshot-p nil)))
+               (collect-garbage)
+               ;; (a) rebuild-shaped open: full journal replay + view
+               ;; rebuild from nodes (the v1 fallback path).
+               (let (g2)
+                 (timed-seconds ("memory-open-rebuild")
+                   (setf g2 (graph-db::open-memory-graph
+                             *perf-graph-name* loc)))
+                 (unwind-protect
+                      (progn
+                        (%assert-mem-graph g2 n "memory-open-rebuild")
+                        ;; Checkpoint at scale (writes graph.img,
+                        ;; clears the journal).
+                        (timed-seconds ("memory-checkpoint")
+                          (graph-db::checkpoint-memory-graph g2)))
+                   (close-graph g2 :snapshot-p nil)))
+               (collect-garbage)
+               ;; (b) image-restore open (structural; no map/reduce).
+               (let (g3)
+                 (timed-seconds ("memory-open-image-restore")
+                   (setf g3 (graph-db::open-memory-graph
+                             *perf-graph-name* loc)))
+                 (unwind-protect
+                      (%assert-mem-graph g3 n "memory-open-image-restore")
+                   (close-graph g3 :snapshot-p nil))))
+          (remhash *perf-graph-name* graph-db::*schema-view-metadata*)
+          (collect-garbage))))))
+
+(defun %insert-compact-mix (e batch)
+  "Insert E p-knows edges bucketed by (MOD i 100): <30 a fresh dead v5
+:TO id, 30-39 healthy then soft-deleted below, 40-49 an unassigned-tag
+v8 id (:UNKNOWN -- kept by :CONSERVATIVE, collected by :TRUST-TAGS, so
+the two policy cells genuinely differ; the #243 tests' idiom), else
+healthy.  Returns the count of edges soft-deleted."
+  (let* ((v (min e 500))
+         (ids (insert-p-nodes v :batch batch))
+         (del '())
+         (i 0))
+    (loop while (< i e) do
+      (with-transaction ()
+        (dotimes (k (min batch (- e i)))
+          (let* ((bucket (mod i 100))
+                 (to (cond ((< bucket 30) (graph-db::gen-vertex-id))
+                           ((< bucket 50)
+                            (if (< bucket 40)
+                                (lookup-vertex (aref ids (mod (1+ i) v)))
+                                (graph-db::gen-v8-uuid 4000)))
+                           (t (lookup-vertex
+                               (aref ids (mod (1+ i) v))))))
+                 (edge (make-p-knows
+                        :from (lookup-vertex (aref ids (mod i v)))
+                        :to to)))
+            (when (and (>= bucket 30) (< bucket 40))
+              (push (id edge) del)))
+          (incf i))))
+    (let ((remaining del))
+      (loop while remaining do
+        (with-transaction ()
+          (dotimes (k (min batch (length remaining)))
+            (mark-deleted (lookup-edge (pop remaining)))))))
+    (length del)))
+
+(defun %count-live-p-knows (g)
+  "Count of non-soft-deleted p-knows edges.  :INCLUDE-DELETED-P bypasses
+the ACTIVE-EDGE-P emit filter, so dead-endpoint edges are counted too
+and the sweep pays no endpoint-status cost."
+  (let ((live 0))
+    (map-edges (lambda (e) (unless (deleted-p e) (incf live)))
+               g :edge-type 'p-knows :include-deleted-p t)
+    live))
+
+(defun %run-compact-cell (policy label)
+  "One COMPACT-EDGES cell (GH #208, #243, #254): fresh v5-mix fixture
+((SCALE 2000) edges: 30% dead-v5, 10% soft-deleted, 10% unknown-tag),
+one EXTRA open store so v5 misses take the all-open-stores scan, POLICY
+timed, :COMPACTED derived from live counts before/after and asserted
+against the bucket arithmetic."
+  (let* ((e (scale 2000)) (batch 500)
+         (dead (loop for i below e count (< (mod i 100) 30)))
+         (soft (loop for i below e count (<= 30 (mod i 100) 39)))
+         (unknown (loop for i below e count (<= 40 (mod i 100) 49)))
+         (expect (ecase policy
+                   (:conservative dead)
+                   (:trust-tags (+ dead unknown)))))
+    (with-perf-graph (g)
+      (let ((deleted (%insert-compact-mix e batch))
+            (extra-dir (make-temp-directory))
+            (extra nil))
+        (assert (= soft deleted))
+        (unwind-protect
+             (progn
+               (setf extra (make-graph :perf-compact-extra
+                                       (namestring extra-dir)))
+               (let ((before (%count-live-p-knows g))
+                     (elapsed nil))
+                 (assert (= (- e soft) before))
+                 (setf elapsed
+                       (timed-seconds (label)
+                         (graph-db::compact-edges g :policy policy)))
+                 (let* ((after (%count-live-p-knows g))
+                        (compacted (- before after)))
+                   (assert (= expect compacted) ()
+                           "~A: expected ~D edges compacted, got ~D"
+                           label expect compacted)
+                   ;; Re-record with the derived count alongside the
+                   ;; timing (last write wins for the label).
+                   (record label
+                           :seconds (float-3 elapsed)
+                           :compacted compacted))))
+          (when extra (ignore-errors (close-graph extra :snapshot-p nil)))
+          (uiop:delete-directory-tree extra-dir :validate t
+                                      :if-does-not-exist :ignore))))
+    (collect-garbage)))
+
+(defun bench-compact-edges ()
+  "COMPACT-EDGES wall time under both policies over a controlled
+dead-endpoint mix (GH #208, #243, #254).  :CONSERVATIVE DELETES the
+dead-v5 group and DE-INDEXES the already-soft-deleted group;
+:TRUST-TAGS additionally deletes the unknown-tag group.  :COMPACTED
+counts only NEWLY-deleted edges -- the de-index work on the
+soft-deleted group is in the timing but, by construction, invisible in
+the live-count delta.  Each policy gets a fresh fixture (compaction is
+destructive)."
+  (%run-compact-cell :conservative "compact-conservative")
+  (%run-compact-cell :trust-tags "compact-trust-tags"))
+
 ;;; ---------------------------------------------------------------------------
 ;;; Entry point
 ;;; ---------------------------------------------------------------------------
@@ -429,7 +719,10 @@ Measurement-only; always returns T."
   (let* ((*perf-scale* scale)
          (system-dir (make-temp-directory))
          (graph-db::*system-directory* (namestring system-dir))
-         (graph-db::*type-registry* nil))
+         (graph-db::*type-registry* nil)
+         ;; A user image's global clock must not silently attach every
+         ;; bench graph (GH #254); the clock cells bind their own.
+         (graph-db:*system-clock* nil))
     (reset-perf-report)
     (format t "~&=== graph-db perf (~A, scale ~A) ===~%" *lisp-impl* scale)
     (finish-output)
@@ -447,6 +740,10 @@ Measurement-only; always returns T."
            (bench-snapshot-restore-reopen)
            (bench-multigraph-commit)
            (bench-v5-cross-store-scan)
+           ;; coverage benches, batch A (GH #254)
+           (bench-system-clock)
+           (bench-memory-open)
+           (bench-compact-edges)
            (write-perf-report output :tag tag))
       ;; system-dir and all bench scratch live under the shared per-run
       ;; parent; drop it whole (GH #214).
