@@ -57,6 +57,27 @@ type -- pins the file layout index.html depends on (GH #270)."
       (asset "/js/stats.js" "application/javascript")
       (asset "/js/main.js" "application/javascript"))))
 
+(test static-explorer-assets-serve
+  "The explorer's assets serve 200 with the right content types, and
+the vendored cytoscape build is non-trivially large (GH #271)."
+  (with-gui-server ()
+    (flet ((asset (path ctype)
+             (multiple-value-bind (json status actual raw)
+                 (gui-request path)
+               (declare (ignore json))
+               (is (= 200 status) "~A did not serve 200" path)
+               (is (eql 0 (search ctype actual))
+                   "~A served content type ~A, wanted ~A"
+                   path actual ctype)
+               raw)))
+      (let ((cyto (asset "/vendor/cytoscape.min.js"
+                         "application/javascript")))
+        (is (> (length cyto) 100000)
+            "cytoscape.min.js is suspiciously small (~A bytes)"
+            (length cyto)))
+      (asset "/js/explorer.js" "application/javascript")
+      (asset "/js/inspector.js" "application/javascript"))))
+
 (test static-missing-file-404
   "A missing static path yields 404."
   (with-gui-server ()
@@ -405,6 +426,53 @@ JSON object with the slot values intact; in/out edge counts are right."
                    (make-string 32 :initial-element #\f)))
         (is (= 404 status))
         (is (string= "unknown-node" (jref json :error)))))))
+
+(test edge-inspection-after-neighborhood-fetch
+  "GET /node/:id for an EDGE id renders the edge card.  Exercised
+AFTER a neighborhood fetch: that warms the id-keyed node cache, which
+makes LOOKUP-VERTEX return the cached edge -- the path that used to
+500 (GH #271)."
+  (with-gui-fixture ()
+    (with-gui-server ()
+      (multiple-value-bind (nbhd status)
+          (gui-request (node-path (getf *fixture* :alice)
+                                  "neighborhood"))
+        (is (= 200 status))
+        (let ((edge-id (jref (first (jref nbhd :edges)) :id)))
+          (multiple-value-bind (json status)
+              (gui-request
+               (format nil "/api/graphs/gui-test-graph/node/~A"
+                       edge-id))
+            (is (= 200 status))
+            (is (string= "guiVisited" (jref json :type)))
+            (is (stringp (jref json :from)))
+            (is (stringp (jref json :to)))
+            (is (numberp (jref (jref json :slots) :year))))))
+      ;; The frontend discriminates vertex vs edge by the presence of
+      ;; FROM: a vertex body must not carry the key at all.
+      (multiple-value-bind (vjson vstatus)
+          (gui-request (node-path (getf *fixture* :alice)))
+        (is (= 200 vstatus))
+        (is (null (assoc :from vjson)))))))
+
+(test neighborhood-edge-center-404
+  "An edge id as neighborhood center answers a clean 404
+unknown-node, even with the edge sitting in the id-keyed node cache
+(GH #271): a neighborhood is defined on vertices only."
+  (with-gui-fixture ()
+    (with-gui-server ()
+      (multiple-value-bind (nbhd status)
+          (gui-request (node-path (getf *fixture* :alice)
+                                  "neighborhood"))
+        (is (= 200 status))
+        (let ((edge-id (jref (first (jref nbhd :edges)) :id)))
+          (multiple-value-bind (json status)
+              (gui-request
+               (format nil
+                       "/api/graphs/gui-test-graph/neighborhood/~A"
+                       edge-id))
+            (is (= 404 status))
+            (is (string= "unknown-node" (jref json :error)))))))))
 
 ;;; ---------------------------------------------------------------------
 ;;; Neighborhood

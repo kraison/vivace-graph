@@ -1864,8 +1864,27 @@ per-graph Open/Close buttons and a manual Refresh — engine errors,
 including the dirty-store 409 report, surface verbatim in a
 dismissible error strip — and a stats pane for the selected graph
 (totals, per-type counts, views, indexes, on-disk size, schema).
-Nothing polls; the panes re-render from each server response. The
-explorer canvas and node inspector arrive in U3 (GH #271).
+Nothing polls; the panes re-render from each server response.
+
+The main region (GH #271) is the read-only neighborhood explorer.
+Clicking a vertex-type row in the stats pane fetches that type's
+bounded node sample and shows a pick-list; picking a node seeds the
+canvas (a vendored cytoscape.js, see ~gui/static/vendor/VENDOR.md~).
+Double-clicking a node — or the inspector's Expand button — fetches
+its neighborhood and merges it *additively* into the canvas
+(Bloom-style: deduplicated by id, never a reset), settled by an
+incremental layout. Single-click opens the inspector dock: type, full
+id, slots, in/out edge counts for vertices; type, from/to and slots
+for edges. Right-click removes an element from the canvas only (a
+removed node takes its edges with it), and Clear empties it — both
+view-local; the explorer never mutates a graph. Node colors are
+derived deterministically from the type name, edges carry direction
+arrows and show their type on hover, and a status bar keeps a live
+node/edge count. When the server truncates a sample or neighborhood
+(default limits 50 and 100), the ~truncated~ flag surfaces as a
+notice naming the limit — the canvas never silently pretends to be
+complete. Switching or closing the selected graph clears canvas and
+inspector.
 
 Static assets under
 ~gui/static/~ are served at ~/~ (resolved via

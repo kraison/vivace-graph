@@ -44,6 +44,9 @@ function typeTable(vertexCounts, edgeCounts) {
       const tr = document.createElement("tr");
       tr.dataset.type = type;
       tr.dataset.kind = kind;
+      // Explorer entry ramp (GH #271): vertex rows are clickable
+      // seeds; edge rows stay inert (no edge sample endpoint).
+      if (kind === "vertex") tr.classList.add("type-row-seed");
       const name = el("td");
       name.appendChild(el("span", "kind-tag", kind === "vertex"
                           ? "V" : "E"));
@@ -93,7 +96,7 @@ function schemaItem(t) {
   return li;
 }
 
-export function createStatsPane({ bodyEl }) {
+export function createStatsPane({ bodyEl, onTypeSelect }) {
   // Monotonic token: a slow response for a graph the user has since
   // navigated away from must not overwrite the newer render.
   let requestToken = 0;
@@ -118,8 +121,17 @@ export function createStatsPane({ bodyEl }) {
     bodyEl.appendChild(totals);
 
     bodyEl.appendChild(heading("Counts by type"));
-    bodyEl.appendChild(typeTable(stats.vertexCountsByType,
-                                 stats.edgeCountsByType));
+    const table = typeTable(stats.vertexCountsByType,
+                            stats.edgeCountsByType);
+    // Delegated seam for the explorer (GH #271): the pane reports the
+    // clicked vertex type; it never touches the canvas itself.
+    if (onTypeSelect) {
+      table.addEventListener("click", (ev) => {
+        const row = ev.target.closest("tr.type-row-seed");
+        if (row) onTypeSelect(row.dataset.type);
+      });
+    }
+    bodyEl.appendChild(table);
 
     bodyEl.appendChild(heading("Views"));
     bodyEl.appendChild(listOf(stats.views, viewItem));

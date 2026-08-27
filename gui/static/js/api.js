@@ -44,4 +44,16 @@ export const api = {
   closeGraph: (name) =>
     request(graphPath(name, "close"), { method: "POST" }),
   stats: (name) => request(graphPath(name, "stats")),
+  // Explorer reads (GH #271).  Limits ride as query parameters; the
+  // server applies its own default when omitted.
+  nodes: (name, type, limit) =>
+    request(graphPath(name,
+                      `nodes?type=${encodeURIComponent(type)}` +
+                      (limit ? `&limit=${limit}` : ""))),
+  node: (name, id) =>
+    request(graphPath(name, `node/${encodeURIComponent(id)}`)),
+  neighborhood: (name, id, limit) =>
+    request(graphPath(name,
+                      `neighborhood/${encodeURIComponent(id)}` +
+                      (limit ? `?limit=${limit}` : ""))),
 };

@@ -455,21 +455,28 @@ the JSON-object rendering of it."
           (gui-error 400 "malformed-id"
                      (format nil "Malformed node id ~A"
                              (param params :id)))
+          ;; The per-graph node cache is keyed by id alone, so
+          ;; LOOKUP-VERTEX can return a cached EDGE for an edge id.
+          ;; Branch on the object's class, never on which lookup
+          ;; found it (GH #271).
           (let ((v (graph-db:lookup-vertex id :graph graph)))
             (cond
-              (v (%json-response
-                  (list (cons :id (graph-db:string-id v))
-                        (cons :type (%camel (class-name (class-of v))))
-                        (cons :slots (%obj (%node-slots-alist v)))
-                        (cons :in-edge-count
-                              (length (graph-db:incoming-edges
-                                       v :graph graph)))
-                        (cons :out-edge-count
-                              (length (graph-db:outgoing-edges
-                                       v :graph graph))))))
+              ((typep v 'graph-db::vertex)
+               (%json-response
+                (list (cons :id (graph-db:string-id v))
+                      (cons :type (%camel (class-name (class-of v))))
+                      (cons :slots (%obj (%node-slots-alist v)))
+                      (cons :in-edge-count
+                            (length (graph-db:incoming-edges
+                                     v :graph graph)))
+                      (cons :out-edge-count
+                            (length (graph-db:outgoing-edges
+                                     v :graph graph))))))
               (t
-               (let ((e (graph-db:lookup-edge id :graph graph)))
-                 (if e
+               (let ((e (if (typep v 'graph-db::edge)
+                            v
+                            (graph-db:lookup-edge id :graph graph))))
+                 (if (typep e 'graph-db::edge)
                      (%json-response
                       (list (cons :id (graph-db:string-id e))
                             (cons :type (%camel
@@ -496,7 +503,11 @@ the JSON-object rendering of it."
           ;; edges in both directions, and every neighbor endpoint.
           (graph-db:with-read-snapshot (graph)
             (let ((center (graph-db:lookup-vertex id :graph graph)))
-              (if (null center)
+              ;; Same id-keyed-cache gotcha as API-GRAPH-NODE: an edge
+              ;; id can come back from LOOKUP-VERTEX.  A neighborhood
+              ;; is defined on vertices only, so an edge center is a
+              ;; 404 by decision (GH #271).
+              (if (not (typep center 'graph-db::vertex))
                   (gui-error 404 "unknown-node"
                              (format nil "Unknown node ~A"
                                      (param params :id)))
