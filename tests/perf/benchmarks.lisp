@@ -297,12 +297,13 @@ landed, then records LABEL."
 (defun bench-multigraph-commit ()
   "Multi-graph commit contention (GH #237, #252): N graphs, one
 committing thread per graph.  An nN cell measures EVERYTHING the
-graphs share -- the global watermark lock, the process-global buffer
-pool, GC, one filesystem -- so the n8:n1 ratio alone does not
-implicate the lock.  The nN-rawwm control reruns the largest cell
-with PERSIST-HIGHEST-TRANSACTION-ID swapped for the raw writer
-(unconditional write, no global lock, no re-read): nN minus nN-rawwm
-is the watermark lock+read's share.  The watermark-* pair prices one
+graphs share -- the process-global buffer pool, GC, one filesystem.
+It originally measured the pre-#237 global watermark lock's convoy
+(~89% of n8 commit latency); that fix landed, and the cell stays as
+a regression sentinel for it.  The nN-rawwm control reruns the
+largest cell with PERSIST-HIGHEST-TRANSACTION-ID swapped for the raw
+writer: nN minus nN-rawwm now bounds any residual per-commit
+watermark cost (~nothing post-fix).  The watermark-* pair prices one
 call in isolation -- single-threaded, ascending ids, warm OS cache."
   (let* ((per-thread (scale 1000))
          (ns (if (eq *perf-scale* :small) '(1 4) '(1 2 4 8)))
