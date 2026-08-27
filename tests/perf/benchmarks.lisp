@@ -707,6 +707,250 @@ destructive)."
   (%run-compact-cell :conservative "compact-conservative")
   (%run-compact-cell :trust-tags "compact-trust-tags"))
 
+(defparameter *peer-bench-origin*
+  (make-array 16 :element-type '(unsigned-byte 8)
+                 :initial-contents '(9 9 9 9 0 0 0 0 0 0 0 0 0 0 0 2))
+  "Fixed device origin id (the tests/peer-replication schema idiom).")
+
+(defun %peer-disclosable-p (vertex graph scope)
+  "Perf export predicate: disclosable iff VAL >= 0 (the harness's
+flag-slot idiom, on p-node's existing VAL slot)."
+  (declare (ignore graph scope))
+  (not (minusp (slot-value vertex 'val))))
+
+(defun %peer-build-corpus (g n batch)
+  "Root p-node + N children, each edged root->child; every 10th child
+withheld (VAL -1).  Returns the root vertex."
+  (let ((*graph* g) root)
+    (with-transaction ()
+      (setf root (make-p-node :val 0 :label "root" :graph g)))
+    (let ((i 0))
+      (loop while (< i n) do
+        (with-transaction ()
+          (dotimes (k (min batch (- n i)))
+            (let ((c (make-p-node :val (if (zerop (mod i 10)) -1 i)
+                                  :label "c" :graph g)))
+              (make-p-knows :from root :to c :graph g))
+            (incf i)))))
+    root))
+
+(defun %peer-write-node-create (stream graph node)
+  "WRITE-NODE-AS-CREATE's exact three state-create packets (peer-meta,
+tx-header, tx-write -- peer-streaming.lisp) to a binary STREAM instead
+of a socket: the sockets-free export half."
+  ;; Keep in lockstep with WRITE-NODE-AS-CREATE (peer-streaming.lisp).
+  ;; No per-packet FORCE-OUTPUT here (WRITE-PACKET does one) -- another
+  ;; reason this is serialization cost, not wire throughput.
+  (graph-db::maybe-init-node-data node :graph graph)
+  (setf (graph-db::bytes node)
+        (graph-db::serialize (graph-db::data node)))
+  (let* ((origin (or (graph-db::origin-id graph)
+                     graph-db::+peer-null-origin+))
+         (epoch (or (graph-db::commit-epoch node) 0))
+         (write (make-instance 'graph-db::tx-create :node node))
+         (txh (make-instance 'graph-db::tx-header
+                             :transaction-id epoch
+                             :writes (list write) :graph graph)))
+    (write-sequence (graph-db::serialize-peer-meta
+                     origin (id node) epoch
+                     graph-db::+peer-op-state-create+)
+                    stream)
+    (write-sequence (graph-db::tx-header-vector txh epoch) stream)
+    (write-sequence (graph-db::tx-write-vector write) stream)))
+
+(defun %peer-apply-wire-file (dev path)
+  "Device-side decode + apply of the state-create packet file at PATH
+into DEV -- PEER-READ-AND-ENQUEUE's decode and the writer-loop's
+:state-create decode+apply work (mailbox hop and manifest accumulation
+excluded -- GH #260), single-threaded.  Returns the op count."
+  ;; Two deliberate exclusions vs the real writer loop: the mailbox
+  ;; hop (connection thread -> writer thread), and the created-manifest
+  ;; PUSHNEW accumulation -- O(ops^2) in production, filed as GH #260.
+  (let ((*graph* dev) (applied 0))
+    (with-open-file (in path :element-type '(unsigned-byte 8))
+      (loop
+        (let ((meta (graph-db::read-stream-packet in)))
+          (unless meta (return applied))
+          (multiple-value-bind (origin op-id lamport op-class)
+              (graph-db::deserialize-peer-meta meta)
+            (declare (ignore op-id lamport op-class))
+            (let* ((txh (graph-db::deserialize-tx-header-vector
+                         (graph-db::read-stream-packet in)))
+                   (writes
+                     (loop repeat (graph-db::write-count txh)
+                           collect (graph-db::deserialize-tx-write-vector
+                                    (graph-db::read-stream-packet in)))))
+              (graph-db::apply-peer-create-writes
+               dev (graph-db::transaction-id txh) writes origin)
+              (incf applied))))))))
+
+(defun bench-peer-replication ()
+  "Peer replication cost, sockets-free (GH #254).  Hub and device peers
+cannot share one image -- *GRAPHS*, the schema registry and *GRAPH* are
+process-global, which is why tests/peer-replication runs two OS
+processes -- so this benches the two halves of the wire separately:
+  peer-export-scope = SCOPE-NODE-SET closure + the exact state-create
+  packets a pull serves (WRITE-NODE-AS-CREATE's), written to a file;
+  peer-apply = the device-side packet decode + APPLY-PEER-CREATE-WRITES
+  of that file into a fresh :device peer graph (the writer-loop
+  :state-create path, single-threaded), cold device store included --
+  that IS a first sync.
+10% of children are withheld so DISCLOSABLE-P and the closed rule
+(edge kept iff both endpoints disclosable) do real work."
+  (let* ((n (scale 2000)) (batch 500)
+         (withheld (loop for i below n count (zerop (mod i 10))))
+         (disc (- n withheld))
+         (vexp (1+ disc))               ; root + disclosable children
+         (eexp disc)
+         (total (+ vexp eexp)))
+    (with-temp-directory (hub-dir)
+      (with-temp-directory (dev-dir)
+        (let ((wire (merge-pathnames "peer-wire.dat" hub-dir)))
+          ;; Export half: hub-role peer graph.  Port 0 = ephemeral; the
+          ;; accept loop is idle and joined by CLOSE-GRAPH.
+          (let ((hub (make-graph *perf-graph-name* (namestring hub-dir)
+                                 :peer-role :hub
+                                 :replication-port 0
+                                 :export-predicate #'%peer-disclosable-p
+                                 :buffer-pool-size 4000)))
+            (unwind-protect
+                 (let ((*graph* hub)
+                       (root (%peer-build-corpus hub n batch))
+                       (vcount 0) (ecount 0) (exported 0))
+                   (timed-ops ("peer-export-scope" total)
+                     (graph-db::with-read-snapshot (hub)
+                       (multiple-value-bind (vset eset)
+                           (graph-db::scope-node-set hub (list root)
+                                                     :main)
+                         (setf vcount (hash-table-count vset)
+                               ecount (hash-table-count eset))
+                         (with-open-file
+                             (out wire :direction :output
+                                       :element-type '(unsigned-byte 8)
+                                       :if-exists :supersede)
+                           (flet ((ship (id node)
+                                    (declare (ignore id))
+                                    (%peer-write-node-create out hub
+                                                             node)
+                                    (incf exported)))
+                             ;; vertices before edges (the closed rule)
+                             (maphash #'ship vset)
+                             (maphash #'ship eset))))))
+                   (assert (= vexp vcount) ()
+                           "peer-export-scope: expected ~D vertices in ~
+                            scope, got ~D" vexp vcount)
+                   (assert (= eexp ecount) ()
+                           "peer-export-scope: expected ~D edges in ~
+                            scope, got ~D" eexp ecount)
+                   (assert (= total exported) ()
+                           "peer-export-scope: expected ~D nodes ~
+                            shipped, wrote ~D" total exported))
+              (ignore-errors (close-graph hub :snapshot-p nil))))
+          (collect-garbage)
+          ;; Apply half: fresh device-role peer graph.
+          (let ((dev (make-graph :perf-peer-device (namestring dev-dir)
+                                 :peer-role :device
+                                 :origin-id *peer-bench-origin*
+                                 :buffer-pool-size 4000)))
+            (unwind-protect
+                 (let ((*graph* dev) (applied 0))
+                   ;; Warm-up commit adopts p-node/p-knows into this
+                   ;; store (the %RUN-MULTIGRAPH-CELL idiom), out of the
+                   ;; timing.
+                   (with-transaction ()
+                     (let ((a (make-p-node :val -1 :label "w"
+                                           :graph dev))
+                           (b (make-p-node :val -2 :label "w"
+                                           :graph dev)))
+                       (make-p-knows :from a :to b :graph dev)))
+                   (timed-ops ("peer-apply" total)
+                     (setf applied (%peer-apply-wire-file dev wire)))
+                   (assert (= total applied) ()
+                           "peer-apply: expected ~D ops, applied ~D"
+                           total applied)
+                   (let ((vc (count-vertices dev)) (ec (count-edges dev)))
+                     (assert (= (+ vexp 2) vc) ()
+                             "peer-apply: expected ~D vertices, got ~D"
+                             (+ vexp 2) vc)
+                     (assert (= (1+ eexp) ec) ()
+                             "peer-apply: expected ~D edges, got ~D"
+                             (1+ eexp) ec)))
+              (ignore-errors (close-graph dev :snapshot-p nil))))))))
+  (collect-garbage))
+
+(defun %pv-vector (seed dim)
+  "Deterministic pseudo-random single-float vector in [-1,1): an inline
+LCG from SEED -- a fixed integer sequence, no RANDOM state (GH #254)."
+  (let ((v (make-array dim :element-type 'single-float))
+        (s (logand (+ (* 2654435761 (1+ seed)) 104729) #xFFFFFFFF)))
+    (dotimes (i dim v)
+      (setf s (logand (+ (* 1103515245 s) 12345) #xFFFFFFFF))
+      (setf (aref v i)
+            (- (/ (float (ash s -8) 1.0f0) 8388608.0f0) 1.0f0)))))
+
+(defun %pv-insert (n dim batch &key (seed-base 0))
+  "Insert N pv-nodes with dim-DIM embeddings; return their id vector."
+  (let ((ids (make-array n)) (i 0))
+    (loop while (< i n) do
+      (with-transaction ()
+        (dotimes (k (min batch (- n i)))
+          (setf (aref ids i)
+                (id (make-pv-node :label "v"
+                                  :embedding (%pv-vector (+ seed-base i)
+                                                         dim))))
+          (incf i))))
+    ids))
+
+(defun %pv-knn-cell (g label queries ids n dim k seed-base)
+  "Time QUERIES vector-search calls (k=K) over the N-vector segment,
+querying with STORED vectors; then pin exact-match recall: a stored
+vector's own query must return its node first at cosine ~1."
+  (timed-ops (label queries)
+    (dotimes (q queries)
+      (vector-search g 'pv-node 'embedding
+                     (%pv-vector (+ seed-base (mod (* q 7) n)) dim)
+                     k)))
+  (dotimes (probe 20)
+    (let* ((i (mod (* probe (floor n 20)) n))
+           (got (vector-search g 'pv-node 'embedding
+                               (%pv-vector (+ seed-base i) dim) k)))
+      (assert (= (min k n) (length got)) ()
+              "~A: expected ~D results, got ~D" label (min k n)
+              (length got))
+      (assert (equalp (aref ids i) (cdr (first got))) ()
+              "~A: exact-match query for node ~D did not return it first"
+              label i)
+      (assert (> (car (first got)) 0.9999) ()
+              "~A: self-cosine ~F < 1" label (car (first got))))))
+
+(defun bench-vector-search ()
+  "Vector-segment throughput (GH #254): VECTOR-INSERT = transactional
+inserts through the :VECTOR-INDEX apply path (encode + SEGMENT-PUT,
+vectors/s); VECTOR-KNN-K10 = VECTOR-SEARCH cosine top-10 scans
+(queries/s) -- the post-decode-tax fixed path scores straight off the
+mmap.  Exact-match recall is asserted (a stored vector must return its
+own node first), so neither cell can time an empty or wrong segment.
+At :normal a 4x-larger segment repeats the kNN cell (scan cost is
+O(n*dim))."
+  (let ((n (scale 5000)) (dim 128) (batch 500) (q (scale 200)) (k 10))
+    (with-perf-graph (g)
+      (let (ids)
+        (timed-ops ("vector-insert" n)
+          (setf ids (%pv-insert n dim batch)))
+        (let ((seg (gethash (cons 'pv-node 'embedding)
+                            (graph-db::vector-segments g))))
+          (assert (and seg (= n (graph-db::segment-live-count seg))) ()
+                  "vector-insert: segment live-count /= ~D" n))
+        (%pv-knn-cell g "vector-knn-k10" q ids n dim k 0)
+        ;; Larger segment, :normal only: 5000 -> 20000 vectors.
+        (when (eq *perf-scale* :normal)
+          (let* ((extra (* 3 n)) (big (+ n extra))
+                 (more (%pv-insert extra dim batch :seed-base n))
+                 (all (make-array big)))
+            (replace all ids) (replace all more :start1 n)
+            (%pv-knn-cell g "vector-knn-k10-20k" 100 all big dim k
+                          0)))))))
+
 ;;; ---------------------------------------------------------------------------
 ;;; Entry point
 ;;; ---------------------------------------------------------------------------
@@ -744,6 +988,9 @@ Measurement-only; always returns T."
            (bench-system-clock)
            (bench-memory-open)
            (bench-compact-edges)
+           ;; coverage benches, batch B (GH #254)
+           (bench-peer-replication)
+           (bench-vector-search)
            (write-perf-report output :tag tag))
       ;; system-dir and all bench scratch live under the shared per-run
       ;; parent; drop it whole (GH #214).

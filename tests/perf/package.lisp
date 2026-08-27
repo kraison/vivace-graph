@@ -36,6 +36,8 @@
                 #:index-range
                 #:map-index
                 #:yield
+                ;; vector segments
+                #:vector-search
                 ;; prolog
                 #:select-flat
                 #:is-a/2

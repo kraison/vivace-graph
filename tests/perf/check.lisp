@@ -22,7 +22,14 @@ purpose; tighten per-label as variance.py data accumulates.")
     ("v5scan-f10-s1" . 0.30)
     ("v5scan-f10-s2" . 0.30)
     ("v5scan-f10-s4" . 0.30)
-    ("v5scan-f10-s8" . 0.30))
+    ("v5scan-f10-s8" . 0.30)
+    ;; The aggregate multigraph-commit contention cells are scheduler-
+    ;; placement-sensitive: two independent >=17% excursions across the
+    ;; #252/#254 runs on otherwise-idle passes.  n1 (no contention) and
+    ;; n8-rawwm (the control) stay at the default band; tighten as
+    ;; variance.py data accumulates.
+    ("commit-multigraph-n2" . 0.30)
+    ("commit-multigraph-n4" . 0.30))
   "Alist of (label . tolerance) for known-noisy benches.  An entry here
 takes precedence over CHECK-PERF's :TOLERANCE argument for its label.")
 
