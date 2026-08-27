@@ -75,6 +75,10 @@ export function createRosterPane({ listEl, refreshBtn, errorStrip,
   }
 
   async function refresh() {
+    // Visible feedback: an unchanged roster re-renders identically,
+    // so without this the button appears to do nothing.
+    refreshBtn.disabled = true;
+    refreshBtn.textContent = "Refreshing\u2026";
     try {
       const body = await api.graphs();
       graphs = body.graphs || [];
@@ -82,6 +86,7 @@ export function createRosterPane({ listEl, refreshBtn, errorStrip,
       graphs = [];
       showError(err.message);
     }
+    refreshBtn.textContent = "Refresh";
     render();
     onRosterChange(graphs);
   }

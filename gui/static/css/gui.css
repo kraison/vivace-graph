@@ -20,6 +20,10 @@
 
 * { box-sizing: border-box; }
 
+/* An author display rule beats the UA's [hidden] { display: none },
+   so hidden elements (error strip, inspector dock) need this. */
+[hidden] { display: none !important; }
+
 html, body {
   height: 100%;
   margin: 0;
