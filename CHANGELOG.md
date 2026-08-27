@@ -11,6 +11,24 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Watermark persistence no longer convoys commits** (#237). The #177
+  monotonic fix made `persist-highest-transaction-id` re-read
+  `transaction-id.dat` on every commit under one process-global lock;
+  the #252 microbenchmarks measured that at ~89% of 8-graph commit
+  latency (aggregate throughput *inverting* past 4 committers), and
+  the #263 release comparison showed the same fingerprint in the wild:
+  commit-per-op −34%, concurrent-rw −34%, restore-replay −21% since
+  3.0.0. The durable watermark is now cached on the graph object (an
+  already-covered id returns lock-free with no I/O; steady state is
+  one compare + one write, the disk read happens once per graph
+  object) and the lock is per-graph — each graph has its own watermark
+  file, so the global lock protected nothing cross-graph and is
+  removed. The raw test writer `%write-highest-transaction-id` keeps
+  the cache mirroring disk, so fabricated rewinds stay honest.
+  Monotonic semantics are unchanged.
+
 ### Added
 
 - **Release-baseline measurement record** (#263). Three-tree perf

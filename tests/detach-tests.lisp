@@ -1629,11 +1629,110 @@ crash states (see CRASH-RECOVERY-RESEEDS-THE-TX-ID-WATERMARK)."
                  (is (= 150 (graph-db::persist-highest-transaction-id
                              150 g)))
                  (is (= 150 (load-highest-transaction-id g)))
-                 ;; The raw writer is the deliberate escape hatch.
+                 ;; The raw writer is the deliberate escape hatch --
+                 ;; and it must rewind the cache along with the file,
+                 ;; or the next persist would answer from a watermark
+                 ;; the rewind erased (GH #237).
                  (graph-db::%write-highest-transaction-id 10 g)
-                 (is (= 10 (load-highest-transaction-id g))))
+                 (is (= 10 (load-highest-transaction-id g)))
+                 (is (= 20 (graph-db::persist-highest-transaction-id
+                            20 g))
+                     "persist after a raw rewind must see the rewound ~
+watermark, not a stale cached 150")
+                 (is (= 20 (load-highest-transaction-id g))))
             (let ((graph-db:*graph* g))
               (ignore-errors (close-graph g :snapshot-p nil)))))))))
+
+(test watermark-fast-path-touches-no-file
+  "GH #237: once the cache holds a watermark >= the id, PERSIST-HIGHEST-
+TRANSACTION-ID answers from the cache with no lock and no I/O.  Proof:
+delete transaction-id.dat after seeding -- a lower-id persist must
+still answer correctly WITHOUT recreating the file."
+  (with-temp-directory (sys)
+    (with-temp-directory (dir)
+      (let ((graph-db::*system-directory* (namestring sys))
+            (graph-db::*store-registry* nil))
+        (let ((g (make-graph :gh-237-fastpath (namestring dir)
+                             :buffer-pool-size 1000)))
+          (unwind-protect
+               (let ((file (graph-db::highest-transaction-id-file g)))
+                 (is (= 100 (graph-db::persist-highest-transaction-id
+                             100 g)))
+                 (delete-file file)
+                 (is (= 100 (graph-db::persist-highest-transaction-id
+                             50 g))
+                     "fast path answers from the cache")
+                 (is (null (probe-file file))
+                     "and performed no file I/O at all")
+                 ;; A higher id takes the slow path and writes again.
+                 (is (= 150 (graph-db::persist-highest-transaction-id
+                             150 g)))
+                 (is (= 150 (load-highest-transaction-id g))))
+            (let ((graph-db:*graph* g))
+              (ignore-errors (close-graph g :snapshot-p nil)))))))))
+
+(test watermark-cache-seeds-from-disk-after-reopen
+  "GH #237: a fresh graph object has an unknown cache; the first
+persist seeds it from transaction-id.dat, so monotonicity holds
+across close/open exactly as it did against the bare file."
+  (with-temp-directory (sys)
+    (with-temp-directory (dir)
+      (let ((graph-db::*system-directory* (namestring sys))
+            (graph-db::*store-registry* nil)
+            (path (namestring dir)))
+        (let ((g (make-graph :gh-237-reseed path
+                             :buffer-pool-size 1000)))
+          (graph-db::persist-highest-transaction-id 100 g)
+          (let ((graph-db:*graph* g))
+            (close-graph g :snapshot-p nil)))
+        (let ((g2 (open-graph :gh-237-reseed path)))
+          (unwind-protect
+               (let ((base (load-highest-transaction-id g2)))
+                 (is (>= base 100)
+                     "the durable watermark survived the reopen")
+                 (is (= base (graph-db::persist-highest-transaction-id
+                              1 g2))
+                     "a low persist on the fresh object seeds from ~
+disk and refuses to rewind")
+                 (is (= base (load-highest-transaction-id g2)))
+                 (is (= (+ base 50)
+                        (graph-db::persist-highest-transaction-id
+                         (+ base 50) g2))))
+            (let ((graph-db:*graph* g2))
+              (ignore-errors (close-graph g2 :snapshot-p nil)))))))))
+
+(test watermarks-are-per-graph
+  "GH #237: each graph carries its own watermark lock and cache --
+interleaved persists on two graphs never observe each other."
+  (with-temp-directory (sys)
+    (with-temp-directory (dir-a)
+      (with-temp-directory (dir-b)
+        (let ((graph-db::*system-directory* (namestring sys))
+              (graph-db::*store-registry* nil))
+          (let ((ga (make-graph :gh-237-per-graph-a (namestring dir-a)
+                                :buffer-pool-size 1000))
+                (gb (make-graph :gh-237-per-graph-b (namestring dir-b)
+                                :buffer-pool-size 1000)))
+            (unwind-protect
+                 (progn
+                   (is (not (eq (graph-db::watermark-lock ga)
+                                (graph-db::watermark-lock gb)))
+                       "no shared lock between graphs")
+                   (is (= 100 (graph-db::persist-highest-transaction-id
+                               100 ga)))
+                   (is (= 5 (graph-db::persist-highest-transaction-id
+                             5 gb)))
+                   (is (= 100 (graph-db::persist-highest-transaction-id
+                               50 ga))
+                       "graph A's watermark unmoved by graph B's")
+                   (is (= 200 (graph-db::persist-highest-transaction-id
+                               200 gb)))
+                   (is (= 100 (load-highest-transaction-id ga)))
+                   (is (= 200 (load-highest-transaction-id gb))))
+              (let ((graph-db:*graph* gb))
+                (ignore-errors (close-graph gb :snapshot-p nil)))
+              (let ((graph-db:*graph* ga))
+                (ignore-errors (close-graph ga :snapshot-p nil))))))))))
 
 (defun %mock-clock-failing-ceiling (journal-file)
   "A real SYSTEM-CLOCK struct whose JOURNAL-APPEND works (the journal

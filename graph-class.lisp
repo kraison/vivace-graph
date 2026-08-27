@@ -238,6 +238,20 @@ received an UNRESOLVED-NODE marker instead (GH #169, D8)."
    ;; receives.
    (shadow-p :accessor graph-shadow-p :initform nil)
    (epoch-lease :accessor graph-epoch-lease :initform nil)
+   ;; Durable-watermark cache + per-graph lock for transaction-id.dat
+   ;; (GH #237).  CACHE: NIL = unknown; otherwise the value the locked
+   ;; writer (or the raw test writer) last put on disk.  Read lock-free
+   ;; on the commit fast path -- a stale-low read only forces the locked
+   ;; slow path, and nothing but the writers ever raises it, so the fast
+   ;; path can skip work but never skip a needed write.  LOCK: each
+   ;; graph has its own watermark file; the old process-global lock
+   ;; convoyed every committing graph in the image.  Load-bearing
+   ;; assumption: ONE live graph object per store directory (the
+   ;; .dirty sentinel enforces it) -- two objects on one file would
+   ;; have disjoint locks/caches and resurrect the #177 race.
+   (watermark-cache :accessor watermark-cache :initform nil)
+   (watermark-lock :accessor watermark-lock
+                   :initform (make-recursive-lock "watermark"))
    ;; WAL-suppressed fast path (GH #170 Task 4).  T only on a shadow opened
    ;; via OPEN-SHADOW-GRAPH :FAST-LOAD T against a :DERIVABLE-policy source;
    ;; PERSIST-TRANSACTION's callers skip the .txn file and replication log

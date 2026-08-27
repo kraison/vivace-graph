@@ -4145,10 +4145,16 @@ is one lower than before, closing a gap that was always wasted.
 
 The persisted watermark itself is now *monotonic* (GH #177):
 ~persist-highest-transaction-id~ takes its lock around the whole
-read-compare-write and writes only when the new id is *greater* than
-what ~transaction-id.dat~ already holds, returning whatever is on disk
-after the call — two racing committers can no longer let the lower id
-land last and silently rewind the file.
+compare-and-write and writes only when the new id is *greater* than
+the standing watermark, returning whatever stands after the call — two
+racing committers can no longer let the lower id land last and
+silently rewind the file. The standing watermark is *cached on the
+graph object* and the lock is *per graph* (GH #237): an id the cache
+already covers returns lock-free with no file I/O, the steady-state
+commit does one compare plus one write (the disk re-read happens once
+per graph object, to seed the cache), and committers on different
+graphs no longer serialize against each other — each graph has its own
+~transaction-id.dat~, so nothing cross-graph was ever protected.
 
 *** Cross-store snapshots pin every store they touch
 

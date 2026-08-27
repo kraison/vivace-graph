@@ -1002,8 +1002,10 @@ APPLY-TRANSACTION)."
 
 ;;; Applying the transaction
 
-(defvar *highest-transaction-id-lock*
-  (make-recursive-lock "transaction id file"))
+;; The former process-global *HIGHEST-TRANSACTION-ID-LOCK* is gone:
+;; each graph has its own transaction-id.dat, so the watermark now
+;; locks per graph -- (WATERMARK-LOCK graph) -- and nothing cross-graph
+;; was ever protected (GH #237).
 
 (defgeneric highest-transaction-id-file (graph)
   (:method (graph)
@@ -1014,7 +1016,10 @@ APPLY-TRANSACTION)."
 (defgeneric %write-highest-transaction-id (transaction-id graph)
   (:documentation "Unconditional raw overwrite of transaction-id.dat --
 no max, no lock.  For crash-fabricating tests; production writers go
-through PERSIST-HIGHEST-TRANSACTION-ID (GH #177).")
+through PERSIST-HIGHEST-TRANSACTION-ID (GH #177).  Sets GRAPH's
+watermark cache to the written value -- a deliberate rewind must not
+leave a stale higher cache behind (GH #237).  Not concurrency-safe;
+never call it on a graph with live committers.")
   (:method (transaction-id graph)
     (let ((persist-file (highest-transaction-id-file graph))
           (serialized (make-byte-vector 8)))
@@ -1025,26 +1030,41 @@ through PERSIST-HIGHEST-TRANSACTION-ID (GH #177).")
                               :if-does-not-exist :create
                               :if-exists :overwrite)
         (write-sequence serialized stream))
+      (setf (watermark-cache graph) transaction-id)
       transaction-id)))
 
 (defgeneric persist-highest-transaction-id (transaction-id graph)
   (:documentation "Persist TRANSACTION-ID as GRAPH's durable watermark
-unless a higher one is already on disk -- the file only ever moves
-forward.  Returns the id actually on disk after the call (GH #177).")
+unless a higher one is already recorded -- the file only ever moves
+forward.  Returns the watermark standing after the call (GH #177).
+Steady state is one lock-free cache compare, or compare + write under
+GRAPH's own lock; the disk re-read happens once per graph object, to
+seed the cache (GH #237).")
   (:method (transaction-id graph)
-    ;; Lock spans read-compare-write: two racing writers must not let
-    ;; the lower id land last (GH #177).
-    (with-recursive-lock-held (*highest-transaction-id-lock*)
-      (let ((current (load-highest-transaction-id graph)))
-        (if (> transaction-id current)
-            (%write-highest-transaction-id transaction-id graph)
-            current)))))
+    ;; Fast path, no lock, no I/O: the cache only ever holds a value a
+    ;; writer put on disk, so cache >= id proves the file already holds
+    ;; >= id and the pre-#237 code would have skipped the write too.
+    ;; The slot is NIL or an integer -- a plain CLOS slot read cannot
+    ;; tear -- and a stale-low read just falls into the locked path.
+    (let ((cached (watermark-cache graph)))
+      (if (and cached (<= transaction-id cached))
+          cached
+          ;; Lock spans compare-write: two racing writers must not let
+          ;; the lower id land last (GH #177).
+          (with-recursive-lock-held ((watermark-lock graph))
+            (let ((current (or (watermark-cache graph)
+                               (load-highest-transaction-id graph))))
+              (setf (watermark-cache graph)
+                    (if (> transaction-id current)
+                        (%write-highest-transaction-id transaction-id
+                                                       graph)
+                        current))))))))
 
 (defgeneric load-highest-transaction-id (graph)
   (:method (graph)
     (let ((persist-file (highest-transaction-id-file graph))
           (serialized (make-byte-vector 8)))
-      (with-recursive-lock-held (*highest-transaction-id-lock*)
+      (with-recursive-lock-held ((watermark-lock graph))
         (if (probe-file persist-file)
             (with-open-file (stream persist-file
                                     :direction :input
