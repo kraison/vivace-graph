@@ -29,7 +29,10 @@ purpose; tighten per-label as variance.py data accumulates.")
     ;; n8-rawwm (the control) stay at the default band; tighten as
     ;; variance.py data accumulates.
     ("commit-multigraph-n2" . 0.30)
-    ("commit-multigraph-n4" . 0.30))
+    ("commit-multigraph-n4" . 0.30)
+    ;; Same family: the 4-thread epoch-alloc cell swung 1.25M/1.82M/
+    ;; 1.54M ops/s across the g4 re-bless runs (+/-20%).
+    ("clock-epoch-alloc-contended" . 0.30))
   "Alist of (label . tolerance) for known-noisy benches.  An entry here
 takes precedence over CHECK-PERF's :TOLERANCE argument for its label.")
 
