@@ -2,19 +2,29 @@
 
 This directory contains the source code for the **Vivace-Graph Performance Profiling Tool**, a modular benchmarking and PDF reporting suite built using SBCL's `sb-sprof` and `sb-profile` tools alongside `cl-typesetting` and `cl-pdf`.
 
+This harness answers **"why is it slow?"** (where the time goes). The
+throughput suite in `tests/perf/` (`graph-db/perf-test`) answers the other
+question — **"did it get slower?"** — with report files, per-host baselines
+and `check-perf` gating. See:
+
+- Chapter 19 of [`docs/vivace-graph-v3-doc.org`](../docs/vivace-graph-v3-doc.org)
+  — the perf-vs-profiling split and how to run each.
+- [`docs/perf-baselines.md`](../docs/perf-baselines.md) — the baseline /
+  regression-gating ritual for the throughput suite.
+
 For the complete usage guide, API reference, and examples, see:
-- [`docs/profiler-guide.md`](file:///Users/kraison/work/vivace-graph-v3/docs/profiler-guide.md)
+- [`docs/profiler-guide.md`](../docs/profiler-guide.md)
 
 ---
 
 ## Directory Layout
 
-- [`package.lisp`](file:///Users/kraison/work/vivace-graph-v3/profiling/package.lisp): Package definition (`graph-db/profiler`) and exports.
-- [`registry.lisp`](file:///Users/kraison/work/vivace-graph-v3/profiling/registry.lisp): Subsystem function registry for function tracing.
-- [`sprof.lisp`](file:///Users/kraison/work/vivace-graph-v3/profiling/sprof.lisp): `sb-sprof` statistical sample profiling wrapper and parser.
-- [`profile.lisp`](file:///Users/kraison/work/vivace-graph-v3/profiling/profile.lisp): `sb-profile` deterministic tracing wrapper and parser.
-- [`harness.lisp`](file:///Users/kraison/work/vivace-graph-v3/profiling/harness.lisp): Core unified `profile-block` macro harness.
-- [`modules/`](file:///Users/kraison/work/vivace-graph-v3/profiling/modules/): Subsystem-specific profiler modules:
+- [`package.lisp`](./package.lisp): Package definition (`graph-db/profiler`) and exports.
+- [`registry.lisp`](./registry.lisp): Subsystem function registry for function tracing.
+- [`sprof.lisp`](./sprof.lisp): `sb-sprof` statistical sample profiling wrapper and parser.
+- [`profile.lisp`](./profile.lisp): `sb-profile` deterministic tracing wrapper and parser.
+- [`harness.lisp`](./harness.lisp): Core unified `profile-block` macro harness.
+- [`modules/`](./modules/): Subsystem-specific profiler modules:
   - `mmap.lisp` (SAP byte access & memory arena allocation)
   - `serialization.lisp` (Binary codecs & key encoders)
   - `index.lisp` (Skip-List & B+ Tree index backends)
@@ -24,7 +34,7 @@ For the complete usage guide, API reference, and examples, see:
   - `spatial.lisp` (Geohash cell math & GEOS CFFI operations)
   - `prolog.lisp` (Prolog engine, predicate compilation, & unification)
   - `suite.lisp` (Full suite runner `run-full-profiling-suite`)
-- [`reporting/`](file:///Users/kraison/work/vivace-graph-v3/profiling/reporting/):
+- [`reporting/`](./reporting/):
   - `pdf.lisp` (PDF generation & 2-pass vector graph rendering engine)
 
 ---

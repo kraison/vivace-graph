@@ -41,7 +41,10 @@ subdirectories, **3,359 checks** as of 2026-08-08. Run a suite through ASDF:
 with "Heap exhausted, game over" partway in — `make-graph`'s type index eagerly builds
 131,072 index-lists, and a suite creates many graphs in one image.
 
-Perf regression checking (per-host/per-generation baselines, `check-perf`) is
+Two perf measurement systems coexist — `tests/perf/` (throughput trends, "did it
+get slower?") vs `profiling/` ("why is it slow?" — sprof/sb-profile harness).
+The split and how to run each is Chapter 19 of `docs/vivace-graph-v3-doc.org`;
+regression checking (per-host/per-generation baselines, `check-perf`) is
 documented in `docs/perf-baselines.md`.
 
 Each `test-op` errors on failure, so they are safe to gate on. Run the main suite before

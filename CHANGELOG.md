@@ -43,6 +43,15 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Added
 
+- **The perf-vs-profiling split is documented** (#255). Chapter 19 of
+  the manual (`docs/vivace-graph-v3-doc.org`) now states which
+  measurement system answers which question — `tests/perf/`
+  (throughput trends, "did it get slower?", baselines + `check-perf`)
+  vs `profiling/` (where-time-goes, "why is it slow?",
+  sprof/sb-profile harness) — and how to run each. New
+  `tests/perf/README.md`; `profiling/README.md` and CLAUDE.md point at
+  the chapter and at `docs/perf-baselines.md`.
+
 - **Release-baseline measurement record** (#263). Three-tree perf
   measurement (v2.1.1 / v3.0.0 / experiment, each running its own
   suite; comparison over the byte-identical-verified intersection) on
