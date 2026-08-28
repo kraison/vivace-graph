@@ -1915,6 +1915,45 @@ backtrace; details go to the log4cl log. The two management verbs
 serialize through one lock. Tests: ~(asdf:test-system
 :graph-db/gui-test)~ drives the whole surface over real HTTP.
 
+**** Naming on the wire
+
+Two vocabularies share one JSON body, and the split is deliberate
+(GH #277). JSON *keys* are protocol — nobody types them — and stay
+camelCase, produced automatically by cl-json's keyword encoding:
+~vertexCount~, ~onDiskBytes~, ~inEdgeCount~. *Values that name schema
+entities* — vertex and edge types, slot names, view names and classes,
+index owners and slots — are domain identifiers a query author types,
+and ship exactly as the engine spells them: lowercase kebab,
+~gui-person~, ~gui-visited~, ~home-city~. The one place a *key*
+follows the value rule is the node inspector's ~slots~ object, whose
+keys are slot names.
+
+#+BEGIN_SRC js
+  // GET /api/graphs/demo/stats  (excerpt)
+  { "vertexCount": 4,
+    "vertexCountsByType": { "gui-city": 2, "gui-person": 2 },
+    "views": [ { "class": "gui-person", "name": "people-by-name" } ],
+    "onDiskBytes": 2260992,
+    "schema": { "vertexTypes": [ { "name": "gui-person",
+                                   "slots": ["name", "age",
+                                             "home-city"] } ] } }
+
+  // GET /api/graphs/demo/node/:id  (excerpt)
+  { "type": "gui-person",
+    "slots": { "name": "Alice", "home-city": "Paris" },
+    "inEdgeCount": 0, "outEdgeCount": 2 }
+#+END_SRC
+
+A type name the API emits is therefore accepted verbatim by ~?type=~:
+the round trip is exact for every type name the standard reader
+produces (~?type=~ upcases and interns, so case does not matter). A
+type deliberately defined with a pipe-quoted mixed-case symbol —
+~|weird Name|~ — is the one exception, and always was. It was worse
+before: names were camelized out and ~camel-case-to-lisp~-d back, a
+transform that loses consecutive capitals and digits (~HTTP-URL~,
+~FOO-BAR2~) for *ordinary* names. The rule is the GUI's alone;
+~rest.lisp~ keeps its own JSON conventions.
+
 ** Chapter 10: Replication and High Availability (~replication.lisp~)
 
 For production environments, relying on a single database instance creates a single point of failure. If the machine hosting the database goes down, your application becomes unavailable. To solve this, VivaceGraph provides a built-in *master-slave replication* system, implemented primarily in ~replication.lisp~ and ~transaction-streaming.lisp~.

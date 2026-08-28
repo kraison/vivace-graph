@@ -14,6 +14,8 @@ const NEIGHBORHOOD_LIMIT = 100; // truncation notices can name it
 
 // Deterministic type -> hue: djb2 over the type name, mod 360.
 // Stable across sessions by construction (no randomness, no state).
+// Hues moved once when type names went kebab on the wire (GH #277) --
+// the mapping is over whatever string the API sends, by design.
 export function typeHue(type) {
   let h = 5381;
   for (let i = 0; i < type.length; i += 1) {
