@@ -44,6 +44,15 @@ export const api = {
   closeGraph: (name) =>
     request(graphPath(name, "close"), { method: "POST" }),
   stats: (name) => request(graphPath(name, "stats")),
+  types: (name) => request(graphPath(name, "types")),
+  // Query workbench (GH #278): the structured DSL rides as a JSON
+  // document, so this is the one POST with a body.
+  query: (name, dsl) =>
+    request(graphPath(name, "query"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(dsl),
+    }),
   // Explorer reads (GH #271).  Limits ride as query parameters; the
   // server applies its own default when omitted.
   nodes: (name, type, limit) =>

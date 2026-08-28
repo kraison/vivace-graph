@@ -32,34 +32,6 @@
                           #+graph-db-ecl-sync-hash :synchronized
                           #+graph-db-ecl-sync-hash t))
 
-(defvar *query-default-limit* 1000
-  "Maximum solutions a DEF-QUERY returns unless it overrides :LIMIT.")
-(defvar *query-default-max-inferences* 1000000
-  "Inference budget for a DEF-QUERY unless it overrides :MAX-INFERENCES.")
-(defvar *query-default-timeout* 30
-  "Wall-clock seconds a DEF-QUERY may run unless it overrides :TIMEOUT.")
-
-(defvar *pattern-query-callback* nil
-  "Per-row callback for an EVAL'd ad-hoc pattern query (which has no lexical
-environment to capture one); RUN-PATTERN-QUERY binds it around the SELECT.")
-
-(define-condition query-param-error (error)
-  ((reason :initarg :reason :reader query-param-error-reason))
-  (:report (lambda (c s)
-             (format s "Query parameter error: ~A" (query-param-error-reason c)))))
-
-(defun %query-var-name (var)
-  "The bare name of a query variable: ?min-age -> \"MIN-AGE\"."
-  (string-left-trim "?" (symbol-name var)))
-
-(defun %query-var-key (var)
-  "The *QUERY-PARAMS* key for VAR: ?min-age -> :MIN-AGE."
-  (intern (%query-var-name var) :keyword))
-
-(defun %query-var-field (var)
-  "The JSON field name for VAR: ?min-age -> \"minAge\"."
-  (json:lisp-to-camel-case (%query-var-name var)))
-
 (defun coerce-query-param (raw type field)
   "Validate/convert request value RAW to TYPE (:string :integer :number :boolean
 :keyword), signaling QUERY-PARAM-ERROR on a missing or malformed value.  FIELD is
@@ -102,52 +74,12 @@ request alist REQ-PARAMS, coercing each value to its declared type."
                                         type (%query-var-field var)))))
           specs))
 
-(defun %query-value->json (v)
-  "Render a query result value as a JSON-encodable datum: a node becomes its id
-string, a non-keyword symbol its name; scalars pass through."
-  (cond ((node-p v) (string-id v))
-        ((keywordp v) v)
-        ((symbolp v) (symbol-name v))
-        (t v)))
-
-(defun query-row->alist (return-vars row)
-  "One result ROW (a list of values aligned with RETURN-VARS) as a JSON object
-alist keyed by the camelCase result-variable names."
-  (mapcar (lambda (var val) (cons (%query-var-field var) (%query-value->json val)))
-          return-vars row))
-
-(defun query-results->json (return-vars tuples)
-  "Encode TUPLES (one row per solution) as a JSON array of objects."
-  (json:encode-json-to-string
-   (mapcar (lambda (row) (query-row->alist return-vars row)) tuples)))
-
 (defun query-format (params)
   "The requested response format: :NDJSON when the \"format\" parameter is
 \"ndjson\" (newline-delimited JSON, one object per line), else :JSON (an array)."
   (if (string-equal "ndjson" (or (get-param params "format") ""))
       :ndjson
       :json))
-
-(defun emit-query-results (return-vars format run)
-  "Render a query's results.  RUN is a function of one argument -- a per-row
-callback -- that runs the query, invoking the callback for each result row as it
-is produced (via SELECT :callback, so no intermediate result list is built).
-With FORMAT :JSON returns a JSON array; with :NDJSON streams each row as its own
-JSON line and sets the application/x-ndjson content type."
-  (ecase format
-    (:json
-     (let ((rows '()))
-       (funcall run (lambda (row) (push row rows)))
-       (query-results->json return-vars (nreverse rows))))
-    (:ndjson
-     (setf (lack.response:response-headers ningle:*response*)
-           (list* :content-type "application/x-ndjson"
-                  (lack.response:response-headers ningle:*response*)))
-     (with-output-to-string (out)
-       (funcall run
-                (lambda (row)
-                  (json:encode-json (query-row->alist return-vars row) out)
-                  (terpri out)))))))
 
 (defun register-query (name fn)
   "Register query handler FN under NAME (both its symbol name and camelCase)."
@@ -449,63 +381,6 @@ the declared parameters."
               (cons :error
                     (format nil "Unknown query '~A'" name)))))))))
 
-;;; ---------------------------------------------------------------------------
-;;; Constrained JSON pattern queries (#44, tier 2).
-;;;
-;;; A client may POST an ad-hoc, read-only query as a JSON object compiled to a
-;;; bounded SELECT -- no server-authored template, no client Lisp.  The shape:
-;;;
-;;;   {"match":  [ {"vertex":"?p","type":"gPerson"},
-;;;                {"edge":"gKnows","from":"?p","to":"?f"} ],
-;;;    "where":  [ {"slot":"?f","name":"name","bind":"?fname"},
-;;;                {"slot":"?p","name":"name","value":"Alice"},
-;;;                {"compare":"<","args":["?age",30]} ],
-;;;    "select": ["?fname"],
-;;;    "limit":  50, "skip": 0}
-;;;
-;;; Each goal is built from a fixed set of safe pattern kinds (no arbitrary
-;;; predicate naming).  Type/edge names are resolved against the live schema (an
-;;; unknown one is a 400), which also yields the schema package the query is
-;;; compiled in.  The query runs read-only (:effects nil), under one MVCC
-;;; snapshot, capped by the *QUERY-DEFAULT-* bounds; a breach is a 400.
-;;; ---------------------------------------------------------------------------
-
-(defun %dsl-var-or-literal (v)
-  "Map a decoded JSON value to a Prolog term: a \"?x\" string becomes a query
-variable symbol (variables are matched by name, so the package is irrelevant);
-any other value is a literal (string/number/boolean) used as-is."
-  (if (and (stringp v) (plusp (length v)) (char= (char v 0) #\?))
-      (intern (string-upcase v) :graph-db)
-      v))
-
-(defun %dsl-keyword (name)
-  "A client field name (camelCase string) as a lisp keyword: \"minAge\" -> :MIN-AGE."
-  (intern (string-upcase (json:camel-case-to-lisp name)) :keyword))
-
-(defun %dsl-resolve-type (name parent graph)
-  "Resolve a vertex/edge type NAME to its canonical class symbol via GRAPH's
-schema (PARENT is :vertex or :edge).  Returns (values symbol schema-package).
-Signals QUERY-PARAM-ERROR for an unknown type."
-  (unless (stringp name)
-    (error 'query-param-error :reason (format nil "~(~A~) type must be a string" parent)))
-  (let ((meta (handler-case
-                  (lookup-node-type-by-name (%dsl-keyword name) parent
-                                            :graph graph)
-                (ambiguous-node-type-name (c)
-                  (error 'query-param-error
-                         :reason (format nil "ambiguous ~(~A~) type '~A': ~
-one of ~{~A~^, ~}"
-                                         parent name
-                                         (mapcar
-                                          #'%qualified-type-name-string
-                                          (ambiguous-type-candidates
-                                           c))))))))
-    (unless meta
-      (error 'query-param-error
-             :reason (format nil "unknown ~(~A~) type '~A'" parent name)))
-    (values (node-type-name meta)
-            (or (find-package (node-type-package meta)) (find-package :graph-db)))))
-
 (defun %rest-resolve-post-type (type-name parent)
   "TYPE-NAME (a client camelCase string) resolved to a node-type of PARENT
 in *GRAPH*.  (values META ERROR-STRING), exactly one non-NIL: the POST
@@ -525,103 +400,12 @@ handlers turn ERROR-STRING into their :error JSON (GH #190)."
                       (mapcar #'%qualified-type-name-string
                               (ambiguous-type-candidates c)))))))
 
-(defparameter *dsl-compare-ops*
-  '(("<" . <) (">" . >) ("<=" . <=) (">=" . >=) ("=" . =) ("==" . ==) ("/=" . /=))
-  "Comparison operators a pattern query may use, mapped to their Prolog functors.")
-
-(defun %compile-match-pattern (pat graph)
-  "Compile one MATCH pattern object (an alist) to a goal; second value is the
-schema package (or NIL)."
-  (cond
-    ((assoc :vertex pat)
-     (multiple-value-bind (sym pkg)
-         (%dsl-resolve-type (cdr (assoc :type pat)) :vertex graph)
-       (values (list 'is-a (%dsl-var-or-literal (cdr (assoc :vertex pat))) sym) pkg)))
-    ((assoc :edge pat)
-     (multiple-value-bind (sym pkg)
-         (%dsl-resolve-type (cdr (assoc :edge pat)) :edge graph)
-       (values (list sym
-                     (%dsl-var-or-literal (cdr (assoc :from pat)))
-                     (%dsl-var-or-literal (cdr (assoc :to pat))))
-               pkg)))
-    (t (error 'query-param-error
-              :reason (format nil "unrecognized match pattern ~S" pat)))))
-
-(defun %compile-where-constraint (con)
-  "Compile one WHERE constraint object (an alist) to a goal."
-  (cond
-    ((assoc :slot con)
-     (let ((var (%dsl-var-or-literal (cdr (assoc :slot con))))
-           (name (cdr (assoc :name con)))
-           (bind (assoc :bind con))
-           (value (assoc :value con)))
-       (unless (stringp name)
-         (error 'query-param-error :reason "slot constraint needs a string \"name\""))
-       (cond (bind  (list 'node-slot-value var (%dsl-keyword name)
-                          (%dsl-var-or-literal (cdr bind))))
-             (value (list 'node-slot-value var (%dsl-keyword name) (cdr value)))
-             (t (error 'query-param-error
-                       :reason "slot constraint needs \"bind\" or \"value\"")))))
-    ((assoc :compare con)
-     (let ((op (cdr (assoc (cdr (assoc :compare con)) *dsl-compare-ops* :test #'equal)))
-           (args (cdr (assoc :args con))))
-       (unless op
-         (error 'query-param-error
-                :reason (format nil "unsupported comparison '~A'" (cdr (assoc :compare con)))))
-       (unless (and (listp args) (= 2 (length args)))
-         (error 'query-param-error :reason "compare needs exactly two \"args\""))
-       (cons op (mapcar #'%dsl-var-or-literal args))))
-    (t (error 'query-param-error
-              :reason (format nil "unrecognized where constraint ~S" con)))))
-
-(defun compile-pattern-query (dsl graph)
-  "Compile a decoded JSON pattern query DSL (an alist) for GRAPH.  Returns
-(values select-vars goals limit skip schema-package).  Signals
-QUERY-PARAM-ERROR on malformed input."
-  (let ((pkg nil) (goals nil))
-    (dolist (pat (cdr (assoc :match dsl)))
-      (multiple-value-bind (goal p) (%compile-match-pattern pat graph)
-        (when (and p (null pkg)) (setf pkg p))
-        (push goal goals)))
-    (dolist (con (cdr (assoc :where dsl)))
-      (push (%compile-where-constraint con) goals))
-    (let ((select (cdr (assoc :select dsl))))
-      (unless (and (listp select) select)
-        (error 'query-param-error
-               :reason "query must specify a non-empty \"select\" list"))
-      (values (mapcar #'%dsl-var-or-literal select)
-              (nreverse goals)
-              (cdr (assoc :limit dsl))
-              (cdr (assoc :skip dsl))
-              (or pkg (find-package :graph-db))))))
-
-(defun run-pattern-query (dsl graph)
-  "Compile and run a decoded JSON pattern query DSL against GRAPH, returning the
-result string.  Read-only, snapshot-isolated, and bounded; the client :limit is
-capped at *QUERY-DEFAULT-LIMIT*.  A \"format\":\"ndjson\" field streams the rows
-as newline-delimited JSON instead of an array."
-  (multiple-value-bind (vars goals limit skip pkg) (compile-pattern-query dsl graph)
-    (let* ((*graph* graph)   ; the eval'd SELECT / node-slot-value goals key off *GRAPH*
-           (*package* pkg)
-           (cap (if (and (integerp limit) (plusp limit))
-                    (min limit *query-default-limit*)
-                    *query-default-limit*))
-           (format (if (string-equal "ndjson"
-                                      (princ-to-string (or (cdr (assoc :format dsl)) "")))
-                       :ndjson :json)))
-      (emit-query-results
-       vars format
-       (lambda (cb)
-         ;; the select form is EVAL'd (null lexenv), so pass the callback through
-         ;; a special the form references rather than a lexical.
-         (let ((*pattern-query-callback* cb))
-           (eval `(select (:effects nil :snapshot t
-                           :limit ,cap
-                           :skip ,(when (integerp skip) skip)
-                           :max-inferences ,*query-default-max-inferences*
-                           :timeout ,*query-default-timeout*
-                           :callback *pattern-query-callback*)
-                          ,vars ,@goals))))))))
+;;; ---------------------------------------------------------------------------
+;;; Ad-hoc JSON pattern queries (#44, tier 2): the HTTP wrappers only.  The DSL
+;;; itself -- COMPILE-PATTERN-QUERY / RUN-PATTERN-QUERY / EMIT-QUERY-RESULTS and
+;;; the shape it accepts -- moved to query-dsl.lisp, which the GUI workbench
+;;; compiles through as well (GH #278).
+;;; ---------------------------------------------------------------------------
 
 (defun %request-query-dsl ()
   "Decode the JSON request body of an ad-hoc pattern query into a DSL alist.

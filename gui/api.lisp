@@ -517,6 +517,126 @@ are domain identifiers a query author types, not protocol (GH #277)."
                                 (format nil "Unknown node ~A"
                                         (param params :id))))))))))))
 
+;;; ---------------------------------------------------------------------
+;;; Query workbench (GH #278).  The body is the same structured DSL
+;;; rest.lisp's /graph/:g/query route accepts, compiled and run by the
+;;; SHARED implementation in query-dsl.lisp -- read-only, snapshot-
+;;; isolated and capped, exactly as REST gets it.  Nothing here parses
+;;; or reads user text into symbols beyond what that compiler does.
+;;; ---------------------------------------------------------------------
+
+(defun %request-json-body ()
+  "The request body decoded as JSON, or :MALFORMED.  The GUI's own
+seam onto the DSL -- it does not call through rest.lisp.
+
+The :MALFORMED arm covers only bodies sent under a content type lack
+does NOT pre-parse.  Under application/json lack parses the body when
+it builds the request, before ningle dispatches, so a JSON syntax
+error is ITS plain-text 400 and this handler never runs (GH #278)."
+  (handler-case
+      (let ((raw (lack/request:request-content ningle:*request*)))
+        (json:decode-json-from-string
+         (if (stringp raw)
+             raw
+             (flexi-streams:octets-to-string raw
+                                             :external-format :utf-8))))
+    (error () :malformed)))
+
+(defun %query-row-cap (dsl)
+  "The row cap RUN-PATTERN-QUERY will apply to DSL: its \"limit\"
+clamped by *QUERY-DEFAULT-LIMIT*.  Mirrors query-dsl.lisp's rule so
+the response can report the bound it was actually run under."
+  (let ((n (cdr (assoc :limit dsl))))
+    (if (and (integerp n) (plusp n))
+        (min n graph-db::*query-default-limit*)
+        graph-db::*query-default-limit*)))
+
+(defun %query-probe-limit (cap)
+  "Rows to ask the runner for when the answer must show CAP of them.
+One past the cap tells a truncated result from an exactly-full page.
+At *QUERY-DEFAULT-LIMIT* there is no room to ask for one more -- the
+runner clamps there -- so the probe is the cap itself and an
+exactly-full page reads as truncated (GH #278)."
+  (if (< cap graph-db::*query-default-limit*) (1+ cap) cap))
+
+(defun %query-dsl-for-gui (dsl limit)
+  "DSL with its \"format\" field dropped and \"limit\" forced to LIMIT.
+The GUI answers one JSON object; the DSL's REST-only NDJSON streaming
+arm would both break that envelope and push a second content-type
+header (GH #278)."
+  (cons (cons :limit limit)
+        (remove-if (lambda (cell) (member (car cell) '(:format :limit)))
+                   dsl)))
+
+(defun %decode-query-rows (json-string)
+  "RUN-PATTERN-QUERY's JSON array decoded back to alists with the key
+STRINGS intact -- cl-json's default readers fold them to keywords and
+lose the spelling the DSL chose for each result variable."
+  (let ((json:*json-identifier-name-to-lisp* #'identity)
+        (json:*identifier-name-to-key* #'identity))
+    (json:decode-json-from-string json-string)))
+
+(defun %query-row-json (row)
+  (%obj (mapcar (lambda (cell)
+                  (cons (car cell) (%json-value (cdr cell))))
+                row)))
+
+;; The whole query runs under WITH-GUI-GRAPH's read side, so a slow one
+;; delays open/close for up to the DSL's *QUERY-DEFAULT-TIMEOUT*.  That
+;; is deliberate: resolving under the lock and running outside it would
+;; restore exactly the hazard the lock exists for -- CLOSE-GRAPH unmaps
+;; the store's mmaps under a live reader (GH #269).
+(def-gui-handler api-graph-query (params)
+  (with-gui-graph (graph params)
+    (let ((dsl (%request-json-body)))
+      (cond
+        ((eq dsl :malformed)
+         (gui-error 400 "malformed-json"
+                    "Request body is not valid JSON"))
+        ;; A decoded JSON object is an alist; anything else (an array,
+        ;; a bare scalar) would make ASSOC signal deep in the compiler.
+        ((not (and (listp dsl) (every #'consp dsl)))
+         (gui-error 400 "malformed-query"
+                    "Request body must be a JSON query object"))
+        (t
+         (handler-case
+             (let* ((cap (%query-row-cap dsl))
+                    (probe (%query-probe-limit cap))
+                    (rows (%decode-query-rows
+                           (graph-db::run-pattern-query
+                            (%query-dsl-for-gui dsl probe) graph)))
+                    (n (length rows))
+                    ;; The probe row proves there was more; it is never
+                    ;; shown.  Without room for it, >= is the best the
+                    ;; runner's own clamp allows.
+                    (truncated (if (> probe cap) (> n cap) (>= n cap)))
+                    (shown (if (> n cap) (subseq rows 0 cap) rows)))
+               (%json-response
+                (list
+                 ;; QUERY-ROW->ALIST builds every row in select order,
+                 ;; so the first row names the columns.
+                 (cons :columns (%arr (mapcar #'car (first shown))))
+                 (cons :rows (%arr (mapcar #'%query-row-json shown)))
+                 (cons :row-count (length shown))
+                 (cons :limit cap)
+                 (cons :truncated (%bool truncated)))))
+           ;; Same mapping REST uses for the same conditions: one DSL,
+           ;; one meaning per failure.  A resource-budget breach is 400,
+           ;; not 413 -- 413 is about the size of the request entity,
+           ;; and the request here is tiny; what blew the budget is the
+           ;; query the client wrote.
+           (graph-db:query-param-error (c)
+             (gui-error 400 "bad-query"
+                        (graph-db::query-param-error-reason c)))
+           (graph-db:prolog-resource-error (c)
+             (declare (ignore c))
+             (gui-error 400 "query-too-expensive"
+                        "Query exceeded its resource limits"))
+           (graph-db:prolog-permission-error (c)
+             (declare (ignore c))
+             (gui-error 403 "forbidden-operation"
+                        "Query attempted a forbidden operation"))))))))
+
 (def-gui-handler api-graph-neighborhood (params)
   (with-gui-graph (graph params)
     (let ((id (%parse-node-id (param params :id)))

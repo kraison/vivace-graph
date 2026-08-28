@@ -78,6 +78,17 @@ the vendored cytoscape build is non-trivially large (GH #271)."
       (asset "/js/explorer.js" "application/javascript")
       (asset "/js/inspector.js" "application/javascript"))))
 
+(test static-workbench-asset-serves
+  "The query workbench's modules serve 200 as javascript (GH #278)."
+  (with-gui-server ()
+    (dolist (path '("/js/workbench.js" "/js/wb-splitter.js"))
+      (multiple-value-bind (json status ctype)
+          (gui-request path)
+        (declare (ignore json))
+        (is (= 200 status) "~A did not serve 200" path)
+        (is (eql 0 (search "application/javascript" ctype))
+            "~A served content type ~A" path ctype)))))
+
 (test static-missing-file-404
   "A missing static path yields 404."
   (with-gui-server ()
@@ -590,3 +601,260 @@ directions, type-labeled."
                    (string-id (getf *fixture* :alice))))
         (is (= 404 status))
         (is (string= "unknown-graph" (jref json :error)))))))
+
+;;; ---------------------------------------------------------------------
+;;; Query workbench: POST /api/graphs/:name/query (GH #278)
+;;; ---------------------------------------------------------------------
+
+(defun run-query (body &key (content-type "application/json"))
+  "POST BODY (a JSON string) to the fixture graph's query endpoint."
+  (gui-request "/api/graphs/gui-test-graph/query"
+               :method :post :content body
+               :content-type content-type))
+
+(defun rows-of (json key)
+  "The KEY column of every row in a query response, sorted."
+  (sort (mapcar (lambda (row) (jref row key)) (jref json :rows))
+        #'string< :key #'princ-to-string))
+
+(test query-vertex-pattern-and-slot-bind
+  "A vertex pattern plus a slot bind returns one row per match, keyed
+by the result variable, with the shape the frontend renders."
+  (with-gui-fixture ()
+    (with-gui-server ()
+      (multiple-value-bind (json status ctype raw)
+          (run-query
+           "{\"match\":[{\"vertex\":\"?p\",\"type\":\"gui-person\"}],
+             \"where\":[{\"slot\":\"?p\",\"name\":\"name\",
+                         \"bind\":\"?n\"}],
+             \"select\":[\"?n\"],\"limit\":10}")
+        (declare (ignore ctype))
+        (is (= 200 status))
+        (is (equal '("n") (jref json :columns)))
+        (is (= 2 (jref json :row-count)))
+        (is (equal '("Alice" "Bob") (rows-of json :n)))
+        (is (= 10 (jref json :limit)))
+        (is-false (jref json :truncated))
+        ;; Envelope keys are protocol and stay camelCase (GH #277).
+        (dolist (key '("\"rowCount\"" "\"truncated\"" "\"columns\""
+                       "\"rows\"" "\"limit\""))
+          (is-true (search key raw) "key ~A is not camelCase" key))))))
+
+(test query-accepts-kebab-schema-names
+  "Type and slot names go in exactly as /types and /stats emit them --
+kebab, multi-word included -- and the result key is the variable the
+query named (GH #277, #278)."
+  (with-gui-fixture ()
+    (with-gui-server ()
+      (multiple-value-bind (json status ctype raw)
+          (run-query
+           "{\"match\":[{\"vertex\":\"?p\",\"type\":\"gui-person\"}],
+             \"where\":[{\"slot\":\"?p\",\"name\":\"home-city\",
+                         \"bind\":\"?hc\"}],
+             \"select\":[\"?hc\"]}")
+        (declare (ignore ctype))
+        (is (= 200 status))
+        (is (equal '("hc") (jref json :columns)))
+        ;; Both persons match: NODE-SLOT-VALUE binds an unset slot to
+        ;; NIL rather than failing, so Bob contributes a null row.
+        (is (= 2 (jref json :row-count)))
+        (is (member "Paris" (rows-of json :hc) :test #'equal))
+        (is-true (search "\"hc\"" raw))))))
+
+(test query-edge-pattern-joins-vertices
+  "An edge pattern joins two variables; a slot value filters one end."
+  (with-gui-fixture ()
+    (with-gui-server ()
+      (multiple-value-bind (json status)
+          (run-query
+           "{\"match\":[{\"vertex\":\"?p\",\"type\":\"gui-person\"},
+                        {\"vertex\":\"?c\",\"type\":\"gui-city\"},
+                        {\"edge\":\"gui-visited\",\"from\":\"?p\",
+                         \"to\":\"?c\"}],
+             \"where\":[{\"slot\":\"?p\",\"name\":\"name\",
+                         \"value\":\"Alice\"},
+                        {\"slot\":\"?c\",\"name\":\"name\",
+                         \"bind\":\"?cn\"}],
+             \"select\":[\"?cn\"]}")
+        (is (= 200 status))
+        (is (equal '("Paris" "Tokyo") (rows-of json :cn)))))))
+
+(test query-compare-constraint
+  "A compare constraint filters on a bound numeric slot."
+  (with-gui-fixture ()
+    (with-gui-server ()
+      (multiple-value-bind (json status)
+          (run-query
+           "{\"match\":[{\"vertex\":\"?p\",\"type\":\"gui-person\"}],
+             \"where\":[{\"slot\":\"?p\",\"name\":\"age\",
+                         \"bind\":\"?age\"},
+                        {\"compare\":\">\",\"args\":[\"?age\",40]},
+                        {\"slot\":\"?p\",\"name\":\"name\",
+                         \"bind\":\"?n\"}],
+             \"select\":[\"?n\"]}")
+        (is (= 200 status))
+        (is (equal '("Bob") (rows-of json :n)))))))
+
+(test query-selects-node-ids-for-canvas-handoff
+  "Selecting a pattern variable yields the engine's 32-hex string ids,
+which is what the workbench hands to the explorer canvas (GH #278)."
+  (with-gui-fixture ()
+    (with-gui-server ()
+      (multiple-value-bind (json status)
+          (run-query
+           "{\"match\":[{\"vertex\":\"?p\",\"type\":\"gui-person\"}],
+             \"select\":[\"?p\"]}")
+        (is (= 200 status))
+        (let ((ids (rows-of json :p)))
+          (is (= 2 (length ids)))
+          (is (every (lambda (id)
+                       (and (stringp id) (= 32 (length id))))
+                     ids))
+          (is (equal (sort (list (string-id (getf *fixture* :alice))
+                                 (string-id (getf *fixture* :bob)))
+                           #'string<)
+                     ids)))))))
+
+(test query-limit-is-enforced-and-reported
+  "A client limit caps the rows and comes back as the bound the query
+ran under.  TRUNCATED distinguishes an exactly-full page from a cut
+one: the endpoint asks the runner for one row past the cap and never
+shows it (GH #278)."
+  (with-gui-fixture ()
+    (with-gui-server ()
+      ;; 2 persons, limit 1 -> cut.
+      (multiple-value-bind (json status)
+          (run-query
+           "{\"match\":[{\"vertex\":\"?p\",\"type\":\"gui-person\"}],
+             \"where\":[{\"slot\":\"?p\",\"name\":\"name\",
+                         \"bind\":\"?n\"}],
+             \"select\":[\"?n\"],\"limit\":1}")
+        (is (= 200 status))
+        (is (= 1 (jref json :row-count)))
+        (is (= 1 (length (jref json :rows))))
+        (is (= 1 (jref json :limit)))
+        (is-true (jref json :truncated)))
+      ;; 2 persons, limit exactly 2 -> complete, NOT truncated.
+      (multiple-value-bind (json status)
+          (run-query
+           "{\"match\":[{\"vertex\":\"?p\",\"type\":\"gui-person\"}],
+             \"where\":[{\"slot\":\"?p\",\"name\":\"name\",
+                         \"bind\":\"?n\"}],
+             \"select\":[\"?n\"],\"limit\":2}")
+        (is (= 200 status))
+        (is (= 2 (jref json :row-count)))
+        (is (= 2 (length (jref json :rows))))
+        (is (= 2 (jref json :limit)))
+        (is-false (jref json :truncated)))
+      ;; Limit well above the 2 matching cities: short of the cap, and
+      ;; the probe row must not leak into the answer either way.
+      (multiple-value-bind (json status)
+          (run-query
+           "{\"match\":[{\"vertex\":\"?c\",\"type\":\"gui-city\"}],
+             \"select\":[\"?c\"],\"limit\":4}")
+        (is (= 200 status))
+        (is (= 2 (jref json :row-count)))
+        (is-false (jref json :truncated))))))
+
+(test query-literal-with-leading-question-mark
+  "A \"?\"-leading LITERAL must not become a variable.  The slot
+\"value\" arm is already safe -- it passes the datum raw, so nothing
+matches.  The DSL's COMPARE arm is asymmetric: it maps
+%DSL-VAR-OR-LITERAL over its args and interns such a string as a query
+variable, which makes the row vacuous.  The workbench therefore
+refuses a \"?\"-leading comparison literal in the builder and offers an
+explicit variable-vs-variable mode instead (GH #278).
+
+⚠ The second assertion pins the DSL defect, NOT desired behaviour: it
+is the tripwire for the follow-up that fixes %COMPILE-WHERE-CONSTRAINT.
+When that lands, this assertion is what tells you to update it."
+  (with-gui-fixture ()
+    (with-gui-server ()
+      (multiple-value-bind (json status)
+          (run-query
+           "{\"match\":[{\"vertex\":\"?p\",\"type\":\"gui-person\"}],
+             \"where\":[{\"slot\":\"?p\",\"name\":\"name\",
+                         \"value\":\"?zz\"}],
+             \"select\":[\"?p\"]}")
+        (is (= 200 status))
+        (is (= 0 (jref json :row-count))
+            "a \"?\"-leading slot value is a literal and matches none"))
+      (multiple-value-bind (json status)
+          (run-query
+           "{\"match\":[{\"vertex\":\"?p\",\"type\":\"gui-person\"}],
+             \"where\":[{\"slot\":\"?p\",\"name\":\"age\",
+                         \"bind\":\"?age\"},
+                        {\"compare\":\"=\",
+                         \"args\":[\"?age\",\"?zz\"]}],
+             \"select\":[\"?p\"]}")
+        (is (= 200 status))
+        (is (= 2 (jref json :row-count))
+            "DSL defect pinned: compare interns \"?zz\", so the row is ~
+vacuous and every person matches.  The builder never emits this.")))))
+
+(test query-error-contract
+  "Malformed JSON, a non-object body, an unrecognized pattern, a
+missing select and an unknown type are each a clean 400 carrying the
+DSL's own reason; a closed graph is a 404."
+  (with-gui-fixture ()
+    (with-gui-server ()
+      ;; Under application/json the lack layer parses the body before
+      ;; ningle dispatches, so a syntax error is ITS plain-text 400 --
+      ;; the handler never runs.  Same for rest.lisp's /query route.
+      (multiple-value-bind (json status) (run-query "{not json")
+        (declare (ignore json))
+        (is (= 400 status)))
+      ;; Under any other content type the body reaches the handler,
+      ;; which answers the GUI's own {error, message} 400.
+      (multiple-value-bind (json status)
+          (run-query "{not json" :content-type "text/plain")
+        (is (= 400 status))
+        (is (string= "malformed-json" (jref json :error))))
+      (multiple-value-bind (json status) (run-query "[1,2]")
+        (is (= 400 status))
+        (is (string= "malformed-query" (jref json :error))))
+      (multiple-value-bind (json status)
+          (run-query "{\"match\":[{\"bogus\":\"?p\"}],
+                       \"select\":[\"?p\"]}")
+        (is (= 400 status))
+        (is (string= "bad-query" (jref json :error)))
+        (is (search "unrecognized match pattern" (jref json :message))))
+      (multiple-value-bind (json status)
+          (run-query "{\"match\":[{\"vertex\":\"?p\",
+                                   \"type\":\"gui-person\"}]}")
+        (is (= 400 status))
+        (is (string= "bad-query" (jref json :error)))
+        (is (search "select" (jref json :message))))
+      ;; An unknown type is a field value inside the query document, not
+      ;; the addressed resource, so it is a 400 (like REST) -- unlike
+      ;; /nodes?type=, where the type IS what is being addressed (404).
+      (multiple-value-bind (json status)
+          (run-query "{\"match\":[{\"vertex\":\"?p\",
+                                   \"type\":\"no-such-type\"}],
+                       \"select\":[\"?p\"]}")
+        (is (= 400 status))
+        (is (string= "bad-query" (jref json :error)))
+        (is (search "unknown vertex type" (jref json :message))))
+      (gui-request "/api/graphs/gui-test-graph/close" :method :post)
+      (multiple-value-bind (json status)
+          (run-query "{\"match\":[{\"vertex\":\"?p\",
+                                   \"type\":\"gui-person\"}],
+                       \"select\":[\"?p\"]}")
+        (is (= 404 status))
+        (is (string= "unknown-graph" (jref json :error))))
+      (gui-request "/api/graphs/gui-test-graph/open" :method :post))))
+
+(test query-ignores-ndjson-format-field
+  "The DSL's REST-only NDJSON arm is not offered here: a \"format\"
+field is dropped, so the answer is still one JSON object (GH #278)."
+  (with-gui-fixture ()
+    (with-gui-server ()
+      (multiple-value-bind (json status ctype)
+          (run-query
+           "{\"match\":[{\"vertex\":\"?p\",\"type\":\"gui-person\"}],
+             \"where\":[{\"slot\":\"?p\",\"name\":\"name\",
+                         \"bind\":\"?n\"}],
+             \"select\":[\"?n\"],\"format\":\"ndjson\"}")
+        (is (= 200 status))
+        (is (eql 0 (search "application/json" ctype)))
+        (is (= 2 (jref json :row-count)))))))

@@ -1,6 +1,7 @@
 <!DOCTYPE html>
 <!-- VivaceGraph GUI cockpit: roster + stats frame (GH #270),
-     explorer canvas + inspector dock (GH #271). -->
+     explorer canvas + inspector dock (GH #271), query workbench
+     (GH #278) -- the main region is tabbed, Explorer | Query. -->
 <html lang="en">
 <head>
   <meta charset="utf-8">
@@ -36,28 +37,84 @@
         </div>
       </section>
     </aside>
-    <main id="main-canvas" class="main-canvas" aria-label="Explorer">
-      <div id="cy" class="cy-host"></div>
-      <p id="canvas-placeholder" class="placeholder">
-        Select a graph, click a vertex type in the stats pane, then
-        pick a node to seed the canvas.
-      </p>
-      <div id="canvas-status" class="canvas-status">
-        <span id="canvas-counts"></span>
-        <span id="canvas-notice" class="canvas-notice"></span>
-        <button id="canvas-clear" type="button"
-                title="Empty the canvas (view only)">Clear</button>
-      </div>
-      <div id="pick-list" class="pick-list" hidden>
-        <div class="pick-list-header">
-          <h3 id="pick-list-title"></h3>
-          <button id="pick-list-close" type="button"
-                  aria-label="Close node list">&#215;</button>
+    <main class="main-region">
+      <nav class="tab-bar" role="tablist" aria-label="Main region">
+        <button id="tab-explorer" class="tab active" type="button"
+                role="tab" aria-selected="true"
+                aria-controls="explorer-view">Explorer</button>
+        <button id="tab-query" class="tab" type="button" role="tab"
+                aria-selected="false"
+                aria-controls="workbench-view">Query</button>
+      </nav>
+      <div id="explorer-view" class="main-canvas" role="tabpanel"
+           aria-label="Explorer">
+        <div id="cy" class="cy-host"></div>
+        <p id="canvas-placeholder" class="placeholder">
+          Select a graph, click a vertex type in the stats pane, then
+          pick a node to seed the canvas.
+        </p>
+        <div id="canvas-status" class="canvas-status">
+          <span id="canvas-counts"></span>
+          <span id="canvas-notice" class="canvas-notice"></span>
+          <button id="canvas-clear" type="button"
+                  title="Empty the canvas (view only)">Clear</button>
         </div>
-        <p id="pick-list-notice" class="pick-list-notice"></p>
-        <ul id="pick-list-items" class="pick-list-items"></ul>
+        <div id="pick-list" class="pick-list" hidden>
+          <div class="pick-list-header">
+            <h3 id="pick-list-title"></h3>
+            <button id="pick-list-close" type="button"
+                    aria-label="Close node list">&#215;</button>
+          </div>
+          <p id="pick-list-notice" class="pick-list-notice"></p>
+          <ul id="pick-list-items" class="pick-list-items"></ul>
+        </div>
+        <div id="edge-tooltip" class="edge-tooltip" hidden></div>
       </div>
-      <div id="edge-tooltip" class="edge-tooltip" hidden></div>
+      <section id="workbench-view" class="workbench" role="tabpanel"
+               aria-label="Query workbench" hidden>
+        <div class="wb-builder">
+          <div class="wb-section">
+            <div class="wb-section-head">
+              <h3>Match</h3>
+              <span class="wb-actions">
+                <button id="wb-add-vertex" type="button">+ vertex</button>
+                <button id="wb-add-edge" type="button">+ edge</button>
+              </span>
+            </div>
+            <ul id="wb-match" class="wb-rows"></ul>
+          </div>
+          <div class="wb-section">
+            <div class="wb-section-head">
+              <h3>Where</h3>
+              <span class="wb-actions">
+                <button id="wb-add-slot" type="button">+ slot</button>
+                <button id="wb-add-compare" type="button">+ compare</button>
+              </span>
+            </div>
+            <ul id="wb-where" class="wb-rows"></ul>
+          </div>
+          <div class="wb-section">
+            <div class="wb-section-head"><h3>Select</h3></div>
+            <div id="wb-select" class="wb-select"></div>
+          </div>
+          <div class="wb-run">
+            <label for="wb-limit">Limit</label>
+            <input id="wb-limit" class="wb-limit" type="number" min="1"
+                   max="1000" value="50">
+            <button id="wb-run" type="button">Run</button>
+            <button id="wb-send" type="button" hidden></button>
+          </div>
+          <p id="wb-error" class="wb-error" hidden></p>
+        </div>
+        <div id="wb-splitter" class="wb-splitter" role="separator"
+             aria-orientation="horizontal" tabindex="0"
+             aria-label="Resize the query builder"
+             title="Drag to resize (double-click to reset)"></div>
+        <div class="wb-results">
+          <p id="wb-status" class="wb-status"></p>
+          <div id="wb-table" class="wb-table-host"></div>
+        </div>
+      </section>
     </main>
     <aside id="inspector-dock" class="inspector-dock" hidden
            aria-label="Node inspector">

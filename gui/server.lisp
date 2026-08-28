@@ -108,7 +108,13 @@ the static tree, with index.html at /."
 
           (ningle:route app "/api/graphs/:name/neighborhood/:id"
                         :method :get)
-          'api-graph-neighborhood)
+          'api-graph-neighborhood
+
+          ;; Query workbench (GH #278): a POST because the structured
+          ;; DSL is a JSON document, not query parameters.  Read-only
+          ;; all the same -- run-pattern-query never writes.
+          (ningle:route app "/api/graphs/:name/query" :method :post)
+          'api-graph-query)
     app))
 
 (defun start-gui (&key (port *gui-port*) (bind "127.0.0.1"))
