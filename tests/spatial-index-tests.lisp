@@ -391,3 +391,80 @@ were never touched by either call")))))
     (with-temp-memory (heap)                 ; on-disk backend
       (exercise (make-spatial-index heap :precision 7)))
     (exercise (graph-db::make-mem-spatial-index :precision 7))))
+
+;;; ---------------------------------------------------------------------
+;;; An absurd radius is bounded, not quadratic (GH #279).
+;;;
+;;; MAP-SPATIAL-INDEX-RADIUS turned RADIUS-M into a degree span with no
+;;; clamp, and MAP-SPATIAL-INDEX-BBOX passes an explicit :PRECISION, which
+;;; used to skip GEOHASH-COVERING's cell budget.  The two together made a
+;;; query's cost quadratic in a CLIENT-SUPPLIED number and independent of
+;;; the data: on a five-node index, radius 2e10 m took 24.6 s and 4e10
+;;; took 99.5 s, firing a 30 s query deadline 69 s late because %TICK
+;;; cannot preempt inside the call.  The exposure was not GUI-only -- a
+;;; DEF-QUERY taking a radius parameter, or any SELECT over client data,
+;;; reached the same path -- so the fix is here, in the engine.
+;;; ---------------------------------------------------------------------
+
+(test absurd-radius-is-bounded-and-correct
+  "A radius past the planet returns exactly what a whole-globe query
+returns, and returns it promptly."
+  (with-temp-memory (heap)
+    (let ((idx (make-spatial-index heap :precision 7)))
+      (spatial-index-insert idx (bid 1) (pt *pt-a*))
+      (spatial-index-insert idx (bid 2) (pt *pt-b*))
+      (spatial-index-insert idx (bid 3) (pt *far*))
+      (let* ((lat (second *pt-a*)) (lon (first *pt-a*))
+             (globe (sort (copy-list
+                           (spatial-index-query-bbox idx -180d0 -90d0
+                                                     180d0 90d0))
+                          #'< :key (lambda (id) (aref id 0))))
+             (start (get-internal-real-time))
+             (absurd (sort (copy-list
+                            (spatial-index-query-radius idx lat lon 2d10))
+                           #'< :key (lambda (id) (aref id 0))))
+             (elapsed (/ (- (get-internal-real-time) start)
+                         internal-time-units-per-second)))
+        ;; Correct: a radius that big means "everything".
+        (is (= 3 (length absurd)) "an absurd radius must find every node")
+        (is (equalp globe absurd)
+            "an absurd radius must agree with a whole-globe window")
+        ;; Bounded: 24.6 s before the clamp, milliseconds after.
+        (is (< elapsed 5)
+            "an absurd radius took ~,1F s -- the span clamp is not ~
+holding" elapsed)))))
+
+(test absurd-radius-cost-does-not-grow-with-the-radius
+  "The tell-tale of the defect was a cost that scaled with the client's
+number rather than with the data: doubling the radius quadrupled the
+time.  Past the clamp, ten thousand times the radius costs the same."
+  (with-temp-memory (heap)
+    (let ((idx (make-spatial-index heap :precision 7)))
+      (spatial-index-insert idx (bid 1) (pt *pt-a*))
+      (let ((lat (second *pt-a*)) (lon (first *pt-a*)))
+        (flet ((secs (radius)
+                 (let ((start (get-internal-real-time)))
+                   (spatial-index-query-radius idx lat lon radius)
+                   (/ (- (get-internal-real-time) start)
+                      internal-time-units-per-second))))
+          ;; Warm the code path, then compare two radii four orders of
+          ;; magnitude apart.  Both are clamped to the same globe window,
+          ;; so neither can be slow; an absolute bound is the honest
+          ;; assertion here (a ratio over millisecond timings is noise).
+          (secs 1d10)
+          (is (< (secs 1d10) 5))
+          (is (< (secs 1d14) 5)))))))
+
+(test small-radius-window-is-unchanged
+  "The clamp must not perturb ordinary queries: below the planet the
+span arithmetic is what it always was."
+  (with-temp-memory (heap)
+    (let ((idx (make-spatial-index heap :precision 9)))
+      (spatial-index-insert idx (bid 1) (pt *pt-a*))
+      (spatial-index-insert idx (bid 2) (pt *pt-b*))
+      (spatial-index-insert idx (bid 3) (pt *far*))
+      (let* ((lat (second *pt-a*)) (lon (first *pt-a*))
+             (cands (spatial-index-query-radius idx lat lon 600d0)))
+        (is (has-p (bid 1) cands))
+        (is (not (has-p (bid 3) cands))
+            "the distant point must still be filtered by the bbox")))))

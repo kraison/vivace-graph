@@ -943,7 +943,13 @@ order of terms with duplicates removed."
   (let ((lat1 (var-deref ?lat1)) (lon1 (var-deref ?lon1))
         (lat2 (var-deref ?lat2)) (lon2 (var-deref ?lon2)))
     (when (and (numberp lat1) (numberp lon1) (numberp lat2) (numberp lon2))
-      (when (unify ?dist (geodesic-distance lat1 lon1 lat2 lon2))
+      ;; Clamp to the globe before the trigonometry: a bignum or ratio
+      ;; coordinate overflows on coercion, and NUMBERP admits both
+      ;; (GH #279).  Same clamp the index path applies.
+      (when (unify ?dist (geodesic-distance (clamp-latitude lat1)
+                                            (clamp-longitude lon1)
+                                            (clamp-latitude lat2)
+                                            (clamp-longitude lon2)))
         (funcall cont)))))
 
 (def-global-prolog-functor geo-near/5 (?lat1 ?lon1 ?lat2 ?lon2 ?radius cont)
@@ -953,7 +959,13 @@ another.  All five arguments must be bound numbers."
         (lat2 (var-deref ?lat2)) (lon2 (var-deref ?lon2)) (radius (var-deref ?radius)))
     (when (and (numberp lat1) (numberp lon1) (numberp lat2) (numberp lon2)
                (numberp radius))
-      (when (<= (geodesic-distance lat1 lon1 lat2 lon2) radius)
+      ;; See GEO-DISTANCE/5.  RADIUS stays exact: it is only compared
+      ;; against, never coerced, so a bignum is harmless there.
+      (when (<= (geodesic-distance (clamp-latitude lat1)
+                                   (clamp-longitude lon1)
+                                   (clamp-latitude lat2)
+                                   (clamp-longitude lon2))
+                radius)
         (funcall cont)))))
 
 (def-global-prolog-functor geo-within/3 (?lon ?lat ?area cont)
@@ -961,7 +973,9 @@ another.  All five arguments must be bound numbers."
 geometry ?AREA.  ?LON/?LAT must be bound numbers and ?AREA a bound geometry."
   (let ((lon (var-deref ?lon)) (lat (var-deref ?lat)) (area (var-deref ?area)))
     (when (and (numberp lon) (numberp lat) (geometryp area))
-      (when (geometry-contains-point-p area lon lat)
+      ;; See GEO-DISTANCE/5: clamp to the globe before any coercion.
+      (when (geometry-contains-point-p area (clamp-longitude lon)
+                                       (clamp-latitude lat))
         (funcall cont)))))
 
 ;;; Generated edge functors (GH #172, R1).  DEF-NODE-TYPE used to inline

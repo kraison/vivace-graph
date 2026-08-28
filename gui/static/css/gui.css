@@ -544,10 +544,119 @@ button:disabled { opacity: 0.5; cursor: default; }
   overflow: hidden;
 }
 
+/* The surface half of the split holds the Builder | Prolog sub-tabs and
+   whichever surface is showing; the splitter still sizes it as one row,
+   so #278's drag/keyboard/reset behaviour is untouched (GH #279). */
+.wb-surface {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.wb-subtabs {
+  display: flex;
+  flex: none;
+  gap: 4px;
+  padding: 6px 16px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.wb-subtab {
+  padding: 2px 12px;
+  font-size: 12px;
+  border-bottom-left-radius: 0;
+  border-bottom-right-radius: 0;
+}
+
+.wb-subtab.active {
+  color: var(--accent);
+  border-color: var(--accent);
+  background: var(--bg);
+}
+
+/* The editor was offered by the server but could not load: visibly
+   present and visibly broken, never mistakable for "not enabled". */
+.wb-subtab.failed {
+  color: var(--err-text);
+  border-color: var(--err-border);
+  cursor: not-allowed;
+}
+
 .wb-builder {
   padding: 10px 16px 12px;
   overflow-y: auto;
   min-height: 0;
+  flex: 1;
+}
+
+/* --- free-text Prolog surface (GH #279) ---------------------------- */
+
+.wb-prolog {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  flex: 1;
+  padding: 8px 16px 12px;
+}
+
+.wb-hint {
+  flex: none;
+  margin: 0 0 6px;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.wb-editor {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg-pane);
+}
+
+.wb-balance {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text-dim);
+  margin-right: auto;
+}
+
+.wb-balance.unbalanced {
+  color: var(--err-text);
+  font-weight: 600;
+}
+
+/* CodeMirror is themed from the cockpit's own variables rather than
+   one of its bundled themes -- one fewer vendored file. */
+.wb-editor .CodeMirror {
+  height: 100%;
+  background: transparent;
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 13px;
+}
+
+.wb-editor .CodeMirror-gutters {
+  background: var(--bg);
+  border-right: 1px solid var(--border);
+}
+
+.wb-editor .CodeMirror-linenumber { color: var(--text-dim); }
+.wb-editor .CodeMirror-cursor { border-left: 1px solid var(--text); }
+.wb-editor .CodeMirror-selected { background: var(--bg-raised); }
+.wb-editor .cm-string { color: var(--ok); }
+.wb-editor .cm-comment { color: var(--text-dim); }
+.wb-editor .cm-number { color: var(--warn); }
+
+/* The overlay's two tokens: a query variable, and a head symbol this
+   server would not recognise. */
+.wb-editor .cm-vg-var { color: var(--accent); }
+
+.wb-editor .cm-vg-unknown {
+  color: var(--text-dim);
+  text-decoration: underline dotted var(--err-border);
 }
 
 .wb-splitter {
@@ -685,9 +794,19 @@ button:disabled { opacity: 0.5; cursor: default; }
   padding: 8px 16px 12px;
 }
 
-.wb-status {
+/* Status and the canvas handoff share a row: the handoff belongs to
+   the results, not to whichever surface produced them (GH #279). */
+.wb-results-head {
+  display: flex;
   flex: none;
-  margin: 0 0 6px;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 6px;
+}
+
+.wb-status {
+  flex: 1;
+  margin: 0;
   font-family: var(--mono);
   font-size: 12px;
   color: var(--text-dim);

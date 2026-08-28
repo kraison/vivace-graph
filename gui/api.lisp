@@ -542,14 +542,17 @@ error is ITS plain-text 400 and this handler never runs (GH #278)."
                                              :external-format :utf-8))))
     (error () :malformed)))
 
+(defun %clamp-row-cap (n)
+  "N clamped by *QUERY-DEFAULT-LIMIT*.  Mirrors RUN-QUERY-GOALS' own
+rule so a response can report the bound it was actually run under."
+  (if (and (integerp n) (plusp n))
+      (min n graph-db::*query-default-limit*)
+      graph-db::*query-default-limit*))
+
 (defun %query-row-cap (dsl)
   "The row cap RUN-PATTERN-QUERY will apply to DSL: its \"limit\"
-clamped by *QUERY-DEFAULT-LIMIT*.  Mirrors query-dsl.lisp's rule so
-the response can report the bound it was actually run under."
-  (let ((n (cdr (assoc :limit dsl))))
-    (if (and (integerp n) (plusp n))
-        (min n graph-db::*query-default-limit*)
-        graph-db::*query-default-limit*)))
+clamped by *QUERY-DEFAULT-LIMIT*."
+  (%clamp-row-cap (cdr (assoc :limit dsl))))
 
 (defun %query-probe-limit (cap)
   "Rows to ask the runner for when the answer must show CAP of them.
@@ -581,6 +584,28 @@ lose the spelling the DSL chose for each result variable."
                   (cons (car cell) (%json-value (cdr cell))))
                 row)))
 
+(defun %query-envelope (json-string cap probe)
+  "The workbench result envelope -- {columns, rows, rowCount, limit,
+truncated} -- for RUN-QUERY-GOALS' JSON-STRING, run under PROBE rows
+and answered under CAP.  Shared by the builder endpoint and the
+free-text Prolog one so one results table renders both (GH #278, #279)."
+  (let* ((rows (%decode-query-rows json-string))
+         (n (length rows))
+         ;; The probe row proves there was more; it is never shown.
+         ;; Without room for it, >= is the best the runner's own clamp
+         ;; allows.
+         (truncated (if (> probe cap) (> n cap) (>= n cap)))
+         (shown (if (> n cap) (subseq rows 0 cap) rows)))
+    (%json-response
+     (list
+      ;; QUERY-ROW->ALIST builds every row in select order, so the
+      ;; first row names the columns.
+      (cons :columns (%arr (mapcar #'car (first shown))))
+      (cons :rows (%arr (mapcar #'%query-row-json shown)))
+      (cons :row-count (length shown))
+      (cons :limit cap)
+      (cons :truncated (%bool truncated))))))
+
 ;; The whole query runs under WITH-GUI-GRAPH's read side, so a slow one
 ;; delays open/close for up to the DSL's *QUERY-DEFAULT-TIMEOUT*.  That
 ;; is deliberate: resolving under the lock and running outside it would
@@ -601,25 +626,11 @@ lose the spelling the DSL chose for each result variable."
         (t
          (handler-case
              (let* ((cap (%query-row-cap dsl))
-                    (probe (%query-probe-limit cap))
-                    (rows (%decode-query-rows
-                           (graph-db::run-pattern-query
-                            (%query-dsl-for-gui dsl probe) graph)))
-                    (n (length rows))
-                    ;; The probe row proves there was more; it is never
-                    ;; shown.  Without room for it, >= is the best the
-                    ;; runner's own clamp allows.
-                    (truncated (if (> probe cap) (> n cap) (>= n cap)))
-                    (shown (if (> n cap) (subseq rows 0 cap) rows)))
-               (%json-response
-                (list
-                 ;; QUERY-ROW->ALIST builds every row in select order,
-                 ;; so the first row names the columns.
-                 (cons :columns (%arr (mapcar #'car (first shown))))
-                 (cons :rows (%arr (mapcar #'%query-row-json shown)))
-                 (cons :row-count (length shown))
-                 (cons :limit cap)
-                 (cons :truncated (%bool truncated)))))
+                    (probe (%query-probe-limit cap)))
+               (%query-envelope
+                (graph-db::run-pattern-query
+                 (%query-dsl-for-gui dsl probe) graph)
+                cap probe))
            ;; Same mapping REST uses for the same conditions: one DSL,
            ;; one meaning per failure.  A resource-budget breach is 400,
            ;; not 413 -- 413 is about the size of the request entity,

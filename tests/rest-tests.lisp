@@ -589,3 +589,53 @@ follows is the thing under test (GH #167)."
         (is (string= "in-b" (cdr (assoc :label j))))
         (is-true (lookup-vertex id :graph gb))
         (is (null (lookup-vertex id :graph ga)))))))
+
+;;; ---------------------------------------------------------------------
+;;; An unbound result variable is an ANSWER, not a fault (GH #279).
+;;;
+;;; Reachable from the structured DSL too: a "select" variable that
+;;; appears nowhere in "match" or "where" is never bound, so it reaches
+;;; the encoder as a raw VAR STRUCT (prologc.lisp:97).  The GUI's
+;;; free-text surface hits the same defect with (= ?x ?y); the fix is in
+;;; the shared encoder, so both are covered by one change.
+;;; ---------------------------------------------------------------------
+
+(test pattern-query-unbound-select-var-is-null
+  "A selected variable that nothing binds comes back JSON null, and a
+bound variable in the SAME query keeps its value."
+  (with-test-graph (g)
+    (declare (ignore g))
+    (with-rest-env ()
+      (with-transaction () (make-g-person :name "A"))
+      (let* ((j (pattern-query
+                 "{\"match\":[{\"vertex\":\"?p\",\"type\":\"gPerson\"}],
+                   \"where\":[{\"slot\":\"?p\",\"name\":\"name\",
+                               \"bind\":\"?n\"}],
+                   \"select\":[\"?n\",\"?unbound\"]}"))
+             (row (first j)))
+        (is (= 1 (length j)))
+        (is (equal "A" (cdr (assoc :n row))) "the bound var lost its value")
+        (is-true (assoc :unbound row) "the unbound column is missing")
+        (is-false (cdr (assoc :unbound row))
+                  "the unbound var did not render as null")))))
+
+(test pattern-query-all-null-row-is-still-an-object
+  "A row whose values are ALL null stays a JSON OBJECT.  (cons key NIL)
+is not a dotted pair, so cl-json's guessing encoder used to render such
+a row as the array [[\"unbound\"]] and silently change the response's
+shape -- hence ENCODE-JSON-ALIST in QUERY-RESULTS->JSON (GH #279)."
+  (with-test-graph (g)
+    (declare (ignore g))
+    (with-rest-env ()
+      (with-transaction () (make-g-person :name "A"))
+      (let ((body (graph-db::call-rest-pattern-query
+                   (json:decode-json-from-string
+                    "{\"match\":[{\"vertex\":\"?p\",\"type\":\"gPerson\"}],
+                      \"select\":[\"?unbound\"]}")
+                   (rest-params))))
+        ;; Assert on the RAW body: the decoded form cannot tell an
+        ;; object from an array of one-element lists.
+        (is-true (search "{\"unbound\":null}" body)
+                 "an all-null row is not an object: ~A" body)
+        (is-false (search "[[" body)
+                  "an all-null row came out as an array: ~A" body)))))

@@ -114,6 +114,6 @@ export function createRosterPane({ listEl, refreshBtn, errorStrip,
 
   refreshBtn.addEventListener("click", () => refresh());
 
-  return { refresh, setSelected,
+  return { refresh, setSelected, showError,
            getGraph: (name) => graphs.find((g) => g.name === name) };
 }

@@ -149,6 +149,13 @@ for FIND-NODES-WITHIN."
 (defun find-nodes-near (scope lat lon radius &key (graph *graph*))
   "(NODE . DISTANCE-METRES) for live nodes in SCOPE within RADIUS of (LAT, LON),
 nearest first.  SCOPE is as for FIND-NODES-WITHIN."
+  ;; Clamp ONCE, here, so the index window and the exact GEODESIC-DISTANCE
+  ;; refinement below agree on the same numbers -- and so neither
+  ;; overflows on a bignum or ratio argument (GH #279).
+  (when (and (numberp lat) (numberp lon) (numberp radius))
+    (setf lat (clamp-latitude lat)
+          lon (clamp-longitude lon)
+          radius (clamp-radius-metres radius)))
   (let ((result '()))
     (%do-scoped-candidates (node scope graph
                             :guard (and (numberp lat) (numberp lon)
@@ -216,6 +223,9 @@ number of indexed nodes the window encloses (the bbox query covers a window with
 a bounded set of coarse cells and range-scans them, so empty space is free);
 widen MAX-RADIUS only if you accept scanning the larger candidate set."
   (let ((indexes (%resolve-spatial-scope scope graph)))
+    (when (and (numberp lat) (numberp lon))
+      ;; As FIND-NODES-NEAR: clamp before any float arithmetic (GH #279).
+      (setf lat (clamp-latitude lat) lon (clamp-longitude lon)))
     (when (and indexes (numberp lat) (numberp lon) (integerp k) (plusp k))
       ;; Seed off the FINEST precision in scope: with a mixed-precision scope,
       ;; seeding from a coarse index would make the very first query an enormous

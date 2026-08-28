@@ -172,7 +172,13 @@ SPATIAL-INDEX-INSERT wrote."
                   (%covering-precision (max 0d0 (- max-lon min-lon))
                                        (max 0d0 (- max-lat min-lat))
                                        max-cells))))
-      (geohash-covering min-lon min-lat max-lon max-lat :precision p))))
+      ;; :MAX-CELLS is this budget, not GEOHASH-COVERING's 256 default.
+      ;; P already fits it, so the covering's own check (GH #279) is a
+      ;; no-op here -- which is what keeps this a pure function of
+      ;; (geom, precision, max-cells) and keeps remove recomputing
+      ;; exactly what insert wrote.
+      (geohash-covering min-lon min-lat max-lon max-lat
+                        :precision p :max-cells max-cells))))
 
 (defun %geometry-part-bboxes (geom)
   "GEOM's bounding boxes as (MIN-LON MIN-LAT MAX-LON MAX-LAT): one PER PART for
@@ -228,8 +234,12 @@ SPATIAL-INDEX-REMOVE recompute exactly the set SPATIAL-INDEX-INSERT wrote."
               (cells '()))
           (dolist (b bboxes cells)
             (destructuring-bind (min-lon min-lat max-lon max-lat) b
+              ;; P was chosen from the TOTAL across parts, so each part
+              ;; alone is within MAX-CELLS and the covering's own check
+              ;; (GH #279) is a no-op -- see %BBOX-CELLS.
               (dolist (c (geohash-covering min-lon min-lat max-lon max-lat
-                                           :precision p))
+                                           :precision p
+                                           :max-cells max-cells))
                 (unless (gethash c seen)
                   (setf (gethash c seen) t)
                   (push c cells)))))))))
@@ -357,11 +367,34 @@ plus another in the caller."
 (defun map-spatial-index-radius (fn idx lat lon radius-m &key tags seen)
   "Call FN on each candidate node-id within ~RADIUS-M metres of (LAT, LON), via
 a bounding-box prefilter.  Refine with GEODESIC-DISTANCE for an exact radius.
-TAGS and SEEN are as for MAP-SPATIAL-INDEX-BBOX."
-  (let ((dlat (/ radius-m 111320d0))
-        (dlon (/ radius-m (* 111320d0 (max 0.01d0 (cos (deg->rad lat)))))))
-    (map-spatial-index-bbox fn idx (- lon dlon) (- lat dlat)
-                            (+ lon dlon) (+ lat dlat) :tags tags :seen seen)))
+TAGS and SEEN are as for MAP-SPATIAL-INDEX-BBOX.
+
+RADIUS-M is clamped to the planet before it becomes a degree span, per axis, and
+the window is then clamped to the globe.  A radius past half the circumference
+already means \"every node\", so this loses no result -- and the exact
+GEODESIC-DISTANCE refinement still applies the caller's true radius.  Without it
+the span grew without bound and drove GEOHASH-COVERING's grid walk
+quadratically: radius 2e10 m took 24.6 s on a FIVE-node index and 4e10 took
+99.5 s, firing a 30 s query deadline 69 s late, because %TICK cannot preempt
+inside this call.  Clamping per axis rather than short-circuiting to the whole
+globe keeps a polar query a latitude BAND: near the pole the COS term already
+inflates DLON, and a 200 km radius there must not come to mean everything
+(GH #279)."
+  ;; CLAMP-* first, and rationally: a bignum or ratio LAT or RADIUS-M
+  ;; would overflow the float arithmetic below before any clamp on the
+  ;; result could see it (GH #279).
+  (let* ((lat (clamp-latitude lat))
+         (lon (clamp-longitude lon))
+         (radius-m (clamp-radius-metres radius-m))
+         (dlat (min 90d0 (/ radius-m 111320d0)))
+         (dlon (min 180d0 (/ radius-m
+                             (* 111320d0 (max 0.01d0 (cos (deg->rad lat))))))))
+    (map-spatial-index-bbox fn idx
+                            (max -180d0 (- lon dlon))
+                            (max -90d0 (- lat dlat))
+                            (min 180d0 (+ lon dlon))
+                            (min 90d0 (+ lat dlat))
+                            :tags tags :seen seen)))
 
 (defun spatial-index-query-bbox (idx min-lon min-lat max-lon max-lat &key tags)
   "The candidate node-ids MAP-SPATIAL-INDEX-BBOX would visit, as a list.  Prefer
