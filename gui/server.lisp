@@ -73,19 +73,69 @@ matches (a pathname body is streamed by the handler)."
             (list :content-type (%static-content-type file))
             file))))
 
+(defvar *max-request-body-bytes* 65536
+  "Largest request body the API accepts, in bytes.  A query document is
+a few hundred bytes and free-text Prolog is capped at 4096 characters,
+so 64 KB is generous for anything legitimate.
+
+The check is on CONTENT-LENGTH and happens in %GUI-DISPATCH, before the
+request reaches ningle -- which is the only place it CAN happen: lack
+parses an application/json body while building the request, so by the
+time a handler runs the bytes are already read and decoded.  A 32 MB
+body cost ~7.3 s of CPU and 32 MB of transient allocation on an
+unauthenticated endpoint before any handler could object (GH #279).
+
+Refusing on the header means the body is never drained, so a client
+still uploading a very large one sees the connection close rather than
+a tidy 413 -- which is the point, and is what nginx does too.  A body
+that fits the socket buffer gets the 413 itself.")
+
+(defun %too-large-response (length)
+  "413 for an over-large request, in the GUI's own {error, message}
+shape.  Built by hand because NINGLE:*RESPONSE* does not exist yet:
+this runs before the ningle app is entered at all."
+  (list 413
+        (list :content-type "application/json; charset=utf-8")
+        (list (json:with-explicit-encoder
+                (json:encode-json-to-string
+                 (list :object
+                       (cons :error "request-too-large")
+                       (cons :message
+                             (format nil "Request body is ~D bytes; ~
+the limit is ~D" length *max-request-body-bytes*))))))))
+
 (defun %gui-dispatch (env ningle-fn root)
   "Route ENV: /api/* to the ningle app, everything else (GET/HEAD) to
-the static tree, with index.html at /."
-  (let ((path (getf env :path-info)))
-    (if (and (member (getf env :request-method) '(:get :head))
-             (not (eql 0 (search "/api/" path))))
-        (or (%static-response path root)
-            '(404 (:content-type "text/plain") ("not found")))
-        (funcall ningle-fn env))))
+the static tree, with index.html at /.
+
+An over-large body is refused here, ahead of both.  413 rather than 400
+because for once the request ENTITY really is what is too large -- the
+DSL's resource-budget breach stays a 400, where the request is tiny and
+it is the query that is expensive.
+
+A chunked body has no CONTENT-LENGTH and so cannot be pre-checked here.
+Deliberately not special-cased: hunchentoot never hands one to a
+handler at all -- it answers its own 400 after a read timeout -- and 40
+concurrent held chunked connections were measured not to degrade
+service, so a 411 here would add a branch on every request to change an
+outcome that is already safe."
+  (let ((path (getf env :path-info))
+        (length (getf env :content-length)))
+    (cond
+      ((and (integerp length) (> length *max-request-body-bytes*))
+       (%too-large-response length))
+      ((and (member (getf env :request-method) '(:get :head))
+            (not (eql 0 (search "/api/" path))))
+       (or (%static-response path root)
+           '(404 (:content-type "text/plain") ("not found"))))
+      (t (funcall ningle-fn env)))))
 
 (defun %make-gui-app ()
   (let ((app (make-instance 'ningle:<app>)))
-    (setf (ningle:route app "/api/graphs" :method :get)
+    (setf (ningle:route app "/api/capabilities" :method :get)
+          'api-capabilities
+
+          (ningle:route app "/api/graphs" :method :get)
           'api-graphs
 
           (ningle:route app "/api/graphs/:name/open" :method :post)
@@ -114,22 +164,40 @@ the static tree, with index.html at /."
           ;; DSL is a JSON document, not query parameters.  Read-only
           ;; all the same -- run-pattern-query never writes.
           (ningle:route app "/api/graphs/:name/query" :method :post)
-          'api-graph-query)
+          'api-graph-query
+
+          ;; Free-text Prolog (GH #279).  Routed unconditionally; the
+          ;; handler itself refuses when :ALLOW-PROLOG is off, so the
+          ;; flag is enforced at the endpoint and not by the UI hiding
+          ;; a tab.
+          (ningle:route app "/api/graphs/:name/prolog" :method :post)
+          'api-graph-prolog)
     app))
 
-(defun start-gui (&key (port *gui-port*) (bind "127.0.0.1"))
+(defun start-gui (&key (port *gui-port*) (bind "127.0.0.1")
+                       (allow-prolog nil))
   "Start the GUI HTTP server on PORT, bound to BIND (loopback by
 default -- localhost is the v1 security boundary).  A non-loopback
 BIND serves the UNAUTHENTICATED API and open/close verbs to that
 network: bind only interfaces whose peers you trust.  Returns the
 clack handler.  Idempotent: a second call while running returns the
-running handler unchanged."
+running handler unchanged.
+
+ALLOW-PROLOG (default NIL) opens POST /api/graphs/:name/prolog, which
+accepts a free-text Prolog query.  Everything that text can name is
+whitelisted against the live functor registries and this graph's
+schema before it compiles (gui/prolog.lisp), and it runs on the same
+read-only, bounded rails as the structured builder -- but it is still
+the only surface that reads client text, so it is off unless asked
+for.  Being idempotent, START-GUI sets the flag only when it actually
+starts a server: restart to change it."
   (or *gui-handler*
       (let* ((app (%make-gui-app))
              (root (gui-static-root))
              (ningle-fn (lack.component:to-app app)))
         (setq *gui-app* app)
         (setq *gui-port* port)
+        (setq *allow-prolog* (and allow-prolog t))
         (setq *gui-handler*
               ;; :debug nil -- a handler bug must never put a backtrace
               ;; in the browser; api.lisp logs details via log4cl.

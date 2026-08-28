@@ -38,6 +38,9 @@ const graphPath = (name, tail) =>
   `/api/graphs/${encodeURIComponent(name)}/${tail}`;
 
 export const api = {
+  // What this server offers (GH #279): server-level, fetched once at
+  // boot, before any graph exists to ask about.
+  capabilities: () => request("/api/capabilities"),
   graphs: () => request("/api/graphs"),
   openGraph: (name) =>
     request(graphPath(name, "open"), { method: "POST" }),
@@ -52,6 +55,14 @@ export const api = {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(dsl),
+    }),
+  // Free-text Prolog (GH #279).  Present on every build; the server
+  // refuses it with a 403 unless it was started with :ALLOW-PROLOG.
+  prolog: (name, text, limit) =>
+    request(graphPath(name, "prolog"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ query: text, limit }),
     }),
   // Explorer reads (GH #271).  Limits ride as query parameters; the
   // server applies its own default when omitted.

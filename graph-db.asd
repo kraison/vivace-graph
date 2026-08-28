@@ -231,14 +231,22 @@ and read-only neighborhood exploration."
   :serial t
   :components ((:file "package")
                (:file "api")
+               ;; The free-text Prolog surface and its read guard (GH
+               ;; #279).  After "api" (it reuses the error contract, the
+               ;; graph resolution macro and the query envelope), before
+               ;; "server" (which routes to it and sets its flag).
+               (:file "prolog")
                (:file "server"))
   :in-order-to ((test-op (test-op :graph-db/gui-test))))
 
 (defsystem graph-db/gui-test
   :name "VivaceGraph GUI test suite"
   :description "FiveAM + drakma tests driving the GUI API over real HTTP."
+  ;; :cl-ppcre is already in the image (graph-db/core depends on it) --
+  ;; declared because the vendored-asset test scans the frontend sources
+  ;; for CodeMirror entry points with it (GH #279).
   :depends-on (:graph-db/gui :graph-db/test-scratch :fiveam :drakma
-               :usocket :flexi-streams :bordeaux-threads)
+               :usocket :flexi-streams :bordeaux-threads :cl-ppcre)
   :pathname "tests/gui/"
   :serial t
   :components ((:file "package")

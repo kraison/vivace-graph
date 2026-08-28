@@ -16,12 +16,12 @@
 // refused here, and comparing two bound variables -- which the DSL
 // does support -- is an explicit second mode instead of an accident.
 //
-// The handoff never touches the explorer: it reports ids through
-// onSendToCanvas and main.js wires that to the canvas.
+// The results table and the canvas handoff moved to wb-results.js in
+// GH #279: the free-text Prolog surface answers in the same envelope
+// and renders through the same table.
 
 import { api } from "./api.js";
 
-const NODE_ID_RE = /^[0-9a-f]{32}$/;
 const NUMBER_RE = /^-?\d+(\.\d+)?$/;
 
 // Exactly *DSL-COMPARE-OPS* (query-dsl.lisp); nothing else compiles.
@@ -68,8 +68,7 @@ function literal(text) {
 export function createWorkbench({ matchEl, whereEl, selectEl,
                                   addVertexBtn, addEdgeBtn, addSlotBtn,
                                   addCompareBtn, limitEl, runBtn,
-                                  sendBtn, errorEl, statusEl, tableEl,
-                                  onSendToCanvas }) {
+                                  errorEl, results, onSchema }) {
   let graphName = null;
   let schema = null;
   let patterns = [];            // vertex/edge match rows
@@ -77,7 +76,6 @@ export function createWorkbench({ matchEl, whereEl, selectEl,
   let chosen = [];              // selected variable names, in order
   let nextVertexVar = 1;
   let nextBindVar = 1;
-  let lastIds = [];
   // Same stale-token rule as stats.js: a slow response for a graph or
   // a query the operator has moved on from must not win.
   let requestToken = 0;
@@ -295,10 +293,6 @@ export function createWorkbench({ matchEl, whereEl, selectEl,
     }
     addEdgeBtn.disabled = !ready || vertexRows().length === 0;
     limitEl.disabled = !ready;
-    sendBtn.hidden = lastIds.length === 0;
-    sendBtn.textContent =
-      `Send ${lastIds.length} node${lastIds.length === 1 ? "" : "s"} ` +
-      "to canvas";
   }
 
   function render() {
@@ -319,9 +313,7 @@ export function createWorkbench({ matchEl, whereEl, selectEl,
   }
 
   function clearResults() {
-    statusEl.textContent = "";
-    tableEl.textContent = "";
-    lastIds = [];
+    results.clear();
     showError("");
   }
 
@@ -347,52 +339,6 @@ export function createWorkbench({ matchEl, whereEl, selectEl,
       select: chosen,
       limit: Number.isInteger(limit) && limit > 0 ? limit : DEFAULT_LIMIT,
     };
-  }
-
-  function renderResults(body) {
-    const columns = body.columns || [];
-    const rows = body.rows || [];
-    tableEl.textContent = "";
-    const ids = [];
-    const table = el("table", "wb-table");
-    const head = document.createElement("thead");
-    const headRow = document.createElement("tr");
-    for (const c of columns) headRow.appendChild(el("th", null, c));
-    head.appendChild(headRow);
-    table.appendChild(head);
-    const tbody = document.createElement("tbody");
-    for (const row of rows) {
-      const tr = document.createElement("tr");
-      for (const c of columns) {
-        const value = row[c];
-        const td = document.createElement("td");
-        if (typeof value === "string" && NODE_ID_RE.test(value)) {
-          if (!ids.includes(value)) ids.push(value);
-          // A node id is a handoff affordance, not just text.
-          const b = el("button", "wb-id", value);
-          b.type = "button";
-          b.title = "Add this node to the canvas";
-          b.addEventListener("click", () => onSendToCanvas([value]));
-          td.appendChild(b);
-        } else {
-          td.textContent = value === null || value === undefined
-            ? "null"
-            : typeof value === "object"
-              ? JSON.stringify(value)
-              : String(value);
-        }
-        tr.appendChild(td);
-      }
-      tbody.appendChild(tr);
-    }
-    table.appendChild(tbody);
-    tableEl.appendChild(table);
-    lastIds = ids;
-    statusEl.textContent =
-      `${body.rowCount} row${body.rowCount === 1 ? "" : "s"}` +
-      (body.truncated
-        ? ` — truncated at the server's limit of ${body.limit}`
-        : "");
   }
 
   async function run() {
@@ -429,19 +375,18 @@ export function createWorkbench({ matchEl, whereEl, selectEl,
       return;
     }
     const token = ++requestToken;
-    clearResults();
-    renderControls();            // drops a stale "send to canvas"
-    statusEl.textContent = "running…";
+    clearResults();              // drops a stale "send to canvas"
+    results.status("running…");
     runBtn.disabled = true;
     try {
       const body = await api.query(graphName, buildDsl());
       if (token !== requestToken) return; // stale response, drop it
-      renderResults(body);
+      results.show(body);
     } catch (err) {
       if (token !== requestToken) return;
       // The server's message, verbatim -- it names the offending
       // pattern, type or bound.
-      statusEl.textContent = "";
+      results.status("");
       showError(err.message);
     }
     renderControls();
@@ -449,15 +394,25 @@ export function createWorkbench({ matchEl, whereEl, selectEl,
 
   function buildSchema(types, stats) {
     const slots = new Map();
+    const names = new Set();
     const s = (stats && stats.schema) || {};
     for (const t of [...(s.vertexTypes || []),
                      ...(s.edgeTypes || [])]) {
       slots.set(t.name, t.slots || []);
+      names.add(t.name);
+      for (const slot of t.slots || []) names.add(slot);
+    }
+    for (const t of [...(types.vertexTypes || []),
+                     ...(types.edgeTypes || [])]) {
+      names.add(t);
     }
     return {
       vertexTypes: types.vertexTypes || [],
       edgeTypes: types.edgeTypes || [],
       slotsOf: (type) => slots.get(type) || [],
+      // Every schema name a query may spell -- the Prolog editor dims
+      // heads that are neither these nor a registered functor.
+      names: [...names],
     };
   }
 
@@ -471,6 +426,7 @@ export function createWorkbench({ matchEl, whereEl, selectEl,
     nextBindVar = 1;
     clearResults();
     schema = null;
+    onSchema(null, []);
     render();
     if (!name) return;
     try {
@@ -480,6 +436,7 @@ export function createWorkbench({ matchEl, whereEl, selectEl,
                                                 api.stats(name)]);
       if (token !== requestToken) return;
       schema = buildSchema(types, stats);
+      onSchema(name, schema.names);
     } catch (err) {
       if (token !== requestToken) return;
       schema = null;
@@ -540,9 +497,6 @@ export function createWorkbench({ matchEl, whereEl, selectEl,
   });
 
   runBtn.addEventListener("click", () => run());
-  sendBtn.addEventListener("click", () => {
-    if (lastIds.length > 0) onSendToCanvas(lastIds);
-  });
 
   render();
 

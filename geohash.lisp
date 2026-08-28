@@ -107,8 +107,40 @@ about whether a cover fits."
   (multiple-value-bind (lw lh) (geohash-cell-size precision)
     (* (+ 1 (ceiling dlon lw)) (+ 1 (ceiling dlat lh)))))
 
+;;; Coordinate clamps (GH #279).
+;;;
+;;; Every one of these clamps with RATIONAL bounds and coerces AFTERWARDS.
+;;; The order is the whole point: a caller's number may be a bignum or a
+;;; ratio, and coercing that to a double signals FLOATING-POINT-OVERFLOW
+;;; before any clamp on the result could see it.  CL compares a rational
+;;; against a float exactly, so (min 180 <bignum>) is 180 and the overflow
+;;; never happens.  A coordinate outside the globe is meaningless anyway,
+;;; and a radius past half the circumference already means "everything".
+
+(defun clamp-latitude (lat)
+  "LAT clamped to [-90, 90] as a double-float."
+  (float (max -90 (min 90 lat)) 1d0))
+
+(defun clamp-longitude (lon)
+  "LON clamped to [-180, 180] as a double-float."
+  (float (max -180 (min 180 lon)) 1d0))
+
+(defun clamp-radius-metres (radius)
+  "RADIUS clamped to [0, 20_100_000] metres -- just past half the
+earth's circumference, beyond which a radius query means every node.
+Stays RATIONAL until the bound is applied, so a bignum cannot overflow
+on the way in."
+  (float (max 0 (min 20100000 radius)) 1d0))
+
 (defun %covering-precision (dlon dlat max-cells)
-  "Finest precision whose grid covers a DLON x DLAT degree box in <= MAX-CELLS."
+  "Finest precision whose grid covers a DLON x DLAT degree box in <= MAX-CELLS
+cells, FLOORED AT 1.
+
+The floor is not a fit guarantee, and callers must not read it as one: precision
+1 is the coarsest grid there is, so when even it exceeds MAX-CELLS this still
+returns 1 and the caller's grid walk is larger than it budgeted for.  What makes
+that bounded is GEOHASH-COVERING clamping its box to the globe before walking --
+at precision 1 the whole planet is 60 grid steps (GH #279)."
   (let ((best 1))
     (loop for p from 1 to 12 do
       (if (<= (%covering-cell-count dlon dlat p) max-cells)
@@ -120,10 +152,33 @@ about whether a cover fits."
                          &key precision (max-cells 256))
   "List of distinct geohash cells (strings) covering the given bounding box.
 Used to turn a map viewport into a set of prefix range scans.  PRECISION is
-chosen adaptively to stay under MAX-CELLS unless given explicitly."
-  (let* ((dlon (max 0d0 (- max-lon min-lon)))
+chosen adaptively to stay under MAX-CELLS; an explicitly supplied one is still
+LOWERED until the grid fits.
+
+Both bounds are load-bearing, because this walks the grid: the cost is
+(1+nlon)x(1+nlat) GEOHASH-ENCODE calls no matter how few DISTINCT cells come
+back, so MAX-CELLS bounds the answer, not the work.  Before GH #279 an explicit
+PRECISION skipped the check entirely and the box was unclamped, so a spatial
+query with a client-supplied radius drove a quadratic grid walk: radius 2e10 m
+became a ~180,000-degree span and 24.6 s of CPU on a FIVE-node index, with the
+query deadline unable to fire inside the call.
+
+The box is clamped to the globe first -- no geohash cell exists outside it, so
+that cannot lose a result.  Lowering the precision cannot either: a coarser cell
+still COVERS the box, and callers scan each returned cell as a prefix range,
+which reaches every finer cell nested inside it."
+  ;; Clamp BEFORE coercing -- see the clamp helpers above.  Coercing
+  ;; first overflowed on a bignum or ratio coordinate, which let an
+  ;; unauthenticated caller manufacture a FLOATING-POINT-OVERFLOW and,
+  ;; through it, a spurious server-fault alarm (GH #279).
+  (let* ((min-lon (clamp-longitude min-lon))
+         (max-lon (clamp-longitude max-lon))
+         (min-lat (clamp-latitude min-lat))
+         (max-lat (clamp-latitude max-lat))
+         (dlon (max 0d0 (- max-lon min-lon)))
          (dlat (max 0d0 (- max-lat min-lat)))
-         (p (or precision (%covering-precision dlon dlat max-cells)))
+         (fits (%covering-precision dlon dlat max-cells))
+         (p (if precision (min precision fits) fits))
          (seen (make-hash-table :test 'equal))
          (cells '()))
     (multiple-value-bind (lw lh) (geohash-cell-size p)

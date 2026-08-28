@@ -11,7 +11,260 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A spatial query's cost was quadratic in a client-supplied radius,
+  and independent of the data** (#279). `map-spatial-index-radius`
+  turned `radius-m` into a degree span with no clamp, and
+  `geohash-covering` — which *walks* a `(1+nlon)x(1+nlat)` grid —
+  skipped its `max-cells` budget entirely whenever a `:precision` was
+  supplied, which every query path does. `+spatial-query-max-cells+`
+  bounded the covering's **answer**, never its **work**. On a
+  *five*-node index, `(find-near ?n place 0 0 2e10)` took 24.6 s and
+  `4e10` took 99.5 s — firing a 30 s query deadline 69 s late, because
+  `%tick` runs at goal boundaries and cannot preempt inside the call.
+  Extrapolating the measured 4.05x-per-doubling, a legal literal of
+  `1e15` was on the order of millennia.
+
+  Fixed in the engine rather than by withholding the predicate from the
+  GUI, because the same path is reached by a `def-query` taking a
+  radius parameter and by any `select` over client data — excluding it
+  from one surface would have left the defect live everywhere else. The
+  radius is now clamped to the planet per axis before it becomes a
+  degree span (per axis, so a polar query stays a latitude *band*
+  rather than collapsing to the whole globe), and `geohash-covering`
+  clamps its box to the globe and lowers an explicitly requested
+  precision until the grid fits. Neither can lose a result: no geohash
+  cell exists outside the globe, a coarser cell still covers the box
+  and callers scan it as a prefix range, and the exact
+  `geodesic-distance` refinement still applies the true radius — a
+  radius past half the circumference simply means "every node". The
+  insert path is provably unaffected: `%bbox-cells` and
+  `%geometry-cells` now pass their own `:max-cells`, and the precision
+  they already compute fits it, so the new check is a no-op there and
+  `spatial-index-remove` still recomputes exactly what
+  `spatial-index-insert` wrote. Measured after: 2e10 → 0.025 s, 4e10 →
+  0.025 s, 1e15 → 0.027 s, all returning the whole-globe result set.
+
+- **The Prolog editor tab never appeared** (#279).
+  `CodeMirror.overlayMode` is *not* part of CM5's `lib/codemirror.js` —
+  it is `addon/mode/overlay.js`, which was never vendored. Building the
+  `vg-prolog` mode therefore threw during editor construction,
+  `enableProlog`'s exception was swallowed into a `console.warn`, and
+  the *Builder | Prolog* sub-tab nav — revealed on that function's last
+  line — stayed hidden. A GUI started with `:allow-prolog t` looked
+  exactly like one started without it. Fixed by vendoring
+  `codemirror-overlay.js` and loading it before the mode is used.
+
+  Hardened, because that failure mode was the real defect: the sub-tab
+  nav is now revealed as soon as the *server* advertises the capability,
+  before anything is loaded, so a load failure leaves the nav visible
+  with the Prolog tab disabled, relabelled *Prolog (unavailable)*, the
+  reason in its tooltip and in the pane, and the message in the roster's
+  error strip. "Not enabled" and "enabled but broken" are now
+  distinguishable. `createRosterPane` returns its `showError` so the
+  frame can use it.
+
+  A new test, `codemirror-entry-points-are-vendored-and-loaded`, reads
+  every `CodeMirror.<x>` call out of `js/prolog.js` and asserts each is
+  defined in a vendor file `js/main.js` actually loads. It is derived
+  from the source rather than hand-listed, and it fails on both ways
+  this goes wrong: calling an API that lives in an unvendored addon, and
+  vendoring a file without loading it.
+
+- **An unbound result variable returned 500** (#279). `{"query":"(= ?x
+  ?y)"}` — eleven characters, whitelisted predicates only, default
+  configuration — answered `500` and logged an `UNEXPECTED SERVER
+  FAULT`, as did `(var ?x)` and `(atom ?x)`. These are idiomatic Prolog:
+  `var/1` and `atom/1` exist precisely to be called on an unbound
+  variable, and unifying two fresh variables legitimately succeeds with
+  both still unbound. An unbound variable reaches the encoder as a `var`
+  **struct** (`prologc.lisp:97`) whose `:print-function` renders it
+  `?1` — so it looks like a symbol in a backtrace but is not one,
+  matched neither `node-p` nor `symbolp`, fell through
+  `%query-value->json`'s identity branch and reached cl-json raw
+  (`JSON:UNENCODABLE-VALUE-ERROR`). Fixed as **semantics, not
+  classification**: it is a legitimate answer, so it now renders as JSON
+  null and returns 200. A *bound* variable is dereferenced first, so
+  only a genuinely unbound one becomes null.
+
+  Fixed in the shared `query-dsl.lisp`, so REST's `/graph/:g/query` —
+  which had the identical defect, reachable with a `"select"` variable
+  that appears in neither `"match"` nor `"where"` — is fixed with it.
+  The same change also stops cl-json's *guessing* encoder mangling a row
+  whose values are all null: `(cons key NIL)` is not a dotted pair, so
+  such a row was guessed to be a plain list and encoded as
+  `[["x"],["y"]]` instead of `{"x":null,"y":null}`. Rows now go through
+  `json:encode-json-alist`, which forces the object and still encodes
+  each value with the ordinary encoder — a list-valued slot is still a
+  JSON array, which the *explicit* encoder would not be. An empty result
+  still encodes as `null`. A slot whose value is really `NIL` still
+  renders as the string `"NIL"`; that is a different value class and
+  stays #282.
+
+- **Bignum and ratio coordinates overflowed on coercion** (#279).
+  `geohash-covering`'s globe clamp coerced to `double-float` *before*
+  clamping, so a coordinate or radius given as a bignum or a ratio
+  signalled `floating-point-overflow` on the way in — letting an
+  unauthenticated caller manufacture the very "unexpected server fault"
+  alarm the ill-typed/fault split exists to keep trustworthy. All the
+  clamps now bound with *rational* limits and coerce afterwards; CL
+  compares a rational against a float exactly, so `(min 180 <bignum>)`
+  is `180` and the overflow cannot arise. Applied at every place a
+  caller's number enters: `geohash-covering`,
+  `map-spatial-index-radius`, `find-nodes-near`, `find-nearest-k`, and
+  the three Prolog geo predicates `geo-distance/5`, `geo-near/5` and
+  `geo-within/3`, which reach the trigonometry without touching the
+  index at all. Thirteen bignum/ratio shapes across every geo and
+  spatial functor now answer cleanly.
+
+- **The GUI decoded a request body before checking its size** (#279).
+  Both POST endpoints — the builder's `/query` (#278) and the new
+  `/prolog` — read and JSON-decoded an arbitrarily large body before
+  any length check applied: 32 MB cost ~7.3 s of CPU and 32 MB of
+  transient allocation on each, unauthenticated. The check now sits in
+  the dispatcher, on `Content-Length`, ahead of ningle — the only place
+  it *can* sit, since lack parses an `application/json` body while
+  building the request. Bodies over
+  `graph-db.gui::*max-request-body-bytes*` (64 KB) are a `413`; a
+  resource-budget breach stays a `400`, since there the request is tiny
+  and it is the query that is expensive.
+
 ### Added
+
+- **GUI free-text Prolog, behind an opt-in `start-gui :allow-prolog`
+  flag** (#279, tracker #272). The Query tab grows a second surface —
+  a *Prolog* sub-tab beside *Builder* — that exists only when the
+  server advertises it, and a new endpoint `POST
+  /api/graphs/:name/prolog` that accepts a raw query string. **The
+  default is off**, and `:allow-prolog` is enforced *at the endpoint*,
+  before the graph is even resolved (`403 prolog-disabled`): the UI
+  hiding a tab is decoration, not the control. A new server-level `GET
+  /api/capabilities` tells the frontend which it is, and — when on —
+  carries the functor inventory the editor dims unknown heads against.
+  `start-gui` is idempotent, so it sets the flag only when it actually
+  starts a server; restart to change it.
+
+  The read guard is the substance, and it runs entirely before the
+  Prolog compiler sees anything: (1) the flag; (2) a **character screen
+  ahead of `read`** — length (4096) and nesting-depth (32) caps,
+  balance, and a refusal by name of the package marker, every `#`
+  reader macro, backquote and comma. The package marker has to be
+  refused *textually*, because by the time `read` has resolved
+  `graph-db::anything` it has already interned it. Inside a string or a
+  `|…|` name none of those characters is syntax, so a literal
+  `"#.(…)"` is data and passes. (3) A read with `*read-eval*` nil, a
+  readtable with `#`/backquote/comma disabled, and `*package*` bound to
+  a **scratch package made for that one request that uses nothing**.
+  (4) A **whitelist walk that rebuilds the form out of canonical
+  symbols** — a symbol survives only as a registered functor *of that
+  arity*, a control construct, a vertex/edge type or slot of *this*
+  graph, a `?variable`, or `t`/`nil`; goal heads must be symbols,
+  because a string head reaches `prolog-compiler-macro`, which interns
+  it into `GRAPH-DB`. (5) The existing rails, through
+  `query-dsl.lisp`'s own runner: `:effects nil`, one MVCC snapshot,
+  the inference/time/row bounds. (6) `delete-package` in an
+  `unwind-protect`, so every symbol a hostile query interned leaves
+  with the request.
+
+  The whitelist is **derived from the live image**, not hand-listed:
+  `(name . arity)` pairs enumerated out of `*prolog-global-functors*`
+  and `*user-functors*` (so a graph's edge functors come along for
+  free), control constructs out of the `prolog-compiler-macro` property
+  on `GRAPH-DB`'s symbols. Enumerated, never probed — `make-functor-
+  symbol` *interns*, so asking the registry about a client's
+  `name/arity` would create it; names are matched as strings. Two
+  things are withheld on purpose: the runtime meta-call family (`call`,
+  `catch`, `findall`, `bagof`, `setof`), each of which hands a term to
+  `%solve` and lets it build a functor symbol from that term's *run-
+  time* head; and a variable where a control construct expects a goal
+  (`(not ?g)`), which is the same hazard by another door. Together
+  those close `%solve` to free text. A whitelisted but *effectful*
+  predicate is not refused by the guard — it passes and `:effects nil`
+  stops it at run time (`403`), and a runaway query hits the inference
+  budget (`400 query-too-expensive`) rather than hanging.
+
+  The answer is the *same* `{columns, rows, rowCount, limit,
+  truncated}` envelope the builder's endpoint returns, so one results
+  table, one limit semantics and one canvas handoff serve both
+  surfaces. The editor is a vendored **CodeMirror 5** (5.65.21, MIT;
+  CodeMirror 6 needs a bundler, which the no-build posture rules out)
+  with a small overlay mode colouring `?variables` and dimming
+  unrecognised heads, and a live paren-balance indicator beside Run.
+  Its assets are injected only when the capability says the editor
+  exists, so a default GUI never fetches them. 202 new adversarial
+  checks over real HTTP cover reader-eval, package-qualified names,
+  string heads, unknown functors and arities, meta-call escapes,
+  effectful goals, the resource cap, both flag states, and that fifty
+  hostile queries add no symbol to `GRAPH-DB` or `KEYWORD` and no
+  package to the image.
+
+  A third exclusion category, **cost-unbounded predicates**, withholds
+  `regex-match/2`. All three lists name *engine* predicates and are
+  matched two ways, independently: by **home**, only against
+  `GRAPH-DB`-homed registry entries, so a schema declaring an edge type
+  called `regex-match` (or `findall`, or `select`) keeps its own
+  auto-installed functors; and by **routing**, refusing any head whose
+  name a `GRAPH-DB` symbol carries a `prolog-compiler-macro` for,
+  whatever package the head came from. The second is what makes the
+  first safe — `prolog-compiler-macro` canonicalizes a foreign-package
+  head *by name* back into `GRAPH-DB`, so home-scoping alone would
+  exclude by home while the compiler routed by name, and a
+  schema-package `call/2` would be admitted by the whitelist and then
+  compiled by the engine's own `call` macro, re-opening `%solve-call`.
+  Only `call` and `%commit` are both excluded and compiler-macro-backed,
+  so the routing test refuses exactly those two and asks the image
+  rather than a list. The query rails are enforced by `%tick`, which runs
+  at inference and goal boundaries and *never inside a functor that is
+  already running*, so a predicate that can burn arbitrary time in one
+  atomic Lisp call is not preemptible by `*query-default-timeout*` or
+  `*query-default-max-inferences*`. `regex-match/2` takes both the
+  pattern and the subject from the client, so `(a+)+$` against a run of
+  `a`s is ~2^n from a payload of a few dozen characters — 6.0 s at 26
+  `a`s, 51.2 s at 29, the latter answering 200 well past a 30 s
+  deadline that never fired. Exclusion rather than a watchdog:
+  interrupting a worker mid-call could unwind holding the GUI's rw lock
+  or with an mmap operation in flight. `valid-date-p/1` also runs a
+  regex and stays — its pattern is a fixed anchored constant and its
+  cost is linear in a subject the length cap bounds.
+
+  A query that gets past the guard but hands a predicate arguments it
+  cannot use is now `400 ill-typed-query` with a **generic** message,
+  not the condition's own report: several whitelisted read functors
+  raise conditions that are not `prolog-error` subtypes and whose
+  reports name engine internals (a store's keyword name, a
+  generic-function name, an ANSI section reference), and they were
+  reaching the browser as 500s. The read path likewise stops echoing
+  the implementation's reader-error text for a rejected numeric literal
+  such as `1/0`. In both cases the detail goes to `log:error`, so the
+  operator keeps it; the DSL's own `prolog-error` / `query-param-error`
+  messages are still returned verbatim.
+
+  The ill-typed conversion is **narrow**, so a genuine engine defect is
+  never labelled the client's: only the two families client input was
+  *measured* to produce become a 400 — `no-applicable-method` (an
+  unbound variable reaching a generic that dispatches on node classes)
+  and `simple-error` (how the query layer reports a precondition it
+  checked on purpose, e.g. "No secondary index on …"). Everything else
+  — `type-error` above all, which is the classic shape of a real defect
+  — is a **500** with a fixed generic body, and the two log under
+  distinct labels (`ill-typed query` vs `UNEXPECTED SERVER FAULT`) so an
+  operator can grep them apart. Known residual: an internal `assert` or
+  `(error "…")` in engine code is also a `simple-error` and is still
+  counted the client's; the durable fix is a distinct condition class
+  for validated query preconditions, which is an engine change (#286).
+
+  Those three exclusion lists are the *only* hand-maintained part of
+  the guard, and the one part that cannot notice the engine changing
+  under it: the whitelist grows with the registries automatically, so a
+  meta-calling or cost-unbounded predicate added tomorrow would be
+  admitted to free text with no test failing. A tripwire closes that —
+  `prolog-functor-inventory-is-pinned` pins the whole set of registered
+  functor `name/arity` strings against a reviewed inventory committed
+  in the test file, and fails on any addition or removal with a message
+  that walks the reader through *both* questions the new arrival has to
+  answer: does it reach `%solve`, and is its worst-case cost bounded by
+  the graph or by the query's length.
 
 - **GUI query workbench: a schema-driven builder, a results table and
   a result-to-canvas handoff** (#278, tracker #272). The cockpit's

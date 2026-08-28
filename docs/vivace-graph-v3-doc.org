@@ -1999,6 +1999,267 @@ Result keys are the select variables' names (a leading ~?~ stripped),
 and a value that is a node renders as its 32-hex ~string-id~ — which
 is what makes the canvas handoff possible.
 
+An *unbound* result variable renders as JSON ~null~, and the query
+succeeds. That is not an error case: ~var/1~ and ~atom/1~ exist to be
+called on an unbound variable, unifying two fresh variables succeeds
+with both still unbound, and a ~"select"~ variable that appears in
+neither ~"match"~ nor ~"where"~ is never bound. (An unbound variable is
+a ~var~ *struct* internally, printed ~?1~; before GH #279 it reached the
+JSON encoder raw and produced a 500.) Note that a slot whose stored
+value is genuinely ~NIL~ is a different case and still renders as the
+string ~"NIL"~ — see GH #282.
+
+**** Free-text Prolog (opt-in, GH #279)
+
+The builder above reads no user text at all. A second surface inside
+the Query tab — a *Prolog* sub-tab beside *Builder* — does, and it is
+therefore off unless asked for:
+
+#+BEGIN_SRC lisp
+  (graph-db.gui:start-gui :allow-prolog t)   ; default is NIL
+#+END_SRC
+
+~start-gui~ is idempotent, so it sets the flag only when it actually
+starts a server; restart to change it. With the flag off, ~POST
+/api/graphs/:name/prolog~ answers ~403 prolog-disabled~ *before it
+resolves the graph* — the flag is enforced at the endpoint, and the UI
+hiding the sub-tab is decoration, not the control. A frontend learns
+which it is from ~GET /api/capabilities~ (server-level, not
+per-graph):
+
+#+BEGIN_SRC js
+  // GET /api/capabilities  (flag off)
+  { "allowProlog": false, "prolog": null }
+
+  // GET /api/capabilities  (flag on)
+  { "allowProlog": true,
+    "prolog": { "maxQueryLength": 4096, "maxDepth": 32,
+                "functors": ["!", "/=", "<", "=", "is-a",
+                             "node-slot-value", "not", "..."] } }
+#+END_SRC
+
+The request and the answer:
+
+#+BEGIN_SRC js
+  // POST /api/graphs/demo/prolog
+  { "query": "(is-a ?p gui-person) (node-slot-value ?p name ?n)",
+    "limit": 50 }
+
+  // 200 -- the SAME envelope the builder's endpoint returns
+  { "columns": ["p", "n"],
+    "rows": [ { "p": "5087bb…c001", "n": "Alice" } ],
+    "rowCount": 1, "limit": 50, "truncated": false }
+#+END_SRC
+
+The text is a *sequence of goals*, nothing else: not a ~select~ form.
+The server owns the option list — a client that could write
+~(select (:effects t) …)~ would own the rails it is bounded by. The
+result columns are the ~?variables~ in order of first appearance.
+
+***** The guard
+
+Everything the text can name is checked before one character of it
+reaches the Prolog compiler. In order (~gui/prolog.lisp~):
+
+1. *The flag*, before the graph is resolved.
+2. *A character screen*, before ~read~. Length (4096) and nesting depth
+   (32) caps; balance; and an outright refusal of the *package marker*,
+   every ~#~ reader macro, backquote and comma — each named in the
+   error. The package marker has to be refused *textually*: by the time
+   ~read~ has resolved ~graph-db::anything~ it has already interned it,
+   which is the growth the guard exists to prevent. Inside a string or
+   a ~|…|~ name none of those characters is syntax, so a literal
+   ~"#.(…)"~ is data and passes.
+3. *A restricted read*: ~*read-eval*~ bound to ~nil~, a readtable with
+   ~#~, backquote and comma disabled (a second line of defence behind
+   the screen), standard IO syntax otherwise, and ~*package*~ bound to
+   a *scratch package created for that one request that uses nothing* —
+   so a bare name the client types can intern nowhere else. Reading
+   from a string cannot block, and unbalanced input signals
+   ~end-of-file~ rather than hanging.
+4. *A whitelist walk* that rebuilds the form out of canonical symbols.
+   A symbol survives only as a registered Prolog functor *of that
+   arity*, a control construct, a vertex/edge type or slot name of *the
+   target graph*, a ~?variable~, or ~t~/~nil~. Everything else — a
+   package-qualified name that somehow got past step 2, an unregistered
+   head, a slot name from another graph — is refused with a message
+   naming it. Goal heads must be *symbols*: a string head would reach
+   ~prolog-compiler-macro~, which interns it into ~GRAPH-DB~.
+5. *The existing rails*, through ~query-dsl.lisp~'s own
+   ~run-query-goals~ (the same runner the builder's endpoint uses):
+   ~:effects nil~, one MVCC snapshot, ~*query-default-max-inferences*~,
+   ~*query-default-timeout*~, and the row cap.
+6. *~delete-package~ on the scratch package*, in an ~unwind-protect~ —
+   so every symbol a hostile query interned leaves with the request
+   that made it. The suite proves this: fifty hostile queries with
+   distinct names add no symbol to ~GRAPH-DB~ or ~KEYWORD~ and no
+   package to the image.
+
+The whitelist is *derived from the live image*, never hand-maintained:
+the ~(name . arity)~ pairs are enumerated out of
+~*prolog-global-functors*~ and ~*user-functors*~ (so a graph's edge
+functors and any ~def-index~ predicates are automatically in it), and
+the control constructs out of the ~prolog-compiler-macro~ property on
+~GRAPH-DB~'s symbols. Enumerated, never probed: ~make-functor-symbol~
+*interns*, so asking the registry whether a client's ~name/arity~
+exists would create the very symbol it was asking about. Names are
+compared as strings.
+
+Three things are withheld on purpose:
+
+- ~regex-match/2~, because its worst-case cost is bounded neither by
+  the graph nor by the length of the query. The rails are enforced by
+  ~%tick~, which runs at inference and goal boundaries and *never
+  inside a functor that is already running*, so a predicate that can
+  burn arbitrary time in one atomic Lisp call is not preemptible by
+  ~*query-default-timeout*~ or ~*query-default-max-inferences*~.
+  ~regex-match/2~ takes both the pattern and the subject from the
+  client, so ~(a+)+$~ against a run of ~a~'s costs ~~2^n~ from a
+  payload of a few dozen characters — measured at 6.0 s for 26 ~a~'s
+  and 51.2 s for 29, the latter answering 200 well past a 30 s
+  deadline that never fired. A watchdog is *not* the alternative:
+  interrupting a worker mid-call can unwind holding the GUI's rw lock
+  or with an mmap operation in flight, which is worse than the hazard
+  it closes. ~valid-date-p/1~ also runs a regex and *stays*, because
+  its pattern is a fixed, anchored, quantifier-free constant and its
+  cost is linear in a subject the length cap already bounds — that is
+  the line the category draws. Graph-bounded scans (~is-a/2~,
+  ~find-slot-range/5~, the spatial ~find-*~ family) are *not* in this
+  category: their cost tracks the operator's own data, and the
+  un-flagged structured builder already reaches all of it.
+
+  ⚠ The spatial family only belongs on that list *since* the radius
+  clamp below. ~+spatial-query-max-cells+~ bounds the covering's
+  ANSWER, not its WORK — ~geohash-covering~ walks a
+  ~(1+nlon)x(1+nlat)~ grid — and it was skipped outright when a
+  ~:precision~ was passed, which every query does. An unclamped
+  ~find-near/5~ radius therefore drove a grid quadratic in a number the
+  client chose and *independent of the data*: on a five-node index,
+  ~2e10~ metres took 24.6 s and ~4e10~ took 99.5 s, firing the 30 s
+  query deadline 69 s late. Observing that a planet-sized window
+  resolves to a handful of cells was *not* a bound on this — the
+  failure needs a window larger than the planet, which an unclamped
+  radius produces from a 44-character query.
+
+- The *runtime meta-call family* — ~call~, ~catch~, ~findall~, ~bagof~,
+  ~setof~ (and the internal ~select~ / ~show-prolog-vars~ /
+  ~%commit~). Each hands a term to ~%solve~, which builds a functor
+  symbol from that term's *head at run time*; for a string head that is
+  an ~intern~ of graph data into the live schema package.
+- A *variable where a control construct expects a goal* — ~(not ?g)~,
+  ~(once ?g)~, ~(if ?g …)~, ~(and ?g …)~, ~(forall ?g …)~. A variable
+  there makes ~static-goal-p~ fail, the compiler macro declines, and
+  the runtime functor behind it meta-calls whatever the variable holds.
+  Writing the goal out in full keeps all of them on the compile-time
+  path. ~(not (node-slot-value ?p name "Alice"))~ is fine.
+
+All three lists name *engine* predicates, so they are matched two ways,
+independently. By **home**: only against registry entries homed in
+~GRAPH-DB~, so a schema that declares an edge type called
+~regex-match~ (or ~findall~, or ~select~) owns that name in its own
+package and the ~NAME/2~ / ~NAME/3~ functors ~def-edge~ installs for it
+stay available. And by **routing**: a head is refused when a same-named
+~GRAPH-DB~ symbol carries a ~prolog-compiler-macro~, whatever package
+the head came from.
+
+The second is not belt-and-braces, it is what makes the first safe.
+~prolog-compiler-macro~ canonicalizes a foreign-package head *by name*
+back into ~GRAPH-DB~, so home-scoping alone excluded by home while the
+compiler routed by name: a schema-package ~call/2~ was admitted by the
+whitelist and then compiled by the engine's own ~call~ macro, re-opening
+~%solve-call~. Only ~call~ and ~%commit~ are both excluded and
+compiler-macro-backed, so the routing test refuses exactly those two —
+it asks the image, so it needs no maintenance as the engine grows.
+
+Together those close ~%solve~ to free text. The cost is that list
+*data* is not expressible — every parenthesised form is validated as a
+goal — which is what keeps an unvetted symbol or string out of head
+position in the first place.
+
+Those three lists are the only hand-maintained part of the guard, and
+the only part that cannot notice the engine changing under it: the
+whitelist grows with the registries by itself, so a meta-calling or
+cost-unbounded predicate added tomorrow would reach free text with
+nothing failing. The test ~prolog-functor-inventory-is-pinned~
+(~tests/gui/gui-tests.lisp~) is the tripwire — it pins the whole set of
+registered ~name/arity~ strings against a reviewed inventory and fails
+on any addition or removal, with a message that walks the reader
+through *both* questions a new arrival has to answer (does it reach
+~%solve~, and is its worst-case cost bounded by the graph or by the
+query's length). **Update that inventory only after reading the added
+functor**, never to make the suite pass.
+
+A whitelisted but *effectful* predicate is not refused by the guard: it
+passes, and ~:effects nil~ stops it at run time. ~(nl)~, ~(write ?p)~,
+~(lisp ?r ?x)~ and ~(retract ?p)~ are each a ~403
+forbidden-operation~. A runaway query (~(repeat) (fail) …~) hits the
+inference budget and is a ~400 query-too-expensive~ — not a hang.
+
+Guard refusals are ~400 refused-query~ with the reason verbatim, which
+names the offending token. Past the guard, a query's *shape* is the
+client's, so a goal handed arguments its predicate cannot use — an
+unbound class where an index lookup wants one, a variable where a
+method wants a node — is ~400 ill-typed-query~ with a *generic*
+message. It is deliberately not the condition's own report: those name
+engine internals (a store's keyword name, a generic-function name, an
+ANSI section reference), and the client that provoked them is
+unauthenticated. The same rule covers the read path, where a rejected
+numeric literal such as ~1/0~ or ~1e999999~ answers "the query could
+not be read" rather than the implementation's reader-error text. The
+commonest way to provoke it is an *edge-traversal* goal whose first
+argument is unbound: ~outgoing-edges~ / ~incoming-edges~ need a bound
+node to start from, so ~(incoming-edges ?v gui-visited ?e)~ — the
+natural "every visit" query — is ill-typed, and you must bind ~?v~
+first (typically with an ~is-a~ goal). In
+every case the detail goes to ~log:error~, so the operator keeps it.
+The DSL's own ~prolog-error~ / ~query-param-error~ messages *are*
+returned verbatim — they were written to be client-facing and are
+actionable. Everything else maps exactly as the builder's endpoint
+does.
+
+***** The editor
+
+The sub-tab is a CodeMirror 5 editor (vendored; see
+~gui/static/vendor/VENDOR.md~ — CodeMirror 6 needs a bundler, which the
+no-build posture rules out). A small *overlay mode* over the stock
+Common Lisp mode gives ~?variables~ their own colour and *dims a head
+symbol the server would not recognise* — the functor inventory comes
+from ~/api/capabilities~ and the type and slot names from the ~/types~
+and ~/stats~ responses the builder already loads. A *paren-balance
+indicator* sits beside Run, showing nesting depth at the cursor and an
+unmistakable unbalanced state. Ctrl-Enter runs.
+
+The CodeMirror assets are injected only when the capability says the
+editor exists, so a default GUI never fetches them. Note that
+~overlayMode~ is a CodeMirror *addon*, not core: ~codemirror-overlay.js~
+is vendored and loaded alongside the library, and a test asserts that
+every ~CodeMirror.<x>~ the frontend calls is defined in a vendor file
+~main.js~ loads (GH #279).
+
+If the editor cannot load, the sub-tab nav still appears with the
+*Prolog* tab disabled and labelled *Prolog (unavailable)*, the reason on
+the tab and in the pane, and a message in the error strip. A broken
+editor must not be mistakable for a disabled one — the tab silently
+never appearing is exactly how a missing addon went unnoticed.
+
+Both surfaces share one results table, one row limit semantics and one
+canvas handoff — they answer in the same envelope.
+
+**Request size.** Every API request body is capped at
+~graph-db.gui::*max-request-body-bytes*~ (64 KB); a larger one is a
+~413~ before it is decoded. The check has to sit in the dispatcher
+rather than a handler, because the lack layer parses an
+~application/json~ body while building the request — by the time a
+handler runs, the bytes are already read and decoded. A 32 MB body
+previously cost ~7.3 s of CPU and 32 MB of transient allocation on an
+unauthenticated endpoint, on *both* POST routes, before anything could
+object. ~413~ rather than ~400~ because here the request entity really
+is what is too large — a resource-budget breach stays a ~400~, where
+the request is tiny and it is the query that is expensive. Refusing on
+the header means the body is never drained, so a client still uploading
+a very large one sees the connection close rather than a tidy ~413~
+(GH #279).
+
 Static assets under
 ~gui/static/~ are served at ~/~ (resolved via
 ~asdf:system-relative-pathname~); every request path must resolve, by
@@ -2604,6 +2865,31 @@ Every query takes a *scope* as its first argument: a node-class name, a list of 
 - *The indexes* are ordered indexes (in the graph's index region, ~indexes.dat~) — a skip list by default, or a B+ tree if the graph's ~:index-backend~ selects one (see Chapter 3) — one per spatially indexed ~(class . slot)~, each keyed by the composite ~(geohash-cell . node-id)~: a node's id is entered under every grid cell its geometry occupies, at that index's precision. Folding the id into the key keeps the index *duplicate-free*, so insert and — especially — *remove* are O(log n) (an older duplicate-cell layout made removal O(n)). Each entry also stores the *type tag* of the node it points at, which is what lets a scoped query reject an out-of-scope candidate from the index entry alone, without materialising the node — so a query on an index /shared/ by several classes costs its own results, not the whole index's population. A query covers its window with as few, possibly coarser, cells as it can and does one *prefix range scan* per covering cell — geohash keys are prefix-nested, so every finer cell within a coarse one sorts inside its range — touching only the cells in view. Each index carries its own precision: the ~:spatial-precision~ slot option if the geometry slot declares one, else the graph default (~make-graph~'s ~:spatial-precision~ keyword, default 7 ≈150 m cells; 9 ≈ 5 m). A precision is persisted with its index and read back by ~open-graph~. A graph written before the current scheme (the spatial sidecar is now ~spatial-indexes.dat~, format v5) re-derives /all/ its spatial indexes from the live node geometries on first open — index only, node data untouched, nothing re-fetched.
 - *A bounded insert, self-healed at query time.* To stop a huge polygon from covering an astronomical number of fine cells, an insert caps its cover (16384 cells per index) and, when it must, stores that geometry more coarsely. The coarsening is made safe by the same /filter then refine/ contract: each index remembers the coarsest precision it actually holds and a query never covers finer than that, so a coarsely-stored country-scale polygon is still found (then refined exactly). Deleting the oversized geometry lets the finer selectivity return on its own, with no rebuild. Per-index precision (above) is the real control; the cap and clamp are a safety net for data that does not match the grid. The cap bounds a /whole geometry's/ cover: a multipolygon is covered part by part (so the gaps between separated parts are not indexed) but at one precision — the finest whose total fits — so a small island in a large boundary keeps full precision rather than dragging the index's clamp down with it (GH #103).
 - *Matching uses a representative point*: a ~:point~ matches exactly; an extended geometry (line, polygon) is matched by the centre of its bounding box, so radius/containment results for extended geometries are approximate. Point-in-polygon refinement honours holes.
+- *A bounded query window.* A radius query's window is clamped to the
+  planet before it becomes a degree span — per axis, so a query near a
+  pole stays a latitude *band* rather than becoming the whole globe —
+  and ~geohash-covering~ clamps its box to the globe and lowers an
+  explicitly requested precision until the grid fits its cell budget.
+  Coordinates and radii are clamped with *rational* bounds and coerced
+  afterwards — a bignum or ratio argument would otherwise overflow on
+  conversion before any clamp could see it, which let a caller
+  manufacture a ~floating-point-overflow~ (the same clamp is applied by
+  ~geo-distance/5~, ~geo-near/5~ and ~geo-within/3~, which reach the
+  trigonometry without going through the index at all).
+  Both are cost bounds, not result bounds: the covering *walks* a
+  ~(1+nlon)x(1+nlat)~ grid, so an unbounded span costs that many
+  ~geohash-encode~ calls however few distinct cells come back. Without
+  the clamp, ~(find-near ?n place 0 0 2e10)~ took 24.6 s on a *five*-node
+  index and ~4e10~ took 99.5 s — quadratic in a number the caller
+  chose and independent of the data, and not interruptible by a query
+  timeout, since ~%tick~ cannot run inside the call. Neither clamp can
+  lose a result: no geohash cell exists outside the globe, a coarser
+  cell still covers the box (and callers scan each cell as a prefix
+  range, reaching everything nested inside it), and the exact
+  ~geodesic-distance~ refinement still applies the caller's true radius.
+  A radius past half the circumference simply means "every node"
+  (GH #279).
+
 - *Distance* is the haversine great-circle distance — accurate to roughly half a percent, ample for most uses; a more precise geodesic can replace it later without changing the API.
 - *Heavier topology* (intersection, union, validity repair) is intentionally out of this dependency-free core and is left to an optional GEOS-backed module.
 

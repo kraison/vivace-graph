@@ -72,7 +72,20 @@
       </div>
       <section id="workbench-view" class="workbench" role="tabpanel"
                aria-label="Query workbench" hidden>
-        <div class="wb-builder">
+        <div class="wb-surface">
+        <!-- Builder | Prolog. The Prolog sub-tab is revealed only when
+             GET /api/capabilities reports allowProlog (GH #279); the
+             endpoint refuses free text on its own regardless. -->
+        <nav id="wb-subtabs" class="wb-subtabs" role="tablist"
+             aria-label="Query surface" hidden>
+          <button id="wb-tab-builder" class="wb-subtab active"
+                  type="button" role="tab" aria-selected="true"
+                  aria-controls="wb-builder">Builder</button>
+          <button id="wb-tab-prolog" class="wb-subtab" type="button"
+                  role="tab" aria-selected="false"
+                  aria-controls="wb-prolog">Prolog</button>
+        </nav>
+        <div id="wb-builder" class="wb-builder">
           <div class="wb-section">
             <div class="wb-section-head">
               <h3>Match</h3>
@@ -102,16 +115,35 @@
             <input id="wb-limit" class="wb-limit" type="number" min="1"
                    max="1000" value="50">
             <button id="wb-run" type="button">Run</button>
-            <button id="wb-send" type="button" hidden></button>
           </div>
           <p id="wb-error" class="wb-error" hidden></p>
+        </div>
+        <section id="wb-prolog" class="wb-prolog" role="tabpanel"
+                 aria-label="Prolog editor" hidden>
+          <p class="wb-hint">
+            One goal per parenthesised form; every ?variable becomes a
+            result column. Ctrl-Enter runs.
+          </p>
+          <div id="wb-editor" class="wb-editor"></div>
+          <div class="wb-run">
+            <span id="wb-balance" class="wb-balance"></span>
+            <label for="wb-prolog-limit">Limit</label>
+            <input id="wb-prolog-limit" class="wb-limit" type="number"
+                   min="1" max="1000" value="50">
+            <button id="wb-prolog-run" type="button">Run</button>
+          </div>
+          <p id="wb-prolog-error" class="wb-error" hidden></p>
+        </section>
         </div>
         <div id="wb-splitter" class="wb-splitter" role="separator"
              aria-orientation="horizontal" tabindex="0"
              aria-label="Resize the query builder"
              title="Drag to resize (double-click to reset)"></div>
         <div class="wb-results">
-          <p id="wb-status" class="wb-status"></p>
+          <div class="wb-results-head">
+            <p id="wb-status" class="wb-status"></p>
+            <button id="wb-send" type="button" hidden></button>
+          </div>
           <div id="wb-table" class="wb-table-host"></div>
         </div>
       </section>

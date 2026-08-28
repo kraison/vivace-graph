@@ -47,8 +47,24 @@ environment to capture one); RUN-PATTERN-QUERY binds it around the SELECT.")
 
 (defun %query-value->json (v)
   "Render a query result value as a JSON-encodable datum: a node becomes its id
-string, a non-keyword symbol its name; scalars pass through."
-  (cond ((node-p v) (string-id v))
+string, a non-keyword symbol its name, an UNBOUND query variable JSON null;
+scalars pass through.
+
+An unbound variable is a legitimate ANSWER, not a client error: var/1 and atom/1
+exist to be called on one, and unifying two fresh variables succeeds with both
+still unbound.  It arrives here as a VAR STRUCT (prologc.lisp:97) whose
+:PRINT-FUNCTION renders it \"?1\" -- which is why it looks like a symbol in a
+backtrace but is not one, so it matched neither NODE-P nor SYMBOLP, fell through
+to the identity branch and reached cl-json as a raw struct
+(JSON:UNENCODABLE-VALUE-ERROR, a 500).  A BOUND variable is dereferenced first,
+so only a genuinely unbound one becomes null (GH #279).
+
+NOT touched here: a slot whose value is really NIL still renders as the STRING
+\"NIL\", because (SYMBOLP NIL) is true.  That is a different value class with
+wider client impact and stays GH #282's business."
+  (setq v (var-deref v))
+  (cond ((var-p v) nil)                 ; unbound -> JSON null
+        ((node-p v) (string-id v))
         ((keywordp v) v)
         ((symbolp v) (symbol-name v))
         (t v)))
@@ -60,9 +76,27 @@ alist keyed by the camelCase result-variable names."
           return-vars row))
 
 (defun query-results->json (return-vars tuples)
-  "Encode TUPLES (one row per solution) as a JSON array of objects."
-  (json:encode-json-to-string
-   (mapcar (lambda (row) (query-row->alist return-vars row)) tuples)))
+  "Encode TUPLES (one row per solution) as a JSON array of objects.
+
+Rows go through ENCODE-JSON-ALIST rather than cl-json's guessing encoder.
+(CONS key NIL) is not a dotted pair, so a row whose values are ALL null -- which
+(= ?x ?y) and (var ?x) legitimately produce -- was guessed to be a plain list
+and came out as [[\"x\"],[\"y\"]] instead of {\"x\":null,\"y\":null}.
+ENCODE-JSON-ALIST forces the object and still encodes each VALUE with the
+ordinary encoder, so a list-valued slot is still a JSON array -- which the
+explicit encoder would NOT be: it would read the list as its own markup
+(GH #279).
+
+An empty result stays \"null\", exactly as before; widening it to [] would be a
+second, unrelated change to the wire."
+  (if (null tuples)
+      (json:encode-json-to-string nil)
+      (with-output-to-string (out)
+        (json:with-array (out)
+          (dolist (row tuples)
+            (json:as-array-member (out)
+              (json:encode-json-alist
+               (query-row->alist return-vars row) out)))))))
 
 (defun emit-query-results (return-vars format run)
   "Render a query's results.  RUN is a function of one argument -- a per-row
@@ -82,7 +116,10 @@ JSON line and sets the application/x-ndjson content type."
      (with-output-to-string (out)
        (funcall run
                 (lambda (row)
-                  (json:encode-json (query-row->alist return-vars row) out)
+                  ;; ENCODE-JSON-ALIST, not ENCODE-JSON: same all-null-row
+                  ;; hazard as QUERY-RESULTS->JSON (GH #279).
+                  (json:encode-json-alist
+                   (query-row->alist return-vars row) out)
                   (terpri out)))))))
 
 ;;; ---------------------------------------------------------------------------
@@ -212,30 +249,51 @@ QUERY-PARAM-ERROR on malformed input."
               (cdr (assoc :skip dsl))
               (or pkg (find-package :graph-db))))))
 
+(defun run-query-goals (vars goals graph
+                        &key (package (find-package :graph-db))
+                             limit skip (format :json))
+  "Run the already-compiled query GOALS against GRAPH, collecting VARS.
+
+This is THE runner: every client-supplied query -- the JSON pattern DSL and
+the GUI's free-text Prolog alike -- reaches SELECT through here, so the rails
+are stated once.  Read-only (:EFFECTS NIL), snapshot-isolated, bounded by
+*QUERY-DEFAULT-MAX-INFERENCES* / *QUERY-DEFAULT-TIMEOUT*, and LIMIT capped at
+*QUERY-DEFAULT-LIMIT*.  PACKAGE is bound around the EVAL because COMPILE-CALL
+canonicalizes each goal head through MAKE-FUNCTOR-SYMBOL, which interns
+NAME/ARITY in *PACKAGE*: it must be the schema's package for an edge functor
+to resolve.  Callers built from untrusted text must whitelist every symbol
+BEFORE calling (see gui/prolog.lisp, GH #279).  Returns the result string."
+  ;; The eval'd SELECT / node-slot-value goals key off *GRAPH*.
+  (let* ((*graph* graph)
+         (*package* package)
+         (cap (if (and (integerp limit) (plusp limit))
+                  (min limit *query-default-limit*)
+                  *query-default-limit*)))
+    (emit-query-results
+     vars format
+     (lambda (cb)
+       ;; the select form is EVAL'd (null lexenv), so pass the callback through
+       ;; a special the form references rather than a lexical.
+       (let ((*pattern-query-callback* cb))
+         (eval `(select (:effects nil :snapshot t
+                         :limit ,cap
+                         :skip ,(when (integerp skip) skip)
+                         :max-inferences ,*query-default-max-inferences*
+                         :timeout ,*query-default-timeout*
+                         :callback *pattern-query-callback*)
+                        ,vars ,@goals)))))))
+
 (defun run-pattern-query (dsl graph)
   "Compile and run a decoded JSON pattern query DSL against GRAPH, returning the
 result string.  Read-only, snapshot-isolated, and bounded; the client :limit is
 capped at *QUERY-DEFAULT-LIMIT*.  A \"format\":\"ndjson\" field streams the rows
 as newline-delimited JSON instead of an array."
-  (multiple-value-bind (vars goals limit skip pkg) (compile-pattern-query dsl graph)
-    (let* ((*graph* graph)   ; the eval'd SELECT / node-slot-value goals key off *GRAPH*
-           (*package* pkg)
-           (cap (if (and (integerp limit) (plusp limit))
-                    (min limit *query-default-limit*)
-                    *query-default-limit*))
-           (format (if (string-equal "ndjson"
-                                      (princ-to-string (or (cdr (assoc :format dsl)) "")))
-                       :ndjson :json)))
-      (emit-query-results
-       vars format
-       (lambda (cb)
-         ;; the select form is EVAL'd (null lexenv), so pass the callback through
-         ;; a special the form references rather than a lexical.
-         (let ((*pattern-query-callback* cb))
-           (eval `(select (:effects nil :snapshot t
-                           :limit ,cap
-                           :skip ,(when (integerp skip) skip)
-                           :max-inferences ,*query-default-max-inferences*
-                           :timeout ,*query-default-timeout*
-                           :callback *pattern-query-callback*)
-                          ,vars ,@goals))))))))
+  (multiple-value-bind (vars goals limit skip pkg)
+      (compile-pattern-query dsl graph)
+    (run-query-goals vars goals graph
+                     :package pkg :limit limit :skip skip
+                     :format (if (string-equal
+                                  "ndjson"
+                                  (princ-to-string
+                                   (or (cdr (assoc :format dsl)) "")))
+                                 :ndjson :json))))

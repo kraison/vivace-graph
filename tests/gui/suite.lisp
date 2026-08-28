@@ -129,11 +129,15 @@ graph and clock (globals, not LET -- see the file header)."
     (unwind-protect (usocket:get-local-port s)
       (usocket:socket-close s))))
 
-(defmacro with-gui-server (() &body body)
+(defmacro with-gui-server ((&key allow-prolog) &body body)
+  "Run BODY against a GUI on a fresh ephemeral port.  ALLOW-PROLOG
+opens the free-text Prolog endpoint; the default NIL is the shipped
+default, and the suite proves the flag in both states (GH #279)."
   `(let ((*gui-test-port* (free-tcp-port)))
      (unwind-protect
           (progn
-            (start-gui :port *gui-test-port* :bind "127.0.0.1")
+            (start-gui :port *gui-test-port* :bind "127.0.0.1"
+                       :allow-prolog ,allow-prolog)
             (sleep 0.3)                 ; let the listener bind
             ,@body)
        (ignore-errors (stop-gui)))))
