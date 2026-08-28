@@ -46,9 +46,12 @@
 (eval-when (:load-toplevel :execute)
   (setf (gethash *gui-graph-name* graph-db::*schema-node-metadata*) nil))
 
+;; HOME-CITY is deliberately multi-word: it is the only slot whose
+;; wire spelling can tell kebab from camelCase (GH #277).
 (def-vertex gui-person ()
   ((name :type string)
-   (age))
+   (age)
+   (home-city))
   :gui-test-graph)
 
 (def-vertex gui-city ()
@@ -80,7 +83,8 @@
   (let ((*graph* graph) alice bob paris tokyo)
     (define-gui-views)
     (with-transaction ()
-      (setq alice (make-gui-person :name "Alice" :age 34)
+      (setq alice (make-gui-person :name "Alice" :age 34
+                                   :home-city "Paris")
             bob (make-gui-person :name "Bob" :age 41)
             paris (make-gui-city :name "Paris")
             tokyo (make-gui-city :name "Tokyo"))
@@ -156,4 +160,8 @@ or percent normalization) -- for the traversal tests."
               string))))
 
 (defun jref (alist key)
+  "Decoded-body lookup.  ⚠ cl-json's decoder folds BOTH \"guiPerson\"
+and \"gui-person\" to :GUI-PERSON, so a JREF assertion cannot pin the
+wire spelling -- assert on GUI-REQUEST's raw fourth value for that
+\(GH #277)."
   (cdr (assoc key alist)))

@@ -11,6 +11,32 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ## [Unreleased]
 
+### Changed
+
+- **BREAKING (`graph-db/gui` wire format): schema names ship as the
+  engine spells them, in kebab-case** (#277, tracker #272). Every JSON
+  *value* naming a schema entity — vertex and edge type names, slot
+  names, view names and classes, index owners and slots — was
+  camelCased on the way out (`"guiPerson"`, `"peopleByName"`) and
+  turned back with `camel-case-to-lisp` on the way in, for
+  `/nodes?type=`. That round trip is not bijective: names with
+  consecutive capitals or digits (`HTTP-URL`, `FOO-BAR2`) do not
+  survive it. Those values are now the engine's own lowercase kebab
+  spelling (`"gui-person"`, `"people-by-name"`, `"home-city"`), and
+  `?type=` interns the incoming string directly — so a type name the
+  API emits is accepted back verbatim. This is the naming prerequisite
+  for the query workbench: what the UI shows is what a query types.
+  JSON *keys* are unchanged and stay camelCase (`vertexCount`,
+  `onDiskBytes`, `inEdgeCount`) — they are protocol, and nobody types
+  them. The one deliberate exception is the node inspector's `slots`
+  object, whose keys ARE slot names and therefore go kebab too.
+  `rest.lisp` is untouched and keeps its own JSON conventions.
+  Consumers are all in-tree — the bundled frontend (which renders
+  these values verbatim; explorer node colors are derived from the
+  type string and shift accordingly) and the `graph-db/gui-test`
+  suite, both updated here. Any out-of-tree client of the GUI API
+  must be updated.
+
 ### Fixed
 
 - **Peer pull manifest accumulation is O(ops), not O(ops²)** (#260).

@@ -314,20 +314,73 @@ schema summary for the known fixture."
           (is (= 2 (jref by-type :gui-person)))
           (is (= 2 (jref by-type :gui-city))))
         (is (= 3 (jref (jref json :edge-counts-by-type) :gui-visited)))
-        (is (find "peopleByName" (jref json :views)
+        (is (find "people-by-name" (jref json :views)
                   :key (lambda (v) (jref v :name)) :test #'string=))
         (is (listp (jref json :indexes)))
         (is (plusp (jref json :on-disk-bytes)))
         (let* ((schema (jref json :schema))
-               (person (find "guiPerson" (jref schema :vertex-types)
+               (person (find "gui-person" (jref schema :vertex-types)
                              :key (lambda (v) (jref v :name))
                              :test #'string=)))
           (is-true person)
           (is (find "name" (jref person :slots) :test #'string=))
           (is (find "age" (jref person :slots) :test #'string=))
-          (is (find "guiVisited" (jref schema :edge-types)
+          (is (find "home-city" (jref person :slots) :test #'string=))
+          (is (find "gui-visited" (jref schema :edge-types)
                     :key (lambda (v) (jref v :name))
                     :test #'string=)))))))
+
+(test wire-names-are-kebab
+  "Schema names ship as the engine spells them and JSON keys stay
+camelCase; a type value the API emits is accepted verbatim by ?type=
+\(GH #277).  Asserted on the RAW body -- the decoder folds both
+spellings together, so JREF cannot see the difference."
+  (with-gui-fixture ()
+    (with-gui-server ()
+      (multiple-value-bind (json status ctype raw)
+          (gui-request "/api/graphs/gui-test-graph/stats")
+        (declare (ignore json ctype))
+        (is (= 200 status))
+        ;; Values naming schema entities: the engine's own spelling.
+        (dolist (kebab '("\"gui-person\"" "\"gui-city\""
+                         "\"gui-visited\"" "\"people-by-name\""
+                         "\"home-city\""))
+          (is-true (search kebab raw) "~A missing from stats" kebab))
+        (dolist (camel '("guiPerson" "guiCity" "guiVisited"
+                         "peopleByName" "homeCity"))
+          (is-false (search camel raw) "~A still on the wire" camel))
+        ;; Keys are protocol and stay camelCase.
+        (dolist (key '("\"vertexCount\"" "\"edgeCount\""
+                       "\"onDiskBytes\"" "\"vertexCountsByType\""
+                       "\"vertexTypes\""))
+          (is-true (search key raw) "key ~A is not camelCase" key)))
+      ;; Round trip: take a type value verbatim, feed it to ?type=.
+      (let ((type (multiple-value-bind (json status)
+                      (gui-request "/api/graphs/gui-test-graph/types")
+                    (is (= 200 status))
+                    (first (jref json :vertex-types)))))
+        (is (string= "gui-city" type))
+        (multiple-value-bind (json status)
+            (gui-request
+             (format nil "/api/graphs/gui-test-graph/nodes?type=~A"
+                     type))
+          (is (= 200 status))
+          (is (string= type (jref json :type)))
+          (is (plusp (length (jref json :nodes))))))
+      ;; Inspector slot names are dynamic KEYS built from domain
+      ;; identifiers -- kebab by decision (GH #277).
+      (multiple-value-bind (json status ctype raw)
+          (gui-request
+           (format nil "/api/graphs/gui-test-graph/node/~A"
+                   (string-id (getf *fixture* :alice))))
+        (declare (ignore ctype))
+        (is (= 200 status))
+        (is-true (search "\"home-city\"" raw))
+        (is-false (search "homeCity" raw))
+        (is (string= "Paris" (jref (jref json :slots) :home-city)))
+        ;; ...while the body's own keys stay camelCase.
+        (is-true (search "\"inEdgeCount\"" raw))
+        (is-true (search "\"outEdgeCount\"" raw))))))
 
 (test types-inventory
   (with-gui-fixture ()
@@ -335,9 +388,10 @@ schema summary for the known fixture."
       (multiple-value-bind (json status)
           (gui-request "/api/graphs/gui-test-graph/types")
         (is (= 200 status))
-        (is (find "guiPerson" (jref json :vertex-types) :test #'string=))
-        (is (find "guiCity" (jref json :vertex-types) :test #'string=))
-        (is (find "guiVisited" (jref json :edge-types)
+        (is (find "gui-person" (jref json :vertex-types)
+                  :test #'string=))
+        (is (find "gui-city" (jref json :vertex-types) :test #'string=))
+        (is (find "gui-visited" (jref json :edge-types)
                   :test #'string=))))))
 
 ;;; ---------------------------------------------------------------------
@@ -348,17 +402,18 @@ schema summary for the known fixture."
   (with-gui-fixture ()
     (with-gui-server ()
       (multiple-value-bind (json status)
-          (gui-request "/api/graphs/gui-test-graph/nodes?type=guiPerson")
+          (gui-request
+           "/api/graphs/gui-test-graph/nodes?type=gui-person")
         (is (= 200 status))
         (is (= 2 (length (jref json :nodes))))
         (is-false (jref json :truncated))
         (is (every (lambda (n)
                      (and (stringp (jref n :id))
-                          (string= "guiPerson" (jref n :type))))
+                          (string= "gui-person" (jref n :type))))
                    (jref json :nodes))))
       (multiple-value-bind (json status)
           (gui-request
-           "/api/graphs/gui-test-graph/nodes?type=guiPerson&limit=1")
+           "/api/graphs/gui-test-graph/nodes?type=gui-person&limit=1")
         (is (= 200 status))
         (is (= 1 (length (jref json :nodes))))
         (is-true (jref json :truncated))))))
@@ -367,7 +422,7 @@ schema summary for the known fixture."
   (with-gui-fixture ()
     (with-gui-server ()
       (multiple-value-bind (json status)
-          (gui-request "/api/graphs/gui-test-graph/nodes?type=noSuch")
+          (gui-request "/api/graphs/gui-test-graph/nodes?type=no-such")
         (is (= 404 status))
         (is (string= "unknown-type" (jref json :error)))))))
 
@@ -397,10 +452,11 @@ JSON object with the slot values intact; in/out edge counts are right."
         (is (= 200 status))
         (is (string= (string-id (getf *fixture* :alice))
                      (jref json :id)))
-        (is (string= "guiPerson" (jref json :type)))
+        (is (string= "gui-person" (jref json :type)))
         (let ((slots (jref json :slots)))
           (is (string= "Alice" (jref slots :name)))
-          (is (= 34 (jref slots :age))))
+          (is (= 34 (jref slots :age)))
+          (is (string= "Paris" (jref slots :home-city))))
         (is (= 2 (jref json :out-edge-count)))
         (is (= 0 (jref json :in-edge-count))))
       (multiple-value-bind (json status)
@@ -444,7 +500,7 @@ makes LOOKUP-VERTEX return the cached edge -- the path that used to
                (format nil "/api/graphs/gui-test-graph/node/~A"
                        edge-id))
             (is (= 200 status))
-            (is (string= "guiVisited" (jref json :type)))
+            (is (string= "gui-visited" (jref json :type)))
             (is (stringp (jref json :from)))
             (is (stringp (jref json :to)))
             (is (numberp (jref (jref json :slots) :year))))))
@@ -492,7 +548,7 @@ directions, type-labeled."
         (is (= 2 (length (jref json :edges))))
         (is-false (jref json :truncated))
         (is (every (lambda (e)
-                     (and (string= "guiVisited" (jref e :type))
+                     (and (string= "gui-visited" (jref e :type))
                           (stringp (jref e :from))
                           (stringp (jref e :to))))
                    (jref json :edges))))

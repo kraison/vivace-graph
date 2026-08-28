@@ -7,6 +7,12 @@
 ;;;; JSON {error, message}; 404 unknown graph/node/type, 409
 ;;;; dirty/conflict, 400 malformed, 500 with the condition's report.  No
 ;;;; backtraces to the browser; details go to log4cl.
+;;;;
+;;;; Naming on the wire (GH #277): JSON KEYS are protocol and stay
+;;;; camelCase (cl-json's keyword encoding).  VALUES naming schema
+;;;; entities -- types, slots, views, index owners -- ship as the engine
+;;;; spells them, lowercase kebab, so what the UI shows is what a query
+;;;; types.  See %WIRE-SYMBOL and %NODE-SLOTS-ALIST.
 
 (in-package #:graph-db.gui)
 
@@ -255,12 +261,15 @@ close cannot unmap the store mid-read (GH #269)."
                              (graph-db::schema graph))))
     (sort names #'string< :key #'symbol-name)))
 
-(defun %camel (symbol)
-  (json:lisp-to-camel-case (symbol-name symbol)))
+(defun %wire-symbol (symbol)
+  "SYMBOL as its wire spelling: the engine's own name, downcased kebab
+\(GUI-PERSON -> \"gui-person\").  Schema names are NOT camelized -- a
+query author types them as the engine spells them (GH #277)."
+  (string-downcase (symbol-name symbol)))
 
 (defun %per-type-counts (graph)
-  "(values vertex-alist edge-alist) of (class-name . count), one sweep
-of each table."
+  "(values vertex-alist edge-alist) of (wire-type-name . count), one
+sweep of each table."
   (let ((v (make-hash-table :test 'eq))
         (e (make-hash-table :test 'eq)))
     (graph-db:map-vertices
@@ -268,10 +277,13 @@ of each table."
     (graph-db:map-edges
      (lambda (x) (incf (gethash (class-name (class-of x)) e 0))) graph)
     (flet ((as-alist (table)
+             ;; Keys here are type names, not protocol -- string keys
+             ;; so cl-json emits them verbatim (GH #277).
              (let ((acc '()))
-               (maphash (lambda (k n) (push (cons k n) acc)) table)
-               (sort acc #'string< :key (lambda (c)
-                                          (symbol-name (car c)))))))
+               (maphash (lambda (k n)
+                          (push (cons (%wire-symbol k) n) acc))
+                        table)
+               (sort acc #'string< :key #'car))))
       (values (as-alist v) (as-alist e)))))
 
 (defun %on-disk-size (graph)
@@ -297,13 +309,14 @@ count zero."
                          (intern (symbol-name type-name) :keyword)
                          parent :graph graph)))
               (%obj
-               (list (cons :name (%camel type-name))
+               (list (cons :name (%wire-symbol type-name))
                      (cons :slots
                            (%arr
                             (mapcar (lambda (slot-def)
-                                      (%camel (if (consp slot-def)
-                                                  (first slot-def)
-                                                  slot-def)))
+                                      (%wire-symbol
+                                       (if (consp slot-def)
+                                           (first slot-def)
+                                           slot-def)))
                                     (and meta
                                          (graph-db::node-type-slots
                                           meta)))))))))
@@ -316,11 +329,11 @@ count zero."
              (%obj
               (list (cons :kind "ordered")
                     (cons :owner
-                          (%camel
+                          (%wire-symbol
                            (graph-db::index-spec-owner-name spec)))
                     (cons :slots
                           (%arr
-                           (mapcar #'%camel
+                           (mapcar #'%wire-symbol
                                    (graph-db::index-spec-slot-names
                                     spec)))))))
            (graph-db::%registered-index-specs graph))
@@ -329,9 +342,10 @@ count zero."
                 (declare (ignore idx))
                 (push (%obj
                        (list (cons :kind "spatial")
-                             (cons :owner (%camel (car key)))
+                             (cons :owner (%wire-symbol (car key)))
                              (cons :slots
-                                   (%arr (list (%camel (cdr key)))))))
+                                   (%arr
+                                    (list (%wire-symbol (cdr key)))))))
                       acc))
               (graph-db::spatial-indexes graph))
      (nreverse acc))))
@@ -353,8 +367,10 @@ count zero."
                    (%arr
                     (mapcar (lambda (pair)
                               (%obj
-                               (list (cons :class (%camel (car pair)))
-                                     (cons :name (%camel (cdr pair))))))
+                               (list (cons :class
+                                           (%wire-symbol (car pair)))
+                                     (cons :name
+                                           (%wire-symbol (cdr pair))))))
                             (graph-db::list-views graph))))
              (cons :indexes (%arr (%index-inventory graph)))
              (cons :on-disk-bytes (%on-disk-size graph))
@@ -370,10 +386,10 @@ count zero."
   (with-gui-graph (graph params)
     (%json-response
      (list (cons :vertex-types
-                 (%arr (mapcar #'%camel
+                 (%arr (mapcar #'%wire-symbol
                                (%schema-type-names graph :vertex))))
            (cons :edge-types
-                 (%arr (mapcar #'%camel
+                 (%arr (mapcar #'%wire-symbol
                                (%schema-type-names graph :edge))))))))
 
 ;;; ---------------------------------------------------------------------
@@ -390,17 +406,19 @@ count zero."
     (if (and n (plusp n)) n default)))
 
 (defun %resolve-vertex-type (graph wire-type)
-  "WIRE-TYPE (camelCase) as a vertex class symbol of GRAPH, or NIL."
+  "WIRE-TYPE (the engine's own kebab spelling) as a vertex class symbol
+of GRAPH, or NIL.  Interned directly -- the old camel-case round trip
+was not bijective (GH #277)."
   (let ((meta (handler-case
                   (graph-db::lookup-node-type-by-name
-                   (intern (json:camel-case-to-lisp wire-type) :keyword)
+                   (intern (string-upcase wire-type) :keyword)
                    :vertex :graph graph)
                 (error () nil))))
     (and meta (graph-db::node-type-name meta))))
 
 (defun %vertex-brief (v)
   (list (cons :id (graph-db:string-id v))
-        (cons :type (%camel (class-name (class-of v))))))
+        (cons :type (%wire-symbol (class-name (class-of v))))))
 
 (def-gui-handler api-graph-nodes (params)
   (with-gui-graph (graph params)
@@ -414,7 +432,10 @@ count zero."
                 (gui-error 404 "unknown-type"
                            (format nil "Unknown vertex type ~A"
                                    wire-type))
-                (let ((nodes '()) (count 0) (truncated nil))
+                ;; Echo the canonical spelling, not the raw parameter:
+                ;; the response's type must be re-usable as ?type=.
+                (let ((nodes '()) (count 0) (truncated nil)
+                      (canonical (%wire-symbol type)))
                   (block sample
                     (graph-db:map-vertices
                      (lambda (v)
@@ -425,7 +446,7 @@ count zero."
                        (incf count))
                      graph :vertex-type type))
                   (%json-response
-                   (list (cons :type wire-type)
+                   (list (cons :type canonical)
                          (cons :nodes
                                (%arr (mapcar #'%obj
                                              (nreverse nodes))))
@@ -440,11 +461,14 @@ the engine's 32-hex-character STRING-ID form."
        (graph-db::read-id-array-from-string string)))
 
 (defun %node-slots-alist (node)
-  "NODE's data slots as an alist keyed by camelCase slot names.  The
+  "NODE's data slots as an alist keyed by the engine's slot names.  The
 underlying node data is an ALIST of (:SLOT . value) conses -- this is
-the JSON-object rendering of it."
+the JSON-object rendering of it.
+
+The one place the keys-stay-camelCase rule is overridden: these keys
+are domain identifiers a query author types, not protocol (GH #277)."
   (mapcar (lambda (slot-name)
-            (cons (%camel slot-name)
+            (cons (%wire-symbol slot-name)
                   (%json-value (slot-value node slot-name))))
           (graph-db::data-slots (class-of node))))
 
@@ -464,7 +488,8 @@ the JSON-object rendering of it."
               ((typep v 'graph-db::vertex)
                (%json-response
                 (list (cons :id (graph-db:string-id v))
-                      (cons :type (%camel (class-name (class-of v))))
+                      (cons :type
+                            (%wire-symbol (class-name (class-of v))))
                       (cons :slots (%obj (%node-slots-alist v)))
                       (cons :in-edge-count
                             (length (graph-db:incoming-edges
@@ -479,8 +504,9 @@ the JSON-object rendering of it."
                  (if (typep e 'graph-db::edge)
                      (%json-response
                       (list (cons :id (graph-db:string-id e))
-                            (cons :type (%camel
-                                         (class-name (class-of e))))
+                            (cons :type
+                                  (%wire-symbol
+                                   (class-name (class-of e))))
                             (cons :from (graph-db:string-id
                                          (graph-db::from e)))
                             (cons :to (graph-db:string-id
@@ -555,7 +581,7 @@ the JSON-object rendering of it."
                                    (list
                                     (cons :id (graph-db:string-id e))
                                     (cons :type
-                                          (%camel
+                                          (%wire-symbol
                                            (class-name (class-of e))))
                                     (cons :from
                                           (graph-db:string-id

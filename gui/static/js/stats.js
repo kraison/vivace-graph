@@ -3,6 +3,10 @@
 // carry data-type / data-kind attributes -- U3's explorer entry ramp
 // hooks them (GH #271).  A closed or unknown graph shows the API's
 // error message, never a blank pane.
+//
+// Schema names render verbatim: the API sends the engine's own kebab
+// spelling and data-type rides straight back out as ?type= (GH #277).
+// Never case-fold them here.
 
 import { api } from "./api.js";
 
