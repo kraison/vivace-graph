@@ -194,7 +194,18 @@
                :usocket
                :trivial-shell)
   :serial t
-  :components ((:file "rest"))
+  ;; QUERY-DSL is the structured JSON query compiler+runner extracted from
+  ;; rest.lisp (GH #278): REST's /query route and the GUI workbench compile
+  ;; through the one implementation.  It needs the prolog compiler (SELECT,
+  ;; via prologc/prolog-functors), the schema type lookups
+  ;; (LOOKUP-NODE-TYPE-BY-NAME) and NODE-SLOT-VALUE (index) -- all already
+  ;; loaded by graph-db/core, which the system-level :depends-on guarantees,
+  ;; so no intra-file :depends-on is possible or needed here.  It is NOT in
+  ;; graph-db/core because EMIT-QUERY-RESULTS' :ndjson arm sets a header on
+  ;; NINGLE:*RESPONSE*, and core deliberately drops ningle/clack (the
+  ;; ECL/Android build).  :serial t puts it before "rest", which calls into it.
+  :components ((:file "query-dsl")
+               (:file "rest"))
   :in-order-to ((test-op (test-op :graph-db/test))))
 
 ;; OPTIONAL GUI cockpit backend (GH #269, design doc
@@ -211,7 +222,11 @@ and read-only neighborhood exploration."
   :maintainer "Kevin Raison"
   :author "Kevin Raison <last name @ chatsubo dot net>"
   :version "3.0.0"
-  :depends-on (:graph-db :ningle :clack :cl-json :lack-component)
+  ;; :flexi-streams is not new to the image (rest.lisp uses it, and
+  ;; hunchentoot pulls it in) -- declared because api.lisp now decodes
+  ;; a POST body's octets itself for the query endpoint (GH #278).
+  :depends-on (:graph-db :ningle :clack :cl-json :lack-component
+               :flexi-streams)
   :pathname "gui/"
   :serial t
   :components ((:file "package")

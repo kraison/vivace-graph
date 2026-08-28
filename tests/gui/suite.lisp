@@ -141,14 +141,21 @@ graph and clock (globals, not LET -- see the file header)."
 (defun gui-url (path)
   (format nil "http://127.0.0.1:~D~A" *gui-test-port* path))
 
-(defun gui-request (path &key (method :get) preserve-uri)
+(defun gui-request (path &key (method :get) preserve-uri content
+                             (content-type "application/json"))
   "Request PATH; (values decoded-json status content-type raw-body).
 DRAKMA returns 4xx/5xx without signaling, so status is always there.
 :PRESERVE-URI T sends PATH byte-for-byte (no client-side dot-segment
-or percent normalization) -- for the traversal tests."
+or percent normalization) -- for the traversal tests.  :CONTENT is a
+UTF-8 request body sent under :CONTENT-TYPE (GH #278)."
   (multiple-value-bind (body status headers)
-      (drakma:http-request (gui-url path) :method method
-                           :preserve-uri preserve-uri)
+      (apply #'drakma:http-request (gui-url path)
+             :method method
+             :preserve-uri preserve-uri
+             (when content
+               (list :content (flexi-streams:string-to-octets
+                               content :external-format :utf-8)
+                     :content-type content-type)))
     (let ((string (cond ((null body) "")
                         ((stringp body) body)
                         (t (flexi-streams:octets-to-string

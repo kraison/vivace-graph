@@ -11,6 +11,7 @@ import { api } from "./api.js";
 
 const SAMPLE_LIMIT = 50;        // /nodes default, made explicit so
 const NEIGHBORHOOD_LIMIT = 100; // truncation notices can name it
+const HANDOFF_LIMIT = 50;       // node ids one query handoff may seed
 
 // Deterministic type -> hue: djb2 over the type name, mod 360.
 // Stable across sessions by construction (no randomness, no state).
@@ -192,6 +193,38 @@ export function createExplorer({ hostEl, placeholderEl, countsEl,
     }
   }
 
+  // Query-result handoff (GH #278): seed or additively merge the nodes
+  // a workbench row named by id.  Each id is resolved through /node/:id
+  // for its type (the canvas needs it for label and color); an edge id
+  // is skipped -- the canvas seeds vertices only.  Edges between the
+  // seeded nodes appear on expansion, as they do for any other seed.
+  async function addNodes(ids) {
+    if (!graphName || !ids || ids.length === 0) return;
+    const gen = generation;
+    const wanted = ids.slice(0, HANDOFF_LIMIT);
+    const bodies = await Promise.all(
+      wanted.map((id) => api.node(graphName, id).catch(() => null)));
+    if (gen !== generation) return; // canvas cleared/switched
+    const briefs = bodies
+      .filter((b) => b && b.from === undefined)
+      .map((b) => ({ id: b.id, type: b.type }));
+    merge(briefs, [], null);
+    const missed = wanted.length - briefs.length;
+    notice([
+      ids.length > wanted.length
+        ? `showing ${wanted.length} of ${ids.length} result nodes ` +
+          `(limit ${HANDOFF_LIMIT})`
+        : "",
+      missed > 0 ? `${missed} id(s) were not vertices of this graph` : "",
+    ].filter(Boolean).join(" — "));
+  }
+
+  // Cytoscape reads its container's size on mount; a tab switch shows
+  // it again after a spell at zero size, so re-measure (GH #278).
+  function resize() {
+    cy.resize();
+  }
+
   // View-local removal: cytoscape drops the node's connected edges
   // with it, so nothing dangles.
   function removeElement(id) {
@@ -277,6 +310,6 @@ export function createExplorer({ hostEl, placeholderEl, countsEl,
   refreshStatus();
 
   return { setGraph, clear, showTypeSample, expandNode,
-           removeElement,
+           removeElement, addNodes, resize,
            hasElement: (id) => cy.getElementById(id).length > 0 };
 }
