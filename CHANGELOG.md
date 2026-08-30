@@ -13,6 +13,23 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Fixed
 
+- **Chapter 17 stated two things about multi-store transactions that #168
+  had already made false** (#93). It said a cross-graph transaction "would
+  need a global ordering across independent counters", and that a
+  cross-graph read instant "would need an epoch shared by every transaction
+  manager, which is not implemented" — the image-level epoch clock shipped
+  in #168 and both claims outlived it. Corrected to say what is actually
+  missing: a *durable* prepare record (the prepared temp file is flushed,
+  not fsynced, and recovery ignores it by design), a decision record, and
+  an in-doubt recovery protocol. The read-instant paragraph now says the
+  epoch exists and what is missing is an API applying one chosen epoch to
+  every participating store. Chapter 17 also gains **the supported
+  multi-store write pattern** — resolve foreign endpoints before opening
+  the transaction, write the regenerable store last, make each write
+  idempotent on a stable identity tuple, reconcile forward — which the
+  manual previously replaced with a bare "that coordination is not
+  atomic" warning. Documentation only; no behaviour change.
+
 - **A spatial query's cost was quadratic in a client-supplied radius,
   and independent of the data** (#279). `map-spatial-index-radius`
   turned `radius-m` into a degree span with no clamp, and

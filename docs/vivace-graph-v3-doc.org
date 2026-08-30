@@ -3474,14 +3474,44 @@ whose home graph differs from the transaction's — reading it *or* writing it �
 ~cross-graph-transaction-error~.
 
 This is not a restriction added for convenience; it is what atomicity and durability
-already mean here. A transaction spanning two graphs would need a global ordering across
-independent counters and two-phase commit across two logs. Without 2PC, a crash between
-the two commits leaves one graph committed and the other not.
+already mean here. Without two-phase commit, a crash between the two commits leaves one
+graph committed and the other not.
+
+The global ordering such a transaction would also need *does* now exist — since GH #168
+an attached store draws its transaction ids from one image-level epoch clock, so
+transactions in different stores are already comparable. What is still missing is
+narrower than it once was: a *durable* prepare record (the prepared temp file is flushed,
+not fsynced, and recovery deliberately ignores it), a decision record naming the outcome,
+and an in-doubt recovery protocol to resolve a prepared-but-undecided transaction at
+restart. GH #93 records the analysis and why it is deferred rather than scheduled.
+
+**** Writing to several stores: the supported pattern
 
 To write to several graphs, use one transaction per graph and sequence them yourself.
 *That coordination is not atomic.* If the second transaction fails, the first has already
-committed, and nothing rolls it back. Design for that, or keep the invariant inside one
-graph.
+committed, and nothing rolls it back.
+
+There is no rollback to compensate with, so the pattern is to make the sequence
+*convergent* rather than reversible. Four rules, in order of how much they buy:
+
+1. *Resolve every foreign endpoint before opening the write transaction.* A cross-store
+   read from inside a read-write transaction signals; resolving first also means the
+   transaction holds no lock while waiting on another store.
+2. *Write the regenerable store last.* Order the sequence so the store that can be rebuilt
+   from the others is the one left inconsistent by a partial failure.
+3. *Make each write idempotent on a stable identity tuple*, so re-running the sequence
+   after a partial failure converges instead of duplicating. ~def-unique~ is what makes
+   this an upsert rather than an append.
+4. *Reconcile forward, never backward.* Recovery is re-running the derivation, not undoing
+   the half that succeeded.
+
+Cross-store references held as external keys rather than node ids are what make (2) and
+(4) possible at all — a reference that survives its target store being rebuilt is a
+reference a reconciliation pass can re-resolve. See "A namespace is a package; a store is
+files" below.
+
+Where none of that applies — where the invariant genuinely spans two stores and must hold
+at every instant — keep the invariant inside one graph instead.
 
 *** The rule covers the transactional path, not literally every read
 
@@ -3504,9 +3534,13 @@ and that is the caller's responsibility, not something the engine checks.
 query may hold one snapshot per participating graph, each internally consistent and
 repeatable.
 
-There is deliberately *no single instant across graphs*: two graphs may be observed at
-different logical moments. A cross-graph instant would need an epoch shared by every
-transaction manager, which is not implemented.
+There is still *no single instant across graphs*: two graphs may be observed at different
+logical moments. Note that the reason has changed. The shared epoch this once waited on
+now exists — since GH #168 attached stores draw ids from one image-level clock, so the
+snapshots are mutually *ordered*. What is missing is an API that applies one chosen epoch
+to every participating store: ~with-read-snapshot~ takes each store's snapshot when it is
+called, so two calls at two moments still observe two moments. Each snapshot pins its own
+store's reaper for the extent, which is what keeps a composed cross-store read safe.
 
 A read-write transaction takes precedence and does *not* fall through to a snapshot. If a
 read-write transaction on graph A is active, reading graph B signals — even if a snapshot
