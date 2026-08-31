@@ -186,6 +186,11 @@ hedges rather than asserts it (GH #209)."
               :edge-id (id edge) :endpoint-id endpoint-id
               :store-id store-id)))))
 
+(defparameter +snapshot-header-line+ "(:SNAPSHOT-HEADER :FORMAT 1)"
+  "First line of every snapshot written since GH #127.  Its PRESENCE is
+what lets FIND-NEWEST-SNAPSHOT tell a truncated modern file (header, no
+trailer) from a legacy one (no header, unverifiable).")
+
 (defmethod backup ((graph graph) location &key include-deleted-p)
   (ensure-directories-exist location)
   (let ((count 0))
@@ -195,6 +200,11 @@ hedges rather than asserts it (GH #209)."
     ;; backup path from the clock; ECL's permissive default was what hid the
     ;; constant txn-log snapshot name.
     (with-open-file (out location :direction :output :if-exists :error)
+      ;; Header first, completion trailer last (GH #127): the reader
+      ;; skips both, and their PAIRING is what makes a snapshot
+      ;; verifiable -- a file with the header and no trailer was cut
+      ;; short, however it got that way.
+      (write-line +snapshot-header-line+ out)
       (map-vertices (lambda (v)
                       (maybe-init-node-data v :graph graph)
                       (incf count)
@@ -207,6 +217,7 @@ hedges rather than asserts it (GH #209)."
                    (%warn-if-dangling-endpoint e (from e) graph)
                    (%warn-if-dangling-endpoint e (to e) graph))
                  graph :include-deleted-p include-deleted-p)
+      (write-backup-plist (list :snapshot-complete :count count) out)
       (values count location))))
 
 (defmethod check-data-integrity ((graph graph) &key include-deleted-p)

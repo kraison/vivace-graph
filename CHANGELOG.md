@@ -158,6 +158,21 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Fixed
 
+- **A truncated snapshot can no longer be silently restored** (#127,
+  breaking #146's silent data-loss chain). Three layers, each sufficient
+  alone: `snapshot` now writes under an `in-progress.*` name the
+  `^snap-` scan can never match and renames only after completion, so an
+  interrupted writer leaves no `snap-` file; `backup` writes a format
+  header first and a completion trailer last, making every new snapshot
+  verifiable; and `find-newest-snapshot` — which picked by
+  `file-write-date` alone, so a truncated file won *because* it was
+  newest — refuses a header-without-trailer file with
+  `snapshot-refused-warning` and falls back to the next newest complete
+  one. Legacy trailer-less snapshots (every file in the field) are
+  accepted with the same warning's `:legacy` reason, since refusing them
+  would break every existing store's replay. The replay reader treats
+  the markers as content-free.
+
 - **Opening a graph whose schema file was never loaded now fails
   clearly, and strands nothing** (#144). `schema.dat` persists type
   *metadata* for type-id stability — never CLOS classes — so the schema's

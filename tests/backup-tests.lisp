@@ -652,3 +652,151 @@ recovery route for graphs with no rebuild path, so this is the recovery gate."
                                (list min-lon min-lat max-lon max-lat))))))))
             (close-graph g2 :snapshot-p nil)
             (collect-garbage)))))))
+
+;;; --- Verifiable snapshots (GH #127) --------------------------------------
+
+(defun %bk-latest-snap (dir)
+  (graph-db::find-newest-snapshot (format nil "~A/txn-log/" dir)))
+
+(defun %bk-truncate-file (file fraction)
+  "Cut FILE to FRACTION of its bytes -- what a heap-exhausted writer
+leaves, except that since GH #127 the real writer's partials never bear
+the snap- name; this simulates a bad copy or a pre-fix remnant."
+  (let (bytes)
+    (with-open-file (in file :element-type '(unsigned-byte 8))
+      (setq bytes (make-array (floor (* (file-length in) fraction))
+                              :element-type '(unsigned-byte 8)))
+      (read-sequence bytes in))
+    (with-open-file (out file :direction :output
+                              :element-type '(unsigned-byte 8)
+                              :if-exists :supersede)
+      (write-sequence bytes out))))
+
+(defmacro %bk-with-graph ((g dir) &body body)
+  "A fresh integration graph in DIR, closed on EVERY exit -- an errored
+test must not leak an open store into the image (store-id collision for
+every test after it)."
+  `(let ((,g (make-graph *integration-graph-name* (namestring ,dir)
+                         :buffer-pool-size 1000)))
+     (unwind-protect (progn ,@body)
+       (ignore-errors (close-graph ,g :snapshot-p nil))
+       (collect-garbage))))
+
+(defun %bk-refusals (thunk)
+  "(values THUNK-RESULT REFUSAL-REASONS), warnings muffled."
+  (let ((reasons '()))
+    (handler-bind ((snapshot-refused-warning
+                     (lambda (w)
+                       (push (graph-db::snapshot-refused-reason w) reasons)
+                       (muffle-warning w))))
+      (values (funcall thunk) reasons))))
+
+(test a-truncated-snapshot-is-refused-and-the-previous-one-wins
+  "GH #127, the #146 chain-breaker.  FIND-NEWEST-SNAPSHOT picked by
+FILE-WRITE-DATE alone, so a truncated file won PRECISELY because it was
+newest, and REPLAY reported a clean restore of half a graph.  Now a
+modern file with the header but no completion trailer is refused with a
+warning and the next newest complete one is chosen."
+  (with-temp-directory (dir)
+    (%bk-with-graph (g dir)
+      (let ((*graph* g))
+        (with-transaction () (make-g-person :name "First"))
+        (graph-db:snapshot g)
+        (sleep 1)                       ; distinct FILE-WRITE-DATEs
+        (with-transaction () (make-g-person :name "Second"))
+        (graph-db:snapshot g))
+      (multiple-value-bind (newest) (%bk-latest-snap (namestring dir))
+        (is-true newest)
+        (%bk-truncate-file newest 0.5)
+        (multiple-value-bind (chosen reasons)
+            (%bk-refusals (lambda () (%bk-latest-snap (namestring dir))))
+          (is (member :truncated reasons)
+              "the refusal is loud, not a silent skip")
+          (is-true chosen "the previous complete snapshot is chosen")
+          (when chosen
+            (is (not (equal (namestring chosen) (namestring newest)))
+                "and it is not the truncated one")))))))
+
+(test a-legacy-snapshot-without-a-header-restores-with-a-warning
+  "GH #127.  Every snapshot in the field predates the header; refusing
+them all would break every existing store's replay.  Unverifiable is
+accepted -- loudly."
+  (with-temp-directory (dir)
+    (%bk-with-graph (g dir)
+      (let ((*graph* g))
+        (with-transaction () (make-g-person :name "Elder"))
+        (graph-db:snapshot g))
+      (multiple-value-bind (file) (%bk-latest-snap (namestring dir))
+        ;; Strip the markers: exactly what a pre-#127 writer produced.
+        (let ((lines (uiop:read-file-lines file)))
+          (with-open-file (out file :direction :output
+                                    :if-exists :supersede)
+            (dolist (line lines)
+              (unless (or (uiop:string-prefix-p "(:SNAPSHOT-HEADER" line)
+                          (uiop:string-prefix-p "(:SNAPSHOT-COMPLETE"
+                                                line))
+                (write-line line out)))))
+        (multiple-value-bind (chosen reasons)
+            (%bk-refusals (lambda () (%bk-latest-snap (namestring dir))))
+          (is (equal '(:legacy) reasons))
+          (is (equal (namestring file) (namestring chosen))))))))
+
+(test an-interrupted-snapshot-never-bears-the-snap-name
+  "GH #127.  The writer works under in-progress.* -- a name the ^snap-
+scan can never match -- and renames only after the completion trailer is
+written, so however the writer dies, no snap- file appears and the
+partial is deleted on the way out."
+  (with-temp-directory (dir)
+    (%bk-with-graph (g dir)
+      (let ((orig (fdefinition 'graph-db::backup)))
+        (let ((*graph* g))
+          (with-transaction () (make-g-person :name "Doomed")))
+        (unwind-protect
+             (progn
+               (setf (fdefinition 'graph-db::backup)
+                     (lambda (&rest args)
+                       (declare (ignore args))
+                       (error "mid-snapshot failure (fixture)")))
+               (let ((*graph* g))
+                 (signals error
+                   (graph-db:snapshot g :check-data-integrity-p nil))))
+          (setf (fdefinition 'graph-db::backup) orig)))
+      (let ((leftovers (remove-if-not
+                        (lambda (f)
+                          (let ((n (file-namestring f)))
+                            (or (cl-ppcre:scan "^snap-" n)
+                                (cl-ppcre:scan "^in-progress" n))))
+                        (cl-fad:list-directory
+                         (format nil "~A/txn-log/" (namestring dir))))))
+        (is (null leftovers)
+            "no snap- file and no stranded partial: ~S" leftovers)))))
+
+(test a-verified-snapshot-round-trips
+  "The markers are content-free to the reader: a modern snapshot replays
+exactly as before, and the file self-identifies as :COMPLETE."
+  (with-temp-directory (dir)
+    (with-temp-directory (dir2)
+      (%bk-with-graph (g dir)
+        (let ((*graph* g))
+          (with-transaction () (make-g-person :name "Round" :age 42))
+          (graph-db:snapshot g))
+        (multiple-value-bind (file) (%bk-latest-snap (namestring dir))
+          (is (eq :complete (graph-db::%snapshot-completeness file)))))
+      ;; Same NAME, fresh directory: the schema's types are registered
+      ;; under the graph NAME, so a differently named target would refuse
+      ;; every vertex as an unknown type (as the older round-trip tests).
+      (let ((g2 (make-graph *integration-graph-name* (namestring dir2)
+                            :buffer-pool-size 1000)))
+        (unwind-protect
+             (progn
+               (let ((*graph* g2))
+                 (graph-db:replay g2 (format nil "~A/txn-log/" (namestring dir))
+                         :graph-db/test))
+               (let ((people (map-vertices 'identity g2
+                                           :vertex-type 'g-person
+                                           :collect-p t)))
+                 (is (= 1 (length people)))
+                 (is (string= "Round" (name (first people))))))
+          (ignore-errors (close-graph g2 :snapshot-p nil))
+          (collect-garbage))))))
+

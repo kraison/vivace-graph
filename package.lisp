@@ -397,6 +397,8 @@
            #:schema-withdrawal-matched-nothing              ; GH #152
            #:schema-classes-not-loaded                      ; GH #144
            #:scnl-graph-name #:scnl-location #:scnl-missing
+           #:snapshot-refused-warning                       ; GH #127
+           #:snapshot-refused-file #:snapshot-refused-reason
            #:swmn-kind #:swmn-owner #:swmn-graph-name #:swmn-name #:swmn-slots
            ;; declarative value constraints (GH #149)
            #:def-value-constraint #:undef-value-constraint

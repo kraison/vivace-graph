@@ -148,6 +148,8 @@ a plain SIMPLE-VECTOR.  Re-snapshot after restoring to get the types back."
           (when (zerop (mod (incf count) 1000))
             (log:info "~A RESTORED ~A NODES" (current-thread) count))
           (ecase (car plist)
+            ;; The format markers (GH #127): content-free to the replay.
+            ((:snapshot-header :snapshot-complete))
             (:v
              ;; (TYPE DATA :ID id :REVISION n :DELETED-P p)
              (apply 'make-vertex (fix-restore-node-args (rest plist) '())))

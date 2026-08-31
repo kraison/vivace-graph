@@ -2633,7 +2633,7 @@ When you call ~snapshot~, it performs several important steps to ensure a high-q
 
 2.  *Checks Data Integrity (Optional but Recommended):* By default, ~snapshot~ first runs a full data integrity check on the graph. It iterates through every vertex and edge, attempting to deserialize its data from the heap. This is an invaluable process that can detect data corruption *before* it gets written into your backup file. If any corruption is found, the snapshot is aborted, and a list of the problematic nodes is returned.
 
-3.  *Writes the Backup File:* It then calls the lower-level ~backup~ function to serialize every node and edge in the graph into a single, human-readable text file. The file is saved in a subdirectory of your graph's location named `txn-log/`, with a timestamped filename like `snap-3979326061.272155.log`.
+3.  *Writes the Backup File:* It then calls the lower-level ~backup~ function to serialize every node and edge in the graph into a single, human-readable text file. The file is written under an ~in-progress.*~ name and *renamed* to its final ~snap-~ name only once complete, so an interrupted snapshot never masquerades as a real one; the first line is a format header and the last a completion trailer, which is what makes the file *verifiable* (vivace-graph#127). It lands in a subdirectory of your graph's location named `txn-log/`, with a name like `snap-<time>-<uuid>`.
 
 The resulting file contains a series of Lisp s-expressions, one for each node in the graph. This format is not only easy to inspect but is also crucial for the restore process.
 
@@ -2665,6 +2665,16 @@ gaps never warns.
 The `replay` function is the counterpart to `snapshot`. It reads a snapshot file and uses it to reconstruct a graph from scratch. This is the primary tool for disaster recovery or for cloning an existing graph into a new environment (e.g., for staging or development).
 
 *Important Prerequisite:* The `replay` function must be run on a *new, empty graph*. You cannot replay a snapshot on top of an existing graph with data in it.
+
+⚠ ~replay~ selects the newest *complete* snapshot. A modern file cut
+short — format header present, completion trailer absent — is *refused*
+with ~snapshot-refused-warning~ and the next newest complete file is
+used instead; before vivace-graph#127 the newest file won on
+~file-write-date~ alone, so a truncated snapshot was restored *because*
+it was newest, and the restore reported success. A snapshot from before
+the trailer existed cannot be verified and is accepted with the same
+warning's ~:legacy~ reason — re-snapshot after restoring to get a
+verifiable file.
 
 *Restoring a whole multi-store system to an epoch, across a shadow swap, is a different mechanism* — ~restore-system~ (Chapter 17, "Restore across a swap") selects which retired generation was live at a given epoch. It does not replace `replay`: `replay` remains the only way to recover content to a point *inside* one generation.
 
