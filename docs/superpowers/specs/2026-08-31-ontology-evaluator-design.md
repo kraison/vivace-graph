@@ -6,8 +6,9 @@
 `def-cardinality` — the "which index" answer is the ve adjacency index);
 #156 implemented over EDGES (`def-domain-range`, `view-node` for the other
 end, `:dangling` ≠ `:wrong-type`); claim endpoints stay a namespace-level
-question, §3 and §5 — `view-lookup` as a general overlay is not needed by
-any unit and is not built
+question, §3 and §5 — #157 4b implemented (membership disjointness via
+`*commit-validators*` + the view — its subject-index overlay is the
+view-lookup shape, living with the check per §3)
 **Issues:** #109 (epic); decides once for #158 (unit 5), #155 (unit 2),
 #156 (unit 3); #157's 4b inherits it (disjointness note, open question 3)
 **Branch:** `experiment`

@@ -418,6 +418,9 @@
            #:drv-edge-type #:drv-end #:drv-reason #:drv-actual
            #:drv-expected #:drv-node-id #:drv-endpoint-id
            #:check-domain-range-constraints
+           ;; The commit view + subsystem validator seam (#109 note; #157 4b)
+           #:make-commit-view #:view-node #:view-old-node #:view-writes
+           #:commit-view-graph #:*commit-validators*
            ;; Disjointness over vertex types (GH #157, 4a)
            #:def-disjoint #:undef-disjoint #:disjointness-violation
            #:djv-classes #:djv-offender #:djv-name

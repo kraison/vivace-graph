@@ -381,7 +381,11 @@ when: its transaction period closes at AT, the recorded-at start survives,
 and the claim is still there -- CLAIMS-TOUCHING returns it unless :CURRENT
 filters it.  Not a deletion."
   (with-claim-graph (g)
-    (with-transaction () (make-u :subject "s1"))
+    ;; RECORDED-AT pinned in the past: with a wall-clock stamp this test
+    ;; is a time bomb -- a fixed :AT of noon fails every afternoon with
+    ;; "END precedes START".
+    (with-transaction () (make-u-at :subject "s1"
+                                    :recorded-at (ts 2026 1 1)))
     (let ((c (first (claims-touching g 'ct-claim :ns "s1")))
           (at (ts 2026 8 31 12)))
       (is-true (claim-current-p c) "a fresh claim is current")
@@ -426,7 +430,8 @@ fabricated."
 period ended when belief ended, and a sweep that runs daily must not
 walk the end forward."
   (with-claim-graph (g)
-    (with-transaction () (make-u :subject "s3"))
+    (with-transaction () (make-u-at :subject "s3"
+                                    :recorded-at (ts 2026 1 1)))
     (let ((c (first (claims-touching g 'ct-claim :ns "s3")))
           (first-at (ts 2026 8 31 12))
           (later (ts 2026 9 1 12)))

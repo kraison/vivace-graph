@@ -108,21 +108,24 @@ NOT a deletion.  A retracted claim still occupies its identity tuple, so a
 later assertion of the same fact re-opens it (REGISTER-NODE does this),
 and CLAIMS-TOUCHING still returns it unless :CURRENT filters it;
 CLAIM-CURRENT-P tells the two apart.  A claim predating the axis closes as
-[unknown, AT).  Already-retracted claims are left as they are.  Runs in
-its own transaction and returns the saved copy, or CLAIM itself when
-nothing was written."
-  (if (not (claim-current-p claim))
-      claim
-      (graph-db:with-transaction ()
-        (let* ((c (graph-db:copy claim))
-               (e (claim-transaction-extent c))
-               (start (if e (extent-start e) (unknown-bound))))
-          (setf (claim-transaction-extent-sexp c)
-                (extent->sexp (make-interval start (exact-bound at)
-                                             :semantics :transaction
-                                             :standing :asserted)))
-          (graph-db:save c)
-          c))))
+[unknown, AT).  Already-retracted claims are left as they are.  JOINS an
+ambient transaction when one is open -- so retract-then-assert inside one
+WITH-TRANSACTION commits or fails as a unit, which membership
+disjointness depends on (GH #157 4b) -- and opens its own otherwise.
+Returns the saved copy, or CLAIM itself when nothing was written."
+  (flet ((%retract ()
+           (let* ((c (graph-db:copy claim))
+                  (e (claim-transaction-extent c))
+                  (start (if e (extent-start e) (unknown-bound))))
+             (setf (claim-transaction-extent-sexp c)
+                   (extent->sexp (make-interval start (exact-bound at)
+                                                :semantics :transaction
+                                                :standing :asserted)))
+             (graph-db:save c)
+             c)))
+    (cond ((not (claim-current-p claim)) claim)
+          (graph-db::*transaction* (%retract))
+          (t (graph-db:with-transaction () (%retract))))))
 
 (defun claims-by-producer (graph claim-class producer)
   "Every live claim PRODUCER wrote, both arities.  CLAIM-CLASS is the PARENT,

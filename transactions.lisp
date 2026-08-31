@@ -10,6 +10,15 @@
                 validate-domain-range-constraints))
 
 (defvar *transaction* nil)
+
+(defvar *commit-validators* '()
+  "Functions of (TX GRAPH), run in %COMMIT's manager-locked pre-durability
+region after the built-in validators.  The seam an OPTIONAL subsystem's
+constraint family plugs into -- the spacetime substrate's membership
+disjointness registers here (GH #157 4b) -- mirroring
+*NODE-TYPE-DEFINITION-HOOKS* (schema.lisp).  A validator that signals
+aborts the commit before anything is journaled; it MUST be pure reads
+plus signalling, and should read tx state through MAKE-COMMIT-VIEW.")
 (defvar *quiesced-store-closing-p* nil
   "Bound T only in the detaching thread's dynamic extent, while
 DETACH-STORE's own CLOSE-GRAPH runs its post-quiesce snapshot scan.  Lets
@@ -3417,6 +3426,10 @@ See CALL-WITH-READ-SNAPSHOT."
                ;; Domain and range (GH #156): same region; the other end
                ;; is read through the commit view.
                (validate-domain-range-constraints tx (graph tx))
+               ;; Subsystem validators (GH #157 4b): same region, same
+               ;; abort-before-durability contract.
+               (dolist (fn *commit-validators*)
+                 (funcall fn tx (graph tx)))
                ;; Vector-segment dimension check (Task 4 fix): same pre-durability,
                ;; manager-locked region as the unique-constraint check above -- a
                ;; mismatch aborts before FINALIZE-TX-PERSISTENCE, so the node write

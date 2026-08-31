@@ -5292,6 +5292,40 @@ source declares once, about its own geometry, at ~DEF-SOURCE~ time;
 what keeps the two apart in code that reads only the accessor names —
 do not "harmonise" them.
 
+*** Membership disjointness (~def-disjoint-membership~)
+
+A record's class can be *derived per ingest* — the same external key
+reclassified later — so "what class is the thing named by key K" is a
+fact that changes over time and is only expressible as a claim: a binary
+claim whose subject is the record's key, whose object is a class
+designator, under one canonical relation. ~def-disjoint-membership~
+declares that a subject holds at most **one live** such claim within a
+set of membership-object *keys* (vivace-graph#157 unit 4b):
+
+#+BEGIN_SRC lisp
+  (def-disjoint-membership site-claim :my-graph
+    :relation "instance-of"
+    :object-namespace :classes
+    :object-keys ("observation" "fortification" "unclassified")
+    :name placemark-membership)     ; :NAME required -- it IS the identity
+
+  (undef-disjoint-membership site-claim :my-graph
+    :name placemark-membership)
+  (check-disjoint-memberships graph)
+    ;; => (values violations checked spec-count)
+#+END_SRC
+
+Enforced at commit, against *post-commit* state: reclassification is
+~retract-claim~ then the new claim **in one transaction** —
+~retract-claim~ joins an ambient transaction — and the check, reading
+through the commit view, does not count the sibling being retracted
+while counting the one being asserted. A second live membership is
+refused with ~membership-disjointness-violation~, a condition of its
+own. Claims under another relation, another object namespace, or keys
+outside the set never participate. The declaration, check and audit are
+single-store by design: a membership claim names its subject by external
+key, so there is no store reference to cross.
+
 *** Arity is a type, not a nullable slot
 
 ~DEF-CLAIM-CLASSES~ generates *three* classes, not one:

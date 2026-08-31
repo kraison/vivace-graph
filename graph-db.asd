@@ -510,7 +510,11 @@ cl-temporal-extent."
                (:file "claim-query")
                (:file "source")
                (:file "resolve")
-               (:file "register")))
+               (:file "register")
+               ;; Membership disjointness (GH #157 4b): needs
+               ;; claim-query's RETRACT-CLAIM/CLAIM-CURRENT-P and core's
+               ;; commit view + *COMMIT-VALIDATORS* seam.
+               (:file "membership")))
 
 (defsystem graph-db/spacetime-test
   :name "VivaceGraph spacetime test suite"
@@ -542,7 +546,8 @@ cl-temporal-extent."
                (:file "conformance-tests")
                (:file "claim-standing-guard-tests")    ; GH #149
                (:file "claim-transaction-tests")       ; GH #148
-               (:file "register-tests"))               ; GH #138
+               (:file "register-tests")                ; GH #138
+               (:file "membership-tests"))             ; GH #157 4b
   :perform (test-op (op c)
                     (unless (uiop:symbol-call :graph-db/spacetime-test
                                               :run-spacetime-tests)

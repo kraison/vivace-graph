@@ -58,6 +58,11 @@
    #:claims-by-producer #:delete-claims-by-producer   ; GH #145
    #:canonical-relation-p #:canonical-producer-p      ; GH #160
    #:transaction-extent-step                           ; GH #158
+   ;; membership disjointness (GH #157 4b)
+   #:def-disjoint-membership #:undef-disjoint-membership
+   #:membership-disjointness-violation
+   #:mdv-name #:mdv-subject-namespace #:mdv-subject-key #:mdv-members
+   #:check-disjoint-memberships
    #:unknown-claim-family
    ;; source onboarding contract (GH #132)
    #:def-source #:source-contract #:+source-facets+

@@ -205,3 +205,64 @@ anything is checked. The discriminating cases:
    correct and the second half is the one that is easy to omit.
 3. If #156 lands a read-in-commit hook, is disjointness expressible *through*
    it rather than as a fourth registry?
+
+## Addendum: 4b as built (2026-08-31, after the tenant answer)
+
+The tenant's answer (on #157, mirrored as their #143) resolved every
+question this note left open, and reshaped one premise: seen from the
+claim store, the disjoint set is a set of **membership-object keys** —
+values — not classes in that store's schema. 4a and 4b share vocabulary
+and nothing else.
+
+**The shape.** Membership is a binary claim: subject = the record's
+external key, object = `(class-namespace, class-designator-key)`, one
+canonical relation. The declaration ranges over object keys:
+
+```lisp
+(def-disjoint-membership claim-class graph-name
+  :relation "instance-of"
+  :object-namespace :classes
+  :object-keys ("observation" "fortification" "unclassified")
+  :name placemark-membership)
+```
+
+**The invariant**: at most one *live* (CLAIM-CURRENT-P) membership claim
+per subject key within a declared set. Reclassification is
+retract-then-assert; to make that atomic, `retract-claim` now JOINS an
+ambient transaction instead of always opening its own — the whole
+tenant flow `(with-transaction () (retract old) (make new))` commits or
+fails as one unit, and the commit check evaluates against the
+post-commit view, where the retracted sibling is no longer current.
+
+**The check** runs at commit, in the manager-locked region, through the
+commit view: for every written live membership claim of a declared set,
+the subject's other claims are read via the family's subject index and
+OVERLAID with the transaction's writes — a sibling retracted in the same
+transaction does not count, one asserted in the same transaction does.
+This is the view-lookup shape the evaluator note deferred "until a unit
+needs it"; 4b is that unit, and the overlay lives with the check.
+
+**The refusal** is `membership-disjointness-violation` — its own
+condition, per the tenant's condition 3: distinct from
+`value-constraint-violation` and catchable on its own. The scope note's
+"cross-store membership must be refused" test is VACUOUS under this
+shape and is recorded as such: a membership claim lives in the claim
+store and names its subject by external key; there is no store
+reference to cross.
+
+**Where it lives.** The registry, declaration, check and audit are part
+of the spacetime substrate (claims are its objects). Core's `%commit`
+gains one generic seam — `*commit-validators*`, a list of
+`(fn tx graph)` run beside the built-in validators — mirroring
+`*node-type-definition-hooks*`; the substrate pushes its validator at
+load. An image without spacetime pays one empty-list traversal.
+
+**Audit**: `check-disjoint-memberships graph` sweeps the family's
+claims, groups by subject, counts live members per declared set;
+`(values violations checked spec-count)`, the usual contract.
+
+**Migration**: none in place. Per the tenant, the deployed corpus is
+derived and disposable — the writer emits the new shape and one
+re-registration pass rebuilds; their sweep stays through a soak as
+belt-and-braces.
+
