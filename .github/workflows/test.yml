@@ -28,7 +28,7 @@ jobs:
                                   (merge-pathnames "src/cl-temporal-extent/"
                                                    (user-homedir-pathname)))
                             :ignore-inherited-configuration))' \
-            --eval '(ql:quickload :graph-db :silent t)' \
+            --eval '(ql:quickload :graph-db/test :silent t)' \
             --eval '(asdf:test-system :graph-db)'
       - name: concurrency suite
         run: |
@@ -81,5 +81,5 @@ jobs:
                                    "work/sitrep-deps/cl-temporal-extent/"
                                    (user-homedir-pathname)))
                             :ignore-inherited-configuration))' \
-            --eval '(ql:quickload :graph-db :silent t)' \
+            --eval '(ql:quickload :graph-db/test :silent t)' \
             --eval '(asdf:test-system :graph-db)'
