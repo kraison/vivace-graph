@@ -2635,6 +2635,10 @@ When you call ~snapshot~, it performs several important steps to ensure a high-q
 
 3.  *Writes the Backup File:* It then calls the lower-level ~backup~ function to serialize every node and edge in the graph into a single, human-readable text file. The file is written in a ~txn-log/in-progress/~ subdirectory and *renamed* up to its final ~snap-~ name only once complete, so an interrupted snapshot never masquerades as a real one; the first line is a format header and the last a completion trailer, which is what makes the file *verifiable* (vivace-graph#127). It lands in a subdirectory of your graph's location named `txn-log/`, with a name like `snap-<time>-<uuid>`.
 
+**** Heap sizing for snapshots
+
+A snapshot's *transient* allocation is large even though it retains nothing: measured on a deployed instance (vivace-graph#119, 2026-08-31), a snapshot cycle over graphs whose live post-GC footprint was ~0.7 GB drove the process RSS to ~9 GB at peak, returning to baseline (+15 MB) afterwards. The churn is the per-node deserialize-and-print walk, and it scales with the largest graph. On an 8 GB heap that same peak was the "Heap exhausted" crash the issue was filed about; on 16 GB it is routine GC traffic. Rule of thumb: give a long-lived image a heap comfortably above the transient peak you measure for your largest graph's snapshot, and re-measure as the graph grows. If exhaustion does fire, since vivace-graph#120/#127 the cost is one missing snapshot plus a loud warning — never a truncated file or an aborted close.
+
 The resulting file contains a series of Lisp s-expressions, one for each node in the graph. This format is not only easy to inspect but is also crucial for the restore process.
 
 #+BEGIN_EXAMPLE
