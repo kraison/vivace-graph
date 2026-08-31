@@ -772,6 +772,130 @@ constructor is what races)."
       (is (= 1 (length (%subject-claims g :ctr-records "s-10")))
           "one claim, updated seven times, never duplicated"))))
 
+(test a-region-the-subject-left-is-retracted-not-left-live
+  "GH #162.  A subject that shrinks, moves or is corrected out of a region
+used to leave that region's claim standing with its old fraction, reading
+as live.  Now REGISTER-NODE retracts it -- closes its transaction period,
+never deletes it -- and reports how many.  :CURRENT is how a consumer
+tells the two apart."
+  (if (not graph-db::*geos-available-p*)
+      (skip "GEOS not available")
+      (with-region-graph (g)
+        (%make-place g "west" '((0d0 0d0) (1d0 0d0) (1d0 2d0) (0d0 2d0)
+                                (0d0 0d0)))
+        (%make-place g "east" '((1d0 0d0) (2d0 0d0) (2d0 2d0) (1d0 2d0)
+                                (1d0 0d0)))
+        (let ((a (%make-area g "a-7" (make-polygon
+                                      '(((0.5d0 0.5d0) (1.5d0 0.5d0)
+                                         (1.5d0 1.5d0) (0.5d0 1.5d0)
+                                         (0.5d0 0.5d0)))))))
+          (multiple-value-bind (written evaluated unmeasured regs retracted)
+              (register-node a :graph g)
+            (declare (ignore unmeasured regs))
+            (is-true evaluated)
+            (is (= 2 written) "straddling both, two claims")
+            (is (zerop retracted) "nothing to retract on first sight"))
+          ;; Corrected: wholly inside WEST now.
+          (%move-area g "a-7" (make-polygon
+                               '(((0.2d0 0.5d0) (0.8d0 0.5d0) (0.8d0 1.5d0)
+                                  (0.2d0 1.5d0) (0.2d0 0.5d0)))))
+          (multiple-value-bind (written evaluated unmeasured regs retracted)
+              (register-node (%refind :ctr-areas "a-7") :graph g)
+            (declare (ignore unmeasured regs))
+            (is-true evaluated)
+            (is (= 1 written))
+            (is (= 1 retracted) "the region it left is retracted"))
+          (let ((all (%subject-claims g :ctr-areas "a-7"))
+                (live (claims-touching g 'ctr-claim :ctr-areas "a-7"
+                                       :role :subject :current t)))
+            (is (= 2 (length all)) "retracted, not deleted: both still here")
+            (is (= 1 (length live)))
+            (is (string= "west" (claim-object-key (first live))))
+            (let ((east (find "east" all :key #'claim-object-key
+                                         :test #'string=)))
+              (is-false (claim-current-p east))
+              (is-true (bound-exact-p
+                        (extent-end (claim-transaction-extent east)))
+                       "its period is CLOSED; the belief is kept")))))))
+
+(test a-subject-returning-to-a-region-re-opens-its-claim
+  "GH #162.  The identity tuple is still occupied by the retracted claim,
+so a later assertion of the same fact re-opens it with a fresh stamp
+rather than duplicating it (or failing on DEF-UNIQUE)."
+  (if (not graph-db::*geos-available-p*)
+      (skip "GEOS not available")
+      (with-region-graph (g)
+        (%make-place g "west" '((0d0 0d0) (1d0 0d0) (1d0 2d0) (0d0 2d0)
+                                (0d0 0d0)))
+        (%make-place g "east" '((1d0 0d0) (2d0 0d0) (2d0 2d0) (1d0 2d0)
+                                (1d0 0d0)))
+        (let ((straddle (make-polygon '(((0.5d0 0.5d0) (1.5d0 0.5d0)
+                                         (1.5d0 1.5d0) (0.5d0 1.5d0)
+                                         (0.5d0 0.5d0)))))
+              (west-only (make-polygon '(((0.2d0 0.5d0) (0.8d0 0.5d0)
+                                          (0.8d0 1.5d0) (0.2d0 1.5d0)
+                                          (0.2d0 0.5d0))))))
+          (%make-area g "a-8" straddle)
+          (register-node (%refind :ctr-areas "a-8") :graph g)
+          (%move-area g "a-8" west-only)
+          (register-node (%refind :ctr-areas "a-8") :graph g)
+          (%move-area g "a-8" straddle)
+          (multiple-value-bind (written evaluated unmeasured regs retracted)
+              (register-node (%refind :ctr-areas "a-8") :graph g)
+            (declare (ignore unmeasured regs))
+            (is-true evaluated)
+            (is (= 2 written))
+            (is (zerop retracted)))
+          (is (= 2 (length (%subject-claims g :ctr-areas "a-8")))
+              "re-opened, not duplicated")
+          (is (= 2 (length (claims-touching g 'ctr-claim :ctr-areas "a-8"
+                                            :role :subject :current t)))
+              "both current again")))))
+
+(test an-unmeasured-region-is-not-retracted
+  "GH #162 meets #164.  A region this scan could not measure is unknown,
+not left: its existing claim stays current, and nothing is retracted."
+  (with-region-graph (g)
+    (%make-place g "p-a" +ctr-square+)
+    (%make-place g "p-b" +ctr-square+)
+    (let ((n (%make-record g "s-11" (make-point 1d0 1d0))))
+      (register-node n :graph g)
+      (%reset-trap-reads)
+      (let ((*ctr-place-trap* '("p-b" . :geos)))
+        (multiple-value-bind (written evaluated unmeasured regs retracted)
+            (register-node n :graph g)
+          (declare (ignore regs))
+          (is-true evaluated)
+          (is (= 1 written))
+          (is (= 1 (length unmeasured)))
+          (is (zerop retracted) "unmeasured is not left")))
+      (is (= 2 (length (claims-touching g 'ctr-claim :ctr-records "s-11"
+                                        :role :subject :current t)))
+          "both claims still current"))))
+
+(test an-unevaluated-scan-retracts-nothing
+  "GH #162 meets #164's refusal: a scan that was never answered says
+nothing about which regions the subject left, so it retracts none."
+  (if (not graph-db::*geos-available-p*)
+      (skip "GEOS not available")
+      (with-region-graph (g)
+        (%make-place g "p-a" +ctr-square+)
+        (let ((a (%make-area g "a-9" (make-polygon
+                                      '(((0.5d0 0.5d0) (1.5d0 0.5d0)
+                                         (1.5d0 1.5d0) (0.5d0 1.5d0)
+                                         (0.5d0 0.5d0)))))))
+          (register-node a :graph g)
+          (let ((graph-db::*geos-available-p* nil))
+            (multiple-value-bind (written evaluated unmeasured regs retracted)
+                (register-node a :graph g)
+              (declare (ignore unmeasured regs))
+              (is (zerop written))
+              (is-false evaluated)
+              (is (zerop retracted))))
+          (is (= 1 (length (claims-touching g 'ctr-claim :ctr-areas "a-9"
+                                            :role :subject :current t)))
+              "the claim from the answered scan is still current")))))
+
 (test a-subject-with-no-geometry-is-not-answered
   "Where the record is, is unknown -- which is not the same as its being
 in no region (design §6)."

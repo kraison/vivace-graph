@@ -4,11 +4,15 @@
 (in-package #:graph-db.spacetime)
 
 (defun claims-touching (graph claim-class namespace key
-                        &key (role :either))
+                        &key (role :either) current)
   "Claims in GRAPH naming (NAMESPACE, KEY) as subject, object, or either.
 CLAIM-CLASS is the PARENT class name; one call covers both arities.  Answers
 from the claim graph's own indexes -- no cross-graph read, no snapshot, which
 is what makes it implementable in this unit (design §8).
+
+With :CURRENT, only claims still believed -- CLAIM-CURRENT-P -- so a
+retracted registration does not read as live (GH #162).  The default
+returns retracted claims too: they are the record of what was believed.
 
 An out-of-range ROLE signals rather than silently returning NIL -- NIL is
 also the correct answer for \"no claims touch this endpoint\", and this
@@ -26,10 +30,13 @@ subsystem exists to keep those two cases from being confused."
                      '(object-namespace object-key) want))))
     ;; A claim naming one endpoint as BOTH subject and object appears in both
     ;; lookups; the union must still return it once.
-    (if (and subjects objects)
-        (remove-duplicates (append subjects objects)
-                            :key #'graph-db:id :test #'equalp)
-        (or subjects objects))))
+    (let ((all (if (and subjects objects)
+                   (remove-duplicates (append subjects objects)
+                                      :key #'graph-db:id :test #'equalp)
+                   (or subjects objects))))
+      (if current
+          (remove-if-not #'claim-current-p all)
+          all))))
 
 (defun claim-extent (claim)
   "CLAIM's TEMPORAL-EXTENT, decoded from the stored sexp, or NIL.  The stored
@@ -61,9 +68,10 @@ predates the axis (GH #148).  NIL is INDETERMINATE, never the epoch."
 (defun (setf claim-transaction-extent) (extent claim)
   "Store EXTENT as CLAIM's transaction extent, once.  Signals
 TRANSACTION-EXTENT-IMMUTABLE if CLAIM already has one -- an audit field is
-written at creation and not revised (GH #148).  Writing
-CLAIM-TRANSACTION-EXTENT-SEXP bypasses this; engine-level enforcement waits
-on a constraint family (#109)."
+written at creation and not revised (GH #148).  The one sanctioned change
+after that is CLOSING the period, and RETRACT-CLAIM is its only writer
+(GH #162).  Writing CLAIM-TRANSACTION-EXTENT-SEXP bypasses this;
+engine-level enforcement waits on a constraint family (#109, #158)."
   (when (claim-transaction-extent-sexp claim)
     (error 'transaction-extent-immutable))
   (setf (claim-transaction-extent-sexp claim)
@@ -82,6 +90,38 @@ TIMESTAMP without checking (GH #148)."
     (if (null e)
         (values nil :indeterminate)
         (values (bound-earliest (extent-start e)) (extent-standing e)))))
+
+(defun claim-current-p (claim)
+  "True while CLAIM is still believed: its transaction period is open, or
+absent -- a claim predating the axis was never retracted.  NIL once
+RETRACT-CLAIM has closed the period (GH #162)."
+  (let ((e (claim-transaction-extent claim)))
+    (or (null e) (bound-unknown-p (extent-end e)))))
+
+(defun retract-claim (claim &key (at (local-time:now)))
+  "Close CLAIM's transaction period at AT: it was believed until now and no
+longer is, and the record of that belief stays -- the bitemporal
+[recorded, superseded) the #148 design left as a seam (GH #162).
+
+NOT a deletion.  A retracted claim still occupies its identity tuple, so a
+later assertion of the same fact re-opens it (REGISTER-NODE does this),
+and CLAIMS-TOUCHING still returns it unless :CURRENT filters it;
+CLAIM-CURRENT-P tells the two apart.  A claim predating the axis closes as
+[unknown, AT).  Already-retracted claims are left as they are.  Runs in
+its own transaction and returns the saved copy, or CLAIM itself when
+nothing was written."
+  (if (not (claim-current-p claim))
+      claim
+      (graph-db:with-transaction ()
+        (let* ((c (graph-db:copy claim))
+               (e (claim-transaction-extent c))
+               (start (if e (extent-start e) (unknown-bound))))
+          (setf (claim-transaction-extent-sexp c)
+                (extent->sexp (make-interval start (exact-bound at)
+                                             :semantics :transaction
+                                             :standing :asserted)))
+          (graph-db:save c)
+          c))))
 
 (defun claims-by-producer (graph claim-class producer)
   "Every live claim PRODUCER wrote, both arities.  CLAIM-CLASS is the PARENT,

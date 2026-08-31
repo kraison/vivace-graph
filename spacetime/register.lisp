@@ -212,7 +212,12 @@ subject are few (design §4)."
 (defun %update-registration-claim (existing registration facet precision
                                    confidence method)
   "Rewrite EXISTING with this scan's values, in its own transaction.  The
-COPY is INSIDE the transaction or SAVE signals MODIFYING-NON-COPY."
+COPY is INSIDE the transaction or SAVE signals MODIFYING-NON-COPY.
+
+A RETRACTED claim (GH #162) is RE-OPENED with a fresh stamp: the fact is
+asserted again as of now, and the closed period it replaces survives only
+in MVCC -- #148's recorded limitation, no retention of superseded
+periods, not a new one."
   (graph-db:with-transaction ()
     (let ((c (graph-db:copy existing)))
       (setf (claim-method c) method
@@ -221,7 +226,37 @@ COPY is INSIDE the transaction or SAVE signals MODIFYING-NON-COPY."
             (claim-precision-m c) precision
             (claim-fraction c) (getf registration :fraction)
             (claim-standing c) :inferred)
+      (unless (claim-current-p c)
+        (setf (claim-transaction-extent-sexp c)
+              (extent->sexp (%open-transaction-extent (local-time:now)))))
       (graph-db:save c))))
+
+(defun %retract-left-regions (facet subject-ns subject-key keep-keys
+                              registry-graph)
+  "Retract this registration's CURRENT claims for (SUBJECT-NS .
+SUBJECT-KEY) whose object key is not in KEEP-KEYS -- the regions the
+subject no longer overlaps (GH #162).  Same identity filter as the upsert,
+minus the object; same index lookup.  Returns how many were retracted."
+  (let* ((family (claim-family (getf facet :claim-class)))
+         (binary (claim-family-binary family))
+         (relation (getf facet :relation))
+         (producer (getf facet :producer))
+         (object-ns (getf facet :registry-namespace))
+         (n 0))
+    (dolist (c (graph-db:index-lookup registry-graph
+                                      (claim-family-parent family)
+                                      '(subject-namespace subject-key)
+                                      (list subject-ns subject-key))
+               n)
+      (when (and (typep c binary)
+                 (equal relation (claim-relation c))
+                 (equal producer (claim-producer c))
+                 (equal object-ns (claim-object-namespace c))
+                 (claim-current-p c)
+                 (not (member (claim-object-key c) keep-keys
+                              :test #'equal)))
+        (retract-claim c)
+        (incf n)))))
 
 (defun %insert-registration-claim (binary registration facet subject-ns
                                    subject-key object-ns object-key
@@ -303,17 +338,28 @@ WITH-TRANSACTION's default transaction manager is taken from."
 (defun register-node (node &key (graph graph-db:*graph*)
                                 (registry-graph graph))
   "Register NODE against its source contract's registry, writing one claim
-per region.  Four values: how many claims were written, whether the scan
-was EVALUATED at all, the regions it could NOT measure, and the
-registrations it wrote -- REGISTER-GEOMETRY's third and first values,
-passed through unchanged (GH #164, #165).  No claim is written for an
-unmeasured region: absence with a reason, never a fabricated binding, and
-a caller keeping coverage figures must read that list, since EVALUATED-P
-alone reports a PARTIAL scan as evaluated.  The registrations are the
-regions THIS scan bound, so a caller needing them does not scan twice --
-and does not read them back off the claims, which would fold in stale
-ones from an earlier extent (GH #162).  Their region nodes belong to
+per region, and retracting the claims for regions it has left.  Five
+values: how many claims were written, whether the scan was EVALUATED at
+all, the regions it could NOT measure, the registrations it wrote --
+REGISTER-GEOMETRY's third and first values, passed through (GH #164,
+#165) -- and how many claims it RETRACTED (GH #162).
+
+No claim is written for an unmeasured region: absence with a reason,
+never a fabricated binding, and a caller keeping coverage figures must
+read that list, since EVALUATED-P alone reports a PARTIAL scan as
+evaluated.  The registrations are the regions THIS scan bound, so a
+caller needing them does not scan twice.  Their region nodes belong to
 REGISTRY-GRAPH: read their slots under that binding (GH #53).
+
+RETRACTION (GH #162): a current claim of this facet's PRODUCER and
+RELATION for the subject, naming a region that is in NEITHER list -- not
+bound by this scan, not merely unmeasured by it -- is closed with
+RETRACT-CLAIM: the subject shrank, moved or was corrected out of it.
+Never deleted; the record of the belief stays, CLAIM-CURRENT-P is NIL,
+and CLAIMS-TOUCHING :CURRENT no longer returns it.  An unmeasured region
+keeps its claim -- nothing is known either way -- and an UNEVALUATED scan
+retracts nothing at all.  A subject that later returns to a region
+re-opens its claim with a fresh stamp (%UPDATE-REGISTRATION-CLAIM).
 
 A source declaring :REGISTRATION :NONE writes nothing and reports an
 EVALUATED scan -- structural absence, not an unanswered question.  Every
@@ -330,7 +376,7 @@ anyway."
   (let ((facet (source-facets-registration
                 (source-contract (type-of node)))))
     (if (eq facet :none)
-        (values 0 t nil nil)
+        (values 0 t nil nil 0)
         (let (geometry subject-ns subject-key precision confidence method)
           (let ((graph-db:*graph* graph))
             (setf geometry (graph-db:node-geometry node)
@@ -346,18 +392,32 @@ anyway."
             (multiple-value-setq (subject-ns subject-key)
               (%source-endpoint node graph)))
           (if (null geometry)
-              (values 0 nil nil nil)
+              (values 0 nil nil nil 0)
               (multiple-value-bind (regs evaluated unmeasured)
                   (register-geometry geometry (getf facet :registry)
                                      :registry-graph registry-graph)
                 (if (not evaluated)
-                    (values 0 nil nil nil)
+                    (values 0 nil nil nil 0)
                     (let ((graph-db:*graph* registry-graph))
-                      (values (loop for r in regs
+                      (let ((written
+                              (loop for r in regs
                                     count (%upsert-registration-claim
                                            r facet subject-ns subject-key
                                            precision confidence method
-                                           registry-graph))
-                              t
-                              unmeasured
-                              regs)))))))))
+                                           registry-graph)))
+                            ;; Keep what this scan bound AND what it could
+                            ;; not measure: an unmeasured region is
+                            ;; unknown, not left (GH #164, #162).
+                            (keep (mapcar
+                                   (lambda (r)
+                                     (nth-value 1 (%source-endpoint
+                                                   (getf r :region)
+                                                   registry-graph)))
+                                   (append regs unmeasured))))
+                        (values written
+                                t
+                                unmeasured
+                                regs
+                                (%retract-left-regions
+                                 facet subject-ns subject-key keep
+                                 registry-graph)))))))))))

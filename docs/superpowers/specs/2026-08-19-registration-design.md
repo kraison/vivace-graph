@@ -173,7 +173,8 @@ meaning, in both functions.
 
 ```lisp
 (register-node node &key graph registry-graph)
-  ;; => (values claims-written evaluated-p unmeasured registrations)
+  ;; => (values claims-written evaluated-p unmeasured registrations
+  ;;            retracted)
 ```
 
 Reads `node`'s source contract, computes the registrations, and upserts one
@@ -461,3 +462,36 @@ back through the substrate accessors with their values intact.
   GEOS intersection on adjacent polygons double-counts shared boundaries by
   a negligible amount. The test needs a stated tolerance rather than an
   exact comparison.
+
+## 14. Retraction (#162)
+
+Registration owns it. After the upsert, `register-node` retracts the
+subject's other *current* claims under the facet's producer and relation
+whose region is in neither the registrations nor the unmeasured list, and
+reports the count as a fifth value. An unmeasured region (§6, #164) keeps
+its claim — unknown is not left — and an unevaluated scan retracts
+nothing.
+
+**Retraction closes the transaction period; it does not delete.**
+`retract-claim` writes `[recorded, at)` with standing `:asserted` — the
+bitemporal `[recorded, superseded)` the transaction-time design named as
+the seam. The claim stays, still occupies its identity tuple, and
+`claim-current-p` is NIL; `claims-touching` gains `:current` to filter.
+A claim predating the axis closes as `[unknown, at)`. Retracting twice is
+a no-op. This is the one sanctioned change to the transaction extent
+after creation, and it is the constraint #158's write-once family must
+admit: the *start* is immutable, the *end* may be closed once by the
+substrate.
+
+Transaction time rather than validity time because registration derives
+from the current geometry and cannot tell a correction from a move; "we
+no longer derive this" is what it honestly knows. A tenant with the
+world-time story writes the validity extent itself.
+
+A subject returning to a region re-opens its retracted claim with a fresh
+stamp — the tuple is occupied, so a second claim is impossible — and the
+closed period survives only in MVCC, which is #148's recorded limitation.
+The tenant's producer-scoped sweep (`delete-claims-by-producer`,
+sweep-then-insert) is unchanged and still the right tool for a rule that
+stops producing altogether.
+

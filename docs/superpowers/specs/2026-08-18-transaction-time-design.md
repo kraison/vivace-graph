@@ -130,6 +130,15 @@ a determined or careless tenant can overwrite a stamp, and nothing in the
 engine will refuse it. This is the first concrete requirement for #109's
 next unit and should be cited there.
 
+**Addendum (#162).** One change after creation is sanctioned: *closing*
+the period. `retract-claim` writes `[recorded, at)` — the `[recorded,
+superseded)` named above — and is the only writer that does so; the
+accessor still refuses a replacement. Re-registration of a retracted
+claim re-opens it with a fresh stamp, so the closed period survives only
+in MVCC: the "no retention of superseded versions" limitation below, not
+a new one. #158's write-once family should therefore treat the start as
+immutable and the end as closeable once.
+
 ## Absence, and claims already on disk
 
 A claim written before this unit has no such key in its `DATA` alist and

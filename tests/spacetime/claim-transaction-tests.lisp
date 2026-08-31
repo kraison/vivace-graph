@@ -355,3 +355,68 @@ values -- exactly what an imprecise ingest source time produces."
       (multiple-value-bind (recorded standing) (claim-recorded-at c2)
         (is (local-time:timestamp= (ts 2020 1 1) recorded))
         (is (eq :asserted standing))))))
+
+;;; --- Retraction: closing the transaction period (GH #162) ---------------
+
+(test retracting-a-claim-closes-its-period-and-keeps-it
+  "GH #162.  A retracted claim is the record of what was believed until
+when: its transaction period closes at AT, the recorded-at start survives,
+and the claim is still there -- CLAIMS-TOUCHING returns it unless :CURRENT
+filters it.  Not a deletion."
+  (with-claim-graph (g)
+    (with-transaction () (make-u :subject "s1"))
+    (let ((c (first (claims-touching g 'ct-claim :ns "s1")))
+          (at (ts 2026 8 31 12)))
+      (is-true (claim-current-p c) "a fresh claim is current")
+      (retract-claim c :at at)
+      (let* ((r (first (claims-touching g 'ct-claim :ns "s1")))
+             (e (claim-transaction-extent r)))
+        (is-false (claim-current-p r))
+        (is (eq :transaction (extent-semantics e)))
+        (is-true (bound-exact-p (extent-start e))
+                 "the recorded-at start survives the close")
+        (is-true (bound-exact-p (extent-end e)))
+        (is-true (local-time:timestamp= at (bound-earliest (extent-end e)))
+                 "closed exactly at AT")
+        (is (= 1 (length (claims-touching g 'ct-claim :ns "s1")))
+            "retracted, not deleted")
+        (is (null (claims-touching g 'ct-claim :ns "s1" :current t))
+            ":CURRENT filters it out")))))
+
+(test retracting-a-claim-that-predates-the-axis-closes-from-unknown
+  "GH #162 meets #148's absence rule: a claim with no stamp is current
+(never retracted) and closes as [unknown, AT) -- the start is not
+fabricated."
+  (with-claim-graph (g)
+    (with-transaction () (make-u :subject "s2"))
+    (let ((c (first (claims-touching g 'ct-claim :ns "s2"))))
+      (with-transaction ()
+        (let ((copy (graph-db::copy c)))
+          (setf (claim-transaction-extent-sexp copy) nil)
+          (graph-db::save copy)))
+      (let ((legacy (first (claims-touching g 'ct-claim :ns "s2"))))
+        (is (null (claim-transaction-extent legacy)) "fixture: unstamped")
+        (is-true (claim-current-p legacy) "absence is not retraction")
+        (retract-claim legacy :at (ts 2026 8 31 12))
+        (let ((e (claim-transaction-extent
+                  (first (claims-touching g 'ct-claim :ns "s2")))))
+          (is-true (bound-unknown-p (extent-start e)))
+          (is-true (bound-exact-p (extent-end e))))))))
+
+(test retracting-twice-leaves-the-first-close-standing
+  "GH #162.  A second retraction is a no-op, not a later close: the
+period ended when belief ended, and a sweep that runs daily must not
+walk the end forward."
+  (with-claim-graph (g)
+    (with-transaction () (make-u :subject "s3"))
+    (let ((c (first (claims-touching g 'ct-claim :ns "s3")))
+          (first-at (ts 2026 8 31 12))
+          (later (ts 2026 9 1 12)))
+      (retract-claim c :at first-at)
+      (retract-claim (first (claims-touching g 'ct-claim :ns "s3"))
+                     :at later)
+      (let ((e (claim-transaction-extent
+                (first (claims-touching g 'ct-claim :ns "s3")))))
+        (is-true (local-time:timestamp= first-at
+                                        (bound-earliest (extent-end e))))))))
+

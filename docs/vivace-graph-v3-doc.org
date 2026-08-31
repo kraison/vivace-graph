@@ -5502,7 +5502,8 @@ registry:
     ;; => (values registrations evaluated-p unmeasured)
 
   (register-node node &key graph registry-graph)
-    ;; => (values claims-written evaluated-p unmeasured registrations)
+    ;; => (values claims-written evaluated-p unmeasured registrations
+    ;;            retracted)
 #+END_SRC
 
 ~registry~ is a spatial SCOPE — a class name, a list of names, or
@@ -5638,6 +5639,40 @@ and writes no claim for those regions. Before this, one such region
 refused the whole subject — 1,560 claims lost across ten consecutive
 days of a deployed series, where a missing claim reads as a definite
 negative.
+
+**** RETRACTION: a region the subject left
+
+Registration owns retraction (vivace-graph#162). After writing, 
+~register-node~ looks at the subject's other *current* claims under the
+same producer and relation and, for every region that is in neither the
+registrations nor the unmeasured list — the subject shrank, moved or was
+corrected out of it — calls ~retract-claim~, and reports the count as
+its fifth value. An unmeasured region keeps its claim (nothing is known
+either way), and an unevaluated scan retracts nothing at all.
+
+~retract-claim~ does not delete. It closes the claim's *transaction*
+period at ~:at~ (default now): ~[recorded, retracted)~, standing
+~:asserted~ — "this was believed from then until now" — which is the
+bitemporal seam the transaction-time design (#148) left open, and the
+one sanctioned change to that audit field after creation. The claim
+stays in the graph and still occupies its identity tuple; ~claim-current-p~
+is ~nil~ for it, and ~claims-touching~ returns it unless called with
+~:current t~. A claim predating the axis closes as ~[unknown, at)~ — the
+start is not fabricated. Retracting twice is a no-op: a daily sweep must
+not walk the end forward.
+
+Why transaction time and not validity time: registration derives from
+the subject's *current* geometry and cannot tell a correction ("it was
+never there") from a move ("it was there until T"). "We no longer derive
+this" is the only thing it honestly knows, and that is a transaction-time
+fact. A tenant that knows the world-time story writes the validity
+extent itself.
+
+A subject that later returns to a region *re-opens* the retracted claim
+with a fresh stamp rather than duplicating it — the tuple is occupied,
+and ~def-unique~ would refuse a second. The closed period it replaces
+survives only in MVCC: that is #148's recorded limitation (no retention
+of superseded periods), not a new one.
 
 *** What is not here yet
 

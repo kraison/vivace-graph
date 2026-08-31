@@ -53,6 +53,7 @@
    #:claim-extent #:claims-touching
    #:claim-transaction-extent-sexp                     ; GH #148
    #:claim-transaction-extent #:claim-recorded-at
+   #:claim-current-p #:retract-claim                   ; GH #162
    #:transaction-extent-immutable
    #:claims-by-producer #:delete-claims-by-producer   ; GH #145
    #:canonical-relation-p #:canonical-producer-p      ; GH #160

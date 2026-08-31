@@ -13,6 +13,21 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Added
 
+- **Claims can be retracted, and registration retracts the regions a
+  subject has left** (#162). `retract-claim` closes a claim's transaction
+  period at `:at` — `[recorded, retracted)`, standing `:asserted` — and
+  never deletes: the record of what was believed stays, `claim-current-p`
+  is NIL for it, and `claims-touching` gains `:current` to filter it. A
+  claim predating the transaction-time axis closes as `[unknown, at)`;
+  retracting twice is a no-op. `register-node` now retracts the subject's
+  current claims (same producer and relation) for every region in neither
+  its registrations nor its unmeasured list, and reports the count as a
+  **fifth value**; an unmeasured region keeps its claim and an unevaluated
+  scan retracts nothing. A subject returning to a region re-opens the
+  retracted claim with a fresh stamp rather than duplicating it. Before
+  this, a subject that shrank, moved or was corrected left its old
+  region's claim standing with its old fraction, reading as live.
+
 - **`register-node` returns its registrations as a fourth value** (#165):
   the `(:region node :fraction double)` list `register-geometry` computed
   and the claims were written from. A caller that needs the regions bound
