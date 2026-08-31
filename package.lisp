@@ -406,6 +406,12 @@
            #:cdv-class-name #:cdv-edge-type #:cdv-direction
            #:cdv-actual #:cdv-min #:cdv-max #:cdv-node-id
            #:check-cardinality-constraints
+           ;; Domain and range (GH #156)
+           #:def-domain-range #:undef-domain-range
+           #:domain-range-violation
+           #:drv-edge-type #:drv-end #:drv-reason #:drv-actual
+           #:drv-expected #:drv-node-id #:drv-endpoint-id
+           #:check-domain-range-constraints
            #:vc-violation-spec #:vc-violation-node-id
            #:vc-violation-class-name #:vc-violation-slot
            #:vc-violation-actual #:vc-violation-expected

@@ -143,6 +143,9 @@
                ;; Cardinality constraints (GH #155): counts through the
                ;; commit view value-constraint.lisp defines.
                (:file "cardinality" :depends-on ("value-constraint"))
+               ;; Domain and range (GH #156): the other endpoint, through
+               ;; the commit view.
+               (:file "domain-range" :depends-on ("value-constraint"))
                ;; The per-(owner . slot) spatial index registry.  Loaded LAST so it
                ;; can see the MOP helpers (node-class), the graph, the memory-graph
                ;; backend and the ordered-index factory; TRANSACTIONS.LISP,
@@ -647,6 +650,7 @@ cl-temporal-extent."
                (:file "index-prolog-tests")        ; GH #102
                (:file "value-constraint-tests")     ; GH #149
                (:file "cardinality-tests")          ; GH #155
+               (:file "domain-range-tests")         ; GH #156
                (:file "peer-unique-tests")
                (:file "peer-index-tests")
                (:file "open-hygiene-tests")    ; GH #222, #224

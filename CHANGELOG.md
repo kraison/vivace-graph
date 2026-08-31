@@ -13,6 +13,20 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Added
 
+- **Domain and range constraints on edges** (#156, ontology unit 3).
+  `def-domain-range` declares the classes an edge type's endpoints may
+  have — `:domain` for `from`, `:range` for `to`, each a class or a list,
+  subtypes admitted, a subtype edge inheriting the rule — enforced at
+  commit on every create of such an edge. The endpoint is read through
+  the commit view, so both endpoints created in the same commit as the
+  edge are found in the writes rather than missed in the store, and an
+  endpoint deleted in the same commit is absent. A **missing** endpoint
+  (`:dangling` — `make-edge` accepts a raw id nothing answers to) and a
+  **wrong-typed** one (`:wrong-type`) are distinct reasons, never one
+  condition. `check-domain-range-constraints` is the audit pass. Fifth
+  schema registry, same identity rule. With `def-cardinality`, this is
+  what `def-edge`'s endpoint comments meant.
+
 - **Cardinality constraints on edges** (#155, ontology unit 2).
   `def-cardinality` bounds how many edges of a type a vertex may have —
   `:min` / `:max`, `:direction :out` (edges from it) or `:in` (edges to

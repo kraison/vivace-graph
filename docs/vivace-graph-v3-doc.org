@@ -1782,6 +1782,37 @@ counts, since zero violations over zero specs is an unchecked graph.
 Name a declaration whenever a macro emits it (GH #139); withdrawal by
 ~:name~ resolves the symbol in the package it was read in (GH #152).
 
+*** Domain and range (~def-domain-range~)
+
+~def-edge~ has never typed its endpoints — the classes an edge may join
+have lived in comments. ~def-domain-range~ declares them and enforces
+them at commit (vivace-graph#156): ~:domain~ is the class (or list of
+classes) a ~from~ vertex may have, ~:range~ the same for ~to~; subtypes
+are admitted, a subtype edge inherits its parent's rule, and an end left
+unspecified is unconstrained.
+
+#+BEGIN_SRC lisp
+  (def-domain-range zone-of :my-app
+    :domain hazard-zone :range hazard-area :name zone-of-endpoints)
+
+  (undef-domain-range zone-of :my-app :name zone-of-endpoints)
+  (check-domain-range-constraints graph :edge-type 'zone-of)
+    ;; => (values violations checked spec-count)
+#+END_SRC
+
+The check runs on every create of such an edge. The endpoint is read
+through the *commit view* — the transaction's writes overlaid on the
+store — so the ordinary case of creating both endpoints and the edge in
+one transaction is one answer, and a vertex deleted in the same
+transaction is absent. Two failures are kept apart, because they are
+different facts: a ~:dangling~ endpoint (~make-edge~ accepts a raw id
+that nothing answers to) and a ~:wrong-type~ one; ~domain-range-violation~
+carries the reason, the end (~:from~ / ~:to~), the actual class and the
+expected list. Together with ~def-cardinality~, this is the graph-level
+half of the ontology epic; a claim's endpoints, which may live in another
+store, are a namespace-level question (Chapter 18) rather than a node
+read across the boundary.
+
 ** Chapter 9: The REST API (~rest.lisp~)
 
 While VivaceGraph is written in Common Lisp, your applications don't have to be. VivaceGraph includes a built-in, high-performance web server that exposes a complete RESTful API for graph operations. This allows programs written in Python, JavaScript, Java, or any other language to create, read, update, and delete nodes and edges over standard HTTP.
