@@ -11,6 +11,25 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ## [Unreleased]
 
+### Changed
+
+- **A claim's `relation` and `producer` are canonical strings, enforced at
+  commit** (#160). Both are components of the `def-unique` identity tuple
+  and are compared with `equal`, so `:registered-at`, `"registered-at"`
+  and `"Registered-At"` were three *different* claims — a tenant that
+  changed spelling would have written a parallel identity space rather
+  than updating anything, and nothing signalled. `def-claim-classes` now
+  emits a `:check` on each slot: `canonical-relation-p` (non-empty,
+  lowercase, `[a-z0-9-]`) and `canonical-producer-p` (the same plus `/`,
+  the deployed path-like `"tenant/rule"` convention). Both predicates are
+  exported. A keyword or a case/whitespace variant now aborts the
+  transaction on every write path, not only through `make-<name>`.
+  Measured against the full deployed corpus before enforcing (352,689
+  claims, 5 relations, 2 producers — all already canonical), so no
+  migration. Engine tests that passed keywords were rewritten.
+  Downstream: a tenant whose *tests* pass keywords will start failing at
+  commit; its data is unaffected.
+
 ### Fixed
 
 - **An overlay of two VALID geometries could answer with a

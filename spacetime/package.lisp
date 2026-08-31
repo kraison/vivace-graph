@@ -55,6 +55,7 @@
    #:claim-transaction-extent #:claim-recorded-at
    #:transaction-extent-immutable
    #:claims-by-producer #:delete-claims-by-producer   ; GH #145
+   #:canonical-relation-p #:canonical-producer-p      ; GH #160
    #:unknown-claim-family
    ;; source onboarding contract (GH #132)
    #:def-source #:source-contract #:+source-facets+

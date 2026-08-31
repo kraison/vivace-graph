@@ -113,9 +113,9 @@ representable here (deferred to #132)."
       (let ((unary (make-u))
             (uncertain (make-ct-claim-binary
                         :subject-namespace :ns :subject-key "s9"
-                        :relation :r :object-namespace :ns
+                        :relation "r" :object-namespace :ns
                         :object-key "o9"
-                        :producer :p :standing :indeterminate)))
+                        :producer "p" :standing :indeterminate)))
         ;; Structural absence: the slot does not exist at all.
         (is-false (slot-exists-p unary 'graph-db.spacetime::object-key))
         ;; The binary claim's object slot exists and holds a real value;
@@ -136,8 +136,8 @@ fixed."
     (declare (ignorable g))
     (with-transaction ()
       (let ((c (make-ct-claim-unary
-                :subject-namespace :ns :subject-key "s" :relation :r
-                :producer :p :standing :asserted
+                :subject-namespace :ns :subject-key "s" :relation "r"
+                :producer "p" :standing :asserted
                 :extent (make-granule-instant (ts 2026 1 15) :day
                                               :standing :observed))))
         (is (eq :asserted (claim-standing c)))

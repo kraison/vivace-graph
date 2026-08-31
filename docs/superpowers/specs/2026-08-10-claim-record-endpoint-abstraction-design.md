@@ -151,14 +151,18 @@ same way the subject index does. It exists so the regeneration sweep
 | `subject-key` | string | the subject's stable **external** key, not a node id |
 | `object-namespace` | keyword | `binary-claim` only |
 | `object-key` | string | `binary-claim` only |
-| `relation` | keyword | open vocabulary |
-| `producer` | keyword | the rule or operator that made it — see §6 |
+| `relation` | canonical string¹ | open vocabulary |
+| `producer` | canonical string¹ | the rule or operator that made it — see §6 |
 | `rule-version` | string | provenance, **not** identity |
 | `method` | keyword | how it was derived — open vocabulary |
 | `standing` | S1a `standing` | validated by `check-standing` at construction |
 | `confidence` | double-float or nil | |
 | `extent-sexp` | list | the stored form; read it through `claim-extent` (§7) |
 | `geometry` | engine `geometry` | optional, unindexed here — see §7 |
+
+¹ Written as "keyword" here; settled as canonical strings by #160 —
+`[a-z0-9-]`, plus `/` for `producer` — enforced at commit by a `:check`
+on each slot, because both are in the identity tuple.
 
 The triple proper is three of these. Everything else is provenance, and that
 asymmetry is the point: an edge carries the three and nothing else, which is why

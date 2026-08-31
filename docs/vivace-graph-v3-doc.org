@@ -5045,9 +5045,9 @@ tenants both loaded it:
 #+END_SRC
 
 Every claim, regardless of arity, carries the same core: ~subject-namespace~
-/ ~subject-key~ (the triple's subject), ~relation~ (an open vocabulary,
-whose TYPE is not settled — see below), ~producer~ (which rule or operator
-made the claim), an optional
+/ ~subject-key~ (the triple's subject), ~relation~ (an open vocabulary
+of canonical strings — see below), ~producer~ (which rule or operator
+made the claim; a canonical string too), an optional
 ~rule-version~ kept as provenance only, ~method~, ~standing~ (S1a's
 provenance vocabulary — see above — validated by ~check-standing~ at
 construction, so an invalid one cannot be built), ~confidence~, an encoded
@@ -5056,15 +5056,20 @@ metres value, or ~nil~), and ~fraction~ (a dimensionless ratio,
 defaulting to ~1.0d0~). ~:extra-slots~ land on the shared parent, so a
 tenant that adds ~weight~ gets it on both arities for free.
 
-⚠ ~relation~'s TYPE is an open question, not a free choice per call.
-This engine's own tests pass keywords (~:relation :r~), while the
-~:REGISTRATION~ facet (below) requires a STRING, following the tenant
-whose 345,939 deployed claims already use strings. The trap a reader must
-know: ~relation~ is part of ~DEF-UNIQUE~'s identity tuple, so
-~:registered-at~ and ~"registered-at"~ are DIFFERENT claims — a producer
-that changed representation would silently DOUBLE every claim it holds
-rather than updating them. Pick one per producer and do not migrate it
-casually. Tracked as vivace-graph#160.
+⚠ ~relation~ and ~producer~ are CANONICAL STRINGS, enforced at commit
+(vivace-graph#160). Both are part of ~DEF-UNIQUE~'s identity tuple and
+are compared with ~EQUAL~, so ~:registered-at~, ~"registered-at"~ and
+~"Registered-At"~ would be three DIFFERENT claims — a producer that
+changed spelling would silently write a parallel set rather than update
+anything. ~DEF-CLAIM-CLASSES~ therefore emits a ~:CHECK~ on each slot:
+~canonical-relation-p~ admits a non-empty lowercase ~[a-z0-9-]~ string
+and nothing else; ~canonical-producer-p~ additionally admits ~/~, for the
+path-like ~"tenant/rule"~ names a producer carries. A keyword, an empty
+string, or a case or whitespace variant aborts the transaction on every
+write path, including a ~SETF~ + ~SAVE~ and the REST put. Both predicates
+are exported, so a tenant can pre-check a value it is about to write.
+~relation~ stays an OPEN vocabulary — the check is on form, not on
+membership; a closed vocabulary is ~DEF-VALUE-CONSTRAINT :ONE-OF~.
 
 ~precision-m~ and ~fraction~ are what a registration (below) records
 about *how* a subject binds to a region: ~precision-m~ how accurately

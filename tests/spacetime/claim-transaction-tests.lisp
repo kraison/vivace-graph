@@ -17,7 +17,7 @@ case is OVERWRITING-A-STAMP-IS-REFUSED, below."
                             :standing :asserted)))
       (with-transaction ()
         (make-ct-claim-unary :subject-namespace :ns :subject-key "s1"
-                             :relation :r :producer :rule-a
+                             :relation "r" :producer "rule-a"
                              :standing :inferred
                              :transaction-extent e))
       (let ((c2 (first (claims-touching g 'ct-claim :ns "s1"))))
@@ -44,7 +44,7 @@ no such guard."
                               :standing :asserted)))
       (with-transaction ()
         (make-ct-claim-unary :subject-namespace :ns :subject-key "s1"
-                             :relation :r :producer :rule-a
+                             :relation "r" :producer "rule-a"
                              :standing :inferred
                              :transaction-extent txn))
       (let ((c (first (claims-touching g 'ct-claim :ns "s1"))))
@@ -133,7 +133,7 @@ fixed that, so the constraint is now only distance from now."
               :semantics :transaction :standing :indeterminate)))
       (with-transaction ()
         (make-ct-claim-unary :subject-namespace :ns :subject-key "s1"
-                             :relation :r :producer :p
+                             :relation "r" :producer "p"
                              :standing :inferred
                              :transaction-extent e))
       (let ((c (first (claims-touching g 'ct-claim :ns "s1"))))
@@ -151,7 +151,7 @@ ask for; parity with :EXTENT versus :EXTENT-SEXP (claim.lisp)."
     (signals error
       (with-transaction ()
         (make-ct-claim-unary :subject-namespace :ns :subject-key "s1"
-                             :relation :r :producer :p
+                             :relation "r" :producer "p"
                              :standing :inferred
                              :recorded-at (local-time:now)
                              :transaction-extent
@@ -227,7 +227,7 @@ answer is still the default stamp."
     (declare (ignorable g))
     (with-transaction ()
       (make-ct-claim-unary :subject-namespace :ns :subject-key "s1"
-                           :relation :r :producer :p
+                           :relation "r" :producer "p"
                            :standing :inferred
                            :transaction-extent nil))
     (let ((c (first (claims-touching g 'ct-claim :ns "s1"))))
@@ -241,7 +241,7 @@ answer is still the default stamp."
     (declare (ignorable g))
     (with-transaction ()
       (make-ct-claim-unary :subject-namespace :ns :subject-key "s1"
-                           :relation :r :producer :p
+                           :relation "r" :producer "p"
                            :standing :inferred
                            :recorded-at nil))
     (let ((c (first (claims-touching g 'ct-claim :ns "s1"))))
@@ -256,7 +256,7 @@ initarg, closest to how a legacy pre-#148 claim would arrive."
     (declare (ignorable g))
     (with-transaction ()
       (make-ct-claim-unary :subject-namespace :ns :subject-key "s1"
-                           :relation :r :producer :p
+                           :relation "r" :producer "p"
                            :standing :inferred
                            :transaction-extent-sexp nil))
     (let ((c (first (claims-touching g 'ct-claim :ns "s1"))))
@@ -273,7 +273,7 @@ weakening into counting values instead of keys."
     (signals error
       (with-transaction ()
         (make-ct-claim-unary :subject-namespace :ns :subject-key "s1"
-                             :relation :r :producer :p
+                             :relation "r" :producer "p"
                              :standing :inferred
                              :recorded-at nil
                              :transaction-extent
@@ -332,7 +332,7 @@ values -- exactly what an imprecise ingest source time produces."
     (declare (ignorable g))
     (with-transaction ()
       (make-ct-claim-unary :subject-namespace :ns :subject-key "s1"
-                           :relation :r :producer :p
+                           :relation "r" :producer "p"
                            :standing :inferred
                            :transaction-extent
                            (make-interval (unknown-bound) (unknown-bound)
@@ -340,7 +340,7 @@ values -- exactly what an imprecise ingest source time produces."
                                           :standing :asserted)))
     (with-transaction ()
       (make-ct-claim-unary :subject-namespace :ns :subject-key "s2"
-                           :relation :r :producer :p
+                           :relation "r" :producer "p"
                            :standing :inferred
                            :transaction-extent
                            (make-interval

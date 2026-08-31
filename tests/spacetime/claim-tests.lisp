@@ -49,11 +49,11 @@ CLOSER-MOP is not loaded here and this test package sees neither."
     (declare (ignorable g))
     (with-transaction ()
       (let ((u (make-ct-claim-unary :subject-namespace :ns :subject-key "s"
-                                    :relation :r :producer :p
+                                    :relation "r" :producer "p"
                                     :standing :inferred))
             (b (make-ct-claim-binary :subject-namespace :ns :subject-key "s"
-                                     :relation :r :object-namespace :ns
-                                     :object-key "o" :producer :p
+                                     :relation "r" :object-namespace :ns
+                                     :object-key "o" :producer "p"
                                      :standing :inferred)))
         (is-true (slot-exists-p b 'graph-db.spacetime::object-key))
         (is-false (slot-exists-p u 'graph-db.spacetime::object-key))))))
@@ -64,13 +64,13 @@ CLOSER-MOP is not loaded here and this test package sees neither."
     (let (u b)
       (with-transaction ()
         (setq u (make-ct-claim-unary :subject-namespace :ns
-                                     :subject-key "s1" :relation :r
-                                     :producer :rule-a :standing :inferred
+                                     :subject-key "s1" :relation "r"
+                                     :producer "rule-a" :standing :inferred
                                      :weight 1.5d0))
         (setq b (make-ct-claim-binary :subject-namespace :ns
-                                      :subject-key "s1" :relation :r
+                                      :subject-key "s1" :relation "r"
                                       :object-namespace :ns :object-key "o1"
-                                      :producer :rule-a :standing :inferred
+                                      :producer "rule-a" :standing :inferred
                                       :weight 2.5d0)))
       (is (= 1.5d0 (ct-weight u)))
       (is (= 2.5d0 (ct-weight b))))))
@@ -89,7 +89,8 @@ CLOSER-MOP is not loaded here and this test package sees neither."
     (signals invalid-standing
       (with-transaction ()
         (make-ct-claim-unary :subject-namespace :ns :subject-key "s"
-                             :relation :r :producer :p :standing :probably)))))
+                             :relation "r" :producer "p"
+                             :standing :probably)))))
 
 (test a-graph-holding-claims-closes-and-reopens-cleanly
   "Regression test for GH #131: an earlier STANDING check hooked
@@ -104,11 +105,11 @@ approach must not reintroduce that (design §5)."
           (with-transaction ()
             (setq uid (id (make-ct-claim-unary
                            :subject-namespace :ns :subject-key "s"
-                           :relation :r :producer :p :standing :observed)))
+                           :relation "r" :producer "p" :standing :observed)))
             (setq bid (id (make-ct-claim-binary
                            :subject-namespace :ns :subject-key "s"
-                           :relation :r :object-namespace :ns
-                           :object-key "o" :producer :p
+                           :relation "r" :object-namespace :ns
+                           :object-key "o" :producer "p"
                            :standing :observed))))
           (close-graph g)))              ; :snapshot-p t (default)
       (let ((g2 (open-graph *claim-graph-name* path)))

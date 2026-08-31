@@ -14,7 +14,7 @@
                  (let ((graph-db:*graph* g))
                    (handler-case
                        (progn (with-transaction ()
-                                (make-b :producer :race :object "one"))
+                                (make-b :producer "race" :object "one"))
                               (bt:with-lock-held (lock) (incf oks)))
                      (graph-db:unique-constraint-violation ()
                        (bt:with-lock-held (lock) (incf rejects)))))))
@@ -36,7 +36,7 @@ so passing on binary claims proves nothing about it."
                  (let ((graph-db:*graph* g))
                    (handler-case
                        (progn (with-transaction ()
-                                (make-u :producer :race-u))
+                                (make-u :producer "race-u"))
                               (bt:with-lock-held (lock) (incf oks)))
                      (graph-db:unique-constraint-violation ()
                        (bt:with-lock-held (lock) (incf rejects)))))))

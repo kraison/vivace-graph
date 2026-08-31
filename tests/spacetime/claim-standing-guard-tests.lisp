@@ -137,7 +137,7 @@ the constraint and +STANDINGS+ have drifted apart -- which is the drift
         (with-transaction ()
           (make-ct-claim-unary :subject-namespace :ns
                                :subject-key (string s)
-                               :relation :r :producer :p
+                               :relation "r" :producer "p"
                                :standing s))))))
 
 (test construction-still-refuses-an-invalid-standing
@@ -148,5 +148,5 @@ stops being the only thing there."
     (signals invalid-standing
       (with-transaction ()
         (make-ct-claim-unary :subject-namespace :ns :subject-key "s9"
-                             :relation :r :producer :p9
+                             :relation "r" :producer "p9"
                              :standing :nonsense)))))

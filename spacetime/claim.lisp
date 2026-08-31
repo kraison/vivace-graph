@@ -29,12 +29,51 @@ from the parent name alone."
   (or (gethash parent *claim-families*)
       (error 'unknown-claim-family :parent parent)))
 
+;;; RELATION and PRODUCER are canonical strings (GH #160).  Both are in
+;;; the DEF-UNIQUE identity tuple and compared with EQUAL, so a second
+;;; spelling of one name (:x, "X", " x") is a second claim, never an
+;;; update.  Two predicates, not one: relation is vocabulary, producer is
+;;; provenance, and a deployed producer is path-like ("tenant/rule").
+
+(defun %canonical-name-p (value extra-chars)
+  "True when VALUE is a non-empty string over [a-z0-9-] plus EXTRA-CHARS."
+  (and (stringp value)
+       (plusp (length value))
+       (every (lambda (ch)
+                (or (char<= #\a ch #\z)
+                    (char<= #\0 ch #\9)
+                    (char= ch #\-)
+                    (find ch extra-chars)))
+              value)))
+
+(defun canonical-relation-p (value)
+  "True when VALUE is a canonical RELATION: a non-empty lowercase kebab
+string, [a-z0-9-] only.  The :CHECK behind the RELATION slot (GH #160)."
+  (%canonical-name-p value ""))
+
+(defun canonical-producer-p (value)
+  "True when VALUE is a canonical PRODUCER: as CANONICAL-RELATION-P, plus
+/ for a path-like rule name.  The :CHECK behind the PRODUCER slot
+(GH #160)."
+  (%canonical-name-p value "/"))
+
+;; Registered at load, so the :CHECK names below resolve in any image
+;; that has this file before a tenant's DEF-CLAIM-CLASSES expands.  A
+;; lambda, not #'..., so a redefined predicate takes effect immediately.
+(graph-db:register-schema-function
+ 'canonical-relation-p (lambda (v) (canonical-relation-p v)))
+(graph-db:register-schema-function
+ 'canonical-producer-p (lambda (v) (canonical-producer-p v)))
+
 (defparameter +claim-shared-slots+
   '((subject-namespace :initarg :subject-namespace
                        :accessor claim-subject-namespace)
     (subject-key :initarg :subject-key :accessor claim-subject-key)
-    (relation :initarg :relation :accessor claim-relation)
-    (producer :initarg :producer :accessor claim-producer)
+    ;; Canonical strings, enforced at commit on every write path (GH #160).
+    (relation :initarg :relation :accessor claim-relation
+              :check canonical-relation-p)
+    (producer :initarg :producer :accessor claim-producer
+              :check canonical-producer-p)
     (rule-version :initarg :rule-version :accessor claim-rule-version
                   :initform nil)
     (method :initarg :method :accessor claim-method :initform nil)
@@ -67,9 +106,9 @@ package so two claim families share one set of accessors (design §5).")
 
 (defun %plist-key-p (plist key)
   "True when KEY occupies a KEY position in PLIST.  MEMBER would also match
-KEY sitting in a VALUE position -- :EXTENT is a legal open-vocabulary
-RELATION, so (MAKE-B :RELATION :EXTENT ...) must not spuriously trip an
-:EXTENT check (GH #131 finding 6)."
+KEY sitting in a VALUE position -- :EXTENT is a legal namespace keyword,
+so (MAKE-B :SUBJECT-NAMESPACE :EXTENT ...) must not spuriously trip an
+:EXTENT check (GH #131 finding 6; relations are strings since GH #160)."
   (loop for (k) on plist by #'cddr thereis (eq k key)))
 
 (defun %claim-encode-extent-arg (args)
@@ -187,7 +226,13 @@ DATA alist is not populated yet -- it would reject already-valid claims.
 
 STANDING is ALSO declared as a value constraint on PARENT, so the closed
 vocabulary is enforced at commit on every write path, not only through the
-MAKE-<NAME> wrapper (GH #149)."
+MAKE-<NAME> wrapper (GH #149).
+
+RELATION and PRODUCER are canonical strings -- CANONICAL-RELATION-P and
+CANONICAL-PRODUCER-P, as :CHECK slot options on PARENT, enforced at commit
+on every write path (GH #160).  A keyword is refused, and so is a case or
+whitespace variant: both slots are in the identity tuple, so a variant
+would be a second claim rather than an update."
   (let ((unary (intern (format nil "~A-UNARY" parent)))
         (binary (intern (format nil "~A-BINARY" parent))))
     `(progn

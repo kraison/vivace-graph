@@ -93,12 +93,12 @@ because SETF fails to persist."
 (test the-sweep-removes-only-the-named-producers-claims
   (with-claim-graph (g)
     (with-transaction ()
-      (make-b :producer :rule-a :object "o1")
-      (make-b :producer :rule-a :object "o2")
-      (make-u :producer :rule-a)
-      (make-b :producer :rule-b :object "o1"))
+      (make-b :producer "rule-a" :object "o1")
+      (make-b :producer "rule-a" :object "o2")
+      (make-u :producer "rule-a")
+      (make-b :producer "rule-b" :object "o1"))
     (is (= 3 (with-transaction ()
-               (delete-claims-by-producer g 'ct-claim :rule-a))))
+               (delete-claims-by-producer g 'ct-claim "rule-a"))))
     (is (= 1 (length (claims-touching g 'ct-claim :ns "s1"))))))
 
 (test regeneration-leaves-no-orphan-when-a-rule-stops-producing-a-claim
@@ -115,12 +115,12 @@ SWEEP-THEN-INSERT-OF-AN-UNCHANGED-CLAIM-COLLIDES-WITHIN-ONE-TRANSACTION
 below, which pins that as the enforced boundary."
   (with-claim-graph (g)
     (with-transaction ()
-      (make-b :producer :rule-a :object "kept")
-      (make-b :producer :rule-a :object "dropped"))
+      (make-b :producer "rule-a" :object "kept")
+      (make-b :producer "rule-a" :object "dropped"))
     (with-transaction ()
-      (delete-claims-by-producer g 'ct-claim :rule-a))
+      (delete-claims-by-producer g 'ct-claim "rule-a"))
     (with-transaction ()
-      (make-b :producer :rule-a :object "kept"))
+      (make-b :producer "rule-a" :object "kept"))
     (let ((live (claims-touching g 'ct-claim :ns "s1")))
       (is (= 1 (length live)))
       (is (string= "kept" (claim-object-key (first live)))))))
@@ -136,20 +136,20 @@ stylistic (design §6.4)."
     (with-transaction () (make-b))
     (signals graph-db:unique-constraint-violation
       (with-transaction ()
-        (delete-claims-by-producer g 'ct-claim :rule-a)
+        (delete-claims-by-producer g 'ct-claim "rule-a")
         (make-b)))))
 
 (test the-sweep-makes-a-claim-re-insertable
   "After a sweep the constraint must not still be holding the old key."
   (with-claim-graph (g)
     (with-transaction () (make-b))
-    (with-transaction () (delete-claims-by-producer g 'ct-claim :rule-a))
+    (with-transaction () (delete-claims-by-producer g 'ct-claim "rule-a"))
     (finishes (with-transaction () (make-b)))))
 
 (test the-sweep-signals-on-an-unregistered-parent
   (with-claim-graph (g)
     (signals unknown-claim-family
-      (delete-claims-by-producer g 'no-such-claim :rule-a))))
+      (delete-claims-by-producer g 'no-such-claim "rule-a"))))
 
 (test setf-claim-extent-persists-on-an-uncommitted-claim
   "GH #135 is fixed: SETF on a node created in the current transaction now
@@ -191,17 +191,17 @@ fix landed."
 as DELETE-CLAIMS-BY-PRODUCER does."
   (with-claim-graph (g)
     (with-transaction ()
-      (make-b :producer :rule-a :object "o1")
-      (make-u :producer :rule-a)
-      (make-b :producer :rule-b :object "o2"))
-    (is (= 2 (length (claims-by-producer g 'ct-claim :rule-a))))
-    (is (= 1 (length (claims-by-producer g 'ct-claim :rule-b))))))
+      (make-b :producer "rule-a" :object "o1")
+      (make-u :producer "rule-a")
+      (make-b :producer "rule-b" :object "o2"))
+    (is (= 2 (length (claims-by-producer g 'ct-claim "rule-a"))))
+    (is (= 1 (length (claims-by-producer g 'ct-claim "rule-b"))))))
 
 (test claims-by-producer-returns-nil-for-a-producer-that-wrote-nothing
   "NIL is a real answer here -- 'that rule has produced nothing' -- and must
 not be an error."
   (with-claim-graph (g)
-    (with-transaction () (make-b :producer :rule-a))
+    (with-transaction () (make-b :producer "rule-a"))
     (is (null (claims-by-producer g 'ct-claim :rule-never-ran)))))
 
 (test claims-by-producer-does-not-return-swept-claims
@@ -211,14 +211,14 @@ ghosts.  A reconciliation built on this would report a stale projection as
 current -- the failure it exists to catch."
   (with-claim-graph (g)
     (with-transaction ()
-      (make-b :producer :rule-a :object "o1")
-      (make-u :producer :rule-a))
-    (with-transaction () (delete-claims-by-producer g 'ct-claim :rule-a))
-    (is (null (claims-by-producer g 'ct-claim :rule-a)))))
+      (make-b :producer "rule-a" :object "o1")
+      (make-u :producer "rule-a"))
+    (with-transaction () (delete-claims-by-producer g 'ct-claim "rule-a"))
+    (is (null (claims-by-producer g 'ct-claim "rule-a")))))
 
 (test claims-by-producer-signals-on-an-unregistered-parent
   "Same contract as the sweep: an unknown family signals rather than
 answering NIL, which is also the correct answer for 'wrote nothing'."
   (with-claim-graph (g)
     (signals unknown-claim-family
-      (claims-by-producer g 'no-such-claim :rule-a))))
+      (claims-by-producer g 'no-such-claim "rule-a"))))
