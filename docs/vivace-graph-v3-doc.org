@@ -671,6 +671,22 @@ Here is the canonical example of updating a node, which demonstrates the use of 
   ;; other processes.
 #+END_SRC
 
+~with-transaction~'s first argument selects the store. Three forms:
+
+#+BEGIN_SRC lisp
+  (with-transaction () ...)                       ; the current *graph*
+  (with-transaction ((transaction-manager g)) ...) ; an explicit manager
+  (with-transaction (:graph g) ...)               ; g's manager, AND *graph*
+                                                  ; bound to g for the body
+#+END_SRC
+
+In an image holding several stores the third form is the one to reach
+for (vivace-graph#175): it both routes the commit to ~g~ and binds
+~*graph*~ to ~g~, so the body's reads and writes agree on the store — a
+body committing to one store while its lookups default to another is the
+node-escape class Chapter 17 describes. The explicit-manager form binds
+nothing and is unchanged.
+
 If any error had occurred within the body of the ~with-transaction~ block (e.g., a failed validation, a network error, or a simple Lisp error), the transaction would be automatically *rolled back*. The changes to Alice's username would be discarded, and the database would be left in the state it was in before the transaction began.
 
 *** Read/Write Sets and Validation
@@ -3634,7 +3650,8 @@ the contract; it is enforced, not advisory.
 *** A read-write transaction belongs to exactly one graph
 
 The transaction manager is per graph. ~with-transaction~ defaults to
-~(transaction-manager *graph*)~, each graph has its own transaction-id counter, its own
+~(transaction-manager *graph*)~ — ~(with-transaction (:graph g) ...)~ selects
+~g~'s manager *and* binds ~*graph*~ to ~g~ (Chapter 5) — each graph has its own transaction-id counter, its own
 committed-transaction set for validation, and its own write-ahead log. Touching a node
 whose home graph differs from the transaction's — reading it *or* writing it — signals
 ~cross-graph-transaction-error~.

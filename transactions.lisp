@@ -399,10 +399,20 @@ detach aborted and the store resumes its prior accepting state."
   (:documentation "Call FUN with *TRANSACTION* bound to a new
   transaction created from TRANSACTION-MANAGER."))
 
-(defmacro with-transaction ((&optional (transaction-manager '(transaction-manager *graph*)))
-                            &body body)
-  "Run BODY as a single ACID transaction against TRANSACTION-MANAGER (by
-default that of the current *GRAPH*) and return BODY's value.
+(defmacro with-transaction ((&rest spec) &body body)
+  "Run BODY as a single ACID transaction and return BODY's value.  Three
+forms of SPEC:
+
+  (with-transaction () ...)              the current *GRAPH*'s manager
+  (with-transaction (TM) ...)            an explicit transaction manager
+  (with-transaction (:graph G) ...)      G's manager, with *GRAPH* bound
+                                         to G for BODY (GH #175)
+
+The :GRAPH form is the multi-store idiom: it selects the store's manager
+AND binds *GRAPH*, because a body committing to one store while its
+reads default to another is the node-escape class (GH #53).  The TM form
+binds nothing -- it is unchanged.  Dispatched on the literal keyword at
+macroexpansion, so no existing caller changes meaning.
 
 All mutations -- MAKE-<type> constructors, SAVE, DELETE-NODE/MARK-DELETED --
 must run inside a transaction.  On normal exit the transaction is validated
@@ -410,7 +420,22 @@ against its read/write sets and committed; if validation finds a conflict it
 is retried (up to *MAXIMUM-TRANSACTION-ATTEMPTS*, then under an exclusive
 lock).  A non-local exit rolls it back.  To modify an existing node, COPY it
 inside the transaction, mutate the copy, then SAVE it."
-  `(call-with-transaction (lambda () ,@body) ,transaction-manager))
+  (cond ((null spec)
+         `(call-with-transaction (lambda () ,@body)
+                                 (transaction-manager *graph*)))
+        ((eq (first spec) :graph)
+         (unless (and (= (length spec) 2) (second spec))
+           (error "WITH-TRANSACTION: (:GRAPH G) takes exactly one graph ~
+                   form, got ~S." spec))
+         (let ((g (gensym "GRAPH")))
+           `(let* ((,g ,(second spec))
+                   (*graph* ,g))
+              (call-with-transaction (lambda () ,@body)
+                                     (transaction-manager ,g)))))
+        ((= (length spec) 1)
+         `(call-with-transaction (lambda () ,@body) ,(first spec)))
+        (t (error "WITH-TRANSACTION: SPEC is (), (TM) or (:GRAPH G), ~
+                   got ~S." spec))))
 
 (defclass tx ()
   ((read-set

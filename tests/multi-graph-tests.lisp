@@ -59,6 +59,45 @@ store alongside two existing ones assumes."
       (is (= 3 (length (remove-duplicates names)))
           "expected three DISTINCT graph-names, got ~S" names))))
 
+(test with-transaction-graph-form-routes-to-that-store-and-binds-it
+  "GH #175.  (WITH-TRANSACTION (:GRAPH G) ...) commits against G's manager
+AND binds *GRAPH* to G for the body -- the multi-store idiom in one form
+rather than a LET around a manager projection.  The ambient *GRAPH* is
+deliberately a DIFFERENT store, so a form that only selected the manager,
+or only bound the variable, would be told apart."
+  (with-three-graphs (ga gb gc)
+    gc                                  ; the fixture binds three; two suffice
+    (let ((*graph* ga) seen)
+      (with-transaction (:graph gb)
+        (setq seen *graph*)
+        (make-mg-text :label "routed" :graph gb))
+      (is (eq gb seen) "*GRAPH* is bound to the :GRAPH store inside")
+      (is (eq ga *graph*) "and restored after")
+      (is (= 1 (length (map-vertices 'identity gb :vertex-type 'mg-text
+                                     :collect-p t))))
+      (is (= 0 (length (map-vertices 'identity ga :vertex-type 'mg-text
+                                     :collect-p t)))
+          "nothing landed in the ambient store"))))
+
+(test with-transaction-manager-form-is-unchanged
+  "The existing (WITH-TRANSACTION (TM) ...) form still binds nothing: the
+:GRAPH form is an addition, not a redefinition (GH #175)."
+  (with-three-graphs (ga gb gc)
+    gc
+    (let ((*graph* ga) seen)
+      (with-transaction ((graph-db::transaction-manager gb))
+        (setq seen *graph*)
+        (make-mg-text :label "explicit" :graph gb))
+      (is (eq ga seen) "*GRAPH* is NOT rebound by the manager form")
+      (is (= 1 (length (map-vertices 'identity gb :vertex-type 'mg-text
+                                     :collect-p t)))))))
+
+(test with-transaction-rejects-a-malformed-spec
+  (signals error
+    (macroexpand '(with-transaction (:graph) (values))))
+  (signals error
+    (macroexpand '(with-transaction (a b) (values)))))
+
 (test writes-land-only-in-their-own-graph
   "Writing to each graph under its own *GRAPH* binding must land only in
 that graph's own type index.  The cross probes below -- every FOREIGN type

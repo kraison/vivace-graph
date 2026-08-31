@@ -13,6 +13,14 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Added
 
+- **`(with-transaction (:graph g) …)`** (#175): selects `g`'s transaction
+  manager *and* binds `*graph*` to `g` for the body — the multi-store idiom
+  in one form, instead of a `let` around `(transaction-manager g)`. Binding
+  `*graph*` is deliberate: a body committing to one store while its reads
+  default to another is the node-escape class (#53). The `()` and explicit
+  manager forms are unchanged; the macro dispatches on the literal keyword,
+  so no existing caller changes meaning.
+
 - **Disjointness over vertex types, as a schema lint** (#157 unit 4a).
   `def-disjoint` declares that no node instantiates two of a set of
   classes. Because a node's class is fixed at creation, the answer is
