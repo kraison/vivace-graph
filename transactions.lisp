@@ -6,7 +6,7 @@
 (declaim (ftype (function (t t) t)
                 validate-unique-constraints apply-tx-writes-to-unique-indexes
                 apply-tx-writes-to-secondary-indexes
-                validate-value-constraints))
+                validate-value-constraints validate-cardinality-constraints))
 
 (defvar *transaction* nil)
 (defvar *quiesced-store-closing-p* nil
@@ -3383,6 +3383,9 @@ See CALL-WITH-READ-SNAPSHOT."
                ;; Declarative value constraints (GH #149): same region, same
                ;; reason -- a violation aborts before anything is journaled.
                (validate-value-constraints tx (graph tx))
+               ;; Cardinality (GH #155): same region; counts the store's
+               ;; adjacency overlaid with this transaction's edge writes.
+               (validate-cardinality-constraints tx (graph tx))
                ;; Vector-segment dimension check (Task 4 fix): same pre-durability,
                ;; manager-locked region as the unique-constraint check above -- a
                ;; mismatch aborts before FINALIZE-TX-PERSISTENCE, so the node write

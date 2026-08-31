@@ -263,6 +263,9 @@
                 #:undef-value-constraint
                 #:value-constraint-violation
                 #:check-value-constraints
+                ;; Cardinality constraints (GH #155)
+                #:def-cardinality #:undef-cardinality
+                #:cardinality-violation #:check-cardinality-constraints
                 ;; index-backed generator predicates (GH #102)
                 #:find-by-slot/4
                 #:find-slot-range/5

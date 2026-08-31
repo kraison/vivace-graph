@@ -1741,6 +1741,47 @@ Likewise ~spec-count~ counts this registry's declarations only — a
 schema constrained purely by ~:check~ reports 0 specs and is still
 audited.
 
+*** Cardinality constraints (~def-cardinality~)
+
+A *cardinality constraint* bounds how many edges of a type a vertex may
+have — the graph's own notion of a property's cardinality
+(vivace-graph#155). It is enforced at commit in the same manager-locked
+region as the other constraints, and it is the first family whose answer
+lives *outside* the node: the count is the store's adjacency index — what
+~outgoing-edges~ / ~incoming-edges~ return, soft-deleted edges excluded,
+subtypes included — overlaid with the committing transaction's own edge
+writes, so it is always the *post-commit* count.
+
+#+BEGIN_SRC lisp
+  (def-cardinality hazard-zone zone-of :my-app
+    :min 1 :max 1                 ; exactly one ZONE-OF edge out of a zone
+    :name zone-has-one-area)
+
+  (def-cardinality hazard-area zone-of :my-app
+    :direction :in :max 50        ; at most 50 zones point AT an area
+    :name area-holds-zones)
+
+  (undef-cardinality hazard-zone :my-app :name zone-has-one-area)
+  (check-cardinality-constraints graph :vertex-type 'hazard-zone)
+    ;; => (values violations checked spec-count)
+#+END_SRC
+
+The check runs on every write of a constrained vertex and on every
+create or delete of an edge of the constrained type, re-counting the
+edge's endpoint. Because it counts post-commit state, a vertex created
+*with* its edges in one transaction is one answer rather than a ~:min~
+violation followed by a fix; an edge created and deleted in the same
+transaction counts zero; and deleting the last edge below ~:min~ is
+refused. The cost is O(degree) per constrained vertex per commit.
+
+⚠ A pre-existing violation blocks the vertex's later *unrelated* updates
+— the same hazard ~:required~ has — because the check reads whole
+post-commit state, not the delta. Run ~check-cardinality-constraints~
+over an existing graph *before* declaring a bound over it; and read its
+counts, since zero violations over zero specs is an unchecked graph.
+Name a declaration whenever a macro emits it (GH #139); withdrawal by
+~:name~ resolves the symbol in the package it was read in (GH #152).
+
 ** Chapter 9: The REST API (~rest.lisp~)
 
 While VivaceGraph is written in Common Lisp, your applications don't have to be. VivaceGraph includes a built-in, high-performance web server that exposes a complete RESTful API for graph operations. This allows programs written in Python, JavaScript, Java, or any other language to create, read, update, and delete nodes and edges over standard HTTP.

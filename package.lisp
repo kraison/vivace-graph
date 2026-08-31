@@ -400,6 +400,12 @@
            #:vcv-class-name #:vcv-slot-name #:vcv-value
            #:vcv-expected #:vcv-reason #:vcv-node-id
            #:check-value-constraints
+           ;; Cardinality constraints (GH #155)
+           #:def-cardinality #:undef-cardinality
+           #:cardinality-violation
+           #:cdv-class-name #:cdv-edge-type #:cdv-direction
+           #:cdv-actual #:cdv-min #:cdv-max #:cdv-node-id
+           #:check-cardinality-constraints
            #:vc-violation-spec #:vc-violation-node-id
            #:vc-violation-class-name #:vc-violation-slot
            #:vc-violation-actual #:vc-violation-expected

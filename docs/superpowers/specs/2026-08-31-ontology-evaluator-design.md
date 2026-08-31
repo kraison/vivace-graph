@@ -2,7 +2,9 @@
 
 **Status:** design note, APPROVED 2026-08-31 (Kevin); #158 implemented
 (`commit-view`, `view-old-node`, `:transition`/`:write-once`,
-`transaction-extent-step`); `view-node` / `view-lookup` land with #155/#156
+`transaction-extent-step`); #155 implemented (`view-node`, `view-edge-count`,
+`def-cardinality` — the "which index" answer is the ve adjacency index, so
+`view-lookup` as a general overlay is deferred to #156's need)
 **Issues:** #109 (epic); decides once for #158 (unit 5), #155 (unit 2),
 #156 (unit 3); #157's 4b inherits it (disjointness note, open question 3)
 **Branch:** `experiment`

@@ -140,6 +140,9 @@
                ;; Declarative value constraints (GH #149).  After INDEX for
                ;; %SPEC-IDENTITY; no index of its own to build.
                (:file "value-constraint" :depends-on ("index"))
+               ;; Cardinality constraints (GH #155): counts through the
+               ;; commit view value-constraint.lisp defines.
+               (:file "cardinality" :depends-on ("value-constraint"))
                ;; The per-(owner . slot) spatial index registry.  Loaded LAST so it
                ;; can see the MOP helpers (node-class), the graph, the memory-graph
                ;; backend and the ordered-index factory; TRANSACTIONS.LISP,
@@ -643,6 +646,7 @@ cl-temporal-extent."
                (:file "schema-retraction-tests")   ; GH #139, #140
                (:file "index-prolog-tests")        ; GH #102
                (:file "value-constraint-tests")     ; GH #149
+               (:file "cardinality-tests")          ; GH #155
                (:file "peer-unique-tests")
                (:file "peer-index-tests")
                (:file "open-hygiene-tests")    ; GH #222, #224

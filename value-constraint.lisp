@@ -176,6 +176,18 @@ this is where the evaluator is finally handed it (GH #158)."
                 ((typep w 'tx-update) (old-node w))
                 (t nil))))))
 
+(defun view-node (view id)
+  "The node ID names as it will be after commit: this transaction's
+write of it (NIL if that write deletes it), else the store's vertex or
+edge, else NIL.  A node created in this commit is found here, not missed
+in the store (evaluator note §3; GH #155)."
+  (let* ((h (commit-view-writes view))
+         (w (and h (gethash id h))))
+    (if w
+        (let ((n (node w))) (and (not (deleted-p n)) n))
+        (let ((g (commit-view-graph view)))
+          (or (lookup-vertex id :graph g) (lookup-edge id :graph g))))))
+
 (defun %same-stored-value-p (old new)
   "True when OLD and NEW are the same STORED value: EQUAL, or serialising
 to the same octets.  EQUAL alone is not enough -- a slot holding objects

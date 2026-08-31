@@ -13,6 +13,22 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Added
 
+- **Cardinality constraints on edges** (#155, ontology unit 2).
+  `def-cardinality` bounds how many edges of a type a vertex may have —
+  `:min` / `:max`, `:direction :out` (edges from it) or `:in` (edges to
+  it), subtypes counted as `outgoing-edges` counts them — enforced at
+  commit on the vertex's own writes and on every create or delete of such
+  an edge. The count is read through the commit view: the store's
+  adjacency index overlaid with the transaction's edge writes, so a vertex
+  created *with* its edges in one commit is one answer, an edge created
+  and deleted in one commit counts zero, and deleting the last edge below
+  `:min` is refused. `check-cardinality-constraints` is the audit pass,
+  returning `(values violations checked spec-count)`. A pre-existing
+  violation blocks the vertex's later unrelated updates, as unit 1's
+  `:required` does — audit before declaring. O(degree) per constrained
+  vertex per commit. Fourth schema registry, same identity rule as the
+  other three (`%spec-identity`).
+
 - **A slot can be declared write-once, or constrained by a named
   transition** (#158, ontology unit 5). `def-value-constraint` gains
   `:write-once t` — settable at creation or while still NIL, never revised,
