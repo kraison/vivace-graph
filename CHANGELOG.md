@@ -11,6 +11,19 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ## [Unreleased]
 
+### Added
+
+- **`register-node` returns its registrations as a fourth value** (#165):
+  the `(:region node :fraction double)` list `register-geometry` computed
+  and the claims were written from. A caller that needs the regions bound
+  by *this* scan — an agreement test against a coded key, say — took them
+  by running `register-geometry` a second time over the same geometry
+  (two spatial scans and two GEOS refinements per subject), because
+  reading them back off the claims would fold in stale ones from an
+  earlier extent (#162). Fourth rather than the third the issue sketched:
+  #164's `unmeasured` holds the third slot because it is the value a
+  caller must not ignore. An unmeasured region appears in neither list.
+
 ### Changed
 
 - **A GEOS failure on one region no longer refuses the whole registration

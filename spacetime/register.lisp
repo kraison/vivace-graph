@@ -262,12 +262,17 @@ transaction or SAVE signals MODIFYING-NON-COPY."
 (defun register-node (node &key (graph graph-db:*graph*)
                                 (registry-graph graph))
   "Register NODE against its source contract's registry, writing one claim
-per region.  Three values: how many claims were written, whether the scan
-was EVALUATED at all, and the regions it could NOT measure -- REGISTER-
-GEOMETRY's third value, passed through unchanged (GH #164).  No claim is
-written for one of those: absence with a reason, never a fabricated
-binding, and a caller keeping coverage figures must read it, since
-EVALUATED-P alone now reports a PARTIAL scan as evaluated.
+per region.  Four values: how many claims were written, whether the scan
+was EVALUATED at all, the regions it could NOT measure, and the
+registrations it wrote -- REGISTER-GEOMETRY's third and first values,
+passed through unchanged (GH #164, #165).  No claim is written for an
+unmeasured region: absence with a reason, never a fabricated binding, and
+a caller keeping coverage figures must read that list, since EVALUATED-P
+alone reports a PARTIAL scan as evaluated.  The registrations are the
+regions THIS scan bound, so a caller needing them does not scan twice --
+and does not read them back off the claims, which would fold in stale
+ones from an earlier extent (GH #162).  Their region nodes belong to
+REGISTRY-GRAPH: read their slots under that binding (GH #53).
 
 A source declaring :REGISTRATION :NONE writes nothing and reports an
 EVALUATED scan -- structural absence, not an unanswered question.  Every
@@ -284,7 +289,7 @@ anyway."
   (let ((facet (source-facets-registration
                 (source-contract (type-of node)))))
     (if (eq facet :none)
-        (values 0 t)
+        (values 0 t nil nil)
         (let (geometry subject-ns subject-key precision confidence method)
           (let ((graph-db:*graph* graph))
             (setf geometry (graph-db:node-geometry node)
@@ -300,12 +305,12 @@ anyway."
             (multiple-value-setq (subject-ns subject-key)
               (%source-endpoint node graph)))
           (if (null geometry)
-              (values 0 nil)
+              (values 0 nil nil nil)
               (multiple-value-bind (regs evaluated unmeasured)
                   (register-geometry geometry (getf facet :registry)
                                      :registry-graph registry-graph)
                 (if (not evaluated)
-                    (values 0 nil nil)
+                    (values 0 nil nil nil)
                     (let ((graph-db:*graph* registry-graph))
                       (values (loop for r in regs
                                     count (%upsert-registration-claim
@@ -313,4 +318,5 @@ anyway."
                                            precision confidence method
                                            registry-graph))
                               t
-                              unmeasured)))))))))
+                              unmeasured
+                              regs)))))))))

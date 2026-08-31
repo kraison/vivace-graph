@@ -658,6 +658,53 @@ unmeasured place: absence with a reason, never a fabricated binding."
         (is (string= "p-a" (claim-object-key (first claims)))
             "the measurable place is bound; the unmeasured one is not")))))
 
+(test registering-a-node-returns-the-registrations-it-wrote
+  "GH #165.  The fourth value is what REGISTER-GEOMETRY computed and the
+claims were written from, so a caller needing the regions bound by THIS
+scan takes them here rather than scanning twice or reading them back off
+the claims (where a stale one from an earlier extent would fold in, GH
+#162).  With a region unmeasured (GH #164) it is absent from both lists
+that matter: not registered, not fabricated."
+  (with-region-graph (g)
+    (%make-place g "p-a" +ctr-square+)
+    (%make-place g "p-b" +ctr-square+)
+    (let ((n (%make-record g "s-8" (make-point 1d0 1d0))))
+      (multiple-value-bind (written evaluated unmeasured regs)
+          (register-node n :graph g)
+        (is-true evaluated)
+        (is (= 2 written))
+        (is (null unmeasured))
+        (is (= 2 (length regs)))
+        (is (equal '("p-a" "p-b")
+                   (sort (mapcar (lambda (r) (place-key (getf r :region)))
+                                 regs)
+                         #'string<))
+            "the registrations name the regions the claims were written to")
+        (dolist (r regs)
+          (is (%near 1d0 (%fraction-of r)) "a point registers at 1.0")))
+      (%reset-trap-reads)
+      (let ((*ctr-place-trap* '("p-b" . :geos)))
+        (multiple-value-bind (written evaluated unmeasured regs)
+            (register-node n :graph g)
+          (is-true evaluated)
+          (is (= 1 written))
+          (is (= 1 (length unmeasured)))
+          (is (= 1 (length regs)))
+          (is (string= "p-a" (place-key (getf (first regs) :region)))
+              "an unmeasured region is in neither list of bindings"))))))
+
+(test a-source-declaring-registration-none-returns-no-registrations
+  "GH #165.  Structural absence: nothing was scanned, so the fourth value
+is NIL alongside the evaluated T -- not an empty scan's empty list."
+  (with-region-graph (g)
+    (let ((n (%make-plain g "pl-2" (make-point 1d0 1d0))))
+      (multiple-value-bind (written evaluated unmeasured regs)
+          (register-node n :graph g)
+        (is (zerop written))
+        (is-true evaluated)
+        (is (null unmeasured))
+        (is (null regs))))))
+
 (test a-subject-with-no-geometry-is-not-answered
   "Where the record is, is unknown -- which is not the same as its being
 in no region (design §6)."

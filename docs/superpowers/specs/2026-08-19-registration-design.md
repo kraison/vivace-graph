@@ -173,11 +173,14 @@ meaning, in both functions.
 
 ```lisp
 (register-node node &key graph registry-graph)
-  ;; => (values claims-written evaluated-p unmeasured)
+  ;; => (values claims-written evaluated-p unmeasured registrations)
 ```
 
 Reads `node`'s source contract, computes the registrations, and upserts one
-claim per region. Idempotent on
+claim per region. The fourth value is that computed list (#165), so a
+caller needing the regions bound by *this* scan neither scans twice nor
+reads them back off the claims, where a stale one would fold in (#162);
+an unmeasured region appears in neither. Idempotent on
 `(subject-namespace subject-key relation object object producer)` — the
 identity the spine already uses, looked up through the declared subject
 index and filtered in Lisp, since claims per subject are few.

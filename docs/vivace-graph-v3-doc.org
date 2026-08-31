@@ -5502,7 +5502,7 @@ registry:
     ;; => (values registrations evaluated-p unmeasured)
 
   (register-node node &key graph registry-graph)
-    ;; => (values claims-written evaluated-p unmeasured)
+    ;; => (values claims-written evaluated-p unmeasured registrations)
 #+END_SRC
 
 ~registry~ is a spatial SCOPE — a class name, a list of names, or
@@ -5557,6 +5557,16 @@ through its own ~ignore-errors~ — an empty list with ~evaluated-p~ TRUE.
 A source declaring
 ~:REGISTRATION :NONE~ writes nothing but still reports an evaluated
 scan (~T~) — that is structural absence, not an unanswered question.
+
+~register-node~'s fourth value is the ~registrations~ list the claims
+were written from — the regions bound by *this* scan (vivace-graph#165).
+A caller that needs them (an agreement test between a coded key and the
+regions actually found, say) takes them here rather than running
+~register-geometry~ a second time over the same geometry, or reading
+them back off the claims, where a stale claim from an earlier extent
+would fold in (#162). An unmeasured region (below) appears in neither
+list. The region nodes belong to ~:registry-graph~; read their slots
+under that binding.
 
 **** EVALUATED-P: false means "could not tell"
 
