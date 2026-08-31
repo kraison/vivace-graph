@@ -556,6 +556,57 @@ snapshots must leave two files."
 (defstruct (bk-frozen (:constructor make-bk-frozen (label)))
   (label "" :read-only t))                ; a struct slot with NO setf writer
 
+(test backup-literalize-shares-unchanged-structure
+  "GH #119: data holding no specialized vector must come back EQ -- the
+literalize walk used to copy every cons of every node's alist purely so
+the rare specialized vector could be wrapped.  Structural sharing means
+the common case allocates nothing."
+  (let ((alist '((:name . "a") (:tags . ("x" "y")) (:n . 42)))
+        (vec (vector "p" '(1 2) :q)))
+    (is (eq alist (graph-db::backup-literalize alist)))
+    (is (eq vec (graph-db::backup-literalize vec)))))
+
+(test backup-literalize-still-wraps-nested-specialized-vectors
+  "The sharing shortcut must not skip the one job the walk exists for: a
+specialized vector nested in a cons or a general vector is wrapped, the
+spine above it is fresh, and the ORIGINAL structure is untouched."
+  (let* ((coords (make-array 4 :element-type 'double-float
+                               :initial-contents '(1d0 2d0 3d0 4d0)))
+         (alist (list (cons :ring coords) (cons :name "r")))
+         (out (graph-db::backup-literalize alist)))
+    (is (not (eq alist out)))
+    (is (typep (cdr (first out)) 'graph-db::backup-vector-literal))
+    (is (eq coords (cdr (first alist)))
+        "the original alist must be untouched")
+    (is (eq (second alist) (second out))
+        "the unchanged tail is shared, not copied")))
+
+(test snapshot-integrity-sweep-is-opt-in
+  "GH #119: SNAPSHOT's integrity sweep deserializes every node a second
+time, so it is opt-in -- the default snapshot must NOT run it, and
+:CHECK-DATA-INTEGRITY-P T must.  Stubbed at CHECK-DATA-INTEGRITY, the
+same fdefinition idiom CLOSE-GRAPH-REPORTS-DATA-INTEGRITY-ISSUES uses."
+  (with-temp-directory (dir)
+    (let ((g (make-graph *integration-graph-name* (namestring dir)
+                         :buffer-pool-size 1000))
+          (orig (fdefinition 'graph-db:check-data-integrity))
+          (calls 0))
+      (unwind-protect
+           (let ((*graph* g))
+             (with-transaction () (make-bk-vec :label "sweep"))
+             (setf (fdefinition 'graph-db:check-data-integrity)
+                   (lambda (graph &rest args)
+                     (declare (ignore graph args))
+                     (incf calls)
+                     nil))
+             (graph-db::snapshot g)
+             (is (= 0 calls) "the default snapshot must not sweep")
+             (graph-db::snapshot g :check-data-integrity-p t)
+             (is (= 1 calls) ":check-data-integrity-p t must sweep"))
+        (setf (fdefinition 'graph-db:check-data-integrity) orig)
+        (let ((*graph* g)) (close-graph g :snapshot-p nil))
+        (collect-garbage)))))
+
 (test backup-literalize-passes-unchanged-structs-through
   "A struct no slot of which needs literalizing must come back untouched.
 SBCL has no (SETF SLOT-VALUE) writer for a :READ-ONLY struct slot and

@@ -1,7 +1,12 @@
 (in-package :graph-db)
 
+;; CHECK-DATA-INTEGRITY-P defaults to NIL (GH #119): the sweep
+;; deserializes every node a SECOND time -- measured as the larger half
+;; of a snapshot's allocation -- for a check the snapshot itself does
+;; not need.  CHECK-DATA-INTEGRITY is the explicit audit, and REPLAY
+;; still verifies restored data by default.
 (defmethod snapshot ((graph graph) &key include-deleted-p
-                                     (check-data-integrity-p t))
+                                     check-data-integrity-p)
   (let ((count nil))
     (with-recursive-lock-held ((txn-lock graph))
       (let ((problems (when check-data-integrity-p

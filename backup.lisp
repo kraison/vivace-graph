@@ -95,7 +95,9 @@ cl-store-ecl.lisp relies on, and is verified on SBCL and ECL."
           copy))))
 
 (defun backup-literalize (object)
-  "Recursively copy OBJECT, wrapping every specialized vector for printing.
+  "OBJECT with every specialized vector wrapped for printing; OBJECT
+ITSELF (EQ) when nothing inside needed wrapping -- the common case, and
+it allocates nothing (GH #119).
 
 A vector whose ARRAY-ELEMENT-TYPE is not T loses that type through the standard
 #(...) printer, so it is wrapped in a BACKUP-VECTOR-LITERAL.  Strings are left
@@ -107,14 +109,27 @@ The struct branch reads back through the standard #S(...) reader, so the struct
 type must be defined -- and its name readable -- in the restoring image; see
 RECREATE-GRAPH's :PACKAGE-NAME."
   (typecase object
-    (cons (cons (backup-literalize (car object))
-                (backup-literalize (cdr object))))
+    ;; Share where nothing changed (GH #119): most node data holds no
+    ;; specialized vector, and copying every cons of every alist made
+    ;; the printer walk a per-node allocation for nothing.  EQ results
+    ;; propagate bottom-up, so the common case allocates zero.
+    (cons (let ((head (backup-literalize (car object)))
+                (tail (backup-literalize (cdr object))))
+            (if (and (eq head (car object)) (eq tail (cdr object)))
+                object
+                (cons head tail))))
     (string object)
     (vector
      (if (eq (array-element-type object) t)
-         (let ((copy (make-array (length object))))
-           (dotimes (i (length object) copy)
-             (setf (aref copy i) (backup-literalize (aref object i)))))
+         (let ((copy nil))
+           (dotimes (i (length object))
+             (let ((new (backup-literalize (aref object i))))
+               (unless (eq new (aref object i))
+                 (unless copy
+                   (setf copy (make-array (length object)))
+                   (replace copy object))
+                 (setf (aref copy i) new))))
+           (or copy object))
          (make-backup-vector-literal object)))
     (structure-object (%backup-literalize-struct object))
     (t object)))

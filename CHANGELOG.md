@@ -127,6 +127,17 @@ between releases; cutting a release renames it to the new version and dates it.
   policy; `tm-next-epoch` is the named extension point.
 
 ### Changed
+- **`snapshot`'s integrity sweep is opt-in** (#119): `:check-data-integrity-p`
+  now defaults to `NIL`. The sweep deserializes every node a second time —
+  measured on the deployed tenant as the larger half of a snapshot's
+  allocation — for a check the snapshot itself does not need, and it ran on
+  every routine snapshot including `close-graph`'s. Pass
+  `:check-data-integrity-p t` to opt in, or run `check-data-integrity`
+  directly; `replay` still verifies restored data by default. Alongside it,
+  `backup-literalize` now shares unchanged structure instead of copying
+  every cons of every node's data alist — data with no specialized vector
+  (the common case) allocates nothing in the printer walk.
+
 - **A GEOS failure on one region no longer refuses the whole registration
   scan** (#164, option 2). `register-geometry` now catches `geos-error`
   around each candidate region's own measurement: that region is dropped
