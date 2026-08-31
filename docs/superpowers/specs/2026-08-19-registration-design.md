@@ -183,7 +183,13 @@ reads them back off the claims, where a stale one would fold in (#162);
 an unmeasured region appears in neither. Idempotent on
 `(subject-namespace subject-key relation object object producer)` — the
 identity the spine already uses, looked up through the declared subject
-index and filtered in Lisp, since claims per subject are few.
+index and filtered in Lisp, since claims per subject are few. The lookup
+runs outside the transaction, and OCC cannot see a phantom, so two
+concurrent registrations of one subject can both take the insert branch;
+`def-unique` catches the second at commit and the upsert reads it as
+"someone else won" — re-read and update (#161). Moving the lookup inside
+the transaction would not have helped; the retry is the usual upsert
+answer and needs no lock.
 
 **One query, exact hits.** There is no candidates-then-verify phase.
 #138's original scope named one, but the tenant it would be generalised

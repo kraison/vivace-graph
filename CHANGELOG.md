@@ -63,6 +63,17 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Fixed
 
+- **Concurrent registrations of one subject no longer kill the batch**
+  (#161). `register-node`'s idempotency lookup runs outside the
+  transaction and OCC cannot see a phantom, so two registrations of the
+  same subject could both take the insert branch; `def-unique` caught the
+  second at commit and the violation propagated — harmless serially, fatal
+  to a parallel backfill (one failed subject partway through). The upsert
+  now reads that violation as "someone else won": it re-reads and updates
+  the winner with this scan's values. A violation whose re-read finds
+  nothing is re-signalled. Eight threads registering one subject now all
+  succeed against one claim.
+
 - **An overlay of two VALID geometries could answer with a
   `GEOMETRYCOLLECTION`, and `register-geometry` then refused the whole
   subject** (#164). Two polygons that overlap in an *area* and separately

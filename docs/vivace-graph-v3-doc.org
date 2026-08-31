@@ -5545,7 +5545,14 @@ per region under the facet's ~:claim-class~, ~:producer~, ~:relation~
 and ~:method~. Every claim it writes carries ~STANDING :INFERRED~. It
 is idempotent on the full ~DEF-UNIQUE~ binary tuple, PRODUCER
 included: re-running it against an unchanged subject updates the same
-claim rather than duplicating it. ~:graph~ is where the subject's own
+claim rather than duplicating it. It is also safe under *concurrent*
+registration of one subject (vivace-graph#161): the idempotency lookup
+runs outside the transaction and OCC cannot see a phantom, so a
+competitor can commit the same tuple in between; ~DEF-UNIQUE~ catches
+that at commit and ~register-node~ reads it as "someone else won" —
+re-reads, and updates the winner with this scan's values — so a parallel
+backfill loses no subject to the race. A violation whose re-read finds
+nothing is re-signalled: that one was not the race. ~:graph~ is where the subject's own
 slots are read; ~:registry-graph~ (default: the same graph) is where
 the regions live and the claims are written — a node object itself
 never crosses that boundary, only plain values do (Chapter 17,

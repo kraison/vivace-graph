@@ -705,6 +705,73 @@ is NIL alongside the evaluated T -- not an empty scan's empty list."
         (is (null unmeasured))
         (is (null regs))))))
 
+(test a-registration-that-loses-the-insert-race-updates-the-winner
+  "GH #161.  The idempotency lookup runs outside the transaction, and OCC
+cannot see a phantom, so a competitor can commit the same identity tuple
+between the lookup and this insert's commit.  DEF-UNIQUE catches it at
+commit; before this it propagated and killed the batch.  Now it reads as
+'someone else won': re-read, then UPDATE with this scan's values.  The
+competitor is staged deterministically inside the constructor, in its
+own (independent, nested) transaction -- exactly the window the race
+lives in."
+  (with-region-graph (g)
+    (%make-place g "p-a" +ctr-square+)
+    (let ((n (%make-record g "s-9" (make-point 1d0 1d0)))
+          (raw (fdefinition 'make-ctr-claim-binary))
+          (fired nil))
+      (unwind-protect
+           (progn
+             (setf (fdefinition 'make-ctr-claim-binary)
+                   (lambda (&rest args)
+                     (unless fired
+                       (setf fired t)
+                       ;; The competitor: same tuple, other values.
+                       ;; Leftmost keyword wins, so these override ARGS'.
+                       (with-transaction ()
+                         (apply raw :method "competitor" :fraction 0.25d0
+                                args)))
+                     (apply raw args)))
+             (multiple-value-bind (written evaluated) (register-node n :graph g)
+               (is-true evaluated)
+               (is (= 1 written)
+                   "the lost race counts as a write, not a failed batch")))
+        (setf (fdefinition 'make-ctr-claim-binary) raw))
+      (is-true fired "the competitor really ran inside the window")
+      (let ((claims (%subject-claims g :ctr-records "s-9")))
+        (is (= 1 (length claims)) "one claim: not two, not zero")
+        (is (string= "geometry-overlap" (claim-method (first claims)))
+            "the winner's row carries THIS scan's values, not the competitor's")
+        (is (= 1.0d0 (claim-fraction (first claims))))))))
+
+(test eight-concurrent-registrations-of-one-subject-all-succeed
+  "GH #161, for real: eight threads register the same subject at once.
+Every one reports a write, one claim exists, and no thread sees the
+constraint violation that used to be the outcome for seven of them
+(compare CONCURRENT-IDENTICAL-CLAIMS-EXACTLY-ONE-WINS, where the raw
+constructor is what races)."
+  (with-region-graph (g)
+    (%make-place g "p-a" +ctr-square+)
+    (let ((n (%make-record g "s-10" (make-point 1d0 1d0)))
+          (oks 0) (errors nil) (lock (bt:make-lock)) (threads nil))
+      (dotimes (i 8)
+        (push (bt:make-thread
+               (lambda ()
+                 (let ((graph-db:*graph* g))
+                   (handler-case
+                       (multiple-value-bind (written evaluated)
+                           (register-node n :graph g)
+                         (when (and evaluated (= 1 written))
+                           (bt:with-lock-held (lock) (incf oks))))
+                     (error (e)
+                       (bt:with-lock-held (lock)
+                         (push (princ-to-string e) errors)))))))
+              threads))
+      (mapc #'bt:join-thread threads)
+      (is (= 8 oks) "all eight registered (got ~D; errors: ~S)" oks errors)
+      (is (null errors))
+      (is (= 1 (length (%subject-claims g :ctr-records "s-10")))
+          "one claim, updated seven times, never duplicated"))))
+
 (test a-subject-with-no-geometry-is-not-answered
   "Where the record is, is unknown -- which is not the same as its being
 in no region (design §6)."

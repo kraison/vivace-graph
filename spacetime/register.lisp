@@ -195,6 +195,52 @@ accessors, which only BINARY has."
        (equal object-ns (claim-object-namespace c))
        (equal object-key (claim-object-key c))))
 
+(defun %find-registration-claim (family binary relation producer object-ns
+                                 object-key subject-ns subject-key
+                                 registry-graph)
+  "The one claim binding (SUBJECT-NS . SUBJECT-KEY) to (OBJECT-NS .
+OBJECT-KEY) under RELATION and PRODUCER in FAMILY, or NIL.  Looked up
+through the declared subject index and filtered in Lisp, since claims per
+subject are few (design §4)."
+  (find-if (lambda (c)
+             (%registration-claim-p c binary relation producer object-ns
+                                    object-key))
+           (graph-db:index-lookup registry-graph (claim-family-parent family)
+                                  '(subject-namespace subject-key)
+                                  (list subject-ns subject-key))))
+
+(defun %update-registration-claim (existing registration facet precision
+                                   confidence method)
+  "Rewrite EXISTING with this scan's values, in its own transaction.  The
+COPY is INSIDE the transaction or SAVE signals MODIFYING-NON-COPY."
+  (graph-db:with-transaction ()
+    (let ((c (graph-db:copy existing)))
+      (setf (claim-method c) method
+            (claim-rule-version c) (getf facet :rule-version)
+            (claim-confidence c) confidence
+            (claim-precision-m c) precision
+            (claim-fraction c) (getf registration :fraction)
+            (claim-standing c) :inferred)
+      (graph-db:save c))))
+
+(defun %insert-registration-claim (binary registration facet subject-ns
+                                   subject-key object-ns object-key
+                                   relation producer precision confidence
+                                   method)
+  "Write a new claim for REGISTRATION, in its own transaction."
+  (graph-db:with-transaction ()
+    (funcall (%claim-constructor binary)
+             :subject-namespace subject-ns :subject-key subject-key
+             :object-namespace object-ns :object-key object-key
+             :relation relation :producer producer
+             :method method
+             :rule-version (getf facet :rule-version)
+             :confidence confidence :precision-m precision
+             :fraction (getf registration :fraction)
+             ;; A registration is DERIVED by computation, which is
+             ;; what :INFERRED means.  Not configurable (design §3).
+             :standing :inferred)))
+
 (defun %upsert-registration-claim (registration facet subject-ns
                                    subject-key precision confidence method
                                    registry-graph)
@@ -209,13 +255,17 @@ also produce, which is what makes the UPDATE branch overwrite a stale
 method rather than leaving it (plan Task 2).
 
 Idempotent on DEF-UNIQUE's binary tuple -- PRODUCER, the subject pair, the
-object pair and RELATION.  Looked up through the declared subject index
-and filtered in Lisp, since claims per subject are few (design §4).
+object pair and RELATION -- and SAFE UNDER CONCURRENT REGISTRATION of one
+subject: the lookup runs outside the transaction and OCC cannot see a
+phantom, so a competitor can commit the same tuple between the lookup and
+this insert's commit.  DEF-UNIQUE catches that at commit, and it is read
+as 'someone else won': the claim is re-read and UPDATED with this scan's
+values, so a parallel backfill loses no subject to the race (GH #161).
+The violation is re-signalled when the re-read finds nothing -- then it
+was not this tuple's race, and hiding it would hide a real error.
 
 ⚠ Runs under an ambient GRAPH-DB:*GRAPH* of REGISTRY-GRAPH: that is what
-WITH-TRANSACTION's default transaction manager is taken from.  A mutation
-needs (COPY c) then (SAVE c), and the COPY must happen INSIDE the
-transaction or SAVE signals MODIFYING-NON-COPY."
+WITH-TRANSACTION's default transaction manager is taken from."
   (let* ((family (claim-family (getf facet :claim-class)))
          (binary (claim-family-binary family))
          (relation (getf facet :relation))
@@ -228,35 +278,26 @@ transaction or SAVE signals MODIFYING-NON-COPY."
          (object-key (nth-value 1 (%source-endpoint
                                    (getf registration :region)
                                    registry-graph)))
-         (existing (find-if (lambda (c)
-                              (%registration-claim-p c binary relation
-                                                     producer object-ns
-                                                     object-key))
-                            (graph-db:index-lookup
-                             registry-graph (claim-family-parent family)
-                             '(subject-namespace subject-key)
-                             (list subject-ns subject-key)))))
-    (graph-db:with-transaction ()
-      (if existing
-          (let ((c (graph-db:copy existing)))
-            (setf (claim-method c) method
-                  (claim-rule-version c) (getf facet :rule-version)
-                  (claim-confidence c) confidence
-                  (claim-precision-m c) precision
-                  (claim-fraction c) (getf registration :fraction)
-                  (claim-standing c) :inferred)
-            (graph-db:save c))
-          (funcall (%claim-constructor binary)
-                   :subject-namespace subject-ns :subject-key subject-key
-                   :object-namespace object-ns :object-key object-key
-                   :relation relation :producer producer
-                   :method method
-                   :rule-version (getf facet :rule-version)
-                   :confidence confidence :precision-m precision
-                   :fraction (getf registration :fraction)
-                   ;; A registration is DERIVED by computation, which is
-                   ;; what :INFERRED means.  Not configurable (design §3).
-                   :standing :inferred)))
+         (existing (%find-registration-claim family binary relation producer
+                                             object-ns object-key subject-ns
+                                             subject-key registry-graph)))
+    (if existing
+        (%update-registration-claim existing registration facet precision
+                                    confidence method)
+        (handler-case
+            (%insert-registration-claim binary registration facet subject-ns
+                                        subject-key object-ns object-key
+                                        relation producer precision
+                                        confidence method)
+          (graph-db:unique-constraint-violation (e)
+            (let ((won (%find-registration-claim family binary relation
+                                                 producer object-ns
+                                                 object-key subject-ns
+                                                 subject-key registry-graph)))
+              (if won
+                  (%update-registration-claim won registration facet
+                                              precision confidence method)
+                  (error e))))))
     t))
 
 (defun register-node (node &key (graph graph-db:*graph*)
