@@ -138,11 +138,13 @@ engine now agrees with.
 
 ```lisp
 (register-geometry geometry registry &key registry-graph)
-  ;; => (values registrations evaluated-p)
+  ;; => (values registrations evaluated-p unmeasured)
 ```
 
 `registrations` is a list of `(:region <node> :fraction <double>)`,
-**unordered** — see §13. `evaluated-p` is §6.
+**unordered** — see §13. `evaluated-p` is §6. `unmeasured` (#164) is a
+list of `(:region <node> :error <string>)` — the candidate regions the
+scan could not measure — empty for a complete scan; see §6.
 
 **Both geometries are repaired before intersecting, and the fraction is
 clamped to 1.0.** `geometry-make-valid` runs on the subject once (so the
@@ -171,7 +173,7 @@ meaning, in both functions.
 
 ```lisp
 (register-node node &key graph registry-graph)
-  ;; => (values claims-written evaluated-p)
+  ;; => (values claims-written evaluated-p unmeasured)
 ```
 
 Reads `node`'s source contract, computes the registrations, and upserts one
@@ -276,6 +278,26 @@ the same answer. A caller that ignores `evaluated-p` degrades its own
 coverage silently, which is the defect the tenant has already paid for
 once; callers aggregating registrations should carry a partial-coverage
 flag the way `spine-backfill` carries `:sites-geos-skipped`.
+
+**Per-region failure is not a scan failure (#164).** The section above
+was written with one `geos-error` handler around the whole region loop,
+so the fourth case — an unrepresentable intersection — refused the whole
+subject: measured at 10 pairs in 1.3M, but clustered, costing 1,560
+claims across ten consecutive days of a series where a missing claim
+reads as a definite negative. The failure granularity #138 left open is
+settled here: **a `geos-error` while measuring one candidate drops that
+region and names it in a third value**, `unmeasured` — a list of
+`(:region <node> :error <string>)` — while every other region registers
+and `evaluated-p` stays true. The dropped region is never written at
+fraction 0, which would assert a touch; absence carries its reason
+instead. So an evaluated scan with a non-empty `unmeasured` is
+**partial**, and a caller keeping coverage figures must read the third
+value — `evaluated-p` alone now reports such a scan as evaluated.
+`register-node` passes it through unchanged and writes no claim for
+those regions. The whole-scan refusal remains for the first three cases
+and for a `geos-error` inside the candidate query itself (typically GEOS
+rejecting the subject), where the candidate list is unknown. Both
+handlers catch `geos-error` and nothing wider, for the reason above.
 
 ## 7. The cross-graph contract
 

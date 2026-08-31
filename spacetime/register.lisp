@@ -76,38 +76,41 @@ the subject's; REGISTER-NODE's :GRAPH is the subject's, and passing that
 here reads every region under the wrong binding, which NODE-GEOMETRY's
 IGNORE-ERRORS turns into an empty list with EVALUATED-P true (GH #53).
 
-Two values: a list of (:REGION node :FRACTION double), and whether the
-scan was EVALUATED at all.  A registration is PARTIAL AND FRACTIONAL: a
-point takes fraction 1.0, a polygon its share of each region's AREA, a
-line its share by LENGTH -- a line's area is zero, so an area ratio
-would give it 1.0 everywhere it went (design §13).  The list is
-UNORDERED -- 'most specific' is a tenant's notion, so a tenant sorts.
+Three values: a list of (:REGION node :FRACTION double), whether the
+scan was EVALUATED at all, and the candidate regions the scan could NOT
+measure -- a list of (:REGION node :ERROR string), empty for a complete
+scan (GH #164).  A registration is PARTIAL AND FRACTIONAL: a point takes
+fraction 1.0, a polygon its share of each region's AREA, a line its
+share by LENGTH -- a line's area is zero, so an area ratio would give it
+1.0 everywhere it went (design §13).  Both lists are UNORDERED -- 'most
+specific' is a tenant's notion, so a tenant sorts.
 
 A region the subject merely TOUCHES is NOT registered: GEOS `intersects'
 is true for boundary contact, so an abutting region is a candidate whose
 fraction is 0, and writing it would bind a record to a region it does
 not overlap.
 
-⚠ Read (VALUES NIL NIL) as 'not answered', never as 'no region here'.
-The scan is unevaluated for any of three reasons: GEOS is absent and the
-geometry is extended -- the index falls back to a COARSE bounding box,
-which is over-inclusive, and a fraction cannot be computed at all; GEOS
-rejects the geometry as invalid, which is host-dependent; or the
-intersection GEOS returns is a kind this engine's GEOMETRY type cannot
-represent (design §6).
+⚠ Read (VALUES NIL NIL NIL) as 'not answered', never as 'no region
+here'.  The scan is unevaluated for either of two reasons: GEOS is
+absent and the geometry is extended -- the index falls back to a COARSE
+bounding box, which is over-inclusive, and a fraction cannot be computed
+at all; or GEOS refuses inside the CANDIDATE QUERY, typically rejecting
+the subject as invalid, which is host-dependent -- then the candidate
+list itself is unknown (design §6).
 
-⚠ A SINGLE-EDGE TOUCH IS NOT THAT THIRD CASE, and reading it as one
-sends a reader hunting the wrong signature in their data.  Two polygons
-sharing ONE contiguous edge intersect in a LINESTRING, which
-WKT->GEOMETRY parses; its geodesic AREA is zero, so that region is
-dropped as a touch and every OTHER region still registers, with
-EVALUATED-P true.  What cannot be represented is a MULTI-COMPONENT
-boundary intersection: a MULTILINESTRING (two DISJOINT shared edges) or
-a GEOMETRYCOLLECTION (a vertex touch together with an edge touch).
-Those two refuse the whole scan."
+⚠ A GEOS refusal while measuring ONE candidate is not a refusal of the
+scan.  That region is dropped and reported in the third value -- never
+written at fraction 0, which would assert a touch -- and every other
+region still registers, with EVALUATED-P true.  An evaluated scan with a
+non-empty third value is therefore PARTIAL, and a caller keeping its own
+coverage figures must read it (GH #164; design §6).  The classic case is
+an intersection this engine's GEOMETRY type cannot represent: a
+MULTILINESTRING, two DISJOINT shared edges.  A SINGLE shared edge is not
+even that: it intersects in a LINESTRING, whose area is zero, so that
+region drops as a touch."
   (if (and (%extended-geometry-p geometry)
            (not graph-db::*geos-available-p*))
-      (values nil nil)
+      (values nil nil nil)
       (handler-case
           ;; Region slots are read under the registry graph's own binding:
           ;; NODE-SLOT-VALUE defaults to *GRAPH*, and reading a node under
@@ -121,21 +124,31 @@ Those two refuse the whole scan."
                  ;; candidates rather than how much of each is covered.
                  (subject (%repaired geometry))
                  (measure (%measure-fn subject))
-                 (subject-measure (funcall measure subject)))
-            (values
-             (loop for region in (graph-db:find-nodes-intersecting
-                                  registry geometry :graph registry-graph)
-                   for g = (graph-db:node-geometry region)
-                   for f = (and g (%overlap-fraction subject g measure
-                                                     subject-measure))
-                   ;; A zero fraction is a TOUCH, not an overlap: dropped
-                   ;; rather than written as a claim (design §13).
-                   when (and f (plusp f))
-                     collect (list :region region :fraction f))
-             t))
+                 (subject-measure (funcall measure subject))
+                 (registrations '())
+                 (unmeasured '()))
+            (dolist (region (graph-db:find-nodes-intersecting
+                             registry geometry :graph registry-graph))
+              ;; ONLY geos-error, and only around THIS region's measure:
+              ;; a refusal here is one region's, not the scan's (GH #164).
+              ;; Broader would swallow the node-escape class (GH #53).
+              (handler-case
+                  (let* ((g (graph-db:node-geometry region))
+                         (f (and g (%overlap-fraction subject g measure
+                                                      subject-measure))))
+                    ;; A zero fraction is a TOUCH, not an overlap: dropped
+                    ;; rather than written as a claim (design §13).
+                    (when (and f (plusp f))
+                      (push (list :region region :fraction f)
+                            registrations)))
+                (graph-db:geos-error (e)
+                  (push (list :region region :error (princ-to-string e))
+                        unmeasured))))
+            (values (nreverse registrations) t (nreverse unmeasured)))
         ;; ONLY geos-error: broader would swallow the node-escape class
-        ;; (GH #53).
-        (graph-db:geos-error () (values nil nil)))))
+        ;; (GH #53).  Reached from the candidate query and the subject's
+        ;; own measure; nothing inside the region loop escapes to here.
+        (graph-db:geos-error () (values nil nil nil)))))
 
 ;;; --- REGISTER-NODE: the registration, written as claims -----------------
 
@@ -249,8 +262,12 @@ transaction or SAVE signals MODIFYING-NON-COPY."
 (defun register-node (node &key (graph graph-db:*graph*)
                                 (registry-graph graph))
   "Register NODE against its source contract's registry, writing one claim
-per region.  Two values: how many claims were written, and whether the
-scan was EVALUATED at all (see REGISTER-GEOMETRY).
+per region.  Three values: how many claims were written, whether the scan
+was EVALUATED at all, and the regions it could NOT measure -- REGISTER-
+GEOMETRY's third value, passed through unchanged (GH #164).  No claim is
+written for one of those: absence with a reason, never a fabricated
+binding, and a caller keeping coverage figures must read it, since
+EVALUATED-P alone now reports a PARTIAL scan as evaluated.
 
 A source declaring :REGISTRATION :NONE writes nothing and reports an
 EVALUATED scan -- structural absence, not an unanswered question.  Every
@@ -284,15 +301,16 @@ anyway."
               (%source-endpoint node graph)))
           (if (null geometry)
               (values 0 nil)
-              (multiple-value-bind (regs evaluated)
+              (multiple-value-bind (regs evaluated unmeasured)
                   (register-geometry geometry (getf facet :registry)
                                      :registry-graph registry-graph)
                 (if (not evaluated)
-                    (values 0 nil)
+                    (values 0 nil nil)
                     (let ((graph-db:*graph* registry-graph))
                       (values (loop for r in regs
                                     count (%upsert-registration-claim
                                            r facet subject-ns subject-key
                                            precision confidence method
                                            registry-graph))
-                              t)))))))))
+                              t
+                              unmeasured)))))))))

@@ -5499,10 +5499,10 @@ registry:
 
 #+BEGIN_SRC lisp
   (register-geometry geometry registry &key registry-graph)
-    ;; => (values registrations evaluated-p)
+    ;; => (values registrations evaluated-p unmeasured)
 
   (register-node node &key graph registry-graph)
-    ;; => (values claims-written evaluated-p)
+    ;; => (values claims-written evaluated-p unmeasured)
 #+END_SRC
 
 ~registry~ is a spatial SCOPE — a class name, a list of names, or
@@ -5560,13 +5560,13 @@ scan (~T~) — that is structural absence, not an unanswered question.
 
 **** EVALUATED-P: false means "could not tell"
 
-Both functions return a second value. Read ~(values nil nil)~ — or,
-from ~register-node~, ~(values 0 nil)~ — as "the scan was never
+Both functions return a second value. Read ~(values nil nil nil)~ — or,
+from ~register-node~, ~(values 0 nil nil)~ — as "the scan was never
 answered," and *never* as "no regions here." An empty ~registrations~
 list with ~evaluated-p~ true IS a real "no region here" answer; a
 false ~evaluated-p~ is a refusal, not a result.
 
-~evaluated-p~ is false in exactly four cases, and none of them
+~evaluated-p~ is false in exactly three cases, and none of them
 signal — ~register-geometry~ catches only ~geos-error~, deliberately
 no broader, so it cannot swallow a cross-graph node-escape error:
 
@@ -5577,29 +5577,50 @@ no broader, so it cannot swallow a cross-graph node-escape error:
   be computed at all. A ~:point~ is unaffected — its candidates are
   exact and its fraction is 1.0 by definition — so points register
   with or without GEOS.
-- GEOS rejects the subject's geometry as topologically invalid. Which
-  polygons are invalid is host- and GEOS-version-dependent.
-- The intersection GEOS returns is a geometry kind this engine's
-  ~geometry~ type has no representation for. ~wkt->geometry~ parses
-  POINT, LINESTRING, POLYGON and MULTIPOLYGON; a *multi-component*
-  boundary intersection is what falls outside that — a MULTILINESTRING
-  (two *disjoint* shared edges) or a GEOMETRYCOLLECTION (a vertex touch
-  together with an edge touch). ⚠ A *single* shared edge is NOT this
-  case: it intersects in a LINESTRING, which parses, and whose geodesic
-  area is zero, so that one region drops as a touch and the rest of the
-  scan is unaffected.
+- GEOS refuses inside the *candidate query* — typically rejecting the
+  subject's geometry as topologically invalid, which is host- and
+  GEOS-version-dependent. The candidate list itself is then unknown,
+  so nothing can be answered.
 - The subject's geometry slot is unset, or unreadable under the
   ambient graph binding (~register-node~ only — ~node-geometry~
   returns ~nil~ either way). Reporting an evaluated scan there would
   assert "this record is in no region" when the truth is "its
   position is unknown."
 
-All four take the same exit: **registration refuses rather than
+All three take the same exit: **registration refuses rather than
 approximates.** A bounding box is over-inclusive, so approximating
 here would silently write claims binding a record to regions it does
 not actually touch. A caller aggregating registrations across many
 subjects should carry its own partial-coverage flag rather than let a
 false ~evaluated-p~ disappear into "0 claims written."
+
+**** UNMEASURED: the third value, and what "partial" means
+
+A GEOS refusal while measuring *one* candidate region is that region's
+failure, not the scan's (vivace-graph#164). The region is dropped and
+named in the third value, ~unmeasured~ — a list of
+~(:region node :error string)~ — while every other region registers
+and ~evaluated-p~ stays true. It is never written at fraction 0, which
+would assert a touch: absence carries its reason instead. The classic
+cause is an intersection this engine's ~geometry~ type cannot
+represent: ~wkt->geometry~ parses POINT, LINESTRING, POLYGON and
+MULTIPOLYGON, so a MULTILINESTRING (two *disjoint* shared edges) falls
+outside it. ⚠ A *single* shared edge is NOT this case: it intersects
+in a LINESTRING, which parses, and whose geodesic area is zero, so that
+one region drops as a touch and reports nothing. A GEOMETRYCOLLECTION
+result is reduced to its highest-dimension parts before it gets here
+(~%geos-overlay~, #164 option 1).
+
+⚠ So an evaluated scan with a non-empty ~unmeasured~ is PARTIAL, and
+~evaluated-p~ alone no longer distinguishes it from a complete one. A
+caller keeping coverage figures must read the third value; one that
+sweeps stale claims by comparing against ~registrations~ must exclude
+the unmeasured regions from the sweep, or it deletes a binding it merely
+failed to re-measure. ~register-node~ passes the list through unchanged
+and writes no claim for those regions. Before this, one such region
+refused the whole subject — 1,560 claims lost across ten consecutive
+days of a deployed series, where a missing claim reads as a definite
+negative.
 
 *** What is not here yet
 

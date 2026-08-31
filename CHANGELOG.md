@@ -13,6 +13,24 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Changed
 
+- **A GEOS failure on one region no longer refuses the whole registration
+  scan** (#164, option 2). `register-geometry` now catches `geos-error`
+  around each candidate region's own measurement: that region is dropped
+  and named in a **new third value**, `unmeasured` — a list of
+  `(:region node :error string)` — while every other region registers and
+  `evaluated-p` stays true. `register-node` passes the list through and
+  writes no claim for those regions; nothing is ever written at fraction
+  0. The whole-scan refusal (`(values nil nil nil)`) remains for no-GEOS
+  with an extended subject and for a `geos-error` inside the candidate
+  query, where the candidate list itself is unknown. ⚠ **An evaluated
+  scan with a non-empty third value is partial** — a caller that keeps
+  coverage figures from `evaluated-p` alone now under-counts refusals and
+  must read the third value; one that sweeps stale claims against
+  `registrations` must exclude the unmeasured regions. Measured
+  motivation: 10 unrepresentable pairs in 1.3M cost 1,560 claims across
+  ten consecutive days of a series. Option 3 (representing
+  `GEOMETRYCOLLECTION`) is split out as #291.
+
 - **A claim's `relation` and `producer` are canonical strings, enforced at
   commit** (#160). Both are components of the `def-unique` identity tuple
   and are compared with `equal`, so `:registered-at`, `"registered-at"`

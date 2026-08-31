@@ -177,10 +177,35 @@ registration is broken entirely."
 ;;; very HANDLER-CASE under test, deterministically on any host.
 
 (defparameter *ctr-region-trap* nil
-  "What CTR-TRAP-REGION's NODE-GEOMETRY signals: :GEOS, :OTHER, or NIL to
-read the slot normally.  NIL while the fixture is written, so the region
-indexes like any other and is a genuine candidate; set only around the
-scan under test.")
+  "What CTR-TRAP-REGION's NODE-GEOMETRY signals: :GEOS or :OTHER on EVERY
+read, :GEOS-IN-LOOP or :OTHER-IN-LOOP on a node's SECOND read only (see
+%TRAP-SECOND-READ), or NIL to read the slot normally.  NIL while the
+fixture is written, so the region indexes like any other and is a genuine
+candidate; set only around the scan under test.")
+
+(defvar *ctr-trap-reads* (make-hash-table :test 'equalp)
+  "Node id -> geometry reads served, for the -IN-LOOP modes.  Cleared by
+%RESET-TRAP-READS before each trapped scan.")
+
+(defun %reset-trap-reads ()
+  (clrhash *ctr-trap-reads*))
+
+(defun %trap-signal (mode)
+  (ecase mode
+    (:geos (error 'graph-db:geos-error
+                  :message "TopologyException (fixture, no GEOS call made)"))
+    (:other (error "a non-GEOS failure raised inside the scan (fixture)"))))
+
+(defun %trap-second-read (node mode)
+  "Serve NODE's first geometry read; fail with MODE on its second.
+FIND-NODES-INTERSECTING's refinement reads each candidate's geometry
+ONCE (spatial-query.lisp), and REGISTER-GEOMETRY's region loop reads it
+again -- so failing the second read puts the failure INSIDE the loop,
+where GH #164's per-region handler is.  Failing the first puts it in the
+candidate query, which is the whole scan's refusal.  The only way to
+reach the loop deterministically without a host-dependent invalid ring."
+  (when (>= (incf (gethash (id node) *ctr-trap-reads* 0)) 2)
+    (%trap-signal mode)))
 
 (def-vertex ctr-trap-region ()
   ((name :type string)
@@ -188,12 +213,11 @@ scan under test.")
   :graph-db-register-test)
 
 (defmethod graph-db:node-geometry ((n ctr-trap-region))
-  (declare (ignorable n))
   (case *ctr-region-trap*
-    (:geos (error 'graph-db:geos-error
-                  :message "TopologyException (fixture, no GEOS call made)"))
-    (:other (error "a non-GEOS failure raised inside the scan (fixture)"))
-    (t (call-next-method))))
+    ((:geos :other) (%trap-signal *ctr-region-trap*))
+    (:geos-in-loop (%trap-second-read n :geos))
+    (:other-in-loop (%trap-second-read n :other)))
+  (call-next-method))
 
 (defun %make-trap-region (graph name ring)
   (let ((graph-db:*graph* graph))
@@ -201,10 +225,13 @@ scan under test.")
       (make-ctr-trap-region :name name
                             :geom (make-polygon (list ring))))))
 
-(test a-geos-error-anywhere-in-the-scan-refuses-the-whole-scan
+(test a-geos-error-in-the-candidate-query-refuses-the-whole-scan
   "⚠ The refusal with production history: four sites killed a backfill on
 GEOS 3.10.2 that 3.14.1 ran clean, so a scan that meets one is UNANSWERED,
-not empty.  A valid region sits in the same scan, so this cannot pass by
+not empty.  The trap fires on EVERY read, so it fires first inside
+FIND-NODES-INTERSECTING's refinement -- the candidate list itself is
+unknown, which is the scan's refusal, not one region's (GH #164 keeps
+this exit).  A valid region sits in the same scan, so this cannot pass by
 finding nothing, and the first scan is the control -- same run, same
 fixture, trap off."
   (with-region-graph (g)
@@ -221,13 +248,64 @@ fixture, trap off."
             "with the trap off BOTH regions register, so the refusal below ~
 is not just an empty registry"))
       (let ((*ctr-region-trap* :geos))
-        (multiple-value-bind (regs evaluated)
+        (multiple-value-bind (regs evaluated unmeasured)
             (register-geometry subject scope :registry-graph g)
           (is-false evaluated "a GEOS-ERROR is a REFUSAL, never a signal")
           (is (null regs)
               "the VALID region's registration goes too: the scan was ~
 never answered, and a partial answer would be the false positive design ~
-§6 exists to prevent"))))))
+§6 exists to prevent")
+          (is (null unmeasured)
+              "an unanswered scan names no region: it never got that far"))))))
+
+(test a-geos-error-in-one-region-drops-that-region-and-reports-it
+  "GH #164.  A region GEOS cannot measure is ONE region's failure: it is
+dropped -- never written at fraction 0, which would assert a touch -- and
+named in the third value, while the valid region still registers and the
+scan reports EVALUATED.  Before this, one unrepresentable intersection
+refused the whole subject: 1,560 claims across ten consecutive days,
+measured.  The first scan is the control -- same fixture, trap off."
+  (with-region-graph (g)
+    (%make-region g "valid" '((0d0 0d0) (2d0 0d0) (2d0 2d0) (0d0 2d0)
+                              (0d0 0d0)))
+    (let ((trap (%make-trap-region g "trap" '((0d0 0d0) (2d0 0d0)
+                                              (2d0 2d0) (0d0 2d0)
+                                              (0d0 0d0))))
+          (scope '(ct-region ctr-trap-region))
+          (subject (make-point 1d0 1d0)))
+      (multiple-value-bind (regs evaluated unmeasured)
+          (register-geometry subject scope :registry-graph g)
+        (is-true evaluated)
+        (is (= 2 (length regs)) "control: both register with the trap off")
+        (is (null unmeasured) "control: a complete scan names nothing"))
+      (%reset-trap-reads)
+      (let ((*ctr-region-trap* :geos-in-loop))
+        (multiple-value-bind (regs evaluated unmeasured)
+            (register-geometry subject scope :registry-graph g)
+          (is-true evaluated "one region's failure is not the scan's")
+          (is (= 1 (length regs)))
+          (is (string= "valid" (name (getf (first regs) :region)))
+              "the region that could be measured still registers")
+          (is (= 1 (length unmeasured)))
+          (let ((u (first unmeasured)))
+            (is (equalp (id trap) (id (getf u :region)))
+                "the dropped region is named, not merely counted")
+            (is (stringp (getf u :error)))
+            (is (search "TopologyException" (getf u :error))
+                "the reason travels with it")))))))
+
+(test a-non-geos-error-in-one-region-still-propagates
+  "⚠ The per-region handler is as NARROW as the scan's: GEOS-ERROR and
+nothing wider, or the node-escape class (GH #53) would be swallowed one
+region at a time and reported as merely 'unmeasured'."
+  (with-region-graph (g)
+    (%make-trap-region g "trap" '((0d0 0d0) (2d0 0d0) (2d0 2d0) (0d0 2d0)
+                                  (0d0 0d0)))
+    (%reset-trap-reads)
+    (let ((*ctr-region-trap* :other-in-loop))
+      (signals simple-error
+        (register-geometry (make-point 1d0 1d0) 'ctr-trap-region
+                           :registry-graph g)))))
 
 (test a-non-geos-error-in-the-scan-propagates-rather-than-being-caught
   "⚠ The handler catches GEOS-ERROR and NOTHING WIDER.  Widening it to
@@ -398,6 +476,19 @@ accidentally the same graph, which every Task 4 test left them."
     (with-transaction ()
       (make-ctr-place :place-key key :extent (make-polygon (list ring))))))
 
+(defvar *ctr-place-trap* nil
+  "(PLACE-KEY . MODE): CTR-PLACE's NODE-GEOMETRY fails with MODE on the
+SECOND read of the place called PLACE-KEY (%TRAP-SECOND-READ), so a
+REGISTER-NODE scan meets a per-region failure on one place and not the
+other.  NIL reads normally.  An :AROUND so DEF-SOURCE's own methods, if
+any, stay in the chain.")
+
+(defmethod graph-db:node-geometry :around ((n ctr-place))
+  (when (and *ctr-place-trap*
+             (string= (car *ctr-place-trap*) (place-key n)))
+    (%trap-second-read n (cdr *ctr-place-trap*)))
+  (call-next-method))
+
 (defun %make-record (graph key point)
   (let ((graph-db:*graph* graph))
     (with-transaction () (make-ctr-record :record-key key :loc point))))
@@ -543,6 +634,29 @@ this cannot tell 'refused correctly' from 'broken everywhere'."
           (is (= 1 written)))))
     (is (null (%subject-claims g :ctr-areas "a-1"))
         "the refused scan wrote nothing at all")))
+
+(test registering-a-node-reports-the-region-it-could-not-measure
+  "GH #164 through REGISTER-NODE: the third value passes through, so a
+tenant keeping coverage figures can count a PARTIAL scan -- which
+EVALUATED-P alone now reports as evaluated.  No claim is written for the
+unmeasured place: absence with a reason, never a fabricated binding."
+  (with-region-graph (g)
+    (%make-place g "p-a" +ctr-square+)
+    (%make-place g "p-b" +ctr-square+)
+    (let ((n (%make-record g "s-7" (make-point 1d0 1d0))))
+      (%reset-trap-reads)
+      (let ((*ctr-place-trap* '("p-b" . :geos)))
+        (multiple-value-bind (written evaluated unmeasured)
+            (register-node n :graph g)
+          (is-true evaluated)
+          (is (= 1 written))
+          (is (= 1 (length unmeasured)))
+          (is (string= "p-b"
+                       (place-key (getf (first unmeasured) :region))))))
+      (let ((claims (%subject-claims g :ctr-records "s-7")))
+        (is (= 1 (length claims)))
+        (is (string= "p-a" (claim-object-key (first claims)))
+            "the measurable place is bound; the unmeasured one is not")))))
 
 (test a-subject-with-no-geometry-is-not-answered
   "Where the record is, is unknown -- which is not the same as its being
