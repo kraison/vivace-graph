@@ -65,8 +65,11 @@ finalization, so a class mid-definition can be asked."
     seen))
 
 (defun %node-classes ()
-  "Every defined node class in the image: the transitive subclasses of
-VERTEX and EDGE."
+  "Every CURRENT node class in the image: the transitive subclasses of
+VERTEX and EDGE whose name still resolves to them.  A class object
+orphaned by a redefinition or an (SETF FIND-CLASS NIL) stays linked from
+its old superclasses' direct-subclass lists and is not a class anything
+can instantiate, so it must not count."
   (let ((seen '()))
     (labels ((walk (c)
                (unless (member c seen)
@@ -74,7 +77,8 @@ VERTEX and EDGE."
                  (mapc #'walk (class-direct-subclasses c)))))
       (walk (find-class 'vertex))
       (walk (find-class 'edge)))
-    seen))
+    (remove-if-not (lambda (c) (eq (find-class (class-name c) nil) c))
+                   seen)))
 
 (defun %disjointness-offender-p (class spec)
   "True when CLASS instantiates two or more of SPEC's classes -- itself
@@ -137,7 +141,12 @@ a subtype of another, and no defined class inherits from two.  Checked
 NOW against every defined node class, and again whenever a node type is
 defined later -- never at commit, since no write can change the answer
 (GH #157, 4a).  Order does not matter; :NAME is required and is the
-declaration's identity, so re-declaring the same name replaces."
+declaration's identity, so re-declaring the same name replaces.
+
+⚠ A DEF-VERTEX the hook refuses is refused AFTER its DEFCLASS: the class
+exists in the image, unregistered and without helpers, and any later
+declaration over the same pair sees it.  Fix the definition and
+re-evaluate; the leftover cannot be un-defined portably."
   `(register-disjointness-spec
     (make-disjointness-spec :classes ',classes
                             :graph-name ',graph-name

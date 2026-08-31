@@ -16,6 +16,11 @@
 (def-vertex dj-fortification () () :graph-db-dj-test)
 (def-vertex dj-unclassified () () :graph-db-dj-test)
 (def-vertex dj-bunker (dj-fortification) () :graph-db-dj-test)   ; a subtype
+;; Named by ONE test only: a refused DEF-VERTEX leaves its class defined
+;; (the DEFCLASS precedes the hook), and a leftover class under two of a
+;; pair contradicts every later declaration over that pair in the image.
+(def-vertex dj-left () () :graph-db-dj-test)
+(def-vertex dj-right () () :graph-db-dj-test)
 
 (defun %dj-specs ()
   (gethash *dj-graph-name* graph-db::*schema-disjointness-metadata*))
@@ -101,21 +106,23 @@ is defined (next test)."
 from two declared-disjoint classes is refused as it is defined, through
 *NODE-TYPE-DEFINITION-HOOKS*."
   (%dj-clear)
-  (def-disjoint (dj-observation dj-fortification) :graph-db-dj-test
-    :name dj-classes)
+  ;; Re-runnable in one image: a previous run's refused DJ-BOTH is still a
+  ;; class (see DEF-DISJOINT's ⚠) and would contradict the declaration.
+  (dolist (leftover '(dj-both dj-only-one))
+    (when (find-class leftover nil) (setf (find-class leftover) nil)))
+  (def-disjoint (dj-left dj-right) :graph-db-dj-test :name dj-sides)
   (let ((e (handler-case
                (progn
-                 (eval '(graph-db:def-vertex dj-both
-                         (dj-observation dj-fortification) ()
+                 (eval '(graph-db:def-vertex dj-both (dj-left dj-right) ()
                          :graph-db-dj-test))
                  nil)
              (disjointness-violation (e) e))))
     (is-true e "a class under both is refused at definition")
     (is (eq 'dj-both (djv-offender e)))
-    (is (eq 'dj-classes (graph-db::djv-name e))))
+    (is (eq 'dj-sides (graph-db::djv-name e))))
   ;; and a class under ONE of them is fine
   (finishes
-    (eval '(graph-db:def-vertex dj-only-one (dj-observation) ()
+    (eval '(graph-db:def-vertex dj-only-one (dj-left) ()
             :graph-db-dj-test)))
   (%dj-clear))
 
