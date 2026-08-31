@@ -91,6 +91,45 @@ no key must be lost or corrupted."
           (is (every (lambda (pair) (= (car pair) (cdr pair))) entries)
               "Key/value mismatch after concurrent inserts"))))))
 
+(test skip-list-concurrent-add-and-remove
+  "GH #294: N/2 adder threads and N/2 remover threads hammer one skip list.
+The old locking acquired pred locks one node at a time in list-position
+order over STRIPED mutexes -- position order is not stripe order, so two
+mutators could take two stripes AB/BA and deadlock (seen in CI run
+33417325199); remove also locked the victim before the preds, a second
+ordering violation.  Stripe-ordered acquisition (%GRAB-STRIPES) is the fix;
+this is the discriminating load.  Each adder owns a key range; removers
+chase the same ranges, so preds collide constantly.  The final state must
+be exactly the never-removed keys, intact."
+  (let* ((n (max 4 *thread-count*))
+         (pairs (floor n 2))
+         (m 60)
+         (keep 10))  ; per range, keys < KEEP are never removed
+    (with-conc-memory (heap)
+      (let ((sl (make-conc-integer-skip-list heap)))
+        (run-threads
+         n
+         (lambda (i)
+           (let* ((pair (mod i pairs))
+                  (base (* pair m)))
+             (if (< i pairs)
+                 ;; Adder for range PAIR.
+                 (dotimes (j m)
+                   (add-to-skip-list sl (+ base j) (+ base j)))
+                 ;; Remover for range PAIR: spin on the removable keys
+                 ;; until each has been observed and removed once.
+                 (loop for j from keep below m do
+                      (loop until (remove-from-skip-list sl (+ base j))
+                            do (bt:thread-yield)))))))
+        (let ((entries (skip-list-to-list sl)))
+          (is (= (* pairs keep) (length entries))
+              "Expected ~D surviving entries; found ~D"
+              (* pairs keep) (length entries))
+          (is (every (lambda (pair) (= (car pair) (cdr pair))) entries)
+              "Key/value mismatch after concurrent add+remove")
+          (is (every (lambda (pair) (< (mod (car pair) m) keep)) entries)
+              "A removed key survived"))))))
+
 ;;; ---------------------------------------------------------------------------
 ;;; Test 3: ve-index concurrent traversal and mutation
 ;;;

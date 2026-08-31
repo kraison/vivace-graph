@@ -175,6 +175,26 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Fixed
 
+- **Skip-list mutators could deadlock under concurrency** (#294). The
+  optimistic insert locked each level's predecessor bottom-up — deadlock-free
+  on per-node locks, but these are *striped* (`mod addr n-locks`), and stripe
+  order is not list-position order, so two inserts could take two stripes in
+  opposite orders (caught once by SBCL's deadlock detector in CI). Removal
+  additionally locked the victim before the preds, and `lock-skip-node`'s
+  reentrancy shortcut returned an already-owned stripe without re-grabbing
+  while the caller released everything — a double release on stripe
+  collision. All mutators now collect their nodes' stripes, dedupe **by
+  stripe**, sort, and acquire in ascending stripe order (`%grab-stripes`);
+  remove marks and splices atomically under the locks. The new mixed
+  add/remove hammer test then exposed two more defects in the same
+  structure: **remove freed the node's heap memory immediately**, crashing
+  concurrent lock-free walkers that still held its address (H&S traversal
+  is only safe because unlinked nodes remain readable stepping stones) —
+  frees are now deferred and reclaimed at `close`/`delete`, with a
+  snapshot+replay rebuilding clean regardless; and `update-in-skip-list`'s
+  grow path called remove+add while holding the node's stripe, a
+  self-deadlock under non-reentrant locks — it releases first now.
+
 - **A truncated snapshot can no longer be silently restored** (#127,
   breaking #146's silent data-loss chain). Three layers, each sufficient
   alone: `snapshot` now writes in a `txn-log/in-progress/` subdirectory

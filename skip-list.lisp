@@ -12,6 +12,12 @@
   #+ecl `(mp:with-lock ((%sl-cache-lock ,skip-list)) ,@body)
   #-ecl `(progn ,@body))
 
+;;; On the lock-free implementations, MUTATORS coordinate through a striped
+;;; per-node lock vector (%SL-LOCKS).  The one rule: a mutator that needs
+;;; several nodes' locks collects the STRIPES, sorts them, and acquires in
+;;; ascending stripe order via %GRAB-STRIPES -- never one node at a time in
+;;; list-position order, which deadlocks under striping (GH #294).
+;;;
 ;;; ECL cannot run the skip list's lock-free reads safely: it has no CAS for
 ;;; atomic pointer/value publication, and it cannot catch the SIGSEGV a torn read
 ;;; of a node's multi-byte size/pointers causes (SBCL/CCL/LispWorks recover via
@@ -350,6 +356,13 @@ garbage), but is cleared here too so both caches are dropped in one place."
                #+lispworks (mp:make-lock)
                #+ccl (ccl:make-lock)
                #+ecl (mp:make-lock :recursive t))
+  ;; Addresses unlinked by REMOVE but NOT yet freed (GH #294): a freed
+  ;; node's zeroed header crashes the lock-free walk that still holds its
+  ;; address, and H&S traversal is only safe because unlinked nodes stay
+  ;; readable.  Flushed under %SL-LENGTH-LOCK; reclaimed at CLOSE/DELETE
+  ;; (exclusive by contract), so on-disk leakage is bounded per session
+  ;; and a snapshot+replay rebuilds clean regardless.
+  (deferred-frees '())
   (locks (map-into (make-array 1000)
                    #+ccl 'ccl:make-lock
                    #+lispworks 'mp:make-lock
@@ -445,12 +458,22 @@ garbage), but is cleared here too so both caches are dropped in one place."
       (setf (%sl-length sl) length)
       sl)))
 
+(defun %sl-flush-deferred-frees (skip-list)
+  "Free every address REMOVE deferred (GH #294).  Caller must guarantee
+exclusive access -- close and delete, by contract."
+  (with-recursive-lock-held ((%sl-length-lock skip-list))
+    (dolist (addr (%sl-deferred-frees skip-list))
+      (invalidate-cached-skip-node skip-list addr)
+      (free (%sl-heap skip-list) addr))
+    (setf (%sl-deferred-frees skip-list) '())))
+
 (defun close-skip-list (skip-list)
-  (declare (ignore skip-list))
+  (%sl-flush-deferred-frees skip-list)
   nil)
 
 (defun delete-skip-list (skip-list)
   (with-sl-write-lock (skip-list)
+    (%sl-flush-deferred-frees skip-list)
     (let ((pred (%sl-head skip-list))
           (address-list (list (%sn-addr (%sl-head skip-list)))))
       (loop
@@ -485,20 +508,50 @@ garbage), but is cleared here too so both caches are dropped in one place."
           (decf-uint64 (%sl-heap skip-list)
                        (1+ (%sl-address skip-list))))))
 
+(defun %sl-stripe-index (skip-list addr)
+  (mod addr (length (%sl-locks skip-list))))
+
+(defun %stripes-for (skip-list addrs)
+  "The sorted, duplicate-free stripe indexes covering ADDRS.  Dedup must be
+by STRIPE, not by node address: two distinct nodes can share a stripe, and
+acquiring one stripe twice is the double-release half of GH #294."
+  (sort (delete-duplicates
+         (mapcar (lambda (a) (%sl-stripe-index skip-list a)) addrs))
+        #'<))
+
+(defun %grab-stripes (skip-list stripe-indexes)
+  "Acquire STRIPE-INDEXES' mutexes in the given (ascending) order and return
+them newest-first for %RELEASE-STRIPES.  Ascending stripe order is the ONE
+global acquisition order every mutator uses -- the optimistic insert's
+bottom-up pred locking is only deadlock-free on per-node locks, and these
+are striped, so position order is not stripe order (GH #294)."
+  (let ((locks '()))
+    (dolist (i stripe-indexes locks)
+      (let ((mutex (aref (%sl-locks skip-list) i)))
+        #+sbcl (sb-thread:grab-mutex mutex :waitp t)
+        #+lispworks (mp:process-lock mutex)
+        #+ccl (ccl:grab-lock mutex)
+        #+ecl (mp:get-lock mutex t)
+        (push mutex locks)))))
+
+(defun %release-stripes (locks)
+  (dolist (mutex locks)
+    #+sbcl (sb-thread:release-mutex mutex)
+    #+lispworks (mp:process-unlock mutex)
+    #+ccl (ccl:release-lock mutex)
+    #+ecl (mp:giveup-lock mutex)))
+
 (defun lock-skip-node (skip-list node &key (waitp t) timeout)
+  "Lock the ONE stripe covering NODE.  Single-node use only (the update
+path); a mutator locking several nodes must go through %GRAB-STRIPES so
+acquisition is stripe-ordered (GH #294).  The old reentrancy shortcut is
+gone with the nesting that excused it: it returned an already-owned mutex
+without re-grabbing, and the caller's unwind released it anyway."
+  (declare (ignorable waitp timeout))
   (let ((mutex (aref (%sl-locks skip-list)
-                     (mod (%sn-addr node) (length (%sl-locks skip-list))))))
+                     (%sl-stripe-index skip-list (%sn-addr node)))))
     #+sbcl
-    (let ((inner-lock-p (eq (sb-thread::mutex-owner mutex)
-                            sb-thread:*current-thread*))
-          (got-it nil))
-      (sb-sys:without-interrupts
-        (if (or inner-lock-p
-                (setf got-it (sb-sys:allow-with-interrupts
-                               (sb-thread:grab-mutex mutex
-                                                     :waitp waitp
-                                                     :timeout timeout))))
-            mutex)))
+    (and (sb-thread:grab-mutex mutex :waitp waitp :timeout timeout) mutex)
     #+lispworks (progn (mp:process-lock mutex nil timeout)
                        mutex)
     #+ccl
@@ -622,42 +675,40 @@ garbage), but is cleared here too so both caches are dropped in one place."
                    (log:debug "ATTEMPT TO INSERT DUP KV '~A/~A' IN ~A" key value skip-list))
                  (return-from add-to-skip-list nil)))))
          (log:debug "~S / ~S:~%  ~S~%  ~S~%" key value (elt preds 0) (elt succs 0))
-         (let ((locks nil) pred succ prev-pred (valid-p t))
+         ;; Stripe-ordered locking (GH #294): collect every pred's stripe,
+         ;; sort, acquire, THEN validate.  Validation failure releases all
+         ;; and retries via the enclosing loop's re-find.
+         (let ((locks '()) (valid-p nil))
            (unwind-protect
                 (progn
-                  (loop for level from 0 to (1- top-level) while valid-p do
-                       (setq pred (aref preds level)
-                             succ (aref succs level))
-                       (when (or (null prev-pred)
-                                 (and prev-pred
-                                      (/= (%sn-addr pred) (%sn-addr prev-pred))))
-                         (let ((lock (lock-skip-node skip-list pred :waitp t)))
-                           (if lock
-                               (push lock locks)
-                               (error "Unable to acquire skip-node lock for ~A" pred)))
-                         (setq prev-pred pred))
-                       (setq valid-p (and (not (%sn-marked-p skip-list pred))
-                                          (not (%sn-marked-p skip-list succ))
-                                          (= (aref (%sn-pointers pred) level)
-                                             (%sn-addr succ)))))
+                  (setq locks
+                        (%grab-stripes
+                         skip-list
+                         (%stripes-for
+                          skip-list
+                          (loop for level from 0 to (1- top-level)
+                                collect (%sn-addr (aref preds level))))))
+                  (setq valid-p
+                        (loop for level from 0 to (1- top-level)
+                              always
+                              (let ((pred (aref preds level))
+                                    (succ (aref succs level)))
+                                (and (not (%sn-marked-p skip-list pred))
+                                     (not (%sn-marked-p skip-list succ))
+                                     (= (aref (%sn-pointers pred) level)
+                                        (%sn-addr succ))))))
                   (when valid-p
                     (let ((node (make-skip-node skip-list key value top-level)))
                       (log:debug "Adding ~A" node)
                       (loop for level from 0 to (1- top-level) do
-                           (log:debug "Setting pointer at level ~A" level)
                            (set-node-pointer skip-list node level
                                              (%sn-addr (aref succs level)))
                            (set-node-pointer skip-list (aref preds level) level
                                              (%sn-addr node)))
-                      (log:debug "Setting ~A to fully linked" node)
                       (set-node-fully-linked skip-list node)
-                      (log:debug "Updating list count for ~A" skip-list)
                       (incf-skip-list-count skip-list)
                       (return-from add-to-skip-list node))))
-             (dolist (lock (nreverse locks))
-               (if lock
-                   (unlock-skip-node skip-list lock)
-                   (log:info "SKIP-LIST: Got null lock in ~A / ~A" key value)))))))))
+             (%release-stripes locks)))))))
 
 (defgeneric update-in-skip-list (skip-list key value &optional old-value))
 
@@ -697,8 +748,12 @@ garbage), but is cleared here too so both caches are dropped in one place."
                              (with-sl-cache-lock (skip-list)
                                (setf (gethash (%sn-addr node) (%sl-node-cache skip-list)) node))))
                          (progn
-                           ;;(unlock-skip-node skip-list lock)
-                           ;;(setq lock nil)
+                           ;; Release BEFORE remove+add: both now grab
+                           ;; stripes through %GRAB-STRIPES and the locks
+                           ;; are non-reentrant, so holding the node's
+                           ;; stripe here self-deadlocks (GH #294).
+                           (unlock-skip-node skip-list lock)
+                           (setq lock nil)
                            (remove-from-skip-list skip-list key)
                            (let ((new-node (add-to-skip-list skip-list key value)))
                              new-node)))))
@@ -721,10 +776,8 @@ pair (needed for duplicate-key lists); without it, removes one occurrence of
 KEY (arbitrary when duplicates exist).  Returns T if a node was removed, NIL if
 none matched."
   (with-sl-write-lock (skip-list)
-    (let ((node-to-delete nil) (marked-p nil) (top-level -1)
-          (preds (make-array (%sl-max-level skip-list)))
+    (let ((preds (make-array (%sl-max-level skip-list)))
           (succs (make-array (%sl-max-level skip-list)))
-          (lock nil)
           ;; Target a SPECIFIC node and use find-kv-in-skip-list's preds/succs,
           ;; which are positioned for that exact (key,value) node.
           ;; find-in-skip-list returns the tallest-tower duplicate but positions
@@ -738,9 +791,8 @@ none matched."
                value
                (let ((n (%find-in-skip-list skip-list key)))
                  (if n (%sn-value n) (return-from remove-from-skip-list nil))))))
-      (unwind-protect
-           (loop
-              (multiple-value-bind (node level-found)
+      (loop
+         (multiple-value-bind (node level-found)
                   ;; Duplicate-free lists (views, unique indexes): KEY alone
                   ;; identifies the node, so %FIND-IN-SKIP-LIST descends in
                   ;; O(log n) and returns correct preds/succs (leftmost match ==
@@ -756,52 +808,57 @@ none matched."
                                             target-value (%sn-value n)))
                             (values n lvl)
                             (values nil -1))))
-                (unless node (return-from remove-from-skip-list nil))
-                (when (or marked-p
-                          (and node (ok-to-delete-p skip-list node level-found)))
-                  (when (not marked-p)
-                    (setq node-to-delete node
-                          top-level (%sn-level node)
-                          lock (lock-skip-node skip-list node :waitp t))
-                    (when (%sn-marked-p skip-list node-to-delete)
-                      (return-from remove-from-skip-list nil))
-                    (mark-node skip-list node-to-delete)
-                    (setq marked-p t))
-                  (let ((locks nil) pred succ prev-pred (valid-p t))
-                    (unwind-protect
-                         (progn
-                           (loop for level from 0 to (1- top-level) while valid-p do
-                                (setq pred (aref preds level)
-                                      succ (aref succs level))
-                                (when (or (null prev-pred)
-                                          (and prev-pred (/= (%sn-addr pred)
-                                                             (%sn-addr prev-pred))))
-                                  (push (lock-skip-node skip-list pred :waitp t) locks)
-                                  (setq prev-pred pred))
-                                (setq valid-p (and (not (%sn-marked-p skip-list pred))
-                                                   (= (aref (%sn-pointers pred) level)
-                                                      (%sn-addr succ)))))
-                           (when valid-p
-                             (loop for level from (1- top-level) downto 0 do
-                                  (set-node-pointer
-                                   skip-list
-                                   (aref preds level)
-                                   level
-                                   (aref (%sn-pointers node-to-delete) level)))
-                             (decf-skip-list-count skip-list)
-                             ;; Evict from BOTH caches BEFORE handing the address
-                             ;; back to the allocator -- see
-                             ;; INVALIDATE-CACHED-SKIP-NODE.
-                             (invalidate-cached-skip-node
-                              skip-list (%sn-addr node-to-delete))
-                             (free (%sl-heap skip-list) (%sn-addr node-to-delete))
-                             (unlock-skip-node skip-list lock)
-                             (setq lock nil)
-                             (return-from remove-from-skip-list t)))
-                      (dolist (lock (nreverse locks))
-                        (unlock-skip-node skip-list lock)))))))
-        (when lock
-          (unlock-skip-node skip-list lock))))))
+           (unless node (return-from remove-from-skip-list nil))
+           (when (ok-to-delete-p skip-list node level-found)
+             ;; Stripe-ordered locking (GH #294): the victim's stripe joins
+             ;; the preds' in ONE sorted acquisition, and mark-and-splice
+             ;; happens atomically under the locks -- the old shape locked
+             ;; the victim first and the preds after, an ordering violation,
+             ;; and could hold a marked-but-unspliced victim across retries.
+             (let* ((top-level (%sn-level node))
+                    (locks '()))
+               (unwind-protect
+                    (progn
+                      (setq locks
+                            (%grab-stripes
+                             skip-list
+                             (%stripes-for
+                              skip-list
+                              (cons (%sn-addr node)
+                                    (loop for level from 0 to (1- top-level)
+                                          collect
+                                          (%sn-addr (aref preds level)))))))
+                      (when (and (not (%sn-marked-p skip-list node))
+                                 (%sn-fully-linked-p skip-list node)
+                                 (loop for level from 0 to (1- top-level)
+                                       always
+                                       (let ((pred (aref preds level)))
+                                         (and (not (%sn-marked-p skip-list
+                                                                 pred))
+                                              (= (aref (%sn-pointers pred)
+                                                       level)
+                                                 (%sn-addr node))))))
+                        (mark-node skip-list node)
+                        (loop for level from (1- top-level) downto 0 do
+                             (set-node-pointer
+                              skip-list (aref preds level) level
+                              (aref (%sn-pointers node) level)))
+                        (decf-skip-list-count skip-list)
+                        ;; Evict from BOTH caches BEFORE handing the address
+                        ;; back to the allocator -- see
+                        ;; INVALIDATE-CACHED-SKIP-NODE.
+                        (invalidate-cached-skip-node
+                         skip-list (%sn-addr node))
+                        ;; DEFER the free (GH #294): concurrent lock-free
+                        ;; walkers may still hold this address, and the
+                        ;; unlinked node's forward pointers remain valid
+                        ;; stepping stones only while its bytes survive.
+                        (with-recursive-lock-held
+                            ((%sl-length-lock skip-list))
+                          (push (%sn-addr node)
+                                (%sl-deferred-frees skip-list)))
+                        (return-from remove-from-skip-list t)))
+                 (%release-stripes locks)))))))))
 
 (defun node-forward (skip-list node)
   (unless (= 0 (aref (%sn-pointers node) 0))
