@@ -1813,6 +1813,41 @@ half of the ontology epic; a claim's endpoints, which may live in another
 store, are a namespace-level question (Chapter 18) rather than a node
 read across the boundary.
 
+*** Disjointness over vertex types (~def-disjoint~)
+
+~def-disjoint~ declares that no node may instantiate two of a set of
+classes (vivace-graph#157, unit 4a). A node's class is fixed at creation
+and nothing retypes it, so the set of classes a node instantiates is
+exactly its class's ancestors — a fact of the class graph, not of any
+node's data. The declaration is therefore a *schema lint*, not a
+commit-time constraint: it is checked against every defined node class
+when it is made, again whenever a node type is defined afterwards, and
+by an audit pass; it never runs on the commit path, since no write can
+change the answer.
+
+#+BEGIN_SRC lisp
+  (def-disjoint (observation fortification unclassified) :my-app
+    :name placemark-classes)        ; :NAME is required -- it IS the identity
+
+  (undef-disjoint :my-app :name placemark-classes)
+  (check-disjointness graph)
+    ;; => (values violations spec-count)
+#+END_SRC
+
+A declaration the class graph already contradicts — one class in the set
+a subtype of another, or a defined class inheriting from two — is an
+*error at definition*, not a silent no-op; and a class defined later
+under two of the set is refused as it is defined. The set is
+canonicalised, so ~(def-disjoint (a b) …)~ and ~(def-disjoint (b a) …)~
+are one declaration. A class not yet defined may be named and is checked
+when it appears.
+
+What this does *not* do: membership asserted by a *claim* — "subject S
+is a member of class C", the shape the deployed spatial tenant encodes in
+its relation strings — is a different feature (4b), a real constraint
+family that needs a membership representation the substrate does not
+yet have. It is deferred, not folded in.
+
 ** Chapter 9: The REST API (~rest.lisp~)
 
 While VivaceGraph is written in Common Lisp, your applications don't have to be. VivaceGraph includes a built-in, high-performance web server that exposes a complete RESTful API for graph operations. This allows programs written in Python, JavaScript, Java, or any other language to create, read, update, and delete nodes and edges over standard HTTP.

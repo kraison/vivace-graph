@@ -270,6 +270,9 @@
                 #:def-domain-range #:undef-domain-range
                 #:domain-range-violation #:check-domain-range-constraints
                 #:drv-reason #:drv-end #:drv-actual
+                ;; Disjointness (GH #157, 4a)
+                #:def-disjoint #:undef-disjoint #:disjointness-violation
+                #:djv-offender #:check-disjointness
                 ;; index-backed generator predicates (GH #102)
                 #:find-by-slot/4
                 #:find-slot-range/5

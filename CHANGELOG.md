@@ -13,6 +13,22 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Added
 
+- **Disjointness over vertex types, as a schema lint** (#157 unit 4a).
+  `def-disjoint` declares that no node instantiates two of a set of
+  classes. Because a node's class is fixed at creation, the answer is
+  decided by the class graph alone, so it is checked at `def-disjoint`
+  time against every defined node class, again whenever a node type is
+  defined later (a new `*node-type-definition-hooks*` list in
+  `%install-node-type`, run for source and runtime schema alike), and by
+  `check-disjointness` — never on the commit path. A declaration that the
+  class graph already contradicts (a class that is a subtype of another in
+  the set, or one that inherits from two) is an error at definition, not
+  a silent no-op. `:name` is mandatory and is the identity; the set is
+  canonicalised so either argument order is one declaration. Sixth
+  registry. Claim-asserted membership (4b) is a different feature and is
+  not built; `def-node-type` / `def-vertex` now agree that the superclass
+  list is single-inheritance by convention only.
+
 - **Domain and range constraints on edges** (#156, ontology unit 3).
   `def-domain-range` declares the classes an edge type's endpoints may
   have — `:domain` for `from`, `:range` for `to`, each a class or a list,

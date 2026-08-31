@@ -723,6 +723,13 @@ empty cache (review round 3, I-1)."
             (setf (gethash key *schema-manifest-type-cache*)
                   sans-time)))))))
 
+(defvar *node-type-definition-hooks* '()
+  "Functions of one argument, a just-defined node type's NAME, run by
+%INSTALL-NODE-TYPE after the class is finalized and before its helpers
+are installed.  A schema lint that must see every later definition
+registers here (disjointness.lisp, GH #157) rather than being forward-
+referenced from this file.  A hook that signals refuses the definition.")
+
 (defun %install-node-type (meta)
   "Everything DEF-NODE-TYPE's expansion does except the DEFCLASS: warn on
 cross-store divergence, finalize the class, install the generated
@@ -735,6 +742,8 @@ named by META must already exist.  Returns META (GH #172)."
     ;; FIXME: why is this necessary when inheriting from another node
     ;; subclass?
     (finalize-inheritance (find-class name))
+    (dolist (hook *node-type-definition-hooks*)
+      (funcall hook name))
     (%install-node-helpers name kind (node-type-graph-name meta))
     (when (eq kind :edge)
       (%install-edge-functors name))
@@ -760,7 +769,10 @@ time, not from this form -- namespace and default store are independent axes
 (GH #167); the generated helpers and functors are interned in NAME's own
 package (GH #172).
 
-PARENT-TYPES is a single-inheritance superclass list ending in VERTEX or EDGE.
+PARENT-TYPES is the superclass list, ending in VERTEX or EDGE.  Single
+inheritance is the convention; the macro enforces neither, and DEFCLASS
+accepts several -- a DEF-DISJOINT declaration is what forbids a class
+under two of a set (GH #157).
 SLOT-SPECS are CLOS-style slot definitions (a bare symbol, or (name :type ...)
 etc.); an :accessor and :initarg are supplied automatically when omitted.
 
@@ -800,7 +812,8 @@ not already known there (GH #167, R1/R3)."
 (defmacro def-vertex (name parent-types slot-specs graph-name &key keep-revisions)
   "Define a vertex (node) type NAME whose default store is GRAPH-NAME.
 
-PARENT-TYPES is a list of other vertex types to inherit from (often empty);
+PARENT-TYPES is a list of other vertex types to inherit from (often empty;
+single inheritance is the convention, not enforced -- see DEF-NODE-TYPE);
 VERTEX is appended automatically.  SLOT-SPECS are CLOS-style typed slots.
 Generates MAKE-NAME / LOOKUP-NAME / NAME-P and slot accessors.  Example:
   (def-vertex user () ((username :type string)) :social-app)

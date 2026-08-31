@@ -412,6 +412,10 @@
            #:drv-edge-type #:drv-end #:drv-reason #:drv-actual
            #:drv-expected #:drv-node-id #:drv-endpoint-id
            #:check-domain-range-constraints
+           ;; Disjointness over vertex types (GH #157, 4a)
+           #:def-disjoint #:undef-disjoint #:disjointness-violation
+           #:djv-classes #:djv-offender #:djv-name
+           #:check-disjointness
            #:vc-violation-spec #:vc-violation-node-id
            #:vc-violation-class-name #:vc-violation-slot
            #:vc-violation-actual #:vc-violation-expected

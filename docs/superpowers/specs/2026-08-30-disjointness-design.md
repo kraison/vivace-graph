@@ -1,6 +1,10 @@
 # Disjointness — membership, ownership and trigger
 
-**Status:** design note, not approved, not implemented
+**Status:** 4a IMPLEMENTED 2026-08-31 (`disjointness.lisp`: `def-disjoint`,
+`*node-type-definition-hooks*`, `check-disjointness`); 4b open — the
+membership-claim shape is undecided (see "What this note does NOT decide");
+open question 3 is answered by the evaluator note: 4b reads membership
+claims through the commit view when it is built
 **Issue:** #157 (unit 4 of the ontology epic, #109)
 **Branch:** `experiment` (no release; see #109)
 

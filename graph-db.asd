@@ -146,6 +146,9 @@
                ;; Domain and range (GH #156): the other endpoint, through
                ;; the commit view.
                (:file "domain-range" :depends-on ("value-constraint"))
+               ;; Disjointness over vertex types (GH #157, 4a): a schema
+               ;; lint, hooked into %INSTALL-NODE-TYPE.
+               (:file "disjointness" :depends-on ("schema" "index"))
                ;; The per-(owner . slot) spatial index registry.  Loaded LAST so it
                ;; can see the MOP helpers (node-class), the graph, the memory-graph
                ;; backend and the ordered-index factory; TRANSACTIONS.LISP,
@@ -651,6 +654,7 @@ cl-temporal-extent."
                (:file "value-constraint-tests")     ; GH #149
                (:file "cardinality-tests")          ; GH #155
                (:file "domain-range-tests")         ; GH #156
+               (:file "disjointness-tests")         ; GH #157
                (:file "peer-unique-tests")
                (:file "peer-index-tests")
                (:file "open-hygiene-tests")    ; GH #222, #224
