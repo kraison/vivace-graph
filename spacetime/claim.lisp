@@ -65,6 +65,49 @@ string, [a-z0-9-] only.  The :CHECK behind the RELATION slot (GH #160)."
 (graph-db:register-schema-function
  'canonical-producer-p (lambda (v) (canonical-producer-p v)))
 
+(defun %extent-open-p (e)
+  (bound-unknown-p (extent-end e)))
+
+(defun %bound-same-p (a b)
+  "True when bounds A and B pin the same range."
+  (flet ((same (x y)
+           (or (and (eq x :unbounded) (eq y :unbounded))
+               (and (typep x 'local-time:timestamp)
+                    (typep y 'local-time:timestamp)
+                    (local-time:timestamp= x y)))))
+    (and (same (bound-earliest a) (bound-earliest b))
+         (same (bound-latest a) (bound-latest b)))))
+
+(defun transaction-extent-step (old new)
+  "True when a claim's transaction extent may go from OLD to NEW, both
+stored sexps: from absent to anything (a stamp, or a legacy claim being
+stamped, GH #148); open -> closed with the same start (RETRACT-CLAIM,
+GH #162); closed -> open starting no earlier than the close (re-assertion,
+%UPDATE-REGISTRATION-CLAIM).  Everything else -- clearing it, moving the
+start, re-closing, junk -- is refused.  The :TRANSITION behind the slot
+(GH #158): the audit field's rule, enforced at commit on every write path
+including REST, rather than only at the accessor."
+  (or (null old)
+      (and new
+           (handler-case
+               (let ((o (sexp->extent old))
+                     (n (sexp->extent new)))
+                 (or (and (%extent-open-p o) (not (%extent-open-p n))
+                          (%bound-same-p (extent-start o)
+                                         (extent-start n)))
+                     (and (not (%extent-open-p o)) (%extent-open-p n)
+                          (let ((closed (bound-latest (extent-end o)))
+                                (start (bound-earliest (extent-start n))))
+                            (and (typep closed 'local-time:timestamp)
+                                 (typep start 'local-time:timestamp)
+                                 (local-time:timestamp>= start closed))))))
+             (error () nil)))))
+
+;; A lambda, as the canonical-name predicates above: a redefinition takes
+;; effect immediately.
+(graph-db:register-schema-function
+ 'transaction-extent-step (lambda (o n) (transaction-extent-step o n)))
+
 (defparameter +claim-shared-slots+
   '((subject-namespace :initarg :subject-namespace
                        :accessor claim-subject-namespace)
@@ -232,7 +275,13 @@ RELATION and PRODUCER are canonical strings -- CANONICAL-RELATION-P and
 CANONICAL-PRODUCER-P, as :CHECK slot options on PARENT, enforced at commit
 on every write path (GH #160).  A keyword is refused, and so is a case or
 whitespace variant: both slots are in the identity tuple, so a variant
-would be a second claim rather than an update."
+would be a second claim rather than an update.
+
+The TRANSACTION STAMP is a :TRANSITION constraint on PARENT --
+TRANSACTION-EXTENT-STEP: start immutable, end closeable once, re-openable
+by a later re-assertion -- enforced at commit on every write path, REST
+included (GH #148, #158, #162).  The accessor's own refusal stays as the
+fast-fail with the better error site."
   (let ((unary (intern (format nil "~A-UNARY" parent)))
         (binary (intern (format nil "~A-BINARY" parent))))
     `(progn
@@ -254,6 +303,13 @@ would be a second claim rather than an update."
          :one-of +standings+
          :required t
          :name standing-vocabulary)
+       ;; The audit field's rule (GH #148/#162), as a commit-time check
+       ;; rather than an accessor guard a raw slot write walks past --
+       ;; which REST-PUT-VERTEX does (GH #158).
+       (graph-db:def-value-constraint ,parent transaction-extent-sexp
+           ,graph-name
+         :transition transaction-extent-step
+         :name transaction-extent-transition)
        ;; The unary constraint goes on UNARY, never on PARENT: PARENT has
        ;; exactly the unary slot set, so declaring it there would bind
        ;; BINARY too (CLASS-UNIQUE-TUPLE-SPECS matches on SUBTYPEP) and

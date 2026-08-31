@@ -1682,6 +1682,65 @@ A note on implementations: the hot vector-decode path has an SBCL-specific fast 
 
 This final part of the manual covers advanced features that allow VivaceGraph to integrate with a broader ecosystem of tools and services. We will explore the built-in REST API, the replication system for high availability, and the procedures for backing up and restoring your database.
 
+*** Value constraints (~def-value-constraint~)
+
+A *value constraint* is a declarative rule about one slot's value,
+enforced at commit — inside the manager-locked, pre-durability region
+where unique constraints are checked — and surveyable by an audit pass.
+It is the third schema registry beside indexes and unique constraints
+and shares their identity rule: a *named* declaration replaces rather
+than stacks (GH #139/#140), so name anything a macro emits.
+
+#+BEGIN_SRC lisp
+  (def-value-constraint doc status :my-app
+    :one-of '(:draft :final :withdrawn)     ; a closed vocabulary
+    :required t                             ; and never NIL
+    :name doc-status)
+
+  (def-value-constraint claim recorded-at :my-app
+    :write-once t                           ; settable once, never revised
+    :name claim-recorded-at)
+
+  (def-value-constraint doc status :my-app
+    :transition doc-status-step             ; a named (OLD NEW) predicate
+    :name doc-status-step)
+
+  (undef-value-constraint doc :my-app :name doc-status)
+  (check-value-constraints graph :vertex-type 'doc)
+    ;; => (values violations checked spec-count unaudited-count)
+#+END_SRC
+
+~:one-of~ is *evaluated*, so it can name an existing vocabulary
+constant. Without ~:required~, NIL is exempt — "if present, it must be
+one of these" — matching ~def-unique~'s null rule on purpose. A
+~def-vertex~ slot can also carry a ~:check~ option naming a schema
+function of one argument (Chapter 17's runtime schema); it is enforced
+by the same evaluator but lives on the class, not in this registry.
+
+**Write-once and transitions** (vivace-graph#158). ~:write-once t~
+means the slot is settable at creation, or later while it is still NIL,
+and never revised after — clearing it counts as a revision. It is the
+degenerate case of ~:transition~, which names a function registered
+with ~register-schema-function~ taking the *committed* value and the
+*proposed* value and answering whether that change is legal. A create
+is never a transition violation; an unchanged value is always allowed;
+an unregistered name refuses loudly at check time rather than letting
+every change through. Enforced on every write path — ~copy~/~save~ and
+the REST ~PUT~ alike — because the evaluator reads the pre-image from
+the transaction's own write record through a *commit view*, the
+transaction's writes overlaid on the store. The spacetime substrate
+uses this for the claim's transaction stamp: start immutable, end
+closeable once (retraction), re-openable by a later re-assertion.
+
+⚠ ~check-value-constraints~ returns *four* values, and the last one
+matters: a transition is a fact about a *change*, and an audit over a
+quiescent graph sees none, so transition specs are counted in
+~unaudited-count~ and never appear in ~violations~. Zero violations over
+a schema that is all transitions is an unchecked graph, not a clean one.
+Likewise ~spec-count~ counts this registry's declarations only — a
+schema constrained purely by ~:check~ reports 0 specs and is still
+audited.
+
 ** Chapter 9: The REST API (~rest.lisp~)
 
 While VivaceGraph is written in Common Lisp, your applications don't have to be. VivaceGraph includes a built-in, high-performance web server that exposes a complete RESTful API for graph operations. This allows programs written in Python, JavaScript, Java, or any other language to create, read, update, and delete nodes and edges over standard HTTP.

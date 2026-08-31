@@ -28,7 +28,7 @@ Dependencies (bordeaux-threads, alexandria, cffi, uuid, cl-store, hunchentoot, n
 ## Tests
 
 **There IS an automated test framework** — FiveAM, ~50 files across `tests/` and its
-subdirectories, **3,359 checks** as of 2026-08-08. Run a suite through ASDF:
+subdirectories, **5,035 checks** as of 2026-08-31. Run a suite through ASDF:
 
 ```
 (asdf:test-system :graph-db)              ; the main suite

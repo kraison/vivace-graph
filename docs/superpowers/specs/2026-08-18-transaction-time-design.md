@@ -130,6 +130,11 @@ a determined or careless tenant can overwrite a stamp, and nothing in the
 engine will refuse it. This is the first concrete requirement for #109's
 next unit and should be cited there.
 
+*Closed by #158:* `def-claim-classes` now declares the stamp as a
+`:transition` constraint, `transaction-extent-step`, enforced at commit on
+every write path including `rest-put-vertex`. The accessor guard remains
+as the fast-fail with the better error site.
+
 **Addendum (#162).** One change after creation is sanctioned: *closing*
 the period. `retract-claim` writes `[recorded, at)` — the `[recorded,
 superseded)` named above — and is the only writer that does so; the

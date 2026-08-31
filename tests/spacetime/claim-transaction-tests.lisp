@@ -285,6 +285,22 @@ weakening into counting values instead of keys."
 ;;; --- A claim predating the axis is indeterminate, not the epoch
 ;;; (GH #148) ---
 
+(defmacro with-legacy-stamps (&body body)
+  "Run BODY with CT-CLAIM's transaction-stamp transition withdrawn, so a
+test can fabricate a claim written before the axis -- raw slot NIL --
+which is exactly the write #158 now refuses on every live path.  The
+declaration is re-emitted after, by its NAME, in DEF-CLAIM-CLASSES's
+package (GH #152: a same-named symbol elsewhere withdraws nothing)."
+  `(unwind-protect
+        (progn
+          (graph-db:undef-value-constraint ct-claim :graph-db-claim-test
+            :name graph-db.spacetime::transaction-extent-transition)
+          ,@body)
+     (graph-db:def-value-constraint ct-claim
+         graph-db.spacetime::transaction-extent-sexp :graph-db-claim-test
+       :transition graph-db.spacetime::transaction-extent-step
+       :name graph-db.spacetime::transaction-extent-transition)))
+
 (test a-claim-predating-the-axis-reports-indeterminate-not-the-epoch
   "⚠ The whole migration story rests on this.  NIL must never read as the
 epoch: a fabricated audit time is worse than an admitted unknown (#148)."
@@ -292,11 +308,12 @@ epoch: a fabricated audit time is worse than an admitted unknown (#148)."
     (declare (ignorable g))
     (with-transaction () (make-u :subject "s1"))
     (let ((c (first (claims-touching g 'ct-claim :ns "s1"))))
-      (with-transaction ()
-        (let ((copy (graph-db::copy c)))
-          ;; The raw slot, which is exactly what an old on-disk node has.
-          (setf (claim-transaction-extent-sexp copy) nil)
-          (graph-db::save copy)))
+      (with-legacy-stamps
+        (with-transaction ()
+          (let ((copy (graph-db::copy c)))
+            ;; The raw slot, which is exactly what an old on-disk node has.
+            (setf (claim-transaction-extent-sexp copy) nil)
+            (graph-db::save copy))))
       (let ((c2 (first (claims-touching g 'ct-claim :ns "s1"))))
         (is (null (claim-transaction-extent c2)))
         (multiple-value-bind (ts standing) (claim-recorded-at c2)
@@ -390,10 +407,11 @@ fabricated."
   (with-claim-graph (g)
     (with-transaction () (make-u :subject "s2"))
     (let ((c (first (claims-touching g 'ct-claim :ns "s2"))))
-      (with-transaction ()
-        (let ((copy (graph-db::copy c)))
-          (setf (claim-transaction-extent-sexp copy) nil)
-          (graph-db::save copy)))
+      (with-legacy-stamps
+        (with-transaction ()
+          (let ((copy (graph-db::copy c)))
+            (setf (claim-transaction-extent-sexp copy) nil)
+            (graph-db::save copy))))
       (let ((legacy (first (claims-touching g 'ct-claim :ns "s2"))))
         (is (null (claim-transaction-extent legacy)) "fixture: unstamped")
         (is-true (claim-current-p legacy) "absence is not retraction")
@@ -419,4 +437,65 @@ walk the end forward."
                 (first (claims-touching g 'ct-claim :ns "s3")))))
         (is-true (local-time:timestamp= first-at
                                         (bound-earliest (extent-end e))))))))
+
+;;; --- The stamp is enforced at commit, not only at the accessor (GH #158) --
+
+(test the-stamp-cannot-be-cleared-or-moved-at-commit
+  "GH #158.  Before this the accessor refused and the raw slot did not; a
+COPY/SETF/SAVE -- or a REST put -- could clear or rewrite any claim's
+audit field.  Now TRANSACTION-EXTENT-STEP refuses both at commit."
+  (with-claim-graph (g)
+    (with-transaction () (make-u :subject "s4"))
+    (let* ((c (first (claims-touching g 'ct-claim :ns "s4")))
+           (stamp (claim-transaction-extent-sexp c)))
+      (signals graph-db:value-constraint-violation
+        (with-transaction ()
+          (let ((copy (graph-db::copy c)))
+            (setf (claim-transaction-extent-sexp copy) nil)
+            (graph-db::save copy))))
+      (signals graph-db:value-constraint-violation
+        (with-transaction ()
+          (let ((copy (graph-db::copy c)))
+            (setf (claim-transaction-extent-sexp copy)
+                  (extent->sexp (graph-db.spacetime::%open-transaction-extent
+                                 (ts 2020 1 1))))
+            (graph-db::save copy))))
+      (is (equal stamp (claim-transaction-extent-sexp
+                        (first (claims-touching g 'ct-claim :ns "s4"))))
+          "the stamp is exactly what it was"))))
+
+(test transaction-extent-step-admits-exactly-the-substrate-s-own-moves
+  "The rule, as a table.  (NIL x) is a stamp or a legacy claim being
+stamped; open -> closed same start is RETRACT-CLAIM; closed -> open no
+earlier than the close is re-assertion.  Everything else is refused."
+  (let* ((t1 (ts 2026 1 1)) (t2 (ts 2026 6 1)) (t3 (ts 2026 9 1))
+         (open-t1 (extent->sexp
+                   (graph-db.spacetime::%open-transaction-extent t1)))
+         (open-t2 (extent->sexp
+                   (graph-db.spacetime::%open-transaction-extent t2)))
+         (closed-t1-t2 (extent->sexp
+                        (make-interval (exact-bound t1) (exact-bound t2)
+                                       :semantics :transaction
+                                       :standing :asserted)))
+         (closed-t2-t3 (extent->sexp
+                        (make-interval (exact-bound t2) (exact-bound t3)
+                                       :semantics :transaction
+                                       :standing :asserted)))
+         (open-t3 (extent->sexp
+                   (graph-db.spacetime::%open-transaction-extent t3))))
+    (is-true (transaction-extent-step nil open-t1) "a stamp")
+    (is-true (transaction-extent-step open-t1 closed-t1-t2) "a retraction")
+    (is-false (transaction-extent-step open-t1 closed-t2-t3)
+              "a close that moves the start")
+    (is-true (transaction-extent-step closed-t1-t2 open-t2)
+             "re-asserted at the close")
+    (is-true (transaction-extent-step closed-t1-t2 open-t3)
+             "re-asserted later")
+    (is-false (transaction-extent-step closed-t1-t2 open-t1)
+              "re-asserted BEFORE the close: a rewrite of history")
+    (is-false (transaction-extent-step open-t1 nil) "clearing")
+    (is-false (transaction-extent-step open-t1 open-t2) "moving the start")
+    (is-false (transaction-extent-step closed-t1-t2 closed-t2-t3)
+              "re-closing")
+    (is-false (transaction-extent-step open-t1 '(:junk)) "junk is refused")))
 

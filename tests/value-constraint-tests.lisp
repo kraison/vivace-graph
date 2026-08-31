@@ -429,3 +429,181 @@ passes :VERTEX-TYPE, leaving it untested."
       (is (= 1 (length violations)))
       (is (= 1 checked))
       (is (= 1 specs)))))
+
+;;; --- :TRANSITION / :WRITE-ONCE and the commit view (GH #158) --------------
+
+(defun %vc-update (node slot value)
+  "COPY NODE inside a transaction, SETF SLOT to VALUE, SAVE -- the ordinary
+update idiom, and the tx-update whose OLD-NODE the evaluator now sees."
+  (with-transaction ()
+    (let ((c (copy node)))
+      (setf (slot-value c slot) value)
+      (save c))))
+
+(defun %vc-current (node)
+  (lookup-vertex (id node)))
+
+(test write-once-registers-as-a-transition-spec
+  (%vc-clear)
+  (def-value-constraint vc-doc status :graph-db-vc-test
+    :write-once t :name vc-status-once)
+  (is (= 1 (length (%vc-specs))))
+  (is (eq :write-once
+          (graph-db::value-constraint-spec-transition (first (%vc-specs)))))
+  (%vc-clear))
+
+(test write-once-and-transition-together-are-refused
+  (signals error
+    (eval '(graph-db:def-value-constraint vc-doc status :graph-db-vc-test
+            :write-once t :transition vc-anything :name vc-both))))
+
+(test a-transition-that-is-not-a-name-is-refused
+  (signals error
+    (graph-db::register-value-constraint-spec
+     (graph-db::make-value-constraint-spec
+      :owner-name 'vc-doc :slot-name 'status :graph-name :graph-db-vc-test
+      :transition (lambda (o n) (declare (ignore o n)) t)
+      :name 'vc-lambda))))
+
+(test a-write-once-slot-is-settable-at-creation-and-once-after
+  "GH #158.  NIL is 'not yet written': a create passes, NIL -> value
+passes once, value -> value is refused, value -> NIL (clearing the audit
+field) is refused, and an update to an UNRELATED slot still commits."
+  (%vc-clear)
+  (with-vc-graph (g)
+    (declare (ignorable g))
+    (def-value-constraint vc-doc status :graph-db-vc-test
+      :write-once t :name vc-status-once)
+    (let ((created (%vc-make g :status :draft :note "n")))
+      (is (eq :draft (vc-doc-status created)) "a create is never refused")
+      (signals value-constraint-violation
+        (%vc-update created 'status :final))
+      (is (eq :draft (vc-doc-status (%vc-current created)))
+          "the refused write left the slot as it was")
+      (signals value-constraint-violation
+        (%vc-update created 'status nil))
+      (finishes (%vc-update (%vc-current created) 'note "changed"))
+      (is (string= "changed" (vc-doc-note (%vc-current created)))
+          "an unrelated update is not a transition of STATUS"))
+    (let ((blank (%vc-make g :status nil)))
+      (finishes (%vc-update blank 'status :draft))
+      (is (eq :draft (vc-doc-status (%vc-current blank)))
+          "the first write may come after creation")
+      (signals value-constraint-violation
+        (%vc-update (%vc-current blank) 'status :final))))
+  (%vc-clear))
+
+(test rewriting-a-write-once-slot-to-its-own-value-is-not-a-change
+  (%vc-clear)
+  (with-vc-graph (g)
+    (declare (ignorable g))
+    (def-value-constraint vc-doc status :graph-db-vc-test
+      :write-once t :name vc-status-once)
+    (let ((v (%vc-make g :status :draft)))
+      (finishes (%vc-update v 'status :draft))))
+  (%vc-clear))
+
+(test an-unrelated-update-of-a-node-holding-an-object-is-not-a-change
+  "⚠ Found by the spacetime suite: a write-once slot holding a TIMESTAMP
+(or any object) reads back as a fresh instance on every deserialization,
+so the pre-image and the copy are never EQUAL.  'Unchanged' must mean
+the same STORED value, or every unrelated update is refused (GH #158)."
+  (%vc-clear)
+  (with-vc-graph (g)
+    (declare (ignorable g))
+    (def-value-constraint vc-doc note :graph-db-vc-test
+      :write-once t :name vc-note-once)
+    (let ((v (%vc-make g :status :draft
+                         :note (local-time:encode-timestamp
+                                0 0 0 12 1 1 2026))))
+      (finishes (%vc-update v 'status :final)
+                "an update that never touches NOTE must commit")
+      (signals value-constraint-violation
+        (%vc-update (%vc-current v) 'note
+                    (local-time:encode-timestamp 0 0 0 13 1 1 2026))
+        "a real change is still refused")))
+  (%vc-clear))
+
+(test a-transition-function-decides-which-changes-are-legal
+  "GH #158.  :TRANSITION names an (OLD NEW) schema function; :WRITE-ONCE
+is its degenerate case.  Forward-only here: draft -> final is a step,
+final -> draft is not."
+  (%vc-clear)
+  (graph-db:register-schema-function
+   'vc-forward-only
+   (lambda (old new)
+     (let ((order '(:draft :final :withdrawn)))
+       (< (or (position old order) -1) (or (position new order) -1)))))
+  (with-vc-graph (g)
+    (declare (ignorable g))
+    (def-value-constraint vc-doc status :graph-db-vc-test
+      :transition vc-forward-only :name vc-status-step)
+    (let ((v (%vc-make g :status :draft)))
+      (finishes (%vc-update v 'status :final))
+      (signals value-constraint-violation
+        (%vc-update (%vc-current v) 'status :draft))
+      (is (eq :final (vc-doc-status (%vc-current v))))
+      (let ((e (handler-case
+                   (progn (%vc-update (%vc-current v) 'status :draft) nil)
+                 (value-constraint-violation (e) e))))
+        (is (eq :transition-refused (graph-db::vcv-reason e)))
+        (is (eq 'vc-forward-only (graph-db::vcv-expected e))
+            "the report names the transition that refused")
+        (is (search "VC-FORWARD-ONLY" (princ-to-string e))))))
+  (%vc-clear))
+
+(test an-unresolved-transition-function-signals-at-check-time
+  "As :CHECK does (GH #172): the name is resolved when a change is
+evaluated, so an image that never registered it refuses loudly rather
+than letting every change through."
+  (%vc-clear)
+  (with-vc-graph (g)
+    (declare (ignorable g))
+    (def-value-constraint vc-doc status :graph-db-vc-test
+      :transition vc-never-registered :name vc-status-step)
+    (let ((v (%vc-make g :status :draft)))
+      (finishes (%vc-update v 'status :draft) "no change: never consulted")
+      (signals graph-db::schema-function-unresolved
+        (%vc-update (%vc-current v) 'status :final))))
+  (%vc-clear))
+
+(test the-audit-pass-counts-the-transitions-it-cannot-check
+  "GH #158.  A transition is a fact about a change; a store-only view sees
+none.  The fourth value is what stops '0 violations' reading as audited."
+  (%vc-clear)
+  (with-vc-graph (g)
+    (def-value-constraint vc-doc status :graph-db-vc-test
+      :write-once t :name vc-status-once)
+    (def-value-constraint vc-doc note :graph-db-vc-test
+      :required t :name vc-note)
+    (%vc-make g :status :draft :note "n")
+    (multiple-value-bind (violations checked specs unaudited)
+        (check-value-constraints g :vertex-type 'vc-doc)
+      (is (null violations))
+      (is (= 1 checked))
+      (is (= 2 specs))
+      (is (= 1 unaudited) "one of the two specs is a transition")))
+  (%vc-clear))
+
+(test rest-put-cannot-rewrite-a-write-once-slot
+  "⚠ The live hole #158 was filed for: REST-PUT-VERTEX writes raw slots
+inside a transaction, past every accessor guard.  It is a TX-UPDATE like
+any other, so the same transition refuses it."
+  (%vc-clear)
+  (with-vc-graph (g)
+    (declare (ignorable g))
+    (def-value-constraint vc-doc status :graph-db-vc-test
+      :write-once t :name vc-status-once)
+    (let* ((v (%vc-make g :status :draft))
+           (params (list (cons "username" "u") (cons "password" "p")
+                         (cons :graph-name
+                               (json:lisp-to-camel-case
+                                (symbol-name *vc-graph-name*)))
+                         (cons :node-id (string-id (id v)))
+                         (cons "status" "rewritten"))))
+      (with-rest-env ()
+        (signals value-constraint-violation
+          (graph-db::rest-put-vertex params)))
+      (is (eq :draft (vc-doc-status (%vc-current v))))))
+  (%vc-clear))
+

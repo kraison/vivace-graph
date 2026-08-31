@@ -70,8 +70,9 @@ predates the axis (GH #148).  NIL is INDETERMINATE, never the epoch."
 TRANSACTION-EXTENT-IMMUTABLE if CLAIM already has one -- an audit field is
 written at creation and not revised (GH #148).  The one sanctioned change
 after that is CLOSING the period, and RETRACT-CLAIM is its only writer
-(GH #162).  Writing CLAIM-TRANSACTION-EXTENT-SEXP bypasses this;
-engine-level enforcement waits on a constraint family (#109, #158)."
+(GH #162).  Writing CLAIM-TRANSACTION-EXTENT-SEXP bypasses this guard
+but not the commit: TRANSACTION-EXTENT-STEP refuses the same changes on
+every write path, REST included (GH #158)."
   (when (claim-transaction-extent-sexp claim)
     (error 'transaction-extent-immutable))
   (setf (claim-transaction-extent-sexp claim)

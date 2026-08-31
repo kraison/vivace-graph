@@ -13,6 +13,24 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Added
 
+- **A slot can be declared write-once, or constrained by a named
+  transition** (#158, ontology unit 5). `def-value-constraint` gains
+  `:write-once t` — settable at creation or while still NIL, never revised,
+  never cleared — and `:transition <name>`, a schema function of
+  `(old new)` deciding whether a change is legal; write-once is its
+  degenerate case. Enforced at commit on every write path, including
+  `rest-put-vertex`, which writes raw slots past every accessor guard and
+  was the live hole #148 recorded. The evaluator reads the pre-image
+  through a **commit view** (`make-commit-view`, `view-old-node`) — the
+  transaction's writes overlaid on the store, store-only for the audit
+  pass — built once per commit and shared by every constraint family
+  (evaluator design note, #109). `check-value-constraints` returns a
+  fourth value: how many specs are transitions and therefore could not be
+  audited; zero violations over those is not a clean graph. The spacetime
+  substrate declares its transaction stamp as `transaction-extent-step`:
+  start immutable, end closeable once (#162's retraction), re-openable by
+  a later re-assertion — so #148's "known limitation" is closed.
+
 - **Claims can be retracted, and registration retracts the regions a
   subject has left** (#162). `retract-claim` closes a claim's transaction
   period at `:at` — `[recorded, retracted)`, standing `:asserted` — and
