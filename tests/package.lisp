@@ -259,6 +259,7 @@
                 #:undef-index
                 #:undef-unique
                 #:schema-withdrawal-matched-nothing   ; GH #152
+                #:schema-classes-not-loaded           ; GH #144
                 ;; declarative value constraints (GH #149)
                 #:def-value-constraint
                 #:undef-value-constraint

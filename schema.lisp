@@ -853,6 +853,39 @@ Example:
                           (node-type-keep-revisions meta2))))
             new-slots removed-slots)))
 
+(define-condition schema-classes-not-loaded (error)
+  ((graph-name :initarg :graph-name :reader scnl-graph-name)
+   (location   :initarg :location   :reader scnl-location)
+   (missing    :initarg :missing    :reader scnl-missing))
+  (:report
+   (lambda (c s)
+     (format s "Cannot open graph ~S at ~A: ~D node type~:P in its ~
+                schema.dat have no CLOS class in this image:~{ ~S~}.  ~
+                schema.dat persists type METADATA (ids, names, slots) ~
+                for type-id stability -- never classes -- so the ~
+                schema's DEF-VERTEX / DEF-EDGE forms must be loaded ~
+                BEFORE OPEN-GRAPH.  Nothing is corrupt and no recovery ~
+                is needed (GH #144)."
+             (scnl-graph-name c) (scnl-location c)
+             (length (scnl-missing c)) (scnl-missing c)))))
+
+(defun %check-schema-classes-loaded (graph)
+  "Signal SCHEMA-CLASSES-NOT-LOADED naming EVERY restored node type with
+no CLOS class, rather than letting the open die later with a bare
+CLASS-NOT-FOUND-ERROR from GC-HEAP's node sweep -- an error that never
+mentions the schema, from a store that was never corrupt (GH #144).
+Runs on the reopen path only, after the schema.dat restore and before
+.dirty is written, so a failed open strands nothing."
+  (let ((missing (remove-if (lambda (name) (find-class name nil))
+                            (mapcar #'first
+                                    (%store-schema-claims
+                                     (schema graph))))))
+    (when missing
+      (error 'schema-classes-not-loaded
+             :graph-name (graph-name graph)
+             :location (location graph)
+             :missing missing))))
+
 (defun %store-schema-claims (schema)
   "(values CLAIMS HIGHEST) for SCHEMA's persisted type table.
 

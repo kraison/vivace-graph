@@ -864,7 +864,12 @@ policy.dat's ~S; the file wins."
                 ;; Locks aren't persisted; rebuild the per-class rw-locks for
                 ;; the restored types (otherwise schema-class-locks is nil and
                 ;; def-vertex/def-edge and with-*-locked-class fail -- #32).
-                (restore-schema-locks (schema graph))))
+                (restore-schema-locks (schema graph))
+                ;; Fail CLEARLY when the schema's classes are not in this
+                ;; image, before anything mutates and before .dirty is
+                ;; written -- not with GC-HEAP's bare CLASS-NOT-FOUND and a
+                ;; stranded recovery prompt (GH #144).
+                (%check-schema-classes-loaded graph)))
           ;; GH #170 Task 4: policy.dat is authoritative once it exists --
           ;; a supplied :RECOVERY-POLICY that disagrees only WARNS, never
           ;; overwrites it.  Absent, it is persisted only on the same

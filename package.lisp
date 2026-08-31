@@ -395,6 +395,8 @@
            ;; schema retraction: withdraw a declaration (GH #139, #140)
            #:undef-index #:undef-unique
            #:schema-withdrawal-matched-nothing              ; GH #152
+           #:schema-classes-not-loaded                      ; GH #144
+           #:scnl-graph-name #:scnl-location #:scnl-missing
            #:swmn-kind #:swmn-owner #:swmn-graph-name #:swmn-name #:swmn-slots
            ;; declarative value constraints (GH #149)
            #:def-value-constraint #:undef-value-constraint

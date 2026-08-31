@@ -158,6 +158,17 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Fixed
 
+- **Opening a graph whose schema file was never loaded now fails
+  clearly, and strands nothing** (#144). `schema.dat` persists type
+  *metadata* for type-id stability — never CLOS classes — so the schema's
+  `def-vertex` / `def-edge` forms must be loaded before `open-graph`. An
+  image that hadn't died deep in `gc-heap`'s node sweep with a bare
+  `class-not-found-error`, and the stranded `.dirty` turned the next open
+  into a recovery prompt for a store that was never corrupt. The reopen
+  now pre-flights the restored schema before `.dirty` is written and
+  signals `schema-classes-not-loaded`, naming the graph, every missing
+  type at once, and the actual cause.
+
 - **A schema withdrawal that matches nothing is now loud** (#152). Every
   `undef-*` macro — index, unique, value-constraint, cardinality,
   domain-range, disjointness — warns `schema-withdrawal-matched-nothing`

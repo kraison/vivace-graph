@@ -16,7 +16,9 @@
        x))
 (deftype email () `(satisfies email-p))
 
-;;; Schema
+;;; Schema.  ⚠ These forms must be LOADED before make-graph/open-graph:
+;;; schema.dat persists type metadata for id stability, never the CLOS
+;;; classes themselves (GH #144).
 (def-vertex person ()
   ((first-name :type string)
    (middle-name :type string)

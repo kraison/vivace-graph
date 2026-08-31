@@ -432,6 +432,48 @@ directories before dying on a raw FILE-ERROR (GH #246)."
       (is (null (graph-db:lookup-graph :oh-graph))
           "the refused MAKE-GRAPH must not have registered a graph"))))
 
+(test opening-without-the-schema-loaded-fails-clearly-and-strands-nothing
+  "GH #144.  A graph opened in an image that never loaded its DEF-VERTEX
+forms died with a bare CLASS-NOT-FOUND-ERROR from GC-HEAP's node sweep
+and stranded .dirty -- so the NEXT open demanded recovery for a store
+that was never corrupt.  Now the reopen pre-flights the restored schema:
+the error names the graph, the missing types and the actual cause, and
+.dirty is not left behind.  Simulated by removing the class between a
+clean close and the reopen -- what a fresh image looks like."
+  (with-temp-directory (dir)
+    (let ((path (namestring dir)))
+      (let ((g (make-graph :oh-graph path :buffer-pool-size 1000)))
+        (let ((*graph* g))
+          (with-transaction () (make-oh-thing :label "survivor")))
+        (close-graph g :snapshot-p nil))
+      (unwind-protect
+           (progn
+             (setf (find-class 'oh-thing) nil)
+             (let ((c (handler-case
+                          (let ((g (open-graph :oh-graph path
+                                               :buffer-pool-size 1000)))
+                            ;; a wrong success must not strand live mmaps
+                            (close-graph g :snapshot-p nil)
+                            nil)
+                        (schema-classes-not-loaded (c) c))))
+               (is-true c "the clear condition, not CLASS-NOT-FOUND")
+               (when c
+                 (is (member 'oh-thing (graph-db::scnl-missing c))
+                     "the missing type is named"))
+               (is (null (probe-file (%oh-dirty-file path)))
+                   "a failed open strands no .dirty")))
+        ;; Restore the class for every later test in this image.
+        (eval '(def-vertex oh-thing () ((label :type string)) :oh-graph)))
+      ;; With the schema back, the same store opens and reads clean.
+      (let ((g (open-graph :oh-graph path :buffer-pool-size 1000)))
+        (unwind-protect
+             (is (= 1 (length (map-vertices 'identity g
+                                            :vertex-type 'oh-thing
+                                            :collect-p t)))
+                 "nothing was ever corrupt")
+          (close-graph g :snapshot-p nil)))
+      (collect-garbage))))
+
 (test open-graph-dirty-refusal-is-named-with-location
   "OPEN-GRAPH's .dirty refusal must be STORE-NOT-CLOSED-CLEANLY-ERROR
 whose STORE-NOT-CLOSED-LOCATION names the store (GH #246); the
