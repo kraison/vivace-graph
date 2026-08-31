@@ -3071,9 +3071,18 @@ stops appearing in queries.  MARK-DELETED is the usual entry point.")
                     (prog1
                         (funcall fun)
                       (setf completed t))
-                 (when completed
-                   (funcall *end-of-transaction-action* *transaction*))
-                 (cleanup-transaction *transaction*)))))
+                 ;; The commit runs INSIDE this cleanup, and it signals --
+                 ;; VALIDATION-CONFLICT on every retry, and each
+                 ;; pre-durability refusal (unique, value, cardinality,
+                 ;; domain/range).  A signal in a cleanup form abandons the
+                 ;; forms after it, so CLEANUP-TRANSACTION must be its own
+                 ;; protected step or the transaction stays in the manager
+                 ;; table as :COMMITTING and pins the prune floor for the
+                 ;; life of the image (GH #150).
+                 (unwind-protect
+                      (when completed
+                        (funcall *end-of-transaction-action* *transaction*))
+                   (cleanup-transaction *transaction*))))))
       (loop
          (when (<= *maximum-transaction-attempts* attempt-count)
            (with-transaction-manager-lock (transaction-manager)

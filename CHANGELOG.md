@@ -158,6 +158,18 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Fixed
 
+- **A refused or retried commit no longer pins the prune floor** (#150).
+  `%commit` runs inside `call-with-transaction`'s cleanup form and
+  signals — `validation-conflict` on every retry, and each
+  pre-durability refusal (unique, value, cardinality, domain/range) — and
+  `cleanup-transaction` came *after* it in the same cleanup list, so it
+  never ran: the transaction stayed in the manager table as
+  `:committing`, `minimum-start-transaction-id` counted it, and committed
+  records accumulated behind that floor for the life of the image. Every
+  OCC retry leaked one. `cleanup-transaction` is now its own protected
+  step. Pre-existing; found by #149's review, and materially more
+  reachable now that declarative constraints refuse ordinary writes.
+
 - **Two allocation tests were flaky in the full suite** (#174).
   `sb-ext:get-bytes-consed` is process-wide, so a reaper, replication or
   peer thread allocating inside the measured window was charged to the

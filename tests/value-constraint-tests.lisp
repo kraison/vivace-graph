@@ -430,6 +430,34 @@ passes :VERTEX-TYPE, leaving it untested."
       (is (= 1 checked))
       (is (= 1 specs)))))
 
+(test a-refused-commit-leaves-no-committing-transaction-behind
+  "GH #150.  %COMMIT signals from inside CALL-WITH-TRANSACTION's cleanup
+form, and CLEANUP-TRANSACTION came AFTER it in the same cleanup list --
+so a refused commit left its transaction in the manager table in
+:COMMITTING state, where MINIMUM-START-TRANSACTION-ID counts it and the
+prune floor stays pinned for the life of the image.  The same path
+leaked every retried VALIDATION-CONFLICT.  After the refusal nothing
+must be in flight: the floor reads NIL."
+  (%vc-clear)
+  (with-vc-graph (g)
+    (def-value-constraint vc-doc status :graph-db-vc-test
+      :one-of +vc-statuses+ :name vc-status)
+    (let ((tm (graph-db::transaction-manager g)))
+      (signals value-constraint-violation
+        (with-transaction () (make-vc-doc :status :nonsense)))
+      (let ((in-flight 0))
+        (graph-db::do-transactions (tx tm)
+          (when (member (graph-db::state tx) '(:active :committing))
+            (incf in-flight)))
+        (is (zerop in-flight)
+            "~D transaction(s) still in flight after a refused commit"
+            in-flight))
+      (is (null (graph-db::minimum-start-transaction-id tm))
+          "a leaked :COMMITTING transaction pins the prune floor")
+      ;; and the store still works: the refusal took nothing with it
+      (finishes (with-transaction () (make-vc-doc :status :draft)))))
+  (%vc-clear))
+
 ;;; --- :TRANSITION / :WRITE-ONCE and the commit view (GH #158) --------------
 
 (defun %vc-update (node slot value)
