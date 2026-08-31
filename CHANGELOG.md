@@ -160,8 +160,10 @@ between releases; cutting a release renames it to the new version and dates it.
 
 - **A truncated snapshot can no longer be silently restored** (#127,
   breaking #146's silent data-loss chain). Three layers, each sufficient
-  alone: `snapshot` now writes under an `in-progress.*` name the
-  `^snap-` scan can never match and renames only after completion, so an
+  alone: `snapshot` now writes in a `txn-log/in-progress/` subdirectory
+  and renames the file up only after completion — same dot-free
+  basename, so `rename-file`'s type-merging cannot mangle the final
+  name and the historical `txn-log/snap-*` glob keeps working — so an
   interrupted writer leaves no `snap-` file; `backup` writes a format
   header first and a completion trailer last, making every new snapshot
   verifiable; and `find-newest-snapshot` — which picked by

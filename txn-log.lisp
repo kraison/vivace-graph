@@ -26,17 +26,26 @@
               (let* ((snap-file (format nil "~A/txn-log/snap-~D-~A"
                                         (location graph) (get-universal-time)
                                         (uuid:make-v4-uuid)))
-                     ;; Written under a name FIND-NEWEST-SNAPSHOT's ^snap-
-                     ;; scan can never match, renamed only once BACKUP has
-                     ;; written its completion trailer -- so an interrupted
-                     ;; snapshot, however it dies, never bears the snap-
-                     ;; name at all (GH #127).  The partial is deleted on
-                     ;; the way out; a crash that skips even that leaves
-                     ;; only an inert in-progress. file.
-                     (tmp-file (format nil "~A/txn-log/in-progress.~A"
+                     ;; Written in an in-progress/ SUBDIRECTORY -- where
+                     ;; FIND-NEWEST-SNAPSHOT's scan and the historical
+                     ;; "txn-log/snap-*" glob never look -- and renamed up
+                     ;; only once BACKUP has written its completion
+                     ;; trailer, so an interrupted snapshot never bears
+                     ;; the snap- name at all (GH #127).  The partial
+                     ;; keeps the SAME dot-free basename: RENAME-FILE
+                     ;; merges a missing TYPE from the old pathname, so a
+                     ;; dotted temp name ("in-progress.snap-X") comes out
+                     ;; the other side as "snap-X.snap-X" -- matching the
+                     ;; ^snap- regex but not the type-less glob every
+                     ;; operator script uses.  Measured, not guessed.
+                     ;; The partial is deleted on the way out; a crash
+                     ;; that skips even that leaves it inert in the
+                     ;; subdirectory.
+                     (tmp-file (format nil "~A/txn-log/in-progress/~A"
                                        (location graph)
                                        (file-namestring snap-file)))
                      (renamed nil))
+                (ensure-directories-exist tmp-file)
                 (unwind-protect
                      (progn
                        (setq count (backup graph tmp-file

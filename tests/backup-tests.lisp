@@ -761,13 +761,17 @@ partial is deleted on the way out."
                  (signals error
                    (graph-db:snapshot g :check-data-integrity-p nil))))
           (setf (fdefinition 'graph-db::backup) orig)))
-      (let ((leftovers (remove-if-not
-                        (lambda (f)
-                          (let ((n (file-namestring f)))
-                            (or (cl-ppcre:scan "^snap-" n)
-                                (cl-ppcre:scan "^in-progress" n))))
-                        (cl-fad:list-directory
-                         (format nil "~A/txn-log/" (namestring dir))))))
+      (let ((leftovers (append
+                        ;; nothing bearing the snap- name in txn-log/
+                        (remove-if-not
+                         (lambda (f)
+                           (cl-ppcre:scan "^snap-" (file-namestring f)))
+                         (cl-fad:list-directory
+                          (format nil "~A/txn-log/" (namestring dir))))
+                        ;; and no stranded partial in in-progress/
+                        (directory
+                         (format nil "~A/txn-log/in-progress/*"
+                                 (namestring dir))))))
         (is (null leftovers)
             "no snap- file and no stranded partial: ~S" leftovers)))))
 
