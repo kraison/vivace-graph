@@ -142,6 +142,15 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Fixed
 
+- **Two allocation tests were flaky in the full suite** (#174).
+  `sb-ext:get-bytes-consed` is process-wide, so a reaper, replication or
+  peer thread allocating inside the measured window was charged to the
+  code under test — only ever upward — and `point-in-ring-packed-conses-
+  nothing` (2.6× its 64-byte budget once, against a 47 KB regression it
+  guards) and `do-geometry-coordinates-zero-allocation` (exactly 0 bytes,
+  one window) could fail on a loaded host. Both now take the minimum over
+  five rounds, the idiom `node-class-tests` already used.
+
 - **Concurrent registrations of one subject no longer kill the batch**
   (#161). `register-node`'s idempotency lookup runs outside the
   transaction and OCC cannot see a phantom, so two registrations of the

@@ -88,14 +88,25 @@ must not re-box them one at a time on every read (GH #86: 47 KB/call on a
         (setf (aref ring (* 2 i))      (+ 30d0 (* 5d0 (cos th)))
               (aref ring (1+ (* 2 i))) (+ 50d0 (* 5d0 (sin th))))))
     (funcall (compile nil '(lambda (r) (point-in-ring-p 30d0 50d0 r))) ring) ; warm
-    (sb-ext:gc :full t)
+    ;; GET-BYTES-CONSED is process-wide: reapers, replication and peer
+    ;; threads allocating inside the window are charged to this loop, and
+    ;; only ever upward -- 163.76 bytes/call once, in the full suite, 2.6x
+    ;; the budget and three orders of magnitude under the 47 KB regression
+    ;; this guards.  The MINIMUM over several rounds is robust to that and
+    ;; still fails decisively on the real thing (GH #174; the idiom
+    ;; node-class-tests.lisp uses).
     (let* ((call (compile nil '(lambda (r) (point-in-ring-p 30d0 50d0 r))))
-           (before (sb-ext:get-bytes-consed)))
-      (dotimes (i 200) (funcall call ring))
-      (let ((per-call (/ (- (sb-ext:get-bytes-consed) before) 200)))
-        (is (< per-call 64)
-            "packed point-in-ring-p consed ~A bytes/call on a 740-vertex ring"
-            per-call)))))
+           (per-call
+             (loop repeat 5
+                   minimize (progn
+                              (sb-ext:gc :full t)
+                              (let ((before (sb-ext:get-bytes-consed)))
+                                (dotimes (i 200) (funcall call ring))
+                                (/ (- (sb-ext:get-bytes-consed) before)
+                                   200))))))
+      (is (< per-call 64)
+          "packed point-in-ring-p consed ~,1F bytes/call on a 740-vertex ring"
+          (float per-call)))))
 
 ;;; ---- boundary semantics ------------------------------------------------
 ;;;

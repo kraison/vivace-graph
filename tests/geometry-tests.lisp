@@ -110,16 +110,24 @@
                      collect (list (+ 37d0 (* 0.5d0 (cos (* 2 pi (/ i n)))))
                                    (+ 48d0 (* 0.5d0 (sin (* 2 pi (/ i n))))))))
          (poly (make-polygon (list (append ring (list (first ring)))))))
+    ;; GET-BYTES-CONSED is process-wide, and this asserts EXACTLY zero: one
+    ;; stray allocation on any other thread inside the window fails it.
+    ;; The minimum over several rounds is immune to that and still zero
+    ;; only when the loop itself allocates nothing (GH #174).
     (let ((c 0))
       (declare (fixnum c))
-      (let ((before #+sbcl (sb-ext:get-bytes-consed) #-sbcl 0))
-        (dotimes (rep 10)
-          (do-geometry-coordinates (lon lat) poly
-            (declare (ignore lon lat))
-            (incf c)))
-        (let ((after #+sbcl (sb-ext:get-bytes-consed) #-sbcl 0))
-          (is (= (* 10 (1+ n)) c))
-          (is (= 0 (- after before)) "Expected 0 bytes consed, but consed ~:D bytes" (- after before)))))))
+      (let ((consed
+              (loop repeat 5
+                    minimize
+                    (let ((before #+sbcl (sb-ext:get-bytes-consed) #-sbcl 0))
+                      (dotimes (rep 10)
+                        (do-geometry-coordinates (lon lat) poly
+                          (declare (ignore lon lat))
+                          (incf c)))
+                      (- #+sbcl (sb-ext:get-bytes-consed) #-sbcl 0 before)))))
+        (is (= (* 5 10 (1+ n)) c))
+        (is (= 0 consed)
+            "Expected 0 bytes consed, but consed ~:D bytes" consed)))))
 
 
 
