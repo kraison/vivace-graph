@@ -103,6 +103,14 @@ between releases; cutting a release renames it to the new version and dates it.
   #164's `unmeasured` holds the third slot because it is the value a
   caller must not ignore. An unmeasured region appears in neither list.
 
+### Removed
+
+- **`assign-transaction-id`** (#173), a generic with no callers whose
+  method allocated from the per-store counter — the policy #168 replaced
+  with `tm-next-epoch` (the image-level clock, per-store counter as the
+  fallback). A plausible-looking dead function that described the *old*
+  policy; `tm-next-epoch` is the named extension point.
+
 ### Changed
 
 - **A GEOS failure on one region no longer refuses the whole registration

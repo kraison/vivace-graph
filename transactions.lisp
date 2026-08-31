@@ -260,13 +260,6 @@ detach aborted and the store resumes its prior accepting state."
                                (lambda ()
                                  ,@body)))
 
-(defgeneric assign-transaction-id (transaction transaction-manager)
-  (:method (transaction transaction-manager)
-    (let ((new-id (tx-id-counter transaction-manager)))
-      (setf (transaction-id transaction) new-id)
-      (incf (tx-id-counter transaction-manager))
-      new-id)))
-
 ;;; Transactions
 (defgeneric transaction-manager (object)
   (:documentation
