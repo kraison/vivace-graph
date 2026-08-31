@@ -76,6 +76,10 @@ jobs:
             --eval '(asdf:initialize-source-registry
                       (list :source-registry
                             (list :tree (uiop:getcwd))
+                            (list :directory
+                                  (merge-pathnames
+                                   "work/sitrep-deps/cl-temporal-extent/"
+                                   (user-homedir-pathname)))
                             :ignore-inherited-configuration))' \
             --eval '(ql:quickload :graph-db :silent t)' \
             --eval '(asdf:test-system :graph-db)'
