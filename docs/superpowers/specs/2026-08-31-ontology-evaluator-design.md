@@ -1,6 +1,6 @@
 # Ontology evaluator — pre-image, delta and the other endpoint
 
-**Status:** design note, not approved, not implemented
+**Status:** design note, APPROVED 2026-08-31 (Kevin), implementation begins with #158
 **Issues:** #109 (epic); decides once for #158 (unit 5), #155 (unit 2),
 #156 (unit 3); #157's 4b inherits it (disjointness note, open question 3)
 **Branch:** `experiment`
