@@ -1,7 +1,8 @@
 # CI: the full suite runs itself
 
 `.github/workflows/test.yml` runs the full test suite (main,
-concurrency, ACID; 12GiB heap per `tests/README.md`) on every push
+concurrency, ACID, spacetime, geos, algorithms, gui; 12GiB heap
+per `tests/README.md`) on every push
 to `experiment` or `master` and on pull requests.
 
 - **Runners are self-hosted** (personal-account runners are
@@ -18,5 +19,12 @@ to `experiment` or `master` and on pull requests.
   source registry to the workspace checkout plus the host's
   `cl-temporal-extent`, so the tested tree is exactly the pushed
   tree, never a host pin.
+- The geos lane needs `libgeos_c` on the runner host; the suite
+  SKIPS (green) where it is absent, so a green geos lane on a
+  bare host proves nothing -- keep the library installed.
+- NOT in CI: the stress suites (`stress-test`,
+  `concurrent-stress-test`; long, load-sensitive on a shared
+  host) and `perf-test` (measurement, not pass/fail --
+  `docs/perf-baselines.md`).  Run those deliberately.
 - Fork PRs require approval before workflows run on these machines
   (repository default; do not relax it).

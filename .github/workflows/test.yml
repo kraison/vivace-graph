@@ -1,4 +1,5 @@
-# The full suite in CI (see docs/ci.md).  The habit this replaces:
+# The full suite in CI (see docs/ci.md): main, concurrency,
+# ACID, spacetime, geos, algorithms, gui.  The habit this replaces:
 # running 35+ minutes of tests by hand on every change.  Local runs
 # are the affected subsystem's tests; every push here gets the full
 # matrix, and experiment -> master promotion waits for green.
@@ -58,6 +59,62 @@ jobs:
                             :ignore-inherited-configuration))' \
             --eval '(ql:quickload :graph-db/acid-test :silent t)' \
             --eval '(asdf:test-system :graph-db/acid-test)'
+      - name: spacetime suite
+        run: |
+          sbcl --dynamic-space-size 12288 --non-interactive \
+            --load "$HOME/quicklisp/setup.lisp" \
+            --eval '(setf ql:*local-project-directories* nil)' \
+            --eval '(asdf:initialize-source-registry
+                      (list :source-registry
+                            (list :tree (uiop:getcwd))
+                            (list :directory
+                                  (merge-pathnames "src/cl-temporal-extent/"
+                                                   (user-homedir-pathname)))
+                            :ignore-inherited-configuration))' \
+            --eval '(ql:quickload :graph-db/spacetime-test :silent t)' \
+            --eval '(asdf:test-system :graph-db/spacetime-test)'
+      - name: geos suite
+        run: |
+          sbcl --dynamic-space-size 12288 --non-interactive \
+            --load "$HOME/quicklisp/setup.lisp" \
+            --eval '(setf ql:*local-project-directories* nil)' \
+            --eval '(asdf:initialize-source-registry
+                      (list :source-registry
+                            (list :tree (uiop:getcwd))
+                            (list :directory
+                                  (merge-pathnames "src/cl-temporal-extent/"
+                                                   (user-homedir-pathname)))
+                            :ignore-inherited-configuration))' \
+            --eval '(ql:quickload :graph-db/geos-test :silent t)' \
+            --eval '(asdf:test-system :graph-db/geos-test)'
+      - name: algorithms suite
+        run: |
+          sbcl --dynamic-space-size 12288 --non-interactive \
+            --load "$HOME/quicklisp/setup.lisp" \
+            --eval '(setf ql:*local-project-directories* nil)' \
+            --eval '(asdf:initialize-source-registry
+                      (list :source-registry
+                            (list :tree (uiop:getcwd))
+                            (list :directory
+                                  (merge-pathnames "src/cl-temporal-extent/"
+                                                   (user-homedir-pathname)))
+                            :ignore-inherited-configuration))' \
+            --eval '(ql:quickload :graph-db/algorithms-test :silent t)' \
+            --eval '(asdf:test-system :graph-db/algorithms-test)'
+      - name: gui suite
+        run: |
+          sbcl --dynamic-space-size 12288 --non-interactive \
+            --load "$HOME/quicklisp/setup.lisp" \
+            --eval '(setf ql:*local-project-directories* nil)' \
+            --eval '(asdf:initialize-source-registry
+                      (list :source-registry
+                            (list :tree (uiop:getcwd))
+                            (list :directory
+                                  (merge-pathnames "src/cl-temporal-extent/"
+                                                   (user-homedir-pathname)))
+                            :ignore-inherited-configuration))' \
+            --eval '(ql:quickload :graph-db/gui-test :silent t)' \
+            --eval '(asdf:test-system :graph-db/gui-test)'
 
   arm64-advisory:
     # horus, when awake: an advisory lane whose value is exactly the

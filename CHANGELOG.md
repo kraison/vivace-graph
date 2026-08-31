@@ -13,6 +13,13 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Added
 
+- **CI runs the spacetime, geos, algorithms and gui suites** in addition
+  to main/concurrency/ACID (`.github/workflows/test.yml`; docs/ci.md).
+  The gap: the lanes were fixed at the three suites that existed when CI
+  was set up, while new work landed almost entirely in the optional
+  subsystems, so a green check did not cover it. The stress and perf
+  suites stay deliberately manual.
+
 - **`(with-transaction (:graph g) …)`** (#175): selects `g`'s transaction
   manager *and* binds `*graph*` to `g` for the body — the multi-store idiom
   in one form, instead of a `let` around `(transaction-manager g)`. Binding
@@ -33,8 +40,8 @@ between releases; cutting a release renames it to the new version and dates it.
   the set, or one that inherits from two) is an error at definition, not
   a silent no-op. `:name` is mandatory and is the identity; the set is
   canonicalised so either argument order is one declaration. Sixth
-  registry. Claim-asserted membership (4b) is a different feature and is
-  not built; `def-node-type` / `def-vertex` now agree that the superclass
+  registry. Claim-asserted membership (4b) is a different feature,
+  built separately (see the membership disjointness entry); `def-node-type` / `def-vertex` now agree that the superclass
   list is single-inheritance by convention only.
 
 - **Domain and range constraints on edges** (#156, ontology unit 3).
@@ -120,7 +127,6 @@ between releases; cutting a release renames it to the new version and dates it.
   policy; `tm-next-epoch` is the named extension point.
 
 ### Changed
-
 - **A GEOS failure on one region no longer refuses the whole registration
   scan** (#164, option 2). `register-geometry` now catches `geos-error`
   around each candidate region's own measurement: that region is dropped
