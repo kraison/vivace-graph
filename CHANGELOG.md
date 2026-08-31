@@ -175,6 +175,14 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Fixed
 
+- **Type-id seeding tests were red on macOS (the arm64 advisory lane's 11
+  failures)**: the fixture compared raw `merge-pathnames` namestrings
+  against the seeding report's `truename`'d ones, which diverge wherever
+  the scratch root crosses a symlink — macOS's `$TMPDIR` always does
+  (`/var/folders` → `/private/var`). Reproduced on Linux via a symlinked
+  `TMPDIR`; the fixture now canonicalizes through the same
+  `%seeding-location` the engine uses. Engine behaviour was correct.
+
 - **Skip-list mutators could deadlock under concurrency** (#294). The
   optimistic insert locked each level's predecessor bottom-up — deadlock-free
   on per-node locks, but these are *striped* (`mod addr n-locks`), and stripe

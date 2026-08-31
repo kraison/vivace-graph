@@ -86,7 +86,12 @@ private directory is left under ROOT and read again only by
         (unwind-protect (%fill-store g vertices edge-type extra-types)
           (close-graph g))))
     (collect-garbage)
-    location))
+    ;; Return the CANONICAL location -- the same %SEEDING-LOCATION the
+    ;; report's contents go through.  Raw MERGE-PATHNAMES output diverges
+    ;; from TRUENAME wherever the scratch root crosses a symlink (macOS
+    ;; $TMPDIR = /var/folders -> /private/var), and every EQUAL lookup in
+    ;; these tests then misses: the arm64 lane's 11 red checks (#295).
+    (graph-db::%seeding-location location)))
 
 (defun %add-vertices (graph type n)
   "Write N vertices of TYPE into GRAPH, under whatever type-id its schema
