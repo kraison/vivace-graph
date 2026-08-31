@@ -258,6 +258,7 @@
                 ;; schema retraction (GH #139, #140)
                 #:undef-index
                 #:undef-unique
+                #:schema-withdrawal-matched-nothing   ; GH #152
                 ;; declarative value constraints (GH #149)
                 #:def-value-constraint
                 #:undef-value-constraint

@@ -114,6 +114,35 @@ multi-index case.  A name is a symbol and SLOT-NAMES a list, so the two
 identity spaces cannot collide under EQUAL."
   (cons owner-name (or name slot-names)))
 
+(define-condition schema-withdrawal-matched-nothing (warning)
+  ((kind       :initarg :kind       :reader swmn-kind)
+   (owner      :initarg :owner      :reader swmn-owner)
+   (graph-name :initarg :graph-name :reader swmn-graph-name)
+   (name       :initarg :name       :reader swmn-name)
+   (slots      :initarg :slots      :reader swmn-slots))
+  (:report
+   (lambda (c s)
+     (format s "~(~A~) withdrawal~@[ on ~S~] in ~S matched nothing~
+                ~@[ -- :NAME ~S~]~@[ -- slots ~S~].~:[~;  If the ~
+                declaration was emitted by a macro, its name is interned ~
+                in THAT package: write it package-qualified (GH #152).~]"
+             (swmn-kind c) (swmn-owner c) (swmn-graph-name c)
+             (swmn-name c) (swmn-slots c) (and (swmn-name c) t)))))
+
+(defun %withdrawn-p (withdrawn kind owner graph-name name slots)
+  "WITHDRAWN, after warning SCHEMA-WITHDRAWAL-MATCHED-NOTHING when it is
+NIL.  The one exit of every UNDEF-* macro (GH #152): a withdrawal that
+matched nothing used to be indistinguishable from one that succeeded,
+and the commonest cause -- a :NAME read in another package than the one
+the declaration was emitted in -- shows up as some later test looking
+wrong.  The UNREGISTER-* functions stay silent and boolean for a caller
+who wants idempotent withdrawal."
+  (unless withdrawn
+    (warn 'schema-withdrawal-matched-nothing
+          :kind kind :owner owner :graph-name graph-name
+          :name name :slots slots))
+  withdrawn)
+
 (defun index-spec-identity (spec)
   (%spec-identity (index-spec-owner-name spec) (index-spec-slot-names spec)
                   (index-spec-name spec)))
@@ -864,12 +893,14 @@ Both are keywords rather than mirroring DEF-INDEX's positional SLOT, because a
 graph name IS a keyword here -- a positional form could not tell a slot list
 from a graph without guessing, and guessing wrong is silent.
 
-A no-op when nothing matches.  This withdraws the DECLARATION; the index
-structure it built is dropped at the next open, when the sidecar is reconciled
+Warns SCHEMA-WITHDRAWAL-MATCHED-NOTHING when nothing matches (GH #152).
+This withdraws the DECLARATION; the index structure it built is dropped at
+the next open, when the sidecar is reconciled
 against the live schema (RESTORE-SECONDARY-INDEX-ROOTS).  Its heap pages are
 not reclaimed -- GH #147."
-  `(unregister-index-spec ',owner-class ',graph-name
-                          :slot-names ',slots :name ',name))
+  `(%withdrawn-p (unregister-index-spec ',owner-class ',graph-name
+                                        :slot-names ',slots :name ',name)
+                 :index ',owner-class ',graph-name ',name ',slots))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Query API -- all resolve node ids in the PASSED graph (wrong-graph discipline).

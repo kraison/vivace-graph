@@ -394,6 +394,8 @@
            #:def-index
            ;; schema retraction: withdraw a declaration (GH #139, #140)
            #:undef-index #:undef-unique
+           #:schema-withdrawal-matched-nothing              ; GH #152
+           #:swmn-kind #:swmn-owner #:swmn-graph-name #:swmn-name #:swmn-slots
            ;; declarative value constraints (GH #149)
            #:def-value-constraint #:undef-value-constraint
            #:value-constraint-violation

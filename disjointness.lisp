@@ -153,8 +153,10 @@ re-evaluate; the leftover cannot be un-defined portably."
                             :name ',name)))
 
 (defmacro undef-disjoint (graph-name &key name)
-  "Withdraw a DEF-DISJOINT declaration by :NAME."
-  `(unregister-disjointness-spec ',graph-name ',name))
+  "Withdraw a DEF-DISJOINT declaration by :NAME.  Warns
+SCHEMA-WITHDRAWAL-MATCHED-NOTHING when nothing matches (GH #152)."
+  `(%withdrawn-p (unregister-disjointness-spec ',graph-name ',name)
+                 :disjointness nil ',graph-name ',name nil))
 
 ;;; --- The definition-time hook and the audit ---------------------------
 

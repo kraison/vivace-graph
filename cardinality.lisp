@@ -134,10 +134,14 @@ declaration whenever a macro emits it (GH #139)."
 (defmacro undef-cardinality (owner-class graph-name
                              &key edge-type (direction :out) name)
   "Withdraw a DEF-CARDINALITY declaration, by :NAME or by :EDGE-TYPE (and
-:DIRECTION)."
-  `(unregister-cardinality-spec ',owner-class ',graph-name
-                                :edge-type ',edge-type
-                                :direction ,direction :name ',name))
+:DIRECTION).  Warns SCHEMA-WITHDRAWAL-MATCHED-NOTHING when nothing matches
+(GH #152)."
+  `(%withdrawn-p (unregister-cardinality-spec ',owner-class ',graph-name
+                                              :edge-type ',edge-type
+                                              :direction ,direction
+                                              :name ',name)
+                 :cardinality ',owner-class ',graph-name ',name
+                 ',(and edge-type (list edge-type direction))))
 
 ;;; --- Counting through the view -------------------------------------------
 

@@ -191,3 +191,75 @@ So the sidecar must be reconciled against the live specs at open."
                    "a withdrawn index must not be reopened from the sidecar"))
           (ignore-errors (close-graph g2))
           (collect-garbage))))))
+
+;;; --- a withdrawal that matches nothing is loud (GH #152) -----------------
+
+(defmacro %sr-warns-p (form)
+  "T when FORM signals SCHEMA-WITHDRAWAL-MATCHED-NOTHING, else its value."
+  `(handler-case (progn ,form)
+     (schema-withdrawal-matched-nothing () :warned)))
+
+(test a-withdrawal-whose-name-is-in-another-package-warns
+  "GH #152.  The identity is the name SYMBOL, so a name read in another
+package matches nothing -- correct, but it used to be silent, and the
+symptom surfaced as some later test looking wrong.  Every UNDEF-* now
+warns; the right name, in the right package, withdraws without one."
+  (%sr-clear-registries)
+  (def-index sr-rec (k1) :graph-db-schema-retraction-test :name sr-152-idx)
+  (def-unique sr-rec (k1 k2) :graph-db-schema-retraction-test
+    :name sr-152-uq)
+  (is (eq :warned (%sr-warns-p
+                   (undef-index sr-rec :graph-db-schema-retraction-test
+                                :name cl-user::sr-152-idx)))
+      "the same characters in CL-USER are a different symbol")
+  (is (eq :warned (%sr-warns-p
+                   (undef-unique sr-rec :graph-db-schema-retraction-test
+                                 :name cl-user::sr-152-uq))))
+  (is (eq :warned (%sr-warns-p
+                   (undef-index sr-rec :graph-db-schema-retraction-test
+                                :slots (k2))))
+      "and an unmatched slot list warns too")
+  (is (= 1 (length (%sr-index-specs))) "nothing was withdrawn by any of those")
+  (is (eq t (%sr-warns-p
+             (undef-index sr-rec :graph-db-schema-retraction-test
+                          :name sr-152-idx)))
+      "the right symbol withdraws, and does not warn")
+  (is (eq t (%sr-warns-p
+             (undef-unique sr-rec :graph-db-schema-retraction-test
+                           :name sr-152-uq))))
+  (is (null (%sr-index-specs)))
+  (%sr-clear-registries))
+
+(test the-warning-names-the-registry-and-hints-at-the-package
+  (let ((text (princ-to-string
+               (make-condition 'schema-withdrawal-matched-nothing
+                               :kind :value-constraint :owner 'sr-rec
+                               :graph-name :g :name 'some-name :slots nil))))
+    (is (search "value-constraint withdrawal" text))
+    (is (search "SOME-NAME" text))
+    (is (search "package-qualified" text)
+        "the hint is the point: the failure is otherwise invisible"))
+  (let ((text (princ-to-string
+               (make-condition 'schema-withdrawal-matched-nothing
+                               :kind :index :owner 'sr-rec
+                               :graph-name :g :name nil :slots '(k2)))))
+    (is (search "(K2)" text))
+    (is (not (search "package-qualified" text))
+        "no package hint when no name was given")))
+
+(test every-registry-s-undef-warns-when-nothing-matches
+  "The four registries the ontology epic added share the exit."
+  (is (eq :warned (%sr-warns-p
+                   (undef-value-constraint sr-rec
+                                           :graph-db-schema-retraction-test
+                                           :name cl-user::nope))))
+  (is (eq :warned (%sr-warns-p
+                   (undef-cardinality sr-rec :graph-db-schema-retraction-test
+                                      :name cl-user::nope))))
+  (is (eq :warned (%sr-warns-p
+                   (undef-domain-range sr-rec :graph-db-schema-retraction-test
+                                       :name cl-user::nope))))
+  (is (eq :warned (%sr-warns-p
+                   (undef-disjoint :graph-db-schema-retraction-test
+                                   :name cl-user::nope)))))
+

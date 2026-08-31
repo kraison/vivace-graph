@@ -111,8 +111,11 @@ DEF-CARDINALITY this is what DEF-EDGE's endpoint comments meant (GH #156).
      :name ',name)))
 
 (defmacro undef-domain-range (edge-type graph-name &key name)
-  "Withdraw a DEF-DOMAIN-RANGE declaration, by :NAME or by the edge type."
-  `(unregister-domain-range-spec ',edge-type ',graph-name :name ',name))
+  "Withdraw a DEF-DOMAIN-RANGE declaration, by :NAME or by the edge type.
+Warns SCHEMA-WITHDRAWAL-MATCHED-NOTHING when nothing matches (GH #152)."
+  `(%withdrawn-p (unregister-domain-range-spec ',edge-type ',graph-name
+                                               :name ',name)
+                 :domain-range ',edge-type ',graph-name ',name nil))
 
 ;;; --- Evaluation ----------------------------------------------------------
 

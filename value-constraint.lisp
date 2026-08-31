@@ -311,9 +311,12 @@ change a registered constraint -- re-evaluate this form (idempotent, GH #139)."
 (defmacro undef-value-constraint (owner-class graph-name &key slot name)
   "Withdraw a DEF-VALUE-CONSTRAINT declaration, by :NAME or by :SLOT.
 Keyword rather than positional for the same reason as UNDEF-INDEX: a graph
-name is itself a keyword."
-  `(unregister-value-constraint-spec ',owner-class ',graph-name
-                                     :slot ',slot :name ',name))
+name is itself a keyword.  Warns SCHEMA-WITHDRAWAL-MATCHED-NOTHING when
+nothing matches (GH #152)."
+  `(%withdrawn-p (unregister-value-constraint-spec ',owner-class ',graph-name
+                                                   :slot ',slot :name ',name)
+                 :value-constraint ',owner-class ',graph-name ',name
+                 ',(and slot (list slot))))
 
 (defun validate-value-constraints (tx graph)
   "Signal VALUE-CONSTRAINT-VIOLATION if any write in TX violates a declared

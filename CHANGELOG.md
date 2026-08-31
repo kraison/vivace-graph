@@ -158,6 +158,16 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Fixed
 
+- **A schema withdrawal that matches nothing is now loud** (#152). Every
+  `undef-*` macro — index, unique, value-constraint, cardinality,
+  domain-range, disjointness — warns `schema-withdrawal-matched-nothing`
+  when no declaration matched, with the hint that bites in practice: a
+  declaration emitted by a macro has its `:name` interned in *that*
+  package, and the same characters read elsewhere are a different symbol.
+  Previously the withdrawal returned NIL and nothing else happened, so the
+  failure surfaced later as an unrelated test looking wrong. The
+  `unregister-*` functions stay silent and boolean for idempotent callers.
+
 - **A refused or retried commit no longer pins the prune floor** (#150).
   `%commit` runs inside `call-with-transaction`'s cleanup form and
   signals — `validation-conflict` on every retry, and each

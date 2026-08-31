@@ -583,10 +583,13 @@ null semantics a reader would assume were unchanged (GH #107)."
 
 Keyword rather than positional for the same reason as UNDEF-INDEX: a graph name
 is itself a keyword, so a positional slot list could only be told apart by
-guessing.  A no-op when nothing matches; see UNREGISTER-UNIQUE-TUPLE-SPEC for
-what withdrawal does and does not undo."
-  `(unregister-unique-tuple-spec ',owner-class ',graph-name
-                                 :slot-names ',slots :name ',name))
+guessing.  Warns SCHEMA-WITHDRAWAL-MATCHED-NOTHING when nothing matches
+(GH #152); see UNREGISTER-UNIQUE-TUPLE-SPEC for what withdrawal does and
+does not undo."
+  `(%withdrawn-p (unregister-unique-tuple-spec ',owner-class ',graph-name
+                                               :slot-names ',slots
+                                               :name ',name)
+                 :unique ',owner-class ',graph-name ',name ',slots))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Maintenance (APPLY, post-durability, journal-replayable)

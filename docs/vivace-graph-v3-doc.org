@@ -1430,7 +1430,14 @@ Give a declaration a ~:name~ and its identity becomes ~(owner . name)~ instead, 
 
 ⚠ *Name a declaration whenever a macro emits it on a caller's behalf.* A macro cannot name what a previous version of itself emitted, so slot-name identity gives it no way to say "this constraint changed shape" — both specs stay live, and for ~def-unique~ the stale one keeps *rejecting writes the current schema permits* (GH #139; GH #140 is ~def-index~'s quieter twin, a stale index built and maintained for nothing). ~def-source~ and ~def-claim-classes~ both name every spec they emit for exactly this reason.
 
-Withdraw a declaration with ~undef-index~ / ~undef-unique~ — by name, or by slots for an unnamed one:
+Withdraw a declaration with ~undef-index~ / ~undef-unique~ (and, for the
+constraint families, ~undef-value-constraint~, ~undef-cardinality~,
+~undef-domain-range~, ~undef-disjoint~) — by name, or by slots for an
+unnamed one. ⚠ A withdrawal that matches nothing *warns*
+(~schema-withdrawal-matched-nothing~, vivace-graph#152) rather than
+returning NIL silently; the usual cause is a ~:name~ read in a different
+package from the one the declaration was emitted in — a macro-emitted
+declaration's name lives in the macro's package, so write it qualified:
 
 #+BEGIN_SRC lisp
   (undef-index  user :social-app :name user-lookup-key)
@@ -3834,6 +3841,15 @@ the start, because it now *is* one, on disk. A ~make-<type>~ call that names
 a store with no registered metadata for that class anywhere in the image
 still errors, as before — adoption finds an existing declaration, it does
 not invent one.
+
+⚠ **~schema.dat~ does not make the schema file optional.** It persists
+type *metadata* — names, ids, slots — so that stored nodes' numeric
+type-ids stay stable across reopens; it never stores CLOS classes, and
+nothing reconstructs ~def-vertex~'s constructors, accessors or functors
+from it. Load the schema's ~def-vertex~ / ~def-edge~ forms *before*
+~open-graph~. An image that hasn't signals ~schema-classes-not-loaded~
+at open, naming every missing type — nothing is corrupt and no recovery
+is needed (vivace-graph#144).
 
 **Edges place by their own class default, not by an endpoint's store.** An
 edge is a node, so §4's rule covers it with no special case: a cross-store
