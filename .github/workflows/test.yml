@@ -1,0 +1,81 @@
+# The full suite in CI (see docs/ci.md).  The habit this replaces:
+# running 35+ minutes of tests by hand on every change.  Local runs
+# are the affected subsystem's tests; every push here gets the full
+# matrix, and experiment -> master promotion waits for green.
+name: test
+on:
+  push:
+    branches: [experiment, master]
+  pull_request:
+    branches: [experiment, master]
+  workflow_dispatch:
+
+jobs:
+  full-suite:
+    runs-on: [self-hosted, Linux]
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: full suite (12GiB heap per tests/README.md)
+        run: |
+          sbcl --dynamic-space-size 12288 --non-interactive \
+            --load "$HOME/quicklisp/setup.lisp" \
+            --eval '(setf ql:*local-project-directories* nil)' \
+            --eval '(asdf:initialize-source-registry
+                      (list :source-registry
+                            (list :tree (uiop:getcwd))
+                            (list :directory
+                                  (merge-pathnames "src/cl-temporal-extent/"
+                                                   (user-homedir-pathname)))
+                            :ignore-inherited-configuration))' \
+            --eval '(ql:quickload :graph-db :silent t)' \
+            --eval '(asdf:test-system :graph-db)'
+      - name: concurrency suite
+        run: |
+          sbcl --dynamic-space-size 12288 --non-interactive \
+            --load "$HOME/quicklisp/setup.lisp" \
+            --eval '(setf ql:*local-project-directories* nil)' \
+            --eval '(asdf:initialize-source-registry
+                      (list :source-registry
+                            (list :tree (uiop:getcwd))
+                            (list :directory
+                                  (merge-pathnames "src/cl-temporal-extent/"
+                                                   (user-homedir-pathname)))
+                            :ignore-inherited-configuration))' \
+            --eval '(ql:quickload :graph-db/concurrency-test :silent t)' \
+            --eval '(asdf:test-system :graph-db/concurrency-test)'
+      - name: acid suite
+        run: |
+          sbcl --dynamic-space-size 12288 --non-interactive \
+            --load "$HOME/quicklisp/setup.lisp" \
+            --eval '(setf ql:*local-project-directories* nil)' \
+            --eval '(asdf:initialize-source-registry
+                      (list :source-registry
+                            (list :tree (uiop:getcwd))
+                            (list :directory
+                                  (merge-pathnames "src/cl-temporal-extent/"
+                                                   (user-homedir-pathname)))
+                            :ignore-inherited-configuration))' \
+            --eval '(ql:quickload :graph-db/acid-test :silent t)' \
+            --eval '(asdf:test-system :graph-db/acid-test)'
+
+  arm64-advisory:
+    # horus, when awake: an advisory lane whose value is exactly the
+    # class of bug #218 was (arm64-only %POSIX-OPEN).  Never gates.
+    runs-on: [self-hosted, macOS, ARM64]
+    continue-on-error: true
+    timeout-minutes: 90
+    if: github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@v4
+      - name: full suite
+        run: |
+          sbcl --dynamic-space-size 12288 --non-interactive \
+            --load "$HOME/quicklisp/setup.lisp" \
+            --eval '(setf ql:*local-project-directories* nil)' \
+            --eval '(asdf:initialize-source-registry
+                      (list :source-registry
+                            (list :tree (uiop:getcwd))
+                            :ignore-inherited-configuration))' \
+            --eval '(ql:quickload :graph-db :silent t)' \
+            --eval '(asdf:test-system :graph-db)'
