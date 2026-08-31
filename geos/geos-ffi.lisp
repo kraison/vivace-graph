@@ -173,7 +173,12 @@ dependency-free fallbacks. (~A)" e)
 
 ;; enum GEOSGeomTypes (geos_c.h) -- what %GEOS-GEOM-TYPE-ID returns and what
 ;; GEOSGeom_createCollection_r takes.
+(defconstant +geos-point+ 0)
+(defconstant +geos-linestring+ 1)
+(defconstant +geos-linearring+ 2)
 (defconstant +geos-polygon+ 3)
+(defconstant +geos-multipoint+ 4)
+(defconstant +geos-multilinestring+ 5)
 (defconstant +geos-multipolygon+ 6)
 (defconstant +geos-geometrycollection+ 7)
 

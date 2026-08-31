@@ -146,8 +146,71 @@ consistency, not a live bug; a guard with a gap in it reads as covered
 
 ;;; ---- constructive (overlay) operations ---------------------------------
 
+(defun %geos-type-dimension (tid)
+  "Topological dimension of GEOS type id TID: 2 areal, 1 linear, 0 puntal,
+NIL for a GEOMETRYCOLLECTION, whose parts need not share one."
+  (cond ((or (= tid +geos-polygon+) (= tid +geos-multipolygon+)) 2)
+        ((or (= tid +geos-linestring+) (= tid +geos-linearring+)
+             (= tid +geos-multilinestring+))
+         1)
+        ((or (= tid +geos-point+) (= tid +geos-multipoint+)) 0)
+        (t nil)))
+
+(defun %geos-parts-of-dimension (handle geom want acc)
+  "GEOM's parts whose dimension is WANT (2 areal, 1 linear, 0 puntal),
+consed onto ACC, descending into collections.
+
+⚠ EVERY POINTER COLLECTED IS BORROWED from GEOM, exactly as in
+%GEOS-POLYGONAL-PARTS: destroying one double-frees with GEOM."
+  (let ((tid (%geos-geom-type-id handle geom)))
+    (cond ((= tid +geos-geometrycollection+)
+           (dotimes (i (%geos-get-num-geometries handle geom) acc)
+             (let ((sub (%geos-get-geometry-n handle geom i)))
+               (unless (cffi:null-pointer-p sub)
+                 (setf acc (%geos-parts-of-dimension handle sub want acc))))))
+          ;; EQL, not =: %GEOS-TYPE-DIMENSION answers NIL for a type id it
+          ;; does not classify, and = would signal on it.
+          ((eql (%geos-type-dimension tid) want) (cons geom acc))
+          (t acc))))
+
+(defun %geos-collection->geometry (ctx res)
+  "RES as a VG geometry, reducing a GEOMETRYCOLLECTION to the union of its
+HIGHEST-DIMENSION parts.  RES stays the caller's to destroy.
+
+An overlay of two VALID inputs can still answer with a collection: two
+polygons overlapping in an AREA and separately meeting at a point or edge
+intersect in POLYGON + LINESTRING (GH #164).  The VG GEOMETRY type has no
+collection kind, so this signalled and REGISTER-GEOMETRY refused the whole
+subject -- 1,560 claims over ten consecutive days of a deployed series.
+
+⚠ HIGHEST DIMENSION, NOT \"THE POLYGONS\".  The measure a caller takes
+follows its subject: %MEASURE-FN uses AREA for a polygon and LENGTH for a
+LINESTRING (spacetime, design §13).  Keeping only areal parts would hand a
+LINE subject an empty geometry -- length 0, read as a mere touch -- and
+silently drop an overlap it really has.  The dimension below the top one
+is always the boundary contact, and it carries none of the measure.
+
+⚠ EMPTY IS A RESULT, NOT A FAILURE.  Unlike %GEOS-REPAIRED->GEOMETRY,
+which signals when a repair kept no area, an overlay legitimately answers
+\"they share nothing\" and callers depend on reading that as measure 0
+(GH #105).  A repair that repaired nothing and an intersection that
+intersected in nothing are different facts."
+  (let ((handle (geos-ctx-handle ctx)))
+    (if (/= (%geos-geom-type-id handle res) +geos-geometrycollection+)
+        (geos->geometry ctx res)
+        (let ((parts (loop for want from 2 downto 0
+                           for p = (nreverse (%geos-parts-of-dimension
+                                              handle res want '()))
+                           when p return p)))
+          (if (null parts)
+              ;; An EMPTY collection: no parts of any dimension.  Answer
+              ;; with the empty geometry the caller's measure reads as 0.
+              (make-polygon '())
+              (%geos-union-of-borrowed ctx parts))))))
+
 (defun %geos-overlay (op-fn a b operation)
-  "Run a binary GEOS op returning a new geometry, and convert it back to VG."
+  "Run a binary GEOS op returning a new geometry, and convert it back to VG.
+A GEOMETRYCOLLECTION result is reduced by %GEOS-COLLECTION->GEOMETRY."
   (with-geos-context (ctx)
     (with-geos-geoms ((ga ctx a) (gb ctx b))
       (let ((res (funcall op-fn (geos-ctx-handle ctx) ga gb)))
@@ -155,7 +218,7 @@ consistency, not a live bug; a guard with a gap in it reads as covered
           (error 'geos-error
                  :message (or *geos-last-error*
                               (format nil "GEOS ~A returned NULL" operation))))
-        (unwind-protect (geos->geometry ctx res)
+        (unwind-protect (%geos-collection->geometry ctx res)
           (%geos-geom-destroy (geos-ctx-handle ctx) res))))))
 
 (defmethod geometry-union :around ((a geometry) (b geometry))

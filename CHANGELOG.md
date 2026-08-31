@@ -13,6 +13,43 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Fixed
 
+- **An overlay of two VALID geometries could answer with a
+  `GEOMETRYCOLLECTION`, and `register-geometry` then refused the whole
+  subject** (#164). Two polygons that overlap in an *area* and separately
+  meet at a point or along an edge intersect in `POLYGON + LINESTRING`.
+  The VG `geometry` type has no collection kind, so `wkt->geometry`
+  signalled, and `register-geometry`'s `geos-error` handler — which wraps
+  the entire region loop — returned `(values nil nil)`. Measured on a
+  quiesced copy of deployed data: 10 of 1,312,704 pairs, but because the
+  same shapes recur daily it cost **1,560 claims across ten consecutive
+  days** of a time series, where a missing claim reads as a definite
+  negative rather than as "unknown".
+
+  This is distinct from #163, which was `GEOSMakeValid` answering that way
+  for an *invalid* ring. Here nothing is repaired — `%repaired` succeeds
+  because there is nothing wrong with either input — and the collection
+  arrives one step later, out of `geometry-intersection`.
+
+  **`%geos-overlay` now reduces a collection result to the union of its
+  highest-dimension parts**, extending to the overlay path the treatment
+  #163 gave the repair path.
+
+  ⚠ **Highest dimension, not "the polygons".** The measure a caller takes
+  follows its subject: `spacetime`'s `%measure-fn` uses area for a polygon
+  and *length* for a `LINESTRING`. Keeping only areal parts would hand a
+  line subject an empty geometry — length 0, read as a mere touch — and
+  silently drop a real overlap. The dimension below the top one is the
+  boundary contact, and it carries none of the measure.
+
+  ⚠ **Empty is a result here, not a failure**, unlike
+  `%geos-repaired->geometry`, which signals when a repair kept no area. An
+  overlay legitimately answers "they share nothing", and callers depend on
+  reading that as measure 0 (#105). A repair that repaired nothing and an
+  intersection that intersected in nothing are different facts.
+
+  The five remaining `GEOSGeomTypes` constants are now defined in
+  `geos/geos-ffi.lisp` alongside the three #163 added.
+
 - **Chapter 17 stated two things about multi-store transactions that #168
   had already made false** (#93). It said a cross-graph transaction "would
   need a global ordering across independent counters", and that a
