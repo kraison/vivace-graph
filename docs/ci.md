@@ -16,9 +16,12 @@ to `experiment` or `master` and on pull requests.
   the push gets the full matrix; `experiment -> master` promotion
   waits for the green check.
 - The runner neutralises quicklisp `local-projects` and pins the
-  source registry to the workspace checkout plus the host's
-  `cl-temporal-extent`, so the tested tree is exactly the pushed
-  tree, never a host pin.
+  source registry to the workspace checkout plus
+  `cl-temporal-extent` refreshed to master head each run (in
+  `~/ci-deps-vivace-graph`, this runner's own dir -- shared-user
+  checkouts race), so the tested tree is exactly the pushed tree
+  against current deps, never a host pin (policy extended
+  2026-09-01).
 - The geos lane needs `libgeos_c` on the runner host; the suite
   SKIPS (green) where it is absent, so a green geos lane on a
   bare host proves nothing -- keep the library installed.
