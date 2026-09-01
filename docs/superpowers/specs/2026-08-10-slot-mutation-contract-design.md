@@ -243,7 +243,10 @@ error.
 
 ## Out of scope
 
-- The `bytes`-invalidation root fix (follow-up issue).
+- The `bytes`-invalidation root fix — DONE as #136 (2026-09-01): every DATA
+  mutation marks the node stale and the `bytes` reader re-derives lazily; the
+  hand compensations in `apply-tx-write`, `update-node`, `save-node` and the
+  create-set refresh are gone.
 - An ergonomic `UPSERT`-shaped macro in the engine.
 - #131's spacetime workaround, which moved extent assignment to construction time and no
   longer depends on this gap.

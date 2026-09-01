@@ -435,6 +435,10 @@ AMBIGUOUS-NODE-TYPE-NAME (GH #190)."
    (heap-merged-p :accessor heap-merged-p :initform nil :initarg :heap-merged-p
                   :type boolean :meta t :persistent nil)
    (bytes :accessor bytes :initform :init :initarg :bytes :meta t :persistent nil)
+   ;; True when DATA has changed since BYTES was derived from it; the BYTES
+   ;; reader re-serializes lazily, so no writer re-derives it by hand (GH #136).
+   (bytes-stale-p :accessor bytes-stale-p :initform nil :initarg :bytes-stale-p
+                  :type boolean :meta t :persistent nil)
    ;; Home graph; NIL = unknown -> caller falls back to *GRAPH* (GH #53)
    (graph :accessor node-graph :initform nil :initarg :graph
           :meta t :persistent nil))

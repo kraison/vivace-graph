@@ -473,3 +473,85 @@ guard (transactions.lisp)."
                                :transaction-id 999999999)))
           (finishes (setf (note n) "under a restore-transaction"))
           (is (equal "under a restore-transaction" (note n))))))))
+
+;;; ---------------------------------------------------------------------
+;;; GH #136: BYTES is a derived cache of DATA, invalidated on write.  Read
+;;; BYTES DIRECTLY here -- the cache, not DATA -- so the invariant is
+;;; pinned rather than re-derived at each call site.
+;;; ---------------------------------------------------------------------
+
+(defun %sm-bytes-slot (node key)
+  "KEY's value as recorded in NODE's BYTES, read straight off the cache."
+  (cdr (assoc key (deserialize (graph-db::bytes node)))))
+
+(test bytes-follow-a-setf-on-a-created-node
+  (with-temp-directory (dir)
+    (with-sm-graph (g dir)
+      (with-transaction ()
+        (let ((n (make-sm-thing :name "before" :note "n")))
+          (is (equal "before" (%sm-bytes-slot n :name)))
+          (setf (slot-value n 'name) "after")
+          (is (equal "after" (%sm-bytes-slot n :name))
+              "BYTES read directly reflect the mutation"))))))
+
+(test bytes-follow-a-setf-on-a-copy-before-save
+  (with-temp-directory (dir)
+    (with-sm-graph (g dir)
+      (let ((id (id (with-transaction ()
+                      (make-sm-thing :name "v1" :note "n")))))
+        (with-transaction ()
+          (let ((c (copy (lookup-vertex id))))
+            (is (equal "v1" (%sm-bytes-slot c :name)))
+            (setf (slot-value c 'name) "v2")
+            (is (equal "v2" (%sm-bytes-slot c :name))
+                "before SAVE, BYTES already agree with DATA")
+            (save c)))
+        (is (equal "v2" (slot-value (lookup-vertex id) 'name)))))
+    (with-sm-reopen (g dir)
+      (is (equal "v2" (slot-value (first (map-vertices #'identity g
+                                                        :collect-p t
+                                                        :vertex-type 'sm-thing))
+                                  'name))
+          "and the durable record carried it"))))
+
+(test bytes-follow-a-slot-makunbound
+  (with-temp-directory (dir)
+    (with-sm-graph (g dir)
+      (let ((id (id (with-transaction ()
+                      (make-sm-thing :name "v1" :note "gone")))))
+        (with-transaction ()
+          (let ((c (copy (lookup-vertex id))))
+            (slot-makunbound c 'note)
+            (is (null (assoc :note (deserialize (graph-db::bytes c))))
+                "the dropped slot is gone from BYTES too")
+            (save c)))))
+    (with-sm-reopen (g dir)
+      (let ((v (first (map-vertices #'identity g :collect-p t
+                                    :vertex-type 'sm-thing))))
+        (is-false (slot-boundp v 'note))
+        (is (equal "v1" (slot-value v 'name)))))))
+
+(test bytes-are-not-rederived-on-a-plain-read
+  "The hot read path pays nothing: an untouched node's BYTES, read twice,
+is the same vector, and the node is never marked stale by reading."
+  (with-temp-directory (dir)
+    (with-sm-graph (g dir)
+      (let ((id (id (with-transaction ()
+                      (make-sm-thing :name "v1" :note "n")))))
+        (clrhash (graph-db::cache g))
+        (let ((v (lookup-vertex id)))
+          (slot-value v 'name)
+          (is-false (graph-db::bytes-stale-p v))
+          (is (eq (graph-db::bytes v) (graph-db::bytes v))))))))
+
+(test a-mutated-node-is-rederived-once-not-per-read
+  (with-temp-directory (dir)
+    (with-sm-graph (g dir)
+      (with-transaction ()
+        (let ((n (make-sm-thing :name "a" :note "n")))
+          (setf (slot-value n 'name) "b")
+          (is-true (graph-db::bytes-stale-p n))
+          (let ((b1 (graph-db::bytes n)))
+            (is-false (graph-db::bytes-stale-p n))
+            (is (eq b1 (graph-db::bytes n))
+                "re-derived once, then cached")))))))

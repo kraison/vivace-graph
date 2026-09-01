@@ -204,6 +204,20 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Fixed
 
+- **`BYTES` was a derived cache of `DATA` with no invalidation on write**
+  (#136). A persistent-slot `setf` updated the node's `DATA` alist and left
+  its serialized `BYTES` stale, so every consumer that needed correct bytes
+  — `apply-tx-write`, `update-node`, `save-node`, the create-set refresh —
+  re-serialized by hand at its own call site, and the next path to forget
+  would have logged and replicated stale data invisibly until a restart.
+  One invariant now, in one place: every `DATA` mutation marks the node
+  stale (`(setf data)`, the in-place branch of `(setf node-slot-value)`,
+  `slot-makunbound`), and the `bytes` reader re-derives once on the next
+  read; writing `bytes` asserts freshness. The four hand compensations are
+  gone. Pinned by tests that read `BYTES` directly after a mutation; the
+  slot-read hot path is unchanged (2e6 reads: 847 ms vs 883 ms before —
+  `maybe-init-node-data` now reads `bytes` once instead of three times).
+
 - **Spatial radius queries missed results across the antimeridian and at
   the poles** (#287). `map-spatial-index-radius` built its longitude span
   at the query latitude and truncated it to `[-180, 180]`, so a window

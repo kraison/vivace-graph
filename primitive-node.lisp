@@ -255,6 +255,37 @@ garbage.  So MAYBE-INIT-NODE-DATA no-ops while this is bound; the data is set
 explicitly afterward (the transaction-node path) or materialized lazily later
 (the lhash path, when this is NIL and the pointer is local).")
 
+;;; BYTES is a DERIVED CACHE of DATA (GH #136).  One invariant, one place:
+;;; every DATA mutation marks the node stale -- (SETF DATA) here, the
+;;; in-place branch of (SETF NODE-SLOT-VALUE) above -- and the BYTES reader
+;;; re-serializes on the next read, once.  Writing BYTES asserts freshness.
+;;; Before this, APPLY-TX-WRITE, UPDATE-NODE, SAVE-NODE and the create-set
+;;; refresh each re-derived it by hand, and the next path to forget would
+;;; have logged and replicated stale data invisibly until a restart.
+
+(defmethod (setf data) :after (new-value (node node))
+  (declare (ignore new-value))
+  (setf (bytes-stale-p node) t))
+
+(defmethod (setf bytes) :after (new-value (node node))
+  (declare (ignore new-value))
+  (setf (bytes-stale-p node) nil))
+
+(defmethod bytes :around ((node node))
+  "The stored bytes, re-derived from DATA first when a write left them stale.
+Never for a node whose heap data is still unmaterialized (bytes :INIT with a
+DATA-POINTER): its DATA then holds at most the class :INITFORMs, applied
+through the funnel before the heap was read, and serializing THOSE would
+hide the stored value behind the default -- the GH #128 rule inverted.
+That case is left for MAYBE-INIT-NODE-DATA, which merges stored over
+defaults and clears the flag (GH #136)."
+  (let ((bytes (call-next-method)))
+    (if (and (bytes-stale-p node)
+             (or (typep bytes 'sequence)
+                 (zerop (data-pointer node))))
+        (setf (bytes node) (serialize (data node)))   ; the :AFTER clears
+        bytes)))
+
 (defun %merge-stored-over-defaults (stored current)
   "STORED wins per slot; entries in CURRENT whose key STORED has no entry for
 survive.  CURRENT holds whatever CHANGE-NODE-CLASS's :INITFORM application put
@@ -280,21 +311,28 @@ stored reads as what was stored (GH #128)."
     ;; *GRAPH*) is only a fallback for an unstamped node (GH #53).  Resolved HERE
     ;; rather than around the whole body because this is the only use of it and
     ;; this branch runs once per node, while the body runs on every slot access.
-    (when (or (eq (bytes node) :init) (null (bytes node)))
-      (setf (bytes node)
-            (read-bytes (make-mpointer
-                         :mmap (memory-mmap (heap (node-home-graph node graph)))
-                         :loc (data-pointer node)))))
-    ;; Deserialize lazily from the in-memory bytes (safe; *graph* is bound here).
-    ;; Gated on HEAP-MERGED-P, not on (NULL (DATA NODE)): a slot with an
-    ;; :INITFORM arrives with DATA already populated, and gating on emptiness
-    ;; would silently keep the default instead of the stored value (GH #128).
-    (when (and (not (heap-merged-p node))
-               (bytes node)
-               (not (eq (bytes node) :init)))
-      (setf (data node) (%merge-stored-over-defaults (deserialize (bytes node))
-                                                     (data node))
-            (heap-merged-p node) t)))
+    ;; ONE read of BYTES: it is a generic accessor with a staleness check
+    ;; on it (GH #136), and this runs on every slot access.
+    (let ((bytes (bytes node)))
+      (when (or (eq bytes :init) (null bytes))
+        (setf bytes
+              (setf (bytes node)
+                    (read-bytes (make-mpointer
+                                 :mmap (memory-mmap
+                                        (heap (node-home-graph node graph)))
+                                 :loc (data-pointer node))))))
+      ;; Deserialize lazily from the in-memory bytes (safe; *graph* is bound
+      ;; here).  Gated on HEAP-MERGED-P, not on (NULL (DATA NODE)): a slot
+      ;; with an :INITFORM arrives with DATA already populated, and gating on
+      ;; emptiness would silently keep the default instead of the stored
+      ;; value (GH #128).  DATA derived FROM bytes is not stale (GH #136).
+      (when (and (not (heap-merged-p node))
+                 bytes
+                 (not (eq bytes :init)))
+        (setf (data node) (%merge-stored-over-defaults (deserialize bytes)
+                                                       (data node))
+              (heap-merged-p node) t
+              (bytes-stale-p node) nil))))
   node)
 
 (defmethod lookup-node ((table lhash) (key array) (graph graph))
@@ -326,9 +364,9 @@ stored reads as what was stored (GH #128)."
   ;;(log:info "SAVING ~A" (string-id node))
   (let ((old-node nil))
     (when (plusp (data-pointer node))
-      (if (data node)
-          (setf (bytes node) (serialize (data node)))
-          (maybe-init-node-data node :graph graph))
+      ;; BYTES re-derives itself from a mutated DATA on read (GH #136).
+      (unless (data node)
+        (maybe-init-node-data node :graph graph))
       (let ((addr (allocate (heap graph) (length (bytes node)))))
         (dotimes (i (length (bytes node)))
           (set-byte (heap graph)
@@ -427,7 +465,11 @@ stored reads as what was stored (GH #128)."
                         (push (cons ,keyword ,value) (data ,node)))))
                  (t
                   (error "Cannot set slot value when data slot is of type ~A"
-                         (type-of (data ,node)))))))))
+                         (type-of (data ,node)))))
+           ;; DATA changed under BYTES; the PUSH branches went through (SETF
+           ;; DATA) but the in-place (SETF CDR) branch did not (GH #136).
+           (setf (bytes-stale-p ,node) t)
+           ,value))))
 
 (defun node-slot-boundp (node key &key (graph *graph*))
   "True if NODE's persistent slot KEY has a stored value -- i.e. an entry is

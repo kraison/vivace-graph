@@ -935,11 +935,9 @@ APPLY-TRANSACTION)."
   (let ((table (tx-write-table write graph))
         (node (node write)))
     (setf (revision node) 0)
-    ;; BYTES is refreshed from DATA once, in REFRESH-CREATE-SET-BYTES, which
-    ;; runs in PREPARE-TX-PERSISTENCE before the durable record (.txn file +
-    ;; replication log) is written -- doing it again here would be redundant
-    ;; on the same NODE object and, worse, too late to fix what is already
-    ;; on disk/wire (GH #135).
+    ;; BYTES re-derives itself from a mutated DATA on read (GH #136), so the
+    ;; durable record written in PREPARE-TX-PERSISTENCE already carried the
+    ;; post-construction mutations (GH #135); nothing to refresh here.
     (maybe-write-to-heap node graph)
     (add-node-to-indexes node graph
                          :unless-present *add-to-indexes-unless-present-p*)
@@ -968,8 +966,8 @@ APPLY-TRANSACTION)."
         (table (tx-write-table write graph)))
     (setf (revision new-node)
           (ldb (byte 32 0) (1+ (revision old-node))))
-    (setf (bytes new-node)
-          (serialize (data new-node)))
+    ;; BYTES re-derives itself from a mutated DATA on read (GH #136); the
+    ;; hand re-serialize that used to sit here is gone.
     ;; Stamp home graph, symmetric with the create path's FINALIZE-NODE (GH #53).
     (setf (node-graph new-node) graph
           (node-graph old-node) graph)
@@ -2645,18 +2643,6 @@ op-class).  Asserts the packet's type byte."
             (deserialize-uint64 vector (+ i 32))
             (aref vector (+ i 40)))))
 
-(defun refresh-create-set-bytes (transaction)
-  "Refresh each created node's BYTES from DATA before TRANSACTION is
-serialized for the durable record.  BYTES is a cache filled at construction;
-a SETF between MAKE-<TYPE> and commit updates DATA alone (pattern A), and
-without this the .txn file / replication log carry the pre-mutation bytes
-permanently -- no crash required.  Mirrors UPDATE-NODE's own re-serialize
-below, and must run before WRITE-TX-WRITES-TO-STREAM, which freezes BYTES
-into the wire vector (GH #135)."
-  (dolist (w (object-set-list (create-set transaction)))
-    (let ((n (node w)))
-      (when (data n) (setf (bytes n) (serialize (data n)))))))
-
 (defun prepare-tx-persistence (transaction)
   "Serialize TRANSACTION to a temp file and populate its BYTES slot.  Runs BEFORE
 the transaction-manager lock, so the bulk serialization + disk write (and the
@@ -2668,11 +2654,10 @@ pathname.
 WAL-suppressed (GH #170 Task 4): when (GRAPH TRANSACTION)'s WAL-SUPPRESSED-P
 is set, no temp file is written and BYTES is left unpopulated -- FINALIZE-TX-
 PERSISTENCE checks the same slot and skips both the rename and the
-replication-log write, so nothing here would ever be read.  REFRESH-CREATE-
-SET-BYTES still runs unconditionally: it refreshes each node's own BYTES from
-DATA, which APPLY-TRANSACTION's heap allocation depends on regardless of WAL
-suppression (GH #135)."
-  (refresh-create-set-bytes transaction)
+replication-log write, so nothing here would ever be read.  Each written
+node's BYTES re-derive themselves from a mutated DATA on read (GH #136), so
+nothing is refreshed by hand before WRITE-TX-WRITES-TO-STREAM freezes them
+into the wire vector."
   (let ((tmp (transaction-prepare-pathname transaction)))
     (unless (wal-suppressed-p (graph transaction))
       (with-open-file (stream tmp :direction :output
@@ -2904,13 +2889,8 @@ NEW-NODE was not produced by COPY.")
         (when (and home (not (eq home txn-graph)))
           (error 'cross-graph-transaction-error
                  :node new-node :transaction-graph txn-graph :node-graph home)))
-      ;; Refresh the serialized bytes from the (modified) data: NEW-NODE is a
-      ;; COPY that still carries the ORIGINAL node's bytes, and mutating a slot
-      ;; updates DATA but not BYTES.  The write is serialized from BYTES into
-      ;; both the .txn log and the replication stream, so without this the
-      ;; logged/replicated update carries the OLD data (the master only looks
-      ;; correct because apply-tx-write re-serializes its own copy locally).
-      (setf (bytes new-node) (serialize (data new-node)))
+      ;; NEW-NODE is a COPY whose slot writes marked its BYTES stale; the
+      ;; .txn log and replication stream read them re-derived (GH #136).
       (add-to-object-set (make-instance 'tx-update
                                         :node new-node
                                         :old-node old-node)
