@@ -203,6 +203,15 @@ between releases; cutting a release renames it to the new version and dates it.
   both docstrings. Audit: `lhash` was the only cl-stored structure carrying
   a filesystem path, and no engine path calls `delete-lhash` today.
 
+- **`migrate-graph` silently dropped a store's peer-replication sidecars**
+  (#289). Snapshot + replay carried nodes only; `lamport.dat`,
+  `field-stamps.dat`, `node-origins.dat`, `conflicts.dat` and `applied-ops/`
+  were left behind, and the next `open-graph :peer-role` recreated each one
+  empty — a reset Lamport clock and an empty applied-op index, visible only
+  at the next sync. They are now copied verbatim after the replay (their
+  keys are node ids, which survive it) and named in the migration log; a
+  non-peer store carries nothing.
+
 - **Type-id seeding tests were red on macOS (the arm64 advisory lane's 11
   failures)**: the fixture compared raw `merge-pathnames` namestrings
   against the seeding report's `truename`'d ones, which diverge wherever

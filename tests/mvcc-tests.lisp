@@ -185,6 +185,73 @@ snapshot and the replay leaked the file permanently.  It is now on every exit."
       (is (not (probe-file snap))
           "the snapshot must be removed even when the migration fails"))))
 
+(defparameter *migration-origin*
+  (make-array 16 :element-type '(unsigned-byte 8) :initial-element 9)
+  "A fixed device origin id for the sidecar-migration tests (GH #289).")
+
+(test migration-carries-the-peer-replication-sidecars
+  "GH #289: MIGRATE-GRAPH is snapshot + replay, which carries the nodes and
+nothing else.  A peer-replicating store's Lamport clock, applied-op index,
+field stamps, node origins and conflict records live BESIDE the graph, and
+OPEN-GRAPH recreated each one empty after a migration -- a reset clock
+loses later LWW races, an empty applied-op index re-applies ops, both
+silently and only at the next sync.  Node UUIDs survive the replay, so the
+sidecars' keys stay valid and they are carried verbatim."
+  (with-temp-directory (root)
+    (let ((old-dir (namestring (merge-pathnames "peer-old/" root)))
+          (new-dir (namestring (merge-pathnames "peer-new/" root)))
+          (op-id (gen-id)))
+      (let ((g (make-graph *integration-graph-name* old-dir
+                           :peer-role :device :origin-id *migration-origin*
+                           :peer-host "localhost" :replication-port 0
+                           :buffer-pool-size 1000)))
+        (let ((*graph* g))
+          (dotimes (i 3) (with-transaction () (make-g-person :name "m")))
+          (graph-db::peer-observe-lamport g 40)
+          (graph-db::record-applied-op g op-id 40))
+        (close-graph g :snapshot-p nil))
+      (let ((g (graph-db::migrate-graph
+                *integration-graph-name* old-dir new-dir
+                :package :graph-db/test
+                :snapshot-file (namestring
+                                (merge-pathnames "peer.snapshot" root)))))
+        (close-graph g :snapshot-p nil))
+      (dolist (f '("lamport.dat" "applied-ops/struct.dat"
+                   "applied-ops/table.dat"))
+        (is (probe-file (merge-pathnames f new-dir)) "~A was carried" f))
+      (let ((g (open-graph *integration-graph-name* new-dir
+                           :peer-role :device :origin-id *migration-origin*
+                           :peer-host "localhost" :replication-port 0)))
+        (unwind-protect
+             (let ((*graph* g))
+               (is (= 40 (graph-db::lamport-counter g))
+                   "the Lamport clock survives the migration")
+               (is-true (graph-db::op-applied-p g op-id)
+                        "the applied-op index survives the migration")
+               (is (= 3 (length (map-vertices #'identity g :collect-p t
+                                              :vertex-type 'g-person)))))
+          (close-graph g :snapshot-p nil))))))
+
+(test migrating-a-non-peer-store-carries-no-sidecars
+  "The other side of GH #289: a store with no peer sidecars migrates as
+before -- nothing is invented for it."
+  (with-temp-directory (root)
+    (let ((old-dir (namestring (merge-pathnames "plain-old/" root)))
+          (new-dir (namestring (merge-pathnames "plain-new/" root))))
+      (let ((g (make-graph *integration-graph-name* old-dir
+                           :buffer-pool-size 1000)))
+        (let ((*graph* g))
+          (with-transaction () (make-g-person :name "p")))
+        (close-graph g :snapshot-p nil))
+      (let ((g (graph-db::migrate-graph
+                *integration-graph-name* old-dir new-dir
+                :package :graph-db/test
+                :snapshot-file (namestring
+                                (merge-pathnames "plain.snapshot" root)))))
+        (close-graph g :snapshot-p nil))
+      (is (not (probe-file (merge-pathnames "lamport.dat" new-dir))))
+      (is (not (probe-file (merge-pathnames "applied-ops/" new-dir)))))))
+
 ;;; ---------------------------------------------------------------------------
 ;;; Versioned write path + reaper (P2)
 ;;; ---------------------------------------------------------------------------

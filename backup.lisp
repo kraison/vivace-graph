@@ -317,6 +317,39 @@ failure mode this function exists to prevent.  See GH #100."
               "/tmp/")
           name (uuid:make-v4-uuid)))
 
+(defparameter +peer-sidecar-files+
+  '("lamport.dat" "field-stamps.dat" "node-origins.dat" "conflicts.dat")
+  "The single-file peer-replication sidecars a store keeps beside its graph;
+APPLIED-OPS/ (an lhash directory) is the fifth.  Written by the peer-graph
+open/close paths in graph.lisp, transactions.lisp and peer-merge.lisp.")
+
+(defun %carry-peer-sidecars (old-location new-location)
+  "Copy the peer-replication sidecars present under OLD-LOCATION to
+NEW-LOCATION verbatim: +PEER-SIDECAR-FILES+ and every file of APPLIED-OPS/.
+A logical replay carries nodes only, and OPEN-GRAPH recreates a missing
+sidecar EMPTY -- a reset Lamport clock, an empty applied-op index -- which
+shows up only at the next sync (GH #289).  Their keys are node ids, which
+survive the replay, so the copies stay valid; APPLIED-OPS/struct.dat's
+recorded location is stale after the copy and OPEN-LHASH resets it
+(GH #143).  Returns the relative paths carried."
+  (let ((old (uiop:ensure-directory-pathname old-location))
+        (new (uiop:ensure-directory-pathname new-location))
+        (carried '()))
+    (flet ((carry (rel)
+             (let ((src (merge-pathnames rel old)))
+               (when (probe-file src)
+                 (let ((dst (merge-pathnames rel new)))
+                   (ensure-directories-exist dst)
+                   (uiop:copy-file src dst)
+                   (push rel carried))))))
+      (dolist (f +peer-sidecar-files+) (carry f))
+      (let ((ops (merge-pathnames "applied-ops/" old)))
+        (when (probe-file ops)
+          (dolist (f (uiop:directory-files ops))
+            (carry (concatenate 'string "applied-ops/"
+                                (file-namestring f)))))))
+    (nreverse carried)))
+
 (defun migrate-graph (name old-location new-location
                       &key (package :graph-db) include-deleted-p
                            (delete-snapshot-p t) renumber-p
@@ -330,7 +363,11 @@ Migration is a logical snapshot + replay: OLD-LOCATION's own stamped storage
 version is read first, so the old graph is opened read-only with the head
 shim that matches IT (15-byte v1, 31-byte v2), every live node is written to a
 format-independent snapshot file, then a fresh v3 graph is created and the
-snapshot replayed through the normal MAKE-VERTEX / MAKE-EDGE path.
+snapshot replayed through the normal MAKE-VERTEX / MAKE-EDGE path.  A
+peer-replicating store's sidecars -- Lamport clock, applied-op index, field
+stamps, node origins, conflicts -- are then copied across verbatim, since
+the replay carries nodes only and a missing sidecar would silently come up
+empty at the next OPEN-GRAPH :PEER-ROLE (GH #289).
 
 :RENUMBER-P decides which type-ids the new graph gets, and it is the one
 guarantee here that is mode-dependent (GH #186, spec §10.1):
@@ -431,6 +468,11 @@ type-ids, which are NOT this system's registry ids (:RENUMBER-P NIL, #186)."
                    (log:info "MIGRATE-GRAPH: replaying snapshot ~
 into v~D graph ~A" +storage-version+ new-location)
                    (recreate-graph new snapshot-file :package-name package)
+                   (let ((carried (%carry-peer-sidecars old-location
+                                                        new-location)))
+                     (when carried
+                       (log:info "MIGRATE-GRAPH: carried peer sidecars ~S"
+                                 carried)))
                    (values new unified))
                (error (c)
                  (close-graph new)

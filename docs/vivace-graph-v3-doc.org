@@ -2932,6 +2932,17 @@ This is a materially better rollback story than some earlier on-disk format
 changes, whose rollback needs replaying a full snapshot rather than a plain
 repoint at the old directory.
 
+*Peer-replicating stores.* A store opened with ~:peer-role~ keeps five
+things beside the graph that no snapshot contains: ~lamport.dat~ (the
+Lamport clock), ~applied-ops/~ (the applied-op index that makes a replayed
+op idempotent), ~field-stamps.dat~, ~node-origins.dat~ and
+~conflicts.dat~. ~migrate-graph~ copies whichever of these the source has
+across verbatim after the replay — their keys are node ids, which survive
+it — and logs what it carried (vivace-graph#289). Before that fix the next
+~open-graph :peer-role~ recreated each one empty, which reset the clock
+and forgot every applied op, silently and only at the next sync. A store
+without them carries nothing.
+
 *Copies and moves.* A path stored *inside* a persisted structure says where
 it was created, not where it now lives. The linear hash tables under
 ~vertex/~, ~edge/~, the ve/vev indexes and ~applied-ops/~ cl-store their
