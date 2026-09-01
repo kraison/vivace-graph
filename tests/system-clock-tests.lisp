@@ -348,7 +348,8 @@ would silently drop every record it appends after the rename (GH #182,
 #191).  An unowned read still warns and reports TORN-P true, but leaves
 the bytes alone -- it re-warns on every read until an OWNING clock
 truncates it.  Ablation: removing the lock-fd guard in JOURNAL-RECORDS
-makes the file-unchanged assertion below fail (see fix-wave-report.md)."
+makes the file-unchanged assertion below fail (GH #191, 0f72998; the
+ablation is recorded in docs/superpowers/plans/2026-08-22-torn-journal-191.md)."
   (with-temp-directory (dir)
     (let ((c (open-system-clock (namestring dir))))
       (journal-append c :create :store :alpha)

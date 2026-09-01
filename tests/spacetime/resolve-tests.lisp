@@ -123,7 +123,8 @@ the class and the graph, not just crash."
                (unopened-source-graph-graph-name c)))))))
 
 (test inheriting-a-source-with-one-record-resolves-cleanly
-  "Fix 2 (fix-wave review).  GRAPH-DB:INDEX-LOOKUP matches a class and its
+  "GH #132 review, gap 2 (25ffa22).  GRAPH-DB:INDEX-LOOKUP matches a class and
+its
 subclasses (index.lisp), so ST-PSRC's own index-lookup call and ST-CSRC's
 own both find the SAME physical ST-CSRC record.  Before the fix, that made
 RESOLVE-ENDPOINT see two classes answering and signal AMBIGUOUS-ENDPOINT
@@ -144,7 +145,8 @@ EQUALP fails here and only here."
         (is (string= "inh-solo" (st-psrc-pid n)))))))
 
 (test resolve-endpoint-guards-cross-class-ambiguity-after-dedup
-  "Fix 2 (fix-wave review), the other half: de-duplicating HITS by node id
+  "GH #132 review, gap 2 (25ffa22), the other half: de-duplicating HITS by node
+id
 must not swallow genuine ambiguity -- two DIFFERENT physical records
 answering under two different classes.  A live ST-PSRC/ST-CSRC pair
 cannot drive this through the public API: DEF-UNIQUE turns out to make a

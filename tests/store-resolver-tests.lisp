@@ -189,8 +189,8 @@ DIFFERENT system directory gets a different registry id than the one
 baked into its own already-minted v8 ids, so the tag mismatches even
 though every vertex IS local.  The tag-based gate (pre-#209) truncates
 BFS after depth 1 here; the fix walks the whole chain.  Nearest wrong
-implementation: the reverted tag-equality gate (see the ablation notes
-in the fix-wave report)."
+implementation: the reverted tag-equality gate (GH #209, efaecd5; the
+ablation notes are in docs/superpowers/plans/2026-08-22-tagged-uuid-169.md)."
   (with-temp-directory (sys1)
     (with-temp-directory (d)
       (let (v1id v2id v3id)

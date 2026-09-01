@@ -359,7 +359,7 @@ ST-DERIVED is a genuine subtype of ST-BASE-THING and inherits its slot."
         (is (string= "l" (st-base-label n)))
         (is (string= "e9" (st-derived-extra n)))))))
 
-;; Fix 2 (fix-wave review): ST-PSRC and ST-CSRC both a source, ST-CSRC
+;; GH #132 review, gap 2 (25ffa22): ST-PSRC and ST-CSRC both a source, ST-CSRC
 ;; inheriting ST-PSRC and sharing its namespace.  GRAPH-DB:INDEX-LOOKUP
 ;; matches a class and its subclasses (index.lisp), so one physical
 ;; ST-CSRC record answers under both class names -- resolve-tests.lisp
@@ -394,7 +394,7 @@ ST-DERIVED is a genuine subtype of ST-BASE-THING and inherits its slot."
         (is (string= "inh-1" (st-psrc-pid n)))))))
 
 (test a-keyword-key-slot-signals-and-names-the-mistake
-  "Fix 1 (fix-wave review).  :KEY-SLOT :PID passed the old REQ-SYMBOL
+  "GH #132 review, gap 1 (25ffa22).  :KEY-SLOT :PID passed the old REQ-SYMBOL
 check -- a non-NIL symbol -- because keywords are symbols too.  The class
 defined, records wrote, and RESOLVE-ENDPOINT returned NIL for the life of
 the class, because keyword :PID never matches slot name PID.  This is the
@@ -413,7 +413,8 @@ likeliest slip a user makes, and must be caught at macroexpansion."
                   (graph-db.spacetime::invalid-source-facet-reason c))))))
 
 (test a-malformed-plist-signals-instead-of-a-raw-type-error
-  "Fix 3 (fix-wave review).  A dropped value -- the likeliest typo -- left
+  "GH #132 review, gap 3 (25ffa22).  A dropped value -- the likeliest typo --
+left
 an odd-length plist, which reached SBCL's malformed-property-list error
 straight out of GETF.  Every other malformed declaration in this unit
 signals INVALID-SOURCE-FACET; this one must too."
