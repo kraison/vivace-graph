@@ -1130,3 +1130,24 @@ version fork in %READ-MEMORY-IMAGE is what this pins."
                    "exactly one edge, so no key was dropped or duplicated"))
           (ignore-errors (close-graph g2 :snapshot-p nil))
           (collect-garbage))))))
+
+(test make-memory-graph-refuses-a-dirty-location-before-side-effects
+  "GH #250: creation over a location carrying .dirty -- a live holder or a
+crashed store -- is refused upfront with STORE-NOT-CLOSED-CLEANLY-ERROR,
+as disk MAKE-GRAPH does since GH #246, and nothing is created or
+registered.  OPEN-MEMORY-GRAPH still supersedes the marker (an open
+rebuilds from the journal), which is the documented recovery."
+  (with-temp-directory (dir)
+    (let ((loc (namestring dir)))
+      (with-open-file (s (format nil "~A.dirty" loc) :direction :output
+                         :if-does-not-exist :create)
+        (write-line "crashed" s))
+      (signals graph-db::store-not-closed-cleanly-error
+        (graph-db::make-memory-graph *mem-test-graph-name* loc))
+      (is (null (graph-db:lookup-graph *mem-test-graph-name*))
+          "a refused create must not register the graph")
+      (is (null (remove-if (lambda (p) (string= (file-namestring p) ".dirty"))
+                           (uiop:directory-files dir)))
+          "a refused create must leave no files behind")
+      (is (probe-file (format nil "~A.dirty" loc))
+          "the marker that records the earlier crash is kept"))))

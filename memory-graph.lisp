@@ -303,9 +303,15 @@ Registers the graph and returns it."
   ;; store's PARENT directory.  Normalize once, before any use
   ;; (GH #222/#230).
   (setq location (namestring (uiop:ensure-directory-pathname location)))
+  ;; A .dirty under LOCATION means a live holder or a crashed store, and
+  ;; CREATING over either silently orphans its journal and image.  Refuse
+  ;; before any side effect, as MAKE-GRAPH does (GH #246, #250).  Only
+  ;; OPEN-MEMORY-GRAPH supersedes the marker: an open always rebuilds
+  ;; from the durable journal, so there an unclean shutdown is recovered.
+  (when (probe-file (format nil "~A.dirty" location))
+    (error 'store-not-closed-cleanly-error :location location))
   (ensure-directories-exist location)
   (let* ((path (pathname location))
-         (dirty-preexisted (probe-file (format nil "~A.dirty" location)))
          (graph (%make-empty-memory-graph
                  name path
                  :class (if peer-role 'memory-peer-graph 'memory-graph)
@@ -352,7 +358,9 @@ Registers the graph and returns it."
           (setf done t)
           graph)
       (unless done
-        (%abort-memory-graph-open graph dirty-preexisted)))))
+        ;; The marker is always ours here: a pre-existing one was
+        ;; refused above (GH #250).
+        (%abort-memory-graph-open graph nil)))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Durability (design §7).  Three tiers, all reusing the existing journal:

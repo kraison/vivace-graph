@@ -146,6 +146,13 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Changed
 
+- **`make-memory-graph` refuses a location carrying `.dirty`** (#250), with
+  `store-not-closed-cleanly-error` before any side effect — the same rule
+  disk `make-graph` has had since #246. It used to supersede the marker and
+  create over the live or crashed store beneath it. `open-memory-graph` is
+  unchanged: an open rebuilds from the journal, so there the marker is
+  recovered, not refused.
+
 - **Query results render `NIL` as JSON `null`, `T` as `true`, and a stored
   object as an object** (#282). `%query-value->json` tested `symbolp`
   before anything mapped `NIL`, so an empty slot came back as the string
