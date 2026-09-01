@@ -273,6 +273,8 @@
            #:*query-default-max-inferences*
            #:*query-default-timeout*
            #:query-param-error
+           ;; checked query preconditions, typed (GH #286)
+           #:query-precondition-error #:query-precondition-error-reason
 
            #:with-transaction
            #:with-read-snapshot

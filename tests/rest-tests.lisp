@@ -677,3 +677,25 @@ query surface -- not the strings \"NIL\" / \"T\"."
         (is-false (search "\"T\"" raw))
         (is (member nil ages) "A's missing age is null")
         (is (member t ages) "B's age T is true")))))
+
+;; A query over an UNINDEXED slot through the index functor: the engine's
+;; checked precondition, a typed condition since GH #286.
+(def-query people-by-age-index
+  :params ((?age :integer))
+  :return (?n)
+  :where ((find-by-slot ?p g-person age ?age)
+          (node-slot-value ?p name ?n)))
+
+(test def-query-checked-precondition-is-400-with-the-reason
+  "GH #286: an engine precondition the caller failed -- no index on
+G-PERSON.AGE -- is the client's 400 with the reason, not a 500."
+  (with-test-graph (g)
+    (declare (ignore g))
+    (with-rest-env ()
+      (let ((j (rest-decode
+                (graph-db::call-rest-query "peopleByAgeIndex"
+                                           (rest-params (cons "age" "3"))))))
+        (is (= 400 (rest-status)))
+        (is-true (search "No secondary index" (cdr (assoc :error j)))
+                 "the reason names the precondition: ~S"
+                 (cdr (assoc :error j)))))))

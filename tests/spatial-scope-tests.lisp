@@ -495,7 +495,9 @@ every A point, and scoping to B returns no A nodes."
     (with-transaction ()
       (make-scope-probe :geom (make-point 12.3424d0 45.6720d0)))
     (let ((window (scope-rect 1.0d0 40.0d0 16.0d0 48.0d0)))
-      (signals error (find-nodes-within 'scope-aspatial window :graph g))
+      ;; Typed: the caller's error, not a defect (GH #286).
+      (signals graph-db:query-precondition-error
+        (find-nodes-within 'scope-aspatial window :graph g))
       ;; SCOPE-ZONE is declared but nothing was written: empty, not an error.
       (is (null (find-nodes-within 'scope-zone window :graph g))))))
 

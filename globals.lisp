@@ -468,3 +468,14 @@ Transient failures (conflicts, I/O) are never subclasses (GH #151)."))
 not match established segment dimension ~D"
                      (vdv-slot c) (vdv-owner c) (vdv-actual c)
                      (vdv-expected c)))))
+
+;;; A precondition the query layer checked deliberately and the CALLER
+;;; failed (GH #286): an unindexed slot, an unscoped spatial class, a wrong
+;;; index arity.  Distinct from SIMPLE-ERROR / TYPE-ERROR so a server can
+;;; answer 400 for these and 500 for an engine defect; QUERY-PARAM-ERROR
+;;; (query-dsl.lisp) is its DSL-level subclass.
+
+(define-condition query-precondition-error (error)
+  ((reason :initarg :reason :reader query-precondition-error-reason))
+  (:report (lambda (c s)
+             (format s "~A" (query-precondition-error-reason c)))))

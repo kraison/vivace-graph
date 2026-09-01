@@ -626,11 +626,11 @@ whitelisted read functors, not assumed (GH #279):
     that dispatches on node classes: (outgoing-edges ?a ?b),
     (incoming-edges ?a ?b), (invoke-view ?a ?b ?c ?d).
 
-  SIMPLE-ERROR -- how the query layer reports a failed precondition it
-    checked on purpose: \"No secondary index on ?2.?3 in :G\"
-    (index.lisp:932) for (find-by-slot ?a ?b ?c ?d), and the
-    not-spatially-indexed report from %RESOLVE-SPATIAL-SCOPE for
-    (find-nearest ?n some-type 0 0 5).
+  QUERY-PRECONDITION-ERROR -- how the query layer reports a failed
+    precondition it checked on purpose: \"No secondary index on ?2.?3
+    in :G\" for (find-by-slot ?a ?b ?c ?d), and the not-spatially-indexed
+    report from %RESOLVE-SPATIAL-SCOPE for (find-nearest ?n some-type
+    0 0 5).  Both were SIMPLE-ERRORs before GH #286.
 
 TYPE-ERROR and UNBOUND-VARIABLE are deliberately NOT here, though they
 are the obvious guesses.  No client input produced either: the read
@@ -639,12 +639,12 @@ signalling.  A TYPE-ERROR is instead the classic shape of a real defect
 -- a NIL where a struct was expected -- so admitting it would relabel
 exactly the fault this split exists to surface.
 
-Known residual: an internal (error \"...\") or a failed ASSERT in engine
-code is also a SIMPLE-ERROR and is still labelled the client's.  The
-durable fix is a distinct condition class for validated query
-preconditions in the engine, which is an engine change, not a GUI one
-(GH #286)."
-  (or (typep c 'simple-error)
+Since GH #286 the engine signals those preconditions as
+QUERY-PRECONDITION-ERROR, so that class is what is admitted here; a
+plain SIMPLE-ERROR -- an internal (error \"...\") or a failed ASSERT --
+is a defect again and answers 500, which closes the residual the first
+cut recorded."
+  (or (typep c 'graph-db:query-precondition-error)
       (and *no-applicable-method-type*
            (typep c *no-applicable-method-type*))))
 

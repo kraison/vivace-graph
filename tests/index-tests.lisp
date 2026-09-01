@@ -137,7 +137,9 @@
   (with-ix-graph (g)
     (with-transaction () (make-ix-person :name "d" :email "D@X.COM"))
     (is (equal '("d") (ix-names (index-lookup g 'ix-person 'email "d@x.com"))))
-    (signals error (index-lookup g 'ix-person 'title "x"))))
+    ;; Typed: the caller's error, not a defect (GH #286).
+    (signals graph-db:query-precondition-error
+      (index-lookup g 'ix-person 'title "x"))))
 
 ;;; --- the generalised composite comparator (GH #107) -------------------------
 

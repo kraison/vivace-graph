@@ -2397,7 +2397,14 @@ names the offending token. Past the guard, a query's *shape* is the
 client's, so a goal handed arguments its predicate cannot use — an
 unbound class where an index lookup wants one, a variable where a
 method wants a node — is ~400 ill-typed-query~ with a *generic*
-message. It is deliberately not the condition's own report: those name
+message. The engine signals such checked preconditions as
+~query-precondition-error~ (vivace-graph#286) — an unindexed slot, an
+unscoped spatial class, a wrong index arity — and that class, plus the
+implementation's no-applicable-method condition, is the *whole* of what
+the endpoint labels the client's; a plain ~simple-error~ from engine
+code is an engine defect and answers ~500 internal-error~. The REST
+endpoints map the same class to ~400~ with the reason verbatim
+(~query-param-error~, the DSL's own refusal, is its subclass). It is deliberately not the condition's own report: those name
 engine internals (a store's keyword name, a generic-function name, an
 ANSI section reference), and the client that provoked them is
 unauthenticated. The same rule covers the read path, where a rejected

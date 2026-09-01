@@ -28,7 +28,7 @@
   "Per-row callback for an EVAL'd ad-hoc pattern query (which has no lexical
 environment to capture one); RUN-PATTERN-QUERY binds it around the SELECT.")
 
-(define-condition query-param-error (error)
+(define-condition query-param-error (query-precondition-error)
   ((reason :initarg :reason :reader query-param-error-reason))
   (:report (lambda (c s)
              (format s "Query parameter error: ~A" (query-param-error-reason c)))))

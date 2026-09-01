@@ -239,9 +239,11 @@ error, and catching it is the reason the scope is required."
              (indexes '()))
         (dolist (name names)
           (unless (%class-geometry-slots-declared-p name)
-            (error "~S is not a spatially indexed class in ~S: it declares no ~
-                    :INDEX-marked geometry slot and has no NODE-GEOMETRY method."
-                   name (graph-name graph)))
+            ;; The caller's error, typed (GH #286).
+            (error 'query-precondition-error
+                   :reason (format nil "~S is not a spatially indexed class ~
+in ~S: it declares no :INDEX-marked geometry slot and has no NODE-GEOMETRY ~
+method." name (graph-name graph))))
           (dolist (key (class-spatial-index-keys (find-class name) graph))
             (unless (gethash key keys)
               (setf (gethash key keys) t)

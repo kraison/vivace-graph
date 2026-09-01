@@ -2043,3 +2043,34 @@ the query endpoint refused the schema's own name."
         (is (= 200 status) "digit-bearing names must resolve: ~A"
             (jref json :message))
         (is (equal '(7) (rows-of json :v)))))))
+
+(test prolog-plain-simple-error-is-an-engine-fault
+  "A bare (ERROR \"...\") in engine code is a defect, not the client's:
+500 internal-error.  Before GH #286 every SIMPLE-ERROR was labelled
+ill-typed, because the engine's own checked preconditions were
+SIMPLE-ERRORs; they are QUERY-PRECONDITION-ERRORs now, so the label can
+be exact in both directions."
+  (with-gui-fixture ()
+    (with-gui-server (:allow-prolog t)
+      (let* ((key (find-symbol "VALID-DATE-P/1" :graph-db))
+             (saved (gethash key graph-db::*prolog-global-functors*)))
+        (assert saved)
+        (unwind-protect
+             (progn
+               (setf (gethash key graph-db::*prolog-global-functors*)
+                     (lambda (&rest args)
+                       (declare (ignore args))
+                       (error "boom, an engine defect")))
+               (multiple-value-bind (json status ctype raw)
+                   (run-prolog
+                    "(is-a ?p gui-person) (valid-date-p \"2026-08-28\")")
+                 (declare (ignore ctype))
+                 (is (= 500 status) "a SIMPLE-ERROR answered ~A" status)
+                 (is (string= "internal-error" (jref json :error)))
+                 (is-false (search "boom" raw))))
+          (setf (gethash key graph-db::*prolog-global-functors*) saved)))
+      ;; ...and a checked precondition is still the client's 400.
+      (multiple-value-bind (json status)
+          (run-prolog "(find-by-slot ?a ?b ?c ?d)")
+        (is (= 400 status))
+        (is (string= "ill-typed-query" (jref json :error)))))))

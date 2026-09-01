@@ -479,9 +479,11 @@ class (GH #107)."
                            (make-list (- arity n)
                                       :initial-element +max-sentinel+)
                            (list +max-key+))))
-          (t (error "Index on ~S has arity ~D; got ~D value(s)~
-~:[~; -- pass :PREFIX T for a prefix scan~]"
-                    (slot-index-slot-names six) arity n (< n arity))))))
+          (t (error 'query-precondition-error
+                    :reason (format nil "Index on ~S has arity ~D; got ~D ~
+value(s)~:[~; -- pass :PREFIX T for a prefix scan~]"
+                                    (slot-index-slot-names six) arity n
+                                    (< n arity)))))))
 
 (defun ix-lookup (six key &key prefix)
   "List of node-ids whose indexed tuple matches KEY, the canonical component
@@ -960,8 +962,12 @@ result); signals only when the slot is not indexed at all (a programming error).
           ((or (%slot-index-declared-p class-name slot-names)
                (%def-index-declared-p graph class-name slot-names))
            nil)                                             ; declared, empty
-          (t (error "No secondary index on ~S.~S in ~S"
-                    class-name slot-name (graph-name graph))))))
+          ;; A caller's error, typed so a server can tell it from a
+          ;; defect (GH #286).
+          (t (error 'query-precondition-error
+                    :reason (format nil "No secondary index on ~S.~S in ~S"
+                                    class-name slot-name
+                                    (graph-name graph)))))))
 
 (defun index-lookup (graph class-name slot-name value
                      &key (collect-p t) prefix)

@@ -353,10 +353,13 @@ the declared parameters."
                ;; :ndjson writes one JSON object per line
                (emit-query-results ',return (query-format req-params)
                                    (lambda (,cb) ,run-form)))
-           (query-param-error (c)
+           ;; QUERY-PARAM-ERROR is a subclass, so one clause covers the
+           ;; DSL's own refusals and the engine's typed preconditions --
+           ;; an unindexed slot, an unscoped spatial class (GH #286).
+           (query-precondition-error (c)
              (setf (lack.response:response-status ningle:*response*) 400)
              (json:encode-json-to-string
-              (list (cons :error (query-param-error-reason c)))))
+              (list (cons :error (query-precondition-error-reason c)))))
            (prolog-resource-error (c)
              (declare (ignore c))
              (setf (lack.response:response-status ningle:*response*) 400)
@@ -421,10 +424,11 @@ A malformed query or a resource-bound breach is a 400, a forbidden effect a 403.
   (with-rest-auth ((get-param params "username") (get-param params "password"))
     (with-rest-graph ((get-param params :graph-name))
       (handler-case (run-pattern-query dsl *graph*)
-        (query-param-error (c)
+        ;; Includes QUERY-PARAM-ERROR, its subclass (GH #286).
+        (query-precondition-error (c)
           (setf (lack.response:response-status ningle:*response*) 400)
           (json:encode-json-to-string
-           (list (cons :error (query-param-error-reason c)))))
+           (list (cons :error (query-precondition-error-reason c)))))
         (prolog-resource-error (c)
           (declare (ignore c))
           (setf (lack.response:response-status ningle:*response*) 400)

@@ -161,6 +161,15 @@ between releases; cutting a release renames it to the new version and dates it.
   lowercase kebab name is now interned verbatim; a name carrying an
   uppercase letter still takes the legacy camelCase fold (`minAge`).
 
+- **Checked query preconditions are a typed condition** (#286).
+  `query-precondition-error` (with `query-param-error` as its DSL subclass)
+  replaces the bare `SIMPLE-ERROR`s for "no secondary index on X.Y", the
+  index-arity mismatch and "not a spatially indexed class". REST answers it
+  `400` with the reason on both query surfaces; the GUI's Prolog endpoint
+  admits *only* this class (and no-applicable-method) as the client's, so a
+  plain `simple-error` from engine code is a `500` again — the residual the
+  #279 classifier recorded is closed.
+
 - **`geometry-contains-point-p` stays native by decision** (#99, closing
   the characterised inconsistency 3.0.0 shipped). The even-odd ray-cast is
   the hot predicate behind `find-nodes-within` / `geo-within/3`, ~77x
