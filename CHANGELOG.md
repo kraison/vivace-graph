@@ -263,6 +263,75 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Fixed
 
+- **ECL/Darwin-arm64: files created through `%POSIX-OPEN` got mode 000**
+  (#306). CFFI's ECL backend drops `open(2)`'s variadic MODE on Apple
+  arm64 (the same ABI split #218 fixed for SBCL), so the type registry's
+  and system clock's files were born unreadable and every graph open in
+  the image then failed EACCES. ECL now compiles a direct C `open()`
+  call (`ffi:c-inline`) — correct ABI by construction; other
+  implementations unchanged. The exact-mode regression test now runs on
+  ECL too (its own c-inline `stat`).
+
+- **`%COPY-DIRECTORY-TREE` could truncate the live store to zero bytes**
+  (#307). When the directory walk returns truenames but the caller's
+  root is unresolved (macOS `/var` → `/private/var`; ECL's walk resolves,
+  and any SBCL caller passing an unresolved symlinked location hits the
+  same), `ENOUGH-PATHNAME` fell back to absolute paths and the shadow
+  copy degenerated into copying every store file onto itself —
+  `:supersede` truncating each to 0. Both roots are now truenamed before
+  the walk and a non-relative relativization is a hard error, never a
+  self-copy. Regression test copies through an explicit symlinked root
+  and asserts both directions.
+
+- **The restore planner lost generations under a symlinked root** (#311).
+  `%RETIRED-DIRS-FOR` reported scanned generation directories as
+  truenames while the `:swap`/`:restore` journal records carry
+  caller-form paths, so on ECL/macOS keyed comparisons never matched:
+  existing generations planned as `AUTHORED-GENERATION-MISSING`. Scan
+  entries are now rebuilt from the caller-form location string.
+
+- **spacetime: same-second assert/retract signalled `INVALID-EXTENT` on
+  whole-second clocks** (#308). ECL's `local-time:now` ticks in whole
+  seconds (Linux and macOS alike), so closing a transaction extent in
+  the same second as its start made a zero-width interval. `%ST-NOW`
+  makes the substrate's stamps strictly monotonic per image (ties bump
+  1 ns); caller-supplied stamps are untouched.
+
+- **GUI Prolog error taxonomy holds on every implementation** (#309).
+  Three ECL-only misclassifications: (1) ECL reads `1e999999` as
+  `single-float` infinity instead of signalling, so the query ran and
+  died at JSON encoding as a 500 — read forms are now screened for
+  non-finite floats and answer the same 400 refusal as an unreadable
+  literal. (2) ECL signals a bare `SIMPLE-ERROR` for
+  no-applicable-method (deliberately a 500), so ill-typed goals reaching
+  the whitelisted read generics answered 500 — `OUTGOING-EDGES`,
+  `INCOMING-EDGES` and `INVOKE-GRAPH-VIEW` now define
+  `NO-APPLICABLE-METHOD` methods signalling `QUERY-PRECONDITION-ERROR`,
+  which the classifier admits portably. Direct Lisp callers of those
+  three generics now see `QUERY-PRECONDITION-ERROR` instead of the
+  implementation's own condition on an ill-typed call. (3) The
+  oversize-body test accepts a client-side stream error mid-send as the
+  refusal observed at the transport layer (ECL's client hits EPIPE
+  before it can read the 413; the status-code assertion stays pinned on
+  SBCL).
+
+- **The system-clock journal truncate renamed with `CL:RENAME-FILE`**
+  (#313), whose over-existing-target behavior is implementation-defined:
+  ECL (like CCL) signals "already exists", so every torn-tail recovery
+  on ECL died instead of truncating. Now `%POSIX-RENAME` (rename(2):
+  atomic, replaces), the engine's established idiom; the stale comment
+  claiming ECL's `RENAME-FILE` overwrites is corrected.
+
+- **Test infrastructure portability for the ECL matrix** (#310, #307,
+  #167, #313): `%DIRECTORY-FILE-HASHES` shells out to
+  `sha256sum`/`shasum` (ironclad's ECL digest path is bignum-slow and
+  shadow stores are ~1 GB apparent size); the detach-tests helpers
+  truename their roots; `%FILE-REAL-BYTES` gained an ECL `st_blocks`
+  branch; and `REHOME-AUTHORED-OP` / `%EDGE-OCCUPANCY-FILE` /
+  `PIN-READ-EPOCH` are `notinline` so the suites' fdefinition spies
+  observe them on ECL (same-file calls compile to direct C calls
+  there).
+
 - **`BYTES` was a derived cache of `DATA` with no invalidation on write**
   (#136). A persistent-slot `setf` updated the node's `DATA` alist and left
   its serialized `BYTES` stale, so every consumer that needed correct bytes

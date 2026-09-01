@@ -123,7 +123,7 @@ RETRACT-CLAIM has closed the period (GH #162)."
   (let ((e (claim-transaction-extent claim)))
     (or (null e) (bound-unknown-p (extent-end e)))))
 
-(defun retract-claim (claim &key (at (local-time:now)))
+(defun retract-claim (claim &key (at (%st-now)))
   "Close CLAIM's transaction period at AT: it was believed until now and no
 longer is, and the record of that belief stays -- the bitemporal
 [recorded, superseded) the #148 design left as a seam (GH #162).

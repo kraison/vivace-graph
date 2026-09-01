@@ -585,6 +585,30 @@ is the package a goal head must canonicalize in."
     (or (and types (symbol-package (first types)))
         (find-package :graph-db))))
 
+(defun %non-finite-p (x)
+  "True for a float that is not a finite number.  A comparison that
+itself signals counts too: this feeds a refusal screen (GH #309)."
+  (and (floatp x)
+       (handler-case
+           (let ((most (etypecase x
+                         (single-float most-positive-single-float)
+                         (double-float most-positive-double-float)
+                         (short-float most-positive-short-float)
+                         (long-float most-positive-long-float))))
+             (or (/= x x) (> x most) (< x (- most))))
+         (arithmetic-error () t))))
+
+(defun %screen-non-finite (form)
+  "Refuse FORM if any float in it is non-finite.  Not every reader
+rejects an overflowing literal: ECL reads 1e999999 as infinity, which
+would sail past the read guard and 500 at JSON encoding (GH #309)."
+  (cond ((consp form)
+         (%screen-non-finite (car form))
+         (%screen-non-finite (cdr form)))
+        ((%non-finite-p form)
+         (%refuse "the query could not be read: check the quoting and ~
+the numeric literals"))))
+
 (defun %read-guarded-forms (text scratch ctx)
   "TEXT screened, read into SCRATCH, and guarded through CTX -- steps 2,
 3 and 4 in order.  The screen runs FIRST and on the raw characters:
@@ -592,20 +616,23 @@ once READ has resolved a package-qualified name the interning it was
 meant to prevent has already happened.  Every way READ can fail is a
 refusal, so a malformed query is a 400 and never a 500."
   (%scan-query-text text)
-  (%guard-query
-   (handler-case (%read-query-forms text scratch)
-     (prolog-guard-error (c) (error c))
-     (end-of-file ()
-       (%refuse "the query ends mid-form: unbalanced parentheses or ~
-an unterminated string"))
-     ;; A reader condition's report is raw implementation text (SBCL
-     ;; spells out its internal reader-error classes), so it is logged,
-     ;; not echoed.  1/0 and 1e999999 both land here.
-     (error (c)
-       (log:error "GUI prolog: unreadable query: ~A" c)
-       (%refuse "the query could not be read: check the quoting and ~
-the numeric literals")))
-   ctx))
+  (let ((forms (handler-case (%read-query-forms text scratch)
+                 (prolog-guard-error (c) (error c))
+                 (end-of-file ()
+                   (%refuse "the query ends mid-form: unbalanced ~
+parentheses or an unterminated string"))
+                 ;; A reader condition's report is raw implementation
+                 ;; text (SBCL spells out its internal reader-error
+                 ;; classes), so it is logged, not echoed.  1/0 and (on
+                 ;; SBCL) 1e999999 land here; a reader that instead
+                 ;; produces infinity is caught by %SCREEN-NON-FINITE
+                 ;; below (GH #309).
+                 (error (c)
+                   (log:error "GUI prolog: unreadable query: ~A" c)
+                   (%refuse "the query could not be read: check the ~
+quoting and the numeric literals")))))
+    (%screen-non-finite forms)
+    (%guard-query forms ctx)))
 
 (defvar *no-applicable-method-type*
   (or #+sbcl (find-symbol "NO-APPLICABLE-METHOD-ERROR" "SB-PCL")
@@ -614,9 +641,12 @@ the numeric literals")))
   "The implementation's condition class for a generic function called
 with arguments no method matches, or NIL where it has none.  ANSI
 defines the NO-APPLICABLE-METHOD generic but no condition class, so
-this is looked up by name once at load.  Where it is NIL the
-implementation signals a SIMPLE-ERROR instead, which
-%ILL-TYPED-CONDITION-P already covers.")
+this is looked up by name once at load.  Belt-and-suspenders since GH
+#309: the three whitelisted read generics define their own
+NO-APPLICABLE-METHOD methods signalling QUERY-PRECONDITION-ERROR, which
+%ILL-TYPED-CONDITION-P admits on every implementation -- necessary
+because ECL has no distinct class here (it signals a bare SIMPLE-ERROR,
+which is deliberately a 500).")
 
 (defun %ill-typed-condition-p (c)
   "True when C is a shape that CLIENT INPUT is known to produce, as

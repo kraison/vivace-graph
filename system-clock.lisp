@@ -229,8 +229,9 @@ multibyte test pins (GH #191)."
                              :if-exists :supersede)
       (write-sequence buf out)
       (finish-output out))
-    ;; Replaces the target (POSIX rename semantics on SBCL).
-    (rename-file tmp file)))
+    ;; rename(2), not CL:RENAME-FILE: the target always exists here, and
+    ;; ECL/CCL's RENAME-FILE signal on an existing target (GH #313).
+    (%posix-rename (namestring tmp) (namestring file))))
 
 (defun journal-records (clock)
   "Every lifecycle record, oldest first, as (values RECORDS TORN-P).

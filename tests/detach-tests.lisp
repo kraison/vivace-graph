@@ -4,6 +4,10 @@
 ;;;; and closes durably -- then can be reopened and rejoined later.
 (in-package #:graph-db/test)
 
+;; %FILE-REAL-BYTES' #+ecl branch stats via c-inline (GH #306 idiom).
+#+ecl
+(ffi:clines "#include <sys/stat.h>")
+
 (def-suite detach-suite :in graph-db-suite
   :description "Quiescence, DETACH-STORE, and REATTACH-STORE.")
 (in-suite detach-suite)
@@ -448,17 +452,52 @@ normally with a usable graph."
 
 ;;; Swap (GH #170 Task 3).
 
+(defvar *sha256-command* :unprobed
+  "The external sha256 tool: :SHA256SUM, :SHASUM, or NIL (ironclad
+fallback).  Probed once per image by %SHA256-COMMAND (GH #310).")
+
+(defun %sha256-command ()
+  (when (eq *sha256-command* :unprobed)
+    (flet ((%tool-p (cmd)
+             (ignore-errors
+               (uiop:run-program cmd :output nil :error-output nil)
+               t)))
+      (setf *sha256-command*
+            (cond ((%tool-p '("sha256sum" "--version")) :sha256sum)
+                  ((%tool-p '("shasum" "--version")) :shasum)
+                  (t nil)))))
+  *sha256-command*)
+
+(defun %file-sha256 (file)
+  "Lowercase-hex SHA-256 of FILE.  Shells out where a native tool
+exists: ironclad's ECL digest path is generic bignum arithmetic
+(~1000x slower than SBCL), and a shadow store's sparse heap.dat is
+~1 GB APPARENT size, so one swap test digested ~6 GB through it and
+blew the ECL suite timeout (GH #310).  Same portability boundary as
+%DATA-FINGERPRINT's sha256sum shell-out (type-id-width-tests)."
+  (let ((path (namestring (truename file))))
+    (flet ((%hash (cmd)
+             (subseq (uiop:run-program cmd :output '(:string :stripped t))
+                     0 64)))
+      (case (%sha256-command)
+        (:sha256sum (%hash (list "sha256sum" path)))
+        (:shasum (%hash (list "shasum" "-a" "256" path)))
+        (t (ironclad:byte-array-to-hex-string
+            (ironclad:digest-file :sha256 file)))))))
+
 (defun %directory-file-hashes (dir)
-  "Map of relative-path-string -> sha256 digest, every regular file
-under DIR.  Test-only byte-identity tool (GH #170)."
-  (let ((root (uiop:ensure-directory-pathname dir))
+  "Map of relative-path-string -> sha256 hex string, every regular file
+under DIR.  Test-only byte-identity tool (GH #170).  TRUENAME'd root:
+the walk returns truenames, and an unresolved root makes the relpath
+keys absolute (GH #307)."
+  (let ((root (truename (uiop:ensure-directory-pathname dir)))
         (table (make-hash-table :test 'equal)))
     (uiop:collect-sub*directories
      root t t
      (lambda (subdir)
        (dolist (file (uiop:directory-files subdir))
          (setf (gethash (namestring (uiop:enough-pathname file root)) table)
-               (ironclad:digest-file :sha256 file)))))
+               (%file-sha256 file)))))
     table))
 
 (defun %directory-diff (before after)
@@ -736,7 +775,9 @@ accessor either -- so this uses SBCL's own SB-UNIX:UNIX-STAT, whose
 atime mtime ctime blksize blocks) (GH #170).  SBCL-only:
 SB-UNIX:UNIX-STAT is a bare SBCL symbol, so the whole body is #+SBCL --
 otherwise it is a read-time package error on ECL/CCL (fold-in from Task
-3's re-review; see tests/geometry-tests.lisp for the same #+sbcl idiom)."
+3's re-review; see tests/geometry-tests.lisp for the same #+sbcl idiom).
+ECL: direct C stat, same idiom as tests/posix-tests.lisp' %STAT-MODE
+(GH #306/#307 validation)."
   #+sbcl
   (multiple-value-bind (ok dev ino mode nlink uid gid rdev size
                         atime mtime ctime blksize blocks)
@@ -745,16 +786,21 @@ otherwise it is a read-time package error on ECL/CCL (fold-in from Task
                      atime mtime ctime blksize))
     (unless ok (error "SB-UNIX:UNIX-STAT failed for ~A" path))
     (* 512 blocks))
-  #-sbcl
-  (error "%FILE-REAL-BYTES (sparse-file real-usage check) is SBCL-only; ~
+  #+ecl
+  (* 512 (ffi:c-inline ((namestring path)) (:cstring) :long
+                       "{ struct stat sb; stat(#0,&sb);
+                          @(return)=(long)sb.st_blocks; }"))
+  #-(or sbcl ecl)
+  (error "%FILE-REAL-BYTES (sparse-file real-usage check) is SBCL/ECL-only; ~
 no portable ST_BLOCKS accessor is wired up for this implementation."))
 
 (defun %directory-usage (dir)
   "(values APPARENT-SIZES REAL-BYTES) for every regular file under DIR:
 APPARENT-SIZES is a relpath -> byte-length hash table (the logical
 FILE-LENGTH); REAL-BYTES is the sum of %FILE-REAL-BYTES over every file
-(GH #170)."
-  (let ((root (uiop:ensure-directory-pathname dir))
+(GH #170).  TRUENAME'd root: same reasoning as %DIRECTORY-FILE-HASHES
+(GH #307)."
+  (let ((root (truename (uiop:ensure-directory-pathname dir)))
         (sizes (make-hash-table :test 'equal))
         (real 0))
     (uiop:collect-sub*directories
@@ -827,6 +873,44 @@ apparent ~A bytes" shadow-real apparent)))
                        (ignore-errors (close-graph sg :snapshot-p nil)))))))
           (let ((graph-db:*graph* g2))
             (ignore-errors (close-graph g2 :snapshot-p nil))))))))
+
+(test copy-directory-tree-relativizes-through-a-symlinked-root
+  "GH #307.  A SOURCE root named through a symlink (the wild case is
+macOS $TMPDIR under /var -> /private/var) while the directory walk
+returns truenames made ENOUGH-PATHNAME fall back to ABSOLUTE paths, so
+the copy degenerated to source-onto-source -- :SUPERSEDE then TRUNCATED
+every store file to 0 bytes.  Both directions asserted: the destination
+holds real copies, and the source survives at full length."
+  (with-temp-directory (dir)
+    (let* ((real (merge-pathnames "real/sub/" dir))
+           (link (merge-pathnames "link" dir))
+           (payload (make-array 4096 :element-type '(unsigned-byte 8)
+                                     :initial-element 7)))
+      (ensure-directories-exist real)
+      (dolist (f (list (merge-pathnames "real/heap.dat" dir)
+                       (merge-pathnames "table.dat" real)))
+        (with-open-file (s f :direction :output
+                             :element-type '(unsigned-byte 8))
+          (write-sequence payload s)))
+      (uiop:run-program
+       (list "ln" "-s" (namestring (merge-pathnames "real/" dir))
+             (namestring link)))
+      (let ((dst (graph-db::%copy-directory-tree
+                  (uiop:ensure-directory-pathname link)
+                  (merge-pathnames "dst/" dir))))
+        (dolist (rel '("heap.dat" "sub/table.dat"))
+          (is (eql 4096 (ignore-errors
+                          (with-open-file
+                              (s (merge-pathnames rel dst)
+                                 :element-type '(unsigned-byte 8))
+                            (file-length s))))
+              "~A must be a real 4096-byte copy" rel)
+          (is (eql 4096 (with-open-file
+                            (s (merge-pathnames
+                                rel (merge-pathnames "real/" dir))
+                               :element-type '(unsigned-byte 8))
+                          (file-length s)))
+              "source ~A must survive untruncated" rel))))))
 
 (test killed-loader-leaves-live-byte-identical
   "ABANDON-SHADOW is the discard path exercised here; it must also

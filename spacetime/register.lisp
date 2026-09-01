@@ -228,7 +228,7 @@ periods, not a new one."
             (claim-standing c) :inferred)
       (unless (claim-current-p c)
         (setf (claim-transaction-extent-sexp c)
-              (extent->sexp (%open-transaction-extent (local-time:now)))))
+              (extent->sexp (%open-transaction-extent (%st-now)))))
       (graph-db:save c))))
 
 (defun %retract-left-regions (facet subject-ns subject-key keep-keys

@@ -835,6 +835,14 @@ not exist."
              :class-name class-name
              :view-name view-name)))
 
+;; Same contract as the adjacency generics' methods in edge.lisp: an
+;; ill-typed dispatch (a Prolog var where a symbol belongs) signals
+;; QUERY-PRECONDITION-ERROR, not the impl's own condition (GH #309).
+(defmethod no-applicable-method ((gf (eql #'invoke-graph-view)) &rest args)
+  (declare (ignore args))
+  (error 'query-precondition-error
+         :reason "INVOKE-GRAPH-VIEW needs symbols for class and view-name"))
+
 #|
 (def-view email (customer :offerly)
   (:map

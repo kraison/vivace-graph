@@ -521,6 +521,20 @@ subtypes.  :INCLUDE-DELETED-P includes soft-deleted edges (excluded by default).
              :include-subclasses-p include-subclasses-p :direction :in
              :collect-p t :include-deleted-p include-deleted-p))
 
+;; Ill-typed dispatch on the adjacency generics signals the engine's own
+;; QUERY-PRECONDITION-ERROR instead of the implementation's
+;; no-applicable-method condition -- ECL's is a bare SIMPLE-ERROR the GUI
+;; classifier cannot distinguish from a defect (GH #309).
+(defmethod no-applicable-method ((gf (eql #'outgoing-edges)) &rest args)
+  (declare (ignore args))
+  (error 'query-precondition-error
+         :reason "OUTGOING-EDGES needs a vertex as its first argument"))
+
+(defmethod no-applicable-method ((gf (eql #'incoming-edges)) &rest args)
+  (declare (ignore args))
+  (error 'query-precondition-error
+         :reason "INCOMING-EDGES needs a vertex as its first argument"))
+
 (define-condition compact-trust-tags-on-peer-error (error)
   ((graph :initarg :graph :reader compact-trust-tags-peer-graph))
   (:report

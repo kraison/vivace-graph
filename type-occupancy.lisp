@@ -21,6 +21,11 @@ cache would keep answering for whatever directory was current first.")
 
 (defvar *edge-occupancy-lock* (make-lock "edge occupancy"))
 
+;; NOTINLINE so the GH #167 fault-injection tests can intercept this
+;; with an FDEFINITION swap: ECL compiles same-file calls into direct C
+;; calls, bypassing the symbol, so the injected paths were never seen on
+;; ECL.  Same reason as %MUNMAP-OR-WARN (mmap.lisp).
+(declaim (notinline %edge-occupancy-file))
 (defun %edge-occupancy-file ()
   "EDGE-OCCUPANCY.DAT beside the type registry, or NIL when no system
 directory is configured, or any other failure (R4 fallback: in-image

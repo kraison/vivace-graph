@@ -22,7 +22,18 @@
 (eval-when (:compile-toplevel :load-toplevel :execute)
   (require :sb-posix))
 
-#+sbcl
+;; ECL has no stat wrapper; a direct C call is the same idiom the fix under
+;; test uses (GH #306).
+#+ecl
+(ffi:clines "#include <sys/stat.h>")
+
+#+(or sbcl ecl)
+(defun %stat-mode (path)
+  #+sbcl (sb-posix:stat-mode (sb-posix:stat path))
+  #+ecl (ffi:c-inline ((namestring path)) (:cstring) :int
+                      "{ struct stat sb; stat(#0,&sb); @(return)=sb.st_mode; }"))
+
+#+(or sbcl ecl)
 (test posix-open-creates-with-exactly-the-requested-mode
   "Apple arm64 passes variadic arguments differently from fixed ones, so a
 MODE handed to open(2) as a fixed argument is read from where the callee never
@@ -30,14 +41,16 @@ wrote.  Observed 0140 and 0200 on consecutive runs for a requested 0640 --
 arbitrary, and different each time, which is why an equality assertion is the
 only honest one.  Ablate by restoring the plain FOREIGN-FUNCALL in
 %POSIX-OPEN: this goes red on Darwin/arm64.  It cannot fail on x86_64, where
-the two conventions coincide -- that platform split is the whole of GH #218."
+the two conventions coincide -- that platform split is the whole of GH #218.
+ECL needs its own ablation: CFFI's varargs form drops MODE there too (mode
+000), so %POSIX-OPEN compiles a direct C call under #+ecl -- GH #306."
   (with-temp-directory (dir)
     (let* ((path (namestring (merge-pathnames "modeprobe" dir)))
            (fd (graph-db::%posix-open path (logior graph-db::+o-creat+
                                                    graph-db::+o-rdwr+)
                                       #o640)))
       (graph-db::%posix-close fd)
-      (is (= #o640 (logand #o777 (sb-posix:stat-mode (sb-posix:stat path))))
+      (is (= #o640 (logand #o777 (%stat-mode path)))
           "created with the requested mode, not an arbitrary one"))))
 
 (test posix-open-creates-a-file-its-own-image-can-reopen

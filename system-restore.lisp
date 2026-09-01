@@ -27,7 +27,11 @@ journal record (GH #212); its epoch is taken from the directory name."
       (parse-integer name :start (length prefix)))))
 
 (defun %retired-dirs-for (location)
-  "((E3 . \"<location>-retired-E3\") ...) for LOCATION, ascending by E3."
+  "((E3 . \"<location>-retired-E3\") ...) for LOCATION, ascending by E3.
+Entries are rebuilt from LOCATION's own string, never from the scanned
+pathname: the walk returns truenames (ECL resolves macOS /var ->
+/private/var), and a truename here would never match the caller-form
+paths the :SWAP/:RESTORE journal records carry (GH #311)."
   (let* ((live (%trimmed-namestring location))
          (parent (uiop:pathname-parent-directory-pathname
                   (uiop:ensure-directory-pathname live)))
@@ -38,7 +42,8 @@ journal record (GH #212); its epoch is taken from the directory name."
       (let* ((name (car (last (pathname-directory dir))))
              (epoch (%retired-suffix-epoch name live-name)))
         (when epoch
-          (push (cons epoch (%trimmed-namestring dir)) found))))
+          (push (cons epoch (format nil "~A-retired-~D" live epoch))
+                found))))
     (sort found #'< :key #'car)))
 
 (defun %live-location-of-retired (path)

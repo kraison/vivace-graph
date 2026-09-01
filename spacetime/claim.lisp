@@ -199,6 +199,23 @@ believed; an end genuinely unknown is :INDETERMINATE (GH #148)."
   (make-interval (exact-bound timestamp) (unknown-bound)
                  :semantics :transaction :standing :asserted))
 
+(defvar *last-stamp* nil)
+(defvar *stamp-lock* (bordeaux-threads:make-lock "spacetime stamp"))
+
+(defun %st-now ()
+  "LOCAL-TIME:NOW, strictly monotonic per image.  A whole-second clock
+(ECL) stamps consecutive events identically, and closing a transaction
+extent at its own start is a zero-width interval the constructor
+refuses -- ties break by one nanosecond (GH #308).  Caller-supplied
+stamps never route through here."
+  (bordeaux-threads:with-lock-held (*stamp-lock*)
+    (let ((now (local-time:now)))
+      (setf *last-stamp*
+            (if (and *last-stamp*
+                     (not (local-time:timestamp< *last-stamp* now)))
+                (local-time:timestamp+ *last-stamp* 1 :nsec)
+                now)))))
+
 (defun %stamp-now (args)
   "ARGS with a fresh open :TRANSACTION-EXTENT-SEXP stamp prepended -- the
 default whenever none of the three transaction initargs carries a value.
@@ -206,7 +223,7 @@ A key present with a NIL value counts as this default too: the caller is
 saying \"nothing to say about transaction time\", not \"leave this
 unstamped\" (design, Stamping; GH #148 review)."
   (list* :transaction-extent-sexp
-         (extent->sexp (%open-transaction-extent (local-time:now)))
+         (extent->sexp (%open-transaction-extent (%st-now)))
          args))
 
 (defun %claim-encode-transaction-arg (args)

@@ -725,6 +725,11 @@ vertices (the normal case for ingested source records) are unaffected."
 ;;; by the pin, so any version that was live at pin time (stop-epoch >= pin)
 ;;; cannot be reclaimed out from under the reader.
 
+;; NOTINLINE so PIN-READ-EPOCH-SIGNAL-DOES-NOT-LEAK-THE-TX-ENTRY can
+;; intercept this with an FDEFINITION swap: ECL compiles the same-file
+;; call in the snapshot path into a direct C call, bypassing the symbol.
+;; Same reason as %MUNMAP-OR-WARN (mmap.lisp); GH #313.
+(declaim (notinline pin-read-epoch))
 (defun pin-read-epoch (transaction-manager)
   "Register a read pin at the current epoch; return its token (for UNPIN).
 Refused -- STORE-NOT-ACCEPTING-ERROR -- only under FULL quiescence
@@ -2688,11 +2693,10 @@ own GRAPH, a per-graph slot, never a dynamic variable -- a special would leak
 suppression onto any OTHER graph committing on the same thread."
   (unless (wal-suppressed-p (graph transaction))
     ;; Use POSIX rename(2) (atomic; replaces an existing target) rather
-    ;; than cl:rename-file.  SBCL/ECL's rename-file already overwrites
-    ;; per POSIX, but CCL's signals "File exists" when the target
-    ;; exists — which intermittently crashed concurrent-stress on CCL.
-    ;; %posix-rename gives portable, atomic, overwrite-on-rename
-    ;; behavior across all implementations.
+    ;; than cl:rename-file: CCL's signals "File exists" on an existing
+    ;; target (intermittently crashed concurrent-stress), and ECL 26.5.5
+    ;; does too (GH #313 — an earlier version of this comment claimed
+    ;; ECL overwrites; it does not).
     (%posix-rename (namestring tmp)
                    (namestring (transaction-pathname transaction)))
     (let ((tm (transaction-manager transaction)))

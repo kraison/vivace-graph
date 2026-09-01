@@ -96,6 +96,10 @@
 (declaim (inline %posix-close %posix-lseek %posix-fchmod %posix-munmap
                  %posix-msync))
 
+;; %POSIX-OPEN's #+ecl c-inline needs open(2)'s declaration.
+#+ecl
+(ffi:clines "#include <fcntl.h>")
+
 (defun %posix-open (path flags &optional (mode #o640))
   "open(2).  PATH is a Lisp pathname/string.  Returns the fd, signals on error.
 
@@ -108,15 +112,17 @@ When that mode omits owner read/write the next ordinary OPEN of the path fails
 EACCES -- which is every graph in the image, since the type registry (#186) and
 the system clock (#182) both create their files here.  GH #218.
 
-Only the SBCL/Darwin/arm64 backend actually needs the distinction -- CFFI emits
-SBCL's `&optional` variadic marker under `#+(and darwin arm64)` alone -- but
-routing every caller through the correct form is what keeps the next port from
-inheriting the bug."
-  (let ((fd (cffi:foreign-funcall-varargs
-             "open"
-             (:string (namestring path) :int flags)
-             :unsigned-int mode
-             :int)))
+ECL cannot use the varargs form: CFFI's ECL backend drops the variadic MODE
+on Darwin/arm64 too (files created mode 000), so ECL compiles a direct C call
+instead -- correct ABI by construction.  GH #306."
+  (let ((fd #+ecl (ffi:c-inline ((namestring path) flags mode)
+                                (:cstring :int :int) :int
+                                "open(#0,#1,#2)" :one-liner t)
+            #-ecl (cffi:foreign-funcall-varargs
+                   "open"
+                   (:string (namestring path) :int flags)
+                   :unsigned-int mode
+                   :int)))
     (when (minusp fd)
       (error "posix open failed for ~A (flags ~D)" path flags))
     fd))

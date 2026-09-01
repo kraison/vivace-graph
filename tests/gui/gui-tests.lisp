@@ -1709,7 +1709,12 @@ in a STRING VALUE -- so nothing but the size can be what refuses it."
 which is the only place it can be caught, because lack parses an
 application/json body while building the request.  Both POST endpoints,
 since the builder's (GH #278) shares the hazard: a 32 MB body cost
-~7.3 s of CPU on each before any handler could object."
+~7.3 s of CPU on each before any handler could object.
+
+A stream error while SENDING is pass-equivalent (GH #309): the refusal
+closes the connection early, and ECL's client stack signals EPIPE
+mid-write before it can read the 413.  The status-code half of the
+contract stays pinned wherever the client survives to read it (SBCL)."
   (with-gui-fixture ()
     (with-gui-server (:allow-prolog t)
       (let ((body (big-body (* 2 1024 1024))))   ; 2 MB, 32x the cap
@@ -1717,10 +1722,19 @@ since the builder's (GH #278) shares the hazard: a 32 MB body cost
                         "/api/graphs/gui-test-graph/query"))
           (let ((start (get-internal-real-time)))
             (multiple-value-bind (json status)
-                (gui-request path :method :post :content body)
-              (is (= 413 status) "~A answered ~A, not 413" path status)
-              (is (string= "request-too-large" (jref json :error))
-                  "~A answered error code ~A" path (jref json :error)))
+                (handler-case
+                    (gui-request path :method :post :content body)
+                  ((or stream-error usocket:socket-error) ()
+                    (values nil :closed-mid-send)))
+              (if (eq status :closed-mid-send)
+                  (pass "~A closed the connection mid-send -- the ~
+refusal observed at the transport layer" path)
+                  (progn
+                    (is (= 413 status) "~A answered ~A, not 413"
+                        path status)
+                    (is (string= "request-too-large" (jref json :error))
+                        "~A answered error code ~A"
+                        path (jref json :error)))))
             (is (< (/ (- (get-internal-real-time) start)
                       internal-time-units-per-second)
                    5)

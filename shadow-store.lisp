@@ -93,18 +93,30 @@ materializes every one of those holes, writing the full 12GB to disk per
 shadow of an EMPTY store, worse for a store with real data in it. That
 breaks the spec's \"copies in seconds\" premise and can exhaust disk
 outright (GH #170)."
-  (let ((source (uiop:ensure-directory-pathname source))
+  ;; TRUENAME both roots: the walk below returns truename-resolved paths,
+  ;; and an unresolved SOURCE (e.g. macOS /var -> /private/var) makes
+  ;; ENOUGH-PATHNAME fall back to the absolute source path, turning the
+  ;; copy into a self-copy that TRUNCATES the store (GH #307).  %REL
+  ;; hard-errors on any residual mismatch rather than let that recur.
+  (let ((source (truename (uiop:ensure-directory-pathname source)))
         (destination (uiop:ensure-directory-pathname destination)))
     (ensure-directories-exist destination)
-    (uiop:collect-sub*directories
-     source t t
-     (lambda (dir)
-       (ensure-directories-exist
-        (merge-pathnames (uiop:enough-pathname dir source) destination))
-       (dolist (file (uiop:directory-files dir))
-         (%copy-file-sparse
-          file
-          (merge-pathnames (uiop:enough-pathname file source) destination)))))
+    (setf destination (truename destination))
+    (flet ((%rel (path)
+             (let ((rel (uiop:enough-pathname path source)))
+               (when (uiop:absolute-pathname-p rel)
+                 (error "~A did not relativize against ~A; refusing a ~
+self-copy (GH #307)." path source))
+               rel)))
+      (uiop:collect-sub*directories
+       source t t
+       (lambda (dir)
+         (ensure-directories-exist
+          (merge-pathnames (%rel dir) destination))
+         (dolist (file (uiop:directory-files dir))
+           (%copy-file-sparse
+            file
+            (merge-pathnames (%rel file) destination))))))
     destination))
 
 ;;; Recovery policy (GH #170 Task 4).  A store's policy.dat records

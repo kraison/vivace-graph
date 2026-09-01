@@ -1298,6 +1298,12 @@ of (node-id slot lamport origin)."
                      collect (list nid slot lamport origin))
                nil)))))
 
+;; NOTINLINE so A-TRANSIENT-FAILURE-STILL-PROPAGATES can intercept this
+;; with an FDEFINITION swap: ECL compiles %REHOME-OR-REJECT's same-file
+;; call into a direct C call, bypassing the symbol, so the injected
+;; failure was never observed on ECL.  Same reason as %MUNMAP-OR-WARN
+;; (mmap.lisp).  Costs one indirect call per pushed op.
+(declaim (notinline rehome-authored-op))
 (defun rehome-authored-op (graph op)
   "Hub re-home of a device-pushed AUTHORED op: dedup by op-id, then apply through a
 JOURNALING transaction (so every other device pulls the result), MERGING each held-

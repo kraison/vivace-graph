@@ -609,11 +609,23 @@ order of terms with duplicates removed."
                 (push result *select-list*))))))
     (funcall cont)))
 
+;; GH #309: an unbound or non-vertex source arg must be the client's
+;; error (QUERY-PRECONDITION-ERROR -> a GUI 400), not a
+;; no-applicable-method deep inside MAP-EDGES -- ECL reports those as
+;; bare SIMPLE-ERRORs no classifier can tell from a defect.
+;; OUTGOING-EDGES/4 already guarded with VERTEX-P; these joined at #309.
+(defun %require-vertex-arg (functor v)
+  (unless (vertex-p v)
+    (error 'query-precondition-error
+           :reason (format nil "~A needs its vertex argument bound to ~
+a vertex" functor))))
+
 (def-global-prolog-functor outgoing-edges/2 (vertex var cont)
   (setq vertex (var-deref vertex)
         var (var-deref var))
   (when *prolog-trace*
     (format t "TRACE: outgoing-edges/2(~S ~S)~%" vertex var))
+  (%require-vertex-arg 'outgoing-edges vertex)
   (map-edges (lambda (edge)
               (let ((old-trail (fill-pointer *trail*)))
                 (when (unify var edge)
@@ -627,6 +639,7 @@ order of terms with duplicates removed."
         var (var-deref var))
   (when *prolog-trace*
     (format t "TRACE: outgoing-edges/3(~S ~S ~S)~%" vertex edge-type var))
+  (%require-vertex-arg 'outgoing-edges vertex)
   (map-edges (lambda (edge)
               (let ((old-trail (fill-pointer *trail*)))
                 (when (unify var edge)
@@ -639,6 +652,7 @@ order of terms with duplicates removed."
         var (var-deref var))
   (when *prolog-trace*
     (format t "TRACE: incoming-edges/2(~S ~S)~%" vertex var))
+  (%require-vertex-arg 'incoming-edges vertex)
   (map-edges (lambda (edge)
               (let ((old-trail (fill-pointer *trail*)))
                 (when (unify var edge)
@@ -652,6 +666,7 @@ order of terms with duplicates removed."
         var (var-deref var))
   (when *prolog-trace*
     (format t "TRACE: incoming-edges/3(~S ~S ~S)~%" vertex edge-type var))
+  (%require-vertex-arg 'incoming-edges vertex)
   (map-edges (lambda (edge)
                (let ((old-trail (fill-pointer *trail*)))
                  (when (unify var edge)
@@ -668,7 +683,8 @@ order of terms with duplicates removed."
   (when *prolog-trace*
     (format t "TRACE: incoming-edges/4(~S ~S ~S ~S)~%"
             vertex edge-type edge-var vertex-var))
-    (map-edges (lambda (edge)
+  (%require-vertex-arg 'incoming-edges vertex)
+  (map-edges (lambda (edge)
                  (let ((old-trail (fill-pointer *trail*)))
                    (when (unify edge-var edge)
                      (let ((v2 (lookup-vertex (from edge))))
