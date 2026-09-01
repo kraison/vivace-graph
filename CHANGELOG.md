@@ -193,6 +193,16 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Fixed
 
+- **`open-lhash` reset the persisted location; `delete-lhash` on a copied
+  graph deleted the ORIGINAL's files** (#143). `struct.dat` cl-stores the
+  whole lhash struct, `location` included, and `open-lhash` mmapped from
+  the passed path but left that slot pointing at wherever the lhash was
+  *created*. A `cp -a` rehearsal copy therefore read from the copy and
+  deleted through the original — silently, and pointing the wrong way.
+  The slot is now reset to the opened location; the invariant is stated in
+  both docstrings. Audit: `lhash` was the only cl-stored structure carrying
+  a filesystem path, and no engine path calls `delete-lhash` today.
+
 - **Type-id seeding tests were red on macOS (the arm64 advisory lane's 11
   failures)**: the fixture compared raw `merge-pathnames` namestrings
   against the seeding report's `truename`'d ones, which diverge wherever

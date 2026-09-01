@@ -2932,6 +2932,15 @@ This is a materially better rollback story than some earlier on-disk format
 changes, whose rollback needs replaying a full snapshot rather than a plain
 repoint at the old directory.
 
+*Copies and moves.* A path stored *inside* a persisted structure says where
+it was created, not where it now lives. The linear hash tables under
+~vertex/~, ~edge/~, the ve/vev indexes and ~applied-ops/~ cl-store their
+whole struct, location included; ~open-lhash~ resets that slot to the
+directory it was actually opened from, so ~delete-lhash~ on a ~cp -a~ copy
+deletes the copy and not the original (vivace-graph#143). Rehearsing a
+risky change against a copy of real data is safe again — it was not, if
+the rehearsal reached a rebuild or delete path.
+
 *Plan for 2x transient disk.* While a migration runs, you have the source
 graph, the intermediate snapshot file, and the new v3 graph's data all on
 disk at once — roughly twice the source graph's size, freed once the
