@@ -3171,6 +3171,35 @@ The add-on /upgrades/ a set of generic functions in place (no API change). When 
 
 Threading: GEOS's reentrant API forbids sharing a context between concurrent threads, and VivaceGraph runs transactions in the caller's thread. The add-on keeps a process-global **borrow/return context pool** (~with-geos-context~): each operation checks out a context for its duration, so a context is only ever used by one thread at a time, and contexts are reused across threads (bounded by peak concurrency). ~geos-shutdown~ releases the pool. This is validated under a concurrency storm and cross-checked against Python ~shapely~ in =tests/geos/=.
 
+**** The point-in-polygon boundary convention (deliberately native)
+
+One predicate stays native even with the add-on loaded:
+~geometry-contains-point-p~, the point-in-area test behind
+~find-nodes-within~ and ~geo-within/3~. It is an even-odd ray-cast, about
+77x cheaper than the GEOS bridge and dependency-free, and it is the hottest
+spatial predicate there is — so it does not dispatch to GEOS
+(vivace-graph#99, decided 2026-09-01 after characterising the two against
+each other across 45 systematic cases and generative sweeps).
+
+The consequence is a defined *boundary convention*, and it is part of the
+contract:
+
+- Strictly inside or strictly outside an area, the native test and GEOS
+  never disagree.
+- On the boundary the native rule is *half-open*: of two areas sharing an
+  edge, a point on that edge is inside **exactly one** of them, so a
+  partition of space neither double-counts nor drops any point. Which side
+  wins is an implementation detail, not something to rely on.
+- GEOS applies DE-9IM instead: ~geometry-contains-geometry-p~ with a point
+  *excludes* every boundary point and ~geometry-intersects-p~ *includes*
+  every one. Use those when a boundary point must be classified the OGC
+  way.
+
+The ~gh-99-*~ tests in =tests/geometry-ops-tests.lisp= pin the native rule
+and its relation to GEOS on edges, vertices, hole boundaries,
+self-touching and degenerate rings, both winding orders and shared
+multipolygon edges.
+
 *** Area and length: coordinate units versus metres
 
 ~geometry-area~ (GEOS-backed; signals

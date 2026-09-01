@@ -91,7 +91,20 @@ point is inside the exterior ring and outside every hole."
        (notany (lambda (hole) (point-in-ring-p lon lat hole)) (rest rings))))
 
 (defun geometry-contains-point-p (g lon lat)
-  "True if the :POLYGON or :MULTIPOLYGON geometry G contains (LON, LAT)."
+  "True if the :POLYGON or :MULTIPOLYGON geometry G contains (LON, LAT).
+
+Deliberately NATIVE -- an even-odd ray-cast, never GEOS (GH #99, decided
+2026-09-01): it is the hot predicate behind FIND-NODES-WITHIN and
+GEO-WITHIN/3, ~77x cheaper than the GEOS bridge, and dependency-free.  Its
+BOUNDARY convention is therefore VG's defined semantics, not an accident:
+half-open -- of two areas sharing an edge, a point on that edge is inside
+EXACTLY ONE of them, so a tiling counts every point once and drops none;
+which side wins is an implementation detail.  GEOS differs only there:
+its CONTAINS excludes every boundary point and its INTERSECTS includes
+every one; strictly inside or outside, the two never disagree.  Pinned
+against GEOS by the GH-99-* tests in tests/geometry-ops-tests.lisp; a
+caller needing DE-9IM semantics on the boundary uses
+GEOMETRY-CONTAINS-GEOMETRY-P / GEOMETRY-INTERSECTS-P with a point."
   (ecase (geometry-kind g)
     (:polygon (point-in-polygon-rings-p lon lat (geometry-coordinates g)))
     (:multipolygon (some (lambda (poly) (point-in-polygon-rings-p lon lat poly))

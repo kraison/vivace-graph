@@ -146,6 +146,16 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Changed
 
+- **`geometry-contains-point-p` stays native by decision** (#99, closing
+  the characterised inconsistency 3.0.0 shipped). The even-odd ray-cast is
+  the hot predicate behind `find-nodes-within` / `geo-within/3`, ~77x
+  cheaper than the GEOS bridge and dependency-free, so it does not gain a
+  GEOS `:around`. Its half-open boundary rule — a point on an edge shared
+  by two areas is inside exactly one of them — is now documented as the
+  contract (docstring; manual, *The point-in-polygon boundary convention*),
+  with GEOS's DE-9IM `contains`/`intersects` named as the route for OGC
+  boundary semantics. No behaviour change.
+
 - **`snapshot`'s integrity sweep is opt-in** (#119): `:check-data-integrity-p`
   now defaults to `NIL`. The sweep deserializes every node a second time —
   measured on the deployed tenant as the larger half of a snapshot's
