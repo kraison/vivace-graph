@@ -415,6 +415,13 @@
            ;; Domain and range (GH #156)
            #:def-domain-range #:undef-domain-range
            #:domain-range-violation
+           ;; deterministic refusals + refused peer pushes (GH #151)
+           #:constraint-violation #:vector-dimension-violation
+           #:peer-rejection #:peer-rejection-op-id #:peer-rejection-origin
+           #:peer-rejection-lamport #:peer-rejection-device-seq
+           #:peer-rejection-condition #:peer-rejection-message
+           #:peer-rejection-at #:get-peer-rejections
+           #:record-peer-rejection #:clear-peer-rejections
            #:drv-edge-type #:drv-end #:drv-reason #:drv-actual
            #:drv-expected #:drv-node-id #:drv-endpoint-id
            #:check-domain-range-constraints

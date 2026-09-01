@@ -18,7 +18,7 @@
 
 (in-package :graph-db)
 
-(define-condition value-constraint-violation (error)
+(define-condition value-constraint-violation (constraint-violation)
   ((class-name :initarg :class-name :reader vcv-class-name)
    (slot-name  :initarg :slot-name  :reader vcv-slot-name)
    (value      :initarg :value      :reader vcv-value)

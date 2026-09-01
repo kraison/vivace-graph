@@ -17,7 +17,8 @@
 
 (in-package #:graph-db.spacetime)
 
-(define-condition membership-disjointness-violation (error)
+(define-condition membership-disjointness-violation
+    (graph-db:constraint-violation)
   ((name        :initarg :name        :reader mdv-name)
    (subject-namespace :initarg :subject-namespace
                       :reader mdv-subject-namespace)

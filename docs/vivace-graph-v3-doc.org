@@ -2933,11 +2933,11 @@ This is a materially better rollback story than some earlier on-disk format
 changes, whose rollback needs replaying a full snapshot rather than a plain
 repoint at the old directory.
 
-*Peer-replicating stores.* A store opened with ~:peer-role~ keeps five
+*Peer-replicating stores.* A store opened with ~:peer-role~ keeps six
 things beside the graph that no snapshot contains: ~lamport.dat~ (the
 Lamport clock), ~applied-ops/~ (the applied-op index that makes a replayed
-op idempotent), ~field-stamps.dat~, ~node-origins.dat~ and
-~conflicts.dat~. ~migrate-graph~ copies whichever of these the source has
+op idempotent), ~field-stamps.dat~, ~node-origins.dat~, ~conflicts.dat~
+and ~rejections.dat~ (refused pushes, vivace-graph#151). ~migrate-graph~ copies whichever of these the source has
 across verbatim after the replay — their keys are node ids, which survive
 it — and logs what it carried (vivace-graph#289). Before that fix the next
 ~open-graph :peer-role~ recreated each one empty, which reset the clock
@@ -3562,6 +3562,41 @@ The feed carries two kinds of traffic, with different rules:
 When two replicas edit the same node, the hub re-homes the device's authored op and resolves it per field by Lamport-ordered last-writer-wins, with an app-supplied *merge policy* for safety-bearing fields. A rejected change is not silently dropped — it surfaces as a *conflict record* the application can inspect. Safety-critical fields resolve by *semantics, not clock*: for example, a hazard *release* loses to a hazard *assertion* regardless of which carries the later timestamp.
 
 The merge above is *per field of the same node* (keyed by UUID). Unique-slot constraints (Chapter 8) are a different axis — two *different* nodes claiming one value — and are handled by *scope*. A ~:scope :origin~ constraint partitions by authoring device, so it never collides across devices and each device enforces it locally against everything it holds; this is the recommended choice under peer replication. A value that must be unique across the *whole* fleet (~:scope :local~/~:hub~) needs the hub to arbitrate colliding claims — that arbiter is not yet built (issue #51).
+
+*** Refused pushes: rejected ops
+
+A device's authored op can reach a hub whose commit *refuses* it — a
+unique value already taken, a slot outside a declared vocabulary, a
+cardinality, domain/range or vector-dimension rule — and such a refusal is
+*deterministic*: the same op against the same schema is refused however
+often it is retried. Every such refusal is a ~constraint-violation~ (the
+superclass of ~unique-constraint-violation~, ~value-constraint-violation~,
+~cardinality-violation~, ~domain-range-violation~,
+~vector-dimension-violation~ and the spacetime disjointness conditions).
+The hub therefore does not drop the op back into the device's push queue
+(vivace-graph#151): it records a *rejection*, advances ~PUSH-ACK~ past
+the op, and returns the rejection in the push ack under ~:rejected~, so
+the device records it too and carries on with the ops behind it. Before
+that fix the op was re-streamed on every push, refused for the same
+reason, and every later op from that device queued behind it — an
+ordinary version-skew scenario (an older build with an older vocabulary),
+not an exotic one.
+
+Anything that is *not* a ~constraint-violation~ — a transient failure —
+still propagates and leaves ~PUSH-ACK~ below the op, so it is retried.
+
+#+BEGIN_SRC lisp
+  (get-peer-rejections graph)                    ; newest first, both roles
+  (get-peer-rejections graph :origin device-id)  ; one device's
+  (peer-rejection-op-id r) (peer-rejection-device-seq r)
+  (peer-rejection-condition r) (peer-rejection-message r)
+  (clear-peer-rejections graph)
+#+END_SRC
+
+Rejections are durable on both sides (~rejections.dat~, beside the graph,
+carried by ~migrate-graph~ with the other peer sidecars) and idempotent by
+op-id, so a device that re-streams before it has read the ack records the
+op once.
 
 *** Setting up a hub and a device
 

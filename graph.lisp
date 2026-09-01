@@ -546,6 +546,8 @@ condition unchanged."
               (node-origins graph) (load-node-origins graph)
               ;; B3: recover the durable conflict records for the review surface.
               (peer-conflicts graph) (load-peer-conflicts graph)
+              ;; GH #151: refused pushes, durable on both roles.
+              (peer-rejections graph) (load-peer-rejections graph)
               ;; WP-3: durable applied-op-id dedup index -- op-id (16-byte uuid key)
               ;; -> lamport (uint64 value), the make-lhash defaults.
               (applied-op-ids graph)
@@ -1054,6 +1056,8 @@ policy.dat's ~S; the file wins."
               (node-origins graph) (load-node-origins graph)
               ;; B3: recover the durable conflict records for the review surface.
               (peer-conflicts graph) (load-peer-conflicts graph)
+              ;; GH #151: refused pushes, durable on both roles.
+              (peer-rejections graph) (load-peer-rejections graph)
               ;; WP-3: open the applied-op-id index (create it if this peer-graph
               ;; predates the index, so reopening an older graph upgrades cleanly).
               (applied-op-ids graph)
@@ -1336,6 +1340,8 @@ a snapshot failure does NOT abort the close (GH #120)."
   (ignore-errors (persist-node-origins graph))
   ;; B3: snapshot the durable conflict records for the review surface.
   (ignore-errors (persist-peer-conflicts graph))
+  ;; GH #151: refused pushes.
+  (ignore-errors (persist-peer-rejections graph))
   (when (and (slot-boundp graph 'applied-op-ids)
              (lhash-p (applied-op-ids graph)))
     (close-lhash (applied-op-ids graph))

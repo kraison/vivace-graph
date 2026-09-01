@@ -318,10 +318,12 @@ failure mode this function exists to prevent.  See GH #100."
           name (uuid:make-v4-uuid)))
 
 (defparameter +peer-sidecar-files+
-  '("lamport.dat" "field-stamps.dat" "node-origins.dat" "conflicts.dat")
+  '("lamport.dat" "field-stamps.dat" "node-origins.dat" "conflicts.dat"
+    "rejections.dat")
   "The single-file peer-replication sidecars a store keeps beside its graph;
-APPLIED-OPS/ (an lhash directory) is the fifth.  Written by the peer-graph
-open/close paths in graph.lisp, transactions.lisp and peer-merge.lisp.")
+APPLIED-OPS/ (an lhash directory) is the sixth.  Written by the peer-graph
+open/close paths in graph.lisp, transactions.lisp, peer-merge.lisp and
+peer-streaming.lisp (rejections, GH #151).")
 
 (defun %carry-peer-sidecars (old-location new-location)
   "Copy the peer-replication sidecars present under OLD-LOCATION to

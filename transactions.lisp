@@ -1586,9 +1586,9 @@ either source) establishes the dimension."
                      ;; write establishes the dimension for the rest of TX
                      (setf (gethash key intra) (length v)))
                     ((/= (length v) expected)
-                     (error "vector-index slot ~A on ~A: vector length ~D does not ~
-match established segment dimension ~D"
-                            slot (car key) (length v) expected))))))))))))
+                     (error 'vector-dimension-violation
+                            :slot slot :owner (car key)
+                            :actual (length v) :expected expected))))))))))))
 
 (defun ensure-vector-segment-capacity (tx graph)
   "Grow every vector segment TX writes to until it can hold what TX will put in

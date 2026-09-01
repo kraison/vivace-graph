@@ -9,7 +9,8 @@
 
 (in-package #:graph-db.spacetime)
 
-(define-condition extent-disjointness-violation (error)
+(define-condition extent-disjointness-violation
+    (graph-db:constraint-violation)
   ((claim-class :initarg :claim-class :reader edv-claim-class)
    (subject-namespace :initarg :subject-namespace
                       :reader edv-subject-namespace)

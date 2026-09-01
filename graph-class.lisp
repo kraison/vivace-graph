@@ -398,6 +398,13 @@ EPOCH-LEASE-EXHAUSTED in transactions.lisp."
                        instead (GH #186).  NIL falls back to
                        ENSURE-TYPE-REGISTRY.")
    (peer-conflicts-lock :accessor peer-conflicts-lock :initform (make-recursive-lock "peer-conflicts"))
+   ;; Authored ops the hub refused deterministically -- recorded on the hub
+   ;; and, from the push ack, on the device (GH #151).  A list of
+   ;; PEER-REJECTION, persisted beside the graph as rejections.dat.
+   (peer-rejections :accessor peer-rejections :initarg :peer-rejections
+                    :initform nil)
+   (peer-rejections-lock :accessor peer-rejections-lock
+                         :initform (make-recursive-lock "peer-rejections"))
    (applied-op-ids :accessor applied-op-ids :initarg :applied-op-ids :initform nil
                    :documentation "Durable OP-ID -> lamport dedup index (WP-3), checked
                    before apply so a re-homed op bouncing back is not duplicated.  NIL

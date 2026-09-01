@@ -42,7 +42,7 @@
          ;; so both registries key alike (GH #139, #140).
          (ftype (function (t t t) t) %spec-identity))
 
-(define-condition unique-constraint-violation (error)
+(define-condition unique-constraint-violation (constraint-violation)
   ((class-name :initarg :class-name :reader ucv-class-name)
    (slot-name  :initarg :slot-name  :reader ucv-slot-name)
    (value      :initarg :value      :reader ucv-value)

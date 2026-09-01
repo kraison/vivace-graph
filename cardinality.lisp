@@ -13,7 +13,7 @@
 
 (in-package :graph-db)
 
-(define-condition cardinality-violation (error)
+(define-condition cardinality-violation (constraint-violation)
   ((class-name :initarg :class-name :reader cdv-class-name)
    (edge-type  :initarg :edge-type  :reader cdv-edge-type)
    (direction  :initarg :direction  :reader cdv-direction)

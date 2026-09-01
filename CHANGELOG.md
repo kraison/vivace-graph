@@ -218,6 +218,22 @@ between releases; cutting a release renames it to the new version and dates it.
   slot-read hot path is unchanged (2e6 reads: 847 ms vs 883 ms before —
   `maybe-init-node-data` now reads `bytes` once instead of three times).
 
+- **A refused re-homed op made peer push a poison-pill loop** (#151). When
+  the hub's commit refused a device-pushed op — a unique, value,
+  cardinality, domain/range or vector-dimension constraint — the error left
+  `peer-receive-push` before `PUSH-ACK` advanced, so the device re-streamed
+  the same op on every push, refused for the same reason, with every later
+  op queued behind it. Deterministic refusals now share one superclass,
+  `constraint-violation` (the spacetime disjointness conditions inherit it
+  too; the bare vector-dimension `error` became `vector-dimension-violation`),
+  and the hub treats one as a **rejection**: recorded durably
+  (`rejections.dat`, `get-peer-rejections`), `PUSH-ACK` advances past the
+  op, and the ack carries it under `:rejected` so the device records it as
+  well and moves on. Anything else is still transient: it propagates and
+  the op is retried, as before. New API: `get-peer-rejections`,
+  `clear-peer-rejections`, the `peer-rejection` record; `migrate-graph`
+  carries `rejections.dat` with the other sidecars (#289).
+
 - **Spatial radius queries missed results across the antimeridian and at
   the poles** (#287). `map-spatial-index-radius` built its longitude span
   at the query latitude and truncated it to `[-180, 180]`, so a window

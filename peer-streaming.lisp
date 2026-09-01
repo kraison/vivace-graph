@@ -1304,15 +1304,52 @@ op-id/origin/lamport on the re-journaled feed entry (via *PEER-REHOME-OP*, desig
         (peer-observe-lamport graph lamport)
         t)))
 
+(defun %condition-name-string (condition)
+  "CONDITION's type as a portable string -- package-qualified when it is not
+GRAPH-DB's own, so a device can tell a spacetime refusal from a core one."
+  (peer-portable-string
+   (let ((*package* (find-package :graph-db)))
+     (prin1-to-string (type-of condition)))))
+
+(defun %rehome-or-reject (graph op device-seq)
+  "Re-home OP, or REJECT it.  A CONSTRAINT-VIOLATION is deterministic -- a
+pure function of the op and the hub's schema, which no retry can change --
+so it is recorded as a PEER-REJECTION (durable, on the hub) and returned as
+the second value instead of propagating, and PUSH-ACK advances past the op.
+Anything else is treated as transient and propagates, leaving PUSH-ACK
+below the op so the device re-streams it (GH #151).  Returns
+ (values APPLIED-P REJECTION)."
+  (handler-case (values (rehome-authored-op graph op) nil)
+    (constraint-violation (c)
+      (let ((rejection (make-peer-rejection
+                        :op-id (peer-op-op-id op)
+                        :origin (peer-op-origin op)
+                        :lamport (peer-op-lamport op)
+                        :device-seq device-seq
+                        :condition (%condition-name-string c)
+                        :message (peer-portable-string (princ-to-string c)))))
+        (record-peer-rejection graph rejection)
+        (log:warn "peer push: refused op ~A (device-seq ~A) from ~A: ~A"
+                  (peer-id->hex (peer-op-op-id op)) device-seq
+                  (peer-id->hex (peer-op-origin op))
+                  (peer-rejection-message rejection))
+        (values nil rejection)))))
+
 (defun peer-receive-push (graph socket device)
   "Hub push-receive (B2d-2b): read the device's streamed authored ops until its
 :PUSH-END control, RE-HOME each (§5 -- merge + re-journal under a fresh hub-seq
 preserving the author's op-id), and send back the new :PUSH-ACK -- the highest device
 feed-seq the hub saw.  Runs on the session thread (the hub is multi-writer, and
 REHOME-AUTHORED-OP journals + merges under its own transaction).  A dropped op leaves
-PUSH-ACK below it, so the device re-streams it next time (re-deduped by op-id)."
+PUSH-ACK below it, so the device re-streams it next time (re-deduped by op-id).
+
+An op the hub refuses DETERMINISTICALLY (a CONSTRAINT-VIOLATION) is not
+dropped: it is recorded as a rejection, PUSH-ACK advances past it, and the
+ack carries it under :REJECTED so the device records it too -- otherwise the
+device re-streamed it forever and every later op queued behind it (GH #151)."
   (let ((*graph* graph)
-        (high (peer-device-push-ack device)))
+        (high (peer-device-push-ack device))
+        (rejected '()))
     (loop
       (let* ((packet (read-packet socket))
              (type (aref packet 9)))
@@ -1325,10 +1362,16 @@ PUSH-ACK below it, so the device re-streams it next time (re-deduped by op-id)."
                                   collect (deserialize-tx-write-vector (read-packet socket))))
                     (seq (transaction-id txh)))
                (when (= op-class +peer-op-authored+)
-                 (rehome-authored-op graph
-                                     (make-peer-op :kind :authored :op-id op-id
-                                                   :origin origin :lamport lamport
-                                                   :tx-id seq :writes writes))
+                 (multiple-value-bind (applied rejection)
+                     (%rehome-or-reject
+                      graph
+                      (make-peer-op :kind :authored :op-id op-id
+                                    :origin origin :lamport lamport
+                                    :tx-id seq :writes writes)
+                      seq)
+                   (declare (ignore applied))
+                   (when rejection
+                     (push (peer-rejection->plist rejection) rejected)))
                  (when (> seq high) (setf high seq))))))
           ((= type +plist-packet-type-code+)
            (let ((pl (deserialize-plist-packet packet)))
@@ -1337,7 +1380,14 @@ PUSH-ACK below it, so the device re-streams it next time (re-deduped by op-id)."
           (t (error "Unknown peer push packet type ~A" type)))))
     (with-recursive-lock-held ((peer-device-lock device))
       (setf (peer-device-push-ack device) high))
-    (peer-write-plist (list :peer-control :push-ack :push-ack high) socket)
+    ;; The plist channel admits scalars only (CHECK-PACKET-PLIST), so the
+    ;; rejections ride as ONE printed string; PEER-STRING->REJECTIONS reads
+    ;; it back the way the channel reads itself, *READ-EVAL* off.
+    (peer-write-plist (append (list :peer-control :push-ack :push-ack high)
+                              (when rejected
+                                (list :rejected (peer-rejections->string
+                                                 (nreverse rejected)))))
+                      socket)
     high))
 
 (defun peer-purge-node (graph node)
@@ -1551,6 +1601,15 @@ time).  Returns the acked feed-seq."
     (peer-write-plist (list :peer-control :push-end) socket)
     (let* ((ack (read-plist-packet socket))
            (acked (getf ack :push-ack)))
+      ;; Ops the hub refused deterministically: record them here too, so
+      ;; the operator can see what did not land, and let PUSH-ACK move
+      ;; past them (GH #151).
+      (dolist (pl (peer-string->rejections (getf ack :rejected)))
+        (let ((r (record-peer-rejection graph (plist->peer-rejection pl))))
+          (log:warn "peer push: hub refused op ~A (device-seq ~A): ~A -- ~A; ~
+not retried"
+                    (getf pl :op-id) (peer-rejection-device-seq r)
+                    (peer-rejection-condition r) (peer-rejection-message r))))
       (when (and acked (> acked from))
         (persist-peer-push-ack acked graph))
       (or acked from))))
@@ -1679,3 +1738,106 @@ re-ship.  Returns the ack result plist (:created / :purged id lists)."
      (let ((thread (peer-writer-thread graph)))
        (when (and (threadp thread) (thread-alive-p thread))
          (join-thread thread))))))
+
+;;; ---------------------------------------------------------------------------
+;;; Refused pushes (GH #151): an authored op the hub could never accept.
+;;; Recorded on the hub when it refuses, and on the device from the push
+;;; ack; persisted beside the graph as rejections.dat, the same shape as the
+;;; conflict review surface in peer-merge.lisp.
+;;; ---------------------------------------------------------------------------
+
+(defstruct (peer-rejection (:constructor make-peer-rejection))
+  "An authored op refused DETERMINISTICALLY: OP-ID/ORIGIN/LAMPORT identify it,
+DEVICE-SEQ is its feed-seq on the authoring device (the seq PUSH-ACK moved
+past), CONDITION the refusing condition's name, MESSAGE its report, AT the
+universal time it was recorded."
+  op-id origin lamport device-seq condition message
+  (at (get-universal-time)))
+
+(defun peer-rejection->plist (r)
+  "R as the plist that travels on the push ack and sits in rejections.dat --
+ids as hex, strings portable."
+  (list :op-id (peer-id->hex (peer-rejection-op-id r))
+        :origin (and (peer-rejection-origin r)
+                     (peer-id->hex (peer-rejection-origin r)))
+        :lamport (peer-rejection-lamport r)
+        :device-seq (peer-rejection-device-seq r)
+        :condition (peer-portable-string (peer-rejection-condition r))
+        :message (peer-portable-string (peer-rejection-message r))
+        :at (peer-rejection-at r)))
+
+(defun plist->peer-rejection (pl)
+  (make-peer-rejection
+   :op-id (peer-hex->id (getf pl :op-id))
+   :origin (and (getf pl :origin) (peer-hex->id (getf pl :origin)))
+   :lamport (getf pl :lamport)
+   :device-seq (getf pl :device-seq)
+   :condition (getf pl :condition)
+   :message (getf pl :message)
+   :at (or (getf pl :at) (get-universal-time))))
+
+(defun peer-rejections->string (plists)
+  "PLISTS (PEER-REJECTION->PLIST forms) as one printed string for the push
+ack -- keywords, strings and integers only, so PEER-STRING->REJECTIONS can
+read it with *READ-EVAL* off, exactly as the plist channel reads itself."
+  (with-standard-io-syntax
+    (let ((*package* (find-package :keyword)))
+      (peer-portable-string (prin1-to-string plists)))))
+
+(defun peer-string->rejections (string)
+  "Inverse of PEER-REJECTIONS->STRING; NIL for NIL (an old hub sends none)."
+  (when (and string (plusp (length string)))
+    (with-standard-io-syntax
+      (let ((*package* (find-package :keyword)) (*read-eval* nil))
+        (values (read-from-string string))))))
+
+(defgeneric peer-rejections-file (graph)
+  (:method (graph)
+    (make-pathname :name "rejections" :type "dat" :defaults (location graph))))
+
+(defun persist-peer-rejections (graph)
+  (with-recursive-lock-held ((peer-rejections-lock graph))
+    (with-open-file (s (peer-rejections-file graph) :direction :output
+                       :if-exists :supersede :if-does-not-exist :create)
+      (with-standard-io-syntax
+        (let ((*package* (find-package :graph-db)))
+          (write (mapcar #'peer-rejection->plist (peer-rejections graph))
+                 :stream s)))))
+  graph)
+
+(defun load-peer-rejections (graph)
+  (let ((file (peer-rejections-file graph)))
+    (setf (peer-rejections graph)
+          (when (probe-file file)
+            (with-open-file (s file :direction :input)
+              (with-standard-io-syntax
+                (let ((*package* (find-package :graph-db)) (*read-eval* nil))
+                  (mapcar #'plist->peer-rejection (read s nil nil)))))))))
+
+(defun record-peer-rejection (graph rejection)
+  "Retain REJECTION -- idempotently by op-id, so a device that re-streams an
+op before it has read the ack records it once -- and durably.  Returns the
+retained record."
+  (with-recursive-lock-held ((peer-rejections-lock graph))
+    (or (find (peer-rejection-op-id rejection) (peer-rejections graph)
+              :key #'peer-rejection-op-id :test #'equalp)
+        (progn
+          (push rejection (peer-rejections graph))
+          (persist-peer-rejections graph)
+          rejection))))
+
+(defun get-peer-rejections (graph &key origin)
+  "A snapshot list of the refused ops (newest first), optionally those
+authored by ORIGIN.  NIL on a graph that has refused nothing."
+  (with-recursive-lock-held ((peer-rejections-lock graph))
+    (let ((all (copy-list (peer-rejections graph))))
+      (if origin
+          (remove-if-not (lambda (r) (equalp origin (peer-rejection-origin r)))
+                         all)
+          all))))
+
+(defun clear-peer-rejections (graph)
+  "Forget every recorded rejection (the operator has dealt with them)."
+  (with-recursive-lock-held ((peer-rejections-lock graph))
+    (setf (peer-rejections graph) nil)
+    (persist-peer-rejections graph)))

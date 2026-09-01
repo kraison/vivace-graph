@@ -665,6 +665,7 @@ cl-temporal-extent."
                (:file "domain-range-tests")         ; GH #156
                (:file "disjointness-tests")         ; GH #157
                (:file "peer-unique-tests")
+               (:file "peer-rejection-tests")           ; GH #151
                (:file "peer-index-tests")
                (:file "open-hygiene-tests")    ; GH #222, #224
                (:file "scratch-cleanup-tests")  ; GH #214

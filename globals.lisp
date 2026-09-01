@@ -445,3 +445,26 @@ strictly-safe pre-durability abort.")
 (alexandria:define-constant +unbound+ :unbound)
 (alexandria:define-constant +no-bindings+ '((t . t)) :test 'equalp)
 (alexandria:define-constant +fail+ nil)
+
+;;; Deterministic commit refusals (GH #151).  A CONSTRAINT-VIOLATION is a
+;;; pure function of the write and the schema -- retrying the same write
+;;; can never succeed -- which is what lets the peer push path reject an op
+;;; instead of re-streaming it forever.  Every constraint family's condition
+;;; inherits it: unique, value, cardinality, domain/range, vector dimension
+;;; (core) and the spacetime disjointness conditions.
+
+(define-condition constraint-violation (error) ()
+  (:documentation "Superclass of every DETERMINISTIC commit refusal: the same
+write against the same schema is refused again, however often it is retried.
+Transient failures (conflicts, I/O) are never subclasses (GH #151)."))
+
+(define-condition vector-dimension-violation (constraint-violation)
+  ((slot :initarg :slot :reader vdv-slot)
+   (owner :initarg :owner :reader vdv-owner)
+   (actual :initarg :actual :reader vdv-actual)
+   (expected :initarg :expected :reader vdv-expected))
+  (:report (lambda (c s)
+             (format s "vector-index slot ~A on ~A: vector length ~D does ~
+not match established segment dimension ~D"
+                     (vdv-slot c) (vdv-owner c) (vdv-actual c)
+                     (vdv-expected c)))))

@@ -13,7 +13,7 @@
 
 (in-package :graph-db)
 
-(define-condition domain-range-violation (error)
+(define-condition domain-range-violation (constraint-violation)
   ((edge-type   :initarg :edge-type   :reader drv-edge-type)
    (end         :initarg :end         :reader drv-end)         ; :from / :to
    (reason      :initarg :reason      :reader drv-reason)      ; see below
