@@ -5590,7 +5590,8 @@ Three things change, and nothing else does:
   membership condition, and the audit reports only the overlapping
   members.
 
-*Disjoint* is ~extents-disjoint-p~: every Allen relation possible between
+*Disjoint* is ~extents-disjoint-p~ (cl-temporal-extent's since its 0.2.0,
+re-exported here): every Allen relation possible between
 the two extents is ~:before~ or ~:after~. So ~:meets~ is NOT disjoint —
 intervals are closed, and two runs that meet hold at their shared boundary
 instant — and an ambiguous pair (fuzzy bounds that might overlap) is not

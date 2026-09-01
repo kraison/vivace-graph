@@ -66,7 +66,8 @@
    #:unknown-claim-family
    ;; temporal claim families (GH #296)
    #:claim-family-temporal-p #:extent-sexp-start-key
-   #:extents-disjoint-p #:extent-disjointness-violation
+   ;; extents-disjoint-p is cl-temporal-extent's since its 0.2.0 (#1 there)
+   #:extents-disjoint-p #:extents-intersect-p #:extent-disjointness-violation
    #:edv-claim-class #:edv-subject-namespace #:edv-subject-key
    #:edv-object-namespace #:edv-object-key #:edv-relation
    #:edv-conflicting-ids #:check-extent-disjointness

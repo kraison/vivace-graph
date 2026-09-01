@@ -501,7 +501,8 @@ and read-only neighborhood exploration."
   :name "VivaceGraph spacetime (temporal substrate)"
   :description "The claim record and source-onboarding contract over
 cl-temporal-extent."
-  :depends-on (:graph-db/core :local-time :cl-temporal-extent)
+  :depends-on (:graph-db/core :local-time
+               (:version :cl-temporal-extent "0.2.0"))
   :pathname "spacetime/"
   :serial t
   :components ((:file "package")
