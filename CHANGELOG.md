@@ -146,6 +146,17 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Changed
 
+- **The peer type table refuses a type whose class is not loaded** (#200),
+  on the scoped auth-ok path, with `peer-type-class-not-loaded-error`
+  naming the type and store. `supers` comes from CLOS, so a registered type
+  with no class in the hub image shipped an empty field — on the frozen
+  wire grammar (#199) indistinguishable from a type that roots at
+  vertex/edge, so every device placed it at the root and dropped it from
+  its parent's closure. Since #206 the session table is one store's own
+  schema, an unloaded class there is that store's deployment fault, and the
+  blast radius is its sessions; the unscoped whole-image table stays
+  tolerant as before.
+
 - **`make-memory-graph` refuses a location carrying `.dirty`** (#250), with
   `store-not-closed-cleanly-error` before any side effect — the same rule
   disk `make-graph` has had since #246. It used to supersede the marker and

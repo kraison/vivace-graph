@@ -158,6 +158,22 @@ consumer can rebuild the closure itself."
         (walk class))
       (nreverse out))))
 
+(defun %peer-check-classes-loaded (rows graph)
+  "Signal PEER-TYPE-CLASS-NOT-LOADED-ERROR unless every row's TYPE has a class
+in this image; returns ROWS.  SUPERS comes from CLOS, so a registered type
+with no loaded class emits an EMPTY field -- on the wire identical to a type
+that roots at VERTEX/EDGE, which a device resolves the wrong way (GH #200).
+The grammar cannot say \"unknown\" (a frozen contract, GH #199), so the
+encoder refuses instead -- on the SCOPED path only: with GRAPH the rows are
+that store's own schema and its supers-closure, so an unloaded class there
+is that store's deployment fault, and the blast radius is its sessions.  An
+unscoped, whole-image table stays tolerant, as before."
+  (dolist (row rows rows)
+    (let ((type (fifth row)))
+      (unless (find-class type nil)
+        (error 'peer-type-class-not-loaded-error
+               :type type :graph-name (graph-name graph))))))
+
 (defun %peer-type-label (type)
   "TYPE printed package-qualified, for an error an operator has to act on.  ~S
 alone omits the package whenever the symbol is accessible in the ambient
@@ -221,10 +237,11 @@ unrepresentable type name elsewhere in the image fails only unscoped
 callers -- see %PEER-VALIDATE-TYPE-TABLE-ROWS.
 
 SUPERS comes from CLOS, so a registered symbol whose class this image has not
-loaded emits an EMPTY supers field -- indistinguishable on the wire from a
-type that really does root at VERTEX/EDGE, so the device places it at the root
-and drops it from its parent's closure.  GH #200; GH #195 is the same absence
-one level down.  An UNREGISTERED CLOS mixin in the chain is spliced out of
+loaded would emit an EMPTY supers field -- indistinguishable on the wire from
+a type that really does root at VERTEX/EDGE.  The scoped (auth-ok) path
+therefore REFUSES such a row (%PEER-CHECK-CLASSES-LOADED, GH #200); only an
+unscoped whole-image table still emits it.  GH #195 is the same absence one
+level down.  An UNREGISTERED CLOS mixin in the chain is spliced out of
 SUPERS, its registered ancestors kept (GH #216)."
   ;; REGISTERED mirrors the rows' own source, so the SUPERS filter in
   ;; %PEER-TYPE-DIRECT-SUPERS can never disagree with the row set (GH #216).
@@ -420,6 +437,7 @@ either way, but the traceback points at a session, not at the schema form
 that caused it."
   (let* ((rows (%peer-type-table-rows registry))
          (rows (if graph (%peer-graph-scoped-rows rows graph) rows))
+         (rows (if graph (%peer-check-classes-loaded rows graph) rows))
          (rows (%peer-validate-type-table-rows rows)))
     (with-output-to-string (s)
       (loop for row in rows
@@ -508,6 +526,19 @@ names), because the table is sorted by id and may carry forward references."
 ;;; a disagreement between two populated stores is an operator event
 ;;; (spec §3.4).
 ;;; ---------------------------------------------------------------------------
+
+(define-condition peer-type-class-not-loaded-error (error)
+  ((type :initarg :type :reader peer-type-class-not-loaded-type)
+   (graph-name :initarg :graph-name :reader peer-type-class-not-loaded-graph))
+  (:report
+   (lambda (c s)
+     (format s "Type ~A is registered in ~S's schema but this image has not ~
+loaded its class, so its superclasses cannot be put on the peer type table: ~
+an empty SUPERS field would place it at the root and drop it from its ~
+parent's closure on every device (GH #200).  Load the schema before ~
+starting replication."
+             (%peer-type-label (peer-type-class-not-loaded-type c))
+             (peer-type-class-not-loaded-graph c)))))
 
 (define-condition peer-type-registry-conflict-error (error)
   ((conflicts :initarg :conflicts :reader peer-type-registry-conflicts))

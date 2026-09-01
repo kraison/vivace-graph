@@ -276,6 +276,7 @@
            ;; checked query preconditions, typed (GH #286)
            #:query-precondition-error #:query-precondition-error-reason
            #:decode-dsl-json #:decode-json-string-keys ; GH #284
+           #:peer-type-class-not-loaded-error     ; GH #200
 
            #:with-transaction
            #:with-read-snapshot

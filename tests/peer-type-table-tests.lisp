@@ -1051,3 +1051,28 @@ closure-integrity check, and neither must a whole-image table."
   (with-ptt-registry-graph (g *integration-graph-name*)
     (declare (ignorable g))
     (is (stringp (graph-db::peer-type-table-string)))))
+
+(test type-table-scoped-refuses-a-type-whose-class-is-not-loaded
+  "GH #200: a type registered in the session's store whose class this image
+has not loaded would ship an EMPTY supers field -- on the wire the same as
+a root type, so a device drops it from its parent's closure.  The scoped
+(auth-ok) table refuses it instead, naming the type; the unscoped
+whole-image table stays tolerant.  The class is unbound for the duration
+of the test and restored, so the rest of the suite sees it again."
+  (with-ptt-two-stores (r ga gb)
+    (declare (ignorable gb))
+    (let ((class (find-class 'pts-a-only)))
+      (unwind-protect
+           (progn
+             (setf (find-class 'pts-a-only) nil)
+             (let ((c (handler-case
+                          (progn (graph-db::peer-type-table-string r ga) nil)
+                        (graph-db:peer-type-class-not-loaded-error (c) c))))
+               (is-true c "the scoped table must refuse the unloaded type")
+               (when c
+                 (is (eq 'pts-a-only
+                         (graph-db::peer-type-class-not-loaded-type c)))
+                 (is (search "GH #200" (princ-to-string c)))))
+             (finishes (graph-db::peer-type-table-string r)
+                       "the unscoped table stays tolerant"))
+        (setf (find-class 'pts-a-only) class)))))
