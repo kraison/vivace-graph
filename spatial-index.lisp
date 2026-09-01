@@ -369,17 +369,28 @@ plus another in the caller."
 a bounding-box prefilter.  Refine with GEODESIC-DISTANCE for an exact radius.
 TAGS and SEEN are as for MAP-SPATIAL-INDEX-BBOX.
 
-RADIUS-M is clamped to the planet before it becomes a degree span, per axis, and
-the window is then clamped to the globe.  A radius past half the circumference
-already means \"every node\", so this loses no result -- and the exact
-GEODESIC-DISTANCE refinement still applies the caller's true radius.  Without it
-the span grew without bound and drove GEOHASH-COVERING's grid walk
-quadratically: radius 2e10 m took 24.6 s on a FIVE-node index and 4e10 took
-99.5 s, firing a 30 s query deadline 69 s late, because %TICK cannot preempt
-inside this call.  Clamping per axis rather than short-circuiting to the whole
-globe keeps a polar query a latitude BAND: near the pole the COS term already
-inflates DLON, and a 200 km radius there must not come to mean everything
-(GH #279)."
+The window is a latitude BAND crossed with a longitude span, and both are
+built to lose no result (GH #287):
+
+  - the span is sized at the band's POLEWARD edge, where a degree of
+    longitude is shortest, not at the query latitude -- sized at the query
+    latitude it under-reaches a point that is both poleward and sideways;
+  - a band that touches a pole spans EVERY longitude -- at the pole cos is
+    0 and no finite span is enough;
+  - a span that crosses the antimeridian is scanned as TWO windows, the
+    part above +180 wrapped to the west edge (or below -180 to the east),
+    sharing one SEEN table.  Truncating it at +/-180 silently dropped the
+    far side; GEOHASH-ENCODE saturates there, so the loss was invisible at
+    the cell level.
+
+RADIUS-M is clamped to the planet before it becomes a degree span, per axis
+(GH #279): a radius past half the circumference already means \"every node\",
+and the exact GEODESIC-DISTANCE refinement still applies the caller's true
+radius.  Without that clamp the span grew without bound and drove
+GEOHASH-COVERING's grid walk quadratically -- radius 2e10 m took 24.6 s on a
+FIVE-node index, firing a 30 s query deadline 69 s late, because %TICK cannot
+preempt inside this call.  Clamping per axis keeps a polar query a latitude
+band rather than the whole globe: full longitude, bounded latitude."
   ;; CLAMP-* first, and rationally: a bignum or ratio LAT or RADIUS-M
   ;; would overflow the float arithmetic below before any clamp on the
   ;; result could see it (GH #279).
@@ -387,14 +398,29 @@ inflates DLON, and a 200 km radius there must not come to mean everything
          (lon (clamp-longitude lon))
          (radius-m (clamp-radius-metres radius-m))
          (dlat (min 90d0 (/ radius-m 111320d0)))
-         (dlon (min 180d0 (/ radius-m
-                             (* 111320d0 (max 0.01d0 (cos (deg->rad lat))))))))
-    (map-spatial-index-bbox fn idx
-                            (max -180d0 (- lon dlon))
-                            (max -90d0 (- lat dlat))
-                            (min 180d0 (+ lon dlon))
-                            (min 90d0 (+ lat dlat))
-                            :tags tags :seen seen)))
+         (min-lat (max -90d0 (- lat dlat)))
+         (max-lat (min 90d0 (+ lat dlat)))
+         (edge-lat (max (abs min-lat) (abs max-lat)))
+         (dlon (if (>= edge-lat 90d0)
+                   180d0
+                   (min 180d0 (/ radius-m
+                                 (* 111320d0
+                                    (cos (deg->rad edge-lat)))))))
+         (seen (or seen (make-hash-table :test 'equalp))))
+    (flet ((scan (west east)
+             (map-spatial-index-bbox fn idx west min-lat east max-lat
+                                     :tags tags :seen seen)))
+      (cond ((>= dlon 180d0)
+             (scan -180d0 180d0))
+            ((< (- lon dlon) -180d0)
+             (scan -180d0 (+ lon dlon))
+             (scan (+ 360d0 (- lon dlon)) 180d0))
+            ((> (+ lon dlon) 180d0)
+             (scan (- lon dlon) 180d0)
+             (scan -180d0 (- (+ lon dlon) 360d0)))
+            (t
+             (scan (- lon dlon) (+ lon dlon)))))
+    nil))
 
 (defun spatial-index-query-bbox (idx min-lon min-lat max-lon max-lat &key tags)
   "The candidate node-ids MAP-SPATIAL-INDEX-BBOX would visit, as a list.  Prefer

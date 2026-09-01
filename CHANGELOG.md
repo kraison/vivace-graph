@@ -145,6 +145,7 @@ between releases; cutting a release renames it to the new version and dates it.
   policy; `tm-next-epoch` is the named extension point.
 
 ### Changed
+
 - **`snapshot`'s integrity sweep is opt-in** (#119): `:check-data-integrity-p`
   now defaults to `NIL`. The sweep deserializes every node a second time —
   measured on the deployed tenant as the larger half of a snapshot's
@@ -192,6 +193,19 @@ between releases; cutting a release renames it to the new version and dates it.
   commit; its data is unaffected.
 
 ### Fixed
+
+- **Spatial radius queries missed results across the antimeridian and at
+  the poles** (#287). `map-spatial-index-radius` built its longitude span
+  at the query latitude and truncated it to `[-180, 180]`, so a window
+  crossing the dateline lost its far half and a window touching a pole
+  never spanned all longitudes — a query *at* the pole returned nothing.
+  Silent, from every surface (GUI builder, REST DSL, `find-near/5`). The
+  span is now sized at the band's poleward edge, a band that touches a
+  pole covers every longitude, and a span crossing ±180 is scanned as two
+  windows sharing one dedup table. The #279 clamp is unchanged: a polar
+  query is still a latitude band, not the whole globe. Tests assert against
+  `geodesic-distance` ground truth, since the loss was invisible at the
+  cell level.
 
 - **`open-lhash` reset the persisted location; `delete-lhash` on a copied
   graph deleted the ORIGINAL's files** (#143). `struct.dat` cl-stores the

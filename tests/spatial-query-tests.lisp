@@ -55,6 +55,28 @@
       (is (has-id-p ida nodes))
       (is (not (has-id-p idb nodes))))))
 
+(test find-nodes-near-wraps-the-antimeridian-and-the-poles
+  "GH #287, end to end: the query path inherits the index window, so a
+node across the dateline or across the pole must come back with its
+true distance."
+  (with-test-graph (g)
+    (let (east west north-a north-b)
+      (with-transaction ()
+        (setq east    (id (make-geo-place :loc (make-point 179.5d0 0d0)))
+              west    (id (make-geo-place :loc (make-point -179.5d0 0d0)))
+              north-a (id (make-geo-place :loc (make-point 100d0 89.9d0)))
+              north-b (id (make-geo-place :loc (make-point -100d0 89.9d0)))))
+      (let ((nodes (mapcar #'car (find-nodes-near 'geo-place 0d0 179.5d0
+                                                  200000d0 :graph g))))
+        (is (has-id-p east nodes))
+        (is (has-id-p west nodes) "the node across the dateline")
+        (is (= 2 (length nodes))))
+      (let ((hits (find-nodes-near 'geo-place 90d0 0d0 100000d0 :graph g)))
+        (is (has-id-p north-a (mapcar #'car hits)))
+        (is (has-id-p north-b (mapcar #'car hits)))
+        (is (every (lambda (h) (< (cdr h) 12000d0)) hits)
+            "both are ~11.1 km from the pole")))))
+
 (test find-nodes-within-lisp
   "find-nodes-within returns nodes inside the region polygon only."
   (with-three-places (g ida idb idfar)

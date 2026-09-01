@@ -3065,6 +3065,16 @@ Every query takes a *scope* as its first argument: a node-class name, a list of 
 
 ~find-nearest-k~ is bounded by ~:max-radius~ (default 25 km): the geohash index answers a window by enumerating its grid cells, so an unbounded nearest-neighbour search is not supported — it returns the K nearest /within max-radius/ (widen it only if you accept the per-query cost, which grows with the square of the radius).
 
+A radius query is correct anywhere on the globe (vivace-graph#287). The
+index window is a latitude band crossed with a longitude span sized at the
+band's *poleward* edge; a window that crosses the antimeridian is scanned
+as two windows (the overflow wrapped to the other edge), and one that
+touches a pole spans every longitude — so a 200 km query at lon 179.5
+finds a node at lon −179.5, and a query *at* the pole finds what is around
+it. The #279 cost bound is unchanged: a polar query is still a latitude
+band, never the whole globe. The candidates are then refined with
+~geodesic-distance~, as always.
+
 *Prolog functors* (these /yield/ matching nodes, so they compose with the rest of a query):
 
 #+BEGIN_SRC lisp

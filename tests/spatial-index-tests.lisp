@@ -468,3 +468,89 @@ span arithmetic is what it always was."
         (is (has-p (bid 1) cands))
         (is (not (has-p (bid 3) cands))
             "the distant point must still be filtered by the bbox")))))
+
+;;; ---------------------------------------------------------------------
+;;; GH #287: the radius window must WRAP at the antimeridian and SPAN all
+;;; longitudes when it reaches a pole.  Every assertion is against
+;;; GEODESIC-DISTANCE ground truth, never cell membership -- the defect
+;;; is invisible at the cell level (GEOHASH-ENCODE saturates at +/-180).
+;;; ---------------------------------------------------------------------
+
+(defparameter *globe-points*
+  ;; (id lon lat)
+  (list (list (bid 1)  179.5d0   0d0)      ; dateline, east side
+        (list (bid 2) -179.5d0   0d0)      ; dateline, west side (111 km)
+        (list (bid 3)  100d0    89.9d0)    ; near the north pole
+        (list (bid 4) -100d0    89.9d0)    ; 21.9 km from (bid 3)
+        (list (bid 5)  100d0   -89.9d0)    ; near the south pole
+        (list (bid 6) -100d0   -89.9d0)
+        (list (bid 7) (first *far*) (second *far*))))   ; control
+
+(defun %globe-index (heap)
+  (let ((idx (make-spatial-index heap :precision 7)))
+    (loop for (id lon lat) in *globe-points*
+          do (spatial-index-insert idx id (make-point lon lat)))
+    idx))
+
+(defun %radius-covers-truth-p (idx lat lon radius)
+  "True when every point GEODESIC-DISTANCE puts within RADIUS of (LAT, LON)
+is among the index's candidates.  Candidates may be a superset -- the
+index is a prefilter -- but never a subset."
+  (let ((cands (spatial-index-query-radius idx lat lon radius))
+        (truth (loop for (id plon plat) in *globe-points*
+                     when (<= (geodesic-distance lat lon plat plon) radius)
+                       collect id)))
+    (values (subsetp truth cands :test 'equalp) truth cands)))
+
+(test radius-window-wraps-the-antimeridian
+  "A 200 km window at lon +/-179.5 must reach both dateline nodes, which
+are 111 km apart; before the fix the window was truncated at +/-180 and
+returned only the query's own side."
+  (with-temp-memory (heap)
+    (let ((idx (%globe-index heap)))
+      (dolist (lon '(179.5d0 -179.5d0))
+        (multiple-value-bind (ok truth cands)
+            (%radius-covers-truth-p idx 0d0 lon 200000d0)
+          (is-true ok "at lon ~A: truth ~S, candidates ~S"
+                   lon (mapcar (lambda (i) (aref i 0)) truth)
+                   (mapcar (lambda (i) (aref i 0)) cands))
+          (is (= 2 (length truth)) "fixture: both dateline nodes are in range")
+          (is (not (has-p (bid 7) cands))
+              "the wrap must not turn the window into the whole globe"))))))
+
+(test radius-window-spans-all-longitudes-at-a-pole
+  "Near a pole the window must cover every longitude: two nodes 21.9 km
+apart across the pole, and a query AT the pole (cos = 0), used to find
+one or none."
+  (with-temp-memory (heap)
+    (let ((idx (%globe-index heap)))
+      (loop for (lat lon) in '((89.9d0 100d0) (89.9d0 -100d0) (90d0 0d0)
+                               (-89.9d0 100d0) (-89.9d0 -100d0) (-90d0 0d0))
+            do (multiple-value-bind (ok truth cands)
+                   (%radius-covers-truth-p idx lat lon 100000d0)
+                 (is-true ok "at (~A ~A): truth ~S, candidates ~S"
+                          lat lon (mapcar (lambda (i) (aref i 0)) truth)
+                          (mapcar (lambda (i) (aref i 0)) cands))
+                 (is (= 2 (length truth))
+                     "fixture: both polar nodes are in range of (~A ~A)"
+                     lat lon)
+                 (is (not (has-p (bid 7) cands))
+                     "a polar band is not the whole globe"))))))
+
+(test radius-window-near-a-pole-uses-the-poleward-edge
+  "The longitude span is computed at the window's poleward EDGE, not at
+the query latitude: a node north-east of the query can sit inside the
+radius but outside a window sized with cos(query-lat)."
+  (with-temp-memory (heap)
+    (let ((idx (make-spatial-index heap :precision 7))
+          ;; Query (85N, 0), 100 km.  cos(85) sizes the half-span at
+          ;; 10.307 deg; this node is 99,986 m away at 10.367 deg east --
+          ;; 0.06 deg past that edge, ~40 precision-7 cells: unreachable
+          ;; by any covering margin.  Sized at the band's poleward edge
+          ;; (85.9N) the span is 11.7 deg and reaches it.
+          (lon 10.367d0) (lat 85.05d0))
+      (spatial-index-insert idx (bid 1) (make-point lon lat))
+      (let ((d (geodesic-distance 85d0 0d0 lat lon)))
+        (is (< d 100000d0) "fixture: the node is within 100 km (~,0F m)" d)
+        (is (has-p (bid 1) (spatial-index-query-radius idx 85d0 0d0 100000d0))
+            "a node within the radius must be a candidate")))))
