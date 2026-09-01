@@ -545,21 +545,28 @@ are domain identifiers a query author types, not protocol (GH #277)."
 ;;; or reads user text into symbols beyond what that compiler does.
 ;;; ---------------------------------------------------------------------
 
-(defun %request-json-body ()
+(defun %request-json-body (&key (intern-dsl-keys t))
   "The request body decoded as JSON, or :MALFORMED.  The GUI's own
-seam onto the DSL -- it does not call through rest.lisp.
+seam onto the DSL -- it does not call through rest.lisp.  With
+INTERN-DSL-KEYS (the default) only the DSL's own keys become keywords
+(DECODE-DSL-JSON, GH #284); NIL leaves every key a string, for an
+endpoint that reads its fields by string (the Prolog editor).
 
 The :MALFORMED arm covers only bodies sent under a content type lack
 does NOT pre-parse.  Under application/json lack parses the body when
 it builds the request, before ningle dispatches, so a JSON syntax
 error is ITS plain-text 400 and this handler never runs (GH #278)."
+  ;; Neither decoder interns a client-supplied key; the default decoder
+  ;; interned every object key a client sent (GH #284).
   (handler-case
-      (let ((raw (lack/request:request-content ningle:*request*)))
-        (json:decode-json-from-string
-         (if (stringp raw)
-             raw
-             (flexi-streams:octets-to-string raw
-                                             :external-format :utf-8))))
+      (let* ((raw (lack/request:request-content ningle:*request*))
+             (string (if (stringp raw)
+                         raw
+                         (flexi-streams:octets-to-string
+                          raw :external-format :utf-8))))
+        (if intern-dsl-keys
+            (graph-db:decode-dsl-json string)
+            (graph-db:decode-json-string-keys string)))
     (error () :malformed)))
 
 (defun %clamp-row-cap (n)

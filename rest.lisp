@@ -412,8 +412,10 @@ handlers turn ERROR-STRING into their :error JSON (GH #190)."
 
 (defun %request-query-dsl ()
   "Decode the JSON request body of an ad-hoc pattern query into a DSL alist.
-The HTTP integration seam for the /query route."
-  (json:decode-json-from-string
+The HTTP integration seam for the /query route.  DECODE-DSL-JSON interns
+only the DSL's own keys, so a client cannot grow the KEYWORD package one
+bogus field per request (GH #284)."
+  (decode-dsl-json
    (flexi-streams:octets-to-string
     (lack/request:request-content ningle:*request*)
     :external-format :utf-8)))

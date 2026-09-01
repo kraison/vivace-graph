@@ -153,6 +153,49 @@ any other value is a literal (string/number/boolean) used as-is."
       (intern (string-upcase v) :graph-db)
       v))
 
+;;; JSON bodies are decoded with STRING keys and only the DSL's own
+;;; vocabulary is turned into keywords (GH #284).  cl-json's default
+;;; decoder interned every object key it met, so an unauthenticated
+;;; caller could grow the image's KEYWORD package one bogus field per
+;;; request; the free-text Prolog endpoint (GH #279) already decoded by
+;;; string, this makes the builder and REST pattern-query bodies do the
+;;; same.  An unknown key stays a string, and (ASSOC :FOO ...) simply
+;;; misses it.
+
+(defparameter +dsl-json-keys+
+  '("match" "where" "select" "limit" "skip" "format"
+    "vertex" "edge" "type" "from" "to"
+    "slot" "name" "bind" "value" "compare" "args")
+  "Every object key the pattern-query DSL reads (RUN-PATTERN-QUERY and its
+helpers).  The whole vocabulary a decoded body may intern.")
+
+(defun %dsl-intern-known-keys (value)
+  "VALUE (a string-keyed decode) with every DSL key replaced by its keyword,
+recursively through nested objects and arrays; unknown keys stay strings."
+  (cond ((and (consp value) (consp (car value)) (stringp (caar value)))
+         ;; a JSON object: alist of (string . value)
+         (mapcar (lambda (pair)
+                   (cons (if (member (car pair) +dsl-json-keys+ :test #'string=)
+                             (intern (string-upcase (car pair)) :keyword)
+                             (car pair))
+                         (%dsl-intern-known-keys (cdr pair))))
+                 value))
+        ((consp value) (mapcar #'%dsl-intern-known-keys value))
+        (t value)))
+
+(defun decode-json-string-keys (string)
+  "Decode JSON STRING with every object key left a STRING -- nothing is
+interned, whatever a client sends (GH #279, #284)."
+  (let ((json:*json-identifier-name-to-lisp* #'identity)
+        (json:*identifier-name-to-key* #'identity))
+    (json:decode-json-from-string string)))
+
+(defun decode-dsl-json (string)
+  "Decode a pattern-query JSON body STRING into the alist RUN-PATTERN-QUERY
+reads, interning only the DSL's own keys (GH #284).  The one decoder for
+the REST /query route and the GUI builder."
+  (%dsl-intern-known-keys (decode-json-string-keys string)))
+
 (defun %dsl-keyword (name)
   "A client type or slot NAME as a keyword.  Two spellings arrive: the
 engine's own wire form -- lowercase kebab, exactly what the GUI's /types

@@ -2074,3 +2074,26 @@ be exact in both directions."
           (run-prolog "(find-by-slot ?a ?b ?c ?d)")
         (is (= 400 status))
         (is (string= "ill-typed-query" (jref json :error)))))))
+
+(test builder-query-bodies-do-not-intern-bogus-keys
+  "GH #284: fifty builder requests each carrying a never-seen JSON field
+leave the KEYWORD package exactly as large as before -- the same guard
+the Prolog endpoint has had since GH #279, now on the DSL decoder both
+surfaces share."
+  (with-gui-fixture ()
+    (with-gui-server ()
+      (run-query "{\"match\":[{\"vertex\":\"?p\",\"type\":\"gui-person\"}],
+                   \"select\":[\"?p\"]}")
+      (let ((kw (package-symbol-count :keyword)))
+        (dotimes (i 50)
+          (multiple-value-bind (json status)
+              (run-query
+               (format nil "{\"match\":[{\"vertex\":\"?p\",
+                                      \"type\":\"gui-person\",
+                                      \"zzHostile~D\":~D}],
+                             \"select\":[\"?p\"],\"zzTop~D\":true}" i i i))
+            (is (= 200 status) "request ~D answered ~A: ~A" i status
+                (jref json :message))))
+        (is (= kw (package-symbol-count :keyword))
+            "KEYWORD gained ~D symbol(s)"
+            (- (package-symbol-count :keyword) kw))))))

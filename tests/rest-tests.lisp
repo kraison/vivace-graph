@@ -376,7 +376,7 @@ persists (the retract flattens into the wrapping with-transaction)."
   "Run an ad-hoc pattern query given its JSON body (decoded as the route would),
 returning the decoded JSON response."
   (rest-decode
-   (graph-db::call-rest-pattern-query (json:decode-json-from-string json-string)
+   (graph-db::call-rest-pattern-query (graph-db:decode-dsl-json json-string)
                                       (rest-params))))
 
 (test pattern-query-vertex-and-slot
@@ -699,3 +699,29 @@ G-PERSON.AGE -- is the client's 400 with the reason, not a 500."
         (is-true (search "No secondary index" (cdr (assoc :error j)))
                  "the reason names the precondition: ~S"
                  (cdr (assoc :error j)))))))
+
+(test decode-dsl-json-interns-only-the-dsl-vocabulary
+  "GH #284: a bogus object key in a query body stays a STRING -- the
+KEYWORD package does not grow -- while the DSL's own keys are keywords."
+  (flet ((kw-count ()
+           (let ((n 0))
+             (do-symbols (s :keyword) (declare (ignore s)) (incf n))
+             n)))
+  (let* ((before (kw-count))
+         (dsl (graph-db:decode-dsl-json
+               (format nil "{\"match\":[{\"vertex\":\"?p\",\"type\":\"gPerson\",
+                                    \"zzBogusKey~D\":1}],
+                            \"zzAnotherBogus~D\":{\"deeper~D\":2},
+                            \"limit\":3}" (random 1000000) (random 1000000)
+                            (random 1000000))))
+         (after (kw-count)))
+    (is (= before after) "the KEYWORD package gained ~D symbol(s)"
+        (- after before))
+    (is (= 3 (cdr (assoc :limit dsl))))
+    (let ((pat (first (cdr (assoc :match dsl)))))
+      (is (string= "?p" (cdr (assoc :vertex pat))))
+      (is (string= "gPerson" (cdr (assoc :type pat))))
+      (is (find-if (lambda (pair) (and (stringp (car pair))
+                                       (search "zzBogusKey" (car pair))))
+                   pat)
+          "the unknown key survives as a string, uninterned")))))

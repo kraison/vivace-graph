@@ -557,10 +557,11 @@ the editor's overlay mode, which dims a head it does not know here."
   "The request body decoded as JSON with its object KEYS LEFT AS
 STRINGS, or :MALFORMED.  cl-json's default decoder INTERNS every key it
 meets as a keyword, so a client could grow the KEYWORD package one
-bogus field per request; nothing on this path needs a symbol (GH #279)."
-  (let ((json:*json-identifier-name-to-lisp* #'identity)
-        (json:*identifier-name-to-key* #'identity))
-    (%request-json-body)))
+bogus field per request; nothing on this path needs a symbol (GH #279).
+Since GH #284 the shared decoder interns the DSL's own keys -- \"limit\"
+among them -- so this endpoint, which reads its two fields by string,
+asks for none."
+  (%request-json-body :intern-dsl-keys nil))
 
 (defun %prolog-field (body name)
   (cdr (assoc name body :test #'equal)))

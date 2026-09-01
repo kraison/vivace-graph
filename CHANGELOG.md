@@ -153,6 +153,14 @@ between releases; cutting a release renames it to the new version and dates it.
   unchanged: an open rebuilds from the journal, so there the marker is
   recovered, not refused.
 
+- **Query bodies no longer intern client-supplied JSON keys** (#284).
+  `decode-dsl-json` decodes with string keys and turns only the DSL's own
+  vocabulary into keywords; the REST `/query` route and the GUI builder both
+  use it. Before, cl-json's default decoder interned every object key it
+  met, so an unauthenticated caller could grow the image's `KEYWORD`
+  package one bogus field per request. Exported, since a tenant decoding a
+  DSL body itself wants the same guard.
+
 - **Query results render `NIL` as JSON `null`, `T` as `true`, and a stored
   object as an object** (#282). `%query-value->json` tested `symbolp`
   before anything mapped `NIL`, so an empty slot came back as the string
