@@ -13,6 +13,24 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Added
 
+- **Temporal claim families** (#296): `(def-claim-classes f :g :temporal t)`
+  turns a claim family into a state series. The validity extent's START
+  joins both identity tuples (`extent-sexp-start-key`, the start bound as
+  fixnums — a timestamp object is never `EQUAL` to its re-read twin and
+  nanoseconds-since-epoch is a bignum off SBCL), so "X in state A during
+  [a,b]" and "… during [c,d]" are two claims and the daily rewrite of an
+  ongoing run is an update of one. Live claims sharing a base tuple must
+  have pairwise **disjoint** validity — `extents-disjoint-p`: every
+  possible Allen relation is `:before`/`:after`, so `:meets` (closed
+  intervals share the boundary instant) and an ambiguous pair are both
+  refused — enforced at commit through the commit view with its own
+  condition, `extent-disjointness-violation`; `check-extent-disjointness`
+  is the audit. A temporal claim must carry an extent (constructor +
+  named `:required` constraint). `def-disjoint-membership` holds **per
+  instant** for such a family, and `claims-touching` gains `:at instant`
+  / `:during extent` validity filters, orthogonal to `:current`. Design:
+  `docs/superpowers/specs/2026-09-01-temporal-claim-families-design.md`.
+
 - **CI runs the spacetime, geos, algorithms and gui suites** in addition
   to main/concurrency/ACID (`.github/workflows/test.yml`; docs/ci.md).
   The gap: the lanes were fixed at the three suites that existed when CI

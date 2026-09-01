@@ -12,14 +12,16 @@
                      (unknown-claim-family-parent c)))))
 
 (defstruct (claim-family (:constructor %make-claim-family
-                             (parent unary binary))
+                             (parent unary binary temporal-p))
                          (:copier nil))
   "The three class names DEF-CLAIM-CLASSES generated together.  Registered so
 CLAIMS-TOUCHING and DELETE-CLAIMS-BY-PRODUCER can reach the arity subclasses
-from the parent name alone."
+from the parent name alone.  TEMPORAL-P: the extent start is in the
+identity tuple and live runs must be pairwise disjoint (GH #296)."
   (parent nil :read-only t)
   (unary nil :read-only t)
-  (binary nil :read-only t))
+  (binary nil :read-only t)
+  (temporal-p nil :read-only t))
 
 (defvar *claim-families* (make-hash-table :test 'eq)
   "Parent class name -> CLAIM-FAMILY.")
@@ -107,6 +109,25 @@ including REST, rather than only at the accessor."
 ;; effect immediately.
 (graph-db:register-schema-function
  'transaction-extent-step (lambda (o n) (transaction-extent-step o n)))
+
+(defun %timestamp-key (ts)
+  "TS as LOCAL-TIME's three fixnums: EQUAL-comparable, LESS-THAN-orderable
+and SERIALIZE-able, which a TIMESTAMP object is not (GH #296)."
+  (list (local-time:day-of ts) (local-time:sec-of ts)
+        (local-time:nsec-of ts)))
+
+(defun extent-sexp-start-key (sexp)
+  "The identity component a temporal family derives from a stored extent
+SEXP: its START bound as ((day sec nsec) (day sec nsec)), :UNBOUNDED
+where open; NIL for NIL.  Fixnums, not TIMESTAMP objects -- the memory
+backend's unique index is an EQUAL hash table and structures are EQUAL
+only when EQ -- and not nanoseconds since the epoch, a bignum off SBCL
+that SERIALIZE cannot write.  The :CANONICALIZE behind the temporal
+identity tuple (GH #296, design §2.2)."
+  (when sexp
+    (let ((start (extent-start (sexp->extent sexp))))
+      (flet ((key (x) (if (eq x :unbounded) x (%timestamp-key x))))
+        (list (key (bound-earliest start)) (key (bound-latest start)))))))
 
 (defparameter +claim-shared-slots+
   '((subject-namespace :initarg :subject-namespace
@@ -250,7 +271,7 @@ claim (design §3.1, GH #131 finding 1)."
   "Slots only BINARY-CLAIM carries.  Their absence from UNARY-CLAIM is what
 makes a unary claim unable to carry an object (design §3.1).")
 
-(defmacro def-claim-classes (parent graph-name &key extra-slots)
+(defmacro def-claim-classes (parent graph-name &key extra-slots temporal)
   "Define PARENT and its UNARY/BINARY subclasses in GRAPH-NAME, and register
 the family.  The subsystem cannot ship these classes: DEF-VERTEX binds a node
 type to a graph name and class names are globally unique, so a shipped class
@@ -281,9 +302,27 @@ The TRANSACTION STAMP is a :TRANSITION constraint on PARENT --
 TRANSACTION-EXTENT-STEP: start immutable, end closeable once, re-openable
 by a later re-assertion -- enforced at commit on every write path, REST
 included (GH #148, #158, #162).  The accessor's own refusal stays as the
-fast-fail with the better error site."
-  (let ((unary (intern (format nil "~A-UNARY" parent)))
-        (binary (intern (format nil "~A-BINARY" parent))))
+fast-fail with the better error site.
+
+:TEMPORAL T makes the family a STATE SERIES (GH #296): the extent START
+joins both identity tuples (EXTENT-SEXP-START-KEY), an extent is required
+at construction and at commit, and live claims sharing a base tuple must
+have pairwise disjoint validity (spacetime/temporal.lisp).  Same
+declaration names, so flipping the flag re-declares rather than stacks."
+  (let* ((unary (intern (format nil "~A-UNARY" parent)))
+         (binary (intern (format nil "~A-BINARY" parent)))
+         (extent-slot (when temporal '(extent-sexp)))
+         (unary-slots (append '(producer subject-namespace subject-key
+                                relation)
+                              extent-slot))
+         (binary-slots (append '(producer subject-namespace subject-key
+                                 object-namespace object-key relation)
+                               extent-slot)))
+    (flet ((identity-options (slots)
+             ;; Positional :CANONICALIZE, the start key on the last slot.
+             (when temporal
+               `(:canonicalize ,(append (make-list (1- (length slots)))
+                                        '(extent-sexp-start-key))))))
     `(progn
        (graph-db:def-vertex ,parent ()
            (,@+claim-shared-slots+ ,@extra-slots)
@@ -325,13 +364,19 @@ fast-fail with the better error site."
        ;; permits, the stale index built and maintained for nothing.  A
        ;; name is stable across a change of shape, so re-declaring
        ;; replaces.  #138 changes this record.
-       (graph-db:def-unique ,unary
-           (producer subject-namespace subject-key relation)
-         ,graph-name :name claim-unary-identity)
-       (graph-db:def-unique ,binary
-           (producer subject-namespace subject-key
-            object-namespace object-key relation)
-         ,graph-name :name claim-binary-identity)
+       (graph-db:def-unique ,unary ,unary-slots
+         ,graph-name :name claim-unary-identity
+         ,@(identity-options unary-slots))
+       (graph-db:def-unique ,binary ,binary-slots
+         ,graph-name :name claim-binary-identity
+         ,@(identity-options binary-slots))
+       ;; A temporal claim without an extent would sit under NO identity
+       ;; (DEF-UNIQUE's null exemption), so the extent is required on
+       ;; every write path, not only at MAKE-<NAME> (GH #296).
+       ,@(when temporal
+           `((graph-db:def-value-constraint ,parent extent-sexp ,graph-name
+               :required t
+               :name claim-extent-required)))
        ;; Subject index on PARENT reaches both arities via SUBTYPEP.  Object
        ;; index on BINARY, where those slots live -- declaring it on PARENT
        ;; also works (%APPLICABLE-INDEX-DESCRIPTORS requires every named slot
@@ -353,15 +398,21 @@ fast-fail with the better error site."
                  (setf (fdefinition ',ctor)
                        (lambda (&rest args)
                          (%check-claim-identity args ',identity-keys)
-                         (let ((c (apply %raw
-                                        (%claim-encode-transaction-arg
-                                         (%claim-encode-extent-arg args)))))
-                           (check-standing (claim-standing c))
-                           c))))))
+                         (let ((args (%claim-encode-extent-arg args)))
+                           ,@(when temporal
+                               `((unless (getf args :extent-sexp)
+                                   (error 'missing-claim-identity-component
+                                          :slot :extent))))
+                           (let ((c (apply %raw
+                                          (%claim-encode-transaction-arg
+                                           args))))
+                             (check-standing (claim-standing c))
+                             c)))))))
           (list unary binary)
           (list +claim-identity-slots+
                 (append +claim-identity-slots+
                         +claim-object-identity-slots+)))
        (setf (gethash ',parent *claim-families*)
-             (%make-claim-family ',parent ',unary ',binary))
-       ',parent)))
+             (%make-claim-family ',parent ',unary ',binary
+                                 ,(and temporal t)))
+       ',parent))))

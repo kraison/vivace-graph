@@ -64,6 +64,12 @@
    #:mdv-name #:mdv-subject-namespace #:mdv-subject-key #:mdv-members
    #:check-disjoint-memberships
    #:unknown-claim-family
+   ;; temporal claim families (GH #296)
+   #:claim-family-temporal-p #:extent-sexp-start-key
+   #:extents-disjoint-p #:extent-disjointness-violation
+   #:edv-claim-class #:edv-subject-namespace #:edv-subject-key
+   #:edv-object-namespace #:edv-object-key #:edv-relation
+   #:edv-conflicting-ids #:check-extent-disjointness
    ;; source onboarding contract (GH #132)
    #:def-source #:source-contract #:+source-facets+
    #:source-facets #:source-facets-p #:source-facets-class

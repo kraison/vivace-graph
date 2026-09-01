@@ -3,8 +3,25 @@
 
 (in-package #:graph-db.spacetime)
 
+(defun extents-disjoint-p (a b)
+  "True when extents A and B certainly share no instant: every Allen
+relation possible between them is :BEFORE or :AFTER.  :MEETS is NOT
+disjoint -- intervals are closed, so meeting extents share their boundary
+instant -- and an ambiguous pair is not disjoint either.  A NIL extent
+overlaps everything, so the predicate is total (GH #296, design §2.3)."
+  (and a b
+       (every (lambda (r) (member r '(:before :after)))
+              (temporal-relation-relations (allen-relations a b)))
+       t))
+
+(defun %claim-validity-touches-p (claim probe)
+  "True when CLAIM's extent possibly shares an instant with PROBE.  A
+claim with no extent makes no validity statement and never matches."
+  (let ((e (claim-extent claim)))
+    (and e (not (extents-disjoint-p e probe)))))
+
 (defun claims-touching (graph claim-class namespace key
-                        &key (role :either) current)
+                        &key (role :either) current at during)
   "Claims in GRAPH naming (NAMESPACE, KEY) as subject, object, or either.
 CLAIM-CLASS is the PARENT class name; one call covers both arities.  Answers
 from the claim graph's own indexes -- no cross-graph read, no snapshot, which
@@ -14,11 +31,25 @@ With :CURRENT, only claims still believed -- CLAIM-CURRENT-P -- so a
 retracted registration does not read as live (GH #162).  The default
 returns retracted claims too: they are the record of what was believed.
 
+:AT (a TIMESTAMP) keeps claims whose validity extent possibly contains
+that instant; :DURING (a TEMPORAL-EXTENT) keeps claims whose extent
+possibly shares an instant with it -- the runs INTERSECTING the window,
+not Allen's stricter :DURING.  One or the other, not both.  Both are
+orthogonal to :CURRENT (validity vs transaction time, GH #148), both
+exclude a claim with no extent, and both filter the candidates the
+endpoint index already bounded (GH #296, design §2.5).
+
 An out-of-range ROLE signals rather than silently returning NIL -- NIL is
 also the correct answer for \"no claims touch this endpoint\", and this
 subsystem exists to keep those two cases from being confused."
   (check-type role (member :subject :object :either))
-  (let* ((family (claim-family claim-class))
+  (check-type at (or null local-time:timestamp))
+  (check-type during (or null temporal-extent))
+  (when (and at during)
+    (error "Pass only one of :AT or :DURING, not both."))
+  (let* ((probe (cond (at (make-instant (exact-bound at)))
+                      (during during)))
+         (family (claim-family claim-class))
          (want (list namespace key))
          (subjects (when (member role '(:subject :either))
                      (graph-db:index-lookup
@@ -34,9 +65,13 @@ subsystem exists to keep those two cases from being confused."
                    (remove-duplicates (append subjects objects)
                                       :key #'graph-db:id :test #'equalp)
                    (or subjects objects))))
-      (if current
-          (remove-if-not #'claim-current-p all)
-          all))))
+      (when current
+        (setf all (remove-if-not #'claim-current-p all)))
+      (when probe
+        (setf all (remove-if-not (lambda (c)
+                                   (%claim-validity-touches-p c probe))
+                                 all)))
+      all)))
 
 (defun claim-extent (claim)
   "CLAIM's TEMPORAL-EXTENT, decoded from the stored sexp, or NIL.  The stored

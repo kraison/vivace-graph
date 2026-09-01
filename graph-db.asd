@@ -514,7 +514,10 @@ cl-temporal-extent."
                ;; Membership disjointness (GH #157 4b): needs
                ;; claim-query's RETRACT-CLAIM/CLAIM-CURRENT-P and core's
                ;; commit view + *COMMIT-VALIDATORS* seam.
-               (:file "membership")))
+               (:file "membership")
+               ;; Temporal claim families (GH #296): the extent-overlap
+               ;; validator; needs membership's post-commit overlay.
+               (:file "temporal")))
 
 (defsystem graph-db/spacetime-test
   :name "VivaceGraph spacetime test suite"
@@ -547,7 +550,8 @@ cl-temporal-extent."
                (:file "claim-standing-guard-tests")    ; GH #149
                (:file "claim-transaction-tests")       ; GH #148
                (:file "register-tests")                ; GH #138
-               (:file "membership-tests"))             ; GH #157 4b
+               (:file "membership-tests")              ; GH #157 4b
+               (:file "temporal-tests"))               ; GH #296
   :perform (test-op (op c)
                     (unless (uiop:symbol-call :graph-db/spacetime-test
                                               :run-spacetime-tests)

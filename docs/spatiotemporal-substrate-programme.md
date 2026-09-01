@@ -34,6 +34,12 @@ immutable at the accessor only — on `experiment`; see
 `docs/transaction-time-design.md`. Tracked by #148. Its ingest override
 (`:recorded-at`) accepts dates before 2000-03-01 now that GH #153 is fixed.
 
+S1 can now hold a **state series**: a claim family declared `:temporal t`
+puts the validity extent's start into the identity tuple and requires live
+claims of one base tuple to be pairwise disjoint in validity, with
+`claims-touching :at` / `:during` as the reads. Tracked by #296; see
+`docs/superpowers/specs/2026-09-01-temporal-claim-families-design.md`.
+
 ## Why this matters to the engine
 
 The substrate (S1) is an **opt-in subsystem** beside `graph-db/geos` and

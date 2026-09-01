@@ -5328,7 +5328,10 @@ refused with ~membership-disjointness-violation~, a condition of its
 own. Claims under another relation, another object namespace, or keys
 outside the set never participate. The declaration, check and audit are
 single-store by design: a membership claim names its subject by external
-key, so there is no store reference to cross.
+key, so there is no store reference to cross. For a *temporal* family
+(~:temporal t~, below) the invariant holds per instant rather than per
+subject: two live memberships whose validity extents are disjoint are
+both admitted.
 
 *** Arity is a type, not a nullable slot
 
@@ -5435,6 +5438,79 @@ That shape is chosen to permit two things and forbid a third:
   concurrent producers racing to write the same claim resolve to exactly
   one winner and one signalled loser.
 
+*** Temporal claim families: a state series (~:temporal t~)
+
+The identity tuple above has no room for *when*. A subject that enters,
+leaves and re-enters the same state — "X stood in relation R to Y during
+[a,b], then again during [c,d]" — needs several live claims with the same
+tuple and disjoint validity extents, and under the plain tuple the second
+one collides (vivace-graph#296). Declaring the family *temporal* is how a
+state series becomes claims:
+
+#+BEGIN_SRC lisp
+  (def-claim-classes region-state :my-graph :temporal t)
+
+  (with-transaction ()                       ; A -> B -> A, one relation
+    (make-region-state-binary
+     :subject-namespace :region :subject-key "r1" :relation "in-state"
+     :object-namespace :state :object-key "a" :producer "series"
+     :standing :observed
+     :extent (make-interval (exact-bound jan-1) (exact-bound mar-31)))
+    (make-region-state-binary ... :object-key "b"
+     :extent (make-interval (exact-bound apr-1) (exact-bound jun-30)))
+    (make-region-state-binary ... :object-key "a"
+     :extent (make-interval (exact-bound jul-1) (exact-bound sep-30))))
+#+END_SRC
+
+Three things change, and nothing else does:
+
+- *Identity.* The extent's START joins both identity tuples —
+  ~(producer subject-ns subject-key [object-ns object-key] relation
+  extent-sexp)~, the last position canonicalised by
+  ~extent-sexp-start-key~ (the start bound as fixnums). The start rather
+  than the whole extent, deliberately: a run the subject is *still in* is
+  rewritten by each ingest with a later end, and that must be an UPDATE of
+  one claim (~copy~, ~(setf claim-extent)~, ~save~), not a new claim per
+  day. A new claim with the same start is the ordinary "same claim twice"
+  ~unique-constraint-violation~. A temporal claim must carry an extent:
+  the constructor signals ~missing-claim-identity-component~ without one,
+  and a named ~:required~ value constraint refuses it on every other write
+  path — otherwise ~def-unique~'s null exemption would leave it under no
+  identity at all.
+- *Disjointness.* Live claims sharing a *base tuple* (everything but the
+  extent) must have pairwise disjoint validity, so no instant sees two.
+  Enforced at commit through the commit view, like membership: a run
+  retracted in the same transaction does not count, one created in it
+  does. The refusal is ~extent-disjointness-violation~, its own condition
+  (~edv-subject-key~, ~edv-object-key~, ~edv-relation~,
+  ~edv-conflicting-ids~ …). ~check-extent-disjointness graph 'family~ is
+  the audit, for runs written before the flag or past the check; it
+  returns ~(values violations checked)~ and ~(values nil 0)~ for a
+  non-temporal family.
+- *Membership per instant.* Under a temporal family
+  ~def-disjoint-membership~ no longer counts live claims; it requires that
+  no two live membership claims of a subject *possibly overlap* in
+  validity. A region may be ~"a"~ during [a,b] and ~"b"~ during [c,d]
+  with both live; a ~"c"~ overlapping either is refused with the
+  membership condition, and the audit reports only the overlapping
+  members.
+
+*Disjoint* is ~extents-disjoint-p~: every Allen relation possible between
+the two extents is ~:before~ or ~:after~. So ~:meets~ is NOT disjoint —
+intervals are closed, and two runs that meet hold at their shared boundary
+instant — and an ambiguous pair (fuzzy bounds that might overlap) is not
+disjoint either; the algebra's rule is applied as written. Day-granular
+runs that end at the day's last nanosecond (~granule-bounds … :day~) never
+meet the next day's start.
+
+The transaction axis is untouched: each run is stamped, retracted and
+re-asserted on its own, and a retracted run still occupies its
+~(base tuple, start)~ exactly as any retracted claim occupies its tuple.
+Registration (~register-node~) writes no extent and upserts on the base
+tuple, so a ~:registration~ facet's ~:claim-class~ must be a non-temporal
+family. Design note:
+~docs/superpowers/specs/2026-09-01-temporal-claim-families-design.md~.
+
 *** Regeneration: sweep, then insert, in two transactions
 
 Rules get re-run and change their minds. If v2 of a rule stops producing a
@@ -5496,6 +5572,23 @@ family, so there is no single "the" claim class to infer. ~:ROLE~ defaults
 to ~:EITHER~; an unrecognized role signals rather than returning ~NIL~,
 because ~NIL~ is also the correct, honest answer to "nothing touches this
 endpoint," and the two must not be confused.
+
+Two validity filters, orthogonal to ~:CURRENT~ (which is transaction
+time), answer "what held at day D" and "which runs fall in this window"
+from the same index-bounded candidate set (vivace-graph#296):
+
+#+BEGIN_SRC lisp
+  (claims-touching graph 'region-state :region "r1" :at day)
+  ;; claims whose validity extent possibly contains DAY (a TIMESTAMP)
+  (claims-touching graph 'region-state :region "r1" :during window)
+  ;; claims whose extent possibly shares an instant with WINDOW (an
+  ;; extent) -- runs INTERSECTING the window, not Allen's stricter :DURING
+  (claims-touching graph 'region-state :region "r1" :at day :current t)
+  ;; ... as believed now
+#+END_SRC
+
+One of ~:AT~ or ~:DURING~, not both. A claim with no extent makes no
+validity statement and is excluded by either filter.
 
 ~CLAIMS-BY-PRODUCER~ asks the other question: not "what names this endpoint"
 but "what did this rule write". It is the non-destructive twin of

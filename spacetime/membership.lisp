@@ -121,6 +121,22 @@ SCHEMA-WITHDRAWAL-MATCHED-NOTHING when nothing matches (GH #152)."
                  :test #'equal)
          (claim-current-p c))))
 
+(defun %conflicting-members (members family)
+  "The MEMBERS that violate the set: for a temporal FAMILY, every member
+whose validity possibly overlaps another's -- disjointness holds PER
+INSTANT, so A during [a,b] and B during [c,d] may both be live (GH #296,
+design §2.4); otherwise all of them when there is more than one."
+  (if (claim-family-temporal-p family)
+      (remove-if-not
+       (lambda (a)
+         (some (lambda (b)
+                 (and (not (equalp (graph-db:id a) (graph-db:id b)))
+                      (not (extents-disjoint-p (claim-extent a)
+                                               (claim-extent b)))))
+               members))
+       members)
+      (and (cdr members) members)))
+
 (defun %post-commit-subject-claims (view graph family subject-ns
                                     subject-key)
   "The subject's claims as the committing transaction will leave them:
@@ -171,11 +187,13 @@ left with at most one -- counted over post-commit state (GH #157 4b)."
                       (let* ((family (claim-family
                                       (mds-claim-class spec)))
                              (members
-                               (remove-if-not
-                                (lambda (c) (%membership-claim-p c spec))
-                                (%post-commit-subject-claims
-                                 view graph family ns key))))
-                        (when (> (length members) 1)
+                               (%conflicting-members
+                                (remove-if-not
+                                 (lambda (c) (%membership-claim-p c spec))
+                                 (%post-commit-subject-claims
+                                  view graph family ns key))
+                                family)))
+                        (when members
                           (error 'membership-disjointness-violation
                                  :name (mds-name spec)
                                  :subject-namespace ns
@@ -189,8 +207,9 @@ left with at most one -- counted over post-commit state (GH #157 4b)."
 (defun check-disjoint-memberships (graph)
   "Survey GRAPH's declared membership sets without signalling.  Returns
  (values VIOLATIONS CHECKED SPEC-COUNT); VIOLATIONS are
- (NAME SUBJECT-NS SUBJECT-KEY MEMBER-KEYS) lists.  Zero violations over
-zero specs is an unchecked graph, as every audit here."
+ (NAME SUBJECT-NS SUBJECT-KEY MEMBER-KEYS) lists -- for a temporal family
+only the members that overlap in validity (GH #296).  Zero violations
+over zero specs is an unchecked graph, as every audit here."
   (let ((specs (gethash (graph-db:graph-name graph)
                         *membership-disjointness-metadata*))
         (violations '())
@@ -202,15 +221,16 @@ zero specs is an unchecked graph, as every audit here."
          (lambda (c)
            (incf checked)
            (when (%membership-claim-p c spec)
-             (push (claim-object-key c)
-                   (gethash (list (claim-subject-namespace c)
-                                  (claim-subject-key c))
-                            by-subject))))
+             (push c (gethash (list (claim-subject-namespace c)
+                                    (claim-subject-key c))
+                              by-subject))))
          graph :vertex-type (claim-family-binary family))
-        (maphash (lambda (subject keys)
-                   (when (> (length keys) 1)
-                     (push (list (mds-name spec)
-                                 (first subject) (second subject) keys)
-                           violations)))
+        (maphash (lambda (subject members)
+                   (let ((bad (%conflicting-members members family)))
+                     (when bad
+                       (push (list (mds-name spec)
+                                   (first subject) (second subject)
+                                   (mapcar #'claim-object-key bad))
+                             violations))))
                  by-subject)))
     (values (nreverse violations) checked (length specs))))
