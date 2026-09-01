@@ -59,11 +59,13 @@ to the identity branch and reached cl-json as a raw struct
 (JSON:UNENCODABLE-VALUE-ERROR, a 500).  A BOUND variable is dereferenced first,
 so only a genuinely unbound one becomes null (GH #279).
 
-NOT touched here: a slot whose value is really NIL still renders as the STRING
-\"NIL\", because (SYMBOLP NIL) is true.  That is a different value class with
-wider client impact and stays GH #282's business."
+A slot whose stored value is NIL is JSON null too, and T is JSON true: both
+are symbols, and the SYMBOLP branch used to render them as the strings
+\"NIL\" and \"T\" (GH #282).  Other symbols are still their names."
   (setq v (var-deref v))
   (cond ((var-p v) nil)                 ; unbound -> JSON null
+        ((null v) nil)                  ; an empty slot -> JSON null
+        ((eq v t) t)                    ; -> JSON true
         ((node-p v) (string-id v))
         ((keywordp v) v)
         ((symbolp v) (symbol-name v))
@@ -152,8 +154,17 @@ any other value is a literal (string/number/boolean) used as-is."
       v))
 
 (defun %dsl-keyword (name)
-  "A client field name (camelCase string) as a lisp keyword: \"minAge\" -> :MIN-AGE."
-  (intern (string-upcase (json:camel-case-to-lisp name)) :keyword))
+  "A client type or slot NAME as a keyword.  Two spellings arrive: the
+engine's own wire form -- lowercase kebab, exactly what the GUI's /types
+and /stats emit -- goes in verbatim, upcased; legacy camelCase (any
+uppercase letter present) folds through CAMEL-CASE-TO-LISP: \"minAge\" ->
+:MIN-AGE.  Never the latter for a kebab name: it inserts a hyphen before
+every digit, so \"foo-bar2\" became :FOO-BAR-2 and the schema's own
+spelling was refused (GH #281)."
+  (intern (if (some #'upper-case-p name)
+              (string-upcase (json:camel-case-to-lisp name))
+              (string-upcase name))
+          :keyword))
 
 (defun %dsl-resolve-type (name parent graph)
   "Resolve a vertex/edge type NAME to its canonical class symbol via GRAPH's

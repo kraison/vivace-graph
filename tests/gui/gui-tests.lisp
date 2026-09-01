@@ -1972,3 +1972,74 @@ Loaded: ~S" name scripts))))
       (is (eql 0 (search "application/javascript" ctype)))
       (is-true (search "overlayMode" raw)
                "the vendored addon does not define overlayMode"))))
+
+;;; ---------------------------------------------------------------------
+;;; Value fidelity, name resolution, and the error contract
+;;; (GH #282, #281, #286).
+;;; ---------------------------------------------------------------------
+
+(test query-null-and-true-slot-values-render-as-json
+  "An empty slot is JSON null and T is JSON true -- not the strings
+\"NIL\" and \"T\" (GH #282).  Bob has no home-city; a third person's
+age is T."
+  (with-gui-fixture ()
+    (let ((*graph* (getf *fixture* :graph)))
+      (with-transaction () (make-gui-person :name "Cy" :age t)))
+    (with-gui-server ()
+      (multiple-value-bind (json status ctype raw)
+          (run-query
+           "{\"match\":[{\"vertex\":\"?p\",\"type\":\"gui-person\"}],
+             \"where\":[{\"slot\":\"?p\",\"name\":\"home-city\",
+                         \"bind\":\"?hc\"},
+                        {\"slot\":\"?p\",\"name\":\"age\",
+                         \"bind\":\"?a\"}],
+             \"select\":[\"?hc\",\"?a\"]}")
+        (declare (ignore ctype))
+        (is (= 200 status))
+        (is (= 3 (jref json :row-count)))
+        (is-false (search "\"NIL\"" raw)
+                  "an empty slot must not be the string NIL")
+        (is-false (search "\"T\"" raw) "T must not be the string T")
+        (let ((rows (jref json :rows)))
+          (is (member nil (mapcar (lambda (r) (jref r :hc)) rows))
+              "Bob's missing home-city is null")
+          (is (member t (mapcar (lambda (r) (jref r :a)) rows))
+              "Cy's age T is true"))))))
+
+(test node-inspection-renders-a-stored-object-as-an-object
+  "A slot holding a JSON object -- stored as an alist -- comes back from
+the inspector as a JSON object, not as printed Lisp (GH #282)."
+  (with-gui-fixture ()
+    (let (node)
+      (let ((*graph* (getf *fixture* :graph)))
+        (with-transaction ()
+          (setq node (make-gui-person :name "Di"
+                                      :age '((:nested . 1)
+                                             (:label . "x"))))))
+      (with-gui-server ()
+        (multiple-value-bind (json status ctype raw)
+            (gui-request (node-path node))
+          (declare (ignore ctype))
+          (is (= 200 status))
+          (let ((age (jref (jref json :slots) :age)))
+            (is (= 1 (jref age :nested)))
+            (is (string= "x" (jref age :label))))
+          (is-false (search "(nested" raw) "no printed Lisp on the wire"))))))
+
+(test query-resolves-digit-bearing-names
+  "Type and slot names with digits resolve exactly as /types spells them
+(GH #281): CAMEL-CASE-TO-LISP used to turn gui-zone3 into GUI-ZONE-3 and
+the query endpoint refused the schema's own name."
+  (with-gui-fixture ()
+    (let ((*graph* (getf *fixture* :graph)))
+      (with-transaction () (make-gui-zone3 :x1-y2 7)))
+    (with-gui-server ()
+      (multiple-value-bind (json status)
+          (run-query
+           "{\"match\":[{\"vertex\":\"?z\",\"type\":\"gui-zone3\"}],
+             \"where\":[{\"slot\":\"?z\",\"name\":\"x1-y2\",
+                         \"bind\":\"?v\"}],
+             \"select\":[\"?v\"]}")
+        (is (= 200 status) "digit-bearing names must resolve: ~A"
+            (jref json :message))
+        (is (equal '(7) (rows-of json :v)))))))

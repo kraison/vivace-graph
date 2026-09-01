@@ -36,15 +36,35 @@ parameter), as ningle delivers them."
 (defun %bool (x) (json:json-bool x))
 (defun %maybe (x) (json:json-or-null x))
 
+(defun %alist-p (v)
+  "True when V is a proper list of (KEY . VALUE) conses whose keys are
+symbols or strings -- the shape a decoded JSON object is stored as."
+  (and (consp v)
+       (ignore-errors (list-length v))
+       (every (lambda (e)
+                (and (consp e) (or (symbolp (car e)) (stringp (car e)))))
+              v)))
+
 (defun %json-value (v)
   "An arbitrary slot value in explicit-encoder terms: atoms pass (NIL
-as null), proper lists become arrays, anything else prints."
+as null, T as true), an alist becomes an object keyed by its keys'
+wire spelling, other proper lists become arrays, anything else prints.
+A stored JSON object is an alist, and before GH #282 the improper-cons
+branch printed each (key . value) pair as Lisp text."
   (typecase v
     (null (%maybe nil))
+    ((eql t) (%bool t))
     ((or string number keyword symbol) v)
-    (cons (if (ignore-errors (list-length v))
-              (%arr (mapcar #'%json-value v))
-              (princ-to-string v)))
+    (cons (cond ((%alist-p v)
+                 (%obj (mapcar (lambda (e)
+                                 (cons (if (stringp (car e))
+                                           (car e)
+                                           (%wire-symbol (car e)))
+                                       (%json-value (cdr e))))
+                               v)))
+                ((ignore-errors (list-length v))
+                 (%arr (mapcar #'%json-value v)))
+                (t (princ-to-string v))))
     (t (princ-to-string v))))
 
 (defun %json-response (alist &key (status 200))

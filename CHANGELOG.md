@@ -146,6 +146,21 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Changed
 
+- **Query results render `NIL` as JSON `null`, `T` as `true`, and a stored
+  object as an object** (#282). `%query-value->json` tested `symbolp`
+  before anything mapped `NIL`, so an empty slot came back as the string
+  `"NIL"` on both the REST pattern-query surface and the GUI builder, and
+  `T` as `"T"`; the GUI's `%json-value` printed a stored alist's pairs as
+  Lisp text. Client-visible, hence in a major: a client that special-cased
+  the string `"NIL"` sees `null` now.
+
+- **The query DSL resolves names as the engine spells them** (#281).
+  `%dsl-keyword` folded every name through `camel-case-to-lisp`, which
+  inserts a hyphen before each digit, so a schema with `foo-bar2` or
+  `node-3d-point` had GUI-emitted names its own query endpoint refused. A
+  lowercase kebab name is now interned verbatim; a name carrying an
+  uppercase letter still takes the legacy camelCase fold (`minAge`).
+
 - **`geometry-contains-point-p` stays native by decision** (#99, closing
   the characterised inconsistency 3.0.0 shipped). The even-odd ray-cast is
   the hot predicate behind `find-nodes-within` / `geo-within/3`, ~77x

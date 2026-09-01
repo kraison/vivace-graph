@@ -2195,9 +2195,16 @@ called on an unbound variable, unifying two fresh variables succeeds
 with both still unbound, and a ~"select"~ variable that appears in
 neither ~"match"~ nor ~"where"~ is never bound. (An unbound variable is
 a ~var~ *struct* internally, printed ~?1~; before GH #279 it reached the
-JSON encoder raw and produced a 500.) Note that a slot whose stored
-value is genuinely ~NIL~ is a different case and still renders as the
-string ~"NIL"~ — see GH #282.
+JSON encoder raw and produced a 500.) A slot whose stored value is
+genuinely ~NIL~ is JSON ~null~ as well, and ~T~ is JSON ~true~ — before
+vivace-graph#282 both rendered as the strings ~"NIL"~ and ~"T"~, and a
+slot holding a JSON object (stored as an alist) came back from the
+inspector as printed Lisp; all three now round-trip as JSON values.
+Type and slot names go in as the engine spells them — lowercase kebab,
+exactly what ~/types~ and ~/stats~ emit — digits included
+(~foo-bar2~, ~node-3d-point~); the legacy camelCase spelling
+(~minAge~) is still accepted whenever a name carries an uppercase
+letter (vivace-graph#281).
 
 **** Free-text Prolog (opt-in, GH #279)
 

@@ -58,6 +58,13 @@
   ((name :type string))
   :gui-test-graph)
 
+;; A digit-bearing type and slot: the spelling CAMEL-CASE-TO-LISP mangled
+;; (GH #281).  Sorts after the others, so an inventory assertion that reads
+;; the first type is unaffected; no node of it in the base fixture.
+(def-vertex gui-zone3 ()
+  ((x1-y2))
+  :gui-test-graph)
+
 (def-edge gui-visited ()
   ((year))
   :gui-test-graph)

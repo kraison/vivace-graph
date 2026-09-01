@@ -639,3 +639,41 @@ shape -- hence ENCODE-JSON-ALIST in QUERY-RESULTS->JSON (GH #279)."
                  "an all-null row is not an object: ~A" body)
         (is-false (search "[[" body)
                   "an all-null row came out as an array: ~A" body)))))
+
+;;; ---------------------------------------------------------------------------
+;;; Value fidelity, name resolution, and the error contract (GH #282, #281,
+;;; #286) on the REST surface.
+;;; ---------------------------------------------------------------------------
+
+(test dsl-keyword-accepts-both-spellings
+  "GH #281: the engine's kebab spelling goes in verbatim -- digits and all
+-- and legacy camelCase still folds."
+  (is (eq :foo-bar2 (graph-db::%dsl-keyword "foo-bar2")))
+  (is (eq :node-3d-point (graph-db::%dsl-keyword "node-3d-point")))
+  (is (eq :x1-y2 (graph-db::%dsl-keyword "x1-y2")))
+  (is (eq :gui-person (graph-db::%dsl-keyword "gui-person")))
+  (is (eq :min-age (graph-db::%dsl-keyword "minAge"))))
+
+(test pattern-query-nil-slot-is-null-and-t-is-true
+  "GH #282: an empty slot is JSON null and T is JSON true on the pattern-
+query surface -- not the strings \"NIL\" / \"T\"."
+  (with-test-graph (g)
+    (declare (ignore g))
+    (with-rest-env ()
+      (with-transaction ()
+        (make-g-person :name "A")
+        (make-g-person :name "B" :age t))
+      (let* ((raw (graph-db::call-rest-pattern-query
+                   (json:decode-json-from-string
+                    "{\"match\":[{\"vertex\":\"?p\",\"type\":\"gPerson\"}],
+                      \"where\":[{\"slot\":\"?p\",\"name\":\"age\",
+                                  \"bind\":\"?a\"}],
+                      \"select\":[\"?a\"]}")
+                   (rest-params)))
+             (j (rest-decode raw))
+             (ages (mapcar (lambda (row) (cdr (assoc :a row))) j)))
+        (is (= 2 (length j)))
+        (is-false (search "\"NIL\"" raw))
+        (is-false (search "\"T\"" raw))
+        (is (member nil ages) "A's missing age is null")
+        (is (member t ages) "B's age T is true")))))
