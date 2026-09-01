@@ -3,17 +3,6 @@
 
 (in-package #:graph-db.spacetime)
 
-(defun extents-disjoint-p (a b)
-  "True when extents A and B certainly share no instant: every Allen
-relation possible between them is :BEFORE or :AFTER.  :MEETS is NOT
-disjoint -- intervals are closed, so meeting extents share their boundary
-instant -- and an ambiguous pair is not disjoint either.  A NIL extent
-overlaps everything, so the predicate is total (GH #296, design §2.3)."
-  (and a b
-       (every (lambda (r) (member r '(:before :after)))
-              (temporal-relation-relations (allen-relations a b)))
-       t))
-
 (defun %claim-validity-touches-p (claim probe)
   "True when CLAIM's extent possibly shares an instant with PROBE.  A
 claim with no extent makes no validity statement and never matches."
