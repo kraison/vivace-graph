@@ -302,6 +302,24 @@ presence, not non-NIL value."
           (close-graph g :snapshot-p nil)
           (collect-garbage))))))
 
+(test initform-fills-fresh-node-at-creation
+  "The freshly created node itself -- not a reopen -- reads an
+initform-only slot as its default.  ECL's direct-construction path (the
+#47 CHANGE-CLASS-leak workaround) let the caller's DATA alist REPLACE
+everything MAKE-INSTANCE had initialized, so an initform-only slot read
+NIL until %MAKE-VERTEX/%MAKE-EDGE ran the initform pass by hand (GH
+#312); the pooled CHANGE-CLASS implementations always merged.  The
+reopen tests below cannot catch this: the deserialize path re-applies
+defaults at materialization, so the loss is visible only on the fresh
+object."
+  (with-test-graph (g)
+    (with-transaction ()
+      (let ((v (make-g-defaulted :name "EXPLICIT")))
+        (is (string= "EXPLICIT" (slot-value v 'name))
+            "an explicit initarg still wins over the initform")
+        (is (string= "FILLER" (slot-value v 'gap))
+            "the initform must fill a slot the constructor was not given")))))
+
 (test stored-value-beats-initform-across-reopen
   "A persistent slot's STORED value survives a reopen even when the slot
 declares an :INITFORM, and an initform still fills a slot the stored data

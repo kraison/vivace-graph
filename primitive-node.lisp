@@ -481,6 +481,28 @@ to NIL is bound.  Materializes the data first (mirrors NODE-SLOT-VALUE)."
          (assoc keyword (data node))
          t)))
 
+#+ecl
+(defun %apply-missing-initforms (node)
+  "Fill NODE's data alist with :INITFORM defaults for persistent slots
+the alist does not carry.  ECL constructs a node's subclass directly
+(#47's CHANGE-CLASS-leak workaround) and the caller's DATA then replaces
+anything MAKE-INSTANCE initialized -- so the added-slot initform pass
+CHANGE-CLASS performs on the pooled-buffer implementations never runs,
+and an initform-only slot read NIL (GH #312).  *INITIALIZING-NODE*
+keeps MAYBE-INIT-NODE-DATA from dereferencing a foreign DATA-POINTER,
+exactly as during CHANGE-NODE-CLASS; for a data-pointer node the
+defaults are the same pre-materialization state the BYTES :AROUND
+documents, and the heap read replaces them (stored values win)."
+  (let ((*initializing-node* t)
+        (class (class-of node)))
+    (dolist (slot (class-slots class))
+      (let* ((name (slot-definition-name slot))
+             (kw (%persistent-slot-keyword class name))
+             (initfn (and kw (slot-definition-initfunction slot))))
+        (when (and initfn (not (node-slot-boundp node kw)))
+          (setf (node-slot-value node kw) (funcall initfn))))))
+  node)
+
 (defmethod slot-value-using-class :around ((class node-class) instance slot)
   "Around method that is alternate-version aware and will show values for the current,
    working private version of instance."

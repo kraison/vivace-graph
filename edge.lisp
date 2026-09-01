@@ -67,6 +67,9 @@
     ;; Non-ECL: promote the pooled base EDGE to its subclass (unchanged; no leak
     ;; on these impls).  On ECL EDGE is already CLASS.
     #-ecl (change-node-class edge class)
+    ;; ECL: EDGE is already CLASS; run the initform pass CHANGE-CLASS
+    ;; would have performed (GH #312).
+    #+ecl (%apply-missing-initforms edge)
     edge))
 
 (defun serialize-edge-head (mf e offset)

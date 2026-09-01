@@ -55,8 +55,11 @@
     (when data (setf (data vertex) data))
     (when bytes (setf (bytes vertex) bytes))
     ;; Non-ECL: promote the pooled base VERTEX to its subclass (unchanged
-    ;; behaviour; no leak on these impls).  On ECL VERTEX is already CLASS.
+    ;; behaviour; no leak on these impls).  On ECL VERTEX is already CLASS,
+    ;; so the initform pass CHANGE-CLASS would have run is done by hand
+    ;; (GH #312).
     #-ecl (change-node-class vertex class)
+    #+ecl (%apply-missing-initforms vertex)
     vertex))
 
 (defun serialize-vertex-head (mf v offset)

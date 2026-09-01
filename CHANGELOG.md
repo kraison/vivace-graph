@@ -315,7 +315,19 @@ between releases; cutting a release renames it to the new version and dates it.
   before it can read the 413; the status-code assertion stays pinned on
   SBCL).
 
-- **The system-clock journal truncate renamed with `CL:RENAME-FILE`**
+- **ECL: an initform-only persistent slot read NIL on the freshly
+  created node** (#312). ECL constructs a node's concrete class directly
+  (the #47 CHANGE-CLASS-leak workaround), and the caller's DATA alist
+  then replaced everything `MAKE-INSTANCE` had initialized — so the
+  added-slot initform pass `CHANGE-CLASS` performs on the pooled-buffer
+  implementations never ran on the create path. Explicit initargs and
+  the reopen path were unaffected (the deserialize path re-applies
+  defaults at materialization, which is why the GH #128 tests never saw
+  it). `%MAKE-VERTEX`/`%MAKE-EDGE` now run the initform pass by hand on
+  ECL (`%APPLY-MISSING-INITFORMS`, through the persistent-slot funnel
+  under `*INITIALIZING-NODE*`); on-disk bytes are unchanged and
+  identical across implementations. New main-suite regression pins the
+  fresh-node direction the reopen tests cannot see.
   (#313), whose over-existing-target behavior is implementation-defined:
   ECL (like CCL) signals "already exists", so every torn-tail recovery
   on ECL died instead of truncating. Now `%POSIX-RENAME` (rename(2):
