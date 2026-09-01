@@ -196,6 +196,15 @@ between releases; cutting a release renames it to the new version and dates it.
   plain `simple-error` from engine code is a `500` again — the residual the
   #279 classifier recorded is closed.
 
+- **`extents-disjoint-p` is cl-temporal-extent's now** (kraison/cl-temporal-extent#1).
+  `graph-db/spacetime` drops its copy and re-exports the library's, with
+  `extents-intersect-p` beside it; the two rules (`:meets` is not disjoint,
+  an ambiguous pair is not disjoint) are unchanged and now live where the
+  algebra does. The library floor is declared: `cl-temporal-extent` >= 0.2.0.
+  The one behavioural difference is at the edge: the library version takes
+  two extents and refuses NIL, so `claims-touching`'s own NIL guard is what
+  keeps "a claim with no extent is never excluded" true, as before.
+
 - **`geometry-contains-point-p` stays native by decision** (#99, closing
   the characterised inconsistency 3.0.0 shipped). The even-odd ray-cast is
   the hot predicate behind `find-nodes-within` / `geo-within/3`, ~77x

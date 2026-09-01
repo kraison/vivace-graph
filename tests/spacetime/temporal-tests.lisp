@@ -276,9 +276,11 @@ and admitted outside it."
   (is-true (extents-disjoint-p
             (exact-interval (ts 2022 1 1) (ts 2022 3 31))
             (make-instant (exact-bound (ts 2022 4 1)))))
-  (is-false (extents-disjoint-p (exact-interval (ts 2022 1 1) (ts 2022 3 31))
-                                nil)
-            "no extent overlaps everything -- the predicate is total"))
+  ;; The NIL-overlaps-everything totality was this copy's; the algebra's
+  ;; version takes two extents (cl-temporal-extent#1), and CLAIMS-TOUCHING
+  ;; keeps the convention at its own call site.
+  (signals type-error
+    (extents-disjoint-p (exact-interval (ts 2022 1 1) (ts 2022 3 31)) nil)))
 
 ;;; --- membership per instant ----------------------------------------------
 
