@@ -917,6 +917,18 @@ must not trigger a spurious rebuild -- hence T from the empty loop, not NIL."
                 ;; REJECTING WRITES the current schema permits -- the very
                 ;; defect #139 reports, merely relocated from the registry to
                 ;; the sidecar.
+                (unless (%unique-spec-declared-p owner
+                                                 (%normalize-slots slot)
+                                                 graph)
+                  ;; Reclaim a withdrawn constraint's pages at the open
+                  ;; that drops its record (GH #147), as the secondary
+                  ;; index restore does.
+                  (handler-case
+                      (delete-view-index
+                       (%open-unique-skip-list graph address backend))
+                    (error (e)
+                      (warn "could not reclaim retired unique index ~
+~A.~A: ~A" owner slot e))))
                 (when (%unique-spec-declared-p owner (%normalize-slots slot)
                                                 graph)
                   (if (listp slot)

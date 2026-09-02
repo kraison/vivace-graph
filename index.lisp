@@ -774,17 +774,35 @@ must degrade to rebuild like any other unreadable sidecar, not fail OPEN-GRAPH."
                             ;; from the caller.  A stale index that answers
                             ;; queries is worse than the useless-but-correct
                             ;; one retraction was meant to remove.
-                            (when (%index-spec-declared-p owner slot-names
-                                                          graph)
-                              (setf (gethash (cons owner slot-names) reg)
-                                    (%make-slot-index
-                                     :owner-name owner :slot-names slot-names
-                                     :canonicalizers (%owner-slot-canonicalizer
-                                                      owner slot-names graph)
-                                     :skip-list (%open-secondary-skip-list
-                                                 graph address
-                                                 (length slot-names)
-                                                 backend))))))))
+                            (if (%index-spec-declared-p owner slot-names
+                                                        graph)
+                                (setf (gethash (cons owner slot-names) reg)
+                                      (%make-slot-index
+                                       :owner-name owner
+                                       :slot-names slot-names
+                                       :canonicalizers
+                                       (%owner-slot-canonicalizer
+                                        owner slot-names graph)
+                                       :skip-list
+                                       (%open-secondary-skip-list
+                                        graph address
+                                        (length slot-names)
+                                        backend)))
+                                ;; Withdrawn/re-shaped: this open is the
+                                ;; safe moment -- nothing can be mid-read
+                                ;; -- so reclaim the orphaned pages
+                                ;; instead of stranding them (GH #147).
+                                (handler-case
+                                    (let ((stale (%open-secondary-skip-list
+                                                  graph address
+                                                  (length slot-names)
+                                                  backend)))
+                                      (delete-view-index stale)
+                                      (log:info "reclaimed retired index ~
+~A.~A (GH #147)" owner slot-names))
+                                  (error (e)
+                                    (warn "could not reclaim retired ~
+index ~A.~A: ~A" owner slot-names e))))))))
                   (error (e)
                     (warn "Secondary index sidecar ~A is unreadable (~A); ~
 rebuilding from live nodes, which are authoritative."
@@ -897,9 +915,9 @@ from a graph without guessing, and guessing wrong is silent.
 
 Warns SCHEMA-WITHDRAWAL-MATCHED-NOTHING when nothing matches (GH #152).
 This withdraws the DECLARATION; the index structure it built is dropped at
-the next open, when the sidecar is reconciled
-against the live schema (RESTORE-SECONDARY-INDEX-ROOTS).  Its heap pages are
-not reclaimed -- GH #147."
+the next open, when the sidecar is reconciled against the live schema
+(RESTORE-SECONDARY-INDEX-ROOTS), and its heap pages are reclaimed at that
+same open (GH #147) -- deliberately deferred, never freed mid-image."
   `(%withdrawn-p (unregister-index-spec ',owner-class ',graph-name
                                         :slot-names ',slots :name ',name)
                  :index ',owner-class ',graph-name ',name ',slots))

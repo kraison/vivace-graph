@@ -885,3 +885,38 @@ under it."
              (is (equal '("a") (ix-names (index-lookup g 'ix-person 'note "HI")))))
         (ignore-errors (close-graph g))
         (collect-garbage)))))
+
+(test a-withdrawn-index-s-pages-are-reclaimed-at-open
+  "GH #147: the open that drops a withdrawn declaration's sidecar record
+also frees the structure it built -- observed through the DELETE-VIEW-INDEX
+seam -- and a re-shaped record takes the same path."
+  (with-temp-directory (dir)
+    ;; A dedicated class with NO :index slot options: the declared-p
+    ;; predicate's class arm is graph-agnostic by design, so a shared
+    ;; class would keep the record alive past the undef.
+    (def-vertex ix-reclaim-item ()
+      ((tag :type string))
+      :ix-reclaim-graph)
+    (let ((g (make-graph :ix-reclaim-graph (namestring dir)
+                         :buffer-pool-size 1000)))
+      (unwind-protect
+           (let ((*graph* g))
+             (graph-db:def-index ix-reclaim-item tag :ix-reclaim-graph
+                                 :name reclaim-probe)
+             (with-transaction ()
+               (make-ix-reclaim-item :tag "a" :graph g)))
+        (close-graph g :snapshot-p nil)))
+    (graph-db::undef-index ix-reclaim-item :ix-reclaim-graph
+                           :name reclaim-probe)
+    (let ((freed 0)
+          (orig (fdefinition 'graph-db::delete-view-index)))
+      (unwind-protect
+           (progn
+             (setf (fdefinition 'graph-db::delete-view-index)
+                   (lambda (idx) (incf freed) (funcall orig idx)))
+             (let ((g (open-graph :ix-reclaim-graph (namestring dir)
+                                  :buffer-pool-size 1000)))
+               (close-graph g :snapshot-p nil)))
+        (setf (fdefinition 'graph-db::delete-view-index) orig))
+      (is (plusp freed)
+          "the dropped record's pages were stranded, not reclaimed"))))
