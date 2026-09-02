@@ -175,6 +175,39 @@ method) lands in the method owner's index, not a per-subclass one."
                       (%node-spatial-owner-name (class-of node) slot-name)
                       slot-name))
 
+;;; Scope-resolution memo (GH #64).  Resolving a named scope walked
+;;; GENERIC-FUNCTION-METHODS / SUBTYPEP per query -- and FIND-NEAREST-K
+;;; re-walks per widening.  The memo covers exactly the class-derived
+;;; half (CLASS-SPATIAL-INDEX-KEYS's docstring: "derived entirely from
+;;; the class"); type TAGS stay per-query, because they depend on
+;;; per-graph registrations and a stale tag set silently DROPS results.
+;;; Invalidated whole on every %INSTALL-NODE-TYPE: a redefinition can
+;;; move the most-general owner of OTHER classes, so per-name eviction
+;;; would under-invalidate.
+(defvar *spatial-scope-memo*
+  #+sbcl (make-hash-table :test 'eq :synchronized t)
+  #+ccl (make-hash-table :test 'eq :shared t)
+  #+lispworks (make-hash-table :test 'eq :single-thread nil)
+  #+ecl (make-hash-table :test 'eq
+                         #+graph-db-ecl-sync-hash :synchronized
+                         #+graph-db-ecl-sync-hash t))
+
+(defun %invalidate-spatial-scope-memo (name)
+  (declare (ignore name))
+  (clrhash *spatial-scope-memo*))
+(pushnew '%invalidate-spatial-scope-memo *node-type-definition-hooks*)
+
+(defun %spatial-scope-entry (class-name)
+  "(DECLARED-P . KEYS) for CLASS-NAME, memoized (GH #64)."
+  (or (gethash class-name *spatial-scope-memo*)
+      (setf (gethash class-name *spatial-scope-memo*)
+            (let ((class (ignore-errors (find-class class-name nil))))
+              (if (and class (class-finalized-p class)
+                       (or (node-geometry-index-slots class)
+                           (%node-geometry-method-owner-name class)))
+                  (cons t (class-spatial-index-keys class nil))
+                  (cons nil nil))))))
+
 (defun %class-geometry-slots-declared-p (class-name)
   "True when CLASS-NAME is a scopeable spatial class: it declares at least one
 :INDEX-marked slot, OR it carries an application-supplied NODE-GEOMETRY method.
@@ -184,11 +217,7 @@ otherwise overriding NODE-GEOMETRY would leave a class reachable only through
 :ALL, which is the unscoped query this API exists to forbid.  Distinguishes a
 declared-but-empty index (a legitimate empty result) from a class that is not
 spatially indexed at all (an error).  Direct mirror of %SLOT-INDEX-DECLARED-P."
-  (let ((class (ignore-errors (find-class class-name nil))))
-    (and class (class-finalized-p class)
-         (or (node-geometry-index-slots class)
-             (%node-geometry-method-owner-name class))
-         t)))
+  (car (%spatial-scope-entry class-name)))
 
 (defun %scope-type-tags (names graph)
   "The set of index-entry type tags (%SPATIAL-TYPE-TAG) NAMES admits, as an EQL
@@ -244,7 +273,7 @@ error, and catching it is the reason the scope is required."
                    :reason (format nil "~S is not a spatially indexed class ~
 in ~S: it declares no :INDEX-marked geometry slot and has no NODE-GEOMETRY ~
 method." name (graph-name graph))))
-          (dolist (key (class-spatial-index-keys (find-class name) graph))
+          (dolist (key (cdr (%spatial-scope-entry name)))
             (unless (gethash key keys)
               (setf (gethash key keys) t)
               (let ((idx (spatial-index-for graph (car key) (cdr key))))

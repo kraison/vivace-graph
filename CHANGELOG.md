@@ -13,6 +13,23 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Added
 
+- **The edge-occupancy hint finally has a consumer** (#244): the v5
+  untagged-id scan (`resolve-node-graph`, `active-edge-p`,
+  `compact-edges`) now tries the stores `edge-type-stores` names FIRST,
+  with every other open store still following — pure ordering, so a
+  stale or incomplete hint costs lookups, never an answer. Restricting
+  disproof to the hinted set would need a completeness marker the hint
+  does not carry; noted on the issue.
+
+- **Spatial scope resolution is memoized** (#64): resolving a named
+  scope walked `generic-function-methods`/`subtypep` per query — and
+  `find-nearest-k` re-walked per widening, up to ~16 times per call.
+  The class-derived half (declared-p + index keys) is now memoized,
+  invalidated whole on every type (re)definition via
+  `*node-type-definition-hooks*`; type tags stay per-query, since they
+  depend on per-graph registrations and a stale set would silently drop
+  results.
+
 - **GUI stats report allocated bytes, not apparent** (#274): sparse
   mmap stores showed GiB for MiB of data. `onDiskBytes` is now the
   allocated sum (`SEEK_DATA`/`SEEK_HOLE` extent hops in the POSIX

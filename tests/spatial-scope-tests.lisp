@@ -1541,3 +1541,28 @@ that follows must leave every entry tagged."
       (let ((idx (spatial-index-for g 'scope-shared 'geom)))
         (is (every #'integerp (scope-entry-tags idx id pt))
             "the rebuild must write the tags the v4 index lacked")))))
+
+(test scope-memo-invalidates-on-redefinition
+  "GH #64: the scope-resolution memo answers as a fresh walk would, and
+a class redefinition (the staleness hazard that kept this uncached)
+invalidates it -- a class gaining or losing its spatial declaration is
+seen immediately."
+  ;; Not yet spatial: declared-p is false, memoized.
+  (def-vertex sc-memo-item ()
+    ((label :type string))
+    :sc-memo-graph)
+  (is-false (graph-db::%class-geometry-slots-declared-p 'sc-memo-item))
+  ;; Redefine WITH a geometry slot: the definition hook must clear the
+  ;; memo, so the same question now answers T with the key resolved.
+  (def-vertex sc-memo-item ()
+    ((label :type string)
+     (loc :type geometry :index t))
+    :sc-memo-graph)
+  (is-true (graph-db::%class-geometry-slots-declared-p 'sc-memo-item))
+  (is (equal '((sc-memo-item . loc))
+             (cdr (graph-db::%spatial-scope-entry 'sc-memo-item))))
+  ;; And back: losing the slot is seen too.
+  (def-vertex sc-memo-item ()
+    ((label :type string))
+    :sc-memo-graph)
+  (is-false (graph-db::%class-geometry-slots-declared-p 'sc-memo-item)))
