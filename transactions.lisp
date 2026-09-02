@@ -2946,7 +2946,14 @@ stops appearing in queries.  MARK-DELETED is the usual entry point.")
    (transactions
     :initarg :transactions
     :reader transactions
-    :initform (make-hash-table))
+    ;; Synchronized AND every accessor takes the manager lock (GH #318):
+    ;; CLEANUP-TRANSACTION's remhash ran outside the lock and raced the
+    ;; commit path's locked traversals.
+    :initform #+sbcl (make-hash-table :synchronized t)
+              #+ccl (make-hash-table :shared t)
+              #+lispworks (make-hash-table :single-thread nil)
+              #+ecl (make-hash-table #+graph-db-ecl-sync-hash :synchronized
+                                     #+graph-db-ecl-sync-hash t))
    (lock
     :initarg :lock
     :reader lock
@@ -3087,16 +3094,22 @@ stops appearing in queries.  MARK-DELETED is the usual entry point.")
 
 (defgeneric add-transaction (transaction transaction-manager)
   (:method (transaction transaction-manager)
-    (setf (gethash (sequence-number transaction)
-                   (transactions transaction-manager))
-          transaction)))
+    ;; The manager lock is recursive, so taking it here is safe under
+    ;; CREATE-TRANSACTION's hold and mandatory everywhere else (GH #318).
+    (with-transaction-manager-lock (transaction-manager)
+      (setf (gethash (sequence-number transaction)
+                     (transactions transaction-manager))
+            transaction))))
 
 (defgeneric call-for-transactions (fun transaction-manager)
   (:method (fun (transaction-manager transaction-manager))
-    (maphash (lambda (sequence-number tx)
-               (declare (ignore sequence-number))
-               (funcall fun tx))
-             (transactions transaction-manager))))
+    ;; Locked traversal: an unlocked REMHASH concurrent with this MAPHASH
+    ;; is how a committer's validation missed entries (GH #318).
+    (with-transaction-manager-lock (transaction-manager)
+      (maphash (lambda (sequence-number tx)
+                 (declare (ignore sequence-number))
+                 (funcall fun tx))
+               (transactions transaction-manager)))))
 
 (defmacro do-transactions ((transaction transaction-manager) &body body)
   `(call-for-transactions (lambda (,transaction) ,@body)
@@ -3243,8 +3256,11 @@ longer open (GH #171, spec R6)."
 
 (defgeneric remove-transaction (transaction transaction-manager)
   (:method (transaction transaction-manager)
-    (remhash (sequence-number transaction)
-             (transactions transaction-manager))))
+    ;; CLEANUP-TRANSACTION and the read-snapshot teardown call this with
+    ;; no lock held; the recursive lock closes the race (GH #318).
+    (with-transaction-manager-lock (transaction-manager)
+      (remhash (sequence-number transaction)
+               (transactions transaction-manager)))))
 
 (defgeneric next-sequence-number (transaction-manager)
   (:method (transaction-manager)

@@ -14,7 +14,7 @@
   :name "VivaceGraph (embeddable core)"
   :maintainer "Kevin Raison"
   :author "Kevin Raison <last name @ chatsubo dot net>"
-  :version "4.0.0"
+  :version "4.0.1"
   :depends-on (:bordeaux-threads
                :alexandria
                :iterate
@@ -168,7 +168,7 @@
   :name "VivaceGraph (replication transport)"
   :maintainer "Kevin Raison"
   :author "Kevin Raison <last name @ chatsubo dot net>"
-  :version "4.0.0"
+  :version "4.0.1"
   :depends-on (:graph-db/core
                :usocket)
   :serial t
@@ -189,7 +189,7 @@
   :name "VivaceGraph"
   :maintainer "Kevin Raison"
   :author "Kevin Raison <last name @ chatsubo dot net>"
-  :version "4.0.0"
+  :version "4.0.1"
   :depends-on (:graph-db/replication
                :hunchentoot
                :ningle
@@ -230,7 +230,7 @@
 and read-only neighborhood exploration."
   :maintainer "Kevin Raison"
   :author "Kevin Raison <last name @ chatsubo dot net>"
-  :version "4.0.0"
+  :version "4.0.1"
   ;; :flexi-streams is not new to the image (rest.lisp uses it, and
   ;; hunchentoot pulls it in) -- declared because api.lisp now decodes
   ;; a POST body's octets itself for the query endpoint (GH #278).
