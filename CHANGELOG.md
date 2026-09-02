@@ -11,6 +11,21 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ## [Unreleased]
 
+### Added
+
+- **`examples/`** (#316): `example.lisp` moved here and extended with the
+  4.0 index surface (`:unique`, `def-index`/`index-lookup`/`index-range`/
+  `map-index`, `:vector-index` + `vector-search`); new
+  `example-spacetime.lisp`, a runnable claims walkthrough (Chapter 18);
+  `runtime-schema-example.lisp` moved from `docs/`.
+
+### Removed
+
+- **`demo/` (social-shopping)** (#317): untouched since 2024-10, predates
+  2.0, and cannot load against the 4.0 API — it taught a dead API while
+  presenting as example code. `examples/` is the example surface now;
+  git history keeps the demo.
+
 ## [4.0.0] - 2026-09-02
 
 ### Added
