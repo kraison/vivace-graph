@@ -7,7 +7,16 @@
 ;; boot (device AND hub).  Removed.  (If genuinely-distinct entropy is ever wanted here,
 ;; use (make-random-state t) per element -- a behavioural change, tracked separately.)
 (let ((random-states (list (make-random-state t)
-                           (make-random-state t))))
+                           (make-random-state t)))
+      ;; RANDOM on a shared RANDOM-STATE is NOT thread-safe: concurrent
+      ;; draws can return IDENTICAL sequences (the state update races), so
+      ;; two threads minting node ids at once could collide -- 590 dups in
+      ;; 200k concurrent draws measured, the root cause of the lost
+      ;; concurrent inserts (GH #298).  One short lock per id.
+      (id-lock #+sbcl (sb-thread:make-mutex :name "node-id")
+               #+ccl (make-lock)
+               #+lispworks (mp:make-lock)
+               #+ecl (mp:make-lock)))
 
   (defun generate-uuid-name ()
     "Generate a byte array for V5 UUID generation using time and random bytes"
@@ -26,8 +35,10 @@
             (dotimes (i n-bytes)
               (setf (aref vec offset) (ldb (byte 8 (* i 8)) msec))
               (incf offset)))
-          (loop for i from offset below total-bytes do
-               (setf (aref vec i) (random 256 (nth (random 2) random-states))))
+          (with-lock (id-lock)
+            (loop for i from offset below total-bytes do
+                 (setf (aref vec i)
+                       (random 256 (nth (random 2) random-states)))))
           vec)))
 
   (defun gen-v8-uuid (store-tag)
@@ -37,8 +48,9 @@ variant stamped.  The tag is the O(1) resolver's index (GH #169)."
     (declare (optimize (speed 3) (safety 0))
              (type (unsigned-byte 12) store-tag))
     (let ((id (make-array 16 :element-type '(unsigned-byte 8))))
-      (dotimes (i 16)
-        (setf (aref id i) (random 256 (nth (random 2) random-states))))
+      (with-lock (id-lock)
+        (dotimes (i 16)
+          (setf (aref id i) (random 256 (nth (random 2) random-states)))))
       (setf (aref id 6) (dpb #x8 (byte 4 4) (aref id 6)))
       (setf (aref id 8) (dpb #b10 (byte 2 6) (aref id 8)))
       (setf (aref id 14) (dpb (ldb (byte 4 8) store-tag) (byte 4 0)

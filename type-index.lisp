@@ -27,12 +27,18 @@
    #+lispworks (make-hash-table :test 'eq :single-thread nil)
    #+ccl (make-hash-table :test 'eq :shared t)
    #+ecl (make-hash-table :test 'eq))
-  ;; ECL only: its hash tables predate :SYNCHRONIZED (GH #101), so the cache
-  ;; is guarded by this explicit lock instead.  Elsewhere CACHE's own
-  ;; synchronized/shared option makes a single GETHASH/(SETF GETHASH) atomic,
-  ;; and a lazy-populate race just deserializes the same on-disk bytes twice
-  ;; -- idempotent, not corrupting.
-  #+ecl (cache-lock (mp:make-lock))
+  ;; Guards CACHE's lazy populate on EVERY implementation (GH #298).  The
+  ;; old rationale ("a lazy-populate race just deserializes the same bytes
+  ;; twice -- idempotent") was wrong: an INDEX-LIST is a mutable handle, and
+  ;; two first-touch instantiations let a push land on the object that then
+  ;; loses the cache race -- the next push chains from the stale head and
+  ;; serializes over it, silently orphaning one entry.  Creation is
+  ;; single-shot under this lock; reads stay lock-free where CACHE itself
+  ;; is synchronized (ECL's is not -- GH #101 -- so ECL locks reads too).
+  (cache-lock #+ccl (make-lock)
+              #+lispworks (mp:make-lock)
+              #+ecl (mp:make-lock)
+              #+sbcl (sb-thread:make-mutex))
   ;; Number of type-id slots TABLE currently has room for.  Grown on demand by
   ;; %TI-ENSURE-CAPACITY, which also extends TABLE itself; guarded by
   ;; GROW-LOCK, a lock distinct from the per-type stripe locks above because a
@@ -108,6 +114,10 @@ implementation in #166): return the cached list, or deserialize-and-cache it
 on first touch.  On ECL this is guarded by an explicit lock (GH #101); see the
 CACHE-LOCK slot comment for why other implementations need none."
   (%ti-ensure-capacity idx type-id)
+  ;; Double-checked: the hit path is lock-free (CACHE is synchronized),
+  ;; the miss path re-probes under CACHE-LOCK so exactly one index-list
+  ;; object is ever created per slot (GH #298).  ECL's table is not
+  ;; synchronized (GH #101), so ECL takes the lock on the hit path too.
   #+ecl
   (with-lock ((type-index-cache-lock idx))
     (or (gethash type-id (type-index-cache idx))
@@ -117,10 +127,12 @@ CACHE-LOCK slot comment for why other implementations need none."
                                       (type-index-heap idx)))))
   #-ecl
   (or (gethash type-id (type-index-cache idx))
-      (setf (gethash type-id (type-index-cache idx))
-            (deserialize-index-list (type-index-table idx)
-                                    (* type-id +index-list-bytes+)
-                                    (type-index-heap idx)))))
+      (with-lock ((type-index-cache-lock idx))
+        (or (gethash type-id (type-index-cache idx))
+            (setf (gethash type-id (type-index-cache idx))
+                  (deserialize-index-list (type-index-table idx)
+                                          (* type-id +index-list-bytes+)
+                                          (type-index-heap idx)))))))
 
 (defmethod close-type-index ((index type-index))
   (munmap-file (type-index-table index) :save-p t))

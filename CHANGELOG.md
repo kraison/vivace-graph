@@ -9,6 +9,49 @@ format bumps), MINOR for backward-compatible features, PATCH for backward-compat
 fixes. The `## [Unreleased]` section accumulates changes on the `experiment` branch
 between releases; cutting a release renames it to the new version and dates it.
 
+## [4.0.1] - 2026-09-02
+
+### Fixed
+
+- **Concurrent node creation could mint DUPLICATE node ids** (#298's
+  root cause). `gen-v8-uuid` drew its 110 random bits from shared
+  `random-state` objects, and `random` on a shared state is not
+  thread-safe — concurrent draws can return identical sequences (590
+  duplicate ids in 200,000 concurrent draws, measured). The second node
+  of a colliding pair silently swallows the first in the vertex table:
+  the lost concurrent inserts CI observed, and real data loss under
+  concurrent writers. Id generation now takes a short lock
+  (`generate-uuid-name` and `gen-v8-uuid` both), with a regression test
+  minting 200k ids across 10 threads.
+
+- **The type-index lost a concurrent insert at first touch of a type-id**
+  (#298, second mechanism). `%ti-list`'s lazy cache populate was unguarded off ECL — two
+  threads racing the first touch each deserialized their own `index-list`
+  handle, a push through the losing handle was serialized over by the
+  next push through the winner, and exactly one entry vanished (the
+  observed 199-of-200, reproduced locally at ~1%). The populate is now
+  double-checked under a per-index cache lock on every implementation;
+  cache hits stay lock-free where the table is synchronized.
+  A second mechanism with the same shape lived in the skip list (the
+  spatial index's backend): mutators validated and spliced against a
+  cached node OBJECT's pointer snapshot, and a reader deserializing the
+  same address could clobber the cache with a pre-update snapshot — a
+  consistent-but-stale view passes validation and the splice orphans a
+  newer neighbour. `add-to-skip-list` and `remove-from-skip-list` now
+  validate and splice against `get-node-pointer`, a fresh heap read
+  under the held stripe locks.
+
+- **The transaction registry raced its own cleanup** (#318).
+  `transaction-manager`'s txn-id table was a bare unsynchronized hash
+  table, and `cleanup-transaction` / the read-snapshot teardown removed
+  entries with no lock held while the commit path traversed it under the
+  manager lock — SBCL's concurrency detector caught it once in CI and a
+  local loop reproduced it at ~1%. A torn traversal during validation can
+  skip a conflicting commit (a lost update — the very anomaly the failing
+  regression test guards), and plausibly explains #298's lost concurrent
+  inserts. All three registry accessors now take the manager's recursive
+  lock and the table is synchronized on every implementation.
+
 ## [4.0.0] - 2026-09-02
 
 ### Added
@@ -3452,7 +3495,8 @@ suite, and an ACID-compliance audit.
 - LispWorks support is currently **untested** (no license access; the free
   Personal Edition's heap is too small to compile VivaceGraph).
 
-[Unreleased]: https://github.com/kraison/vivace-graph/compare/v4.0.0...HEAD
+[Unreleased]: https://github.com/kraison/vivace-graph/compare/v4.0.1...HEAD
+[4.0.1]: https://github.com/kraison/vivace-graph/compare/v4.0.0...v4.0.1
 [4.0.0]: https://github.com/kraison/vivace-graph/compare/v3.0.0...v4.0.0
 [3.0.0]: https://github.com/kraison/vivace-graph/compare/v2.1.1...v3.0.0
 [2.1.1]: https://github.com/kraison/vivace-graph/compare/v2.1.0...v2.1.1
