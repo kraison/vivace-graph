@@ -35,8 +35,16 @@ pass. The temporal algebra now lives in its own library,
 
 **What's new, briefly:**
 
-- **Runtime schema.** A node type can be defined at runtime, from data,
-  and survive a reopen; a store adopts a foreign class at first write;
+- **Namespaces & runtime schema** (the #110 epic). `ensure-namespace`
+  creates a namespace with no files and no store; a node type can be
+  defined at runtime, from data (`create-vertex-type` /
+  `create-edge-type`), and survive a restart as a live class: a
+  system-level schema manifest records every namespace and type, and
+  `materialize-schema` rebuilds runtime-defined classes *before*
+  dependent methods compile — the load-order answer that blocked this
+  for years. `describe-schema` dumps the whole schema as text;
+  `export-schema-source` turns a runtime type back into ordinary
+  source for good. A store adopts a foreign class at first write, and
   new ids are UUIDv8, tagged with a 12-bit store field.
 - **Store lifecycle.** Detach a store, bulk-load a shadow copy, and swap
   it in — in-process, with whole-system restore across the swap; an
