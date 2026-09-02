@@ -27,6 +27,16 @@ A comprehensive developer's manual lives in [`docs/vivace-graph-v3-doc.org`](doc
 
 This manual was written by [Gwang-Jin Kim (@gwangjinkim)](https://github.com/gwangjinkim) — the project's first thorough documentation, and a great piece of work. Many thanks to him. It has been adopted here and is maintained alongside the code; newer chapters (such as Chapter 12 on MVCC) are maintainer additions written in his style.
 
+### Announcement, 2026-09-02 — VivaceGraph 4.0.1 (bug fix)
+
+Four concurrency fixes, one family: concurrent node creation could mint
+**duplicate node ids** (`random` on a shared `random-state` is not
+thread-safe; a colliding node silently swallowed its twin — the CI
+"lost concurrent insert"), plus a type-index first-touch cache race, a
+transaction-registry locking hole, and skip-list pointer-snapshot
+hardening. Upgrade recommended for any concurrent-writer workload. See
+[`CHANGELOG.md`](CHANGELOG.md).
+
 ### Announcement, 2026-09-02 — VivaceGraph 4.0.0 (breaking)
 
 A major release. The on-disk storage format is bumped (node head v3):

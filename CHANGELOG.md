@@ -9,7 +9,7 @@ format bumps), MINOR for backward-compatible features, PATCH for backward-compat
 fixes. The `## [Unreleased]` section accumulates changes on the `experiment` branch
 between releases; cutting a release renames it to the new version and dates it.
 
-## [Unreleased]
+## [4.0.1] - 2026-09-02
 
 ### Fixed
 
@@ -3495,7 +3495,8 @@ suite, and an ACID-compliance audit.
 - LispWorks support is currently **untested** (no license access; the free
   Personal Edition's heap is too small to compile VivaceGraph).
 
-[Unreleased]: https://github.com/kraison/vivace-graph/compare/v4.0.0...HEAD
+[Unreleased]: https://github.com/kraison/vivace-graph/compare/v4.0.1...HEAD
+[4.0.1]: https://github.com/kraison/vivace-graph/compare/v4.0.0...v4.0.1
 [4.0.0]: https://github.com/kraison/vivace-graph/compare/v3.0.0...v4.0.0
 [3.0.0]: https://github.com/kraison/vivace-graph/compare/v2.1.1...v3.0.0
 [2.1.1]: https://github.com/kraison/vivace-graph/compare/v2.1.0...v2.1.1
