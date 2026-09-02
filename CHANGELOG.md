@@ -30,6 +30,12 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Added
 
+- **`examples/`** (#316): `example.lisp` moved here and extended with the
+  4.0 index surface (`:unique`, `def-index`/`index-lookup`/`index-range`/
+  `map-index`, `:vector-index` + `vector-search`); new
+  `example-spacetime.lisp`, a runnable claims walkthrough (Chapter 18);
+  `runtime-schema-example.lisp` moved from `docs/`.
+
 - **Temporal claim families** (#296): `(def-claim-classes f :g :temporal t)`
   turns a claim family into a state series. The validity extent's START
   joins both identity tuples (`extent-sexp-start-key`, the start bound as
@@ -154,6 +160,11 @@ between releases; cutting a release renames it to the new version and dates it.
   caller must not ignore. An unmeasured region appears in neither list.
 
 ### Removed
+
+- **`demo/` (social-shopping)** (#317): untouched since 2024-10, predates
+  2.0, and cannot load against the 4.0 API — it taught a dead API while
+  presenting as example code. `examples/` is the example surface now;
+  git history keeps the demo.
 
 - **`assign-transaction-id`** (#173), a generic with no callers whose
   method allocated from the per-store counter — the policy #168 replaced
