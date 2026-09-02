@@ -344,7 +344,17 @@ detach aborted and the store resumes its prior accepting state."
                                value (graph transaction)
                                (start-tx-id transaction))))
                 (when value
-                  (add-to-object-set value (read-set transaction))
+                  ;; GH #92: a scan opting out of serializability against
+                  ;; what it visits (MAP-VERTICES/MAP-EDGES :RECORD-READS
+                  ;; NIL) skips the read-set -- validation never sees the
+                  ;; visit, so a concurrent write to a scanned node no
+                  ;; longer forces the retry->global-lock cliff.  The
+                  ;; local-cache entry is unconditional: repeatable reads
+                  ;; within the transaction are consistency, not
+                  ;; validation.  Snapshot reads stay MVCC-consistent
+                  ;; either way.
+                  (when *record-reads*
+                    (add-to-object-set value (read-set transaction)))
                   (setf (gethash id local-cache) value)))))))))
 
 (defgeneric write-object (object transaction))

@@ -184,7 +184,8 @@ the id on a duplicate-key collision."
 
 (defun map-vertices (fn graph &key collect-p vertex-type include-vertex-types
                                 exclude-vertex-types include-deleted-p
-                                (include-subclasses-p t))
+                                (include-subclasses-p t)
+                                (record-reads t))
   "Call FN on vertices of GRAPH.
 
 Narrow the set with :VERTEX-TYPE (a single type name or numeric type-id) and/or
@@ -206,11 +207,21 @@ snapshot isolation.  It is intended for back-end / admin passes (backup, GC,
 reindex) run while the graph is quiescent; a typed scan goes through the type
 index + LOOKUP-VERTEX and is snapshot-consistent.  (This is why IS-A/2 enumerates
 per-type instead of using the untyped scan.)"
+  ;; :RECORD-READS NIL (GH #92): inside a read-write transaction, a scan
+  ;; that records every visited node makes the transaction conflict with
+  ;; ANY concurrent writer touching anything it scanned -- measured at a
+  ;; 100% fall-back-to-global-lock rate for scan-and-write shapes.  NIL
+  ;; opts this scan's visits out of the read-set: the transaction keeps
+  ;; MVCC-snapshot-consistent reads and keeps validating what it WRITES,
+  ;; but no longer claims serializability against the scanned corpus
+  ;; (write skew against scanned-but-unwritten nodes becomes possible).
+  ;; Explicit at the call site by design.
   ;; Bind *GRAPH* to the GRAPH argument: the lhash value-deserializer
   ;; (deserialize-vertex-head) resolves a node's type-id -> class via *GRAPH*'s
   ;; schema, so mapping a graph that isn't the current *GRAPH* would otherwise
   ;; fail (NO-APPLICABLE-METHOD on SCHEMA/VERTEX-TABLE with NIL).
   (let* ((result nil)
+         (*record-reads* (if record-reads *record-reads* nil))
          (*graph* graph)
          ;; When collecting, each node ESCAPES the scan pin, so materialize its
          ;; bytes before FN sees it.  For a side-effect scan FN runs inside the

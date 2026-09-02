@@ -453,6 +453,15 @@ strictly-safe pre-durability abort.")
 ;;; inherits it: unique, value, cardinality, domain/range, vector dimension
 ;;; (core) and the spacetime disjointness conditions.
 
+;; GH #92.  Lives HERE, not transactions.lisp: vertex.lisp/edge.lisp
+;; compile first and bind it in MAP-VERTICES/MAP-EDGES -- a later defvar
+;; would leave those bindings lexical and the opt-out silently inert.
+(defvar *record-reads* t
+  "When true (the default), a transactional read joins the read-set and
+so participates in OCC backward validation.  MAP-VERTICES/MAP-EDGES bind
+this NIL under :RECORD-READS NIL -- the explicit opt-out of
+serializability against a whole scanned corpus (GH #92).")
+
 (define-condition constraint-violation (error) ()
   (:documentation "Superclass of every DETERMINISTIC commit refusal: the same
 write against the same schema is refused again, however often it is retried.

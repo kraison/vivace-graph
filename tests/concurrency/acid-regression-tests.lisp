@@ -138,3 +138,26 @@ each vertex final value must equal 40 with no lost updates."
                    (is (<= a-end b-start)
                        "Allocation overlap: [~D,~D) overlaps [~D,...)"
                        (car a) a-end b-start)))))))
+
+(test unrecorded-scan-reads-stay-out-of-the-read-set
+  "GH #92: MAP-VERTICES :record-reads nil keeps a scan's visits out of
+the transaction's read-set -- the explicit opt-out of serializability
+against the scanned corpus -- while the default still records them and
+the transaction's own writes still validate."
+  (with-conc-graph (g)
+    (with-transaction ()
+      (dotimes (k 10)
+        (make-c-item :value k)))
+    (with-transaction ()
+      (map-vertices #'identity g :vertex-type 'c-item
+                    :record-reads nil)
+      (is (zerop (graph-db::object-set-count
+                  (graph-db::read-set graph-db::*transaction*)))
+          "an unrecorded scan joined the read-set")
+      ;; the transaction still functions: it can write and commit
+      (make-c-item :value 99))
+    (with-transaction ()
+      (map-vertices #'identity g :vertex-type 'c-item)
+      (is (plusp (graph-db::object-set-count
+                  (graph-db::read-set graph-db::*transaction*)))
+          "the default no longer records scan reads"))))

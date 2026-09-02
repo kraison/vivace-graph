@@ -13,6 +13,17 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Added
 
+- **Scan-and-write transactions can opt out of the retry cliff** (#92):
+  every node a `map-vertices`/`map-edges` scan visited joined the
+  read-set, so a scanning transaction conflicted with any concurrent
+  writer touching anything it scanned — measured at a 100%
+  fall-back-to-global-lock rate for the scan-and-write ETL shape.
+  `:record-reads nil` (explicit at the call site, by design) keeps the
+  scan's visits out of the read-set: MVCC snapshot consistency and
+  write validation are unchanged, serializability against the scanned
+  corpus is knowingly waived. Defaults unchanged. The coarser-fallback
+  and attempt-cap options stay open on the issue.
+
 - **`vector-search` takes a `:filter` inside the top-K scan** (#293): a
   bounded query fills k with in-bounds hits instead of post-filtering an
   unbounded top-K below k. The filter sees only the candidate's node id

@@ -389,7 +389,8 @@ graph-class.lisp."
 
 (defun map-edges (fn graph &key collect-p edge-type include-edge-types vertex
                              direction include-deleted-p to-vertex from-vertex
-                             exclude-edge-types (include-subclasses-p t))
+                             exclude-edge-types (include-subclasses-p t)
+                             (record-reads t))
   "Call FN on edges of GRAPH.
 
 Narrow the set with :EDGE-TYPE (a single type name or numeric type-id) and/or
@@ -417,6 +418,7 @@ typed/adjacency scans skip the 0 sentinel, as they always have.)"
   ;; resolves type-ids against the right schema even when mapping a graph that
   ;; isn't the current *GRAPH* (see the note in MAP-VERTICES).
   (let* ((result nil)
+         (*record-reads* (if record-reads *record-reads* nil))
          (*graph* graph)
          ;; Collected edges escape the scan pin -> materialize before FN; a
          ;; side-effect scan runs FN inside the pin so its lazy reads are safe.
