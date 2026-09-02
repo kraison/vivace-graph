@@ -13,6 +13,14 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Added
 
+- **`vector-search` takes a `:filter` inside the top-K scan** (#293): a
+  bounded query fills k with in-bounds hits instead of post-filtering an
+  unbounded top-K below k. The filter sees only the candidate's node id
+  — gated before the vector is even read — so the segment's
+  no-materialisation property survives. The second return value now
+  disambiguates NIL: `:ok`, `:no-such-class`,
+  `:not-a-vector-index-slot` (the typo case), or `:no-segment-yet`.
+
 - **The edge-occupancy hint finally has a consumer** (#244): the v5
   untagged-id scan (`resolve-node-graph`, `active-edge-p`,
   `compact-edges`) now tries the stores `edge-type-stores` names FIRST,

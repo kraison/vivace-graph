@@ -304,7 +304,7 @@ Gates the v5 cross-store scan in %ACTIVE-ENDPOINT-STATUS (GH #208)."
            *graphs*)
   nil)
 
-(defun %active-endpoint-status (id graph)
+(defun %active-endpoint-status (id graph &optional class-hint)
   "(values VERTEX-OR-NIL STATUS) for edge endpoint ID against GRAPH,
 for ACTIVE-EDGE-P and COMPACT-EDGES.  STATUS is one of:
   :FOUND    -- a live table holds the vertex (GRAPH's own, or another
@@ -345,7 +345,8 @@ graph-class.lisp."
                  (:detached (values nil :detached))
                  (:unknown (values nil :unknown)))))
             ((and (null tag) (%another-store-open-p graph))
-             (let ((r (lookup-vertex-anywhere id)))
+             ;; GH #244: the edge's class orders the scan.
+             (let ((r (lookup-vertex-anywhere id :class-hint class-hint)))
                (if (vertex-p r)
                    (values r :found)
                    (values nil :missing))))
@@ -353,7 +354,9 @@ graph-class.lisp."
 
 (defmethod active-edge-p ((edge edge) &key (graph *graph*))
   (flet ((endpoint-active-p (id)
-           (multiple-value-bind (v status) (%active-endpoint-status id graph)
+           (multiple-value-bind (v status)
+               (%active-endpoint-status id graph
+                                        (class-name (class-of edge)))
              (ecase status
                (:found (not (deleted-p v)))
                ;; Not disprovable without trusting the tag -> live
@@ -582,8 +585,9 @@ only."
     ;; tag would classify :UNKNOWN and be collected (GH #208, #209).
     (unless *system-directory*
       (error 'compact-trust-tags-no-registry-error :graph graph)))
-  (flet ((endpoint-dead-p (id)
-           (multiple-value-bind (v status) (%active-endpoint-status id graph)
+  (flet ((endpoint-dead-p (id class-hint)
+           (multiple-value-bind (v status)
+               (%active-endpoint-status id graph class-hint)
              (ecase status
                (:found (deleted-p v))
                (:missing t)
@@ -591,8 +595,9 @@ only."
                ((:unknown :absent-in-store) (eq policy :trust-tags))))))
     (map-edges (lambda (edge)
                  (when (or (deleted-p edge)
-                           (endpoint-dead-p (from edge))
-                           (endpoint-dead-p (to edge)))
+                           (let ((hint (class-name (class-of edge))))
+                             (or (endpoint-dead-p (from edge) hint)
+                                 (endpoint-dead-p (to edge) hint))))
                    (unless (deleted-p edge)
                      (delete-edge edge :graph graph))
                    (remove-from-type-index edge graph)
