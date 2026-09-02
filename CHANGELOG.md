@@ -13,6 +13,14 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Added
 
+- **B+ tree cursors stopped consing a page per level and per crossing**
+  (#97): `%bpt-read-page` reuses a caller buffer; a descent threads one
+  buffer down the internal levels and a leaf crossing reuses the
+  crossed-from page. Measured on short scans (the dominant spatial
+  pattern): 10.6 → 6.4 KB consed and 13 → 11 µs per 0–3-row scan. The
+  remaining consing is the cursor-owned leaf page plus per-probe key
+  decodes — the latter stays on the issue.
+
 - **Scan-and-write transactions can opt out of the retry cliff** (#92):
   every node a `map-vertices`/`map-edges` scan visited joined the
   read-set, so a scanning transaction conflicted with any concurrent

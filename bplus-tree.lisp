@@ -163,11 +163,15 @@ in-bounds page address in the heap."
       (error "BPT: page address ~S out of heap bounds [~S,~S) (page-size ~S)"
              addr (memory-data-offset heap) (memory-size heap) ps))))
 
-(defun %bpt-read-page (tree addr)
+(defun %bpt-read-page (tree addr &optional out)
+  "Read the page at ADDR into OUT (a page-size byte vector, reused) or a
+fresh vector.  Reuse is what keeps a descent at ONE allocation and a
+leaf crossing at zero (GH #97): internal levels and crossed-from leaves
+are dead the moment the next page is chosen."
   (%bpt-note-page addr)
   (%bpt-check-addr tree addr)
   (let* ((ps (%bpt-page-size tree))
-         (buf (make-byte-vector ps))
+         (buf (if (and out (= (length out) ps)) out (make-byte-vector ps)))
          (src (cffi:inc-pointer (m-pointer (%bpt-mmap tree)) addr)))
     (cffi:with-pointer-to-vector-data (dst buf)
       (cffi:foreign-funcall "memcpy" :pointer dst :pointer src :size ps :pointer))
@@ -403,9 +407,14 @@ its address) matters: every caller used to immediately re-issue %BPT-READ-PAGE
 on this same address, paying a second full-page memcpy + fresh allocation for a
 page this function had just read -- one wasted ~page-size cons on every point
 lookup, insert/delete descent, and range-cursor open (GH #97 localization)."
-  (let ((addr (%bpt-root tree)))
+  (let ((addr (%bpt-root tree))
+        (buf nil))
     (loop
-      (let ((buf (%bpt-read-page tree addr)))
+      ;; One buffer threads down the levels (GH #97): each internal
+      ;; page is dead once its child is chosen, so the whole descent
+      ;; costs a single allocation, and the caller owns the leaf's.
+      (setf buf (%bpt-read-page tree addr buf))
+      (progn
         (if (%bpt-leaf-p buf)
             (return (values addr buf))
             (let ((n (buf-u16 buf +bpt-p-count-offset+)))
@@ -890,7 +899,9 @@ entry with key >= DKEY in the leaf that would hold DKEY."
           (if (zerop (bpc-next-addr c))
               (return eoc)
               (let* ((next-addr (bpc-next-addr c))
-                     (buf (%bpt-read-page tree next-addr))
+                     ;; Crossed-from leaf's buffer is dead: reuse it
+                     ;; (GH #97) -- zero allocation per crossing.
+                     (buf (%bpt-read-page tree next-addr (bpc-buf c)))
                      (count (buf-u16 buf +bpt-p-count-offset+))
                      (link (buf-u64 buf +bpt-p-link-offset+)))
                 (setf (bpc-buf c) buf
