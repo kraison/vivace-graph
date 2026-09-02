@@ -263,6 +263,14 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Fixed
 
+- **`%oh-fd-count` no longer resolves `/proc/self/fd` symlinks** (#314):
+  ECL/Linux parsed a pipe fd's target (`pipe:[8398]`) as a `pipe:` host
+  pathname and errored, failing all seven OPEN-HYGIENE ABORTED-* tests
+  (first ECL/Linux execution of that region — #310 masked it before).
+  `:resolve-symlinks nil` (`:follow-links nil` on CCL) counts every fd,
+  which also lets a leaked socket move the counter (GH #224 M1 caveat
+  shrinks). Test-only.
+
 - **ECL/Darwin-arm64: files created through `%POSIX-OPEN` got mode 000**
   (#306). CFFI's ECL backend drops `open(2)`'s variadic MODE on Apple
   arm64 (the same ABI split #218 fixed for SBCL), so the type registry's

@@ -39,17 +39,18 @@
 ;;; ---------------------------------------------------------------------------
 
 (defun %oh-fd-count ()
-  "Open fd count for this process, via SBCL's DIRECTORY over
-/proc/self/fd -- internally consistent across calls (a fixed small
-offset from the readdir fd itself), which is all a before/after delta
-needs.  Linux-only (see the #-LINUX SKIP in every caller).  CAVEAT (GH
-#224 review M1): DIRECTORY resolves each /proc/self/fd/N entry as a
-pathname, and a socket or pipe fd's target (e.g. \"socket:[12345]\") is
-not a filesystem path -- SBCL silently drops those rather than
-counting them.  A leaked listening socket (the I2b hazard) therefore
-does NOT move this number; the I2b coverage below asserts call
-ORDERING instead of relying on this counter to see a socket leak."
-  (length (directory "/proc/self/fd/*")))
+  "Open fd count for this process, via DIRECTORY over /proc/self/fd --
+internally consistent across calls (a fixed small offset from the
+readdir fd itself), which is all a before/after delta needs.
+Linux-only (see the #-LINUX SKIP in every caller).  Symlink resolution
+must stay OFF (GH #314): a pipe/socket fd's target (\"pipe:[8398]\")
+is not a filesystem path -- ECL parses it as a pipe: host and errors,
+SBCL silently drops the entry.  Unresolved, every fd is counted, so a
+leaked socket moves this number too (shrinking the GH #224 M1 caveat);
+the I2b coverage below still asserts call ordering."
+  (length (directory "/proc/self/fd/*"
+                     #+ccl :follow-links #-ccl :resolve-symlinks
+                     nil)))
 
 (defmacro %oh-skip-unless-linux (&body body)
   `(progn
