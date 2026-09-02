@@ -16,44 +16,38 @@ Invoked by (asdf:test-system :graph-db)."
   ;; and aborts with EXT:STORAGE-EXHAUSTED.  Raise the ceiling (a limit, not a
   ;; reservation) so the suite fits.  SBCL/CCL grow their heaps automatically.
   #+ecl (ext:set-limit 'ext:heap-size (* 6 1024 1024 1024))
-  (let ((results (run 'graph-db-suite)))
-    (explain! results)
-    (results-status results)))
+  ;; Type-ids come from the system-wide registry, so a system directory is
+  ;; mandatory for every store the suite opens (GH #186).  One directory for
+  ;; the whole run, which is the shape a real system has: many stores, one
+  ;; registry.  Tests that need their own bind GRAPH-DB::*SYSTEM-DIRECTORY*
+  ;; themselves.
+  (let* ((system-dir (make-temp-directory))
+         (graph-db::*system-directory* (namestring system-dir))
+         (graph-db::*type-registry* nil))
+    (unwind-protect
+         (let ((results (run 'graph-db-suite)))
+           (explain! results)
+           (results-status results))
+      ;; Everything this run scratched -- system-dir included -- lives
+      ;; under the shared per-run parent; drop it whole (GH #214).
+      (graph-db-test-scratch:cleanup-scratch-run))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Temp-file fixtures
 ;;;
 ;;; The storage layers all live in mmap'd files, so each test needs a
 ;;; private scratch directory that is reliably torn down afterwards.
+;;; All scratch lives under GRAPH-DB-TEST-SCRATCH's per-run parent, which
+;;; also sweeps stale trees from killed runs (GH #214).
 ;;; ---------------------------------------------------------------------------
-
-;; SBCL's initial *RANDOM-STATE* is a fixed constant, so an unseeded (RANDOM ...)
-;; produces the SAME name sequence in every image: two concurrent suite runs on a
-;; shared host would share -- and delete -- each other's scratch dirs.  Seed from
-;; entropy, lazily so a dumped image reseeds in each new process, and add a
-;; counter so one image can never repeat a name either.
-(defvar *scratch-random-state* nil)
-(defvar *scratch-counter* 0)
-
-(defun scratch-tag ()
-  "A name fragment unique across concurrent processes and across calls."
-  (unless *scratch-random-state*
-    (setf *scratch-random-state* (make-random-state t)))
-  (format nil "~36R-~36R"
-          (random (expt 36 12) *scratch-random-state*)
-          (incf *scratch-counter*)))
 
 (defun make-temp-directory ()
   "Create and return a fresh, unique scratch directory pathname."
-  (let ((dir (merge-pathnames (format nil "graph-db-test-~A/" (scratch-tag))
-                              (uiop:temporary-directory))))
-    (ensure-directories-exist dir)
-    dir))
+  (graph-db-test-scratch:make-scratch-directory "graph-db-test"))
 
 (defun make-temp-file-name (prefix type)
   "A unique, not-yet-created scratch file pathname (PREFIX-<tag>.TYPE)."
-  (merge-pathnames (format nil "~A-~A.~A" prefix (scratch-tag) type)
-                   (uiop:temporary-directory)))
+  (graph-db-test-scratch:make-scratch-file-name prefix type))
 
 (defmacro with-temp-directory ((var) &body body)
   "Bind VAR to a fresh scratch directory, run BODY, then delete the tree."
@@ -62,9 +56,13 @@ Invoked by (asdf:test-system :graph-db)."
        (uiop:delete-directory-tree ,var :validate t :if-does-not-exist :ignore))))
 
 (defun collect-garbage ()
-  "Force a full GC.  Each graph / type-index preallocates 65536 index-lists
-per type table, so without reclaiming between tests a whole suite run in one
-image exhausts the default heap."
+  "Force a full GC.  This reclaims Lisp-heap objects only -- index-list
+structs, buffer-pool entries, node instances -- not mmap'd regions (those
+are freed by MUNMAP-FILE, not GC).  Each graph creates plenty of the former
+per test; without reclaiming between tests, a whole suite run in one image
+exhausts the default heap.  (Before #166, a type-index alone preallocated
+65536 index-list structs per type table -- no longer true, but many tests
+per image still adds up.)"
   #+sbcl (sb-ext:gc :full t)
   #+ccl (ccl:gc)
   #+lispworks (hcl:gc-all)

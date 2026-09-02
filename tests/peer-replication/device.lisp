@@ -4,10 +4,11 @@
 ;;;; from the environment, opens an EMPTY device graph, and verifies:
 ;;;;
 ;;;;   PHASE 1 (seed pull): after PEER-SYNC the device holds exactly its closed
-;;;;     disclosable subgraph -- site + survey + Find-1 + the two connecting
-;;;;     edges -- and NOT the withheld Find-2 (nor its edge).
-;;;;   PHASE 2 (purge): after the hub flips Find-1 to non-disclosable, a second
-;;;;     PEER-SYNC PURGES Find-1 + its edge (scope exit), leaving site + survey.
+;;;; disclosable subgraph -- depot + inspection + Item-1 + the two connecting
+;;;;     edges -- and NOT the withheld Item-2 (nor its edge).
+;;;;   PHASE 2 (purge): after the hub flips Item-1 to non-disclosable, a second
+;;;; PEER-SYNC PURGES Item-1 + its edge (scope exit), leaving depot +
+;;;; inspection.
 ;;;;   SCHEMA COMPAT (WP-6/PT-6): the device runs at schema (1 3) against a hub at
 ;;;;     (1 0) throughout -- a minor drift that must still sync (same major).  A
 ;;;;     final major bump to (2 0) must be REJECTED (peer-schema-incompatible).
@@ -21,7 +22,7 @@
 ;;; especially one raised in a spawned thread, outside the main HANDLER-CASE --
 ;;; drops into a debugger with no tty and recurses into a STORAGE-EXHAUSTED
 ;;; cascade that buries the real error.  Set as a global (not LET) so spawned
-;;; threads inherit it.  (mine-action item 2.)
+;;; threads inherit it.  (app-harness item 2.)
 (flet ((bail (condition)
          (format *error-output* "~&=== UNHANDLED ~S ===~%~A~%"
                  (type-of condition) condition)
@@ -46,6 +47,27 @@
   (let ((*standard-output* s) (*error-output* s))
     (ql:quickload :graph-db :silent t)))
 (in-package :graph-db)
+;; Provenance: prove WHICH tree this process loaded (GH #260).
+(format t "~&SOURCE: ~A~%" (asdf:system-source-directory :graph-db))
+(finish-output)
+
+;;; Type-ids come from the image-level registry in *SYSTEM-DIRECTORY* (GH
+;;; #186), so this process needs one before it opens anything.  Its OWN,
+;;; under REPL_WORK: these harnesses exist because hub and device are
+;;; separate IMAGES, and a shared registry would quietly undo that.  Both
+;;; ends evaluate one schema.lisp in one order, so their registries agree
+;;; and the handshake's registry check (D15) passes -- which is the point.
+;;;
+;;; SETF, not a LET around the body: replication runs on threads that do
+;;; not inherit dynamic bindings.
+(setf *system-directory*
+      (namestring
+       (ensure-directories-exist
+        (merge-pathnames
+         "system-device/"
+         ;; Trailing slash: REPL_WORK has none, and MERGE-PATHNAMES
+         ;; would otherwise treat its last component as a file name.
+         (format nil "~A/" (or (uiop:getenv "REPL_WORK") "/tmp"))))))
 (log:config :error)
 
 (defun dflag (name) (format nil "~A/~A" (uiop:getenv "REPL_WORK") name))
@@ -108,29 +130,38 @@
                  (ecount () (length (map-edges #'identity g :collect-p t)))
                  (find-names () (mapcar (lambda (v) (slot-value v 'name))
                                         (map-vertices #'identity g :collect-p t
-                                                                 :vertex-type 'p-find))))
+                                                                 :vertex-type
+                                                                     'p-item))))
             ;; --- PHASE 1: seed pull ---
             (peer-sync g)
-            (check (= 1 (vcount 'p-site))   "phase1: 1 site (got ~D)"   (vcount 'p-site))
-            (check (= 1 (vcount 'p-survey)) "phase1: 1 survey (got ~D)" (vcount 'p-survey))
-            (check (= 1 (vcount 'p-find))   "phase1: 1 find (got ~D)"   (vcount 'p-find))
-            (check (member "Find-1" (find-names) :test 'string=)
-                   "phase1: disclosable Find-1 present")
-            (check (not (member "Find-2" (find-names) :test 'string=))
-                   "phase1: withheld Find-2 absent (fail-closed)")
-            (check (= 2 (ecount)) "phase1: 2 edges, Find-2's edge omitted (got ~D)" (ecount))
+            (check (= 1 (vcount 'p-depot))   "phase1: 1 depot (got ~D)"
+              (vcount 'p-depot))
+            (check (= 1 (vcount 'p-inspection)) "phase1: 1 inspection (got ~D)"
+              (vcount 'p-inspection))
+            (check (= 1 (vcount 'p-item))   "phase1: 1 item (got ~D)"   (vcount
+                                                                       'p-item))
+            (check (member "Item-1" (find-names) :test 'string=)
+                   "phase1: disclosable Item-1 present")
+            (check (not (member "Item-2" (find-names) :test 'string=))
+                   "phase1: withheld Item-2 absent (fail-closed)")
+            (check (= 2 (ecount))
+              "phase1: 2 edges, Item-2's edge omitted (got ~D)" (ecount))
             (write-flag "phase1-verified")
 
             ;; --- PHASE 2: scope exit -> purge ---
             (unless (wait-flag "phase2-ready")
               (check nil "hub never readied phase 2"))
             (peer-sync g)
-            (check (= 1 (vcount 'p-site))   "phase2: site retained (got ~D)" (vcount 'p-site))
-            (check (= 1 (vcount 'p-survey)) "phase2: survey retained (got ~D)" (vcount 'p-survey))
-            (check (= 0 (vcount 'p-find))
-                   "phase2: Find-1 PURGED after leaving scope (finds=~D)" (vcount 'p-find))
+            (check (= 1 (vcount 'p-depot))   "phase2: depot retained (got ~D)"
+              (vcount 'p-depot))
+            (check (= 1 (vcount 'p-inspection))
+              "phase2: inspection retained (got ~D)" (vcount 'p-inspection))
+            (check (= 0 (vcount 'p-item))
+                   "phase2: Item-1 PURGED after leaving scope (items=~D)"
+                       (vcount 'p-item))
             (check (= 1 (ecount))
-                   "phase2: only site->survey edge remains (got ~D)" (ecount))
+                   "phase2: only depot->inspection edge remains (got ~D)"
+                       (ecount))
 
             ;; --- SCHEMA COMPAT: a major bump must be rejected ---
             (setf (peer-schema-version g) '(2 0))
@@ -138,12 +169,13 @@
                     (handler-case (progn (peer-sync g) nil)
                       (peer-schema-incompatible-error () t))))
               (check rejected "schema: major mismatch (2 x) vs hub (1 x) rejected"))
-            (check (= 1 (vcount 'p-survey))
+            (check (= 1 (vcount 'p-inspection))
                    "schema: device data intact after a rejected major-mismatch sync"))
           ;; --- LAZY: fault-on-access reopen of the peer-synced subgraph ---
           ;; Checkpoint (writes the VG-native image), close, reopen with :LAZY t,
           ;; and confirm (a) OPEN built NO live node (all LZNODE blobs) and (b) the
-          ;; retained site+survey still materialize correctly on first access.
+          ;; retained depot+inspection still materialize correctly on first
+          ;; access.
           (if (uiop:getenv "REPL_DEVICE_LAZY")
               (progn
                 (checkpoint-memory-graph g)
@@ -155,11 +187,13 @@
                                  always (lznode-p v))
                            "lazy: reopen built no live node (fault-on-access)")
                     (check (= 1 (length (map-vertices #'identity g2 :collect-p t
-                                                              :vertex-type 'p-site)))
-                           "lazy: site survives native-image reopen + materializes")
+                                                              :vertex-type
+                                                                  'p-depot)))
+                      "lazy: depot survives native-image reopen + materializes")
                     (check (= 1 (length (map-vertices #'identity g2 :collect-p t
-                                                              :vertex-type 'p-survey)))
-                           "lazy: survey survives native-image reopen + materializes"))
+                                                              :vertex-type
+                                                                'p-inspection)))
+                "lazy: inspection survives native-image reopen + materializes"))
                   (close-graph g2 :snapshot-p nil)))
               (close-graph g :snapshot-p nil))))
       (write-flag "device-done")

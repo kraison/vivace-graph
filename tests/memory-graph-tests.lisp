@@ -200,17 +200,21 @@ is rebuilt on reopen."
       (let ((g (graph-db::make-memory-graph *mem-test-graph-name* loc)))
         (let ((*graph* g))
           (with-transaction ()
-            (make-m-place :label "kharkiv" :geom (graph-db::make-point 36.3d0 50.0d0))
-            (make-m-place :label "lviv"    :geom (graph-db::make-point 24.0d0 49.8d0))
+            (make-m-place :label "east-town" :geom (graph-db::make-point 12.3d0
+                                                     45.7d0))
+            (make-m-place :label "west-town"    :geom (graph-db::make-point
+                                                        9.5d0 44.2d0))
             (make-m-place :label "london"  :geom (graph-db::make-point -0.1d0 51.5d0)))
           (let ((hits (graph-db::spatial-index-query-bbox
-                       (graph-db::spatial-index-for g 'm-place 'geom) 22.0d0 48.0d0 40.0d0 51.0d0)))
+                       (graph-db::spatial-index-for g 'm-place 'geom) 8.0d0
+                           41.0d0 14.0d0 47.0d0)))
             (is (= 2 (length hits)))))
         (close-graph g :snapshot-p t))
       (let ((g2 (graph-db::open-memory-graph *mem-test-graph-name* loc)))
         (unwind-protect
              (let ((hits (graph-db::spatial-index-query-bbox
-                          (graph-db::spatial-index-for g2 'm-place 'geom) 22.0d0 48.0d0 40.0d0 51.0d0)))
+                          (graph-db::spatial-index-for g2 'm-place 'geom) 8.0d0
+                              41.0d0 14.0d0 47.0d0)))
                (is (= 2 (length hits))))
           (ignore-errors (close-graph g2 :snapshot-p nil))
           (collect-garbage))))))
@@ -266,11 +270,13 @@ the indexes were loaded from the image, not re-derived by scanning the nodes."
       (let ((g (graph-db::make-memory-graph *mem-test-graph-name* loc)))
         (let ((*graph* g))
           (with-transaction ()
-            (setq place-id (id (make-m-place :label "kharkiv"
-                                             :geom (graph-db::make-point 36.3d0 50.0d0))))
+            (setq place-id (id (make-m-place :label "east-town"
+                                             :geom (graph-db::make-point 12.3d0
+                                                     45.7d0))))
             (setq region-id (id (make-m-region
                                  :label "east"
-                                 :extent (scope-rect 22.1d0 44.4d0 40.2d0 52.4d0)))))
+                                 :extent (scope-rect 8.1d0 40.9d0 14.2d0
+                                           47.4d0)))))
           ;; Canary straight into M-PLACE's index at a corner nothing else occupies.
           (graph-db::spatial-index-insert
            (graph-db::spatial-index-for g 'm-place 'geom)
@@ -286,10 +292,10 @@ the indexes were loaded from the image, not re-derived by scanning the nodes."
                    "the two classes keep their own indexes across a reopen")
                (is (has-p place-id
                           (graph-db::spatial-index-query-bbox
-                           place-ix 36.0d0 49.9d0 36.5d0 50.1d0)))
+                           place-ix 12.0d0 45.5d0 12.5d0 45.9d0)))
                (is (has-p region-id
                           (graph-db::spatial-index-query-bbox
-                           region-ix 30.0d0 48.0d0 31.0d0 49.0d0)))
+                           region-ix 10.0d0 41.0d0 11.0d0 43.0d0)))
                (is (has-p canary
                           (graph-db::spatial-index-query-bbox
                            place-ix 9.0d0 9.0d0 11.0d0 11.0d0))
@@ -358,7 +364,8 @@ still restored and queryable without a scan."
           (let ((*graph* g))
             (with-transaction ()
               (dotimes (i 10) (make-m-tag :label (format nil "t~D" i)))
-              (make-m-place :label "site" :geom (graph-db::make-point 36.3d0 50.0d0))))
+              (make-m-place :label "spot" :geom (graph-db::make-point 12.3d0
+                                                  45.7d0))))
           (close-graph g :snapshot-p t))
         (let ((g2 (graph-db::open-memory-graph *mem-test-graph-name* loc :lazy t)))
           (unwind-protect
@@ -375,7 +382,7 @@ still restored and queryable without a scan."
                  ;; ...and the geometry index came back structurally, queryable.
                  (is (= 1 (length (graph-db::spatial-index-query-bbox
                                    (graph-db::spatial-index-for g2 'm-place 'geom)
-                                   22.0d0 48.0d0 40.0d0 51.0d0)))
+                                   8.0d0 41.0d0 14.0d0 47.0d0)))
                      "the geometry index restored structurally, still findable")
                  ;; And the query did not have to materialize any node either.
                  (is (= 0 (n-materialized g2))
@@ -440,7 +447,7 @@ empty/stale image and the app re-cold-syncs."
 
 (test open-restores-derived-structurally-without-regen
   "A v2 image restores views / indexes / spatial STRUCTURALLY: OPEN-MEMORY-GRAPH does
-NOT call regenerate-all-views (the ~23 s on-device view rebuild, #50 / mine-action
+NOT call regenerate-all-views (the ~23 s on-device view rebuild, #50
 open-bench), yet the reduce view and node tables come back correct.  This is the
 boot-latency fix -- rebuild-on-open is gone for a clean/checkpointed image."
   (with-temp-directory (dir)
@@ -506,7 +513,7 @@ reflect BOTH the image aggregate and the replayed tail."
 (test lazy-restore-plus-journal-tail
   "The LAZY (fault-on-access) crash-recovery path: a stale native-image checkpoint
 plus a journal tail authored after it -- the device's real crash path (checkpoint
-after peer-sync, author record-finds that journal, killed before the next
+after peer-sync, author records that journal, killed before the next
 checkpoint).  On open the image's 10 nodes restore as LZNODE blobs (unmaterialized)
 while recover-transactions replays the 5 journaled nodes as LIVE nodes; the two
 coexist in the table and the reduce view reflects BOTH the image aggregate and the
@@ -551,7 +558,8 @@ replayed tail."
 (test reduce-view-remove-re-reduces
   "Deleting a node from a map-reduce view re-reduces the aggregate via
 GET-NON-AGGREGATE-PAIRS / GET-ALL-AGGREGATE-PAIRS on the mem-skip-list -- the
-maintenance path the on-device eo-find rollup views hit during peer-sync (adding
+maintenance path the on-device aggregate rollup views hit during peer-sync
+    (adding
 never calls them, so the earlier map-reduce test missed this)."
   (with-test-memory-graph (g)
     (declare (ignorable g))
@@ -640,7 +648,8 @@ access."
                   b (id (make-m-person :name "Bo"  :age 31)))
             (make-m-knows :from a :to b))
           (with-transaction ()
-            (make-m-place :label "site" :geom (graph-db::make-point 36.3d0 50.0d0))))
+            (make-m-place :label "spot" :geom (graph-db::make-point 12.3d0
+                                                45.7d0))))
         (close-graph g :snapshot-p t))
       (let ((g2 (graph-db::open-memory-graph *mem-test-graph-name* loc :lazy t)))
         (unwind-protect
@@ -652,7 +661,8 @@ access."
                (is (= 1 (length (incoming-edges (lookup-vertex b)))))
                ;; spatial bbox (restored structurally; hit id -> materialize)
                (is (= 1 (length (graph-db::spatial-index-query-bbox
-                                 (graph-db::spatial-index-for g2 'm-place 'geom) 22.0d0 48.0d0 40.0d0 51.0d0))))
+                                 (graph-db::spatial-index-for g2 'm-place 'geom)
+                                     8.0d0 41.0d0 14.0d0 47.0d0))))
                ;; reduce view (decade 3 = Ann + Bo = 2), no node materialization
                (is (equal '((3 . 2))
                           (map-reduced-view (lambda (k id v) (declare (ignore id)) (cons k v))
@@ -756,24 +766,24 @@ is the same call sequence as today's writer."
     (let ((vt (graph-db::mem-table-data (graph-db::vertex-table graph)))
           (et (graph-db::mem-table-data (graph-db::edge-table graph))))
       (graph-db::ni-uint buf (hash-table-count vt) 4)
-      (maphash (lambda (id x) (graph-db::ni-node buf id x nil)) vt)
+      (maphash (lambda (id x) (graph-db::ni-node buf id x nil 2)) vt)
       (graph-db::ni-uint buf (hash-table-count et) 4)
-      (maphash (lambda (id x) (graph-db::ni-node buf id x t)) et))
+      (maphash (lambda (id x) (graph-db::ni-node buf id x t 2)) et))
     (graph-db::ni-index buf (graph-db::%dump-mem-index
                               (graph-db::mem-type-index-data (graph-db::vertex-index graph)))
-                         #'graph-db::ni-key-type)
+                         (lambda (b k) (graph-db::ni-key-type b k 2)))
     (graph-db::ni-index buf (graph-db::%dump-mem-index
                               (graph-db::mem-type-index-data (graph-db::edge-index graph)))
-                         #'graph-db::ni-key-type)
+                         (lambda (b k) (graph-db::ni-key-type b k 2)))
     (graph-db::ni-index buf (graph-db::%dump-mem-index
                               (graph-db::mem-ve-index-data (graph-db::ve-index-in graph)))
-                         #'graph-db::ni-key-ve)
+                         (lambda (b k) (graph-db::ni-key-ve b k 2)))
     (graph-db::ni-index buf (graph-db::%dump-mem-index
                               (graph-db::mem-ve-index-data (graph-db::ve-index-out graph)))
-                         #'graph-db::ni-key-ve)
+                         (lambda (b k) (graph-db::ni-key-ve b k 2)))
     (graph-db::ni-index buf (graph-db::%dump-mem-index
                               (graph-db::mem-vev-index-data (graph-db::vev-index graph)))
-                         #'graph-db::ni-key-vev)
+                         (lambda (b k) (graph-db::ni-key-vev b k 2)))
     (graph-db::ni-pairs buf '())          ; v5's flat spatial section: always empty
     (graph-db::ni-views buf graph)
     (graph-db::ni-val buf (graph-db::%dump-unique-indexes graph))
@@ -801,11 +811,13 @@ derivable, and whose loss is unrecoverable) comes through the wire untouched."
             (setq person-id (id (make-m-person :name "alice" :age 30)))
             (make-m-person :name "bob" :age 40)
             (setq tag-id (id (make-m-tag :label "urgent")))
-            (setq place-id (id (make-m-place :label "kharkiv"
-                                             :geom (graph-db::make-point 36.3d0 50.0d0))))
+            (setq place-id (id (make-m-place :label "east-town"
+                                             :geom (graph-db::make-point 12.3d0
+                                                     45.7d0))))
             (setq region-id (id (make-m-region
                                  :label "east"
-                                 :extent (scope-rect 22.1d0 44.4d0 40.2d0 52.4d0))))
+                                 :extent (scope-rect 8.1d0 40.9d0 14.2d0
+                                           47.4d0))))
             (make-m-widget :sku "SKU-1")
             (make-m-widget :sku "SKU-2")))
         ;; Write the REAL v5 layout, then close WITHOUT a checkpoint so the clean
@@ -830,10 +842,10 @@ derivable, and whose loss is unrecoverable) comes through the wire untouched."
                      "the two classes still keep their own indexes post-migration")
                  (is (has-p place-id
                             (graph-db::spatial-index-query-bbox
-                             place-ix 36.0d0 49.9d0 36.5d0 50.1d0)))
+                             place-ix 12.0d0 45.5d0 12.5d0 45.9d0)))
                  (is (has-p region-id
                             (graph-db::spatial-index-query-bbox
-                             region-ix 30.0d0 48.0d0 31.0d0 49.0d0))))
+                             region-ix 10.0d0 41.0d0 11.0d0 43.0d0))))
                ;; view
                (is (equal '("alice" "bob")
                           (map-view (lambda (k id v) (declare (ignore id v)) k)
@@ -870,11 +882,13 @@ touched (GH #65)."
             (with-transaction ()
               (dotimes (i 5) (make-m-tag :label (format nil "t~D" i)))
               (dotimes (i 3) (make-m-person :name (format nil "p~D" i) :age (+ 20 i)))
-              (setq place-id (id (make-m-place :label "kharkiv"
-                                               :geom (graph-db::make-point 36.3d0 50.0d0))))
+              (setq place-id (id (make-m-place :label "east-town"
+                                               :geom (graph-db::make-point
+                                                       12.3d0 45.7d0))))
               (setq region-id (id (make-m-region
                                    :label "east"
-                                   :extent (scope-rect 22.1d0 44.4d0 40.2d0 52.4d0))))))
+                                   :extent (scope-rect 8.1d0 40.9d0 14.2d0
+                                             47.4d0))))))
           (%write-v5-test-image g)
           (close-graph g :snapshot-p nil))
         (let ((g2 (graph-db::open-memory-graph *mem-test-graph-name* loc :lazy t)))
@@ -885,11 +899,11 @@ touched (GH #65)."
                  (is (has-p place-id
                             (graph-db::spatial-index-query-bbox
                              (graph-db::spatial-index-for g2 'm-place 'geom)
-                             36.0d0 49.9d0 36.5d0 50.1d0)))
+                             12.0d0 45.5d0 12.5d0 45.9d0)))
                  (is (has-p region-id
                             (graph-db::spatial-index-query-bbox
                              (graph-db::spatial-index-for g2 'm-region 'extent)
-                             30.0d0 48.0d0 31.0d0 49.0d0)))
+                             10.0d0 41.0d0 11.0d0 43.0d0)))
                  ;; the 3 plain M-PERSON nodes (no :INDEX slot at all) are untouched
                  (is (= 3 (n-lznodes g2))
                      "nodes with no :INDEX slot were never touched by the migration")
@@ -924,5 +938,216 @@ empty, and deleting the image discards the ONLY durable copy of the graph
         (when msg
           (is (search "v5" msg))
           (is (search "v6" msg))
+          (is (search "v8" msg)
+              "the message names the version this build writes")
           (is (not (search "Delete" msg)))
           (is (not (search "delete" msg))))))))
+
+;;; ---------------------------------------------------------------------------
+;;; GH #187: the native image packed type-id at 2 bytes and truncated silently.
+;;;
+;;; NI-UINT writes with LDB, so a type-id above 65535 lost its high bits with no
+;;; signal -- 70000 (#x11170) came back as 4464 (#x1170).  Unreachable while
+;;; type-ids were per-graph and handed out from 1, but #166 widened the on-disk
+;;; field to 32 bits and #186 makes ids global, so the image is now the only
+;;; 16-bit narrowing left.  v8 widens it; v5/v6/v7 stay readable, because the
+;;; image is the ONLY durable copy of a cleanly-closed memory graph.
+;;; ---------------------------------------------------------------------------
+
+(defun %mem-image-big-type-id-lznode ()
+  (graph-db::make-lznode :type-id 70000 :revision 3 :commit-epoch 9
+                         :data-blob (graph-db::serialize '(:a 1))))
+
+(test memory-image-node-record-round-trips-a-type-id-above-16-bits
+  "A vertex record's type-id survives NI-NODE -> RI-NODE.  At 2 bytes it did
+not: 70000 restored as 4464, silently."
+  (let ((buf (graph-db::ni-mkbuf))
+        (id (graph-db::gen-vertex-id)))
+    (graph-db::ni-node buf id (%mem-image-big-type-id-lznode) nil)
+    (multiple-value-bind (rid lz)
+        (graph-db::ri-node (graph-db::ni-ric buf) nil)
+      (is (equalp id rid) "id round-trips")
+      (is (= 70000 (graph-db::lznode-type-id lz))
+          "type-id round-trips; 4464 means it was truncated to 2 bytes")
+      (is (= 3 (graph-db::lznode-revision lz)) "revision still lands")
+      (is (= 9 (graph-db::lznode-commit-epoch lz))
+          "commit-epoch still lands -- a mis-sized type-id shifts every
+field after it, so these pin the whole record layout, not just the type-id"))))
+
+(test memory-image-edge-record-round-trips-a-type-id-above-16-bits
+  "The edge arm writes its own type-id and carries from/to/weight after the
+head, so a mis-sized type-id corrupts those too."
+  (let* ((buf (graph-db::ni-mkbuf))
+         (id (graph-db::gen-edge-id))
+         (from (graph-db::gen-vertex-id))
+         (to (graph-db::gen-vertex-id))
+         (lz (%mem-image-big-type-id-lznode)))
+    (setf (graph-db::lznode-from lz) from
+          (graph-db::lznode-to lz) to
+          (graph-db::lznode-weight lz) 2.5)
+    (graph-db::ni-node buf id lz t)
+    (multiple-value-bind (rid rlz)
+        (graph-db::ri-node (graph-db::ni-ric buf) t)
+      (is (equalp id rid))
+      (is (= 70000 (graph-db::lznode-type-id rlz)))
+      (is (equalp from (graph-db::lznode-from rlz)))
+      (is (equalp to (graph-db::lznode-to rlz)))
+      (is (= 2.5 (graph-db::lznode-weight rlz))))))
+
+(test memory-image-type-key-round-trips-a-type-id-above-16-bits
+  "The type index's key IS a bare type-id."
+  (let ((buf (graph-db::ni-mkbuf)))
+    (graph-db::ni-key-type buf 70000)
+    (is (= 70000 (graph-db::ri-key-type (graph-db::ni-ric buf))))))
+
+(test memory-image-ve-key-round-trips-a-type-id-above-16-bits
+  (let ((buf (graph-db::ni-mkbuf))
+        (k (graph-db::make-ve-key :id (graph-db::gen-vertex-id)
+                                  :type-id 70000)))
+    (graph-db::ni-key-ve buf k)
+    (let ((back (graph-db::ri-key-ve (graph-db::ni-ric buf))))
+      (is (equalp (graph-db::ve-key-id k) (graph-db::ve-key-id back)))
+      (is (= 70000 (graph-db::ve-key-type-id back))))))
+
+(test memory-image-vev-key-round-trips-a-type-id-above-16-bits
+  (let ((buf (graph-db::ni-mkbuf))
+        (k (graph-db::make-vev-key :out-id (graph-db::gen-vertex-id)
+                                   :in-id (graph-db::gen-vertex-id)
+                                   :type-id 70000)))
+    (graph-db::ni-key-vev buf k)
+    (let ((back (graph-db::ri-key-vev (graph-db::ni-ric buf))))
+      (is (equalp (graph-db::vev-key-out-id k) (graph-db::vev-key-out-id back)))
+      (is (equalp (graph-db::vev-key-in-id k) (graph-db::vev-key-in-id back)))
+      (is (= 70000 (graph-db::vev-key-type-id back))))))
+
+(test memory-image-writer-refuses-a-type-id-it-cannot-represent
+  "The v5/v6/v7 writers are still reachable (the old-image test helpers use
+them).  Handing one a type-id too wide for its field must SIGNAL rather than
+drop the high bits -- silence is what made #187 invisible.  A dedicated
+condition, so an arity or type error cannot satisfy this by accident."
+  (let ((buf (graph-db::ni-mkbuf)))
+    (signals graph-db::memory-image-type-id-too-wide
+      (graph-db::ni-node buf (graph-db::gen-vertex-id)
+                         (%mem-image-big-type-id-lznode) nil 2))
+    (signals graph-db::memory-image-type-id-too-wide
+      (graph-db::ni-key-type buf 70000 2))
+    (signals graph-db::memory-image-type-id-too-wide
+      (graph-db::ni-key-ve buf (graph-db::make-ve-key
+                                :id (graph-db::gen-vertex-id) :type-id 70000)
+                           2))
+    (signals graph-db::memory-image-type-id-too-wide
+      (graph-db::ni-key-vev buf (graph-db::make-vev-key
+                                 :out-id (graph-db::gen-vertex-id)
+                                 :in-id (graph-db::gen-vertex-id)
+                                 :type-id 70000)
+                            2))))
+
+(defun %write-v7-test-image (graph)
+  "Write GRAPH as a v7 native image: byte-identical to today's v8 writer except
+the version stamp and the 2-byte type-id fields.  Clears the journal afterward,
+like a real checkpoint, so the reopen exercises the image and not a replay."
+  (let ((buf (graph-db::ni-mkbuf)))
+    (graph-db::ni-bytes buf graph-db::*native-image-magic*)
+    (graph-db::ni-uint buf 7 4)
+    (graph-db::ni-uint buf (graph-db::load-highest-transaction-id graph) 8)
+    (let ((vt (graph-db::mem-table-data (graph-db::vertex-table graph)))
+          (et (graph-db::mem-table-data (graph-db::edge-table graph))))
+      (graph-db::ni-uint buf (hash-table-count vt) 4)
+      (maphash (lambda (id x) (graph-db::ni-node buf id x nil 2)) vt)
+      (graph-db::ni-uint buf (hash-table-count et) 4)
+      (maphash (lambda (id x) (graph-db::ni-node buf id x t 2)) et))
+    (graph-db::ni-index buf (graph-db::%dump-mem-index
+                             (graph-db::mem-type-index-data
+                              (graph-db::vertex-index graph)))
+                        (lambda (b k) (graph-db::ni-key-type b k 2)))
+    (graph-db::ni-index buf (graph-db::%dump-mem-index
+                             (graph-db::mem-type-index-data
+                              (graph-db::edge-index graph)))
+                        (lambda (b k) (graph-db::ni-key-type b k 2)))
+    (graph-db::ni-index buf (graph-db::%dump-mem-index
+                             (graph-db::mem-ve-index-data
+                              (graph-db::ve-index-in graph)))
+                        (lambda (b k) (graph-db::ni-key-ve b k 2)))
+    (graph-db::ni-index buf (graph-db::%dump-mem-index
+                             (graph-db::mem-ve-index-data
+                              (graph-db::ve-index-out graph)))
+                        (lambda (b k) (graph-db::ni-key-ve b k 2)))
+    (graph-db::ni-index buf (graph-db::%dump-mem-index
+                             (graph-db::mem-vev-index-data
+                              (graph-db::vev-index graph)))
+                        (lambda (b k) (graph-db::ni-key-vev b k 2)))
+    (graph-db::ni-spatial buf graph)
+    (graph-db::ni-views buf graph)
+    (graph-db::ni-val buf (graph-db::%dump-unique-indexes graph))
+    (with-open-file (s (graph-db::memory-image-file
+                        (graph-db::location graph))
+                       :direction :output :element-type '(unsigned-byte 8)
+                       :if-exists :supersede :if-does-not-exist :create)
+      (write-sequence buf s))
+    (graph-db::clear-memory-journal graph)))
+
+(test v7-memory-image-still-opens-on-the-v8-build
+  "The image is the ONLY durable copy of a cleanly-closed memory graph, so
+widening type-id must not orphan images written before #187.  A real v7 image
+-- 2-byte type-ids throughout, including every index key -- restores whole.
+
+This is the half of #187 that a writer-only fix would break: reading a v7
+image with v8's 4-byte parse shifts every field after the type-id, so the
+version fork in %READ-MEMORY-IMAGE is what this pins."
+  (reset-mem-view-registry)
+  (with-temp-directory (dir)
+    (let ((loc (namestring dir))
+          person-id place-id knows-id)
+      (let ((g (graph-db::make-memory-graph *mem-test-graph-name* loc)))
+        (let ((*graph* g))
+          (with-transaction ()
+            (let ((a (make-m-person :name "alice" :age 30))
+                  (b (make-m-person :name "bob" :age 40)))
+              (setq person-id (id a))
+              (setq knows-id (id (make-m-knows :from (id a) :to (id b))))
+              (setq place-id
+                    (id (make-m-place
+                         :label "east-town"
+                         :geom (graph-db::make-point 12.3d0 45.7d0)))))))
+        (%write-v7-test-image g)
+        (close-graph g :snapshot-p nil))
+      (let ((g2 (graph-db::open-memory-graph *mem-test-graph-name* loc)))
+        (unwind-protect
+             (let ((*graph* g2))
+               (is (= 3 (graph-db::mem-table-count
+                         (graph-db::vertex-table g2)))
+                   "all three vertices survived the v7 read")
+               (is (string= "alice" (slot-value (lookup-vertex person-id)
+                                                'name))
+                   "a v7 node's data blob is still found at the right offset")
+               (is (string= "east-town" (slot-value (lookup-vertex place-id)
+                                                  'label)))
+               ;; The ve/vev index keys carry their own type-id, so a
+               ;; mis-parsed key silently loses adjacency rather than erroring.
+               (is-true (lookup-edge knows-id) "the edge record survived")
+               (is (= 1 (length (graph-db::map-edges #'identity g2
+                                                    :collect-p t)))
+                   "exactly one edge, so no key was dropped or duplicated"))
+          (ignore-errors (close-graph g2 :snapshot-p nil))
+          (collect-garbage))))))
+
+(test make-memory-graph-refuses-a-dirty-location-before-side-effects
+  "GH #250: creation over a location carrying .dirty -- a live holder or a
+crashed store -- is refused upfront with STORE-NOT-CLOSED-CLEANLY-ERROR,
+as disk MAKE-GRAPH does since GH #246, and nothing is created or
+registered.  OPEN-MEMORY-GRAPH still supersedes the marker (an open
+rebuilds from the journal), which is the documented recovery."
+  (with-temp-directory (dir)
+    (let ((loc (namestring dir)))
+      (with-open-file (s (format nil "~A.dirty" loc) :direction :output
+                         :if-does-not-exist :create)
+        (write-line "crashed" s))
+      (signals graph-db::store-not-closed-cleanly-error
+        (graph-db::make-memory-graph *mem-test-graph-name* loc))
+      (is (null (graph-db:lookup-graph *mem-test-graph-name*))
+          "a refused create must not register the graph")
+      (is (null (remove-if (lambda (p) (string= (file-namestring p) ".dirty"))
+                           (uiop:directory-files dir)))
+          "a refused create must leave no files behind")
+      (is (probe-file (format nil "~A.dirty" loc))
+          "the marker that records the earlier crash is kept"))))

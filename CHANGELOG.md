@@ -9,7 +9,2492 @@ format bumps), MINOR for backward-compatible features, PATCH for backward-compat
 fixes. The `## [Unreleased]` section accumulates changes on the `experiment` branch
 between releases; cutting a release renames it to the new version and dates it.
 
-## [Unreleased]
+## [4.0.0] - 2026-09-02
+
+### Added
+
+- **Temporal claim families** (#296): `(def-claim-classes f :g :temporal t)`
+  turns a claim family into a state series. The validity extent's START
+  joins both identity tuples (`extent-sexp-start-key`, the start bound as
+  fixnums — a timestamp object is never `EQUAL` to its re-read twin and
+  nanoseconds-since-epoch is a bignum off SBCL), so "X in state A during
+  [a,b]" and "… during [c,d]" are two claims and the daily rewrite of an
+  ongoing run is an update of one. Live claims sharing a base tuple must
+  have pairwise **disjoint** validity — `extents-disjoint-p`: every
+  possible Allen relation is `:before`/`:after`, so `:meets` (closed
+  intervals share the boundary instant) and an ambiguous pair are both
+  refused — enforced at commit through the commit view with its own
+  condition, `extent-disjointness-violation`; `check-extent-disjointness`
+  is the audit. A temporal claim must carry an extent (constructor +
+  named `:required` constraint). `def-disjoint-membership` holds **per
+  instant** for such a family, and `claims-touching` gains `:at instant`
+  / `:during extent` validity filters, orthogonal to `:current`. Design:
+  `docs/superpowers/specs/2026-09-01-temporal-claim-families-design.md`.
+
+- **CI runs the spacetime, geos, algorithms and gui suites** in addition
+  to main/concurrency/ACID (`.github/workflows/test.yml`; docs/ci.md).
+  The gap: the lanes were fixed at the three suites that existed when CI
+  was set up, while new work landed almost entirely in the optional
+  subsystems, so a green check did not cover it. The stress and perf
+  suites stay deliberately manual.
+
+- **`(with-transaction (:graph g) …)`** (#175): selects `g`'s transaction
+  manager *and* binds `*graph*` to `g` for the body — the multi-store idiom
+  in one form, instead of a `let` around `(transaction-manager g)`. Binding
+  `*graph*` is deliberate: a body committing to one store while its reads
+  default to another is the node-escape class (#53). The `()` and explicit
+  manager forms are unchanged; the macro dispatches on the literal keyword,
+  so no existing caller changes meaning.
+
+- **Disjointness over vertex types, as a schema lint** (#157 unit 4a).
+  `def-disjoint` declares that no node instantiates two of a set of
+  classes. Because a node's class is fixed at creation, the answer is
+  decided by the class graph alone, so it is checked at `def-disjoint`
+  time against every defined node class, again whenever a node type is
+  defined later (a new `*node-type-definition-hooks*` list in
+  `%install-node-type`, run for source and runtime schema alike), and by
+  `check-disjointness` — never on the commit path. A declaration that the
+  class graph already contradicts (a class that is a subtype of another in
+  the set, or one that inherits from two) is an error at definition, not
+  a silent no-op. `:name` is mandatory and is the identity; the set is
+  canonicalised so either argument order is one declaration. Sixth
+  registry. Claim-asserted membership (4b) is a different feature,
+  built separately (see the membership disjointness entry); `def-node-type` / `def-vertex` now agree that the superclass
+  list is single-inheritance by convention only.
+
+- **Domain and range constraints on edges** (#156, ontology unit 3).
+  `def-domain-range` declares the classes an edge type's endpoints may
+  have — `:domain` for `from`, `:range` for `to`, each a class or a list,
+  subtypes admitted, a subtype edge inheriting the rule — enforced at
+  commit on every create of such an edge. The endpoint is read through
+  the commit view, so both endpoints created in the same commit as the
+  edge are found in the writes rather than missed in the store, and an
+  endpoint deleted in the same commit is absent. A **missing** endpoint
+  (`:dangling` — `make-edge` accepts a raw id nothing answers to) and a
+  **wrong-typed** one (`:wrong-type`) are distinct reasons, never one
+  condition. `check-domain-range-constraints` is the audit pass. Fifth
+  schema registry, same identity rule. With `def-cardinality`, this is
+  what `def-edge`'s endpoint comments meant.
+
+- **Cardinality constraints on edges** (#155, ontology unit 2).
+  `def-cardinality` bounds how many edges of a type a vertex may have —
+  `:min` / `:max`, `:direction :out` (edges from it) or `:in` (edges to
+  it), subtypes counted as `outgoing-edges` counts them — enforced at
+  commit on the vertex's own writes and on every create or delete of such
+  an edge. The count is read through the commit view: the store's
+  adjacency index overlaid with the transaction's edge writes, so a vertex
+  created *with* its edges in one commit is one answer, an edge created
+  and deleted in one commit counts zero, and deleting the last edge below
+  `:min` is refused. `check-cardinality-constraints` is the audit pass,
+  returning `(values violations checked spec-count)`. A pre-existing
+  violation blocks the vertex's later unrelated updates, as unit 1's
+  `:required` does — audit before declaring. O(degree) per constrained
+  vertex per commit. Fourth schema registry, same identity rule as the
+  other three (`%spec-identity`).
+
+- **A slot can be declared write-once, or constrained by a named
+  transition** (#158, ontology unit 5). `def-value-constraint` gains
+  `:write-once t` — settable at creation or while still NIL, never revised,
+  never cleared — and `:transition <name>`, a schema function of
+  `(old new)` deciding whether a change is legal; write-once is its
+  degenerate case. Enforced at commit on every write path, including
+  `rest-put-vertex`, which writes raw slots past every accessor guard and
+  was the live hole #148 recorded. The evaluator reads the pre-image
+  through a **commit view** (`make-commit-view`, `view-old-node`) — the
+  transaction's writes overlaid on the store, store-only for the audit
+  pass — built once per commit and shared by every constraint family
+  (evaluator design note, #109). `check-value-constraints` returns a
+  fourth value: how many specs are transitions and therefore could not be
+  audited; zero violations over those is not a clean graph. The spacetime
+  substrate declares its transaction stamp as `transaction-extent-step`:
+  start immutable, end closeable once (#162's retraction), re-openable by
+  a later re-assertion — so #148's "known limitation" is closed.
+
+- **Claims can be retracted, and registration retracts the regions a
+  subject has left** (#162). `retract-claim` closes a claim's transaction
+  period at `:at` — `[recorded, retracted)`, standing `:asserted` — and
+  never deletes: the record of what was believed stays, `claim-current-p`
+  is NIL for it, and `claims-touching` gains `:current` to filter it. A
+  claim predating the transaction-time axis closes as `[unknown, at)`;
+  retracting twice is a no-op. `register-node` now retracts the subject's
+  current claims (same producer and relation) for every region in neither
+  its registrations nor its unmeasured list, and reports the count as a
+  **fifth value**; an unmeasured region keeps its claim and an unevaluated
+  scan retracts nothing. A subject returning to a region re-opens the
+  retracted claim with a fresh stamp rather than duplicating it. Before
+  this, a subject that shrank, moved or was corrected left its old
+  region's claim standing with its old fraction, reading as live.
+
+- **`register-node` returns its registrations as a fourth value** (#165):
+  the `(:region node :fraction double)` list `register-geometry` computed
+  and the claims were written from. A caller that needs the regions bound
+  by *this* scan — an agreement test against a coded key, say — took them
+  by running `register-geometry` a second time over the same geometry
+  (two spatial scans and two GEOS refinements per subject), because
+  reading them back off the claims would fold in stale ones from an
+  earlier extent (#162). Fourth rather than the third the issue sketched:
+  #164's `unmeasured` holds the third slot because it is the value a
+  caller must not ignore. An unmeasured region appears in neither list.
+
+### Removed
+
+- **`assign-transaction-id`** (#173), a generic with no callers whose
+  method allocated from the per-store counter — the policy #168 replaced
+  with `tm-next-epoch` (the image-level clock, per-store counter as the
+  fallback). A plausible-looking dead function that described the *old*
+  policy; `tm-next-epoch` is the named extension point.
+
+### Changed
+
+- **The peer type table refuses a type whose class is not loaded** (#200),
+  on the scoped auth-ok path, with `peer-type-class-not-loaded-error`
+  naming the type and store. `supers` comes from CLOS, so a registered type
+  with no class in the hub image shipped an empty field — on the frozen
+  wire grammar (#199) indistinguishable from a type that roots at
+  vertex/edge, so every device placed it at the root and dropped it from
+  its parent's closure. Since #206 the session table is one store's own
+  schema, an unloaded class there is that store's deployment fault, and the
+  blast radius is its sessions; the unscoped whole-image table stays
+  tolerant as before.
+
+- **`make-memory-graph` refuses a location carrying `.dirty`** (#250), with
+  `store-not-closed-cleanly-error` before any side effect — the same rule
+  disk `make-graph` has had since #246. It used to supersede the marker and
+  create over the live or crashed store beneath it. `open-memory-graph` is
+  unchanged: an open rebuilds from the journal, so there the marker is
+  recovered, not refused.
+
+- **Query bodies no longer intern client-supplied JSON keys** (#284).
+  `decode-dsl-json` decodes with string keys and turns only the DSL's own
+  vocabulary into keywords; the REST `/query` route and the GUI builder both
+  use it. Before, cl-json's default decoder interned every object key it
+  met, so an unauthenticated caller could grow the image's `KEYWORD`
+  package one bogus field per request. Exported, since a tenant decoding a
+  DSL body itself wants the same guard.
+
+- **Query results render `NIL` as JSON `null`, `T` as `true`, and a stored
+  object as an object** (#282). `%query-value->json` tested `symbolp`
+  before anything mapped `NIL`, so an empty slot came back as the string
+  `"NIL"` on both the REST pattern-query surface and the GUI builder, and
+  `T` as `"T"`; the GUI's `%json-value` printed a stored alist's pairs as
+  Lisp text. Client-visible, hence in a major: a client that special-cased
+  the string `"NIL"` sees `null` now.
+
+- **The query DSL resolves names as the engine spells them** (#281).
+  `%dsl-keyword` folded every name through `camel-case-to-lisp`, which
+  inserts a hyphen before each digit, so a schema with `foo-bar2` or
+  `node-3d-point` had GUI-emitted names its own query endpoint refused. A
+  lowercase kebab name is now interned verbatim; a name carrying an
+  uppercase letter still takes the legacy camelCase fold (`minAge`).
+
+- **Checked query preconditions are a typed condition** (#286).
+  `query-precondition-error` (with `query-param-error` as its DSL subclass)
+  replaces the bare `SIMPLE-ERROR`s for "no secondary index on X.Y", the
+  index-arity mismatch and "not a spatially indexed class". REST answers it
+  `400` with the reason on both query surfaces; the GUI's Prolog endpoint
+  admits *only* this class (and no-applicable-method) as the client's, so a
+  plain `simple-error` from engine code is a `500` again — the residual the
+  #279 classifier recorded is closed.
+
+- **`extents-disjoint-p` is cl-temporal-extent's now** (kraison/cl-temporal-extent#1).
+  `graph-db/spacetime` drops its copy and re-exports the library's, with
+  `extents-intersect-p` beside it; the two rules (`:meets` is not disjoint,
+  an ambiguous pair is not disjoint) are unchanged and now live where the
+  algebra does. The library floor is declared: `cl-temporal-extent` >= 0.2.0.
+  The one behavioural difference is at the edge: the library version takes
+  two extents and refuses NIL, so `claims-touching`'s own NIL guard is what
+  keeps "a claim with no extent is never excluded" true, as before.
+
+- **`geometry-contains-point-p` stays native by decision** (#99, closing
+  the characterised inconsistency 3.0.0 shipped). The even-odd ray-cast is
+  the hot predicate behind `find-nodes-within` / `geo-within/3`, ~77x
+  cheaper than the GEOS bridge and dependency-free, so it does not gain a
+  GEOS `:around`. Its half-open boundary rule — a point on an edge shared
+  by two areas is inside exactly one of them — is now documented as the
+  contract (docstring; manual, *The point-in-polygon boundary convention*),
+  with GEOS's DE-9IM `contains`/`intersects` named as the route for OGC
+  boundary semantics. No behaviour change.
+
+- **`snapshot`'s integrity sweep is opt-in** (#119): `:check-data-integrity-p`
+  now defaults to `NIL`. The sweep deserializes every node a second time —
+  measured on the deployed tenant as the larger half of a snapshot's
+  allocation — for a check the snapshot itself does not need, and it ran on
+  every routine snapshot including `close-graph`'s. Pass
+  `:check-data-integrity-p t` to opt in, or run `check-data-integrity`
+  directly; `replay` still verifies restored data by default. Alongside it,
+  `backup-literalize` now shares unchanged structure instead of copying
+  every cons of every node's data alist — data with no specialized vector
+  (the common case) allocates nothing in the printer walk.
+
+- **A GEOS failure on one region no longer refuses the whole registration
+  scan** (#164, option 2). `register-geometry` now catches `geos-error`
+  around each candidate region's own measurement: that region is dropped
+  and named in a **new third value**, `unmeasured` — a list of
+  `(:region node :error string)` — while every other region registers and
+  `evaluated-p` stays true. `register-node` passes the list through and
+  writes no claim for those regions; nothing is ever written at fraction
+  0. The whole-scan refusal (`(values nil nil nil)`) remains for no-GEOS
+  with an extended subject and for a `geos-error` inside the candidate
+  query, where the candidate list itself is unknown. ⚠ **An evaluated
+  scan with a non-empty third value is partial** — a caller that keeps
+  coverage figures from `evaluated-p` alone now under-counts refusals and
+  must read the third value; one that sweeps stale claims against
+  `registrations` must exclude the unmeasured regions. Measured
+  motivation: 10 unrepresentable pairs in 1.3M cost 1,560 claims across
+  ten consecutive days of a series. Option 3 (representing
+  `GEOMETRYCOLLECTION`) is split out as #291.
+
+- **A claim's `relation` and `producer` are canonical strings, enforced at
+  commit** (#160). Both are components of the `def-unique` identity tuple
+  and are compared with `equal`, so `:registered-at`, `"registered-at"`
+  and `"Registered-At"` were three *different* claims — a tenant that
+  changed spelling would have written a parallel identity space rather
+  than updating anything, and nothing signalled. `def-claim-classes` now
+  emits a `:check` on each slot: `canonical-relation-p` (non-empty,
+  lowercase, `[a-z0-9-]`) and `canonical-producer-p` (the same plus `/`,
+  the deployed path-like `"tenant/rule"` convention). Both predicates are
+  exported. A keyword or a case/whitespace variant now aborts the
+  transaction on every write path, not only through `make-<name>`.
+  Measured against the full deployed corpus before enforcing (352,689
+  claims, 5 relations, 2 producers — all already canonical), so no
+  migration. Engine tests that passed keywords were rewritten.
+  Downstream: a tenant whose *tests* pass keywords will start failing at
+  commit; its data is unaffected.
+
+### Fixed
+
+- **`%oh-fd-count` no longer resolves `/proc/self/fd` symlinks** (#314):
+  ECL/Linux parsed a pipe fd's target (`pipe:[8398]`) as a `pipe:` host
+  pathname and errored, failing all seven OPEN-HYGIENE ABORTED-* tests
+  (first ECL/Linux execution of that region — #310 masked it before).
+  `:resolve-symlinks nil` (`:follow-links nil` on CCL) counts every fd,
+  which also lets a leaked socket move the counter (GH #224 M1 caveat
+  shrinks). Test-only.
+
+- **ECL/Darwin-arm64: files created through `%POSIX-OPEN` got mode 000**
+  (#306). CFFI's ECL backend drops `open(2)`'s variadic MODE on Apple
+  arm64 (the same ABI split #218 fixed for SBCL), so the type registry's
+  and system clock's files were born unreadable and every graph open in
+  the image then failed EACCES. ECL now compiles a direct C `open()`
+  call (`ffi:c-inline`) — correct ABI by construction; other
+  implementations unchanged. The exact-mode regression test now runs on
+  ECL too (its own c-inline `stat`).
+
+- **`%COPY-DIRECTORY-TREE` could truncate the live store to zero bytes**
+  (#307). When the directory walk returns truenames but the caller's
+  root is unresolved (macOS `/var` → `/private/var`; ECL's walk resolves,
+  and any SBCL caller passing an unresolved symlinked location hits the
+  same), `ENOUGH-PATHNAME` fell back to absolute paths and the shadow
+  copy degenerated into copying every store file onto itself —
+  `:supersede` truncating each to 0. Both roots are now truenamed before
+  the walk and a non-relative relativization is a hard error, never a
+  self-copy. Regression test copies through an explicit symlinked root
+  and asserts both directions.
+
+- **The restore planner lost generations under a symlinked root** (#311).
+  `%RETIRED-DIRS-FOR` reported scanned generation directories as
+  truenames while the `:swap`/`:restore` journal records carry
+  caller-form paths, so on ECL/macOS keyed comparisons never matched:
+  existing generations planned as `AUTHORED-GENERATION-MISSING`. Scan
+  entries are now rebuilt from the caller-form location string.
+
+- **spacetime: same-second assert/retract signalled `INVALID-EXTENT` on
+  whole-second clocks** (#308). ECL's `local-time:now` ticks in whole
+  seconds (Linux and macOS alike), so closing a transaction extent in
+  the same second as its start made a zero-width interval. `%ST-NOW`
+  makes the substrate's stamps strictly monotonic per image (ties bump
+  1 ns); caller-supplied stamps are untouched.
+
+- **GUI Prolog error taxonomy holds on every implementation** (#309).
+  Three ECL-only misclassifications: (1) ECL reads `1e999999` as
+  `single-float` infinity instead of signalling, so the query ran and
+  died at JSON encoding as a 500 — read forms are now screened for
+  non-finite floats and answer the same 400 refusal as an unreadable
+  literal. (2) ECL signals a bare `SIMPLE-ERROR` for
+  no-applicable-method (deliberately a 500), so ill-typed goals reaching
+  the whitelisted read generics answered 500 — `OUTGOING-EDGES`,
+  `INCOMING-EDGES` and `INVOKE-GRAPH-VIEW` now define
+  `NO-APPLICABLE-METHOD` methods signalling `QUERY-PRECONDITION-ERROR`,
+  which the classifier admits portably. Direct Lisp callers of those
+  three generics now see `QUERY-PRECONDITION-ERROR` instead of the
+  implementation's own condition on an ill-typed call. (3) The
+  oversize-body test accepts a client-side stream error mid-send as the
+  refusal observed at the transport layer (ECL's client hits EPIPE
+  before it can read the 413; the status-code assertion stays pinned on
+  SBCL).
+
+- **ECL: an initform-only persistent slot read NIL on the freshly
+  created node** (#312). ECL constructs a node's concrete class directly
+  (the #47 CHANGE-CLASS-leak workaround), and the caller's DATA alist
+  then replaced everything `MAKE-INSTANCE` had initialized — so the
+  added-slot initform pass `CHANGE-CLASS` performs on the pooled-buffer
+  implementations never ran on the create path. Explicit initargs and
+  the reopen path were unaffected (the deserialize path re-applies
+  defaults at materialization, which is why the GH #128 tests never saw
+  it). `%MAKE-VERTEX`/`%MAKE-EDGE` now run the initform pass by hand on
+  ECL (`%APPLY-MISSING-INITFORMS`, through the persistent-slot funnel
+  under `*INITIALIZING-NODE*`); on-disk bytes are unchanged and
+  identical across implementations. New main-suite regression pins the
+  fresh-node direction the reopen tests cannot see.
+  (#313), whose over-existing-target behavior is implementation-defined:
+  ECL (like CCL) signals "already exists", so every torn-tail recovery
+  on ECL died instead of truncating. Now `%POSIX-RENAME` (rename(2):
+  atomic, replaces), the engine's established idiom; the stale comment
+  claiming ECL's `RENAME-FILE` overwrites is corrected.
+
+- **Test infrastructure portability for the ECL matrix** (#310, #307,
+  #167, #313): `%DIRECTORY-FILE-HASHES` shells out to
+  `sha256sum`/`shasum` (ironclad's ECL digest path is bignum-slow and
+  shadow stores are ~1 GB apparent size); the detach-tests helpers
+  truename their roots; `%FILE-REAL-BYTES` gained an ECL `st_blocks`
+  branch; and `REHOME-AUTHORED-OP` / `%EDGE-OCCUPANCY-FILE` /
+  `PIN-READ-EPOCH` are `notinline` so the suites' fdefinition spies
+  observe them on ECL (same-file calls compile to direct C calls
+  there).
+
+- **`BYTES` was a derived cache of `DATA` with no invalidation on write**
+  (#136). A persistent-slot `setf` updated the node's `DATA` alist and left
+  its serialized `BYTES` stale, so every consumer that needed correct bytes
+  — `apply-tx-write`, `update-node`, `save-node`, the create-set refresh —
+  re-serialized by hand at its own call site, and the next path to forget
+  would have logged and replicated stale data invisibly until a restart.
+  One invariant now, in one place: every `DATA` mutation marks the node
+  stale (`(setf data)`, the in-place branch of `(setf node-slot-value)`,
+  `slot-makunbound`), and the `bytes` reader re-derives once on the next
+  read; writing `bytes` asserts freshness. The four hand compensations are
+  gone. Pinned by tests that read `BYTES` directly after a mutation; the
+  slot-read hot path is unchanged (2e6 reads: 847 ms vs 883 ms before —
+  `maybe-init-node-data` now reads `bytes` once instead of three times).
+
+- **A refused re-homed op made peer push a poison-pill loop** (#151). When
+  the hub's commit refused a device-pushed op — a unique, value,
+  cardinality, domain/range or vector-dimension constraint — the error left
+  `peer-receive-push` before `PUSH-ACK` advanced, so the device re-streamed
+  the same op on every push, refused for the same reason, with every later
+  op queued behind it. Deterministic refusals now share one superclass,
+  `constraint-violation` (the spacetime disjointness conditions inherit it
+  too; the bare vector-dimension `error` became `vector-dimension-violation`),
+  and the hub treats one as a **rejection**: recorded durably
+  (`rejections.dat`, `get-peer-rejections`), `PUSH-ACK` advances past the
+  op, and the ack carries it under `:rejected` so the device records it as
+  well and moves on. Anything else is still transient: it propagates and
+  the op is retried, as before. New API: `get-peer-rejections`,
+  `clear-peer-rejections`, the `peer-rejection` record; `migrate-graph`
+  carries `rejections.dat` with the other sidecars (#289).
+
+- **Spatial radius queries missed results across the antimeridian and at
+  the poles** (#287). `map-spatial-index-radius` built its longitude span
+  at the query latitude and truncated it to `[-180, 180]`, so a window
+  crossing the dateline lost its far half and a window touching a pole
+  never spanned all longitudes — a query *at* the pole returned nothing.
+  Silent, from every surface (GUI builder, REST DSL, `find-near/5`). The
+  span is now sized at the band's poleward edge, a band that touches a
+  pole covers every longitude, and a span crossing ±180 is scanned as two
+  windows sharing one dedup table. The #279 clamp is unchanged: a polar
+  query is still a latitude band, not the whole globe. Tests assert against
+  `geodesic-distance` ground truth, since the loss was invisible at the
+  cell level.
+
+- **`open-lhash` reset the persisted location; `delete-lhash` on a copied
+  graph deleted the ORIGINAL's files** (#143). `struct.dat` cl-stores the
+  whole lhash struct, `location` included, and `open-lhash` mmapped from
+  the passed path but left that slot pointing at wherever the lhash was
+  *created*. A `cp -a` rehearsal copy therefore read from the copy and
+  deleted through the original — silently, and pointing the wrong way.
+  The slot is now reset to the opened location; the invariant is stated in
+  both docstrings. Audit: `lhash` was the only cl-stored structure carrying
+  a filesystem path, and no engine path calls `delete-lhash` today.
+
+- **`migrate-graph` silently dropped a store's peer-replication sidecars**
+  (#289). Snapshot + replay carried nodes only; `lamport.dat`,
+  `field-stamps.dat`, `node-origins.dat`, `conflicts.dat` and `applied-ops/`
+  were left behind, and the next `open-graph :peer-role` recreated each one
+  empty — a reset Lamport clock and an empty applied-op index, visible only
+  at the next sync. They are now copied verbatim after the replay (their
+  keys are node ids, which survive it) and named in the migration log; a
+  non-peer store carries nothing.
+
+- **Type-id seeding tests were red on macOS (the arm64 advisory lane's 11
+  failures)**: the fixture compared raw `merge-pathnames` namestrings
+  against the seeding report's `truename`'d ones, which diverge wherever
+  the scratch root crosses a symlink — macOS's `$TMPDIR` always does
+  (`/var/folders` → `/private/var`). Reproduced on Linux via a symlinked
+  `TMPDIR`; the fixture now canonicalizes through the same
+  `%seeding-location` the engine uses. Engine behaviour was correct.
+
+- **Skip-list mutators could deadlock under concurrency** (#294). The
+  optimistic insert locked each level's predecessor bottom-up — deadlock-free
+  on per-node locks, but these are *striped* (`mod addr n-locks`), and stripe
+  order is not list-position order, so two inserts could take two stripes in
+  opposite orders (caught once by SBCL's deadlock detector in CI). Removal
+  additionally locked the victim before the preds, and `lock-skip-node`'s
+  reentrancy shortcut returned an already-owned stripe without re-grabbing
+  while the caller released everything — a double release on stripe
+  collision. All mutators now collect their nodes' stripes, dedupe **by
+  stripe**, sort, and acquire in ascending stripe order (`%grab-stripes`);
+  remove marks and splices atomically under the locks. The new mixed
+  add/remove hammer test then exposed two more defects in the same
+  structure: **remove freed the node's heap memory immediately**, crashing
+  concurrent lock-free walkers that still held its address (H&S traversal
+  is only safe because unlinked nodes remain readable stepping stones) —
+  frees are now deferred and reclaimed at `close`/`delete`, with a
+  snapshot+replay rebuilding clean regardless; and `update-in-skip-list`'s
+  grow path called remove+add while holding the node's stripe, a
+  self-deadlock under non-reentrant locks — it releases first now.
+
+- **A truncated snapshot can no longer be silently restored** (#127,
+  breaking #146's silent data-loss chain). Three layers, each sufficient
+  alone: `snapshot` now writes in a `txn-log/in-progress/` subdirectory
+  and renames the file up only after completion — same dot-free
+  basename, so `rename-file`'s type-merging cannot mangle the final
+  name and the historical `txn-log/snap-*` glob keeps working — so an
+  interrupted writer leaves no `snap-` file; `backup` writes a format
+  header first and a completion trailer last, making every new snapshot
+  verifiable; and `find-newest-snapshot` — which picked by
+  `file-write-date` alone, so a truncated file won *because* it was
+  newest — refuses a header-without-trailer file with
+  `snapshot-refused-warning` and falls back to the next newest complete
+  one. Legacy trailer-less snapshots (every file in the field) are
+  accepted with the same warning's `:legacy` reason, since refusing them
+  would break every existing store's replay. The replay reader treats
+  the markers as content-free.
+
+- **Opening a graph whose schema file was never loaded now fails
+  clearly, and strands nothing** (#144). `schema.dat` persists type
+  *metadata* for type-id stability — never CLOS classes — so the schema's
+  `def-vertex` / `def-edge` forms must be loaded before `open-graph`. An
+  image that hadn't died deep in `gc-heap`'s node sweep with a bare
+  `class-not-found-error`, and the stranded `.dirty` turned the next open
+  into a recovery prompt for a store that was never corrupt. The reopen
+  now pre-flights the restored schema before `.dirty` is written and
+  signals `schema-classes-not-loaded`, naming the graph, every missing
+  type at once, and the actual cause.
+
+- **A schema withdrawal that matches nothing is now loud** (#152). Every
+  `undef-*` macro — index, unique, value-constraint, cardinality,
+  domain-range, disjointness — warns `schema-withdrawal-matched-nothing`
+  when no declaration matched, with the hint that bites in practice: a
+  declaration emitted by a macro has its `:name` interned in *that*
+  package, and the same characters read elsewhere are a different symbol.
+  Previously the withdrawal returned NIL and nothing else happened, so the
+  failure surfaced later as an unrelated test looking wrong. The
+  `unregister-*` functions stay silent and boolean for idempotent callers.
+
+- **A refused or retried commit no longer pins the prune floor** (#150).
+  `%commit` runs inside `call-with-transaction`'s cleanup form and
+  signals — `validation-conflict` on every retry, and each
+  pre-durability refusal (unique, value, cardinality, domain/range) — and
+  `cleanup-transaction` came *after* it in the same cleanup list, so it
+  never ran: the transaction stayed in the manager table as
+  `:committing`, `minimum-start-transaction-id` counted it, and committed
+  records accumulated behind that floor for the life of the image. Every
+  OCC retry leaked one. `cleanup-transaction` is now its own protected
+  step. Pre-existing; found by #149's review, and materially more
+  reachable now that declarative constraints refuse ordinary writes.
+
+- **Two allocation tests were flaky in the full suite** (#174).
+  `sb-ext:get-bytes-consed` is process-wide, so a reaper, replication or
+  peer thread allocating inside the measured window was charged to the
+  code under test — only ever upward — and `point-in-ring-packed-conses-
+  nothing` (2.6× its 64-byte budget once, against a 47 KB regression it
+  guards) and `do-geometry-coordinates-zero-allocation` (exactly 0 bytes,
+  one window) could fail on a loaded host. Both now take the minimum over
+  five rounds, the idiom `node-class-tests` already used.
+
+- **Concurrent registrations of one subject no longer kill the batch**
+  (#161). `register-node`'s idempotency lookup runs outside the
+  transaction and OCC cannot see a phantom, so two registrations of the
+  same subject could both take the insert branch; `def-unique` caught the
+  second at commit and the violation propagated — harmless serially, fatal
+  to a parallel backfill (one failed subject partway through). The upsert
+  now reads that violation as "someone else won": it re-reads and updates
+  the winner with this scan's values. A violation whose re-read finds
+  nothing is re-signalled. Eight threads registering one subject now all
+  succeed against one claim.
+
+- **An overlay of two VALID geometries could answer with a
+  `GEOMETRYCOLLECTION`, and `register-geometry` then refused the whole
+  subject** (#164). Two polygons that overlap in an *area* and separately
+  meet at a point or along an edge intersect in `POLYGON + LINESTRING`.
+  The VG `geometry` type has no collection kind, so `wkt->geometry`
+  signalled, and `register-geometry`'s `geos-error` handler — which wraps
+  the entire region loop — returned `(values nil nil)`. Measured on a
+  quiesced copy of deployed data: 10 of 1,312,704 pairs, but because the
+  same shapes recur daily it cost **1,560 claims across ten consecutive
+  days** of a time series, where a missing claim reads as a definite
+  negative rather than as "unknown".
+
+  This is distinct from #163, which was `GEOSMakeValid` answering that way
+  for an *invalid* ring. Here nothing is repaired — `%repaired` succeeds
+  because there is nothing wrong with either input — and the collection
+  arrives one step later, out of `geometry-intersection`.
+
+  **`%geos-overlay` now reduces a collection result to the union of its
+  highest-dimension parts**, extending to the overlay path the treatment
+  #163 gave the repair path.
+
+  ⚠ **Highest dimension, not "the polygons".** The measure a caller takes
+  follows its subject: `spacetime`'s `%measure-fn` uses area for a polygon
+  and *length* for a `LINESTRING`. Keeping only areal parts would hand a
+  line subject an empty geometry — length 0, read as a mere touch — and
+  silently drop a real overlap. The dimension below the top one is the
+  boundary contact, and it carries none of the measure.
+
+  ⚠ **Empty is a result here, not a failure**, unlike
+  `%geos-repaired->geometry`, which signals when a repair kept no area. An
+  overlay legitimately answers "they share nothing", and callers depend on
+  reading that as measure 0 (#105). A repair that repaired nothing and an
+  intersection that intersected in nothing are different facts.
+
+  The five remaining `GEOSGeomTypes` constants are now defined in
+  `geos/geos-ffi.lisp` alongside the three #163 added.
+
+- **Chapter 17 stated two things about multi-store transactions that #168
+  had already made false** (#93). It said a cross-graph transaction "would
+  need a global ordering across independent counters", and that a
+  cross-graph read instant "would need an epoch shared by every transaction
+  manager, which is not implemented" — the image-level epoch clock shipped
+  in #168 and both claims outlived it. Corrected to say what is actually
+  missing: a *durable* prepare record (the prepared temp file is flushed,
+  not fsynced, and recovery ignores it by design), a decision record, and
+  an in-doubt recovery protocol. The read-instant paragraph now says the
+  epoch exists and what is missing is an API applying one chosen epoch to
+  every participating store. Chapter 17 also gains **the supported
+  multi-store write pattern** — resolve foreign endpoints before opening
+  the transaction, write the regenerable store last, make each write
+  idempotent on a stable identity tuple, reconcile forward — which the
+  manual previously replaced with a bare "that coordination is not
+  atomic" warning. Documentation only; no behaviour change.
+
+- **A spatial query's cost was quadratic in a client-supplied radius,
+  and independent of the data** (#279). `map-spatial-index-radius`
+  turned `radius-m` into a degree span with no clamp, and
+  `geohash-covering` — which *walks* a `(1+nlon)x(1+nlat)` grid —
+  skipped its `max-cells` budget entirely whenever a `:precision` was
+  supplied, which every query path does. `+spatial-query-max-cells+`
+  bounded the covering's **answer**, never its **work**. On a
+  *five*-node index, `(find-near ?n place 0 0 2e10)` took 24.6 s and
+  `4e10` took 99.5 s — firing a 30 s query deadline 69 s late, because
+  `%tick` runs at goal boundaries and cannot preempt inside the call.
+  Extrapolating the measured 4.05x-per-doubling, a legal literal of
+  `1e15` was on the order of millennia.
+
+  Fixed in the engine rather than by withholding the predicate from the
+  GUI, because the same path is reached by a `def-query` taking a
+  radius parameter and by any `select` over client data — excluding it
+  from one surface would have left the defect live everywhere else. The
+  radius is now clamped to the planet per axis before it becomes a
+  degree span (per axis, so a polar query stays a latitude *band*
+  rather than collapsing to the whole globe), and `geohash-covering`
+  clamps its box to the globe and lowers an explicitly requested
+  precision until the grid fits. Neither can lose a result: no geohash
+  cell exists outside the globe, a coarser cell still covers the box
+  and callers scan it as a prefix range, and the exact
+  `geodesic-distance` refinement still applies the true radius — a
+  radius past half the circumference simply means "every node". The
+  insert path is provably unaffected: `%bbox-cells` and
+  `%geometry-cells` now pass their own `:max-cells`, and the precision
+  they already compute fits it, so the new check is a no-op there and
+  `spatial-index-remove` still recomputes exactly what
+  `spatial-index-insert` wrote. Measured after: 2e10 → 0.025 s, 4e10 →
+  0.025 s, 1e15 → 0.027 s, all returning the whole-globe result set.
+
+- **The Prolog editor tab never appeared** (#279).
+  `CodeMirror.overlayMode` is *not* part of CM5's `lib/codemirror.js` —
+  it is `addon/mode/overlay.js`, which was never vendored. Building the
+  `vg-prolog` mode therefore threw during editor construction,
+  `enableProlog`'s exception was swallowed into a `console.warn`, and
+  the *Builder | Prolog* sub-tab nav — revealed on that function's last
+  line — stayed hidden. A GUI started with `:allow-prolog t` looked
+  exactly like one started without it. Fixed by vendoring
+  `codemirror-overlay.js` and loading it before the mode is used.
+
+  Hardened, because that failure mode was the real defect: the sub-tab
+  nav is now revealed as soon as the *server* advertises the capability,
+  before anything is loaded, so a load failure leaves the nav visible
+  with the Prolog tab disabled, relabelled *Prolog (unavailable)*, the
+  reason in its tooltip and in the pane, and the message in the roster's
+  error strip. "Not enabled" and "enabled but broken" are now
+  distinguishable. `createRosterPane` returns its `showError` so the
+  frame can use it.
+
+  A new test, `codemirror-entry-points-are-vendored-and-loaded`, reads
+  every `CodeMirror.<x>` call out of `js/prolog.js` and asserts each is
+  defined in a vendor file `js/main.js` actually loads. It is derived
+  from the source rather than hand-listed, and it fails on both ways
+  this goes wrong: calling an API that lives in an unvendored addon, and
+  vendoring a file without loading it.
+
+- **An unbound result variable returned 500** (#279). `{"query":"(= ?x
+  ?y)"}` — eleven characters, whitelisted predicates only, default
+  configuration — answered `500` and logged an `UNEXPECTED SERVER
+  FAULT`, as did `(var ?x)` and `(atom ?x)`. These are idiomatic Prolog:
+  `var/1` and `atom/1` exist precisely to be called on an unbound
+  variable, and unifying two fresh variables legitimately succeeds with
+  both still unbound. An unbound variable reaches the encoder as a `var`
+  **struct** (`prologc.lisp:97`) whose `:print-function` renders it
+  `?1` — so it looks like a symbol in a backtrace but is not one,
+  matched neither `node-p` nor `symbolp`, fell through
+  `%query-value->json`'s identity branch and reached cl-json raw
+  (`JSON:UNENCODABLE-VALUE-ERROR`). Fixed as **semantics, not
+  classification**: it is a legitimate answer, so it now renders as JSON
+  null and returns 200. A *bound* variable is dereferenced first, so
+  only a genuinely unbound one becomes null.
+
+  Fixed in the shared `query-dsl.lisp`, so REST's `/graph/:g/query` —
+  which had the identical defect, reachable with a `"select"` variable
+  that appears in neither `"match"` nor `"where"` — is fixed with it.
+  The same change also stops cl-json's *guessing* encoder mangling a row
+  whose values are all null: `(cons key NIL)` is not a dotted pair, so
+  such a row was guessed to be a plain list and encoded as
+  `[["x"],["y"]]` instead of `{"x":null,"y":null}`. Rows now go through
+  `json:encode-json-alist`, which forces the object and still encodes
+  each value with the ordinary encoder — a list-valued slot is still a
+  JSON array, which the *explicit* encoder would not be. An empty result
+  still encodes as `null`. A slot whose value is really `NIL` still
+  renders as the string `"NIL"`; that is a different value class and
+  stays #282.
+
+- **Bignum and ratio coordinates overflowed on coercion** (#279).
+  `geohash-covering`'s globe clamp coerced to `double-float` *before*
+  clamping, so a coordinate or radius given as a bignum or a ratio
+  signalled `floating-point-overflow` on the way in — letting an
+  unauthenticated caller manufacture the very "unexpected server fault"
+  alarm the ill-typed/fault split exists to keep trustworthy. All the
+  clamps now bound with *rational* limits and coerce afterwards; CL
+  compares a rational against a float exactly, so `(min 180 <bignum>)`
+  is `180` and the overflow cannot arise. Applied at every place a
+  caller's number enters: `geohash-covering`,
+  `map-spatial-index-radius`, `find-nodes-near`, `find-nearest-k`, and
+  the three Prolog geo predicates `geo-distance/5`, `geo-near/5` and
+  `geo-within/3`, which reach the trigonometry without touching the
+  index at all. Thirteen bignum/ratio shapes across every geo and
+  spatial functor now answer cleanly.
+
+- **The GUI decoded a request body before checking its size** (#279).
+  Both POST endpoints — the builder's `/query` (#278) and the new
+  `/prolog` — read and JSON-decoded an arbitrarily large body before
+  any length check applied: 32 MB cost ~7.3 s of CPU and 32 MB of
+  transient allocation on each, unauthenticated. The check now sits in
+  the dispatcher, on `Content-Length`, ahead of ningle — the only place
+  it *can* sit, since lack parses an `application/json` body while
+  building the request. Bodies over
+  `graph-db.gui::*max-request-body-bytes*` (64 KB) are a `413`; a
+  resource-budget breach stays a `400`, since there the request is tiny
+  and it is the query that is expensive.
+
+### Added
+
+- **GUI free-text Prolog, behind an opt-in `start-gui :allow-prolog`
+  flag** (#279, tracker #272). The Query tab grows a second surface —
+  a *Prolog* sub-tab beside *Builder* — that exists only when the
+  server advertises it, and a new endpoint `POST
+  /api/graphs/:name/prolog` that accepts a raw query string. **The
+  default is off**, and `:allow-prolog` is enforced *at the endpoint*,
+  before the graph is even resolved (`403 prolog-disabled`): the UI
+  hiding a tab is decoration, not the control. A new server-level `GET
+  /api/capabilities` tells the frontend which it is, and — when on —
+  carries the functor inventory the editor dims unknown heads against.
+  `start-gui` is idempotent, so it sets the flag only when it actually
+  starts a server; restart to change it.
+
+  The read guard is the substance, and it runs entirely before the
+  Prolog compiler sees anything: (1) the flag; (2) a **character screen
+  ahead of `read`** — length (4096) and nesting-depth (32) caps,
+  balance, and a refusal by name of the package marker, every `#`
+  reader macro, backquote and comma. The package marker has to be
+  refused *textually*, because by the time `read` has resolved
+  `graph-db::anything` it has already interned it. Inside a string or a
+  `|…|` name none of those characters is syntax, so a literal
+  `"#.(…)"` is data and passes. (3) A read with `*read-eval*` nil, a
+  readtable with `#`/backquote/comma disabled, and `*package*` bound to
+  a **scratch package made for that one request that uses nothing**.
+  (4) A **whitelist walk that rebuilds the form out of canonical
+  symbols** — a symbol survives only as a registered functor *of that
+  arity*, a control construct, a vertex/edge type or slot of *this*
+  graph, a `?variable`, or `t`/`nil`; goal heads must be symbols,
+  because a string head reaches `prolog-compiler-macro`, which interns
+  it into `GRAPH-DB`. (5) The existing rails, through
+  `query-dsl.lisp`'s own runner: `:effects nil`, one MVCC snapshot,
+  the inference/time/row bounds. (6) `delete-package` in an
+  `unwind-protect`, so every symbol a hostile query interned leaves
+  with the request.
+
+  The whitelist is **derived from the live image**, not hand-listed:
+  `(name . arity)` pairs enumerated out of `*prolog-global-functors*`
+  and `*user-functors*` (so a graph's edge functors come along for
+  free), control constructs out of the `prolog-compiler-macro` property
+  on `GRAPH-DB`'s symbols. Enumerated, never probed — `make-functor-
+  symbol` *interns*, so asking the registry about a client's
+  `name/arity` would create it; names are matched as strings. Two
+  things are withheld on purpose: the runtime meta-call family (`call`,
+  `catch`, `findall`, `bagof`, `setof`), each of which hands a term to
+  `%solve` and lets it build a functor symbol from that term's *run-
+  time* head; and a variable where a control construct expects a goal
+  (`(not ?g)`), which is the same hazard by another door. Together
+  those close `%solve` to free text. A whitelisted but *effectful*
+  predicate is not refused by the guard — it passes and `:effects nil`
+  stops it at run time (`403`), and a runaway query hits the inference
+  budget (`400 query-too-expensive`) rather than hanging.
+
+  The answer is the *same* `{columns, rows, rowCount, limit,
+  truncated}` envelope the builder's endpoint returns, so one results
+  table, one limit semantics and one canvas handoff serve both
+  surfaces. The editor is a vendored **CodeMirror 5** (5.65.21, MIT;
+  CodeMirror 6 needs a bundler, which the no-build posture rules out)
+  with a small overlay mode colouring `?variables` and dimming
+  unrecognised heads, and a live paren-balance indicator beside Run.
+  Its assets are injected only when the capability says the editor
+  exists, so a default GUI never fetches them. 202 new adversarial
+  checks over real HTTP cover reader-eval, package-qualified names,
+  string heads, unknown functors and arities, meta-call escapes,
+  effectful goals, the resource cap, both flag states, and that fifty
+  hostile queries add no symbol to `GRAPH-DB` or `KEYWORD` and no
+  package to the image.
+
+  A third exclusion category, **cost-unbounded predicates**, withholds
+  `regex-match/2`. All three lists name *engine* predicates and are
+  matched two ways, independently: by **home**, only against
+  `GRAPH-DB`-homed registry entries, so a schema declaring an edge type
+  called `regex-match` (or `findall`, or `select`) keeps its own
+  auto-installed functors; and by **routing**, refusing any head whose
+  name a `GRAPH-DB` symbol carries a `prolog-compiler-macro` for,
+  whatever package the head came from. The second is what makes the
+  first safe — `prolog-compiler-macro` canonicalizes a foreign-package
+  head *by name* back into `GRAPH-DB`, so home-scoping alone would
+  exclude by home while the compiler routed by name, and a
+  schema-package `call/2` would be admitted by the whitelist and then
+  compiled by the engine's own `call` macro, re-opening `%solve-call`.
+  Only `call` and `%commit` are both excluded and compiler-macro-backed,
+  so the routing test refuses exactly those two and asks the image
+  rather than a list. The query rails are enforced by `%tick`, which runs
+  at inference and goal boundaries and *never inside a functor that is
+  already running*, so a predicate that can burn arbitrary time in one
+  atomic Lisp call is not preemptible by `*query-default-timeout*` or
+  `*query-default-max-inferences*`. `regex-match/2` takes both the
+  pattern and the subject from the client, so `(a+)+$` against a run of
+  `a`s is ~2^n from a payload of a few dozen characters — 6.0 s at 26
+  `a`s, 51.2 s at 29, the latter answering 200 well past a 30 s
+  deadline that never fired. Exclusion rather than a watchdog:
+  interrupting a worker mid-call could unwind holding the GUI's rw lock
+  or with an mmap operation in flight. `valid-date-p/1` also runs a
+  regex and stays — its pattern is a fixed anchored constant and its
+  cost is linear in a subject the length cap bounds.
+
+  A query that gets past the guard but hands a predicate arguments it
+  cannot use is now `400 ill-typed-query` with a **generic** message,
+  not the condition's own report: several whitelisted read functors
+  raise conditions that are not `prolog-error` subtypes and whose
+  reports name engine internals (a store's keyword name, a
+  generic-function name, an ANSI section reference), and they were
+  reaching the browser as 500s. The read path likewise stops echoing
+  the implementation's reader-error text for a rejected numeric literal
+  such as `1/0`. In both cases the detail goes to `log:error`, so the
+  operator keeps it; the DSL's own `prolog-error` / `query-param-error`
+  messages are still returned verbatim.
+
+  The ill-typed conversion is **narrow**, so a genuine engine defect is
+  never labelled the client's: only the two families client input was
+  *measured* to produce become a 400 — `no-applicable-method` (an
+  unbound variable reaching a generic that dispatches on node classes)
+  and `simple-error` (how the query layer reports a precondition it
+  checked on purpose, e.g. "No secondary index on …"). Everything else
+  — `type-error` above all, which is the classic shape of a real defect
+  — is a **500** with a fixed generic body, and the two log under
+  distinct labels (`ill-typed query` vs `UNEXPECTED SERVER FAULT`) so an
+  operator can grep them apart. Known residual: an internal `assert` or
+  `(error "…")` in engine code is also a `simple-error` and is still
+  counted the client's; the durable fix is a distinct condition class
+  for validated query preconditions, which is an engine change (#286).
+
+  Those three exclusion lists are the *only* hand-maintained part of
+  the guard, and the one part that cannot notice the engine changing
+  under it: the whitelist grows with the registries automatically, so a
+  meta-calling or cost-unbounded predicate added tomorrow would be
+  admitted to free text with no test failing. A tripwire closes that —
+  `prolog-functor-inventory-is-pinned` pins the whole set of registered
+  functor `name/arity` strings against a reviewed inventory committed
+  in the test file, and fails on any addition or removal with a message
+  that walks the reader through *both* questions the new arrival has to
+  answer: does it reach `%solve`, and is its worst-case cost bounded by
+  the graph or by the query's length.
+
+- **GUI query workbench: a schema-driven builder, a results table and
+  a result-to-canvas handoff** (#278, tracker #272). The cockpit's
+  main region is now tabbed — *Explorer* | *Query* — and the Query tab
+  builds a `match` / `where` / `select` query from the selected
+  graph's own schema: vertex and edge types and their slots come from
+  the existing `/types` and `/stats` endpoints, so the pane can only
+  express queries the schema supports. **Every query variable is
+  generated by the builder** (`?v1`, `?b1`, …) and picked from
+  dropdowns, never typed; free text appears only in a literal slot or
+  comparison value. The DSL's comparison arm interns an argument
+  beginning with `?` as a query variable (its slot-`value` arm does
+  not), which would silently turn a filter into a match-all, so the
+  builder refuses a `?`-leading comparison literal and offers
+  *compare against a bound variable* as an explicit second mode.
+  `truncated` distinguishes a cut result from an exactly-full page:
+  the endpoint asks the runner for one row past the reported `limit`
+  and never shows it. Rows whose values are node ids are clickable
+  and seed or additively merge into the explorer canvas (per row, or
+  the whole result set), and switching or closing a graph resets the
+  pane like every other. New endpoint `POST
+  /api/graphs/:name/query` takes the same structured DSL body
+  `rest.lisp`'s `/graph/:g/query` route accepts and answers
+  `{columns, rows, rowCount, limit, truncated}` — read-only,
+  snapshot-isolated and capped, on the GUI's `{error, message}` error
+  contract (400 for a malformed query, an unknown type or a resource
+  breach; 403 for a forbidden effect; 404 for a closed graph). The
+  DSL's NDJSON streaming mode stays a REST-only affordance. The
+  builder/results divider is draggable (arrow keys when focused,
+  double-click to reset) so a long query can be read whole; the split
+  is remembered in browser local storage and falls back to the default
+  wherever storage is unavailable.
+
+- **`query-dsl.lisp`: the structured query DSL is now a shared core
+  file, not part of `rest.lisp`** (#278). `compile-pattern-query`,
+  `run-pattern-query`, `emit-query-results`, the `%compile-*` /
+  `%dsl-*` helpers, `*pattern-query-callback*`, the `*query-default-*`
+  bounds and the `query-param-error` condition moved out of
+  `rest.lisp` verbatim into a new `query-dsl.lisp` component of the
+  `:graph-db` system, loaded before `rest`. `rest.lisp` keeps only its
+  HTTP wrappers (`%request-query-dsl`, `call-rest-pattern-query`,
+  `def-query`, the routes); REST's behaviour and its routes are
+  unchanged, which the existing `rest-tests` / `rest-http-tests` in
+  the main suite gate. The alternative — duplicating a query compiler
+  for the GUI, or making `graph-db/gui` depend on the whole REST
+  system — was worse. The file sits in `:graph-db` rather than
+  `:graph-db/core` because `emit-query-results`' NDJSON arm sets a
+  header on `ningle:*response*`, and core deliberately drops
+  ningle/clack for the ECL/Android build.
+
+### Changed
+
+- **BREAKING (`graph-db/gui` wire format): schema names ship as the
+  engine spells them, in kebab-case** (#277, tracker #272). Every JSON
+  *value* naming a schema entity — vertex and edge type names, slot
+  names, view names and classes, index owners and slots — was
+  camelCased on the way out (`"guiPerson"`, `"peopleByName"`) and
+  turned back with `camel-case-to-lisp` on the way in, for
+  `/nodes?type=`. That round trip is not bijective: names with
+  consecutive capitals or digits (`HTTP-URL`, `FOO-BAR2`) do not
+  survive it. Those values are now the engine's own lowercase kebab
+  spelling (`"gui-person"`, `"people-by-name"`, `"home-city"`), and
+  `?type=` interns the incoming string directly — so a type name the
+  API emits is accepted back verbatim. This is the naming prerequisite
+  for the query workbench: what the UI shows is what a query types.
+  JSON *keys* are unchanged and stay camelCase (`vertexCount`,
+  `onDiskBytes`, `inEdgeCount`) — they are protocol, and nobody types
+  them. The one deliberate exception is the node inspector's `slots`
+  object, whose keys ARE slot names and therefore go kebab too.
+  `rest.lisp` is untouched and keeps its own JSON conventions.
+  Consumers are all in-tree — the bundled frontend (which renders
+  these values verbatim; explorer node colors are derived from the
+  type string and shift accordingly) and the `graph-db/gui-test`
+  suite, both updated here. Any out-of-tree client of the GUI API
+  must be updated.
+
+### Fixed
+
+- **Peer pull manifest accumulation is O(ops), not O(ops²)** (#260).
+  The device writer loop accumulated the created-node manifest with a
+  `pushnew ... :test #'equalp` list — a linear scan of 16-byte id
+  arrays per state-create op, ~N²/2 compares on an N-node first sync.
+  It is now an id-keyed hash table, keeping the ack bounded and
+  duplicate-free across resumes (unacked creates are re-shipped after
+  a dropped connection and the accumulator survives it); the ack list
+  is materialized at the barrier, and its consumer folds it into a
+  set, so semantics are unchanged. The `peer-apply` bench now measures
+  the (now-cheap) accumulation it used to exclude (the #260 carve-out)
+  — suite generation bumps to 5.
+
+- **Watermark persistence no longer convoys commits** (#237). The #177
+  monotonic fix made `persist-highest-transaction-id` re-read
+  `transaction-id.dat` on every commit under one process-global lock;
+  the #252 microbenchmarks measured that at ~89% of 8-graph commit
+  latency (aggregate throughput *inverting* past 4 committers), and
+  the #263 release comparison showed the same fingerprint in the wild:
+  commit-per-op −34%, concurrent-rw −34%, restore-replay −21% since
+  3.0.0. The durable watermark is now cached on the graph object (an
+  already-covered id returns lock-free with no I/O; steady state is
+  one compare + one write, the disk read happens once per graph
+  object) and the lock is per-graph — each graph has its own watermark
+  file, so the global lock protected nothing cross-graph and is
+  removed. The raw test writer `%write-highest-transaction-id` keeps
+  the cache mirroring disk, so fabricated rewinds stay honest.
+  Monotonic semantics are unchanged.
+
+### Added
+
+- **`graph-db/gui`: the explorer frontend** (#271, epic #106). The
+  cockpit's main region is now the Bloom-style neighborhood explorer:
+  clicking a vertex-type row in the stats pane fetches the bounded
+  node sample and shows a pick-list; picking a node seeds the
+  cytoscape canvas. Double-click (or the inspector's Expand button)
+  fetches `/neighborhood/:id` and merges it additively — dedup by id,
+  never a canvas reset — settled by an incremental cose layout that
+  pre-places new nodes around their anchor. Single-click opens the
+  inspector dock (type, full id, slots table, in/out edge counts for
+  vertices; type/from/to/slots for edges), fetched on demand from
+  `/node/:id` with a stale-response guard. Right-click removes an
+  element view-locally (connected edges drop with a node); Clear
+  empties the canvas; switching or closing the selected graph clears
+  canvas + inspector. Node colors derive deterministically from the
+  type name (hash → hue, stable across sessions); edges carry
+  direction arrows and show their type on hover. Server `truncated`
+  flags surface as a status-bar notice naming the limit, beside a
+  live node/edge count. Strictly read-only. The one vendored library
+  is `gui/static/vendor/cytoscape.min.js` (3.34.2, MIT, UMD — loaded
+  by a classic script tag, the sole window-global exception) with
+  `VENDOR.md` recording version/source/license/upgrade; still no
+  build step, no npm, no CDN. gui-test now pins the new assets'
+  paths, content types and the vendored file's size. Also fixes a U1
+  defect the explorer smoke surfaced: `/node/:id` for an edge id
+  500'd once the id-keyed node cache made `lookup-vertex` return the
+  cached edge — `api-graph-node` now branches on the object's class
+  (edge card, not a vertex crash) and an edge id as neighborhood
+  center is a clean 404; both paths gain gui-tests.
+
+- **`graph-db/gui`: the cockpit frame frontend** (#270, epic #106).
+  The placeholder page is now the real single-page frame: a roster
+  pane (every known store with open/closed badge, recorded location,
+  per-graph Open/Close buttons, manual Refresh — no polling; engine
+  error text, including the dirty-store 409 report, surfaces verbatim
+  in a dismissible error strip) and a stats pane for the selected
+  graph (totals, per-type count table, views, indexes, human-readable
+  on-disk size, schema summary). Plain HTML/CSS/ES modules under
+  `gui/static/` — no build step, no framework, no external assets.
+  The explorer canvas and inspector regions are placeholders U3
+  (#271) fills. A new gui-test check pins each shipped asset's path
+  and content type. The manual's GUI section now describes the served
+  page and warns that a non-loopback `:bind` (e.g. a tailnet address)
+  exposes the unauthenticated API and management verbs to that
+  network; the `start-gui` docstring carries the same caveat.
+
+- **`graph-db/gui`: the web cockpit's backend** (#269, epic #106).
+  A new optional subsystem serving a JSON management/exploration API
+  and static frontend assets over ningle/clack: `start-gui`/`stop-gui`
+  (port 4270, loopback-bound by default), a store roster derived from
+  the store registry + clock-journal `:attach` records (falling back
+  to the open-graph table without a system directory), open/close
+  management verbs (dirty stores answer 409 with the condition's
+  report), per-graph stats, type inventory, bounded node samples, node
+  inspection, and a snapshot-consistent `neighborhood` batch endpoint
+  for the explorer. Reads resolve the graph by name per request — the
+  GUI holds no graph state — and `rest.lisp` is untouched. Tested by
+  the new `graph-db/gui-test` FiveAM suite over real HTTP (drakma).
+  Manual: the "GUI cockpit" section beside Chapter 9.
+
+- **The perf-vs-profiling split is documented** (#255). Chapter 19 of
+  the manual (`docs/vivace-graph-v3-doc.org`) now states which
+  measurement system answers which question — `tests/perf/`
+  (throughput trends, "did it get slower?", baselines + `check-perf`)
+  vs `profiling/` (where-time-goes, "why is it slow?",
+  sprof/sb-profile harness) — and how to run each. New
+  `tests/perf/README.md`; `profiling/README.md` and CLAUDE.md point at
+  the chapter and at `docs/perf-baselines.md`.
+
+- **Release-baseline measurement record** (#263). Three-tree perf
+  measurement (v2.1.1 / v3.0.0 / experiment, each running its own
+  suite; comparison over the byte-identical-verified intersection) on
+  one host, medians of three interleaved runs: reads/scans/queries
+  flat-to-better since 3.0.0, commit-heavy cells regressed 14-34% —
+  the #177 watermark cost, corroborating #237's fix. Raw reports and
+  the dated comparison live in `tests/perf/results/release-*` and
+  `release-comparison-2026-08-27.md`.
+
+- **Perf regression detection** (#253). Perf reports are now stamped
+  with a suite generation (`*perf-suite-generation*`) and a sanitized
+  host name; `bless-perf-baseline` copies a `:normal`-scale report to
+  the committed per-host/per-generation baseline
+  (`tests/perf/results/baseline-<host>-g<gen>.report`), and
+  `check-perf` gates a run against it with per-metric-class tolerance
+  bands (15% default, per-label overrides for known-noisy benches;
+  missing labels fail, new labels are reported unbaselined). Comparing
+  across host, generation, or scale is refused. Measurement-only
+  remains the default (`:error-p t` opts into signalling). Ritual in
+  `docs/perf-baselines.md`; first blessed baseline (host `odm`, g4)
+  committed.
+
+- **`store-not-closed-cleanly-error`** (#246). The `.dirty` refusal is
+  now a named, exported condition with a `store-not-closed-location`
+  reader, signalled by both `open-graph` and `make-graph`; its report
+  carries the recovery procedure (delete the marker and reopen —
+  `open-graph` then runs recovery itself). Behavior change for callers
+  that matched the old anonymous `error` by message text ("graph not
+  closed properly"): handle the condition type instead. `handler-case`
+  on plain `error` still catches it.
+
+- **`type-registry-package-missing-error`** (#195). A type-registry
+  record naming a package absent from the image used to re-signal as a
+  generic "malformed type registry record" wrapping a reader error, so
+  `make-graph`/`def-vertex` in an image that had not loaded every
+  contributing package failed without naming the actual constraint.
+  `%registry-load` now signals this named condition instead, carrying
+  the missing package name and the registry file, with the remedy in
+  its report (load the system that defines the package first).
+  Torn-final-record tolerance is unchanged — a tail cut mid-symbol is
+  still dropped with a log, whatever error it raises — and genuinely
+  malformed records still signal the malformed-record error. The
+  operational requirement itself is now documented in the manual's
+  type-registry chapter. (Option 2 — lazy per-record interning — is
+  deferred pending a format decision.)
+
+- **`schema-graph-name-cross-file-style-warning`** (#198). Test files
+  isolate reloads by clearing their graph name's entry in
+  `*schema-node-metadata*` at load time; two files claiming one graph
+  name therefore silently erase each other, with the failures landing
+  in the innocent file. Registration now records which loaded file
+  registered which types per graph name, and warns — naming BOTH
+  files — when a registration finds that another file's types under
+  the name have all vanished. Same-file reloads, REPL/runtime
+  definitions, and a second file merely *adding* types stay silent on
+  clean sequential loads; a warm-image reload of the owning file may
+  warn transiently — its own clear discards the adder's types — until
+  the later files reload too.
+
+- **GC mark-phase enumeration regression test** (#194).
+  `map-type-index-list-addresses` has been wrong twice (#166, #186),
+  both times caught only by incidental tests. A new test pins the
+  invariant by name against a store whose type-ids are sparse and
+  non-contiguous (placed via `%registry-adopt`, the registry-assigned
+  shape): every node of every type must survive `gc-heap`, verified
+  down to the allocation table. Dropping any one id from the
+  enumeration fails it.
+
+- **#202 documented as policy.** The manual's renumbering section now
+  states that reconcile-at-open's tolerance of an orphaned occupied id
+  at/below the registry mark is a policy choice, not a reachability
+  proof — a later `%registry-adopt` can bind another symbol to that
+  id, after which registry-derived views (e.g. peer type tables)
+  misread that store at that id; the remedy is the documented
+  renumbering migration.
+
+- **`compact-edges` `:policy` keyword** (#208, #209). The default
+  `:conservative` compacts exactly what it always did (soft-deleted
+  edges, provably-missing endpoints); `:policy :trust-tags` additionally
+  compacts endpoints whose v8 tag the registry never assigned
+  (`:unknown`) or whose tag resolves to an open store that lacks the
+  vertex (`:absent-in-store`) — treating this system's tag space as
+  authoritative. It is refused with `compact-trust-tags-on-peer-error`
+  on a peer graph, whose tables hold device-minted foreign tags, and a
+  `:detached` endpoint (registered store, not open) is never compacted
+  under either policy; `:trust-tags` is likewise refused
+  (`compact-trust-tags-no-registry-error`) when no store registry is
+  loaded, since `:detached` is then indistinguishable from `:unknown`.
+  `%active-endpoint-status` now returns the full five-way
+  classification instead of collapsing everything non-provable into
+  one `:unknown` bucket; `active-edge-p`'s visible behavior is
+  unchanged. `compact-edges` (and `map-edges`' emit filters) now
+  resolve endpoint liveness against the explicit graph argument
+  rather than the dynamic `*graph*` — the wrong-graph audit's defect
+  shape, latent here.
+
+### Removed
+
+- **`dso-lex` dependency** (#240). It was dropped from Quicklisp between
+  the 2025-06-22 and 2026-01-01 dists, which made `graph-db/algorithms-io`
+  (and with it `graph-db/algorithms-test`) unloadable on a current dist —
+  the "Known issues" entry under 3.0.0 below. Its only use, the GML
+  tokenizer `SCAN-GML`, is now a plain hand-rolled function with the same
+  `(values class image remainder)` contract, including the silent-NIL
+  result for an unterminated quoted string. `cl-yacc` (still in the dist)
+  remains the GML parser. New lexer unit tests pin the token stream.
+
+### Fixed
+
+- **The memory constructors mirror the disk side's open hygiene**
+  (#230). `make-memory-graph`/`open-memory-graph` now normalize a
+  slashless `location` namestring at the boundary (the #222 shape:
+  a file pathname used to scatter the `tx/` journal and `applied-ops/`
+  sidecars into the store's *parent* directory), and both run under an
+  abort guard (the #224 shape, `%abort-memory-graph-open`): a
+  construction that fails partway closes the replication-log stream, a
+  peer's applied-op-ids table and any restored vector segments,
+  deregisters the graph, and removes the `.dirty` marker — but only
+  when *this* call wrote it; a pre-existing marker (an earlier crash's
+  record) is left in place. Once `graph-open-p` is set the guard
+  unwinds through the normal `close-graph` path instead — which
+  removes the marker regardless of provenance, harmless on a memory
+  graph since opens never gate on it — and subsumes the constructors'
+  previous attach-only unwind.
+
+- **Memory peer-hub: the clock attach now precedes
+  `start-replication`** (#238). Both memory constructors used to start
+  replication before attaching to the system clock, leaving a
+  microseconds-wide window in which a peer hub's live listener could
+  re-home an inbound push with ids minted from the pre-attach local
+  counter (the #180 bug class). The attach now runs between
+  `(setf (graph-open-p ...) t)` and `start-replication`, so the window
+  is gone — and a failed attach never has replication threads to tear
+  down. The disk constructors already attached first and are
+  unchanged.
+
+- **`make-graph` refuses a `.dirty`-carrying location upfront** (#246).
+  It used to create `heap.dat`, both linear-hash tables, `indexes.dat`
+  and the three adjacency-index directories before dying on a raw
+  `FILE-ERROR` when writing the marker — and that error then unwound
+  into the GH #224 abort path, which deleted the operator's
+  pre-existing `.dirty`, destroying the very evidence that recovery
+  was needed. It now probes right after
+  location normalization — before any side effect — and signals
+  `store-not-closed-cleanly-error`, since a `.dirty` there means either
+  a live holder or a crashed store, and creating over either is wrong.
+  The memory-graph open path is unchanged (it deliberately supersedes
+  the marker; see the manual's in-memory chapter, which now states that
+  cross-process exclusion is the application's responsibility there).
+
+- **`close-graph` no longer signals `FILE-ERROR` after a successful
+  close when the `.dirty` marker is already gone** (#246). The final
+  marker delete was unguarded, so a marker removed mid-session made a
+  fully completed teardown report failure. The delete is now
+  attempt-and-catch (no TOCTOU window): when the marker is absent, the
+  close completes and signals `dirty-marker-already-gone-warning` (a
+  named, exported warning with a `dirty-marker-already-gone-location`
+  reader) — a missing marker at close time is itself a signal something
+  odd happened, but the close did succeed.
+
+- **Unregistered CLOS mixin superclasses no longer break the peer type
+  table** (#216). `%peer-type-direct-supers` emitted every non-base
+  direct superclass name, so a plain-CLOS mixin that `def-vertex`/
+  `def-edge` never registered appeared in a row's SUPERS with no row of
+  its own, and `%peer-validate-type-table-rows`' closure check refused
+  to encode the table — on the hub's auth-ok path and the device path
+  alike. Unregistered superclasses are now spliced out of SUPERS,
+  replaced by their nearest *registered* ancestors (a node type may
+  inherit through such a mixin from a registered type, and dropping the
+  mixin outright would sever that chain on the wire). The validator
+  itself stays strict: a dangling SUPERS reference is still a refusal.
+
+- **Legacy v5 cross-store edges are no longer filtered as inactive**
+  (#208). `active-edge-p` (and so `map-edges`/`edge-exists-p`) now
+  falls back to the all-open-stores scan for an untagged v5 endpoint
+  that misses the local table — but only when another store is
+  actually open, keeping the single-store hot path's short-circuit
+  (the scan measures ~3.5 µs per open store). `resolve-node-graph`'s
+  docstring and `dangling-edge-warning`'s report now state the
+  resolver trust boundary: a store tag indexes THIS system's registry,
+  so a foreign-minted id resolves unsoundly (#209).
+
+- **`remove-from-index-list` looped forever on a lazily-deleted cell**
+  (#242, found on #208). Deleted pcons cells stay in the chain (removal
+  only flags
+  them), but the walk never advanced past one, so any removal that met
+  an earlier removal's cell spun forever. Latent since the beginning —
+  reachable only through `compact-edges`, which had zero test coverage;
+  exposed by its first tests on this unit.
+
+- **Clock/journal hygiene batch** (#184, #178, #177, #183, #179, #180,
+  #176, #212, #234):
+  - `JOURNAL-APPEND` reads the epoch *inside* the clock lock, and
+    attach (watermark raise + `:ATTACH` record) and detach (lease +
+    `:DETACH` record) each hold the clock lock across both steps, so
+    journal records always land in `:EPOCH` order (#184). Lock
+    ordering is manager → clock, never the reverse.
+  - `JOURNAL-APPEND` normalizes its `:STORE` property to a keyword,
+    and the restore scans normalize both journal-read `:STORE` values
+    (tolerating pre-fix records) and live graph names when comparing —
+    a graph named by a user-package symbol now round-trips through the
+    journal and is found by `RETIRED-GENERATIONS`/`RESTORE-SYSTEM`
+    (#178).
+  - `PERSIST-HIGHEST-TRANSACTION-ID` is monotonic: it locks around the
+    whole read-compare-write and never rewinds `transaction-id.dat`;
+    the raw overwrite survives as the internal
+    `%WRITE-HIGHEST-TRANSACTION-ID` for crash-fabricating tests
+    (#177).
+  - `GRAPH-SYSTEM-CLOCK` is now a reader-only export (writer internal:
+    `%GRAPH-SYSTEM-CLOCK`), so `ATTACH-TO-SYSTEM-CLOCK`'s watermark
+    and journal record cannot be bypassed by `SETF` (#183); the
+    `TM-NEXT-EPOCH`/`TM-CURRENT-EPOCH`/`TM-PEEK-EPOCH` helpers are
+    unexported (#179).
+  - `MAKE-GRAPH :SLAVE-P T :REPLAY-TXN-DIR` under a system clock
+    (explicit or via `*SYSTEM-CLOCK*`) is refused before any side
+    effect — replay would mint ids from the local counter before the
+    clock attaches (#180).
+  - `MAKE-MEMORY-GRAPH`/`OPEN-MEMORY-GRAPH` take `:SYSTEM-CLOCK`
+    (default `*SYSTEM-CLOCK*`) and attach like the disk constructors,
+    so memory graphs no longer silently opt out of the image clock; a
+    failed attach unwinds through the normal `CLOSE-GRAPH` instead of
+    leaving a half-registered graph (#176).
+  - A failed `ATTACH-TO-SYSTEM-CLOCK` after a successful reopen inside
+    `SWAP-IN-SHADOW`/`%REOPEN-AND-RESUME` closes the just-opened graph
+    before propagating, so the recovery path no longer dies on the
+    stranded `.dirty` marker (#212). The other #212 shape — a missing
+    `:SWAP` record after a post-rename journal failure — remains
+    tolerated as warnings on both the write and read sides.
+  - shadow-store's `policy.dat`/`lease.dat` and system-restore's
+    manifest now use the shared `WITH-SIDECAR-OUTPUT`/`-INPUT`
+    discipline instead of partial `*PRINT-READABLY*`/`*READ-EVAL*`
+    bindings, surviving hostile ambient printer/reader bindings
+    (#234).
+
+### Changed
+
+- **Domain-neutral example vocabulary** (#197). Production source, tests,
+  the profiling suite, and the manual now use domain-neutral example
+  vocabulary throughout; eleven dated design documents moved to the
+  downstream application's private repository.
+
+- **Test scratch space is now self-cleaning** (#214). All FiveAM suites
+  route their scratch (per-test directories, loose files, each runner's
+  system directory) through a new shared `GRAPH-DB/TEST-SCRATCH` system:
+  everything lives under one lazily created per-run parent,
+  `$TMPDIR/graph-db-test-run-<tag>/`, which each runner deletes whole in
+  its unwind — a killed or crashed run leaks exactly one tree instead of
+  hundreds of flat `graph-db-test-*` entries. Creating the parent also
+  sweeps the temp root once per run parent for stale scratch (an exact
+  whitelist of `graph-db-*`/`gda-*`/`vgseg-*`/`vgquery-*` name prefixes;
+  symlinks are skipped, never followed) older than 24 hours
+  (`SWEEP-STALE-SCRATCH`), so leaked trees from aborted runs no longer
+  accumulate (1.2 TB was observed once). The age guard keeps concurrent
+  runs on a shared host safe. Manual cleanup:
+  `rm -rf ${TMPDIR:-/tmp}/graph-db-* ${TMPDIR:-/tmp}/gda-*` (plus
+  `vgseg-*`/`vgquery-*` loose files).
+
+- **`DEF-NODE-TYPE` now installs through a shared functional core**
+  (#172). The macro's expansion keeps only the literal `DEFCLASS`; the
+  generated helpers (`MAKE-<N>`, `LOOKUP-<N>`, `<N>-P`), the `<N>/2` and
+  `<N>/3` Prolog functors for edge types, the `*SCHEMA-NODE-METADATA*`
+  registration and the instantiation into an open default store all run
+  in `%INSTALL-NODE-TYPE`, so a later runtime path can build a class
+  from persisted metadata and get exactly the same installation. No
+  behaviour change for source-defined types: the helpers are closures
+  installed with `(SETF FDEFINITION)` instead of compiled `DEFUN`s, and
+  the functor symbols are now interned in the class symbol's own
+  package rather than the expansion-time `*PACKAGE*` — identical for
+  every ordinary `DEF-VERTEX` / `DEF-EDGE`, where the class symbol is
+  read into the defining package. Functors are still installed under
+  both `FDEFINITION` and `*PROLOG-GLOBAL-FUNCTORS*` and exported, as
+  `DEF-GLOBAL-PROLOG-FUNCTOR` did.
+
+### Fixed
+
+- **`CALL-WITH-READ-SNAPSHOT` could leak a registered transaction or a held
+  read-epoch pin, wedging the reaper forever** (#181, #211). It acquired its
+  transaction (`CREATE-TRANSACTION`, which registers the tx) and its read
+  pin (`PIN-READ-EPOCH`) as two separate `LET` bindings *before* entering
+  the `UNWIND-PROTECT` that releases them. A signal from either call left
+  whatever the prior call had already acquired stranded: the tx stayed
+  `:active` in the manager's table forever, so `MINIMUM-START-TRANSACTION-ID`
+  never returned NIL again and the reaper's floor never advanced. #211's
+  concrete trigger is a `%QUIESCE-TRANSACTION-MANAGER` flip (#170) landing
+  in the window between the two calls, making `PIN-READ-EPOCH` signal
+  `STORE-NOT-ACCEPTING-ERROR` after the tx was already registered. Fixed by
+  acquiring progressively inside nested `UNWIND-PROTECT`s, each covering its
+  resource from the instant it succeeds, so a later cleanup signal (e.g. from
+  `REMOVE-TRANSACTION`) cannot skip an earlier one (`UNPIN-READ-EPOCH` no
+  longer depends on `REMOVE-TRANSACTION`'s outcome at all). New suite
+  `read-snapshot-leak-suite` reproduces both leak arms via `FDEFINITION`
+  swaps and asserts the pre-fix failure mode is impossible.
+
+- **`MAKE-GRAPH`/`OPEN-GRAPH` accepted a slashless `LOCATION` and scattered
+  its sidecar files into the parent directory** (#222). Every sidecar built
+  with `(MAKE-PATHNAME :defaults (LOCATION GRAPH))` -- `.dirty`, `heap.dat`,
+  `schema.dat`, and the rest -- depends on `LOCATION` being a *directory*
+  pathname; a trimmed namestring kept it as a *file* pathname instead, so
+  those sidecars landed next to the store rather than inside it. Both
+  functions now normalize `LOCATION` once, via `UIOP:ENSURE-DIRECTORY-
+  PATHNAME`, before any use -- the same fix `%REOPEN-AND-RESUME`
+  (`shadow-store.lisp`, #171) already applied locally, generalized to the
+  entry points themselves so every caller gets it for free.
+
+  ⚠ **Upgrade note.** A store originally *created* through a slashless
+  `LOCATION` has `transaction-id.dat`, `lamport.dat` (peer graphs) and
+  `pull-cursor.dat` (peer devices) -- among others -- sitting in its
+  PARENT directory, not inside the store. After this fix, `OPEN-GRAPH`
+  looks for them inside the store and will not find them: the
+  transaction-id watermark and, on a peer graph, the durable Lamport
+  clock and pull cursor all silently reset to their zero/absent
+  defaults on the next open. Before upgrading a store you know was
+  ever created or reopened with a trailing-slash-free `LOCATION`,
+  manually move any of those files sitting beside the store directory
+  (check the PARENT of `LOCATION` for `.dirty`, `heap.dat`,
+  `schema.dat`, `transaction-id.dat`, `lamport.dat`, `pull-cursor.dat`,
+  `policy.dat`) into the store directory itself first. A store that
+  was always opened with a trailing slash is unaffected.
+- **An aborted `MAKE-GRAPH`/`OPEN-GRAPH` leaked every fd it had already
+  opened** (#224). Neither function had any teardown on a non-local exit
+  partway through -- a `STORE-ID-COLLISION-ERROR` or any other failure left
+  the heap, indexes, vertex/edge tables and ve/vev indexes already opened
+  memory-mapped and open, and could leave the graph half-registered in
+  `*GRAPHS*`. `MAKE-INSTANCE` evaluates its initarg value-forms before it
+  runs, so a failure partway through that argument list left the
+  already-opened ones reachable from nothing but a local variable; the
+  open-sequence in both functions now binds each resource to a name and
+  tracks it in a small mutable list *before* handing it to `MAKE-INSTANCE`,
+  so the list has every fd-bearing resource open at the moment of failure
+  regardless of where in the sequence it happens. Both functions now run
+  their body under `UNWIND-PROTECT`, and a new `%ABORT-GRAPH-OPEN` best-
+  effort closes (`IGNORE-ERRORS` per component, tolerating slots still
+  unbound) everything the partial open acquired, and deregisters the graph
+  from `*GRAPHS*`/the open-store vector if that ran before the failure. The
+  signalled condition always propagates unchanged. The teardown also
+  stops replication before closing anything else (a master's accept
+  thread and listening socket must not outlive the mmaps they
+  reference) and closes every vector segment `RESTORE-VECTOR-SEGMENTS`
+  had already opened (each is marked dirty-on-disk the moment it
+  opens, so leaving one open forces a full rebuild-from-nodes on the
+  next open). One rule needs stating explicitly: the abort deletes a
+  `.dirty` marker only when nothing that can mutate an EXISTING
+  store's heap has run yet (`OPEN-GRAPH`'s recovery/rebuild steps,
+  `MAKE-GRAPH`'s WAL replay for a slave). Once one of those has run,
+  `.dirty` is deliberately left in place -- the store now genuinely
+  needs recovery, and deleting the sentinel would let a later open
+  adopt stale index roots against the now-mutated heap with no
+  recovery pass to catch the mismatch.
+- **Every line-oriented sidecar file (type registry, store registry,
+  edge-occupancy hint, schema manifest, system journal) now shares one
+  print/read control-set discipline** (#226). The writers previously
+  bound only `*PRINT-READABLY*`/`*PRINT-PRETTY*`/`*PACKAGE*` and the
+  readers only `*READ-EVAL*`, leaving `*PRINT-LENGTH*`, `*PRINT-LEVEL*`,
+  `*PRINT-BASE*`, `*PRINT-RADIX*`, `*PRINT-CIRCLE*`, `*PRINT-CASE*`,
+  `*READ-BASE*` and `*READTABLE*` to whatever a caller had ambient --
+  these writers are reachable from arbitrary application code (e.g.
+  `CREATE-VERTEX-TYPE`), so a caller with any of those rebound could
+  write a truncated, elided, or wrong-radix line the tolerant readers
+  would then silently drop. New `WITH-SIDECAR-OUTPUT`/`WITH-SIDECAR-
+  INPUT` macros (`sidecar-io.lisp`) bind the full set; every named
+  writer/reader in `type-registry.lisp`, `store-registry.lisp`,
+  `type-occupancy.lisp`, `runtime-schema.lisp` and `system-clock.lisp`
+  (`JOURNAL-APPEND`/`JOURNAL-RECORDS`, whose #191 corruption/torn-tail
+  machinery is otherwise untouched) now uses them. Also fixes the
+  multi-line-string hazard the issue named: a legal slot-spec option
+  value (e.g. `:DOCUMENTATION`) containing a newline used to split a
+  manifest record across two lines; the edge-occupancy and schema-
+  manifest readers now read FORMS via `READ` (`READ-SIDECAR-FORMS`),
+  which spans an embedded newline naturally, instead of `READ-LINE`
+  splitting on it, while still tolerating a bad or torn record anywhere
+  in the file by resyncing to the next line boundary.
+- **A schema-manifest row that fails to `READ` -- most commonly a type
+  row naming a symbol in a package this image does not have -- is now
+  reported, not silently dropped** (#227). `READ-SCHEMA-MANIFEST`
+  signals `SIDECAR-RECORDS-SKIPPED` (file, count, first bad byte
+  position) once per read when any record was unreadable, as a
+  warning, never an error -- the existing drop-and-continue tolerance
+  is unchanged. `MATERIALIZE-SCHEMA`'s summary plist gains
+  `:SKIPPED-UNREADABLE`, counted from the read pass that runs after
+  `%MATERIALIZE-ORPHAN-PACKAGES` has had its chance to create a
+  missing *outer* type-symbol package, so the count reflects what is
+  still genuinely unreadable afterward -- e.g. #227's actual scenario,
+  an *interior* symbol (a `:CHECK` function name) in an unrelated
+  missing package, which the orphan-package pre-scan never looks at.
+- **`%POSIX-OPEN` created files with an arbitrary permission mode on Apple
+  arm64** (#218). `open(2)` is `int open(const char *, int, ...)`, and the
+  `mode` argument was passed through a plain `CFFI:FOREIGN-FUNCALL` — as a
+  *fixed* argument. On Darwin/arm64 variadic arguments use a different
+  convention, so the callee read `mode` from where nothing had written it:
+  `0140` and `0200` were both observed for a requested `0640`, on consecutive
+  runs. When the resulting mode omitted owner read/write, the next ordinary
+  `WITH-OPEN-FILE` on that path failed `EACCES` — and since the type registry
+  (#186) and the system clock (#182) both create their files this way, **no
+  graph in the image could be opened at all**, with a zero-byte file left
+  behind that reproduced the failure on every subsequent run. Now routed
+  through `CFFI:FOREIGN-FUNCALL-VARARGS`, which emits SBCL's variadic marker.
+  x86_64 was never affected (the two conventions coincide there), which is why
+  this reached a release: it presented as a broken developer machine rather
+  than a defect. `open` was the only variadic call in `posix.lisp`; the rest
+  (`flock`, `close`, `lseek`, `write`, `fchmod`, `rename`, `mmap`, `munmap`,
+  `msync`, `getpagesize`, `gettimeofday`) have fixed signatures and are
+  correct as written. Regression test asserts the created file's **mode** —
+  every previous test asserted only that the fd was valid, which is exactly
+  what a garbage mode still yields to its creator.
+
+- **`SYSTEM-CLOCK-SUITE`'s graph-creating tests never bound
+  `*SYSTEM-DIRECTORY*`** (#220), test-only. They passed under
+  `(ASDF:TEST-SYSTEM :GRAPH-DB)` only because `RUN-TESTS` binds it for the
+  whole run (#186); run standalone (e.g. bare `FIVEAM:RUN!`) 14 of them
+  signalled `SYSTEM-DIRECTORY-REQUIRED`. Added a `WITH-CLOCK-SYSTEM-DIR`
+  fixture, matching `TYPE-REGISTRY-SUITE`/`STORE-REGISTRY-SUITE`'s pattern.
+
+### Added
+
+- **A node type can now be defined at runtime, from data, and survive a
+  restart as a live class instead of only as metadata** (#172, unit 7 of
+  the namespaces epic, #110). `ENSURE-NAMESPACE` (name &key nicknames)
+  creates a package -- no files, no store -- as the functional twin of
+  writing a new `IN-PACKAGE`; `CREATE-VERTEX-TYPE` / `CREATE-EDGE-TYPE`
+  (name slot-specs &key parents default-store keep-revisions) are the
+  runtime twins of `DEF-VERTEX`/`DEF-EDGE`, building a class from a data
+  slot-spec list through the same `%INSTALL-NODE-TYPE` path a macro
+  expansion uses, so a runtime type is indistinguishable from a
+  source-defined one once built (redefining an existing name, runtime-
+  or source-defined, is ordinary CLOS redefinition, with the existing
+  #196 divergence warning on slot disagreement). `DEFAULT-STORE`
+  defaults to `NIL` -- "no default store" -- so a runtime type need not
+  commit to placement at creation; its generated constructor then
+  requires an explicit `:GRAPH`.
+
+  A system-level manifest, `schema-manifest.dat` beside the type
+  registry, records every namespace and type -- appended by both the
+  source and runtime installation paths, so it describes the WHOLE
+  schema, fail-safe like the #167 occupancy sidecar (no system
+  directory, or a torn/damaged file, degrades to in-image-only rather
+  than aborting a definition). `MATERIALIZE-SCHEMA` (dir &key
+  namespaces) is the load-order answer this manifest exists for: a
+  macro carrying its own `EVAL-WHEN`, placed in its own file between
+  the static schema and any file with methods on a runtime type, that
+  rebuilds every runtime-defined package and class from the manifest
+  before those methods compile -- the twenty-year blocker on this
+  feature. It is idempotent and **source wins**: a type whose class
+  already exists is left alone, with the #196 warning on divergence.
+  Nothing is evaluated -- the input is plists, the output is MOP
+  calls -- and it fails fast, before building anything, naming every
+  offender in one condition each: `MATERIALIZE-UNRESOLVED-FUNCTIONS`
+  for a `:CHECK` name the image does not provide, and
+  `MATERIALIZE-UNRESOLVED-PARENTS` for a row whose parent neither
+  exists nor is itself being built in this call (a half-built
+  materialization would otherwise leave stub classes that poison every
+  later attempt). Returns `(:NAMESPACES n :MATERIALIZED n
+  :SKIPPED-EXISTING n)`.
+
+  Behaviour is the one thing that never crosses the metadata boundary:
+  a closure does not serialize, so a runtime type that wants a
+  constraint names a function the image registers by code,
+  `REGISTER-SCHEMA-FUNCTION` (name fn) / `FIND-SCHEMA-FUNCTION` (name),
+  and the metadata stores only that name. The sole v1 consumer is a new
+  `:CHECK FN-NAME` slot option (accepted by `DEF-VERTEX`/`DEF-EDGE`
+  slot-specs too, for parity), enforced where value constraints already
+  are, NULL-exempt, violating with the existing condition's `:reason
+  :CHECK-FAILED`; presence is verified at `CREATE-*-TYPE` time
+  (signalling `SCHEMA-FUNCTION-UNRESOLVED` if the name is not yet
+  registered) and again at `MATERIALIZE-SCHEMA` time, resolution
+  happens at each check so a re-registration takes effect immediately.
+  Restart never evaluates data -- this is the invariant the whole unit
+  is built to hold.
+
+  Two read-only visibility tools close the opacity gap a runtime type
+  otherwise opens (a class with no source file, ungreppable): `DESCRIBE-
+  SCHEMA` (&key namespace store since stream) is a plain-text dump,
+  joining the manifest with live metas, grouped by namespace, one line
+  per type (kind, default store, a `[source]`/`[runtime YYYY-MM-DD]`
+  provenance tag) and one line per slot (name, type, `:CHECK` name);
+  `:SINCE` filters by record time, so the dump doubles as a change log.
+  `EXPORT-SCHEMA-SOURCE` (path &key namespace store) writes a generated-
+  header comment plus literal `DEFPACKAGE`/`DEF-VERTEX`/`DEF-EDGE` forms
+  reconstructed from the metadata -- a symbol foreign to the exported
+  namespace prints package-qualified so it re-reads to the SAME symbol
+  rather than interning a new one under the freshly created package,
+  which would silently break an EQ-keyed lookup like a `:CHECK` name.
+  This is the promotion path: loading the generated file is the
+  ordinary source path, idempotent (same names, same registry ids), and
+  turns a runtime type into a source-defined one for good. Export never
+  runs implicitly and the engine never reads the file back.
+
+  Not in this unit, deliberately: runtime type deletion/retraction,
+  runtime `DEF-VIEW`/index/unique definition (those macros stay
+  code-side), and an Emacs mode (the text dump is SLIME-usable as-is).
+
+  Final-review fixes (#172, review round 3): the manifest dedup cache
+  is now seeded from the on-disk file on a fresh image's first write,
+  so a reopen no longer re-appends every type row with a new `:time`
+  (previously `DESCRIBE-SCHEMA :SINCE` listed the whole schema after
+  any reopen); `CREATE-VERTEX-TYPE`/`CREATE-EDGE-TYPE`'s symbol-argument
+  path now refuses a CL-homed name before interning any slot into it,
+  instead of hitting SBCL's raw package-lock error; `EXPORT-SCHEMA-
+  SOURCE` now qualifies a bare symbol whose name shadows an external
+  `COMMON-LISP`/`GRAPH-DB` symbol (e.g. a slot named `TYPE`), which
+  previously round-tripped to the wrong symbol silently; `DESCRIBE-
+  SCHEMA`'s `:SINCE` string now parses at UTC, matching the UTC dates
+  it prints; and `ENSURE-NAMESPACE` refuses `COMMON-LISP`/`KEYWORD` (or
+  a nickname of either) the same way `CREATE-*-TYPE` already does.
+  `REGISTER-SCHEMA-FUNCTION`'s docstring and the manual now say
+  explicitly that a `:CHECK` function must be pure: OCC retry can run
+  it more than once per logical write.
+
+- **A store adopts a foreign class at first write; lookup of a class
+  registered in more than one store is deterministic** (#167). Writing a
+  node of a class via an explicit `:graph` that names a store other
+  than the class's declared default no longer requires that store to
+  have seen the class before: the first such write finds the class's
+  registered metadata, instantiates it into the target store under the
+  schema lock, and saves that store's `schema.dat` — the type is then
+  durably part of that store, surviving close and reopen like any type
+  declared there from the start. This is the mechanism behind "one
+  class, many stores" (cl-llm#20; #186). Because a class can be
+  registered under more than one store simultaneously,
+  `%find-registered-node-type` takes an optional preferred store and
+  checks that store's own registration first before falling back to a
+  full scan, so `:graph`-directed lookups resolve to the calling
+  store's own meta rather than whichever store a hash-table scan
+  happens to visit first.
+  Edge classes additionally maintain a store-occupancy hint,
+  `edge-type-stores` (name) — the list of stores known to hold a given
+  edge class, or `NIL` for "no hint, sweep everything." It is updated
+  at the same instantiation point that adoption uses, so both a
+  class's declared-store write and a lazy cross-store adoption keep it
+  current. The hint is a best-effort, append-only sidecar
+  (`edge-occupancy.dat`, beside the type registry) that fails safe: a
+  missing system directory, an unreadable or torn file, or a never-
+  written class all answer `NIL`, and a failed append degrades to
+  in-image-only for the session rather than aborting the write that
+  triggered it. Nothing in this change consumes the hint for query
+  routing — that is left to the ontology/cross-store query work.
+
+- **New node ids are tagged UUIDv8, carrying a 12-bit store field** for
+  O(1) cross-store resolution; existing v5 ids are unchanged and a v5
+  id still resolves via a per-open-store scan, so there is no flag
+  day. The tag is a stable numeric id from a new append-only
+  `store-registry.log` in the system directory (one entry per
+  graph-name, never reused). `resolve-node-graph` reports
+  `:resolved`/`:detached`/`:unknown`; `lookup-vertex-anywhere` returns
+  the vertex, an `unresolved-node` marker for a registered-but-closed
+  store, or (with `:if-detached :error`) signals
+  `store-detached-error`. `traverse` surfaces a cross-store endpoint or
+  a detached-store marker in its results without walking past it —
+  continuing across stores is left to a follow-on. `active-edge-p`
+  resolves cross-store endpoints too, with two narrow, documented gaps
+  (no cross-store scan for an untagged v5 endpoint; an unregistered tag
+  counts as live) tracked as #208. `backup` now includes a dangling
+  cross-store edge rather than dropping it, and warns with
+  `dangling-edge-warning` naming the edge, the missing endpoint and its
+  store; a backup with no cross-store gaps never warns. (#169)
+
+- **Detach a store, bulk-load a shadow copy, and swap it in — all in-process,
+  with only two brief unavailable windows.** `detach-store` quiesces a
+  graph (refuses new transactions and read pins, drains in-flight ones),
+  leases a range of its system clock's epoch space via
+  `clock-lease-epochs`, journals `:detach`, closes it durably, and
+  returns a `store-detachment` handle; `reattach-store` reopens it and
+  rejoins the ambient `*system-clock*`. `shadow-store` takes a
+  consistent copy for a bulk load while the store keeps serving reads:
+  quiesce, close, recursive sparse-preserving copy to
+  `<location>-shadow/` (reservations are unwritten holes, so an empty
+  multi-gigabyte store copies in seconds, not by materializing every
+  reserved byte), reopen the live store and resume service — left
+  **read-only** (Kevin's ruling: a write during the shadow window signals
+  `store-not-accepting-error` with reason `:shadow-load` rather than
+  being silently dropped) until the caller calls `swap-in-shadow` or
+  `abandon-shadow`. A copy failure reopens the original store and
+  restores full service before re-signalling. `open-shadow-graph` opens
+  the copy as an unregistered graph, under the live store's own name and
+  store-id (so ids minted there resolve back to the live store), against
+  a leased `(start . end)` epoch range persisted in `lease.dat`; its
+  allocation cursor is always derived fresh from the shadow's own
+  highest committed transaction id, never from a separately persisted
+  cursor, and an already-exhausted range signals
+  `epoch-lease-exhausted` immediately rather than wrapping or
+  colliding. `swap-in-shadow` promotes the shadow: quiesce, close,
+  rename the live directory to `<location>-retired-<epoch>` **first**,
+  then rename the shadow into the live location — that second rename,
+  not the best-effort `:swap` journal record after it, is what "the
+  swap happened" means (a crash between the two renames is out of scope
+  here, tracked as #171/#212) — and reopens the new generation.
+  `discard-shadow` deletes a shadow tree (hard-gated on a `-shadow`
+  suffix) and `abandon-shadow` combines that with restoring the live
+  store to full service.
+
+  **Recovery policy licenses a fast, non-transactional load.** A store's
+  `policy.dat` (`store-recovery-policy` / `set-store-recovery-policy`,
+  default `:authored`) records whether a crash mid-load can simply be
+  repaired by redoing it (`:derivable`) or whether its writes are the
+  only durable record (`:authored`). `make-graph :recovery-policy`
+  writes `policy.dat` at creation; `open-graph :recovery-policy` is
+  only a hint once the file exists — a disagreeing value signals
+  `recovery-policy-mismatch-warning` (naming the location, the
+  requested policy and the on-disk one) rather than overwriting it.
+  `open-shadow-graph :fast-load t` suppresses the `.txn` file and
+  replication log for the shadow's transactions, but only when the
+  shadow's copied policy says `:derivable`; otherwise it signals
+  `fast-load-requires-derivable` rather than silently keeping the
+  store's only record on an unsuppressed WAL.
+  **`presize-vector-segment`** turns a bulk load's
+  vector-segment capacity hazard into an upfront allocation instead of a
+  mid-apply failure discovered after some writes are already durable;
+  `open-shadow-graph :expected-vectors n` applies it to every segment
+  the shadow's graph object carries.
+
+  V1 ships in-process only — no separate loader process — with the
+  epoch lease already shaped to carry that later without a redesign.
+  (#170)
+
+- **Whole-system restore across a shadow swap.** `retired-generations`
+  lists every `<location>-retired-<epoch>` directory a system's clock
+  knows about, joined to its journal record where one exists (a
+  directory with none is reported `:journaled nil` and warns
+  `swap-record-missing-warning`, the #212 shape; a record with no
+  directory is `:present nil`). Each generation carries its ERAS — the
+  half-open `[from, to)` intervals of content it actually held, which
+  keeps working across a restore-then-swap chain where a promoted
+  directory is later retired again under a new name.
+  `prune-retired-generations (clock floor &key discard-derivable
+  dry-run)` deletes generations at or before `floor`; an `:authored`
+  generation still inside the window is refused by name
+  (`retention-required-error`) rather than silently discarded, and a
+  `:derivable` one is kept unless `:discard-derivable t`.
+  `plan-system-restore` / `restore-system (clock epoch &key
+  require-exact rebuild timeout)` restore every affected store to the
+  generation live at `epoch`, at generation granularity — the swap is
+  the *generation* mechanism, and `snapshot`/`replay` remains the sole
+  mechanism for content *inside* a generation (this does **not**
+  supersede it; point-in-time rewind inside a generation is a separate
+  follow-up). A retained generation frozen at or before `epoch` is
+  exact; one frozen later is used anyway and reported `:exact nil`
+  unless `:require-exact t` refuses instead. A `:derivable` store with
+  no retained generation is rebuilt by a caller-supplied `(lambda (name
+  graph) ...)`, cascading to any `:derivable` dependent whose edges
+  point into the rebuilt store's tag (an `:authored` dependent is left
+  alone and reported `:dangling n`). Every refusal — an authored
+  generation gone, no rebuild callback, the store not open, a
+  replicated/peer graph (v1 is plain-graph-only), an inexact result
+  under `:require-exact`, or a stranded interrupted swap — surfaces as
+  one `restore-refused-error` naming every `(store . reason)` before
+  any rename happens, `:authored-generation-missing`
+  `:no-rebuild` `:not-open` `:unsupported-graph` `:inexact`
+  `:interrupted-swap`. A manifest (`(:restore t :requested ... :at ...
+  :clock ... :stores (...))`) is written to `restore-<epoch>.manifest`
+  and returned; `read-restore-manifest` reads it back with
+  `*read-eval*` nil. `repair-interrupted-swap (clock name location)`
+  fixes the one window `swap-in-shadow` (#170) cannot recover from
+  itself — a crash between its two renames — by renaming the stranded
+  generation back and journaling `:swap-aborted`; restore refuses to
+  start against a store in that state and names the tool. (#171)
+
+- Defining one class name in two stores with *different* slot sets now
+  signals `divergent-node-type-redefinition` (a `style-warning`): both
+  definitions name one CLOS class, so the last one loaded determines the
+  slots and the earlier store's data becomes unreachable through the API
+  (the GH #53 failure). Identical slot sets — the multi-store feature —
+  stay silent. (#196)
+
+- **A store's persisted type-ids are reconciled with the registry at open,
+  or the open is refused** (#186). This is the invariant the rest of the unit
+  assumed and nothing established. `instantiate-node-type` keeps a persisted
+  id without telling the registry and mints a new one from a counter that has
+  never seen that store's ids, so the ordinary upgrade — open an existing
+  store under a fresh system directory, then ship one more `def-vertex` —
+  minted an id the store already used and `update-node-type` overwrote it:
+  every persisted node of the first type then materialised as the second,
+  silently. `reconcile-schema-with-registry` now runs before the schema
+  replay on every open. A type the registry has never seen, at an id nothing
+  else claims, is **adopted** (a single-store deployment therefore needs no
+  operator action at all); a type the registry gives a different id, or an id
+  it gives to a different type, signals the new
+  `graph-db:store-registry-conflict`, naming both sides and pointing at
+  `registry-seed-from-stores`. It is also what makes the peer type table
+  honest — the table is the registry while the wire carries store ids.
+
+- **`graph-db:with-schema-frozen`** (#186) opens a store exactly as it stands
+  on disk, replaying no schema and checking no ids. The supported way to
+  *read* a store the registry contradicts — a class census, a backup, the
+  before-and-after of an adoption run — which an ordinary open now refuses.
+  Writes made through a frozen open go out under the store's own ids.
+
+  **It may read such a store; it may not serve one.** `start-replication`
+  signals the new `graph-db:frozen-graph-cannot-replicate` for a master,
+  slave or peer graph opened frozen. Every transport puts raw type-ids on the
+  wire, so a frozen hub would ship a type table built from the *registry*
+  while its node heads carried the store's contradicted ids — and the damage
+  would land on a remote peer, where no local guard can see it.
+
+- **A replication handshake refuses a peer whose type registry disagrees**
+  (#186). After `:auth-ok`, a device compares the hub's type table against
+  this image's registry and signals
+  `graph-db::peer-type-registry-conflict-error`, closing the session and
+  naming every conflicting symbol package-qualified. Both directions are
+  checked, because neither subsumes the other: *one name at two ids* (a node
+  arriving under the hub's id would materialise as some other class here) and
+  *one id at two names* (the hub's type is unknown in this image and its id
+  already means a local type). This is deliberately not a reconciliation —
+  agreeing at a handshake would mean rewriting every node of the losing type
+  because a network event said so. A hub too old to ship a table sends no
+  `:type-table` key and cannot be compared, so it is still trusted; that path
+  is kept for pre-#186 hubs. See docs/vivace-graph-v3-doc.org, Chapter 16,
+  "Type-ids on the wire, and the handshake that refuses a disagreeing peer".
+
+- **The peer type-table encoder refuses a type-id the wire cannot carry**
+  (#186). The registry assigns 32-bit type-ids while the table's `id` field
+  is frozen at `(unsigned-byte 16)`. Previously only the reference *parser*
+  enforced that, so a hub emitted a row its own parser could not read and the
+  failure landed on the device. The encoder now signals at the hub, naming
+  the type and the id. Widening the field is a change to a frozen external
+  contract and is tracked separately as #199.
+
+- **Adopting global type-ids on an existing system** (#186).
+  `registry-seed-from-stores` seeds the type registry from stores that were
+  each numbered from 1, and reports which of them must now be rewritten. It
+  opens no graph: each store is read from its `schema.dat` and the allocation
+  high-water mark in its `heap.dat` header. Stores are offered their ids
+  **largest on disk first**, and each keeps every id it can, so the store
+  that costs most to rewrite wins every contest — the cost of adoption is
+  bytes replayed, not types moved. (Measured on a five-store system: 66
+  vertex type names competing for 36 ids, and the store holding 59 of the 95
+  types was among the smallest, so seeding by type count would have replayed
+  ~4.9 GB instead of ~1.1 GB.) The returned `seeding-report` names the seed
+  store, every id that moves, the stores to migrate, and any name a single
+  store's history left holding **two** ids — a case no seeding policy
+  exempts, since those must unify whichever store wins. See
+  docs/vivace-graph-v3-doc.org, Chapter 17, "Adopting global type-ids on an
+  existing system".
+
+- **`migrate-graph` gains `:renumber-p`** (#186), default `nil`. `nil`
+  preserves the source's type-ids exactly as #166 built it. `t` takes every
+  type-id from the system registry instead, so a renumbered store's ids mean
+  the same thing in every other store of the system; this is the migration
+  half of the adoption procedure above. `migrate-graph` now returns
+  `(values new-graph unified)`, where `unified` names each type whose several
+  ids collapsed into one. #166's migration tests were renamed to say which
+  mode they pin (`migrate-v1-graph-to-v3-without-renumbering`,
+  `migrate-v2-graph-to-v3-without-renumbering`) — the type-id guarantee is
+  mode-dependent now, and the renumbering path is the exact reverse of what
+  they assert.
+
+- **The image-level system clock** (#168). `open-system-clock` /
+  `close-system-clock` open a durable, crash-safe epoch counter shared by
+  every store attached to it, in place of each store's own per-graph
+  `transaction-id` counter. `*system-clock*` defaults to `nil`; with no
+  clock bound, `make-graph`/`open-graph` and every transaction-allocation
+  path behave exactly as before #168. `make-graph` and `open-graph` gain
+  `:system-clock` (default `*system-clock*`); attaching a store raises the
+  clock above that store's own persisted history (its highest committed
+  transaction id, and for a peer-graph, its pull-cursor too, since those
+  are distinct number spaces) so the clock can never reissue an epoch that
+  store has already used, and refuses while the store has an in-flight
+  transaction. See docs/vivace-graph-v3-doc.org, Chapter 17, "The
+  image-level system clock (optional)".
+
+- **Epoch leases and the store lifecycle journal** (#168). `clock-lease-epochs`
+  reserves a range `[start, end)` on a system clock and skips the clock past
+  it, so a store being detached can allocate offline from its own range with
+  no further coordination — the mechanism #170's shadow-generation swap will
+  use. `journal-append` / `journal-records` keep a small append-only journal
+  of store lifecycle events (`:create`, `:detach`, `:swap`, `:attach`,
+  `:retire`) beside the clock's own counter file; `attach-to-system-clock`
+  already appends an `:attach` record. `journal-records` reads with
+  `*read-eval*` bound to `nil` — the journal is data and is never evaluated.
+  Both are new, currently-unconsumed primitives that #170/#171 build a
+  restore path on. See docs/vivace-graph-v3-doc.org, Chapter 17.
+
+- **`peer-observe-epoch` observes the image clock** (#168). A pulled node
+  carries the *hub's* commit epoch; when the pulling store has a system
+  clock bound, that observation now raises the clock instead of the store's
+  own `tx-id-counter` (which a bound clock leaves dead). Without a clock the
+  original per-store counter path is unchanged. Consequence worth knowing:
+  the image clock is therefore not purely local — a peer sync on one store
+  can advance the whole image's clock, driven by another image's clock.
+
+- **Cross-store read snapshots pin every participating store** (#168).
+  `with-read-snapshot` composes by nesting, and each nested call now takes a
+  read-epoch pin on its own graph's transaction manager for the snapshot's
+  extent, so a cross-store composition ends up pinning every store it
+  touches, not just the innermost or outermost one. Named cost: a long
+  cross-store query delays reaping in every store it touched, for its full
+  duration — the intended price of a shared instant across stores, not a
+  regression.
+
+- **Registration — binding a record's geometry to a registry's regions**
+  (#138). `graph-db/spacetime` gains `register-geometry` and `register-node`,
+  which turn a source's `:REGISTRATION` facet into one claim per region the
+  subject overlaps. Registration is **partial and fractional, not boolean**: a
+  point registers at fraction 1.0, a polygon at its share of each region by
+  AREA, a line at its share by LENGTH — a line's area is zero, so an area ratio
+  would give it 1.0 in every region it crossed.
+  - **Both geometries are repaired with `geometry-make-valid` before
+    intersecting, and `fraction` is clamped to 1.0.** An invalid ring can clear
+    the spatial index's `intersects` refinement and then throw inside
+    `GEOSIntersection`, which would refuse the *whole* subject and drop every
+    region it genuinely overlaps — the host-dependent invalid-polygon case that
+    partial coverage exists to report, turned into a total loss. The clamp
+    holds `fraction`'s documented `[0,1]` contract — and is pinned by a
+    DIRECT unit test on `%overlap-fraction`, because end to end it cannot be
+    made to fire: with subject and region both repaired the intersection is a
+    subset of the subject, so the ratio never exceeds 1 by more than float
+    noise.
+  - **`fraction` and `precision-m` join `+claim-shared-slots+`**, so every
+    claim of every tenant carries them rather than a tenant declaring them in
+    `:extra-slots`. A retrieval layer weighting expansion by overlap is
+    domain-neutral and cannot know each tenant's accessor names. `precision-m`
+    is a magnitude in METRES (or `nil`) and is **not** the `:space` facet's
+    `:precision` keyword; `fraction` is a ratio defaulting to `1.0d0`.
+  - **The `:REGISTRATION` facet carries a payload** where #132 stored an
+    opaque value nothing consulted: `:registry` (which must name a
+    `def-source` class, since a claim's object endpoint is
+    `(object-namespace object-key)`), `:registry-namespace` (a KEYWORD),
+    `:claim-class`, `:producer`, `:relation`, `:method`, `:rule-version`,
+    `:precision-fn`, `:confidence-fn` and `:method-fn`. `:none` stays fully
+    supported.
+    ⚠ **`:method-fn` is REQUIRED, and that constrains the upgrade order.** A
+    tenant already on an older engine must declare the key on every
+    `:registration` facet — `NIL` where that source's method is a source-wide
+    constant — and land that change *first*; taking this version before it
+    fails `def-source` at MACROEXPANSION for every faceted class. Declaring it
+    early is inert on the older engine, which accepts and ignores facet keys
+    it does not know.
+    `standing` is deliberately not a field: a registration is derived by
+    computation, so every claim written carries `:inferred`.
+  - **`geometry-geodesic-area`** (m², by spherical excess, holes subtracted)
+    and **`geometry-geodesic-length`** (metres, haversine folded over
+    consecutive vertices) are CORE geometry ops — neither needs
+    `graph-db/geos`. Not to be confused with `geometry-area`, which returns
+    SQUARED DEGREES and does need the add-on; a degree of longitude is a
+    different distance at every latitude, so a ratio of two such areas is only
+    accidentally right.
+  - **A refusal is a first-class result.** Both functions return `evaluated-p`
+    as a second value, and `(values nil nil)` means "the scan was never
+    answered", never "no region here". Three things refuse: no GEOS for an
+    extended geometry (the index falls back to an over-inclusive bounding box,
+    so approximating would write false positives), a geometry GEOS rejects as
+    invalid (which polygons those are is host-dependent), and an intersection
+    whose kind this engine's `geometry` type cannot represent.
+    `register-node` adds a fourth — a subject whose geometry is unset or
+    unreadable. None of them signals, and the handler catches `geos-error` and
+    nothing wider, so it cannot swallow a cross-graph node escape (#53).
+  - **`register-node` is idempotent** on the full `def-unique` binary tuple,
+    `producer` included, so a re-ingest updates its claim instead of doubling
+    it; a region the subject merely TOUCHES has a zero fraction and is dropped
+    rather than written. `:graph` is where the subject is read,
+    `:registry-graph` where the regions live and the claims are written — only
+    plain values cross between them. Manual: Chapter 18, "Registration:
+    binding geometry to a registry".
+
+- **The general ordered index is reachable from Prolog** (#102). Two *generating*
+  predicates — `(find-by-slot ?node CLASS SLOT VALUE)` for equality and
+  `(find-slot-range ?node CLASS SLOT START END)` for an ascending range — bind
+  `?node` once per hit. Previously the index accelerated Lisp callers and was
+  invisible to the query language: `node-slot-value/3` is a *filter*, not a
+  lookup, so a query over an indexed slot generated candidates with `is-a/2`
+  (every instance of the class) and tested them one at a time — O(instances)
+  against an O(log n) index already maintained on every commit.
+  - `?node` comes first, matching the other generating predicates
+    (`find-within/3`, `find-near/5`) rather than the filtering `geo-*` ones.
+  - A subclass argument resolves to the owning index; an unindexed slot
+    **signals** (silence would make "no index" look like "no rows", and a scan
+    fallback would make the cost unpredictable); a *declared but unbuilt* index
+    correctly yields nothing.
+  - Either range bound may be `nil` **or left unbound** for open-ended.
+  - `find-slot-range` streams via `map-index`, so an early cut does not
+    materialise the whole range.
+  - Not included: making the **planner** index-aware, which is separate work.
+
+- **Named schema declarations and retraction** (#139, #140). `def-index` and
+  `def-unique` take an optional `:name`; a named declaration is identified by
+  `(owner . name)` rather than `(owner . slot-names)`, so **re-declaring the name
+  replaces it whatever the slots became**. Unnamed declarations keep slot-name
+  identity and behave exactly as before. New `undef-index` / `undef-unique`
+  withdraw a declaration by name or by slots; withdrawing something never
+  declared is a no-op.
+  - **Why naming, rather than an unregister keyed by slots:** a macro that emits
+    schema on a caller's behalf cannot name what a *previous version of itself*
+    emitted, so slot-name identity gives it no way to express "this changed
+    shape". Both specs stayed live — the stale `def-unique` rejecting writes the
+    current schema permits, the stale `def-index` built and maintained for
+    nothing, with no retraction path anywhere in the image.
+  - `def-source` and `def-claim-classes` now name every spec they emit (one
+    unique for the former; two uniques and three indexes for the latter).
+  - **Registration replaces in place**, so `*schema-index-metadata*` and
+    `*schema-unique-metadata*` hold one entry per logical declaration rather
+    than one per *evaluation* — both tables are scanned linearly and previously
+    grew forever in a long-lived image that reloads schema.
+  - **The sidecars are reconciled against the live schema at open.**
+    Maintenance is spec-driven while reopen was sidecar-driven; those agreed
+    only while a spec could never go away. Without this, a withdrawn index would
+    be reopened, left unmaintained, re-saved at close, and still be *readable*
+    via `index-lookup` — a stale index that answers queries, which is worse than
+    the useless one retraction removes. Reconciliation fails safe towards
+    keeping: positive evidence is required to drop a record, never the absence
+    of evidence to keep it.
+  - Not included: reclaiming a retired index's heap pages (#147).
+
+- **`claims-by-producer`** (#145) — the non-destructive counterpart to
+  `delete-claims-by-producer`, returning every live claim a producer wrote across
+  both arities. Same contract as the sweep: parent claim class, the producer index
+  (so O(matching), not a scan), `unknown-claim-family` on an unregistered class,
+  and `NIL` for a producer that has written nothing. Swept claims are not
+  returned. Fills the audit direction `claims-touching` cannot serve — that one
+  answers only for an endpoint the caller already names, so it structurally cannot
+  find a claim nothing justifies, which is the same orphan case the uniqueness
+  constraint cannot catch. Purely additive; nothing existing changes behaviour.
+
+- **Multi-slot (tuple) keys for `def-index` and `def-unique`** (#107). Both macros
+  now accept a *slot list* — `(def-index claim (ns key rel) :app)`, `(def-unique
+  claim (ns key) :app)` — giving an ordered index or a uniqueness constraint over
+  the tuple, keyed left to right; a bare symbol still works unchanged, as the
+  arity-1 case of the same machinery. Query a tuple index with a value list:
+  `(index-lookup graph 'claim '(ns key rel) (list "ops" "e1" "at"))`.
+  - `:canonicalize` on a multi-slot index takes a *positional list*, one entry
+    per component (`nil` = identity); a single function designator still applies
+    to a single-slot index exactly as before. A positional list whose length
+    doesn't match the index's arity now **signals** rather than silently
+    truncating or padding — nothing shipped relied on the old behavior.
+  - **Footgun, pre-existing and unchanged by this work**: the arity check above
+    applies only to a *list*. A bare function designator (`string-downcase`,
+    not `(string-downcase nil nil)`) is legal on a multi-slot index too, and is
+    silently applied to component 0 only — every other component stays
+    identity, with no signal. Use a positional list, padded with `nil`, to
+    canonicalize more than the first component.
+  - `index-lookup` takes `:prefix t` for a value list shorter than the index's
+    arity (a prefix scan); without it, a short list **signals** rather than
+    silently returning a wider result than asked for. Too many components
+    always signals, `:prefix t` or not, on both `index-lookup` and
+    `index-range`.
+  - **The null asymmetry, worth stating plainly**: an ordinary index *stores* a
+    null component under a sentinel, so the row stays findable by a prefix scan
+    of its populated components; a `def-unique` constraint instead *exempts*
+    any tuple containing a null component, matching SQL's NULL-never-equals-
+    NULL. Two rows agreeing on every populated component but both `nil`
+    elsewhere therefore do not collide.
+  - `def-unique`'s build is **strict** (signals on a pre-existing duplicate)
+    only when a constraint is newly declared against an already-open graph;
+    it is **tolerant** (logs and keeps the first) when reconciled at graph
+    open, matching the existing single-slot `:unique` split — multi-slot
+    extends that policy rather than introducing a new one.
+  - The peer pull-apply paths (`apply-peer-authored-op`,
+    `apply-peer-create-writes`) maintain multi-slot indexes and constraints the
+    same as the local-commit path, since all three route through the same
+    apply functions — verified directly rather than assumed, with dedicated
+    peer-suite coverage.
+  - **No rebuild and no on-disk storage-version change** for existing
+    single-slot indexes or constraints — a single-slot index is simply the
+    arity-1 case of the tuple machinery. Manual: Chapter 8, "Multi-slot (tuple)
+    indexes and unique constraints".
+
+### Fixed
+
+- **`migrate-graph` no longer pollutes the type registry** (#186). Creating
+  the destination graph ran `update-schema`, which interned every one of the
+  graph's types and assigned them real ids; `migrate-graph` then installed
+  the source's schema over the top, discarding those ids and leaving the
+  registry permanently holding entries at ids no store uses. Opening the
+  *source* had the same effect for any type declared in the image but absent
+  from that store — and wrote a registry id into a store whose every other id
+  was per-graph. The schema replay is now suppressed for both of
+  `migrate-graph`'s opens, since it installs the schema it wants by hand in
+  either mode; a `:renumber-p nil` migration therefore leaves the registry
+  untouched, which is the only answer consistent with preserving the source's
+  own ids. One consequence for the record: `migrate-graph` no longer rewrites
+  the source's `schema.dat` at all.
+
+- **`open-system-clock` let two processes both allocate epochs for the same
+  system directory, silently** (#182). The image-level clock (#168) had no
+  cross-process exclusion: two images opening one clock directory both read
+  the persisted ceiling, both reserved a block, and both started issuing
+  epochs from overlapping ranges — destroying the one property the clock
+  exists to provide, that no two transactions in the system share an epoch.
+  `open-system-clock` now takes an exclusive, non-blocking `flock(2)` on
+  `system-clock.lock` (a sibling of `system-clock.dat` and
+  `system-journal.log`) before touching the ceiling file, and signals
+  `system-clock-in-use` (with a `system-clock-in-use-location` reader) when
+  the lock is already held. Non-blocking is deliberate: a blocking wait
+  would present as a startup hang with no diagnostic. `close-system-clock`
+  releases by closing the fd — there is no `LOCK_UN` path — and the kernel
+  releases the lock automatically if the holder dies, so a crashed process
+  leaves no residue for the next opener to clean up.
+
+  **No recovery step, deliberately.** The counter is already crash-safe:
+  `%write-clock-ceiling` persists `ceiling + block-size` before any id in
+  that block is issued, so a crashed process's successor simply resumes
+  above the persisted ceiling and never reissues. A `.dirty`-style marker
+  or other recovery path would force manual intervention for a condition
+  the ceiling protocol already handles correctly, so none was added.
+
+- **The memory-graph native image (`VGMI`) packed `type-id` at 2 bytes and
+  truncated silently; format bumped to v8** (#187). `ni-uint` writes with
+  `ldb`, so a `type-id` above 65535 lost its high bits with no signal — 70000
+  was restored as 4464, yielding either a node built against the **wrong
+  class** or a `NIL` type lookup. Six sites were affected: the node record
+  (both the live-node and `LZNODE` arms, plus its reader) and all three index
+  key codecs (`type`, `ve`, `vev`).
+
+  Unreachable while type-ids were per-graph and handed out from 1, but #166
+  widened the on-disk field to 32 bits and #186 makes ids global, so this was
+  the last 16-bit narrowing on the path. It mattered more than the equivalent
+  assumption on the replication wire (`peer-streaming.lisp`), which validates
+  and **signals**: this one failed silently, and a memory graph's image is its
+  **only** durable copy — the journal is cleared on every checkpoint.
+
+  **v5, v6 and v7 images still open.** Record and key layouts are parsed
+  positionally, so `%read-memory-image` selects the type-id width from the
+  version and threads it through the record reader and all three key readers;
+  reading a v7 image at v8's width would shift every field after the type-id.
+  Writers always emit 4 bytes. The width is a defaulted parameter on each
+  codec rather than a duplicated set of `*-v7` functions.
+
+  `ni-type-id` replaces the bare `ni-uint` on every type-id write and
+  **signals `memory-image-type-id-too-wide`** rather than truncating, so the
+  silent-narrowing class of bug is gone and not merely this instance of it.
+
+
+- **`recreate-graph` (restore/replay) minted ids from a per-store scalar,
+  bypassing both the transaction manager and any bound system clock**
+  (#168). Reached via `replay` (snapshot and backup restore) and
+  `migrate-graph`. Under a shared clock this could reissue an epoch some
+  other store had already committed at — exactly the collision a system
+  clock exists to prevent. Restore now allocates through `tm-next-epoch`,
+  which draws from the system clock when the graph has one and otherwise
+  falls back to the store's own counter (unchanged behaviour with no clock
+  bound).
+
+  **Behaviour change, independent of any clock:** the watermark restore
+  persists afterward is now the last id actually used, not one past it —
+  the old code always wasted one epoch on the trailing `+1`, including on
+  an empty snapshot, which bumped the watermark for zero work. This brings
+  `recreate-graph` in line with `apply-transaction` (which persists the id
+  it actually used) and a fresh transaction manager's own `(1+ (max ...))`
+  re-seeding; it closes a gap that was always wasted, it does not shift
+  any restored node's id. Anyone who read a restored store's persisted
+  highest-transaction-id and expected it one past the last restored id
+  will now see it one lower. Separately, under a bound clock, restored ids
+  also stop being dense from a fresh store's own zero — they draw from the
+  clock's shared, current position instead, which is the point of the fix.
+
+- **`GEOSMakeValid` returning a `GEOMETRYCOLLECTION` refused the whole
+  subject** (#163). A repair that splits its input across dimensions — the
+  polygonal area plus the zero-width slivers the repair shed — comes back from
+  GEOS as a `GEOMETRYCOLLECTION`, which `wkt->geometry` has no kind for, so
+  `geometry-make-valid` signalled. `spacetime::%repaired`'s `ignore-errors`
+  then handed back the **unrepaired** ring, `geometry-intersection` threw on
+  it, and `register-geometry`'s `geos-error` handler returned
+  `(values nil nil)` — losing every region the subject genuinely overlapped,
+  the exact loss the repair was added to close.
+
+  **`geometry-make-valid` now keeps the collection's polygonal components and
+  returns their union**, which is what `GEOSMakeValid` callers are expected to
+  do: the linear components are degenerate slivers, the polygons are the
+  repaired area. Valid geometry is untouched — `GEOSMakeValid` answers it with
+  a `POLYGON`/`MULTIPOLYGON`, which takes the same path it always did — and
+  without the add-on the base method still signals
+  `geos-required-for-operation`.
+
+  **A repair with no area in it signals `geos-error`** rather than yielding an
+  empty polygon. Nothing was repaired, and "covers nothing" is a
+  *measurement*: `%overlap-fraction` reads a zero-measure subject as fraction
+  1.0 in *every* candidate region, so fabricating one is the same fault
+  inverted. `%repaired`'s contract — something usable, else the original — is
+  what the caller wants there. ⚠ The test is on the **emptiness of the
+  result, on both paths**, not on whether any polygonal component was found:
+  `POLYGON EMPTY` has the type id of a polygon, so a component-count test alone
+  passes it through inside a collection, and a *top-level* one is not a
+  collection at all. No reachable input is known for either — `GEOSMakeValid_r`
+  defaults to linework mode, which keeps degenerate linework as lines rather
+  than collapsing it to an empty polygon, and the structure mode that yields
+  empties is not bound — so covering both is defensive consistency, not a live
+  bug; a guard with a gap in it reads as covered.
+
+  Three bindings are new in `geos/geos-ffi.lisp`: `GEOSGeomTypeId_r`,
+  `GEOSGetNumGeometries_r` and `GEOSGetGeometryN_r`. ⚠ `GEOSGetGeometryN_r`
+  returns **internal storage owned by the parent collection** — unlike every
+  other geometry the bindings hand back, it must NOT be destroyed. The fold
+  over the extracted parts frees only the intermediate unions it creates
+  itself.
+
+  Measured on the deployed data that found it: 7 of 4,196 subjects took this
+  path and lost every region. Regression tests cover the repair
+  (`tests/geos/makevalid-tests.lisp`) and the registration it broke
+  (`tests/spacetime/register-tests.lisp`).
+
+- **Every `LOCAL-TIME:TIMESTAMP` before 2000-03-01 was silently corrupted on
+  read** (#153). `SERIALIZE` writes `day-of` — which is negative before
+  local-time's epoch — through `LDB`, but `DESERIALIZE-HELP` read it back with
+  `DESERIALIZE-UINT64`, so a day of `-61` returned as `18446744073709551555`
+  and the timestamp came back with a nonsense year. No error was signalled at
+  write or at read.
+
+  **Read-side only, so no migration is needed.** The bytes on disk were always
+  a faithful two's-complement representation; only the read was wrong.
+  Deploying the fix recovers every affected timestamp already stored. Anything
+  that had already *derived* a value from a corrupted read is not recovered.
+
+  `DESERIALIZE-UINT64` itself is untouched — the rest of the storage layer uses
+  it for pointers, sizes and packet lengths, which are genuinely unsigned. The
+  timestamp codec now sign-extends its `day` field alone; `sec` and `nsec` are
+  normalised non-negative by local-time.
+
+- **Multi-slot index/constraint defects found by the whole-branch review** (#107).
+  All five were reproduced before being fixed, and each carries a regression test
+  confirmed to fail against the unfixed code.
+  - **A memory graph carrying any `def-unique` was unopenable after a clean close.**
+    The checkpoint image's unique-index dump had no multi-slot branch — it wrote the
+    singular slot name, which is `nil` for a tuple index — and the reopen fed that to
+    the single-slot resolver, ending in `(fdefinition nil)`. Since the image is the
+    only durable copy of a cleanly-closed memory graph (the journal is cleared at
+    checkpoint), this was data loss. The dump now records the slot *list*, and the
+    loader dispatches on its shape, exactly as the on-disk sidecar already did. An
+    image written by the broken code is skipped with a warning and its constraint
+    rebuilt, rather than failing the open.
+  - **A lazy memory graph reopened with a `def-unique` silently absent** whenever the
+    image did not carry it, because the open-time install sat inside the
+    `(unless (lazy-p graph) …)` block. It now runs on the lazy path too — the same
+    trade `rebuild-unique-indexes` already makes, since a constraint that stops
+    enforcing is worse than materializing its owner's blobs. It scans per owner type,
+    so unrelated classes stay unmaterialized.
+  - **`regenerate-secondary-indexes` silently emptied every `def-index`-only index.**
+    Its guard consulted only the MOP `:index` slots — and every multi-slot index is
+    `def-index`-only, there being no MOP surface for a tuple — so the rebuild no-opped
+    after the delete and an empty sidecar was persisted. Lookups then returned empty
+    instead of signalling. The guard now consults the `def-index` registry the way its
+    `:unique` counterpart already did, and `regenerate` runs `install` after `rebuild`
+    as `open-graph` does, so a declared index whose owner has no live node is
+    recreated rather than dropped.
+  - **An all-null query prefix returned wrong answers.** The query-side key builder
+    computed its "every component is null" gate over the components *given* rather
+    than over the index arity, conflating an all-null prefix — a real query, since the
+    write side stores a null component under a sentinel and the row does sit there —
+    with "no key at all". A prefix lookup missed those rows and a range bound went
+    open-ended. The write side was always correct.
+  - **A failed strict `def-unique` left a half-built, live constraint.** The index was
+    published before the scan and the strict path signalled on the *first* duplicate,
+    so the constraint covered only the prefix scanned before the error and duplicates
+    in the un-scanned tail committed unchecked. The strict signal is now deferred to
+    the end of a complete scan, so the constraint left behind is whole (keep-first on
+    the duplicate) and enforcing; a scan that dies for any other reason unregisters
+    what it created, so the build can be retried.
+  - The secondary and unique sidecar readers' `handler-case` now spans the per-record
+    loop, not just `cl-store:restore`: a sidecar can deserialize cleanly and still
+    hold a record shape this build does not know, and that must degrade to rebuild
+    like a torn write rather than failing `open-graph`.
+
+- **A failed snapshot no longer aborts `close-graph`** (#120). `close-graph` deregisters
+  the graph from `*graphs*` and *then* snapshots, with nothing guarding the call — so a
+  snapshot that signalled left every mmap open (heap, indexes, vertex/edge tables, vector
+  segments), `.dirty` still on disk forcing recovery on the next open, and no way to reach
+  the graph by name to retry. The on-disk data was intact the whole time.
+  For a disk graph the snapshot is a *logical backup*; durability is the heap/lhash mmaps
+  plus the transaction journal, so losing one snapshot only means the next `replay` starts
+  from an older snapshot plus more journal. The close now completes and the failure is
+  reported rather than swallowed: `close-graph` returns `(values graph snapshot-problem)`,
+  logs at `:error`, and `warn`s once the teardown is done.
+  The handler is on `serious-condition`, **not** `error`: SBCL's `heap-exhausted-error` is
+  a `storage-condition`, which is not an `error` subtype, and heap exhaustion on a large
+  graph is the failure this exists for (#119). Application code guarding a snapshot with
+  `(handler-case … (error (e) …))` has the same gap.
+  `snapshot` reports integrity problems by *returning* `:data-integrity-issues` rather than
+  signalling, and `close-graph` discarded its return value entirely — so such a graph closed
+  with no snapshot taken and no indication of it. That is now the same second value.
+  Deliberately unchanged: the three `save-*-index-roots` calls above the snapshot still
+  abort the close. Those sidecars write atomically (temp + rename, #63), so a failure leaves
+  the *previous* sidecar naming the *previous* roots; closing past that and clearing `.dirty`
+  would let the next open adopt roots that no longer match the index, with no recovery pass
+  to catch it. A missing snapshot costs replay time; a stale index root is silently wrong.
+  The memory-graph path is also unchanged — it overrides `snapshot` to `nil` and checkpoints
+  in a `close-graph :before` method, where failure *should* be fatal because the image is
+  that graph's only durable record.
+
+- **A slot mutation made after `MAKE-<TYPE>` in the same transaction was
+  discarded** (#135). `MAKE-<TYPE>` serializes `BYTES` once at construction;
+  a `SETF` between construction and commit updated `DATA` alone, and
+  `MAYBE-INITIALIZE-BYTES` only fills an *empty* `BYTES`, so the
+  construction-time value was what persisted. The value read back correctly
+  for the rest of the session — the node cache serves `DATA` — and came
+  back `NIL` after reopen. The `tx-update` path had always re-serialized
+  for this reason; the create path never did.
+  The fix went through two iterations, caught by a subsequent whole-branch
+  review: refreshing `BYTES` in `APPLY-TX-WRITE (tx-create)` fixed a disk
+  graph's own heap, but `%COMMIT` serializes the durable record (the `.txn`
+  file, and — for a graph that journals its own feed — the replication log)
+  in `PREPARE-TX-PERSISTENCE`, which runs *before* `APPLY-TRANSACTION`. So
+  the journal and replication log still carried the pre-mutation bytes,
+  permanently, no crash required — worst on a memory graph, which keeps
+  every committed `.txn` as its durable journal until a clean-close
+  checkpoint (the Android/ECL production backend). The refresh now runs in
+  `PREPARE-TX-PERSISTENCE`, over the transaction's create-set, before that
+  record is written; `APPLY-TX-WRITE (tx-create)`'s own copy was removed,
+  returning that apply path to master's shipped behavior, which never
+  re-serialized there either.
+
+- **`COPY` of a node created in the same transaction corrupted the graph**
+  (#135). It built a `tx-update` whose `OLD-NODE` was a pending create.
+  The transaction committed, the graph closed, and `OPEN-GRAPH` then
+  *succeeded* — the damage was in the node, not the graph: reading a data
+  slot back signalled `DESERIALIZATION-ERROR` (`Deserialization failed
+  for #(0 0)`). The exact mechanism is not established — an earlier
+  explanation (a race with `ARCHIVE-NODE-VERSION`) was disproven by
+  tracing the apply order, and no replacement has been confirmed. It now
+  signals the new `COPYING-UNCOMMITTED-NODE` at the `COPY` instead of
+  committing.
+  The create-set membership check this guard (and the slot-mutation guard
+  below) relies on was itself keyed by node id, not node identity — any
+  instance carrying a re-created id (`MAKE-<TYPE>` accepts `:ID`) passed,
+  letting exactly the shared-cache mutation this branch exists to stop
+  through. Both guards now check by `EQ` against the create-set's
+  registered node.
+
+- **`interface.lisp` was missing an ASDF dependency on `transactions`**
+  (#135), the file that defines `%COPY`, `COPYING-UNCOMMITTED-NODE` and
+  `NODE-CREATED-IN-TRANSACTION-P`, all used by `COPY` above. The gap
+  predates this branch — master's `interface.lisp` already called
+  `UPDATE-NODE` (also defined in `transactions.lisp`) from `SAVE` — and it
+  built only because `graph-db.asd` happens to declare `transactions`
+  earlier in the component list; `graph-db/core`'s `:depends-on` now says
+  so explicitly.
+
+- The schema's bare (keyword) type-name lookup was package-blind: two
+  same-named types in different packages silently clobbered one alias
+  entry, and REST/DSL callers got whichever class was defined last. A bare
+  name now resolves only when unique and signals
+  `ambiguous-node-type-name` otherwise; the alias key is no longer
+  written, and stale aliases in old `schema.dat` files are ignored.
+  (#190)
+
+- A torn final record in the system-clock journal (a power loss
+  mid-append) made every record unreadable, since the reader signalled
+  on the incomplete form. The reader now drops a torn tail — truncating
+  it atomically and signalling the `system-journal-torn-tail` warning —
+  and returns the intact history; damage anywhere other than the tail
+  still signals, as `system-journal-corrupt`. The writer is unchanged:
+  per-record fsync was considered and rejected in the issue. (#191)
+
+### Changed
+
+- **BREAKING: a `make-<type>` constructor's `:graph` default is now the
+  class's declared store, not the ambient `*graph*`** (#167). The
+  trailing argument to `def-vertex`/`def-edge` is documented from here
+  on as the class's *default store*; omitting `:graph` places the node
+  there, not wherever `*graph*` happens to be bound at the call site.
+  If that default store is not open and no `:graph` was passed, the
+  constructor now signals the new `default-store-not-open-error`
+  (naming the class and the store) rather than silently writing into
+  `*graph*` — placement determines recovery policy (which store's WAL,
+  backup schedule and detach boundary a node falls under), so a quiet
+  substitution would change a node's durability story without saying
+  so. Single-package/single-store code is unaffected: there, `*graph*`
+  already *is* the declared store on every call. The behaviour change
+  reaches only code that relied on `*graph*` differing from a class's
+  declared store to place nodes elsewhere without passing `:graph`.
+  `lookup-<type>` and the generic `make-vertex`/`make-edge` keep their
+  existing `*graph*` behaviour; they take ids or explicit types, not
+  class policy.
+
+- **BREAKING: peer wire protocol bumped 1 -> 2; a v1 device is now
+  refused, not misparsed** (#206, #201). This is a wire-generation
+  change — every peer device and hub must move together. The v2
+  contract, in four points: (1) the peer wire now carries v3 node
+  heads (33-byte vertex / 73-byte edge, #166's on-disk format) instead
+  of the old v1 layout; (2) the type table's `name` and `supers`
+  fields are downcased, **package-qualified** names
+  (`package:symbol`), so two same-named types from different packages
+  no longer collide on the wire (#201); (3) the type table the hub
+  ships in `:auth-ok` is now **scoped to the replicated store's own
+  schema**, closure-completed over `supers` so no row's superclass
+  reference dangles; (4) the device auth plist **must** carry
+  `:peer-protocol-version` — absent (a v1 device) or mismatched
+  refuses the connection with `peer-protocol-mismatch-error`, checked
+  hub-side before the schema-compatibility gate and before any
+  mutation. A stale-but-present node-head size is refused too
+  (`node-head-size-mismatch-error` in `transactions.lisp`), as defense
+  in depth below the version gate. The wire *grammar* (4-field
+  `kind,id,name,supers` type-table rows; `:` still unreserved) is
+  unchanged. Coordinates with a device-contract issue in a
+  private downstream repository.
+
+- **The hub resolves its type registry on the thread that starts
+  replication** (#186). A hub serves each device connection on a new thread,
+  and a new thread does not inherit dynamic bindings, so a session calling
+  `ensure-type-registry` read the *global* `*system-directory*` — `nil`, so
+  auth-ok failed on every connection and the device saw a closed socket, or
+  worse, another system's directory. `start-replication` now captures it on
+  the caller's thread (`peer-type-registry` on the graph).
+
+- **A store that owes a renumbering says so at open** (#186). An id the
+  store occupies but its own name lookup no longer returns — orphaned
+  metadata, with nodes still on disk under it — is tolerated when it sits at
+  or below the registry's high-water mark, and now emits a `log:warn` naming
+  the type and both ids instead of passing silently. Above the mark it is
+  still refused: the registry would hand that id to another type and there is
+  no way to reserve it. The tolerance is a policy choice about
+  already-orphaned metadata rather than a proof of safety — see #202.
+
+- **Seeding breaks a size tie on the store location** (#186).
+  `registry-seed-from-stores` ranked stores by heap high-water mark with a
+  `sort` that is not required to be stable, and equal marks are ordinary
+  (fresh or empty stores), so two images could rank one store set differently
+  and seed two different registries.
+
+- **The out-of-process harnesses set a system directory** (#186). Every
+  script under `tests/replication/`, `tests/peer-replication*/`, the
+  profiling modules and the `example.lisp` / `test.lisp` / `test-mop.lisp`
+  scratch files called `make-graph` without one and had been failing
+  outright since a system directory became mandatory; none of them is in the
+  FiveAM suite, so its green hid this. Each peer harness process now takes
+  its *own* system directory under `REPL_WORK`, which is what makes them
+  faithful: hub and device are separate images with separate registries that
+  agree because both evaluate one `schema.lisp`.
+
+- **The peer type table is the image's type registry, not one graph's
+  schema** (#186). The `:type-table` string the hub ships in its `:auth-ok`
+  plist now names every type this system has assigned an id, because type-ids
+  are image-level and a device may be sent an id belonging to any store.
+  `peer-type-table-string` takes a registry (defaulting to this image's)
+  rather than a graph. The wire *grammar* is unchanged — it is a frozen
+  external contract parsed by non-Lisp peers — only what fills it. Two
+  consequences, both intended: a type the hub's own graph does not
+  instantiate still appears in the table, and a type name that cannot be
+  encoded now fails every device connection in the image rather than only
+  sessions for the store that declared it. A third consequence is not
+  intended and is tracked as #200: a registry entry whose class this image
+  never loaded emits an empty `supers` field, which the wire cannot tell
+  apart from a type that genuinely roots at `vertex`/`edge`.
+
+- **The downcased-name collision error names the packages, and no longer
+  advises a rename** (#186). Pooling every store's types into one table
+  widened that collision surface: two types that never shared a schema now
+  share one namespace, and same-named symbols from two packages are no longer
+  exotic. The error prints both symbols package-qualified — the package is
+  the only thing that distinguishes them — and says the fix is a retirement
+  or rename, which for a type with nodes on disk is a store migration rather
+  than an edit.
+
+- **The renumbering migration mints in a deterministic order** (#186).
+  `renumber-schema` iterated survivors with `maphash`, so two images
+  renumbering one store into two empty registries could assign different ids
+  — a disagreement the new handshake guard would then refuse, though nothing
+  about the two systems actually differed. It now mints in package-name then
+  symbol-name order. This makes a single migration reproducible (and so
+  verifiable by re-running it); it is *not* a substitute for distributing the
+  registry, and images that opened different stores still disagree.
+
+- **BREAKING: type-ids are assigned system-wide, and a system directory is
+  now mandatory** (#186). `graph-db:*system-directory*` names the directory
+  holding this system's shared state; type-ids are assigned there, in an
+  append-only registry (`type-registry.log`) keyed on the package-qualified
+  type name, in place of each graph's own counter. One type name therefore
+  means one id in every store of the system, and no two names share an id.
+  Vertices and edges remain separate id spaces.
+
+  **The special has no default and is required.** `make-graph` and
+  `open-graph` signal the new `graph-db:system-directory-required` when it is
+  `nil`. There is deliberately no per-graph fallback: two id regimes drifting
+  apart unnoticed is the failure the registry exists to prevent, and a
+  fallback would make the divergence invisible. Set it once, from your
+  application's configuration, before opening anything:
+  `(setf graph-db:*system-directory* "/var/lib/my-system/")`.
+
+  Existing stores keep the ids already written into their nodes — reopening
+  one replays its persisted schema and does not renumber. Adopting the
+  registry for a system whose stores were numbered independently is the
+  seeding-plus-renumbering procedure added below.
+
+  A store's type-ids are now **sparse**: it holds the ids of its own types,
+  wherever those landed in the system's numbering, not a dense run from 1.
+  Code that enumerated types by counting from 0 to the schema's `next-*-id`
+  must enumerate the schema's actual ids instead; `gc.lisp`'s mark phase did
+  exactly that and now uses `list-vertex-types`/`list-edge-types`. The type
+  index is sized by the highest id a store holds rather than by how many
+  types it has.
+
+- **BREAKING: a node class may now be defined for more than one graph**
+  (#186). The cross-graph name check existed only because type-ids were
+  per-graph; with a system-wide id space it has no job, so it and its call
+  are gone. `duplicate-node-class-error` is no longer signalled by anything.
+  The condition remains exported so existing handlers still compile. Note
+  that both definitions define the *same* CLOS class, so the last one loaded
+  determines its slots — keep them identical, or use different type names.
+  See the manual, Chapter 17, "Class names are global, and one class may
+  serve several stores".
+
+- **The temporal algebra now lives in its own library**,
+  [cl-temporal-extent](https://github.com/kraison/cl-temporal-extent) (#159).
+  Bounds, extents, the Allen relations and the standing vocabulary never
+  depended on the graph — the only occurrence of `graph-db` in any of those
+  files was the `in-package` form — so they are now usable without loading a
+  database engine. `graph-db/spacetime` depends on the library and keeps the
+  claim record, the source-onboarding contract and endpoint resolution.
+
+  **No consumer needs to change.** `graph-db.spacetime` `:use`s the new
+  package and re-exports every symbol it previously exported, so code
+  written against `graph-db.spacetime:make-interval`,
+  `graph-db.spacetime:+standings+` and the rest compiles unchanged. The root
+  condition keeps the name `spacetime-error` for the same reason.
+
+  922 of the spacetime suite's 1169 checks moved with the code; the
+  remaining 247 are the claim and source layers, and 247 + 922 accounts for
+  all of them.
+
+
+- **Writing a persistent slot now requires a node the current transaction
+  may mutate** (#135) — a copy registered by `COPY`, or a node created in
+  that same transaction. Anything else signals the new
+  `MUTATING-UNREGISTERED-NODE`. The case this matters most for is not in
+  the issue: `lookup-*` returns the **shared cached instance**, so `(setf
+  (slot (lookup-thing id)) v)` mutated state every other reader and
+  thread could see, was never persisted, and read back correctly until
+  restart — wrong and invisible until a restart exposed it. Ephemeral
+  and meta slots are unaffected; the guard only ever sees persistent
+  slots.
+  `MARK-DELETED` is deliberately exempt from the `COPY` half of this
+  guard — it copies internally, and create-then-`MARK-DELETED` in one
+  transaction was measured to work correctly before this change and
+  still does.
+  A consequence found while installing the guard: redefining a class to
+  add an `:initform` persistent slot while instances are live made a
+  plain *read* signal. CLOS runs `UPDATE-INSTANCE-FOR-REDEFINED-CLASS`
+  lazily on the next slot access to an obsolete instance, and that wrote
+  the new slot's initform through this same guarded path — on the shared
+  cached node, with no transaction bound and nothing registered.
+  `*INITIALIZING-NODE*` is now bound around it, matching
+  `CHANGE-NODE-CLASS`; this never shipped, so it is not a user-facing fix,
+  only a defect this branch introduced and removed before release.
+  Both halves of the guard (the `SETF` check and `COPY`'s create-set
+  check) treated a non-`TX` `*TRANSACTION*` — e.g. a `RESTORE-TRANSACTION`
+  during snapshot replay — as `NO-APPLICABLE-METHOD` rather than behaving,
+  since `COPIES` and `CREATE-SET` are readers on `TX` alone. Both now test
+  `(TYPEP *TRANSACTION* 'TX)` first, matching `CREATE-NODE`'s existing
+  guard, and trust a non-`TX` transaction unconditionally.
+  Not addressed here: `SLOT-MAKUNBOUND` semantics are unchanged on both
+  backends, including the pre-existing divergence where an `:initform`
+  slot resurrects as its default after reopen on a disk graph but stays
+  unbound on a memory graph. That gap is out of scope for #135 and is
+  getting its own spec.
+
+- **`type-id` widened from 16 to 32 bits; on-disk storage format bumped to
+  v3** (#166, unit 1a, task 1). Every place `type-id` was written or typed
+  widens together (no useful intermediate state): the node head (2 -> 4
+  bytes; head grows 31 -> 33, edge head 71 -> 73), `ve-key` (18 -> 20
+  bytes) and `vev-key` (34 -> 36 bytes), the CLOS `type-id` slot, and the
+  schema's `next-vertex-id` / `next-edge-id` counters. Type-ids remain
+  **per-graph** — no global registry, no distribution change; that is a
+  separate issue (#186).
+  A v1 or v2 graph cannot be opened directly by this build — `open-graph`
+  signals, naming the version found and the version expected and pointing
+  at `migrate-graph`, rather than silently misreading a 2-byte type-id as
+  4 (which would otherwise corrupt every subsequent field in the head,
+  and every adjacent record via the widened `ve-key`/`vev-key`).
+  `deserialize-node-head-v2` (a byte-for-byte copy of the prior 31-byte
+  reader) lets `migrate-graph` read a v2 source; see the next two entries
+  for the type-index sizing this widening required and the migration
+  path itself.
+
+- **The type-index no longer pre-allocates a slot for every possible
+  type-id** (#166, unit 1a, task 2). At the old 16-bit ceiling that cost
+  ~1.1 MB per index per store; at the widened 32-bit ceiling the same
+  scheme would cost ~73 GB. A type-index now starts sized for 4,096
+  types and grows by doubling, in place — the mapping's base address
+  never moves, so a concurrent reader is never at risk from a grow.
+  Locking changed too: one mutex per type-id (65,536 of them per index
+  per store, regardless of how many types were in use) is now 256 fixed
+  stripes selected by `(mod type-id 256)`. **This is a real behaviour
+  change, not a pure optimization** — two type-ids that land on the same
+  stripe now serialize their pushes and removes against each other,
+  where before they never contended.
+  Fixed in passing: `gc.lisp`'s mark phase read the type-index's cache
+  directly, which was only safe while that cache was eagerly populated
+  at open. Under the new lazy population this marked nothing for a type
+  not yet touched this session, and `gc-heap`'s sweep then reclaimed
+  those nodes as garbage on the very first reopen after this change —
+  caught before release by a dedicated close/reopen/gc test, not by any
+  pre-existing coverage.
+
+- **`migrate-graph` now carries a v1 *or* v2 graph to v3 through one
+  version-detecting path** (#166, unit 1a, task 3). It reads the source's
+  own stamped storage-version byte and opens it with the matching head
+  reader, so the same call handles either source version — no second,
+  parallel migration function.
+  **Corrected a false claim in `migrate-graph`'s own docstring**: the
+  source directory is not left byte-for-byte untouched. Producing the
+  snapshot requires opening the source, and that open unconditionally
+  rewrites `schema.dat` (same content, re-serialized — type-ids
+  unaffected) and creates one new, empty `tx/replication-*.log` file.
+  Those are the only two files that change; the source's data — its heap
+  and every vertex/edge/index table — is untouched, and a pre-#166
+  engine can reopen the source directly afterward and read every node
+  with its type-ids intact. That is the actual rollback story
+  (repointing at the old directory, not restoring from a snapshot), and
+  it was verified by reopening a post-migration source with a genuine,
+  unmodified old-version engine rather than assumed from the (now-fixed)
+  docstring.
+  A migration needs roughly 2x the source graph's disk space while it
+  runs (source + intermediate snapshot + new graph), and every engine
+  that will subsequently open the migrated graph — not just the one
+  performing the migration — must already be built from a #166-or-later
+  checkout.
 
 ## [3.0.0] - 2026-08-09
 
@@ -72,7 +2557,8 @@ between releases; cutting a release renames it to the new version and dates it.
   shared index — separated at query time by the required type filter, not by
   storage — which is narrower than "per class"; a class that overrides
   `node-geometry` is indexed under `(owner . NIL)` and is still scopeable by name.
-  Motivated by the mine-action team's spatial-index change request (CR-1).
+  Motivated by a downstream application team's spatial-index change request
+  (CR-1).
 - **`:spatial-precision` slot option — per-index geohash precision.** A geometry
   slot may declare `(slot :type geometry :index t :spatial-precision N)`; that
   index is built on an `N`-level geohash grid instead of the graph default (7).
@@ -367,7 +2853,8 @@ between releases; cutting a release renames it to the new version and dates it.
   filter is what makes a scoped query correct when sibling subclasses share a
   mixin-owned index. A required positional argument makes every stale call site a
   compile-time warning on SBCL and ECL, which is the safest way to land a
-  deliberate break. Requested by the mine-action team (CR-1): they needed to
+  deliberate break. Requested by a downstream application team (CR-1): they
+  needed to
   query one class's geometry without dredging up another's.
   *Known limitation:* a scope resolves the named class's own geometry slots, so
   scoping to a parent does not reach an index a *subclass* declares on an extra
@@ -954,7 +3441,8 @@ suite, and an ACID-compliance audit.
 - LispWorks support is currently **untested** (no license access; the free
   Personal Edition's heap is too small to compile VivaceGraph).
 
-[Unreleased]: https://github.com/kraison/vivace-graph/compare/v3.0.0...HEAD
+[Unreleased]: https://github.com/kraison/vivace-graph/compare/v4.0.0...HEAD
+[4.0.0]: https://github.com/kraison/vivace-graph/compare/v3.0.0...v4.0.0
 [3.0.0]: https://github.com/kraison/vivace-graph/compare/v2.1.1...v3.0.0
 [2.1.1]: https://github.com/kraison/vivace-graph/compare/v2.1.0...v2.1.1
 [2.1.0]: https://github.com/kraison/vivace-graph/compare/v2.0...v2.1.0

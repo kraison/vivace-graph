@@ -31,8 +31,8 @@
   "Two classes declaring their own geometry slot get two distinct indexes."
   (with-test-graph (g)
     (with-transaction ()
-      (make-scope-probe :geom (make-point 37.1724d0 49.2020d0))
-      (make-scope-zone :extent (scope-rect 22.1d0 44.4d0 40.2d0 52.4d0)))
+      (make-scope-probe :geom (make-point 12.3424d0 45.6720d0))
+      (make-scope-zone :extent (scope-rect 8.1d0 40.9d0 14.2d0 47.4d0)))
     (let ((probe-ix (spatial-index-for g 'scope-probe 'geom))
           (zone-ix  (spatial-index-for g 'scope-zone 'extent)))
       (is (spatial-index-p probe-ix))
@@ -54,7 +54,7 @@
   "A slot that never holds a geometry never creates an index (§4.1)."
   (with-test-graph (g)
     (with-transaction ()
-      (make-scope-probe :geom (make-point 37.1724d0 49.2020d0)))
+      (make-scope-probe :geom (make-point 12.3424d0 45.6720d0)))
     (is (null (spatial-index-for g 'scope-zone 'extent)))))
 
 ;;; ---------------------------------------------------------------------------
@@ -95,8 +95,8 @@ shows up as the indexes heap's bump pointer climbing on every open."
         (let ((*graph* g))
           (with-transaction ()
             (dotimes (i 200)
-              (make-scope-probe :geom (make-point (+ 37d0 (* i 1d-3))
-                                                  (+ 49d0 (* i 1d-3))))
+              (make-scope-probe :geom (make-point (+ 12d0 (* i 1d-3))
+                                                  (+ 45d0 (* i 1d-3))))
               (make-scope-zone :extent (scope-rect (+ 20d0 (* i 1d-3))
                                                    (+ 44d0 (* i 1d-3))
                                                    (+ 20.01d0 (* i 1d-3))
@@ -127,7 +127,7 @@ are untouched.  The old file is left in place, not renamed."
         (let ((*graph* g))
           (with-transaction ()
             (setq probe-id (id (make-scope-probe
-                                :geom (make-point 37.1724d0 49.2020d0)))))
+                                :geom (make-point 12.3424d0 45.6720d0)))))
           (close-graph g :snapshot-p nil)))
       ;; Fabricate the pre-v3 on-disk shape: no v3 sidecar, an old single-index
       ;; root file in its place.  (Its address is never read on this path -- the
@@ -140,8 +140,8 @@ are untouched.  The old file is left in place, not renamed."
              (let ((idx (spatial-index-for g 'scope-probe 'geom)))
                (is (spatial-index-p idx) "the index was re-derived from the nodes")
                (is (has-p probe-id
-                          (spatial-index-query-bbox idx 37.16d0 49.19d0
-                                                    37.19d0 49.21d0)))
+                          (spatial-index-query-bbox idx 12.33d0 45.66d0
+                                                    12.36d0 45.68d0)))
                (is (probe-file (graph-db::spatial-indexes-root-file path))
                    "migration wrote the v3 sidecar")
                (is (probe-file (graph-db::spatial-index-root-file path))
@@ -161,7 +161,7 @@ entirely intact."
         (let ((*graph* g))
           (with-transaction ()
             (setq probe-id (id (make-scope-probe
-                                :geom (make-point 37.1724d0 49.2020d0)))))
+                                :geom (make-point 12.3424d0 45.6720d0)))))
           (close-graph g :snapshot-p nil)))
       ;; Truncate the sidecar mid-record, as an interrupted write would.
       (let* ((file (graph-db::spatial-indexes-root-file path))
@@ -179,8 +179,8 @@ entirely intact."
                (let ((idx (spatial-index-for g 'scope-probe 'geom)))
                  (is (spatial-index-p idx) "the index was re-derived from the nodes")
                  (is (has-p probe-id
-                            (spatial-index-query-bbox idx 37.16d0 49.19d0
-                                                      37.19d0 49.21d0))))
+                            (spatial-index-query-bbox idx 12.33d0 45.66d0
+                                                      12.36d0 45.68d0))))
             (close-graph g :snapshot-p nil)
             (collect-garbage)))))))
 
@@ -227,8 +227,8 @@ PAST the coarser stored key: a silent miss on an index that is physically intact
   "REGENERATE-SPATIAL-INDEX rebuilds exactly one (owner . slot) index."
   (with-test-graph (g)
     (with-transaction ()
-      (make-scope-probe :geom (make-point 37.1724d0 49.2020d0))
-      (make-scope-zone :extent (scope-rect 22.1d0 44.4d0 40.2d0 52.4d0)))
+      (make-scope-probe :geom (make-point 12.3424d0 45.6720d0))
+      (make-scope-zone :extent (scope-rect 8.1d0 40.9d0 14.2d0 47.4d0)))
     (let ((probe-before (spatial-index-for g 'scope-probe 'geom)))
       (regenerate-spatial-index g 'scope-zone 'extent)
       ;; The untouched index is the SAME struct; the regenerated one is fresh.
@@ -241,11 +241,11 @@ PAST the coarser stored key: a silent miss on an index that is physically intact
     (let (zone-id)
       (with-transaction ()
         (setq zone-id (id (make-scope-zone
-                           :extent (scope-rect 22.1d0 44.4d0 40.2d0 52.4d0)))))
+                           :extent (scope-rect 8.1d0 40.9d0 14.2d0 47.4d0)))))
       (is (= 1 (regenerate-spatial-index g 'scope-zone 'extent)))
       (let ((idx (spatial-index-for g 'scope-zone 'extent)))
         (is (has-p zone-id
-                   (spatial-index-query-bbox idx 30d0 48d0 31d0 49d0)))))))
+                   (spatial-index-query-bbox idx 10d0 42d0 11d0 43d0)))))))
 
 (test regenerate-all-spatial-indexes-persists-roots
   "REGENERATE-SPATIAL-INDEXES rebuilds every index and re-saves the sidecar, so a
@@ -256,7 +256,7 @@ reopen sees the NEW roots rather than the freed ones."
         (let ((*graph* g))
           (with-transaction ()
             (setq probe-id (id (make-scope-probe
-                                :geom (make-point 37.1724d0 49.2020d0)))))
+                                :geom (make-point 12.3424d0 45.6720d0)))))
           (is (eq g (regenerate-spatial-indexes g)))
           (close-graph g :snapshot-p nil)))
       (let ((g (open-graph *integration-graph-name* path)))
@@ -264,8 +264,8 @@ reopen sees the NEW roots rather than the freed ones."
              (let ((idx (spatial-index-for g 'scope-probe 'geom)))
                (is (spatial-index-p idx))
                (is (has-p probe-id
-                          (spatial-index-query-bbox idx 37.16d0 49.19d0
-                                                    37.19d0 49.21d0))))
+                          (spatial-index-query-bbox idx 12.33d0 45.66d0
+                                                    12.36d0 45.68d0))))
           (close-graph g :snapshot-p nil)
           (collect-garbage))))))
 
@@ -287,7 +287,7 @@ map freed pages on the next open."
     (let (zone)
       (with-transaction ()
         (setq zone (make-scope-zone
-                    :extent (scope-rect 22.1d0 44.4d0 40.2d0 52.4d0))))
+                    :extent (scope-rect 8.1d0 40.9d0 14.2d0 47.4d0))))
       ;; %SPATIAL-INDEX-FOR persisted this index's root the moment it was
       ;; created, so the sidecar is already up to date and names a live address.
       (is (spatial-index-p (spatial-index-for g 'scope-zone 'extent)))
@@ -336,7 +336,7 @@ resolves to no registered type at all should."
     (let (zone warnings)
       (with-transaction ()
         (setq zone (make-scope-zone
-                    :extent (scope-rect 22.1d0 44.4d0 40.2d0 52.4d0))))
+                    :extent (scope-rect 8.1d0 40.9d0 14.2d0 47.4d0))))
       (mark-deleted zone)
       (let (count)
         (handler-bind ((warning (lambda (w) (push w warnings) (muffle-warning w))))
@@ -369,9 +369,9 @@ declared-but-empty index."
     (let (probe-id zone-id)
       (with-transaction ()
         (setq probe-id (id (make-scope-probe
-                            :geom (make-point 37.1724d0 49.2020d0))))
+                            :geom (make-point 12.3424d0 45.6720d0))))
         (setq zone-id (id (make-scope-zone
-                           :extent (scope-rect 22.1d0 44.4d0 40.2d0 52.4d0)))))
+                           :extent (scope-rect 8.1d0 40.9d0 14.2d0 47.4d0)))))
       ;; Both indexes are live and queryable before the simulated crash.
       (is (spatial-index-p (spatial-index-for g 'scope-probe 'geom)))
       (is (spatial-index-p (spatial-index-for g 'scope-zone 'extent)))
@@ -389,7 +389,7 @@ declared-but-empty index."
       ;; with a premature :COMPLETE T.)
       (spatial-index-insert
        (graph-db::%spatial-index-for g 'scope-probe 'geom)
-       probe-id (make-point 37.1724d0 49.2020d0))
+       probe-id (make-point 12.3424d0 45.6720d0))
       ;; -- crash here; the closing COMPLETE save at the end of REBUILD-SPATIAL-
       ;; INDEXES never runs. --
       ;; Simulate the reopen WITHOUT going through CLOSE-GRAPH (which would
@@ -413,10 +413,10 @@ declared-but-empty index."
             "index B must come back after the fallback rebuild, not stay ~
              silently unindexed forever")
         (is (has-p probe-id
-                   (spatial-index-query-bbox probe-ix 37.16d0 49.19d0
-                                             37.19d0 49.21d0)))
+                   (spatial-index-query-bbox probe-ix 12.33d0 45.66d0
+                                             12.36d0 45.68d0)))
         (is (has-p zone-id
-                   (spatial-index-query-bbox zone-ix 22d0 44d0 41d0 53d0))
+                   (spatial-index-query-bbox zone-ix 8d0 40d0 15d0 48d0))
             "B's node must actually be findable, not merely present as a struct")))))
 
 (test sidecar-without-complete-key-restores-normally
@@ -428,7 +428,7 @@ format from being forced into a needless rebuild by this change."
     (let (probe-id)
       (with-transaction ()
         (setq probe-id (id (make-scope-probe
-                            :geom (make-point 37.1724d0 49.2020d0)))))
+                            :geom (make-point 12.3424d0 45.6720d0)))))
       ;; The commit path no longer writes the sidecar (it is written at CLOSE-GRAPH
       ;; and by the rebuild/regenerate ops); write it explicitly here, then rewrite
       ;; it in the PRE-MARKER shape, with no :COMPLETE key in the plist at all.
@@ -448,8 +448,8 @@ format from being forced into a needless rebuild by this change."
       (let ((idx (spatial-index-for g 'scope-probe 'geom)))
         (is (spatial-index-p idx))
         (is (has-p probe-id
-                   (spatial-index-query-bbox idx 37.16d0 49.19d0
-                                             37.19d0 49.21d0)))))))
+                   (spatial-index-query-bbox idx 12.33d0 45.66d0
+                                             12.36d0 45.68d0)))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; The required query scope (§6).  A scope both SELECTS the indexes scanned and
@@ -462,9 +462,9 @@ format from being forced into a needless rebuild by this change."
 every A point, and scoping to B returns no A nodes."
   (with-test-graph (g)
     (with-transaction ()
-      (make-scope-probe :geom (make-point 37.1724d0 49.2020d0))
-      (make-scope-zone :extent (scope-rect 22.1d0 44.4d0 40.2d0 52.4d0)))
-    (let ((window (scope-rect 22.0d0 44.0d0 41.0d0 53.0d0)))
+      (make-scope-probe :geom (make-point 12.3424d0 45.6720d0))
+      (make-scope-zone :extent (scope-rect 8.1d0 40.9d0 14.2d0 47.4d0)))
+    (let ((window (scope-rect 1.0d0 40.0d0 16.0d0 48.0d0)))
       (let ((probes (find-nodes-within 'scope-probe window :graph g))
             (zones  (find-nodes-within 'scope-zone window :graph g)))
         (is (= 1 (length probes)))
@@ -476,9 +476,9 @@ every A point, and scoping to B returns no A nodes."
   "A list scope unions the named classes; :ALL unions everything."
   (with-test-graph (g)
     (with-transaction ()
-      (make-scope-probe :geom (make-point 37.1724d0 49.2020d0))
-      (make-scope-zone :extent (scope-rect 22.1d0 44.4d0 40.2d0 52.4d0)))
-    (let ((window (scope-rect 22.0d0 44.0d0 41.0d0 53.0d0)))
+      (make-scope-probe :geom (make-point 12.3424d0 45.6720d0))
+      (make-scope-zone :extent (scope-rect 8.1d0 40.9d0 14.2d0 47.4d0)))
+    (let ((window (scope-rect 1.0d0 40.0d0 16.0d0 48.0d0)))
       (is (= 2 (length (find-nodes-within '(scope-probe scope-zone) window :graph g))))
       (is (= 2 (length (find-nodes-within :all window :graph g)))))))
 
@@ -493,9 +493,11 @@ every A point, and scoping to B returns no A nodes."
   "A class with no geometry at all signals; a declared-but-empty one is NIL."
   (with-test-graph (g)
     (with-transaction ()
-      (make-scope-probe :geom (make-point 37.1724d0 49.2020d0)))
-    (let ((window (scope-rect 22.0d0 44.0d0 41.0d0 53.0d0)))
-      (signals error (find-nodes-within 'scope-aspatial window :graph g))
+      (make-scope-probe :geom (make-point 12.3424d0 45.6720d0)))
+    (let ((window (scope-rect 1.0d0 40.0d0 16.0d0 48.0d0)))
+      ;; Typed: the caller's error, not a defect (GH #286).
+      (signals graph-db:query-precondition-error
+        (find-nodes-within 'scope-aspatial window :graph g))
       ;; SCOPE-ZONE is declared but nothing was written: empty, not an error.
       (is (null (find-nodes-within 'scope-zone window :graph g))))))
 
@@ -505,9 +507,9 @@ scopeable by name -- not reachable only through :ALL.  GEO-PLACE (defined in
 spatial-hook-tests.lisp) has a hand-written method and no :INDEX-marked slot."
   (with-test-graph (g)
     (with-transaction ()
-      (make-geo-place :loc (make-point 37.1724d0 49.2020d0))
-      (make-scope-probe :geom (make-point 37.1730d0 49.2025d0)))
-    (let ((window (scope-rect 37.0d0 49.0d0 37.5d0 49.5d0)))
+      (make-geo-place :loc (make-point 12.3424d0 45.6720d0))
+      (make-scope-probe :geom (make-point 12.3430d0 45.6725d0)))
+    (let ((window (scope-rect 12.0d0 45.0d0 12.5d0 46.0d0)))
       (let ((places (find-nodes-within 'geo-place window :graph g)))
         (is (= 1 (length places)))
         (is (every #'geo-place-p places)))
@@ -539,13 +541,13 @@ Keying such a node by its OWN class -- which is what falling back to
 across per-subclass indexes and make this parent scope miss the outpost entirely."
   (with-test-graph (g)
     (with-transaction ()
-      (make-scope-site :where (make-point 37.1724d0 49.2020d0))
-      (make-scope-outpost :where (make-point 37.1730d0 49.2025d0)))
+      (make-scope-site :where (make-point 12.3424d0 45.6720d0))
+      (make-scope-outpost :where (make-point 12.3430d0 45.6725d0)))
     (is (spatial-index-p (spatial-index-for g 'scope-site nil))
         "the shared index is keyed by the METHOD OWNER")
     (is (null (spatial-index-for g 'scope-outpost nil))
         "no per-subclass index was created")
-    (let ((window (scope-rect 37.0d0 49.0d0 37.5d0 49.5d0)))
+    (let ((window (scope-rect 12.0d0 45.0d0 12.5d0 46.0d0)))
       (let ((both (find-nodes-within 'scope-site window :graph g)))
         (is (= 2 (length both)) "the parent scope spans the subclass")
         (is (some #'scope-outpost-p both)))
@@ -561,9 +563,10 @@ the entry behind forever, un-removable, since nothing else ever visits that key.
   (with-test-graph (g)
     (let (outpost)
       (with-transaction ()
-        (make-scope-site :where (make-point 37.1724d0 49.2020d0))
-        (setq outpost (make-scope-outpost :where (make-point 37.1730d0 49.2025d0))))
-      (let ((window (scope-rect 37.0d0 49.0d0 37.5d0 49.5d0)))
+        (make-scope-site :where (make-point 12.3424d0 45.6720d0))
+        (setq outpost (make-scope-outpost :where (make-point 12.3430d0
+                                                   45.6725d0))))
+      (let ((window (scope-rect 12.0d0 45.0d0 12.5d0 46.0d0)))
         (is (= 2 (length (find-nodes-within 'scope-site window :graph g))))
         (with-transaction () (mark-deleted (lookup-vertex (id outpost))))
         (is (= 1 (length (find-nodes-within 'scope-site window :graph g)))
@@ -573,7 +576,7 @@ the entry behind forever, un-removable, since nothing else ever visits that key.
         (is (not (has-p (id outpost)
                         (spatial-index-query-bbox
                          (spatial-index-for g 'scope-site nil)
-                         37.0d0 49.0d0 37.5d0 49.5d0)))
+                         12.0d0 45.0d0 12.5d0 46.0d0)))
             "the raw index entry was removed, not just filtered by deleted-p")))))
 
 (test method-owner-survives-a-rebuild
@@ -582,13 +585,13 @@ path used.  A rebuild that resolved the owner differently would quietly move eve
 such node into a different index than queries and removes look in."
   (with-test-graph (g)
     (with-transaction ()
-      (make-scope-site :where (make-point 37.1724d0 49.2020d0))
-      (make-scope-outpost :where (make-point 37.1730d0 49.2025d0)))
+      (make-scope-site :where (make-point 12.3424d0 45.6720d0))
+      (make-scope-outpost :where (make-point 12.3430d0 45.6725d0)))
     (is (= 2 (rebuild-spatial-indexes g)))
     (is (spatial-index-p (spatial-index-for g 'scope-site nil)))
     (is (null (spatial-index-for g 'scope-outpost nil)))
     (is (= 2 (length (find-nodes-within 'scope-site
-                                        (scope-rect 37.0d0 49.0d0 37.5d0 49.5d0)
+                                        (scope-rect 12.0d0 45.0d0 12.5d0 46.0d0)
                                         :graph g))))))
 
 (test prolog-scope-shapes
@@ -605,18 +608,22 @@ the narrow-radius symbol case above cannot distinguish."
   (with-test-graph (g)
     (let ((*graph* g))
       (with-transaction ()
-        (make-scope-probe :geom (make-point 37.1724d0 49.2020d0))
-        (make-scope-zone :extent (scope-rect 22.1d0 44.4d0 40.2d0 52.4d0)))
+        (make-scope-probe :geom (make-point 12.3424d0 45.6720d0))
+        (make-scope-zone :extent (scope-rect 8.1d0 40.9d0 14.2d0 47.4d0)))
       (is (= 1 (length (select-flat (?n) (find-near ?n scope-probe
-                                                    49.2020d0 37.1724d0 500.0d0)))))
+                                                    45.6720d0 12.3424d0
+                                                        500.0d0)))))
       (is (= 2 (length (select-flat (?n) (find-near ?n (scope-probe scope-zone)
-                                                    49.2020d0 37.1724d0 1.0d6))))
+                                                    45.6720d0 12.3424d0
+                                                        1.0d6))))
           "a literal list scope survives the Prolog compiler and unions both classes")
       (is (= 1 (length (select-flat (?n) (find-near ?n (scope-probe)
-                                                    49.2020d0 37.1724d0 1.0d6))))
+                                                    45.6720d0 12.3424d0
+                                                        1.0d6))))
           "a one-element literal list still resolves to a valid scope")
       (is (<= 1 (length (select-flat (?n) (find-near ?n :all
-                                                     49.2020d0 37.1724d0 500.0d0))))))))
+                                                     45.6720d0 12.3424d0
+                                                         500.0d0))))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Eager scope validation (§6).  Signalling on an unscopeable class is the whole
@@ -633,7 +640,7 @@ The second half pins the other side of the line: a payload that is junk on a
 SCOPEABLE class is still an empty result, not an error."
   (with-test-graph (g)
     (with-transaction ()
-      (make-scope-probe :geom (make-point 37.1724d0 49.2020d0)))
+      (make-scope-probe :geom (make-point 12.3424d0 45.6720d0)))
     (signals error (find-nodes-within 'scope-aspatial nil :graph g))
     (signals error (find-nodes-intersecting 'scope-aspatial nil :graph g))
     (signals error (find-nodes-near 'scope-aspatial nil nil nil :graph g))
@@ -663,7 +670,7 @@ SCOPEABLE class is still an empty result, not an error."
   "A :SPATIAL-PRECISION slot option is the index's grid precision."
   (with-test-graph (g)
     (with-transaction ()
-      (make-scope-coarse :extent (scope-rect 22.1d0 44.4d0 40.2d0 52.4d0)))
+      (make-scope-coarse :extent (scope-rect 8.1d0 40.9d0 14.2d0 47.4d0)))
     (let ((idx (spatial-index-for g 'scope-coarse 'extent)))
       (is (= 3 (spatial-index-precision idx)))
       ;; At p=3 a country-scale polygon is ~98 cells, so the cap never fires and
@@ -688,7 +695,7 @@ same-class test went on passing everywhere."
   ;; precision -- the behaviour the inheritance exists for.
   (with-test-graph (g)
     (with-transaction ()
-      (make-scope-coarse-sub :extent (scope-rect 22.1d0 44.4d0 40.2d0 52.4d0)))
+      (make-scope-coarse-sub :extent (scope-rect 8.1d0 40.9d0 14.2d0 47.4d0)))
     (is (null (spatial-index-for g 'scope-coarse-sub 'extent))
         "no per-subclass index was created")
     (is (= 3 (spatial-index-precision (spatial-index-for g 'scope-coarse 'extent))))))
@@ -783,8 +790,9 @@ as putting the schema registry back the way it was."
           (let ((*graph* g))
             (with-transaction ()
               (setq zone-id (id (make-scope-restale
-                                 :extent (scope-rect 22.1d0 44.4d0 40.2d0 52.4d0))))
-              (make-scope-probe :geom (make-point 37.1724d0 49.2020d0)))
+                                 :extent (scope-rect 8.1d0 40.9d0 14.2d0
+                                           47.4d0))))
+              (make-scope-probe :geom (make-point 12.3424d0 45.6720d0)))
             (is (= 6 (spatial-index-precision
                       (spatial-index-for g 'scope-restale 'extent))))
             (is (= 7 (spatial-index-precision
@@ -806,8 +814,8 @@ as putting the schema registry back the way it was."
                         (is (= 5 (spatial-index-precision zone-ix))
                             "the index adopted the newly declared precision at open")
                         (is (has-p zone-id
-                                   (spatial-index-query-bbox zone-ix
-                                                             30d0 48d0 31d0 49d0))
+                                   (spatial-index-query-bbox
+                                    zone-ix 10d0 42d0 11d0 43d0))
                             "and was repopulated from the live nodes, not left empty")
                         (is (has-p canary
                                    (spatial-index-query-bbox
@@ -846,7 +854,8 @@ polygon coarsens, and that is expected and beside the point here."
           (let ((*graph* g))
             (with-transaction ()
               (setq zone-id (id (make-scope-zone
-                                 :extent (scope-rect 22.1d0 44.4d0 40.2d0 52.4d0)))))
+                                 :extent (scope-rect 8.1d0 40.9d0 14.2d0
+                                           47.4d0)))))
             (is (= 5 (spatial-index-precision
                       (spatial-index-for g 'scope-zone 'extent))))
             (close-graph g :snapshot-p nil)))
@@ -856,7 +865,8 @@ polygon coarsens, and that is expected and beside the point here."
                  (is (= 5 (spatial-index-precision idx))
                      "the persisted precision survived a reopen at the default")
                  (is (has-p zone-id
-                            (spatial-index-query-bbox idx 30d0 48d0 31d0 49d0))))
+                            (spatial-index-query-bbox idx
+                                                      10d0 42d0 11d0 43d0))))
             (close-graph g :snapshot-p nil)
             (collect-garbage)))))))
 
@@ -882,20 +892,21 @@ would keep answering spatial queries with its ghost."
   (with-test-graph (g)
     (let (edge-id)
       (with-transaction ()
-        (let ((a (make-scope-probe :geom (make-point 37.1724d0 49.2020d0)))
-              (b (make-scope-probe :geom (make-point 37.1730d0 49.2025d0))))
+        (let ((a (make-scope-probe :geom (make-point 12.3424d0 45.6720d0)))
+              (b (make-scope-probe :geom (make-point 12.3430d0 45.6725d0))))
           (setq edge-id (id (make-scope-route
                              :from a :to b :weight 1.0
-                             :path (make-point 37.1727d0 49.2022d0))))))
+                             :path (make-point 12.3427d0 45.6722d0))))))
       (let ((idx (spatial-index-for g 'scope-route 'path)))
         (is (spatial-index-p idx) "the edge's geometry was indexed on create")
         (is (has-p edge-id
-                   (spatial-index-query-bbox idx 37.17d0 49.20d0 37.18d0 49.21d0))))
+                   (spatial-index-query-bbox idx 12.34d0 45.67d0 12.35d0
+                     45.68d0))))
       (graph-db::peer-purge-node g (lookup-edge edge-id))
       (let ((idx (spatial-index-for g 'scope-route 'path)))
         (is (not (has-p edge-id
-                        (spatial-index-query-bbox idx 37.17d0 49.20d0
-                                                  37.18d0 49.21d0)))
+                        (spatial-index-query-bbox idx 12.34d0 45.67d0
+                                                  12.35d0 45.68d0)))
             "the purged edge's spatial entry must be gone from the index itself")))))
 
 ;;; ---------------------------------------------------------------------------
@@ -999,7 +1010,7 @@ second geometry; getting it wrong would bury the real finding in noise."
                                   (setf warned (princ-to-string c)))
                                 (muffle-warning c))))
         (with-transaction ()
-          (make-scope-mixed-index :geom (make-point 37.1724d0 49.2020d0)
+          (make-scope-mixed-index :geom (make-point 12.3424d0 45.6720d0)
                                   :label "alpha" :rank 3)))
       (is (null warned)
           "one geometry slot plus two indexed scalars never warns")
@@ -1162,9 +1173,9 @@ slots into its notion of 'more than one geometry-valued slot' -- that noise is
 the actual risk an all-geometry fixture can't defend against."
   (with-test-graph (g)
     (with-transaction ()
-      (make-scope-probe :geom (make-point 37.1724d0 49.2020d0))
-      (make-scope-zone :extent (scope-rect 22.1d0 44.4d0 40.2d0 52.4d0))
-      (make-scope-mixed-index :geom (make-point 37.1730d0 49.2025d0)
+      (make-scope-probe :geom (make-point 12.3424d0 45.6720d0))
+      (make-scope-zone :extent (scope-rect 8.1d0 40.9d0 14.2d0 47.4d0))
+      (make-scope-mixed-index :geom (make-point 12.3430d0 45.6725d0)
                               :label "delta" :rank 2))
     (is (null (audit-spatial-slots g)))))
 
@@ -1207,8 +1218,8 @@ evidence no node was mutated -- not an inference from the absence of symptoms
 in an unrelated registry and a file stat."
   (with-test-graph (g)
     (with-transaction ()
-      (make-scope-probe :geom (make-point 37.1724d0 49.2020d0))
-      (make-scope-mixed-index :geom (make-point 37.1730d0 49.2025d0)
+      (make-scope-probe :geom (make-point 12.3424d0 45.6720d0))
+      (make-scope-mixed-index :geom (make-point 12.3430d0 45.6725d0)
                               :label "beta" :rank 7))
     (flet ((keys (graph)
              (sort (loop for k being the hash-keys of (spatial-indexes graph)
@@ -1255,12 +1266,12 @@ in an unrelated registry and a file stat."
   (with-test-graph (g)
     (handler-bind ((warning #'muffle-warning))
       (with-transaction ()
-        (let ((a (make-scope-probe :geom (make-point 37.1724d0 49.2020d0)))
-              (b (make-scope-probe :geom (make-point 37.1730d0 49.2025d0))))
+        (let ((a (make-scope-probe :geom (make-point 12.3424d0 45.6720d0)))
+              (b (make-scope-probe :geom (make-point 12.3430d0 45.6725d0))))
           (make-scope-two-geom-route
            :from a :to b :weight 1.0
-           :track (make-point 37.1727d0 49.2022d0)
-           :corridor (scope-rect 37.17d0 49.20d0 37.18d0 49.21d0)))))
+           :track (make-point 12.3427d0 45.6722d0)
+           :corridor (scope-rect 12.34d0 45.67d0 12.35d0 45.68d0)))))
     (let ((entry (assoc 'scope-two-geom-route (audit-spatial-slots g))))
       (is (not (null entry)) "the mis-declared edge class is reported")
       (is (equal '(track corridor) (rest entry))))))
@@ -1288,7 +1299,8 @@ to force a synchronous SAVE-SPATIAL-INDEX-ROOTS under the transaction-manager lo
                    (lambda (&rest args) (incf saves) (apply orig args)))
              (with-transaction ()
                ;; a country-scale extent: capped and coarsened at the default p7
-               (make-scope-zone :extent (scope-rect 22.1d0 44.4d0 40.2d0 52.4d0)))
+               (make-scope-zone :extent (scope-rect 8.1d0 40.9d0 14.2d0
+                                          47.4d0)))
              (is (< (spatial-index-coarsest-precision
                      (spatial-index-for g 'scope-zone 'extent))
                     7)
@@ -1327,8 +1339,8 @@ user-visible property: the recovery path yields a correct, queryable spatial ind
                (handler-case
                    (with-transaction ()
                      (setq zone-id (id (make-scope-zone
-                                        :extent (scope-rect 22.1d0 44.4d0
-                                                            40.2d0 52.4d0)))))
+                                        :extent (scope-rect 8.1d0 40.9d0
+                                                            14.2d0 47.4d0)))))
                  (error () nil)))
           (setf graph-db::*after-apply-tx-writes-hook* nil)
           (ignore-errors (close-graph g :snapshot-p nil))))
@@ -1341,7 +1353,8 @@ user-visible property: the recovery path yields a correct, queryable spatial ind
                  (is (< (spatial-index-coarsest-precision idx) 7)
                      "recovery reconstructed the coarsened histogram")
                  (is (has-p zone-id
-                            (spatial-index-query-bbox idx 30d0 48d0 30.1d0 48.1d0))
+                            (spatial-index-query-bbox
+                             idx 10d0 42d0 10.1d0 42.1d0))
                      "the coarse geometry is findable after recovery")))
           (ignore-errors (close-graph g2 :snapshot-p nil))
           (collect-garbage))))))
@@ -1363,8 +1376,8 @@ user-visible property: the recovery path yields a correct, queryable spatial ind
            (let ((*graph* g))
              (is (= 512 (graph-default-spatial-max-cells g)))
              (with-transaction ()
-               (make-scope-site :where (make-point 37.1724d0 49.2020d0))
-               (make-scope-custom-cap :extent (make-point 37.1730d0 49.2025d0)))
+               (make-scope-site :where (make-point 12.3424d0 45.6720d0))
+               (make-scope-custom-cap :extent (make-point 12.3430d0 45.6725d0)))
              (let ((site-idx (spatial-index-for g 'scope-site nil))
                    (cap-idx (spatial-index-for g 'scope-custom-cap 'extent)))
 
@@ -1437,7 +1450,7 @@ hold both kinds."
 subclasses sharing one index get DIFFERENT tags -- that difference IS the
 filter."
   (with-test-graph (g)
-    (let (a-id b-id (pt (make-point 37.1724d0 49.2020d0)))
+    (let (a-id b-id (pt (make-point 12.3424d0 45.6720d0)))
       (with-transaction ()
         (setq a-id (id (make-scope-shared-a :geom pt)))
         (setq b-id (id (make-scope-shared-b :geom pt))))
@@ -1457,13 +1470,13 @@ filter."
 window, a query scoped to A must materialise exactly ONE node.  Before GH #104
 it materialised all 21 -- and on a real corpus, 39,409 to answer 206."
   (with-test-graph (g)
-    (let ((pt (make-point 37.1724d0 49.2020d0)))
+    (let ((pt (make-point 12.3424d0 45.6720d0)))
       (with-transaction ()
         (make-scope-shared-a :geom pt)
         (dotimes (i 20)
-          (make-scope-shared-b :geom (make-point (+ 37.1724d0 (* i 1d-4))
-                                                 49.2020d0))))
-      (let ((window (scope-rect 37.0d0 49.0d0 37.5d0 49.5d0)))
+          (make-scope-shared-b :geom (make-point (+ 12.3424d0 (* i 1d-4))
+                                                 45.6720d0))))
+      (let ((window (scope-rect 12.0d0 45.0d0 12.5d0 46.0d0)))
         ;; Sanity: the index really does hold all 21 candidates.
         (is (= 21 (length (find-nodes-within 'scope-shared window :graph g)))
             "the ancestor scope sees every node in the shared index")
@@ -1483,8 +1496,8 @@ it materialised all 21 -- and on a real corpus, 39,409 to answer 206."
 NIL, and NIL must be ADMITTED -- the TYPEP filter then decides it.  Rejecting it
 would turn a stale index into silently empty results, not merely slow ones."
   (with-test-graph (g)
-    (let ((pt (make-point 37.1724d0 49.2020d0))
-          (window (scope-rect 37.0d0 49.0d0 37.5d0 49.5d0))
+    (let ((pt (make-point 12.3424d0 45.6720d0))
+          (window (scope-rect 12.0d0 45.0d0 12.5d0 46.0d0))
           id)
       (with-transaction ()
         (setq id (id (make-scope-shared-a :geom pt))))
@@ -1507,7 +1520,7 @@ would turn a stale index into silently empty results, not merely slow ones."
 ADOPTED (so the rebuild can free its storage) but NOT trusted, and the rebuild
 that follows must leave every entry tagged."
   (with-test-graph (g)
-    (let ((pt (make-point 37.1724d0 49.2020d0)) id)
+    (let ((pt (make-point 12.3424d0 45.6720d0)) id)
       (with-transaction ()
         (setq id (id (make-scope-shared-a :geom pt))))
       (graph-db::save-spatial-index-roots g)

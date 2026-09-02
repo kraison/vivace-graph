@@ -8,7 +8,7 @@
 (in-package #:graph-db/test)
 
 (def-suite mvcc-suite
-  :description "MVCC: v2 node-head codec (commit-epoch + prev-pointer), versioning."
+  :description "MVCC: v3 head codec (commit-epoch, prev-pointer), versioning."
   :in graph-db-suite)
 
 (in-suite mvcc-suite)
@@ -19,9 +19,10 @@
   (setf (gethash :mvcc-keep-test *schema-node-metadata*) nil))
 (def-vertex mvcc-kept-node () ((n)) :mvcc-keep-test :keep-revisions 2)
 
-(test node-head-v2-round-trip-vertex
-  "A vertex head round-trips revision, data-pointer, commit-epoch and prev-pointer
-through serialize-node-head / deserialize-node-head (31-byte v2 head)."
+(test node-head-v3-round-trip-vertex
+  "A vertex head round-trips revision, data-pointer, commit-epoch and
+prev-pointer through serialize-node-head / deserialize-node-head (33-byte
+head; type-id widened to 4 bytes, GH #166)."
   (with-test-graph (g)
     (declare (ignore g))
     (let (v)
@@ -31,9 +32,9 @@ through serialize-node-head / deserialize-node-head (31-byte v2 head)."
             (graph-db::commit-epoch v) 123456789
             (graph-db::prev-pointer v) 987654321)
       (let ((buf (graph-db::make-byte-vector graph-db::+node-header-size+)))
-        (is (= 31 graph-db::+node-header-size+))
-        (is (= 30 (graph-db::serialize-node-head buf v 0))
-            "serialize returns the final offset (31-byte head ends at 30)")
+        (is (= 33 graph-db::+node-header-size+))
+        (is (= 32 (graph-db::serialize-node-head buf v 0))
+            "serialize returns the final offset (33-byte head ends at 32)")
         (multiple-value-bind (del wr hw tiw vw vew vvw type-id rev ptr epoch prev offset)
             (graph-db::deserialize-node-head buf 0)
           (declare (ignore del wr hw tiw vw vew vvw))
@@ -42,12 +43,12 @@ through serialize-node-head / deserialize-node-head (31-byte v2 head)."
           (is (= 4242 ptr))
           (is (= 123456789 epoch) "commit-epoch round-trips")
           (is (= 987654321 prev) "prev-pointer round-trips")
-          (is (= 30 offset)))))))
+          (is (= 32 offset)))))))
 
-(test node-head-v2-round-trip-edge
+(test node-head-v3-round-trip-edge
   "An edge head round-trips its from/to/weight AND the new commit-epoch /
 prev-pointer (the edge codec positions from/to/weight after the node head, so it
-auto-shifts with the larger v2 head)."
+auto-shifts with the larger v3 head)."
   (with-test-graph (g)
     (declare (ignore g))
     (let (e aid bid)
@@ -59,7 +60,7 @@ auto-shifts with the larger v2 head)."
             (graph-db::commit-epoch e) 555
             (graph-db::prev-pointer e) 666)
       (let ((buf (graph-db::make-byte-vector graph-db::+edge-header-size+)))
-        (is (= 71 graph-db::+edge-header-size+))
+        (is (= 73 graph-db::+edge-header-size+))
         (graph-db::serialize-edge-head buf e 0)
         (let ((e2 (graph-db::deserialize-edge-head buf 0)))
           (is (= 4 (graph-db::revision e2)))
@@ -70,7 +71,7 @@ auto-shifts with the larger v2 head)."
           (is (= 2.5 (weight e2))))))))
 
 ;;; ---------------------------------------------------------------------------
-;;; v1 -> v2 migration (MIGRATE-GRAPH)
+;;; v1 -> v3 migration (MIGRATE-GRAPH)
 ;;;
 ;;; tests/fixtures/v1-graph.tar.gz is a pristine pre-MVCC (storage-version 1,
 ;;; 15-byte head) graph built on the experiment branch with this same test
@@ -91,10 +92,14 @@ DEST as a string."
                       :output t :error-output t)
     (namestring dest)))
 
-(test migrate-v1-graph-to-v2
-  "A pre-MVCC (v1, 15-byte head) graph cannot be opened directly by v2 code but
+(test migrate-v1-graph-to-v3-without-renumbering
+  "A pre-MVCC (v1, 15-byte head) graph cannot be opened directly by v3 code but
 MIGRATE-GRAPH carries it across (logical snapshot + replay), preserving every
-node, its slot data, the subclass, and the edge topology."
+node, its slot data, the subclass, and the edge topology.
+
+Pins the DEFAULT mode, :RENUMBER-P NIL, which is passed explicitly below: the
+type-id guarantee became mode-dependent at #186 (spec §10.1), and :RENUMBER-P T
+is the exact reverse of what this test asserts."
   ;; The committed v1 fixture's struct.dat/schema.dat were cl-store'd by SBCL.
   ;; cl-store's struct encoding is not portable across implementations, so ECL
   ;; cannot restore an SBCL-written graph (a pre-existing property of the on-disk
@@ -105,23 +110,24 @@ node, its slot data, the subclass, and the edge topology."
   #-ecl
   (with-temp-directory (root)
     (let ((old-dir (extract-v1-fixture (merge-pathnames "v1/" root)))
-          (new-dir (namestring (merge-pathnames "v2/" root))))
-      ;; v2 code refuses to open the v1 graph directly (the format gate).
+          (new-dir (namestring (merge-pathnames "v3/" root))))
+      ;; v3 code refuses to open the v1 graph directly (the format gate).
       (signals error (graph-db:open-graph :mvcc-mig-guard old-dir
                                           :buffer-pool-p nil :gc-heap-p nil))
-      ;; ...but MIGRATE-GRAPH brings it forward to v2.  The default snapshot-file
-      ;; is per-run since GH #98, so this no longer has to dodge a shared path --
-      ;; but keep it inside our temp tree anyway, so a killed run leaves nothing
-      ;; behind in the system temp directory.
+      ;; ...but MIGRATE-GRAPH brings it forward to v3.  The default
+      ;; snapshot-file is per-run since GH #98, so this no longer has to dodge
+      ;; a shared path -- but keep it inside our temp tree anyway, so a killed
+      ;; run leaves nothing behind in the system temp directory.
       (let ((g (graph-db::migrate-graph :graph-db-mvcc-migration old-dir new-dir
                                         :package :graph-db/test
+                                        :renumber-p nil
                                         :snapshot-file
                                         (namestring
                                          (merge-pathnames "migrate.snapshot" root)))))
         (unwind-protect
              (let ((*graph* g))
-               (is (= 2 graph-db::+storage-version+)
-                   "the migrated graph is written in the current (v2) format")
+               (is (= 3 graph-db::+storage-version+)
+                   "the migrated graph is written in the current (v3) format")
                ;; All three people survive, with name + age intact.  :vertex-type
                ;; g-person includes the g-employee subclass (Carol) by default.
                (let ((people (sort (map-vertices
@@ -178,6 +184,73 @@ snapshot and the replay leaked the file permanently.  It is now on every exit."
         (setf (fdefinition 'graph-db::recreate-graph) orig))
       (is (not (probe-file snap))
           "the snapshot must be removed even when the migration fails"))))
+
+(defparameter *migration-origin*
+  (make-array 16 :element-type '(unsigned-byte 8) :initial-element 9)
+  "A fixed device origin id for the sidecar-migration tests (GH #289).")
+
+(test migration-carries-the-peer-replication-sidecars
+  "GH #289: MIGRATE-GRAPH is snapshot + replay, which carries the nodes and
+nothing else.  A peer-replicating store's Lamport clock, applied-op index,
+field stamps, node origins and conflict records live BESIDE the graph, and
+OPEN-GRAPH recreated each one empty after a migration -- a reset clock
+loses later LWW races, an empty applied-op index re-applies ops, both
+silently and only at the next sync.  Node UUIDs survive the replay, so the
+sidecars' keys stay valid and they are carried verbatim."
+  (with-temp-directory (root)
+    (let ((old-dir (namestring (merge-pathnames "peer-old/" root)))
+          (new-dir (namestring (merge-pathnames "peer-new/" root)))
+          (op-id (gen-id)))
+      (let ((g (make-graph *integration-graph-name* old-dir
+                           :peer-role :device :origin-id *migration-origin*
+                           :peer-host "localhost" :replication-port 0
+                           :buffer-pool-size 1000)))
+        (let ((*graph* g))
+          (dotimes (i 3) (with-transaction () (make-g-person :name "m")))
+          (graph-db::peer-observe-lamport g 40)
+          (graph-db::record-applied-op g op-id 40))
+        (close-graph g :snapshot-p nil))
+      (let ((g (graph-db::migrate-graph
+                *integration-graph-name* old-dir new-dir
+                :package :graph-db/test
+                :snapshot-file (namestring
+                                (merge-pathnames "peer.snapshot" root)))))
+        (close-graph g :snapshot-p nil))
+      (dolist (f '("lamport.dat" "applied-ops/struct.dat"
+                   "applied-ops/table.dat"))
+        (is (probe-file (merge-pathnames f new-dir)) "~A was carried" f))
+      (let ((g (open-graph *integration-graph-name* new-dir
+                           :peer-role :device :origin-id *migration-origin*
+                           :peer-host "localhost" :replication-port 0)))
+        (unwind-protect
+             (let ((*graph* g))
+               (is (= 40 (graph-db::lamport-counter g))
+                   "the Lamport clock survives the migration")
+               (is-true (graph-db::op-applied-p g op-id)
+                        "the applied-op index survives the migration")
+               (is (= 3 (length (map-vertices #'identity g :collect-p t
+                                              :vertex-type 'g-person)))))
+          (close-graph g :snapshot-p nil))))))
+
+(test migrating-a-non-peer-store-carries-no-sidecars
+  "The other side of GH #289: a store with no peer sidecars migrates as
+before -- nothing is invented for it."
+  (with-temp-directory (root)
+    (let ((old-dir (namestring (merge-pathnames "plain-old/" root)))
+          (new-dir (namestring (merge-pathnames "plain-new/" root))))
+      (let ((g (make-graph *integration-graph-name* old-dir
+                           :buffer-pool-size 1000)))
+        (let ((*graph* g))
+          (with-transaction () (make-g-person :name "p")))
+        (close-graph g :snapshot-p nil))
+      (let ((g (graph-db::migrate-graph
+                *integration-graph-name* old-dir new-dir
+                :package :graph-db/test
+                :snapshot-file (namestring
+                                (merge-pathnames "plain.snapshot" root)))))
+        (close-graph g :snapshot-p nil))
+      (is (not (probe-file (merge-pathnames "lamport.dat" new-dir))))
+      (is (not (probe-file (merge-pathnames "applied-ops/" new-dir)))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Versioned write path + reaper (P2)

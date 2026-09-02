@@ -1,7 +1,7 @@
 ;;;; graph-db/algorithms-io -- graph import (GML, Pajek) and Graphviz export.
 ;;;;
 ;;;; The OPTIONAL io add-on for graph-db/algorithms.  It pulls in the parsing
-;;;; dependencies (cl-ppcre, yacc, dso-lex, parse-number) that the core algorithm
+;;;; dependencies (cl-ppcre, yacc, parse-number) that the core algorithm
 ;;;; add-on deliberately avoids, so importers stay out of the embeddable core.
 ;;;;
 ;;;; The file parsers are vendored from graph-utils: they build an in-memory
@@ -15,7 +15,7 @@
 ;;; ==================================================================
 
 (defpackage :graph-db-algorithms-io
-  (:use :cl :cl-ppcre :yacc :dso-lex)
+  (:use :cl :cl-ppcre :yacc)
   (:nicknames :graph-db-aio)
   (:export #:parse-gml #:parse-pajek))
 
@@ -26,12 +26,53 @@
 (defun un-dquote (s) (regex-replace-all "\"\"" (snip s) "\""))
 (defun strip-whitespace (s) (regex-replace-all "(^\\s+|\\s+$)" s ""))
 
-(deflexer scan-gml ()
-  ("\\s+" whitespace strip-whitespace)
-  ("[^\"'\\[\\]\\s]+" val strip-whitespace)
-  ("(\\[|\\])" bracket)
-  ("'(?:[^']|'')*'" val un-squote)
-  ("\"(?:[^\"]|\"\")*\"" val un-dquote))
+;; Hand-rolled replacement for the dso-lex DEFLEXER, which was dropped
+;; from Quicklisp (GH #240).  Same (values class image remainder)
+;; contract; rules are disjoint on the first character.
+(defun scan-gml (input &optional (start 0))
+  "Scan one GML token in INPUT at START.
+Returns (values class image next-start).  An unterminated quoted
+string returns class NIL (LEX-GML then yields NIL), not an error."
+  (flet ((ws-p (ch)
+           (member ch '(#\Space #\Tab #\Newline #\Return #\Page)))
+         (quoted-end (qch)
+           ;; Index just past the closing QCH, honoring doubled
+           ;; QCH-QCH escapes; NIL when unterminated.
+           (loop with i = (1+ start) with len = (length input)
+                 while (< i len)
+                 do (cond ((char/= (char input i) qch) (incf i))
+                          ((and (< (1+ i) len)
+                                (char= (char input (1+ i)) qch))
+                           (incf i 2))
+                          (t (return (1+ i)))))))
+    (when (>= start (length input))          ; exhausted input, no match
+      (return-from scan-gml (values nil nil start)))
+    (let ((len (length input))
+          (ch (char input start)))
+      (cond ((ws-p ch)
+             (values 'whitespace ""
+                     (or (position-if-not #'ws-p input :start start)
+                         len)))
+            ((or (char= ch #\[) (char= ch #\]))
+             (values 'bracket (string ch) (1+ start)))
+            ((char= ch #\')
+             (let ((end (quoted-end #\')))
+               (if end
+                   (values 'val (un-squote (subseq input start end)) end)
+                   (values nil nil start))))
+            ((char= ch #\")
+             (let ((end (quoted-end #\")))
+               (if end
+                   (values 'val (un-dquote (subseq input start end)) end)
+                   (values nil nil start))))
+            (t
+             (let ((end (or (position-if
+                             (lambda (c)
+                               (or (ws-p c) (find c "\"'[]")))
+                             input :start start)
+                            len)))
+               (values 'val (strip-whitespace (subseq input start end))
+                       end)))))))
 
 (defun lex-gml (lexer input)
   (labels ((my-scan (start tokens)

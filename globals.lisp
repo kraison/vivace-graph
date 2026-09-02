@@ -75,11 +75,54 @@ application's own config; graph-db does not read an ini file itself.")
 (alexandria:define-constant +data-file+ "data.dat" :test 'equal)
 
 (defvar *schema-node-metadata* (make-hash-table :test 'equal))
-(alexandria:define-constant +max-node-types+ 65536)
+
+(defvar *system-directory* nil
+  "Directory holding this SYSTEM's image-level state: the type-id registry
+(GH #186), a sibling of the optional system clock's files (#182).  It has no
+default and is MANDATORY -- MAKE-GRAPH and OPEN-GRAPH signal
+SYSTEM-DIRECTORY-REQUIRED when it is NIL rather than fall back to per-graph
+type-id counters, because two id regimes that diverge unnoticed is exactly
+what #186 exists to prevent.  Set it from your application's own config.")
+
+(defvar *type-registry* nil
+  "The open TYPE-REGISTRY for this image, opened from *SYSTEM-DIRECTORY* on
+first use by ENSURE-TYPE-REGISTRY and reopened whenever that changes.  Bind
+*SYSTEM-DIRECTORY*, not this.")
+
+(defvar *schema-update-suppressed* nil
+  "When true, UPDATE-SCHEMA is a no-op -- including its
+RECONCILE-SCHEMA-WITH-REGISTRY pass.  Bound by MIGRATE-GRAPH around the opens
+whose schema it then installs by hand: minting registry type-ids for a schema
+discarded on the next form leaves the registry holding ids no store uses
+(GH #186), and adopting them would be the same mistake in the other
+direction.
+
+Bind it elsewhere only for a store deliberately held inconsistent with its
+own registry -- a fixture, or a rescue open.  A store opened with the replay
+skipped does not learn the types declared since it was closed, and its ids
+are not checked against the registry.")
+
+;; The type-id READ-PATH ceiling (schema.lisp's LOOKUP-NODE-TYPE-BY-ID
+;; assert), not an allocation size -- TYPE-INDEX no longer preallocates by
+;; this (#166; see +TYPE-INDEX-INITIAL-TYPES+ below).  Matches the type-id
+;; field's full width: (UNSIGNED-BYTE 32), widened by #166's Task 1, so the
+;; registry (ASSIGN-TYPE-ID, #186) can never issue an id the read path then
+;; refuses.
+(alexandria:define-constant +max-node-types+ (expt 2 32))
 
 ;; v2 (2026): MVCC node head grew 15 -> 31 bytes (commit-epoch + prev-pointer).
-;; Old (v1) graphs must be migrated via MIGRATE-GRAPH (snapshot + replay).
-(alexandria:define-constant +storage-version+     #x02)
+;; v3 (#166): type-id widened 16 -> 32 bits, head grew 31 -> 33 bytes, ve-key
+;; 18 -> 20, vev-key 34 -> 36.  Old (v1/v2) graphs must be migrated via
+;; MIGRATE-GRAPH (snapshot + replay); a v1 or v2 graph is refused at
+;; OPEN-GRAPH, not silently misread.
+(alexandria:define-constant +storage-version+     #x03)
+
+;; The memory-graph native image ("VGMI") carries its own format version,
+;; independent of +STORAGE-VERSION+.  v8 (#187) widens type-id from 2 to 4
+;; bytes; v5/v6/v7 stay readable, because a cleanly-closed memory graph's
+;; image is its ONLY durable copy -- the journal is cleared on checkpoint.
+(alexandria:define-constant +native-image-version+ 8)
+(alexandria:define-constant +image-type-id-bytes+  4)
 (alexandria:define-constant +fixed-integer-64+    #x01)
 (alexandria:define-constant +data-magic-byte+     #x17)
 (alexandria:define-constant +lhash-magic-byte+    #x18)
@@ -131,7 +174,7 @@ application's own config; graph-db does not read an ini file itself.")
 ;; reservation is PROT_NONE + MAP_NORESERVE anonymous address space, and on
 ;; 64-bit the address space it consumes is irrelevant.  Exception: RLIMIT_AS /
 ;; `ulimit -v` counts reserved address space regardless of MAP_NORESERVE, so a
-;; process capped by one (e.g. a systemd unit's LimitAS=, as on odm) can fail
+;; process capped by one (e.g. a systemd unit's LimitAS=) can fail
 ;; to open a graph outright even though nothing here is actually resident.
 ;;
 ;; At dimension 1024 (4,112 bytes per slot), capacity only ever advances by
@@ -227,14 +270,29 @@ strictly-safe pre-durability abort.")
 ;; Sentinel values for skip lists
 (alexandria:define-constant +min-sentinel+ :gmin)
 (alexandria:define-constant +max-sentinel+ :gmax)
+;; A stored "this component has no value" marker for a multi-slot index key.
+;; Distinct from +MIN-SENTINEL+ (which stays a pure range bound, so an exact
+;; match on a null component stays expressible) and from NIL (which %INDEX-KEY
+;; already uses to mean "not indexable").  (GH #107)
+(alexandria:define-constant +null-component+ :gnull)
 ;; For views, aggregrate key symbol
 (alexandria:define-constant +reduce-master-key+ :gagg)
 
 ;; index-lists
 (alexandria:define-constant +index-list-bytes+ 17)
 
+;; Type-index lock striping (GH #166).  One mutex per type-id cost 65,536 of
+;; them per index per store; two types sharing a stripe now serialise, which
+;; is a push or a remove on one index-list.
+(alexandria:define-constant +type-index-lock-stripes+ 256)
+
+;; Initial type-index capacity in TYPES, not the id ceiling.  The file grows
+;; on demand; type-ids are assigned sequentially so the used range stays
+;; dense.
+(alexandria:define-constant +type-index-initial-types+ 4096)
+
 ;; ve-key / ve-index
-(alexandria:define-constant +ve-key-bytes+ 18)
+(alexandria:define-constant +ve-key-bytes+ 20)
 (alexandria:define-constant +null-ve-key+
     (make-array +ve-key-bytes+ :initial-element 0 :element-type '(unsigned-byte 8))
   :test 'equalp)
@@ -243,7 +301,7 @@ strictly-safe pre-durability abort.")
   :test 'equalp)
 
 ;; vev-key / vev-index
-(alexandria:define-constant +vev-key-bytes+ 34)
+(alexandria:define-constant +vev-key-bytes+ 36)
 (alexandria:define-constant +null-vev-key+
     (make-array +vev-key-bytes+ :initial-element 0 :element-type '(unsigned-byte 8))
   :test 'equalp)
@@ -323,6 +381,16 @@ strictly-safe pre-durability abort.")
 (alexandria:define-constant +timestamp+ 101)
 (alexandria:define-constant +geometry+ 102) ;; spatial extension (see geometry.lisp)
 
+;; Marker byte for the INDEX key codec (index.lisp), not a general SERIALIZE
+;; type -- it occupies the same byte position (right after a key's 16-byte
+;; id) that a real type tag would, so the deserializer can tell an arity>=2
+;; tuple from an arity-1 key whose lone value is itself a list (which
+;; serializes starting with +LIST+, not this).  255 is chosen far outside
+;; today's tag range (0-31, 100-102); it collides only if some future
+;; SERIALIZE type ever claims byte 255, at which point this must move (GH
+;; #107).
+(alexandria:define-constant +index-tuple+ 255)
+
 ;; GEOS availability flags.  These are inert in core graph-db (no FFI, no libgeos
 ;; dependency).  The OPTIONAL `graph-db/geos' add-on system flips them at load
 ;; time when it successfully binds libgeos_c; the spatial refine seam
@@ -377,3 +445,37 @@ strictly-safe pre-durability abort.")
 (alexandria:define-constant +unbound+ :unbound)
 (alexandria:define-constant +no-bindings+ '((t . t)) :test 'equalp)
 (alexandria:define-constant +fail+ nil)
+
+;;; Deterministic commit refusals (GH #151).  A CONSTRAINT-VIOLATION is a
+;;; pure function of the write and the schema -- retrying the same write
+;;; can never succeed -- which is what lets the peer push path reject an op
+;;; instead of re-streaming it forever.  Every constraint family's condition
+;;; inherits it: unique, value, cardinality, domain/range, vector dimension
+;;; (core) and the spacetime disjointness conditions.
+
+(define-condition constraint-violation (error) ()
+  (:documentation "Superclass of every DETERMINISTIC commit refusal: the same
+write against the same schema is refused again, however often it is retried.
+Transient failures (conflicts, I/O) are never subclasses (GH #151)."))
+
+(define-condition vector-dimension-violation (constraint-violation)
+  ((slot :initarg :slot :reader vdv-slot)
+   (owner :initarg :owner :reader vdv-owner)
+   (actual :initarg :actual :reader vdv-actual)
+   (expected :initarg :expected :reader vdv-expected))
+  (:report (lambda (c s)
+             (format s "vector-index slot ~A on ~A: vector length ~D does ~
+not match established segment dimension ~D"
+                     (vdv-slot c) (vdv-owner c) (vdv-actual c)
+                     (vdv-expected c)))))
+
+;;; A precondition the query layer checked deliberately and the CALLER
+;;; failed (GH #286): an unindexed slot, an unscoped spatial class, a wrong
+;;; index arity.  Distinct from SIMPLE-ERROR / TYPE-ERROR so a server can
+;;; answer 400 for these and 500 for an engine defect; QUERY-PARAM-ERROR
+;;; (query-dsl.lisp) is its DSL-level subclass.
+
+(define-condition query-precondition-error (error)
+  ((reason :initarg :reason :reader query-precondition-error-reason))
+  (:report (lambda (c s)
+             (format s "~A" (query-precondition-error-reason c)))))

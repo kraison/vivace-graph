@@ -9,10 +9,8 @@
 (in-suite io-suite)
 
 (defun write-temp-file (content ext)
-  ;; SCRATCH-TAG, not a bare (RANDOM ...): SBCL's default *RANDOM-STATE* is
-  ;; constant, so concurrent runs would pick the same name.
-  (let ((path (merge-pathnames (format nil "gda-io-~A.~A" (scratch-tag) ext)
-                               (uiop:temporary-directory))))
+  (let ((path (graph-db-test-scratch:make-scratch-file-name
+               "gda-io" ext)))
     (with-open-file (out path :direction :output :if-exists :supersede
                               :if-does-not-exist :create)
       (write-string content out))
@@ -20,6 +18,47 @@
 
 (defun io-vc () (lambda (i label) (declare (ignore i)) (make-an :name label)))
 (defun io-ec () (lambda (a b w) (make-ae :from a :to b :weight (coerce w 'float))))
+
+(test gml-lexer-token-stream
+  "Hand-rolled SCAN-GML (GH #240) yields the dso-lex-era token stream."
+  (let ((line
+         (concatenate
+          'string
+          "  node [ id 1 label \"say \"\"hi\"\"\" tag 'it''s' ]  ")))
+    (is (equal
+         (list (list 'graph-db-aio::val "node")
+               (list 'graph-db-aio::bracket "[")
+               (list 'graph-db-aio::val "id")
+               (list 'graph-db-aio::val "1")
+               (list 'graph-db-aio::val "label")
+               (list 'graph-db-aio::val "say \"hi\"")
+               (list 'graph-db-aio::val "tag")
+               (list 'graph-db-aio::val "it's")
+               (list 'graph-db-aio::bracket "]"))
+         (graph-db-aio::lex-gml 'graph-db-aio::scan-gml line)))))
+
+(test gml-lexer-single-token-classes
+  "Each rule in isolation: bare val, brackets, quoted vals."
+  (flet ((one (s)
+           (first (graph-db-aio::lex-gml 'graph-db-aio::scan-gml s))))
+    (is (equal (list 'graph-db-aio::val "42.5") (one "42.5")))
+    (is (equal (list 'graph-db-aio::bracket "[") (one "[")))
+    (is (equal (list 'graph-db-aio::bracket "]") (one "]")))
+    (is (equal (list 'graph-db-aio::val "a b") (one "'a b'")))
+    (is (equal (list 'graph-db-aio::val "a b") (one "\"a b\"")))
+    ;; LEX-GML drops empty images, so "" lexes to no token at all --
+    ;; exactly as under dso-lex.
+    (is (null (one "\"\"")))
+    ;; Doubled escape flush against the closing quote at end of input.
+    (is (equal (list 'graph-db-aio::val "a\"") (one "\"a\"\"\"")))))
+
+(test gml-lexer-unterminated-string-yields-nil
+  "An unterminated quoted string makes LEX-GML return NIL, as the
+dso-lex lexer did (no rule matched => silent NIL)."
+  (is (null (graph-db-aio::lex-gml 'graph-db-aio::scan-gml
+                                   "label \"oops")))
+  (is (null (graph-db-aio::lex-gml 'graph-db-aio::scan-gml
+                                   "label 'oops"))))
 
 (defparameter +pajek-text+
   "*Vertices 3

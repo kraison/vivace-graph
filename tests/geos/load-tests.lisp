@@ -74,3 +74,32 @@ bogus library so the test is meaningful even on a machine that HAS GEOS."
             (error () :handled))))
     (is (eq :handled survived)
         "missing library must raise an error our handler catches, not crash")))
+
+(test search-dirs-keep-their-declared-priority-order
+  "%ADD-GEOS-LIBRARY-DIRECTORIES must leave CFFI's search list in the SAME order
+as the dirs it was given -- highest priority first.
+
+Asserted against dirs that certainly exist, on a fresh binding, so the result
+does not depend on which library dirs this particular host happens to have.
+That matters: on an Apple-Silicon Mac /usr/local/lib does not exist at all, so a
+test phrased against the real list silently asserts nothing and passes on the
+BUGGY code.  PUSHNEW prepends, so pushing a priority-ordered list forward
+reverses it; this is the regression that behaviour would represent."
+  (let* ((cffi:*foreign-library-directories* '())
+         (dirs '("/usr" "/tmp"))
+         (added (graph-db::%add-geos-library-directories dirs)))
+    (is (equal '("/usr" "/tmp") added)
+        "returns the dirs it added, in priority order")
+    (is (equal (mapcar (lambda (d) (pathname (concatenate 'string d "/"))) dirs)
+               cffi:*foreign-library-directories*)
+        "search list must read highest-priority-first, got ~S"
+        cffi:*foreign-library-directories*)))
+
+(test nonexistent-search-dirs-are-skipped-not-pushed
+  "A dir that does not exist is not added -- CFFI would otherwise stat a bogus
+path on every library load."
+  (let* ((cffi:*foreign-library-directories* '())
+         (added (graph-db::%add-geos-library-directories
+                 '("/usr" "/no/such/dir/ever" "/tmp"))))
+    (is (equal '("/usr" "/tmp") added))
+    (is (= 2 (length cffi:*foreign-library-directories*)))))

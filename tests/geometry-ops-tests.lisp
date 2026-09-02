@@ -15,15 +15,17 @@
   (is (< (abs (- (geodesic-distance 0d0 0d0 1d0 0d0) 111194.927d0)) 1d0)))
 
 (test distance-symmetric-and-zero
-  (is (= 0d0 (geodesic-distance 49.2d0 37.1d0 49.2d0 37.1d0)))
-  (is (= (geodesic-distance 49.2d0 37.1d0 50.0d0 23.7d0)
-         (geodesic-distance 50.0d0 23.7d0 49.2d0 37.1d0))))
+  (is (= 0d0 (geodesic-distance 45.67d0 12.34d0 45.67d0 12.34d0)))
+  (is (= (geodesic-distance 45.67d0 12.34d0 41.75d0 2.45d0)
+         (geodesic-distance 41.75d0 2.45d0 45.67d0 12.34d0))))
 
 (test distance-vs-pyproj-oracle
-  "Haversine agrees with the pyproj WGS84 geodesic (397.444 m) to within 0.5%."
-  (let ((d (geodesic-distance 49.2020584d0 37.1724312d0 49.2036314d0 37.1773283d0)))
-    (is (< (abs (- d 397.444d0)) (* 0.005d0 397.444d0))
-        "haversine ~A m vs oracle 397.444 m" d)))
+  "Haversine agrees with the Vincenty WGS84 geodesic (419.721 m) to
+within 0.5%."
+  (let ((d (geodesic-distance 45.6720584d0 12.3424312d0 45.6736314d0
+             12.3473283d0)))
+    (is (< (abs (- d 419.721d0)) (* 0.005d0 419.721d0))
+        "haversine ~A m vs oracle 419.721 m" d)))
 
 ;;; ---- point in polygon --------------------------------------------------
 
@@ -86,14 +88,25 @@ must not re-box them one at a time on every read (GH #86: 47 KB/call on a
         (setf (aref ring (* 2 i))      (+ 30d0 (* 5d0 (cos th)))
               (aref ring (1+ (* 2 i))) (+ 50d0 (* 5d0 (sin th))))))
     (funcall (compile nil '(lambda (r) (point-in-ring-p 30d0 50d0 r))) ring) ; warm
-    (sb-ext:gc :full t)
+    ;; GET-BYTES-CONSED is process-wide: reapers, replication and peer
+    ;; threads allocating inside the window are charged to this loop, and
+    ;; only ever upward -- 163.76 bytes/call once, in the full suite, 2.6x
+    ;; the budget and three orders of magnitude under the 47 KB regression
+    ;; this guards.  The MINIMUM over several rounds is robust to that and
+    ;; still fails decisively on the real thing (GH #174; the idiom
+    ;; node-class-tests.lisp uses).
     (let* ((call (compile nil '(lambda (r) (point-in-ring-p 30d0 50d0 r))))
-           (before (sb-ext:get-bytes-consed)))
-      (dotimes (i 200) (funcall call ring))
-      (let ((per-call (/ (- (sb-ext:get-bytes-consed) before) 200)))
-        (is (< per-call 64)
-            "packed point-in-ring-p consed ~A bytes/call on a 740-vertex ring"
-            per-call)))))
+           (per-call
+             (loop repeat 5
+                   minimize (progn
+                              (sb-ext:gc :full t)
+                              (let ((before (sb-ext:get-bytes-consed)))
+                                (dotimes (i 200) (funcall call ring))
+                                (/ (- (sb-ext:get-bytes-consed) before)
+                                   200))))))
+      (is (< per-call 64)
+          "packed point-in-ring-p consed ~,1F bytes/call on a 740-vertex ring"
+          (float per-call)))))
 
 ;;; ---- boundary semantics ------------------------------------------------
 ;;;
@@ -154,12 +167,12 @@ on repeated calls (no randomness / order dependence)."
     (is (not (geometry-contains-point-p g 5d0 5d0)))))
 
 (test geometry-contains-realish-aoi
-  "A find inside a small task-area square is contained; a nearby one is not."
-  (let ((aoi (make-polygon '(((37.170 49.200) (37.180 49.200)
-                              (37.180 49.206) (37.170 49.206)
-                              (37.170 49.200))))))
-    (is (geometry-contains-point-p aoi 37.1724312d0 49.2020584d0))
-    (is (not (geometry-contains-point-p aoi 37.1900d0 49.2100d0)))))
+  "A point inside a small region square is contained; a nearby one is not."
+  (let ((aoi (make-polygon '(((12.340 45.670) (12.350 45.670)
+                              (12.350 45.676) (12.340 45.676)
+                              (12.340 45.670))))))
+    (is (geometry-contains-point-p aoi 12.3424312d0 45.6720584d0))
+    (is (not (geometry-contains-point-p aoi 12.3600d0 45.6800d0)))))
 
 ;;; ---- GH #99: point-in-polygon vs GEOS characterization -----------------
 ;;;
@@ -242,7 +255,7 @@ differs from the axis-aligned case. Refs GH #99."
 (test gh-99-hole-boundary-vs-geos
   "A point on a hole's boundary, or on the exterior ring's boundary: the
 convention gap applies to hole rings too -- this is the case that matters
-most for hazard-area containment (a find sitting on a cleared/uncleared
+most for parcel containment (a point sitting on a covered/uncovered
 boundary). Strictly inside the hole, both implementations agree (no
 boundary involved). Refs GH #99."
   (let ((g (make-polygon '(((0d0 0d0) (10d0 0d0) (10d0 10d0) (0d0 10d0) (0d0 0d0))
@@ -322,7 +335,7 @@ GEOMETRY-VALID-P below) -- and empirically, GEOS's own GEOSContains_r
 verdict on this invalid input is GEOS-version-dependent (observed NIL on
 3.14.1, T on 3.12.1), so only GEOS-intersects-p (stable: the point
 unambiguously touches the geometry) is pinned here, not GEOS-contains.
-Real adjacent hazard-area parcels should be modeled as separate objects (or
+Real adjacent parcels should be modeled as separate objects (or
 unioned into one valid polygon), not as touching MultiPolygon members --
 this case is GH #99's own flagged scenario, and the invalidity is itself
 part of the characterization."
@@ -345,26 +358,29 @@ the ray-cast and GEOS agree on interior/exterior classification at both
 scales, and boundary points show the same convention gap as at ordinary
 scale -- it is not a magnitude-dependent effect. Refs GH #99."
   (let* ((tiny (make-polygon
-                (list (list (list 37.123456d0 49.654321d0)
-                            (list (+ 37.123456d0 1d-9) 49.654321d0)
-                            (list (+ 37.123456d0 1d-9) (+ 49.654321d0 1d-9))
-                            (list 37.123456d0 (+ 49.654321d0 1d-9))
-                            (list 37.123456d0 49.654321d0)))))
+                (list (list (list 12.123456d0 45.654321d0)
+                            (list (+ 12.123456d0 1d-9) 45.654321d0)
+                            (list (+ 12.123456d0 1d-9) (+ 45.654321d0 1d-9))
+                            (list 12.123456d0 (+ 45.654321d0 1d-9))
+                            (list 12.123456d0 45.654321d0)))))
          (huge (make-polygon
                 (list (list (list 1d8 1d8) (list (+ 1d8 4d0) 1d8)
                             (list (+ 1d8 4d0) (+ 1d8 4d0)) (list 1d8 (+ 1d8 4d0))
                             (list 1d8 1d8))))))
-    (is (geometry-contains-point-p tiny (+ 37.123456d0 0.5d-9) (+ 49.654321d0 0.5d-9)))
-    (is (not (geometry-contains-point-p tiny (- 37.123456d0 1d-9) 49.654321d0)))
+    (is (geometry-contains-point-p tiny (+ 12.123456d0 0.5d-9) (+ 45.654321d0
+                                                                 0.5d-9)))
+    (is (not (geometry-contains-point-p tiny (- 12.123456d0 1d-9) 45.654321d0)))
     (is (geometry-contains-point-p huge (+ 1d8 2d0) (+ 1d8 2d0)))
     (is (geometry-contains-point-p huge (+ 1d8 2d0) 1d8))  ; on bottom edge: native includes
     (is (geometry-contains-point-p huge 1d8 1d8))          ; on bottom-left vertex: native includes
     (if (not (geos-available-p))
         (skip "GEOS not available")
         (progn
-          (is (%geos-touches-point tiny (+ 37.123456d0 0.5d-9) (+ 49.654321d0 0.5d-9)))
-          (is (%geos-contains-point tiny (+ 37.123456d0 0.5d-9) (+ 49.654321d0 0.5d-9)))
-          (is (not (%geos-touches-point tiny (- 37.123456d0 1d-9) 49.654321d0)))
+          (is (%geos-touches-point tiny (+ 12.123456d0 0.5d-9) (+ 45.654321d0
+                                                                 0.5d-9)))
+          (is (%geos-contains-point tiny (+ 12.123456d0 0.5d-9) (+ 45.654321d0
+                                                                  0.5d-9)))
+          (is (not (%geos-touches-point tiny (- 12.123456d0 1d-9) 45.654321d0)))
           (is (%geos-contains-point huge (+ 1d8 2d0) (+ 1d8 2d0)))
           (is (%geos-touches-point huge (+ 1d8 2d0) 1d8))
           (is (not (%geos-contains-point huge (+ 1d8 2d0) 1d8)))
@@ -431,3 +447,50 @@ point reported as exterior, or vice versa. Refs GH #99."
   (is (< (abs (- (geometry-distance (make-point 0d0 0d0) (make-point 0d0 1d0))
                  111194.927d0))
          1d0)))
+
+;;; ---- geodesic area (m^2) ------------------------------------------------
+
+(test geodesic-area-is-square-metres-not-square-degrees
+  "GEOMETRY-AREA returns squared degrees, which is not a usable measure:
+a degree of longitude is a different distance at every latitude, so a
+ratio of two such areas is only accidentally right (design §8)."
+  (let ((sq (make-polygon '(((0d0 0d0) (1d0 0d0) (1d0 1d0)
+                              (0d0 1d0) (0d0 0d0))))))
+    (let ((m2 (geometry-geodesic-area sq)))
+      (is (< 1.2d10 m2 1.3d10))
+      (is (typep m2 'double-float)))))
+
+(test geodesic-area-subtracts-holes
+  (let* ((outer '((0d0 0d0) (1d0 0d0) (1d0 1d0) (0d0 1d0) (0d0 0d0)))
+         (hole '((0.25d0 0.25d0) (0.75d0 0.25d0) (0.75d0 0.75d0)
+                 (0.25d0 0.75d0) (0.25d0 0.25d0)))
+         (solid (make-polygon (list outer)))
+         (holed (make-polygon (list outer hole))))
+    (is (< (geometry-geodesic-area holed)
+           (geometry-geodesic-area solid)))))
+
+(test geodesic-area-of-a-point-or-line-is-zero
+  (is (= 0d0 (geometry-geodesic-area (make-point 1d0 1d0))))
+  (is (= 0d0 (geometry-geodesic-area
+              (make-linestring '((0d0 0d0) (1d0 1d0)))))))
+
+;;; ---- geodesic length (m) ------------------------------------------------
+
+(test geodesic-length-sums-the-segments
+  "A line's fraction of a region is a LENGTH ratio, since its area is
+zero (design §13).  One degree of latitude is ~111195 m, so a two-segment
+meridian line spanning two of them is twice that."
+  (let ((l (geometry-geodesic-length
+            (make-linestring '((0d0 0d0) (0d0 1d0) (0d0 2d0))))))
+    (is (< (abs (- l (* 2 111194.927d0))) 1d0))
+    (is (typep l 'double-float))))
+
+(test geodesic-length-of-a-point-or-polygon-is-zero
+  "A polygon reports zero rather than its perimeter: its extent is
+GEOMETRY-GEODESIC-AREA, and a perimeter divided by an area is a
+plausible-looking number that means nothing."
+  (is (= 0d0 (geometry-geodesic-length (make-point 1d0 1d0))))
+  (is (= 0d0 (geometry-geodesic-length
+              (make-polygon '(((0d0 0d0) (1d0 0d0) (1d0 1d0)
+                               (0d0 1d0) (0d0 0d0)))))))
+  (is (= 0d0 (geometry-geodesic-length (make-linestring '())))))

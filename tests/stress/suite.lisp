@@ -13,9 +13,19 @@
   "Run the stress suite.  Returns T on all-pass.
 Called by (asdf:test-system :graph-db/stress-test)."
   (log:config :error)
-  (let ((results (run 'stress-suite)))
-    (explain! results)
-    (results-status results)))
+  ;; Type-ids come from the system-wide registry, so every store this suite
+  ;; opens needs a system directory (GH #186).  One for the whole run, which
+  ;; is the shape a real system has: many stores, one registry.
+  (let* ((system-dir (make-temp-directory))
+         (graph-db::*system-directory* (namestring system-dir))
+         (graph-db::*type-registry* nil))
+    (unwind-protect
+         (let ((results (run 'stress-suite)))
+           (explain! results)
+           (results-status results))
+      ;; system-dir and all test scratch live under the shared per-run
+      ;; parent; drop it whole (GH #214).
+      (graph-db-test-scratch:cleanup-scratch-run))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Scale control
@@ -81,27 +91,9 @@ Prints a summary line and pushes structured data into *TIMING-REPORT*."
 ;;; Temp-directory helpers (same pattern as concurrency suite)
 ;;; ---------------------------------------------------------------------------
 
-;; SBCL's initial *RANDOM-STATE* is a fixed constant, so an unseeded (RANDOM ...)
-;; produces the SAME name sequence in every image: two concurrent suite runs on a
-;; shared host would share -- and delete -- each other's scratch dirs.  Seed from
-;; entropy, lazily so a dumped image reseeds in each new process, and add a
-;; counter so one image can never repeat a name either.
-(defvar *scratch-random-state* nil)
-(defvar *scratch-counter* 0)
-
-(defun scratch-tag ()
-  "A name fragment unique across concurrent processes and across calls."
-  (unless *scratch-random-state*
-    (setf *scratch-random-state* (make-random-state t)))
-  (format nil "~36R-~36R"
-          (random (expt 36 12) *scratch-random-state*)
-          (incf *scratch-counter*)))
-
 (defun make-temp-directory ()
-  (let ((dir (merge-pathnames (format nil "graph-db-stress-~A/" (scratch-tag))
-                              (uiop:temporary-directory))))
-    (ensure-directories-exist dir)
-    dir))
+  "A fresh scratch dir under the shared per-run parent (GH #214)."
+  (graph-db-test-scratch:make-scratch-directory "graph-db-stress"))
 
 (defmacro with-temp-directory ((var) &body body)
   `(let ((,var (make-temp-directory)))

@@ -23,25 +23,28 @@
   (with-test-graph (g)
     (declare (ignore g))
     (is (select-flat (?x)
-          (geo-near 49.2020584d0 37.1724312d0 49.2036314d0 37.1773283d0 600d0)
+          (geo-near 45.6720584d0 12.3424312d0 45.6736314d0 12.3473283d0 600d0)
           (= ?x t)))
     (is (null (select-flat (?x)
-                (geo-near 49.2020584d0 37.1724312d0 49.2036314d0 37.1773283d0 100d0)
+                (geo-near 45.6720584d0 12.3424312d0 45.6736314d0 12.3473283d0
+                  100d0)
                 (= ?x t))))))
 
 (test geo-within-point-in-polygon
-  "geo-within/3 succeeds for a point inside the task-area polygon, fails outside."
+  "geo-within/3 succeeds for a point inside the region polygon, fails outside."
   (with-test-graph (g)
     (declare (ignore g))
     (is (select-flat (?in)
-          (is ?area (make-polygon '(((37.170d0 49.200d0) (37.180d0 49.200d0)
-                                     (37.180d0 49.206d0) (37.170d0 49.206d0)
-                                     (37.170d0 49.200d0)))))
-          (geo-within 37.1724312d0 49.2020584d0 ?area)
+          (is ?area (make-polygon '(((12.340d0 45.670d0) (12.350d0 45.670d0)
+                                     (12.350d0 45.676d0) (12.340d0 45.676d0)
+                                     (12.340d0 45.670d0)))))
+          (geo-within 12.3424312d0 45.6720584d0 ?area)
           (= ?in t)))
     (is (null (select-flat (?in)
-                (is ?area (make-polygon '(((37.170d0 49.200d0) (37.180d0 49.200d0)
-                                           (37.180d0 49.206d0) (37.170d0 49.206d0)
-                                           (37.170d0 49.200d0)))))
-                (geo-within 37.1900d0 49.2100d0 ?area)
+                (is ?area (make-polygon '(((12.340d0 45.670d0) (12.350d0
+                                                                 45.670d0)
+                                           (12.350d0 45.676d0) (12.340d0
+                                                                 45.676d0)
+                                           (12.340d0 45.670d0)))))
+                (geo-within 12.3600d0 45.6800d0 ?area)
                 (= ?in t))))))

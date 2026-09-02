@@ -260,7 +260,7 @@ read a pre-MVCC graph for logical backup."
       (unless (member found accept-versions)
         (munmap-file (memory-mmap memory))
         (error "~A is storage format v~D but this build expects v~D. ~
-Pre-MVCC (v1) graphs must be migrated with MIGRATE-GRAPH (snapshot + replay)."
+Older graphs must be migrated first -- see MIGRATE-GRAPH (snapshot + replay)."
                location found +storage-version+)))
     (setf (memory-pointer memory) (read-memory-pointer memory)
           (memory-size memory) (size-of (memory-mmap memory)))

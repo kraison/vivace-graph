@@ -16,15 +16,36 @@
 ;;; Foreign library
 ;;; --------------------------------------------------------------------------
 
+(defparameter +geos-library-dirs+
+  '("/opt/homebrew/lib" "/usr/local/lib" "/opt/local/lib"
+    "/usr/lib/x86_64-linux-gnu" "/usr/lib")
+  "Where to look for libgeos_c, HIGHEST PRIORITY FIRST.
+
+⚠ /opt/* and /usr/local MUST precede the distro dirs.  A distro that caps GEOS
+below what the app needs (Ubuntu 22.04 ships 3.10.2, which rejects extents that
+3.12+ accepts) leaves a source build in /usr/local as the only upgrade path, and
+LD_LIBRARY_PATH cannot rescue it -- CFFI resolves from
+CFFI:*FOREIGN-LIBRARY-DIRECTORIES* before the loader ever sees the name.")
+
+(defun %add-geos-library-directories (&optional (dirs +geos-library-dirs+))
+  "Add each existing directory in DIRS to CFFI:*FOREIGN-LIBRARY-DIRECTORIES* so
+that DIRS' OWN order becomes the search order.  Returns the dirs added.
+
+⚠ PUSHNEW PREPENDS, so DIRS is walked in reverse.  Pushing them forward instead
+inverts the precedence -- which is what this code used to do, leaving
+/usr/lib/x86_64-linux-gnu first and a locally built GEOS silently ignored."
+  (let ((added '()))
+    (dolist (dir (reverse dirs) added)
+      (when (probe-file dir)
+        (push dir added)
+        (pushnew (pathname (concatenate 'string dir "/"))
+                 cffi:*foreign-library-directories*
+                 :test #'equal)))))
+
 ;; Help CFFI find a Homebrew/MacPorts/Linux-packaged libgeos_c without the user
-;; having to set DYLD_/LD_LIBRARY_PATH.  Guarded so we only add real dirs.
+;; having to set DYLD_/LD_LIBRARY_PATH.  Verify with (graph-db::geos-version).
 (eval-when (:load-toplevel :execute)
-  (dolist (dir '("/opt/homebrew/lib" "/usr/local/lib" "/opt/local/lib"
-                 "/usr/lib" "/usr/lib/x86_64-linux-gnu"))
-    (when (probe-file dir)
-      (pushnew (pathname (concatenate 'string dir "/"))
-               cffi:*foreign-library-directories*
-               :test #'equal))))
+  (%add-geos-library-directories))
 
 (cffi:define-foreign-library libgeos-c
   (:darwin (:or "libgeos_c.dylib" "libgeos_c.1.dylib"))
@@ -134,6 +155,32 @@ dependency-free fallbacks. (~A)" e)
   (handle :pointer) (geom :pointer))
 (cffi:defcfun ("GEOSFree_r" %geos-free) :void
   (handle :pointer) (buffer :pointer))
+
+;; Geometry inspection + collection walking (GH #163): GEOSMakeValid can
+;; answer a mixed-dimension repair with a GEOMETRYCOLLECTION, and only its
+;; POLYGONAL parts are the repaired area.
+;; int GEOSGeomTypeId_r(handle, g) -> GEOSGeomTypes below, -1 on exception.
+(cffi:defcfun ("GEOSGeomTypeId_r" %geos-geom-type-id) :int
+  (handle :pointer) (geom :pointer))
+;; Direct children of a collection; 1 for a simple geometry, -1 on exception.
+(cffi:defcfun ("GEOSGetNumGeometries_r" %geos-get-num-geometries) :int
+  (handle :pointer) (geom :pointer))
+;; ⚠ BORROWED, unlike every other geometry the bindings hand back: this is
+;; INTERNAL STORAGE of GEOM, freed when GEOM is.  Passing it to
+;; %GEOS-GEOM-DESTROY is a double free (geos_c.h: "do not free!").
+(cffi:defcfun ("GEOSGetGeometryN_r" %geos-get-geometry-n) :pointer
+  (handle :pointer) (geom :pointer) (n :int))
+
+;; enum GEOSGeomTypes (geos_c.h) -- what %GEOS-GEOM-TYPE-ID returns and what
+;; GEOSGeom_createCollection_r takes.
+(defconstant +geos-point+ 0)
+(defconstant +geos-linestring+ 1)
+(defconstant +geos-linearring+ 2)
+(defconstant +geos-polygon+ 3)
+(defconstant +geos-multipoint+ 4)
+(defconstant +geos-multilinestring+ 5)
+(defconstant +geos-multipolygon+ 6)
+(defconstant +geos-geometrycollection+ 7)
 
 ;; Binary predicates: return char 1 (true) / 0 (false) / 2 (exception).
 (cffi:defcfun ("GEOSIntersects_r" %geos-intersects) :char

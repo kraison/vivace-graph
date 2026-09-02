@@ -1,0 +1,854 @@
+/* VivaceGraph GUI frame styling (GH #270).
+   Operator cockpit: dark, quiet, legible at laptop widths.
+   No framework, no external fonts. */
+
+:root {
+  --bg: #14181d;
+  --bg-pane: #1b2129;
+  --bg-raised: #232b35;
+  --border: #303a46;
+  --text: #d7dde4;
+  --text-dim: #8b96a3;
+  --accent: #4fa3d1;
+  --ok: #4cb782;
+  --warn: #d1a04f;
+  --err-bg: #3a2226;
+  --err-border: #8a4550;
+  --err-text: #f0b9c0;
+  --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+
+* { box-sizing: border-box; }
+
+/* An author display rule beats the UA's [hidden] { display: none },
+   so hidden elements (error strip, inspector dock) need this. */
+[hidden] { display: none !important; }
+
+html, body {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font: 14px/1.45 system-ui, sans-serif;
+}
+
+.app {
+  display: grid;
+  grid-template-columns: minmax(280px, 340px) 1fr auto;
+  height: 100%;
+}
+
+/* --- sidebar ------------------------------------------------------- */
+
+.sidebar {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  background: var(--bg-pane);
+  border-right: 1px solid var(--border);
+  overflow-y: auto;
+}
+
+.brand {
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border);
+}
+
+.brand h1 {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--accent);
+}
+
+.pane {
+  border-bottom: 1px solid var(--border);
+  padding: 10px 16px 14px;
+}
+
+.pane-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+
+.pane-header h2 {
+  margin: 0;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+
+button {
+  font: inherit;
+  font-size: 12px;
+  color: var(--text);
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 3px 10px;
+  cursor: pointer;
+}
+
+button:hover { border-color: var(--accent); }
+button:disabled { opacity: 0.5; cursor: default; }
+
+/* --- error strip --------------------------------------------------- */
+
+.error-strip {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin-bottom: 8px;
+  padding: 8px 10px;
+  background: var(--err-bg);
+  border: 1px solid var(--err-border);
+  border-radius: 4px;
+  color: var(--err-text);
+  font-family: var(--mono);
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.error-strip span { flex: 1; }
+
+.error-strip button {
+  flex: none;
+  padding: 0 6px;
+  line-height: 1.3;
+  background: transparent;
+  border-color: var(--err-border);
+  color: var(--err-text);
+}
+
+/* --- roster -------------------------------------------------------- */
+
+.roster-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.roster-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 8px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.roster-item:hover { background: var(--bg-raised); }
+
+.roster-item.selected {
+  background: var(--bg-raised);
+  outline: 1px solid var(--accent);
+}
+
+.roster-name-block {
+  flex: 1;
+  min-width: 0;
+}
+
+.roster-name {
+  font-family: var(--mono);
+  font-size: 13px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.roster-location {
+  color: var(--text-dim);
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.badge {
+  flex: none;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  padding: 1px 7px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+}
+
+.badge.open {
+  color: var(--ok);
+  border-color: var(--ok);
+}
+
+.roster-empty {
+  padding: 6px 8px;
+  color: var(--text-dim);
+}
+
+/* --- stats --------------------------------------------------------- */
+
+.stats-body { font-size: 13px; }
+
+.stats-totals {
+  display: flex;
+  gap: 18px;
+  margin-bottom: 10px;
+}
+
+.stat {
+  display: flex;
+  flex-direction: column;
+}
+
+.stat .stat-value {
+  font-family: var(--mono);
+  font-size: 17px;
+}
+
+.stat .stat-label {
+  color: var(--text-dim);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.stats-body h3 {
+  margin: 12px 0 4px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+
+.type-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+.type-table td {
+  padding: 3px 4px;
+  border-top: 1px solid var(--border);
+}
+
+.type-table td.count { text-align: right; }
+
+.type-table tr[data-type]:hover { background: var(--bg-raised); }
+
+.kind-tag {
+  color: var(--text-dim);
+  font-size: 10px;
+  padding-right: 6px;
+}
+
+.stats-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+.stats-list li {
+  padding: 2px 0;
+  overflow-wrap: anywhere;
+}
+
+.stats-list .dim { color: var(--text-dim); }
+
+.schema-slots { color: var(--text-dim); }
+
+.stats-error {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--warn);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* --- explorer canvas (GH #271) ------------------------------------- */
+
+.main-canvas {
+  position: relative;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.cy-host {
+  position: absolute;
+  inset: 0;
+}
+
+.placeholder {
+  color: var(--text-dim);
+  margin: 0;
+  padding: 8px;
+  text-align: center;
+}
+
+#canvas-placeholder {
+  position: absolute;
+  top: 45%;
+  left: 0;
+  right: 0;
+  pointer-events: none;
+}
+
+.canvas-status {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 6px 12px;
+  background: var(--bg-pane);
+  border-top: 1px solid var(--border);
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+.canvas-notice {
+  flex: 1;
+  color: var(--warn);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pick-list {
+  position: absolute;
+  top: 16px;
+  left: 16px;
+  width: 340px;
+  max-height: 70%;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-pane);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  box-shadow: 0 6px 22px rgba(0, 0, 0, 0.45);
+}
+
+.pick-list-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  padding: 8px 12px 4px;
+}
+
+.pick-list-header h3 {
+  margin: 0;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+
+.pick-list-notice {
+  margin: 0;
+  padding: 0 12px 6px;
+  color: var(--text-dim);
+  font-size: 11px;
+}
+
+.pick-list-items {
+  list-style: none;
+  margin: 0;
+  padding: 0 6px 8px;
+  overflow-y: auto;
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+.pick-list-items li {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 4px 6px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.pick-list-items li:hover { background: var(--bg-raised); }
+
+.pick-id {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pick-type {
+  color: var(--text-dim);
+  font-size: 11px;
+}
+
+.edge-tooltip {
+  position: absolute;
+  padding: 2px 8px;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-family: var(--mono);
+  font-size: 11px;
+  pointer-events: none;
+  z-index: 5;
+}
+
+.type-row-seed { cursor: pointer; }
+
+/* --- inspector dock (GH #271) -------------------------------------- */
+
+.inspector-dock {
+  width: 320px;
+  background: var(--bg-pane);
+  border-left: 1px solid var(--border);
+  padding: 10px 16px 14px;
+  overflow-y: auto;
+  font-size: 13px;
+}
+
+.inspector-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+
+.inspector-header h2 {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  color: var(--accent);
+  overflow-wrap: anywhere;
+}
+
+.inspector-id {
+  margin: 2px 0;
+  font-size: 12px;
+}
+
+.inspector-id code {
+  font-family: var(--mono);
+  overflow-wrap: anywhere;
+}
+
+.inspector-degrees {
+  margin: 6px 0;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.inspector-dock h3 {
+  margin: 12px 0 4px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+
+.slots-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+.slots-table td {
+  padding: 3px 4px;
+  border-top: 1px solid var(--border);
+  vertical-align: top;
+  overflow-wrap: anywhere;
+}
+
+.slots-table .slot-name { color: var(--text-dim); }
+
+.inspector-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 14px;
+}
+
+.inspector-error {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--warn);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.dim { color: var(--text-dim); }
+
+/* --- tabbed main region + query workbench (GH #278) ---------------- */
+
+.main-region {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.tab-bar {
+  display: flex;
+  flex: none;
+  gap: 4px;
+  padding: 6px 12px 0;
+  background: var(--bg-pane);
+  border-bottom: 1px solid var(--border);
+}
+
+.tab {
+  border-bottom-left-radius: 0;
+  border-bottom-right-radius: 0;
+  padding: 4px 14px;
+}
+
+.tab.active {
+  color: var(--accent);
+  border-color: var(--accent);
+  background: var(--bg);
+}
+
+#explorer-view,
+.workbench {
+  flex: 1;
+  min-height: 0;
+}
+
+/* Builder row height is draggable (GH #278): --wb-split is set by the
+   splitter and persisted per browser; the fallback matches the old
+   fixed 55%. */
+.workbench {
+  display: grid;
+  grid-template-rows: minmax(0, var(--wb-split, 55%)) auto 1fr;
+  overflow: hidden;
+}
+
+/* The surface half of the split holds the Builder | Prolog sub-tabs and
+   whichever surface is showing; the splitter still sizes it as one row,
+   so #278's drag/keyboard/reset behaviour is untouched (GH #279). */
+.wb-surface {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.wb-subtabs {
+  display: flex;
+  flex: none;
+  gap: 4px;
+  padding: 6px 16px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.wb-subtab {
+  padding: 2px 12px;
+  font-size: 12px;
+  border-bottom-left-radius: 0;
+  border-bottom-right-radius: 0;
+}
+
+.wb-subtab.active {
+  color: var(--accent);
+  border-color: var(--accent);
+  background: var(--bg);
+}
+
+/* The editor was offered by the server but could not load: visibly
+   present and visibly broken, never mistakable for "not enabled". */
+.wb-subtab.failed {
+  color: var(--err-text);
+  border-color: var(--err-border);
+  cursor: not-allowed;
+}
+
+.wb-builder {
+  padding: 10px 16px 12px;
+  overflow-y: auto;
+  min-height: 0;
+  flex: 1;
+}
+
+/* --- free-text Prolog surface (GH #279) ---------------------------- */
+
+.wb-prolog {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  flex: 1;
+  padding: 8px 16px 12px;
+}
+
+.wb-hint {
+  flex: none;
+  margin: 0 0 6px;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.wb-editor {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg-pane);
+}
+
+.wb-balance {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text-dim);
+  margin-right: auto;
+}
+
+.wb-balance.unbalanced {
+  color: var(--err-text);
+  font-weight: 600;
+}
+
+/* CodeMirror is themed from the cockpit's own variables rather than
+   one of its bundled themes -- one fewer vendored file. */
+.wb-editor .CodeMirror {
+  height: 100%;
+  background: transparent;
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 13px;
+}
+
+.wb-editor .CodeMirror-gutters {
+  background: var(--bg);
+  border-right: 1px solid var(--border);
+}
+
+.wb-editor .CodeMirror-linenumber { color: var(--text-dim); }
+.wb-editor .CodeMirror-cursor { border-left: 1px solid var(--text); }
+.wb-editor .CodeMirror-selected { background: var(--bg-raised); }
+.wb-editor .cm-string { color: var(--ok); }
+.wb-editor .cm-comment { color: var(--text-dim); }
+.wb-editor .cm-number { color: var(--warn); }
+
+/* The overlay's two tokens: a query variable, and a head symbol this
+   server would not recognise. */
+.wb-editor .cm-vg-var { color: var(--accent); }
+
+.wb-editor .cm-vg-unknown {
+  color: var(--text-dim);
+  text-decoration: underline dotted var(--err-border);
+}
+
+.wb-splitter {
+  height: 7px;
+  background: var(--bg-pane);
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  cursor: ns-resize;
+}
+
+.wb-splitter::after {
+  content: "";
+  display: block;
+  width: 40px;
+  height: 1px;
+  margin: 2px auto 0;
+  background: var(--text-dim);
+}
+
+.wb-splitter:hover,
+.wb-splitter:focus-visible {
+  background: var(--bg-raised);
+  outline: none;
+}
+
+.wb-splitter:hover::after,
+.wb-splitter:focus-visible::after { background: var(--accent); }
+
+.wb-section { margin-bottom: 10px; }
+
+.wb-section-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  margin-bottom: 4px;
+}
+
+.wb-section-head h3 {
+  margin: 0;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+
+.wb-actions { display: flex; gap: 6px; }
+
+.wb-rows {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.wb-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 0;
+}
+
+.wb-row select,
+.wb-limit,
+.wb-literal {
+  font: inherit;
+  font-size: 12px;
+  font-family: var(--mono);
+  color: var(--text);
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 2px 6px;
+}
+
+.wb-limit { width: 80px; }
+.wb-literal { width: 140px; }
+
+.wb-var {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--accent);
+}
+
+.wb-remove {
+  padding: 0 6px;
+  line-height: 1.3;
+  background: transparent;
+  color: var(--text-dim);
+}
+
+.wb-select {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+}
+
+.wb-check {
+  font-family: var(--mono);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.wb-run {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.wb-run label {
+  font-size: 11px;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+
+.wb-error {
+  margin: 10px 0 0;
+  padding: 8px 10px;
+  background: var(--err-bg);
+  border: 1px solid var(--err-border);
+  border-radius: 4px;
+  color: var(--err-text);
+  font-family: var(--mono);
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.wb-results {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  padding: 8px 16px 12px;
+}
+
+/* Status and the canvas handoff share a row: the handoff belongs to
+   the results, not to whichever surface produced them (GH #279). */
+.wb-results-head {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 6px;
+}
+
+.wb-status {
+  flex: 1;
+  margin: 0;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.wb-table-host {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+}
+
+.wb-table {
+  border-collapse: collapse;
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+.wb-table th {
+  position: sticky;
+  top: 0;
+  padding: 4px 10px 4px 4px;
+  text-align: left;
+  background: var(--bg-pane);
+  border-bottom: 1px solid var(--border);
+  color: var(--text-dim);
+  font-weight: 600;
+}
+
+.wb-table td {
+  padding: 3px 10px 3px 4px;
+  border-bottom: 1px solid var(--border);
+  vertical-align: top;
+  overflow-wrap: anywhere;
+}
+
+.wb-id {
+  padding: 0 4px;
+  background: transparent;
+  border-color: transparent;
+  color: var(--accent);
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+.wb-id:hover { border-color: var(--accent); }

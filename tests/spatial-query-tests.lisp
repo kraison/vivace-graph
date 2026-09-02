@@ -12,10 +12,10 @@
 
 (in-suite spatial-query-suite)
 
-;; Three places: A and B are ~400 m apart in Kharkiv Oblast; FAR is in Lviv.
-(defparameter *q-a*   '(37.1724312d0 49.2020584d0))   ; lon lat
-(defparameter *q-b*   '(37.1773283d0 49.2036314d0))
-(defparameter *q-far* '(23.7182919d0 50.0263233d0))
+;; Three synthetic places: A and B are ~400 m apart; FAR is ~900 km away.
+(defparameter *q-a*   '(12.3424312d0 45.6720584d0))   ; lon lat
+(defparameter *q-b*   '(12.3473283d0 45.6736314d0))
+(defparameter *q-far* '(2.4682919d0 41.7763233d0))
 
 (defmacro with-three-places ((g ida idb idfar) &body body)
   `(with-test-graph (,g)
@@ -55,12 +55,34 @@
       (is (has-id-p ida nodes))
       (is (not (has-id-p idb nodes))))))
 
+(test find-nodes-near-wraps-the-antimeridian-and-the-poles
+  "GH #287, end to end: the query path inherits the index window, so a
+node across the dateline or across the pole must come back with its
+true distance."
+  (with-test-graph (g)
+    (let (east west north-a north-b)
+      (with-transaction ()
+        (setq east    (id (make-geo-place :loc (make-point 179.5d0 0d0)))
+              west    (id (make-geo-place :loc (make-point -179.5d0 0d0)))
+              north-a (id (make-geo-place :loc (make-point 100d0 89.9d0)))
+              north-b (id (make-geo-place :loc (make-point -100d0 89.9d0)))))
+      (let ((nodes (mapcar #'car (find-nodes-near 'geo-place 0d0 179.5d0
+                                                  200000d0 :graph g))))
+        (is (has-id-p east nodes))
+        (is (has-id-p west nodes) "the node across the dateline")
+        (is (= 2 (length nodes))))
+      (let ((hits (find-nodes-near 'geo-place 90d0 0d0 100000d0 :graph g)))
+        (is (has-id-p north-a (mapcar #'car hits)))
+        (is (has-id-p north-b (mapcar #'car hits)))
+        (is (every (lambda (h) (< (cdr h) 12000d0)) hits)
+            "both are ~11.1 km from the pole")))))
+
 (test find-nodes-within-lisp
-  "find-nodes-within returns nodes inside the task-area polygon only."
+  "find-nodes-within returns nodes inside the region polygon only."
   (with-three-places (g ida idb idfar)
-    (let* ((aoi (make-polygon '(((37.170 49.200) (37.180 49.200)
-                                 (37.180 49.206) (37.170 49.206)
-                                 (37.170 49.200)))))
+    (let* ((aoi (make-polygon '(((12.340 45.670) (12.350 45.670)
+                                 (12.350 45.676) (12.340 45.676)
+                                 (12.340 45.670)))))
            (nodes (find-nodes-within 'geo-place aoi :graph g)))
       (is (has-id-p ida nodes))
       (is (has-id-p idb nodes))
@@ -69,24 +91,25 @@
 (test find-nodes-within-continent-scale
   "REGRESSION: find-nodes-within with a country-sized AREA must complete (not OOM
 in the index's bbox covering) and still return the nodes inside the polygon.  All
-three places are inside Ukraine, so a Ukraine-scale polygon returns all of them."
+three places are inside the polygon, so a country-scale area returns all of
+    them."
   (with-three-places (g ida idb idfar)
-    (let* ((ukraine (make-polygon '(((22.0d0 44.0d0) (41.0d0 44.0d0)
-                                     (41.0d0 53.0d0) (22.0d0 53.0d0)
-                                     (22.0d0 44.0d0)))))
-           (nodes (find-nodes-within 'geo-place ukraine :graph g)))
+    (let* ((country (make-polygon '(((1.0d0 40.0d0) (16.0d0 40.0d0)
+                                     (16.0d0 48.0d0) (1.0d0 48.0d0)
+                                     (1.0d0 40.0d0)))))
+           (nodes (find-nodes-within 'geo-place country :graph g)))
       (is (has-id-p ida nodes))
       (is (has-id-p idb nodes))
-      (is (has-id-p idfar nodes) "Lviv is inside Ukraine too"))))
+      (is (has-id-p idfar nodes) "FAR is inside the polygon too"))))
 
 (test find-nodes-intersecting-continent-scale
   "REGRESSION: the find-nodes-intersecting path shares the same bbox covering and
 must likewise survive a continent-sized window."
   (with-three-places (g ida idb idfar)
-    (let* ((ukraine (make-polygon '(((22.0d0 44.0d0) (41.0d0 44.0d0)
-                                     (41.0d0 53.0d0) (22.0d0 53.0d0)
-                                     (22.0d0 44.0d0)))))
-           (nodes (find-nodes-intersecting 'geo-place ukraine :graph g)))
+    (let* ((country (make-polygon '(((1.0d0 40.0d0) (16.0d0 40.0d0)
+                                     (16.0d0 48.0d0) (1.0d0 48.0d0)
+                                     (1.0d0 40.0d0)))))
+           (nodes (find-nodes-intersecting 'geo-place country :graph g)))
       (is (has-id-p ida nodes))
       (is (has-id-p idb nodes))
       (is (has-id-p idfar nodes)))))
@@ -107,7 +130,8 @@ must likewise survive a continent-sized window."
     (declare (ignore g))
     (let ((ids (id-set (select-flat (?n)
                          (is-a ?n geo-place)
-                         (find-near ?n geo-place 49.2020584d0 37.1724312d0 600d0)))))
+                         (find-near ?n geo-place 45.6720584d0 12.3424312d0
+                           600d0)))))
       (is (member ida ids :test 'equalp))
       (is (member idb ids :test 'equalp))
       (is (not (member idfar ids :test 'equalp))))))
@@ -117,9 +141,11 @@ must likewise survive a continent-sized window."
   (with-three-places (g ida idb idfar)
     (declare (ignore g))
     (let ((ids (id-set (select-flat (?n)
-                         (is ?area (make-polygon '(((37.170d0 49.200d0) (37.180d0 49.200d0)
-                                                    (37.180d0 49.206d0) (37.170d0 49.206d0)
-                                                    (37.170d0 49.200d0)))))
+                         (is ?area (make-polygon '(((12.340d0 45.670d0)
+                                                     (12.350d0 45.670d0)
+                                                    (12.350d0 45.676d0)
+                                                        (12.340d0 45.676d0)
+                                                    (12.340d0 45.670d0)))))
                          (find-within ?n geo-place ?area)))))
       (is (member ida ids :test 'equalp))
       (is (member idb ids :test 'equalp))
@@ -163,7 +189,7 @@ keeps results correct."
 
 (test find-nearest-k-orders-by-distance
   "find-nearest-k from A returns the K closest, nearest first: A then B (the
-~400 m neighbour) before FAR (Lviv) ever appears."
+~400 m neighbour) before FAR ever appears."
   (with-three-places (g ida idb idfar)
     ;; k=1 -> just A (itself, distance ~0)
     (let ((one (find-nearest-k 'geo-place (second *q-a*) (first *q-a*) 1 :graph g)))
@@ -183,14 +209,16 @@ keeps results correct."
   "Asking for more neighbours than exist within MAX-RADIUS returns all of them
 (here a 3-node cluster, all within ~1 km), sorted nearest-first.  Uses a local
 cluster -- find-nearest-k is bounded by MAX-RADIUS (25 km default), so the far
-Lviv node of with-three-places would not be reached."
+FAR node of with-three-places would not be reached."
   (with-test-graph (g)
     (let (ida idb idc)
       (with-transaction ()
-        (setq ida (id (make-geo-place :loc (make-point 37.1724d0 49.2020d0)))
-              idb (id (make-geo-place :loc (make-point 37.1773d0 49.2036d0)))   ; ~400 m
-              idc (id (make-geo-place :loc (make-point 37.1850d0 49.2080d0))))) ; ~1 km
-      (let* ((hits (find-nearest-k 'geo-place 49.2020d0 37.1724d0 10 :graph g))
+        (setq ida (id (make-geo-place :loc (make-point 12.3424d0 45.6720d0)))
+              idb (id (make-geo-place :loc (make-point 12.3473d0 45.6736d0)))
+                  ; ~400 m
+              idc (id (make-geo-place :loc (make-point 12.3520d0 45.6780d0)))))
+                  ; ~1 km
+      (let* ((hits (find-nearest-k 'geo-place 45.6720d0 12.3424d0 10 :graph g))
              (ids (mapcar (lambda (nd) (id (car nd))) hits)))
         (is (= 3 (length hits)) "all 3 nodes returned (k exceeds node count)")
         (is (member ida ids :test 'equalp))
@@ -201,16 +229,16 @@ Lviv node of with-three-places would not be reached."
         (is (apply #'<= (mapcar #'cdr hits)) "distances non-decreasing")))))
 
 (test find-nearest-k-bounded-by-max-radius
-  "find-nearest-k does not chase nodes past MAX-RADIUS: the Lviv node (~1000 km
-from Kharkiv) is excluded even when K is large, and the call returns promptly
+  "find-nearest-k does not chase nodes past MAX-RADIUS: the FAR node (~900 km
+away) is excluded even when K is large, and the call returns promptly
 without enumerating a continent of grid cells."
   (with-three-places (g ida idb idfar)
     (let* ((hits (find-nearest-k 'geo-place (second *q-a*) (first *q-a*) 10 :graph g))
            (ids (mapcar (lambda (nd) (id (car nd))) hits)))
-      (is (= 2 (length hits)) "only the two in-range Kharkiv nodes")
+      (is (= 2 (length hits)) "only the two in-range nearby nodes")
       (is (member ida ids :test 'equalp))
       (is (member idb ids :test 'equalp))
-      (is (not (member idfar ids :test 'equalp)) "Lviv is beyond MAX-RADIUS"))))
+      (is (not (member idfar ids :test 'equalp)) "FAR is beyond MAX-RADIUS"))))
 
 (test find-nearest-functor
   "find-nearest/5 yields the k nearest nodes in a query, composing with is-a."
@@ -218,7 +246,8 @@ without enumerating a continent of grid cells."
     (declare (ignore g idfar))
     (let ((ids (id-set (select-flat (?n)
                          (is-a ?n geo-place)
-                         (find-nearest ?n geo-place 49.2020584d0 37.1724312d0 2)))))
+                         (find-nearest ?n geo-place 45.6720584d0 12.3424312d0
+                           2)))))
       (is (= 2 (length ids)))
       (is (member ida ids :test 'equalp))
       (is (member idb ids :test 'equalp)))))

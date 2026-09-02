@@ -126,3 +126,32 @@ guaranteed; the count must still equal the number of remaining keys."
         (is (= 30 (read-lhash-count h2)))
         (loop for (k . v) in entries
               do (is (= v (lhash-get h2 k))))))))
+
+(test a-copied-lhash-deletes-its-own-files-not-the-originals
+  "GH #143: STRUCT.DAT carries the LOCATION the lhash was CREATED at, and
+OPEN-LHASH used to leave the restored slot alone -- so DELETE-LHASH on a
+cp -a copy deleted the ORIGINAL's files while the copy stayed intact.  The
+slot must describe where the lhash was OPENED from."
+  (with-temp-directory (root)
+    (let* ((orig (merge-pathnames "orig/" root))
+           (copy (merge-pathnames "copy/" root))
+           (h (make-lhash :location orig :buckets 4))
+           (k (gen-id)))
+      (lhash-insert h k 7)
+      (close-lhash h)
+      (ensure-directories-exist copy)
+      (dolist (f (uiop:directory-files orig))
+        (uiop:copy-file f (merge-pathnames (file-namestring f) copy)))
+      (let ((h2 (open-lhash copy)))
+        (is (equal (namestring copy)
+                   (namestring (graph-db::%lhash-location h2)))
+            "the restored struct must record where it was opened from")
+        (is (= 7 (lhash-get h2 k)))
+        (graph-db::delete-lhash h2))
+      (is (not (probe-file (merge-pathnames "table.dat" copy)))
+          "the copy's files are gone")
+      (is (probe-file (merge-pathnames "table.dat" orig))
+          "the original's files remain")
+      (let ((h3 (open-lhash orig)))
+        (is (= 7 (lhash-get h3 k)) "and the original still reads")
+        (close-lhash h3)))))

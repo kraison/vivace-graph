@@ -9,12 +9,12 @@
 ;; This is the target for the offline Android field app (cross-compiled under
 ;; ECL); the app calls in-process, not over HTTP.  The full :graph-db system
 ;; below is core + the two network leaves and stays behaviour-identical for
-;; existing consumers (mine-action, odm).
+;; existing consumers.
 (defsystem graph-db/core
   :name "VivaceGraph (embeddable core)"
   :maintainer "Kevin Raison"
   :author "Kevin Raison <last name @ chatsubo dot net>"
-  :version "3.0.0"
+  :version "4.0.0"
   :depends-on (:bordeaux-threads
                :alexandria
                :iterate
@@ -54,13 +54,29 @@
                (:file "node-id" :depends-on ("package" "posix"))
                (:file "buffer-pool" :depends-on ("pcons" "node-id"))
                (:file "serialize" :depends-on ("conditions" "buffer-pool" "cl-store-ecl"))
+               ;; Shared print/read control-set macros for every line-
+               ;; oriented sidecar file below (GH #226).  Only needs
+               ;; "package"; placed just before its first user.
+               (:file "sidecar-io" :depends-on ("package"))
+               ;; The image-level epoch clock (GH #168).  No graph dependency,
+               ;; so it loads early and tests without one.
+               (:file "system-clock" :depends-on ("serialize" "utilities" "sidecar-io"))
+               ;; The image-level type-id registry (GH #186).  Same shape as
+               ;; system-clock: no graph dependency, loads early.
+               (:file "type-registry" :depends-on ("serialize" "utilities" "sidecar-io"))
+               ;; The image-level store-id registry (GH #169).  Same shape
+               ;; as type-registry; graph-class references +MAX-STORE-TAG+.
+               (:file "store-registry" :depends-on ("type-registry"))
+               ;; The edge store-occupancy sidecar (GH #167, spec R4):
+               ;; registry-adjacent, no graph dependency of its own.
+               (:file "type-occupancy" :depends-on ("type-registry"))
                (:file "geometry" :depends-on ("serialize"))
                (:file "geometry-ops" :depends-on ("geometry"))
                (:file "geohash" :depends-on ("package"))
                (:file "linear-hash" :depends-on ("serialize"))
                (:file "allocator" :depends-on ("serialize"))
                (:file "segment" :depends-on ("allocator" "mmap"))
-               (:file "graph-class" :depends-on ("globals"))
+               (:file "graph-class" :depends-on ("globals" "store-registry"))
                (:file "cursors" :depends-on ("package"))
                (:file "skip-list" :depends-on ("allocator" "linear-hash"))
                (:file "skip-list-cursors" :depends-on ("skip-list" "cursors"))
@@ -79,28 +95,60 @@
                       ("ve-index" "vev-index" "type-index" "linear-hash" "allocator"
                        "spatial-index" "posix"))
                (:file "stats" :depends-on ("graph"))
-               (:file "schema" :depends-on ("stats"))
+               ;; "type-registry" for ASSIGN-TYPE-ID / ENSURE-TYPE-REGISTRY
+               ;; (#186); it only built before because that component happens
+               ;; to precede this one in the list.
+               (:file "schema" :depends-on ("stats" "type-registry" "type-occupancy"))
+               ;; ENSURE-NAMESPACE / CREATE-VERTEX-TYPE / CREATE-EDGE-TYPE
+               ;; (GH #172, R4): the runtime twins of DEF-VERTEX/DEF-EDGE.
+               (:file "runtime-schema" :depends-on ("schema"))
+               ;; DESCRIBE-SCHEMA / EXPORT-SCHEMA-SOURCE (GH #172, R6):
+               ;; read-only visibility tooling over the manifest+metas.
+               (:file "schema-tools" :depends-on ("runtime-schema"))
+               ;; Reads a store's schema.dat and heap header, so it cannot
+               ;; live in "type-registry" -- "schema" depends on THAT (#186).
+               (:file "type-seeding"
+                :depends-on ("schema" "allocator" "mmap"))
                (:file "node-class" :depends-on ("schema"))
                (:file "views" :depends-on ("node-class"))
                (:file "primitive-node" :depends-on ("views"))
                (:file "vertex" :depends-on ("primitive-node"))
                (:file "edge" :depends-on ("vertex"))
                (:file "gc" :depends-on ("edge" "vertex" "views"))
-               (:file "transactions" :depends-on ("graph-class" "type-index" "vev-index" "ve-index" "edge" "vertex" "gc" "spatial-index" "posix"))
+               (:file "transactions" :depends-on ("graph-class" "type-index" "vev-index" "ve-index" "edge" "vertex" "gc" "spatial-index" "posix" "system-clock"))
                (:file "transaction-restore" :depends-on ("transactions"))
                (:file "transaction-log-streaming" :depends-on ("transactions"))
-               (:file "backup" :depends-on ("edge"))
+               ;; Shadow generations (GH #170): quiesce/copy/reopen a store
+               ;; (GRAPH) under a leased epoch range (TRANSACTIONS).  Placed
+               ;; just before BACKUP, which it does not depend on -- it needs
+               ;; only the graph and transaction layers.
+               (:file "shadow-store" :depends-on ("graph" "transactions"))
+               (:file "system-restore" :depends-on ("shadow-store"))
+               (:file "backup" :depends-on ("edge" "type-seeding"))
                (:file "replication" :depends-on ("backup"))
                (:file "txn-log" :depends-on ("replication"))
                (:file "functor" :depends-on ("vertex" "edge" "views" "schema"))
                (:file "prologc" :depends-on ("functor"))
                (:file "prolog-functors" :depends-on ("prologc" "geometry" "geometry-ops"))
                (:file "spatial-query" :depends-on ("prolog-functors" "transactions" "spatial-index" "geometry-ops"))
-               (:file "interface" :depends-on ("schema" "edge" "vertex" "views"))
+               (:file "interface" :depends-on
+                      ("schema" "edge" "vertex" "views" "transactions"))
                (:file "traverse" :depends-on ("interface"))
                (:file "memory-graph" :depends-on ("traverse" "transactions" "graph" "mem-skip-list"))
                (:file "unique-constraint" :depends-on ("traverse" "transactions" "graph" "memory-graph" "node-class" "schema"))
                (:file "index" :depends-on ("unique-constraint" "spatial-query" "interface"))
+               ;; Declarative value constraints (GH #149).  After INDEX for
+               ;; %SPEC-IDENTITY; no index of its own to build.
+               (:file "value-constraint" :depends-on ("index"))
+               ;; Cardinality constraints (GH #155): counts through the
+               ;; commit view value-constraint.lisp defines.
+               (:file "cardinality" :depends-on ("value-constraint"))
+               ;; Domain and range (GH #156): the other endpoint, through
+               ;; the commit view.
+               (:file "domain-range" :depends-on ("value-constraint"))
+               ;; Disjointness over vertex types (GH #157, 4a): a schema
+               ;; lint, hooked into %INSTALL-NODE-TYPE.
+               (:file "disjointness" :depends-on ("schema" "index"))
                ;; The per-(owner . slot) spatial index registry.  Loaded LAST so it
                ;; can see the MOP helpers (node-class), the graph, the memory-graph
                ;; backend and the ordered-index factory; TRANSACTIONS.LISP,
@@ -120,7 +168,7 @@
   :name "VivaceGraph (replication transport)"
   :maintainer "Kevin Raison"
   :author "Kevin Raison <last name @ chatsubo dot net>"
-  :version "3.0.0"
+  :version "4.0.0"
   :depends-on (:graph-db/core
                :usocket)
   :serial t
@@ -135,13 +183,13 @@
 ;; FULL: replication + the HTTP API leaf (rest, clack/ningle).  graph-db/replication
 ;; (and transitively graph-db/core) has already compiled+loaded the engine + transport,
 ;; so rest needs no intra-file :depends-on -- the system-level dependency guarantees
-;; order.  Stays behaviour-identical for existing consumers (mine-action, odm), which
-;; keep depending on :graph-db.
+;; order.  Stays behaviour-identical for existing consumers, which keep
+;; depending on :graph-db.
 (defsystem graph-db
   :name "VivaceGraph"
   :maintainer "Kevin Raison"
   :author "Kevin Raison <last name @ chatsubo dot net>"
-  :version "3.0.0"
+  :version "4.0.0"
   :depends-on (:graph-db/replication
                :hunchentoot
                :ningle
@@ -155,13 +203,79 @@
                :usocket
                :trivial-shell)
   :serial t
-  :components ((:file "rest"))
+  ;; QUERY-DSL is the structured JSON query compiler+runner extracted from
+  ;; rest.lisp (GH #278): REST's /query route and the GUI workbench compile
+  ;; through the one implementation.  It needs the prolog compiler (SELECT,
+  ;; via prologc/prolog-functors), the schema type lookups
+  ;; (LOOKUP-NODE-TYPE-BY-NAME) and NODE-SLOT-VALUE (index) -- all already
+  ;; loaded by graph-db/core, which the system-level :depends-on guarantees,
+  ;; so no intra-file :depends-on is possible or needed here.  It is NOT in
+  ;; graph-db/core because EMIT-QUERY-RESULTS' :ndjson arm sets a header on
+  ;; NINGLE:*RESPONSE*, and core deliberately drops ningle/clack (the
+  ;; ECL/Android build).  :serial t puts it before "rest", which calls into it.
+  :components ((:file "query-dsl")
+               (:file "rest"))
   :in-order-to ((test-op (test-op :graph-db/test))))
+
+;; OPTIONAL GUI cockpit backend (GH #269, design doc
+;; docs/superpowers/specs/2026-08-27-vg-gui-v1-design.md).  Own subsystem,
+;; NOT an extension of rest.lisp: an operational, private surface
+;; (roster/open/close/stats + the explorer's batch endpoints) on a
+;; different evolution clock than the public REST API.  Static frontend
+;; assets live in gui/static/ and resolve via
+;; asdf:system-relative-pathname.
+(defsystem graph-db/gui
+  :name "VivaceGraph GUI backend"
+  :description "Web cockpit for VivaceGraph: roster, open/close, stats,
+and read-only neighborhood exploration."
+  :maintainer "Kevin Raison"
+  :author "Kevin Raison <last name @ chatsubo dot net>"
+  :version "4.0.0"
+  ;; :flexi-streams is not new to the image (rest.lisp uses it, and
+  ;; hunchentoot pulls it in) -- declared because api.lisp now decodes
+  ;; a POST body's octets itself for the query endpoint (GH #278).
+  :depends-on (:graph-db :ningle :clack :cl-json :lack-component
+               :flexi-streams)
+  :pathname "gui/"
+  :serial t
+  :components ((:file "package")
+               (:file "api")
+               ;; The free-text Prolog surface and its read guard (GH
+               ;; #279).  After "api" (it reuses the error contract, the
+               ;; graph resolution macro and the query envelope), before
+               ;; "server" (which routes to it and sets its flag).
+               (:file "prolog")
+               (:file "server"))
+  :in-order-to ((test-op (test-op :graph-db/gui-test))))
+
+(defsystem graph-db/gui-test
+  :name "VivaceGraph GUI test suite"
+  :description "FiveAM + drakma tests driving the GUI API over real HTTP."
+  ;; :cl-ppcre is already in the image (graph-db/core depends on it) --
+  ;; declared because the vendored-asset test scans the frontend sources
+  ;; for CodeMirror entry points with it (GH #279).
+  :depends-on (:graph-db/gui :graph-db/test-scratch :fiveam :drakma
+               :usocket :flexi-streams :bordeaux-threads :cl-ppcre)
+  :pathname "tests/gui/"
+  :serial t
+  :components ((:file "package")
+               (:file "suite")
+               (:file "gui-tests"))
+  :perform (test-op (op c)
+                    (unless (uiop:symbol-call :graph-db/gui-test
+                                              :run-gui-tests)
+                      (error "graph-db GUI tests failed."))))
+
+(defsystem graph-db/test-scratch
+  :name "VivaceGraph shared test scratch-space manager"
+  :description "Per-run scratch parent + stale sweep for all suites (GH #214)."
+  :pathname "tests/"
+  :components ((:file "scratch")))
 
 (defsystem graph-db/concurrency-test
   :name "VivaceGraph concurrency test suite"
   :description "FiveAM thread-safety and concurrency tests for graph-db."
-  :depends-on (:graph-db :fiveam :bordeaux-threads)
+  :depends-on (:graph-db :graph-db/test-scratch :fiveam :bordeaux-threads)
   :pathname "tests/concurrency/"
   :serial t
   :components ((:file "package")
@@ -182,7 +296,7 @@
 
 (defsystem graph-db/acid-test
   :name "VivaceGraph ACID compliance tests"
-  :depends-on (:graph-db :fiveam :bordeaux-threads)
+  :depends-on (:graph-db :graph-db/test-scratch :fiveam :bordeaux-threads)
   :pathname "tests/acid/"
   :serial t
   :components ((:file "package")
@@ -197,7 +311,7 @@
 (defsystem graph-db/stress-test
   :name "VivaceGraph stress test suite"
   :description "Single-threaded scale and correctness stress tests for graph-db."
-  :depends-on (:graph-db :fiveam)
+  :depends-on (:graph-db :graph-db/test-scratch :fiveam)
   :pathname "tests/stress/"
   :serial t
   :components ((:file "package")
@@ -215,7 +329,8 @@
 (defsystem graph-db/concurrent-stress-test
   :name "VivaceGraph concurrent stress test suite"
   :description "Multi-threaded scale and stability tests for graph-db."
-  :depends-on (:graph-db :fiveam :bordeaux-threads)
+  :depends-on (:graph-db :graph-db/test-scratch :fiveam
+               :bordeaux-threads)
   :pathname "tests/concurrent-stress/"
   :serial t
   :components ((:file "package")
@@ -236,12 +351,14 @@
 (defsystem graph-db/perf-test
   :name "VivaceGraph performance benchmark suite"
   :description "SBCL-focused performance benchmarks for graph-db (measurement, not pass/fail)."
-  :depends-on (:graph-db :bordeaux-threads)
+  :depends-on (:graph-db :graph-db/test-scratch :bordeaux-threads)
   :pathname "tests/perf/"
   :serial t
   :components ((:file "package")
                (:file "suite")
                (:file "benchmarks")
+               ;; baseline blessing + regression gating (GH #253)
+               (:file "check")
                ;; B+ tree vs skip-list side-by-side (in-package :graph-db so it can
                ;; trace both read paths); entry point (graph-db::bplus-bench).
                (:file "bplus-bench"))
@@ -303,12 +420,13 @@
                (:file "prolog")))
 
 ;; OPTIONAL io add-on: GML/Pajek import + Graphviz export.  Kept separate so the
-;; parsing deps (yacc, dso-lex, parse-number) stay out of the core algorithm
-;; add-on and the embeddable core.
+;; parsing deps (yacc, parse-number) stay out of the core algorithm
+;; add-on and the embeddable core.  The GML lexer is hand-rolled here
+;; since dso-lex left Quicklisp (GH #240).
 (defsystem graph-db/algorithms-io
   :name "VivaceGraph graph-algorithms IO"
   :description "Optional GML/Pajek import + Graphviz export for graph-db/algorithms."
-  :depends-on (:graph-db/algorithms :cl-ppcre :yacc :dso-lex :parse-number
+  :depends-on (:graph-db/algorithms :cl-ppcre :yacc :parse-number
                :trivial-shell)
   :pathname "algorithms/"
   :serial t
@@ -317,7 +435,8 @@
 (defsystem graph-db/algorithms-test
   :name "VivaceGraph graph-algorithms test suite"
   :description "FiveAM tests for graph-db/algorithms."
-  :depends-on (:graph-db/algorithms :graph-db/algorithms-io :fiveam)
+  :depends-on (:graph-db/algorithms :graph-db/algorithms-io
+               :graph-db/test-scratch :fiveam)
   :pathname "tests/algorithms/"
   :serial t
   :components ((:file "package")
@@ -356,7 +475,8 @@
 (defsystem graph-db/geos-test
   :name "VivaceGraph GEOS test suite"
   :description "FiveAM tests for the optional GEOS integration."
-  :depends-on (:graph-db/geos :fiveam :bordeaux-threads)
+  :depends-on (:graph-db/geos :graph-db/test-scratch :fiveam
+               :bordeaux-threads)
   :pathname "tests/geos/"
   :serial t
   :components ((:file "package")
@@ -374,10 +494,77 @@
                     (unless (uiop:symbol-call :graph-db/geos-test :run-geos-tests)
                       (error "graph-db GEOS tests failed."))))
 
+;; OPTIONAL spacetime add-on: temporal extents, the Allen interval algebra,
+;; and standing.  Pure value types and total functions -- core graph-db does
+;; NOT depend on this, and this reserves no serialize type byte (GH #130).
+(defsystem graph-db/spacetime
+  :name "VivaceGraph spacetime (temporal substrate)"
+  :description "The claim record and source-onboarding contract over
+cl-temporal-extent."
+  :depends-on (:graph-db/core :local-time
+               (:version :cl-temporal-extent "0.2.0"))
+  :pathname "spacetime/"
+  :serial t
+  :components ((:file "package")
+               (:file "conditions")
+               (:file "claim")
+               (:file "claim-query")
+               (:file "source")
+               (:file "resolve")
+               (:file "register")
+               ;; Membership disjointness (GH #157 4b): needs
+               ;; claim-query's RETRACT-CLAIM/CLAIM-CURRENT-P and core's
+               ;; commit view + *COMMIT-VALIDATORS* seam.
+               (:file "membership")
+               ;; Temporal claim families (GH #296): the extent-overlap
+               ;; validator; needs membership's post-commit overlay.
+               (:file "temporal")))
+
+(defsystem graph-db/spacetime-test
+  :name "VivaceGraph spacetime test suite"
+  :description "FiveAM tests for graph-db/spacetime."
+  ;; GRAPH-DB/CORE (not the full GRAPH-DB) so conformance-tests.lisp can
+  ;; drive EXTENT->SEXP output through the real GRAPH-DB:SERIALIZE /
+  ;; GRAPH-DB:DESERIALIZE rather than a structural predicate (#130).  It is
+  ;; already a transitive dependency via GRAPH-DB/SPACETIME; listed
+  ;; explicitly here so the test system's needs are not implicit.
+  ;; GRAPH-DB/GEOS so register-tests.lisp can exercise the EXACT path: an
+  ;; extended geometry's overlap fraction needs GEOMETRY-INTERSECTION, and
+  ;; without the add-on REGISTER-GEOMETRY correctly refuses to answer at
+  ;; all (#138, design §6).  The GEOS-dependent test skips when libgeos_c
+  ;; is absent, as tests/geos/ does.
+  :depends-on (:graph-db/spacetime :graph-db/core :graph-db/geos
+               :graph-db/test-scratch :fiveam)
+  :pathname "tests/spacetime/"
+  :serial t
+  :components ((:file "package")
+               (:file "suite")
+               (:file "claim-tests")
+               (:file "claim-identity-tests")
+               (:file "claim-query-tests")
+               (:file "claim-concurrency-tests")
+               (:file "source-tests")
+               (:file "resolve-tests")
+               ;; Draws on MAKE-U/MAKE-B and WITH-CLAIM-GRAPH from the
+               ;; claim test files above (#131 Task 7).
+               (:file "conformance-tests")
+               (:file "claim-standing-guard-tests")    ; GH #149
+               (:file "claim-transaction-tests")       ; GH #148
+               (:file "register-tests")                ; GH #138
+               (:file "membership-tests")              ; GH #157 4b
+               (:file "temporal-tests"))               ; GH #296
+  :perform (test-op (op c)
+                    (unless (uiop:symbol-call :graph-db/spacetime-test
+                                              :run-spacetime-tests)
+                      (error "graph-db spacetime tests failed."))))
+
 (defsystem graph-db/test
   :name "VivaceGraph test suite"
   :description "FiveAM unit tests for graph-db."
-  :depends-on (:graph-db :fiveam :drakma)
+  ;; :graph-db/perf-test is load-only here: perf/check-tests exercises the
+  ;; pure check-perf comparison logic (GH #253); no benchmark ever runs.
+  :depends-on (:graph-db :graph-db/test-scratch :graph-db/perf-test
+               :fiveam :drakma)
   :pathname "tests/"
   :serial t
   :components ((:file "package")
@@ -387,6 +574,14 @@
                ;; graph, no schema registration), so it has no ordering
                ;; constraint against the graph-level files below.
                (:file "node-class-tests")
+               ;; Mostly a throwaway MAKE-SCHEMA and raw mmap'd byte layouts
+               ;; (#166), but it ALSO declares its own graph (:ti-gc-reopen-
+               ;; test, for the GC-marking regression test) -- distinct from
+               ;; *integration-graph-name*, so it is not exposed to the
+               ;; graph-tests reload hazard noted below, same reasoning as
+               ;; multi-graph-tests.  Still no ordering constraint against
+               ;; the graph-level files below.
+               (:file "type-id-width-tests")
                (:file "geometry-tests")
                (:file "geometry-ops-tests")
                (:file "geohash-tests")
@@ -430,6 +625,7 @@
                (:file "peer-rehome-tests")
                (:file "peer-conflict-tests")
                (:file "peer-type-table-tests")
+               (:file "peer-wire-v2-tests")
                (:file "peer-scope-tests")
                (:file "view-tests")
                (:file "query-tests")
@@ -438,17 +634,43 @@
                (:file "spatial-prolog-tests")
                (:file "traverse-tests")
                (:file "write-path-tests")
+               (:file "slot-mutation-tests")
                (:file "reopen-tests")
+               (:file "map-vertices-untyped-tests") ; GH #219
                (:file "backup-tests")
                (:file "mvcc-tests")
+               (:file "system-clock-tests")       ; GH #168
+               (:file "type-registry-tests")      ; GH #186
+               (:file "global-type-id-tests")     ; GH #186
+               (:file "type-id-seeding-tests")    ; GH #186
+               (:file "keyword-alias-tests")      ; GH #190
+               (:file "store-registry-tests")     ; GH #169
+               (:file "store-resolver-tests")     ; GH #169
+               (:file "detach-tests")             ; GH #170
+               (:file "read-snapshot-leak-tests") ; GH #181, #211
+               (:file "system-restore-tests")     ; GH #171
+               (:file "package-namespace-tests")  ; GH #167
+               (:file "runtime-schema-tests")     ; GH #172
+               (:file "sidecar-io-tests")         ; GH #226, #227
+               (:file "posix-tests")              ; GH #182
                (:file "rest-tests")
                (:file "rest-http-tests")
                (:file "prolog-stress-tests")
                (:file "memory-graph-tests")
                (:file "unique-constraint-tests")
                (:file "index-tests")
+               (:file "schema-retraction-tests")   ; GH #139, #140
+               (:file "index-prolog-tests")        ; GH #102
+               (:file "value-constraint-tests")     ; GH #149
+               (:file "cardinality-tests")          ; GH #155
+               (:file "domain-range-tests")         ; GH #156
+               (:file "disjointness-tests")         ; GH #157
                (:file "peer-unique-tests")
-               (:file "peer-index-tests"))
+               (:file "peer-rejection-tests")           ; GH #151
+               (:file "peer-index-tests")
+               (:file "open-hygiene-tests")    ; GH #222, #224
+               (:file "scratch-cleanup-tests")  ; GH #214
+               (:file "perf/check-tests"))      ; GH #253
   :perform (test-op (op c)
                     (unless (uiop:symbol-call :graph-db/test :run-tests)
                       (error "graph-db test suite failed."))))

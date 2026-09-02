@@ -106,7 +106,10 @@ hub with the incoming state and re-journals it under the op-id."
     (let* ((tid (graph-db::node-type-id
                  (graph-db::lookup-node-type-by-name 'g-person :vertex :graph g)))
            (newid (gen-id))
-           (base (make-instance 'g-person :id newid :type-id tid :revision 0))
+           ;; %MAKE-VERTEX, not a bare (MAKE-INSTANCE 'g-person ...): see
+           ;; tests/peer-unique-tests.lisp's PU-AUTHORED-CREATE (GH #135).
+           (base (graph-db::%make-vertex :class 'g-person :id newid
+                                         :type-id tid :revision 0))
            (op (progn (setf (graph-db::data base) '((:name . "Fresh") (:age . 3)))
                       (graph-db::make-peer-op
                        :kind :authored :op-id (graph-db::gen-op-id)
@@ -202,9 +205,10 @@ silently (no surface) -- the still-live gate is what makes it a conflict."
         (is (null (graph-db::get-peer-conflicts g))
             "no surface when the edge is already gone at the hub")))))
 
-;;; --- B3-2b: find-of-type edge multiplicity surfacing (re-home path) -----------
+;;; --- B3-2b: safety-surface edge multiplicity surfacing (re-home path)
+;;; ---------
 ;;;
-;;; g-likes stands in for find-of-type (bucket :safety-surface-edge).  A 2nd concurrent
+;;; g-likes stands in for a :safety-surface-edge-bucketed edge. A 2nd concurrent
 ;;; g-likes edge out of the same source vertex surfaces a multiplicity conflict; both
 ;;; edges are kept (edges union).  Also exercises edge-create re-home (from/to carried).
 
@@ -222,19 +226,24 @@ silently (no surface) -- the still-live gate is what makes it a conflict."
          (close-graph ,g :snapshot-p nil)))))
 
 (defun make-edge-create-op (edge-type from to graph origin lamport)
-  "An authored op creating a fresh EDGE-TYPE edge FROM->TO (ids)."
+  "An authored op creating a fresh EDGE-TYPE edge FROM->TO (ids).
+
+%MAKE-EDGE, not a bare (MAKE-INSTANCE edge-type ...): see
+tests/peer-unique-tests.lisp's PU-AUTHORED-CREATE docstring (GH #135)."
   (let* ((tid (graph-db::node-type-id
                (graph-db::lookup-node-type-by-name edge-type :edge :graph graph)))
-         (e (make-instance edge-type :id (gen-id) :type-id tid :revision 0
-                                     :from from :to to)))
+         (e (graph-db::%make-edge :class edge-type :id (gen-id) :type-id tid
+                                  :revision 0 :from from :to to)))
     (setf (graph-db::data e) nil (graph-db::bytes e) (graph-db::serialize nil))
     (graph-db::make-peer-op
      :kind :authored :op-id (graph-db::gen-op-id) :origin origin :lamport lamport :tx-id 60
      :writes (list (make-instance 'graph-db::tx-create :node e)))))
 
-(test rehome-find-of-type-multiplicity-surfaces
-  "A device's FIRST find-of-type-style edge re-homes with no conflict; a 2nd concurrent
-one out of the same find SURFACES a multiplicity conflict and both edges are kept."
+(test rehome-surface-edge-multiplicity-surfaces
+  "A device's FIRST safety-surface edge re-homes with no conflict; a 2nd
+concurrent
+one out of the same source SURFACES a multiplicity conflict and both edges are
+    kept."
   (with-multiplicity-hub (g)
     (let (aid bid cid)
       (with-transaction ()

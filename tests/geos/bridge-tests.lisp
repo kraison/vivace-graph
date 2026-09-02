@@ -32,13 +32,13 @@
   (and (eq (geometry-kind a) (geometry-kind b))
        (coords-approx-equal (geometry-coordinates a) (geometry-coordinates b))))
 
-;;; sample geometries (lon lat), Kharkiv-ish; polygon rings are pre-closed.
-(defun sample-point () (make-point 37.1724312d0 49.2020584d0))
+;;; synthetic sample geometries (lon lat); polygon rings are pre-closed.
+(defun sample-point () (make-point 12.3424312d0 45.6720584d0))
 (defun sample-line ()
-  (make-linestring '((37.10d0 49.10d0) (37.20d0 49.15d0) (37.30d0 49.05d0))))
+  (make-linestring '((12.10d0 45.10d0) (12.20d0 45.15d0) (12.30d0 45.05d0))))
 (defun sample-polygon ()
-  (make-polygon '(((37.16d0 49.19d0) (37.19d0 49.19d0)
-                   (37.19d0 49.21d0) (37.16d0 49.21d0) (37.16d0 49.19d0)))))
+  (make-polygon '(((12.33d0 45.66d0) (12.36d0 45.66d0)
+                   (12.36d0 45.68d0) (12.33d0 45.68d0) (12.33d0 45.66d0)))))
 (defun sample-polygon-with-hole ()
   (make-polygon '(((0d0 0d0) (10d0 0d0) (10d0 10d0) (0d0 10d0) (0d0 0d0))
                   ((3d0 3d0) (3d0 6d0) (6d0 6d0) (6d0 3d0) (3d0 3d0)))))

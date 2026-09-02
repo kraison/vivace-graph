@@ -1,12 +1,33 @@
 (in-package :graph-db)
 
-;; Defined in unique-constraint.lisp (loaded after this file); declared here so the
-;; %COMMIT / APPLY-TRANSACTION hooks below compile without a forward-reference warning.
+;; Defined in later-loaded files (unique-constraint / index / value-constraint);
+;; declared here so the %COMMIT / APPLY-TRANSACTION hooks below compile
+;; without a forward-reference warning.
 (declaim (ftype (function (t t) t)
                 validate-unique-constraints apply-tx-writes-to-unique-indexes
-                apply-tx-writes-to-secondary-indexes))
+                apply-tx-writes-to-secondary-indexes
+                validate-value-constraints validate-cardinality-constraints
+                validate-domain-range-constraints))
 
 (defvar *transaction* nil)
+
+(defvar *commit-validators* '()
+  "Functions of (TX GRAPH), run in %COMMIT's manager-locked pre-durability
+region after the built-in validators.  The seam an OPTIONAL subsystem's
+constraint family plugs into -- the spacetime substrate's membership
+disjointness registers here (GH #157 4b) -- mirroring
+*NODE-TYPE-DEFINITION-HOOKS* (schema.lisp).  A validator that signals
+aborts the commit before anything is journaled; it MUST be pure reads
+plus signalling, and should read tx state through MAKE-COMMIT-VIEW.")
+(defvar *quiesced-store-closing-p* nil
+  "Bound T only in the detaching thread's dynamic extent, while
+DETACH-STORE's own CLOSE-GRAPH runs its post-quiesce snapshot scan.  Lets
+that one internal PIN-READ-EPOCH through despite ACCEPTING-P being
+non-T, without opening the door to any other caller -- the binding is
+thread-local, so a concurrent thread still sees the refusal.  Checked
+only by PIN-READ-EPOCH: CLOSE-GRAPH's snapshot path (BACKUP via
+MAP-VERTICES/MAP-EDGES) takes read pins, never a transaction, so
+CREATE-TRANSACTION has no matching bypass (GH #170).")
 (defvar *read-snapshots* nil
   "Graph -> read-only snapshot transaction, or NIL.  Read-only snapshots are
 per graph and may compose; read-write transactions are not (GH #53).")
@@ -127,6 +148,57 @@ per graph and may compose; read-write transactions are not (GH #53).")
 
 (define-condition no-transaction-in-progress (error) ())
 
+(define-condition attach-with-active-transactions (error)
+  ;; Attaching mid-transaction poisons the overlap window (GH #168 review):
+  ;; a transaction already holding a low START-TX-ID would get a raised
+  ;; FINISH-TX-ID, so OVERLAPPING-TRANSACTIONS spuriously returns every
+  ;; committed transaction and VALIDATE conflicts on all of them.
+  ((graph :initarg :graph :reader attach-with-active-transactions-graph))
+  (:report (lambda (condition stream)
+             (format stream "Cannot attach ~A to a system clock: it has ~
+in-flight transactions. Attach only a quiescent store."
+                     (graph-name (attach-with-active-transactions-graph
+                                  condition))))))
+
+(define-condition store-not-accepting-error (error)
+  ;; ACCEPTING-P states: T (all), :READ-ONLY (pins/reads yes, txns no),
+  ;; :OPENING (same admit-pins/refuse-txns shape, for OPEN-GRAPH's own
+  ;; mid-open window -- GH #170 review round 3), :DETACHING/:SWAPPING
+  ;; (nothing new).  REASON mirrors the flag, except :READ-ONLY reports
+  ;; as :SHADOW-LOAD -- the human-facing name for the state Task 2's
+  ;; shadow window puts the store in (GH #170).
+  ((name :initarg :name :reader store-not-accepting-name)
+   (reason :initarg :reason :reader store-not-accepting-reason))
+  (:report (lambda (condition stream)
+             (format stream "Store ~S is not accepting new work (~S)."
+                     (store-not-accepting-name condition)
+                     (store-not-accepting-reason condition)))))
+
+(define-condition detach-drain-timeout (error)
+  ;; ACCEPTING-P is restored to whatever it was BEFORE this quiesce call,
+  ;; not hardcoded T -- a timeout during an already-non-accepting window
+  ;; (e.g. SHADOW-STORE's :READ-ONLY) must not silently lift it (GH #170,
+  ;; review finding C1).
+  ((name :initarg :name :reader detach-timeout-name)
+   (seconds :initarg :seconds :reader detach-timeout-seconds))
+  (:report (lambda (condition stream)
+             (format stream "Store ~S did not drain within ~D second~:P; ~
+detach aborted and the store resumes its prior accepting state."
+                     (detach-timeout-name condition)
+                     (detach-timeout-seconds condition)))))
+
+(define-condition epoch-lease-exhausted (error)
+  ;; A shadow store's leased range is [START, END) -- see EPOCH-LEASE in
+  ;; graph-class.lisp.  Signalled instead of silently falling through to
+  ;; the clock/counter, which would collide with the live store's ids
+  ;; (GH #170).
+  ((name :initarg :name :reader epoch-lease-exhausted-name)
+   (end :initarg :end :reader epoch-lease-exhausted-end))
+  (:report (lambda (condition stream)
+             (format stream "Store ~S exhausted its leased epoch range ~
+(end ~D)." (epoch-lease-exhausted-name condition)
+                     (epoch-lease-exhausted-end condition)))))
+
 (define-condition no-transaction-in-progress-warning (warning) ()
   (:report
    (lambda (condition stream)
@@ -141,8 +213,37 @@ per graph and may compose; read-write transactions are not (GH #53).")
              (format stream "Modifying ~A without copying first"
                      (modifying-non-copy-node condition)))))
 
+(define-condition mutating-unregistered-node (error)
+  ((node
+    :initarg :node
+    :reader mutating-unregistered-node-node)
+   (slot
+    :initarg :slot
+    :reader mutating-unregistered-node-slot))
+  (:report
+   (lambda (condition stream)
+     (format stream
+             "Cannot write persistent slot ~A of ~A: this transaction may ~
+              write only a node it created, or a COPY it registered.  A node ~
+              from LOOKUP-* is the shared cached instance -- COPY it inside ~
+              the transaction, SETF the copy, then SAVE it."
+             (mutating-unregistered-node-slot condition)
+             (mutating-unregistered-node-node condition)))))
+
+(define-condition copying-uncommitted-node (error)
+  ((node
+    :initarg :node
+    :reader copying-uncommitted-node-node))
+  (:report
+   (lambda (condition stream)
+     (format stream
+             "Cannot COPY ~A: it was created in this transaction, so it has no ~
+              committed version to update against.  SETF its slots directly -- ~
+              a node you created is writable without a copy."
+             (copying-uncommitted-node-node condition)))))
+
 ;;; Transaction manager
-(defgeneric create-transaction (transaction-manager))
+(defgeneric create-transaction (transaction-manager &key allow-read-only))
 (defgeneric cleanup-transaction (transaction))
 
 (defgeneric graph (object)
@@ -167,13 +268,6 @@ per graph and may compose; read-write transactions are not (GH #53).")
   `(call-with-transaction-lock ,transaction
                                (lambda ()
                                  ,@body)))
-
-(defgeneric assign-transaction-id (transaction transaction-manager)
-  (:method (transaction transaction-manager)
-    (let ((new-id (tx-id-counter transaction-manager)))
-      (setf (transaction-id transaction) new-id)
-      (incf (tx-id-counter transaction-manager))
-      new-id)))
 
 ;;; Transactions
 (defgeneric transaction-manager (object)
@@ -314,10 +408,20 @@ per graph and may compose; read-write transactions are not (GH #53).")
   (:documentation "Call FUN with *TRANSACTION* bound to a new
   transaction created from TRANSACTION-MANAGER."))
 
-(defmacro with-transaction ((&optional (transaction-manager '(transaction-manager *graph*)))
-                            &body body)
-  "Run BODY as a single ACID transaction against TRANSACTION-MANAGER (by
-default that of the current *GRAPH*) and return BODY's value.
+(defmacro with-transaction ((&rest spec) &body body)
+  "Run BODY as a single ACID transaction and return BODY's value.  Three
+forms of SPEC:
+
+  (with-transaction () ...)              the current *GRAPH*'s manager
+  (with-transaction (TM) ...)            an explicit transaction manager
+  (with-transaction (:graph G) ...)      G's manager, with *GRAPH* bound
+                                         to G for BODY (GH #175)
+
+The :GRAPH form is the multi-store idiom: it selects the store's manager
+AND binds *GRAPH*, because a body committing to one store while its
+reads default to another is the node-escape class (GH #53).  The TM form
+binds nothing -- it is unchanged.  Dispatched on the literal keyword at
+macroexpansion, so no existing caller changes meaning.
 
 All mutations -- MAKE-<type> constructors, SAVE, DELETE-NODE/MARK-DELETED --
 must run inside a transaction.  On normal exit the transaction is validated
@@ -325,7 +429,22 @@ against its read/write sets and committed; if validation finds a conflict it
 is retried (up to *MAXIMUM-TRANSACTION-ATTEMPTS*, then under an exclusive
 lock).  A non-local exit rolls it back.  To modify an existing node, COPY it
 inside the transaction, mutate the copy, then SAVE it."
-  `(call-with-transaction (lambda () ,@body) ,transaction-manager))
+  (cond ((null spec)
+         `(call-with-transaction (lambda () ,@body)
+                                 (transaction-manager *graph*)))
+        ((eq (first spec) :graph)
+         (unless (and (= (length spec) 2) (second spec))
+           (error "WITH-TRANSACTION: (:GRAPH G) takes exactly one graph ~
+                   form, got ~S." spec))
+         (let ((g (gensym "GRAPH")))
+           `(let* ((,g ,(second spec))
+                   (*graph* ,g))
+              (call-with-transaction (lambda () ,@body)
+                                     (transaction-manager ,g)))))
+        ((= (length spec) 1)
+         `(call-with-transaction (lambda () ,@body) ,(first spec)))
+        (t (error "WITH-TRANSACTION: SPEC is (), (TM) or (:GRAPH G), ~
+                   got ~S." spec))))
 
 (defclass tx ()
   ((read-set
@@ -408,6 +527,16 @@ inside the transaction, mutate the copy, then SAVE it."
             (object-set-count (create-set transaction))
             (object-set-count (write-set transaction))
             (state transaction))))
+
+(defun node-created-in-transaction-p (node transaction)
+  "True iff NODE -- by EQ, not merely by shared id -- is the exact node
+CREATE-NODE registered in TRANSACTION's create-set.  OBJECT-SET-MEMBER-P
+keys by (ID OBJECT) alone, so any instance carrying a re-created id (the
+generated constructor accepts :ID) would otherwise pass -- letting the
+create-set branch of the slot-mutation guard, and COPY's create-set check,
+through for a node this transaction never created (GH #135)."
+  (let ((entry (gethash (id node) (table (create-set transaction)))))
+    (and entry (eq (node entry) node))))
 
 
 ;;; Applying transaction writes to the graph
@@ -596,15 +725,44 @@ vertices (the normal case for ingested source records) are unaffected."
 ;;; by the pin, so any version that was live at pin time (stop-epoch >= pin)
 ;;; cannot be reclaimed out from under the reader.
 
+;; NOTINLINE so PIN-READ-EPOCH-SIGNAL-DOES-NOT-LEAK-THE-TX-ENTRY can
+;; intercept this with an FDEFINITION swap: ECL compiles the same-file
+;; call in the snapshot path into a direct C call, bypassing the symbol.
+;; Same reason as %MUNMAP-OR-WARN (mmap.lisp); GH #313.
+(declaim (notinline pin-read-epoch))
 (defun pin-read-epoch (transaction-manager)
-  "Register a read pin at the current epoch; return its token (for UNPIN)."
-  ;; Racy read of tx-id-counter is fine: it is monotonic, and a slightly stale
-  ;; (smaller) value only makes the reaper MORE conservative, never less.
-  (let ((epoch (tx-id-counter transaction-manager)))
-    (with-recursive-lock-held ((read-pins-lock transaction-manager))
-      (let ((token (incf (read-pin-counter transaction-manager))))
-        (setf (gethash token (read-pins transaction-manager)) epoch)
-        token))))
+  "Register a read pin at the current epoch; return its token (for UNPIN).
+Refused -- STORE-NOT-ACCEPTING-ERROR -- only under FULL quiescence
+(:DETACHING / :SWAPPING); :READ-ONLY and :OPENING (OPEN-GRAPH's own
+mid-open window, GH #170 review round 3) both admit new pins -- OPEN-
+GRAPH's own rebuild/recovery scans run under WITH-READ-PIN and must not
+be refused by the very state that protects them from a concurrent
+writer.
+
+The accepting-p CHECK and the pin REGISTRATION run as one critical
+section under READ-PINS-LOCK -- the same lock
+%QUIESCE-TRANSACTION-MANAGER's flip takes (after TM-LOCK; see its
+docstring for the lock-ordering argument).  Without this, the check
+here and the HASH-TABLE write below ran under two different locks, so a
+racing caller could observe ACCEPTING-P as T, then have the flip and
+the full drain both complete, and only THEN land its pin -- a straggler
+admitted after DETACH-STORE had already reported success and begun
+tearing down mmaps (GH #170, fix round 1)."
+  (with-recursive-lock-held ((read-pins-lock transaction-manager))
+    (let ((state (accepting-p transaction-manager)))
+      (unless (or (eq state t) (eq state :read-only) (eq state :opening)
+                  *quiesced-store-closing-p*)
+        (error 'store-not-accepting-error
+               :name (graph-name (graph transaction-manager))
+               :reason state)))
+    ;; Racy read of the epoch is fine: it is monotonic, and a slightly
+    ;; stale (smaller) value only makes the reaper MORE conservative,
+    ;; never less.  Reading it inside the lock now (rather than before
+    ;; it) costs nothing -- TM-PEEK-EPOCH is itself lock-free.
+    (let* ((epoch (tm-peek-epoch transaction-manager))
+           (token (incf (read-pin-counter transaction-manager))))
+      (setf (gethash token (read-pins transaction-manager)) epoch)
+      token)))
 
 (defun unpin-read-epoch (transaction-manager token)
   (with-recursive-lock-held ((read-pins-lock transaction-manager))
@@ -782,6 +940,9 @@ APPLY-TRANSACTION)."
   (let ((table (tx-write-table write graph))
         (node (node write)))
     (setf (revision node) 0)
+    ;; BYTES re-derives itself from a mutated DATA on read (GH #136), so the
+    ;; durable record written in PREPARE-TX-PERSISTENCE already carried the
+    ;; post-construction mutations (GH #135); nothing to refresh here.
     (maybe-write-to-heap node graph)
     (add-node-to-indexes node graph
                          :unless-present *add-to-indexes-unless-present-p*)
@@ -810,8 +971,8 @@ APPLY-TRANSACTION)."
         (table (tx-write-table write graph)))
     (setf (revision new-node)
           (ldb (byte 32 0) (1+ (revision old-node))))
-    (setf (bytes new-node)
-          (serialize (data new-node)))
+    ;; BYTES re-derives itself from a mutated DATA on read (GH #136); the
+    ;; hand re-serialize that used to sit here is gone.
     ;; Stamp home graph, symmetric with the create path's FINALIZE-NODE (GH #53).
     (setf (node-graph new-node) graph
           (node-graph old-node) graph)
@@ -872,8 +1033,10 @@ APPLY-TRANSACTION)."
 
 ;;; Applying the transaction
 
-(defvar *highest-transaction-id-lock*
-  (make-recursive-lock "transaction id file"))
+;; The former process-global *HIGHEST-TRANSACTION-ID-LOCK* is gone:
+;; each graph has its own transaction-id.dat, so the watermark now
+;; locks per graph -- (WATERMARK-LOCK graph) -- and nothing cross-graph
+;; was ever protected (GH #237).
 
 (defgeneric highest-transaction-id-file (graph)
   (:method (graph)
@@ -881,7 +1044,13 @@ APPLY-TRANSACTION)."
                    :type "dat"
                    :defaults (location graph))))
 
-(defgeneric persist-highest-transaction-id (transaction-id graph)
+(defgeneric %write-highest-transaction-id (transaction-id graph)
+  (:documentation "Unconditional raw overwrite of transaction-id.dat --
+no max, no lock.  For crash-fabricating tests; production writers go
+through PERSIST-HIGHEST-TRANSACTION-ID (GH #177).  Sets GRAPH's
+watermark cache to the written value -- a deliberate rewind must not
+leave a stale higher cache behind (GH #237).  Not concurrency-safe;
+never call it on a graph with live committers.")
   (:method (transaction-id graph)
     (let ((persist-file (highest-transaction-id-file graph))
           (serialized (make-byte-vector 8)))
@@ -891,15 +1060,42 @@ APPLY-TRANSACTION)."
                               :element-type '(unsigned-byte 8)
                               :if-does-not-exist :create
                               :if-exists :overwrite)
-        (with-recursive-lock-held (*highest-transaction-id-lock*)
-          (write-sequence serialized stream)))
+        (write-sequence serialized stream))
+      (setf (watermark-cache graph) transaction-id)
       transaction-id)))
+
+(defgeneric persist-highest-transaction-id (transaction-id graph)
+  (:documentation "Persist TRANSACTION-ID as GRAPH's durable watermark
+unless a higher one is already recorded -- the file only ever moves
+forward.  Returns the watermark standing after the call (GH #177).
+Steady state is one lock-free cache compare, or compare + write under
+GRAPH's own lock; the disk re-read happens once per graph object, to
+seed the cache (GH #237).")
+  (:method (transaction-id graph)
+    ;; Fast path, no lock, no I/O: the cache only ever holds a value a
+    ;; writer put on disk, so cache >= id proves the file already holds
+    ;; >= id and the pre-#237 code would have skipped the write too.
+    ;; The slot is NIL or an integer -- a plain CLOS slot read cannot
+    ;; tear -- and a stale-low read just falls into the locked path.
+    (let ((cached (watermark-cache graph)))
+      (if (and cached (<= transaction-id cached))
+          cached
+          ;; Lock spans compare-write: two racing writers must not let
+          ;; the lower id land last (GH #177).
+          (with-recursive-lock-held ((watermark-lock graph))
+            (let ((current (or (watermark-cache graph)
+                               (load-highest-transaction-id graph))))
+              (setf (watermark-cache graph)
+                    (if (> transaction-id current)
+                        (%write-highest-transaction-id transaction-id
+                                                       graph)
+                        current))))))))
 
 (defgeneric load-highest-transaction-id (graph)
   (:method (graph)
     (let ((persist-file (highest-transaction-id-file graph))
           (serialized (make-byte-vector 8)))
-      (with-recursive-lock-held (*highest-transaction-id-lock*)
+      (with-recursive-lock-held ((watermark-lock graph))
         (if (probe-file persist-file)
             (with-open-file (stream persist-file
                                     :direction :input
@@ -1395,9 +1591,9 @@ either source) establishes the dimension."
                      ;; write establishes the dimension for the rest of TX
                      (setf (gethash key intra) (length v)))
                     ((/= (length v) expected)
-                     (error "vector-index slot ~A on ~A: vector length ~D does not ~
-match established segment dimension ~D"
-                            slot (car key) (length v) expected))))))))))))
+                     (error 'vector-dimension-violation
+                            :slot slot :owner (car key)
+                            :actual (length v) :expected expected))))))))))))
 
 (defun ensure-vector-segment-capacity (tx graph)
   "Grow every vector segment TX writes to until it can hold what TX will put in
@@ -1956,6 +2152,23 @@ With no FILTER, returns WRITES unchanged."
         (setf (data vertex) nil))
     vertex))
 
+;; Envelope's header-size byte MUST match this image's current head layout
+;; before any head byte is interpreted -- a version-gate bypass (or a stale
+;; on-disk txn-log predating a head-size change) would otherwise misparse
+;; head fields as data, not fail loudly. Defense in depth for GH #206 gap 2;
+;; the version/schema gates (peer-streaming.lisp) are the primary contract.
+(define-condition node-head-size-mismatch-error (error)
+  ((expected :initarg :expected :reader node-head-size-mismatch-expected)
+   (actual   :initarg :actual   :reader node-head-size-mismatch-actual)
+   (kind     :initarg :kind     :reader node-head-size-mismatch-kind))
+  (:report (lambda (c s)
+             (format s "Node head size mismatch for ~A: expected ~A byte~:P, ~
+got ~A (old-format or corrupt wire data, refused rather than misparsed; ~
+GH #206)"
+                     (node-head-size-mismatch-kind c)
+                     (node-head-size-mismatch-expected c)
+                     (node-head-size-mismatch-actual c)))))
+
 (defun deserialize-transaction-node-vector (vector &optional (offset 0))
   "Return the edge or vertex represented by VECTOR."
   (let (size uuid type header-size end)
@@ -1970,6 +2183,19 @@ With no FILTER, returns WRITES unchanged."
     (incf offset 16)
     (setf header-size (get-byte vector offset))
     (incf offset)
+    ;; Validate BEFORE any head byte is interpreted (below).
+    (let ((expected (cond ((eql type +transaction-node-edge-code+)
+                           +edge-header-size+)
+                          ((eql type +transaction-node-vertex-code+)
+                           +node-header-size+)
+                          (t
+                           (error "Unknown transaction node type ~S" type)))))
+      (unless (= header-size expected)
+        (error 'node-head-size-mismatch-error
+               :expected expected :actual header-size
+               :kind (if (eql type +transaction-node-edge-code+)
+                         :edge
+                         :vertex))))
     (let* ((header-offset offset)
            (data-offset (+ offset header-size))
            (node
@@ -2177,17 +2403,24 @@ left in the stream."
                    :defaults (transaction-pathname transaction))))
 
 (defgeneric persist-transaction (transaction)
+  (:documentation
+   "Legacy single-shot persistence path -- superseded on the commit hot
+path by the PREPARE-TX-PERSISTENCE / FINALIZE-TX-PERSISTENCE split (GH
+#135), which this generic has no callers left in this system; kept
+current for any external caller and honors the same WAL-suppressed
+no-op as FINALIZE-TX-PERSISTENCE (GH #170 Task 4).")
   (:method (transaction)
-    (persist-tx transaction
-                (transaction-temporary-pathname transaction)
-                (transaction-pathname transaction))
-    (let* ((transaction-manager (transaction-manager transaction))
-           (stream (replication-log transaction-manager))
-           (lock (replication-log-lock transaction-manager)))
-      (with-recursive-lock-held (lock)
-        (write-sequence (bytes transaction)
-                        (replication-log (transaction-manager transaction)))
-        (finish-output stream)))))
+    (unless (wal-suppressed-p (graph transaction))
+      (persist-tx transaction
+                  (transaction-temporary-pathname transaction)
+                  (transaction-pathname transaction))
+      (let* ((transaction-manager (transaction-manager transaction))
+             (stream (replication-log transaction-manager))
+             (lock (replication-log-lock transaction-manager)))
+        (with-recursive-lock-held (lock)
+          (write-sequence (bytes transaction)
+                          (replication-log (transaction-manager transaction)))
+          (finish-output stream))))))
 
 (defun transaction-prepare-pathname (transaction)
   "A unique per-attempt temp pathname, keyed by SEQUENCE-NUMBER (the
@@ -2365,20 +2598,32 @@ mint).  Persists if it moved.  A NIL/zero RECEIVED is a no-op."
   graph)
 
 (defun peer-observe-epoch (graph epoch)
-  "Advance GRAPH's TX-ID-COUNTER so it STRICTLY EXCEEDS EPOCH -- the MVCC commit
-epoch of an op this peer just APPLIED from a remote origin (a pulled node carries the
-HUB's epoch).  A device seeds its counter from its OWN feed-seq; without this the
-counter can sit at or below the epochs it applied, so a subsequent LOCAL edit
-transaction starts at a START-TX-ID that MVCC-hides the very node it means to edit
-(the node is invisible until the counter passes its epoch).  Under the tm lock, so it
-composes with CREATE-TRANSACTION; idempotent + monotonic; a NIL/zero EPOCH is a no-op.
-The durable side is the pull-cursor, which the barrier advances to the pull frontier T
-(>= every applied epoch) and which TX-ID-COUNTER is re-seeded from on open."
+  "Advance GRAPH's epoch source so it STRICTLY EXCEEDS EPOCH -- the MVCC
+commit epoch of an op this peer just APPLIED from a remote origin (a pulled
+node carries the HUB's epoch).  A device seeds its counter from its OWN
+feed-seq; without this the counter can sit at or below the epochs it
+applied, so a subsequent LOCAL edit transaction starts at a START-TX-ID that
+MVCC-hides the very node it means to edit (the node is invisible until the
+counter passes its epoch).  With an image clock bound (GH #168), TX-ID-
+COUNTER is dead -- TM-NEXT-EPOCH/TM-CURRENT-EPOCH/TM-PEEK-EPOCH all route
+around it -- so the observation goes to CLOCK-OBSERVE-EPOCH instead,
+taking only the clock's lock, not the tm lock.  That is safe only because
+this function runs solely on the device's peer-writer thread -- WP-8 funnels
+every local write through the same thread (see PEER-WRITER-LOOP and
+PEER-ENQUEUE-WRITE, peer-streaming.lisp) -- so it can never interleave with
+a local CREATE-TRANSACTION on this store.  Without a clock it falls back to
+the manager's own counter under its lock.  Idempotent + monotonic; a
+NIL/zero EPOCH is a no-op.  The durable side is the pull-cursor, which the
+barrier advances to the pull frontier T (>= every applied epoch) and which
+TX-ID-COUNTER is re-seeded from on open."
   (when (and epoch (> epoch 0) (typep graph 'peer-graph))
-    (let ((tm (transaction-manager graph)))
-      (with-recursive-lock-held ((lock tm))
-        (when (>= epoch (tx-id-counter tm))
-          (setf (tx-id-counter tm) (1+ epoch))))))
+    (let* ((tm (transaction-manager graph))
+           (clock (tm-clock tm)))
+      (if clock
+          (clock-observe-epoch clock epoch)
+          (with-recursive-lock-held ((lock tm))
+            (when (>= epoch (tx-id-counter tm))
+              (setf (tx-id-counter tm) (1+ epoch)))))))
   graph)
 
 (defun serialize-peer-meta (origin-id op-id lamport op-class)
@@ -2409,15 +2654,24 @@ the transaction-manager lock, so the bulk serialization + disk write (and the
 flush at close) are off the serialized commit path.  The header id is written as
 the placeholder 0 — the real id is encoded in the final FILENAME by the rename in
 FINALIZE-TX-PERSISTENCE, and recovery reads it from there.  Returns the temp
-pathname."
+pathname.
+
+WAL-suppressed (GH #170 Task 4): when (GRAPH TRANSACTION)'s WAL-SUPPRESSED-P
+is set, no temp file is written and BYTES is left unpopulated -- FINALIZE-TX-
+PERSISTENCE checks the same slot and skips both the rename and the
+replication-log write, so nothing here would ever be read.  Each written
+node's BYTES re-derive themselves from a mutated DATA on read (GH #136), so
+nothing is refreshed by hand before WRITE-TX-WRITES-TO-STREAM freezes them
+into the wire vector."
   (let ((tmp (transaction-prepare-pathname transaction)))
-    (with-open-file (stream tmp :direction :output
-                            :if-exists :supersede
-                            :if-does-not-exist :create
-                            :element-type '(unsigned-byte 8))
-      (write-tx-header-to-stream transaction stream 0)
-      (write-tx-writes-to-stream transaction stream))
-    (initialize-bytes-from-components transaction)
+    (unless (wal-suppressed-p (graph transaction))
+      (with-open-file (stream tmp :direction :output
+                              :if-exists :supersede
+                              :if-does-not-exist :create
+                              :element-type '(unsigned-byte 8))
+        (write-tx-header-to-stream transaction stream 0)
+        (write-tx-writes-to-stream transaction stream))
+      (initialize-bytes-from-components transaction))
     tmp))
 
 (defun finalize-tx-persistence (transaction tmp)
@@ -2430,57 +2684,72 @@ lock).  Recovery reads the id from this filename, so the file's header id stays
 at its placeholder 0.  Master graphs additionally patch the real id into the
 in-memory bytes and append them to the replication log in commit order for
 downstream slaves (the replication path is the only consumer of the header id,
-and it reads these patched bytes, never the .txn files)."
-  ;; Use POSIX rename(2) (atomic; replaces an existing target) rather than
-  ;; cl:rename-file.  SBCL/ECL's rename-file already overwrites per POSIX, but
-  ;; CCL's signals "File exists" when the target exists — which intermittently
-  ;; crashed concurrent-stress on CCL.  %posix-rename gives portable, atomic,
-  ;; overwrite-on-rename behavior across all implementations.
-  (%posix-rename (namestring tmp)
-                 (namestring (transaction-pathname transaction)))
-  (let ((tm (transaction-manager transaction)))
-    ;; peer-replication WP-2: generalized from MASTER-GRAPH-P so a peer-graph also
-    ;; journals its own committed writes (a device's push feed / a hub's pull feed).
-    ;; The patched-in transaction-id is the per-origin feed sequence (design §3 #3).
-    (when (journals-own-feed-p (graph tm))
-      (serialize-uint64 (bytes transaction)
-                        (transaction-id transaction)
-                        +tx-header-id-offset+)
-      (let ((repl-stream (replication-log tm))
-            (lock (replication-log-lock tm))
-            (gr (graph tm)))
-        (with-recursive-lock-held (lock)
-          ;; peer-replication WP-0: a peer-graph prefixes the feed entry with a
-          ;; peer-meta packet (op identity + lamport), then records that it has
-          ;; applied its own authored op so a re-homed bounce-back is deduped
-          ;; (design §6).  A master journals plain tx bytes, unchanged.
-          (when (peer-graph-p gr)
-            (if *peer-rehome-op*
-                ;; B2d-2: a hub re-home preserves the ORIGINAL op's identity on the
-                ;; feed entry (design §5) so device E pulls it as the author's op and
-                ;; the author dedups its own bounce-back; the re-home caller applies
-                ;; the merge's per-field stamps, so finalize does not stamp here.
-                (destructuring-bind (rop-id rorigin rlamport) *peer-rehome-op*
-                  (write-sequence
-                   (serialize-peer-meta rorigin rop-id rlamport +peer-op-authored+)
-                   repl-stream)
-                  (record-applied-op gr rop-id rlamport))
-                (let ((op-id (gen-op-id))
-                      (lamport (peer-next-lamport gr))
-                      (origin (or (origin-id gr) +peer-null-origin+)))
-                  (write-sequence
-                   (serialize-peer-meta origin op-id lamport +peer-op-authored+)
-                   repl-stream)
-                  (record-applied-op gr op-id lamport)
-                  ;; B2b: stamp every field this locally-authored op changed with
-                  ;; (lamport . origin) -- the LWW basis a later concurrent edit
-                  ;; from another replica compares against.
-                  (dolist (w (writes transaction))
-                    (let ((nid (id (node w))))
-                      (dolist (slot (authored-changed-slots w))
-                        (set-node-field-stamp gr nid slot lamport origin)))))))
-          (write-sequence (bytes transaction) repl-stream)
-          (finish-output repl-stream))))))
+and it reads these patched bytes, never the .txn files).
+
+WAL-suppressed (GH #170 Task 4): when (GRAPH TRANSACTION)'s WAL-SUPPRESSED-P
+is set, this whole body is skipped -- no rename (PREPARE-TX-PERSISTENCE wrote
+no TMP file to rename), no replication-log entry.  Checked on the transaction's
+own GRAPH, a per-graph slot, never a dynamic variable -- a special would leak
+suppression onto any OTHER graph committing on the same thread."
+  (unless (wal-suppressed-p (graph transaction))
+    ;; Use POSIX rename(2) (atomic; replaces an existing target) rather
+    ;; than cl:rename-file: CCL's signals "File exists" on an existing
+    ;; target (intermittently crashed concurrent-stress), and ECL 26.5.5
+    ;; does too (GH #313 — an earlier version of this comment claimed
+    ;; ECL overwrites; it does not).
+    (%posix-rename (namestring tmp)
+                   (namestring (transaction-pathname transaction)))
+    (let ((tm (transaction-manager transaction)))
+      ;; peer-replication WP-2: generalized from MASTER-GRAPH-P so a
+      ;; peer-graph also journals its own committed writes (a device's
+      ;; push feed / a hub's pull feed).  The patched-in transaction-id
+      ;; is the per-origin feed sequence (design §3 #3).
+      (when (journals-own-feed-p (graph tm))
+        (serialize-uint64 (bytes transaction)
+                          (transaction-id transaction)
+                          +tx-header-id-offset+)
+        (let ((repl-stream (replication-log tm))
+              (lock (replication-log-lock tm))
+              (gr (graph tm)))
+          (with-recursive-lock-held (lock)
+            ;; peer-replication WP-0: a peer-graph prefixes the feed
+            ;; entry with a peer-meta packet (op identity + lamport),
+            ;; then records that it has applied its own authored op so
+            ;; a re-homed bounce-back is deduped (design §6).  A master
+            ;; journals plain tx bytes, unchanged.
+            (when (peer-graph-p gr)
+              (if *peer-rehome-op*
+                  ;; B2d-2: a hub re-home preserves the ORIGINAL op's
+                  ;; identity on the feed entry (design §5) so device E
+                  ;; pulls it as the author's op and the author dedups
+                  ;; its own bounce-back; the re-home caller applies
+                  ;; the merge's per-field stamps, so finalize does not
+                  ;; stamp here.
+                  (destructuring-bind (rop-id rorigin rlamport) *peer-rehome-op*
+                    (write-sequence
+                     (serialize-peer-meta
+                      rorigin rop-id rlamport +peer-op-authored+)
+                     repl-stream)
+                    (record-applied-op gr rop-id rlamport))
+                  (let ((op-id (gen-op-id))
+                        (lamport (peer-next-lamport gr))
+                        (origin (or (origin-id gr) +peer-null-origin+)))
+                    (write-sequence
+                     (serialize-peer-meta
+                      origin op-id lamport +peer-op-authored+)
+                     repl-stream)
+                    (record-applied-op gr op-id lamport)
+                    ;; B2b: stamp every field this locally-authored op
+                    ;; changed with (lamport . origin) -- the LWW basis
+                    ;; a later concurrent edit from another replica
+                    ;; compares against.
+                    (dolist (w (writes transaction))
+                      (let ((nid (id (node w))))
+                        (dolist (slot (authored-changed-slots w))
+                          (set-node-field-stamp
+                           gr nid slot lamport origin)))))))
+            (write-sequence (bytes transaction) repl-stream)
+            (finish-output repl-stream)))))))
 
 ;;; Locking for object sets
 
@@ -2559,13 +2828,22 @@ and it reads these patched bytes, never the .txn files)."
 (defgeneric copy-node (node)
   (:method ((node node))
     (maybe-init-node-data node)
-    (let ((new-node (make-instance (type-of node)
-                                   :id (slot-value node 'id)
-                                   :type-id (slot-value node 'type-id)
-                                   :revision (slot-value node 'revision)
-                                   :deleted-p (slot-value node 'deleted-p)
-                                   :written-p (slot-value node 'written-p)
-                                   :data-pointer (slot-value node 'data-pointer))))
+    (let ((new-node
+           ;; Internal construction of a node not yet registered with this
+           ;; transaction: any :INITFORM MAKE-INSTANCE applies here must not
+           ;; fire through the guarded funnel.  DATA is set below, not as an
+           ;; initarg here -- NODE's own alist may be short an entry
+           ;; (SLOT-MAKUNBOUND; GH #128 schema evolution on a memory graph),
+           ;; and today's behavior for that gap must not change: it stays a
+           ;; gap on the copy, not backfilled from the class default (GH #135).
+           (let ((*initializing-node* t))
+             (make-instance (type-of node)
+                            :id (slot-value node 'id)
+                            :type-id (slot-value node 'type-id)
+                            :revision (slot-value node 'revision)
+                            :deleted-p (slot-value node 'deleted-p)
+                            :written-p (slot-value node 'written-p)
+                            :data-pointer (slot-value node 'data-pointer)))))
       (setf (node-graph new-node) (node-graph node))
       (setf (data new-node) (copy-tree (slot-value node 'data)))
       ;; Copy bytes so maybe-init-node-data on the copy does not try to
@@ -2575,6 +2853,21 @@ and it reads these patched bytes, never the .txn files)."
           (setf (gethash new-node (copies *transaction*)) node)
           (warn 'no-transaction-in-progress-warning))
       new-node)))
+
+(defgeneric %copy (node)
+  (:documentation
+   "Dispatch NODE to COPY-VERTEX or COPY-EDGE with no create-set guard --
+the same dispatch the public COPY (interface.lisp) uses, minus the guard.
+COPY-EDGE additionally copies FROM/TO/WEIGHT, which COPY-NODE does not; a
+delete's new node (the one persisted as the live head) must carry those or
+COMPACT-EDGES and the peer purge path unindex nothing and orphan the
+ve/vev entries (GH #135).  DELETE-NODE calls this directly, bypassing the
+guard: a node created and then MARK-DELETED in one transaction has no
+committed version either, but must keep working.")
+  (:method ((vertex vertex))
+    (copy-vertex vertex))
+  (:method ((edge edge))
+    (copy-edge edge)))
 
 (defgeneric update-node (new-node graph)
   (:documentation
@@ -2600,13 +2893,8 @@ NEW-NODE was not produced by COPY.")
         (when (and home (not (eq home txn-graph)))
           (error 'cross-graph-transaction-error
                  :node new-node :transaction-graph txn-graph :node-graph home)))
-      ;; Refresh the serialized bytes from the (modified) data: NEW-NODE is a
-      ;; COPY that still carries the ORIGINAL node's bytes, and mutating a slot
-      ;; updates DATA but not BYTES.  The write is serialized from BYTES into
-      ;; both the .txn log and the replication stream, so without this the
-      ;; logged/replicated update carries the OLD data (the master only looks
-      ;; correct because apply-tx-write re-serializes its own copy locally).
-      (setf (bytes new-node) (serialize (data new-node)))
+      ;; NEW-NODE is a COPY whose slot writes marked its BYTES stale; the
+      ;; .txn log and replication stream read them re-derived (GH #136).
       (add-to-object-set (make-instance 'tx-update
                                         :node new-node
                                         :old-node old-node)
@@ -2629,7 +2917,11 @@ stops appearing in queries.  MARK-DELETED is the usual entry point.")
         (error 'cross-graph-transaction-error
                :node node :transaction-graph txn-graph :node-graph home)))
     (let ((old-node node)
-          (new-node (copy node)))
+          ;; %COPY, not the public COPY: same dispatch (so an edge's
+          ;; FROM/TO/WEIGHT survive), minus the create-set guard -- a node
+          ;; created and then MARK-DELETED in this same transaction must
+          ;; keep working (GH #135).
+          (new-node (%copy node)))
       (setf (bytes new-node) (bytes old-node))
       (setf (deleted-p new-node) t)
       (add-to-object-set (make-instance 'tx-delete
@@ -2690,7 +2982,21 @@ stops appearing in queries.  MARK-DELETED is the usual entry point.")
     :initform (make-recursive-lock "read-pins lock"))
    (read-pin-counter
     :accessor read-pin-counter
-    :initform 0)))
+    :initform 0)
+   ;; Detach quiescence (GH #170).  T = accepting everything.  :READ-ONLY =
+   ;; pins/reads yes, new transactions no (Task 2's shadow window).
+   ;; :OPENING = same admit-pins/refuse-transactions shape as :READ-ONLY,
+   ;; but for OPEN-GRAPH's own mid-open window (review round 3): every
+   ;; construction site starts here, before the graph is published to
+   ;; *GRAPHS* -- a name-lookup writer racing the open now gets a loud
+   ;; STORE-NOT-ACCEPTING-ERROR reason :OPENING instead of colliding with
+   ;; a still-running rebuild/recovery.  :DETACHING / :SWAPPING = nothing
+   ;; new -- a full drain is in progress.  :INITARG so OPEN-GRAPH can set
+   ;; this at construction (GH #170, I4/round 3).
+   (accepting-p
+    :accessor accepting-p
+    :initarg :accepting-p
+    :initform t)))
 
 (defmethod print-object ((transaction-manager transaction-manager) stream)
   (print-unreadable-object (transaction-manager stream :type t)
@@ -2758,9 +3064,18 @@ stops appearing in queries.  MARK-DELETED is the usual entry point.")
                     (prog1
                         (funcall fun)
                       (setf completed t))
-                 (when completed
-                   (funcall *end-of-transaction-action* *transaction*))
-                 (cleanup-transaction *transaction*)))))
+                 ;; The commit runs INSIDE this cleanup, and it signals --
+                 ;; VALIDATION-CONFLICT on every retry, and each
+                 ;; pre-durability refusal (unique, value, cardinality,
+                 ;; domain/range).  A signal in a cleanup form abandons the
+                 ;; forms after it, so CLEANUP-TRANSACTION must be its own
+                 ;; protected step or the transaction stays in the manager
+                 ;; table as :COMMITTING and pins the prune floor for the
+                 ;; life of the image (GH #150).
+                 (unwind-protect
+                      (when completed
+                        (funcall *end-of-transaction-action* *transaction*))
+                   (cleanup-transaction *transaction*))))))
       (loop
          (when (<= *maximum-transaction-attempts* attempt-count)
            (with-transaction-manager-lock (transaction-manager)
@@ -2838,6 +3153,94 @@ stops appearing in queries.  MARK-DELETED is the usual entry point.")
         (when (< (transaction-id tx) min-id)
           (remove-transaction tx transaction-manager))))))
 
+(defun tm-clock (transaction-manager)
+  "TRANSACTION-MANAGER's image clock, or NIL for its own counter (GH #168).
+A transaction-manager always has a graph -- INITIALIZE-INSTANCE :AFTER
+dereferences it immediately, so a NIL graph dies there first."
+  (graph-system-clock (graph transaction-manager)))
+
+(defun tm-lease (transaction-manager)
+  "TRANSACTION-MANAGER's leased epoch range, or NIL -- shadow stores
+only (GH #170).  Checked BEFORE both the clock and the per-store
+counter in TM-NEXT-EPOCH/TM-CURRENT-EPOCH/TM-PEEK-EPOCH: a shadow's
+transaction ids must come from its lease, never from either."
+  (graph-epoch-lease (graph transaction-manager)))
+
+(defun tm-next-epoch (transaction-manager)
+  "Allocate a fresh epoch: from the lease when TRANSACTION-MANAGER's
+graph has one (shadow stores, GH #170), else from the image clock when
+the graph has one, otherwise from this manager's own counter (pre-#168
+behaviour)."
+  (let ((lease (tm-lease transaction-manager)))
+    (if lease
+        (let ((next (epoch-lease-next lease)))
+          (when (>= next (epoch-lease-end lease))
+            (error 'epoch-lease-exhausted
+                   :name (graph-name (graph transaction-manager))
+                   :end (epoch-lease-end lease)))
+          (setf (epoch-lease-next lease) (1+ next))
+          next)
+        (let ((clock (tm-clock transaction-manager)))
+          (if clock
+              (clock-next-epoch clock)
+              (prog1 (tx-id-counter transaction-manager)
+                (incf (tx-id-counter transaction-manager))))))))
+
+(defun tm-current-epoch (transaction-manager)
+  "The next epoch TM-NEXT-EPOCH would return."
+  (let ((lease (tm-lease transaction-manager)))
+    (if lease
+        (epoch-lease-next lease)
+        (let ((clock (tm-clock transaction-manager)))
+          (if clock
+              (clock-current-epoch clock)
+              (tx-id-counter transaction-manager))))))
+
+(defun tm-peek-epoch (transaction-manager)
+  "Like TM-CURRENT-EPOCH but lock-free under a clock -- see
+CLOCK-PEEK-EPOCH.  For PIN-READ-EPOCH, where a racy read is fine."
+  (let ((lease (tm-lease transaction-manager)))
+    (if lease
+        (epoch-lease-next lease)
+        (let ((clock (tm-clock transaction-manager)))
+          (if clock
+              (clock-peek-epoch clock)
+              (tx-id-counter transaction-manager))))))
+
+(defun attach-to-system-clock (graph clock)
+  "Raise CLOCK above GRAPH's persisted history and record the attach --
+the spec §6 watermark, applied per store at attach rather than as a
+separate migration pass.  Mirrors TRANSACTION-MANAGER's own counter-
+seeding rule: a peer-graph's pull cursor is a distinct number space from
+its local highest id (see PEER-OBSERVE-EPOCH's docstring), so both are
+watermarked, not just the local one.  Refuses -- signals
+ATTACH-WITH-ACTIVE-TRANSACTIONS -- while GRAPH has any in-flight
+transaction; see that condition for why.
+
+The :ATTACH record also carries :LOCATION (a namestring): a swap-in-
+shadow crash between its two renames leaves no :SWAP record at all, so
+:ATTACH is the only surviving trace REPAIR-INTERRUPTED-SWAP's pre-check
+can use to find the store's live directory once the graph itself is no
+longer open (GH #171, spec R6)."
+  (let ((tm (transaction-manager graph)))
+    (with-transaction-manager-lock (tm)
+      (when (minimum-start-transaction-id tm)
+        (error 'attach-with-active-transactions :graph graph))
+      (let ((watermark (max (load-highest-transaction-id graph)
+                            (if (peer-graph-p graph)
+                                (load-peer-pull-cursor graph)
+                                0))))
+        ;; One clock-lock hold over raise+record, so no allocator slots
+        ;; between them.  Lock ordering invariant: manager -> clock,
+        ;; never the reverse -- every site that holds both takes the TM
+        ;; lock first (GH #184).
+        (with-recursive-lock-held ((system-clock-lock clock))
+          (clock-observe-epoch clock watermark)
+          (journal-append clock :attach :store (graph-name graph)
+                          :location (namestring (location graph)))
+          (setf (%graph-system-clock graph) clock)))))
+  graph)
+
 (defgeneric remove-transaction (transaction transaction-manager)
   (:method (transaction transaction-manager)
     (remhash (sequence-number transaction)
@@ -2847,14 +3250,25 @@ stops appearing in queries.  MARK-DELETED is the usual entry point.")
   (:method (transaction-manager)
     (incf (sequence-number transaction-manager))))
 
-(defmethod create-transaction (transaction-manager)
+(defmethod create-transaction (transaction-manager &key allow-read-only)
+  ;; ALLOW-READ-ONLY is CALL-WITH-READ-SNAPSHOT's escape hatch: its
+  ;; bookkeeping TX is never committed, so it follows the read-pin
+  ;; rule (admitted under :READ-ONLY) rather than the write rule
+  ;; (refused under any non-T state) -- see PIN-READ-EPOCH (GH #170).
   (with-recursive-lock-held ((lock transaction-manager))
+    (let ((state (accepting-p transaction-manager)))
+      (unless (or (eq state t)
+                  (and allow-read-only (eq state :read-only)))
+        (error 'store-not-accepting-error
+               :name (graph-name (graph transaction-manager))
+               :reason (if (eq state :read-only) :shadow-load state))))
     (let* ((sequence-number (next-sequence-number transaction-manager))
            (graph (graph transaction-manager))
            (cache (cache graph))
+           (start-tx-id (tm-current-epoch transaction-manager))
            (tx (make-instance 'tx
                               :sequence-number sequence-number
-                              :start-tx-id (tx-id-counter transaction-manager)
+                              :start-tx-id start-tx-id
                               :finish-tx-id nil
                               :tx-id nil
                               :transaction-manager transaction-manager
@@ -2894,7 +3308,15 @@ The snapshot is recorded in *READ-SNAPSHOTS* under GRAPH rather than bound to
 one snapshot per participating graph, each internally consistent, with
 deliberately no single instant across them (GH #53).  An enclosing snapshot of
 the SAME graph is inherited, as is a read-write transaction on it.  A no-op
-(THUNK runs directly) when GRAPH has no transaction manager yet."
+(THUNK runs directly) when GRAPH has no transaction manager yet.
+
+Also takes a read-epoch pin on GRAPH's own manager for the extent (GH #168):
+under a shared image clock, a cross-store composition holds one such pin per
+participating store, so store B's reaper cannot free a version store A's
+snapshot could still dereference.  Nesting composes this for free -- each
+graph's own CALL-WITH-READ-SNAPSHOT pins only its own manager, and the named
+cost (spec sec.6) is that a long cross-store query delays reaping in every
+store it touched."
   (let ((tm (and graph
                  (slot-boundp graph 'transaction-manager)
                  (transaction-manager graph))))
@@ -2906,16 +3328,31 @@ the SAME graph is inherited, as is a read-write transaction on it.  A no-op
       ;; already snapshotted this graph -> inherit
       ((and *read-snapshots* (gethash graph *read-snapshots*)) (funcall thunk))
       (t
-       (let ((txn (create-transaction tm))
+       (let ((txn nil)
+             (pin nil)
              (table (or *read-snapshots* (make-hash-table :test 'eq))))
+         ;; Each acquisition is covered by cleanup from the instant it
+         ;; succeeds -- a signal from PIN-READ-EPOCH after CREATE-
+         ;; TRANSACTION already registered TXN must not leak the tx
+         ;; entry (GH #181, #211).  Nested UNWIND-PROTECTs release in
+         ;; reverse acquisition order and isolate each cleanup step, so
+         ;; UNPIN runs regardless of what REMOVE-TRANSACTION later does.
          (unwind-protect
-              (let ((*read-snapshots* table))
-                (setf (gethash graph table) txn)
-                (funcall thunk))
-           ;; the entry must not outlive the extent: a stale snapshot pins the
-           ;; reaper's floor and retains versions forever (GH #53)
-           (remhash graph table)
-           (remove-transaction txn tm)))))))
+              (progn
+                (setq txn (create-transaction tm :allow-read-only t))
+                (unwind-protect
+                     (progn
+                       (setq pin (pin-read-epoch tm))
+                       (let ((*read-snapshots* table))
+                         (setf (gethash graph table) txn)
+                         (funcall thunk)))
+                  (when pin (unpin-read-epoch tm pin))))
+           ;; The entry must not outlive the extent: a stale snapshot
+           ;; pins the reaper's floor and retains versions forever (GH
+           ;; #53).  REMHASH is nested so REMOVE-TRANSACTION still runs
+           ;; even if REMHASH itself signals (GH #181).
+           (unwind-protect (remhash graph table)
+             (when txn (remove-transaction txn tm)))))))))
 
 (defmacro with-read-snapshot ((&optional (graph '*graph*)) &body body)
   "Evaluate BODY with reads of GRAPH pinned to a single consistent MVCC snapshot.
@@ -2954,18 +3391,29 @@ See CALL-WITH-READ-SNAPSHOT."
              ;; non-replicated graph).
              (setf tmp (prepare-tx-persistence tx))
              (with-transaction-manager-lock (tm)
-               ;; finish-tx-id must be set inside the manager lock so the overlap
-               ;; window computed by validate is consistent with tx-id-counter.
-               ;; Setting it outside would let concurrent commits advance the
-               ;; counter between the read and the lock acquisition, making lost
-               ;; updates invisible.
-               (setf (finish-tx-id tx) (tx-id-counter tm))
+               ;; finish-tx-id is read under the manager lock so no commit of
+               ;; THIS store can allocate an epoch between the read and VALIDATE
+               ;; (GH #168 for the shared-clock case).
+               (setf (finish-tx-id tx) (tm-current-epoch tm))
                (unless (validate tx)
                  (error 'validation-conflict :transaction tx))
                ;; Unique constraints (issue #6): a pre-durability check under the same
                ;; manager lock -- a violation aborts before FINALIZE-TX-PERSISTENCE, so
                ;; nothing is journaled (the UNWIND-PROTECT below drops the temp file).
                (validate-unique-constraints tx (graph tx))
+               ;; Declarative value constraints (GH #149): same region, same
+               ;; reason -- a violation aborts before anything is journaled.
+               (validate-value-constraints tx (graph tx))
+               ;; Cardinality (GH #155): same region; counts the store's
+               ;; adjacency overlaid with this transaction's edge writes.
+               (validate-cardinality-constraints tx (graph tx))
+               ;; Domain and range (GH #156): same region; the other end
+               ;; is read through the commit view.
+               (validate-domain-range-constraints tx (graph tx))
+               ;; Subsystem validators (GH #157 4b): same region, same
+               ;; abort-before-durability contract.
+               (dolist (fn *commit-validators*)
+                 (funcall fn tx (graph tx)))
                ;; Vector-segment dimension check (Task 4 fix): same pre-durability,
                ;; manager-locked region as the unique-constraint check above -- a
                ;; mismatch aborts before FINALIZE-TX-PERSISTENCE, so the node write
@@ -2982,8 +3430,7 @@ See CALL-WITH-READ-SNAPSHOT."
                ;; exactly what that leaves reachable and why it is benign while
                ;; relocation is on.
                (ensure-vector-segment-capacity tx (graph tx))
-               (setf (transaction-id tx) (tx-id-counter tm))
-               (incf (tx-id-counter tm))
+               (setf (transaction-id tx) (tm-next-epoch tm))
                (prune-committed-transactions tm)
                ;; Cheap under the lock: rename temp to its final id-keyed name
                ;; (+ append replication log in commit order for masters).  Must
@@ -3016,7 +3463,12 @@ image / snapshot at each clean close) is its only durable record.")
 (defmethod cleanup-transaction ((tx tx))
   (let ((transaction-manager (transaction-manager tx)))
     (if (eql (state tx) :committed)
-        (unless (retain-committed-transaction-p (graph tx))
+        ;; WAL-suppressed (GH #170 Task 4): FINALIZE-TX-PERSISTENCE never
+        ;; renamed a .txn file into place for this commit, so there is
+        ;; nothing here for MARK-AS-COMMITTED to delete/rename -- calling
+        ;; it anyway would RENAME-FILE a path that was never created.
+        (unless (or (wal-suppressed-p (graph tx))
+                    (retain-committed-transaction-p (graph tx)))
           (mark-as-committed (transaction-pathname tx)))
         (remove-transaction tx transaction-manager))))
 
@@ -3100,3 +3552,163 @@ Signals NO-TRANSACTION-IN-PROGRESS if none is active."
     :reader graph))
   (:default-initargs
    :writes nil))
+
+;;; Detach quiescence (GH #170).  A store hands its epoch range to its
+;;; system clock and closes durably, so it can move (media swap, cold
+;;; storage) and reopen later without colliding with epochs the clock
+;;; issued elsewhere meanwhile.  See docs/superpowers/specs/
+;;; 2026-08-20-namespaces-design.md.
+
+(define-condition detach-unsupported-graph-error (error)
+  ;; v1 scope (GH #170 review, finding I1): DETACH-STORE / SHADOW-STORE /
+  ;; SWAP-IN-SHADOW all reopen with OPEN-GRAPH's plain default args, which
+  ;; would silently drop a MASTER-GRAPH/SLAVE-GRAPH/PEER-GRAPH's
+  ;; replication/peer configuration on the reopened generation.  Threading
+  ;; the FULL open-args set (master-p, replication-key, peer-role, etc.)
+  ;; through detachment/shadowing is deferred follow-on work -- see the
+  ;; review thread on GH #170.
+  ((graph :initarg :graph :reader detach-unsupported-graph-error-graph)
+   (operation :initarg :operation
+              :reader detach-unsupported-graph-error-operation))
+  (:report (lambda (c s)
+             (format s "~S does not support ~S: it is a ~S, and v1 of ~
+detach/shadow covers only plain clocked stores.  Reopening a replicated ~
+or peer graph with default OPEN-GRAPH args would silently strip its ~
+replication/peer configuration (GH #170)."
+                     (graph-name (detach-unsupported-graph-error-graph c))
+                     (detach-unsupported-graph-error-operation c)
+                     (class-name
+                      (class-of (detach-unsupported-graph-error-graph c)))))))
+
+(defun %check-detach-supported (graph operation)
+  "Signal DETACH-UNSUPPORTED-GRAPH-ERROR unless GRAPH is a plain clocked
+store -- MASTER-GRAPH, SLAVE-GRAPH and PEER-GRAPH are refused by all
+three v1 entry points (GH #170, review finding I1)."
+  (when (typep graph '(or master-graph slave-graph peer-graph))
+    (error 'detach-unsupported-graph-error :graph graph :operation operation)))
+
+(defparameter *quiesce-poll-interval* 0.05
+  "Seconds between REAP-SAFE-FLOOR polls in %QUIESCE-TRANSACTION-MANAGER.")
+
+(defun %set-accepting-p (transaction-manager reason)
+  "Set ACCEPTING-P while holding TM-LOCK, then READ-PINS-LOCK, in that
+fixed order -- the same order every caller of this function uses, and
+the order PIN-READ-EPOCH is compatible with because it only ever takes
+READ-PINS-LOCK alone (never TM-LOCK), so this can never deadlock against
+it.  Grepped every existing site that takes both locks
+(CREATE-TRANSACTION: TM-LOCK only; PIN-READ-EPOCH/UNPIN-READ-EPOCH/
+MINIMUM-READ-PIN: READ-PINS-LOCK only) and found no path that nests them
+in the opposite order.  Holding READ-PINS-LOCK across the SETF is what
+makes the flip atomic with PIN-READ-EPOCH's own check-then-register
+critical section: once this returns, no pin admitted after it can have
+missed seeing REASON (GH #170, fix round 1)."
+  (with-transaction-manager-lock (transaction-manager)
+    (with-recursive-lock-held ((read-pins-lock transaction-manager))
+      (setf (accepting-p transaction-manager) reason))))
+
+(defun %quiesce-transaction-manager (transaction-manager reason timeout)
+  "Flip TRANSACTION-MANAGER's ACCEPTING-P to REASON (a keyword) and wait,
+in short sleeps, for REAP-SAFE-FLOOR to go NIL -- no active transaction and
+no read pin left that could observe a version underneath the coming close.
+On TIMEOUT seconds elapsed with no drain: restore ACCEPTING-P to whatever
+it was PRIOR to this call (captured before the flip) and signal
+DETACH-DRAIN-TIMEOUT -- NOT hardcoded T, which would silently lift an
+already-in-force window (e.g. SHADOW-STORE's :READ-ONLY) that this call
+did not open and has no business closing (GH #170, review finding C1).
+On success return T with ACCEPTING-P left at REASON (GH #170)."
+  (let ((prior (accepting-p transaction-manager)))
+    (%set-accepting-p transaction-manager reason)
+    (let ((deadline (+ (get-internal-real-time)
+                       (round (* timeout internal-time-units-per-second)))))
+      (loop
+        (when (null (reap-safe-floor transaction-manager))
+          (return t))
+        (when (> (get-internal-real-time) deadline)
+          (%set-accepting-p transaction-manager prior)
+          (error 'detach-drain-timeout
+                 :name (graph-name (graph transaction-manager))
+                 :seconds timeout))
+        (sleep *quiesce-poll-interval*)))))
+
+(defstruct store-detachment
+  "A detached store's handle: everything REATTACH-STORE needs to reopen it
+and rejoin its system clock (GH #170)."
+  graph-name location store-id lease-start lease-end)
+
+(defun detach-store (graph &key (lease-epochs 1000000) (timeout 60))
+  "Quiesce GRAPH (no new transactions or read pins), lease it
+LEASE-EPOCHS of its system clock's epoch space, journal the handoff, and
+CLOSE-GRAPH it durably.  Returns a STORE-DETACHMENT for REATTACH-STORE.
+
+Refuses a MASTER-GRAPH/SLAVE-GRAPH/PEER-GRAPH with
+DETACH-UNSUPPORTED-GRAPH-ERROR -- v1 scope, see that condition's
+docstring (GH #170).
+
+Requires (GRAPH-SYSTEM-CLOCK GRAPH) non-NIL: detach without an image
+clock has no lease to hand over.  Propagates DETACH-DRAIN-TIMEOUT
+unchanged if the quiesce wave cannot drain in TIMEOUT seconds -- GRAPH
+is left open and accepting again (GH #170).
+
+Between a successful quiesce and the durable CLOSE-GRAPH, CLOCK-LEASE-
+EPOCHS or JOURNAL-APPEND can still fail; that span is wrapped so an
+error there restores ACCEPTING-P to its pre-quiesce state (not left
+stranded at :DETACHING) before re-signalling (GH #170, review finding
+I3)."
+  (%check-detach-supported graph 'detach-store)
+  (let ((clock (graph-system-clock graph)))
+    (unless clock
+      (error "DETACH-STORE requires GRAPH to be attached to a system ~
+clock (GRAPH-SYSTEM-CLOCK is NIL) -- detach without one has no lease to ~
+hand over."))
+    (let* ((tm (transaction-manager graph))
+           (name (graph-name graph))
+           (location (location graph))
+           (store-id (store-id graph))
+           (prior (accepting-p tm)))
+      (%quiesce-transaction-manager tm :detaching timeout)
+      (handler-case
+          (multiple-value-bind (start end)
+              ;; One clock-lock hold over lease+record (GH #184); no TM
+              ;; lock is held here, so the manager->clock order holds.
+              (with-recursive-lock-held ((system-clock-lock clock))
+                (multiple-value-bind (start end)
+                    (clock-lease-epochs clock lease-epochs)
+                  (journal-append clock :detach :store name
+                                  :lease-start start :lease-end end)
+                  (values start end)))
+            ;; CLOSE-GRAPH's own snapshot scans the graph via WITH-READ-PIN;
+            ;; ACCEPTING-P is already :DETACHING, so it needs the one bypass
+            ;; above -- see *QUIESCED-STORE-CLOSING-P*'s docstring.
+            (let ((*graph* graph)
+                  (*quiesced-store-closing-p* t))
+              (close-graph graph :snapshot-p t))
+            (make-store-detachment :graph-name name
+                                   :location location
+                                   :store-id store-id
+                                   :lease-start start
+                                   :lease-end end))
+        (error (c)
+          (%set-accepting-p tm prior)
+          (error c))))))
+
+(defun reattach-store (detachment &key (buffer-pool-size nil bps-p))
+  "Reopen the store DETACHMENT names at its recorded location and rejoin
+it to the image clock.  REQUIRES *SYSTEM-CLOCK* to already be bound to
+that clock in the caller's dynamic extent -- this function takes no
+clock argument (the contract fixes its lambda list), so it reads the
+ambient *SYSTEM-CLOCK* the same way MAKE-GRAPH/OPEN-GRAPH's own
+:SYSTEM-CLOCK default does.  Passes :SYSTEM-CLOCK NIL to OPEN-GRAPH
+itself (to avoid OPEN-GRAPH attaching a second time from its own
+default) and then calls ATTACH-TO-SYSTEM-CLOCK explicitly -- which
+already refuses active transactions and journals :ATTACH -- rather than
+reimplementing either.  Returns the new GRAPH (GH #170)."
+  (let* ((open-args (list (store-detachment-graph-name detachment)
+                          (namestring (store-detachment-location detachment))
+                          :system-clock nil))
+        (graph (apply #'open-graph
+                      (if bps-p
+                          (append open-args
+                                 (list :buffer-pool-size buffer-pool-size))
+                          open-args))))
+    (attach-to-system-clock graph *system-clock*)
+    graph))

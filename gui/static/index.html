@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<!-- VivaceGraph GUI cockpit: roster + stats frame (GH #270),
+     explorer canvas + inspector dock (GH #271), query workbench
+     (GH #278) -- the main region is tabbed, Explorer | Query. -->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>VivaceGraph GUI</title>
+  <link rel="stylesheet" href="/css/gui.css">
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar">
+      <header class="brand">
+        <h1>VivaceGraph</h1>
+      </header>
+      <section class="pane" id="roster-pane" aria-label="Graph roster">
+        <div class="pane-header">
+          <h2>Graphs</h2>
+          <button id="roster-refresh" type="button"
+                  title="Reload the roster from the server">Refresh</button>
+        </div>
+        <div id="error-strip" class="error-strip" hidden>
+          <span id="error-strip-text"></span>
+          <button id="error-strip-dismiss" type="button"
+                  aria-label="Dismiss error">&#215;</button>
+        </div>
+        <ul id="roster-list" class="roster-list"></ul>
+      </section>
+      <section class="pane" id="stats-pane" aria-label="Graph statistics">
+        <div class="pane-header">
+          <h2>Stats</h2>
+        </div>
+        <div id="stats-body" class="stats-body">
+          <p class="placeholder">Select a graph.</p>
+        </div>
+      </section>
+    </aside>
+    <main class="main-region">
+      <nav class="tab-bar" role="tablist" aria-label="Main region">
+        <button id="tab-explorer" class="tab active" type="button"
+                role="tab" aria-selected="true"
+                aria-controls="explorer-view">Explorer</button>
+        <button id="tab-query" class="tab" type="button" role="tab"
+                aria-selected="false"
+                aria-controls="workbench-view">Query</button>
+      </nav>
+      <div id="explorer-view" class="main-canvas" role="tabpanel"
+           aria-label="Explorer">
+        <div id="cy" class="cy-host"></div>
+        <p id="canvas-placeholder" class="placeholder">
+          Select a graph, click a vertex type in the stats pane, then
+          pick a node to seed the canvas.
+        </p>
+        <div id="canvas-status" class="canvas-status">
+          <span id="canvas-counts"></span>
+          <span id="canvas-notice" class="canvas-notice"></span>
+          <button id="canvas-clear" type="button"
+                  title="Empty the canvas (view only)">Clear</button>
+        </div>
+        <div id="pick-list" class="pick-list" hidden>
+          <div class="pick-list-header">
+            <h3 id="pick-list-title"></h3>
+            <button id="pick-list-close" type="button"
+                    aria-label="Close node list">&#215;</button>
+          </div>
+          <p id="pick-list-notice" class="pick-list-notice"></p>
+          <ul id="pick-list-items" class="pick-list-items"></ul>
+        </div>
+        <div id="edge-tooltip" class="edge-tooltip" hidden></div>
+      </div>
+      <section id="workbench-view" class="workbench" role="tabpanel"
+               aria-label="Query workbench" hidden>
+        <div class="wb-surface">
+        <!-- Builder | Prolog. The Prolog sub-tab is revealed only when
+             GET /api/capabilities reports allowProlog (GH #279); the
+             endpoint refuses free text on its own regardless. -->
+        <nav id="wb-subtabs" class="wb-subtabs" role="tablist"
+             aria-label="Query surface" hidden>
+          <button id="wb-tab-builder" class="wb-subtab active"
+                  type="button" role="tab" aria-selected="true"
+                  aria-controls="wb-builder">Builder</button>
+          <button id="wb-tab-prolog" class="wb-subtab" type="button"
+                  role="tab" aria-selected="false"
+                  aria-controls="wb-prolog">Prolog</button>
+        </nav>
+        <div id="wb-builder" class="wb-builder">
+          <div class="wb-section">
+            <div class="wb-section-head">
+              <h3>Match</h3>
+              <span class="wb-actions">
+                <button id="wb-add-vertex" type="button">+ vertex</button>
+                <button id="wb-add-edge" type="button">+ edge</button>
+              </span>
+            </div>
+            <ul id="wb-match" class="wb-rows"></ul>
+          </div>
+          <div class="wb-section">
+            <div class="wb-section-head">
+              <h3>Where</h3>
+              <span class="wb-actions">
+                <button id="wb-add-slot" type="button">+ slot</button>
+                <button id="wb-add-compare" type="button">+ compare</button>
+              </span>
+            </div>
+            <ul id="wb-where" class="wb-rows"></ul>
+          </div>
+          <div class="wb-section">
+            <div class="wb-section-head"><h3>Select</h3></div>
+            <div id="wb-select" class="wb-select"></div>
+          </div>
+          <div class="wb-run">
+            <label for="wb-limit">Limit</label>
+            <input id="wb-limit" class="wb-limit" type="number" min="1"
+                   max="1000" value="50">
+            <button id="wb-run" type="button">Run</button>
+          </div>
+          <p id="wb-error" class="wb-error" hidden></p>
+        </div>
+        <section id="wb-prolog" class="wb-prolog" role="tabpanel"
+                 aria-label="Prolog editor" hidden>
+          <p class="wb-hint">
+            One goal per parenthesised form; every ?variable becomes a
+            result column. Ctrl-Enter runs.
+          </p>
+          <div id="wb-editor" class="wb-editor"></div>
+          <div class="wb-run">
+            <span id="wb-balance" class="wb-balance"></span>
+            <label for="wb-prolog-limit">Limit</label>
+            <input id="wb-prolog-limit" class="wb-limit" type="number"
+                   min="1" max="1000" value="50">
+            <button id="wb-prolog-run" type="button">Run</button>
+          </div>
+          <p id="wb-prolog-error" class="wb-error" hidden></p>
+        </section>
+        </div>
+        <div id="wb-splitter" class="wb-splitter" role="separator"
+             aria-orientation="horizontal" tabindex="0"
+             aria-label="Resize the query builder"
+             title="Drag to resize (double-click to reset)"></div>
+        <div class="wb-results">
+          <div class="wb-results-head">
+            <p id="wb-status" class="wb-status"></p>
+            <button id="wb-send" type="button" hidden></button>
+          </div>
+          <div id="wb-table" class="wb-table-host"></div>
+        </div>
+      </section>
+    </main>
+    <aside id="inspector-dock" class="inspector-dock" hidden
+           aria-label="Node inspector">
+      <!-- inspector.js renders here (GH #271). -->
+    </aside>
+  </div>
+  <!-- cytoscape's UMD build is not an ES module: classic script tag,
+       loaded before the module entry; explorer.js reads
+       window.cytoscape (the one window-global exception; see
+       vendor/VENDOR.md). -->
+  <script src="/vendor/cytoscape.min.js"></script>
+  <script type="module" src="/js/main.js"></script>
+</body>
+</html>

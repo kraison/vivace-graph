@@ -37,6 +37,15 @@
 (defconstant +seek-set+ 0)
 (defconstant +seek-end+ 2)
 
+;;; flock(2).  Same values on Linux and Darwin, so unlike the mmap and open
+;;; flags above these need no platform conditional.  No +LOCK-UN+: the clock
+;;; releases by closing the fd (GH #182).
+(defconstant +lock-ex+ 2)
+(defconstant +lock-nb+ 4)
+
+;;; EWOULDBLOCK == EAGAIN on both targets, but the value differs.
+(defconstant +eagain+ #+graph-db-posix-linux 11 #-graph-db-posix-linux 35)
+
 (defconstant +prot-none+  0)
 (defconstant +prot-read+  1)
 (defconstant +prot-write+ 2)
@@ -87,16 +96,62 @@
 (declaim (inline %posix-close %posix-lseek %posix-fchmod %posix-munmap
                  %posix-msync))
 
+;; %POSIX-OPEN's #+ecl c-inline needs open(2)'s declaration.
+#+ecl
+(ffi:clines "#include <fcntl.h>")
+
 (defun %posix-open (path flags &optional (mode #o640))
-  "open(2).  PATH is a Lisp pathname/string.  Returns the fd, signals on error."
-  (let ((fd (cffi:foreign-funcall "open"
-                                  :string (namestring path)
-                                  :int flags
-                                  :unsigned-int mode
-                                  :int)))
+  "open(2).  PATH is a Lisp pathname/string.  Returns the fd, signals on error.
+
+MODE rides CFFI's VARARGS path, not a plain FOREIGN-FUNCALL.  open(2) is
+`int open(const char *, int, ...)`, and Apple arm64 passes a variadic argument
+differently from a fixed one, so a fixed-argument MODE is read from somewhere
+the callee never wrote: the file is created with an arbitrary mode, and a
+different one each run (0140 and 0200 both observed for this 0640 default).
+When that mode omits owner read/write the next ordinary OPEN of the path fails
+EACCES -- which is every graph in the image, since the type registry (#186) and
+the system clock (#182) both create their files here.  GH #218.
+
+ECL cannot use the varargs form: CFFI's ECL backend drops the variadic MODE
+on Darwin/arm64 too (files created mode 000), so ECL compiles a direct C call
+instead -- correct ABI by construction.  GH #306."
+  (let ((fd #+ecl (ffi:c-inline ((namestring path) flags mode)
+                                (:cstring :int :int) :int
+                                "open(#0,#1,#2)" :one-liner t)
+            #-ecl (cffi:foreign-funcall-varargs
+                   "open"
+                   (:string (namestring path) :int flags)
+                   :unsigned-int mode
+                   :int)))
     (when (minusp fd)
       (error "posix open failed for ~A (flags ~D)" path flags))
     fd))
+
+;; ECL's C output has no implicit <errno.h>; without this CLINES, the bare
+;; `errno` reference in %ERRNO below fails to compile ("errno undeclared"),
+;; not merely misreports -- verified against ECL 26.5.5.
+#+ecl
+(ffi:clines "#include <errno.h>")
+
+(defun %errno ()
+  "The current errno, or NIL where this implementation cannot report one.
+NIL is honest: a caller must not mistake an unknown failure for a held lock."
+  #+sbcl (sb-alien:get-errno)
+  ;; CCL returns it negated.
+  #+ccl  (- (ccl::%get-errno))
+  #+ecl  (ffi:c-inline () () :int "errno" :one-liner t)
+  #-(or sbcl ecl ccl) nil)
+
+(defun %posix-flock (fd operation)
+  "flock(2).  Returns T when the lock was taken, NIL when OPERATION included
++LOCK-NB+ and the lock is held elsewhere.  Signals on any other failure: a
+caller must not report 'another process holds this' for EBADF or ENOLCK."
+  (let* ((r (cffi:foreign-funcall "flock" :int fd :int operation :int))
+         (e (unless (zerop r) (%errno))))
+    (cond ((zerop r) t)
+          ((eql e +eagain+) nil)
+          (t (error "posix flock failed for fd ~D (operation ~D, errno ~A)"
+                    fd operation e)))))
 
 (defun %posix-close (fd)
   (cffi:foreign-funcall "close" :int fd :int))

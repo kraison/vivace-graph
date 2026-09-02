@@ -22,6 +22,20 @@
 (defparameter *lisp-impl*
   (format nil "~A ~A" (lisp-implementation-type) (lisp-implementation-version)))
 
+(defparameter *perf-suite-generation* 5
+  "Suite generation for baseline comparability (GH #253).  Bump when any
+change alters an existing bench's work or its labels; adding a new bench
+does not bump.  Generations 1-3 retroactively cover the pre-#252 report
+eras still visible in results/ (2.1.1 / 3.0 A-B / mvcc phase runs).
+g4->g5: peer-apply now includes the created-manifest accumulation its
+#260 exclusion note used to carve out.")
+
+(defun perf-host ()
+  "Sanitized (machine-instance): lowercase, [a-z0-9-] only."
+  (string-downcase
+   (substitute-if #\- (lambda (c) (not (or (alphanumericp c) (char= c #\-))))
+                  (machine-instance))))
+
 ;;; ---------------------------------------------------------------------------
 ;;; Report collection
 ;;; ---------------------------------------------------------------------------
@@ -70,27 +84,9 @@
 ;;; Temp dirs / gc (same pattern as the stress suite)
 ;;; ---------------------------------------------------------------------------
 
-;; SBCL's initial *RANDOM-STATE* is a fixed constant, so an unseeded (RANDOM ...)
-;; produces the SAME name sequence in every image: two concurrent suite runs on a
-;; shared host would share -- and delete -- each other's scratch dirs.  Seed from
-;; entropy, lazily so a dumped image reseeds in each new process, and add a
-;; counter so one image can never repeat a name either.
-(defvar *scratch-random-state* nil)
-(defvar *scratch-counter* 0)
-
-(defun scratch-tag ()
-  "A name fragment unique across concurrent processes and across calls."
-  (unless *scratch-random-state*
-    (setf *scratch-random-state* (make-random-state t)))
-  (format nil "~36R-~36R"
-          (random (expt 36 12) *scratch-random-state*)
-          (incf *scratch-counter*)))
-
 (defun make-temp-directory ()
-  (let ((dir (merge-pathnames (format nil "graph-db-perf-~A/" (scratch-tag))
-                              (uiop:temporary-directory))))
-    (ensure-directories-exist dir)
-    dir))
+  "A fresh scratch dir under the shared per-run parent (GH #214)."
+  (graph-db-test-scratch:make-scratch-directory "graph-db-perf"))
 
 (defmacro with-temp-directory ((var) &body body)
   `(let ((,var (make-temp-directory)))
@@ -140,6 +136,12 @@
    (label))
   :graph-db-perf-test)
 
+;; A :VECTOR-INDEX-slotted type for bench-vector-search (GH #254).
+(def-vertex pv-node ()
+  ((label)
+   (embedding :vector-index t))
+  :graph-db-perf-test)
+
 (defun define-perf-views ()
   "Define the perf view against the current *graph* (call after make-graph)."
   (def-view p-node-by-val :lessp (p-node :graph-db-perf-test)
@@ -179,11 +181,13 @@ MVCC-relevant signal).  If :DIR is given, bind it to the graph's temp dir."
     (with-open-file (s path :direction :output :if-exists :supersede
                             :if-does-not-exist :create)
       (format s ";;;; graph-db perf report~%")
-      (format s ";;;; tag=~A impl=~A scale=~A~%~%" tag *lisp-impl* *perf-scale*)
+      (format s ";;;; tag=~A impl=~A scale=~A generation=~D host=~A~%~%"
+              tag *lisp-impl* *perf-scale* *perf-suite-generation* (perf-host))
       (dolist (e entries)
         (format s ";; ~38A ~{~A ~A  ~}~%" (car e) (cdr e)))
       (format s "~%~S~%"
               (list :perf-report :tag tag :impl *lisp-impl* :scale *perf-scale*
+                    :generation *perf-suite-generation* :host (perf-host)
                     :entries entries)))
     (format t "~&~%Wrote perf report: ~A~%" path)
     path))

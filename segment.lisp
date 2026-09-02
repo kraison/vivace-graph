@@ -522,6 +522,23 @@ for segments."
     (serialize-uint64 mmap new-cap 32)         ; capacity := new-cap
     old-cap))                                  ; first fresh slot index
 
+(defun presize-vector-segment (segment n)
+  "Grow SEGMENT under its write lock, via the same doubling path SEGMENT-PUT
+uses (%SEG-GROW), until SEGMENT-CAPACITY >= N.  A no-op if already there.
+
+The point: turn a mid-apply capacity failure into an upfront one.  A
+transaction that would otherwise discover VECTOR-SEGMENT-CAPACITY-EXHAUSTED
+partway through applying its writes (some already durable) instead hits that
+same condition HERE, before any node write, when called ahead of the load
+that will need the room (GH #170 Task 5).
+
+Takes the segment's WRITE lock, same as SEGMENT-PUT/SEGMENT-REMOVE -- %SEG-
+GROW is lock-free by convention and assumes the caller already holds it."
+  (with-write-lock ((segment-lock segment))
+    (loop while (< (segment-capacity segment) n)
+          do (%seg-grow segment)))
+  segment)
+
 (defun %seg-claim-slot (segment)
   "Return a slot index to write a NEW id into: the free-list head if any, else
 the next slot past live-count, growing the segment first if capacity is

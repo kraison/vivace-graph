@@ -18,7 +18,7 @@
 
 (defun geodesic-distance (lat1 lon1 lat2 lon2)
   "Great-circle distance in metres between two WGS84 points (haversine).
-Accurate to ~0.5% vs the ellipsoid -- ample at minefield scale; a Vincenty or
+Accurate to ~0.5% vs the ellipsoid -- ample at field-survey scale; a Vincenty or
 Karney method can replace this later if sub-metre accuracy over long lines is
 needed."
   (let* ((phi1 (deg->rad lat1))
@@ -91,7 +91,20 @@ point is inside the exterior ring and outside every hole."
        (notany (lambda (hole) (point-in-ring-p lon lat hole)) (rest rings))))
 
 (defun geometry-contains-point-p (g lon lat)
-  "True if the :POLYGON or :MULTIPOLYGON geometry G contains (LON, LAT)."
+  "True if the :POLYGON or :MULTIPOLYGON geometry G contains (LON, LAT).
+
+Deliberately NATIVE -- an even-odd ray-cast, never GEOS (GH #99, decided
+2026-09-01): it is the hot predicate behind FIND-NODES-WITHIN and
+GEO-WITHIN/3, ~77x cheaper than the GEOS bridge, and dependency-free.  Its
+BOUNDARY convention is therefore VG's defined semantics, not an accident:
+half-open -- of two areas sharing an edge, a point on that edge is inside
+EXACTLY ONE of them, so a tiling counts every point once and drops none;
+which side wins is an implementation detail.  GEOS differs only there:
+its CONTAINS excludes every boundary point and its INTERSECTS includes
+every one; strictly inside or outside, the two never disagree.  Pinned
+against GEOS by the GH-99-* tests in tests/geometry-ops-tests.lisp; a
+caller needing DE-9IM semantics on the boundary uses
+GEOMETRY-CONTAINS-GEOMETRY-P / GEOMETRY-INTERSECTS-P with a point."
   (ecase (geometry-kind g)
     (:polygon (point-in-polygon-rings-p lon lat (geometry-coordinates g)))
     (:multipolygon (some (lambda (poly) (point-in-polygon-rings-p lon lat poly))
@@ -223,3 +236,67 @@ circle (default 8).  Requires graph-db/geos.")
 NOT m^2).  Requires graph-db/geos.")
   (:method ((g geometry))
     (error 'geos-required-for-operation :operation 'geometry-area)))
+
+(defun %ring-geodesic-area-m2 (ring)
+  "Unsigned spherical area in m^2 of RING, a closed list of (lon lat)
+degree pairs.  Fewer than three vertices is zero, not an error."
+  (let* ((v (coerce ring 'vector))
+         (n (length v)))
+    (if (< n 3)
+        0d0
+        (let ((total 0d0))
+          ;; DEG->RAD, not (/ pi 180d0): PI is a LONG-FLOAT, and on a
+          ;; build where that is wider than a double (ECL with long
+          ;; double) the product leaks a LONG-FLOAT into FRACTION, whose
+          ;; serializer dispatches on DOUBLE-FLOAT (serialize.lisp).
+          (dotimes (i n)
+            (let* ((p1 (aref v i))
+                   (p2 (aref v (mod (1+ i) n)))
+                   (lon1 (deg->rad (first p1)))
+                   (lon2 (deg->rad (first p2)))
+                   (lat1 (deg->rad (second p1)))
+                   (lat2 (deg->rad (second p2))))
+              (incf total (* (- lon2 lon1)
+                             (+ 2d0 (sin lat1) (sin lat2))))))
+          (abs (/ (* total +earth-radius-m+ +earth-radius-m+) 2d0))))))
+
+(defun geometry-geodesic-area (g)
+  "Area of G in SQUARE METRES, by spherical excess.  Zero for a :POINT or
+:LINESTRING.  Holes are subtracted.  ⚠ Not GEOMETRY-AREA, which returns
+squared coordinate units and needs GEOS; this needs neither (design §8)."
+  (flet ((poly (rings)
+           (if (null rings)
+               0d0
+               (- (%ring-geodesic-area-m2 (first rings))
+                  (reduce #'+ (rest rings)
+                          :key #'%ring-geodesic-area-m2
+                          :initial-value 0d0)))))
+    (ecase (geometry-kind g)
+      (:polygon (poly (geometry-coordinate-pairs g)))
+      (:multipolygon (reduce #'+ (geometry-coordinate-pairs g)
+                             :key #'poly :initial-value 0d0))
+      ((:point :linestring) 0d0))))
+
+(defun %pairs-geodesic-length-m (pairs)
+  "Length in metres of the polyline PAIRS, a list of (lon lat) degree
+pairs.  Fewer than two vertices is zero, not an error."
+  (let ((total 0d0))
+    (loop for (p1 p2) on pairs
+          while p2
+          do (incf total (geodesic-distance (second p1) (first p1)
+                                            (second p2) (first p2))))
+    total))
+
+(defun geometry-geodesic-length (g)
+  "Length of G in METRES, by haversine over consecutive vertices.
+Zero for a :POINT, and zero for a :POLYGON or :MULTIPOLYGON, whose
+extent is GEOMETRY-GEODESIC-AREA -- a ring's perimeter is a different
+quantity, and returning it here would let a caller divide a perimeter by
+an area and get a plausible-looking number (design §13).
+
+⚠ This is the measure a LINE's overlap fraction is taken against: its
+area is zero, so an area ratio would give a line 1.0 in every region it
+crosses."
+  (ecase (geometry-kind g)
+    (:linestring (%pairs-geodesic-length-m (geometry-coordinate-pairs g)))
+    ((:point :polygon :multipolygon) 0d0)))

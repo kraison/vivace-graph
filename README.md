@@ -17,9 +17,58 @@ To get started, please see example.lisp.
 
 ### Documentation
 
-A comprehensive developer's manual lives in [`docs/vivace-graph-v3-doc.org`](docs/vivace-graph-v3-doc.org), covering getting started, the storage engine and object model, transactions, the Prolog query language, views, the REST API, replication, backup/recovery, MVCC / versioned nodes, spatial queries, vector indexes and cosine kNN search, graph algorithms, the in-memory backend (eager vs. lazy), and offline-first peer replication, plus an API reference.
+A comprehensive developer's manual lives in [`docs/vivace-graph-v3-doc.org`](docs/vivace-graph-v3-doc.org), covering getting started, the storage engine and object model, transactions, the Prolog query language, views, the REST API, replication, backup/recovery, MVCC / versioned nodes, spatial queries, vector indexes and cosine kNN search, graph algorithms, the in-memory backend (eager vs. lazy), offline-first peer replication, and temporal extents, provenance-carrying claims and geometry registration (the optional `graph-db/spacetime` add-on), plus an API reference.
 
 This manual was written by [Gwang-Jin Kim (@gwangjinkim)](https://github.com/gwangjinkim) — the project's first thorough documentation, and a great piece of work. Many thanks to him. It has been adopted here and is maintained alongside the code; newer chapters (such as Chapter 12 on MVCC) are maintainer additions written in his style.
+
+### Announcement, 2026-09-02 — VivaceGraph 4.0.0 (breaking)
+
+A major release. The on-disk storage format is bumped (node head v3):
+type-ids widen from 16 to 32 bits and are now assigned **system-wide**
+from a registry that lives in a mandatory *system directory*; the peer
+wire protocol goes to generation 2 (a v1 device is refused at
+handshake); and a `make-<type>` constructor's `:graph` default changed.
+Existing v1/v2 graphs are carried forward by `migrate-graph` in one
+pass. The temporal algebra now lives in its own library,
+[`cl-temporal-extent`](https://github.com/kraison/cl-temporal-extent)
+(>= 0.2.0), a new dependency.
+
+**What's new, briefly:**
+
+- **Runtime schema.** A node type can be defined at runtime, from data,
+  and survive a reopen; a store adopts a foreign class at first write;
+  new ids are UUIDv8, tagged with a 12-bit store field.
+- **Store lifecycle.** Detach a store, bulk-load a shadow copy, and swap
+  it in — in-process, with whole-system restore across the swap; an
+  image-level system clock, epoch leases and a lifecycle journal
+  underneath; cross-store read snapshots pin every participating store.
+- **The spacetime layer.** Claims (unary and binary) with validity
+  extents, retraction, canonical relations and producers, registration
+  binding record geometry to registry regions, and *temporal claim
+  families* — a state series (A → B → A) as several live claims whose
+  extents must be pairwise disjoint, enforced at commit.
+- **Ontology constraints.** Domain/range and cardinality on edges,
+  disjointness over vertex types, write-once and named value
+  constraints on slots, named schema declarations with retraction.
+- **A web cockpit** (`graph-db/gui`): roster, stats, a neighborhood
+  explorer, a schema-driven query workbench, and opt-in free-text
+  Prolog; the structured query DSL is a shared core between REST and
+  GUI.
+- **`graph-db/algorithms`**: the graph-utils algorithm suite, ported.
+- The general ordered index is now reachable from Prolog (3.0.0's #102),
+  multi-slot indexes and constraints, and a long list of performance
+  and correctness fixes — including the skip-list concurrency deadlock,
+  the `BYTES`/`DATA` cache coherence hole, and a four-implementation
+  portability batch from the release validation matrix.
+
+Validated for release on SBCL and ECL (macOS arm64 + Linux) and CCL
+(Linux) across all eight test suites (#299). Known and documented:
+CCL's main suite still hangs on writer starvation (#118), and the
+peer type-table wire field stays 16-bit by contract (#199) — type-ids
+above 65535 cannot cross the peer wire.
+
+See [`CHANGELOG.md`](CHANGELOG.md) for the full record and the
+developer's manual for chapters on each subsystem.
 
 ### Announcement, 2026-08-09 — VivaceGraph 3.0.0 (breaking)
 

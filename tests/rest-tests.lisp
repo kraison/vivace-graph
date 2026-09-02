@@ -376,7 +376,7 @@ persists (the retract flattens into the wrapping with-transaction)."
   "Run an ad-hoc pattern query given its JSON body (decoded as the route would),
 returning the decoded JSON response."
   (rest-decode
-   (graph-db::call-rest-pattern-query (json:decode-json-from-string json-string)
+   (graph-db::call-rest-pattern-query (graph-db:decode-dsl-json json-string)
                                       (rest-params))))
 
 (test pattern-query-vertex-and-slot
@@ -509,3 +509,219 @@ application/x-ndjson content type."
                 (graph-db::call-rest-query "noSuchQuery" (rest-params)))))
         (is (= 404 (rest-status)))
         (is-true (assoc :error j))))))
+
+(test dsl-ambiguous-type-name-is-a-query-param-error
+  "An ambiguous bare type name from a REST client must come back as the
+DSL's own client-error surface, not a raw internal condition.  Nearest
+wrong implementation: let AMBIGUOUS-NODE-TYPE-NAME propagate raw (the
+test would then see the wrong condition class)."
+  (with-alias-test-graph (g :alias-two-store)
+    (signals graph-db::query-param-error
+      (graph-db::%dsl-resolve-type "aliasSpecies" :vertex g))))
+
+(test rest-post-type-resolution-reports-ambiguity
+  "The POST vertex/edge path returns (values NIL message) for an ambiguous
+name and (values meta NIL) for a unique one."
+  (with-alias-test-graph (g :alias-two-store)
+    (let ((graph-db::*graph* g))
+      (multiple-value-bind (meta msg)
+          (graph-db::%rest-resolve-post-type "aliasSpecies" :vertex)
+        (is (null meta))
+        (is (search "mbiguous" msg)))))
+  (with-alias-test-graph (g :alias-solo-store)
+    (let ((graph-db::*graph* g))
+      (multiple-value-bind (meta msg)
+          (graph-db::%rest-resolve-post-type "aliasUnique" :vertex)
+        (is (graph-db::node-type-p meta))
+        (is (null msg))))))
+
+;;; ---------------------------------------------------------------------------
+;;; POST places the node in the URL's graph, not the class's declared
+;;; default store (GH #167).
+;;; ---------------------------------------------------------------------------
+
+;; Declared default is store A; a POST to store B must still land there.
+(def-vertex rest-dual-item () ((label :type string)) :rest-dual-store-a)
+
+(defmacro with-rest-dual-stores ((ga gb) &body body)
+  "Two open stores, :REST-DUAL-STORE-A (REST-DUAL-ITEM's declared
+default) and :REST-DUAL-STORE-B (foreign to it), under a fresh system
+directory."
+  (let ((sys (gensym)) (da (gensym)) (db (gensym)))
+    `(with-temp-directory (,sys)
+       (with-temp-directory (,da)
+         (with-temp-directory (,db)
+           (let ((graph-db::*system-directory* (namestring ,sys)))
+             (let ((,ga (make-graph :rest-dual-store-a (namestring ,da)
+                                    :buffer-pool-size 1000))
+                   (,gb nil))
+               (unwind-protect
+                    (progn
+                      (setq ,gb (make-graph :rest-dual-store-b
+                                            (namestring ,db)
+                                            :buffer-pool-size 1000))
+                      ,@body)
+                 (ignore-errors (close-graph ,ga :snapshot-p nil))
+                 (when ,gb
+                   (ignore-errors (close-graph ,gb :snapshot-p nil)))
+                 (collect-garbage)))))))))
+
+(test rest-post-vertex-honors-the-url-graph-over-the-class-default
+  "POST to store B for a class whose declared default is store A: the
+node must be created IN B (the URL's graph), not silently redirected
+to A.  %REST-RESOLVE-POST-TYPE only sees types already known to
+*GRAPH*'s own schema, so B first adopts REST-DUAL-ITEM the ordinary
+way (one direct write with an explicit :GRAPH); the REST POST that
+follows is the thing under test (GH #167)."
+  (with-rest-dual-stores (ga gb)
+    (with-transaction ((graph-db::transaction-manager gb))
+      (make-rest-dual-item :label "seed" :graph gb))
+    (with-rest-env ()
+      (let* ((out (graph-db::rest-post-vertex
+                   (list (cons "username" "u") (cons "password" "p")
+                         (cons :graph-name
+                               (json:lisp-to-camel-case
+                                (symbol-name :rest-dual-store-b)))
+                         (cons :type "restDualItem")
+                         (cons "label" "in-b"))))
+             (j (rest-decode out))
+             (id (cdr (assoc :id j))))
+        (is (string= "in-b" (cdr (assoc :label j))))
+        (is-true (lookup-vertex id :graph gb))
+        (is (null (lookup-vertex id :graph ga)))))))
+
+;;; ---------------------------------------------------------------------
+;;; An unbound result variable is an ANSWER, not a fault (GH #279).
+;;;
+;;; Reachable from the structured DSL too: a "select" variable that
+;;; appears nowhere in "match" or "where" is never bound, so it reaches
+;;; the encoder as a raw VAR STRUCT (prologc.lisp:97).  The GUI's
+;;; free-text surface hits the same defect with (= ?x ?y); the fix is in
+;;; the shared encoder, so both are covered by one change.
+;;; ---------------------------------------------------------------------
+
+(test pattern-query-unbound-select-var-is-null
+  "A selected variable that nothing binds comes back JSON null, and a
+bound variable in the SAME query keeps its value."
+  (with-test-graph (g)
+    (declare (ignore g))
+    (with-rest-env ()
+      (with-transaction () (make-g-person :name "A"))
+      (let* ((j (pattern-query
+                 "{\"match\":[{\"vertex\":\"?p\",\"type\":\"gPerson\"}],
+                   \"where\":[{\"slot\":\"?p\",\"name\":\"name\",
+                               \"bind\":\"?n\"}],
+                   \"select\":[\"?n\",\"?unbound\"]}"))
+             (row (first j)))
+        (is (= 1 (length j)))
+        (is (equal "A" (cdr (assoc :n row))) "the bound var lost its value")
+        (is-true (assoc :unbound row) "the unbound column is missing")
+        (is-false (cdr (assoc :unbound row))
+                  "the unbound var did not render as null")))))
+
+(test pattern-query-all-null-row-is-still-an-object
+  "A row whose values are ALL null stays a JSON OBJECT.  (cons key NIL)
+is not a dotted pair, so cl-json's guessing encoder used to render such
+a row as the array [[\"unbound\"]] and silently change the response's
+shape -- hence ENCODE-JSON-ALIST in QUERY-RESULTS->JSON (GH #279)."
+  (with-test-graph (g)
+    (declare (ignore g))
+    (with-rest-env ()
+      (with-transaction () (make-g-person :name "A"))
+      (let ((body (graph-db::call-rest-pattern-query
+                   (json:decode-json-from-string
+                    "{\"match\":[{\"vertex\":\"?p\",\"type\":\"gPerson\"}],
+                      \"select\":[\"?unbound\"]}")
+                   (rest-params))))
+        ;; Assert on the RAW body: the decoded form cannot tell an
+        ;; object from an array of one-element lists.
+        (is-true (search "{\"unbound\":null}" body)
+                 "an all-null row is not an object: ~A" body)
+        (is-false (search "[[" body)
+                  "an all-null row came out as an array: ~A" body)))))
+
+;;; ---------------------------------------------------------------------------
+;;; Value fidelity, name resolution, and the error contract (GH #282, #281,
+;;; #286) on the REST surface.
+;;; ---------------------------------------------------------------------------
+
+(test dsl-keyword-accepts-both-spellings
+  "GH #281: the engine's kebab spelling goes in verbatim -- digits and all
+-- and legacy camelCase still folds."
+  (is (eq :foo-bar2 (graph-db::%dsl-keyword "foo-bar2")))
+  (is (eq :node-3d-point (graph-db::%dsl-keyword "node-3d-point")))
+  (is (eq :x1-y2 (graph-db::%dsl-keyword "x1-y2")))
+  (is (eq :gui-person (graph-db::%dsl-keyword "gui-person")))
+  (is (eq :min-age (graph-db::%dsl-keyword "minAge"))))
+
+(test pattern-query-nil-slot-is-null-and-t-is-true
+  "GH #282: an empty slot is JSON null and T is JSON true on the pattern-
+query surface -- not the strings \"NIL\" / \"T\"."
+  (with-test-graph (g)
+    (declare (ignore g))
+    (with-rest-env ()
+      (with-transaction ()
+        (make-g-person :name "A")
+        (make-g-person :name "B" :age t))
+      (let* ((raw (graph-db::call-rest-pattern-query
+                   (json:decode-json-from-string
+                    "{\"match\":[{\"vertex\":\"?p\",\"type\":\"gPerson\"}],
+                      \"where\":[{\"slot\":\"?p\",\"name\":\"age\",
+                                  \"bind\":\"?a\"}],
+                      \"select\":[\"?a\"]}")
+                   (rest-params)))
+             (j (rest-decode raw))
+             (ages (mapcar (lambda (row) (cdr (assoc :a row))) j)))
+        (is (= 2 (length j)))
+        (is-false (search "\"NIL\"" raw))
+        (is-false (search "\"T\"" raw))
+        (is (member nil ages) "A's missing age is null")
+        (is (member t ages) "B's age T is true")))))
+
+;; A query over an UNINDEXED slot through the index functor: the engine's
+;; checked precondition, a typed condition since GH #286.
+(def-query people-by-age-index
+  :params ((?age :integer))
+  :return (?n)
+  :where ((find-by-slot ?p g-person age ?age)
+          (node-slot-value ?p name ?n)))
+
+(test def-query-checked-precondition-is-400-with-the-reason
+  "GH #286: an engine precondition the caller failed -- no index on
+G-PERSON.AGE -- is the client's 400 with the reason, not a 500."
+  (with-test-graph (g)
+    (declare (ignore g))
+    (with-rest-env ()
+      (let ((j (rest-decode
+                (graph-db::call-rest-query "peopleByAgeIndex"
+                                           (rest-params (cons "age" "3"))))))
+        (is (= 400 (rest-status)))
+        (is-true (search "No secondary index" (cdr (assoc :error j)))
+                 "the reason names the precondition: ~S"
+                 (cdr (assoc :error j)))))))
+
+(test decode-dsl-json-interns-only-the-dsl-vocabulary
+  "GH #284: a bogus object key in a query body stays a STRING -- the
+KEYWORD package does not grow -- while the DSL's own keys are keywords."
+  (flet ((kw-count ()
+           (let ((n 0))
+             (do-symbols (s :keyword) (declare (ignore s)) (incf n))
+             n)))
+  (let* ((before (kw-count))
+         (dsl (graph-db:decode-dsl-json
+               (format nil "{\"match\":[{\"vertex\":\"?p\",\"type\":\"gPerson\",
+                                    \"zzBogusKey~D\":1}],
+                            \"zzAnotherBogus~D\":{\"deeper~D\":2},
+                            \"limit\":3}" (random 1000000) (random 1000000)
+                            (random 1000000))))
+         (after (kw-count)))
+    (is (= before after) "the KEYWORD package gained ~D symbol(s)"
+        (- after before))
+    (is (= 3 (cdr (assoc :limit dsl))))
+    (let ((pat (first (cdr (assoc :match dsl)))))
+      (is (string= "?p" (cdr (assoc :vertex pat))))
+      (is (string= "gPerson" (cdr (assoc :type pat))))
+      (is (find-if (lambda (pair) (and (stringp (car pair))
+                                       (search "zzBogusKey" (car pair))))
+                   pat)
+          "the unknown key survives as a string, uninterned")))))

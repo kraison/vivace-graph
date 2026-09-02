@@ -190,23 +190,28 @@
   (setf (index-list-head il) 0)
   nil)
 
-(defmethod remove-from-index-list ((uuid array) (il index-list) &key remove-all-p)
-  (let ((address (index-list-head il)) (prev nil)
+(defmethod remove-from-index-list ((uuid array) (il index-list)
+                                   &key remove-all-p)
+  (let ((address (index-list-head il))
         (pcons-buffer (get-pcons-buffer)))
     (loop until (eq address 0) do
          (let ((pcons (deserialize-pcons il address pcons-buffer)))
-           (unless (%pcons-deleted-p pcons)
-             (let ((id (%pcons-car pcons))
-                   (next (%pcons-cdr pcons)))
-               (if (uuid-array-equal id uuid)
-                   (progn ;; remove it!
-                     (mark-pcons-deleted pcons (index-list-heap il) address)
-                     (setf (index-list-dirty-p il) t)
-                     (setq address next)
-                     (unless remove-all-p
-                       ;; Only remove the first one!
-                       (return)))
-                   ;; otherwise, just advance
-                   (setq prev address
-                         address next))))))
+           ;; A deleted cell stays in the chain (MARK-PCONS-DELETED only
+           ;; flags it) -- it MUST still advance, or any walk that meets
+           ;; one spins forever.  First hit by COMPACT-EDGES' second
+           ;; removal pass (GH #242, found on #208).
+           (if (%pcons-deleted-p pcons)
+               (setq address (%pcons-cdr pcons))
+               (let ((id (%pcons-car pcons))
+                     (next (%pcons-cdr pcons)))
+                 (if (uuid-array-equal id uuid)
+                     (progn ;; remove it!
+                       (mark-pcons-deleted pcons (index-list-heap il) address)
+                       (setf (index-list-dirty-p il) t)
+                       (setq address next)
+                       (unless remove-all-p
+                         ;; Only remove the first one!
+                         (return)))
+                     ;; otherwise, just advance
+                     (setq address next))))))
     il))

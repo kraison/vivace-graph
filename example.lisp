@@ -3,6 +3,10 @@
 
 (defvar *graph-name* :test-graph)
 (defvar *graph-path* "/var/tmp/test-graph/")
+;; Type-ids come from the registry in *SYSTEM-DIRECTORY*; a store cannot be
+;; opened without one (GH #186).
+(setf *system-directory*
+      (namestring (ensure-directories-exist "/var/tmp/test-graph-system/")))
 (log:config :all :sane :d :nopretty :thread :daily "/var/tmp/graph.log")
 
 ;;; Types
@@ -12,7 +16,9 @@
        x))
 (deftype email () `(satisfies email-p))
 
-;;; Schema
+;;; Schema.  ⚠ These forms must be LOADED before make-graph/open-graph:
+;;; schema.dat persists type metadata for id stability, never the CLOS
+;;; classes themselves (GH #144).
 (def-vertex person ()
   ((first-name :type string)
    (middle-name :type string)
@@ -92,13 +98,15 @@
         (c2 (make-customer :first-name "Jill" :last-name "Blow" :email "jill@blow.com"))
         ;; m1 carries a LOCATION (lon, lat); committing it indexes it spatially.
         (m1 (make-merchant :name "Snake Oil, Inc."
-                           :location (make-point 37.1724d0 49.2020d0)))
+                           :location (make-point 12.3424d0 45.6720d0)))
         (p1 (make-product :name "Oil of Longevity" :upc "1234567890"))
         (p2 (make-product :name "Oil of Slipperiness" :upc "abcdefghijk")))
-    ;; Two more merchants: one ~1.5 km away, one in another city -- so the
+    ;; Two more merchants: one ~1 km away, one in another city -- so the
     ;; proximity queries below have something to discriminate.
-    (make-merchant :name "Elixir Emporium" :location (make-point 37.1850d0 49.2080d0))
-    (make-merchant :name "Faraway Tonics"  :location (make-point 23.7183d0 50.0263d0))
+    (make-merchant :name "Elixir Emporium" :location (make-point 12.3520d0
+                                                       45.6780d0))
+    (make-merchant :name "Faraway Tonics"  :location (make-point 2.4683d0
+                                                       41.7763d0))
     (make-sells :from m1 :to p1)
     ;; The above is equivalent to
     ;; (make-edge 'sells m1 p1 1 nil)
@@ -171,26 +179,49 @@
 
 ;; Merchants within 2 km of a downtown point (lat, lon, radius-metres).
 ;; Returns (merchant . distance-metres) pairs, nearest first.
-(find-nodes-near 'merchant 49.2020d0 37.1724d0 2000d0)
-;; => Snake Oil, Inc. (~0 m) and Elixir Emporium (~1.5 km); Faraway Tonics
+(find-nodes-near 'merchant 45.6720d0 12.3424d0 2000d0)
+;; => Snake Oil, Inc. (~0 m) and Elixir Emporium (~1 km); Faraway Tonics
 ;;    (another city) is excluded.
 
 ;; The two nearest merchants to that same point, nearest first.
-(find-nearest-k 'merchant 49.2020d0 37.1724d0 2)
+(find-nearest-k 'merchant 45.6720d0 12.3424d0 2)
 
 ;; Merchants whose location falls inside an area of interest (a polygon, given
 ;; as rings of (lon lat) -- the first ring is the outer boundary).
 (find-nodes-within
  'merchant
- (make-polygon '(((37.165d0 49.196d0) (37.195d0 49.196d0)
-                  (37.195d0 49.212d0) (37.165d0 49.212d0)
-                  (37.165d0 49.196d0)))))
+ (make-polygon '(((12.335d0 45.666d0) (12.365d0 45.666d0)
+                  (12.365d0 45.682d0) (12.335d0 45.682d0)
+                  (12.335d0 45.666d0)))))
 
 ;; The same proximity query, composed in Prolog.  find-near/5 takes the scope as
 ;; its second argument and yields nodes, so it cooperates with the rest of the
 ;; query language.  (The scope already restricts the answer to merchants, so the
 ;; is-a goal the pre-scope API needed is no longer required.)
 (select-flat (?m)
-  (find-near ?m merchant 49.2020d0 37.1724d0 2000d0))
+  (find-near ?m merchant 45.6720d0 12.3424d0 2000d0))
+
+;;; Updating a node ------------------------------------------------------
+;;;
+;;; LOOKUP-* (and view helpers like LOOKUP-CUSTOMER-BY-EMAIL above) return
+;;; the SHARED cached node -- the same object every other reader and thread
+;;; holds.  Writing its slots in place would be invisible to disk and
+;;; visible to everyone else immediately, with no transaction protecting
+;;; it.  So COPY it inside the transaction, modify the copy, and SAVE that.
+;;; Writing an uncopied node signals MUTATING-UNREGISTERED-NODE (GH #135).
+
+(with-transaction ()
+  (let ((c (copy (lookup-customer-by-email "joe@blow.com"))))
+    (setf (email c) "joe@blowfish.com")
+    (save c)))
+
+;;; A node created in THIS transaction is different: it has no committed
+;;; version to update against, so it needs no copy -- and COPY of it
+;;; signals COPYING-UNCOMMITTED-NODE.  Just set its slots directly.
+
+(with-transaction ()
+  (let ((c3 (make-customer :first-name "Cara" :last-name "Blow"
+                            :email "cara@blow.com")))
+    (setf (email c3) "cara.blow@blow.com")))
 
 (close-graph *graph*)

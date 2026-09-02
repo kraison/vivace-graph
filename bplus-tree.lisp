@@ -1000,44 +1000,66 @@ the right opener.")
 ;;; there is no load-order problem.  (*INDEX-BACKEND* -- the DEFAULT backend -- is
 ;;; defined in globals.lisp so the graph class's INDEX-BACKEND slot can default to it.)
 
-(defun make-heap-index (backend heap comparison)
+(defun make-heap-index (backend heap comparison
+                        &key (head-key (if (eq comparison 'reduce-comp-greaterp)
+                                            (list +max-sentinel+ +max-key+)
+                                            (list +min-sentinel+ +null-key+)))
+                             (tail-key (if (eq comparison 'reduce-comp-greaterp)
+                                           (list +min-sentinel+ +null-key+)
+                                           (list +max-sentinel+ +max-key+)))
+                             (key-equal 'reduce-equal)
+                             (key-serializer 'view-key-serialize)
+                             (key-deserializer 'view-key-deserialize))
   "Create a fresh heap-backed composite-key ordered map (skip list or B+ tree) with
-the shared view/unique/spatial codec.  COMPARISON is REDUCE-COMP-LESSP or
-REDUCE-COMP-GREATERP (it also picks the skip list's head/tail sentinels)."
+the shared view/unique/spatial codec.  COMPARISON is REDUCE-COMP-LESSP,
+REDUCE-COMP-GREATERP, or (since GH #107) %INDEX-COMP-LESSP.  HEAD-KEY / TAIL-KEY
+are the skip list's sentinels; they default to the arity-1 REDUCE-COMP-LESSP/
+-GREATERP pair, so the view / :unique / spatial callers that omit them are
+unaffected -- only an arity-aware caller (the general index, GH #107) need pass
+its own.  KEY-EQUAL / KEY-SERIALIZER / KEY-DESERIALIZER default to the shared
+view codec (REDUCE-EQUAL / VIEW-KEY-SERIALIZE / VIEW-KEY-DESERIALIZE); the
+general index passes %INDEX-EQUAL / %INDEX-KEY-SERIALIZE /
+%INDEX-KEY-DESERIALIZE instead (GH #107), the only caller that needs to."
   (ecase backend
     (:skip-list
-     (let ((greaterp (eq comparison 'reduce-comp-greaterp)))
-       (make-skip-list
-        :heap heap :duplicates-allowed-p nil
-        :key-equal 'reduce-equal :key-comparison comparison
-        :head-key (if greaterp (list +max-sentinel+ +max-key+) (list +min-sentinel+ +null-key+))
-        :head-value nil
-        :tail-key (if greaterp (list +min-sentinel+ +null-key+) (list +max-sentinel+ +max-key+))
-        :tail-value nil
-        :value-equal 'equal
-        :key-serializer 'view-key-serialize :key-deserializer 'view-key-deserialize
-        :value-serializer 'serialize :value-deserializer 'deserialize)))
+     (make-skip-list
+      :heap heap :duplicates-allowed-p nil
+      :key-equal key-equal :key-comparison comparison
+      :head-key head-key
+      :head-value nil
+      :tail-key tail-key
+      :tail-value nil
+      :value-equal 'equal
+      :key-serializer key-serializer
+      :key-deserializer key-deserializer
+      :value-serializer 'serialize :value-deserializer 'deserialize))
     (:bplus-tree
      (make-bplus-tree
-      :heap heap :key-equal 'reduce-equal :key-comparison comparison
+      :heap heap :key-equal key-equal :key-comparison comparison
       :value-equal 'equal
-      :key-serializer 'view-key-serialize :key-deserializer 'view-key-deserialize
+      :key-serializer key-serializer :key-deserializer key-deserializer
       :value-serializer 'serialize :value-deserializer 'deserialize))))
 
-(defun open-heap-index (backend &key address heap comparison)
+(defun open-heap-index (backend &key address heap comparison
+                                     (key-equal 'reduce-equal)
+                                     (key-serializer 'view-key-serialize)
+                                     (key-deserializer 'view-key-deserialize))
   "Reopen a persisted heap-backed composite-key index at ADDRESS with BACKEND's
 opener and the shared codec.  BACKEND defaults to :skip-list for a pre-B+-tree
-sidecar/alist with no tag."
+sidecar/alist with no tag.  KEY-EQUAL / KEY-SERIALIZER / KEY-DESERIALIZER
+default to the shared view codec, same as MAKE-HEAP-INDEX (GH #107)."
   (ecase (or backend :skip-list)
     (:skip-list
      (open-skip-list :address address :heap heap :duplicates-allowed-p nil
-                     :key-equal 'reduce-equal :key-comparison comparison
+                     :key-equal key-equal :key-comparison comparison
                      :value-equal 'equal
-                     :key-serializer 'view-key-serialize :key-deserializer 'view-key-deserialize
+                     :key-serializer key-serializer
+                     :key-deserializer key-deserializer
                      :value-serializer 'serialize :value-deserializer 'deserialize))
     (:bplus-tree
      (open-bplus-tree :address address :heap heap
-                      :key-equal 'reduce-equal :key-comparison comparison
+                      :key-equal key-equal :key-comparison comparison
                       :value-equal 'equal
-                      :key-serializer 'view-key-serialize :key-deserializer 'view-key-deserialize
+                      :key-serializer key-serializer
+                      :key-deserializer key-deserializer
                       :value-serializer 'serialize :value-deserializer 'deserialize))))

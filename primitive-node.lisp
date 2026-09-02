@@ -1,16 +1,17 @@
 (in-package :graph-db)
 
-;; v2 head (MVCC): flags(1) type-id(2) revision(4) data-pointer(8)
-;;                 commit-epoch(8) prev-pointer(8) = 31.
-;; The first 15 bytes are byte-identical to the v1 head (append-only), so a v1
-;; reader is just "stop after data-pointer".  +edge-header-size+ derives from this.
-(alexandria:define-constant +node-header-size+ 31)
+;; v3 head: flags(1) type-id(4) revision(4) data-pointer(8) commit-epoch(8)
+;; prev-pointer(8) = 33.  type-id widened 2 -> 4 bytes (#166); the v2 (31-byte,
+;; 2-byte type-id) layout stays readable via DESERIALIZE-NODE-HEAD-V2, for
+;; MIGRATE-GRAPH.  +edge-header-size+ derives from this.
+(alexandria:define-constant +node-header-size+ 33)
 
-;; Byte offset of the prev-pointer field WITHIN a head (after flags(1) type-id(2)
-;; revision(4) data-pointer(8) commit-epoch(8) = 23).  The reaper patches this
-;; field in place (in the lhash live head or an archived heap head) to sever a
-;; reclaimed version chain.
-(alexandria:define-constant +node-prev-pointer-offset+ 23)
+;; Byte offset of the prev-pointer field WITHIN a head (after flags(1)
+;; type-id(4) revision(4) data-pointer(8) commit-epoch(8) = 25).  The reaper
+;; patches this field in place (in the lhash live head or an archived heap
+;; head) to sever a reclaimed version chain.  Shifted 23 -> 25 with the v3
+;; type-id width (#166); missing this moves the patch into commit-epoch's tail.
+(alexandria:define-constant +node-prev-pointer-offset+ 25)
 
 (defgeneric node-p (thing)
   (:method ((thing node)) t)
@@ -62,7 +63,7 @@
 (defun pack-node-head (vec i n)
   "Fill the node head of N into VEC starting at index I; return the next index."
   (setf (aref vec i) (flags-as-int n))
-  (setq i (pack-uint vec (1+ i) (type-id n)      2))
+  (setq i (pack-uint vec (1+ i) (type-id n)      4))
   (setq i (pack-uint vec i       (revision n)     4))
   (setq i (pack-uint vec i       (data-pointer n) 8))
   (setq i (pack-uint vec i       (commit-epoch n) 8))   ;; MVCC v2
@@ -78,6 +79,58 @@
     (+ offset (1- +node-header-size+))))
 
 (defun deserialize-node-head (mf offset)
+  (let ((flags (get-byte mf offset)))
+    (values
+     (ldb-test (byte 1 0) flags) ;; deleted-p
+     (ldb-test (byte 1 1) flags) ;; written-p
+     (ldb-test (byte 1 2) flags) ;; heap-written-p
+     (ldb-test (byte 1 3) flags) ;; type-idx-written-p
+     (ldb-test (byte 1 4) flags) ;; views-written-p
+     (ldb-test (byte 1 5) flags) ;; ve-written-p
+     (ldb-test (byte 1 6) flags) ;; vev-written-p
+     (let ((int 0)) ;; type-id
+       (declare (type (integer 0 4294967295) int))
+       (dotimes (i 4)
+         (setq int (dpb (get-byte mf (incf offset))
+                        (byte 8 (* i 8)) int)))
+       int)
+     (let ((int 0)) ;; revision
+       (declare (type (integer 0 4294967295) int))
+       (dotimes (i 4)
+         (setq int (dpb (get-byte mf (incf offset))
+                        (byte 8 (* i 8)) int)))
+       int)
+     (let ((int 0)) ;; data-pointer
+       #+sbcl (declare (type sb-ext:word int))
+       (dotimes (i 8)
+         (setq int (dpb (get-byte mf (incf offset))
+                        (byte 8 (* i 8)) int)))
+       int)
+     (let ((int 0)) ;; commit-epoch (MVCC v2)
+       #+sbcl (declare (type sb-ext:word int))
+       (dotimes (i 8)
+         (setq int (dpb (get-byte mf (incf offset))
+                        (byte 8 (* i 8)) int)))
+       int)
+     (let ((int 0)) ;; prev-pointer (MVCC v2)
+       #+sbcl (declare (type sb-ext:word int))
+       (dotimes (i 8)
+         (setq int (dpb (get-byte mf (incf offset))
+                        (byte 8 (* i 8)) int)))
+       int)
+     offset)))
+
+;; The head reader the vertex/edge codecs dispatch through.  Normally the v3
+;; (33-byte) reader; MIGRATE-GRAPH rebinds it to DESERIALIZE-NODE-HEAD-V1 or
+;; DESERIALIZE-NODE-HEAD-V2 to read an older graph so its data can be logically
+;; backed up + replayed.
+(defvar *node-head-reader* 'deserialize-node-head)
+
+(defun deserialize-node-head-v2 (mf offset)
+  "Read a pre-widening (v2) 31-byte node head: flags(1) type-id(2) revision(4)
+data-pointer(8) commit-epoch(8) prev-pointer(8).  Byte-for-byte the same reader
+as DESERIALIZE-NODE-HEAD before type-id widened to 4 bytes (#166).  Kept for
+MIGRATE-GRAPH so a pre-#166 graph stays readable; not on any live read path."
   (let ((flags (get-byte mf offset)))
     (values
      (ldb-test (byte 1 0) flags) ;; deleted-p
@@ -118,11 +171,6 @@
                         (byte 8 (* i 8)) int)))
        int)
      offset)))
-
-;; The head reader the vertex/edge codecs dispatch through.  Normally the v2
-;; (31-byte) reader; MIGRATE-GRAPH rebinds it to DESERIALIZE-NODE-HEAD-V1 to read
-;; a pre-MVCC (v1, 15-byte) graph so its data can be logically backed up + replayed.
-(defvar *node-head-reader* 'deserialize-node-head)
 
 (defun deserialize-node-head-v1 (mf offset)
   "Read a pre-MVCC (v1) 15-byte node head: flags(1) type-id(2) revision(4)
@@ -207,6 +255,48 @@ garbage.  So MAYBE-INIT-NODE-DATA no-ops while this is bound; the data is set
 explicitly afterward (the transaction-node path) or materialized lazily later
 (the lhash path, when this is NIL and the pointer is local).")
 
+;;; BYTES is a DERIVED CACHE of DATA (GH #136).  One invariant, one place:
+;;; every DATA mutation marks the node stale -- (SETF DATA) here, the
+;;; in-place branch of (SETF NODE-SLOT-VALUE) above -- and the BYTES reader
+;;; re-serializes on the next read, once.  Writing BYTES asserts freshness.
+;;; Before this, APPLY-TX-WRITE, UPDATE-NODE, SAVE-NODE and the create-set
+;;; refresh each re-derived it by hand, and the next path to forget would
+;;; have logged and replicated stale data invisibly until a restart.
+
+(defmethod (setf data) :after (new-value (node node))
+  (declare (ignore new-value))
+  (setf (bytes-stale-p node) t))
+
+(defmethod (setf bytes) :after (new-value (node node))
+  (declare (ignore new-value))
+  (setf (bytes-stale-p node) nil))
+
+(defmethod bytes :around ((node node))
+  "The stored bytes, re-derived from DATA first when a write left them stale.
+Never for a node whose heap data is still unmaterialized (bytes :INIT with a
+DATA-POINTER): its DATA then holds at most the class :INITFORMs, applied
+through the funnel before the heap was read, and serializing THOSE would
+hide the stored value behind the default -- the GH #128 rule inverted.
+That case is left for MAYBE-INIT-NODE-DATA, which merges stored over
+defaults and clears the flag (GH #136)."
+  (let ((bytes (call-next-method)))
+    (if (and (bytes-stale-p node)
+             (or (typep bytes 'sequence)
+                 (zerop (data-pointer node))))
+        (setf (bytes node) (serialize (data node)))   ; the :AFTER clears
+        bytes)))
+
+(defun %merge-stored-over-defaults (stored current)
+  "STORED wins per slot; entries in CURRENT whose key STORED has no entry for
+survive.  CURRENT holds whatever CHANGE-NODE-CLASS's :INITFORM application put
+in the alist, so this is the rule that lets a slot added to the schema after a
+node was written still read as its default, while a slot the node actually
+stored reads as what was stored (GH #128)."
+  (if (null current)
+      stored
+      (append stored
+              (remove-if (lambda (entry) (assoc (car entry) stored)) current))))
+
 (defun maybe-init-node-data (node &key (graph *graph*))
   (when (and (not *initializing-node*)
              (> (data-pointer node) 0))
@@ -221,16 +311,28 @@ explicitly afterward (the transaction-node path) or materialized lazily later
     ;; *GRAPH*) is only a fallback for an unstamped node (GH #53).  Resolved HERE
     ;; rather than around the whole body because this is the only use of it and
     ;; this branch runs once per node, while the body runs on every slot access.
-    (when (or (eq (bytes node) :init) (null (bytes node)))
-      (setf (bytes node)
-            (read-bytes (make-mpointer
-                         :mmap (memory-mmap (heap (node-home-graph node graph)))
-                         :loc (data-pointer node)))))
-    ;; Deserialize lazily from the in-memory bytes (safe; *graph* is bound here).
-    (when (and (null (data node))
-               (bytes node)
-               (not (eq (bytes node) :init)))
-      (setf (data node) (deserialize (bytes node)))))
+    ;; ONE read of BYTES: it is a generic accessor with a staleness check
+    ;; on it (GH #136), and this runs on every slot access.
+    (let ((bytes (bytes node)))
+      (when (or (eq bytes :init) (null bytes))
+        (setf bytes
+              (setf (bytes node)
+                    (read-bytes (make-mpointer
+                                 :mmap (memory-mmap
+                                        (heap (node-home-graph node graph)))
+                                 :loc (data-pointer node))))))
+      ;; Deserialize lazily from the in-memory bytes (safe; *graph* is bound
+      ;; here).  Gated on HEAP-MERGED-P, not on (NULL (DATA NODE)): a slot
+      ;; with an :INITFORM arrives with DATA already populated, and gating on
+      ;; emptiness would silently keep the default instead of the stored
+      ;; value (GH #128).  DATA derived FROM bytes is not stale (GH #136).
+      (when (and (not (heap-merged-p node))
+                 bytes
+                 (not (eq bytes :init)))
+        (setf (data node) (%merge-stored-over-defaults (deserialize bytes)
+                                                       (data node))
+              (heap-merged-p node) t
+              (bytes-stale-p node) nil))))
   node)
 
 (defmethod lookup-node ((table lhash) (key array) (graph graph))
@@ -262,9 +364,9 @@ explicitly afterward (the transaction-node path) or materialized lazily later
   ;;(log:info "SAVING ~A" (string-id node))
   (let ((old-node nil))
     (when (plusp (data-pointer node))
-      (if (data node)
-          (setf (bytes node) (serialize (data node)))
-          (maybe-init-node-data node :graph graph))
+      ;; BYTES re-derives itself from a mutated DATA on read (GH #136).
+      (unless (data node)
+        (maybe-init-node-data node :graph graph))
       (let ((addr (allocate (heap graph) (length (bytes node)))))
         (dotimes (i (length (bytes node)))
           (set-byte (heap graph)
@@ -363,7 +465,11 @@ explicitly afterward (the transaction-node path) or materialized lazily later
                         (push (cons ,keyword ,value) (data ,node)))))
                  (t
                   (error "Cannot set slot value when data slot is of type ~A"
-                         (type-of (data ,node)))))))))
+                         (type-of (data ,node)))))
+           ;; DATA changed under BYTES; the PUSH branches went through (SETF
+           ;; DATA) but the in-place (SETF CDR) branch did not (GH #136).
+           (setf (bytes-stale-p ,node) t)
+           ,value))))
 
 (defun node-slot-boundp (node key &key (graph *graph*))
   "True if NODE's persistent slot KEY has a stored value -- i.e. an entry is
@@ -374,6 +480,28 @@ to NIL is bound.  Materializes the data first (mirrors NODE-SLOT-VALUE)."
     (and (consp (data node))
          (assoc keyword (data node))
          t)))
+
+#+ecl
+(defun %apply-missing-initforms (node)
+  "Fill NODE's data alist with :INITFORM defaults for persistent slots
+the alist does not carry.  ECL constructs a node's subclass directly
+(#47's CHANGE-CLASS-leak workaround) and the caller's DATA then replaces
+anything MAKE-INSTANCE initialized -- so the added-slot initform pass
+CHANGE-CLASS performs on the pooled-buffer implementations never runs,
+and an initform-only slot read NIL (GH #312).  *INITIALIZING-NODE*
+keeps MAYBE-INIT-NODE-DATA from dereferencing a foreign DATA-POINTER,
+exactly as during CHANGE-NODE-CLASS; for a data-pointer node the
+defaults are the same pre-materialization state the BYTES :AROUND
+documents, and the heap read replaces them (stored values win)."
+  (let ((*initializing-node* t)
+        (class (class-of node)))
+    (dolist (slot (class-slots class))
+      (let* ((name (slot-definition-name slot))
+             (kw (%persistent-slot-keyword class name))
+             (initfn (and kw (slot-definition-initfunction slot))))
+        (when (and initfn (not (node-slot-boundp node kw)))
+          (setf (node-slot-value node kw) (funcall initfn))))))
+  node)
 
 (defmethod slot-value-using-class :around ((class node-class) instance slot)
   "Around method that is alternate-version aware and will show values for the current,
@@ -387,6 +515,22 @@ to NIL is bound.  Materializes the data first (mirrors NODE-SLOT-VALUE)."
         (node-slot-value instance slot-keyword-name)
         (call-next-method))))
 
+(defun check-slot-mutation-allowed (node slot-name)
+  "Signal MUTATING-UNREGISTERED-NODE unless the current transaction may write
+NODE's persistent slots: it may write a COPY it registered, or a node it
+created.  Anything else is either lost at commit or a mutation of the shared
+cached instance (GH #135).
+COPIES and CREATE-SET are TX-only readers: a non-TX *TRANSACTION* (e.g. a
+RESTORE-TRANSACTION replay, transaction-restore.lisp) has neither, so is
+trusted unconditionally here, mirroring CREATE-NODE's own TYPEP guard
+(transactions.lisp) rather than signalling NO-APPLICABLE-METHOD."
+  (unless *transaction*
+    (error 'mutating-unregistered-node :node node :slot slot-name))
+  (when (typep *transaction* 'tx)
+    (unless (or (gethash node (copies *transaction*))
+                (node-created-in-transaction-p node *transaction*))
+      (error 'mutating-unregistered-node :node node :slot slot-name))))
+
 (defmethod (setf slot-value-using-class) :around
     (new-value (class node-class) instance slot)
   "Is alternate-version aware and will update values for the current, working private
@@ -397,8 +541,10 @@ to NIL is bound.  Materializes the data first (mirrors NODE-SLOT-VALUE)."
          (slot-name (slot-definition-name slot))
          (slot-keyword-name (%persistent-slot-keyword class slot-name)))
     (if slot-keyword-name
-        ;; FIXME: Check for txn and handle
-        (setf (node-slot-value instance slot-keyword-name) new-value)
+        (progn
+          (unless *initializing-node*
+            (check-slot-mutation-allowed instance slot-name))
+          (setf (node-slot-value instance slot-keyword-name) new-value))
         (call-next-method))))
 
 ;; *INITIALIZING-NODE* is defvar'd above MAYBE-INIT-NODE-DATA (it guards that
@@ -410,6 +556,17 @@ re-initialization CLOS performs does not destroy NODE's alist-backed persistent
 slot values (see *INITIALIZING-NODE*)."
   `(let ((*initializing-node* t))
      (change-class ,node ,subclass)))
+
+(defmethod update-instance-for-redefined-class :around
+    ((instance node) added-slots discarded-slots property-list &rest initargs)
+  "A redefined class (re-evaluated DEF-VERTEX/DEF-EDGE) fires this lazily on
+a live instance's next slot access -- CLOS applies a newly added persistent
+slot's :INITFORM the same way CHANGE-CLASS does, through the guarded funnel,
+on what may be a bare read with no transaction at all.  Same escape as
+CHANGE-NODE-CLASS (GH #135)."
+  (declare (ignore added-slots discarded-slots property-list initargs))
+  (let ((*initializing-node* t))
+    (call-next-method)))
 
 (defmethod slot-boundp-using-class :around ((class node-class) instance slot)
   "Persistent slot VALUES live in the node's DATA alist, not in the real CLOS

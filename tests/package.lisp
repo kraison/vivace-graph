@@ -14,6 +14,21 @@
   ;; so the Prolog compiler recognizes ! in query goals as cut.
   (:shadowing-import-from #:graph-db #:!)
   (:import-from #:graph-db
+                ;; image-level epoch clock (GH #168)
+                #:*system-clock*
+                #:system-clock
+                #:open-system-clock
+                #:close-system-clock
+                #:clock-next-epoch
+                #:clock-current-epoch
+                #:clock-observe-epoch
+                #:clock-lease-epochs
+                #:journal-append
+                #:journal-records
+                #:graph-system-clock
+                #:attach-to-system-clock
+                #:attach-with-active-transactions
+                #:clock-peek-epoch
                 ;; serialization
                 #:serialize
                 #:deserialize
@@ -49,6 +64,8 @@
                 #:geometry-contains-point-p
                 #:bbox-overlap-p
                 #:geometry-distance
+                #:geometry-geodesic-area
+                #:geometry-geodesic-length
                 ;; geohash (spatial extension)
                 #:geohash-encode
                 #:geohash-decode
@@ -203,7 +220,26 @@
                 #:make-graph
                 #:open-graph
                 #:close-graph
+                ;; GH #186: the store/registry type-id agreement guard and
+                ;; the frozen open that reads a store it refuses.
+                #:lookup-node-type-by-name
+                ;; .dirty refusal (GH #246)
+                #:store-not-closed-cleanly-error
+                #:store-not-closed-location
+                #:dirty-marker-already-gone-warning
+                #:dirty-marker-already-gone-location
+                #:store-registry-conflict
+                #:store-registry-conflict-reason
+                #:frozen-graph-cannot-replicate
+                ;; store-id registry (GH #169)
+                #:store-registry-intern
+                #:store-registry-id-for
+                #:store-registry-name-for
+                #:with-schema-frozen
                 #:with-transaction
+                #:*transaction*
+                #:transaction-id
+                #:load-highest-transaction-id
                 #:lookup-vertex
                 #:lookup-edge
                 #:vertex-history
@@ -218,6 +254,31 @@
                 #:index-lookup
                 #:index-range
                 #:map-index
+                #:def-unique
+                ;; schema retraction (GH #139, #140)
+                #:undef-index
+                #:undef-unique
+                #:schema-withdrawal-matched-nothing   ; GH #152
+                #:schema-classes-not-loaded           ; GH #144
+                #:snapshot-refused-warning            ; GH #127
+                ;; declarative value constraints (GH #149)
+                #:def-value-constraint
+                #:undef-value-constraint
+                #:value-constraint-violation
+                #:check-value-constraints
+                ;; Cardinality constraints (GH #155)
+                #:def-cardinality #:undef-cardinality
+                #:cardinality-violation #:check-cardinality-constraints
+                ;; Domain and range (GH #156)
+                #:def-domain-range #:undef-domain-range
+                #:domain-range-violation #:check-domain-range-constraints
+                #:drv-reason #:drv-end #:drv-actual
+                ;; Disjointness (GH #157, 4a)
+                #:def-disjoint #:undef-disjoint #:disjointness-violation
+                #:djv-offender #:check-disjointness
+                ;; index-backed generator predicates (GH #102)
+                #:find-by-slot/4
+                #:find-slot-range/5
                 #:weight
                 #:to
                 #:from
@@ -293,6 +354,9 @@
                 #:lookup-functor
                 #:delete-functor
                 #:make-functor-symbol
+                ;; comparison (utilities.lisp) -- ordering used by skip lists
+                ;; and the multi-slot index (GH #107)
+                #:less-than
                 ;; misc helpers
                 #:gen-id)
   (:export #:run-tests

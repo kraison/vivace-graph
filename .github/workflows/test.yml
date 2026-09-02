@@ -1,0 +1,174 @@
+# The full suite in CI (see docs/ci.md): main, concurrency,
+# ACID, spacetime, geos, algorithms, gui.  The habit this replaces:
+# running 35+ minutes of tests by hand on every change.  Local runs
+# are the affected subsystem's tests; every push here gets the full
+# matrix, and experiment -> master promotion waits for green.
+name: test
+on:
+  push:
+    branches: [experiment, master]
+  pull_request:
+    branches: [experiment, master]
+  workflow_dispatch:
+
+jobs:
+  full-suite:
+    runs-on: [self-hosted, Linux]
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: cl-temporal-extent at master head
+        # Same policy as the mine-action and cl-llm runners
+        # (2026-09-01): deps refresh per run, in this runner's own
+        # dir -- three runners share the ma-dev user, and one shared
+        # checkout would race.
+        run: |
+          mkdir -p ~/ci-deps-vivace-graph
+          d=~/ci-deps-vivace-graph/cl-temporal-extent
+          if [ -d $d/.git ]; then
+            git -C $d fetch -q origin
+            git -C $d checkout -qf origin/master
+          else
+            git clone -q -b master \
+              https://github.com/kraison/cl-temporal-extent $d
+          fi
+          echo "cl-temporal-extent @ $(git -C $d rev-parse --short HEAD)"
+      - name: full suite (12GiB heap per tests/README.md)
+        run: |
+          sbcl --dynamic-space-size 12288 --non-interactive \
+            --load "$HOME/quicklisp/setup.lisp" \
+            --eval '(setf ql:*local-project-directories* nil)' \
+            --eval '(asdf:initialize-source-registry
+                      (list :source-registry
+                            (list :tree (uiop:getcwd))
+                            (list :directory
+                                  (merge-pathnames "ci-deps-vivace-graph/cl-temporal-extent/"
+                                                   (user-homedir-pathname)))
+                            :ignore-inherited-configuration))' \
+            --eval '(ql:quickload :graph-db/test :silent t)' \
+            --eval '(asdf:test-system :graph-db)'
+      - name: concurrency suite
+        run: |
+          sbcl --dynamic-space-size 12288 --non-interactive \
+            --load "$HOME/quicklisp/setup.lisp" \
+            --eval '(setf ql:*local-project-directories* nil)' \
+            --eval '(asdf:initialize-source-registry
+                      (list :source-registry
+                            (list :tree (uiop:getcwd))
+                            (list :directory
+                                  (merge-pathnames "ci-deps-vivace-graph/cl-temporal-extent/"
+                                                   (user-homedir-pathname)))
+                            :ignore-inherited-configuration))' \
+            --eval '(ql:quickload :graph-db/concurrency-test :silent t)' \
+            --eval '(asdf:test-system :graph-db/concurrency-test)'
+      - name: acid suite
+        run: |
+          sbcl --dynamic-space-size 12288 --non-interactive \
+            --load "$HOME/quicklisp/setup.lisp" \
+            --eval '(setf ql:*local-project-directories* nil)' \
+            --eval '(asdf:initialize-source-registry
+                      (list :source-registry
+                            (list :tree (uiop:getcwd))
+                            (list :directory
+                                  (merge-pathnames "ci-deps-vivace-graph/cl-temporal-extent/"
+                                                   (user-homedir-pathname)))
+                            :ignore-inherited-configuration))' \
+            --eval '(ql:quickload :graph-db/acid-test :silent t)' \
+            --eval '(asdf:test-system :graph-db/acid-test)'
+      - name: spacetime suite
+        run: |
+          sbcl --dynamic-space-size 12288 --non-interactive \
+            --load "$HOME/quicklisp/setup.lisp" \
+            --eval '(setf ql:*local-project-directories* nil)' \
+            --eval '(asdf:initialize-source-registry
+                      (list :source-registry
+                            (list :tree (uiop:getcwd))
+                            (list :directory
+                                  (merge-pathnames "ci-deps-vivace-graph/cl-temporal-extent/"
+                                                   (user-homedir-pathname)))
+                            :ignore-inherited-configuration))' \
+            --eval '(ql:quickload :graph-db/spacetime-test :silent t)' \
+            --eval '(asdf:test-system :graph-db/spacetime-test)'
+      - name: geos suite
+        run: |
+          sbcl --dynamic-space-size 12288 --non-interactive \
+            --load "$HOME/quicklisp/setup.lisp" \
+            --eval '(setf ql:*local-project-directories* nil)' \
+            --eval '(asdf:initialize-source-registry
+                      (list :source-registry
+                            (list :tree (uiop:getcwd))
+                            (list :directory
+                                  (merge-pathnames "ci-deps-vivace-graph/cl-temporal-extent/"
+                                                   (user-homedir-pathname)))
+                            :ignore-inherited-configuration))' \
+            --eval '(ql:quickload :graph-db/geos-test :silent t)' \
+            --eval '(asdf:test-system :graph-db/geos-test)'
+      - name: algorithms suite
+        run: |
+          sbcl --dynamic-space-size 12288 --non-interactive \
+            --load "$HOME/quicklisp/setup.lisp" \
+            --eval '(setf ql:*local-project-directories* nil)' \
+            --eval '(asdf:initialize-source-registry
+                      (list :source-registry
+                            (list :tree (uiop:getcwd))
+                            (list :directory
+                                  (merge-pathnames "ci-deps-vivace-graph/cl-temporal-extent/"
+                                                   (user-homedir-pathname)))
+                            :ignore-inherited-configuration))' \
+            --eval '(ql:quickload :graph-db/algorithms-test :silent t)' \
+            --eval '(asdf:test-system :graph-db/algorithms-test)'
+      - name: gui suite
+        run: |
+          sbcl --dynamic-space-size 12288 --non-interactive \
+            --load "$HOME/quicklisp/setup.lisp" \
+            --eval '(setf ql:*local-project-directories* nil)' \
+            --eval '(asdf:initialize-source-registry
+                      (list :source-registry
+                            (list :tree (uiop:getcwd))
+                            (list :directory
+                                  (merge-pathnames "ci-deps-vivace-graph/cl-temporal-extent/"
+                                                   (user-homedir-pathname)))
+                            :ignore-inherited-configuration))' \
+            --eval '(ql:quickload :graph-db/gui-test :silent t)' \
+            --eval '(asdf:test-system :graph-db/gui-test)'
+
+  arm64-advisory:
+    # horus, when awake: an advisory lane whose value is exactly the
+    # class of bug #218 was (arm64-only %POSIX-OPEN).  Never gates.
+    runs-on: [self-hosted, macOS, ARM64]
+    continue-on-error: true
+    timeout-minutes: 90
+    if: github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@v4
+      - name: cl-temporal-extent at master head
+        # Same policy as the mine-action and cl-llm runners
+        # (2026-09-01): deps refresh per run, in this runner's own
+        # dir -- three runners share the ma-dev user, and one shared
+        # checkout would race.
+        run: |
+          mkdir -p ~/ci-deps-vivace-graph
+          d=~/ci-deps-vivace-graph/cl-temporal-extent
+          if [ -d $d/.git ]; then
+            git -C $d fetch -q origin
+            git -C $d checkout -qf origin/master
+          else
+            git clone -q -b master \
+              https://github.com/kraison/cl-temporal-extent $d
+          fi
+          echo "cl-temporal-extent @ $(git -C $d rev-parse --short HEAD)"
+      - name: full suite
+        run: |
+          sbcl --dynamic-space-size 12288 --non-interactive \
+            --load "$HOME/quicklisp/setup.lisp" \
+            --eval '(setf ql:*local-project-directories* nil)' \
+            --eval '(asdf:initialize-source-registry
+                      (list :source-registry
+                            (list :tree (uiop:getcwd))
+                            (list :directory
+                                  (merge-pathnames
+                                   "ci-deps-vivace-graph/cl-temporal-extent/"
+                                   (user-homedir-pathname)))
+                            :ignore-inherited-configuration))' \
+            --eval '(ql:quickload :graph-db/test :silent t)' \
+            --eval '(asdf:test-system :graph-db)'

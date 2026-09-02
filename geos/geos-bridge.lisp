@@ -327,7 +327,8 @@ unsupported type."
        (let* ((polys (geometry-coordinates g))
               (npolys (length polys)))
          (if (zerop npolys)
-             (%geos-create-collection handle 6 (cffi:null-pointer) 0) ; GEOS_MULTIPOLYGON = 6
+             (%geos-create-collection handle +geos-multipolygon+
+                                      (cffi:null-pointer) 0)
              (cffi:with-foreign-object (p-arr :pointer npolys)
                (let ((created-polys '()))
                  (unwind-protect
@@ -337,7 +338,9 @@ unsupported type."
                               for p-geom = (%polygon-body->geos-polygon ctx p)
                               do (push p-geom created-polys)
                                  (setf (cffi:mem-aref p-arr :pointer idx) p-geom))
-                        (let ((mpoly (%geos-create-collection handle 6 p-arr npolys)))
+                        (let ((mpoly (%geos-create-collection
+                                      handle +geos-multipolygon+ p-arr
+                                      npolys)))
                           (when (cffi:null-pointer-p mpoly)
                             (error 'geos-error :message "GEOSGeom_createCollection_r failed"))
                           (setf created-polys nil)

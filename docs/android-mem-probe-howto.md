@@ -1,6 +1,7 @@
 # mem-probe: on-device memory split (for the Android/ECL harness)
 
-**Purpose.** Answer the open question from `android-memory-analysis.md` §5 with numbers
+**Purpose.** Answer the open question from the memory-analysis record (§5; it lives
+in the downstream application's repository) with numbers
 *from the AOT aarch64 runtime*, before anyone designs a fix. Two questions in particular:
 
 1. **How much of the ~800 MB-at-open is the type index?** The engine eagerly materializes

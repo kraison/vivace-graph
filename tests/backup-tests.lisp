@@ -393,13 +393,15 @@ write-path hook repopulates the spatial index.  (GEO-PLACE / NODE-GEOMETRY come
 from spatial-hook-tests.)"
   (with-temp-directory (dir1)
     (with-temp-directory (dir2)
-      (let ((p1 (namestring dir1)) (p2 (namestring dir2)) kh-id lv-id)
-        ;; populate the source graph with a Kharkiv and a Lviv place, then snapshot
+      (let ((p1 (namestring dir1)) (p2 (namestring dir2)) near-id far-id)
+        ;; populate the source graph with a near and a far place, then snapshot
         (let ((g (make-graph *integration-graph-name* p1 :buffer-pool-size 1000)))
           (let ((*graph* g))
             (with-transaction ()
-              (setq kh-id (id (make-geo-place :loc (make-point 37.1724d0 49.2020d0)))
-                    lv-id (id (make-geo-place :loc (make-point 23.7183d0 50.0263d0)))))
+              (setq near-id (id (make-geo-place :loc (make-point 12.3424d0
+                                                       45.6720d0)))
+                    far-id (id (make-geo-place :loc (make-point 2.4683d0
+                                                      41.7763d0)))))
             (graph-db:snapshot g))
           (close-graph g :snapshot-p nil))
         ;; replay into a brand-new empty graph
@@ -411,13 +413,18 @@ from spatial-hook-tests.)"
                  (is (null (all-spatial-indexes g2))
                      "fresh graph has no spatial index yet")
                  (graph-db:replay g2 (merge-pathnames "txn-log/" dir1) :graph-db/test)
-                 ;; after replay the Kharkiv place is spatially indexed; Lviv is elsewhere
+                 ;; after replay the near place is spatially indexed; the far
+                 ;; one is elsewhere
                  (let ((cands (spatial-index-query-bbox (spatial-index-for g2 'geo-place nil)
-                                                        37.16d0 49.19d0 37.19d0 49.21d0)))
-                   (is (member kh-id cands :test 'equalp) "Kharkiv place re-indexed by replay")
-                   (is (not (member lv-id cands :test 'equalp)) "Lviv place outside the window"))
+                                                        12.33d0 45.66d0 12.36d0
+                                                            45.68d0)))
+                   (is (member near-id cands :test 'equalp)
+                     "near place re-indexed by replay")
+                   (is (not (member far-id cands :test 'equalp))
+                     "far place outside the window"))
                  ;; and through the high-level query
-                 (is (= 1 (length (find-nodes-near 'geo-place 49.2020d0 37.1724d0 500d0 :graph g2)))))
+                 (is (= 1 (length (find-nodes-near 'geo-place 45.6720d0
+                                    12.3424d0 500d0 :graph g2)))))
             (close-graph g2 :snapshot-p nil)
             (collect-garbage)))))))
 
@@ -543,11 +550,62 @@ snapshots must leave two files."
 
 (defun %bk-polygon ()
   "A one-ring :POLYGON whose ring is a (simple-array double-float (*))."
-  (make-polygon (list (list '(30.0d0 50.0d0) '(31.0d0 50.0d0)
-                            '(31.0d0 51.0d0) '(30.0d0 50.0d0)))))
+  (make-polygon (list (list '(10.0d0 40.0d0) '(11.0d0 40.0d0)
+                            '(11.0d0 41.0d0) '(10.0d0 40.0d0)))))
 
 (defstruct (bk-frozen (:constructor make-bk-frozen (label)))
   (label "" :read-only t))                ; a struct slot with NO setf writer
+
+(test backup-literalize-shares-unchanged-structure
+  "GH #119: data holding no specialized vector must come back EQ -- the
+literalize walk used to copy every cons of every node's alist purely so
+the rare specialized vector could be wrapped.  Structural sharing means
+the common case allocates nothing."
+  (let ((alist '((:name . "a") (:tags . ("x" "y")) (:n . 42)))
+        (vec (vector "p" '(1 2) :q)))
+    (is (eq alist (graph-db::backup-literalize alist)))
+    (is (eq vec (graph-db::backup-literalize vec)))))
+
+(test backup-literalize-still-wraps-nested-specialized-vectors
+  "The sharing shortcut must not skip the one job the walk exists for: a
+specialized vector nested in a cons or a general vector is wrapped, the
+spine above it is fresh, and the ORIGINAL structure is untouched."
+  (let* ((coords (make-array 4 :element-type 'double-float
+                               :initial-contents '(1d0 2d0 3d0 4d0)))
+         (alist (list (cons :ring coords) (cons :name "r")))
+         (out (graph-db::backup-literalize alist)))
+    (is (not (eq alist out)))
+    (is (typep (cdr (first out)) 'graph-db::backup-vector-literal))
+    (is (eq coords (cdr (first alist)))
+        "the original alist must be untouched")
+    (is (eq (second alist) (second out))
+        "the unchanged tail is shared, not copied")))
+
+(test snapshot-integrity-sweep-is-opt-in
+  "GH #119: SNAPSHOT's integrity sweep deserializes every node a second
+time, so it is opt-in -- the default snapshot must NOT run it, and
+:CHECK-DATA-INTEGRITY-P T must.  Stubbed at CHECK-DATA-INTEGRITY, the
+same fdefinition idiom CLOSE-GRAPH-REPORTS-DATA-INTEGRITY-ISSUES uses."
+  (with-temp-directory (dir)
+    (let ((g (make-graph *integration-graph-name* (namestring dir)
+                         :buffer-pool-size 1000))
+          (orig (fdefinition 'graph-db:check-data-integrity))
+          (calls 0))
+      (unwind-protect
+           (let ((*graph* g))
+             (with-transaction () (make-bk-vec :label "sweep"))
+             (setf (fdefinition 'graph-db:check-data-integrity)
+                   (lambda (graph &rest args)
+                     (declare (ignore graph args))
+                     (incf calls)
+                     nil))
+             (graph-db::snapshot g)
+             (is (= 0 calls) "the default snapshot must not sweep")
+             (graph-db::snapshot g :check-data-integrity-p t)
+             (is (= 1 calls) ":check-data-integrity-p t must sweep"))
+        (setf (fdefinition 'graph-db:check-data-integrity) orig)
+        (let ((*graph* g)) (close-graph g :snapshot-p nil))
+        (collect-garbage)))))
 
 (test backup-literalize-passes-unchanged-structs-through
   "A struct no slot of which needs literalizing must come back untouched.
@@ -594,9 +652,9 @@ wrote: ~A" text)
           ;; makes the bbox four NILs and every caller does arithmetic on NIL.
           (multiple-value-bind (min-lon min-lat max-lon max-lat)
               (geometry-bbox g)
-            (is (equal (list 30.0d0 50.0d0 31.0d0 51.0d0)
+            (is (equal (list 10.0d0 40.0d0 11.0d0 41.0d0)
                        (list min-lon min-lat max-lon max-lat))
-                "restored geometry bbox is ~S, expected (30 50 31 51)"
+                "restored geometry bbox is ~S, expected (10 40 11 41)"
                 (list min-lon min-lat max-lon max-lat))))))))
 
 (test snapshot-replay-preserves-geometry-slot-element-type
@@ -639,9 +697,161 @@ recovery route for graphs with no rebuild path, so this is the recovery gate."
                              (type-of ring))
                          (multiple-value-bind (min-lon min-lat max-lon max-lat)
                              (geometry-bbox geom)
-                           (is (equal (list 30.0d0 50.0d0 31.0d0 51.0d0)
+                           (is (equal (list 10.0d0 40.0d0 11.0d0 41.0d0)
                                       (list min-lon min-lat max-lon max-lat))
-                               "restored bbox is ~S, expected (30 50 31 51)"
+                               "restored bbox is ~S, expected (10 40 11 41)"
                                (list min-lon min-lat max-lon max-lat))))))))
             (close-graph g2 :snapshot-p nil)
             (collect-garbage)))))))
+
+;;; --- Verifiable snapshots (GH #127) --------------------------------------
+
+(defun %bk-latest-snap (dir)
+  (graph-db::find-newest-snapshot (format nil "~A/txn-log/" dir)))
+
+(defun %bk-truncate-file (file fraction)
+  "Cut FILE to FRACTION of its bytes -- what a heap-exhausted writer
+leaves, except that since GH #127 the real writer's partials never bear
+the snap- name; this simulates a bad copy or a pre-fix remnant."
+  (let (bytes)
+    (with-open-file (in file :element-type '(unsigned-byte 8))
+      (setq bytes (make-array (floor (* (file-length in) fraction))
+                              :element-type '(unsigned-byte 8)))
+      (read-sequence bytes in))
+    (with-open-file (out file :direction :output
+                              :element-type '(unsigned-byte 8)
+                              :if-exists :supersede)
+      (write-sequence bytes out))))
+
+(defmacro %bk-with-graph ((g dir) &body body)
+  "A fresh integration graph in DIR, closed on EVERY exit -- an errored
+test must not leak an open store into the image (store-id collision for
+every test after it)."
+  `(let ((,g (make-graph *integration-graph-name* (namestring ,dir)
+                         :buffer-pool-size 1000)))
+     (unwind-protect (progn ,@body)
+       (ignore-errors (close-graph ,g :snapshot-p nil))
+       (collect-garbage))))
+
+(defun %bk-refusals (thunk)
+  "(values THUNK-RESULT REFUSAL-REASONS), warnings muffled."
+  (let ((reasons '()))
+    (handler-bind ((snapshot-refused-warning
+                     (lambda (w)
+                       (push (graph-db::snapshot-refused-reason w) reasons)
+                       (muffle-warning w))))
+      (values (funcall thunk) reasons))))
+
+(test a-truncated-snapshot-is-refused-and-the-previous-one-wins
+  "GH #127, the #146 chain-breaker.  FIND-NEWEST-SNAPSHOT picked by
+FILE-WRITE-DATE alone, so a truncated file won PRECISELY because it was
+newest, and REPLAY reported a clean restore of half a graph.  Now a
+modern file with the header but no completion trailer is refused with a
+warning and the next newest complete one is chosen."
+  (with-temp-directory (dir)
+    (%bk-with-graph (g dir)
+      (let ((*graph* g))
+        (with-transaction () (make-g-person :name "First"))
+        (graph-db:snapshot g)
+        (sleep 1)                       ; distinct FILE-WRITE-DATEs
+        (with-transaction () (make-g-person :name "Second"))
+        (graph-db:snapshot g))
+      (multiple-value-bind (newest) (%bk-latest-snap (namestring dir))
+        (is-true newest)
+        (%bk-truncate-file newest 0.5)
+        (multiple-value-bind (chosen reasons)
+            (%bk-refusals (lambda () (%bk-latest-snap (namestring dir))))
+          (is (member :truncated reasons)
+              "the refusal is loud, not a silent skip")
+          (is-true chosen "the previous complete snapshot is chosen")
+          (when chosen
+            (is (not (equal (namestring chosen) (namestring newest)))
+                "and it is not the truncated one")))))))
+
+(test a-legacy-snapshot-without-a-header-restores-with-a-warning
+  "GH #127.  Every snapshot in the field predates the header; refusing
+them all would break every existing store's replay.  Unverifiable is
+accepted -- loudly."
+  (with-temp-directory (dir)
+    (%bk-with-graph (g dir)
+      (let ((*graph* g))
+        (with-transaction () (make-g-person :name "Elder"))
+        (graph-db:snapshot g))
+      (multiple-value-bind (file) (%bk-latest-snap (namestring dir))
+        ;; Strip the markers: exactly what a pre-#127 writer produced.
+        (let ((lines (uiop:read-file-lines file)))
+          (with-open-file (out file :direction :output
+                                    :if-exists :supersede)
+            (dolist (line lines)
+              (unless (or (uiop:string-prefix-p "(:SNAPSHOT-HEADER" line)
+                          (uiop:string-prefix-p "(:SNAPSHOT-COMPLETE"
+                                                line))
+                (write-line line out)))))
+        (multiple-value-bind (chosen reasons)
+            (%bk-refusals (lambda () (%bk-latest-snap (namestring dir))))
+          (is (equal '(:legacy) reasons))
+          (is (equal (namestring file) (namestring chosen))))))))
+
+(test an-interrupted-snapshot-never-bears-the-snap-name
+  "GH #127.  The writer works under in-progress.* -- a name the ^snap-
+scan can never match -- and renames only after the completion trailer is
+written, so however the writer dies, no snap- file appears and the
+partial is deleted on the way out."
+  (with-temp-directory (dir)
+    (%bk-with-graph (g dir)
+      (let ((orig (fdefinition 'graph-db::backup)))
+        (let ((*graph* g))
+          (with-transaction () (make-g-person :name "Doomed")))
+        (unwind-protect
+             (progn
+               (setf (fdefinition 'graph-db::backup)
+                     (lambda (&rest args)
+                       (declare (ignore args))
+                       (error "mid-snapshot failure (fixture)")))
+               (let ((*graph* g))
+                 (signals error
+                   (graph-db:snapshot g :check-data-integrity-p nil))))
+          (setf (fdefinition 'graph-db::backup) orig)))
+      (let ((leftovers (append
+                        ;; nothing bearing the snap- name in txn-log/
+                        (remove-if-not
+                         (lambda (f)
+                           (cl-ppcre:scan "^snap-" (file-namestring f)))
+                         (cl-fad:list-directory
+                          (format nil "~A/txn-log/" (namestring dir))))
+                        ;; and no stranded partial in in-progress/
+                        (directory
+                         (format nil "~A/txn-log/in-progress/*"
+                                 (namestring dir))))))
+        (is (null leftovers)
+            "no snap- file and no stranded partial: ~S" leftovers)))))
+
+(test a-verified-snapshot-round-trips
+  "The markers are content-free to the reader: a modern snapshot replays
+exactly as before, and the file self-identifies as :COMPLETE."
+  (with-temp-directory (dir)
+    (with-temp-directory (dir2)
+      (%bk-with-graph (g dir)
+        (let ((*graph* g))
+          (with-transaction () (make-g-person :name "Round" :age 42))
+          (graph-db:snapshot g))
+        (multiple-value-bind (file) (%bk-latest-snap (namestring dir))
+          (is (eq :complete (graph-db::%snapshot-completeness file)))))
+      ;; Same NAME, fresh directory: the schema's types are registered
+      ;; under the graph NAME, so a differently named target would refuse
+      ;; every vertex as an unknown type (as the older round-trip tests).
+      (let ((g2 (make-graph *integration-graph-name* (namestring dir2)
+                            :buffer-pool-size 1000)))
+        (unwind-protect
+             (progn
+               (let ((*graph* g2))
+                 (graph-db:replay g2 (format nil "~A/txn-log/" (namestring dir))
+                         :graph-db/test))
+               (let ((people (map-vertices 'identity g2
+                                           :vertex-type 'g-person
+                                           :collect-p t)))
+                 (is (= 1 (length people)))
+                 (is (string= "Round" (name (first people))))))
+          (ignore-errors (close-graph g2 :snapshot-p nil))
+          (collect-garbage))))))
+

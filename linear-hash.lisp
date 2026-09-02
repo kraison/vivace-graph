@@ -317,7 +317,12 @@
     lhash))
 
 (defun open-lhash (location)
+  "Open the lhash persisted under LOCATION.  The struct restored from
+STRUCT.DAT records the location it was CREATED at; it is reset to LOCATION
+here, because a path inside a persisted structure says where it was made,
+not where it now lives -- and DELETE-LHASH trusts it for a write (GH #143)."
   (let ((lhash (cl-store:restore (merge-pathnames "struct.dat" location))))
+    (setf (%lhash-location lhash) location)
     (handler-case
         (progn
           (setf (%lhash-config lhash)
@@ -376,6 +381,8 @@
   (setf lhash nil))
 
 (defun delete-lhash (lhash)
+  "Close LHASH and delete its four files under the location it was OPENED
+from -- never the one recorded at creation (GH #143)."
   (close-lhash lhash)
   (delete-file (merge-pathnames "table.dat" (%lhash-location lhash)))
   (delete-file (merge-pathnames "overflow.dat" (%lhash-location lhash)))

@@ -36,7 +36,14 @@
    ;; Max cells cap for this geometry slot's spatial index, or NIL for the graph
    ;; default.  Declared via the :SPATIAL-MAX-CELLS slot option.
    (spatial-max-cells :accessor spatial-max-cells-spec :initarg :spatial-max-cells
-                      :initform nil :allocation :instance)))
+                      :initform nil :allocation :instance)
+   ;; Function-backed value constraint (GH #172, R5): the NAME of a
+   ;; function in the schema-function registry (runtime-schema.lisp),
+   ;; resolved and applied at commit by %VALUE-CONSTRAINT-VIOLATIONS.
+   ;; A name, never a closure -- behaviour ships in the image, structure
+   ;; in the data.
+   (check :accessor check-function-name :initarg :check :initform nil
+          :allocation :instance)))
 
 (defmethod persistent-p (slot-def)
   nil)
@@ -57,6 +64,9 @@
   nil)
 
 (defmethod spatial-max-cells-spec (slot-def)
+  nil)
+
+(defmethod check-function-name (slot-def)
   nil)
 
 (defmethod ephemeral-p (slot-def)
@@ -97,18 +107,23 @@
   (persistent-names nil :type list)
   (ephemeral-names nil :type list)
   (meta-names nil :type list)
-  (data-names nil :type list))
+  (data-names nil :type list)
+  ;; (SLOT-NAME . CHECK-FUNCTION-NAME) for every :CHECK slot (GH #172).
+  (check-slots nil :type list))
 
 (defun %compute-node-slot-info (class)
   "Build CLASS's NODE-SLOT-INFO.  Each list is filtered independently, exactly
 as the separate walks it replaces did, so a slot carrying more than one flag
 still appears in each list it qualifies for."
   (let ((keywords (make-hash-table :test 'eq))
-        (persistent '()) (ephemeral '()) (meta '()) (data '()))
+        (persistent '()) (ephemeral '()) (meta '()) (data '())
+        (checks '()))
     (dolist (slot (class-slots class))
       (let ((name (slot-definition-name slot))
             (persistentp (persistent-p slot))
-            (ephemeralp (ephemeral-p slot)))
+            (ephemeralp (ephemeral-p slot))
+            (check (check-function-name slot)))
+        (when check (push (cons name check) checks))
         (when persistentp
           (push name persistent)
           (setf (gethash name keywords) (intern (symbol-name name) :keyword)))
@@ -119,7 +134,8 @@ still appears in each list it qualifies for."
                          :persistent-names (nreverse persistent)
                          :ephemeral-names (nreverse ephemeral)
                          :meta-names (nreverse meta)
-                         :data-names (nreverse data))))
+                         :data-names (nreverse data)
+                         :check-slots (nreverse checks))))
 
 (defun %node-slot-info (class)
   "CLASS's cached slot categorization, computing it on first use.
@@ -258,7 +274,22 @@ test in tests/node-class-tests.lisp."
         (setf (slot-value slot 'spatial-max-cells)
               (or (spatial-max-cells-spec slot)
                   (and smc (spatial-max-cells-spec smc))))))
+    ;; Inherit :CHECK from the declaring direct slot, so a constraint on
+    ;; a parent slot is enforced across its subclasses (GH #172, R5).
+    (let ((ck (find-if #'check-function-name direct-slots)))
+      (when (or (check-function-name slot) ck)
+        (setf (slot-value slot 'check)
+              (or (check-function-name slot)
+                  (and ck (check-function-name ck))))
+        ;; One image-wide flag so VALIDATE-VALUE-CONSTRAINTS' fast path
+        ;; stays free for schemas that use no :CHECK at all (GH #172).
+        (setf *schema-check-slots-present-p* t)))
     slot))
+
+(defun node-check-slots (class)
+  "CLASS's (SLOT-NAME . CHECK-FUNCTION-NAME) pairs, cached with the rest
+of its slot categorization.  Read-only (GH #172, R5)."
+  (%nsi-check-slots (%node-slot-info class)))
 
 (defun %indexed-slot-owner-name (class slot-name)
   "The most-general node-class in CLASS's precedence list that declares SLOT-NAME as
@@ -306,7 +337,10 @@ always performed, here factored out so MAP-EDGES can share it.
 
 Designators that resolve to no registered type of KIND are skipped (so the 0
 sentinel and cross-graph subclasses simply drop out).  Order of first appearance
-is preserved."
+is preserved.
+
+An AMBIGUOUS bare (keyword) designator is not skipped: it signals
+AMBIGUOUS-NODE-TYPE-NAME (GH #190)."
   (let ((seen (make-hash-table))
         (ids nil))
     (labels ((add-id (id)
@@ -364,7 +398,7 @@ is preserved."
   ((id :accessor id :initform +null-key+ :initarg :id :meta t
        :type (simple-array (unsigned-byte 8) (16)) :persistent nil)
    (type-id :accessor type-id :initform 1 :initarg :type-id :meta t
-            :type (unsigned-byte 16) :persistent nil)
+            :type (unsigned-byte 32) :persistent nil)
    (revision :accessor revision :initform 0 :initarg :revision :meta t
              :type (unsigned-byte 32) :persistent nil)
    (%revision-table :accessor %revision-table :initform (make-hash-table :test 'eq)
@@ -394,7 +428,17 @@ is preserved."
    (deleted-p :accessor deleted-p :initform nil :initarg :deleted-p :type boolean
               :meta t :persistent nil)
    (data :accessor data :initarg :data :initform nil :meta t :persistent nil)
+   ;; True once DATA has been reconciled against the heap bytes.  DATA alone
+   ;; cannot say so: CHANGE-NODE-CLASS applies a persistent slot's :INITFORM
+   ;; through (SETF SLOT-VALUE-USING-CLASS), which writes the alist, so a
+   ;; defaulted node arrives with DATA already non-NIL (GH #128).
+   (heap-merged-p :accessor heap-merged-p :initform nil :initarg :heap-merged-p
+                  :type boolean :meta t :persistent nil)
    (bytes :accessor bytes :initform :init :initarg :bytes :meta t :persistent nil)
+   ;; True when DATA has changed since BYTES was derived from it; the BYTES
+   ;; reader re-serializes lazily, so no writer re-derives it by hand (GH #136).
+   (bytes-stale-p :accessor bytes-stale-p :initform nil :initarg :bytes-stale-p
+                  :type boolean :meta t :persistent nil)
    ;; Home graph; NIL = unknown -> caller falls back to *GRAPH* (GH #53)
    (graph :accessor node-graph :initform nil :initarg :graph
           :meta t :persistent nil))

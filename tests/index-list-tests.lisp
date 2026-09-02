@@ -98,3 +98,19 @@
       (let ((live (index-list-keys il)))
         (is (= 4 (length live)))
         (is-false (member (third keys) live :test #'equalp))))))
+
+(test remove-advances-past-deleted-cells
+  "Removal must ADVANCE over a lazily-deleted cell, not spin on it:
+remove the head key, then remove a key that lies BEYOND the deleted
+cell.  Pre-fix, REMOVE-FROM-INDEX-LIST never advanced past a deleted
+pcons and looped forever -- first exposed by COMPACT-EDGES' second
+removal pass (GH #242, found on #208)."
+  (with-temp-memory (heap)
+    (let* ((keys (loop repeat 3 collect (gen-id)))
+           (il (apply #'make-index-list heap (mapcar #'copy-seq keys))))
+      ;; head-to-tail walk order == KEYS order
+      (remove-from-index-list (first keys) il)  ; deleted cell at head
+      (remove-from-index-list (third keys) il)  ; must walk past it
+      (let ((live (index-list-keys il)))
+        (is (= 1 (length live)))
+        (is (equalp (second keys) (first live)))))))

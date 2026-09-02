@@ -26,8 +26,8 @@
 
 (in-suite spatial-hook-suite)
 
-(defparameter *kharkiv-box* '(37.16d0 49.19d0 37.19d0 49.21d0))
-(defparameter *lviv-box*    '(23.70d0 50.00d0 23.75d0 50.05d0))
+(defparameter *near-box* '(12.33d0 45.66d0 12.36d0 45.68d0))
+(defparameter *far-box*    '(2.45d0 41.75d0 2.50d0 41.80d0))
 
 (defun in-box-p (g id box)
   (member id (loop for idx in (all-spatial-indexes g)
@@ -39,34 +39,34 @@
   (with-test-graph (g)
     (let (id)
       (with-transaction ()
-        (setq id (id (make-geo-place :loc (make-point 37.1724d0 49.2020d0)))))
-      (is (in-box-p g id *kharkiv-box*))
-      (is (not (in-box-p g id *lviv-box*))))))
+        (setq id (id (make-geo-place :loc (make-point 12.3424d0 45.6720d0)))))
+      (is (in-box-p g id *near-box*))
+      (is (not (in-box-p g id *far-box*))))))
 
 (test update-reindexes-node
   "Updating the geometry moves the node in the index (old cell out, new cell in)."
   (with-test-graph (g)
     (let (id)
       (with-transaction ()
-        (setq id (id (make-geo-place :loc (make-point 37.1724d0 49.2020d0)))))
-      (is (in-box-p g id *kharkiv-box*))
+        (setq id (id (make-geo-place :loc (make-point 12.3424d0 45.6720d0)))))
+      (is (in-box-p g id *near-box*))
       (with-transaction ()
         (let ((v (copy (lookup-vertex id))))
-          (setf (slot-value v 'loc) (make-point 23.7183d0 50.0263d0))
+          (setf (slot-value v 'loc) (make-point 2.4683d0 41.7763d0))
           (save v)))
-      (is (not (in-box-p g id *kharkiv-box*)) "old location de-indexed")
-      (is (in-box-p g id *lviv-box*) "new location indexed"))))
+      (is (not (in-box-p g id *near-box*)) "old location de-indexed")
+      (is (in-box-p g id *far-box*) "new location indexed"))))
 
 (test delete-removes-from-index
   "Deleting a node removes it from the spatial index."
   (with-test-graph (g)
     (let (id)
       (with-transaction ()
-        (setq id (id (make-geo-place :loc (make-point 37.1724d0 49.2020d0)))))
-      (is (in-box-p g id *kharkiv-box*))
+        (setq id (id (make-geo-place :loc (make-point 12.3424d0 45.6720d0)))))
+      (is (in-box-p g id *near-box*))
       (with-transaction ()
         (mark-deleted (lookup-vertex id)))
-      (is (not (in-box-p g id *kharkiv-box*))))))
+      (is (not (in-box-p g id *near-box*))))))
 
 (test nodes-without-geometry-are-ignored
   "A node whose NODE-GEOMETRY is NIL (the default) is not indexed, and commits
@@ -77,7 +77,7 @@ fine."
         (setq id (id (make-g-person :name "No geometry" :age 1))))
       (is (lookup-vertex id))
       ;; querying a wide box returns no g-person (only geo-place nodes index)
-      (is (not (in-box-p g id *kharkiv-box*))))))
+      (is (not (in-box-p g id *near-box*))))))
 
 (test index-survives-reopen-with-real-nodes
   "Nodes indexed via the write-path hook are still queryable after reopen."
@@ -86,12 +86,13 @@ fine."
       (let ((g (make-graph *integration-graph-name* path :buffer-pool-size 1000)))
         (let ((*graph* g))
           (with-transaction ()
-            (setq id (id (make-geo-place :loc (make-point 37.1724d0 49.2020d0)))))
+            (setq id (id (make-geo-place :loc (make-point 12.3424d0
+                                                45.6720d0)))))
           (close-graph g :snapshot-p nil)))
       (let ((g2 (open-graph *integration-graph-name* path)))
         (unwind-protect
              (let ((*graph* g2))
-               (is (in-box-p g2 id *kharkiv-box*)))
+               (is (in-box-p g2 id *near-box*)))
           (close-graph g2 :snapshot-p nil)
           (collect-garbage))))))
 
@@ -101,14 +102,14 @@ hand-written node-geometry method -- node-geometry's default finds the slot."
   (with-test-graph (g)
     (let (id)
       (with-transaction ()
-        (setq id (id (make-geo-auto :loc (make-point 37.1724d0 49.2020d0)))))
+        (setq id (id (make-geo-auto :loc (make-point 12.3424d0 45.6720d0)))))
       ;; auto-indexed on create
-      (is (in-box-p g id *kharkiv-box*))
-      (is (not (in-box-p g id *lviv-box*)))
+      (is (in-box-p g id *near-box*))
+      (is (not (in-box-p g id *far-box*)))
       ;; and reindexed on update through the same default
       (with-transaction ()
         (let ((v (copy (lookup-vertex id))))
-          (setf (slot-value v 'loc) (make-point 23.7183d0 50.0263d0))
+          (setf (slot-value v 'loc) (make-point 2.4683d0 41.7763d0))
           (save v)))
-      (is (not (in-box-p g id *kharkiv-box*)))
-      (is (in-box-p g id *lviv-box*)))))
+      (is (not (in-box-p g id *near-box*)))
+      (is (in-box-p g id *far-box*)))))

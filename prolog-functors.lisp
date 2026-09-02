@@ -609,11 +609,23 @@ order of terms with duplicates removed."
                 (push result *select-list*))))))
     (funcall cont)))
 
+;; GH #309: an unbound or non-vertex source arg must be the client's
+;; error (QUERY-PRECONDITION-ERROR -> a GUI 400), not a
+;; no-applicable-method deep inside MAP-EDGES -- ECL reports those as
+;; bare SIMPLE-ERRORs no classifier can tell from a defect.
+;; OUTGOING-EDGES/4 already guarded with VERTEX-P; these joined at #309.
+(defun %require-vertex-arg (functor v)
+  (unless (vertex-p v)
+    (error 'query-precondition-error
+           :reason (format nil "~A needs its vertex argument bound to ~
+a vertex" functor))))
+
 (def-global-prolog-functor outgoing-edges/2 (vertex var cont)
   (setq vertex (var-deref vertex)
         var (var-deref var))
   (when *prolog-trace*
     (format t "TRACE: outgoing-edges/2(~S ~S)~%" vertex var))
+  (%require-vertex-arg 'outgoing-edges vertex)
   (map-edges (lambda (edge)
               (let ((old-trail (fill-pointer *trail*)))
                 (when (unify var edge)
@@ -627,6 +639,7 @@ order of terms with duplicates removed."
         var (var-deref var))
   (when *prolog-trace*
     (format t "TRACE: outgoing-edges/3(~S ~S ~S)~%" vertex edge-type var))
+  (%require-vertex-arg 'outgoing-edges vertex)
   (map-edges (lambda (edge)
               (let ((old-trail (fill-pointer *trail*)))
                 (when (unify var edge)
@@ -639,6 +652,7 @@ order of terms with duplicates removed."
         var (var-deref var))
   (when *prolog-trace*
     (format t "TRACE: incoming-edges/2(~S ~S)~%" vertex var))
+  (%require-vertex-arg 'incoming-edges vertex)
   (map-edges (lambda (edge)
               (let ((old-trail (fill-pointer *trail*)))
                 (when (unify var edge)
@@ -652,6 +666,7 @@ order of terms with duplicates removed."
         var (var-deref var))
   (when *prolog-trace*
     (format t "TRACE: incoming-edges/3(~S ~S ~S)~%" vertex edge-type var))
+  (%require-vertex-arg 'incoming-edges vertex)
   (map-edges (lambda (edge)
                (let ((old-trail (fill-pointer *trail*)))
                  (when (unify var edge)
@@ -668,7 +683,8 @@ order of terms with duplicates removed."
   (when *prolog-trace*
     (format t "TRACE: incoming-edges/4(~S ~S ~S ~S)~%"
             vertex edge-type edge-var vertex-var))
-    (map-edges (lambda (edge)
+  (%require-vertex-arg 'incoming-edges vertex)
+  (map-edges (lambda (edge)
                  (let ((old-trail (fill-pointer *trail*)))
                    (when (unify edge-var edge)
                      (let ((v2 (lookup-vertex (from edge))))
@@ -930,9 +946,9 @@ order of terms with duplicates removed."
 ;;; values -- they carry no domain knowledge and need no spatial index.  Compose
 ;;; them with slot accessors to filter graph nodes by location, e.g.:
 ;;;   (select-flat (?n)
-;;;     (is-a ?n eo-find)
+;;;     (is-a ?n sensor)
 ;;;     (node-slot-value ?n lon ?lon) (node-slot-value ?n lat ?lat)
-;;;     (geo-near ?lat ?lon 49.2 37.17 500.0))
+;;;     (geo-near ?lat ?lon 45.67 12.34 500.0))
 ;;; Index-backed, node-yielding spatial functors come once the write-path hook
 ;;; populates the spatial index (deferred with the MVCC apply-path work).
 ;;; ---------------------------------------------------------------------------
@@ -943,7 +959,13 @@ order of terms with duplicates removed."
   (let ((lat1 (var-deref ?lat1)) (lon1 (var-deref ?lon1))
         (lat2 (var-deref ?lat2)) (lon2 (var-deref ?lon2)))
     (when (and (numberp lat1) (numberp lon1) (numberp lat2) (numberp lon2))
-      (when (unify ?dist (geodesic-distance lat1 lon1 lat2 lon2))
+      ;; Clamp to the globe before the trigonometry: a bignum or ratio
+      ;; coordinate overflows on coercion, and NUMBERP admits both
+      ;; (GH #279).  Same clamp the index path applies.
+      (when (unify ?dist (geodesic-distance (clamp-latitude lat1)
+                                            (clamp-longitude lon1)
+                                            (clamp-latitude lat2)
+                                            (clamp-longitude lon2)))
         (funcall cont)))))
 
 (def-global-prolog-functor geo-near/5 (?lat1 ?lon1 ?lat2 ?lon2 ?radius cont)
@@ -953,7 +975,13 @@ another.  All five arguments must be bound numbers."
         (lat2 (var-deref ?lat2)) (lon2 (var-deref ?lon2)) (radius (var-deref ?radius)))
     (when (and (numberp lat1) (numberp lon1) (numberp lat2) (numberp lon2)
                (numberp radius))
-      (when (<= (geodesic-distance lat1 lon1 lat2 lon2) radius)
+      ;; See GEO-DISTANCE/5.  RADIUS stays exact: it is only compared
+      ;; against, never coerced, so a bignum is harmless there.
+      (when (<= (geodesic-distance (clamp-latitude lat1)
+                                   (clamp-longitude lon1)
+                                   (clamp-latitude lat2)
+                                   (clamp-longitude lon2))
+                radius)
         (funcall cont)))))
 
 (def-global-prolog-functor geo-within/3 (?lon ?lat ?area cont)
@@ -961,5 +989,124 @@ another.  All five arguments must be bound numbers."
 geometry ?AREA.  ?LON/?LAT must be bound numbers and ?AREA a bound geometry."
   (let ((lon (var-deref ?lon)) (lat (var-deref ?lat)) (area (var-deref ?area)))
     (when (and (numberp lon) (numberp lat) (geometryp area))
-      (when (geometry-contains-point-p area lon lat)
+      ;; See GEO-DISTANCE/5: clamp to the globe before any coercion.
+      (when (geometry-contains-point-p area (clamp-longitude lon)
+                                       (clamp-latitude lat))
         (funcall cont)))))
+
+;;; Generated edge functors (GH #172, R1).  DEF-NODE-TYPE used to inline
+;;; two DEF-GLOBAL-PROLOG-FUNCTOR forms per edge type; they live here as
+;;; closure builders so the runtime schema path installs the identical
+;;; behaviour.  They belong in this file, not schema.lisp: VAR-DEREF is a
+;;; macro defined in prologc.lisp, which schema.lisp precedes.
+
+(defun %edge-functor/2 (name)
+  "The <NAME>/2 functor for edge type NAME: solve (from to) over NAME
+edges, whichever of FROM/TO is bound (GH #172)."
+  (let ((label (format nil "~A/2" (symbol-name name))))
+    (lambda (from to cont)
+      (setq from (var-deref from)
+            to (var-deref to))
+      (when *prolog-trace*
+        (format t "TRACE: ~A(~S ~S)~%" label from to))
+      (flet ((both (edge)
+               (let ((old-trail (fill-pointer *trail*)))
+                 (let ((v1 (lookup-vertex (from edge))))
+                   (when (unify from v1)
+                     (let ((v2 (lookup-vertex (to edge))))
+                       (when (unify to v2)
+                         (funcall cont)))))
+                 (undo-bindings old-trail)))
+             (bind-to (edge)
+               (let ((old-trail (fill-pointer *trail*)))
+                 (let ((v2 (lookup-vertex (to edge))))
+                   (when (unify to v2)
+                     (funcall cont)))
+                 (undo-bindings old-trail)))
+             (bind-from (edge)
+               (let ((old-trail (fill-pointer *trail*)))
+                 (let ((v2 (lookup-vertex (from edge))))
+                   (when (unify from v2)
+                     (funcall cont)))
+                 (undo-bindings old-trail))))
+        (cond ((and (not (var-p from)) (not (var-p to)))
+               (map-edges #'both *graph* :from-vertex from
+                          :to-vertex to :edge-type name))
+              ((not (var-p from))
+               (map-edges #'bind-to *graph* :vertex from
+                          :direction :out :edge-type name))
+              ((not (var-p to))
+               (map-edges #'bind-from *graph* :vertex to
+                          :direction :in :edge-type name))
+              (t
+               (map-edges #'both *graph* :edge-type name)))))))
+
+(defun %edge-functor/3 (name)
+  "The <NAME>/3 functor for edge type NAME: as <NAME>/2, also unifying
+the edge weight (GH #172)."
+  (let ((label (format nil "~A/3" (symbol-name name))))
+    (lambda (from to weight cont)
+      (setq from (var-deref from)
+            to (var-deref to)
+            weight (var-deref weight))
+      (when *prolog-trace*
+        (format t "TRACE: ~A(~S ~S ~S)~%" label from to weight))
+      (flet ((both (edge)
+               (let ((old-trail (fill-pointer *trail*)))
+                 (let ((v1 (lookup-vertex (from edge))))
+                   (when (unify from v1)
+                     (let ((v2 (lookup-vertex (to edge))))
+                       (when (unify to v2)
+                         (when (unify weight (weight edge))
+                           (funcall cont))))))
+                 (undo-bindings old-trail)))
+             (bind-to (edge)
+               (let ((old-trail (fill-pointer *trail*)))
+                 (let ((v2 (lookup-vertex (to edge))))
+                   (when (unify to v2)
+                     (when (unify weight (weight edge))
+                       (funcall cont))))
+                 (undo-bindings old-trail)))
+             (bind-from (edge)
+               (let ((old-trail (fill-pointer *trail*)))
+                 (let ((v2 (lookup-vertex (from edge))))
+                   (when (unify from v2)
+                     (when (unify weight (weight edge))
+                       (funcall cont))))
+                 (undo-bindings old-trail))))
+        (cond ((and (not (var-p from)) (not (var-p to)))
+               (map-edges #'both *graph* :from-vertex from
+                          :to-vertex to :edge-type name))
+              ((not (var-p from))
+               (map-edges #'bind-to *graph* :vertex from
+                          :direction :out :edge-type name))
+              ((not (var-p to))
+               (map-edges #'bind-from *graph* :vertex to
+                          :direction :in :edge-type name))
+              (t
+               (map-edges #'both *graph* :edge-type name)))))))
+
+(defun %install-edge-functors (name)
+  "Install <NAME>/2 and <NAME>/3 for edge type NAME exactly as
+DEF-GLOBAL-PROLOG-FUNCTOR would: FDEFINITION (the compiler's fallback),
+export, and *PROLOG-GLOBAL-FUNCTORS* (what COMPILE-CALL reads).  The
+symbols are interned in NAME's own package.  Skipped, with a warning
+naming NAME, when that package is COMMON-LISP or KEYWORD -- neither
+tolerates new symbols (GH #172)."
+  (let ((pkg (%schema-symbol-package name)))
+    (if (member pkg (list (find-package :common-lisp)
+                          (find-package :keyword)))
+        (warn "Skipping edge functor install for ~S: its package ~A ~
+is locked (GH #172)." name (package-name pkg))
+        (flet ((install (suffix fn)
+                 (let ((sym (intern (concatenate 'string
+                                                 (symbol-name name)
+                                                 suffix)
+                                    pkg)))
+                   (setf (fdefinition sym) fn)
+                   (export sym pkg)
+                   (setf (gethash sym *prolog-global-functors*) fn)
+                   sym)))
+          (install "/2" (%edge-functor/2 name))
+          (install "/3" (%edge-functor/3 name))))
+    name))

@@ -36,6 +36,8 @@
                 #:index-range
                 #:map-index
                 #:yield
+                ;; vector segments
+                #:vector-search
                 ;; prolog
                 #:select-flat
                 #:is-a/2
@@ -46,4 +48,13 @@
   (:export #:run-perf
            #:compare-perf
            #:perf-suite              ; alias entry point used by the headless driver
-           #:*perf-scale*))
+           #:*perf-scale*
+           ;; regression gating (GH #253)
+           #:*perf-suite-generation*
+           #:*perf-tolerance*
+           #:*perf-tolerance-overrides*
+           #:*perf-primary-metric-overrides*
+           #:write-perf-report
+           #:bless-perf-baseline
+           #:check-perf
+           #:perf-regression-error))

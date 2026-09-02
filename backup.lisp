@@ -95,7 +95,9 @@ cl-store-ecl.lisp relies on, and is verified on SBCL and ECL."
           copy))))
 
 (defun backup-literalize (object)
-  "Recursively copy OBJECT, wrapping every specialized vector for printing.
+  "OBJECT with every specialized vector wrapped for printing; OBJECT
+ITSELF (EQ) when nothing inside needed wrapping -- the common case, and
+it allocates nothing (GH #119).
 
 A vector whose ARRAY-ELEMENT-TYPE is not T loses that type through the standard
 #(...) printer, so it is wrapped in a BACKUP-VECTOR-LITERAL.  Strings are left
@@ -107,14 +109,27 @@ The struct branch reads back through the standard #S(...) reader, so the struct
 type must be defined -- and its name readable -- in the restoring image; see
 RECREATE-GRAPH's :PACKAGE-NAME."
   (typecase object
-    (cons (cons (backup-literalize (car object))
-                (backup-literalize (cdr object))))
+    ;; Share where nothing changed (GH #119): most node data holds no
+    ;; specialized vector, and copying every cons of every alist made
+    ;; the printer walk a per-node allocation for nothing.  EQ results
+    ;; propagate bottom-up, so the common case allocates zero.
+    (cons (let ((head (backup-literalize (car object)))
+                (tail (backup-literalize (cdr object))))
+            (if (and (eq head (car object)) (eq tail (cdr object)))
+                object
+                (cons head tail))))
     (string object)
     (vector
      (if (eq (array-element-type object) t)
-         (let ((copy (make-array (length object))))
-           (dotimes (i (length object) copy)
-             (setf (aref copy i) (backup-literalize (aref object i)))))
+         (let ((copy nil))
+           (dotimes (i (length object))
+             (let ((new (backup-literalize (aref object i))))
+               (unless (eq new (aref object i))
+                 (unless copy
+                   (setf copy (make-array (length object)))
+                   (replace copy object))
+                 (setf (aref copy i) new))))
+           (or copy object))
          (make-backup-vector-literal object)))
     (structure-object (%backup-literalize-struct object))
     (t object)))
@@ -155,6 +170,42 @@ RECREATE-GRAPH's :PACKAGE-NAME."
                :deleted-p (deleted-p e))))
     (write-backup-plist plist stream)))
 
+(define-condition dangling-edge-warning (warning)
+  ((edge-id :initarg :edge-id :reader dangling-edge-id)
+   (endpoint-id :initarg :endpoint-id :reader dangling-edge-endpoint-id)
+   (store-id :initarg :store-id :reader dangling-edge-store-id))
+  (:report
+   (lambda (c s)
+     (format s "Backup includes edge ~A whose endpoint ~A is absent ~
+here; its tag resolves to store ~A in THIS system's registry -- a ~
+foreign-minted id may name that store unsoundly (GH #209).  The edge ~
+is written, connectivity is preserved, and restoring it before the ~
+endpoint's store is attached leaves it dangling (GH #169, spec sec.7)."
+             (dangling-edge-id c) (dangling-edge-endpoint-id c)
+             (dangling-edge-store-id c)))))
+
+(defun %warn-if-dangling-endpoint (edge endpoint-id graph)
+  "Signal DANGLING-EDGE-WARNING for ENDPOINT-ID when it is absent from
+GRAPH's own table and either detached (registered, not open) or
+resolved to a DIFFERENT open graph -- both cases leave it absent from
+this backup file (GH #169, spec sec.7).  EDGE is still written either
+way; this only reports the gap.  The named store is per THIS system's
+registry -- a foreign-tagged id resolves unsoundly, so the report
+hedges rather than asserts it (GH #209)."
+  (unless (lookup-vertex endpoint-id :graph graph)
+    (multiple-value-bind (endpoint-graph status store-id)
+        (resolve-node-graph endpoint-id)
+      (when (or (eq status :detached)
+                (and (eq status :resolved) (not (eq endpoint-graph graph))))
+        (warn 'dangling-edge-warning
+              :edge-id (id edge) :endpoint-id endpoint-id
+              :store-id store-id)))))
+
+(defparameter +snapshot-header-line+ "(:SNAPSHOT-HEADER :FORMAT 1)"
+  "First line of every snapshot written since GH #127.  Its PRESENCE is
+what lets FIND-NEWEST-SNAPSHOT tell a truncated modern file (header, no
+trailer) from a legacy one (no header, unverifiable).")
+
 (defmethod backup ((graph graph) location &key include-deleted-p)
   (ensure-directories-exist location)
   (let ((count 0))
@@ -164,6 +215,11 @@ RECREATE-GRAPH's :PACKAGE-NAME."
     ;; backup path from the clock; ECL's permissive default was what hid the
     ;; constant txn-log snapshot name.
     (with-open-file (out location :direction :output :if-exists :error)
+      ;; Header first, completion trailer last (GH #127): the reader
+      ;; skips both, and their PAIRING is what makes a snapshot
+      ;; verifiable -- a file with the header and no trailer was cut
+      ;; short, however it got that way.
+      (write-line +snapshot-header-line+ out)
       (map-vertices (lambda (v)
                       (maybe-init-node-data v :graph graph)
                       (incf count)
@@ -172,8 +228,11 @@ RECREATE-GRAPH's :PACKAGE-NAME."
       (map-edges (lambda (e)
                    (maybe-init-node-data e :graph graph)
                    (incf count)
-                   (backup e out))
+                   (backup e out)
+                   (%warn-if-dangling-endpoint e (from e) graph)
+                   (%warn-if-dangling-endpoint e (to e) graph))
                  graph :include-deleted-p include-deleted-p)
+      (write-backup-plist (list :snapshot-complete :count count) out)
       (values count location))))
 
 (defmethod check-data-integrity ((graph graph) &key include-deleted-p)
@@ -205,15 +264,44 @@ RECREATE-GRAPH's :PACKAGE-NAME."
       problems)))
 
 ;;; ---------------------------------------------------------------------------
-;;; v1 -> v2 migration (MVCC head growth, storage-version 1 -> 2)
+;;; v1 -> v3 and v2 -> v3 migration (MVCC head growth; type-id widened, #166)
 ;;;
-;;; v2 grew the node head 15 -> 31 bytes (commit-epoch + prev-pointer), so v2
-;;; code cannot open a v1 graph directly.  MIGRATE-GRAPH does a format-agnostic
-;;; LOGICAL snapshot + replay: open the v1 graph read-only with a 15-byte head
-;;; shim, BACKUP every live node to a pointer-free plist file, then MAKE-GRAPH a
-;;; fresh v2 graph and RECREATE-GRAPH (replay) into it.  Precedent: the
-;;; pre-58f87d6 UUID/hash change was migrated the same way (snapshot + replay).
+;;; v2 grew the node head 15 -> 31 bytes (commit-epoch + prev-pointer); v3
+;;; widened type-id 2 -> 4 bytes, growing it again to 33.  Current code cannot
+;;; open a v1 or v2 graph directly.  MIGRATE-GRAPH does a format-agnostic
+;;; LOGICAL snapshot + replay: open the old graph read-only with a head shim
+;;; matched to ITS OWN stamped version, BACKUP every live node to a
+;;; pointer-free plist file, then MAKE-GRAPH a fresh v3 graph and
+;;; RECREATE-GRAPH (replay) into it.  Precedent: the pre-58f87d6 UUID/hash
+;;; change was migrated the same way (snapshot + replay).
 ;;; ---------------------------------------------------------------------------
+
+(defparameter *migration-head-readers*
+  '((1 . deserialize-node-head-v1)
+    (2 . deserialize-node-head-v2))
+  "Maps a pre-current STORAGE-VERSION byte to the *NODE-HEAD-READER*
+MIGRATE-GRAPH must bind while opening a graph stamped with that version.  A
+graph already at +STORAGE-VERSION+ needs no entry -- it reads with the live
+DESERIALIZE-NODE-HEAD.")
+
+(defun %migration-source-version (location)
+  "The STORAGE-VERSION byte stamped in LOCATION's heap.dat, read directly --
+no version gate, so MIGRATE-GRAPH can pick the matching head-reader before
+OPEN-GRAPH's gate would refuse an old graph outright."
+  (let ((mf (mmap-file (format nil "~A/heap.dat" (pathname location))
+                       :create-p nil)))
+    (unwind-protect
+         (get-byte mf +memory-storage-version-offset+)
+      (munmap-file mf))))
+
+(defun %migration-source-version-reader (found)
+  "The *NODE-HEAD-READER* to bind while OPEN-GRAPH reads a graph whose heap.dat
+is stamped FOUND, or an error naming FOUND if this build cannot migrate it."
+  (cond ((= found +storage-version+) 'deserialize-node-head)
+        ((cdr (assoc found *migration-head-readers*)))
+        (t (error "MIGRATE-GRAPH: storage format v~D has no known migration ~
+path in this build (understands v1, v2, and the current v~D)."
+                  found +storage-version+))))
 
 (defun %migration-snapshot-file (name)
   "A per-run path for MIGRATE-GRAPH's intermediate snapshot.  A name-only path is
@@ -229,24 +317,96 @@ failure mode this function exists to prevent.  See GH #100."
               "/tmp/")
           name (uuid:make-v4-uuid)))
 
+(defparameter +peer-sidecar-files+
+  '("lamport.dat" "field-stamps.dat" "node-origins.dat" "conflicts.dat"
+    "rejections.dat")
+  "The single-file peer-replication sidecars a store keeps beside its graph;
+APPLIED-OPS/ (an lhash directory) is the sixth.  Written by the peer-graph
+open/close paths in graph.lisp, transactions.lisp, peer-merge.lisp and
+peer-streaming.lisp (rejections, GH #151).")
+
+(defun %carry-peer-sidecars (old-location new-location)
+  "Copy the peer-replication sidecars present under OLD-LOCATION to
+NEW-LOCATION verbatim: +PEER-SIDECAR-FILES+ and every file of APPLIED-OPS/.
+A logical replay carries nodes only, and OPEN-GRAPH recreates a missing
+sidecar EMPTY -- a reset Lamport clock, an empty applied-op index -- which
+shows up only at the next sync (GH #289).  Their keys are node ids, which
+survive the replay, so the copies stay valid; APPLIED-OPS/struct.dat's
+recorded location is stale after the copy and OPEN-LHASH resets it
+(GH #143).  Returns the relative paths carried."
+  (let ((old (uiop:ensure-directory-pathname old-location))
+        (new (uiop:ensure-directory-pathname new-location))
+        (carried '()))
+    (flet ((carry (rel)
+             (let ((src (merge-pathnames rel old)))
+               (when (probe-file src)
+                 (let ((dst (merge-pathnames rel new)))
+                   (ensure-directories-exist dst)
+                   (uiop:copy-file src dst)
+                   (push rel carried))))))
+      (dolist (f +peer-sidecar-files+) (carry f))
+      (let ((ops (merge-pathnames "applied-ops/" old)))
+        (when (probe-file ops)
+          (dolist (f (uiop:directory-files ops))
+            (carry (concatenate 'string "applied-ops/"
+                                (file-namestring f)))))))
+    (nreverse carried)))
+
 (defun migrate-graph (name old-location new-location
                       &key (package :graph-db) include-deleted-p
-                           (delete-snapshot-p t)
+                           (delete-snapshot-p t) renumber-p
                            (snapshot-file (%migration-snapshot-file name)))
-  "Migrate a pre-MVCC (v1) graph at OLD-LOCATION to the current (v2) on-disk
-format at NEW-LOCATION, returning the new, open graph.
+  "Migrate a pre-current (v1 or v2) graph at OLD-LOCATION to the current (v3)
+on-disk format at NEW-LOCATION, returning (values NEW-GRAPH UNIFIED) -- the
+new, open graph, and (under :RENUMBER-P T) the types whose several ids were
+unified into one.
 
-Migration is a logical snapshot + replay: the v1 graph is opened read-only with
-a 15-byte head shim, every live node is written to a format-independent snapshot
-file, then a fresh v2 graph is created and the snapshot replayed through the
-normal MAKE-VERTEX / MAKE-EDGE path.  The v1 graph's schema (its type-id
-registry) is copied to the new graph, so type-ids are preserved.
+Migration is a logical snapshot + replay: OLD-LOCATION's own stamped storage
+version is read first, so the old graph is opened read-only with the head
+shim that matches IT (15-byte v1, 31-byte v2), every live node is written to a
+format-independent snapshot file, then a fresh v3 graph is created and the
+snapshot replayed through the normal MAKE-VERTEX / MAKE-EDGE path.  A
+peer-replicating store's sidecars -- Lamport clock, applied-op index, field
+stamps, node origins, conflicts -- are then copied across verbatim, since
+the replay carries nodes only and a missing sidecar would silently come up
+empty at the next OPEN-GRAPH :PEER-ROLE (GH #289).
 
-OLD-LOCATION is left byte-for-byte untouched; NEW-LOCATION must not already hold
-a graph.  The CLOS classes for the graph's node types must already be defined in
-this image (load your DEF-VERTEX / DEF-EDGE forms first).  :INCLUDE-DELETED-P
-carries tombstoned nodes across too; :DELETE-SNAPSHOT-P (default T) removes the
-intermediate snapshot file on every exit, including a failed migration.
+:RENUMBER-P decides which type-ids the new graph gets, and it is the one
+guarantee here that is mode-dependent (GH #186, spec §10.1):
+
+  NIL (default) -- the old graph's schema is copied across verbatim, so
+    every type-id survives unchanged.  This is #166's format migration.  The
+    new store's ids are then the SOURCE's per-graph ids and NOT this
+    system's registry ids, so the migration deliberately leaves the registry
+    untouched rather than claim ids for names it did not renumber.
+  T -- every type-id is taken from the system registry instead, so the new
+    store's ids mean the same thing in every other store of the system.
+    This is how a populated system adopts global ids; seed the registry
+    first with REGISTRY-SEED-FROM-STORES, which also says which stores need
+    this.  A symbol the source's history left holding two ids unifies under
+    one here, and is named in the second return value.
+
+OLD-LOCATION's DATA -- its heap and its vertex/edge/index tables -- is left
+untouched; it remains fully openable by an engine of its own (pre-migration)
+version afterward, which is the rollback story: repoint at OLD-LOCATION rather
+than restore from a snapshot.  It is NOT byte-for-byte identical, though:
+snapshotting requires OPENing it, and that OPEN creates one new, empty
+tx/replication-*.log file.  (schema.dat is no longer rewritten at all: the
+schema replay is suppressed for both of this function's opens, so a type
+declared in this image but absent from the source is not added to the source
+either -- it would carry a registry id in a store whose every other id is
+per-graph.  GH #186.)
+This assumes OLD-LOCATION was closed cleanly and still has its index
+sidecars: OPEN-GRAPH rebuilds a spatial, unique, or secondary index from a
+live-node scan whenever its sidecar is absent (graph.lisp's
+RESTORE-*-INDEX-ROOTS -> REBUILD-*-INDEXES), and REBUILD-UNIQUE-INDEXES
+writes via UIX-PUT per node -- so a crashed source, or one from before its
+sidecar existed, is modified further by this open.
+NEW-LOCATION must not already hold a graph.  The CLOS classes for the graph's
+node types must already be defined in this image (load your DEF-VERTEX /
+DEF-EDGE forms first).  :INCLUDE-DELETED-P carries tombstoned nodes across
+too; :DELETE-SNAPSHOT-P (default T) removes the intermediate snapshot file on
+every exit, including a failed migration.
 
 :SNAPSHOT-FILE defaults to a PER-RUN path under the temporary directory.  It is
 deliberately not keyed on NAME alone: such a path is constant across runs, users
@@ -264,31 +424,58 @@ an explicit path if you want a predictable one."
     ;; path that leaked file then broke the retry the user reaches for next.
     (unwind-protect
          (progn
-           ;; 1. Open the v1 graph read-only (15-byte heads) and snapshot it logically.
-           (let ((*node-head-reader* 'deserialize-node-head-v1))
+           ;; 1. Open the old graph read-only, at ITS OWN version, and snapshot
+           ;;    it logically.  The reader shim applies only to this read; the
+           ;;    replay below always writes the current (v3) format.
+           (let* ((found (%migration-source-version old-location))
+                  (*node-head-reader* (%migration-source-version-reader found))
+                  ;; Both opens: this function decides both schemas itself
+                  ;; (see :RENUMBER-P above), and UPDATE-SCHEMA running first
+                  ;; would mint registry ids for a schema thrown away on the
+                  ;; next form -- and, on the source, write one into a store
+                  ;; whose every other id is per-graph (GH #186).
+                  (*schema-update-suppressed* t))
              (let ((old (open-graph name old-location
-                                    ;; tolerate v1 AND v2 so a re-run is harmless
-                                    :accept-versions (list 1 +storage-version+)
+                                    ;; tolerate FOUND so a re-run is harmless
+                                    :accept-versions
+                                    (list found +storage-version+)
                                     :gc-heap-p nil :buffer-pool-p t)))
                (unwind-protect
                     (let ((*graph* old)) ;; map-vertices' all-types branch reads *graph*
                       (setq old-schema (schema old))
-                      (log:info "MIGRATE-GRAPH: snapshotting v1 graph ~A -> ~A"
-                                old-location snapshot-file)
+                      (log:info "MIGRATE-GRAPH: snapshotting v~D graph ~A -> ~A"
+                                found old-location snapshot-file)
                       (backup old snapshot-file :include-deleted-p include-deleted-p))
                  (close-graph old :snapshot-p nil))))
-           ;; 2. Create the v2 graph, adopt the v1 schema (preserving type-ids), replay.
-           (let ((new (make-graph name new-location)))
+           ;; 2. Create the v3 graph, install the schema (verbatim, or
+           ;;    renumbered from the registry), replay.
+           (let ((new (let ((*schema-update-suppressed* t))
+                        (make-graph name new-location))))
              (handler-case
-                 (progn
-                   (setf (schema new) old-schema)
+                 (multiple-value-bind (schema unified)
+                     (if renumber-p
+                         (renumber-schema old-schema (ensure-type-registry))
+                         (values old-schema nil))
+                   (setf (schema new) schema)
                    (restore-schema-locks (schema new))
                    (setf (schema-lock (schema new)) (make-recursive-lock))
                    (save-schema (schema new) new)
-                   (log:info "MIGRATE-GRAPH: replaying snapshot into v2 graph ~A"
-                             new-location)
+                   (when unified
+                     (log:warn "MIGRATE-GRAPH: ~D type~:P in ~A held more ~
+than one type-id; unified: ~S" (length unified) old-location unified))
+                   (unless renumber-p
+                     (log:warn "MIGRATE-GRAPH: ~A keeps ~A's per-graph ~
+type-ids, which are NOT this system's registry ids (:RENUMBER-P NIL, #186)."
+                               new-location old-location))
+                   (log:info "MIGRATE-GRAPH: replaying snapshot ~
+into v~D graph ~A" +storage-version+ new-location)
                    (recreate-graph new snapshot-file :package-name package)
-                   new)
+                   (let ((carried (%carry-peer-sidecars old-location
+                                                        new-location)))
+                     (when carried
+                       (log:info "MIGRATE-GRAPH: carried peer sidecars ~S"
+                                 carried)))
+                   (values new unified))
                (error (c)
                  (close-graph new)
                  (error c)))))

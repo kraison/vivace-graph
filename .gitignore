@@ -12,3 +12,13 @@
 
 # Claude
 .claude
+
+# Local dev tooling (REPL server, memory probe) and CLI state -- not engine
+/tools/
+/.local/
+
+# Superpowers SDD scratch (ledger, briefs, reports) -- regenerable
+/.superpowers/
+
+# Local git worktrees for parallel unit work (superpowers:using-git-worktrees)
+.worktrees/

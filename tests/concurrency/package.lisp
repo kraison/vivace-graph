@@ -80,7 +80,7 @@
                 #:create-memory
                 #:close-memory
                 #:make-skip-list
-                #:add-to-skip-list
+                #:add-to-skip-list #:remove-from-skip-list
                 #:skip-list-to-list
                 #:serialize
                 #:deserialize

@@ -2,13 +2,14 @@
 ;;;;
 ;;;; Driven by run-peer-test.sh.  Reads REPL_HUB_DIR, REPL_PORT and REPL_WORK
 ;;;; from the environment, builds a hub graph, registers the device with an
-;;;; authority scope rooted at the site, and runs the scenario:
+;;;; authority scope rooted at the depot, and runs the scenario:
 ;;;;
-;;;;   PHASE 1 (seed): commit a site -> survey -> {find1, find2} graph, with
-;;;;     find2 NOT disclosable.  The device pulls its closed disclosable subgraph
-;;;;     (site, survey, find1 + the two connecting edges; find2 + its edge omitted).
-;;;;   PHASE 2 (purge): flip find1 to non-disclosable.  On the device's next pull
-;;;;     the manifest diff PURGES find1 + its edge (scope EXIT).
+;;;; PHASE 1 (seed): commit a depot -> inspection -> {item1, item2} graph, with
+;;;; item2 NOT disclosable. The device pulls its closed disclosable subgraph
+;;;; (depot, inspection, item1 + the two connecting edges; item2 + its edge
+;;;; omitted).
+;;;; PHASE 2 (purge): flip item1 to non-disclosable. On the device's next pull
+;;;;     the manifest diff PURGES item1 + its edge (scope EXIT).
 ;;;;
 ;;;; Peer replication can't be tested in one image (process-global *graphs*,
 ;;;; schema registry, *graph*), so the hub and device run as two OS processes
@@ -19,7 +20,8 @@
 
 ;;; Disable the interactive debugger (see device.lisp for the rationale): print
 ;;; the condition + a best-effort backtrace, then quit non-zero, so an unhandled
-;;; error surfaces legibly instead of hanging or cascading.  (mine-action item 2.)
+;;; error surfaces legibly instead of hanging or cascading. (app-harness item
+;;; 2.)
 (flet ((bail (condition)
          (format *error-output* "~&=== UNHANDLED ~S ===~%~A~%"
                  (type-of condition) condition)
@@ -44,6 +46,27 @@
   (let ((*standard-output* s) (*error-output* s))
     (ql:quickload :graph-db :silent t)))
 (in-package :graph-db)
+;; Provenance: prove WHICH tree this process loaded (GH #260).
+(format t "~&SOURCE: ~A~%" (asdf:system-source-directory :graph-db))
+(finish-output)
+
+;;; Type-ids come from the image-level registry in *SYSTEM-DIRECTORY* (GH
+;;; #186), so this process needs one before it opens anything.  Its OWN,
+;;; under REPL_WORK: these harnesses exist because hub and device are
+;;; separate IMAGES, and a shared registry would quietly undo that.  Both
+;;; ends evaluate one schema.lisp in one order, so their registries agree
+;;; and the handshake's registry check (D15) passes -- which is the point.
+;;;
+;;; SETF, not a LET around the body: replication runs on threads that do
+;;; not inherit dynamic bindings.
+(setf *system-directory*
+      (namestring
+       (ensure-directories-exist
+        (merge-pathnames
+         "system-hub/"
+         ;; Trailing slash: REPL_WORK has none, and MERGE-PATHNAMES
+         ;; would otherwise treat its last component as a file name.
+         (format nil "~A/" (or (uiop:getenv "REPL_WORK") "/tmp"))))))
 (log:config :error)
 
 (defun hflag (name) (format nil "~A/~A" (uiop:getenv "REPL_WORK") name))
@@ -72,38 +95,43 @@
                           :export-predicate #'peer-test-disclosable
                           :buffer-pool-size 1000)))
       (let ((*graph* g)
-            site)
-        ;; PHASE 1 payload: site -> survey -> {find1 (open), find2 (closed)}.
+            depot)
+        ;; PHASE 1 payload: depot -> inspection -> {item1 (open), item2
+        ;; (closed)}.
         (with-transaction ()
-          (let* ((s   (make-p-site   :name "Site-1"   :disclosable 1))
-                 (sv  (make-p-survey :name "Survey-1" :disclosable 1))
-                 (f1  (make-p-find   :name "Find-1"   :disclosable 1))
-                 (f2  (make-p-find   :name "Find-2"   :disclosable 0)))  ; withheld
-            (make-p-has-survey :from s  :to sv)
-            (make-p-has-find   :from sv :to f1)
-            (make-p-has-find   :from sv :to f2)
-            (setq site s)))
-        (format t "~&HUB: phase-1 committed (site, survey, find1 open, find2 closed)~%")
+          (let* ((s   (make-p-depot   :name "Depot-1"   :disclosable 1))
+                 (sv  (make-p-inspection :name "Inspection-1" :disclosable 1))
+                 (f1  (make-p-item   :name "Item-1"   :disclosable 1))
+                 ;; f2 withheld
+                 (f2  (make-p-item   :name "Item-2"   :disclosable 0)))
+            (make-p-has-inspection :from s  :to sv)
+            (make-p-has-item   :from sv :to f1)
+            (make-p-has-item   :from sv :to f2)
+            (setq depot s)))
+        (format t
+     "~&HUB: phase-1 committed (depot, inspection, item1 open, item2 closed)~%")
         (finish-output)
-        ;; Register the device's authority scope, rooted at the site.
+        ;; Register the device's authority scope, rooted at the depot.
         (register-peer-device g :origin-id *device-origin*
-                                :roots (list (id site)) :scope :hma)
+                                :roots (list (id depot)) :scope :main)
         (write-flag "ready")
 
         ;; Wait for the device to pull + verify phase 1.
         (unless (wait-flag "phase1-verified")
           (format t "~&HUB: timed out waiting for phase-1 verify~%") (hexit 1))
 
-        ;; PHASE 2: flip Find-1 to non-disclosable -> it leaves the device's scope.
+        ;; PHASE 2: flip Item-1 to non-disclosable -> it leaves the device's
+        ;; scope.
         (flet ((by-name (n)
                  (first (remove-if-not
                          (lambda (x) (string= n (slot-value x 'name)))
-                         (map-vertices #'identity g :collect-p t :vertex-type 'p-find)))))
+                         (map-vertices #'identity g :collect-p t :vertex-type
+                           'p-item)))))
           (with-transaction ()
-            (let ((v (copy (by-name "Find-1"))))
+            (let ((v (copy (by-name "Item-1"))))
               (setf (slot-value v 'disclosable) 0)
               (save v))))
-        (format t "~&HUB: phase-2 committed (Find-1 -> non-disclosable)~%")
+        (format t "~&HUB: phase-2 committed (Item-1 -> non-disclosable)~%")
         (finish-output)
         (write-flag "phase2-ready")
 
