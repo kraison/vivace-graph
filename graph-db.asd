@@ -146,6 +146,10 @@
                ;; Domain and range (GH #156): the other endpoint, through
                ;; the commit view.
                (:file "domain-range" :depends-on ("value-constraint"))
+               ;; GH #301: validate without committing; needs every
+               ;; family's collectors loaded.
+               (:file "evaluator" :depends-on ("cardinality"
+                                               "domain-range"))
                ;; Disjointness over vertex types (GH #157, 4a): a schema
                ;; lint, hooked into %INSTALL-NODE-TYPE.
                (:file "disjointness" :depends-on ("schema" "index"))
@@ -664,6 +668,7 @@ cl-temporal-extent."
                (:file "value-constraint-tests")     ; GH #149
                (:file "cardinality-tests")          ; GH #155
                (:file "domain-range-tests")         ; GH #156
+               (:file "evaluator-tests")            ; GH #301
                (:file "disjointness-tests")         ; GH #157
                (:file "peer-unique-tests")
                (:file "peer-rejection-tests")           ; GH #151

@@ -13,6 +13,16 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Added
 
+- **`validate-writes`** (#301, closing the #109 epic's evaluator): run
+  the six constraint families over a proposed write set — value, unique,
+  cardinality, domain/range, and every subsystem commit validator
+  (membership and extent disjointness) — through the commit view,
+  without committing. Returns one `validation-report` carrying every
+  family's own violation structs tagged with the refused write, plus
+  per-family checked and spec counts, so "no violations, N specs
+  checked" and "nothing to check" stay distinguishable. A second entry
+  to the same collectors `%commit` runs, so the two cannot disagree.
+
 - **`claim-identity-key`** (#303): a claim's identity tuple — producer,
   subject, object for a binary claim, relation, and the canonical extent
   start for a temporal family — as one canonical string, so external

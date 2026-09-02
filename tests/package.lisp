@@ -14,6 +14,13 @@
   ;; so the Prolog compiler recognizes ! in query goals as cut.
   (:shadowing-import-from #:graph-db #:!)
   (:import-from #:graph-db
+                #:rollback
+                ;; the evaluator entry point (GH #301)
+                #:validate-writes #:validation-report
+                #:validation-report-violations
+                #:validation-report-family-counts
+                #:validation-report-checked-counts
+                #:validation-report-spec-counts
                 ;; image-level epoch clock (GH #168)
                 #:*system-clock*
                 #:system-clock
@@ -265,6 +272,7 @@
                 #:def-value-constraint
                 #:undef-value-constraint
                 #:value-constraint-violation
+                #:unique-constraint-violation
                 #:check-value-constraints
                 ;; Cardinality constraints (GH #155)
                 #:def-cardinality #:undef-cardinality

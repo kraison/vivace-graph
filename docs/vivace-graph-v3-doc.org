@@ -1872,6 +1872,38 @@ its relation strings — is a different feature (4b), a real constraint
 family that needs a membership representation the substrate does not
 yet have. It is deferred, not folded in.
 
+*** Validating before the side effect (~validate-writes~)
+
+Every family above enforces at commit: the only way to learn a write
+would be refused is to attempt it and catch the condition. When the
+question is *would this be refused, and why* — an agent planning a
+write, a decision trace that must record a refusal structurally —
+~validate-writes~ answers for the cost of a read (vivace-graph#301):
+
+#+BEGIN_SRC lisp
+  (validate-writes graph
+                   (list (list :create new-node)
+                         (list :update changed-copy committed-original)
+                         (list :delete doomed-copy committed-original)))
+  ;; => #S(validation-report ...)
+#+END_SRC
+
+It runs the six constraint families — value, unique, cardinality,
+domain/range, and every subsystem commit validator (membership and
+extent disjointness when ~graph-db/spacetime~ is loaded) — over the same
+commit view ~%commit~ builds, so the two cannot disagree; nothing is
+journaled and nothing changes. The ~validation-report~ carries each
+family's own violation structs tagged with the refused write
+(~validation-report-violations~, a list of ~(family write detail)~),
+violation counts per family, how many writes each family examined, and
+how many specs each family has registered — so "no violations, N specs
+checked" and "nothing to check" stay distinguishable. Two caveats: the
+answer is advisory (the report is computed outside the manager lock, so
+a racing commit can invalidate it — the commit path remains the
+enforcement), and the ~:unique~ and subsystem families report only
+their first violation, which still covers everything ~%commit~ itself
+would have said, since ~%commit~ stops at its first refusal.
+
 ** Chapter 9: The REST API (~rest.lisp~)
 
 While VivaceGraph is written in Common Lisp, your applications don't have to be. VivaceGraph includes a built-in, high-performance web server that exposes a complete RESTful API for graph operations. This allows programs written in Python, JavaScript, Java, or any other language to create, read, update, and delete nodes and edges over standard HTTP.
