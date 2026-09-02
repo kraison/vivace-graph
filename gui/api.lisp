@@ -309,18 +309,23 @@ sweep of each table."
 (defun %on-disk-size (graph)
   "Total bytes of the files under GRAPH's directory; unreadable files
 count zero."
-  (let ((total 0))
+  (let ((apparent 0) (allocated 0))
     (fad:walk-directory
      (graph-db::location graph)
      (lambda (file)
-       (incf total
-             (or (ignore-errors
-                  (with-open-file (s file :element-type
-                                       '(unsigned-byte 8))
-                    (file-length s)))
-                 0)))
+       (let ((size (or (ignore-errors
+                        (with-open-file (s file :element-type
+                                             '(unsigned-byte 8))
+                          (file-length s)))
+                       0)))
+         (incf apparent size)
+         ;; Sparse mmap stores: GiB apparent for MiB of data (GH #274).
+         (incf allocated (or (ignore-errors
+                              (graph-db::%posix-allocated-size
+                               (namestring file)))
+                             size))))
      :directories nil)
-    total))
+    (values allocated apparent)))
 
 (defun %schema-summary (graph parent)
   "[{name, slots:[...]}] for PARENT's node types."
@@ -393,7 +398,14 @@ count zero."
                                            (%wire-symbol (cdr pair))))))
                             (graph-db::list-views graph))))
              (cons :indexes (%arr (%index-inventory graph)))
-             (cons :on-disk-bytes (%on-disk-size graph))
+             ;; :ON-DISK-BYTES is the ALLOCATED size since GH #274 --
+             ;; the honest operator number for sparse mmap stores;
+             ;; :APPARENT-BYTES keeps the old sum.
+             (multiple-value-bind (allocated apparent)
+                 (%on-disk-size graph)
+               (cons :on-disk-bytes allocated))
+             (cons :apparent-bytes
+                   (nth-value 1 (%on-disk-size graph)))
              (cons :schema
                    (%obj
                     (list (cons :vertex-types

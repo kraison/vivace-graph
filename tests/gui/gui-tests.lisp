@@ -329,6 +329,9 @@ schema summary for the known fixture."
                   :key (lambda (v) (jref v :name)) :test #'string=))
         (is (listp (jref json :indexes)))
         (is (plusp (jref json :on-disk-bytes)))
+        ;; GH #274: allocated <= apparent, both present.
+        (is (plusp (jref json :apparent-bytes)))
+        (is (<= (jref json :on-disk-bytes) (jref json :apparent-bytes)))
         (let* ((schema (jref json :schema))
                (person (find "gui-person" (jref schema :vertex-types)
                              :key (lambda (v) (jref v :name))

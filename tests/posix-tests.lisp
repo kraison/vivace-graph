@@ -118,3 +118,29 @@ matter."
                              "closing the holder frees the lock")
                  (graph-db::%posix-close b))))
         (when a (graph-db::%posix-close a))))))
+
+(test allocated-size-sees-through-sparse-files
+  "GH #274: a sparse file's allocated size tracks its data extents, not
+its apparent length; a dense file reports (about) its length."
+  (let ((path (namestring
+               (graph-db-test-scratch:make-scratch-file-name
+                "sparse" "dat"))))
+    (unwind-protect
+         (progn
+           (with-open-file (s path :direction :output
+                                   :element-type '(unsigned-byte 8)
+                                   :if-does-not-exist :create)
+             ;; 64 MiB apparent, one page of data at the end.
+             (file-position s (* 64 1024 1024))
+             (write-sequence (make-array 4096 :element-type
+                                              '(unsigned-byte 8)
+                                              :initial-element 7)
+                             s))
+           (let ((alloc (graph-db::%posix-allocated-size path)))
+             ;; NIL = filesystem without SEEK_DATA; nothing to assert.
+             (when alloc
+               (is (< alloc (* 8 1024 1024))
+                   "allocated ~D should be far below the 64MiB apparent"
+                   alloc)
+               (is (plusp alloc)))))
+      (ignore-errors (delete-file path)))))

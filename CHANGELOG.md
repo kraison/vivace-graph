@@ -13,6 +13,18 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Added
 
+- **GUI stats report allocated bytes, not apparent** (#274): sparse
+  mmap stores showed GiB for MiB of data. `onDiskBytes` is now the
+  allocated sum (`SEEK_DATA`/`SEEK_HOLE` extent hops in the POSIX
+  layer, falling back per file where unsupported); `apparentBytes`
+  carries the old number.
+
+- **A withdrawn index's heap pages are reclaimed at the next open**
+  (#147): the sidecar reconcile that drops a withdrawn or re-shaped
+  declaration's record — secondary and unique alike — now frees the
+  structure it is dropping, at the one moment nothing can be mid-read.
+  Mid-image withdrawal still defers to that open, deliberately.
+
 - **Cost-unbounded functors are classified engine-side, and a
   resource-bounded `select` refuses them** (#285). `%tick` preempts at
   goal boundaries only, so a functor burning arbitrary time in one

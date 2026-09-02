@@ -235,6 +235,35 @@ Linux/x86-64 is 4 KiB, and this file is compiled on one host per target."
 (defun %posix-file-size-fd (fd)
   (%posix-lseek fd 0 +seek-end+))
 
+;; SEEK_DATA/SEEK_HOLE are OS-specific AND swapped between the two
+;; targets: Linux 3/4, Darwin 4/3 (GH #274).
+(defconstant +seek-data+ #+graph-db-posix-linux 3 #-graph-db-posix-linux 4)
+(defconstant +seek-hole+ #+graph-db-posix-linux 4 #-graph-db-posix-linux 3)
+
+(defun %posix-allocated-size (path)
+  "Bytes PATH actually occupies -- the sum of its data extents, hopping
+SEEK_DATA/SEEK_HOLE -- or NIL where the filesystem does not support the
+probe (caller falls back to the apparent size).  Sparse mmap stores
+report GiB of apparent size for MiB of data (GH #274)."
+  (let ((fd (%posix-open path 0)))      ; 0 = O_RDONLY on both targets
+    (when (and fd (>= fd 0))
+      (unwind-protect
+           (handler-case
+               (let ((size (%posix-file-size-fd fd))
+                     (allocated 0)
+                     (pos 0))
+                 (loop
+                   (let ((data (%posix-lseek fd pos +seek-data+)))
+                     (when (or (null data) (minusp data) (>= data size))
+                       (return allocated))
+                     (let ((hole (%posix-lseek fd data +seek-hole+)))
+                       (when (or (null hole) (minusp hole))
+                         (return (+ allocated (- size data))))
+                       (incf allocated (- hole data))
+                       (setf pos hole)))))
+             (error () nil))
+        (%posix-close fd)))))
+
 (defun %file-size (path)
   (with-open-file (s path :element-type '(unsigned-byte 8) :if-does-not-exist :error)
     (file-length s)))
