@@ -25,13 +25,21 @@
    (last-name :type string))
   :test-graph)
 
+;; :unique t puts the slot under a uniqueness constraint, enforced at the
+;; commit boundary (NULL-exempt): two customers with one email cannot both
+;; commit.  (To QUERY a slot by value, give it a DEF-INDEX or a view, as
+;; below -- :unique enforces; it is not a lookup surface.)
 (def-vertex customer (person)
-  ((email :type email))
+  ((email :type email :unique t))
   :test-graph)
 
+;; :vector-index t gives the slot a dedicated mmap vector segment,
+;; maintained by the transaction apply path; VECTOR-SEARCH below does
+;; cosine kNN over it.  (Toy 3-dim embeddings; real ones are model-sized.)
 (def-vertex product ()
   ((name :type string)
-   (upc :type string))
+   (upc :type string)
+   (embedding :vector-index t))
   :test-graph)
 
 ;; A geometry slot marked :index t opts the type into the spatial index: every
@@ -78,6 +86,11 @@
      (apply '+ values))))
 
 
+;; A general ordered index needs no map function: DEF-INDEX indexes a slot
+;; by its stored value, for equality and range lookups.  Declarative and
+;; idempotent like DEF-VIEW; :CANONICALIZE makes this one case-insensitive.
+(def-index product upc :test-graph :canonicalize string-downcase)
+
 (defun lookup-people-by-last-name (last-name)
   (let ((people (invoke-graph-view 'person 'last-name :key last-name)))
     (if people
@@ -99,8 +112,10 @@
         ;; m1 carries a LOCATION (lon, lat); committing it indexes it spatially.
         (m1 (make-merchant :name "Snake Oil, Inc."
                            :location (make-point 12.3424d0 45.6720d0)))
-        (p1 (make-product :name "Oil of Longevity" :upc "1234567890"))
-        (p2 (make-product :name "Oil of Slipperiness" :upc "abcdefghijk")))
+        (p1 (make-product :name "Oil of Longevity" :upc "1234567890"
+                          :embedding #(0.9 0.1 0.0)))
+        (p2 (make-product :name "Oil of Slipperiness" :upc "abcdefghijk"
+                          :embedding #(0.7 0.6 0.1))))
     ;; Two more merchants: one ~1 km away, one in another city -- so the
     ;; proximity queries below have something to discriminate.
     (make-merchant :name "Elixir Emporium" :location (make-point 12.3520d0
@@ -166,6 +181,35 @@
            :edge-type 'likes
            :vertex (lookup-customer-by-email "joe@blow.com")
            :direction :out)
+
+;;; Ordered, unique and vector indexes ----------------------------------
+;;;
+;;; The DEF-INDEX above and the :UNIQUE slot are both ordered secondary
+;;; indexes over stored values -- no view lambda involved.
+
+;; Equality, through the :CANONICALIZE (case does not matter).
+(index-lookup *graph* 'product 'upc "ABCdefGHIJK")
+
+;; Ascending range scan over [start, end]; open-ended when NIL.
+(index-range *graph* 'product 'upc :start "1" :end "2")
+
+;; MAP-INDEX streams the same range without consing a list.
+(map-index (lambda (product) (format t "~a~%" (name product)))
+           *graph* 'product 'upc)
+
+;; The :UNIQUE slot refuses a duplicate at commit: nothing of the
+;; failed transaction survives.  (Equality lookups on email go through
+;; the EMAIL view defined above.)
+(handler-case
+    (with-transaction ()
+      (make-customer :first-name "Imposter" :last-name "Blow"
+                     :email "joe@blow.com"))
+  (unique-constraint-violation (c)
+    (format t "~&Refused, as it should be:~%~a~%" c)))
+
+;; Cosine kNN over the :VECTOR-INDEX slot: the k products most similar
+;; to a query vector, best first.
+(vector-search *graph* 'product 'embedding #(1.0 0.0 0.0) 2)
 
 ;;; Spatial queries
 ;;;
