@@ -52,6 +52,8 @@
    #:claim-precision-m #:claim-fraction                 ; GH #138
    #:claim-extent #:claims-touching
    #:claim-identity-key                                ; GH #303
+   #:claim-version-stamp                               ; GH #300
+   #:reaped-claim #:reaped-claim-p #:reaped-claim-id   ; GH #300
    #:claim-transaction-extent-sexp                     ; GH #148
    #:claim-transaction-extent #:claim-recorded-at
    #:claim-current-p #:retract-claim                   ; GH #162

@@ -151,6 +151,11 @@ identity tuple (GH #296, design §2.2)."
     (transaction-extent-sexp :initarg :transaction-extent-sexp
                              :accessor claim-transaction-extent-sexp
                              :initform nil)
+    ;; The time->version mapping for :AS-OF (GH #300): stamped at every
+    ;; create and save; replicates with the claim, so an as-of read is
+    ;; node-local by construction and no epoch is ever exposed.
+    (version-stamp :initarg :version-stamp :accessor claim-version-stamp
+                   :initform nil)
     (geometry :initarg :geometry :accessor claim-geometry :initform nil)
     ;; Registration outputs (#138).  PRECISION-M is metres, a real
     ;; quantity that flows in both directions -- a source can be finer
@@ -226,6 +231,15 @@ unstamped\" (design, Stamping; GH #148 review)."
          (extent->sexp (%open-transaction-extent (%st-now)))
          args))
 
+(defun %claim-encode-version-stamp (args)
+  "ARGS with :VERSION-STAMP defaulted to now -- the creation half of the
+time->version mapping :AS-OF walks (GH #300); SAVE's :BEFORE method is
+the update half.  A caller-supplied stamp (replication, restore) passes
+through untouched."
+  (if (%plist-key-p args :version-stamp)
+      args
+      (list* :version-stamp (%st-now) args)))
+
 (defun %claim-encode-transaction-arg (args)
   "Rewrite a claim constructor's ARGS so the transaction axis is always
 populated: :TRANSACTION-EXTENT and :RECORDED-AT are encoded to
@@ -288,7 +302,9 @@ claim (design §3.1, GH #131 finding 1)."
   "Slots only BINARY-CLAIM carries.  Their absence from UNARY-CLAIM is what
 makes a unary claim unable to carry an object (design §3.1).")
 
-(defmacro def-claim-classes (parent graph-name &key extra-slots temporal)
+(defmacro def-claim-classes (parent graph-name
+                             &key extra-slots temporal
+                                  (keep-revisions (1- (expt 2 32))))
   "Define PARENT and its UNARY/BINARY subclasses in GRAPH-NAME, and register
 the family.  The subsystem cannot ship these classes: DEF-VERTEX binds a node
 type to a graph name and class names are globally unique, so a shipped class
@@ -344,9 +360,14 @@ declaration names, so flipping the flag re-declares rather than stacks."
        (graph-db:def-vertex ,parent ()
            (,@+claim-shared-slots+ ,@extra-slots)
          ,graph-name)
-       (graph-db:def-vertex ,unary (,parent) () ,graph-name)
+       ;; :KEEP-REVISIONS on the arities retains the version chain the
+       ;; :AS-OF read walks (GH #300); default effectively unbounded --
+       ;; the ongoing-run rewrite costs tens of MB/year on the busiest
+       ;; tenant, accepted in the #300 design.
+       (graph-db:def-vertex ,unary (,parent) () ,graph-name
+         :keep-revisions ,keep-revisions)
        (graph-db:def-vertex ,binary (,parent) (,@+claim-object-slots+)
-           ,graph-name)
+           ,graph-name :keep-revisions ,keep-revisions)
        ;; The closed vocabulary, enforced on every write path -- not only at
        ;; construction, where CHECK-STANDING alone left it (GH #149).
        ;; :ONE-OF is evaluated, so this names +STANDINGS+ rather than
@@ -426,14 +447,22 @@ declaration names, so flipping the flag re-declares rather than stacks."
                                    (error 'missing-claim-identity-component
                                           :slot :extent))))
                            (let ((c (apply %raw
-                                          (%claim-encode-transaction-arg
-                                           args))))
+                                          (%claim-encode-version-stamp
+                                           (%claim-encode-transaction-arg
+                                            args)))))
                              (check-standing (claim-standing c))
                              c)))))))
           (list unary binary)
           (list +claim-identity-slots+
                 (append +claim-identity-slots+
                         +claim-object-identity-slots+)))
+       ;; The update half of the :AS-OF stamp (GH #300): every
+       ;; copy/setf/SAVE re-stamps.  Replication's direct UPDATE-NODE
+       ;; path bypasses this deliberately -- remote state keeps its
+       ;; remote stamp.
+       (defmethod graph-db:save :before ((c ,parent) &key graph)
+         (declare (ignore graph))
+         (setf (claim-version-stamp c) (%st-now)))
        (setf (gethash ',parent *claim-families*)
              (%make-claim-family ',parent ',unary ',binary
                                  ,(and temporal t)))

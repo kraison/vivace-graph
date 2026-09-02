@@ -5750,6 +5750,24 @@ cut (~NIL~ when ~:LIMIT~ was not given) — computed by asking for one
 past the cap, the same rule the REST query envelope uses.
 ~claims-by-producer~ paginates the same way (vivace-graph#302).
 
+~:AS-OF~ (a TIMESTAMP) answers on the *transaction* axis
+(vivace-graph#300): each claim comes back as the *version* believed at
+that instant. An in-place update after the instant is unwound to the
+earlier version; a claim retracted before it, or not yet created, drops
+out; ~:at~/~:during~ then filter the *resolved* version's validity. The
+time→version mapping is a wall-clock stamp in the claim's own data
+(~version-stamp~, written at every create and save), walked over
+~vertex-history~ — so ~def-claim-classes~ now declares
+~:keep-revisions~ for the family (default effectively unbounded; pass
+~:keep-revisions n~ to bound it). Three honest limits: a version past
+the retention window is reported as a ~reaped-claim~ (test with
+~reaped-claim-p~), never silently substituted by a newer one; a claim
+swept by ~delete-claims-by-producer~ is invisible to ~:as-of~; and the
+stamps replicate with the claim, so a device and the hub each answer
+"believed at T" from their *own* applied history — they can differ by
+apply lag, the same footing as any LWW stamp. No argument or result is
+ever an epoch.
+
 One of ~:AT~ or ~:DURING~, not both. A claim with no extent makes no
 validity statement and is excluded by either filter.
 

@@ -13,6 +13,19 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Added
 
+- **`claims-touching`/`claims-by-producer` `:as-of`** (#300, re-targeted
+  to the spacetime layer): answer on the transaction axis — each claim
+  returned as the version believed at the asked instant, in-place
+  updates unwound, retractions honored, composed with `:at`/`:during`
+  over the resolved version's validity. The time→version mapping is a
+  per-version wall-clock stamp in the claim's own data (`version-stamp`,
+  written at every create and save), and `def-claim-classes` now
+  declares `:keep-revisions` for the family (default effectively
+  unbounded; option to override). A version past the retention window is
+  reported as a `reaped-claim`, never silently substituted; a claim
+  swept by `delete-claims-by-producer` is invisible to `:as-of`. No
+  public argument or result is an epoch.
+
 - **`validate-writes`** (#301, closing the #109 epic's evaluator): run
   the six constraint families over a proposed write set — value, unique,
   cardinality, domain/range, and every subsystem commit validator

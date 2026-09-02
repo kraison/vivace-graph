@@ -57,6 +57,59 @@ regeneration, which node ids do not (GH #303).  Fields join on |, with
                         (claim-extent-sexp claim)))))))))
     (format nil "~{~a~^|~}" fields)))
 
+(defstruct (reaped-claim (:constructor %make-reaped-claim (id)))
+  "An :AS-OF answer the store can no longer give: the claim existed at
+the asked instant, but every version stamped then is past the family's
+:KEEP-REVISIONS window and reaped.  Reported, never silently substituted
+(GH #300)."
+  id)
+
+(defun %claim-effective-stamp (version)
+  "VERSION's place on the wall clock: its :AS-OF stamp, else the start of
+its (immutable) transaction extent, else NIL for a claim predating both
+axes -- treated as arbitrarily old."
+  (or (claim-version-stamp version)
+      (let ((te (claim-transaction-extent version)))
+        (when te
+          (let ((b (extent-start te)))
+            (let ((e (bound-earliest b)))
+              (unless (eq e :unbounded) e)))))))
+
+(defun %claim-as-of (graph claim at)
+  "The version of CLAIM believed AT (a TIMESTAMP), or NIL when the claim
+was not believed then (not yet created, or already retracted), or a
+REAPED-CLAIM when it existed but every version of that age is reaped.
+Walks VERTEX-HISTORY newest-first over the family's retained chain."
+  (let* ((history (graph-db:vertex-history graph (graph-db:id claim)))
+         (instant (make-instant (exact-bound at)))
+         (resolved
+           (loop for (version . nil) in history
+                 for stamp = (%claim-effective-stamp version)
+                 when (or (null stamp)
+                          (not (local-time:timestamp< at stamp)))
+                   return version)))
+    (cond
+      (resolved
+       ;; Believed at AT only while AT falls inside that version's
+       ;; transaction period: a retraction closes it, so an instant
+       ;; after the close resolves to the retracted version and drops
+       ;; here.  A NIL extent predates the axis: indeterminate, kept.
+       (let ((te (claim-transaction-extent resolved)))
+         (if (or (null te) (not (extents-disjoint-p te instant)))
+             resolved
+             nil)))
+      ((null history) nil)
+      (t
+       ;; No retained version is old enough.  The immutable transaction
+       ;; start on ANY version says whether the claim existed at AT.
+       (let ((te (claim-transaction-extent (car (first history)))))
+         (cond ((null te) (%make-reaped-claim (graph-db:id claim)))
+               ((let ((e (bound-earliest (extent-start te))))
+                  (and (not (eq e :unbounded))
+                       (local-time:timestamp< at e)))
+                nil)                    ; did not exist yet
+               (t (%make-reaped-claim (graph-db:id claim)))))))))
+
 (defun %paginate (list limit offset)
   "LIST cut to OFFSET/LIMIT; second value T when entries existed past the
 cut (the REST envelope's one-past-the-cap rule, GH #302)."
@@ -69,7 +122,7 @@ cut (the REST envelope's one-past-the-cap rule, GH #302)."
 
 (defun claims-touching (graph claim-class namespace key
                         &key (role :either) current at during
-                             relation limit offset)
+                             relation limit offset as-of)
   "Claims in GRAPH naming (NAMESPACE, KEY) as subject, object, or either.
 CLAIM-CLASS is the PARENT class name; one call covers both arities.  Answers
 from the claim graph's own indexes -- no cross-graph read, no snapshot, which
@@ -86,6 +139,16 @@ not Allen's stricter :DURING.  One or the other, not both.  Both are
 orthogonal to :CURRENT (validity vs transaction time, GH #148), both
 exclude a claim with no extent, and both filter the candidates the
 endpoint index already bounded (GH #296, design §2.5).
+
+:AS-OF (a TIMESTAMP) answers on the TRANSACTION axis (GH #300): each
+claim is returned AS THE VERSION believed at that instant -- an in-place
+update after AS-OF is unwound to the earlier version, a claim retracted
+before AS-OF drops out, one not yet created drops out, and one whose
+versions of that age are reaped past the family's :KEEP-REVISIONS window
+appears as a REAPED-CLAIM, never as a silently-substituted newer
+version.  :AT/:DURING then filter the RESOLVED version's validity.  No
+argument or result is an epoch; the mapping is the per-version stamp in
+the claim's own data, so replicas answer from their own applied history.
 
 :RELATION (a canonical string) restricts to one relation; on the subject
 side it rides the (subject-namespace subject-key relation) index (GH
@@ -124,17 +187,26 @@ subsystem exists to keep those two cases from being confused."
                    (remove-duplicates (append subjects objects)
                                       :key #'graph-db:id :test #'equalp)
                    (or subjects objects))))
+      (when as-of
+        (setf all (loop for c in all
+                        for v = (%claim-as-of graph c as-of)
+                        when v collect v)))
       (when current
-        (setf all (remove-if-not #'claim-current-p all)))
+        (setf all (remove-if-not (lambda (c)
+                                   (or (reaped-claim-p c)
+                                       (claim-current-p c)))
+                                 all)))
       (when probe
         (setf all (remove-if-not (lambda (c)
-                                   (%claim-validity-touches-p c probe))
+                                   (or (reaped-claim-p c)
+                                       (%claim-validity-touches-p c probe)))
                                  all)))
       (when (and relation (member role '(:object :either)))
         ;; The object side has no relation index; filter what the endpoint
         ;; index already bounded (GH #302).
         (setf all (remove-if-not (lambda (c)
-                                   (equal relation (claim-relation c)))
+                                   (or (reaped-claim-p c)
+                                       (equal relation (claim-relation c))))
                                  all)))
       (%paginate all limit offset))))
 
@@ -228,7 +300,7 @@ Returns the saved copy, or CLAIM itself when nothing was written."
           (t (graph-db:with-transaction () (%retract))))))
 
 (defun claims-by-producer (graph claim-class producer
-                           &key limit offset)
+                           &key limit offset as-of)
   "Every live claim PRODUCER wrote, both arities.  CLAIM-CLASS is the PARENT,
 so one call covers unary and binary -- the same contract as this function's
 destructive twin, DELETE-CLAIMS-BY-PRODUCER.
@@ -245,10 +317,14 @@ family\" and \"that family, nothing produced\" stay distinguishable.
 Uses the PRODUCER index, so this is O(matching) rather than a scan of every
 claim.  :LIMIT / :OFFSET cut the result; the second return value is T
 when more claims existed past the cut (NIL without :LIMIT) (GH #302)."
-  (let ((family (claim-family claim-class)))
-    (%paginate (graph-db:index-lookup graph (claim-family-parent family)
-                                      '(producer) producer)
-               limit offset)))
+  (let* ((family (claim-family claim-class))
+         (all (graph-db:index-lookup graph (claim-family-parent family)
+                                     '(producer) producer)))
+    (when as-of
+      (setf all (loop for c in all
+                      for v = (%claim-as-of graph c as-of)
+                      when v collect v)))
+    (%paginate all limit offset)))
 
 (defun delete-claims-by-producer (graph claim-class producer)
   "Mark every claim PRODUCER wrote as deleted; return how many.  CLAIM-CLASS
