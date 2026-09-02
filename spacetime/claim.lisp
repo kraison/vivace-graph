@@ -405,6 +405,11 @@ declaration names, so flipping the flag re-declares rather than stacks."
            ,graph-name :name claim-object)
        (graph-db:def-index ,parent (producer) ,graph-name
                            :name claim-producer)
+       ;; (subject relation) queries ride this instead of filtering the
+       ;; whole endpoint result caller-side (GH #302).
+       (graph-db:def-index ,parent (subject-namespace subject-key
+                                    relation)
+           ,graph-name :name claim-subject-relation)
        (fmakunbound ',(intern (format nil "MAKE-~A" parent)))
        ;; DEF-VERTEX redefines each raw constructor on every expansion, so
        ;; this cannot double-wrap on a re-evaluated DEF-CLAIM-CLASSES form.

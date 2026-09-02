@@ -5390,6 +5390,16 @@ path-like ~"tenant/rule"~ names a producer carries. A keyword, an empty
 string, or a case or whitespace variant aborts the transaction on every
 write path, including a ~SETF~ + ~SAVE~ and the REST put. Both predicates
 are exported, so a tenant can pre-check a value it is about to write.
+
+Anything that must *refer* to a claim from outside the graph — another
+claim, a document, a decision trace — should name it by identity, not by
+node id: an id is a location, and it changes across retraction,
+re-assertion and regeneration. ~claim-identity-key~ renders the identity
+tuple as one canonical string (~|~-joined, ~|~ and ~\~ escaped inside
+string fields): producer, subject namespace and key, the object pair for
+a binary claim, the relation, and — for a temporal family — the extent
+start exactly as ~extent-sexp-start-key~ canonicalises it. Equal tuples
+render ~string=~ keys (vivace-graph#303).
 ~relation~ stays an OPEN vocabulary — the check is on form, not on
 membership; a closed vocabulary is ~DEF-VALUE-CONSTRAINT :ONE-OF~.
 
@@ -5696,6 +5706,17 @@ from the same index-bounded candidate set (vivace-graph#296):
   (claims-touching graph 'region-state :region "r1" :at day :current t)
   ;; ... as believed now
 #+END_SRC
+
+~:RELATION~ (a canonical string) restricts the read to one relation. On
+the subject side it rides a dedicated ~(subject-namespace subject-key
+relation)~ index every family declares (~claim-subject-relation~), so a
+one-relation read of an endpoint carrying thousands of claims touches
+only that relation's rows; on the object side it filters the endpoint
+candidates. ~:LIMIT~ and ~:OFFSET~ cut the final filtered result, and
+the second return value is ~T~ exactly when more claims existed past the
+cut (~NIL~ when ~:LIMIT~ was not given) — computed by asking for one
+past the cap, the same rule the REST query envelope uses.
+~claims-by-producer~ paginates the same way (vivace-graph#302).
 
 One of ~:AT~ or ~:DURING~, not both. A claim with no extent makes no
 validity statement and is excluded by either filter.

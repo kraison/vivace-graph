@@ -152,3 +152,79 @@ must read one accessor (design §2, cl-llm#13)."
                         (list "s" key)))))
         (is (= 12.5d0 (claim-precision-m c)))
         (is (= 0.25d0 (claim-fraction c)))))))
+
+(test claim-identity-key-is-canonical-and-arity-aware
+  "GH #303: equal identity tuples render STRING= keys; a unary key has no
+object segment; the key names identity, not location."
+  (with-claim-graph (g)
+    (declare (ignorable g))
+    (let (b1 b2 u1)
+      (with-transaction ()
+        (setq b1 (make-ct-claim-binary
+                  :subject-namespace :region :subject-key "r1"
+                  :relation "borders"
+                  :object-namespace :region :object-key "r2"
+                  :producer "ingest" :standing :observed)))
+      (with-transaction ()
+        (setq u1 (make-ct-claim-unary
+                  :subject-namespace :region :subject-key "r1"
+                  :relation "verified"
+                  :producer "ingest" :standing :observed)))
+      (setq b2 (first (claims-touching g 'ct-claim :region "r2"
+                                       :role :object)))
+      (is (string= (claim-identity-key b1) (claim-identity-key b2))
+          "same claim read back renders the same key")
+      (is (not (string= (claim-identity-key b1) (claim-identity-key u1))))
+      (is (search "|:region|r2|" (claim-identity-key b1))
+          "binary key carries the object segment")
+      (is (null (search "|:region|r2|" (claim-identity-key u1)))))))
+
+(test claims-touching-paginates-with-a-truncated-flag
+  "GH #302: :limit/:offset cut the final result; the second value is T
+exactly when more existed past the cut."
+  (with-claim-graph (g)
+    (with-transaction ()
+      (dotimes (k 8)
+        (make-ct-claim-binary
+         :subject-namespace :region :subject-key "pg"
+         :relation "contains"
+         :object-namespace :item :object-key (format nil "i~d" k)
+         :producer "ingest" :standing :observed)))
+    (multiple-value-bind (page truncated)
+        (claims-touching g 'ct-claim :region "pg" :role :subject :limit 5)
+      (is (= 5 (length page)))
+      (is-true truncated))
+    (multiple-value-bind (page truncated)
+        (claims-touching g 'ct-claim :region "pg" :role :subject :limit 8)
+      (is (= 8 (length page)))
+      (is-false truncated))
+    (multiple-value-bind (page truncated)
+        (claims-touching g 'ct-claim :region "pg" :role :subject
+                         :limit 5 :offset 5)
+      (is (= 3 (length page)))
+      (is-false truncated))
+    (multiple-value-bind (page truncated)
+        (claims-by-producer g 'ct-claim "ingest" :limit 3)
+      (is (= 3 (length page)))
+      (is-true truncated))))
+
+(test claims-touching-relation-filter-rides-the-index
+  "GH #302: :relation restricts to one relation on both roles; the
+subject side answers from the CLAIM-SUBJECT-RELATION index."
+  (with-claim-graph (g)
+    (with-transaction ()
+      (dotimes (k 4)
+        (make-ct-claim-binary
+         :subject-namespace :region :subject-key "rel"
+         :relation (if (evenp k) "contains" "borders")
+         :object-namespace :item :object-key (format nil "i~d" k)
+         :producer "ingest" :standing :observed)))
+    (is (= 2 (length (claims-touching g 'ct-claim :region "rel"
+                                      :role :subject
+                                      :relation "contains"))))
+    (is (= 4 (length (claims-touching g 'ct-claim :region "rel"
+                                      :role :subject))))
+    (let ((via-object (claims-touching g 'ct-claim :item "i1"
+                                       :role :object
+                                       :relation "borders")))
+      (is (= 1 (length via-object))))))

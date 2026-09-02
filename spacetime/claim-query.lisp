@@ -9,8 +9,67 @@ claim with no extent makes no validity statement and never matches."
   (let ((e (claim-extent claim)))
     (and e (not (extents-disjoint-p e probe)))))
 
+(defun %identity-key-field (x)
+  "One identity-tuple field rendered for CLAIM-IDENTITY-KEY: strings pass
+escaped (\\ then |), keywords/symbols as :lowercase-name, integers as
+decimals, anything else via PRIN1.  Keys are canonically strings here;
+the escapes make the join injective for them."
+  (flet ((esc (str)
+           (with-output-to-string (out)
+             (loop for ch across str do
+               (when (or (char= ch #\\) (char= ch #\|))
+                 (write-char #\\ out))
+               (write-char ch out)))))
+    (etypecase x
+      (string (esc x))
+      (symbol (format nil ":~(~a~)" (symbol-name x)))
+      (integer (format nil "~d" x))
+      (t (esc (prin1-to-string x))))))
+
+(defun claim-identity-key (claim)
+  "CLAIM's identity tuple as one canonical string: producer, subject
+namespace and key, relation, the object pair for a binary claim, and --
+for a temporal family -- the extent START exactly as the identity tuple
+canonicalises it (EXTENT-SEXP-START-KEY).  Equal identity tuples render
+STRING= keys; the key survives retraction, re-assertion and
+regeneration, which node ids do not (GH #303).  Fields join on |, with
+| and \\ escaped inside string fields."
+  (let* ((family (or (find-if (lambda (f)
+                                (typep claim (claim-family-parent f)))
+                              (alexandria:hash-table-values
+                               *claim-families*))
+                     (error 'unknown-claim-family
+                            :name (class-name (class-of claim)))))
+         (binary-p (typep claim (claim-family-binary family)))
+         (fields
+           (append
+            (list (%identity-key-field (claim-producer claim))
+                  (%identity-key-field (claim-subject-namespace claim))
+                  (%identity-key-field (claim-subject-key claim)))
+            (when binary-p
+              (list (%identity-key-field (claim-object-namespace claim))
+                    (%identity-key-field (claim-object-key claim))))
+            (list (%identity-key-field (claim-relation claim)))
+            (when (claim-family-temporal-p family)
+              (list (let ((*print-case* :downcase))
+                      (prin1-to-string
+                       (extent-sexp-start-key
+                        (claim-extent-sexp claim)))))))))
+    (format nil "~{~a~^|~}" fields)))
+
+(defun %paginate (list limit offset)
+  "LIST cut to OFFSET/LIMIT; second value T when entries existed past the
+cut (the REST envelope's one-past-the-cap rule, GH #302)."
+  (let* ((start (min (or offset 0) (length list)))
+         (rest (nthcdr start list)))
+    (if limit
+        (values (subseq rest 0 (min limit (length rest)))
+                (> (length rest) limit))
+        (values rest nil))))
+
 (defun claims-touching (graph claim-class namespace key
-                        &key (role :either) current at during)
+                        &key (role :either) current at during
+                             relation limit offset)
   "Claims in GRAPH naming (NAMESPACE, KEY) as subject, object, or either.
 CLAIM-CLASS is the PARENT class name; one call covers both arities.  Answers
 from the claim graph's own indexes -- no cross-graph read, no snapshot, which
@@ -28,6 +87,12 @@ orthogonal to :CURRENT (validity vs transaction time, GH #148), both
 exclude a claim with no extent, and both filter the candidates the
 endpoint index already bounded (GH #296, design §2.5).
 
+:RELATION (a canonical string) restricts to one relation; on the subject
+side it rides the (subject-namespace subject-key relation) index (GH
+#302), on the object side it filters the endpoint candidates.  :LIMIT /
+:OFFSET cut the FINAL filtered result; the second return value is T when
+more claims existed past the cut (NIL without :LIMIT).
+
 An out-of-range ROLE signals rather than silently returning NIL -- NIL is
 also the correct answer for \"no claims touch this endpoint\", and this
 subsystem exists to keep those two cases from being confused."
@@ -41,9 +106,14 @@ subsystem exists to keep those two cases from being confused."
          (family (claim-family claim-class))
          (want (list namespace key))
          (subjects (when (member role '(:subject :either))
-                     (graph-db:index-lookup
-                      graph (claim-family-parent family)
-                      '(subject-namespace subject-key) want)))
+                     (if relation
+                         (graph-db:index-lookup
+                          graph (claim-family-parent family)
+                          '(subject-namespace subject-key relation)
+                          (list namespace key relation))
+                         (graph-db:index-lookup
+                          graph (claim-family-parent family)
+                          '(subject-namespace subject-key) want))))
          (objects (when (member role '(:object :either))
                     (graph-db:index-lookup
                      graph (claim-family-binary family)
@@ -60,7 +130,13 @@ subsystem exists to keep those two cases from being confused."
         (setf all (remove-if-not (lambda (c)
                                    (%claim-validity-touches-p c probe))
                                  all)))
-      all)))
+      (when (and relation (member role '(:object :either)))
+        ;; The object side has no relation index; filter what the endpoint
+        ;; index already bounded (GH #302).
+        (setf all (remove-if-not (lambda (c)
+                                   (equal relation (claim-relation c)))
+                                 all)))
+      (%paginate all limit offset))))
 
 (defun claim-extent (claim)
   "CLAIM's TEMPORAL-EXTENT, decoded from the stored sexp, or NIL.  The stored
@@ -151,7 +227,8 @@ Returns the saved copy, or CLAIM itself when nothing was written."
           (graph-db::*transaction* (%retract))
           (t (graph-db:with-transaction () (%retract))))))
 
-(defun claims-by-producer (graph claim-class producer)
+(defun claims-by-producer (graph claim-class producer
+                           &key limit offset)
   "Every live claim PRODUCER wrote, both arities.  CLAIM-CLASS is the PARENT,
 so one call covers unary and binary -- the same contract as this function's
 destructive twin, DELETE-CLAIMS-BY-PRODUCER.
@@ -166,10 +243,12 @@ unregistered CLAIM-CLASS signals UNKNOWN-CLAIM-FAMILY instead, so \"no such
 family\" and \"that family, nothing produced\" stay distinguishable.
 
 Uses the PRODUCER index, so this is O(matching) rather than a scan of every
-claim."
+claim.  :LIMIT / :OFFSET cut the result; the second return value is T
+when more claims existed past the cut (NIL without :LIMIT) (GH #302)."
   (let ((family (claim-family claim-class)))
-    (graph-db:index-lookup graph (claim-family-parent family)
-                           '(producer) producer)))
+    (%paginate (graph-db:index-lookup graph (claim-family-parent family)
+                                      '(producer) producer)
+               limit offset)))
 
 (defun delete-claims-by-producer (graph claim-class producer)
   "Mark every claim PRODUCER wrote as deleted; return how many.  CLAIM-CLASS

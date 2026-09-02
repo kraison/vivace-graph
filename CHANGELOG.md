@@ -11,6 +11,20 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ## [Unreleased]
 
+### Added
+
+- **`claim-identity-key`** (#303): a claim's identity tuple — producer,
+  subject, object for a binary claim, relation, and the canonical extent
+  start for a temporal family — as one canonical string, so external
+  references name claims by identity instead of node id. Equal tuples
+  render `string=` keys; `|`-joined with escaping.
+- **`claims-touching` and `claims-by-producer` paginate** (#302):
+  `:limit`/`:offset` and a second `truncated` return value (one past the
+  cap, like the REST envelope). `claims-touching` also gains
+  `:relation`, riding a new `(subject-namespace subject-key relation)`
+  index every claim family now declares (`claim-subject-relation`), so a
+  one-relation read of a busy endpoint touches only that relation's rows.
+
 ## [4.0.1] - 2026-09-02
 
 ### Fixed

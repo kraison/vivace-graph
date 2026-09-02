@@ -51,6 +51,7 @@
    #:claim-extent-sexp #:claim-geometry
    #:claim-precision-m #:claim-fraction                 ; GH #138
    #:claim-extent #:claims-touching
+   #:claim-identity-key                                ; GH #303
    #:claim-transaction-extent-sexp                     ; GH #148
    #:claim-transaction-extent #:claim-recorded-at
    #:claim-current-p #:retract-claim                   ; GH #162
