@@ -23,6 +23,18 @@ checkout (Quicklisp `local-projects` symlink, or push the repo dir onto
 `asdf:*central-registry*`) and verify with
 `(asdf:system-source-directory :graph-db)` before trusting a run.
 
+## The stale-fasl rule (learned 2026-09-02)
+
+**Never benchmark the incrementally-recompiled working checkout after a
+heavy edit day.** ASDF's incremental rebuilds can leave a fasl set that
+runs measurably slower than a clean build of the *same tree* — observed
+at 2.4× on `prolog-is-a-scan` (27k vs 68k ops/s, four stable samples
+each side), which burned an afternoon of bisecting before the clean
+control exposed it. It is 3.0.0's `rsync -a` stale-fasl lesson in a new
+costume. Before any measurement that will be compared or blessed: run
+from a fresh `git worktree` (its own fasl namespace), or purge
+`~/.cache/common-lisp/<impl>/<path-to-checkout>` and rebuild.
+
 ## The comparability rule
 
 Never compare across suite generations or hosts (learned in the 3.0
