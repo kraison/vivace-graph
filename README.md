@@ -13,7 +13,13 @@ LispWorks support is currently **untested** for lack of access to a license; the
 
 A note on CCL: it works on Linux x86_64, but **not on Apple-Silicon macOS** — the Clozure ARM64 port has been stalled for several years and macOS support for Intel (x86_64) binaries is nearly gone, so there is no usable CCL on M-series Macs. On Apple Silicon, use SBCL or ECL.
 
-To get started, please see example.lisp.
+To get started, please see [`examples/example.lisp`](examples/example.lisp) —
+the end-to-end walkthrough (schema, views, ordered/unique/vector indexes,
+transactions, Prolog and spatial queries). Two more walkthroughs live beside
+it: [`examples/example-spacetime.lisp`](examples/example-spacetime.lisp)
+(claims with temporal extents, Chapter 18's subsystem) and
+[`examples/runtime-schema-example.lisp`](examples/runtime-schema-example.lisp)
+(runtime-defined types; documentation, not loadable code).
 
 ### Documentation
 
