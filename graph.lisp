@@ -266,7 +266,18 @@ deliberately not done here."
           ;; to warn about, and nothing to scan.
           (t nil))))))
 
-(defun vector-search (graph class-name slot-name query-vector k)
+(defun %class-declares-vector-index-p (class slot-name)
+  "True when CLASS or an ancestor declares SLOT-NAME :vector-index t --
+the discrimination behind VECTOR-SEARCH's second value (GH #293)."
+  (some (lambda (c)
+          (find-if (lambda (sd)
+                     (and (eq (slot-definition-name sd) slot-name)
+                          (ignore-errors (vector-index-p sd))))
+                   (class-direct-slots c)))
+        (class-precedence-list class)))
+
+(defun vector-search (graph class-name slot-name query-vector k
+                      &key filter)
   "Top-K nodes of CLASS-NAME (and its subclasses) whose SLOT-NAME vector is
 nearest QUERY-VECTOR by cosine, as (score . node-id) conses, best first.
 
@@ -276,19 +287,27 @@ NIL when no segment exists yet: segments are created lazily on the first
 conforming write, so a declared-but-never-written slot simply has nothing to
 search.
 
-NIL is AMBIGUOUS, deliberately.  It means any of: (a) the legitimate lazy case
-above; (b) CLASS-NAME names no class; (c) SLOT-NAME is not a :VECTOR-INDEX slot
-on CLASS-NAME or any ancestor -- in which case %VECTOR-INDEX-SLOT-OWNER-NAME
-falls back to the queried class itself and the lookup misses a key nothing was
-ever stored under.  So a typo in either name is indistinguishable from an empty
-index and reports \"nothing indexed\" rather than signalling.  If you are
-debugging an unexpectedly empty result, check the declaration before the data."
+The SECOND value disambiguates an empty first value (GH #293):
+:OK (a real, possibly empty, answer), :NO-SUCH-CLASS, :NOT-A-VECTOR-
+INDEX-SLOT (the typo case that used to be indistinguishable from an
+empty index), or :NO-SEGMENT-YET (declared, never written -- the
+legitimate lazy case).
+
+:FILTER (GH #293) is a function of the candidate's node id, applied
+INSIDE the scan before the vector is read, so a bounded query fills K
+with in-bounds hits instead of post-filtering below K.  The filter never
+sees a node -- the segment's no-materialisation property survives."
   (let* ((class (find-class class-name nil))
          (owner (and class (%vector-index-slot-owner-name class slot-name)))
          (segment (and owner
-                       (gethash (cons owner slot-name) (vector-segments graph)))))
-    (when segment
-      (segment-scan segment query-vector k))))
+                       (gethash (cons owner slot-name)
+                                (vector-segments graph)))))
+    (cond ((null class) (values nil :no-such-class))
+          ((not (%class-declares-vector-index-p class slot-name))
+           (values nil :not-a-vector-index-slot))
+          ((null segment) (values nil :no-segment-yet))
+          (t (values (segment-scan segment query-vector k :filter filter)
+                     :ok)))))
 
 (defstruct (%graph-open-state (:conc-name %gos-))
   "Mutable state MAKE-GRAPH/OPEN-GRAPH thread through their private

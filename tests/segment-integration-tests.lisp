@@ -1159,3 +1159,56 @@ leaving the file on disk, then write again through the normal commit path."
                    "the newly written vector must also be present")))
         (ignore-errors (close-graph g :snapshot-p nil))
         (collect-garbage)))))
+
+(test vector-search-filter-fills-k-and-disambiguates-nil
+  "GH #293: a candidate filter runs INSIDE the top-K scan, so a bounded
+:k fills with in-bounds hits that ranked below the unfiltered top; and
+vector-search's second value distinguishes the NIL cases."
+  (with-temp-directory (dir)
+    (let ((g (make-graph *integration-graph-name* (namestring dir)
+                         :buffer-pool-size 1000)))
+      (unwind-protect
+           (let ((*graph* g))
+             (with-transaction ()
+               ;; Group A dominates unfiltered similarity to the probe.
+               (dotimes (i 4)
+                 (make-si-doc :title "a" :embedding (%si-embedding 8 1.0)))
+               ;; Group B: far from the probe, loses the unfiltered top.
+               (dotimes (i 3)
+                 (make-si-doc :title "b" :embedding (%si-embedding 8 -9.0))))
+             (let* ((probe (%si-embedding 8 1.0))
+                    (b-ids '()))
+               (map-vertices
+                (lambda (v)
+                  (when (string= "b" (slot-value v 'title))
+                    (push (graph-db:id v) b-ids)))
+                g :vertex-type 'si-doc)
+               (is (= 3 (length b-ids)))
+               ;; Unfiltered top-3: all group A.
+               (multiple-value-bind (top reason)
+                   (vector-search g 'si-doc 'embedding probe 3)
+                 (is (eq :ok reason))
+                 (is (= 3 (length top)))
+                 (is (notany (lambda (hit)
+                               (member (cdr hit) b-ids :test #'equalp))
+                             top)))
+               ;; Filtered: k fills with the B hits a post-filter loses.
+               (multiple-value-bind (top reason)
+                   (vector-search g 'si-doc 'embedding probe 3
+                                  :filter (lambda (id)
+                                            (member id b-ids
+                                                    :test #'equalp)))
+                 (is (eq :ok reason))
+                 (is (= 3 (length top)))
+                 (is (every (lambda (hit)
+                              (member (cdr hit) b-ids :test #'equalp))
+                            top)))
+               ;; The NIL cases, told apart.
+               (is (eq :no-such-class
+                       (nth-value 1 (vector-search g 'si-no-such-class
+                                                   'embedding probe 3))))
+               (is (eq :not-a-vector-index-slot
+                       (nth-value 1 (vector-search g 'si-doc 'title
+                                                   probe 3))))))
+        (close-graph g :snapshot-p nil))
+      (collect-garbage))))

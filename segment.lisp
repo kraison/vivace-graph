@@ -986,7 +986,7 @@ scoring many B's against the same A (segment-scan) should call
   (declare (type (simple-array single-float (*)) a b))
   (%cosine-with-norm a (%vector-norm a) b))
 
-(defun segment-scan (segment query-vector k)
+(defun segment-scan (segment query-vector k &key filter)
   "Top-K by full cosine over every occupied slot, best first, as (score . id)
 conses.  Takes the segment's READ lock, so it is safe against a concurrent
 growing commit (which holds the write lock).
@@ -1003,7 +1003,14 @@ rejected loudly instead of silently scored against a prefix.
 
 The query's own norm is computed ONCE here and threaded through
 %COSINE-WITH-NORM for every candidate, rather than recomputed per occupied
-slot."
+slot.
+
+:FILTER (GH #293), a function of one argument -- the candidate's 16-byte
+node id -- gates a slot BEFORE its vector is read or scored, so a bounded
+top-K fills K with IN-BOUNDS hits in one pass instead of post-filtering
+an unbounded top-K down to fewer than K.  The filter sees only the id
+(never a node -- the no-materialisation property survives); rejecting is
+cheap since the vector block is not touched for a rejected slot."
   (declare (type (simple-array single-float (*)) query-vector))
   (unless (= (length query-vector) (segment-dimension segment))
     (error "query vector length ~D does not match segment dimension ~D"
@@ -1024,8 +1031,11 @@ slot."
         (dotimes (slot cap)
           (unless (= (deserialize-uint64 mmap (%seg-id-offset slot)) +free-slot-marker+)
             (let ((id (get-bytes mmap (%seg-id-offset slot) +key-bytes+)))
-              (%seg-read-vector-into segment slot v)
-              (%topk-offer collector (%cosine-with-norm query-vector qnorm v) id))))
+              (when (or (null filter) (funcall filter id))
+                (%seg-read-vector-into segment slot v)
+                (%topk-offer collector
+                             (%cosine-with-norm query-vector qnorm v)
+                             id)))))
         (%topk-results collector)))))
 
 (defun segment-score-subset (segment query-vector node-ids)
