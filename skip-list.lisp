@@ -185,6 +185,18 @@ L1: 50%, L2: 25%, L3: 12.5%, ..."
       (incf offset))
     (setf (aref (%sn-pointers node) level) addr)))
 
+(defun get-node-pointer (skip-list node level)
+  "NODE's LEVEL forward pointer, read FRESH from the heap, refreshing the
+object's array.  Mutators validate and splice against this, never the
+object snapshot: a cached node can carry pre-update pointers (GH #298)."
+  (let ((offset (+ (%sn-addr node) 10 (* level 8)))
+        (addr 0))
+    (dotimes (i 8)
+      (setf (ldb (byte 8 (* i 8)) addr)
+            (get-byte (%sl-heap skip-list) (+ offset i))))
+    (setf (aref (%sn-pointers node) level) addr)
+    addr))
+
 (defun read-skip-flags (skip-list node)
   (let ((flags (get-byte (%sl-heap skip-list) (+ (%sn-addr node) 9))))
     (setf (%sn-flags node) flags)
@@ -695,7 +707,12 @@ without re-grabbing, and the caller's unwind released it anyway."
                                     (succ (aref succs level)))
                                 (and (not (%sn-marked-p skip-list pred))
                                      (not (%sn-marked-p skip-list succ))
-                                     (= (aref (%sn-pointers pred) level)
+                                     ;; Fresh read, not the object snapshot
+                                     ;; (GH #298): a stale cached pred passes
+                                     ;; a consistent-but-old comparison and
+                                     ;; the splice would orphan a newer node.
+                                     (= (get-node-pointer skip-list pred
+                                                          level)
                                         (%sn-addr succ))))))
                   (when valid-p
                     (let ((node (make-skip-node skip-list key value top-level)))
@@ -835,14 +852,19 @@ none matched."
                                        (let ((pred (aref preds level)))
                                          (and (not (%sn-marked-p skip-list
                                                                  pred))
-                                              (= (aref (%sn-pointers pred)
-                                                       level)
+                                              ;; Fresh read (GH #298), as in
+                                              ;; ADD-TO-SKIP-LIST.
+                                              (= (get-node-pointer
+                                                  skip-list pred level)
                                                  (%sn-addr node))))))
                         (mark-node skip-list node)
                         (loop for level from (1- top-level) downto 0 do
+                             ;; The victim's forwards read fresh too (GH
+                             ;; #298): a stale snapshot here would splice
+                             ;; PAST a node inserted after it was cached.
                              (set-node-pointer
                               skip-list (aref preds level) level
-                              (aref (%sn-pointers node) level)))
+                              (get-node-pointer skip-list node level)))
                         (decf-skip-list-count skip-list)
                         ;; Evict from BOTH caches BEFORE handing the address
                         ;; back to the allocator -- see

@@ -188,3 +188,23 @@ simultaneously must complete without errors."
                           (invoke-graph-view 'c-item 'c-item-by-value
                                              :graph g))))))
       (pass))))
+
+(test concurrent-uuid-generation-is-collision-free
+  "GEN-V8-UUID under concurrency must never mint the same id twice: RANDOM
+on a shared RANDOM-STATE races, and a duplicate node id silently swallows
+a node (GH #298 -- 590 duplicates in 200k concurrent draws before the
+id lock).  10 x 20,000 draws reproduced it reliably; zero is the spec."
+  (let* ((n 10) (m 20000)
+         (results (make-array n)))
+    (run-threads n
+                 (lambda (i)
+                   (let ((v (make-array m)))
+                     (dotimes (k m)
+                       (setf (aref v k) (graph-db::gen-v8-uuid 1)))
+                     (setf (aref results i) v))))
+    (let ((seen (make-hash-table :test 'equalp)) (dups 0))
+      (loop for v across results do
+        (loop for id across v do
+          (if (gethash id seen) (incf dups) (setf (gethash id seen) t))))
+      (is (zerop dups) "~D duplicate uuids in ~D concurrent draws"
+          dups (* n m)))))
