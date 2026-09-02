@@ -13,6 +13,18 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Added
 
+- **Cost-unbounded functors are classified engine-side, and a
+  resource-bounded `select` refuses them** (#285). `%tick` preempts at
+  goal boundaries only, so a functor burning arbitrary time in one
+  atomic call (`regex-match/2`'s catastrophic backtracking) runs past
+  `:timeout`/`:max-inferences` unaborted. `declare-functor-cost-unbounded`
+  classifies such functors; a `select` with either bound in effect
+  refuses goals naming one (`prolog-cost-unbounded-error`, instant,
+  any nesting) unless `:allow-cost-unbounded t` accepts the uncovered
+  bound. The GUI's #279 category now derives from this registry
+  (`cost-unbounded-predicate-names`) — single source. The async
+  watchdog non-option stays a non-option, documented.
+
 - **`claims-touching`/`claims-by-producer` `:as-of`** (#300, re-targeted
   to the spacetime layer): answer on the transaction axis — each claim
   returned as the version believed at the asked instant, in-place

@@ -919,6 +919,44 @@ resource bound is exceeded.  A no-op when no bound is in effect."
 ;;; the same way, since the tag lives on the functor itself.
 ;;; ---------------------------------------------------------------------------
 
+(define-condition prolog-cost-unbounded-error (prolog-error)
+  ((functor :initarg :functor :reader prolog-cost-unbounded-functor))
+  (:report
+   (lambda (c s)
+     (format s "Goal ~(~a~) is cost-unbounded: %TICK cannot preempt ~
+                inside one functor call, so :MAX-INFERENCES/:TIMEOUT ~
+                cannot bound it.  Run without resource bounds, or pass ~
+                :ALLOW-COST-UNBOUNDED T to accept the risk (GH #285)."
+             (prolog-cost-unbounded-functor c))))
+  (:documentation "A resource-bounded SELECT refused a goal the rails
+cannot actually bound (GH #285)."))
+
+(defun %static-goal-functors (goals)
+  "The NAME/ARITY functor symbols named by GOALS, walking the control
+constructs (and/or/not/if/when/unless).  Conservative and static: a
+meta-call through a variable is invisible here, exactly as it is to the
+compile-time path (GH #285, #279)."
+  (let ((acc '()))
+    (labels ((walk (goal)
+               (when (and (consp goal) (symbolp (first goal)))
+                 (let ((head (first goal)))
+                   (if (member head '(and or not if when unless))
+                       (mapc #'walk (rest goal))
+                       (push (make-functor-symbol head
+                                                  (length (rest goal)))
+                             acc))))))
+      (mapc #'walk goals))
+    acc))
+
+(defun %refuse-cost-unbounded (functors allow-p)
+  "Signal for the first cost-unbounded functor in FUNCTORS when a
+resource bound is in effect and ALLOW-P is false (GH #285)."
+  (when (and (not allow-p)
+             (or *inference-budget* *query-deadline*))
+    (dolist (f functors)
+      (when (functor-cost-unbounded-p f)
+        (error 'prolog-cost-unbounded-error :functor f)))))
+
 (define-condition prolog-permission-error (prolog-error)
   ()
   (:documentation "Signaled when a goal attempts a side effect (:write, :eval or
@@ -958,7 +996,12 @@ flat list of the single var's values rather than a list of tuples), :LIMIT,
 and :SKIP.  :MAX-INFERENCES bounds the number of inference steps and :TIMEOUT
 bounds the wall-clock seconds; exceeding either aborts the query with a
 PROLOG-RESOURCE-ERROR (both default to the *DEFAULT-INFERENCE-BUDGET* /
-*DEFAULT-QUERY-TIMEOUT* globals, which are nil = unlimited).  :EFFECTS sets the
+*DEFAULT-QUERY-TIMEOUT* globals, which are nil = unlimited).  When either
+bound is in effect, a goal naming a COST-UNBOUNDED functor (one %TICK
+cannot preempt mid-call -- REGEX-MATCH/2, and anything
+DECLARE-FUNCTOR-COST-UNBOUNDED classifies) is refused up front with
+PROLOG-COST-UNBOUNDED-ERROR; pass :ALLOW-COST-UNBOUNDED T to accept
+that the bound cannot cover it (GH #285).  :EFFECTS sets the
 side-effect policy -- T (all, the default) or a list of permitted tags drawn
 from (:write :eval :io); a disallowed effect aborts with a
 PROLOG-PERMISSION-ERROR.  Reads and pure logic are always allowed, so
@@ -1000,6 +1043,12 @@ SELECT-FIRST for common shorthands."
             (*select-callback* ,(cdr (assoc :callback options)))
             (*seen-table* (make-hash-table)) ;; For unique values
             (functor (make-functor :name *functor* :clauses nil)))
+       ;; A resource-bounded query must not carry a goal the rails
+       ;; cannot bound (GH #285).  Static over the goal list; checked
+       ;; at runtime because the budgets default from runtime globals.
+       (%refuse-cost-unbounded ',(%static-goal-functors goals)
+                               ,(cdr (assoc :allow-cost-unbounded
+                                            options)))
        (unwind-protect
             (let ((func
                    (lambda (cont)

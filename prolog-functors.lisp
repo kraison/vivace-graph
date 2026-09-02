@@ -25,6 +25,46 @@ goal's argument count."
 (defun default-functor-p (symbol)
   (gethash symbol *prolog-global-functors*))
 
+;;; Cost-boundedness classification (GH #285).  %TICK preempts at goal
+;;; boundaries only, so a functor that can burn arbitrary time in ONE
+;;; atomic Lisp call is invisible to the rails.  Classify such functors
+;;; here, engine-side, so every caller -- not just the GUI whitelist --
+;;; can know; SELECT refuses them when a resource bound is in effect.
+(defvar *cost-unbounded-functors*
+  #+sbcl (make-hash-table :test 'eq :synchronized t)
+  #+ccl (make-hash-table :test 'eq :shared t)
+  #+lispworks (make-hash-table :test 'eq :single-thread nil)
+  #+ecl (make-hash-table :test 'eq
+                         #+graph-db-ecl-sync-hash :synchronized
+                         #+graph-db-ecl-sync-hash t)
+  "NAME/ARITY functor symbols whose worst-case cost is bounded neither
+by the graph nor by the query length (GH #285).")
+
+(defun declare-functor-cost-unbounded (functor-symbol)
+  "Classify FUNCTOR-SYMBOL (a NAME/ARITY symbol, e.g. REGEX-MATCH/2) as
+cost-unbounded: %TICK cannot preempt inside it, so SELECT refuses goals
+naming it whenever :MAX-INFERENCES or :TIMEOUT is in effect, unless the
+caller passes :ALLOW-COST-UNBOUNDED T (GH #285)."
+  (setf (gethash functor-symbol *cost-unbounded-functors*) t)
+  functor-symbol)
+
+(defun functor-cost-unbounded-p (functor-symbol)
+  (values (gethash functor-symbol *cost-unbounded-functors*)))
+
+(defun cost-unbounded-predicate-names ()
+  "The classified predicates as bare name strings (sans /arity) -- the
+form surface whitelists compare against (GH #285; the GUI's category
+derives from this, single source)."
+  (let ((names '()))
+    (maphash (lambda (k v)
+               (declare (ignore v))
+               (let* ((s (symbol-name k))
+                      (slash (position #\/ s :from-end t)))
+                 (pushnew (subseq s 0 (or slash (length s))) names
+                          :test #'string=)))
+             *cost-unbounded-functors*)
+    names))
+
 (def-global-prolog-functor read/1 (exp cont)
   (require-effect :io)
   (if (unify exp (read)) (funcall cont)))
@@ -134,11 +174,14 @@ goal's argument count."
 
 (def-global-prolog-functor regex-match/2 (?arg1 ?arg2 cont)
   "Functor that treats first arg as a regex and uses cl-ppcre:scan to check
- for the pattern in the second arg."
+ for the pattern in the second arg.  Cost-unbounded (GH #285): a
+catastrophically backtracking pattern costs ~2^n in one atomic call
+%TICK cannot preempt, so SELECT refuses it under resource bounds."
   (if (and (stringp (var-deref ?arg1))
            (stringp (var-deref ?arg2))
            (cl-ppcre:scan ?arg1 ?arg2))
       (funcall cont)))
+(declare-functor-cost-unbounded 'regex-match/2)
 
 (def-global-prolog-functor var/1 (?arg1 cont)
   (if (unbound-var-p ?arg1) (funcall cont)))

@@ -277,7 +277,7 @@ a static goal keeps all six on the compile-time path (GH #279).  Same
 tripwire as above: PROLOG-FUNCTOR-INVENTORY-IS-PINNED.")
 
 (defparameter *prolog-cost-unbounded-predicates*
-  '("REGEX-MATCH")
+  (graph-db:cost-unbounded-predicate-names)   ; single source: GH #285
   "Predicate names withheld because their worst-case cost is bounded
 neither by the graph nor by the length of the query.
 
@@ -767,6 +767,13 @@ server; start the GUI with :ALLOW-PROLOG T to enable it"))
                  (declare (ignore c))
                  (gui-error 403 "forbidden-operation"
                             "Query attempted a forbidden operation"))
+               (graph-db:prolog-cost-unbounded-error (c)
+                 ;; The engine's #285 rail: admitted by the whitelist
+                 ;; (home-scoped), refused by the engine because the
+                 ;; resource bounds cannot cover one atomic call.  Its
+                 ;; own code, so the layers stay distinguishable.
+                 (gui-error 400 "cost-unbounded-goal"
+                            (princ-to-string c)))
                (graph-db:prolog-error (c)
                  (declare (ignore c))
                  (gui-error 400 "bad-query"

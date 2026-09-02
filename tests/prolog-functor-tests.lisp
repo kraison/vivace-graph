@@ -309,3 +309,40 @@ effect policy."
     (declare (ignore g))
     (signals graph-db:prolog-permission-error
       (select (:effects nil) (?r) (catch (retract ?x) ?b (= ?r :swallowed))))))
+
+(test cost-unbounded-goals-are-refused-under-resource-bounds
+  "GH #285: a resource-bounded SELECT refuses a goal %TICK cannot bound
+-- instantly, before the goal runs -- at any nesting; without bounds, or
+with :allow-cost-unbounded t, the goal runs as before."
+  (with-test-graph (g)
+    (declare (ignorable g))
+    ;; Refused with a bound, even nested under NOT, and instantly.
+    (let ((start (get-internal-real-time)))
+      (signals graph-db:prolog-cost-unbounded-error
+        (select (:timeout 30) (?x)
+                (lisp ?x "abc")
+                (regex-match "b" ?x)))
+      (signals graph-db:prolog-cost-unbounded-error
+        (select (:max-inferences 1000) (?x)
+                (lisp ?x "abc")
+                (not (regex-match "z" ?x))))
+      (is (< (/ (- (get-internal-real-time) start)
+                internal-time-units-per-second)
+             1)
+          "refusal must not cost what the goal would have"))
+    ;; Unbounded query: unchanged behaviour.
+    (is (= 1 (length (select (:flat t) (?x)
+                             (lisp ?x "abc")
+                             (regex-match "b" ?x)))))
+    ;; The explicit override accepts the uncovered bound.
+    (is (= 1 (length (select (:flat t :timeout 30
+                              :allow-cost-unbounded t)
+                             (?x)
+                             (lisp ?x "abc")
+                             (regex-match "b" ?x)))))
+    ;; Classification is engine data, and the name surface derives.
+    (is-true (graph-db:functor-cost-unbounded-p
+              (graph-db::make-functor-symbol
+               (quote graph-db::regex-match) 2)))
+    (is (member "REGEX-MATCH" (graph-db:cost-unbounded-predicate-names)
+                :test #'string=))))

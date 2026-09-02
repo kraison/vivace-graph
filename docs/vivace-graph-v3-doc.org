@@ -2334,7 +2334,11 @@ the control constructs out of the ~prolog-compiler-macro~ property on
 exists would create the very symbol it was asking about. Names are
 compared as strings.
 
-Three things are withheld on purpose:
+Three things are withheld on purpose (the cost-unboundedness category
+is now engine data — ~declare-functor-cost-unbounded~ /
+~cost-unbounded-predicate-names~, vivace-graph#285 — and this list
+derives from it; a resource-bounded ~select~ refuses such goals itself,
+so every caller gets the guard, not only this surface):
 
 - ~regex-match/2~, because its worst-case cost is bounded neither by
   the graph nor by the length of the query. The rails are enforced by
