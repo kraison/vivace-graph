@@ -433,6 +433,7 @@
            #:make-commit-view #:view-node #:view-old-node #:view-writes
            ;; GH #301: the evaluator entry point
            #:validate-writes #:validation-report
+           #:validate-transaction #:writes                 ; GH #320
            #:validation-report-violations #:validation-report-family-counts
            #:validation-report-checked-counts #:validation-report-spec-counts
            #:commit-view-graph #:*commit-validators*

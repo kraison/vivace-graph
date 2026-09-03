@@ -13,6 +13,12 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Added
 
+- **`validate-transaction`, and `writes` exported** (#320): a consumer
+  that stages writes in its own transaction can ask the #301 evaluator
+  about them -- `(validate-transaction graph)` over the ambient
+  transaction, or `(validate-writes graph (writes tx))` -- and commit or
+  roll back on the report, without reaching for an internal symbol.
+
 - **B+ tree cursors stopped consing a page per level and per crossing**
   (#97): `%bpt-read-page` reuses a caller buffer; a descent threads one
   buffer down the internal levels and a leaf crossing reuses the

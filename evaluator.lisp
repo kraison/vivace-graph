@@ -130,3 +130,12 @@ the enforcement (GH #301)."
          :family-counts counts
          :checked-counts checked
          :spec-counts (%evaluator-spec-counts graph))))))
+
+(defun validate-transaction (graph &optional (tx *transaction*))
+  "VALIDATE-WRITES over TX's write set -- the open transaction by
+default -- so a consumer that stages writes and asks before committing
+need not reach for the write set itself (GH #320).  Signals when no
+transaction is open: an empty set would validate clean and mislead."
+  (unless tx
+    (error "VALIDATE-TRANSACTION: no transaction is open."))
+  (validate-writes graph (writes tx)))
