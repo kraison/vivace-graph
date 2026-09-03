@@ -199,7 +199,24 @@ web-free.  docs/guarded-query.md; GH #322."
   :serial t
   :components ((:file "package")
                (:file "dsl")
-               (:file "guard")))
+               (:file "guard"))
+  :in-order-to ((test-op (test-op :graph-db/query-test))))
+
+(defsystem graph-db/query-test
+  :name "VivaceGraph guarded-query test suite"
+  :description "FiveAM tests driving GRAPH-DB.QUERY:RUN-GUARDED-PROLOG
+directly, web-free (GH #322)."
+  :maintainer "Kevin Raison"
+  :author "Kevin Raison <last name @ chatsubo dot net>"
+  :version "4.0.1"
+  :depends-on (:graph-db/query :graph-db/test-scratch :fiveam)
+  :pathname "tests/query/"
+  :serial t
+  :components ((:file "package") (:file "suite") (:file "guard-tests"))
+  :perform (test-op (op c)
+             (unless (uiop:symbol-call :graph-db/query-test
+                                       :run-query-tests)
+               (error "graph-db query tests failed."))))
 
 ;; FULL: replication + the HTTP API leaf (rest, clack/ningle).  graph-db/replication
 ;; (and transitively graph-db/core) has already compiled+loaded the engine + transport,

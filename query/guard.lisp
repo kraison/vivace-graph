@@ -621,3 +621,94 @@ cut recorded."
   (or (typep c 'graph-db:query-precondition-error)
       (and *no-applicable-method-type*
            (typep c *no-applicable-method-type*))))
+
+;;; ---------------------------------------------------------------------
+;;; Step 5-6: the runner, exported (spec SS4, GH #322)
+;;; ---------------------------------------------------------------------
+
+(defun %clamp-cap (limit)
+  (if (and (integerp limit) (plusp limit))
+      (min limit graph-db::*query-default-limit*)
+      graph-db::*query-default-limit*))
+
+(defun %probe (cap)
+  "One past CAP tells truncated from exactly full; at the ceiling there
+is no room, so an exactly-full page reads as truncated (GH #278)."
+  (if (< cap graph-db::*query-default-limit*) (1+ cap) cap))
+
+(defun %guarded-run-package (graph)
+  "The package a guarded goal list's heads canonicalize in.
+
+Single-package resolution: COMPILE-CALL interns NAME/ARITY in
+*PACKAGE*, so one binding must cover every head in the goal list.
+GRAPH's schema package (edge functors are installed there, GH #172) is
+used when it :USES GRAPH-DB -- then a GRAPH-DB global head still
+resolves, by inheritance, alongside the schema's own edge functors,
+exactly as the GUI's former %SCHEMA-PACKAGE ran.  A schema declared
+:USE NOTHING (spec SS6) cannot inherit, so GRAPH-DB is used instead:
+its own globals resolve, an edge functor from that schema does not --
+the gap Task 4's head resolution closes (GH #279, #322)."
+  (let* ((types (append (schema-type-names graph :vertex)
+                        (schema-type-names graph :edge)))
+         (schema-pkg (and types (symbol-package (first types)))))
+    (if (and schema-pkg
+             (member (find-package :graph-db)
+                     (package-use-list schema-pkg)))
+        schema-pkg
+        (find-package :graph-db))))
+
+(defun %run-guarded-goals (vars goals graph probe)
+  "The already-guarded query's rows, RAW, at most PROBE of them, with
+the GUI's three-way condition contract (GH #279)."
+  (handler-case
+      (let ((rows '()))
+        (graph-db::run-query-goals
+         vars goals graph :limit probe :format :raw
+         :package (%guarded-run-package graph)
+         :callback (lambda (row) (push row rows)))
+        (nreverse rows))
+    (graph-db:prolog-error (c) (error c))
+    (graph-db:query-param-error (c) (error c))
+    (error (c)
+      (cond ((%ill-typed-condition-p c)
+             (log:error "query guard: ill-typed query (~S): ~A"
+                        (type-of c) c)
+             (error 'prolog-ill-typed-error))
+            (t
+             (log:error "query guard: UNEXPECTED SERVER FAULT (~S): ~A"
+                        (type-of c) c)
+             (error 'prolog-server-fault))))))
+
+(defun run-guarded-prolog (text graph &key limit max-inferences timeout
+                                            (format :data))
+  "Screen, read, guard and run TEXT against GRAPH; (VALUES COLUMNS ROWS
+TRUNCATED-P).  COLUMNS are the variables in first-appearance order as
+downcased wire strings; ROWS one list per solution, cells JSON-shaped
+under :DATA (a node is its id string; strings, numbers, T, NIL pass) or
+as bound under :RAW.  LIMIT is clamped to *QUERY-DEFAULT-LIMIT*;
+MAX-INFERENCES and TIMEOUT bind the DSL's budgets for this call.
+Refusals signal PROLOG-GUARD-ERROR; see the header for the rest of the
+condition contract (spec SS4, GH #322)."
+  (check-type format (member :data :raw))
+  (let* ((scratch (%make-scratch-package))
+         (cap (%clamp-cap limit))
+         (probe (%probe cap))
+         (graph-db::*query-default-max-inferences*
+           (or max-inferences graph-db::*query-default-max-inferences*))
+         (graph-db::*query-default-timeout*
+           (or timeout graph-db::*query-default-timeout*)))
+    (unwind-protect
+         (multiple-value-bind (vars goals)
+             (%read-guarded-forms text scratch (%guard-context graph scratch))
+           (let* ((rows (%run-guarded-goals vars goals graph probe))
+                  (n (length rows))
+                  (truncated (if (> probe cap) (> n cap) (>= n cap)))
+                  (shown (if (> n cap) (subseq rows 0 cap) rows)))
+             (values (mapcar #'graph-db::%query-var-field vars)
+                     (if (eq format :data)
+                         (mapcar (lambda (row)
+                                   (mapcar #'graph-db::%query-value->json row))
+                                 shown)
+                         shown)
+                     (and truncated t))))
+      (delete-package scratch))))

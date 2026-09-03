@@ -78,54 +78,14 @@ is the package a goal head must canonicalize in."
     (or (and types (symbol-package (first types)))
         (find-package :graph-db))))
 
-(defun %run-guarded-query (vars goals graph limit)
-  "Run the already-guarded query and answer the shared envelope.
-
-Three outcomes, and the point of the split is that the third is never
-dressed up as the second: the DSL's own reviewed Prolog conditions keep
-their messages (they were written to be client-facing); a shape client
-input is known to produce becomes PROLOG-ILL-TYPED-ERROR (400);
-anything else is PROLOG-SERVER-FAULT (500).  Neither of the latter two
-carries the condition's own report to the client -- those name engine
-internals -- but they log under DISTINCT labels, so an operator can
-grep a genuine fault apart from a user's malformed goal (GH #279)."
-  (handler-case
-      (let* ((cap (%clamp-row-cap limit))
-             (probe (%query-probe-limit cap)))
-        (%query-envelope
-         (graph-db::run-query-goals
-          vars goals graph
-          ;; The schema's package, exactly as the JSON DSL runs:
-          ;; COMPILE-CALL canonicalizes each head there.
-          :package (%schema-package graph)
-          :limit probe)
-         cap probe))
-    ;; PROLOG-RESOURCE-ERROR and PROLOG-PERMISSION-ERROR are subtypes,
-    ;; so this one clause re-signals all three unchanged.
-    (graph-db:prolog-error (c) (error c))
-    (graph-db:query-param-error (c) (error c))
-    (error (c)
-      (cond ((graph-db.query::%ill-typed-condition-p c)
-             (log:error "GUI prolog: ill-typed query (~S): ~A"
-                        (type-of c) c)
-             (error 'graph-db.query:prolog-ill-typed-error))
-            (t
-             (log:error "GUI prolog: UNEXPECTED SERVER FAULT (~S): ~A"
-                        (type-of c) c)
-             (error 'graph-db.query:prolog-server-fault))))))
-
 (defun %run-guarded-prolog (text limit graph)
-  "Read, guard and run TEXT against GRAPH; answers the shared workbench
-envelope.  The scratch package dies in the UNWIND-PROTECT, on every
-path including a signal, so no request can leave symbols behind."
-  (let ((scratch (graph-db.query::%make-scratch-package)))
-    (unwind-protect
-         (multiple-value-bind (vars goals)
-             (graph-db.query::%read-guarded-forms
-              text scratch
-              (graph-db.query::%guard-context graph scratch))
-           (%run-guarded-query vars goals graph limit))
-      (delete-package scratch))))
+  "The workbench envelope over GRAPH-DB.QUERY:RUN-GUARDED-PROLOG (GH
+#322).  The runner clamps and probes exactly as the DSL endpoint does,
+so the envelope's CAP/TRUNCATED come straight from its own answer."
+  (let ((cap (%clamp-row-cap limit)))
+    (multiple-value-bind (columns rows truncated)
+        (graph-db.query:run-guarded-prolog text graph :limit cap)
+      (%query-envelope-from-rows columns rows cap truncated))))
 
 ;; The flag is checked FIRST -- before the graph is resolved -- so a GUI
 ;; started without :ALLOW-PROLOG answers identically whatever graph is

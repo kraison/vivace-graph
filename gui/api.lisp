@@ -617,27 +617,40 @@ lose the spelling the DSL chose for each result variable."
                   (cons (car cell) (%json-value (cdr cell))))
                 row)))
 
-(defun %query-envelope (json-string cap probe)
+(defun %query-envelope-from-rows (columns rows cap truncated)
   "The workbench result envelope -- {columns, rows, rowCount, limit,
-truncated} -- for RUN-QUERY-GOALS' JSON-STRING, run under PROBE rows
-and answered under CAP.  Shared by the builder endpoint and the
-free-text Prolog one so one results table renders both (GH #278, #279)."
+truncated} -- built directly from already-JSON-shaped ROWS (one list
+of cells per COLUMNS, positional).  Shared by %QUERY-ENVELOPE and the
+free-text Prolog endpoint, so one results table renders both (GH #278,
+#279, #322)."
+  (%json-response
+   (list
+    (cons :columns (%arr columns))
+    (cons :rows (%arr (mapcar (lambda (row)
+                                (%query-row-json (mapcar #'cons columns row)))
+                              rows)))
+    (cons :row-count (length rows))
+    (cons :limit cap)
+    (cons :truncated (%bool truncated)))))
+
+(defun %query-envelope (json-string cap probe)
+  "The workbench result envelope for RUN-QUERY-GOALS' JSON-STRING, run
+under PROBE rows and answered under CAP.  Decodes the string, then
+shares %QUERY-ENVELOPE-FROM-ROWS' response building with the free-text
+Prolog endpoint (GH #278, #279, #322)."
   (let* ((rows (%decode-query-rows json-string))
          (n (length rows))
          ;; The probe row proves there was more; it is never shown.
          ;; Without room for it, >= is the best the runner's own clamp
          ;; allows.
          (truncated (if (> probe cap) (> n cap) (>= n cap)))
-         (shown (if (> n cap) (subseq rows 0 cap) rows)))
-    (%json-response
-     (list
-      ;; QUERY-ROW->ALIST builds every row in select order, so the
-      ;; first row names the columns.
-      (cons :columns (%arr (mapcar #'car (first shown))))
-      (cons :rows (%arr (mapcar #'%query-row-json shown)))
-      (cons :row-count (length shown))
-      (cons :limit cap)
-      (cons :truncated (%bool truncated))))))
+         (shown (if (> n cap) (subseq rows 0 cap) rows))
+         ;; QUERY-ROW->ALIST builds every row in select order, so the
+         ;; first row names the columns.
+         (columns (mapcar #'car (first shown))))
+    (%query-envelope-from-rows
+     columns (mapcar (lambda (row) (mapcar #'cdr row)) shown)
+     cap truncated)))
 
 ;; The whole query runs under WITH-GUI-GRAPH's read side, so a slow one
 ;; delays open/close for up to the DSL's *QUERY-DEFAULT-TIMEOUT*.  That

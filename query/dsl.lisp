@@ -300,7 +300,7 @@ QUERY-PARAM-ERROR on malformed input."
 
 (defun run-query-goals (vars goals graph
                         &key (package (find-package :graph-db))
-                             limit skip (format :json))
+                             limit skip (format :json) callback)
   "Run the already-compiled query GOALS against GRAPH, collecting VARS.
 
 This is THE runner: every client-supplied query -- the JSON pattern DSL and
@@ -311,26 +311,37 @@ are stated once.  Read-only (:EFFECTS NIL), snapshot-isolated, bounded by
 canonicalizes each goal head through MAKE-FUNCTOR-SYMBOL, which interns
 NAME/ARITY in *PACKAGE*: it must be the schema's package for an edge functor
 to resolve.  Callers built from untrusted text must whitelist every symbol
-BEFORE calling (see gui/prolog.lisp, GH #279).  Returns the result string."
+BEFORE calling (see gui/prolog.lisp, GH #279).  Returns the result string
+under :JSON/:NDJSON.
+
+:RAW is a fourth arm (GH #322): CALLBACK (required) receives each raw
+row -- no JSON rendering -- and the function returns NIL, for a caller
+that wants the bound values themselves (graph-db.query:run-guarded-
+prolog's :DATA format still converts them; :RAW does not)."
+  (when (and (eq format :raw) (not callback))
+    (error "RUN-QUERY-GOALS :FORMAT :RAW requires :CALLBACK."))
   ;; The eval'd SELECT / node-slot-value goals key off *GRAPH*.
   (let* ((*graph* graph)
          (*package* package)
          (cap (if (and (integerp limit) (plusp limit))
                   (min limit *query-default-limit*)
-                  *query-default-limit*)))
-    (emit-query-results
-     vars format
-     (lambda (cb)
-       ;; the select form is EVAL'd (null lexenv), so pass the callback through
-       ;; a special the form references rather than a lexical.
-       (let ((*pattern-query-callback* cb))
-         (eval `(select (:effects nil :snapshot t
-                         :limit ,cap
-                         :skip ,(when (integerp skip) skip)
-                         :max-inferences ,*query-default-max-inferences*
-                         :timeout ,*query-default-timeout*
-                         :callback *pattern-query-callback*)
-                        ,vars ,@goals)))))))
+                  *query-default-limit*))
+         (run (lambda (cb)
+                ;; the select form is EVAL'd (null lexenv), so pass the
+                ;; callback through a special the form references
+                ;; rather than a lexical.
+                (let ((*pattern-query-callback* cb))
+                  (eval `(select (:effects nil :snapshot t
+                                  :limit ,cap
+                                  :skip ,(when (integerp skip) skip)
+                                  :max-inferences
+                                  ,*query-default-max-inferences*
+                                  :timeout ,*query-default-timeout*
+                                  :callback *pattern-query-callback*)
+                                 ,vars ,@goals))))))
+    (if (eq format :raw)
+        (progn (funcall run callback) nil)
+        (emit-query-results vars format run))))
 
 (defun %dsl-ndjson-p (dsl)
   "T when the decoded JSON pattern query DSL asks for \"format\":\"ndjson\"."

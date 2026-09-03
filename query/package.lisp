@@ -9,4 +9,6 @@
    ;; the screen's limits
    #:*prolog-max-query-length* #:*prolog-max-depth*
    ;; schema names, shared with the GUI
-   #:schema-type-names))
+   #:schema-type-names
+   ;; the runner (spec SS4, GH #322)
+   #:run-guarded-prolog))
