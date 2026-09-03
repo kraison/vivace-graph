@@ -197,7 +197,9 @@ web-free.  docs/guarded-query.md; GH #322."
   :depends-on (:graph-db/core)
   :pathname "query/"
   :serial t
-  :components ((:file "dsl")))
+  :components ((:file "package")
+               (:file "dsl")
+               (:file "guard")))
 
 ;; FULL: replication + the HTTP API leaf (rest, clack/ningle).  graph-db/replication
 ;; (and transitively graph-db/core) has already compiled+loaded the engine + transport,

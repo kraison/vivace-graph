@@ -270,16 +270,8 @@ close cannot unmap the store mid-read (GH #269)."
                       (format nil "Graph ~A is not open"
                               (param ,params :name)))))))
 
-(defun %schema-type-names (graph parent)
-  "Node-type names (class symbols) registered for PARENT (:vertex or
-:edge) in GRAPH's schema, sorted by name."
-  (let ((names '()))
-    (maphash (lambda (key meta)
-               (when (numberp key)
-                 (push (graph-db::node-type-name meta) names)))
-             (gethash parent (graph-db::schema-type-table
-                             (graph-db::schema graph))))
-    (sort names #'string< :key #'symbol-name)))
+;; SCHEMA-TYPE-NAMES moved to GRAPH-DB.QUERY (GH #322); called
+;; qualified below.
 
 (defun %wire-symbol (symbol)
   "SYMBOL as its wire spelling: the engine's own name, downcased kebab
@@ -345,7 +337,7 @@ count zero."
                                     (and meta
                                          (graph-db::node-type-slots
                                           meta)))))))))
-          (%schema-type-names graph parent)))
+          (graph-db.query:schema-type-names graph parent)))
 
 (defun %index-inventory (graph)
   "DEF-INDEX specs + spatial indexes registered for GRAPH."
@@ -418,11 +410,13 @@ count zero."
   (with-gui-graph (graph params)
     (%json-response
      (list (cons :vertex-types
-                 (%arr (mapcar #'%wire-symbol
-                               (%schema-type-names graph :vertex))))
+                 (%arr
+                  (mapcar #'%wire-symbol
+                          (graph-db.query:schema-type-names graph :vertex))))
            (cons :edge-types
-                 (%arr (mapcar #'%wire-symbol
-                               (%schema-type-names graph :edge))))))))
+                 (%arr
+                  (mapcar #'%wire-symbol
+                          (graph-db.query:schema-type-names graph :edge))))))))
 
 ;;; ---------------------------------------------------------------------
 ;;; Node sample, inspection, neighborhood
