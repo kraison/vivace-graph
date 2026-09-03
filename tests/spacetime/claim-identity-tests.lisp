@@ -257,3 +257,16 @@ values driving CLAIMS-TOUCHING back to the same claim."
 its colon -- none is a key CLAIM-IDENTITY-KEY produced."
   (dolist (bad '("a|b|c" "a|:b|c|d|e|f|g|h" "a|:b|c\\" "a|b|c|d"))
     (signals malformed-claim-identity-key (split-claim-identity-key bad))))
+
+(test split-claim-identity-key-interns-only-canonical-namespaces
+  "GH #321 follow-up: a namespace field that is not [a-z0-9-]+ is
+refused BEFORE interning, so a caller string cannot grow the KEYWORD
+package -- proved by the keyword not existing afterwards."
+  (dolist (bad '("a|:Bad_NS|c|d" "a|:has space|c|d" "a|:pipe\\|x|c|d"))
+    (signals malformed-claim-identity-key (split-claim-identity-key bad)))
+  (is (null (find-symbol "BAD_NS" :keyword)))
+  (is (null (find-symbol "HAS SPACE" :keyword)))
+  ;; And the canonical case still interns, fresh image or not.
+  (is (eq :never-seen-before-ns
+          (nth-value 1 (split-claim-identity-key
+                        "a|:never-seen-before-ns|c|d")))))
