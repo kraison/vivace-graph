@@ -69,6 +69,7 @@
    #:mdv-name #:mdv-subject-namespace #:mdv-subject-key #:mdv-members
    #:check-disjoint-memberships
    #:unknown-claim-family
+   #:claim-family-conflict                             ; GH #323
    ;; temporal claim families (GH #296)
    #:claim-family-temporal-p #:extent-sexp-start-key
    ;; extents-disjoint-p is cl-temporal-extent's since its 0.2.0 (#1 there)

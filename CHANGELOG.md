@@ -136,6 +136,15 @@ between releases; cutting a release renames it to the new version and dates it.
   index every claim family now declares (`claim-subject-relation`), so a
   one-relation read of a busy endpoint touches only that relation's rows.
 
+### Fixed
+
+- **`def-claim-classes` derived its class names in `*package*`** (#323):
+  a declaration read from another package minted a second
+  `<parent>-binary` there and silently overwrote the family registry,
+  orphaning every existing claim of the family. Names now derive in the
+  parent symbol's package, and registering a family whose classes
+  differ from the registered ones signals `claim-family-conflict`.
+
 ## [4.0.1] - 2026-09-02
 
 ### Fixed

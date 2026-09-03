@@ -31,6 +31,22 @@ identity tuple and live runs must be pairwise disjoint (GH #296)."
   (or (gethash parent *claim-families*)
       (error 'unknown-claim-family :parent parent)))
 
+(defun %register-claim-family (parent unary binary temporal-p)
+  "Register PARENT's family.  Re-declaring with the same UNARY and
+BINARY names replaces silently (a flipped :TEMPORAL included); different
+names signal CLAIM-FAMILY-CONFLICT and leave the entry as it was, since
+replacing it would orphan every existing claim of the family (GH #323)."
+  (let ((old (gethash parent *claim-families*)))
+    (when (and old
+               (not (and (eq (claim-family-unary old) unary)
+                         (eq (claim-family-binary old) binary))))
+      (error 'claim-family-conflict :parent parent
+             :existing (list (claim-family-unary old)
+                             (claim-family-binary old))
+             :proposed (list unary binary))))
+  (setf (gethash parent *claim-families*)
+        (%make-claim-family parent unary binary temporal-p)))
+
 ;;; RELATION and PRODUCER are canonical strings (GH #160).  Both are in
 ;;; the DEF-UNIQUE identity tuple and compared with EQUAL, so a second
 ;;; spelling of one name (:x, "X", " x") is a second claim, never an
@@ -342,8 +358,9 @@ joins both identity tuples (EXTENT-SEXP-START-KEY), an extent is required
 at construction and at commit, and live claims sharing a base tuple must
 have pairwise disjoint validity (spacetime/temporal.lisp).  Same
 declaration names, so flipping the flag re-declares rather than stacks."
-  (let* ((unary (intern (format nil "~A-UNARY" parent)))
-         (binary (intern (format nil "~A-BINARY" parent)))
+  (let* ((home (symbol-package parent))
+         (unary (intern (format nil "~A-UNARY" parent) home))
+         (binary (intern (format nil "~A-BINARY" parent) home))
          (extent-slot (when temporal '(extent-sexp)))
          (unary-slots (append '(producer subject-namespace subject-key
                                 relation)
@@ -431,12 +448,12 @@ declaration names, so flipping the flag re-declares rather than stacks."
        (graph-db:def-index ,parent (subject-namespace subject-key
                                     relation)
            ,graph-name :name claim-subject-relation)
-       (fmakunbound ',(intern (format nil "MAKE-~A" parent)))
+       (fmakunbound ',(intern (format nil "MAKE-~A" parent) home))
        ;; DEF-VERTEX redefines each raw constructor on every expansion, so
        ;; this cannot double-wrap on a re-evaluated DEF-CLAIM-CLASSES form.
        ,@(mapcar
           (lambda (class identity-keys)
-            (let ((ctor (intern (format nil "MAKE-~A" class))))
+            (let ((ctor (intern (format nil "MAKE-~A" class) home)))
               `(let ((%raw (fdefinition ',ctor)))
                  (setf (fdefinition ',ctor)
                        (lambda (&rest args)
@@ -463,7 +480,6 @@ declaration names, so flipping the flag re-declares rather than stacks."
        (defmethod graph-db:save :before ((c ,parent) &key graph)
          (declare (ignore graph))
          (setf (claim-version-stamp c) (%st-now)))
-       (setf (gethash ',parent *claim-families*)
-             (%make-claim-family ',parent ',unary ',binary
-                                 ,(and temporal t)))
+       (%register-claim-family ',parent ',unary ',binary
+                               ,(and temporal t))
        ',parent))))
