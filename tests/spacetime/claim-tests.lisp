@@ -327,3 +327,43 @@ and a claim swept by delete-claims-by-producer is invisible."
       (delete-claims-by-producer g 'kr-claim "audit")
       (is (null (claims-touching g 'kr-claim :region "kr" :role :subject
                                  :as-of t0))))))
+
+;;; GH #323: derived names live with the PARENT, and the registry refuses
+;;; a family whose classes differ from the ones already registered.
+
+(defpackage #:graph-db/spacetime-test.elsewhere
+  (:use)
+  (:documentation "An empty package standing in for a tenant that
+declares a claim family from somewhere other than where the parent
+symbol lives (GH #323)."))
+
+(test def-claim-classes-names-live-with-the-parent
+  "GH #323: a declaration read in THIS package for a parent interned
+ELSEWHERE derives its class and constructor names in ELSEWHERE, so the
+same declaration means the same thing from any package."
+  (let* ((elsewhere (find-package :graph-db/spacetime-test.elsewhere))
+         (parent (intern "PK-CLAIM" elsewhere)))
+    (eval `(def-claim-classes ,parent :graph-db-claim-test))
+    (let ((family (claim-family parent)))
+      (is (eq elsewhere (symbol-package (claim-family-unary family))))
+      (is (eq elsewhere (symbol-package (claim-family-binary family))))
+      (is (fboundp (find-symbol "MAKE-PK-CLAIM-BINARY" elsewhere)))
+      (is (null (find-symbol "PK-CLAIM-UNARY" :graph-db/spacetime-test))))))
+
+(test registering-a-family-with-different-classes-is-refused
+  "GH #323: the registry entry for a parent is replaced silently only by
+a family naming the same unary and binary classes; anything else would
+orphan every existing claim of the family, so it signals and leaves the
+entry as it was."
+  (let ((old (claim-family 'ct-claim)))
+    (unwind-protect
+         (progn
+           (signals claim-family-conflict
+             (graph-db.spacetime::%register-claim-family
+              'ct-claim 'ct-claim-other-unary 'ct-claim-other-binary nil))
+           (is (eq old (claim-family 'ct-claim)))
+           (finishes
+             (graph-db.spacetime::%register-claim-family
+              'ct-claim (claim-family-unary old) (claim-family-binary old)
+              nil)))
+      (setf (gethash 'ct-claim graph-db.spacetime::*claim-families*) old))))

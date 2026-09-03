@@ -220,3 +220,40 @@ never go through MAKE-<NAME> -- here, SETF on an existing claim (GH #160)."
             (graph-db::save copy))))
       (is (equal "r" (claim-relation
                       (first (claims-touching g 'ct-claim :ns "s1"))))))))
+
+(test split-claim-identity-key-round-trips-unary-and-binary
+  "GH #321: the inverse of CLAIM-IDENTITY-KEY, with the escape rule
+exercised by keys holding both | and \\, and the split's first three
+values driving CLAIMS-TOUCHING back to the same claim."
+  (with-claim-graph (g)
+    (let (u b)
+      (with-transaction ()
+        (setq u (make-u :producer "rule-a" :subject "s|1\\x" :relation "r")
+              b (make-b :producer "rule-b" :subject "s2" :object "o|2"
+                        :relation "rel")))
+      (multiple-value-bind (producer ns key relation ons okey start)
+          (split-claim-identity-key (claim-identity-key u))
+        (is (string= "rule-a" producer))
+        (is (eq :ns ns))
+        (is (string= "s|1\\x" key))
+        (is (string= "r" relation))
+        (is (null ons)) (is (null okey)) (is (null start))
+        (is (string= (claim-identity-key u)
+                     (claim-identity-key
+                      (first (claims-touching g 'ct-claim ns key
+                                              :role :subject))))))
+      (multiple-value-bind (producer ns key relation ons okey start)
+          (split-claim-identity-key (claim-identity-key b))
+        (is (string= "rule-b" producer))
+        (is (eq :ns ns))
+        (is (string= "s2" key))
+        (is (string= "rel" relation))
+        (is (eq :ns ons))
+        (is (string= "o|2" okey))
+        (is (null start))))))
+
+(test split-claim-identity-key-refuses-other-shapes
+  "GH #321: three, eight, a dangling escape, a namespace field without
+its colon -- none is a key CLAIM-IDENTITY-KEY produced."
+  (dolist (bad '("a|b|c" "a|:b|c|d|e|f|g|h" "a|:b|c\\" "a|b|c|d"))
+    (signals malformed-claim-identity-key (split-claim-identity-key bad))))

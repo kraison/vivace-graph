@@ -57,6 +57,70 @@ regeneration, which node ids do not (GH #303).  Fields join on |, with
                         (claim-extent-sexp claim)))))))))
     (format nil "~{~a~^|~}" fields)))
 
+(defun %split-identity-key-fields (key)
+  "KEY's fields: split on unescaped |, with \\| and \\\\ unescaped."
+  (let ((fields '()) (buf (make-string-output-stream))
+        (i 0) (n (length key)))
+    (loop while (< i n) do
+      (let ((ch (char key i)))
+        (cond ((char= ch #\\)
+               (when (= (1+ i) n)
+                 (error 'malformed-claim-identity-key :key key))
+               (write-char (char key (1+ i)) buf)
+               (incf i 2))
+              ((char= ch #\|)
+               (push (get-output-stream-string buf) fields)
+               (incf i))
+              (t (write-char ch buf) (incf i)))))
+    (push (get-output-stream-string buf) fields)
+    (nreverse fields)))
+
+(defun %identity-key-namespace (field key)
+  "FIELD as the keyword %IDENTITY-KEY-FIELD rendered, else signal."
+  (if (and (> (length field) 1) (char= (char field 0) #\:))
+      (intern (string-upcase (subseq field 1)) :keyword)
+      (error 'malformed-claim-identity-key :key key)))
+
+(defun %identity-key-extent-start (field key)
+  "FIELD read back as EXTENT-SEXP-START-KEY data, *READ-EVAL* off."
+  (handler-case
+      (with-standard-io-syntax
+        (let ((*read-eval* nil)
+              (*package* (find-package :graph-db.spacetime)))
+          (read-from-string field)))
+    (error () (error 'malformed-claim-identity-key :key key))))
+
+(defun split-claim-identity-key (key)
+  "The inverse of CLAIM-IDENTITY-KEY (GH #321): (VALUES PRODUCER
+SUBJECT-NAMESPACE SUBJECT-KEY RELATION OBJECT-NAMESPACE OBJECT-KEY
+EXTENT-START), NIL for the fields a unary or non-temporal key lacks.
+Arity and temporality follow from the field count -- 4, 5, 6 or 7 --
+so the string alone suffices.  Namespaces come back as keywords, keys
+and relations as strings (an integer key encodes as its decimal string
+and decodes as one), EXTENT-START as EXTENT-SEXP-START-KEY's data.  The
+escape rule lives here and in %IDENTITY-KEY-FIELD, nowhere else.
+Signals MALFORMED-CLAIM-IDENTITY-KEY for any other shape."
+  (let* ((fields (%split-identity-key-fields key))
+         (n (length fields)))
+    (unless (<= 4 n 7)
+      (error 'malformed-claim-identity-key :key key))
+    (let* ((binary-p (>= n 6))
+           (temporal-p (oddp n))
+           (after-subject (cdddr fields))
+           (object-namespace (and binary-p
+                                  (%identity-key-namespace
+                                   (first after-subject) key)))
+           (object-key (and binary-p (second after-subject)))
+           (tail (if binary-p (cddr after-subject) after-subject)))
+      (values (first fields)
+              (%identity-key-namespace (second fields) key)
+              (third fields)
+              (first tail)
+              object-namespace
+              object-key
+              (and temporal-p
+                   (%identity-key-extent-start (second tail) key))))))
+
 (defstruct (reaped-claim (:constructor %make-reaped-claim (id)))
   "An :AS-OF answer the store can no longer give: the claim existed at
 the asked instant, but every version stamped then is past the family's
@@ -120,6 +184,31 @@ cut (the REST envelope's one-past-the-cap rule, GH #302)."
                 (> (length rest) limit))
         (values rest nil))))
 
+(defun %overlay-transaction (graph all family admit)
+  "ALL as the open transaction will commit it (GH #324): a candidate the
+transaction updated is replaced by its written version, one it deleted
+drops out, and a claim of FAMILY it created that satisfies ADMIT is
+added.  ALL itself outside a transaction.  The commit view is the same
+\"store with this transaction's writes on top\" that validation reads."
+  (let ((tx graph-db::*transaction*))
+    (if (null tx)
+        all
+        (let* ((view (graph-db:make-commit-view graph tx))
+               (out '()))
+          (dolist (c all)
+            (let ((v (graph-db:view-node view (graph-db:id c))))
+              (when v (push v out))))
+          (dolist (w (graph-db:view-writes view))
+            (let ((n (graph-db:view-node view (graph-db:id w))))
+              (when (and n
+                         (typep n (claim-family-parent family))
+                         (null (graph-db:view-old-node view n))
+                         (funcall admit n)
+                         (not (find (graph-db:id n) out
+                                    :key #'graph-db:id :test #'equalp)))
+                (push n out))))
+          (nreverse out)))))
+
 (defun claims-touching (graph claim-class namespace key
                         &key (role :either) current at during
                              relation limit offset as-of)
@@ -156,6 +245,12 @@ side it rides the (subject-namespace subject-key relation) index (GH
 :OFFSET cut the FINAL filtered result; the second return value is T when
 more claims existed past the cut (NIL without :LIMIT).
 
+Inside an open transaction the answer is what THAT transaction will
+commit (GH #324): its own retractions, updates and new claims are
+visible, so retract-then-assert on one series reads correctly before
+the commit.  :AS-OF is the exception -- it answers committed history
+only, since an uncommitted change is not yet history.
+
 An out-of-range ROLE signals rather than silently returning NIL -- NIL is
 also the correct answer for \"no claims touch this endpoint\", and this
 subsystem exists to keep those two cases from being confused."
@@ -187,10 +282,24 @@ subsystem exists to keep those two cases from being confused."
                    (remove-duplicates (append subjects objects)
                                       :key #'graph-db:id :test #'equalp)
                    (or subjects objects))))
-      (when as-of
-        (setf all (loop for c in all
-                        for v = (%claim-as-of graph c as-of)
-                        when v collect v)))
+      (if as-of
+          (setf all (loop for c in all
+                          for v = (%claim-as-of graph c as-of)
+                          when v collect v))
+          (setf all (%overlay-transaction
+                     graph all family
+                     (lambda (c)
+                       (or (and (member role '(:subject :either))
+                                (equal namespace
+                                       (claim-subject-namespace c))
+                                (equal key (claim-subject-key c))
+                                (or (null relation)
+                                    (equal relation (claim-relation c))))
+                           (and (member role '(:object :either))
+                                (typep c (claim-family-binary family))
+                                (equal namespace
+                                       (claim-object-namespace c))
+                                (equal key (claim-object-key c))))))))
       (when current
         (setf all (remove-if-not (lambda (c)
                                    (or (reaped-claim-p c)
@@ -320,10 +429,13 @@ when more claims existed past the cut (NIL without :LIMIT) (GH #302)."
   (let* ((family (claim-family claim-class))
          (all (graph-db:index-lookup graph (claim-family-parent family)
                                      '(producer) producer)))
-    (when as-of
-      (setf all (loop for c in all
-                      for v = (%claim-as-of graph c as-of)
-                      when v collect v)))
+    (if as-of
+        (setf all (loop for c in all
+                        for v = (%claim-as-of graph c as-of)
+                        when v collect v))
+        (setf all (%overlay-transaction
+                   graph all family
+                   (lambda (c) (equal producer (claim-producer c))))))
     (%paginate all limit offset)))
 
 (defun delete-claims-by-producer (graph claim-class producer)

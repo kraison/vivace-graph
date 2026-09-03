@@ -107,3 +107,30 @@ unchanged and the same graph still accepts a clean commit."
       (make-ev-item :sku "second" :grade "b"))
     (is (= 2 (length (map-vertices #'identity g :collect-p t
                                    :vertex-type (quote ev-item)))))))
+
+(test validate-transaction-reads-the-ambient-write-set
+  "GH #320: a consumer that stages writes in its own transaction asks
+the evaluator about them through the exported reader, then commits or
+rolls back.  The report equals VALIDATE-WRITES over GRAPH-DB:WRITES,
+and the commit that follows refuses what the report named."
+  (with-ev-graph (g)
+    (with-transaction ()
+      (make-ev-item :sku "taken" :grade "a"))
+    (signals unique-constraint-violation
+      (with-transaction ()
+        (make-ev-item :sku "taken" :grade "z")
+        (let* ((report (graph-db:validate-transaction g))
+               (direct (validate-writes g (graph-db:writes *transaction*)))
+               (families (mapcar #'first
+                                 (validation-report-violations report))))
+          (is (= 1 (length (graph-db:writes *transaction*))))
+          (is (null (set-exclusive-or '(:unique :value) families)))
+          (is (equal (mapcar #'first
+                             (validation-report-violations direct))
+                     families)))))))
+
+(test validate-transaction-needs-an-open-transaction
+  "Outside a transaction there is no write set to read; say so rather
+than validate an empty one and report clean (GH #320)."
+  (with-ev-graph (g)
+    (signals error (graph-db:validate-transaction g))))

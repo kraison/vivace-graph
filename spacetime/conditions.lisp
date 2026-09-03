@@ -83,3 +83,24 @@ transaction is single-graph; resolve before opening it."
   (:documentation
    "Signalled when a claim that already carries a transaction extent is
 given another.  Accessor-level only; see the design's immutability note."))
+
+(define-condition malformed-claim-identity-key (spacetime-error)
+  ((key :initarg :key :reader malformed-claim-identity-key-key))
+  (:report (lambda (c s)
+             (format s "Not a CLAIM-IDENTITY-KEY: ~s"
+                     (malformed-claim-identity-key-key c))))
+  (:documentation "SPLIT-CLAIM-IDENTITY-KEY was handed a string that
+CLAIM-IDENTITY-KEY cannot have produced (GH #321)."))
+
+(define-condition claim-family-conflict (spacetime-error)
+  ((parent :initarg :parent :reader claim-family-conflict-parent)
+   (existing :initarg :existing :reader claim-family-conflict-existing)
+   (proposed :initarg :proposed :reader claim-family-conflict-proposed))
+  (:report (lambda (c s)
+             (format s "Claim family ~s is registered with classes ~s; ~
+refusing to replace them with ~s"
+                     (claim-family-conflict-parent c)
+                     (claim-family-conflict-existing c)
+                     (claim-family-conflict-proposed c))))
+  (:documentation "A DEF-CLAIM-CLASSES for a parent already registered
+with different unary/binary classes (GH #323)."))

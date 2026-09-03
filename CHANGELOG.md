@@ -13,6 +13,26 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Added
 
+- **A transaction reads its own claim writes** (#324): `claims-touching`
+  and `claims-by-producer` overlay the open transaction's write set --
+  the commit view validation already uses -- so retract-then-assert on
+  one series inside one `with-transaction` no longer re-finds the
+  retracted claim as current. `:as-of` still answers committed history
+  only.
+
+- **`split-claim-identity-key`** (#321): the inverse of
+  `claim-identity-key`, so a consumer that stores keys and resolves
+  them later gets producer, subject, relation, object and extent start
+  back without re-implementing the escape rule. Arity and temporality
+  follow from the field count; a string the encoder cannot have
+  produced signals `malformed-claim-identity-key`.
+
+- **`validate-transaction`, and `writes` exported** (#320): a consumer
+  that stages writes in its own transaction can ask the #301 evaluator
+  about them -- `(validate-transaction graph)` over the ambient
+  transaction, or `(validate-writes graph (writes tx))` -- and commit or
+  roll back on the report, without reaching for an internal symbol.
+
 - **B+ tree cursors stopped consing a page per level and per crossing**
   (#97): `%bpt-read-page` reuses a caller buffer; a descent threads one
   buffer down the internal levels and a leaf crossing reuses the
@@ -115,6 +135,15 @@ between releases; cutting a release renames it to the new version and dates it.
   `:relation`, riding a new `(subject-namespace subject-key relation)`
   index every claim family now declares (`claim-subject-relation`), so a
   one-relation read of a busy endpoint touches only that relation's rows.
+
+### Fixed
+
+- **`def-claim-classes` derived its class names in `*package*`** (#323):
+  a declaration read from another package minted a second
+  `<parent>-binary` there and silently overwrote the family registry,
+  orphaning every existing claim of the family. Names now derive in the
+  parent symbol's package, and registering a family whose classes
+  differ from the registered ones signals `claim-family-conflict`.
 
 ## [4.0.1] - 2026-09-02
 
