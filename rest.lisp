@@ -426,8 +426,7 @@ A malformed query or a resource-bound breach is a 400, a forbidden effect a 403.
   (with-rest-auth ((get-param params "username") (get-param params "password"))
     (with-rest-graph ((get-param params :graph-name))
       ;; The DSL renders ndjson; the wire header is HTTP's (GH #322).
-      (when (string-equal "ndjson"
-                          (princ-to-string (or (cdr (assoc :format dsl)) "")))
+      (when (%dsl-ndjson-p dsl)
         (setf (lack.response:response-headers ningle:*response*)
               (list* :content-type "application/x-ndjson"
                      (lack.response:response-headers ningle:*response*))))

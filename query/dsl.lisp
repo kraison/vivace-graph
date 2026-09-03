@@ -332,6 +332,10 @@ BEFORE calling (see gui/prolog.lisp, GH #279).  Returns the result string."
                          :callback *pattern-query-callback*)
                         ,vars ,@goals)))))))
 
+(defun %dsl-ndjson-p (dsl)
+  "T when the decoded JSON pattern query DSL asks for \"format\":\"ndjson\"."
+  (string-equal "ndjson" (princ-to-string (or (cdr (assoc :format dsl)) ""))))
+
 (defun run-pattern-query (dsl graph)
   "Compile and run a decoded JSON pattern query DSL against GRAPH, returning the
 result string.  Read-only, snapshot-isolated, and bounded; the client :limit is
@@ -341,8 +345,4 @@ as newline-delimited JSON instead of an array."
       (compile-pattern-query dsl graph)
     (run-query-goals vars goals graph
                      :package pkg :limit limit :skip skip
-                     :format (if (string-equal
-                                  "ndjson"
-                                  (princ-to-string
-                                   (or (cdr (assoc :format dsl)) "")))
-                                 :ndjson :json))))
+                     :format (if (%dsl-ndjson-p dsl) :ndjson :json))))
