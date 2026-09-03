@@ -8,12 +8,10 @@
 ;;;; routes).  Moved verbatim: bodies here are byte-identical to the
 ;;;; rest.lisp originals, including their pre-80-column line widths.
 ;;;;
-;;;; Why this file sits in the :GRAPH-DB system and not in
-;;;; :GRAPH-DB/CORE: EMIT-QUERY-RESULTS' :NDJSON arm sets the content
-;;;; type on NINGLE:*RESPONSE*, and core deliberately drops
-;;;; ningle/clack/hunchentoot (it is the ECL/Android build).  Hoisting
-;;;; the rest of the DSL below that one line would have meant editing
-;;;; it, which the extraction ruled out.
+;;;; Home: the graph-db/query subsystem (GH #322), which depends on
+;;;; graph-db/core only.  The one web-bound line this file had -- the
+;;;; :NDJSON arm setting a content type on NINGLE:*RESPONSE* -- moved to
+;;;; rest.lisp's /query route, the only caller that asks for ndjson.
 
 (in-package :graph-db)
 
@@ -104,17 +102,14 @@ second, unrelated change to the wire."
   "Render a query's results.  RUN is a function of one argument -- a per-row
 callback -- that runs the query, invoking the callback for each result row as it
 is produced (via SELECT :callback, so no intermediate result list is built).
-With FORMAT :JSON returns a JSON array; with :NDJSON streams each row as its own
-JSON line and sets the application/x-ndjson content type."
+With FORMAT :JSON returns a JSON array; with :NDJSON returns each row as its own
+JSON line; the caller sets the content type."
   (ecase format
     (:json
      (let ((rows '()))
        (funcall run (lambda (row) (push row rows)))
        (query-results->json return-vars (nreverse rows))))
     (:ndjson
-     (setf (lack.response:response-headers ningle:*response*)
-           (list* :content-type "application/x-ndjson"
-                  (lack.response:response-headers ningle:*response*)))
      (with-output-to-string (out)
        (funcall run
                 (lambda (row)

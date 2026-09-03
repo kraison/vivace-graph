@@ -184,6 +184,21 @@
                ;; the master/slave packet primitives in transaction-streaming.
                (:file "peer-streaming")))
 
+;; The web-free query subsystem (GH #322): the JSON pattern DSL and,
+;; from Task 2 on, the free-text Prolog guard.  Depends on core only so
+;; a consumer that wants a bounded query tool never loads a web stack.
+(defsystem graph-db/query
+  :name "VivaceGraph guarded query"
+  :description "The JSON pattern DSL and the free-text Prolog guard,
+web-free.  docs/guarded-query.md; GH #322."
+  :maintainer "Kevin Raison"
+  :author "Kevin Raison <last name @ chatsubo dot net>"
+  :version "4.0.1"
+  :depends-on (:graph-db/core)
+  :pathname "query/"
+  :serial t
+  :components ((:file "dsl")))
+
 ;; FULL: replication + the HTTP API leaf (rest, clack/ningle).  graph-db/replication
 ;; (and transitively graph-db/core) has already compiled+loaded the engine + transport,
 ;; so rest needs no intra-file :depends-on -- the system-level dependency guarantees
@@ -195,6 +210,7 @@
   :author "Kevin Raison <last name @ chatsubo dot net>"
   :version "4.0.1"
   :depends-on (:graph-db/replication
+               :graph-db/query
                :hunchentoot
                :ningle
                :clack
@@ -207,18 +223,7 @@
                :usocket
                :trivial-shell)
   :serial t
-  ;; QUERY-DSL is the structured JSON query compiler+runner extracted from
-  ;; rest.lisp (GH #278): REST's /query route and the GUI workbench compile
-  ;; through the one implementation.  It needs the prolog compiler (SELECT,
-  ;; via prologc/prolog-functors), the schema type lookups
-  ;; (LOOKUP-NODE-TYPE-BY-NAME) and NODE-SLOT-VALUE (index) -- all already
-  ;; loaded by graph-db/core, which the system-level :depends-on guarantees,
-  ;; so no intra-file :depends-on is possible or needed here.  It is NOT in
-  ;; graph-db/core because EMIT-QUERY-RESULTS' :ndjson arm sets a header on
-  ;; NINGLE:*RESPONSE*, and core deliberately drops ningle/clack (the
-  ;; ECL/Android build).  :serial t puts it before "rest", which calls into it.
-  :components ((:file "query-dsl")
-               (:file "rest"))
+  :components ((:file "rest"))
   :in-order-to ((test-op (test-op :graph-db/test))))
 
 ;; OPTIONAL GUI cockpit backend (GH #269, design doc
