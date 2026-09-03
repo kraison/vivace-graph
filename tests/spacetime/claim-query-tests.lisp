@@ -222,3 +222,53 @@ answering NIL, which is also the correct answer for 'wrote nothing'."
   (with-claim-graph (g)
     (signals unknown-claim-family
       (claims-by-producer g 'no-such-claim "rule-a"))))
+
+(test a-transaction-reads-its-own-retraction-and-assertion
+  "GH #324: retract-then-assert in one WITH-TRANSACTION -- the idiom
+RETRACT-CLAIM's docstring recommends -- reads back inside the
+transaction as it will commit: the retracted claim no longer current,
+the new one present, both in CLAIMS-TOUCHING and CLAIMS-BY-PRODUCER."
+  (with-claim-graph (g)
+    (with-transaction () (make-b :object "old"))
+    (with-transaction ()
+      (let ((c (first (claims-touching g 'ct-claim :ns "s1"
+                                       :role :subject :current t))))
+        (retract-claim c)
+        (is (null (claims-touching g 'ct-claim :ns "s1"
+                                   :role :subject :current t)))
+        (make-b :object "new")
+        (let ((live (claims-touching g 'ct-claim :ns "s1"
+                                     :role :subject :current t)))
+          (is (= 1 (length live)))
+          (is (equal "new" (claim-object-key (first live)))))
+        (is (= 2 (length (claims-touching g 'ct-claim :ns "s1"
+                                          :role :subject))))
+        ;; The object side has no index on the new claim yet: the
+        ;; overlay is what admits it.
+        (is (= 1 (length (claims-touching g 'ct-claim :ns "new"
+                                          :role :object))))
+        (is (= 1 (length (claims-touching g 'ct-claim :ns "old"
+                                          :role :object))))
+        (is (null (claims-touching g 'ct-claim :ns "old"
+                                   :role :object :current t)))
+        (is (= 2 (length (claims-by-producer g 'ct-claim "rule-a"))))))
+    (let ((live (claims-touching g 'ct-claim :ns "s1"
+                                 :role :subject :current t)))
+      (is (= 1 (length live)))
+      (is (equal "new" (claim-object-key (first live)))))))
+
+(test as-of-answers-committed-history-only
+  "GH #324: the overlay is for the present.  An :AS-OF read inside a
+transaction still answers from committed versions, so an uncommitted
+retraction does not rewrite history the transaction may yet abandon."
+  (with-claim-graph (g)
+    (with-transaction () (make-b :object "old"))
+    (let ((then (local-time:now)))
+      (sleep 0.01)
+      (with-transaction ()
+        (retract-claim (first (claims-touching g 'ct-claim :ns "s1"
+                                               :role :subject)))
+        (let ((hist (claims-touching g 'ct-claim :ns "s1" :role :subject
+                                     :as-of then)))
+          (is (= 1 (length hist)))
+          (is (claim-current-p (first hist))))))))

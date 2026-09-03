@@ -13,6 +13,13 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Added
 
+- **A transaction reads its own claim writes** (#324): `claims-touching`
+  and `claims-by-producer` overlay the open transaction's write set --
+  the commit view validation already uses -- so retract-then-assert on
+  one series inside one `with-transaction` no longer re-finds the
+  retracted claim as current. `:as-of` still answers committed history
+  only.
+
 - **`split-claim-identity-key`** (#321): the inverse of
   `claim-identity-key`, so a consumer that stores keys and resolves
   them later gets producer, subject, relation, object and extent start
