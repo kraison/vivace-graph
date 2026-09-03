@@ -57,6 +57,70 @@ regeneration, which node ids do not (GH #303).  Fields join on |, with
                         (claim-extent-sexp claim)))))))))
     (format nil "~{~a~^|~}" fields)))
 
+(defun %split-identity-key-fields (key)
+  "KEY's fields: split on unescaped |, with \\| and \\\\ unescaped."
+  (let ((fields '()) (buf (make-string-output-stream))
+        (i 0) (n (length key)))
+    (loop while (< i n) do
+      (let ((ch (char key i)))
+        (cond ((char= ch #\\)
+               (when (= (1+ i) n)
+                 (error 'malformed-claim-identity-key :key key))
+               (write-char (char key (1+ i)) buf)
+               (incf i 2))
+              ((char= ch #\|)
+               (push (get-output-stream-string buf) fields)
+               (incf i))
+              (t (write-char ch buf) (incf i)))))
+    (push (get-output-stream-string buf) fields)
+    (nreverse fields)))
+
+(defun %identity-key-namespace (field key)
+  "FIELD as the keyword %IDENTITY-KEY-FIELD rendered, else signal."
+  (if (and (> (length field) 1) (char= (char field 0) #\:))
+      (intern (string-upcase (subseq field 1)) :keyword)
+      (error 'malformed-claim-identity-key :key key)))
+
+(defun %identity-key-extent-start (field key)
+  "FIELD read back as EXTENT-SEXP-START-KEY data, *READ-EVAL* off."
+  (handler-case
+      (with-standard-io-syntax
+        (let ((*read-eval* nil)
+              (*package* (find-package :graph-db.spacetime)))
+          (read-from-string field)))
+    (error () (error 'malformed-claim-identity-key :key key))))
+
+(defun split-claim-identity-key (key)
+  "The inverse of CLAIM-IDENTITY-KEY (GH #321): (VALUES PRODUCER
+SUBJECT-NAMESPACE SUBJECT-KEY RELATION OBJECT-NAMESPACE OBJECT-KEY
+EXTENT-START), NIL for the fields a unary or non-temporal key lacks.
+Arity and temporality follow from the field count -- 4, 5, 6 or 7 --
+so the string alone suffices.  Namespaces come back as keywords, keys
+and relations as strings (an integer key encodes as its decimal string
+and decodes as one), EXTENT-START as EXTENT-SEXP-START-KEY's data.  The
+escape rule lives here and in %IDENTITY-KEY-FIELD, nowhere else.
+Signals MALFORMED-CLAIM-IDENTITY-KEY for any other shape."
+  (let* ((fields (%split-identity-key-fields key))
+         (n (length fields)))
+    (unless (<= 4 n 7)
+      (error 'malformed-claim-identity-key :key key))
+    (let* ((binary-p (>= n 6))
+           (temporal-p (oddp n))
+           (after-subject (cdddr fields))
+           (object-namespace (and binary-p
+                                  (%identity-key-namespace
+                                   (first after-subject) key)))
+           (object-key (and binary-p (second after-subject)))
+           (tail (if binary-p (cddr after-subject) after-subject)))
+      (values (first fields)
+              (%identity-key-namespace (second fields) key)
+              (third fields)
+              (first tail)
+              object-namespace
+              object-key
+              (and temporal-p
+                   (%identity-key-extent-start (second tail) key))))))
+
 (defstruct (reaped-claim (:constructor %make-reaped-claim (id)))
   "An :AS-OF answer the store can no longer give: the claim existed at
 the asked instant, but every version stamped then is past the family's

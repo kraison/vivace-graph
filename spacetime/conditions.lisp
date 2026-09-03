@@ -83,3 +83,11 @@ transaction is single-graph; resolve before opening it."
   (:documentation
    "Signalled when a claim that already carries a transaction extent is
 given another.  Accessor-level only; see the design's immutability note."))
+
+(define-condition malformed-claim-identity-key (spacetime-error)
+  ((key :initarg :key :reader malformed-claim-identity-key-key))
+  (:report (lambda (c s)
+             (format s "Not a CLAIM-IDENTITY-KEY: ~s"
+                     (malformed-claim-identity-key-key c))))
+  (:documentation "SPLIT-CLAIM-IDENTITY-KEY was handed a string that
+CLAIM-IDENTITY-KEY cannot have produced (GH #321)."))

@@ -13,6 +13,13 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Added
 
+- **`split-claim-identity-key`** (#321): the inverse of
+  `claim-identity-key`, so a consumer that stores keys and resolves
+  them later gets producer, subject, relation, object and extent start
+  back without re-implementing the escape rule. Arity and temporality
+  follow from the field count; a string the encoder cannot have
+  produced signals `malformed-claim-identity-key`.
+
 - **`validate-transaction`, and `writes` exported** (#320): a consumer
   that stages writes in its own transaction can ask the #301 evaluator
   about them -- `(validate-transaction graph)` over the ambient
