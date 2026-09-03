@@ -25,7 +25,9 @@ between releases; cutting a release renames it to the new version and dates it.
   them later gets producer, subject, relation, object and extent start
   back without re-implementing the escape rule. Arity and temporality
   follow from the field count; a string the encoder cannot have
-  produced signals `malformed-claim-identity-key`.
+  produced signals `malformed-claim-identity-key`, including a
+  namespace field that is not canonical (`[a-z0-9-]+`), which is
+  refused before anything is interned.
 
 - **`validate-transaction`, and `writes` exported** (#320): a consumer
   that stages writes in its own transaction can ask the #301 evaluator

@@ -76,10 +76,17 @@ regeneration, which node ids do not (GH #303).  Fields join on |, with
     (nreverse fields)))
 
 (defun %identity-key-namespace (field key)
-  "FIELD as the keyword %IDENTITY-KEY-FIELD rendered, else signal."
-  (if (and (> (length field) 1) (char= (char field 0) #\:))
-      (intern (string-upcase (subseq field 1)) :keyword)
-      (error 'malformed-claim-identity-key :key key)))
+  "FIELD as the keyword %IDENTITY-KEY-FIELD rendered, else signal.
+Validated before interning: only a canonical name ([a-z0-9-]+, the
+RELATION rule) is interned, so a caller-supplied string cannot mint an
+arbitrary keyword through this path -- KEYWORD symbols are never
+collected.  The encoder downcases symbol names, so a non-canonical
+namespace never round-trips anyway (GH #321)."
+  (let ((name (and (> (length field) 1) (char= (char field 0) #\:)
+                   (subseq field 1))))
+    (if (and name (canonical-relation-p name))
+        (intern (string-upcase name) :keyword)
+        (error 'malformed-claim-identity-key :key key))))
 
 (defun %identity-key-extent-start (field key)
   "FIELD read back as EXTENT-SEXP-START-KEY data, *READ-EVAL* off."
