@@ -38,9 +38,10 @@
 ;;;; registries and compares NAMES AS STRINGS; nothing derived from the
 ;;;; request is ever interned into GRAPH-DB or the schema package.
 ;;;;
-;;;; Home: graph-db/query (GH #322) -- the guard (steps 2-4).  The
-;;;; GUI runner and its envelope (steps 1, 5, 6) stay in
-;;;; gui/prolog.lisp, which calls this file's internals qualified.
+;;;; Home: graph-db/query (GH #322) -- steps 2 through 6, including
+;;;; RUN-GUARDED-PROLOG.  Only step 1's flag and the HTTP envelope
+;;;; around a call into this file stay in gui/prolog.lisp, which
+;;;; calls this file's exports qualified.
 
 (in-package #:graph-db.query)
 

@@ -18,7 +18,8 @@ not a v1 deliverable.
 - **Explorer** (the daily-use magnet): Bloom-style click-to-expand
   neighborhood exploration with a node inspector. Read-only.
 - **Fast follow, not v1**: the query workbench (Prolog `select` with
-  tabular results and result-to-canvas handoff).
+  tabular results and result-to-canvas handoff). The guard pipeline it
+  calls lives in `graph-db/query` since #322 (`docs/guarded-query.md`).
 - **Later versions, explicitly out**: uploads/exports, node editing,
   graph creation, free-form path opening, auth, search-by-slot,
   saved layouts/perspectives, style editors, multi-graph canvases,

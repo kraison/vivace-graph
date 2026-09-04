@@ -1,8 +1,8 @@
 # CI: the full suite runs itself
 
 `.github/workflows/test.yml` runs the full test suite (main,
-concurrency, ACID, spacetime, geos, algorithms, gui; 12GiB heap
-per `tests/README.md`) on every push
+concurrency, ACID, spacetime, query, geos, algorithms, gui; 12GiB
+heap per `tests/README.md`) on every push
 to `experiment` or `master` and on pull requests.
 
 - **Runners are self-hosted** (personal-account runners are

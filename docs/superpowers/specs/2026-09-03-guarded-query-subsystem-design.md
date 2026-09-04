@@ -78,7 +78,7 @@ specials, `query-results->json`, `decode-dsl-json`.
   cap and reports `truncated-p` T when it arrives, the GUI's existing
   probe rule, now in one place.
 - **Columns** are the query's variables in first-appearance order, as
-  downcased wire strings without the `?` (`%query-var-field`).
+  camelCase wire strings without the `?` (`%query-var-field`).
 - **Rows** are lists, one per solution, in solution order.
   - `:data`: every cell through `%query-value->json`, so a node is its
     id string and every other value is a string, a number, `t` or NIL.
