@@ -351,23 +351,40 @@ with :allow-cost-unbounded t, the goal runs as before."
 ;;; Head resolution (#322, second finding): a functor DEFINED with <- in
 ;;; a package that does not use GRAPH-DB still lands on that package's
 ;;; own NAME/ARITY symbol, via the :DEFINE T argument ADD-CLAUSE passes
-;;; MAKE-FUNCTOR-SYMBOL -- not on an existing GRAPH-DB functor.
+;;; MAKE-FUNCTOR-SYMBOL -- not on an existing GRAPH-DB functor.  The head
+;;; is =/2, a name GRAPH-DB already registers globally (see
+;;; PROLOG-FUNCTORS.LISP's DEF-GLOBAL-PROLOG-FUNCTOR =/2), so the
+;;; collision the fix must avoid is actually exercised.
 ;;; ---------------------------------------------------------------------------
 
 (defpackage #:graph-db/test.define-probe (:use #:cl))
 
 (test define-in-a-package-that-does-not-use-graph-db
   "<- in a package that does not use GRAPH-DB defines its own NAME/ARITY
-symbol there, not a same-named GRAPH-DB functor (#322)."
-  (let ((pkg (find-package "GRAPH-DB/TEST.DEFINE-PROBE")))
-    ;; GRAPH-DB::<- itself must be qualified to be called at all from
-    ;; a package that uses nothing; only the clause body (head, ?x)
-    ;; reads into PKG, which is the case this test exists for.
-    (let ((*package* pkg))
-      (eval (read-from-string "(graph-db::<- (probe-322-fact ?x) (= ?x 1))")))
-    (let ((own (find-symbol "PROBE-322-FACT/1" pkg)))
-      (is-true own "the clause's functor symbol is not in its own package")
-      (is-true (graph-db::lookup-functor own)
-               "the clause did not register under its own package's symbol"))
-    (is (null (find-symbol "PROBE-322-FACT/1" (find-package :graph-db)))
-        "GRAPH-DB must not have interned a symbol for this functor")))
+symbol there, even though =/2 already names a GRAPH-DB global functor:
+the clause lands on the probe package's own =/2, and GRAPH-DB::=/2
+gains no user clause and stays the registered global (#322)."
+  (let ((pkg (find-package "GRAPH-DB/TEST.DEFINE-PROBE"))
+        (own nil))
+    (unwind-protect
+        (progn
+          ;; GRAPH-DB::<- itself must be qualified to be called at all
+          ;; from a package that uses nothing; only the clause body
+          ;; (head, ?x) reads into PKG, which is the case this test
+          ;; exists for.
+          (let ((*package* pkg))
+            (eval (read-from-string "(graph-db::<- (= ?x ?x))")))
+          (setq own (find-symbol "=/2" pkg))
+          (is-true own "the clause's functor symbol is not in its own package")
+          (is-true (not (eq own 'graph-db::=/2))
+                   "the probe's =/2 must not be GRAPH-DB's own symbol")
+          (is-true (graph-db::lookup-functor own)
+                   "the clause did not register under its own package's symbol")
+          (is (null (graph-db::lookup-functor 'graph-db::=/2))
+              "GRAPH-DB::=/2 must not have picked up a user clause")
+          (is-true (nth-value 1 (gethash 'graph-db::=/2
+                                          graph-db::*prolog-global-functors*))
+                   "GRAPH-DB::=/2 must remain the registered global functor"))
+      (when (and own (graph-db::lookup-functor own))
+        (graph-db::delete-functor (graph-db::lookup-functor own)))
+      (when pkg (delete-package pkg)))))

@@ -794,7 +794,7 @@ in *PACKAGE*, never the lookup-first read path (GH #322)."
          ;; New functor per invocation (GH #322): DEFINE T so this
          ;; never resolves onto an existing functor of the same name.
          (*functor* (make-functor-symbol top-level-query 0
-                                          :define t)))
+                                         :define t)))
     `(let* ((*trail* (make-array 200 :fill-pointer 0 :adjustable t))
             (*var-counter* 0)
             (*functor* ',*functor*)
@@ -833,7 +833,7 @@ in *PACKAGE*, never the lookup-first read path (GH #322)."
   (let* ((goals (replace-?-vars goals)))
     `(let* ((top-level-query (prolog-gensym "PROVE"))
             (*functor* (make-functor-symbol top-level-query 0
-                                             :define t))
+                                            :define t))
             (*trail* (make-array 200 :fill-pointer 0 :adjustable t))
             (*var-counter* 0)
             (*select-list* nil)
@@ -1064,7 +1064,7 @@ SELECT-FIRST for common shorthands."
             ;; New functor per invocation (GH #322): DEFINE T so
             ;; this never resolves onto an existing functor.
             (*functor* (make-functor-symbol top-level-query 0
-                                             :define t))
+                                            :define t))
             (*trail* (make-array 200 :fill-pointer 0 :adjustable t))
             (*var-counter* 0)
             (*select-list* nil)
@@ -1166,7 +1166,7 @@ goals like (trigger ...) or (retract ...)."
   (let* ((goals (replace-?-vars goals)))
     `(let* ((top-level-query (prolog-gensym "PROVE"))
             (*functor* (make-functor-symbol top-level-query 0
-                                             :define t))
+                                            :define t))
             (*trail* (make-array 200 :fill-pointer 0 :adjustable t))
             (*var-counter* 0)
             (*select-list* nil)

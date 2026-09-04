@@ -11,7 +11,8 @@
 ;;;; Home: the graph-db/query subsystem (GH #322), which depends on
 ;;;; graph-db/core only.  The one web-bound line this file had -- the
 ;;;; :NDJSON arm setting a content type on NINGLE:*RESPONSE* -- moved to
-;;;; rest.lisp's /query route, the only caller that asks for ndjson.
+;;;; rest.lisp's %SET-NDJSON-CONTENT-TYPE, called by both the /query
+;;;; route and DEF-QUERY when they ask for ndjson.
 
 (in-package :graph-db)
 
