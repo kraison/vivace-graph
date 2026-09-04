@@ -86,6 +86,30 @@
         (claim ?c rt-claim ?a ?b ?r ?d ?e)))
     (is (= 4 (select-count (?c) (claim ?c rt-claim ?a ?b ?r ?d ?e))))))
 
+(test allow-cost-unbounded-accepts-an-unrouted-goal
+  "GH #334: the escape hatch reaches a run-time refusal now that SELECT
+binds *ALLOW-COST-UNBOUNDED*.  A caller who says the walk is affordable
+gets the walk under a budget, the same answer an unbudgeted query gives."
+  (with-rules-graph (g)
+    (seed g)
+    (is (= 4 (length (select (:max-inferences 1000
+                              :allow-cost-unbounded t)
+                             (?c)
+                             (claim ?c rt-claim ?a ?b ?r ?d ?e)))))
+    ;; The shapes that route nowhere for want of an index prefix, not
+    ;; for want of bindings, take the hatch too.
+    ;; Three: h1 runs web, h1 runs db, h2 runs web.  The unary
+    ;; "reachable" claim on h2 is filtered out by the bound relation.
+    (is (= 3 (length (select (:max-inferences 1000
+                              :allow-cost-unbounded t)
+                             (?c)
+                             (claim ?c rt-claim "host" ?k "runs" ?a ?b)))))
+    ;; Control: without the option the same goals still refuse, so the
+    ;; option is what changed the answer, not the budget.
+    (signals graph-db::prolog-cost-unbounded-error
+      (select (:max-inferences 1000) (?c)
+        (claim ?c rt-claim ?a ?b ?r ?d ?e)))))
+
 ;; The refusal is a property of the goal's shape, not of the
 ;; nothing-bound shape alone.  The namespace is the leading slot of both
 ;; endpoint indexes and an index is usable only from a prefix, so
@@ -241,6 +265,18 @@
 ;; that answers zero rows in silence is the one thing CLAIM/7 already
 ;; refuses to be.  Under a bound it refuses the same way; with no bound
 ;; there is no producer walk to offer, so it still just fails.
+(test allow-cost-unbounded-quiets-the-producer-refusal
+  "GH #334: with neither argument bound CLAIM-PRODUCER/2 has no route, so
+the escape hatch cannot buy a walk -- it buys the silence an unbudgeted
+query already gets, rather than a refusal the caller opted out of."
+  (with-rules-graph (g)
+    (seed g)
+    (is (null (select (:max-inferences 1000 :allow-cost-unbounded t)
+                      (?c ?p) (claim-producer ?c ?p))))
+    ;; Control: without the option, still a refusal.
+    (signals graph-db::prolog-cost-unbounded-error
+      (select (:max-inferences 1000) (?c ?p) (claim-producer ?c ?p)))))
+
 (test claim-producer-with-neither-argument-bound
   (with-rules-graph (g)
     (seed g)

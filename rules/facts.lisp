@@ -101,11 +101,12 @@ asked in; see %NAMESPACE-VALUE."
   "Every claim of FAMILY in GRAPH -- CLAIM/7's fallback, the COND's last
 clause, not a nothing-bound special case.  Refused as cost-unbounded
 when a resource bound is in effect, since %TICK cannot preempt inside a
-family walk (GH #285).  The refusal is unconditional:
-:ALLOW-COST-UNBOUNDED is threaded through SELECT at query-compile time
-and no special variable carries it into a functor body, so it cannot
-reach here."
-  (when (or *inference-budget* *query-deadline*)
+family walk (GH #285) -- unless the caller accepted that with
+:ALLOW-COST-UNBOUNDED, which SELECT now carries into a functor body
+(GH #334).  Same test as %REFUSE-COST-UNBOUNDED's, so the static
+refusal and this one answer to one value."
+  (when (and (not *allow-cost-unbounded*)
+             (or *inference-budget* *query-deadline*))
     (error 'prolog-cost-unbounded-error :functor 'claim/7))
   ;; :INCLUDE-SUBCLASSES-P defaults to T, so the parent covers unary and
   ;; binary.  :COLLECT-P is what materialises node bytes before a node
@@ -248,8 +249,9 @@ instead: every claim ?P wrote, across every family this graph indexes --
 write that goal BEFORE the CLAIM/7 goal it feeds, or ?C is bound by then
 and this filters.  With neither bound there is no index to generate from
 and no walk to fall back to, so the goal is refused as cost-unbounded
-under a resource bound and answers nothing without one (spec §4,
-docs/rules.md)."
+under a resource bound and answers nothing without one -- or with
+:ALLOW-COST-UNBOUNDED, which buys that same silence rather than a walk,
+there being none to buy (spec §4, GH #334, docs/rules.md)."
   (let ((c (%claim-arg ?c))
         (c-arg (%prolog-index-bound ?c))
         (p (%prolog-index-bound ?p)))
@@ -265,6 +267,7 @@ docs/rules.md)."
           ;; than silence.  A bound ?P that names no producer still
           ;; answers empty, as an unresolvable namespace does.
           ((and (null c-arg) (null p)
+                (not *allow-cost-unbounded*)
                 (or *inference-budget* *query-deadline*))
            (error 'prolog-cost-unbounded-error
                   :functor 'claim-producer/2)))))
