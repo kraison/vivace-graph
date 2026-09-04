@@ -5,9 +5,47 @@
 (def-suite graph-db-suite
   :description "All graph-db unit tests.")
 
-(defun run-tests ()
-  "Run the entire graph-db test suite.  Returns T when every test passed.
-Invoked by (asdf:test-system :graph-db)."
+(defparameter *slow-suites*
+  '(system-restore-suite detach-suite type-id-width-suite)
+  "The suites the fast CI tier skips: 71% of this suite's wall time for 8%
+of its checks, all of it building and tearing down on-disk stores
+(measured 2026-09-04).  Keep this beside the suites, not in the workflow,
+so marking a new slow one is a one-line change here.  docs/ci.md has the
+numbers; GH #340 is the ticket to make them fast enough to delete this.")
+
+(defun suite-children (suite-name)
+  "The immediate child test and suite names of SUITE-NAME, in run order.
+A fresh list: FIVEAM runs a suite from the very list this copies, so a
+caller that mutated it would change the run."
+  (copy-list (fiveam::%test-names (fiveam::tests (get-test suite-name)))))
+
+(defun call-with-suites-excluded (names thunk &key (parent 'graph-db-suite))
+  "Call THUNK with NAMES detached from PARENT's child list, restoring it
+however THUNK exits.  A name PARENT does not carry is refused: a typo, or
+a suite renamed out from under *SLOW-SUITES*, would otherwise exclude
+nothing and merely look like a fast run (GH #340)."
+  (let* ((bundle (fiveam::tests (get-test parent)))
+         (saved (copy-list (fiveam::%test-names bundle))))
+    (dolist (n names)
+      (unless (member n saved)
+        (error "~S is not a child of ~S, so it cannot be excluded." n parent)))
+    (unwind-protect
+         (progn
+           (setf (fiveam::%test-names bundle)
+                 (remove-if (lambda (n) (member n names)) saved))
+           (funcall thunk))
+      (setf (fiveam::%test-names bundle) saved))))
+
+(defmacro with-suites-excluded ((names &key (parent ''graph-db-suite))
+                                &body body)
+  "Run BODY with the suites NAMES evaluates to detached from PARENT."
+  `(call-with-suites-excluded ,names (lambda () ,@body) :parent ,parent))
+
+(defun run-tests (&key exclude)
+  "Run the graph-db test suite.  Returns T when every test passed.
+EXCLUDE names child suites to skip -- (asdf:test-system :graph-db/fast-test)
+passes *SLOW-SUITES*; (asdf:test-system :graph-db) passes nothing and runs
+everything."
   ;; The storage layers log prolifically at :debug/:info; keep test output
   ;; to genuine problems.
   (log:config :error)
@@ -25,7 +63,10 @@ Invoked by (asdf:test-system :graph-db)."
          (graph-db::*system-directory* (namestring system-dir))
          (graph-db::*type-registry* nil))
     (unwind-protect
-         (let ((results (run 'graph-db-suite)))
+         (let ((results (if exclude
+                            (with-suites-excluded (exclude)
+                              (run 'graph-db-suite))
+                            (run 'graph-db-suite))))
            (explain! results)
            (results-status results))
       ;; Everything this run scratched -- system-dir included -- lives

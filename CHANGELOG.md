@@ -168,6 +168,21 @@ between releases; cutting a release renames it to the new version and dates it.
   index every claim family now declares (`claim-subject-relation`), so a
   one-relation read of a busy endpoint touches only that relation's rows.
 
+### Changed
+
+- **Pull requests run the main suite's fast tier** (#340): timing all
+  143 children of `graph-db-suite` found three of them -- the
+  `system-restore`, `detach` and `type-id-width` suites, which build
+  real on-disk stores -- are 71% of its wall clock for 8% of its
+  checks. A pull request now runs `graph-db/fast-test`, the same suite
+  minus those three (~10 minutes, 92% of the checks); a push to
+  `experiment` still runs `graph-db` in full and remains the gate
+  promotion waits on. The list is `*slow-suites*` in
+  `tests/suite.lisp`, next to the suites rather than in the workflow,
+  and `run-tests` refuses a name that is not a child of
+  `graph-db-suite` so a rename cannot silently exclude nothing.
+  `docs/ci.md` has the numbers and the trade.
+
 ### Fixed
 
 - **`graph-db/rules`' refusals now honour `:allow-cost-unbounded`**

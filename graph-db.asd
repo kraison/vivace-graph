@@ -725,7 +725,23 @@ cl-temporal-extent."
                (:file "peer-index-tests")
                (:file "open-hygiene-tests")    ; GH #222, #224
                (:file "scratch-cleanup-tests")  ; GH #214
+               (:file "ci-tiering-tests")       ; GH #340
                (:file "perf/check-tests"))      ; GH #253
   :perform (test-op (op c)
                     (unless (uiop:symbol-call :graph-db/test :run-tests)
                       (error "graph-db test suite failed."))))
+
+;; The fast CI tier (docs/ci.md, GH #340): the same suite minus the three
+;; that are 71% of its wall time for 8% of its checks.  Pull requests run
+;; this; a push to experiment still runs GRAPH-DB in full.
+(defsystem graph-db/fast-test
+  :name "VivaceGraph test suite, fast tier"
+  :description "GRAPH-DB/TEST minus *SLOW-SUITES*; docs/ci.md, GH #340."
+  :depends-on (:graph-db/test)
+  :perform (test-op (op c)
+                    (let ((slow (symbol-value
+                                 (uiop:find-symbol* :*slow-suites*
+                                                    :graph-db/test))))
+                      (unless (uiop:symbol-call :graph-db/test :run-tests
+                                                :exclude slow)
+                        (error "graph-db fast-tier test suite failed.")))))

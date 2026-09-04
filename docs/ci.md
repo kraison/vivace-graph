@@ -1,9 +1,36 @@
 # CI: the full suite runs itself
 
-`.github/workflows/test.yml` runs the full test suite (main,
-concurrency, ACID, spacetime, query, rules, geos, algorithms, gui;
-12GiB heap per `tests/README.md`) on every push
-to `experiment` or `master` and on pull requests.
+`.github/workflows/test.yml` runs the test suite (main, concurrency,
+ACID, spacetime, query, rules, geos, algorithms, gui; 12GiB heap per
+`tests/README.md`) on every push to `experiment` or `master` and on
+pull requests.  A push runs all of it; a pull request runs the main
+suite's fast tier and every other lane in full (see below).
+
+- **The main suite is tiered** (GH #340).  Timing all 143 children of
+  `graph-db-suite` on 2026-09-04 found three of them are **71% of the
+  wall clock for 8% of the checks** -- `system-restore-suite` (706s),
+  `detach-suite` (677s) and `type-id-width-suite` (174s), which build
+  and tear down real on-disk stores at 2-5 seconds per check against
+  0.13 for everything else.  So:
+  - a **pull request** runs `graph-db/fast-test`, the same suite minus
+    those three: ~10 minutes, 92% of the checks;
+  - a **push to `experiment`** runs `graph-db` in full, ~36 minutes,
+    and remains the gate `experiment -> master` promotion waits on.
+
+  The list lives in `*slow-suites*` in `tests/suite.lisp`, beside the
+  suites rather than in this workflow, so marking a new slow one is a
+  one-line change there.  `run-tests` refuses a name that is not a
+  child of `graph-db-suite`, so a suite renamed out from under the list
+  fails loudly instead of quietly excluding nothing.
+
+  What this trades: a regression only those three catch lands on
+  `experiment` and is caught by the push run minutes later, rather than
+  on the pull request.  #340 tracks making them fast enough to delete
+  the tier.
+
+  To re-measure, time each child of `graph-db-suite` individually --
+  `fiveam:run` on each name from `(suite-children 'graph-db-suite)` --
+  and compare the total against the step's own duration.
 
 - **Runners are self-hosted** (personal-account runners are
   per-repo).  Primary: the `ma-dev` host, running as its `sitrep`
