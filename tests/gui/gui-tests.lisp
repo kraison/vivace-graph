@@ -1031,7 +1031,9 @@ be refused -- the screen refuses syntax, not text (GH #279)."
                        (node-slot-value ?p name \"#.(cl:print 1)\")")
         (is (= 200 status))
         (is (= 0 (jref json :row-count))
-            "the literal matched something; it should match nothing"))
+            "the literal matched something; it should match nothing")
+        ;; A zero-row answer still names its columns (#322), not [].
+        (is (equal '("p") (jref json :columns))))
       ;; ...and one that DOES match, so the literal really is compared.
       (multiple-value-bind (json status)
           (run-prolog "(is-a ?p gui-person)
