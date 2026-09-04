@@ -69,15 +69,6 @@ asks for none."
                (length text) graph-db.query:*prolog-max-query-length*))
     text))
 
-(defun %schema-package (graph)
-  "The package GRAPH's schema symbols live in, or GRAPH-DB.  Edge
-functors are installed in their own type's package (GH #172), so this
-is the package a goal head must canonicalize in."
-  (let ((types (append (graph-db.query:schema-type-names graph :vertex)
-                        (graph-db.query:schema-type-names graph :edge))))
-    (or (and types (symbol-package (first types)))
-        (find-package :graph-db))))
-
 (defun %run-guarded-prolog (text limit graph)
   "The workbench envelope over GRAPH-DB.QUERY:RUN-GUARDED-PROLOG (GH
 #322).  The runner clamps and probes exactly as the DSL endpoint does,

@@ -23,7 +23,9 @@
 ;;;;      slot of THIS graph, a ?variable, or T/NIL.
 ;;;;   5. RUN-QUERY-GOALS    -- query-dsl.lisp's own runner: :EFFECTS
 ;;;;      NIL, one snapshot, the inference/time/row bounds.  Reached
-;;;;      through %RUN-GUARDED-QUERY, which stays in gui/prolog.lisp.
+;;;;      through %RUN-GUARDED-GOALS in this file.  Goal heads resolve
+;;;;      each in its own package now, not one shared :PACKAGE
+;;;;      (GH #322).
 ;;;;   6. DELETE-PACKAGE     -- in an UNWIND-PROTECT, so a hostile
 ;;;;      query's symbols leave with the request that made them.
 ;;;;      %RUN-GUARDED-PROLOG, which does this, also stays there.
@@ -636,35 +638,14 @@ cut recorded."
 is no room, so an exactly-full page reads as truncated (GH #278)."
   (if (< cap graph-db::*query-default-limit*) (1+ cap) cap))
 
-(defun %guarded-run-package (graph)
-  "The package a guarded goal list's heads canonicalize in.
-
-Single-package resolution: COMPILE-CALL interns NAME/ARITY in
-*PACKAGE*, so one binding must cover every head in the goal list.
-GRAPH's schema package (edge functors are installed there, GH #172) is
-used when it :USES GRAPH-DB -- then a GRAPH-DB global head still
-resolves, by inheritance, alongside the schema's own edge functors,
-exactly as the GUI's former %SCHEMA-PACKAGE ran.  A schema declared
-:USE NOTHING (spec SS6) cannot inherit, so GRAPH-DB is used instead:
-its own globals resolve, an edge functor from that schema does not --
-the gap Task 4's head resolution closes (GH #279, #322)."
-  (let* ((types (append (schema-type-names graph :vertex)
-                        (schema-type-names graph :edge)))
-         (schema-pkg (and types (symbol-package (first types)))))
-    (if (and schema-pkg
-             (member (find-package :graph-db)
-                     (package-use-list schema-pkg)))
-        schema-pkg
-        (find-package :graph-db))))
-
 (defun %run-guarded-goals (vars goals graph probe)
   "The already-guarded query's rows, RAW, at most PROBE of them, with
-the GUI's three-way condition contract (GH #279)."
+the GUI's three-way condition contract (GH #279).  No :PACKAGE is
+passed -- each head resolves in its own package (GH #322)."
   (handler-case
       (let ((rows '()))
         (graph-db::run-query-goals
          vars goals graph :limit probe :format :raw
-         :package (%guarded-run-package graph)
          :callback (lambda (row) (push row rows)))
         (nreverse rows))
     (graph-db:prolog-error (c) (error c))

@@ -307,11 +307,15 @@ This is THE runner: every client-supplied query -- the JSON pattern DSL and
 the GUI's free-text Prolog alike -- reaches SELECT through here, so the rails
 are stated once.  Read-only (:EFFECTS NIL), snapshot-isolated, bounded by
 *QUERY-DEFAULT-MAX-INFERENCES* / *QUERY-DEFAULT-TIMEOUT*, and LIMIT capped at
-*QUERY-DEFAULT-LIMIT*.  PACKAGE is bound around the EVAL because COMPILE-CALL
-canonicalizes each goal head through MAKE-FUNCTOR-SYMBOL, which interns
-NAME/ARITY in *PACKAGE*: it must be the schema's package for an edge functor
-to resolve.  Callers built from untrusted text must whitelist every symbol
-BEFORE calling (see gui/prolog.lisp, GH #279).  Returns the result string
+*QUERY-DEFAULT-LIMIT*.  PACKAGE no longer routes functor resolution: since
+GH #322, MAKE-FUNCTOR-SYMBOL resolves each goal head in its own home
+package (falling back to GRAPH-DB), so a goal list spanning the engine
+and a schema resolves correctly regardless of *PACKAGE*.  PACKAGE stays
+advisory -- it is what COMPILE-PATTERN-QUERY resolved the DSL's own
+match/where types against, and is still bound around the EVAL, but
+nothing here depends on it for a goal head to be found any more.
+Callers built from untrusted text must whitelist every symbol BEFORE
+calling (see gui/prolog.lisp, GH #279).  Returns the result string
 under :JSON/:NDJSON.
 
 :RAW is a fourth arm (GH #322): CALLBACK (required) receives each raw

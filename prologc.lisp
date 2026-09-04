@@ -190,8 +190,30 @@ present, so an error from the continuation after Goal succeeds is not caught.")
   (loop for i from 1 to arity
         collect (new-interned-symbol '?arg i)))
 
+(defun %registered-functor-p (symbol)
+  "True when SYMBOL is a live functor -- a user clause (GET-FUNCTOR-FN)
+or a global primitive (*PROLOG-GLOBAL-FUNCTORS*).  Both lookups are
+read-only: no symbol is created or registered by asking (GH #322)."
+  (or (get-functor-fn symbol)
+      (nth-value 1 (gethash symbol *prolog-global-functors*))))
+
 (defun make-functor-symbol (symbol arity)
-  (new-interned-symbol symbol '/ arity))
+  "The NAME/ARITY functor symbol for SYMBOL.  Resolved by LOOKUP
+before interning: an already-registered functor in SYMBOL's own
+package, then in GRAPH-DB -- so a goal list whose canonical heads
+span the engine's package and a schema's resolves each in its home,
+and a head inherited from COMMON-LISP (>, atom, write) still finds
+the engine's functor.  Otherwise interned in *PACKAGE*, exactly as
+before: that is the definition path (<-) and every caller that
+predates this rule (GH #322)."
+  (let ((name (format nil "~{~a~}" (list symbol '/ arity))))
+    (flet ((hit (pkg)
+             (and pkg
+                  (let ((s (find-symbol name pkg)))
+                    (and s (%registered-functor-p s) s)))))
+      (or (and (symbolp symbol) (hit (symbol-package symbol)))
+          (hit (find-package :graph-db))
+          (new-interned-symbol symbol '/ arity)))))
 
 (defun make-= (x y) `(= ,x ,y))
 
@@ -219,8 +241,11 @@ present, so an error from the continuation after Goal succeeds is not caught.")
   ;; user package (e.g. GRAPH-DB/TEST::ONCE) is a *different* symbol from the
   ;; GRAPH-DB symbol the macro is defined on.  CL-inherited heads (=, and, or,
   ;; not, if) are the same symbol everywhere and hit directly; for the rest we
-  ;; fall back to the same-named symbol interned in GRAPH-DB -- mirroring how
-  ;; MAKE-FUNCTOR-SYMBOL canonicalizes runtime predicate names by string.
+  ;; fall back to the same-named symbol interned in GRAPH-DB, by NAME.
+  ;; Unrelated to MAKE-FUNCTOR-SYMBOL's routing, which since GH #322
+  ;; looks up a registered functor in the head's OWN package before
+  ;; falling back to GRAPH-DB -- a different question, asked by LOOKUP
+  ;; rather than NAME alone.
   (flet ((canonical (sym)
            (let ((c (find-symbol (symbol-name sym) :graph-db)))
              (and c (not (eq c sym)) (get c 'prolog-compiler-macro)))))

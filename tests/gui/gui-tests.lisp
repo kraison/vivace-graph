@@ -1831,24 +1831,20 @@ now asks the same question the compiler will (GH #279)."
          (refused-p "(is-a ?p gui-person) (node-slot-value ?p name ?g)
                      (call ?g ?x)")))
       ;; ...and the home-scoping stays intact at THIS layer: a schema
-      ;; that owns the name is admitted past the whitelist.  Since GH
-      ;; #285 the ENGINE then refuses it under the runner's resource
-      ;; bounds -- the compiler canonicalizes the head back into
-      ;; GRAPH-DB, so the admitted goal would EXECUTE the engine's
-      ;; regex-match/2, the very ReDoS the category exists for.  The
-      ;; proof of layering is the refusal's origin: the engine's
-      ;; cost-unbounded report, not the whitelist's routing message.
+      ;; that owns the name is admitted past the whitelist, and (GH
+      ;; #322) now resolves in ITS OWN package -- the schema's stub
+      ;; runs, not the engine's REGEX-MATCH/2, so the ReDoS the
+      ;; exclusion category exists for never reaches the engine's real
+      ;; implementation.  The stub ignores its args and never calls
+      ;; its continuation, so the query succeeds with zero rows; that
+      ;; (not a refusal) is the proof the schema's own functor ran.
       (with-foreign-schema-functor ("REGEX-MATCH" 2)
-        (multiple-value-bind (ok message)
-            (refused-p "(is-a ?p gui-person) (regex-match \"a\" \"b\")"
-                       :code "cost-unbounded-goal")
-          (is-true ok "the engine rails admitted an unboundable goal")
-          (is-true (search "cost-unbounded" message)
-                   "refused at the wrong layer -- expected the engine's ~
-#285 report, got: ~A" message)
-          (is (null (search "control macro" message))
-              "the whitelist refused it; home-scoping was undone: ~A"
-              message)))
+        (multiple-value-bind (json status)
+            (run-prolog "(is-a ?p gui-person) (regex-match \"a\" \"b\")")
+          (is (= 200 status))
+          (is (= 0 (jref json :row-count)))
+          (is-false (jref json :error)
+                    "a successful query must not carry an :error")))
       ;; Without that registration the engine's own one is still out.
       (is-true (refused-p "(regex-match \"a\" \"b\")"))
       ;; ...and the fixture's real edge functor is untouched.
