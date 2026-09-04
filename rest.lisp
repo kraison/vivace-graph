@@ -419,7 +419,7 @@ handlers turn ERROR-STRING into their :error JSON (GH #190)."
 ;;; ---------------------------------------------------------------------------
 ;;; Ad-hoc JSON pattern queries (#44, tier 2): the HTTP wrappers only.  The DSL
 ;;; itself -- COMPILE-PATTERN-QUERY / RUN-PATTERN-QUERY / EMIT-QUERY-RESULTS and
-;;; the shape it accepts -- moved to query-dsl.lisp, which the GUI workbench
+;;; the shape it accepts -- moved to query/dsl.lisp, which the GUI workbench
 ;;; compiles through as well (GH #278).
 ;;; ---------------------------------------------------------------------------
 

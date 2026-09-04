@@ -115,6 +115,27 @@ landing on an existing `graph-db` functor of the same name; the guard's
 rebuilt heads (`graph-db::is-a`, `schema::follows`, ...) each take the
 lookup path.
 
+This has a trade: with `:define t` the definition itself still lands
+in `*package*` as before, but a *call* whose head is a
+`common-lisp` symbol that collides with a `graph-db` global functor's
+literal name (`write`, `atom`, `not`, `>`, ...) resolves to the
+engine's functor rather than a same-named clause the user package
+defined -- the right choice, since those CL-inherited heads are
+exactly what the lookup exists to serve.
+
+## `schema-type-names`
+
+```lisp
+(schema-type-names graph parent)
+  => (name-symbol ...)
+```
+
+The vertex or edge class names (`parent` one of `:vertex` or `:edge`)
+registered in `graph`'s schema, sorted by name. Used to build the
+guard's own schema-name table (`%schema-name-table`) and, since #322,
+called qualified by `gui/api.lisp` for the same purpose the GUI's
+`/api/graphs/:name/types` route always served.
+
 ## What the guard admits
 
 The whitelist, the exclusions, and the control-word list are derived
@@ -122,6 +143,15 @@ from the live image, not hand-listed here -- see `query/guard.lisp`'s
 header and the block comments above `*prolog-excluded-predicates*`,
 `*prolog-goal-argument-control*`, and `*prolog-cost-unbounded-predicates*`
 for exactly what is admitted and why each exclusion exists.
+
+**Defence in depth, not the front line.** The GUI Prolog handler still
+has a `cost-unbounded-goal` arm (`prolog-cost-unbounded-error`), but it
+is normally unreachable through the guard: the whitelist already
+refuses an engine-homed cost-unbounded name by name before the goal
+ever runs, and a schema-homed name of the same spelling now runs the
+schema's own functor instead of the engine's excluded one. The arm
+exists for the case neither of those covers, not as the mechanism that
+enforces the exclusion.
 
 Two things a new caller reliably gets wrong first:
 

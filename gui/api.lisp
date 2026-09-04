@@ -546,7 +546,7 @@ are domain identifiers a query author types, not protocol (GH #277)."
 ;;; ---------------------------------------------------------------------
 ;;; Query workbench (GH #278).  The body is the same structured DSL
 ;;; rest.lisp's /graph/:g/query route accepts, compiled and run by the
-;;; SHARED implementation in query-dsl.lisp -- read-only, snapshot-
+;;; SHARED implementation in query/dsl.lisp -- read-only, snapshot-
 ;;; isolated and capped, exactly as REST gets it.  Nothing here parses
 ;;; or reads user text into symbols beyond what that compiler does.
 ;;; ---------------------------------------------------------------------

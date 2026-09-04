@@ -39,8 +39,9 @@ depend on a single package binding.
 
 ## 3. Package and exports
 
-`graph-db.query` uses `cl` and imports what it needs from `graph-db` by
-name. Exports:
+`graph-db.query` uses `cl` and reaches `graph-db` through
+fully-qualified references (`graph-db::foo`); there is no
+`:import-from`. Exports:
 
 | symbol | what |
 |---|---|

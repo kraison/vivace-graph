@@ -21,7 +21,7 @@
 ;;;;      canonical symbols.  A symbol survives only as a registered
 ;;;;      functor of that arity, a control construct, a schema type or
 ;;;;      slot of THIS graph, a ?variable, or T/NIL.
-;;;;   5. RUN-QUERY-GOALS    -- query-dsl.lisp's own runner: :EFFECTS
+;;;;   5. RUN-QUERY-GOALS    -- query/dsl.lisp's own runner: :EFFECTS
 ;;;;      NIL, one snapshot, the inference/time/row bounds.  Reached
 ;;;;      through %RUN-GUARDED-GOALS in this file.  Goal heads resolve
 ;;;;      each in its own package now, not one shared :PACKAGE
@@ -32,11 +32,13 @@
 ;;;;      only step 1's flag check stays in gui/prolog.lisp.
 ;;;;
 ;;;; The interning subtlety (issue text, utilities.lisp:155):
-;;;; MAKE-FUNCTOR-SYMBOL calls NEW-INTERNED-SYMBOL, so building
-;;;; NAME/ARITY from client input would itself intern the symbol it was
-;;;; asking about.  The whitelist therefore ENUMERATES the two live
-;;;; registries and compares NAMES AS STRINGS; nothing derived from the
-;;;; request is ever interned into GRAPH-DB or the schema package.
+;;;; MAKE-FUNCTOR-SYMBOL now looks up an existing functor before
+;;;; interning (GH #322), but a miss still falls through to INTERN --
+;;;; so probing it with a client's own NAME/ARITY would create exactly
+;;;; the symbol it was asking about.  The whitelist therefore ENUMERATES
+;;;; the two live registries and compares NAMES AS STRINGS; nothing
+;;;; derived from the request is ever interned into GRAPH-DB or the
+;;;; schema package.
 ;;;;
 ;;;; Home: graph-db/query (GH #322) -- steps 2 through 6, including
 ;;;; RUN-GUARDED-PROLOG.  Only step 1's flag and the HTTP envelope

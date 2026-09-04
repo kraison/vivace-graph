@@ -1,6 +1,6 @@
 ;;;; Free-text Prolog HTTP surface, behind START-GUI's :ALLOW-PROLOG
-;;;; flag.  The guard (screen/read/whitelist) lives in GRAPH-DB.QUERY;
-;;;; the runner and its envelope stay here (GH #279, #322).
+;;;; flag.  The guard and the runner live in GRAPH-DB.QUERY; only the
+;;;; flag, the body helpers and the envelope stay here (GH #279, #322).
 
 (in-package #:graph-db.gui)
 
@@ -66,7 +66,8 @@ asks for none."
       (graph-db.query::%refuse "the request needs a \"query\" string"))
     (when (> (length text) graph-db.query:*prolog-max-query-length*)
       (graph-db.query::%refuse "query is ~D characters; the limit is ~D"
-               (length text) graph-db.query:*prolog-max-query-length*))
+                               (length text)
+                               graph-db.query:*prolog-max-query-length*))
     text))
 
 (defun %run-guarded-prolog (text limit graph)
