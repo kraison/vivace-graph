@@ -197,23 +197,31 @@ read-only: no symbol is created or registered by asking (GH #322)."
   (or (get-functor-fn symbol)
       (nth-value 1 (gethash symbol *prolog-global-functors*))))
 
-(defun make-functor-symbol (symbol arity)
-  "The NAME/ARITY functor symbol for SYMBOL.  Resolved by LOOKUP
-before interning: an already-registered functor in SYMBOL's own
-package, then in GRAPH-DB -- so a goal list whose canonical heads
-span the engine's package and a schema's resolves each in its home,
-and a head inherited from COMMON-LISP (>, atom, write) still finds
-the engine's functor.  Otherwise interned in *PACKAGE*, exactly as
-before: that is the definition path (<-) and every caller that
-predates this rule (GH #322)."
+(defun make-functor-symbol (symbol arity &key define)
+  "The NAME/ARITY functor symbol for SYMBOL.  DEFINE (true only from
+the definition path -- <- via ADD-CLAUSE, and any other site minting
+a symbol for a NEW functor) skips lookup and interns NAME straight
+into *PACKAGE*, the rule those callers already depended on -- a
+schema-package clause must not silently land on, or collide with, an
+existing GRAPH-DB functor of the same name.  Otherwise resolved by
+LOOKUP first: an already-registered functor in SYMBOL's own package,
+then in GRAPH-DB -- so a goal list whose canonical heads span the
+engine's package and a schema's resolves each in its home, and a head
+inherited from COMMON-LISP (>, atom, write) still finds the engine's
+functor.  A string SYMBOL never probes a package -- like DEFINE, it
+interns exactly as before this rule existed.  NAME is built with the
+same \"~{~a~}\" FORMAT NEW-INTERNED-SYMBOL uses (utilities.lisp:155,
+which is nothing but INTERN of that string), so every path spells the
+identical symbol (GH #322)."
   (let ((name (format nil "~{~a~}" (list symbol '/ arity))))
     (flet ((hit (pkg)
              (and pkg
                   (let ((s (find-symbol name pkg)))
                     (and s (%registered-functor-p s) s)))))
-      (or (and (symbolp symbol) (hit (symbol-package symbol)))
-          (hit (find-package :graph-db))
-          (new-interned-symbol symbol '/ arity)))))
+      (or (and (not define) (symbolp symbol)
+               (or (hit (symbol-package symbol))
+                   (hit (find-package :graph-db))))
+          (intern name)))))
 
 (defun make-= (x y) `(= ,x ,y))
 
@@ -649,12 +657,14 @@ inline, composing with cut and the control constructs.  When Goal is a variable
     body))
 
 (defun add-clause (clause)
-  "add a user-defined functor"
+  "add a user-defined functor.  :DEFINE T -- a clause always interns
+in *PACKAGE*, never the lookup-first read path (GH #322)."
   (let* ((functor-name (first (clause-head clause))))
     (when *prolog-trace* (format t "TRACE:  Adding clause ~A~%" clause))
     (assert (and (atom functor-name) (not (variable-p functor-name))))
     (let* ((arity (relation-arity (clause-head clause)))
-           (functor (make-functor-symbol functor-name arity)))
+           (functor (make-functor-symbol functor-name arity
+                                         :define t)))
       (if (gethash functor *prolog-global-functors*)
           (error 'prolog-error
                  :reason

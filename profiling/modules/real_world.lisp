@@ -499,7 +499,8 @@ application-representative."
                   (graph-db::deref-exp 'graph-db::?x)
                   (let ((f (graph-db::make-functor
                             :name (graph-db::make-functor-symbol
-                                   (format nil "prof-pred-~D" (mod i 50)) 1))))
+                                   (format nil "prof-pred-~D" (mod i 50))
+                                   1 :define t))))
                     (graph-db::prolog-compile f)))))))
     (make-realworld-workload-result
      :name "Workload 4: Prolog Engine (synthetic)"

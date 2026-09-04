@@ -28,7 +28,8 @@
 ;;;;      (GH #322).
 ;;;;   6. DELETE-PACKAGE     -- in an UNWIND-PROTECT, so a hostile
 ;;;;      query's symbols leave with the request that made them.
-;;;;      %RUN-GUARDED-PROLOG, which does this, also stays there.
+;;;;      RUN-GUARDED-PROLOG, which does this, is also in this file;
+;;;;      only step 1's flag check stays in gui/prolog.lisp.
 ;;;;
 ;;;; The interning subtlety (issue text, utilities.lisp:155):
 ;;;; MAKE-FUNCTOR-SYMBOL calls NEW-INTERNED-SYMBOL, so building

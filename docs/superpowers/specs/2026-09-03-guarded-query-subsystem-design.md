@@ -126,10 +126,22 @@ package and a tenant whose schema package does not use `graph-db` had
 to bind `graph-db` and refuse edge-typed stores (kraison/cl-llm#14
 unit 2).
 
-Change: `make-functor-symbol` takes the package from its `symbol`
-argument when that is an interned symbol, and falls back to `*package*`
-otherwise (uninterned symbols, and the string heads the compiler macro
-path interns). `compile-call` passes the head through unchanged.
+Change (revised after review: a rebind-`*package*` first attempt
+broke every built-in whose name collides with a `COMMON-LISP` symbol
+— `>`, `atom`, `write`, ... — since such a symbol's home package is
+always `COMMON-LISP`, never `graph-db`, so per-symbol-package
+rebinding can never find the engine's functor for them):
+`make-functor-symbol` resolves by LOOKUP before interning — an
+already-registered functor in the head symbol's own package, then in
+`graph-db` (where `def-global-prolog-functor` registers built-ins
+under their literal name, so the `>`/`atom`/`write` case is found
+there) — and only interns into `*package*` when neither lookup hits.
+Definitions keep the old rule exactly: `<-` (`add-clause`) passes
+`make-functor-symbol` a `:define t` argument that skips both lookups
+and interns straight into `*package*`, because a lookup there would
+let a schema-package clause silently land on an existing `graph-db`
+functor of the same name instead of defining its own. `compile-call`
+passes the head through unchanged.
 
 Consequences, argued once here:
 
@@ -137,12 +149,15 @@ Consequences, argued once here:
   behaves exactly as before, including its known requirement to be in
   `graph-db` or a package that uses it.
 - A functor defined with `<-` in a user package is called from that
-  package by symbols read there; unchanged.
+  package by symbols read there; unchanged, now guaranteed by
+  `:define t` rather than incidentally by a shared `*package*`.
 - The guard's rebuilt heads — `graph-db::is-a`, `schema::follows` —
-  each resolve in their own home. The GUI's `:package` binding becomes
-  redundant for the guard and is removed there; `run-query-goals` keeps
-  the keyword because `%dsl-resolve-type` and `%compile-match-pattern`
-  use it for type names.
+  each resolve in their own home (falling back to `graph-db` for a
+  CL-inherited comparison or `write`/`atom`/etc.). The GUI's
+  `:package` binding becomes redundant for the guard and is removed
+  there; `run-query-goals` keeps the keyword because
+  `%dsl-resolve-type` and `%compile-match-pattern` use it for type
+  names.
 - `prolog-compiler-macro` still interns a string head into `graph-db`
   by name; the guard refuses string heads before it, as today.
 
