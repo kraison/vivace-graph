@@ -270,3 +270,18 @@ package -- proved by the keyword not existing afterwards."
   (is (eq :never-seen-before-ns
           (nth-value 1 (split-claim-identity-key
                         "a|:never-seen-before-ns|c|d")))))
+
+(test claim-identity-key-refusal-is-printable
+  "GH #335: a value matching no registered family is refused with
+UNKNOWN-CLAIM-FAMILY, and the refusal must REPORT.  A signal site passing
+an initarg the condition does not define leaves PARENT unbound, which SBCL
+accepts silently -- so the type is right and only printing fails, inside
+whichever handler formats it."
+  (let* ((c (handler-case (claim-identity-key 42)
+              (unknown-claim-family (e) e)))
+         (report (handler-case (princ-to-string c)
+                   (error (e) (format nil "report signalled ~A"
+                                      (type-of e))))))
+    (is (typep c 'unknown-claim-family))
+    (is (search "names no claim family" report))
+    (is (search "FIXNUM" report))))

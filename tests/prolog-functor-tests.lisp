@@ -347,6 +347,30 @@ with :allow-cost-unbounded t, the goal runs as before."
     (is (member "REGEX-MATCH" (graph-db:cost-unbounded-predicate-names)
                 :test #'string=))))
 
+(test allow-cost-unbounded-reaches-a-running-goal
+  "GH #334: DECLARE-FUNCTOR-COST-UNBOUNDED classifies a whole functor, but
+a functor can be cheap or unbounded per GOAL -- cheap when an argument is
+bound to an indexed value, unbounded when nothing is.  Such a functor must
+refuse from its own body, and can only honour the caller's escape hatch if
+the option reaches it at run time; :ALLOW-COST-UNBOUNDED was read as a
+literal at macroexpansion and reached nothing."
+  (with-test-graph (g)
+    (declare (ignorable g))
+    (is (equal '(:allowed)
+               (select (:flat t :max-inferences 1000
+                        :allow-cost-unbounded t)
+                       (?a)
+                       (lisp ?a (if graph-db:*allow-cost-unbounded*
+                                    :allowed :refused)))))
+    (is (equal '(:refused)
+               (select (:flat t :max-inferences 1000)
+                       (?a)
+                       (lisp ?a (if graph-db:*allow-cost-unbounded*
+                                    :allowed :refused)))))
+    ;; NIL outside a query, so a functor body cannot read a stale value
+    ;; left by the last one.
+    (is (null graph-db:*allow-cost-unbounded*))))
+
 ;;; ---------------------------------------------------------------------------
 ;;; Head resolution (#322, second finding): a functor DEFINED with <- in
 ;;; a package that does not use GRAPH-DB still lands on that package's

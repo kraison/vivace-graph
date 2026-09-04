@@ -170,6 +170,28 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Fixed
 
+- **`:allow-cost-unbounded` reached nothing at run time** (#334):
+  `select` read the option as a literal at macroexpansion and handed it
+  straight to the static refusal, so no running code could see it.
+  `declare-functor-cost-unbounded` classifies a whole functor, but a
+  functor can be cheap or unbounded *per goal* -- cheap with an argument
+  bound to an indexed value, unbounded with nothing bound -- and such a
+  functor must refuse from its own body, where the caller's escape hatch
+  was invisible; the condition's own report told the caller to pass an
+  option that could not work. `select` now binds the exported
+  `*allow-cost-unbounded*` for the query's dynamic extent, and
+  `%refuse-cost-unbounded` reads it, so the static refusal and a
+  functor's run-time one answer to one value.
+
+- **`claim-identity-key`'s refusal could not be printed** (#335): the
+  signal site passed `:name`, an initarg `unknown-claim-family` does not
+  define, so SBCL accepted it silently and left `parent` unbound. The
+  condition was of the right type -- `handler-case` and `typep` both
+  worked -- and only *reporting* it signalled `unbound-slot`, inside
+  whichever handler formatted it. It now passes `:parent`, and a test
+  asserts the report rather than only the type; that branch had no test,
+  which is how a wrong initarg survived.
+
 - **A goal's head resolved through one shared `*package*` binding**
   (#322, second finding): `make-functor-symbol` now looks up an
   already-registered functor first -- the head's own package, then
