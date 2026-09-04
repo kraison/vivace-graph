@@ -154,6 +154,15 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Fixed
 
+- **`claim-identity-key`'s refusal could not be printed** (#335): the
+  signal site passed `:name`, an initarg `unknown-claim-family` does not
+  define, so SBCL accepted it silently and left `parent` unbound. The
+  condition was of the right type -- `handler-case` and `typep` both
+  worked -- and only *reporting* it signalled `unbound-slot`, inside
+  whichever handler formatted it. It now passes `:parent`, and a test
+  asserts the report rather than only the type; that branch had no test,
+  which is how a wrong initarg survived.
+
 - **A goal's head resolved through one shared `*package*` binding**
   (#322, second finding): `make-functor-symbol` now looks up an
   already-registered functor first -- the head's own package, then

@@ -38,8 +38,10 @@ regeneration, which node ids do not (GH #303).  Fields join on |, with
                                 (typep claim (claim-family-parent f)))
                               (alexandria:hash-table-values
                                *claim-families*))
+                     ;; :PARENT is the condition's only initarg; :NAME left
+                     ;; it unbound, so the report signalled (GH #335).
                      (error 'unknown-claim-family
-                            :name (class-name (class-of claim)))))
+                            :parent (class-name (class-of claim)))))
          (binary-p (typep claim (claim-family-binary family)))
          (fields
            (append
