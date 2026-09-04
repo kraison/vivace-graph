@@ -31,6 +31,17 @@
 (def-claim-classes rt-claim :graph-db-rules-test)
 (def-claim-classes rtt-claim :graph-db-rules-test :temporal t)
 
+;; R22's skip path, committed: *CLAIM-FAMILIES* is image-wide, so a
+;; family declared on a graph name this suite never opens is registered
+;; in it and indexed in no graph here -- which is the case
+;; %PRODUCER-CANDIDATES has to skip.  Nothing writes claims of it.
+(eval-when (:load-toplevel :execute)
+  (setf (gethash :graph-db-rules-test-foreign
+                 graph-db::*schema-node-metadata*)
+        nil))
+
+(def-claim-classes rtf-claim :graph-db-rules-test-foreign)
+
 (defmacro with-rules-graph ((g) &body body)
   "A fresh on-disk graph named *GRAPH-NAME*, in a scratch directory."
   (let ((dir (gensym "DIR")))

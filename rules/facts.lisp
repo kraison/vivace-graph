@@ -54,16 +54,10 @@ through the index and then unifies against nothing (spec §4)."
         ((keywordp (var-deref arg)) keyword)
         (t (%keyword-string keyword))))
 
-(defun %bound (x)
-  "X's value when it is bound to a non-variable, else NIL.  An explicit
-NIL argument and an unbound one are one case here, as they are for an
-index range bound."
-  (%prolog-index-bound x))
-
 (defun %family-or-ill-typed (x)
   "The CLAIM-FAMILY the family argument names.  UNKNOWN-CLAIM-FAMILY is
 what the runner reports as ill-typed client input, so it passes."
-  (let ((v (%bound x)))
+  (let ((v (%prolog-index-bound x)))
     (unless (symbolp v)
       (error 'graph-db.spacetime:unknown-claim-family :parent v))
     (graph-db.spacetime:claim-family v)))
@@ -99,14 +93,15 @@ asked in; see %NAMESPACE-VALUE."
                 (%yield (?okey okey)
                   (funcall cont))))))))))
 
-;; CLAIM/7 is cost-unbounded only in the nothing-bound case -- a per-goal
-;; property, so not DECLARE-FUNCTOR-COST-UNBOUNDED, which classifies the
-;; whole functor and would withhold CLAIM from free text entirely
-;; (GH #285).
+;; CLAIM/7 is cost-unbounded only for a goal no index route covers -- a
+;; per-goal property, so not DECLARE-FUNCTOR-COST-UNBOUNDED, which
+;; classifies the whole functor and would withhold CLAIM from free text
+;; entirely (GH #285).
 (defun %unbound-claim-scan (graph family)
-  "Every claim of FAMILY in GRAPH, when no resource bound is in effect;
-refused as cost-unbounded otherwise, since %TICK cannot preempt inside a
-family walk (GH #285).  The refusal is unconditional:
+  "Every claim of FAMILY in GRAPH -- CLAIM/7's fallback for a goal no
+index route covers, not a nothing-bound special case.  Refused as
+cost-unbounded when a resource bound is in effect, since %TICK cannot
+preempt inside a family walk (GH #285).  The refusal is unconditional:
 :ALLOW-COST-UNBOUNDED is threaded through SELECT at query-compile time
 and no special variable carries it into a functor body, so it cannot
 reach here."
@@ -125,21 +120,21 @@ and key, relation, object namespace and key.  A namespace answers as the
 lowercase wire string, or as the keyword when the argument was already
 bound to one; a unary claim's object pair is NIL.  Generates from the
 subject index when the subject is bound, the object index when the object
-is, the producer index through CLAIM-PRODUCER/2 in the same body; with
-nothing bound under a resource bound it is refused as cost-unbounded
-(GH #285), and without a bound it walks the family (spec §4)."
+is, the producer index through CLAIM-PRODUCER/2 in the same body.  A
+goal no route covers walks the family, or is refused as cost-unbounded
+when a resource bound is in effect (GH #285, spec §4)."
   (let* ((family (%family-or-ill-typed ?family))
          (parent (graph-db.spacetime:claim-family-parent family))
          (binary (graph-db.spacetime:claim-family-binary family))
          (g *graph*)
-         (c (%bound ?c))
-         (sns-arg (%bound ?sns))
-         (ons-arg (%bound ?ons))
+         (c (%prolog-index-bound ?c))
+         (sns-arg (%prolog-index-bound ?sns))
+         (ons-arg (%prolog-index-bound ?ons))
          (sns (%namespace-keyword sns-arg))
          (ons (%namespace-keyword ons-arg))
-         (skey (%bound ?skey))
-         (okey (%bound ?okey))
-         (rel (%bound ?rel))
+         (skey (%prolog-index-bound ?skey))
+         (okey (%prolog-index-bound ?okey))
+         (rel (%prolog-index-bound ?rel))
          (candidates
            (cond ((node-p c) (list c))
                  ((and sns skey rel)
@@ -168,7 +163,7 @@ nothing bound under a resource bound it is refused as cost-unbounded
 NIL rather than signalling.  A node of another type is out of contract:
 the accessors signal NO-APPLICABLE-METHOD, which the runner already
 classifies as ill-typed input (spec §4)."
-  (let ((v (%bound x)))
+  (let ((v (%prolog-index-bound x)))
     (and v (node-p v) v)))
 
 (def-global-prolog-functor claim-current/1 (?c cont)
@@ -184,7 +179,7 @@ believed\" (spec §4)."
   "X as a LOCAL-TIME timestamp: a timestamp passes, an ISO-8601 string is
 parsed, everything else -- an unparsable string included -- is NIL, so a
 malformed instant fails the goal instead of signalling."
-  (let ((v (%bound x)))
+  (let ((v (%prolog-index-bound x)))
     (cond ((typep v 'local-time:timestamp) v)
           ((stringp v) (ignore-errors (local-time:parse-timestring v)))
           (t nil))))
@@ -240,6 +235,10 @@ QUERY-PRECONDITION-ERROR means here, not a fault to report."
                                      +claim-producer-index-slots+
                                      producer))
               (push c out))
+          ;; Also the condition a wrong component count signals
+          ;; (%INDEX-BOUNDS, index.lisp) -- safe only while this index
+          ;; is arity 1 and PRODUCER a bare scalar; a multi-slot one
+          ;; would read a shape error as "no candidates".
           (query-precondition-error () nil))))))
 
 (def-global-prolog-functor claim-producer/2 (?c ?p cont)
@@ -248,9 +247,12 @@ instead: every claim ?P wrote, across every family this graph indexes.
 With neither bound the goal fails: there is no index to generate from,
 and the only alternative is a whole-store walk (spec §4)."
   (let ((c (%claim-arg ?c))
-        (p (%bound ?p)))
+        (p (%prolog-index-bound ?p)))
     (cond (c (%yield (?p (graph-db.spacetime:claim-producer c))
                (funcall cont)))
-          ((stringp p)
+          ;; %CLAIM-ARG is NIL for a bound non-node too, and generating
+          ;; there is a whole cross-family lookup that then unifies with
+          ;; nothing, past %TICK's reach.
+          ((and (null (%prolog-index-bound ?c)) (stringp p))
            (dolist (claim (%producer-candidates *graph* p))
              (%yield (?c claim) (funcall cont)))))))

@@ -141,8 +141,9 @@ interns nothing; query text cannot grow the `KEYWORD` package.
 
 **Any shape the table does not route reaches the walk** -- the walk is
 the `cond`'s last clause, not a nothing-bound special case. A bound
-namespace with an unbound key, a bound key with an unbound namespace,
-and a non-node `?c` with nothing else bound all land there.
+namespace this image recorded, with an unbound key, a bound key with an
+unbound namespace, and a non-node `?c` with nothing else bound all land
+there. A namespace that resolves to nothing is the row above instead.
 
 **A bound key with an unbound namespace has no route.** The namespace
 is the leading slot of both endpoint indexes and an index is only

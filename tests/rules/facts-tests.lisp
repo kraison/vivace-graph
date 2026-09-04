@@ -71,6 +71,24 @@
         (claim ?c rt-claim ?a ?b ?r ?d ?e)))
     (is (= 4 (select-count (?c) (claim ?c rt-claim ?a ?b ?r ?d ?e))))))
 
+;; The refusal is a property of the goal's shape, not of the
+;; nothing-bound shape alone.  The namespace is the leading slot of both
+;; endpoint indexes and an index is usable only from a prefix, so
+;; neither half of a subject pair routes on its own (docs/rules.md).
+(test an-unrouted-goal-is-refused-under-a-bound
+  (with-rules-graph (g)
+    (seed g)
+    (signals graph-db::prolog-cost-unbounded-error
+      (select (:max-inferences 1000) (?c)
+        (claim ?c rt-claim "host" ?k ?r ?a ?b)))
+    (signals graph-db::prolog-cost-unbounded-error
+      (select (:max-inferences 1000) (?c)
+        (claim ?c rt-claim ?ns "h1" ?r ?a ?b)))
+    ;; Control: the same pair bound together routes and answers under
+    ;; the very same budget.
+    (is (= 2 (select (:count t :max-inferences 1000) (?c)
+               (claim ?c rt-claim "host" "h1" ?r ?a ?b))))))
+
 ;; R17: a keyword namespace argument selects the right candidates through
 ;; the index, so a string-only unification would answer nothing at all.
 (test a-keyword-namespace-answers-like-its-string
@@ -116,7 +134,31 @@
                                  (claim-valid-at ?c "2026-06-15T00:00:00Z"))))
     ;; A claim with no extent never matches.
     (is (null (select-flat (?c) (claim ?c rt-claim "host" "h1" ?r ?a ?b)
-                                (claim-valid-at ?c "2026-02-15T00:00:00Z"))))))
+                                (claim-valid-at ?c "2026-02-15T00:00:00Z"))))
+    ;; A malformed instant fails the goal; reaching here at all is the
+    ;; assertion that it did not signal.
+    (is (null (select-flat (?v) (claim ?c rtt-claim "app" "web"
+                                       "version" "ver" ?v)
+                                (claim-valid-at ?c "not-a-timestamp"))))))
+
+;; Spec §11: the functor and CLAIMS-TOUCHING :AT must answer the same
+;; claims for the same instant.  They share %CLAIM-VALIDITY-TOUCHES-P,
+;; and this is the assertion that goes red if someone inlines it back.
+;; The pinned ("1") is what keeps the agreement from holding vacuously
+;; on two empty results.
+(test claim-valid-at-agrees-with-claims-touching
+  (with-rules-graph (g)
+    (seed g)
+    (let ((via-goal (select-flat (?k) (claim ?c rtt-claim "app" "web"
+                                             "version" "ver" ?k)
+                                      (claim-valid-at
+                                       ?c "2026-02-15T00:00:00Z")))
+          (via-query (mapcar #'claim-object-key
+                             (claims-touching g 'rtt-claim :app "web"
+                                              :role :subject
+                                              :at (ts 2026 2 15)))))
+      (is (equal '("1") via-goal))
+      (is (equal via-goal via-query)))))
 
 (test claim-producer-generates-from-the-producer-index
   (with-rules-graph (g)
@@ -133,6 +175,76 @@
                (select-flat (?p) (claim ?c rt-claim "host" "h1" "runs"
                                         "app" "db")
                                  (claim-producer ?c ?p))))))
+
+;; R22: %PRODUCER-CANDIDATES walks the image-wide family registry, so it
+;; meets families this graph's schema does not carry.  RTF-CLAIM is one
+;; (suite.lisp); the SIGNALS is the probe that the lookup really does
+;; raise here, so the count below runs through the HANDLER-CASE rather
+;; than past it.
+(test the-producer-generator-skips-a-family-this-graph-lacks
+  (with-rules-graph (g)
+    (seed g)
+    (is (claim-family 'rtf-claim))
+    (signals graph-db:query-precondition-error
+      (graph-db:index-lookup g 'rtf-claim
+                             graph-db::+claim-producer-index-slots+
+                             "scan-a"))
+    (is (= 2 (select (:count t :max-inferences 1000) (?c)
+               (claim-producer ?c "scan-b"))))))
+
+;; The interface contract for all six filters: a bound non-node ?C fails
+;; the goal, and none of them signals -- reaching the end of the test is
+;; the "never signals" half.  The last line is A1's shape: %CLAIM-ARG is
+;; NIL for a bound non-node, so without the unbound-?C gate the
+;; generator ran a whole cross-family lookup here and then unified
+;; nothing.  That gate changes cost, not answers, so this pins the
+;; contract; it does not prove the gate.
+(test a-non-node-c-fails-every-filter
+  (with-rules-graph (g)
+    (seed g)
+    (is (zerop (select-count () (claim-current "x"))))
+    (is (zerop (select-count ()
+                             (claim-valid-at "x" "2026-02-15T00:00:00Z"))))
+    (is (zerop (select-count () (claim-standing "x" ?s))))
+    (is (zerop (select-count () (claim-relation "x" ?r))))
+    (is (zerop (select-count () (claim-rule-version "x" ?v))))
+    (is (zerop (select-count () (claim-producer "x" ?p))))
+    (is (zerop (select-count () (claim-producer "x" "scan-a"))))))
+
+;; The bound-second-argument half of each filter's docstring -- the mode
+;; an S2 rule body writes.  Every pair names both the row the filter
+;; keeps and the row it must drop, so a filter that stopped filtering
+;; fails the second assertion of its pair rather than passing both.
+(test the-filters-filter-on-a-bound-second-argument
+  (with-rules-graph (g)
+    (seed g)
+    ;; h2 carries two claims: "reachable" is :inferred, "runs" :observed.
+    (is (equal '("reachable")
+               (select-flat (?r) (claim ?c rt-claim "host" "h2" ?r ?a ?b)
+                                 (claim-standing ?c "inferred"))))
+    (is (equal '("runs")
+               (select-flat (?r) (claim ?c rt-claim "host" "h2" ?r ?a ?b)
+                                 (claim-standing ?c "observed"))))
+    ;; h1 carries two "runs" claims and nothing else.
+    (is (= 2 (select-count (?c) (claim ?c rt-claim "host" "h1" ?s ?a ?b)
+                                (claim-relation ?c "runs"))))
+    (is (zerop (select-count (?c) (claim ?c rt-claim "host" "h1" ?s ?a ?b)
+                                  (claim-relation ?c "reachable"))))
+    ;; No rule wrote these, so NIL is the value that filters them IN.
+    (is (= 2 (select-count (?c) (claim ?c rt-claim "host" "h1" ?s ?a ?b)
+                                (claim-rule-version ?c nil))))
+    (is (zerop (select-count (?c) (claim ?c rt-claim "host" "h1" ?s ?a ?b)
+                                  (claim-rule-version ?c "v1"))))
+    ;; Both arguments bound is CLAIM-PRODUCER/2's filter half; the two
+    ;; claims on the object route split between the producers.
+    (is (equal '("h1")
+               (select-flat (?k) (claim ?c rt-claim "host" ?k "runs"
+                                        "app" "web")
+                                 (claim-producer ?c "scan-a"))))
+    (is (equal '("h2")
+               (select-flat (?k) (claim ?c rt-claim "host" ?k "runs"
+                                        "app" "web")
+                                 (claim-producer ?c "scan-b"))))))
 
 (test the-slot-filters
   (with-rules-graph (g)
