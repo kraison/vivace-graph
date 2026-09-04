@@ -5,12 +5,15 @@
 run query text an operator did not write: the JSON pattern DSL
 (package `graph-db`, `query/dsl.lisp`, GH #44/#278) and the free-text
 Prolog guard (package `graph-db.query`, `query/guard.lisp`, GH #279).
-Both used to live inside `graph-db/gui`, so any consumer that only
-wanted a bounded query tool -- not a GUI, not ningle -- had to load a
-web stack to reach them. A tenant that hands a language model a query
-tool depends on `graph-db/core` and `graph-db/spacetime` and must not
-pull one in (kraison/cl-llm#14 unit 2); homing the guard here is what
-makes that possible.
+Both used to sit above `graph-db/core`, never below it, but not in
+the same place: the DSL lived in the web system (`rest.lisp`, then
+`query-dsl.lisp`), kept out of core by one ningle line setting an
+ndjson content type; the guard lived inside `graph-db/gui`. Either
+way, any consumer that only wanted a bounded query tool -- not a GUI,
+not ningle -- had to load a web stack to reach them. A tenant that
+hands a language model a query tool depends on `graph-db/core` and
+`graph-db/spacetime` and must not pull one in (kraison/cl-llm#14 unit
+2); homing both here is what makes that possible.
 
 ## Loading it
 
@@ -71,10 +74,14 @@ refusal.
 **Budgets and truncation.** `limit` is clamped to
 `*query-default-limit*` (1000). `max-inferences` and `timeout` bind
 `*query-default-max-inferences*` and `*query-default-timeout*` for the
-call; left out, the specials' current values apply. The runner asks
-the DSL for one row past the clamped cap: `truncated-p` is `t` when
-that extra row shows up (more solutions exist than were returned) and
-`nil` when the result set exactly fills or falls under the cap.
+call; left out, the specials' current values apply. Below the cap,
+the runner asks the DSL for one row past it: `truncated-p` is `t`
+when that extra row shows up (more solutions exist than were
+returned) and `nil` when the result set exactly fills or falls under
+the cap. At the ceiling -- `limit` omitted or `>=
+*query-default-limit*` -- there is no room for the extra row
+(`%probe`), so an exactly-full page there reads as `truncated-p` `t`
+too; only a page short of 1000 rows is `nil` at the ceiling.
 
 ## The condition contract
 
@@ -140,5 +147,5 @@ does not go through `run-guarded-prolog`.
 
 kraison/cl-llm's `cl-llm/agent/prolog` query tool re-homes onto
 `graph-db/query` (filed at landing); kraison/blackboard slice 1's
-`select` builds directly on `run-guarded-prolog` and
-`schema-type-names`.
+`select` and slice 3's structure tier build directly on
+`run-guarded-prolog` and `schema-type-names`.

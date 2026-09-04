@@ -666,7 +666,7 @@ passed -- each head resolves in its own package (GH #322)."
                                             (format :data))
   "Screen, read, guard and run TEXT against GRAPH; (VALUES COLUMNS ROWS
 TRUNCATED-P).  COLUMNS are the variables in first-appearance order as
-downcased wire strings; ROWS one list per solution, cells JSON-shaped
+camelCase wire spelling; ROWS one list per solution, cells JSON-shaped
 under :DATA (a node is its id string; strings, numbers, T, NIL pass) or
 as bound under :RAW.  LIMIT is clamped to *QUERY-DEFAULT-LIMIT*;
 MAX-INFERENCES and TIMEOUT bind the DSL's budgets for this call.
