@@ -346,3 +346,28 @@ with :allow-cost-unbounded t, the goal runs as before."
                (quote graph-db::regex-match) 2)))
     (is (member "REGEX-MATCH" (graph-db:cost-unbounded-predicate-names)
                 :test #'string=))))
+
+;;; ---------------------------------------------------------------------------
+;;; Head resolution (#322, second finding): a functor DEFINED with <- in
+;;; a package that does not use GRAPH-DB still lands on that package's
+;;; own NAME/ARITY symbol, via the :DEFINE T argument ADD-CLAUSE passes
+;;; MAKE-FUNCTOR-SYMBOL -- not on an existing GRAPH-DB functor.
+;;; ---------------------------------------------------------------------------
+
+(defpackage #:graph-db/test.define-probe (:use #:cl))
+
+(test define-in-a-package-that-does-not-use-graph-db
+  "<- in a package that does not use GRAPH-DB defines its own NAME/ARITY
+symbol there, not a same-named GRAPH-DB functor (#322)."
+  (let ((pkg (find-package "GRAPH-DB/TEST.DEFINE-PROBE")))
+    ;; GRAPH-DB::<- itself must be qualified to be called at all from
+    ;; a package that uses nothing; only the clause body (head, ?x)
+    ;; reads into PKG, which is the case this test exists for.
+    (let ((*package* pkg))
+      (eval (read-from-string "(graph-db::<- (probe-322-fact ?x) (= ?x 1))")))
+    (let ((own (find-symbol "PROBE-322-FACT/1" pkg)))
+      (is-true own "the clause's functor symbol is not in its own package")
+      (is-true (graph-db::lookup-functor own)
+               "the clause did not register under its own package's symbol"))
+    (is (null (find-symbol "PROBE-322-FACT/1" (find-package :graph-db)))
+        "GRAPH-DB must not have interned a symbol for this functor")))

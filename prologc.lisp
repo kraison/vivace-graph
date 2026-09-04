@@ -194,6 +194,8 @@ present, so an error from the continuation after Goal succeeds is not caught.")
   "True when SYMBOL is a live functor -- a user clause (GET-FUNCTOR-FN)
 or a global primitive (*PROLOG-GLOBAL-FUNCTORS*).  Both lookups are
 read-only: no symbol is created or registered by asking (GH #322)."
+  ;; GET-FUNCTOR-FN (compiled fn), not LOOKUP-FUNCTOR (struct): an
+  ;; uncompiled registered functor falls through to the old rule.
   (or (get-functor-fn symbol)
       (nth-value 1 (gethash symbol *prolog-global-functors*))))
 
@@ -789,7 +791,10 @@ in *PACKAGE*, never the lookup-first read path (GH #322)."
   (let* ((goals (replace-?-vars goals))
          (vars (delete '? (variables-in goals)))
          (top-level-query (prolog-gensym "PROVE"))
-         (*functor* (make-functor-symbol top-level-query 0)))
+         ;; New functor per invocation (GH #322): DEFINE T so this
+         ;; never resolves onto an existing functor of the same name.
+         (*functor* (make-functor-symbol top-level-query 0
+                                          :define t)))
     `(let* ((*trail* (make-array 200 :fill-pointer 0 :adjustable t))
             (*var-counter* 0)
             (*functor* ',*functor*)
@@ -827,7 +832,8 @@ in *PACKAGE*, never the lookup-first read path (GH #322)."
   ((:entity Spot) (:species Dog)))"
   (let* ((goals (replace-?-vars goals)))
     `(let* ((top-level-query (prolog-gensym "PROVE"))
-            (*functor* (make-functor-symbol top-level-query 0))
+            (*functor* (make-functor-symbol top-level-query 0
+                                             :define t))
             (*trail* (make-array 200 :fill-pointer 0 :adjustable t))
             (*var-counter* 0)
             (*select-list* nil)
@@ -1055,7 +1061,10 @@ SELECT-FIRST for common shorthands."
   (let* ((goals (replace-?-vars goals))
          (options (plist-alist options)))
     `(let* ((top-level-query (prolog-gensym "PROVE"))
-            (*functor* (make-functor-symbol top-level-query 0))
+            ;; New functor per invocation (GH #322): DEFINE T so
+            ;; this never resolves onto an existing functor.
+            (*functor* (make-functor-symbol top-level-query 0
+                                             :define t))
             (*trail* (make-array 200 :fill-pointer 0 :adjustable t))
             (*var-counter* 0)
             (*select-list* nil)
@@ -1156,7 +1165,8 @@ goals like (trigger ...) or (retract ...)."
   ((:entity Spot)(:species Dog)))"
   (let* ((goals (replace-?-vars goals)))
     `(let* ((top-level-query (prolog-gensym "PROVE"))
-            (*functor* (make-functor-symbol top-level-query 0))
+            (*functor* (make-functor-symbol top-level-query 0
+                                             :define t))
             (*trail* (make-array 200 :fill-pointer 0 :adjustable t))
             (*var-counter* 0)
             (*select-list* nil)

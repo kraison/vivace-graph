@@ -153,7 +153,17 @@ Consequences, argued once here:
   `graph-db` or a package that uses it.
 - A functor defined with `<-` in a user package is called from that
   package by symbols read there; unchanged, now guaranteed by
-  `:define t` rather than incidentally by a shared `*package*`.
+  `:define t` rather than incidentally by a shared `*package*`. The
+  trade this brings: a *call* whose head is a `common-lisp` symbol
+  that collides with a `graph-db` global functor's literal name
+  (`write`, `atom`, `not`, `>`, ...) resolves to the engine's functor,
+  not a same-named clause the user package defined, because such a
+  head's home package is always `common-lisp`, never the user
+  package — the call-side lookup cannot tell the two apart by home.
+  This is the right trade: those are exactly the CL-inherited heads
+  the lookup exists to serve (§6 above), and a user package wanting
+  its own `write/1` still gets it by naming it something the engine
+  has not already claimed.
 - The guard's rebuilt heads — `graph-db::is-a`, `schema::follows` —
   each resolve in their own home (falling back to `graph-db` for a
   CL-inherited comparison or `write`/`atom`/etc.). The GUI's
