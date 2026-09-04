@@ -218,6 +218,32 @@ directly, web-free (GH #322)."
                                        :run-query-tests)
                (error "graph-db query tests failed."))))
 
+;; Rules as versioned producers (GH #304): S1 makes claims Prolog facts.
+(defsystem graph-db/rules
+  :name "VivaceGraph rules"
+  :description "Claims as Prolog facts; later, rules as versioned
+producers.  docs/rules.md; GH #304."
+  :maintainer "Kevin Raison"
+  :author "Kevin Raison <last name @ chatsubo dot net>"
+  :version "4.0.1"
+  :depends-on (:graph-db/spacetime :graph-db/query)
+  :pathname "rules/"
+  :serial t
+  :components ((:file "package") (:file "facts"))
+  :in-order-to ((test-op (test-op :graph-db/rules-test))))
+
+(defsystem graph-db/rules-test
+  :name "VivaceGraph rules test suite"
+  :description "FiveAM tests for claims as Prolog facts (GH #330)."
+  :depends-on (:graph-db/rules :graph-db/test-scratch :fiveam)
+  :pathname "tests/rules/"
+  :serial t
+  :components ((:file "package") (:file "suite") (:file "facts-tests"))
+  :perform (test-op (op c)
+             (unless (uiop:symbol-call :graph-db/rules-test
+                                       :run-rules-tests)
+               (error "graph-db rules tests failed."))))
+
 ;; FULL: replication + the HTTP API leaf (rest, clack/ningle).  graph-db/replication
 ;; (and transitively graph-db/core) has already compiled+loaded the engine + transport,
 ;; so rest needs no intra-file :depends-on -- the system-level dependency guarantees
