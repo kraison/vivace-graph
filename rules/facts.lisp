@@ -37,6 +37,16 @@ unbound variable or anything else is NIL (spec §4)."
   "A keyword as the lowercase string the wire uses (spec §4)."
   (string-downcase (symbol-name keyword)))
 
+(defun %namespace-value (arg keyword)
+  "The value a namespace argument unifies against for a claim whose
+namespace is KEYWORD: KEYWORD when ARG already carries a keyword, else
+the lowercase wire string; NIL for a unary claim's absent object
+namespace.  Without the keyword case such an argument selects candidates
+through the index and then unifies against nothing (spec §4)."
+  (cond ((null keyword) nil)
+        ((keywordp (var-deref arg)) keyword)
+        (t (%keyword-string keyword))))
+
 (defun %bound (x)
   "X's value when it is bound to a non-variable, else NIL.  An explicit
 NIL argument and an unbound one are one case here, as they are for an
@@ -62,18 +72,20 @@ what the runner reports as ill-typed client input, so it passes."
   "Bind every argument to CLAIM's fields and continue.  A claim outside
 FAMILY yields nothing; a unary claim binds the object pair to NIL,
 which is also why the object accessors are read under TYPEP -- only the
-binary class has those slots."
+binary class has those slots.  Namespaces answer in the shape they were
+asked in; see %NAMESPACE-VALUE."
   (when (typep claim (graph-db.spacetime:claim-family-parent family))
     (let* ((binary (typep claim
                           (graph-db.spacetime:claim-family-binary family)))
-           (ons (and binary
-                     (%keyword-string
-                      (graph-db.spacetime:claim-object-namespace claim))))
+           (ons-key (and binary
+                         (graph-db.spacetime:claim-object-namespace claim)))
+           (sns (%namespace-value
+                 ?sns (graph-db.spacetime:claim-subject-namespace claim)))
+           (ons (%namespace-value ?ons ons-key))
            (okey (and binary
                       (graph-db.spacetime:claim-object-key claim))))
       (%yield (?c claim)
-        (%yield (?sns (%keyword-string
-                       (graph-db.spacetime:claim-subject-namespace claim)))
+        (%yield (?sns sns)
           (%yield (?skey (graph-db.spacetime:claim-subject-key claim))
             (%yield (?rel (graph-db.spacetime:claim-relation claim))
               (%yield (?ons ons)
@@ -83,13 +95,20 @@ binary class has those slots."
 ;; CLAIM/7 is cost-unbounded only in the nothing-bound case -- a per-goal
 ;; property, so not DECLARE-FUNCTOR-COST-UNBOUNDED, which classifies the
 ;; whole functor and would withhold CLAIM from free text entirely
-;; (GH #285).  The walk that is legal without a resource bound lands in
-;; S1 task 2.
+;; (GH #285).
 (defun %unbound-claim-scan (family)
-  "Refuse a nothing-bound CLAIM/7 as cost-unbounded: %TICK cannot
-preempt inside a family walk (GH #285)."
-  (declare (ignore family))
-  (error 'prolog-cost-unbounded-error :functor 'claim/7))
+  "Every claim of FAMILY, when no resource bound is in effect; refused
+as cost-unbounded otherwise, since %TICK cannot preempt inside a family
+walk (GH #285).  The refusal is unconditional: :ALLOW-COST-UNBOUNDED is
+threaded through SELECT at query-compile time and no special variable
+carries it into a functor body, so it cannot reach here."
+  (when (or *inference-budget* *query-deadline*)
+    (error 'prolog-cost-unbounded-error :functor 'claim/7))
+  ;; :INCLUDE-SUBCLASSES-P defaults to T, so the parent covers unary and
+  ;; binary.  :COLLECT-P is what materialises node bytes before a node
+  ;; escapes the scan's read pin (vertex.lisp) -- not a style choice.
+  (let ((parent (graph-db.spacetime:claim-family-parent family)))
+    (map-vertices #'identity *graph* :vertex-type parent :collect-p t)))
 
 (def-global-prolog-functor claim/7
     (?c ?family ?sns ?skey ?rel ?ons ?okey cont)
