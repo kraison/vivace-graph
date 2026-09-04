@@ -93,15 +93,15 @@ asked in; see %NAMESPACE-VALUE."
                 (%yield (?okey okey)
                   (funcall cont))))))))))
 
-;; CLAIM/7 is cost-unbounded only for a goal no index route covers -- a
-;; per-goal property, so not DECLARE-FUNCTOR-COST-UNBOUNDED, which
-;; classifies the whole functor and would withhold CLAIM from free text
-;; entirely (GH #285).
+;; CLAIM/7 is cost-unbounded only for a goal that reaches the COND's
+;; last clause -- a per-goal property, so not
+;; DECLARE-FUNCTOR-COST-UNBOUNDED, which classifies the whole functor
+;; and would withhold CLAIM from free text entirely (GH #285).
 (defun %unbound-claim-scan (graph family)
-  "Every claim of FAMILY in GRAPH -- CLAIM/7's fallback for a goal no
-index route covers, not a nothing-bound special case.  Refused as
-cost-unbounded when a resource bound is in effect, since %TICK cannot
-preempt inside a family walk (GH #285).  The refusal is unconditional:
+  "Every claim of FAMILY in GRAPH -- CLAIM/7's fallback, the COND's last
+clause, not a nothing-bound special case.  Refused as cost-unbounded
+when a resource bound is in effect, since %TICK cannot preempt inside a
+family walk (GH #285).  The refusal is unconditional:
 :ALLOW-COST-UNBOUNDED is threaded through SELECT at query-compile time
 and no special variable carries it into a functor body, so it cannot
 reach here."
@@ -121,8 +121,9 @@ lowercase wire string, or as the keyword when the argument was already
 bound to one; a unary claim's object pair is NIL.  Generates from the
 subject index when the subject is bound, the object index when the object
 is, the producer index through CLAIM-PRODUCER/2 in the same body.  A
-goal no route covers walks the family, or is refused as cost-unbounded
-when a resource bound is in effect (GH #285, spec §4)."
+bound namespace naming no keyword answers empty; every other goal the
+routes miss reaches the COND's last clause, which walks the family or is
+refused as cost-unbounded under a resource bound (GH #285, spec §4)."
   (let* ((family (%family-or-ill-typed ?family))
          (parent (graph-db.spacetime:claim-family-parent family))
          (binary (graph-db.spacetime:claim-family-binary family))
@@ -243,16 +244,27 @@ QUERY-PRECONDITION-ERROR means here, not a fault to report."
 
 (def-global-prolog-functor claim-producer/2 (?c ?p cont)
   "?C's producer.  With ?C unbound and ?P a producer name it generates
-instead: every claim ?P wrote, across every family this graph indexes.
-With neither bound the goal fails: there is no index to generate from,
-and the only alternative is a whole-store walk (spec §4)."
+instead: every claim ?P wrote, across every family this graph indexes --
+write that goal BEFORE the CLAIM/7 goal it feeds, or ?C is bound by then
+and this filters.  With neither bound there is no index to generate from
+and no walk to fall back to, so the goal is refused as cost-unbounded
+under a resource bound and answers nothing without one (spec §4,
+docs/rules.md)."
   (let ((c (%claim-arg ?c))
+        (c-arg (%prolog-index-bound ?c))
         (p (%prolog-index-bound ?p)))
     (cond (c (%yield (?p (graph-db.spacetime:claim-producer c))
                (funcall cont)))
           ;; %CLAIM-ARG is NIL for a bound non-node too, and generating
           ;; there is a whole cross-family lookup that then unifies with
           ;; nothing, past %TICK's reach.
-          ((and (null (%prolog-index-bound ?c)) (stringp p))
+          ((and (null c-arg) (stringp p))
            (dolist (claim (%producer-candidates *graph* p))
-             (%yield (?c claim) (funcall cont)))))))
+             (%yield (?c claim) (funcall cont))))
+          ;; Nothing bound routes nowhere, so CLAIM/7's refusal rather
+          ;; than silence.  A bound ?P that names no producer still
+          ;; answers empty, as an unresolvable namespace does.
+          ((and (null c-arg) (null p)
+                (or *inference-budget* *query-deadline*))
+           (error 'prolog-cost-unbounded-error
+                  :functor 'claim-producer/2)))))

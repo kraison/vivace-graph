@@ -11,13 +11,28 @@
 ;; only the route can pass.  Under the guard a budget is always in effect,
 ;; which is what makes that degradation a user-visible refusal.
 
-(test claim-generates-from-the-subject-index
+(test claim-generates-from-the-subject-relation-index
   (with-rules-graph (g)
     (seed g)
     (let ((rows (select (:max-inferences 1000) (?o)
                   (claim ?c rt-claim "host" "h1" "runs" "app" ?o))))
       (is (equal '("db" "web")
                  (sort (mapcar #'first rows) #'string<))))))
+
+;; The subject index is the route only while the relation is unbound; a
+;; bound one takes the row above.  Both answer the same rows -- the
+;; subject index is a prefix of the subject-relation one and
+;; %UNIFY-CLAIM filters the relation either way -- so this guards route
+;; SELECTION, not correctness: it is red only if the subject-index
+;; clause itself goes, when the goal falls to the walk and the budget
+;; refuses it (docs/rules.md).
+(test claim-generates-from-the-subject-index
+  (with-rules-graph (g)
+    (seed g)
+    (let ((rows (select (:max-inferences 1000) (?r ?o)
+                  (claim ?c rt-claim "host" "h1" ?r ?ons ?o))))
+      (is (equal '(("runs" "db") ("runs" "web"))
+                 (sort (copy-list rows) #'string< :key #'second))))))
 
 (test claim-generates-from-the-object-index
   (with-rules-graph (g)
@@ -139,13 +154,22 @@
     ;; assertion that it did not signal.
     (is (null (select-flat (?v) (claim ?c rtt-claim "app" "web"
                                        "version" "ver" ?v)
-                                (claim-valid-at ?c "not-a-timestamp"))))))
+                                (claim-valid-at ?c "not-a-timestamp"))))
+    ;; %INSTANT-ARG's timestamp branch: a Lisp caller passes a
+    ;; LOCAL-TIME timestamp, not the wire string, and gets the same row.
+    (is (equal '("1")
+               (select-flat (?v) (lisp ?at (ts 2026 2 15))
+                                 (claim ?c rtt-claim "app" "web"
+                                        "version" "ver" ?v)
+                                 (claim-valid-at ?c ?at))))))
 
 ;; Spec §11: the functor and CLAIMS-TOUCHING :AT must answer the same
 ;; claims for the same instant.  They share %CLAIM-VALIDITY-TOUCHES-P,
 ;; and this is the assertion that goes red if someone inlines it back.
 ;; The pinned ("1") is what keeps the agreement from holding vacuously
-;; on two empty results.
+;; on two empty results.  Sorted, because the two sides build their
+;; lists in different orders and only membership was ever the
+;; requirement.
 (test claim-valid-at-agrees-with-claims-touching
   (with-rules-graph (g)
     (seed g)
@@ -158,7 +182,28 @@
                                               :role :subject
                                               :at (ts 2026 2 15)))))
       (is (equal '("1") via-goal))
-      (is (equal via-goal via-query)))))
+      (is (equal (sort (copy-list via-goal) #'string<)
+                 (sort (copy-list via-query) #'string<))))))
+
+;; Spec §11's other half, which had no differential test: CLAIM-CURRENT/1
+;; and CLAIMS-TOUCHING :CURRENT must keep the same claims.  Both call
+;; CLAIM-CURRENT-P today; this goes red if one of them stops.  ("runs")
+;; is pinned first so the agreement cannot hold on two empty lists.
+(test claim-current-agrees-with-claims-touching
+  (with-rules-graph (g)
+    (seed g)
+    (let ((c (first (claims-touching g 'rt-claim :host "h2" :role :subject
+                                     :relation "reachable"))))
+      (retract-claim c))
+    (let ((via-goal (select-flat (?r) (claim ?c rt-claim "host" "h2"
+                                             ?r ?a ?b)
+                                      (claim-current ?c)))
+          (via-query (mapcar #'claim-relation
+                             (claims-touching g 'rt-claim :host "h2"
+                                              :role :subject :current t))))
+      (is (equal '("runs") via-goal))
+      (is (equal (sort (copy-list via-goal) #'string<)
+                 (sort (copy-list via-query) #'string<))))))
 
 (test claim-producer-generates-from-the-producer-index
   (with-rules-graph (g)
@@ -191,6 +236,17 @@
                              "scan-a"))
     (is (= 2 (select (:count t :max-inferences 1000) (?c)
                (claim-producer ?c "scan-b"))))))
+
+;; Neither argument bound is unroutable, and an unroutable generator
+;; that answers zero rows in silence is the one thing CLAIM/7 already
+;; refuses to be.  Under a bound it refuses the same way; with no bound
+;; there is no producer walk to offer, so it still just fails.
+(test claim-producer-with-neither-argument-bound
+  (with-rules-graph (g)
+    (seed g)
+    (signals graph-db::prolog-cost-unbounded-error
+      (select (:max-inferences 1000) (?c) (claim-producer ?c ?p)))
+    (is (zerop (select-count (?c) (claim-producer ?c ?p))))))
 
 ;; The interface contract for all six filters: a bound non-node ?C fails
 ;; the goal, and none of them signals -- reaching the end of the test is

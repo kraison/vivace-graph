@@ -91,8 +91,17 @@ guard the schema's own canonical symbol is what reaches the goal.
   match.
 - `claim-producer/2` with `?c` unbound and `?p` a producer name
   generates from the producer index of **every** claim family in the
-  image, so pair it with a `claim/7` goal to restrict a family. With
-  neither argument bound it fails: there is no index to generate from.
+  image, so pair it with a `claim/7` goal to restrict a family. **Goal
+  order is load-bearing**: the `claim-producer` goal must come
+  *before* the `claim/7` goal it feeds, or `?c` is already bound by
+  the time it runs and it filters instead of generating. Both examples
+  below are the filter direction.
+- `claim-producer/2` with **neither** argument bound has no index to
+  generate from and no walk to fall back to. Under a resource bound it
+  signals `prolog-cost-unbounded-error`, exactly as an unrouted
+  `claim/7` does; with no bound in effect it fails, answering nothing.
+  A bound `?p` naming no producer is the empty answer instead, the way
+  an unresolvable namespace is.
 - A non-node `?c` fails every filter; none of them signals.
 
 ## Two examples
@@ -160,10 +169,13 @@ so a family walk would run past any budget already in effect:
 - with no bound in effect, it walks the family, which a caller who
   could already call `map-vertices` may do.
 
-`run-guarded-prolog` always binds both budgets, so on the guarded
-surface an unrouted goal is **always** a refusal, exactly as spec §4
-says. The walk is reachable only from an in-image `select` with
-neither `:max-inferences` nor `:timeout`.
+`run-guarded-prolog` binds both budgets from
+`*query-default-max-inferences*` and `*query-default-timeout*`
+(`query/dsl.lisp`), so while those hold a value -- they are `defvar`s,
+and an operator who NILs both reopens the walk on the guarded surface
+too -- an unrouted goal there is **always** a refusal, exactly as spec
+§4 says. Otherwise the walk is reachable only from an in-image
+`select` with neither `:max-inferences` nor `:timeout`.
 
 That refusal is unconditional: `:allow-cost-unbounded t` does not
 reach it. The option is threaded as a literal at query-compile time
