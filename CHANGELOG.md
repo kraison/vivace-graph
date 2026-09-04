@@ -170,6 +170,16 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Fixed
 
+- **`graph-db/rules`' refusals now honour `:allow-cost-unbounded`**
+  (#334, follow-up to #330): `claim/7`'s family walk and
+  `claim-producer/2`'s neither-bound case refuse from their own bodies,
+  per goal rather than per functor, and could not see the option until
+  `select` began binding `*allow-cost-unbounded*`. Both now read it, so
+  a caller who accepts the cost gets the walk under a budget instead of
+  a refusal whose own report told them to pass an option that did
+  nothing. For `claim-producer/2` the option buys the empty answer, not
+  a walk -- that goal has none to buy.
+
 - **`:allow-cost-unbounded` reached nothing at run time** (#334):
   `select` read the option as a literal at macroexpansion and handed it
   straight to the static refusal, so no running code could see it.

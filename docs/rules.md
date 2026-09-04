@@ -177,12 +177,17 @@ too -- an unrouted goal there is **always** a refusal, exactly as spec
 §4 says. Otherwise the walk is reachable only from an in-image
 `select` with neither `:max-inferences` nor `:timeout`.
 
-That refusal is unconditional: `:allow-cost-unbounded t` does not
-reach it. The option is threaded as a literal at query-compile time
-and no special variable carries it into a functor body
-(kraison/vivace-graph#334). A caller who knows the walk is affordable
-drops the budget, or binds a namespace and its key together so the
-goal routes.
+A caller who knows the walk is affordable says so with
+`:allow-cost-unbounded t`, and gets it under a budget
+(kraison/vivace-graph#334): `select` binds `*allow-cost-unbounded*` for
+the query's dynamic extent, and the refusal here reads the same value
+`%refuse-cost-unbounded`'s static one does. Binding a namespace and its
+key together, so the goal routes, remains the cheaper answer.
+
+The option reaches `claim-producer/2`'s neither-bound refusal too, but
+there it buys silence rather than a walk: that goal has no index to
+generate from and nothing to fall back to, so opting out of the refusal
+leaves the empty answer an unbudgeted query already gets.
 
 `claim/7` is deliberately **not** `declare-functor-cost-unbounded`'d.
 That classifies a whole functor, and `%excluded-predicate-p` would
