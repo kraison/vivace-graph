@@ -509,6 +509,7 @@
            #:cost-unbounded-predicate-names #:prolog-cost-unbounded-error
            #:prolog-permission-error
            #:*inference-budget*
+           #:*allow-cost-unbounded*
            #:*default-inference-budget*
            #:*default-query-timeout*
            #:*allowed-effects*

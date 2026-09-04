@@ -920,6 +920,12 @@ for the current query, or nil for unlimited.")
   "Inference budget applied to queries that don't specify :MAX-INFERENCES.")
 (defvar *default-query-timeout* nil
   "Default query timeout in seconds for queries that don't specify :TIMEOUT.")
+(defvar *allow-cost-unbounded* nil
+  "True while a query whose :ALLOW-COST-UNBOUNDED option was set is running.
+Read it in a functor that is unbounded per GOAL rather than per functor --
+cheap with an argument bound to an indexed value, unbounded with nothing
+bound -- so its own run-time refusal honours the same escape hatch
+DECLARE-FUNCTOR-COST-UNBOUNDED's static one does (GH #334).")
 
 (defun %deadline (seconds)
   "Translate a timeout in SECONDS into an INTERNAL-REAL-TIME deadline (or nil)."
@@ -989,10 +995,12 @@ compile-time path (GH #285, #279)."
       (mapc #'walk goals))
     acc))
 
-(defun %refuse-cost-unbounded (functors allow-p)
+(defun %refuse-cost-unbounded (functors)
   "Signal for the first cost-unbounded functor in FUNCTORS when a
-resource bound is in effect and ALLOW-P is false (GH #285)."
-  (when (and (not allow-p)
+resource bound is in effect and the query did not opt out (GH #285).
+Reads *ALLOW-COST-UNBOUNDED*, which SELECT binds, so this static refusal
+and a functor's own run-time one answer to one value (GH #334)."
+  (when (and (not *allow-cost-unbounded*)
              (or *inference-budget* *query-deadline*))
     (dolist (f functors)
       (when (functor-cost-unbounded-p f)
@@ -1083,6 +1091,8 @@ SELECT-FIRST for common shorthands."
             (*allowed-effects* ,(if (assoc :effects options)
                                     `',(cdr (assoc :effects options))
                                     '*default-allowed-effects*))
+            (*allow-cost-unbounded* ,(cdr (assoc :allow-cost-unbounded
+                                                 options)))
             (*select-count-only* ,(cdr (assoc :count options)))
             (*select-callback* ,(cdr (assoc :callback options)))
             (*seen-table* (make-hash-table)) ;; For unique values
@@ -1090,9 +1100,7 @@ SELECT-FIRST for common shorthands."
        ;; A resource-bounded query must not carry a goal the rails
        ;; cannot bound (GH #285).  Static over the goal list; checked
        ;; at runtime because the budgets default from runtime globals.
-       (%refuse-cost-unbounded ',(%static-goal-functors goals)
-                               ,(cdr (assoc :allow-cost-unbounded
-                                            options)))
+       (%refuse-cost-unbounded ',(%static-goal-functors goals))
        (unwind-protect
             (let ((func
                    (lambda (cont)
