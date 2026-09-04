@@ -15,6 +15,19 @@ to `experiment` or `master` and on pull requests.
   on every change.  Local runs are the affected subsystem's suite;
   the push gets the full matrix; `experiment -> master` promotion
   waits for the green check.
+- **One live run per ref**: the workflow sets `concurrency` with
+  `cancel-in-progress`, keyed on the ref.  The runner is serial, so a
+  superseded run does not just waste 40 minutes of its own -- it costs
+  whatever is behind it that whole wait.  A fixup pushed to a PR now
+  cancels that PR's earlier run instead of queueing behind it, and two
+  merges landing close together leave one `experiment` run, the later
+  one, which contains both.  Groups are per-ref, so a PR can cancel
+  only its own earlier run.
+  The cost: when merges land together, the earlier commit never gets a
+  run of its own, so a red head does not say which merge broke it.
+  Promotion is unaffected -- it gates on the head, which always runs.
+  Re-run a cancelled commit with `gh run rerun <id>` if you need to
+  bisect.
 - The runner neutralises quicklisp `local-projects` and pins the
   source registry to the workspace checkout plus
   `cl-temporal-extent` refreshed to master head each run (in

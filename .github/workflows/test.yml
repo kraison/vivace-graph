@@ -12,6 +12,16 @@ on:
     branches: [experiment, master]
   workflow_dispatch:
 
+# One live run per ref (docs/ci.md).  The runner is serial, so a
+# superseded run costs the next one its whole queue wait: a fixup
+# pushed to a PR used to sit behind the run it replaced, and two merges
+# landing close together queued two experiment runs when the second
+# already covers the first.  Groups are per-ref, so a PR can cancel
+# only its own earlier run, never experiment's and never another PR's.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   full-suite:
     runs-on: [self-hosted, Linux]
