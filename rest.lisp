@@ -81,6 +81,14 @@ request alist REQ-PARAMS, coercing each value to its declared type."
       :ndjson
       :json))
 
+(defun %set-ndjson-content-type ()
+  "Mark NINGLE:*RESPONSE* as newline-delimited JSON (GH #322).  Both
+/query and DEF-QUERY's route call this once their query has produced
+its text, so an error body is never labelled ndjson."
+  (setf (lack.response:response-headers ningle:*response*)
+        (list* :content-type "application/x-ndjson"
+               (lack.response:response-headers ningle:*response*))))
+
 (defun register-query (name fn)
   "Register query handler FN under NAME (both its symbol name and camelCase)."
   (setf (gethash (string name) *rest-queries*) fn)
@@ -348,11 +356,16 @@ the declared parameters."
     `(register-query ',name
        (lambda (req-params)
          (handler-case
-             (let ((*query-params* (coerce-query-params ',params req-params)))
-               ;; stream rows through the callback; :json buffers an array,
-               ;; :ndjson writes one JSON object per line
-               (emit-query-results ',return (query-format req-params)
-                                   (lambda (,cb) ,run-form)))
+             (let* ((*query-params* (coerce-query-params ',params req-params))
+                    (fmt (query-format req-params))
+                    ;; stream rows through the callback; :json buffers an
+                    ;; array, :ndjson writes one JSON object per line
+                    (result (emit-query-results ',return fmt
+                                                (lambda (,cb) ,run-form))))
+               ;; Set once the query has produced its text (GH #322), so
+               ;; an error body is never labelled ndjson.
+               (when (eq fmt :ndjson) (%set-ndjson-content-type))
+               result)
            ;; QUERY-PARAM-ERROR is a subclass, so one clause covers the
            ;; DSL's own refusals and the engine's typed preconditions --
            ;; an unindexed slot, an unscoped spatial class (GH #286).
@@ -426,11 +439,12 @@ A malformed query or a resource-bound breach is a 400, a forbidden effect a 403.
   (with-rest-auth ((get-param params "username") (get-param params "password"))
     (with-rest-graph ((get-param params :graph-name))
       ;; The DSL renders ndjson; the wire header is HTTP's (GH #322).
-      (when (%dsl-ndjson-p dsl)
-        (setf (lack.response:response-headers ningle:*response*)
-              (list* :content-type "application/x-ndjson"
-                     (lack.response:response-headers ningle:*response*))))
-      (handler-case (run-pattern-query dsl *graph*)
+      ;; Set only once the query has produced its text, so a refused
+      ;; or errored query never gets an ndjson-labelled error body.
+      (handler-case
+          (let ((result (run-pattern-query dsl *graph*)))
+            (when (%dsl-ndjson-p dsl) (%set-ndjson-content-type))
+            result)
         ;; Includes QUERY-PARAM-ERROR, its subclass (GH #286).
         (query-precondition-error (c)
           (setf (lack.response:response-status ningle:*response*) 400)

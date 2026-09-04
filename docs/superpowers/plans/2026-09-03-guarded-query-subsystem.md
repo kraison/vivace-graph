@@ -105,17 +105,17 @@ In `rest.lisp`, `call-rest-pattern-query`, immediately inside `(with-rest-graph 
                      (lack.response:response-headers ningle:*response*))))
 ```
 
-- [ ] **Step 4: Run the four REST tests by name**
+- [ ] **Step 4: Run the REST tests by name**
 
 ```bash
 W=$(pwd)/; sbcl --dynamic-space-size 4096 --non-interactive \
   --eval "(push #p\"$W\" asdf:*central-registry*)" \
   --eval '(ql:quickload :graph-db/test :silent t)' \
   --eval '(in-package :graph-db/test)' --eval '(log:config :error)' \
-  --eval '(let* ((d (make-temp-directory)) (graph-db::*system-directory* (namestring d)) (graph-db::*type-registry* nil)) (unwind-protect (fiveam:explain! (fiveam:run (quote (http-pattern-query-ndjson http-pattern-query-json-body http-def-query-friends def-query-returns-json-objects)))) (graph-db-test-scratch:cleanup-scratch-run)))'
+  --eval '(let* ((d (make-temp-directory)) (graph-db::*system-directory* (namestring d)) (graph-db::*type-registry* nil)) (unwind-protect (fiveam:explain! (fiveam:run (quote (http-pattern-query-ndjson http-pattern-query-json-body http-def-query-friends def-query-returns-json-objects def-query-ndjson-streams-one-object-per-line pattern-query-ndjson-format)))) (graph-db-test-scratch:cleanup-scratch-run)))'
 ```
 
-Expected: `Did N checks. Pass: N (100%)`. If `fiveam:run` does not accept a list, run the four names in four `run` calls. Also load `graph-db/gui` in a fresh subprocess and confirm it compiles (`(ql:quickload :graph-db/gui)` exits 0).
+Expected: `Did N checks. Pass: N (100%)`. If `fiveam:run` does not accept a list, run the six names in six `run` calls. Also load `graph-db/gui` in a fresh subprocess and confirm it compiles (`(ql:quickload :graph-db/gui)` exits 0).
 
 - [ ] **Step 5: Commit**
 

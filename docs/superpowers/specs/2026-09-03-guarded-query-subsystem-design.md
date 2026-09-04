@@ -109,11 +109,14 @@ unchanged, and the GUI suite is the proof.
 
 `emit-query-results`' `:ndjson` arm stops setting the content type; it
 returns the newline-delimited text. `run-pattern-query` is unchanged.
-The REST `/query` route, which is the only caller that asks for ndjson,
-sets `Content-Type: application/x-ndjson` on ningle's response when the
-decoded request's `format` is `ndjson`, before calling
-`run-pattern-query`. Same wire behaviour; the REST tests that check the
-header are the proof.
+Two callers ask for ndjson and both set
+`Content-Type: application/x-ndjson` on ningle's response themselves,
+through one shared helper (`%set-ndjson-content-type`), after their
+query has produced its text so an errored or refused query never gets
+an ndjson-labelled error body: the REST `/query` route (when the
+decoded request's `format` is `ndjson`) and `def-query`'s generated
+route (when the client's `?format=ndjson`). Same wire behaviour; the
+REST tests that check the header are the proof.
 
 ## 6. Head resolution in core (#322, second finding)
 
