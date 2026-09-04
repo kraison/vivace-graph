@@ -1031,7 +1031,9 @@ be refused -- the screen refuses syntax, not text (GH #279)."
                        (node-slot-value ?p name \"#.(cl:print 1)\")")
         (is (= 200 status))
         (is (= 0 (jref json :row-count))
-            "the literal matched something; it should match nothing"))
+            "the literal matched something; it should match nothing")
+        ;; A zero-row answer still names its columns (#322), not [].
+        (is (equal '("p") (jref json :columns))))
       ;; ...and one that DOES match, so the literal really is compared.
       (multiple-value-bind (json status)
           (run-prolog "(is-a ?p gui-person)
@@ -1794,9 +1796,20 @@ shape of GH #172, where DEF-EDGE installs NAME/2 and NAME/3 into
 nothing, so a symbol interned here is genuinely foreign, exactly as a
 real operator schema's would be.")
 
+(defvar *foreign-schema-functor-fired-p* nil
+  "Set by WITH-FOREIGN-SCHEMA-FUNCTOR's stub when the schema-homed
+functor actually runs.  A plain global, mutated with SETF rather than
+bound with LET: the GUI server answers on its own worker thread, which
+does not see a dynamic binding made on the test's thread (GH #322,
+review round 2).")
+
 (defmacro with-foreign-schema-functor ((name arity) &body body)
   "Register NAME/ARITY in *PROLOG-GLOBAL-FUNCTORS* homed in
-*FOREIGN-SCHEMA-PACKAGE*, run BODY, then remove it.
+*FOREIGN-SCHEMA-PACKAGE*, run BODY, then remove it.  Resets
+*FOREIGN-SCHEMA-FUNCTOR-FIRED-P* to NIL first; the stub sets it T when
+called (it never calls its continuation, so the goal still fails) --
+direct proof, inside BODY, of whether resolution reached the schema's
+own functor rather than GRAPH-DB's.
 
 Registered and removed inside one test, so
 PROLOG-FUNCTOR-INVENTORY-IS-PINNED -- which pins the registry's key set
@@ -1804,10 +1817,14 @@ PROLOG-FUNCTOR-INVENTORY-IS-PINNED -- which pins the registry's key set
   (let ((key (gensym "KEY")))
     `(let ((,key (intern (format nil "~A/~D" (string-upcase ,name) ,arity)
                          *foreign-schema-package*)))
+       (setf *foreign-schema-functor-fired-p* nil)
        (unwind-protect
             (progn
               (setf (gethash ,key graph-db::*prolog-global-functors*)
-                    (lambda (&rest args) (declare (ignore args)) nil))
+                    (lambda (&rest args)
+                      (declare (ignore args))
+                      (setf *foreign-schema-functor-fired-p* t)
+                      nil))
               ,@body)
          (remhash ,key graph-db::*prolog-global-functors*)))))
 
@@ -1829,26 +1846,29 @@ now asks the same question the compiler will (GH #279)."
         ;; The data-driven shape the exclusion exists for, refused too.
         (is-true
          (refused-p "(is-a ?p gui-person) (node-slot-value ?p name ?g)
-                     (call ?g ?x)")))
+                     (call ?g ?x)"))
+        ;; Refused before the engine ever calls it -- the schema's own
+        ;; CALL/2 never ran, direct proof this is a routing refusal.
+        (is-false *foreign-schema-functor-fired-p*
+                  "the excluded name still reached the schema's own ~
+functor"))
       ;; ...and the home-scoping stays intact at THIS layer: a schema
-      ;; that owns the name is admitted past the whitelist.  Since GH
-      ;; #285 the ENGINE then refuses it under the runner's resource
-      ;; bounds -- the compiler canonicalizes the head back into
-      ;; GRAPH-DB, so the admitted goal would EXECUTE the engine's
-      ;; regex-match/2, the very ReDoS the category exists for.  The
-      ;; proof of layering is the refusal's origin: the engine's
-      ;; cost-unbounded report, not the whitelist's routing message.
+      ;; that owns the name is admitted past the whitelist, and (GH
+      ;; #322) now resolves in ITS OWN package -- the schema's stub
+      ;; runs, not the engine's REGEX-MATCH/2, so the ReDoS the
+      ;; exclusion category exists for never reaches the engine's real
+      ;; implementation.  *FOREIGN-SCHEMA-FUNCTOR-FIRED-P* is the
+      ;; direct proof of which functor ran.
       (with-foreign-schema-functor ("REGEX-MATCH" 2)
-        (multiple-value-bind (ok message)
-            (refused-p "(is-a ?p gui-person) (regex-match \"a\" \"b\")"
-                       :code "cost-unbounded-goal")
-          (is-true ok "the engine rails admitted an unboundable goal")
-          (is-true (search "cost-unbounded" message)
-                   "refused at the wrong layer -- expected the engine's ~
-#285 report, got: ~A" message)
-          (is (null (search "control macro" message))
-              "the whitelist refused it; home-scoping was undone: ~A"
-              message)))
+        (let ((status (nth-value
+                       1 (run-prolog
+                          "(is-a ?p gui-person) (regex-match \"a\" \"b\")"))))
+          (is (= 200 status))
+          ;; Direct proof, not just the shape of a non-refusal: the
+          ;; schema's own stub is what actually ran, not a refusal and
+          ;; not the engine's REGEX-MATCH/2.
+          (is-true *foreign-schema-functor-fired-p*
+                   "the schema's own functor never ran")))
       ;; Without that registration the engine's own one is still out.
       (is-true (refused-p "(regex-match \"a\" \"b\")"))
       ;; ...and the fixture's real edge functor is untouched.

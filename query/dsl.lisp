@@ -8,12 +8,11 @@
 ;;;; routes).  Moved verbatim: bodies here are byte-identical to the
 ;;;; rest.lisp originals, including their pre-80-column line widths.
 ;;;;
-;;;; Why this file sits in the :GRAPH-DB system and not in
-;;;; :GRAPH-DB/CORE: EMIT-QUERY-RESULTS' :NDJSON arm sets the content
-;;;; type on NINGLE:*RESPONSE*, and core deliberately drops
-;;;; ningle/clack/hunchentoot (it is the ECL/Android build).  Hoisting
-;;;; the rest of the DSL below that one line would have meant editing
-;;;; it, which the extraction ruled out.
+;;;; Home: the graph-db/query subsystem (GH #322), which depends on
+;;;; graph-db/core only.  The one web-bound line this file had -- the
+;;;; :NDJSON arm setting a content type on NINGLE:*RESPONSE* -- moved to
+;;;; rest.lisp's %SET-NDJSON-CONTENT-TYPE, called by both the /query
+;;;; route and DEF-QUERY when they ask for ndjson.
 
 (in-package :graph-db)
 
@@ -104,17 +103,14 @@ second, unrelated change to the wire."
   "Render a query's results.  RUN is a function of one argument -- a per-row
 callback -- that runs the query, invoking the callback for each result row as it
 is produced (via SELECT :callback, so no intermediate result list is built).
-With FORMAT :JSON returns a JSON array; with :NDJSON streams each row as its own
-JSON line and sets the application/x-ndjson content type."
+With FORMAT :JSON returns a JSON array; with :NDJSON returns each row as its own
+JSON line; the caller sets the content type."
   (ecase format
     (:json
      (let ((rows '()))
        (funcall run (lambda (row) (push row rows)))
        (query-results->json return-vars (nreverse rows))))
     (:ndjson
-     (setf (lack.response:response-headers ningle:*response*)
-           (list* :content-type "application/x-ndjson"
-                  (lack.response:response-headers ningle:*response*)))
      (with-output-to-string (out)
        (funcall run
                 (lambda (row)
@@ -305,37 +301,56 @@ QUERY-PARAM-ERROR on malformed input."
 
 (defun run-query-goals (vars goals graph
                         &key (package (find-package :graph-db))
-                             limit skip (format :json))
+                             limit skip (format :json) callback)
   "Run the already-compiled query GOALS against GRAPH, collecting VARS.
 
 This is THE runner: every client-supplied query -- the JSON pattern DSL and
 the GUI's free-text Prolog alike -- reaches SELECT through here, so the rails
 are stated once.  Read-only (:EFFECTS NIL), snapshot-isolated, bounded by
 *QUERY-DEFAULT-MAX-INFERENCES* / *QUERY-DEFAULT-TIMEOUT*, and LIMIT capped at
-*QUERY-DEFAULT-LIMIT*.  PACKAGE is bound around the EVAL because COMPILE-CALL
-canonicalizes each goal head through MAKE-FUNCTOR-SYMBOL, which interns
-NAME/ARITY in *PACKAGE*: it must be the schema's package for an edge functor
-to resolve.  Callers built from untrusted text must whitelist every symbol
-BEFORE calling (see gui/prolog.lisp, GH #279).  Returns the result string."
+*QUERY-DEFAULT-LIMIT*.  PACKAGE no longer routes functor resolution: since
+GH #322, MAKE-FUNCTOR-SYMBOL resolves each goal head in its own home
+package (falling back to GRAPH-DB), so a goal list spanning the engine
+and a schema resolves correctly regardless of *PACKAGE*.  PACKAGE stays
+advisory -- it is what COMPILE-PATTERN-QUERY resolved the DSL's own
+match/where types against, and is still bound around the EVAL, but
+nothing here depends on it for a goal head to be found any more.
+Callers built from untrusted text must whitelist every symbol BEFORE
+calling (see gui/prolog.lisp, GH #279).  Returns the result string
+under :JSON/:NDJSON.
+
+:RAW is a fourth arm (GH #322): CALLBACK (required) receives each raw
+row -- no JSON rendering -- and the function returns NIL, for a caller
+that wants the bound values themselves (graph-db.query:run-guarded-
+prolog's :DATA format still converts them; :RAW does not)."
+  (when (and (eq format :raw) (not callback))
+    (error "RUN-QUERY-GOALS :FORMAT :RAW requires :CALLBACK."))
   ;; The eval'd SELECT / node-slot-value goals key off *GRAPH*.
   (let* ((*graph* graph)
          (*package* package)
          (cap (if (and (integerp limit) (plusp limit))
                   (min limit *query-default-limit*)
-                  *query-default-limit*)))
-    (emit-query-results
-     vars format
-     (lambda (cb)
-       ;; the select form is EVAL'd (null lexenv), so pass the callback through
-       ;; a special the form references rather than a lexical.
-       (let ((*pattern-query-callback* cb))
-         (eval `(select (:effects nil :snapshot t
-                         :limit ,cap
-                         :skip ,(when (integerp skip) skip)
-                         :max-inferences ,*query-default-max-inferences*
-                         :timeout ,*query-default-timeout*
-                         :callback *pattern-query-callback*)
-                        ,vars ,@goals)))))))
+                  *query-default-limit*))
+         (run (lambda (cb)
+                ;; the select form is EVAL'd (null lexenv), so pass the
+                ;; callback through a special the form references
+                ;; rather than a lexical.
+                (let ((*pattern-query-callback* cb))
+                  (eval `(select (:effects nil :snapshot t
+                                  :limit ,cap
+                                  :skip ,(when (integerp skip) skip)
+                                  :max-inferences
+                                  ,*query-default-max-inferences*
+                                  :timeout ,*query-default-timeout*
+                                  :callback *pattern-query-callback*)
+                                 ,vars ,@goals))))))
+    (if (eq format :raw)
+        (progn (funcall run callback) nil)
+        (emit-query-results vars format run))))
+
+(defun %dsl-ndjson-p (dsl)
+  "T when the decoded JSON pattern query DSL asks for \"format\":\"ndjson\"."
+  (string-equal "ndjson" (princ-to-string (or (cdr (assoc :format dsl)) ""))))
 
 (defun run-pattern-query (dsl graph)
   "Compile and run a decoded JSON pattern query DSL against GRAPH, returning the
@@ -346,8 +361,4 @@ as newline-delimited JSON instead of an array."
       (compile-pattern-query dsl graph)
     (run-query-goals vars goals graph
                      :package pkg :limit limit :skip skip
-                     :format (if (string-equal
-                                  "ndjson"
-                                  (princ-to-string
-                                   (or (cdr (assoc :format dsl)) "")))
-                                 :ndjson :json))))
+                     :format (if (%dsl-ndjson-p dsl) :ndjson :json))))

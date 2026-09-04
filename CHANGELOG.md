@@ -13,6 +13,20 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Added
 
+- **`graph-db/query`, a web-free subsystem for guarded queries** (#322):
+  the JSON pattern DSL moves out of the `graph-db` web system and the
+  free-text Prolog guard moves out of `graph-db/gui`, both into a
+  subsystem depending only on `graph-db/core`, so a consumer wanting a
+  bounded query tool no longer pulls in a web stack. The exported
+  `run-guarded-prolog` screens, reads, guards and runs free text
+  against a graph, returning `(values columns rows truncated-p)` in
+  JSON-shaped `:data` form or in-image `:raw` form; see
+  `docs/guarded-query.md`. The `/query` and `def-query` REST routes,
+  the DSL's only ndjson callers, now set the
+  `application/x-ndjson` content type themselves once their query has
+  produced its text. The GUI Prolog endpoint now reports `columns` for
+  a zero-row answer too, instead of `[]`.
+
 - **A transaction reads its own claim writes** (#324): `claims-touching`
   and `claims-by-producer` overlay the open transaction's write set --
   the commit view validation already uses -- so retract-then-assert on
@@ -139,6 +153,16 @@ between releases; cutting a release renames it to the new version and dates it.
   one-relation read of a busy endpoint touches only that relation's rows.
 
 ### Fixed
+
+- **A goal's head resolved through one shared `*package*` binding**
+  (#322, second finding): `make-functor-symbol` now looks up an
+  already-registered functor first -- the head's own package, then
+  `graph-db`, where CL-inherited heads like `>` are registered -- and
+  interns only when neither hits, so a goal list spanning two packages
+  (the engine's globals and a schema's edge functors) compiles as one
+  query. `<-` definitions are unaffected: `add-clause` passes a new
+  `:define t` argument that skips both lookups and interns straight
+  into `*package*`, exactly as before.
 
 - **`def-claim-classes` derived its class names in `*package*`** (#323):
   a declaration read from another package minted a second

@@ -270,16 +270,8 @@ close cannot unmap the store mid-read (GH #269)."
                       (format nil "Graph ~A is not open"
                               (param ,params :name)))))))
 
-(defun %schema-type-names (graph parent)
-  "Node-type names (class symbols) registered for PARENT (:vertex or
-:edge) in GRAPH's schema, sorted by name."
-  (let ((names '()))
-    (maphash (lambda (key meta)
-               (when (numberp key)
-                 (push (graph-db::node-type-name meta) names)))
-             (gethash parent (graph-db::schema-type-table
-                             (graph-db::schema graph))))
-    (sort names #'string< :key #'symbol-name)))
+;; SCHEMA-TYPE-NAMES moved to GRAPH-DB.QUERY (GH #322); called
+;; qualified below.
 
 (defun %wire-symbol (symbol)
   "SYMBOL as its wire spelling: the engine's own name, downcased kebab
@@ -345,7 +337,7 @@ count zero."
                                     (and meta
                                          (graph-db::node-type-slots
                                           meta)))))))))
-          (%schema-type-names graph parent)))
+          (graph-db.query:schema-type-names graph parent)))
 
 (defun %index-inventory (graph)
   "DEF-INDEX specs + spatial indexes registered for GRAPH."
@@ -418,11 +410,13 @@ count zero."
   (with-gui-graph (graph params)
     (%json-response
      (list (cons :vertex-types
-                 (%arr (mapcar #'%wire-symbol
-                               (%schema-type-names graph :vertex))))
+                 (%arr
+                  (mapcar #'%wire-symbol
+                          (graph-db.query:schema-type-names graph :vertex))))
            (cons :edge-types
-                 (%arr (mapcar #'%wire-symbol
-                               (%schema-type-names graph :edge))))))))
+                 (%arr
+                  (mapcar #'%wire-symbol
+                          (graph-db.query:schema-type-names graph :edge))))))))
 
 ;;; ---------------------------------------------------------------------
 ;;; Node sample, inspection, neighborhood
@@ -552,7 +546,7 @@ are domain identifiers a query author types, not protocol (GH #277)."
 ;;; ---------------------------------------------------------------------
 ;;; Query workbench (GH #278).  The body is the same structured DSL
 ;;; rest.lisp's /graph/:g/query route accepts, compiled and run by the
-;;; SHARED implementation in query-dsl.lisp -- read-only, snapshot-
+;;; SHARED implementation in query/dsl.lisp -- read-only, snapshot-
 ;;; isolated and capped, exactly as REST gets it.  Nothing here parses
 ;;; or reads user text into symbols beyond what that compiler does.
 ;;; ---------------------------------------------------------------------
@@ -623,27 +617,40 @@ lose the spelling the DSL chose for each result variable."
                   (cons (car cell) (%json-value (cdr cell))))
                 row)))
 
-(defun %query-envelope (json-string cap probe)
+(defun %query-envelope-from-rows (columns rows cap truncated)
   "The workbench result envelope -- {columns, rows, rowCount, limit,
-truncated} -- for RUN-QUERY-GOALS' JSON-STRING, run under PROBE rows
-and answered under CAP.  Shared by the builder endpoint and the
-free-text Prolog one so one results table renders both (GH #278, #279)."
+truncated} -- built directly from already-JSON-shaped ROWS (one list
+of cells per COLUMNS, positional).  Shared by %QUERY-ENVELOPE and the
+free-text Prolog endpoint, so one results table renders both (GH #278,
+#279, #322)."
+  (%json-response
+   (list
+    (cons :columns (%arr columns))
+    (cons :rows (%arr (mapcar (lambda (row)
+                                (%query-row-json (mapcar #'cons columns row)))
+                              rows)))
+    (cons :row-count (length rows))
+    (cons :limit cap)
+    (cons :truncated (%bool truncated)))))
+
+(defun %query-envelope (json-string cap probe)
+  "The workbench result envelope for RUN-QUERY-GOALS' JSON-STRING, run
+under PROBE rows and answered under CAP.  Decodes the string, then
+shares %QUERY-ENVELOPE-FROM-ROWS' response building with the free-text
+Prolog endpoint (GH #278, #279, #322)."
   (let* ((rows (%decode-query-rows json-string))
          (n (length rows))
          ;; The probe row proves there was more; it is never shown.
          ;; Without room for it, >= is the best the runner's own clamp
          ;; allows.
          (truncated (if (> probe cap) (> n cap) (>= n cap)))
-         (shown (if (> n cap) (subseq rows 0 cap) rows)))
-    (%json-response
-     (list
-      ;; QUERY-ROW->ALIST builds every row in select order, so the
-      ;; first row names the columns.
-      (cons :columns (%arr (mapcar #'car (first shown))))
-      (cons :rows (%arr (mapcar #'%query-row-json shown)))
-      (cons :row-count (length shown))
-      (cons :limit cap)
-      (cons :truncated (%bool truncated))))))
+         (shown (if (> n cap) (subseq rows 0 cap) rows))
+         ;; QUERY-ROW->ALIST builds every row in select order, so the
+         ;; first row names the columns.
+         (columns (mapcar #'car (first shown))))
+    (%query-envelope-from-rows
+     columns (mapcar (lambda (row) (mapcar #'cdr row)) shown)
+     cap truncated)))
 
 ;; The whole query runs under WITH-GUI-GRAPH's read side, so a slow one
 ;; delays open/close for up to the DSL's *QUERY-DEFAULT-TIMEOUT*.  That

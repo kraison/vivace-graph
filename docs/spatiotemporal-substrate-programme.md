@@ -59,7 +59,9 @@ tenant needs belongs in that tenant.
 spanning namespaces, not an optimisation), #102 (index-backed generator predicate — on
 the retrieval layer's path *and* gating any Datalog work), #104 and #105 (fixed in the
 engine, still open on the tracker), #45 (Prolog modernization; phases 0-1 complete and
-merged, remaining phases tracked as sub-issues #121–#124 plus #102).
+merged, remaining phases tracked as sub-issues #121–#124 plus #102). #322 (the query
+DSL and the free-text Prolog guard as a web-free `graph-db/query`, so a tenant like
+kraison/cl-llm can depend on the retrieval layer without a web stack) has landed.
 
 How much of #45 this programme actually needs is accounted for in §12.1 of the
 programme design — about half of phase 2, one bullet of phase 4, and nothing else until

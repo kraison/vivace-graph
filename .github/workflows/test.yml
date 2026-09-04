@@ -1,8 +1,9 @@
 # The full suite in CI (see docs/ci.md): main, concurrency,
-# ACID, spacetime, geos, algorithms, gui.  The habit this replaces:
-# running 35+ minutes of tests by hand on every change.  Local runs
-# are the affected subsystem's tests; every push here gets the full
-# matrix, and experiment -> master promotion waits for green.
+# ACID, spacetime, query, geos, algorithms, gui.  The habit this
+# replaces: running 35+ minutes of tests by hand on every change.
+# Local runs are the affected subsystem's tests; every push here
+# gets the full matrix, and experiment -> master promotion waits
+# for green.
 name: test
 on:
   push:
@@ -89,6 +90,20 @@ jobs:
                             :ignore-inherited-configuration))' \
             --eval '(ql:quickload :graph-db/spacetime-test :silent t)' \
             --eval '(asdf:test-system :graph-db/spacetime-test)'
+      - name: query suite
+        run: |
+          sbcl --dynamic-space-size 12288 --non-interactive \
+            --load "$HOME/quicklisp/setup.lisp" \
+            --eval '(setf ql:*local-project-directories* nil)' \
+            --eval '(asdf:initialize-source-registry
+                      (list :source-registry
+                            (list :tree (uiop:getcwd))
+                            (list :directory
+                                  (merge-pathnames "ci-deps-vivace-graph/cl-temporal-extent/"
+                                                   (user-homedir-pathname)))
+                            :ignore-inherited-configuration))' \
+            --eval '(ql:quickload :graph-db/query-test :silent t)' \
+            --eval '(asdf:test-system :graph-db/query-test)'
       - name: geos suite
         run: |
           sbcl --dynamic-space-size 12288 --non-interactive \

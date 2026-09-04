@@ -190,8 +190,40 @@ present, so an error from the continuation after Goal succeeds is not caught.")
   (loop for i from 1 to arity
         collect (new-interned-symbol '?arg i)))
 
-(defun make-functor-symbol (symbol arity)
-  (new-interned-symbol symbol '/ arity))
+(defun %registered-functor-p (symbol)
+  "True when SYMBOL is a live functor -- a user clause (GET-FUNCTOR-FN)
+or a global primitive (*PROLOG-GLOBAL-FUNCTORS*).  Both lookups are
+read-only: no symbol is created or registered by asking (GH #322)."
+  ;; GET-FUNCTOR-FN (compiled fn), not LOOKUP-FUNCTOR (struct): an
+  ;; uncompiled registered functor falls through to the old rule.
+  (or (get-functor-fn symbol)
+      (nth-value 1 (gethash symbol *prolog-global-functors*))))
+
+(defun make-functor-symbol (symbol arity &key define)
+  "The NAME/ARITY functor symbol for SYMBOL.  DEFINE (true only from
+the definition path -- <- via ADD-CLAUSE, and any other site minting
+a symbol for a NEW functor) skips lookup and interns NAME straight
+into *PACKAGE*, the rule those callers already depended on -- a
+schema-package clause must not silently land on, or collide with, an
+existing GRAPH-DB functor of the same name.  Otherwise resolved by
+LOOKUP first: an already-registered functor in SYMBOL's own package,
+then in GRAPH-DB -- so a goal list whose canonical heads span the
+engine's package and a schema's resolves each in its home, and a head
+inherited from COMMON-LISP (>, atom, write) still finds the engine's
+functor.  A string SYMBOL never probes a package -- like DEFINE, it
+interns exactly as before this rule existed.  NAME is built with the
+same \"~{~a~}\" FORMAT NEW-INTERNED-SYMBOL uses (utilities.lisp:155,
+which is nothing but INTERN of that string), so every path spells the
+identical symbol (GH #322)."
+  (let ((name (format nil "~{~a~}" (list symbol '/ arity))))
+    (flet ((hit (pkg)
+             (and pkg
+                  (let ((s (find-symbol name pkg)))
+                    (and s (%registered-functor-p s) s)))))
+      (or (and (not define) (symbolp symbol)
+               (or (hit (symbol-package symbol))
+                   (hit (find-package :graph-db))))
+          (intern name)))))
 
 (defun make-= (x y) `(= ,x ,y))
 
@@ -219,8 +251,11 @@ present, so an error from the continuation after Goal succeeds is not caught.")
   ;; user package (e.g. GRAPH-DB/TEST::ONCE) is a *different* symbol from the
   ;; GRAPH-DB symbol the macro is defined on.  CL-inherited heads (=, and, or,
   ;; not, if) are the same symbol everywhere and hit directly; for the rest we
-  ;; fall back to the same-named symbol interned in GRAPH-DB -- mirroring how
-  ;; MAKE-FUNCTOR-SYMBOL canonicalizes runtime predicate names by string.
+  ;; fall back to the same-named symbol interned in GRAPH-DB, by NAME.
+  ;; Unrelated to MAKE-FUNCTOR-SYMBOL's routing, which since GH #322
+  ;; looks up a registered functor in the head's OWN package before
+  ;; falling back to GRAPH-DB -- a different question, asked by LOOKUP
+  ;; rather than NAME alone.
   (flet ((canonical (sym)
            (let ((c (find-symbol (symbol-name sym) :graph-db)))
              (and c (not (eq c sym)) (get c 'prolog-compiler-macro)))))
@@ -624,12 +659,14 @@ inline, composing with cut and the control constructs.  When Goal is a variable
     body))
 
 (defun add-clause (clause)
-  "add a user-defined functor"
+  "add a user-defined functor.  :DEFINE T -- a clause always interns
+in *PACKAGE*, never the lookup-first read path (GH #322)."
   (let* ((functor-name (first (clause-head clause))))
     (when *prolog-trace* (format t "TRACE:  Adding clause ~A~%" clause))
     (assert (and (atom functor-name) (not (variable-p functor-name))))
     (let* ((arity (relation-arity (clause-head clause)))
-           (functor (make-functor-symbol functor-name arity)))
+           (functor (make-functor-symbol functor-name arity
+                                         :define t)))
       (if (gethash functor *prolog-global-functors*)
           (error 'prolog-error
                  :reason
@@ -754,7 +791,10 @@ inline, composing with cut and the control constructs.  When Goal is a variable
   (let* ((goals (replace-?-vars goals))
          (vars (delete '? (variables-in goals)))
          (top-level-query (prolog-gensym "PROVE"))
-         (*functor* (make-functor-symbol top-level-query 0)))
+         ;; New functor per invocation (GH #322): DEFINE T so this
+         ;; never resolves onto an existing functor of the same name.
+         (*functor* (make-functor-symbol top-level-query 0
+                                         :define t)))
     `(let* ((*trail* (make-array 200 :fill-pointer 0 :adjustable t))
             (*var-counter* 0)
             (*functor* ',*functor*)
@@ -792,7 +832,8 @@ inline, composing with cut and the control constructs.  When Goal is a variable
   ((:entity Spot) (:species Dog)))"
   (let* ((goals (replace-?-vars goals)))
     `(let* ((top-level-query (prolog-gensym "PROVE"))
-            (*functor* (make-functor-symbol top-level-query 0))
+            (*functor* (make-functor-symbol top-level-query 0
+                                            :define t))
             (*trail* (make-array 200 :fill-pointer 0 :adjustable t))
             (*var-counter* 0)
             (*select-list* nil)
@@ -1020,7 +1061,10 @@ SELECT-FIRST for common shorthands."
   (let* ((goals (replace-?-vars goals))
          (options (plist-alist options)))
     `(let* ((top-level-query (prolog-gensym "PROVE"))
-            (*functor* (make-functor-symbol top-level-query 0))
+            ;; New functor per invocation (GH #322): DEFINE T so
+            ;; this never resolves onto an existing functor.
+            (*functor* (make-functor-symbol top-level-query 0
+                                            :define t))
             (*trail* (make-array 200 :fill-pointer 0 :adjustable t))
             (*var-counter* 0)
             (*select-list* nil)
@@ -1121,7 +1165,8 @@ goals like (trigger ...) or (retract ...)."
   ((:entity Spot)(:species Dog)))"
   (let* ((goals (replace-?-vars goals)))
     `(let* ((top-level-query (prolog-gensym "PROVE"))
-            (*functor* (make-functor-symbol top-level-query 0))
+            (*functor* (make-functor-symbol top-level-query 0
+                                            :define t))
             (*trail* (make-array 200 :fill-pointer 0 :adjustable t))
             (*var-counter* 0)
             (*select-list* nil)
