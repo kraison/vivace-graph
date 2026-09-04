@@ -24,18 +24,22 @@
 (defparameter +claim-object-index-slots+
   '(graph-db.spacetime::object-namespace graph-db.spacetime::object-key))
 
-(defun %namespace-keyword (x)
-  "The keyword a namespace argument names, or NIL: a string resolves
-with FIND-SYMBOL so a query cannot grow KEYWORD; a keyword passes; an
-unbound variable or anything else is NIL (spec §4)."
-  (let ((v (var-deref x)))
-    (cond ((keywordp v) v)
-          ((stringp v) (find-symbol (string-upcase v) :keyword))
-          (t nil))))
-
 (defun %keyword-string (keyword)
   "A keyword as the lowercase string the wire uses (spec §4)."
   (string-downcase (symbol-name keyword)))
+
+(defun %namespace-keyword (x)
+  "The keyword a namespace argument names, or NIL: a keyword passes; a
+string resolves with FIND-SYMBOL, so a query cannot grow KEYWORD, and
+only when it is that keyword's exact wire form -- \"HOST\" names nothing,
+since lookup and unification must agree on the spelling; anything else is
+NIL (spec §4)."
+  (let ((v (var-deref x)))
+    (cond ((keywordp v) v)
+          ((stringp v)
+           (let ((kw (find-symbol (string-upcase v) :keyword)))
+             (and kw (string= v (%keyword-string kw)) kw)))
+          (t nil))))
 
 (defun %namespace-value (arg keyword)
   "The value a namespace argument unifies against for a claim whose
@@ -96,29 +100,31 @@ asked in; see %NAMESPACE-VALUE."
 ;; property, so not DECLARE-FUNCTOR-COST-UNBOUNDED, which classifies the
 ;; whole functor and would withhold CLAIM from free text entirely
 ;; (GH #285).
-(defun %unbound-claim-scan (family)
-  "Every claim of FAMILY, when no resource bound is in effect; refused
-as cost-unbounded otherwise, since %TICK cannot preempt inside a family
-walk (GH #285).  The refusal is unconditional: :ALLOW-COST-UNBOUNDED is
-threaded through SELECT at query-compile time and no special variable
-carries it into a functor body, so it cannot reach here."
+(defun %unbound-claim-scan (graph family)
+  "Every claim of FAMILY in GRAPH, when no resource bound is in effect;
+refused as cost-unbounded otherwise, since %TICK cannot preempt inside a
+family walk (GH #285).  The refusal is unconditional:
+:ALLOW-COST-UNBOUNDED is threaded through SELECT at query-compile time
+and no special variable carries it into a functor body, so it cannot
+reach here."
   (when (or *inference-budget* *query-deadline*)
     (error 'prolog-cost-unbounded-error :functor 'claim/7))
   ;; :INCLUDE-SUBCLASSES-P defaults to T, so the parent covers unary and
   ;; binary.  :COLLECT-P is what materialises node bytes before a node
   ;; escapes the scan's read pin (vertex.lisp) -- not a style choice.
   (let ((parent (graph-db.spacetime:claim-family-parent family)))
-    (map-vertices #'identity *graph* :vertex-type parent :collect-p t)))
+    (map-vertices #'identity graph :vertex-type parent :collect-p t)))
 
 (def-global-prolog-functor claim/7
     (?c ?family ?sns ?skey ?rel ?ons ?okey cont)
   "Claims of ?FAMILY (a parent class name) as facts: subject namespace
-and key, relation, object namespace and key -- namespaces as strings,
-NIL object pair for a unary claim.  Generates from the subject index
-when the subject is bound, the object index when the object is, the
-producer index through CLAIM-PRODUCER/2 in the same body; with nothing
-bound under a resource bound it is refused as cost-unbounded (GH #285),
-and without a bound it walks the family (spec §4)."
+and key, relation, object namespace and key.  A namespace answers as the
+lowercase wire string, or as the keyword when the argument was already
+bound to one; a unary claim's object pair is NIL.  Generates from the
+subject index when the subject is bound, the object index when the object
+is, the producer index through CLAIM-PRODUCER/2 in the same body; with
+nothing bound under a resource bound it is refused as cost-unbounded
+(GH #285), and without a bound it walks the family (spec §4)."
   (let* ((family (%family-or-ill-typed ?family))
          (parent (graph-db.spacetime:claim-family-parent family))
          (binary (graph-db.spacetime:claim-family-binary family))
@@ -143,10 +149,13 @@ and without a bound it walks the family (spec §4)."
                  ((and ons okey)
                   (index-lookup g binary +claim-object-index-slots+
                                 (list ons okey)))
-                 ;; A namespace no claim was ever recorded under names no
-                 ;; keyword: no solutions, and nothing interned (spec §4).
-                 ((and (stringp sns-arg) (null sns)) '())
-                 ((and (stringp ons-arg) (null ons)) '())
-                 (t (%unbound-claim-scan family)))))
+                 ;; A bound namespace argument naming no keyword of this
+                 ;; image -- a name no claim was recorded under, a
+                 ;; non-wire spelling, a non-string: no solutions, and
+                 ;; nothing interned.  Not the walk below, which under
+                 ;; the guard's budget refuses instead (spec §4).
+                 ((and sns-arg (null sns)) '())
+                 ((and ons-arg (null ons)) '())
+                 (t (%unbound-claim-scan g family)))))
     (dolist (claim candidates)
       (%unify-claim claim ?c ?sns ?skey ?rel ?ons ?okey family cont))))
