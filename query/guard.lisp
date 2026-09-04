@@ -603,17 +603,20 @@ has resolved it, else NIL.")
 
 (defun %unknown-claim-family-type ()
   "The condition class a claim-family name no DEF-CLAIM-CLASSES
-registered signals, or NIL where GRAPH-DB.SPACETIME is not loaded;
+registered signals, or NIL until GRAPH-DB.SPACETIME has defined it;
 cached on the first success.  Deferred to CALL time, unlike
 *NO-APPLICABLE-METHOD-TYPE*: GRAPH-DB/QUERY depends on GRAPH-DB/CORE
 alone and must load standalone, so a load-time FIND-SYMBOL would cache
 NIL for the life of the image and CLAIM/7's ill-typed family name would
 report as an engine fault (GH #330)."
   (or *unknown-claim-family-type*
-      (let ((pkg (find-package "GRAPH-DB.SPACETIME")))
-        (and pkg
-             (setf *unknown-claim-family-type*
-                   (find-symbol "UNKNOWN-CLAIM-FAMILY" pkg))))))
+      (let* ((pkg (find-package "GRAPH-DB.SPACETIME"))
+             (sym (and pkg (find-symbol "UNKNOWN-CLAIM-FAMILY" pkg))))
+        ;; FIND-CLASS, not FIND-SYMBOL alone: spacetime's export list
+        ;; interns the name before claim.lisp defines the condition, so
+        ;; a symbol cached inside that window is one TYPEP cannot use.
+        (and sym (find-class sym nil)
+             (setf *unknown-claim-family-type* sym)))))
 
 (defun %ill-typed-condition-p (c)
   "True when C is a shape that CLIENT INPUT is known to produce, as
@@ -633,7 +636,12 @@ whitelisted read functors, not assumed (GH #279):
   UNKNOWN-CLAIM-FAMILY -- a claim family name graph-db/rules' CLAIM/7
     was handed that DEF-CLAIM-CLASSES never registered, e.g. an arity
     subclass where the parent was meant.  The name is a schema type the
-    guard admits, so only the goal can reject it (GH #330).
+    guard admits, so only the goal can reject it (GH #330).  Client-
+    shaped only while CLAIM/7 is the sole whitelisted path to it:
+    CLAIM-IDENTITY-KEY signals the same condition from an ENGINE state,
+    a stored claim of no registered family (spacetime/claim-query.lisp),
+    so admitting a functor that can reach that one means splitting the
+    two conditions first.
 
 TYPE-ERROR and UNBOUND-VARIABLE are deliberately NOT here, though they
 are the obvious guesses.  No client input produced either: the read

@@ -19,8 +19,11 @@ are slice 2 (GH #331). Nothing here writes.
 `:depends-on (:graph-db/spacetime :graph-db/query)`; no web package.
 Loading it registers the functors in `*prolog-global-functors*`, and
 the guard enumerates that registry per call, so the very next
-`run-guarded-prolog` admits them. No whitelist is edited to add a
-functor, and none can be edited to take one back.
+`run-guarded-prolog` admits them. No whitelist edit adds them;
+withholding one from free text is `*prolog-excluded-predicates*`' job
+(`query/guard.lisp`), not the whitelist's -- and that lever is
+deliberately left unpulled here, for the reason under the
+cost-unbounded rule below.
 
 ## Why the functors are homed in `graph-db`
 
@@ -134,9 +137,12 @@ Raw, in the image, from any package:
 **The empty fast path is not a refusal.** A bound namespace argument
 that resolves to no keyword -- a name no claim was recorded under, a
 non-wire spelling like `"HOST"`, a number -- answers zero solutions and
-interns nothing; query text cannot grow the `KEYWORD` package. Only
-`(claim ?c f ?a ?b ?r ?d ?e)`, with nothing bound at all, reaches the
-walk.
+interns nothing; query text cannot grow the `KEYWORD` package.
+
+**Any shape the table does not route reaches the walk** -- the walk is
+the `cond`'s last clause, not a nothing-bound special case. A bound
+namespace with an unbound key, a bound key with an unbound namespace,
+and a non-node `?c` with nothing else bound all land there.
 
 **A bound key with an unbound namespace has no route.** The namespace
 is the leading slot of both endpoint indexes and an index is only
@@ -144,9 +150,9 @@ usable from a prefix, so `(claim ?c f ?ns "h1" ?r ?ons ?ok)` falls
 through to the walk and, under a budget, refuses. Bind the namespace;
 it is almost always a literal. Not a defect -- the shape of the index.
 
-**The cost-unbounded rule (GH #285).** With nothing bound there is no
-index to generate from, and `%tick` cannot preempt inside one functor
-call, so a family walk would run past any budget already in effect:
+**The cost-unbounded rule (GH #285).** An unrouted goal has no index
+to generate from, and `%tick` cannot preempt inside one functor call,
+so a family walk would run past any budget already in effect:
 
 - under a resource bound -- an inference budget or a deadline -- the
   goal signals `prolog-cost-unbounded-error`;
@@ -154,15 +160,16 @@ call, so a family walk would run past any budget already in effect:
   could already call `map-vertices` may do.
 
 `run-guarded-prolog` always binds both budgets, so on the guarded
-surface the nothing-bound case is **always** a refusal, exactly as
-spec §4 says. The walk is reachable only from an in-image `select`
-with neither `:max-inferences` nor `:timeout`.
+surface an unrouted goal is **always** a refusal, exactly as spec §4
+says. The walk is reachable only from an in-image `select` with
+neither `:max-inferences` nor `:timeout`.
 
 That refusal is unconditional: `:allow-cost-unbounded t` does not
 reach it. The option is threaded as a literal at query-compile time
 and no special variable carries it into a functor body
 (kraison/vivace-graph#334). A caller who knows the walk is affordable
-drops the budget or binds an endpoint.
+drops the budget, or binds a namespace and its key together so the
+goal routes.
 
 `claim/7` is deliberately **not** `declare-functor-cost-unbounded`'d.
 That classifies a whole functor, and `%excluded-predicate-p` would
