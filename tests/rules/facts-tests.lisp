@@ -149,3 +149,31 @@
                (select-flat (?v) (claim ?c rt-claim "host" "h1" "runs"
                                         "app" "db")
                                  (claim-rule-version ?c ?v))))))
+
+;; The same functors from free text.  The guard needs no edit to admit
+;; them -- it enumerates the live registry per call -- so what this pins
+;; is that the names resolve there, that a keyword namespace is a
+;; refusal rather than a match, and that an unregistered family is
+;; client input rather than an engine fault (spec §4).
+(test the-guard-admits-the-claim-functors
+  (with-rules-graph (g)
+    (seed g)
+    (multiple-value-bind (columns rows)
+        (graph-db.query:run-guarded-prolog
+         "(claim ?c rt-claim \"host\" \"h1\" \"runs\" \"app\" ?o)
+          (claim-producer ?c ?p)"
+         g)
+      (is (equal '("c" "o" "p") columns))
+      (is (= 2 (length rows)))
+      (is (every (lambda (row) (string= "scan-a" (third row))) rows)))
+    ;; A keyword namespace is refused before READ runs, so it is never a
+    ;; match -- which is why namespaces cross as strings (spec §4).
+    (signals graph-db.query:prolog-guard-error
+      (graph-db.query:run-guarded-prolog
+       "(claim ?c rt-claim :host \"h1\" ?r ?a ?b)" g))
+    ;; RT-CLAIM-UNARY is a vertex type of this graph, so the guard admits
+    ;; it; only the parent is a claim family, so CLAIM-FAMILY signals at
+    ;; run time and %ILL-TYPED-CONDITION-P must classify it (GH #330).
+    (signals graph-db.query:prolog-ill-typed-error
+      (graph-db.query:run-guarded-prolog
+       "(claim ?c rt-claim-unary \"host\" \"h1\" ?r ?a ?b)" g))))

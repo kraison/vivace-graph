@@ -597,6 +597,24 @@ NO-APPLICABLE-METHOD methods signalling QUERY-PRECONDITION-ERROR, which
 because ECL has no distinct class here (it signals a bare SIMPLE-ERROR,
 which is deliberately a 500).")
 
+(defvar *unknown-claim-family-type* nil
+  "GRAPH-DB.SPACETIME:UNKNOWN-CLAIM-FAMILY once %UNKNOWN-CLAIM-FAMILY-TYPE
+has resolved it, else NIL.")
+
+(defun %unknown-claim-family-type ()
+  "The condition class a claim-family name no DEF-CLAIM-CLASSES
+registered signals, or NIL where GRAPH-DB.SPACETIME is not loaded;
+cached on the first success.  Deferred to CALL time, unlike
+*NO-APPLICABLE-METHOD-TYPE*: GRAPH-DB/QUERY depends on GRAPH-DB/CORE
+alone and must load standalone, so a load-time FIND-SYMBOL would cache
+NIL for the life of the image and CLAIM/7's ill-typed family name would
+report as an engine fault (GH #330)."
+  (or *unknown-claim-family-type*
+      (let ((pkg (find-package "GRAPH-DB.SPACETIME")))
+        (and pkg
+             (setf *unknown-claim-family-type*
+                   (find-symbol "UNKNOWN-CLAIM-FAMILY" pkg))))))
+
 (defun %ill-typed-condition-p (c)
   "True when C is a shape that CLIENT INPUT is known to produce, as
 opposed to an engine defect.  The two were MEASURED against the
@@ -612,6 +630,11 @@ whitelisted read functors, not assumed (GH #279):
     report from %RESOLVE-SPATIAL-SCOPE for (find-nearest ?n some-type
     0 0 5).  Both were SIMPLE-ERRORs before GH #286.
 
+  UNKNOWN-CLAIM-FAMILY -- a claim family name graph-db/rules' CLAIM/7
+    was handed that DEF-CLAIM-CLASSES never registered, e.g. an arity
+    subclass where the parent was meant.  The name is a schema type the
+    guard admits, so only the goal can reject it (GH #330).
+
 TYPE-ERROR and UNBOUND-VARIABLE are deliberately NOT here, though they
 are the obvious guesses.  No client input produced either: the read
 functors guard with NUMBERP / NODE-P and simply fail instead of
@@ -624,9 +647,11 @@ QUERY-PRECONDITION-ERROR, so that class is what is admitted here; a
 plain SIMPLE-ERROR -- an internal (error \"...\") or a failed ASSERT --
 is a defect again and answers 500, which closes the residual the first
 cut recorded."
-  (or (typep c 'graph-db:query-precondition-error)
-      (and *no-applicable-method-type*
-           (typep c *no-applicable-method-type*))))
+  (let ((family-type (%unknown-claim-family-type)))
+    (or (typep c 'graph-db:query-precondition-error)
+        (and *no-applicable-method-type*
+             (typep c *no-applicable-method-type*))
+        (and family-type (typep c family-type)))))
 
 ;;; ---------------------------------------------------------------------
 ;;; Step 5-6: the runner, exported (spec SS4, GH #322)

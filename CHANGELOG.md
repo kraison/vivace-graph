@@ -13,6 +13,22 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Added
 
+- **`graph-db/rules`, claims as Prolog facts** (#304, #330): a new
+  subsystem, `:depends-on (:graph-db/spacetime :graph-db/query)`,
+  registering seven global Prolog functors -- `claim/7`,
+  `claim-current/1`, `claim-valid-at/2`, `claim-producer/2`,
+  `claim-standing/2`, `claim-relation/2` and `claim-rule-version/2` --
+  so a `select`, or a guarded free-text query, reads claims as facts.
+  `claim/7` generates from the subject, subject-relation and object
+  indexes and `claim-producer/2` from the producer index; a goal with
+  no index route is refused as cost-unbounded under a resource bound
+  (#285), which on the guarded surface is always. Namespaces cross as
+  strings, a unary claim binds its object pair to NIL, and a family
+  name no `def-claim-classes` registered now reports as
+  `prolog-ill-typed-error` rather than as an internal fault. CI gains
+  a `rules` lane; `docs/rules.md`. The rule record and `run-rule` are
+  the next slice (#331).
+
 - **`graph-db/query`, a web-free subsystem for guarded queries** (#322):
   the JSON pattern DSL moves out of the `graph-db` web system and the
   free-text Prolog guard moves out of `graph-db/gui`, both into a
