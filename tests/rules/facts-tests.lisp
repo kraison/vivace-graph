@@ -83,3 +83,69 @@
       (is (equal '("db" "web")
                  (sort (mapcar #'first strings) #'string<)))
       (is (equal strings keywords)))))
+
+;; The filters below ride routes CLAIM/7's own tests already prove, so
+;; they run unbudgeted (R21).  CLAIM-PRODUCER/2's generator IS a route,
+;; so its two generating goals carry a budget: without one an unbound ?C
+;; would leave the family walk legal for the goal that follows.
+
+(test claim-current-filters-a-retracted-claim
+  (with-rules-graph (g)
+    (seed g)
+    (let ((c (first (claims-touching g 'rt-claim :host "h2" :role :subject
+                                     :relation "reachable"))))
+      (retract-claim c))
+    (is (= 2 (select-count (?c) (claim ?c rt-claim "host" "h2" ?r ?a ?b))))
+    (is (= 1 (select-count (?c) (claim ?c rt-claim "host" "h2" ?r ?a ?b)
+                                (claim-current ?c))))
+    ;; Which one survives, not just how many: a negated test keeps one too.
+    (is (equal '("runs")
+               (select-flat (?r) (claim ?c rt-claim "host" "h2" ?r ?a ?b)
+                                 (claim-current ?c))))))
+
+(test claim-valid-at-uses-the-validity-extent
+  (with-rules-graph (g)
+    (seed g)
+    (is (equal '("1")
+               (select-flat (?v) (claim ?c rtt-claim "app" "web"
+                                        "version" "ver" ?v)
+                                 (claim-valid-at ?c "2026-02-15T00:00:00Z"))))
+    (is (equal '("2")
+               (select-flat (?v) (claim ?c rtt-claim "app" "web"
+                                        "version" "ver" ?v)
+                                 (claim-valid-at ?c "2026-06-15T00:00:00Z"))))
+    ;; A claim with no extent never matches.
+    (is (null (select-flat (?c) (claim ?c rt-claim "host" "h1" ?r ?a ?b)
+                                (claim-valid-at ?c "2026-02-15T00:00:00Z"))))))
+
+(test claim-producer-generates-from-the-producer-index
+  (with-rules-graph (g)
+    (seed g)
+    (is (= 2 (select (:count t :max-inferences 1000) (?c)
+               (claim-producer ?c "scan-b"))))
+    ;; R6: scan-a wrote 2 rt-claims and 2 rtt-claims; the family goal
+    ;; keeps the 2 rt-claims, which is what proves %UNIFY-CLAIM's
+    ;; parent-class gate.
+    (is (= 2 (select (:count t :max-inferences 1000) (?c)
+               (claim-producer ?c "scan-a")
+               (claim ?c rt-claim ?s ?k ?r ?a ?b))))
+    (is (equal '("scan-a")
+               (select-flat (?p) (claim ?c rt-claim "host" "h1" "runs"
+                                        "app" "db")
+                                 (claim-producer ?c ?p))))))
+
+(test the-slot-filters
+  (with-rules-graph (g)
+    (seed g)
+    (is (equal '("inferred")
+               (select-flat (?s) (claim ?c rt-claim "host" "h2"
+                                        "reachable" ?a ?b)
+                                 (claim-standing ?c ?s))))
+    (is (equal '("runs")
+               (select-flat (?r) (claim ?c rt-claim "host" "h1" "runs"
+                                        "app" "db")
+                                 (claim-relation ?c ?r))))
+    (is (equal '(nil)
+               (select-flat (?v) (claim ?c rt-claim "host" "h1" "runs"
+                                        "app" "db")
+                                 (claim-rule-version ?c ?v))))))

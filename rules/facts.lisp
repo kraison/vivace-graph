@@ -24,6 +24,9 @@
 (defparameter +claim-object-index-slots+
   '(graph-db.spacetime::object-namespace graph-db.spacetime::object-key))
 
+(defparameter +claim-producer-index-slots+
+  '(graph-db.spacetime::producer))
+
 (defun %keyword-string (keyword)
   "A keyword as the lowercase string the wire uses (spec §4)."
   (string-downcase (symbol-name keyword)))
@@ -159,3 +162,95 @@ nothing bound under a resource bound it is refused as cost-unbounded
                  (t (%unbound-claim-scan g family)))))
     (dolist (claim candidates)
       (%unify-claim claim ?c ?sns ?skey ?rel ?ons ?okey family cont))))
+
+(defun %claim-arg (x)
+  "X's value when it is a node, else NIL -- every CLAIM-* filter fails on
+NIL rather than signalling.  A node of another type is out of contract:
+the accessors signal NO-APPLICABLE-METHOD, which the runner already
+classifies as ill-typed input (spec §4)."
+  (let ((v (%bound x)))
+    (and v (node-p v) v)))
+
+(def-global-prolog-functor claim-current/1 (?c cont)
+  "True while ?C's transaction period is open -- a claim RETRACT-CLAIM has
+closed is filtered out.  Claims are generated retracted-and-all, matching
+CLAIMS-TOUCHING's default, so this is the goal that says \"still
+believed\" (spec §4)."
+  (let ((c (%claim-arg ?c)))
+    (when (and c (graph-db.spacetime:claim-current-p c))
+      (funcall cont))))
+
+(defun %instant-arg (x)
+  "X as a LOCAL-TIME timestamp: a timestamp passes, an ISO-8601 string is
+parsed, everything else -- an unparsable string included -- is NIL, so a
+malformed instant fails the goal instead of signalling."
+  (let ((v (%bound x)))
+    (cond ((typep v 'local-time:timestamp) v)
+          ((stringp v) (ignore-errors (local-time:parse-timestring v)))
+          (t nil))))
+
+(def-global-prolog-functor claim-valid-at/2 (?c ?at cont)
+  "True when ?C's validity extent possibly contains ?AT (an ISO-8601
+string or a timestamp); a claim with no extent makes no validity
+statement and never matches.  Shares CLAIMS-TOUCHING's predicate and
+probe shape, so the two cannot diverge (spec §11)."
+  (let ((c (%claim-arg ?c))
+        (at (%instant-arg ?at)))
+    (when (and c at
+               (graph-db.spacetime::%claim-validity-touches-p
+                c (graph-db.spacetime:make-instant
+                   (graph-db.spacetime:exact-bound at))))
+      (funcall cont))))
+
+(def-global-prolog-functor claim-standing/2 (?c ?s cont)
+  "?C's standing as the lowercase wire string (\"inferred\"), the same
+shape a namespace answers in; a bound ?S filters instead (spec §4)."
+  (let ((c (%claim-arg ?c)))
+    (when c
+      (%yield (?s (%keyword-string (graph-db.spacetime:claim-standing c)))
+        (funcall cont)))))
+
+(def-global-prolog-functor claim-relation/2 (?c ?r cont)
+  "?C's relation, a canonical string; a bound ?R filters instead."
+  (let ((c (%claim-arg ?c)))
+    (when c
+      (%yield (?r (graph-db.spacetime:claim-relation c))
+        (funcall cont)))))
+
+(def-global-prolog-functor claim-rule-version/2 (?c ?v cont)
+  "?C's rule version, NIL when it has none -- NIL is a solution here, not
+a failure, so a claim no rule wrote still answers."
+  (let ((c (%claim-arg ?c)))
+    (when c
+      (%yield (?v (graph-db.spacetime:claim-rule-version c))
+        (funcall cont)))))
+
+(defun %producer-candidates (graph producer)
+  "Every claim PRODUCER wrote in GRAPH, from the producer index of each
+family registered in this image.  *CLAIM-FAMILIES* is image-wide, not per
+graph, so a family GRAPH's schema does not carry is skipped: that is what
+QUERY-PRECONDITION-ERROR means here, not a fault to report."
+  (let ((out '()))
+    (dolist (family (alexandria:hash-table-values
+                     graph-db.spacetime::*claim-families*)
+                    (nreverse out))
+      (let ((parent (graph-db.spacetime:claim-family-parent family)))
+        (handler-case
+            (dolist (c (index-lookup graph parent
+                                     +claim-producer-index-slots+
+                                     producer))
+              (push c out))
+          (query-precondition-error () nil))))))
+
+(def-global-prolog-functor claim-producer/2 (?c ?p cont)
+  "?C's producer.  With ?C unbound and ?P a producer name it generates
+instead: every claim ?P wrote, across every family this graph indexes.
+With neither bound the goal fails: there is no index to generate from,
+and the only alternative is a whole-store walk (spec §4)."
+  (let ((c (%claim-arg ?c))
+        (p (%bound ?p)))
+    (cond (c (%yield (?p (graph-db.spacetime:claim-producer c))
+               (funcall cont)))
+          ((stringp p)
+           (dolist (claim (%producer-candidates *graph* p))
+             (%yield (?c claim) (funcall cont)))))))
