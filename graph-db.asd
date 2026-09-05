@@ -229,7 +229,8 @@ docs/rules.md; GH #304."
   :depends-on (:graph-db/spacetime :graph-db/query)
   :pathname "rules/"
   :serial t
-  :components ((:file "package") (:file "facts") (:file "schema"))
+  :components ((:file "package") (:file "facts") (:file "schema")
+               (:file "compile"))
   :in-order-to ((test-op (test-op :graph-db/rules-test))))
 
 (defsystem graph-db/rules-test
@@ -239,7 +240,7 @@ docs/rules.md; GH #304."
   :pathname "tests/rules/"
   :serial t
   :components ((:file "package") (:file "suite") (:file "facts-tests")
-               (:file "schema-tests"))
+               (:file "schema-tests") (:file "compile-tests"))
   :perform (test-op (op c)
              (unless (uiop:symbol-call :graph-db/rules-test
                                        :run-rules-tests)

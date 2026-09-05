@@ -203,6 +203,12 @@ property, not a per-functor one.
   type names the guard admits but no family is keyed on, so
   `host-claim-unary` is the shape a caller gets this from.
 - **An unknown namespace** is the empty fast path above, not an error.
+- **A rule that does not compile** signals
+  `graph-db.rules:rule-compile-error`, a
+  `graph-db:constraint-violation` -- deterministic, so retrying the
+  same write against the same schema is refused again.
+  `rule-compile-error-rule` is the rule's name,
+  `rule-compile-error-reason` the sentence saying what is wrong.
 
 ## What the functors do not see
 
@@ -234,6 +240,88 @@ or `def-claim-classes` call. `name` is the identity key -- one live
 `rule` per name -- so a new version is `copy`, `setf rule-version`,
 `save`, not a second write. A second `def-rules-schema` call (a
 multi-store image) rebinds `make-rule`'s default store, so every
-constructor call after that must pass `:graph` explicitly. `compile-rule`
-and `run-rule` finish this slice; see Task 5 for the rest of this
-section.
+constructor call after that must pass `:graph` explicitly. `run-rule`
+finishes this slice; see Task 5 for the rest of this section.
+
+## Compiling a rule
+
+`graph-db.rules:compile-rule (graph rule &key others)` turns a `rule`
+record -- or a `rule-spec`, which is what `def-rule` registers -- into
+a `compiled-rule`, or signals `rule-compile-error` (spec §6). Head and
+body go through the guard as one text, so a variable shared between
+them reads as one symbol.
+
+**The head is exactly one `claim/7` pattern.** Written out,
+`(claim ?c family sns skey rel ons okey)`:
+
+- A second goal in the head, or any other functor, is refused.
+- `?c` is an unbound variable that must not appear in the body: it
+  names the claim the rule derives.
+- `family` is the rule's own `family` slot, spelled as the schema's
+  parent class name.
+- `rel` is a literal canonical relation (`[a-z0-9-]+`). A variable
+  there is refused -- a rule must say what it derives.
+- The namespaces are canonical strings, interned as keywords at
+  compile time, or body variables; the keys are strings or body
+  variables. A head variable the body does not bind is refused.
+- The object pair is both `nil` (a unary claim) or both given.
+
+**The body is guarded exactly as free text is** -- the same character
+screen, the same functor whitelist, the same refusals
+`run-guarded-prolog` gives (`query/guard.lisp`). Two consequences:
+
+- **No colon anywhere in the rule text.** The screen refuses `:`
+  before the reader runs, so a body can name no keyword and no
+  package-qualified symbol. Namespaces and standings are written as
+  the lowercase wire strings the functors answer in (`"host"`,
+  `"inferred"`).
+- **A bare `?` is refused.** Read into the guard's scratch package
+  every `?` in one text is the *same* named variable, not the engine's
+  anonymous one, so all of them would have to unify. `compile-rule`
+  refuses it rather than let a rule mean something other than it
+  reads (recon note A10,
+  `docs/superpowers/notes/2026-09-05-rules-s2-engine-api-facts.md`).
+
+An effecting functor such as `retract` is **not** a compile refusal:
+there is no static effect registry, so the guard admits the goal and
+running it is what refuses (same note, A16).
+
+**Generators move to the front (ruling P5).** A body goal
+`(claim-producer ?v "p")` -- variable first, literal producer second --
+generates from the producer index, so `compile-rule` runs it before
+the rest of the body and a later `claim/7` on `?v` takes its node
+route instead of walking the family. Every other goal keeps its order;
+`(claim-producer ?p ?who)` is a filter and is left where it was.
+
+**Recursion is refused, and the cycle is named (ruling P6).** The
+cycle graph is over relation names: a rule's head relation points at
+every relation its body reads, and so does every other enabled rule in
+scope -- the store's rules plus every `def-rule`. A path from the head
+relation back to itself is refused, spelling the path
+(`deriving "y" closes a cycle: y -> x -> y`). A body `claim/7` that
+leaves its relation unbound reads *every* relation, its own included,
+so it is always a one-node cycle; that refusal says to bind the
+relation.
+
+**A name belongs to one source.** A stored `rule` and a `def-rule` of
+the same name is a collision, refused whichever arrives second.
+
+**A `rule` write that does not compile is refused at commit** (ruling
+P3). `%validate-rule-writes` sits on `graph-db:*commit-validators*`
+and compiles every written `rule` against the store as the commit will
+leave it -- the cycle check included -- so the store never holds a
+rule that could not run when it was written. `enabled nil` is not an
+exemption: a disabled rule is compiled, only not run. The validator is
+inert until some store has evaluated `def-rules-schema`, which is what
+makes the `rule` class.
+
+### `def-rule`, the in-image escape hatch
+
+`(def-rule "web-hosts" :version "1" :family rt-claim :head ... :body
+...)` registers a rule in the image rather than in a store (spec §5).
+`family` is the parent class symbol, unevaluated; every other argument
+is evaluated. `undef-rule` forgets one and `find-def-rule` returns its
+`rule-spec`. A `def-rule` is compiled per store, when it runs, because
+the cycle check needs that store's other rules -- but it constrains
+the cycle graph of every store in the image, so a `def-rule` can be
+the reason a stored rule's write is refused.
