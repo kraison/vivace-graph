@@ -389,8 +389,10 @@ Refusals signal PROLOG-GUARD-ERROR, as for RUN-GUARDED-PROLOG."
       (is (eq (find-package :graph-db) (symbol-package (first (first goals)))))
       (is (eq 'graph-db/query-test.schema::qt-item
               (third (first goals)))))
+    ;; An unregistered functor is refused by the guard; an EFFECTING
+    ;; one is not -- effects are refused at run (recon A16, ruling PF2).
     (signals graph-db.query:prolog-guard-error
-      (graph-db.query:guard-query-text "(retract ?x)" g))
+      (graph-db.query:guard-query-text "(no-such-functor ?x)" g))
     (signals graph-db.query:prolog-guard-error
       (graph-db.query:guard-query-text "(is-a ?p graph-db::vertex)" g))))
 ```
@@ -449,15 +451,16 @@ class's name as a string, HEAD and BODY guarded Prolog text."
   (check-type graph-name keyword)
   `(progn
      (graph-db.spacetime:def-source rule ,graph-name
-         ((name :type string
+         ((name :type string :accessor rule-name
                 :check graph-db.spacetime:canonical-relation-p)
-          (version :type string
+          (version :type string :accessor rule-version
                    :check graph-db.spacetime:canonical-relation-p)
-          (family :type string)
-          (head :type string)
-          (body :type string)
-          (extent-policy :initform :premises)
-          (enabled :initform t))
+          (family :type string :accessor rule-family)
+          (head :type string :accessor rule-head)
+          (body :type string :accessor rule-body)
+          (extent-policy :initform :premises
+                         :accessor rule-extent-policy)
+          (enabled :initform t :accessor rule-enabled))
        :identity (:namespace :rule :key-slot name)
        :space :none
        :time :none
