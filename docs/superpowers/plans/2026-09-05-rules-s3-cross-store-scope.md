@@ -557,6 +557,14 @@ refuses every read of another store (S3-P2).  ..."
   - `%scope-lookup`'s docstring gains the wrong-arity caveat `%producer-candidates` carries (the same `query-precondition-error` is what a wrong component count signals, so the swallow is safe only at the known arity);
   - the "What the functors do not see" paragraph: "every route" → the three indexed routes and the walk; the bound-`?c` route and the empty fast paths read no store.
 
+- [ ] **Step 1c: Task 2's deferred minors** (ledger, review of c411e5e), in `rules/run.lisp` and `docs/rules.md`:
+  - the keyword-name check moves from `%store-name` into `%normalize-scope`, so a non-keyword-named store in a scope signals before the rule is resolved, as the docs say; `%store-name` keeps a plain `check-type` as belt and braces;
+  - `run-rules` normalises `:scope` once at entry (so a bad scope signals even when no rule is runnable) and passes the normalised list to each `run-rule`;
+  - `%premise-ref`'s docstring: the `resolve-node-graph` fallback scans every open store and, on the single-store path, would meet the cross-graph refusal inside the transaction — unreachable today because every lookup stamps `node-graph`, and said so;
+  - "Running a rule": "every refusal unwinds the transaction" → a refusal raised during a cross-store evaluation unwinds the snapshots (no transaction is open yet); the report is the same either way;
+  - the recon-O1 sentence in "What the functors do not see" carries the recon note's hedge (not settled by a live scenario);
+  - "Provenance": until `premises-of` takes a scope (this task's Step 3), say what it does with a foreign premise.
+
 - [ ] **Step 2: RED**; **Step 3:** `premises-of graph claim &key (scope (list graph))`: for each `derived-from` record, `(claim-method r)` NIL → resolve in `graph`; a name → `(find name scope :key #'%store-name :test #'string=)` → resolve there, else drop. `%claim-by-identity-key` already takes the graph. `dependents-of`: no change beyond the docstring. **Step 4: GREEN**, count.
 
 - [ ] **Step 5: `docs/rules.md`** — new section "Cross-store scope (GH #332)" after "Provenance": what a scope is, own store first, writes only the own store, the schema rule (S3-P5, families declared under both names), the two evaluation paths and the clock as C2 has it (S3-P2), `method` and `premises-of :scope` (S3-P3/P4), the walk (S3-P6), the transaction trap for Lisp callers, the known limit (no cross-store cycle detection, #333). Read the whole file once against the shipped code. `CHANGELOG.md` entry under Added. The decision record with S3-P1..P6 and every execution ruling from the ledger, in the S2 file's shape, stating they were taken without Kevin and which deviate from the spec (none deviate; S3-P2 refines §7's "one transaction" for the cross-store case, forced by GH #53 — say so). One closing line in the S2 handoff pointing at this branch.
