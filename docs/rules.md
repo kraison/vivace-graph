@@ -468,8 +468,14 @@ relation R runs after every rule that derives R (spec §7). Cycles were
 refused at compile, so the order always exists; ties keep the order the
 rules came in.
 
-- **Disabled rules are compiled, not run.** `enabled nil` keeps a rule
-  in the cycle graph and out of the schedule.
+- **A disabled rule is not in scope at all.** `rules-in-scope` filters
+  on `enabled`, stored rules and `def-rule`s alike, so `run-rules`
+  neither compiles a disabled rule nor counts it in the cycle graph --
+  and a rule it would otherwise have made cyclic compiles fine while it
+  stays disabled (ruling T3-R5). The one place `enabled` buys no
+  exemption is the *write*: `%validate-rule-writes` compiles every
+  `rule` record it commits, disabled or not, so a disabled rule is
+  still a rule that could run.
 - **A `def-rule` runs only where the store carries its family (ruling
   P8).** `*def-rules*` is image-wide; a rule whose family this store
   never declared is skipped silently, because it is not this store's

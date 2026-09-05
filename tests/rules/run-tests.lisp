@@ -432,6 +432,46 @@ off; the report names the rule, not the budget."
                  (claim ?c rt-claim "host" ?h "hosts-web" ?a ?b)
                  (claim-producer ?c "rule/hosts-web")))))))
 
+(defparameter *runs-db-body*
+  "(claim ?p rt-claim \"host\" ?h \"runs\" \"app\" \"db\")")
+
+(test run-rules-runs-a-reader-after-every-producer-of-its-relation
+  "Two rules derive \"hosted-on\" -- \"db-hosts\" h1 alone, the
+def-rule \"web-hosts\" h1 and h2 -- and \"hosts-web\" reads it.
+Scheduling the reader once ONE producer has run would hand it h1 only;
+it must wait for both.  The second producer is a DEF-RULE because
+RULES-IN-SCOPE appends the image's rules after the store's, which puts
+the reader ahead of it in the pending set whatever order MAP-VERTICES
+gives the stored two -- so the schedule under test is deterministic."
+  (with-rules-graph (g)
+    (seed g)
+    (graph-db.rules:def-rule "web-hosts" :version "1" :family rt-claim
+      :head *web-hosts-head* :body *web-hosts-body*)
+    (unwind-protect
+         (progn
+           (write-rule g :name "db-hosts" :version "1"
+                       :family "rt-claim"
+                       :head *web-hosts-head* :body *runs-db-body*)
+           (write-rule g :name "hosts-web" :version "1"
+                       :family "rt-claim"
+                       :head *hosts-web-head* :body *hosts-web-body*)
+           (let ((reports (graph-db.rules:run-rules g)))
+             (is (equal '("db-hosts" "web-hosts" "hosts-web")
+                        (mapcar #'graph-db.rules:rule-report-rule-name
+                                reports)))
+             (is (= 1 (graph-db.rules:rule-report-derived
+                       (report-named "db-hosts" reports))))
+             (is (= 2 (graph-db.rules:rule-report-derived
+                       (report-named "web-hosts" reports))))
+             ;; h2 reaches the reader only through the second producer.
+             (is (= 2 (graph-db.rules:rule-report-derived
+                       (report-named "hosts-web" reports))))
+             (is (equal '("h1" "h2")
+                        (sort (mapcar #'claim-subject-key
+                                      (derived g 'rt-claim "hosts-web"))
+                              #'string<)))))
+      (graph-db.rules:undef-rule "web-hosts"))))
+
 (defparameter *derives-x*
   "(claim ?c rt-claim \"app\" \"web\" \"x\" \"host\" ?h)")
 (defparameter *reads-x*

@@ -424,23 +424,24 @@ store's rule, and its text names types this schema does not have."
       (%graph-declares-p graph (rule-spec-family spec))))
 
 (defun %dependency-order (compiled-rules)
-  "COMPILED-RULES sorted so a rule runs after every rule deriving a
-relation it reads (spec §7).  Cycles were refused at compile, so this
-terminates; ties keep the input order."
+  "COMPILED-RULES sorted so a rule runs after EVERY rule deriving a
+relation it reads (spec §7).  Ready means no rule still PENDING derives
+anything it reads: one producer of a relation having run is not enough,
+since a reader scheduled between two producers of one relation sees
+half its premises.  Cycles were refused at compile, so a pending set
+always holds a ready rule; ties keep the input order."
   (let ((pending (copy-list compiled-rules))
-        (done '())
-        (derived '()))
+        (done '()))
     (loop while pending do
       (let ((ready (find-if
                     (lambda (c)
                       (let ((reads (compiled-rule-reads c)))
                         (every (lambda (r)
-                                 (or (member r derived :test #'string=)
-                                     (notany
-                                      (lambda (o)
-                                        (string=
-                                         r (compiled-rule-relation o)))
-                                      pending)))
+                                 (notany
+                                  (lambda (o)
+                                    (string=
+                                     r (compiled-rule-relation o)))
+                                  pending))
                                (if (eq reads :any) '() reads))))
                     pending)))
         (unless ready
@@ -450,8 +451,7 @@ compiler should have refused."
                            (rule-spec-name (compiled-rule-spec c)))
                          pending)))
         (setf pending (remove ready pending))
-        (push ready done)
-        (pushnew (compiled-rule-relation ready) derived :test #'string=)))
+        (push ready done)))
     (nreverse done)))
 
 (defun run-rules (graph)
