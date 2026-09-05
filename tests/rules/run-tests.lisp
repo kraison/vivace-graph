@@ -773,7 +773,9 @@ an attempt must start from zero.  Staging a real conflict is not cheap;
 two %DERIVE calls in one transaction exercise the same accumulation.
 They are not a literal retry -- CLAIMS-BY-PRODUCER overlays the open
 transaction's writes (GH #324), so the second call KEEPS what the first
-derived -- but four counts over two claims is exactly the bug."
+derived -- but four counts over two claims is exactly the bug.
+Evaluation is the caller's since S3-P2, so one %DESIRED and two
+%DERIVEs is now literally the retry shape a cross-store run takes."
   (with-rules-graph (g)
     (seed g)
     (let* ((r (write-web-hosts g))
@@ -781,9 +783,11 @@ derived -- but four counts over two claims is exactly the bug."
            (report (graph-db.rules::%make-rule-report
                     :rule-name "web-hosts" :version "1")))
       (with-transaction ((graph-db::transaction-manager g))
-        (graph-db.rules::%derive compiled g report)
-        (is (= 2 (graph-db.rules:rule-report-derived report)))
-        (graph-db.rules::%derive compiled g report))
+        (multiple-value-bind (desired order)
+            (graph-db.rules::%desired compiled g report)
+          (graph-db.rules::%derive compiled g report desired order)
+          (is (= 2 (graph-db.rules:rule-report-derived report)))
+          (graph-db.rules::%derive compiled g report desired order)))
       (is (= 0 (graph-db.rules:rule-report-derived report)))
       (is (= 2 (graph-db.rules:rule-report-kept report)))
       (is (= 2 (length (derived g 'rt-claim "web-hosts")))))))
