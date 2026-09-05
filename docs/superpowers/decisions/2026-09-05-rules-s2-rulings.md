@@ -194,6 +194,17 @@ the spec asked for.
 re-derived is kept retracted, not re-asserted — a retraction is
 someone's deliberate act; the operator deletes it and reruns.
 
+That cost analysis was incomplete, and the branch review found it
+(2026-09-05, final review): keeping refreshed only `rule-version`, so a
+kept claim's **validity extent** stayed at the value it was first
+derived with — a premise's end closing, an extent change under
+`:premises` in a non-temporal family, or a rule moved from
+`:extent-policy :none` to `:premises` all left the store silently
+stale, the rerun reporting `kept N, derived 0` and changing nothing.
+Closed by `%refresh-kept`, which compares the derivation's extent
+against `claim-extent-sexp` and brings version and extent over in one
+`copy`/`save` (#331).
+
 ### P11 (from recon C5) — two solutions differing only in extent KIND collapse
 
 **Decision.** The dedupe key uses the extent *start* alone for a
@@ -502,3 +513,29 @@ stale wording; its body corrects it, and the history is not being
 rewritten.
 
 **Cost if wrong.** None.
+
+---
+
+## Taken in the final review
+
+### F-R1 — spec §11's `def-unique` refusal is reachable only through a store's own declaration
+
+**Decision.** Spec §11 asks for a `unique-constraint-violation` to be
+reported like any other commit refusal, and it is; but under P10 a run
+cannot collide with *itself*. The dedupe key is the family's unique
+tuple less the producer, which is constant for one rule, so two
+solutions that would collide are one identity before anything is
+constructed. The refusal is therefore reachable only where the store
+declared uniqueness the family does not have of its own. The suite
+declares exactly that — `rtu-claim` with one object per (subject,
+relation) — and the test asserts the report's tag is the family and
+its text names the constraint.
+
+**Evidence.** `%dedupe-key` / `%existing-key` (`rules/run.lisp`)
+against `def-claim-classes`' `claim-binary-identity`
+(`spacetime/claim.lisp`): the same slots, minus `producer`.
+
+**Cost if wrong.** None to the code — the refusal path is the generic
+`constraint-violation` one either way. The cost is to the record: a
+reader who takes spec §11 at face value would look for a collision a
+rule can cause on its own, and there is none.

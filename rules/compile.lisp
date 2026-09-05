@@ -92,7 +92,8 @@ CONSTRAINT-VIOLATION, because a RULE write is refused at commit with it
 HEAD-* are the head's argument terms -- a keyword (namespace), a string
 (key or relation), NIL, or a body variable.  VARS is SELECT's variable
 list, PREMISE-VARS the ?c of every body CLAIM/7 goal, READS the
-relations the body reads or :ANY."
+relations the body reads -- never :ANY, which %CHECK-CYCLE refuses
+before this struct is built."
   spec family relation
   head-c head-sns head-skey head-ons head-okey unary-p
   vars premise-vars goals reads)
@@ -101,6 +102,14 @@ relations the body reads or :ANY."
 
 (defun %variable-p (x)
   (graph-db::variable-p x))
+
+(defun %term-label (x)
+  "X as the rule's author wrote it, for a refusal: a symbol bare and
+downcased, since ~S would spell out the guard's scratch package.  The
+guard's own %TERM-LABEL (query/guard.lisp) reads the same."
+  (if (and x (symbolp x))
+      (string-downcase (symbol-name x))
+      (format nil "~S" x)))
 
 (defun %engine-goal-p (goal name arity)
   "GOAL is a call of the functor NAME/ARITY, by the canonical symbol the
@@ -183,7 +192,15 @@ variable, not ~(~A~)" what term))))
         (t (%refuse spec "~A key must be a string or a body variable, ~
 not ~(~A~)" what term))))
 
-(defun %parse-head (spec head body-vars)
+(defun %check-not-premise (spec term premise-vars what)
+  "Refuse a head namespace or key bound to a body premise's ?c: that
+variable names a claim NODE, which is never a namespace or a key, so
+the rule is refused at compile rather than at run (#331)."
+  (when (and (%variable-p term) (member term premise-vars))
+    (%refuse spec "the head's ~A ~A is a body premise, and a premise ~
+names a claim, not a namespace or a key" what (%term-label term))))
+
+(defun %parse-head (spec head body-vars premise-vars)
   "The head's seven arguments checked against spec §6; returns a plist
 of the COMPILED-RULE head slots."
   (unless (%engine-goal-p head "CLAIM" 7)
@@ -193,7 +210,8 @@ of the COMPILED-RULE head slots."
                  head)))
   (destructuring-bind (?c fam sns skey rel ons okey) (rest head)
     (unless (%variable-p ?c)
-      (%refuse spec "the head's ?c must be an unbound variable, not ~S" ?c))
+      (%refuse spec "the head's ?c must be an unbound variable, not ~A"
+               (%term-label ?c)))
     (when (member ?c body-vars)
       (%refuse spec "the head's ?c ~(~A~) must not appear in the body"
                ?c))
@@ -207,7 +225,11 @@ family ~A" fam (rule-spec-family spec)))
       (unless (and (stringp rel)
                    (graph-db.spacetime:canonical-relation-p rel))
         (%refuse spec "the head's relation must be a canonical string, ~
-not ~S" rel))
+not ~A" (%term-label rel)))
+      (%check-not-premise spec sns premise-vars "subject namespace")
+      (%check-not-premise spec skey premise-vars "subject key")
+      (%check-not-premise spec ons premise-vars "object namespace")
+      (%check-not-premise spec okey premise-vars "object key")
       (let ((unary (and (null ons) (null okey))))
         (when (and (not unary) (or (null ons) (null okey)))
           (%refuse spec "the head's object pair must be both NIL ~
@@ -377,9 +399,9 @@ stored rule and a DEF-RULE is a collision, refused."
         (%check-no-bare-var spec head)
         (when (null body)
           (%refuse spec "the body is empty"))
-        (let* ((parsed (%parse-head spec head body-vars))
+        (let* ((premise-vars (%premise-vars body))
+               (parsed (%parse-head spec head body-vars premise-vars))
                (reads (%body-reads body))
-               (premise-vars (%premise-vars body))
                (head-vars (remove-if-not #'%variable-p
                                          (list (getf parsed :head-sns)
                                                (getf parsed :head-skey)

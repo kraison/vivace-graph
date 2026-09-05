@@ -176,15 +176,42 @@ name nothing defines."
                                       (symbol-name class))
                          (symbol-package class)))))
 
-(defun %refresh-version (claim version)
-  "CLAIM's RULE-VERSION brought to VERSION by copy and save when it
-differs; the saved copy, else CLAIM."
-  (if (equal version (graph-db.spacetime:claim-rule-version claim))
-      claim
-      (let ((c (graph-db:copy claim)))
-        (setf (graph-db.spacetime:claim-rule-version c) version)
-        (graph-db:save c)
-        c)))
+(defun %extent-sexp-key (sexp)
+  "SEXP with its timestamps rendered as EQUAL-comparable triples: a
+LOCAL-TIME:TIMESTAMP is a CLOS object, so two equivalent stored extents
+are EQUAL -- and EQUALP -- only when EQ (%TIMESTAMP-KEY's reason,
+spacetime/claim.lisp)."
+  (cond ((typep sexp 'local-time:timestamp)
+         (graph-db.spacetime::%timestamp-key sexp))
+        ((consp sexp) (cons (%extent-sexp-key (car sexp))
+                            (%extent-sexp-key (cdr sexp))))
+        (t sexp)))
+
+(defun %refresh-kept (claim version extent)
+  "CLAIM brought to the current derivation's VERSION and EXTENT by ONE
+copy and save when either differs; the saved copy, else CLAIM.  EXTENT
+is what this run would derive, NIL under :EXTENT-POLICY :NONE and for a
+DERIVED-FROM record.  A kept temporal claim's extent START cannot move
+-- the dedupe key carries it -- but its END can, and a refreshed extent
+can then overlap a sibling run, which %VALIDATE-EXTENT-DISJOINTNESS
+refuses at commit like any other (#331, docs/rules.md)."
+  (let* ((sexp (and extent (graph-db.spacetime:extent->sexp extent)))
+         (extent-moved
+           (not (equal (%extent-sexp-key sexp)
+                       (%extent-sexp-key
+                        (graph-db.spacetime:claim-extent-sexp claim)))))
+         (version-moved
+           (not (equal version
+                       (graph-db.spacetime:claim-rule-version claim)))))
+    (if (not (or extent-moved version-moved))
+        claim
+        (let ((c (graph-db:copy claim)))
+          (when version-moved
+            (setf (graph-db.spacetime:claim-rule-version c) version))
+          (when extent-moved
+            (setf (graph-db.spacetime:claim-extent c) extent))
+          (graph-db:save c)
+          c))))
 
 (defun %desired (compiled graph report)
   "The derivation the body asks for (spec §7.3): (VALUES TABLE ORDER),
@@ -247,9 +274,10 @@ REPORT and dropped."
 
 (defun %reconcile-claims (compiled graph report desired order)
   "Ruling P10, inside the transaction: the producer's existing claims
-kept when re-derived (version refreshed), deleted when not; new
-identities constructed.  => an alist of (dedupe key . claim) for every
-claim of the derivation that now stands."
+kept when re-derived -- with the version AND the extent this run
+derives, since neither is part of every identity -- deleted when not;
+new identities constructed.  => an alist of (dedupe key . claim) for
+every claim of the derivation that now stands."
   ;; CLAIMS-BY-PRODUCER overlays the open transaction's writes (GH
   ;; #324), so the producer's claims must be read BEFORE this function
   ;; writes any: the reconcile compares against the committed set.
@@ -269,7 +297,14 @@ claim of the derivation that now stands."
                     (not (gethash key seen)))
                (incf (rule-report-kept report))
                (setf (gethash key seen) t)
-               (push (cons key (%refresh-version c version)) standing))
+               ;; The extent %DESIRED holds for this key, i.e. the FIRST
+               ;; solution's where several collapsed (ruling T4-R3) --
+               ;; what a fresh construction would have used.
+               (push (cons key (%refresh-kept
+                                c version
+                                (getf (car (gethash key desired))
+                                      :extent)))
+                     standing))
               (t
                (graph-db:mark-deleted c)
                (incf (rule-report-swept report))))))
@@ -314,7 +349,9 @@ refreshed."
                           (graph-db.spacetime:claim-relation r))
                  (eq t (gethash pair wanted)))
             (progn (setf (gethash pair wanted) :kept)
-                   (%refresh-version r version))
+                   ;; No extent on a DERIVATION record, ever; NIL never
+                   ;; differs from the NIL it stores.
+                   (%refresh-kept r version nil))
             (graph-db:mark-deleted r))))
     (maphash (lambda (pair state)
                (when (eq state t)
@@ -328,7 +365,15 @@ refreshed."
 
 (defun %derive (compiled graph report)
   "Spec §7 as ruling P10 has it, inside the transaction: evaluate, then
-reconcile the claims and their provenance against what stands."
+reconcile the claims and their provenance against what stands.  The
+four counts are REPORT's, so an attempt starts by clearing them:
+CALL-WITH-TRANSACTION re-invokes its thunk on VALIDATION-CONFLICT
+(*MAXIMUM-TRANSACTION-ATTEMPTS*, transactions.lisp) and a retry must
+report what it did, not what it and every earlier attempt did."
+  (setf (rule-report-derived report) 0
+        (rule-report-kept report) 0
+        (rule-report-swept report) 0
+        (rule-report-disjoint-premises report) 0)
   (multiple-value-bind (desired order) (%desired compiled graph report)
     (let ((standing (%reconcile-claims compiled graph report desired
                                        order)))
@@ -449,13 +494,17 @@ always holds a ready rule; ties keep the input order."
       (let ((ready (find-if
                     (lambda (c)
                       (let ((reads (compiled-rule-reads c)))
+                        (when (eq reads :any)
+                          (error "RUN-RULES: compile-rule admits no ~
+:any reads, but ~S has them."
+                                 (rule-spec-name (compiled-rule-spec c))))
                         (every (lambda (r)
                                  (notany
                                   (lambda (o)
                                     (string=
                                      r (compiled-rule-relation o)))
                                   pending))
-                               (if (eq reads :any) '() reads))))
+                               reads)))
                     pending)))
         (unless ready
           (error "RUN-RULES: no runnable rule among ~S -- a cycle the ~
@@ -520,11 +569,12 @@ when nothing in the store has that identity now."
 (defun premises-of (graph claim)
   "The claims CLAIM was derived from (spec §9): its DERIVED-FROM records'
 objects, resolved back to claims.  A premise whose identity no longer
-exists in the store is dropped."
+exists in the store is dropped, and a DERIVATION record of any other
+relation is not provenance and is not read."
   (let ((records (graph-db.spacetime:claims-touching
                   graph 'derivation :claim
                   (graph-db.spacetime:claim-identity-key claim)
-                  :role :subject)))
+                  :role :subject :relation "derived-from")))
     (remove nil (mapcar (lambda (r)
                           (%claim-by-identity-key
                            graph (graph-db.spacetime:claim-object-key r)))
@@ -532,12 +582,13 @@ exists in the store is dropped."
 
 (defun dependents-of (graph claim &key current)
   "Every derived claim whose provenance names CLAIM (spec §9) -- one
-CLAIMS-TOUCHING on the object endpoint, then the subjects resolved.  With
-CURRENT, only dependents still believed.  Nothing is re-derived."
+CLAIMS-TOUCHING on the object endpoint, DERIVED-FROM records only, then
+the subjects resolved.  With CURRENT, only dependents still believed.
+Nothing is re-derived."
   (let* ((records (graph-db.spacetime:claims-touching
                    graph 'derivation :claim
                    (graph-db.spacetime:claim-identity-key claim)
-                   :role :object))
+                   :role :object :relation "derived-from"))
          (claims (remove nil
                          (mapcar
                           (lambda (r)

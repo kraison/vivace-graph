@@ -31,6 +31,18 @@
 (def-claim-classes rt-claim :graph-db-rules-test)
 (def-claim-classes rtt-claim :graph-db-rules-test :temporal t)
 
+;; Ruling F-R1: a run cannot collide with its own dedupe key, so spec
+;; §11's unique refusal needs a constraint the STORE declared on top of
+;; the family's own -- here one object per (subject, relation), which a
+;; rule deriving two objects for one subject breaks.
+(def-claim-classes rtu-claim :graph-db-rules-test)
+
+(graph-db:def-unique rtu-claim-binary
+    (graph-db.spacetime::subject-namespace
+     graph-db.spacetime::subject-key
+     graph-db.spacetime::relation)
+  :graph-db-rules-test :name rtu-one-object-per-subject)
+
 ;; R22's skip path, committed: *CLAIM-FAMILIES* is image-wide, so a
 ;; family declared on a graph name this suite never opens is registered
 ;; in it and indexed in no graph here -- which is the case

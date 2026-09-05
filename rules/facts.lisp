@@ -164,7 +164,9 @@ refused as cost-unbounded under a resource bound (GH #285, spec §4)."
   "X is an unbound Prolog variable -- not a bound NIL, which
 %PROLOG-INDEX-BOUND folds into the same value (S1's deferred gate,
 docs/superpowers/decisions/2026-09-04-rules-s1-rulings.md)."
-  (let ((v x)) (var-p (var-deref v))))
+  ;; VAR-DEREF writes the place it is given; here that place is this
+  ;; function's own parameter binding, as in PRINT-VAR (prologc.lisp).
+  (var-p (var-deref x)))
 
 (defun %claim-arg (x)
   "X's value when it is a node, else NIL -- every CLAIM-* filter fails on

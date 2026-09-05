@@ -686,3 +686,157 @@ which is also why the keep is restricted to \"derived-from\"."
         (is (every (lambda (rec)
                      (string= "derived-from" (claim-relation rec)))
                    after))))))
+
+;;; The whole-branch review's findings (#331)
+
+(defun host-version-of (g host ver)
+  "The claim \"host-version\" derived for HOST and version VER."
+  (find-if (lambda (c) (and (string= host (claim-subject-key c))
+                            (string= ver (claim-object-key c))))
+           (derived g 'rtt-claim "host-version")))
+
+(test a-kept-claims-extent-follows-its-premises
+  "A kept claim's validity is re-read from the current derivation, not
+left at the value it was first derived with.  The dedupe key carries
+the extent START, so h2's deployment ending May 15 rather than May 31
+is the SAME identity -- kept, same node -- and the derived claim's end
+must move with it."
+  (with-rules-graph (g)
+    (seed g)
+    (seed-temporal g)
+    (let ((r (write-host-version g)))
+      (graph-db.rules:run-rule g r)
+      (let ((before (graph-db:id (host-version-of g "h2" "2")))
+            (premise (find "h2"
+                           (claims-touching g 'rtt-claim :app "web"
+                                            :role :subject
+                                            :relation "deployed-on")
+                           :key #'claim-object-key :test #'string=)))
+        (with-transaction ((graph-db::transaction-manager g))
+          (let ((c (copy premise)))
+            (setf (claim-extent c)
+                  (interval (ts 2026 5 1) (ts 2026 5 15)))
+            (save c)))
+        (let ((report (graph-db.rules:run-rule g r)))
+          (is (= 4 (graph-db.rules:rule-report-kept report)))
+          (is (= 0 (graph-db.rules:rule-report-derived report)))
+          (is (= 0 (graph-db.rules:rule-report-swept report))))
+        (let ((after (host-version-of g "h2" "2")))
+          (is-true after)
+          (when after
+            (is (equalp before (graph-db:id after)))
+            (is (local-time:timestamp=
+                 (ts 2026 5 15)
+                 (nth-value 1 (claim-bounds after))))))))))
+
+(test a-policy-change-refreshes-kept-claims
+  "The extent policy is part of the derivation, so a rule moved from
+:NONE to :PREMISES must give its KEPT claims the extent they would now
+be derived with.  On SEED and SEED-TEMPORAL's six solutions :NONE
+derives the four distinct (host, version) pairs with no extent;
+:PREMISES drops the two disjoint solutions -- h1's August run against
+version 1, h2's May run against version 1 -- and the remaining four
+collapse to three pairs, rt-claim's identity ignoring the extent.  So
+(h2, 1) is swept and the other three are kept, each with an extent and
+the new version."
+  (with-rules-graph (g)
+    (seed g)
+    (seed-temporal g)
+    (let ((r (write-rule g :name "hv-flat" :version "1"
+                         :family "rt-claim" :extent-policy :none
+                         :head *hv-flat-head*
+                         :body *host-version-body*)))
+      (is (= 4 (graph-db.rules:rule-report-derived
+                (graph-db.rules:run-rule g r))))
+      (is (every (lambda (c) (null (claim-extent c)))
+                 (derived g 'rt-claim "hv-flat")))
+      (with-transaction ((graph-db::transaction-manager g))
+        (let ((c (copy r)))
+          (setf (graph-db.rules:rule-extent-policy c) :premises
+                (graph-db.rules:rule-version c) "2")
+          (save c)))
+      (let ((report (graph-db.rules:run-rule g "hv-flat")))
+        (is (= 3 (graph-db.rules:rule-report-kept report)))
+        (is (= 1 (graph-db.rules:rule-report-swept report)))
+        (is (= 0 (graph-db.rules:rule-report-derived report)))
+        (is (= 2 (graph-db.rules:rule-report-disjoint-premises report))))
+      (let ((claims (derived g 'rt-claim "hv-flat")))
+        (is (= 3 (length claims)))
+        (is (every #'claim-extent claims))
+        (is (every (lambda (c) (string= "2" (claim-rule-version c)))
+                   claims))))))
+
+(test the-reports-counts-are-per-attempt-not-cumulative
+  "CALL-WITH-TRANSACTION re-invokes its thunk on VALIDATION-CONFLICT
+(transactions.lisp) and %DERIVE INCFs the report the caller holds, so
+an attempt must start from zero.  Staging a real conflict is not cheap;
+two %DERIVE calls in one transaction exercise the same accumulation.
+They are not a literal retry -- CLAIMS-BY-PRODUCER overlays the open
+transaction's writes (GH #324), so the second call KEEPS what the first
+derived -- but four counts over two claims is exactly the bug."
+  (with-rules-graph (g)
+    (seed g)
+    (let* ((r (write-web-hosts g))
+           (compiled (graph-db.rules:compile-rule g r))
+           (report (graph-db.rules::%make-rule-report
+                    :rule-name "web-hosts" :version "1")))
+      (with-transaction ((graph-db::transaction-manager g))
+        (graph-db.rules::%derive compiled g report)
+        (is (= 2 (graph-db.rules:rule-report-derived report)))
+        (graph-db.rules::%derive compiled g report))
+      (is (= 0 (graph-db.rules:rule-report-derived report)))
+      (is (= 2 (graph-db.rules:rule-report-kept report)))
+      (is (= 2 (length (derived g 'rt-claim "web-hosts")))))))
+
+(test the-provenance-reads-see-derived-from-records-only
+  "PREMISES-OF and DEPENDENTS-OF filter the producer's records on
+\"derived-from\": a record of another relation under the same producer
+is not provenance.  The next run sweeps it (the test above), so this
+asks before rerunning."
+  (with-rules-graph (g)
+    (seed g)
+    (let ((r (write-web-hosts g)))
+      (graph-db.rules:run-rule g r)
+      (let* ((claims (derived g 'rt-claim "web-hosts"))
+             (h1 (find "h1" claims :key #'claim-object-key
+                                   :test #'string=))
+             (h2 (find "h2" claims :key #'claim-object-key
+                                   :test #'string=)))
+        ;; One intruder, h2's key as subject and h1's as object, so it
+        ;; lies on the path of both reads at once.
+        (with-transaction ((graph-db::transaction-manager g))
+          (graph-db.rules::make-derivation-binary
+           :graph g :subject-namespace :claim
+           :subject-key (claim-identity-key h2)
+           :relation "annotates" :object-namespace :claim
+           :object-key (claim-identity-key h1)
+           :producer "rule/web-hosts" :rule-version "1"
+           :standing :inferred))
+        (is (= 3 (length (claims-by-producer
+                          g 'graph-db.rules:derivation
+                          "rule/web-hosts"))))
+        (let ((premises (graph-db.rules:premises-of g h2)))
+          (is (= 1 (length premises)))
+          (is (string= "runs" (claim-relation (first premises)))))
+        (is (null (graph-db.rules:dependents-of g h1)))))))
+
+(defparameter *rtu-hosts-head*
+  "(claim ?c rtu-claim \"app\" \"web\" \"hosted-on\" \"host\" ?h)")
+
+(test a-stores-own-def-unique-refuses-the-derivation
+  "Ruling F-R1, spec §11's refusal half: under P10 a run cannot collide
+with its own tuple, so a UNIQUE-CONSTRAINT-VIOLATION reaches RUN-RULE
+only through a constraint the store declared itself.  RTU-CLAIM carries
+one object per (subject, relation) (tests/rules/suite.lisp); this rule
+derives two, h1 and h2."
+  (with-rules-graph (g)
+    (seed g)
+    (let ((report (graph-db.rules:run-rule
+                   g (write-rule g :name "rtu-hosts" :version "1"
+                                 :family "rtu-claim"
+                                 :head *rtu-hosts-head*
+                                 :body *web-hosts-body*))))
+      (is (eq :refused (graph-db.rules:rule-report-outcome report)))
+      (is (eq 'rtu-claim (refusal-tag report)))
+      (is (search "unique" (refusal-text report) :test #'char-equal))
+      (is (null (derived g 'rtu-claim "rtu-hosts"))))))

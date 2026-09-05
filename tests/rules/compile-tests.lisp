@@ -39,6 +39,8 @@
   "(claim ?c rt-claim \"host\" ?h \"scanned\" \"app\" ?a)")
 (defparameter *head-bare-c*
   "(claim ? rt-claim \"app\" \"web\" \"x\" \"host\" ?h)")
+(defparameter *head-premise-key*
+  "(claim ?c rt-claim \"app\" \"web\" \"x\" \"host\" ?p)")
 
 (defparameter *body-no-functor* "(no-such-functor ?p)")
 (defparameter *body-unregistered*
@@ -109,6 +111,10 @@
            :head *head-free-object* :body *web-hosts-body*)
   (refuses "object" :name "r" :version "1" :family "rt-claim"
            :head *head-half-object* :body *web-hosts-body*)
+  ;; A head key bound to a body premise's ?c: a node is never a key, so
+  ;; the compile refuses it rather than the run (#331).
+  (refuses "premise" :name "r" :version "1" :family "rt-claim"
+           :head *head-premise-key* :body *web-hosts-body*)
   (refuses "namespace" :name "r" :version "1" :family "rt-claim"
            :head *head-bad-namespace* :body *web-hosts-body*))
 

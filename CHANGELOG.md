@@ -45,7 +45,9 @@ between releases; cutting a release renames it to the new version and dates it.
   rule/<name>`, `rule-version`, `standing :inferred`, its validity the
   intersection of its premises' (`extent-intersection`,
   cl-temporal-extent 0.3.0), one `derived-from` claim per premise; a
-  refusal unwinds the whole run and the `rule-report` names it.
+  claim kept from the previous derivation follows the current one --
+  its `rule-version` and its validity extent both -- and a refusal
+  unwinds the whole run, with the `rule-report` naming it.
   `run-rules` runs every enabled rule in dependency order;
   `premises-of` and `dependents-of` read provenance back.
   `docs/rules.md`.

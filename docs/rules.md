@@ -263,6 +263,12 @@ erring: `run-rules` on such a store reports nothing, and `run-rule` by
 name says there is no such rule rather than reaching an index this
 schema does not carry.
 
+Once a store has evaluated it, **`graph-db/rules` must be loaded before
+every later `open-graph` of that store**: `rule` and the `derivation`
+classes are this system's, and a persisted node type with no CLOS class
+in the image is `schema-classes-not-loaded` at open (`schema.lisp`,
+GH #144).
+
 ## Compiling a rule
 
 `graph-db.rules:compile-rule (graph rule &key others)` turns a `rule`
@@ -360,8 +366,16 @@ the body first, then compares the identities it derived against the
 claims `rule/<name>` already holds:
 
 - an identity derived again is **kept** -- the same node, so its id and
-  its version chain survive -- with its `rule-version` refreshed by
-  `copy`/`save` when the rule's version moved;
+  its version chain survive -- with its `rule-version` **and its
+  validity extent** brought to what this run derives, in one
+  `copy`/`save` when either moved. A kept claim's extent follows its
+  premises: a premise's open end that has since closed, an extent
+  change under `:premises` in a non-temporal family, or a rule moved
+  from `:extent-policy :none` to `:premises`, all reach the kept claim
+  rather than waiting for something to sweep it. The extent *start*
+  cannot move -- the dedupe key carries it for a temporal family -- and
+  a refreshed extent that overlaps a sibling run is refused at commit
+  like any other;
 - an identity no longer derived is **swept** (`mark-deleted`);
 - an identity not held before is **derived** (constructed).
 
@@ -472,6 +486,10 @@ longer asked for is deleted. **One record per pair**: the records
 `rule/<name>` holds are the rule's alone, so a second record naming a
 pair already kept, or a record under that producer whose relation is
 not `derived-from`, is swept with them.
+
+Both reads filter the records on `derived-from`, so a `derivation`
+record of another relation -- one a foreign writer left under the
+producer, which the next run sweeps -- is never read as provenance.
 
 - `(premises-of graph claim) => claims` -- the claims `claim` was
   derived from. A premise whose identity no longer exists in the store
