@@ -5769,11 +5769,36 @@ the retention window is reported as a ~reaped-claim~ (test with
 swept by ~delete-claims-by-producer~ is invisible to ~:as-of~; and the
 stamps replicate with the claim, so a device and the hub each answer
 "believed at T" from their *own* applied history — they can differ by
-apply lag, the same footing as any LWW stamp. No argument or result is
-ever an epoch.
+apply lag, the same footing as any LWW stamp. For ~:as-of~, no argument
+or result is an epoch; the epoch axis is ~:as-of-epoch~, below.
 
 One of ~:AT~ or ~:DURING~, not both. A claim with no extent makes no
 validity statement and is excluded by either filter.
+
+~:AS-OF-EPOCH~ (an integer) answers on the same transaction axis by
+*commit epoch* rather than by wall clock (vivace-graph#347): each claim
+comes back as the version whose committing transaction id is the newest
+at or below the epoch, and drops out when that version is retracted — a
+retraction is a version, so its epoch is the retracting transaction's.
+When older versions existed but are past ~:keep-revisions~ the claim is
+a ~reaped-claim~, told apart from "created after the epoch" by the
+oldest retained version's ~revision~ (0 is the create), which is a
+sharper rule than the wall-clock axis has. ~claim-commit-epoch~ reads a
+version's epoch (~NIL~ for a ~reaped-claim~ or a version not yet
+committed — the epoch is assigned at commit, so a claim read inside
+its own open transaction has none). Epochs compare across stores only
+while the stores share one system clock (~open-system-clock~ and
+~make-graph :system-clock~, Chapter 12); a store with no clock signals
+~epoch-axis-unavailable~ — a ~query-precondition-error~ that names the
+graph — rather than answering from its private counter, while ~:as-of~
+on the same store keeps working. One of ~:as-of~ or ~:as-of-epoch~, not
+both. An uncommitted write has no epoch, so ~:as-of-epoch~ answers
+committed history only, as ~:as-of~ does. Index membership is not
+versioned (vivace-graph#345): a claim deleted after the epoch is not
+returned. A claim whose transaction period was already closed when it
+was created — a replicated or restored belief retracted upstream —
+reads as retracted at every epoch. ~claims-by-producer~ takes
+~:as-of-epoch~ the same way.
 
 ~CLAIMS-BY-PRODUCER~ asks the other question: not "what names this endpoint"
 but "what did this rule write". It is the non-destructive twin of
@@ -6582,6 +6607,12 @@ This chapter provides a categorized reference for the most important exported sy
 
 - ~make-graph ( ... :keep-revisions N)~ / ~open-graph ( ... :keep-revisions N)~ ::
   Graph-wide default retained-version count (persisted by ~make-graph~; an optional session override on ~open-graph~).
+
+- ~commit-epoch (node)~ (accessor) ::
+  The id of the transaction that committed this version of ~node~. Transaction ids are globally monotonic, so this doubles as a logical timestamp.
+
+- ~vertex-history (graph id &key limit)~ ::
+  The retained versions of vertex ~id~ in ~graph~, newest first, as ~(version . commit-epoch)~ conses; the live version is always first. Depth is bounded by ~:keep-revisions~. See Chapter 12.
 
 **** Spatial (see Chapter 13)
 

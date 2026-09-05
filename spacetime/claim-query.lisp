@@ -137,6 +137,40 @@ the asked instant, but every version stamped then is past the family's
 (GH #300)."
   id)
 
+(defun claim-commit-epoch (claim)
+  "The epoch of the transaction that committed CLAIM's version, or NIL
+for a REAPED-CLAIM (a version the store no longer holds) and for a
+version not yet committed -- an epoch is assigned at commit, so a claim
+read inside its own open transaction has none.  The number is the
+writer's own TRANSACTION-ID, comparable across stores only while they
+share one SYSTEM-CLOCK -- see GRAPH-DB:GRAPH-SYSTEM-CLOCK (GH #347)."
+  (unless (reaped-claim-p claim)
+    (let ((e (graph-db:commit-epoch claim)))
+      (and (plusp e) e))))
+
+(define-condition epoch-axis-unavailable
+    (graph-db:query-precondition-error)
+  ((graph-name :initarg :graph-name
+               :reader epoch-axis-unavailable-graph-name))
+  (:documentation "An :AS-OF-EPOCH read of a store with no system clock.
+Its epochs are a private counter, so an answer would look like the
+attached case and mean something unrelated (GH #347 recon E9).  The
+parent's REASON is filled at the signal site.  The rules subsystem
+handles QUERY-PRECONDITION-ERROR as \"no facts\"; a reader there that
+ever takes the epoch axis must let this subtype through."))
+
+(defun %refuse-epoch-axis (graph)
+  "Signal EPOCH-AXIS-UNAVAILABLE unless GRAPH is attached to a clock.
+Whether two stores share ONE clock is the consumer's precondition; a
+single-store reader cannot see the other store."
+  (unless (graph-db:graph-system-clock graph)
+    (let ((name (graph-db:graph-name graph)))
+      (error 'epoch-axis-unavailable
+             :graph-name name
+             :reason (format nil "~(~s~) has no system clock; ~
+                                  :as-of-epoch needs one"
+                             name)))))
+
 (defun %claim-effective-stamp (version)
   "VERSION's place on the wall clock: its :AS-OF stamp, else the start of
 its (immutable) transaction extent, else NIL for a claim predating both
@@ -183,6 +217,32 @@ Walks VERTEX-HISTORY newest-first over the family's retained chain."
                 nil)                    ; did not exist yet
                (t (%make-reaped-claim (graph-db:id claim)))))))))
 
+(defun %claim-as-of-epoch (graph claim epoch)
+  "The version of CLAIM live at EPOCH -- committed at or before it and
+not retracted at or before it -- or NIL when there is none (created
+after EPOCH, or retracted by then), or a REAPED-CLAIM when versions of
+that age existed but are past the family's :KEEP-REVISIONS window.
+Walks VERTEX-HISTORY newest-first comparing each version's own commit
+epoch with <=; RESOLVE-VERSION-AT-EPOCH is a strict snapshot-start
+predicate and would drop the commit made AT EPOCH (#347 recon C2, C3).
+A retraction is a version, so CLAIM-CURRENT-P on the selected version
+is the whole retraction test (recon E4).  A claim created with an
+already-closed transaction period -- a replicated or restored belief
+retracted upstream -- reads as retracted at every epoch; there is no
+epoch-to-instant map to probe its period with."
+  (let* ((history (graph-db:vertex-history graph (graph-db:id claim)))
+         (resolved (loop for (version . e) in history
+                         when (<= e epoch) return version)))
+    (cond (resolved (and (claim-current-p resolved) resolved))
+          ((null history) nil)
+          ;; Nothing old enough.  Reaping severs the chain, so only the
+          ;; oldest retained REVISION tells created-after-EPOCH (0: it
+          ;; is the create) from reaped (> 0) -- recon C4.  REVISION is
+          ;; 32-bit and wraps; after 2^32 updates to one claim the
+          ;; discriminator reads a wrapped 0 as the create.
+          ((zerop (graph-db:revision (car (first (last history))))) nil)
+          (t (%make-reaped-claim (graph-db:id claim))))))
+
 (defun %paginate (list limit offset)
   "LIST cut to OFFSET/LIMIT; second value T when entries existed past the
 cut (the REST envelope's one-past-the-cap rule, GH #302)."
@@ -220,7 +280,7 @@ added.  ALL itself outside a transaction.  The commit view is the same
 
 (defun claims-touching (graph claim-class namespace key
                         &key (role :either) current at during
-                             relation limit offset as-of)
+                             relation limit offset as-of as-of-epoch)
   "Claims in GRAPH naming (NAMESPACE, KEY) as subject, object, or either.
 CLAIM-CLASS is the PARENT class name; one call covers both arities.  Answers
 from the claim graph's own indexes -- no cross-graph read, no snapshot, which
@@ -248,6 +308,16 @@ version.  :AT/:DURING then filter the RESOLVED version's validity.  No
 argument or result is an epoch; the mapping is the per-version stamp in
 the claim's own data, so replicas answer from their own applied history.
 
+:AS-OF-EPOCH (an integer) answers on the same axis by commit epoch (GH
+#347): each claim is the version whose committing transaction id is the
+newest at or below it, dropped when that version is retracted, and a
+REAPED-CLAIM when older versions existed but are past :KEEP-REVISIONS
+-- told from \"created after\" by the oldest retained REVISION.  Epochs
+compare across stores only while the stores share one SYSTEM-CLOCK; a
+clockless store signals EPOCH-AXIS-UNAVAILABLE.  One of :AS-OF or
+:AS-OF-EPOCH, not both.  :CURRENT is redundant on this axis: only
+versions still believed are ever selected.
+
 :RELATION (a canonical string) restricts to one relation; on the subject
 side it rides the (subject-namespace subject-key relation) index (GH
 #302), on the object side it filters the endpoint candidates.  :LIMIT /
@@ -257,8 +327,9 @@ more claims existed past the cut (NIL without :LIMIT).
 Inside an open transaction the answer is what THAT transaction will
 commit (GH #324): its own retractions, updates and new claims are
 visible, so retract-then-assert on one series reads correctly before
-the commit.  :AS-OF is the exception -- it answers committed history
-only, since an uncommitted change is not yet history.
+the commit.  :AS-OF and :AS-OF-EPOCH are the exceptions -- they answer
+committed history only; an uncommitted change is not yet history and
+has no epoch at all.
 
 An out-of-range ROLE signals rather than silently returning NIL -- NIL is
 also the correct answer for \"no claims touch this endpoint\", and this
@@ -266,8 +337,12 @@ subsystem exists to keep those two cases from being confused."
   (check-type role (member :subject :object :either))
   (check-type at (or null local-time:timestamp))
   (check-type during (or null temporal-extent))
+  (check-type as-of-epoch (or null unsigned-byte))
   (when (and at during)
     (error "Pass only one of :AT or :DURING, not both."))
+  (when (and as-of as-of-epoch)
+    (error "Pass only one of :AS-OF or :AS-OF-EPOCH, not both."))
+  (when as-of-epoch (%refuse-epoch-axis graph))
   (let* ((probe (cond (at (make-instant (exact-bound at)))
                       (during during)))
          (family (claim-family claim-class))
@@ -291,24 +366,33 @@ subsystem exists to keep those two cases from being confused."
                    (remove-duplicates (append subjects objects)
                                       :key #'graph-db:id :test #'equalp)
                    (or subjects objects))))
-      (if as-of
-          (setf all (loop for c in all
-                          for v = (%claim-as-of graph c as-of)
-                          when v collect v))
-          (setf all (%overlay-transaction
-                     graph all family
-                     (lambda (c)
-                       (or (and (member role '(:subject :either))
-                                (equal namespace
-                                       (claim-subject-namespace c))
-                                (equal key (claim-subject-key c))
-                                (or (null relation)
-                                    (equal relation (claim-relation c))))
-                           (and (member role '(:object :either))
-                                (typep c (claim-family-binary family))
-                                (equal namespace
-                                       (claim-object-namespace c))
-                                (equal key (claim-object-key c))))))))
+      ;; The overlay is for the neither-axis arm only: an uncommitted
+      ;; write has no epoch (#347 recon C6).
+      (cond (as-of
+             (setf all (loop for c in all
+                             for v = (%claim-as-of graph c as-of)
+                             when v collect v)))
+            (as-of-epoch
+             (setf all (loop for c in all
+                             for v = (%claim-as-of-epoch graph c
+                                                         as-of-epoch)
+                             when v collect v)))
+            (t
+             (setf all (%overlay-transaction
+                        graph all family
+                        (lambda (c)
+                          (or (and (member role '(:subject :either))
+                                   (equal namespace
+                                          (claim-subject-namespace c))
+                                   (equal key (claim-subject-key c))
+                                   (or (null relation)
+                                       (equal relation
+                                              (claim-relation c))))
+                              (and (member role '(:object :either))
+                                   (typep c (claim-family-binary family))
+                                   (equal namespace
+                                          (claim-object-namespace c))
+                                   (equal key (claim-object-key c)))))))))
       (when current
         (setf all (remove-if-not (lambda (c)
                                    (or (reaped-claim-p c)
@@ -418,7 +502,7 @@ Returns the saved copy, or CLAIM itself when nothing was written."
           (t (graph-db:with-transaction () (%retract))))))
 
 (defun claims-by-producer (graph claim-class producer
-                           &key limit offset as-of)
+                           &key limit offset as-of as-of-epoch)
   "Every live claim PRODUCER wrote, both arities.  CLAIM-CLASS is the PARENT,
 so one call covers unary and binary -- the same contract as this function's
 destructive twin, DELETE-CLAIMS-BY-PRODUCER.
@@ -432,19 +516,32 @@ NIL means PRODUCER has written nothing, which is a real answer.  An
 unregistered CLAIM-CLASS signals UNKNOWN-CLAIM-FAMILY instead, so \"no such
 family\" and \"that family, nothing produced\" stay distinguishable.
 
+:AS-OF and :AS-OF-EPOCH resolve each claim to the version believed at
+a wall-clock instant or live at a commit epoch, exactly as
+CLAIMS-TOUCHING does (GH #300, GH #347); one or the other, not both.
+
 Uses the PRODUCER index, so this is O(matching) rather than a scan of every
 claim.  :LIMIT / :OFFSET cut the result; the second return value is T
 when more claims existed past the cut (NIL without :LIMIT) (GH #302)."
+  (check-type as-of-epoch (or null unsigned-byte))
+  (when (and as-of as-of-epoch)
+    (error "Pass only one of :AS-OF or :AS-OF-EPOCH, not both."))
+  (when as-of-epoch (%refuse-epoch-axis graph))
   (let* ((family (claim-family claim-class))
          (all (graph-db:index-lookup graph (claim-family-parent family)
                                      '(producer) producer)))
-    (if as-of
-        (setf all (loop for c in all
-                        for v = (%claim-as-of graph c as-of)
-                        when v collect v))
-        (setf all (%overlay-transaction
-                   graph all family
-                   (lambda (c) (equal producer (claim-producer c))))))
+    (cond (as-of
+           (setf all (loop for c in all
+                           for v = (%claim-as-of graph c as-of)
+                           when v collect v)))
+          (as-of-epoch
+           (setf all (loop for c in all
+                           for v = (%claim-as-of-epoch graph c as-of-epoch)
+                           when v collect v)))
+          (t
+           (setf all (%overlay-transaction
+                      graph all family
+                      (lambda (c) (equal producer (claim-producer c)))))))
     (%paginate all limit offset)))
 
 (defun delete-claims-by-producer (graph claim-class producer)

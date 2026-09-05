@@ -13,6 +13,24 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Added
 
+- **`claims-touching`/`claims-by-producer` `:as-of-epoch`** (#347): a
+  second resolution axis alongside `:as-of`, answering by *commit
+  epoch* rather than by wall clock -- each claim comes back as the
+  version live at that commit epoch (inclusive comparison: the version
+  whose committing transaction id is newest at or below it), told from
+  "created after the epoch" versus reaped past `:keep-revisions` by
+  the oldest retained version's `revision`. New export
+  `graph-db.spacetime:claim-commit-epoch` reads a version's commit
+  epoch off the newly exported `graph-db:commit-epoch`. Epochs compare
+  across stores only while they share one `system-clock`; a clockless
+  store refuses the axis with `epoch-axis-unavailable`, a
+  `query-precondition-error` subtype, while `:as-of` on the same store
+  keeps answering. Two bounds, documented rather than fixed: index
+  membership is not snapshot-versioned (#345), so a claim deleted
+  after the epoch is not returned; and a claim born with an
+  already-closed transaction period -- a replicated or restored belief
+  retracted upstream -- reads as retracted at every epoch.
+
 - **`graph-db/rules`, claims as Prolog facts** (#304, #330): a new
   subsystem, `:depends-on (:graph-db/spacetime :graph-db/query)`,
   registering seven global Prolog functors -- `claim/7`,

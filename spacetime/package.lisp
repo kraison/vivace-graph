@@ -55,6 +55,9 @@
    #:split-claim-identity-key                          ; GH #321
    #:malformed-claim-identity-key
    #:claim-version-stamp                               ; GH #300
+   #:claim-commit-epoch                                ; GH #347
+   #:epoch-axis-unavailable                            ; GH #347
+   #:epoch-axis-unavailable-graph-name
    #:reaped-claim #:reaped-claim-p #:reaped-claim-id   ; GH #300
    #:claim-transaction-extent-sexp                     ; GH #148
    #:claim-transaction-extent #:claim-recorded-at

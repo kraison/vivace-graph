@@ -364,6 +364,8 @@
            #:lookup-edge
            ;; MVCC: public read path over the versions KEEP-REVISIONS retains
            #:vertex-history
+           ;; MVCC: a version's committing epoch (GH #347)
+           #:commit-epoch
            #:to
            #:from
            #:weight
