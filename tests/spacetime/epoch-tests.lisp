@@ -170,3 +170,106 @@ and :AT apply to the RESOLVED version exactly as they do under :AS-OF."
                                         :role :subject
                                         :as-of-epoch e2 :at (ts 2022 5 1)
                                         :current t)))))))
+
+(test as-of-epoch-tells-reaped-from-created-after
+  "#347 recon C4: with :KEEP-REVISIONS 1, the E1 version of a claim
+updated twice is reaped -> REAPED-CLAIM; a claim created AFTER E1 in
+the same store -> NIL.  Both exhaust the chain identically; only the
+oldest retained REVISION tells them apart, so the second case is the
+non-vacuity control for the first."
+  (with-clocked-stores (a b)
+    (let ((e1 (%tx a (lambda () (%unary a #'make-ek-claim-unary "kr")))))
+      (dotimes (i 2)
+        (%tx a (lambda ()
+                 (let ((k (graph-db:copy (%one a 'ek-claim "kr"))))
+                   (setf (claim-confidence k) (* 0.1 (1+ i)))
+                   (graph-db:save k)))))
+      (%tx a (lambda () (%unary a #'make-ek-claim-unary "late")))
+      (let ((then (claims-touching a 'ek-claim :region "kr" :role :subject
+                                   :as-of-epoch e1)))
+        (is (= 1 (length then)))
+        (is (reaped-claim-p (first then))
+            "the E1 version is past the window: reaped, not substituted")
+        (is (equalp (id (%one a 'ek-claim "kr"))
+                    (reaped-claim-id (first then)))))
+      (is (null (claims-touching a 'ek-claim :region "late" :role :subject
+                                 :as-of-epoch e1))
+          "created after E1: absent, not reaped")
+      (let ((by (claims-by-producer a 'ek-claim "audit" :as-of-epoch e1)))
+        (is (= 1 (length by)) "by producer: the reaped one, not the late one")
+        (is (reaped-claim-p (first by)))))))
+
+(test as-of-epoch-refuses-a-clockless-store-but-as-of-still-answers
+  "#347 recon E9: a store with no system clock draws epochs from its own
+counter, so :AS-OF-EPOCH refuses with EPOCH-AXIS-UNAVAILABLE naming the
+graph -- a QUERY-PRECONDITION-ERROR whose reason prints -- while :AS-OF
+on the same store keeps answering.  *SYSTEM-CLOCK* is bound explicitly
+so the premise does not depend on run order."
+  (let ((graph-db:*system-clock* nil))
+    (with-temp-directory (dir)
+      (let ((g (make-graph *ep-a-name* (namestring dir)
+                           :buffer-pool-size 1000)))
+        (unwind-protect
+             (let ((t0 (graph-db.spacetime::%st-now)))
+               (is (null (graph-db:graph-system-clock g))
+                   "control: no clock")
+               (sleep 0.01)
+               (%tx g (lambda () (%unary g #'make-ea-claim-unary "r1")))
+               (signals epoch-axis-unavailable
+                 (claims-touching g 'ea-claim :region "r1" :role :subject
+                                  :as-of-epoch 1))
+               (signals epoch-axis-unavailable
+                 (claims-by-producer g 'ea-claim "audit" :as-of-epoch 1))
+               (handler-case
+                   (claims-touching g 'ea-claim :region "r1"
+                                    :role :subject :as-of-epoch 1)
+                 (epoch-axis-unavailable (c)
+                   (is (typep c 'graph-db:query-precondition-error))
+                   (is (eq *ep-a-name*
+                           (epoch-axis-unavailable-graph-name c)))
+                   (is (search "no system clock"
+                               (graph-db:query-precondition-error-reason
+                                c)))))
+               (is (null (claims-touching g 'ea-claim :region "r1"
+                                          :role :subject :as-of t0))
+                   "wall clock still answers: not yet created at T0")
+               (is (= 1 (length (claims-touching
+                                 g 'ea-claim :region "r1" :role :subject
+                                 :as-of (graph-db.spacetime::%st-now))))))
+          (ignore-errors (close-graph g))
+          (collect-garbage))))))
+
+(test as-of-and-as-of-epoch-are-exclusive
+  "Passing both axes signals rather than silently preferring one, on
+both readers."
+  (with-clocked-stores (a b)
+    (let ((now (graph-db.spacetime::%st-now)))
+      (signals simple-error
+        (claims-touching a 'ea-claim :region "r1" :role :subject
+                         :as-of now :as-of-epoch 1))
+      (signals simple-error
+        (claims-by-producer a 'ea-claim "audit" :as-of now :as-of-epoch 1))
+      (is (null (claims-touching a 'ea-claim :region "r1" :role :subject
+                                 :as-of-epoch 1))
+          "control: one axis alone is accepted"))))
+
+(test claims-by-producer-as-of-epoch-unwinds-an-update
+  "The producer index takes the same resolver: E1 answers the old
+extent, E2 the new one."
+  (with-clocked-stores (a b)
+    (let* ((old (exact-interval (ts 2022 1 1) (ts 2022 3 31)))
+           (new (exact-interval (ts 2022 1 1) (ts 2022 6 30)))
+           (e1 (%tx a (lambda ()
+                        (%unary a #'make-ea-claim-unary "r1" :extent old))))
+           (e2 (%tx a (lambda ()
+                        (let ((k (graph-db:copy (%one a 'ea-claim "r1"))))
+                          (setf (claim-extent k) new)
+                          (graph-db:save k))))))
+      (is (extent-equals-p
+           old (claim-extent
+                (first (claims-by-producer a 'ea-claim "audit"
+                                           :as-of-epoch e1)))))
+      (is (extent-equals-p
+           new (claim-extent
+                (first (claims-by-producer a 'ea-claim "audit"
+                                           :as-of-epoch e2))))))))

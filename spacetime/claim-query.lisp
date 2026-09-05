@@ -148,6 +148,27 @@ they share one SYSTEM-CLOCK -- see GRAPH-DB:GRAPH-SYSTEM-CLOCK (GH
     (let ((e (graph-db:commit-epoch claim)))
       (and (plusp e) e))))
 
+(define-condition epoch-axis-unavailable
+    (graph-db:query-precondition-error)
+  ((graph-name :initarg :graph-name
+               :reader epoch-axis-unavailable-graph-name))
+  (:documentation "An :AS-OF-EPOCH read of a store with no system clock.
+Its epochs are a private counter, so an answer would look like the
+attached case and mean something unrelated (GH #347 recon E9).  The
+parent's REASON is filled at the signal site."))
+
+(defun %refuse-epoch-axis (graph)
+  "Signal EPOCH-AXIS-UNAVAILABLE unless GRAPH is attached to a clock.
+Whether two stores share ONE clock is the consumer's precondition; a
+single-store reader cannot see the other store."
+  (unless (graph-db:graph-system-clock graph)
+    (let ((name (graph-db:graph-name graph)))
+      (error 'epoch-axis-unavailable
+             :graph-name name
+             :reason (format nil "~(~s~) has no system clock; ~
+                                  :as-of-epoch needs one"
+                             name)))))
+
 (defun %claim-effective-stamp (version)
   "VERSION's place on the wall clock: its :AS-OF stamp, else the start of
 its (immutable) transaction extent, else NIL for a claim predating both
@@ -308,10 +329,12 @@ subsystem exists to keep those two cases from being confused."
   (check-type role (member :subject :object :either))
   (check-type at (or null local-time:timestamp))
   (check-type during (or null temporal-extent))
+  (check-type as-of-epoch (or null integer))
   (when (and at during)
     (error "Pass only one of :AT or :DURING, not both."))
   (when (and as-of as-of-epoch)
     (error "Pass only one of :AS-OF or :AS-OF-EPOCH, not both."))
+  (when as-of-epoch (%refuse-epoch-axis graph))
   (let* ((probe (cond (at (make-instant (exact-bound at)))
                       (during during)))
          (family (claim-family claim-class))
@@ -471,7 +494,7 @@ Returns the saved copy, or CLAIM itself when nothing was written."
           (t (graph-db:with-transaction () (%retract))))))
 
 (defun claims-by-producer (graph claim-class producer
-                           &key limit offset as-of)
+                           &key limit offset as-of as-of-epoch)
   "Every live claim PRODUCER wrote, both arities.  CLAIM-CLASS is the PARENT,
 so one call covers unary and binary -- the same contract as this function's
 destructive twin, DELETE-CLAIMS-BY-PRODUCER.
@@ -485,19 +508,32 @@ NIL means PRODUCER has written nothing, which is a real answer.  An
 unregistered CLAIM-CLASS signals UNKNOWN-CLAIM-FAMILY instead, so \"no such
 family\" and \"that family, nothing produced\" stay distinguishable.
 
+:AS-OF and :AS-OF-EPOCH resolve each claim to the version believed at
+a wall-clock instant or live at a commit epoch, exactly as
+CLAIMS-TOUCHING does (GH #300, GH #347); one or the other, not both.
+
 Uses the PRODUCER index, so this is O(matching) rather than a scan of every
 claim.  :LIMIT / :OFFSET cut the result; the second return value is T
 when more claims existed past the cut (NIL without :LIMIT) (GH #302)."
+  (check-type as-of-epoch (or null integer))
+  (when (and as-of as-of-epoch)
+    (error "Pass only one of :AS-OF or :AS-OF-EPOCH, not both."))
+  (when as-of-epoch (%refuse-epoch-axis graph))
   (let* ((family (claim-family claim-class))
          (all (graph-db:index-lookup graph (claim-family-parent family)
                                      '(producer) producer)))
-    (if as-of
-        (setf all (loop for c in all
-                        for v = (%claim-as-of graph c as-of)
-                        when v collect v))
-        (setf all (%overlay-transaction
-                   graph all family
-                   (lambda (c) (equal producer (claim-producer c))))))
+    (cond (as-of
+           (setf all (loop for c in all
+                           for v = (%claim-as-of graph c as-of)
+                           when v collect v)))
+          (as-of-epoch
+           (setf all (loop for c in all
+                           for v = (%claim-as-of-epoch graph c as-of-epoch)
+                           when v collect v)))
+          (t
+           (setf all (%overlay-transaction
+                      graph all family
+                      (lambda (c) (equal producer (claim-producer c)))))))
     (%paginate all limit offset)))
 
 (defun delete-claims-by-producer (graph claim-class producer)
