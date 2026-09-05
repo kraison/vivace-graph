@@ -163,3 +163,75 @@ keywords.  Returns the record."
                            :object-key "2" :producer "scan-a"
                            :standing :observed
                            :extent (interval (ts 2026 4 1) (ts 2026 12 31)))))
+
+;; S3: a second store the scope tests read from (spec §10, GH #332).  The
+;; same families, declared under B's name too -- the registry is per
+;; family symbol, the indexes per store (S2 recon A4) -- and every
+;; constructor call passes :GRAPH, because this second declaration
+;; rebinds the constructors' default store to B (S2 recon C2).
+(eval-when (:load-toplevel :execute)
+  (setf (gethash :graph-db-rules-b graph-db::*schema-node-metadata*) nil))
+
+(def-claim-classes rt-claim :graph-db-rules-b)
+(def-claim-classes rtt-claim :graph-db-rules-b :temporal t)
+
+(defmacro with-two-stores ((a b) &body body)
+  "A fresh store A (*GRAPH-NAME*) and a fresh store B (:GRAPH-DB-RULES-B),
+*GRAPH* bound to A."
+  (let ((da (gensym "DIR-A")) (db (gensym "DIR-B")))
+    `(let* ((,da (graph-db-test-scratch:make-scratch-directory
+                  "graph-db-rules-a"))
+            (,db (graph-db-test-scratch:make-scratch-directory
+                  "graph-db-rules-b"))
+            (,a (make-graph *graph-name* (namestring ,da)
+                            :buffer-pool-size 1000))
+            (,b (make-graph :graph-db-rules-b (namestring ,db)
+                            :buffer-pool-size 1000)))
+       (unwind-protect (let ((graph-db:*graph* ,a)) ,@body)
+         (ignore-errors (close-graph ,b))
+         (ignore-errors (close-graph ,a))))))
+
+(defun seed-b (g)
+  "Store B's claims: h3 runs web (scan-c), h1 runs cache (scan-c), and
+web version 3 valid Jul 1 - Sep 30 (scan-c).  Returns nothing."
+  (with-transaction ((graph-db::transaction-manager g))
+    (make-rt-claim-binary :graph g :subject-namespace :host :subject-key "h3"
+                          :relation "runs" :object-namespace :app
+                          :object-key "web" :producer "scan-c"
+                          :standing :observed)
+    (make-rt-claim-binary :graph g :subject-namespace :host :subject-key "h1"
+                          :relation "runs" :object-namespace :app
+                          :object-key "cache" :producer "scan-c"
+                          :standing :observed)
+    (make-rtt-claim-binary :graph g :subject-namespace :app :subject-key "web"
+                           :relation "version" :object-namespace :ver
+                           :object-key "3" :producer "scan-c"
+                           :standing :observed
+                           :extent (interval (ts 2026 7 1) (ts 2026 9 30)))))
+
+(defmacro with-clocked-stores ((a b) &body body)
+  "WITH-TWO-STORES under one system clock opened in a scratch directory,
+so the two stores' snapshot epochs come from one counter (#168) -- equal
+in a quiescent image, never guaranteed one instant (recon C2)."
+  (let ((cdir (gensym "CLOCK-DIR")) (clock (gensym "CLOCK"))
+        (da (gensym "DIR-A")) (db (gensym "DIR-B")))
+    `(let* ((,cdir (graph-db-test-scratch:make-scratch-directory
+                    "graph-db-rules-clock"))
+            (,clock (graph-db:open-system-clock (namestring ,cdir)))
+            (,da (graph-db-test-scratch:make-scratch-directory
+                  "graph-db-rules-a"))
+            (,db (graph-db-test-scratch:make-scratch-directory
+                  "graph-db-rules-b"))
+            (,a nil) (,b nil))
+       (unwind-protect
+            (progn
+              (setf ,a (make-graph *graph-name* (namestring ,da)
+                                   :buffer-pool-size 1000
+                                   :system-clock ,clock)
+                    ,b (make-graph :graph-db-rules-b (namestring ,db)
+                                   :buffer-pool-size 1000
+                                   :system-clock ,clock))
+              (let ((graph-db:*graph* ,a)) ,@body))
+         (when ,b (ignore-errors (close-graph ,b)))
+         (when ,a (ignore-errors (close-graph ,a)))
+         (graph-db:close-system-clock ,clock)))))

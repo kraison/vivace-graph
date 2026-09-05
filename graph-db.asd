@@ -241,7 +241,7 @@ docs/rules.md; GH #304."
   :serial t
   :components ((:file "package") (:file "suite") (:file "facts-tests")
                (:file "schema-tests") (:file "compile-tests")
-               (:file "run-tests"))
+               (:file "run-tests") (:file "scope-tests"))
   :perform (test-op (op c)
              (unless (uiop:symbol-call :graph-db/rules-test
                                        :run-rules-tests)

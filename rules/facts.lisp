@@ -27,6 +27,31 @@
 (defparameter +claim-producer-index-slots+
   '(graph-db.spacetime::producer))
 
+(defvar *claim-scope* nil
+  "The stores CLAIM/7 and CLAIM-PRODUCER/2 read, own store first, or NIL
+for *GRAPH* alone (spec §10, GH #332).  RUN-RULE binds it for a body's
+evaluation; a Lisp caller may bind it around a SELECT.  Trap: inside a
+read-write transaction every read of another store is the engine's
+CROSS-GRAPH-TRANSACTION-ERROR (GH #53) -- bind it outside one.")
+
+(defun %scope-graphs ()
+  "The stores in scope, own store first: *CLAIM-SCOPE*, or *GRAPH*
+alone when it is NIL."
+  (or *claim-scope* (list *graph*)))
+
+(defun %scope-lookup (class-name slots value)
+  "INDEX-LOOKUP over every store in scope, in scope order.  A FOREIGN
+store whose schema does not carry CLASS-NAME contributes nothing --
+QUERY-PRECONDITION-ERROR read as %PRODUCER-CANDIDATES reads it -- while
+the own store (first) still signals, so a single-store goal keeps S1's
+ill-typed refusal (ruling S3-R1, recon C1)."
+  (let ((graphs (%scope-graphs)))
+    (append (index-lookup (first graphs) class-name slots value)
+            (loop for g in (rest graphs)
+                  append (handler-case
+                             (index-lookup g class-name slots value)
+                           (query-precondition-error () '()))))))
+
 (defun %keyword-string (keyword)
   "A keyword as the lowercase string the wire uses (spec §4)."
   (string-downcase (symbol-name keyword)))
@@ -97,13 +122,13 @@ asked in; see %NAMESPACE-VALUE."
 ;; last clause -- a per-goal property, so not
 ;; DECLARE-FUNCTOR-COST-UNBOUNDED, which classifies the whole functor
 ;; and would withhold CLAIM from free text entirely (GH #285).
-(defun %unbound-claim-scan (graph family)
-  "Every claim of FAMILY in GRAPH -- CLAIM/7's fallback, the COND's last
-clause, not a nothing-bound special case.  Refused as cost-unbounded
-when a resource bound is in effect, since %TICK cannot preempt inside a
-family walk (GH #285) -- unless the caller accepted that with
-:ALLOW-COST-UNBOUNDED, which SELECT now carries into a functor body
-(GH #334).  Same test as %REFUSE-COST-UNBOUNDED's, so the static
+(defun %unbound-claim-scan (family)
+  "Every claim of FAMILY in every store in scope -- CLAIM/7's fallback,
+the COND's last clause, not a nothing-bound special case.  Refused as
+cost-unbounded when a resource bound is in effect, since %TICK cannot
+preempt inside a family walk (GH #285) -- unless the caller accepted
+that with :ALLOW-COST-UNBOUNDED, which SELECT now carries into a functor
+body (GH #334).  Same test as %REFUSE-COST-UNBOUNDED's, so the static
 refusal and this one answer to one value."
   (when (and (not *allow-cost-unbounded*)
              (or *inference-budget* *query-deadline*))
@@ -111,8 +136,12 @@ refusal and this one answer to one value."
   ;; :INCLUDE-SUBCLASSES-P defaults to T, so the parent covers unary and
   ;; binary.  :COLLECT-P is what materialises node bytes before a node
   ;; escapes the scan's read pin (vertex.lisp) -- not a style choice.
+  ;; :VERTEX-TYPE keeps the scan typed, so a store lacking the family
+  ;; visits nothing rather than reading live versions (recon B8).
   (let ((parent (graph-db.spacetime:claim-family-parent family)))
-    (map-vertices #'identity graph :vertex-type parent :collect-p t)))
+    (loop for g in (%scope-graphs)
+          append (map-vertices #'identity g :vertex-type parent
+                                            :collect-p t))))
 
 (def-global-prolog-functor claim/7
     (?c ?family ?sns ?skey ?rel ?ons ?okey cont)
@@ -124,11 +153,12 @@ subject index when the subject is bound, the object index when the object
 is, the producer index through CLAIM-PRODUCER/2 in the same body.  A
 bound namespace naming no keyword answers empty; every other goal the
 routes miss reaches the COND's last clause, which walks the family or is
-refused as cost-unbounded under a resource bound (GH #285, spec §4)."
+refused as cost-unbounded under a resource bound (GH #285, spec §4).
+Every route reads every store in *CLAIM-SCOPE*, own store first, and
+*GRAPH* alone when it is NIL (spec §10, GH #332)."
   (let* ((family (%family-or-ill-typed ?family))
          (parent (graph-db.spacetime:claim-family-parent family))
          (binary (graph-db.spacetime:claim-family-binary family))
-         (g *graph*)
          (c (%prolog-index-bound ?c))
          (sns-arg (%prolog-index-bound ?sns))
          (ons-arg (%prolog-index-bound ?ons))
@@ -140,15 +170,15 @@ refused as cost-unbounded under a resource bound (GH #285, spec §4)."
          (candidates
            (cond ((node-p c) (list c))
                  ((and sns skey rel)
-                  (index-lookup g parent
-                                +claim-subject-relation-index-slots+
-                                (list sns skey rel)))
+                  (%scope-lookup parent
+                                 +claim-subject-relation-index-slots+
+                                 (list sns skey rel)))
                  ((and sns skey)
-                  (index-lookup g parent +claim-subject-index-slots+
-                                (list sns skey)))
+                  (%scope-lookup parent +claim-subject-index-slots+
+                                 (list sns skey)))
                  ((and ons okey)
-                  (index-lookup g binary +claim-object-index-slots+
-                                (list ons okey)))
+                  (%scope-lookup binary +claim-object-index-slots+
+                                 (list ons okey)))
                  ;; A bound namespace argument naming no keyword of this
                  ;; image -- a name no claim was recorded under, a
                  ;; non-wire spelling, a non-string: no solutions, and
@@ -156,7 +186,7 @@ refused as cost-unbounded under a resource bound (GH #285, spec §4)."
                  ;; the guard's budget refuses instead (spec §4).
                  ((and sns-arg (null sns)) '())
                  ((and ons-arg (null ons)) '())
-                 (t (%unbound-claim-scan g family)))))
+                 (t (%unbound-claim-scan family)))))
     (dolist (claim candidates)
       (%unify-claim claim ?c ?sns ?skey ?rel ?ons ?okey family cont))))
 
@@ -230,30 +260,35 @@ a failure, so a claim no rule wrote still answers."
       (%yield (?v (graph-db.spacetime:claim-rule-version c))
         (funcall cont)))))
 
-(defun %producer-candidates (graph producer)
-  "Every claim PRODUCER wrote in GRAPH, from the producer index of each
-family registered in this image.  *CLAIM-FAMILIES* is image-wide, not per
-graph, so a family GRAPH's schema does not carry is skipped: that is what
-QUERY-PRECONDITION-ERROR means here, not a fault to report."
-  (let ((out '()))
+(defun %producer-candidates (producer)
+  "Every claim PRODUCER wrote in every store in scope, from the producer
+index of each family registered in this image.  *CLAIM-FAMILIES* is
+image-wide, not per graph, so a family a store's schema does not carry is
+skipped -- own store included, unlike %SCOPE-LOOKUP, since the family
+loop was always cross-family: that is what QUERY-PRECONDITION-ERROR means
+here, not a fault to report (ruling S3-R1)."
+  (let ((out '())
+        (graphs (%scope-graphs)))
     (dolist (family (alexandria:hash-table-values
                      graph-db.spacetime::*claim-families*)
                     (nreverse out))
       (let ((parent (graph-db.spacetime:claim-family-parent family)))
-        (handler-case
-            (dolist (c (index-lookup graph parent
-                                     +claim-producer-index-slots+
-                                     producer))
-              (push c out))
-          ;; Also the condition a wrong component count signals
-          ;; (%INDEX-BOUNDS, index.lisp) -- safe only while this index
-          ;; is arity 1 and PRODUCER a bare scalar; a multi-slot one
-          ;; would read a shape error as "no candidates".
-          (query-precondition-error () nil))))))
+        (dolist (graph graphs)
+          (handler-case
+              (dolist (c (index-lookup graph parent
+                                       +claim-producer-index-slots+
+                                       producer))
+                (push c out))
+            ;; Also the condition a wrong component count signals
+            ;; (%INDEX-BOUNDS, index.lisp) -- safe only while this index
+            ;; is arity 1 and PRODUCER a bare scalar; a multi-slot one
+            ;; would read a shape error as "no candidates".
+            (query-precondition-error () nil)))))))
 
 (def-global-prolog-functor claim-producer/2 (?c ?p cont)
   "?C's producer.  With ?C unbound and ?P a producer name it generates
-instead: every claim ?P wrote, across every family this graph indexes --
+instead: every claim ?P wrote, across every family each store in
+*CLAIM-SCOPE* indexes (spec §10, GH #332), or *GRAPH*'s when it is NIL --
 write that goal BEFORE the CLAIM/7 goal it feeds, or ?C is bound by then
 and this filters.  With neither bound there is no index to generate from
 and no walk to fall back to, so the goal is refused as cost-unbounded
@@ -272,7 +307,7 @@ docs/rules.md)."
           ;; cross-family lookup that then unifies with nothing, past
           ;; %TICK's reach.
           ((and unbound (stringp p))
-           (dolist (claim (%producer-candidates *graph* p))
+           (dolist (claim (%producer-candidates p))
              (%yield (?c claim) (funcall cont))))
           ;; Nothing bound routes nowhere, so CLAIM/7's refusal rather
           ;; than silence.  A bound ?P that is a string naming no

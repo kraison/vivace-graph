@@ -232,6 +232,18 @@ a rule that read its own relation would read the *previous* run's
 derivation and one `run-rule` would never settle. `compile-rule`
 refuses that instead of iterating (GH #331).
 
+**A scope widens what they read, not when.** With
+`graph-db::*claim-scope*` bound to a list of open stores -- own store
+first, NIL for `*graph*` alone -- every route of `claim/7` and
+`claim-producer/2` reads all of them and answers the union, still the
+committed state of each. A store in scope whose schema never declared
+the family contributes nothing; the own store still refuses, as slice 1
+documented. The trap is the engine's, not ours: inside a read-write
+transaction on one store every read of another signals
+`cross-graph-transaction-error` (GH #53), so bind the scope outside a
+transaction. Full section, and `run-rule`'s `:scope`, in slice 3
+(GH #332).
+
 ## Tests and CI
 
 FiveAM system `graph-db/rules-test` (`tests/rules/`), on-disk stores,
