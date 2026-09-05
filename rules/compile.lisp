@@ -243,10 +243,22 @@ them leaves the relation unbound (ruling P6)."
 
 ;;; The rule set a compile is checked against
 
+(defun %graph-declares-p (graph type-name)
+  "GRAPH's schema declares the vertex type TYPE-NAME, compared by name so
+a family written as a lowercase string matches its class symbol."
+  (and (member type-name
+               (graph-db.query:schema-type-names graph :vertex)
+               :test #'string-equal)
+       t))
+
 (defun %stored-rules (graph &key view)
   "Every RULE record in GRAPH, as specs.  With VIEW (a commit view),
 records the transaction writes replace or remove their committed
-version, so the set is the store as it will be after the commit."
+version, so the set is the store as it will be after the commit.  A
+store that never ran DEF-RULES-SCHEMA has no RULE type at all and
+answers NIL rather than erring in MAP-VERTICES (T4-R2)."
+  (unless (%graph-declares-p graph 'rule)
+    (return-from %stored-rules '()))
   (let* ((committed (graph-db:map-vertices #'identity graph
                                            :vertex-type 'rule
                                            :collect-p t))
