@@ -5,6 +5,12 @@
 
 (in-suite rules-suite)
 
+(defmacro signalled-text (&body body)
+  "The text of the error BODY signals, or \"\" when it signals none --
+so an assertion can name which of two refusals answered."
+  `(handler-case (progn ,@body "")
+     (error (c) (princ-to-string c))))
+
 (test claim-reads-every-store-in-scope
   "With *CLAIM-SCOPE* bound, CLAIM/7 generates from each store's index in
 scope order; with it NIL, from *GRAPH* alone (S3-P1)."
@@ -80,6 +86,18 @@ nothing (S3-P5)."
                  (select-flat (?t)
                    (claim ?c rtu-claim "app" "web" "owned-by"
                           "team" ?t)))))))
+
+(test the-own-store-still-refuses-a-family-it-does-not-index
+  "S3-R1's other half: %SCOPE-LOOKUP leaves the FIRST store's lookup
+bare, so a scope cannot turn S1's ill-typed refusal into silence.
+Control: a-store-lacking-the-family-contributes-nothing, same scope,
+where B's miss IS swallowed."
+  (with-two-stores (a b)
+    (seed a)
+    (let ((graph-db::*claim-scope* (list a b)))
+      (signals graph-db:query-precondition-error
+        (select-flat (?h)
+          (claim ?c rtf-claim "host" ?h "runs" "app" "web"))))))
 
 (test the-walk-covers-every-store-without-a-bound-and-refuses-under-one
   (with-two-stores (a b)
@@ -321,8 +339,10 @@ it signals rather than being read as an empty store."
       ;; Control: the same call with real stores derives.
       (is (eq :derived (graph-db.rules:rule-report-outcome
                         (graph-db.rules:run-rule a r :scope (list a b)))))
-      (signals error
-        (graph-db.rules:run-rule a r :scope (list b :not-a-graph))))))
+      (is (search "open store"
+                  (signalled-text
+                    (graph-db.rules:run-rule a r :scope (list b :not-a-graph)))
+                  :test #'char-equal)))))
 
 (test a-premise-that-moves-store-renames-its-method
   "S3-P3's collision corner and the METHOD refresh in one: h3's premise
@@ -383,12 +403,6 @@ refusals raised there, and the control that the same run derives."
 ;;; Reading provenance under a scope (S3-P4), and the scope's own
 ;;; refusals.
 
-(defmacro signalled-text (&body body)
-  "The text of the error BODY signals, or \"\" when it signals none --
-so an assertion can name which of two refusals answered."
-  `(handler-case (progn ,@body "")
-     (error (c) (princ-to-string c))))
-
 (test run-rules-normalises-the-scope-before-any-rule-runs
   "RUN-RULES normalises :SCOPE once at entry, so a bad scope signals
 even on a store with no runnable rule -- where no RUN-RULE call would
@@ -397,8 +411,10 @@ ever look at it."
     (seed a)
     ;; Control: nothing to run, a good scope, no error and no reports.
     (is (null (graph-db.rules:run-rules a :scope (list a b))))
-    (signals error
-      (graph-db.rules:run-rules a :scope (list b :not-a-graph)))))
+    (is (search "open store"
+                (signalled-text
+                  (graph-db.rules:run-rules a :scope (list b :not-a-graph)))
+                :test #'char-equal))))
 
 (test a-scope-store-must-be-keyword-named
   "Recon B5: %STORE-NAME downcases the store's SYMBOL-NAME, so a store
@@ -419,6 +435,75 @@ store holds: with the odd store the scope answers, with B it is
                     (graph-db.rules:run-rule a "no-such-rule"
                                              :scope (list b)))
                   :test #'char-equal)))))
+
+(test the-own-store-is-checked-on-the-same-terms-as-the-scope
+  "%NORMALIZE-SCOPE validates GRAPH too, not only the caller's list: the
+own store's name is downcased into every record's METHOD (recon B5), so
+a store that is not keyword-named must be refused there as well, before
+the rule is resolved.  Control: the same call on a keyword-named store
+gets past the scope and meets %RESOLVE-RULE."
+  (with-rules-graph (g)
+    (is (search "keyword"
+                (signalled-text
+                  (graph-db.rules:run-rule
+                   (make-instance 'graph-db::graph :graph-name "b")
+                   "no-such-rule"))
+                :test #'char-equal))
+    (is (search "no rule named"
+                (signalled-text
+                  (graph-db.rules:run-rule g "no-such-rule"))
+                :test #'char-equal))))
+
+;;; The engine's transaction rule, as an operator error (S3-F1).
+
+(test run-rule-with-a-foreign-scope-refuses-to-run-inside-a-transaction
+  "A read-write transaction refuses every read of another store, even
+under that store's snapshot (GH #53, tests/multi-graph-tests.lisp), and
+RUN-RULE's composed snapshots cannot undo that: called inside the
+caller's transaction with a foreign store in :SCOPE it would meet
+CROSS-GRAPH-TRANSACTION-ERROR mid-run, which is no report of its own.
+So it is refused up front, as an operator error (S3-F1).  Control: the
+same call outside a transaction derives."
+  (with-two-stores (a b)
+    (seed a)
+    (seed-b b)
+    (let ((r (write-rule a :name "web-hosts" :version "1"
+                         :family "rt-claim"
+                         :head *web-hosts-head* :body *web-hosts-body*)))
+      (is (search "outside a transaction"
+                  (signalled-text
+                    (with-transaction
+                        ((graph-db::transaction-manager a))
+                      (graph-db.rules:run-rule a r :scope (list a b))))
+                  :test #'char-equal))
+      ;; Control: outside one, the same run derives -- and the refused
+      ;; call wrote nothing, since it refused before any evaluation.
+      (is (= 3 (graph-db.rules:rule-report-derived
+                (graph-db.rules:run-rule a r :scope (list a b))))))))
+
+(test premises-of-with-a-foreign-scope-refuses-inside-a-transaction
+  "The read side of S3-F1: PREMISES-OF resolves a foreign premise in the
+store its record names, which the same transaction rule forbids.
+Control: outside a transaction the premise resolves in B."
+  (with-two-stores (a b)
+    (seed a)
+    (seed-b b)
+    (graph-db.rules:run-rule
+     a (write-rule a :name "web-hosts" :version "1" :family "rt-claim"
+                   :head *web-hosts-head* :body *web-hosts-body*)
+     :scope (list a b))
+    (let ((h3 (find "h3" (derived a 'rt-claim "web-hosts")
+                    :key #'claim-object-key :test #'string=)))
+      (is (search "outside a transaction"
+                  (signalled-text
+                    (with-transaction
+                        ((graph-db::transaction-manager a))
+                      (graph-db.rules:premises-of a h3
+                                                  :scope (list a b))))
+                  :test #'char-equal))
+      (let ((ps (graph-db.rules:premises-of a h3 :scope (list a b))))
+        (is (= 1 (length ps)))
+        (is (eq b (graph-db::node-graph (first ps))))))))
 
 (test premises-of-resolves-in-the-store-the-record-names
   "S3-P4: a record's METHOD says which store its premise is in, and a

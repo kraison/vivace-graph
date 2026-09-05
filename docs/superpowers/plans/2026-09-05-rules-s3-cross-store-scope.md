@@ -582,7 +582,7 @@ refuses every read of another store (S3-P2).  ..."
 - §10 "reads stores in a scope, A first, writes only A": Task 2 (`%normalize-scope`, the nothing-written-to-B assertions).
 - §10 "`claim/7` generates over every store in scope": Task 1.
 - §10 "a premise from B is recorded with its store name in `method`": Task 2 (S3-P3), the cl-llm convention.
-- §10 "reads resolve at one instant under the shared clock": Task 2 (S3-P2, composed snapshots; the clocked fixture).
+- §10 "reads resolve at one instant under the shared clock": NOT delivered — refused by S3-R2 and corrected in the decision record (S3-F3). Task 2 ships composed snapshots and the clocked fixture, which give one comparable epoch space (kraison/vivace-graph#94) over per-store atomicity (#93), never one instant: the engine provides none across stores (`call-with-read-snapshot`, GH #53), so a cross-store run is per-store consistent and is not serialised against a premise committed after its snapshots.
 - §11 S3 bullet: Task 2's first test.
 - §9 reads under scope: Task 3 (S3-P4).
 - Type consistency: `%premise-ref` produces `(key . store-name)`; `%reconcile-provenance` consumes `car`/`cdr` of it; `%store-name` is the one place the string is minted and the one place `premises-of` compares it.

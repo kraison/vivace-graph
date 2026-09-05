@@ -256,7 +256,8 @@ after it is invisible too, though the snapshot's epoch predates the
 delete. Not new with a scope: equally true of a single-store run
 (recon note O1). Read out of the code, not out of a live scenario --
 the note flags it as not adversarially settled, so verify by test
-before relying on it in either direction.
+before relying on it in either direction; kraison/vivace-graph#345
+tracks settling it.
 
 **A cross-store evaluation runs under no transaction at all.**
 `run-rule` opens its write transaction only after the body has been
@@ -470,6 +471,13 @@ signals `cross-graph-transaction-error`, snapshot or no snapshot
   **not** serialised against a premise committed after the snapshots
   were taken -- the next run sees such a premise, this one does not.
 
+**Call it outside a transaction.** A foreign store in `:scope` while
+the caller holds a transaction of its own is an operator error,
+signalled before anything is evaluated, because the engine refuses that
+read whatever snapshot is in force and the run would otherwise die
+part-way through with `cross-graph-transaction-error` (GH #53, ruling
+S3-F1).
+
 Under a shared system clock (`open-system-clock`, GH #168) those
 snapshots take their epochs from one counter, so the epochs are
 *comparable*, and equal when nothing commits between the two
@@ -527,8 +535,9 @@ write transaction unwinds it; one raised during a cross-store
 evaluation unwinds the composed snapshots instead, no transaction being
 open yet. The report is the same either way, and neither path wrote
 anything. Only an operator error signals: no resource bound, no rule of
-that name in the store or the image, or a `:scope` that is not a list
-of open, keyword-named stores.
+that name in the store or the image, a `:scope` that is not a list of
+open, keyword-named stores, or a foreign store in `:scope` inside the
+caller's transaction.
 
 ## Validity of a derived claim
 
@@ -610,7 +619,9 @@ producer, which the next run sweeps -- is never read as provenance.
   the scope sees fewer premises and never wrong ones. A premise whose
   identity no longer exists in the store it resolves in is dropped too,
   rather than faked. A foreign store is read here, so call this outside
-  a transaction (GH #53).
+  a transaction: inside one, a `scope` naming a store other than
+  `graph` is an operator error, signalled before any record is read
+  (GH #53, ruling S3-F1).
 - `(dependents-of graph claim &key current) => claims` -- every derived
   claim whose provenance names `claim`. With `:current`, only those
   still believed. No `scope`: the records and their subjects are

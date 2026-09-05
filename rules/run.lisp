@@ -240,32 +240,42 @@ this CHECK-TYPE is belt and braces for every other caller."
 first and once (spec §10).  Signals on anything that is not an open
 store, and on a store that is not keyword-named -- %STORE-NAME
 downcases its SYMBOL-NAME (recon B5) -- so both are refused before the
-rule is resolved.  Duplicates are dropped: a store named twice would
-answer every route twice and so double every solution."
-  (dolist (g scope)
+rule is resolved.  GRAPH is checked on the same terms: it is a store
+the rule reads and names in a record like any other.  Duplicates are
+dropped: a store named twice would answer every route twice and so
+double every solution."
+  (dolist (g (cons graph scope))
     (unless (typep g 'graph-db::graph)
-      (error "RUN-RULE :SCOPE holds ~S, which is not an open store."
+      (error "A store a rule reads must be an open store; ~S is not."
              g))
     (unless (keywordp (graph-db:graph-name g))
       (error "A store a rule reads must be keyword-named; ~S is not."
              (graph-db:graph-name g))))
-  (cons graph (remove graph (remove-duplicates scope :test #'eq
-                                                     :from-end t)
-                      :test #'eq)))
+  (let ((others (remove-duplicates scope :test #'eq :from-end t)))
+    (cons graph (remove graph others :test #'eq))))
+
+(defun %check-no-foreign-read-in-transaction (what foreign)
+  "Refuses WHAT (an operator-facing name) when FOREIGN names a store and
+a transaction is open: a read-write transaction refuses every foreign
+read, snapshot or no snapshot (transactions.lisp, GH #53), so the read
+would signal CROSS-GRAPH-TRANSACTION-ERROR mid-run.  An operator error,
+not a report (S3-F1)."
+  (when (and foreign graph-db::*transaction*)
+    (error "~A with a foreign store in :SCOPE reads outside a ~
+transaction; call it outside one (GH #53)." what)))
 
 (defun %premise-ref (node graph)
   "A premise as the reconcile carries it: (IDENTITY-KEY . STORE-NAME),
 STORE-NAME NIL for the rule's own GRAPH (S3-P3).  Call this INSIDE the
 snapshot NODE was read under: a node an INDEX-LOOKUP returned under a
 snapshot is not self-contained once the snapshot exits (recon C4).
-The RESOLVE-NODE-GRAPH fallback scans every open store and would, on
-the single-store path, meet the cross-graph refusal inside the
-transaction (GH #53) -- unreachable today, since every lookup stamps
-NODE-GRAPH (recon B3)."
-  (let ((home (or (graph-db::node-graph node)
-                  (graph-db:resolve-node-graph (graph-db:id node)))))
+An unstamped node is the engine's \"unknown, not foreign\":
+NODE-HOME-GRAPH defaults it to GRAPH (node-class.lisp), so the premise
+is recorded as the own store's rather than searched for (S3-F4).
+Unreachable today -- every lookup stamps NODE-GRAPH (recon B3)."
+  (let ((home (graph-db::node-home-graph node graph)))
     (cons (graph-db.spacetime:claim-identity-key node)
-          (and home (not (eq home graph)) (%store-name home)))))
+          (and (not (eq home graph)) (%store-name home)))))
 
 (defun %merge-store-name (old new)
   "The store name one premise keeps when it is named twice: the own
@@ -527,7 +537,8 @@ A refusal of any kind -- compile, the rails, effects, a commit
 constraint, a missing extent -- is reported, never signalled, and
 unwinds the whole run so the previous derivation stands; an operator
 error (no resource bound, no such rule, a SCOPE that is not a list of
-open, keyword-named stores) signals."
+open, keyword-named stores, a foreign store in SCOPE inside the
+caller's transaction) signals."
   (let* ((scope (%normalize-scope graph scope))
          (foreign (rest scope))
          (spec (%resolve-rule graph rule))
@@ -535,6 +546,7 @@ open, keyword-named stores) signals."
                                     :version (rule-spec-version spec)))
          (start (get-internal-real-time))
          (compiled nil))
+    (%check-no-foreign-read-in-transaction "RUN-RULE" foreign)
     (flet ((refuse (tag text)
              (setf (rule-report-outcome report) :refused
                    (rule-report-derived report) 0
@@ -706,7 +718,10 @@ store is not in SCOPE -- fewer premises, never wrong ones (S3-P4,
 cl-llm's :ABSENT convention).  A premise whose identity no longer exists
 in its store is dropped too, and a DERIVATION record of any other
 relation is not provenance and is not read.  Trap: a foreign store in
-SCOPE is read here, so call this OUTSIDE a transaction (GH #53)."
+SCOPE is read here, so call this OUTSIDE a transaction -- inside one it
+is an operator error, not a report (GH #53, S3-F1)."
+  (%check-no-foreign-read-in-transaction
+   "PREMISES-OF" (remove graph scope))
   (let ((records (graph-db.spacetime:claims-touching
                   graph 'derivation :claim
                   (graph-db.spacetime:claim-identity-key claim)

@@ -7,9 +7,21 @@ a source-verified recon pass or a task review; each carries the cost of
 being wrong as it was stated at the time. Nothing here is re-derived or
 improved.
 
-**None deviates from the spec's letter.** S3-P2 is the one that comes
-close and does not: spec §7 says a run is one transaction, and a
-cross-store run's evaluation sits outside it. That is a refinement §7's
+**One ruling deviates from the spec's letter: S3-R2.** Spec §10's
+fourth sentence — "Reads resolve at one instant under the shared clock
+(#94)" — is refused, because the engine deliberately provides no
+cross-store instant (`call-with-read-snapshot`'s own docstring, GH
+#53). What #332 ships is what kraison/vivace-graph#94's closing comment
+describes: one *comparable* epoch space, the epochs equal when nothing
+commits between the two acquisitions, over stores each made atomic on
+its own (#93). The cost is real and is stated under S3-R2, in
+`docs/rules.md` ("Running a rule") and in the plan's self-review: a
+cross-store run is consistent per store and is **not** serialised
+against a premise committed after its snapshots.
+
+S3-P2 is the one that comes close and does not deviate: spec §7 says a
+run is one transaction, and a cross-store run's evaluation sits outside
+it. That is a refinement §7's
 own mechanism forces — the engine refuses every read of another store
 inside a read-write transaction (GH #53), so "one transaction" and
 "reads a scope of stores" cannot both hold literally. The reconcile,
@@ -190,15 +202,22 @@ rather than reading the others.
 **Decision.** No doc, docstring or test asserts that a cross-store
 run's reads resolve at one instant. The wording is "one comparable
 epoch space, equal in a quiescent image", and the clocked test asserts
-only that the run works and derives from both stores.
+only that the run works and derives from both stores. This is the
+slice's one deviation from the spec's letter: §10's fourth sentence
+asks for that instant, and #332 does not deliver it.
 
 **Evidence.** The engine deliberately provides no cross-store instant
 (`call-with-read-snapshot`'s own docstring, GH #53), so a test of one
 would pass vacuously in a quiescent suite and fail the first time the
 suite ran concurrently.
 
-**Cost if wrong.** None; #332 does not close the namespaces design's
-§12 aspiration and says so.
+**Cost if wrong.** Spec §10's fourth sentence goes undelivered: a
+cross-store run is per-store consistent and is not serialised against a
+premise committed after its snapshots, so a caller reading "one
+instant" literally would expect a serialisation nothing provides.
+Recorded in the opening above, in `docs/rules.md` and in the plan's
+self-review rather than left to be discovered; #332 does not close the
+namespaces design's §12 aspiration and says so.
 
 ### S3-R3 (from recon C4) — the read pin is S3-P3's rationale
 
@@ -309,8 +328,119 @@ own-store premises, which is what S3-P4 wants.
 
 ---
 
-## Not yet taken
+## Taken in the final review
 
-The whole-branch review is the controller's, after this commit. Its
-rulings, if any, belong in a closing section here, in S2's "Taken in
-the final review" shape.
+The whole-branch review's rulings, taken without Kevin in the loop like
+the rest, and shipped with their tests in one commit on top of
+`f37c54e`.
+
+### S3-F1 — a foreign store in scope is an operator error inside a transaction
+
+**Decision.** `run-rule` and `premises-of` signal, before anything is
+evaluated or read, when the scope names a store other than `graph` and
+a transaction is open. `run-rules` inherits it through every `run-rule`
+it calls; a `run-rules` with nothing runnable reads nothing and so
+refuses nothing. Single-store calls are unchanged, inside a transaction
+or out.
+
+**Evidence.** A read-write transaction refuses every cross-graph read
+outright and does not fall through to the read snapshots
+(`transactions.lisp:319-323`; `tests/multi-graph-tests.lisp:1183`,
+`read-write-transaction-blocks-a-foreign-read-even-under-a-snapshot`).
+`call-with-read-snapshot` funcalls straight through for a store the
+open transaction already covers, so `%under-snapshots` cannot rescue
+the case: without the guard the run reached its first foreign read and
+let `cross-graph-transaction-error` escape unreported, past every
+handler `run-rule` has.
+
+**Cost if wrong.** A caller who wants the run inside their own
+transaction must restructure — evaluate outside it, or drop the foreign
+store. That is the engine's constraint rather than this system's;
+refusing up front only makes it legible.
+
+### S3-F2 — S3-R1's own-store half is asserted directly
+
+**Decision.** `the-own-store-still-refuses-a-family-it-does-not-index`
+asserts the FIRST store's bare lookup: under a two-store scope, a goal
+on a family the own store does not index still signals
+`query-precondition-error`, so a scope cannot turn S1's ill-typed
+refusal into silence.
+
+**Evidence.** No test reached `%scope-lookup`'s first-store branch —
+`a-store-lacking-the-family-contributes-nothing` and
+`the-walk-skips-a-store-that-lacks-the-family` exercise the foreign,
+swallowed half only. Non-vacuity by ablation: wrapping the first
+store's lookup in the same `handler-case` turns this test red (1
+failure of 401) and leaves the foreign control green; restored,
+401/401.
+
+**Cost if wrong.** None; the test asserts behaviour S3-R1 chose and
+`%scope-lookup` already had.
+
+### S3-F3 — spec §10's fourth sentence is refused, not delivered
+
+**Decision.** The record's opening said "none deviates from the spec's
+letter". S3-R2 does: §10's "Reads resolve at one instant under the
+shared clock (#94)" is refused. The opening, S3-R2's own cost, and the
+plan's "Self-review against the spec" line for that sentence are
+corrected to say so.
+
+**Evidence.** `call-with-read-snapshot`'s docstring (GH #53) states
+that the engine provides no cross-store instant;
+kraison/vivace-graph#94's closing comment describes what the shared
+clock does give — one comparable epoch space — and #93 is the
+per-store atomicity underneath it. The plan claimed Task 2 delivered
+the sentence through the composed snapshots and the clocked fixture;
+that fixture asserts only that the run derives, which is what S3-R2
+chose.
+
+**Cost if wrong.** The deviation is now visible where a consumer looks
+for it. The behaviour is unchanged: a cross-store run is per-store
+consistent and not serialised against a premise committed after its
+snapshots.
+
+### S3-F4 — `%premise-ref` defaults through `node-home-graph`
+
+**Decision.** An unstamped premise node takes the engine's convention —
+`(node-home-graph node graph)`, a NIL home meaning "unknown, not
+foreign" (`node-class.lisp:453`) — instead of `resolve-node-graph`'s
+scan of every open store.
+
+**Evidence.** Recon B3 says every lookup on today's call graph stamps
+`node-graph`, which makes the fallback unreachable; that is a fact
+about today's callers, not an invariant, so the fallback's failure mode
+still matters. The scan's is an unhandled condition — on the
+single-store path it meets the cross-graph refusal inside the
+transaction (GH #53) — while the default's is a dropped store name,
+the same "fewer premises, never wrong ones" trade S3-P4 chose. No new
+test: the branch is unreachable, and the docstring says so.
+
+**Cost if wrong.** An unstamped foreign node would be recorded as the
+own store's: its `derived-from` record's `method` reads NIL, and
+`premises-of` then looks for the premise in `graph` and drops it when
+it is not there.
+
+---
+
+## Carried forward
+
+Seen in the same review and deliberately not fixed in this pass. Each
+is a nit or a latent tidy, none changes behaviour a consumer can see,
+and none belongs in a commit whose subject is the transaction refusal.
+
+- **`%normalize-scope` does not check `graph-open-p`.** A closed store
+  passes the type and keyword checks and fails later, at its first
+  read.
+- **`%reconcile-provenance`'s merge branch is unreachable.**
+  `%merge-premise-refs` has already made each premise key unique per
+  derived claim, so the `seen` case of the `wanted` accumulation cannot
+  fire; the merge rule it applies is right, and the branch is dead.
+- **`rules-in-scope` now reads two ways.** It means "the rules a
+  compile checks against", which since #332 collides with `:scope`, the
+  stores. A rename touches S1 and S2 code and belongs on its own.
+- **`with-two-stores` leaks A if B fails to open.** Both `make-graph`
+  calls are in the `let*`, so a failure on B's leaves A open until the
+  fixture's scratch cleanup runs.
+- **`%scope-lookup` copies the first store's list.** `append` copies
+  every list but the last, so even a single-store scope pays one copy
+  per route.
