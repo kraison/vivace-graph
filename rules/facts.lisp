@@ -44,7 +44,10 @@ alone when it is NIL."
 store whose schema does not carry CLASS-NAME contributes nothing --
 QUERY-PRECONDITION-ERROR read as %PRODUCER-CANDIDATES reads it -- while
 the own store (first) still signals, so a single-store goal keeps S1's
-ill-typed refusal (ruling S3-R1, recon C1)."
+ill-typed refusal (ruling S3-R1, recon C1).  Same caveat as its sibling:
+a wrong component count signals that condition too (%INDEX-BOUNDS,
+index.lisp), so the swallow is safe only at these indexes' known
+arities."
   (let ((graphs (%scope-graphs)))
     (append (index-lookup (first graphs) class-name slots value)
             (loop for g in (rest graphs)

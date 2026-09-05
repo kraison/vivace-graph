@@ -65,9 +65,11 @@ some store has run DEF-RULES-SCHEMA."
 ;;; Evaluating the body
 
 (defun %solutions (compiled graph report)
-  "Every solution of COMPILED's body under RUN-QUERY-GOALS' rails inside
-the current transaction (spec §7.2, ruling P4): a list of rows aligned
-with COMPILED-RULE-VARS.  Refuses past *RULES-MAX-SOLUTIONS*."
+  "Every solution of COMPILED's body under RUN-QUERY-GOALS' rails (spec
+§7.2, ruling P4): a list of rows aligned with COMPILED-RULE-VARS.
+SELECT's :SNAPSHOT inherits the open transaction on the single-store
+path and the composed read snapshots on the cross-store one (S3-P2).
+Refuses past *RULES-MAX-SOLUTIONS*."
   (let ((max-inferences (or *rules-max-inferences*
                             graph-db::*query-default-max-inferences*))
         (timeout (or *rules-timeout* graph-db::*query-default-timeout*))
@@ -226,22 +228,27 @@ re-insert of one identity in a transaction always collide (ruling P10)."
 (defun %store-name (graph)
   "GRAPH's name as a DERIVED-FROM record's METHOD carries it: the
 downcased graph name, cl-llm's STORE-NAME convention (spec §10).  A
-store a rule reads must be keyword-named (recon B5); signals if not."
+store a rule reads must be keyword-named (recon B5); %NORMALIZE-SCOPE
+is where a scope is refused for it, before the rule is resolved, and
+this CHECK-TYPE is belt and braces for every other caller."
   (let ((name (graph-db:graph-name graph)))
-    (unless (keywordp name)
-      (error "A store a rule reads must be keyword-named; ~S is not."
-             name))
+    (check-type name keyword)
     (string-downcase (symbol-name name))))
 
 (defun %normalize-scope (graph scope)
   "SCOPE as RUN-RULE reads it: the open stores a body may read, GRAPH
 first and once (spec §10).  Signals on anything that is not an open
-store.  Duplicates are dropped: a store named twice would answer every
-route twice and so double every solution."
+store, and on a store that is not keyword-named -- %STORE-NAME
+downcases its SYMBOL-NAME (recon B5) -- so both are refused before the
+rule is resolved.  Duplicates are dropped: a store named twice would
+answer every route twice and so double every solution."
   (dolist (g scope)
     (unless (typep g 'graph-db::graph)
       (error "RUN-RULE :SCOPE holds ~S, which is not an open store."
-             g)))
+             g))
+    (unless (keywordp (graph-db:graph-name g))
+      (error "A store a rule reads must be keyword-named; ~S is not."
+             (graph-db:graph-name g))))
   (cons graph (remove graph (remove-duplicates scope :test #'eq
                                                      :from-end t)
                       :test #'eq)))
@@ -250,7 +257,11 @@ route twice and so double every solution."
   "A premise as the reconcile carries it: (IDENTITY-KEY . STORE-NAME),
 STORE-NAME NIL for the rule's own GRAPH (S3-P3).  Call this INSIDE the
 snapshot NODE was read under: a node an INDEX-LOOKUP returned under a
-snapshot is not self-contained once the snapshot exits (recon C4)."
+snapshot is not self-contained once the snapshot exits (recon C4).
+The RESOLVE-NODE-GRAPH fallback scans every open store and would, on
+the single-store path, meet the cross-graph refusal inside the
+transaction (GH #53) -- unreachable today, since every lookup stamps
+NODE-GRAPH (recon B3)."
   (let ((home (or (graph-db::node-graph node)
                   (graph-db:resolve-node-graph (graph-db:id node)))))
     (cons (graph-db.spacetime:claim-identity-key node)
@@ -633,13 +644,15 @@ compiler should have refused."
 (defun run-rules (graph &key scope)
   "Every enabled rule GRAPH can run -- its stored rules, plus the
 DEF-RULEs whose family it carries (ruling P8) -- each through RUN-RULE in
-dependency order (spec §7), with SCOPE (spec §10) passed through to
-every one.  A rule that does not compile is reported :REFUSED and
-skipped; the rest still run.  => the reports, the refused ones first and
-then the rest in the order run.  Compile and the dependency order stay
-single-store, so a cycle through another store's rules is not detected
-(S3-P5)."
-  (let ((reports '())
+dependency order (spec §7), with SCOPE (spec §10) normalised once here
+and passed to every one -- so a scope that is not open stores signals
+even when no rule is runnable.  A rule that does not compile is
+reported :REFUSED and skipped; the rest still run.  => the reports, the
+refused ones first and then the rest in the order run.  Compile and the
+dependency order stay single-store, so a cycle through another store's
+rules is not detected (S3-P5)."
+  (let ((scope (%normalize-scope graph scope))
+        (reports '())
         (compiled '()))
     (dolist (spec (rules-in-scope graph))
       (when (%runnable-spec-p graph spec)
@@ -684,25 +697,40 @@ when nothing in the store has that identity now."
       (or (find-if #'graph-db.spacetime:claim-current-p found)
           (first found)))))
 
-(defun premises-of (graph claim)
+(defun premises-of (graph claim &key (scope (list graph)))
   "The claims CLAIM was derived from (spec §9): its DERIVED-FROM records'
-objects, resolved back to claims.  A premise whose identity no longer
-exists in the store is dropped, and a DERIVATION record of any other
-relation is not provenance and is not read."
+objects, resolved back to claims.  A record's METHOD names the store its
+premise came from (spec §10): the premise resolves there when that store
+is in SCOPE, in GRAPH when METHOD is NIL, and is DROPPED when the named
+store is not in SCOPE -- fewer premises, never wrong ones (S3-P4,
+cl-llm's :ABSENT convention).  A premise whose identity no longer exists
+in its store is dropped too, and a DERIVATION record of any other
+relation is not provenance and is not read.  Trap: a foreign store in
+SCOPE is read here, so call this OUTSIDE a transaction (GH #53)."
   (let ((records (graph-db.spacetime:claims-touching
                   graph 'derivation :claim
                   (graph-db.spacetime:claim-identity-key claim)
                   :role :subject :relation "derived-from")))
-    (remove nil (mapcar (lambda (r)
-                          (%claim-by-identity-key
-                           graph (graph-db.spacetime:claim-object-key r)))
-                        records))))
+    (remove nil
+            (mapcar
+             (lambda (r)
+               (let* ((name (graph-db.spacetime:claim-method r))
+                      (store (if name
+                                 (find name scope :key #'%store-name
+                                                  :test #'string=)
+                                 graph)))
+                 (when store
+                   (%claim-by-identity-key
+                    store (graph-db.spacetime:claim-object-key r)))))
+             records))))
 
 (defun dependents-of (graph claim &key current)
   "Every derived claim whose provenance names CLAIM (spec §9) -- one
 CLAIMS-TOUCHING on the object endpoint, DERIVED-FROM records only, then
 the subjects resolved.  With CURRENT, only dependents still believed.
-Nothing is re-derived."
+Nothing is re-derived.  No scope: the records and the dependents are
+GRAPH's whatever store CLAIM lives in, and a premise is named by its
+identity key (spec §10)."
   (let* ((records (graph-db.spacetime:claims-touching
                    graph 'derivation :claim
                    (graph-db.spacetime:claim-identity-key claim)

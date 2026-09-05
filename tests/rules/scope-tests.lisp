@@ -33,6 +33,24 @@ scope order; with it NIL, from *GRAPH* alone (S3-P1)."
                    (claim ?c rt-claim "host" "h3" "runs" "app" "web")
                    (claim-producer ?c ?p)))))))
 
+(test the-subject-only-route-reads-every-store-in-scope
+  "The subject index route -- namespace and key bound, relation not --
+is the indexed route the test above leaves out: h1 runs web and db in A,
+cache in B."
+  (with-two-stores (a b)
+    (seed a)
+    (seed-b b)
+    ;; Control: NIL scope answers A alone.
+    (is (equal '("db" "web")
+               (sort (select-flat (?o)
+                       (claim ?c rt-claim "host" "h1" ?r ?ons ?o))
+                     #'string<)))
+    (let ((graph-db::*claim-scope* (list a b)))
+      (is (equal '("cache" "db" "web")
+                 (sort (select-flat (?o)
+                         (claim ?c rt-claim "host" "h1" ?r ?ons ?o))
+                       #'string<))))))
+
 (test claim-producer-generates-across-scope
   (with-two-stores (a b)
     (seed a)
@@ -73,6 +91,29 @@ nothing (S3-P5)."
       (signals graph-db::prolog-cost-unbounded-error
         (select (:max-inferences 1000) (?c)
           (claim ?c rt-claim ?a ?b ?r ?d ?e))))))
+
+(test the-walk-skips-a-store-that-lacks-the-family
+  "The unrouted walk visits every store in scope, and one whose schema
+never declared the family visits nothing rather than signalling -- what
+%UNBOUND-CLAIM-SCAN's :VERTEX-TYPE buys (recon B8).  The rt-claim count
+is the control: the same scope, the same walk, a family both stores
+carry."
+  (with-two-stores (a b)
+    (seed a)
+    (seed-b b)
+    (with-transaction ((graph-db::transaction-manager a))
+      (make-rtu-claim-binary :graph a :subject-namespace :app
+                             :subject-key "web" :relation "owned-by"
+                             :object-namespace :team :object-key "t1"
+                             :producer "scan-a" :standing :observed)
+      (make-rtu-claim-binary :graph a :subject-namespace :app
+                             :subject-key "db" :relation "owned-by"
+                             :object-namespace :team :object-key "t2"
+                             :producer "scan-a" :standing :observed))
+    (let ((graph-db::*claim-scope* (list a b)))
+      ;; rtu-claim is declared for A alone: two, and B signals nothing.
+      (is (= 2 (select-count (?c) (claim ?c rtu-claim ?s ?k ?r ?o ?ok))))
+      (is (= 6 (select-count (?c) (claim ?c rt-claim ?s ?k ?r ?o ?ok)))))))
 
 (test a-foreign-read-inside-a-transaction-is-the-engines-refusal
   "The GH #53 contract, not ours: a read-write transaction on A refuses
@@ -338,3 +379,75 @@ refusals raised there, and the control that the same run derives."
       (is (null (derived a 'rt-claim "web-hosts")))
       (is (= 3 (graph-db.rules:rule-report-derived
                 (graph-db.rules:run-rule a r :scope (list a b))))))))
+
+;;; Reading provenance under a scope (S3-P4), and the scope's own
+;;; refusals.
+
+(defmacro signalled-text (&body body)
+  "The text of the error BODY signals, or \"\" when it signals none --
+so an assertion can name which of two refusals answered."
+  `(handler-case (progn ,@body "")
+     (error (c) (princ-to-string c))))
+
+(test run-rules-normalises-the-scope-before-any-rule-runs
+  "RUN-RULES normalises :SCOPE once at entry, so a bad scope signals
+even on a store with no runnable rule -- where no RUN-RULE call would
+ever look at it."
+  (with-two-stores (a b)
+    (seed a)
+    ;; Control: nothing to run, a good scope, no error and no reports.
+    (is (null (graph-db.rules:run-rules a :scope (list a b))))
+    (signals error
+      (graph-db.rules:run-rules a :scope (list b :not-a-graph)))))
+
+(test a-scope-store-must-be-keyword-named
+  "Recon B5: %STORE-NAME downcases the store's SYMBOL-NAME, so a store
+in a scope must be keyword-named -- and %NORMALIZE-SCOPE is where that
+is refused, before the rule is resolved.  Both calls name a rule no
+store holds: with the odd store the scope answers, with B it is
+%RESOLVE-RULE."
+  (with-two-stores (a b)
+    (seed a)
+    (let ((odd (make-instance 'graph-db::graph :graph-name "b")))
+      (is (search "keyword"
+                  (signalled-text
+                    (graph-db.rules:run-rule a "no-such-rule"
+                                             :scope (list odd)))
+                  :test #'char-equal))
+      (is (search "no rule named"
+                  (signalled-text
+                    (graph-db.rules:run-rule a "no-such-rule"
+                                             :scope (list b)))
+                  :test #'char-equal)))))
+
+(test premises-of-resolves-in-the-store-the-record-names
+  "S3-P4: a record's METHOD says which store its premise is in, and a
+premise whose store is not in the caller's scope is dropped rather than
+looked for in the rule's own store.  DEPENDENTS-OF needs no scope: the
+records are the rule's store's whatever store the premise lives in."
+  (with-two-stores (a b)
+    (seed a)
+    (seed-b b)
+    (graph-db.rules:run-rule
+     a (write-rule a :name "web-hosts" :version "1" :family "rt-claim"
+                   :head *web-hosts-head* :body *web-hosts-body*)
+     :scope (list a b))
+    (let ((h3 (find "h3" (derived a 'rt-claim "web-hosts")
+                    :key #'claim-object-key :test #'string=))
+          (h1 (find "h1" (derived a 'rt-claim "web-hosts")
+                    :key #'claim-object-key :test #'string=)))
+      ;; In scope: the premise, from B.
+      (let ((ps (graph-db.rules:premises-of a h3 :scope (list a b))))
+        (is (= 1 (length ps)))
+        (is (string= "h3" (claim-subject-key (first ps))))
+        (is (eq b (graph-db::node-graph (first ps)))))
+      ;; Out of scope: dropped, not resolved in A by mistake (S3-P4).
+      (is (null (graph-db.rules:premises-of a h3)))
+      ;; Control: an own-store premise answers under the default scope.
+      (let ((ps (graph-db.rules:premises-of a h1)))
+        (is (= 1 (length ps)))
+        (is (eq a (graph-db::node-graph (first ps)))))
+      ;; And a B premise's dependents are findable from A.
+      (let ((premise (first (claims-touching b 'rt-claim :host "h3"
+                                             :role :subject))))
+        (is (= 1 (length (graph-db.rules:dependents-of a premise))))))))

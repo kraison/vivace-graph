@@ -52,6 +52,26 @@ between releases; cutting a release renames it to the new version and dates it.
   `premises-of` and `dependents-of` read provenance back.
   `docs/rules.md`.
 
+- **`graph-db/rules`, a rule reads a scope of stores and writes its
+  own** (#304, #332): `run-rule` and `run-rules` take `:scope`, the
+  open stores the body may read -- the rule's own store first, a store
+  named twice read once -- and `claim/7`'s indexed routes and family
+  walk, and `claim-producer/2`'s generator, answer the union of them,
+  still committed state, a store whose schema lacks the family
+  contributing nothing rather than refusing. The rule writes its own
+  store alone. With another store in scope the body is evaluated
+  *before* the write transaction, under one composed read snapshot per
+  store, because a read-write transaction refuses every read of another
+  store (#53); under a shared system clock (#168) those snapshots take
+  their epochs from one counter, and the run is not serialised against
+  a premise committed after them. A premise from another store is
+  recorded in its `derived-from` record's `method` -- the downcased
+  store name, `nil` for the rule's own -- and `premises-of` now takes a
+  `:scope`, resolving each premise in the store its record names and
+  dropping one whose store is out of scope. A Lisp caller can bind
+  `graph-db::*claim-scope*` around a raw `select` for the same reads,
+  outside a transaction. `docs/rules.md`.
+
 - **`graph-db/query`, a web-free subsystem for guarded queries** (#322):
   the JSON pattern DSL moves out of the `graph-db` web system and the
   free-text Prolog guard moves out of `graph-db/gui`, both into a
