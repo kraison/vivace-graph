@@ -609,7 +609,8 @@ cl-temporal-extent."
                (:file "claim-transaction-tests")       ; GH #148
                (:file "register-tests")                ; GH #138
                (:file "membership-tests")              ; GH #157 4b
-               (:file "temporal-tests"))               ; GH #296
+               (:file "temporal-tests")                ; GH #296
+               (:file "epoch-tests"))                  ; GH #347
   :perform (test-op (op c)
                     (unless (uiop:symbol-call :graph-db/spacetime-test
                                               :run-spacetime-tests)

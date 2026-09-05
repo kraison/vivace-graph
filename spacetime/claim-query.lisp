@@ -137,6 +137,17 @@ the asked instant, but every version stamped then is past the family's
 (GH #300)."
   id)
 
+(defun claim-commit-epoch (claim)
+  "The epoch of the transaction that committed CLAIM's version, or NIL
+for a REAPED-CLAIM (a version the store no longer holds) and for a
+version stamped 0, written before the store had a counter.  The number
+is the writer's own TRANSACTION-ID, comparable across stores only while
+they share one SYSTEM-CLOCK -- see GRAPH-DB:GRAPH-SYSTEM-CLOCK (GH
+#347)."
+  (unless (reaped-claim-p claim)
+    (let ((e (graph-db:commit-epoch claim)))
+      (and (plusp e) e))))
+
 (defun %claim-effective-stamp (version)
   "VERSION's place on the wall clock: its :AS-OF stamp, else the start of
 its (immutable) transaction extent, else NIL for a claim predating both
