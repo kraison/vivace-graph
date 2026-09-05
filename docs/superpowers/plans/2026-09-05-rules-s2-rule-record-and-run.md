@@ -2227,6 +2227,14 @@ Run the diffstat check on `facts-tests.lisp`: 0 removed lines.
   - one sentence in `%edges`'s docstring: a def-rule is never validated at registration, so a two-goal head there contributes its second goal as a read;
   - a test `two-mutually-cyclic-rules-in-one-transaction-are-refused` writing rules `a` (head x reads y) and `b` (head y reads x) inside ONE `with-transaction`, expecting `rule-compile-error` and neither record present afterwards — the create-through-the-view branch of `%stored-rules` is what this exercises.
 
+- [ ] **Step 1c: Task 4's deferred minors** (ledger, review of ea6c199), in `rules/run.lisp`, `tests/rules/run-tests.lisp` and `docs/rules.md`:
+  - `%constructor` builds the name with `(format nil "MAKE-~A-~A" …)`, which is `*print-case*`-sensitive: use `(concatenate 'string "MAKE-" (symbol-name parent) …)`;
+  - `%violation-family`'s fallback returns `(type-of c)`, outside the documented tag vocabulary: map every other `constraint-violation` to `:rule`, and say so in the "Running a rule" report paragraph;
+  - `%reconcile-provenance` keeps both of two existing derivation records sharing one `(subject-key . object-key)` pair (the second finds `:kept`, which is truthy): treat a pair already marked `:kept` as a duplicate and `mark-deleted` it, as `%reconcile-claims` does for claims;
+  - a one-line comment at the top of `%reconcile-claims`: the producer's claims are read BEFORE any write, because `claims-by-producer` overlays the open transaction and the reconcile needs the committed set;
+  - ruling T4-R3 documented in "Validity": when solutions collapse to one identity in a non-temporal family, the first solution's extent is the one kept and the premises are unioned; no re-intersection;
+  - tests: `a-retracted-derived-claim-stays-retracted-on-rerun` (run web-hosts, `retract-claim` the h1 derivation, rerun: `kept` 2, the h1 claim still not `claim-current-p`, same node id) and `a-temporal-rerun-keeps-its-claims` (run host-version twice: second report `kept` 4, `derived` 0, `swept` 0); if a second graph name is cheap, `run-rules-on-a-store-without-the-rule-schema-reports-nothing` for T4-R2 (declare `(def-claim-classes rtn-claim :graph-db-rules-norule)` and open a graph under that name; `run-rules` => NIL).
+
 - [ ] **Step 2: `docs/rules.md`'s untrue sentence** — "A bound `?p` naming no producer is the empty answer instead, the way an unresolvable namespace is" holds for a string; a `?p` bound to NIL reaches the neither-bound refusal. Rewrite: "A bound `?p` that is a string naming no producer is the empty answer; a `?p` bound to NIL is not a producer name and takes the neither-bound path."
 
 - [ ] **Step 3: The S1 decision record's framing** — first paragraph of `docs/superpowers/decisions/2026-09-04-rules-s1-rulings.md`, add: "Numbered as in the session notes; the gaps are rulings that were routine and not transcribed, so this is a subset, not the whole."
