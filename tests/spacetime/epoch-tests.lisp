@@ -148,7 +148,7 @@ live version's CLAIM-COMMIT-EPOCH is E2."
         (is (= 1 (length (at e1))))
         (is (claim-current-p (first (at e1))))
         (is (= 1 (length (at eb))))
-        (is (null (at e2)))
+        (is (null (at e2)) "retracted at E2: gone at E2")
         (is (= e2 (claim-commit-epoch (%one a 'ea-claim "r1"))))))))
 
 (test as-of-epoch-composes-with-current-and-at
@@ -287,3 +287,35 @@ does not return it.  The read before the delete is the control."
       (%tx a (lambda () (graph-db:mark-deleted (%one a 'ea-claim "r1"))))
       (is (null (claims-touching a 'ea-claim :region "r1" :role :subject
                                  :as-of-epoch e1))))))
+
+(test as-of-epoch-drops-a-claim-born-with-a-closed-transaction-period
+  "#347 finding I2, pinned: CLAIM-CURRENT-P is the whole retraction
+test on the epoch axis (%CLAIM-AS-OF-EPOCH), and it answers NIL for a
+version created with an already-closed transaction period -- a
+replicated or restored belief retracted upstream materialises as one
+create version carrying that closed extent.  Bound: such a claim reads
+as retracted at every epoch, even its own creating one, though :AS-OF
+still answers for an instant inside the closed period -- the control
+below."
+  (with-clocked-stores (a b)
+    (let* ((start (local-time:now))
+           (close (local-time:timestamp+ start 1 :day))
+           (mid (local-time:timestamp+ start 1 :hour))
+           (txn (make-interval (exact-bound start) (exact-bound close)
+                               :semantics :transaction
+                               :standing :asserted))
+           (e1 (%tx a (lambda ()
+                        (make-ea-claim-unary
+                         :graph a :subject-namespace :region
+                         :subject-key "r1" :relation "verified"
+                         :producer "audit" :standing :observed
+                         :transaction-extent txn)))))
+      (let ((by-as-of (claims-touching a 'ea-claim :region "r1"
+                                       :role :subject :as-of mid)))
+        (is (= 1 (length by-as-of))
+            "control: :AS-OF inside the closed period still answers")
+        (is (not (claim-current-p (first by-as-of)))
+            "control: the version is not current"))
+      (is (null (claims-touching a 'ea-claim :region "r1" :role :subject
+                                 :as-of-epoch e1))
+          "born already retracted: absent at its own creating epoch"))))

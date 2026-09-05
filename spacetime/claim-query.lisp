@@ -140,10 +140,10 @@ the asked instant, but every version stamped then is past the family's
 (defun claim-commit-epoch (claim)
   "The epoch of the transaction that committed CLAIM's version, or NIL
 for a REAPED-CLAIM (a version the store no longer holds) and for a
-version stamped 0, written before the store had a counter.  The number
-is the writer's own TRANSACTION-ID, comparable across stores only while
-they share one SYSTEM-CLOCK -- see GRAPH-DB:GRAPH-SYSTEM-CLOCK (GH
-#347)."
+version not yet committed -- an epoch is assigned at commit, so a claim
+read inside its own open transaction has none.  The number is the
+writer's own TRANSACTION-ID, comparable across stores only while they
+share one SYSTEM-CLOCK -- see GRAPH-DB:GRAPH-SYSTEM-CLOCK (GH #347)."
   (unless (reaped-claim-p claim)
     (let ((e (graph-db:commit-epoch claim)))
       (and (plusp e) e))))
@@ -155,7 +155,9 @@ they share one SYSTEM-CLOCK -- see GRAPH-DB:GRAPH-SYSTEM-CLOCK (GH
   (:documentation "An :AS-OF-EPOCH read of a store with no system clock.
 Its epochs are a private counter, so an answer would look like the
 attached case and mean something unrelated (GH #347 recon E9).  The
-parent's REASON is filled at the signal site."))
+parent's REASON is filled at the signal site.  The rules subsystem
+handles QUERY-PRECONDITION-ERROR as \"no facts\"; a reader there that
+ever takes the epoch axis must let this subtype through."))
 
 (defun %refuse-epoch-axis (graph)
   "Signal EPOCH-AXIS-UNAVAILABLE unless GRAPH is attached to a clock.
@@ -224,7 +226,10 @@ Walks VERTEX-HISTORY newest-first comparing each version's own commit
 epoch with <=; RESOLVE-VERSION-AT-EPOCH is a strict snapshot-start
 predicate and would drop the commit made AT EPOCH (#347 recon C2, C3).
 A retraction is a version, so CLAIM-CURRENT-P on the selected version
-is the whole retraction test (recon E4)."
+is the whole retraction test (recon E4).  A claim created with an
+already-closed transaction period -- a replicated or restored belief
+retracted upstream -- reads as retracted at every epoch; there is no
+epoch-to-instant map to probe its period with."
   (let* ((history (graph-db:vertex-history graph (graph-db:id claim)))
          (resolved (loop for (version . e) in history
                          when (<= e epoch) return version)))
@@ -232,8 +237,10 @@ is the whole retraction test (recon E4)."
           ((null history) nil)
           ;; Nothing old enough.  Reaping severs the chain, so only the
           ;; oldest retained REVISION tells created-after-EPOCH (0: it
-          ;; is the create) from reaped (> 0) -- recon C4.
-          ((zerop (graph-db:revision (car (car (last history))))) nil)
+          ;; is the create) from reaped (> 0) -- recon C4.  REVISION is
+          ;; 32-bit and wraps; after 2^32 updates to one claim the
+          ;; discriminator reads a wrapped 0 as the create.
+          ((zerop (graph-db:revision (car (first (last history))))) nil)
           (t (%make-reaped-claim (graph-db:id claim))))))
 
 (defun %paginate (list limit offset)
@@ -308,7 +315,8 @@ REAPED-CLAIM when older versions existed but are past :KEEP-REVISIONS
 -- told from \"created after\" by the oldest retained REVISION.  Epochs
 compare across stores only while the stores share one SYSTEM-CLOCK; a
 clockless store signals EPOCH-AXIS-UNAVAILABLE.  One of :AS-OF or
-:AS-OF-EPOCH, not both.
+:AS-OF-EPOCH, not both.  :CURRENT is redundant on this axis: only
+versions still believed are ever selected.
 
 :RELATION (a canonical string) restricts to one relation; on the subject
 side it rides the (subject-namespace subject-key relation) index (GH
@@ -329,7 +337,7 @@ subsystem exists to keep those two cases from being confused."
   (check-type role (member :subject :object :either))
   (check-type at (or null local-time:timestamp))
   (check-type during (or null temporal-extent))
-  (check-type as-of-epoch (or null integer))
+  (check-type as-of-epoch (or null unsigned-byte))
   (when (and at during)
     (error "Pass only one of :AT or :DURING, not both."))
   (when (and as-of as-of-epoch)
@@ -515,7 +523,7 @@ CLAIMS-TOUCHING does (GH #300, GH #347); one or the other, not both.
 Uses the PRODUCER index, so this is O(matching) rather than a scan of every
 claim.  :LIMIT / :OFFSET cut the result; the second return value is T
 when more claims existed past the cut (NIL without :LIMIT) (GH #302)."
-  (check-type as-of-epoch (or null integer))
+  (check-type as-of-epoch (or null unsigned-byte))
   (when (and as-of as-of-epoch)
     (error "Pass only one of :AS-OF or :AS-OF-EPOCH, not both."))
   (when as-of-epoch (%refuse-epoch-axis graph))
