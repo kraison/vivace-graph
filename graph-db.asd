@@ -221,15 +221,15 @@ directly, web-free (GH #322)."
 ;; Rules as versioned producers (GH #304): S1 makes claims Prolog facts.
 (defsystem graph-db/rules
   :name "VivaceGraph rules"
-  :description "Claims as Prolog facts; later, rules as versioned
-producers.  docs/rules.md; GH #304."
+  :description "Claims as Prolog facts, and rules as versioned producers.
+docs/rules.md; GH #304."
   :maintainer "Kevin Raison"
   :author "Kevin Raison <last name @ chatsubo dot net>"
   :version "4.0.1"
   :depends-on (:graph-db/spacetime :graph-db/query)
   :pathname "rules/"
   :serial t
-  :components ((:file "package") (:file "facts"))
+  :components ((:file "package") (:file "facts") (:file "schema"))
   :in-order-to ((test-op (test-op :graph-db/rules-test))))
 
 (defsystem graph-db/rules-test
@@ -238,7 +238,8 @@ producers.  docs/rules.md; GH #304."
   :depends-on (:graph-db/rules :graph-db/test-scratch :fiveam)
   :pathname "tests/rules/"
   :serial t
-  :components ((:file "package") (:file "suite") (:file "facts-tests"))
+  :components ((:file "package") (:file "suite") (:file "facts-tests")
+               (:file "schema-tests"))
   :perform (test-op (op c)
              (unless (uiop:symbol-call :graph-db/rules-test
                                        :run-rules-tests)
@@ -556,7 +557,7 @@ and read-only neighborhood exploration."
   :description "The claim record and source-onboarding contract over
 cl-temporal-extent."
   :depends-on (:graph-db/core :local-time
-               (:version :cl-temporal-extent "0.2.0"))
+               (:version :cl-temporal-extent "0.3.0"))
   :pathname "spacetime/"
   :serial t
   :components ((:file "package")

@@ -224,3 +224,16 @@ an image that loads `graph-db/rules` **and** `graph-db/gui-test` fails
 against a hand-reviewed list and the gui lane loads no rules. Classify
 the seven functors there if you build such an image; never weaken the
 check.
+
+## Slice 2 (placeholder; GH #331)
+
+`graph-db.rules:def-rules-schema (graph-name)` declares the store's
+`rule` record (`name version family head body extent-policy enabled`)
+and the `derivation` claim family, both per store like any `def-source`
+or `def-claim-classes` call. `name` is the identity key -- one live
+`rule` per name -- so a new version is `copy`, `setf rule-version`,
+`save`, not a second write. A second `def-rules-schema` call (a
+multi-store image) rebinds `make-rule`'s default store, so every
+constructor call after that must pass `:graph` explicitly. `compile-rule`
+and `run-rule` finish this slice; see Task 5 for the rest of this
+section.

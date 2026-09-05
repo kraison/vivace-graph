@@ -11,4 +11,6 @@
    ;; schema names, shared with the GUI
    #:schema-type-names
    ;; the runner (spec SS4, GH #322)
-   #:run-guarded-prolog))
+   #:run-guarded-prolog
+   ;; the compile half, for a caller that keeps the goals (GH #331)
+   #:guard-query-text))

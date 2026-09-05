@@ -127,3 +127,23 @@ package nor IS-A/2 from the schema's."
         (is (= 2 (length rows)))
         (is (member (list (string-id a) (string-id b)) rows
                     :test #'equal))))))
+
+;; GUARD-QUERY-TEXT (GH #331): the compile half of RUN-GUARDED-PROLOG
+;; for a caller that keeps the goals.
+(test guard-query-text-returns-guarded-goals-with-uninterned-vars
+  (with-query-graph (g)
+    (multiple-value-bind (vars goals)
+        (graph-db.query:guard-query-text
+         "(is-a ?p qt-item) (qt-links ?p ?f)" g)
+      (is (= 2 (length vars)))
+      (is (every (lambda (v) (null (symbol-package v))) vars))
+      ;; The same ?P in both goals is one symbol.
+      (is (eq (second (first goals)) (second (second goals))))
+      ;; Heads are the engine's own symbols, not the scratch package's.
+      (is (eq (find-package :graph-db) (symbol-package (first (first goals)))))
+      (is (eq 'graph-db/query-test.schema::qt-item
+              (third (first goals)))))
+    (signals graph-db.query:prolog-guard-error
+      (graph-db.query:guard-query-text "(no-such-functor ?x)" g))
+    (signals graph-db.query:prolog-guard-error
+      (graph-db.query:guard-query-text "(is-a ?p graph-db::vertex)" g))))

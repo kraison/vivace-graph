@@ -730,3 +730,17 @@ condition contract (spec SS4, GH #322)."
                          shown)
                      (and truncated t))))
       (delete-package scratch))))
+
+(defun guard-query-text (text graph)
+  "TEXT screened, read and guarded against GRAPH exactly as
+RUN-GUARDED-PROLOG does before it runs: (VALUES VARS GOALS), VARS in
+first-appearance order.  For a caller that keeps the goals rather than
+running them once -- graph-db/rules compiles a rule's text through
+this (GH #331).  The scratch package the read interned into is deleted
+before returning, so every ?variable comes back UNINTERNED; they stay
+EQ across the goals, which is all the compiler asks of a variable.
+Refusals signal PROLOG-GUARD-ERROR, as for RUN-GUARDED-PROLOG."
+  (let ((scratch (%make-scratch-package)))
+    (unwind-protect
+         (%read-guarded-forms text scratch (%guard-context graph scratch))
+      (delete-package scratch))))
