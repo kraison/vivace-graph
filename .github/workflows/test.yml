@@ -44,8 +44,18 @@ jobs:
               https://github.com/kraison/cl-temporal-extent $d
           fi
           echo "cl-temporal-extent @ $(git -C $d rev-parse --short HEAD)"
-      - name: full suite (12GiB heap per tests/README.md)
+      # Full on a push, fast tier on a pull request (docs/ci.md, GH #340):
+      # three suites are 71% of this step's wall time for 8% of its checks.
+      # The other lanes below run either way -- together they are ~4
+      # minutes, so there is nothing to tier there.
+      - name: main suite (12GiB heap per tests/README.md)
         run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            SYSTEM=graph-db/fast-test
+          else
+            SYSTEM=graph-db
+          fi
+          echo "main suite: asdf:test-system :$SYSTEM"
           sbcl --dynamic-space-size 12288 --non-interactive \
             --load "$HOME/quicklisp/setup.lisp" \
             --eval '(setf ql:*local-project-directories* nil)' \
@@ -57,7 +67,7 @@ jobs:
                                                    (user-homedir-pathname)))
                             :ignore-inherited-configuration))' \
             --eval '(ql:quickload :graph-db/test :silent t)' \
-            --eval '(asdf:test-system :graph-db)'
+            --eval "(asdf:test-system :$SYSTEM)"
       - name: concurrency suite
         run: |
           sbcl --dynamic-space-size 12288 --non-interactive \
