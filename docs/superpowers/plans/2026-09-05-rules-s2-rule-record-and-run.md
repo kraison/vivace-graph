@@ -2220,6 +2220,13 @@ and use `(%unbound-p ?c)` where `(null c-arg)` meant unbound (both the generator
 
 Run the diffstat check on `facts-tests.lisp`: 0 removed lines.
 
+- [ ] **Step 1b: Task 3's deferred minors** (ledger, review of a0789ff), all in `rules/compile.lisp` and `tests/rules/compile-tests.lisp`:
+  - a bare `?` in the head's `?c` position is not refused: scan the head for a bare `?` separately (do not pass the head to `%body-variables`, which would defeat the "not bound by the body" check); add the head case to `the-body-goes-through-the-guard`'s bare-`?` assertion (a second `refuses "bare ?"` with `(claim ? rt-claim "app" "web" "x" "host" ?h)` as the head);
+  - `rules-in-scope` filters disabled def-rules (ruling T3-R5: the filter stands) but its docstring and `docs/rules.md` say "every def-rule": make both say "every enabled def-rule";
+  - refusal messages that print `~S` on a schema symbol or `(symbol-name term)` on a variable (the not-a-claim-family, not-bound-by-the-body and non-string-term cases) print downcased with `~(~A~)`;
+  - one sentence in `%edges`'s docstring: a def-rule is never validated at registration, so a two-goal head there contributes its second goal as a read;
+  - a test `two-mutually-cyclic-rules-in-one-transaction-are-refused` writing rules `a` (head x reads y) and `b` (head y reads x) inside ONE `with-transaction`, expecting `rule-compile-error` and neither record present afterwards — the create-through-the-view branch of `%stored-rules` is what this exercises.
+
 - [ ] **Step 2: `docs/rules.md`'s untrue sentence** — "A bound `?p` naming no producer is the empty answer instead, the way an unresolvable namespace is" holds for a string; a `?p` bound to NIL reaches the neither-bound refusal. Rewrite: "A bound `?p` that is a string naming no producer is the empty answer; a `?p` bound to NIL is not a producer name and takes the neither-bound path."
 
 - [ ] **Step 3: The S1 decision record's framing** — first paragraph of `docs/superpowers/decisions/2026-09-04-rules-s1-rulings.md`, add: "Numbered as in the session notes; the gaps are rulings that were routine and not transcribed, so this is a subset, not the whole."
