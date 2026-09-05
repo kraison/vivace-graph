@@ -526,8 +526,8 @@ not.
 A refusal of any kind -- compile, the rails, effects, a commit
 constraint, a missing extent -- is reported, never signalled, and
 unwinds the whole run so the previous derivation stands; an operator
-error (no resource bound, no such rule, a SCOPE that is not open
-stores) signals."
+error (no resource bound, no such rule, a SCOPE that is not a list of
+open, keyword-named stores) signals."
   (let* ((scope (%normalize-scope graph scope))
          (foreign (rest scope))
          (spec (%resolve-rule graph rule))

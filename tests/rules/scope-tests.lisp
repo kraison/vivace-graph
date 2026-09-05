@@ -424,7 +424,11 @@ store holds: with the odd store the scope answers, with B it is
   "S3-P4: a record's METHOD says which store its premise is in, and a
 premise whose store is not in the caller's scope is dropped rather than
 looked for in the rule's own store.  DEPENDENTS-OF needs no scope: the
-records are the rule's store's whatever store the premise lives in."
+records are the rule's store's whatever store the premise lives in.
+
+The decoy is what makes the drop assertion discriminate: A holds a
+claim with the B premise's exact identity, written after the run, so a
+resolve-in-GRAPH fallback answers it instead of NIL."
   (with-two-stores (a b)
     (seed a)
     (seed-b b)
@@ -432,6 +436,12 @@ records are the rule's store's whatever store the premise lives in."
      a (write-rule a :name "web-hosts" :version "1" :family "rt-claim"
                    :head *web-hosts-head* :body *web-hosts-body*)
      :scope (list a b))
+    ;; Written AFTER the run, so no record names A for this premise.
+    (with-transaction ((graph-db::transaction-manager a))
+      (make-rt-claim-binary :graph a :subject-namespace :host
+                            :subject-key "h3" :relation "runs"
+                            :object-namespace :app :object-key "web"
+                            :producer "scan-c" :standing :observed))
     (let ((h3 (find "h3" (derived a 'rt-claim "web-hosts")
                     :key #'claim-object-key :test #'string=))
           (h1 (find "h1" (derived a 'rt-claim "web-hosts")

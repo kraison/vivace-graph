@@ -157,8 +157,10 @@ is, the producer index through CLAIM-PRODUCER/2 in the same body.  A
 bound namespace naming no keyword answers empty; every other goal the
 routes miss reaches the COND's last clause, which walks the family or is
 refused as cost-unbounded under a resource bound (GH #285, spec §4).
-Every route reads every store in *CLAIM-SCOPE*, own store first, and
-*GRAPH* alone when it is NIL (spec §10, GH #332)."
+The three indexed routes and the walk read every store in
+*CLAIM-SCOPE*, own store first, or *GRAPH* alone when it is NIL; a
+bound ?C and the empty fast paths read no store at all (spec §10,
+GH #332)."
   (let* ((family (%family-or-ill-typed ?family))
          (parent (graph-db.spacetime:claim-family-parent family))
          (binary (graph-db.spacetime:claim-family-binary family))
