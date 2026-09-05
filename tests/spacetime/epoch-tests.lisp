@@ -273,3 +273,17 @@ extent, E2 the new one."
            new (claim-extent
                 (first (claims-by-producer a 'ea-claim "audit"
                                            :as-of-epoch e2))))))))
+
+(test as-of-epoch-does-not-resurrect-a-deleted-claim
+  "The stated bound, pinned: index membership is not snapshot-versioned
+(kraison/vivace-graph#345, docs/rules.md), so a claim created at E1 and
+MARK-DELETED later is gone from the endpoint index and :AS-OF-EPOCH E1
+does not return it.  The read before the delete is the control."
+  (with-clocked-stores (a b)
+    (let ((e1 (%tx a (lambda () (%unary a #'make-ea-claim-unary "r1")))))
+      (is (= 1 (length (claims-touching a 'ea-claim :region "r1"
+                                        :role :subject :as-of-epoch e1)))
+          "control: visible before the delete")
+      (%tx a (lambda () (graph-db:mark-deleted (%one a 'ea-claim "r1"))))
+      (is (null (claims-touching a 'ea-claim :region "r1" :role :subject
+                                 :as-of-epoch e1))))))
