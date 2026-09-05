@@ -29,6 +29,27 @@ between releases; cutting a release renames it to the new version and dates it.
   a `rules` lane; `docs/rules.md`. The rule record and `run-rule` are
   the next slice (#331).
 
+- **`graph-db/rules`, rules as versioned producers** (#304, #331):
+  `def-rules-schema` gives a store the `rule` record (`def-source`,
+  identity `:rule`/`name`, one record per name) and the `derivation`
+  provenance family; `def-rule` is the in-image escape hatch.
+  `compile-rule` reads a rule's head and body through the guard's own
+  screen, reader and whitelist (new export
+  `graph-db.query:guard-query-text`), checks the head as one `claim/7`
+  pattern, moves `claim-producer` generators first, and refuses
+  recursion over every rule in scope with the cycle named; a `rule`
+  write that does not compile is refused at commit
+  (`rule-compile-error`). `run-rule` derives afresh and reconciles the
+  result with the rule's previous derivation in one validated
+  transaction under the query rails, each derived claim `producer
+  rule/<name>`, `rule-version`, `standing :inferred`, its validity the
+  intersection of its premises' (`extent-intersection`,
+  cl-temporal-extent 0.3.0), one `derived-from` claim per premise; a
+  refusal unwinds the whole run and the `rule-report` names it.
+  `run-rules` runs every enabled rule in dependency order;
+  `premises-of` and `dependents-of` read provenance back.
+  `docs/rules.md`.
+
 - **`graph-db/query`, a web-free subsystem for guarded queries** (#322):
   the JSON pattern DSL moves out of the `graph-db` web system and the
   free-text Prolog guard moves out of `graph-db/gui`, both into a
@@ -169,6 +190,10 @@ between releases; cutting a release renames it to the new version and dates it.
   one-relation read of a busy endpoint touches only that relation's rows.
 
 ### Changed
+
+- **`graph-db/spacetime` now requires cl-temporal-extent 0.3.0**
+  (`extent-intersection`, kraison/cl-temporal-extent#5), which
+  `graph-db/rules` uses to intersect a derived claim's premises.
 
 - **Pull requests run the main suite's fast tier** (#340): timing all
   143 children of `graph-db-suite` found three of them -- the

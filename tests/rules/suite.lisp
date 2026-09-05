@@ -42,6 +42,15 @@
 
 (def-claim-classes rtf-claim :graph-db-rules-test-foreign)
 
+;; T4-R2's store: claim classes but no DEF-RULES-SCHEMA, so the schema
+;; carries no RULE vertex type at all.
+(eval-when (:load-toplevel :execute)
+  (setf (gethash :graph-db-rules-norule
+                 graph-db::*schema-node-metadata*)
+        nil))
+
+(def-claim-classes rtn-claim :graph-db-rules-norule)
+
 ;; S2: the rule record and the derivation family on the test store
 ;; (spec §5, §9).
 (graph-db.rules:def-rules-schema :graph-db-rules-test)
@@ -65,6 +74,16 @@ closes and reopens the store."
                           :buffer-pool-size 1000)))
      (unwind-protect (let ((graph-db:*graph* ,g)) ,@body)
        (ignore-errors (close-graph ,g)))))
+
+(defmacro with-norule-graph ((g) &body body)
+  "A fresh store under the graph name DEF-RULES-SCHEMA never touched."
+  (let ((dir (gensym "DIR")))
+    `(let* ((,dir (graph-db-test-scratch:make-scratch-directory
+                   "graph-db-rules-norule"))
+            (,g (make-graph :graph-db-rules-norule (namestring ,dir)
+                            :buffer-pool-size 1000)))
+       (unwind-protect (let ((graph-db:*graph* ,g)) ,@body)
+         (ignore-errors (close-graph ,g))))))
 
 (defun seed-temporal (g)
   "Three deployments of web, by producer \"deploy\": h1 twice with a gap,

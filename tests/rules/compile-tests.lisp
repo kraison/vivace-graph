@@ -37,6 +37,8 @@
   "(claim ?c rt-claim \"app\" \"web\" \"runs\" \"host\" ?h)")
 (defparameter *head-scanned*
   "(claim ?c rt-claim \"host\" ?h \"scanned\" \"app\" ?a)")
+(defparameter *head-bare-c*
+  "(claim ? rt-claim \"app\" \"web\" \"x\" \"host\" ?h)")
 
 (defparameter *body-no-functor* "(no-such-functor ?p)")
 (defparameter *body-unregistered*
@@ -116,6 +118,10 @@
            :head *web-hosts-head* :body *body-unregistered*)
   (refuses "bare ?" :name "r" :version "1" :family "rt-claim"
            :head *web-hosts-head* :body *body-bare-question*)
+  ;; The head is scanned separately: %BODY-VARIABLES sees the body
+  ;; alone, so a bare ? in the head's ?c position reached no check.
+  (refuses "bare ?" :name "r" :version "1" :family "rt-claim"
+           :head *head-bare-c* :body *web-hosts-body*)
   (refuses "package-qualified" :name "r" :version "1" :family "rt-claim"
            :head *web-hosts-head* :body *body-qualified*)
   (refuses "empty" :name "r" :version "1" :family "rt-claim"
@@ -205,3 +211,33 @@
                          :head *head-x* :body *body-producer-var*)))
              (goals (graph-db.rules::compiled-rule-goals d)))
         (is (string= "CLAIM" (symbol-name (first (first goals)))))))))
+
+(test two-mutually-cyclic-rules-in-one-transaction-are-refused
+  "The create-through-the-view branch of %STORED-RULES: neither record
+is committed, so only VIEW-WRITES can show one rule the other."
+  (with-rules-graph (g)
+    (signals graph-db.rules:rule-compile-error
+      (with-transaction ((graph-db::transaction-manager g))
+        (graph-db.rules:make-rule :graph g :name "a" :version "1"
+                                  :family "rt-claim"
+                                  :head *head-x* :body *body-y*)
+        (graph-db.rules:make-rule :graph g :name "b" :version "1"
+                                  :family "rt-claim"
+                                  :head *head-y* :body *body-x*)))
+    (is (null (graph-db:index-lookup g 'graph-db.rules:rule
+                                     '(graph-db.rules::name) "a")))
+    (is (null (graph-db:index-lookup g 'graph-db.rules:rule
+                                     '(graph-db.rules::name) "b")))
+    ;; Control: the same pair with b reading a third relation commits.
+    (finishes
+      (with-transaction ((graph-db::transaction-manager g))
+        (graph-db.rules:make-rule :graph g :name "a" :version "1"
+                                  :family "rt-claim"
+                                  :head *head-x* :body *body-y*)
+        (graph-db.rules:make-rule :graph g :name "b" :version "1"
+                                  :family "rt-claim"
+                                  :head *head-y* :body *body-z*)))
+    (is (= 2 (length (graph-db:map-vertices #'identity g
+                                            :vertex-type
+                                            'graph-db.rules:rule
+                                            :collect-p t))))))

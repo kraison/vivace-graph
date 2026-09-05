@@ -544,3 +544,145 @@ graph here."
       (is (plusp (graph-db.rules:rule-report-inferences report)))
       (is (typep (graph-db.rules:rule-report-elapsed report) 'real))
       (is (>= (graph-db.rules:rule-report-elapsed report) 0)))))
+
+(test a-retracted-derived-claim-stays-retracted-on-rerun
+  "Ruling P10's stated cost: keeping is not re-assertion.  The claim is
+kept -- same node -- and its closed transaction period stands."
+  (with-rules-graph (g)
+    (seed g)
+    (let ((r (write-web-hosts g)))
+      (graph-db.rules:run-rule g r)
+      (let* ((h1 (find "h1" (derived g 'rt-claim "web-hosts")
+                       :key #'claim-object-key :test #'string=))
+             (before (graph-db:id h1)))
+        (retract-claim h1)
+        (let ((report (graph-db.rules:run-rule g r)))
+          (is (= 2 (graph-db.rules:rule-report-kept report)))
+          (is (= 0 (graph-db.rules:rule-report-derived report)))
+          (is (= 0 (graph-db.rules:rule-report-swept report))))
+        (let ((again (find "h1" (claims-by-producer g 'rt-claim
+                                                    "rule/web-hosts")
+                           :key #'claim-object-key :test #'string=)))
+          (is-true again)
+          (when again
+            (is (equalp before (graph-db:id again)))
+            (is-false (claim-current-p again))))
+        ;; Control: h2 was never retracted and is still believed.
+        (is (equal '("h2")
+                   (mapcar #'claim-object-key
+                           (derived g 'rt-claim "web-hosts"))))
+        ;; And through the COPY/SAVE %REFRESH-VERSION does when the
+        ;; rule's version moves -- the other path that touches a kept
+        ;; claim -- the closed period still stands.
+        (with-transaction ((graph-db::transaction-manager g))
+          (let ((c (copy r)))
+            (setf (graph-db.rules:rule-version c) "2")
+            (save c)))
+        (is (= 2 (graph-db.rules:rule-report-kept
+                  (graph-db.rules:run-rule g "web-hosts"))))
+        (let ((again (find "h1" (claims-by-producer g 'rt-claim
+                                                    "rule/web-hosts")
+                           :key #'claim-object-key :test #'string=)))
+          (is-true again)
+          (when again
+            (is (string= "2" (claim-rule-version again)))
+            (is-false (claim-current-p again))))))))
+
+(test a-temporal-rerun-keeps-its-claims
+  "Ruling P10 on a temporal family, where the extent start joins the
+identity: the same premises re-derive the same four identities, so a
+rerun keeps all four and constructs nothing."
+  (with-rules-graph (g)
+    (seed g)
+    (seed-temporal g)
+    (let ((r (write-host-version g)))
+      (graph-db.rules:run-rule g r)
+      (let ((before (sort (mapcar #'claim-identity-key
+                                  (derived g 'rtt-claim "host-version"))
+                          #'string<))
+            (report (graph-db.rules:run-rule g r)))
+        (is (= 4 (length before)))
+        (is (= 4 (graph-db.rules:rule-report-kept report)))
+        (is (= 0 (graph-db.rules:rule-report-derived report)))
+        (is (= 0 (graph-db.rules:rule-report-swept report)))
+        (is (equal before
+                   (sort (mapcar #'claim-identity-key
+                                 (derived g 'rtt-claim "host-version"))
+                         #'string<)))
+        ;; The provenance reconciles the same way: two premises each.
+        (is (= 8 (length (claims-by-producer
+                          g 'graph-db.rules:derivation
+                          "rule/host-version"))))))))
+
+(test a-store-without-the-rule-schema-runs-no-rules
+  "Ruling T4-R2: :GRAPH-DB-RULES-NORULE never ran DEF-RULES-SCHEMA, so
+its schema carries no RULE vertex type.  RUN-RULES reports nothing, and
+a rule asked for by name is \"no such rule\" -- which is the guarded
+half: MAP-VERTICES skips a type the schema lacks on its own, but the
+INDEX-LOOKUP behind %RESOLVE-RULE signals QUERY-PRECONDITION-ERROR
+unless %GRAPH-DECLARES-P holds it back."
+  (with-norule-graph (g)
+    (is-false (member "RULE" (graph-db.query:schema-type-names g :vertex)
+                      :test #'string-equal))
+    (is (null (graph-db.rules::rules-in-scope g)))
+    (is (null (graph-db.rules:run-rules g)))
+    (is (search "no rule named"
+                (handler-case (progn (graph-db.rules:run-rule g "nope")
+                                     "")
+                  (error (c) (princ-to-string c)))
+                :test #'char-equal))))
+
+(test the-constructor-name-is-not-print-case-sensitive
+  "%CONSTRUCTOR interns MAKE-<CLASS> from the class's own SYMBOL-NAME:
+a *PRINT-CASE* the operator set must not change which function the
+derivation calls.  A unit test rather than a RUN-RULE one on purpose --
+the engine's MAKE-FUNCTOR-SYMBOL builds NAME/ARITY with the same FORMAT
+(prologc.lisp), so under :DOWNCASE no Prolog goal resolves at all; that
+is core, pre-existing and outside this slice (GH #342)."
+  (let ((*print-case* :downcase))
+    (is (eq #'make-rt-claim-binary
+            (graph-db.rules::%constructor (claim-family 'rt-claim) nil)))
+    (is (eq #'make-rt-claim-unary
+            (graph-db.rules::%constructor (claim-family 'rt-claim) t)))))
+
+(test an-unclassified-commit-refusal-is-tagged-rule
+  "The report's tag vocabulary is closed (docs/rules.md): a
+CONSTRAINT-VIOLATION that is none of the three the report names is
+tagged :RULE, not with its own class name.  The classified paths have
+their own tests above, both tagging 'RTT-CLAIM."
+  (is (eq :rule (graph-db.rules::%violation-family
+                 (make-condition 'graph-db:constraint-violation)))))
+
+(defparameter *twin-relation* "explains")
+
+(test a-second-derivation-record-for-one-pair-is-swept
+  "One derivation record per (derived claim, premise) pair: a second
+record naming a pair already kept goes with the records the derivation
+no longer asks for.  DEF-CLAIM-CLASSES' identity constraint makes an
+exact twin impossible, so the intruder here differs in its relation --
+which is also why the keep is restricted to \"derived-from\"."
+  (with-rules-graph (g)
+    (seed g)
+    (let ((r (write-web-hosts g)))
+      (graph-db.rules:run-rule g r)
+      (let ((recs (claims-by-producer g 'graph-db.rules:derivation
+                                      "rule/web-hosts")))
+        (is (= 2 (length recs)))
+        (let ((c (first recs)))
+          (with-transaction ((graph-db::transaction-manager g))
+            (graph-db.rules::make-derivation-binary
+             :graph g :subject-namespace :claim
+             :subject-key (claim-subject-key c)
+             :relation *twin-relation* :object-namespace :claim
+             :object-key (claim-object-key c)
+             :producer "rule/web-hosts" :rule-version "1"
+             :standing :inferred))))
+      (is (= 3 (length (claims-by-producer g 'graph-db.rules:derivation
+                                           "rule/web-hosts"))))
+      (graph-db.rules:run-rule g r)
+      (let ((after (claims-by-producer g 'graph-db.rules:derivation
+                                       "rule/web-hosts")))
+        (is (= 2 (length after)))
+        (is (every (lambda (rec)
+                     (string= "derived-from" (claim-relation rec)))
+                   after))))))

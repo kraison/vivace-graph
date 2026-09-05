@@ -166,11 +166,14 @@ solution, so the two match by EQUAL."
 
 (defun %constructor (family unary-p)
   "The MAKE-<CLASS> function of FAMILY's unary or binary class, interned
-where that class is."
+where that class is.  Built from SYMBOL-NAME, not FORMAT: ~A on a symbol
+follows *PRINT-CASE*, so an operator who set it would send this to a
+name nothing defines."
   (let ((class (if unary-p
                    (graph-db.spacetime:claim-family-unary family)
                    (graph-db.spacetime:claim-family-binary family))))
-    (fdefinition (intern (format nil "MAKE-~A" class)
+    (fdefinition (intern (concatenate 'string "MAKE-"
+                                      (symbol-name class))
                          (symbol-package class)))))
 
 (defun %refresh-version (claim version)
@@ -247,6 +250,9 @@ REPORT and dropped."
 kept when re-derived (version refreshed), deleted when not; new
 identities constructed.  => an alist of (dedupe key . claim) for every
 claim of the derivation that now stands."
+  ;; CLAIMS-BY-PRODUCER overlays the open transaction's writes (GH
+  ;; #324), so the producer's claims must be read BEFORE this function
+  ;; writes any: the reconcile compares against the committed set.
   (let* ((spec (compiled-rule-spec compiled))
          (family (compiled-rule-family compiled))
          (producer (rule-producer (rule-spec-name spec)))
@@ -297,11 +303,16 @@ refreshed."
                             (graph-db.spacetime:claim-identity-key p))
                       wanted)
                      t)))
+    ;; One record per pair: a pair already kept is a duplicate and goes
+    ;; with the records the derivation no longer asks for, as does a
+    ;; record under this producer that is not a DERIVED-FROM at all.
     (dolist (r (graph-db.spacetime:claims-by-producer graph 'derivation
                                                       producer))
       (let ((pair (cons (graph-db.spacetime:claim-subject-key r)
                         (graph-db.spacetime:claim-object-key r))))
-        (if (gethash pair wanted)
+        (if (and (string= "derived-from"
+                          (graph-db.spacetime:claim-relation r))
+                 (eq t (gethash pair wanted)))
             (progn (setf (gethash pair wanted) :kept)
                    (%refresh-version r version))
             (graph-db:mark-deleted r))))
@@ -338,8 +349,10 @@ itself."
     (if f (graph-db.spacetime:claim-family-parent f) class-name)))
 
 (defun %violation-family (c)
-  "The claim family a commit refusal names, as the report's tag, else the
-condition's class name."
+  "The claim family a commit refusal names, as the report's tag, else
+:RULE.  The report's tag vocabulary is closed (docs/rules.md), so a
+CONSTRAINT-VIOLATION none of the three name is the rule's own fault
+rather than a fourth kind of tag."
   (typecase c
     (graph-db.spacetime:extent-disjointness-violation
      (graph-db.spacetime:edv-claim-class c))
@@ -347,7 +360,7 @@ condition's class name."
      (%parent-of (graph-db:ucv-class-name c)))
     (graph-db:value-constraint-violation
      (%parent-of (graph-db:vcv-class-name c)))
-    (t (type-of c))))
+    (t :rule)))
 
 (defun run-rule (graph rule)
   "Derive RULE afresh and reconcile the result with its previous

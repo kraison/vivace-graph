@@ -134,16 +134,25 @@ text, which here is a refusal in its own words."
       (%refuse spec "head: ~A"
                (graph-db.query:prolog-guard-error-reason c)))))
 
+(defun %check-no-bare-var (spec form)
+  "Refuse a bare ? anywhere in FORM: read into the guard's scratch
+package it is one NAMED variable shared by every goal that writes it,
+not the engine's anonymous one (recon A10).  The head is scanned by
+this on its own -- passing it to %BODY-VARIABLES would make its
+variables \"bound by the body\"."
+  (labels ((walk (x)
+             (cond ((and (%variable-p x) (string= (symbol-name x) "?"))
+                    (%refuse spec "a bare ? is one shared variable ~
+here, not an anonymous one: name it"))
+                   ((consp x) (walk (car x)) (walk (cdr x))))))
+    (walk form)))
+
 (defun %body-variables (spec goals)
-  "Every ?variable in GOALS, once each.  A bare ? is refused: read into
-the guard's scratch package it is one NAMED variable shared by every
-goal that writes it, not the engine's anonymous one (recon A10)."
+  "Every ?variable in GOALS, once each; a bare ? is refused."
+  (%check-no-bare-var spec goals)
   (let ((vars '()))
     (labels ((walk (x)
-               (cond ((and (%variable-p x) (string= (symbol-name x) "?"))
-                      (%refuse spec "a bare ? is one shared variable ~
-here, not an anonymous one: name it"))
-                     ((%variable-p x) (pushnew x vars))
+               (cond ((%variable-p x) (pushnew x vars))
                      ((consp x) (walk (car x)) (walk (cdr x))))))
       (walk goals))
     vars))
@@ -160,19 +169,19 @@ rules that compile); a body variable passes; anything else refuses."
                   what term))
         ((and (%variable-p term) (member term body-vars)) term)
         ((%variable-p term)
-         (%refuse spec "~A namespace ~A is not bound by the body"
-                  what (symbol-name term)))
+         (%refuse spec "~A namespace ~(~A~) is not bound by the body"
+                  what term))
         (t (%refuse spec "~A namespace must be a string or a body ~
-variable, not ~S" what term))))
+variable, not ~(~A~)" what term))))
 
 (defun %head-key (spec term body-vars what)
   (cond ((stringp term) term)
         ((and (%variable-p term) (member term body-vars)) term)
         ((%variable-p term)
-         (%refuse spec "~A key ~A is not bound by the body"
-                  what (symbol-name term)))
+         (%refuse spec "~A key ~(~A~) is not bound by the body"
+                  what term))
         (t (%refuse spec "~A key must be a string or a body variable, ~
-not ~S" what term))))
+not ~(~A~)" what term))))
 
 (defun %parse-head (spec head body-vars)
   "The head's seven arguments checked against spec §6; returns a plist
@@ -186,11 +195,12 @@ of the COMPILED-RULE head slots."
     (unless (%variable-p ?c)
       (%refuse spec "the head's ?c must be an unbound variable, not ~S" ?c))
     (when (member ?c body-vars)
-      (%refuse spec "the head's ?c ~A must not appear in the body"
-               (symbol-name ?c)))
+      (%refuse spec "the head's ?c ~(~A~) must not appear in the body"
+               ?c))
     (let ((family (handler-case (graph-db.spacetime:claim-family fam)
                     (graph-db.spacetime:unknown-claim-family ()
-                      (%refuse spec "~S is not a claim family" fam)))))
+                      (%refuse spec "~(~A~) is not a claim family"
+                               fam)))))
       (unless (string-equal (symbol-name fam) (rule-spec-family spec))
         (%refuse spec "the head's family ~(~A~) is not the rule's ~
 family ~A" fam (rule-spec-family spec)))
@@ -281,8 +291,9 @@ answers NIL rather than erring in MAP-VERTICES (T4-R2)."
 (defun rules-in-scope (graph &key view)
   "The specs a compile checks a rule against (spec §6): every enabled
 stored rule of GRAPH -- through VIEW when a commit is in flight -- plus
-every DEF-RULE.  A def-rule the store cannot run still constrains the
-cycle graph; RUN-RULES is what filters by family (ruling P8)."
+every enabled DEF-RULE (ruling T3-R5: ENABLED reads the same on both).
+A def-rule the store cannot run still constrains the cycle graph;
+RUN-RULES is what filters by family (ruling P8)."
   (append (remove-if-not #'rule-spec-enabled
                          (%stored-rules graph :view view))
           (loop for spec being the hash-values of *def-rules*
@@ -291,7 +302,9 @@ cycle graph; RUN-RULES is what filters by family (ruling P8)."
 (defun %edges (spec graph)
   "SPEC's (head-relation . reads) for the cycle graph, or NIL when the
 spec's text does not guard -- such a rule cannot run and constrains
-nothing."
+nothing.  Only the FIRST goal is read as the head: a DEF-RULE is never
+validated at registration, so a two-goal head there contributes its
+second goal as a read, which over-constrains rather than under-."
   (handler-case
       (multiple-value-bind (vars goals) (%guard spec graph)
         (declare (ignore vars))
@@ -361,6 +374,7 @@ stored rule and a DEF-RULE is a collision, refused."
       (let* ((head (first goals))
              (body (%order-body (rest goals)))
              (body-vars (%body-variables spec body)))
+        (%check-no-bare-var spec head)
         (when (null body)
           (%refuse spec "the body is empty"))
         (let* ((parsed (%parse-head spec head body-vars))

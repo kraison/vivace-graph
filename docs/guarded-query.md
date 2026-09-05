@@ -136,6 +136,26 @@ guard's own schema-name table (`%schema-name-table`) and, since #322,
 called qualified by `gui/api.lisp` for the same purpose the GUI's
 `/api/graphs/:name/types` route always served.
 
+## `guard-query-text` (GH #331)
+
+```lisp
+(guard-query-text text graph)
+  => (values vars goals)
+```
+
+The compile half of `run-guarded-prolog`, for a caller that keeps the
+goals instead of running them once: `text` screened, read and guarded
+against `graph` exactly as above, with `vars` in first-appearance
+order. Refusals signal `prolog-guard-error`, the same contract.
+
+The scratch package the read interned into is **deleted before this
+returns**, so every `?variable` comes back uninterned. They stay `eq`
+across the goals, which is all the engine asks of a variable
+(`graph-db::variable-p` is name-based), and they cannot collide with
+anything the caller's own package holds. `graph-db/rules` compiles a
+rule's head and body through this, as one text so a variable shared
+between them reads as one symbol (`docs/rules.md`).
+
 ## What the guard admits
 
 The whitelist, the exclusions, and the control-word list are derived
@@ -164,6 +184,10 @@ Two things a new caller reliably gets wrong first:
   `graph-db` or a schema package from client text.
 
 ## Callers
+
+`graph-db/rules` is a caller of `guard-query-text`: `compile-rule`
+guards a stored rule's text with it, so rule text is screened by
+exactly the rules client free text is (`docs/rules.md`, GH #331).
 
 The GUI's free-text Prolog workbench (`gui/prolog.lisp`, behind
 `START-GUI`'s `:allow-prolog` flag) is a caller: it calls
