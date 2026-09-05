@@ -130,23 +130,63 @@ engine's error."
         (is (string= "graph-db-rules-b" (claim-method rec-h3)))
         (is (null (claim-method rec-h1)))))))
 
-(test a-single-store-scope-is-s2-unchanged
-  "Control for S3-P2: RUN-RULE with no scope, or a scope of the store
-alone, derives inside its transaction exactly as before."
+(defmacro with-transaction-probe ((place) &body body)
+  "BODY with %DESIRED wrapped so PLACE records whether a transaction was
+open when the body's evaluation ran: T on S2's path, NIL on the
+cross-store one, where the evaluation precedes the write transaction
+(S3-P2).  The redefine/restore shape is tests/open-hygiene-tests.lisp's
+%OH-WITH-INJECTED-FAILURE."
+  (let ((orig (gensym "ORIG")))
+    `(let ((,orig (fdefinition 'graph-db.rules::%desired)))
+       (unwind-protect
+            (progn
+              (setf (fdefinition 'graph-db.rules::%desired)
+                    (lambda (&rest args)
+                      (setf ,place (and graph-db::*transaction* t))
+                      (apply ,orig args)))
+              ,@body)
+         (setf (fdefinition 'graph-db.rules::%desired) ,orig)))))
+
+(test the-scope-decides-where-the-body-is-evaluated
+  "S3-P2's discriminator, not only its counts: every count below is the
+same whichever path a run takes, so the test observes the path itself --
+%DESIRED runs with a transaction open on the single-store path and with
+none on the cross-store one.  That NIL is also recon B9's corollary:
+during a cross-store evaluation there is no transaction to overlay."
   (with-two-stores (a b)
     (seed a)
     (seed-b b)
     (let ((r (write-rule a :name "web-hosts" :version "1" :family "rt-claim"
-                         :head *web-hosts-head* :body *web-hosts-body*)))
-      (is (= 2 (graph-db.rules:rule-report-derived
-                (graph-db.rules:run-rule a r))))
-      (is (= 2 (graph-db.rules:rule-report-kept
-                (graph-db.rules:run-rule a r :scope (list a)))))
-      ;; The scope's own store is put first whatever the caller wrote,
-      ;; and named twice it is still read once.
-      (let ((report (graph-db.rules:run-rule a r :scope (list b a b))))
-        (is (= 1 (graph-db.rules:rule-report-derived report)))
-        (is (= 2 (graph-db.rules:rule-report-kept report)))))))
+                         :head *web-hosts-head* :body *web-hosts-body*))
+          (seen :unset))
+      (with-transaction-probe (seen)
+        ;; No scope: S2 exactly, evaluated inside the transaction.
+        (is (= 2 (graph-db.rules:rule-report-derived
+                  (graph-db.rules:run-rule a r))))
+        (is (eq t seen))
+        (setf seen :unset)
+        ;; A scope naming the own store alone takes the same path.
+        (is (= 2 (graph-db.rules:rule-report-kept
+                  (graph-db.rules:run-rule a r :scope (list a)))))
+        (is (eq t seen))
+        (setf seen :unset)
+        ;; The own store is put first whatever the caller wrote, and
+        ;; named twice it is still read once -- and this one evaluates
+        ;; before its transaction.
+        (let ((report (graph-db.rules:run-rule a r :scope (list b a b))))
+          (is (= 1 (graph-db.rules:rule-report-derived report)))
+          (is (= 2 (graph-db.rules:rule-report-kept report))))
+        ;; :UNSET, not NIL, when the probe never fired.
+        (is (null seen))))))
+
+(test the-store-name-merge-prefers-the-own-store-then-the-first
+  "S3-P3's rule, one helper for both merge sites (%MERGE-PREMISE-REFS
+within a solution set, %RECONCILE-PROVENANCE across derived claims)."
+  (is (null (graph-db.rules::%merge-store-name "b" nil)))
+  (is (null (graph-db.rules::%merge-store-name nil "b")))
+  (is (null (graph-db.rules::%merge-store-name nil nil)))
+  (is (string= "b" (graph-db.rules::%merge-store-name "b" "c")))
+  (is (string= "b" (graph-db.rules::%merge-store-name "b" "b"))))
 
 (test cross-store-validity-intersects-across-stores
   "rtt premises: web version 3 (B, Jul 1 - Sep 30) against h1's

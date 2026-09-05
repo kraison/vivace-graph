@@ -256,17 +256,24 @@ snapshot is not self-contained once the snapshot exits (recon C4)."
     (cons (graph-db.spacetime:claim-identity-key node)
           (and home (not (eq home graph)) (%store-name home)))))
 
+(defun %merge-store-name (old new)
+  "The store name one premise keeps when it is named twice: the own
+store's NIL beats any name, and between two names the FIRST wins
+(S3-P3).  One rule for both merge sites -- %MERGE-PREMISE-REFS within a
+solution set, %RECONCILE-PROVENANCE across derived claims."
+  (and old new old))
+
 (defun %merge-premise-refs (refs more)
-  "REFS with MORE added, one entry per identity key: a key already
-present keeps the own store's NIL over a foreign name, else the first
-seen (S3-P3).  Order is first-seen, so which records a run writes does
-not depend on hash order."
+  "REFS with MORE added, one entry per identity key, the store name
+merged by %MERGE-STORE-NAME.  Order is first-seen, so which records a
+run writes does not depend on hash order."
   (let ((out refs))
     (dolist (r more out)
       (let ((seen (assoc (car r) out :test #'string=)))
-        (cond ((null seen) (setf out (nconc out (list r))))
-              ((and (cdr seen) (null (cdr r)))
-               (setf (cdr seen) nil)))))))
+        (if (null seen)
+            (setf out (nconc out (list r)))
+            (setf (cdr seen)
+                  (%merge-store-name (cdr seen) (cdr r))))))))
 
 (defun %desired (compiled graph report)
   "The derivation the body asks for (spec §7.3): (VALUES TABLE ORDER),
@@ -401,10 +408,11 @@ on the family's unique key (%REFRESH-KEPT)."
           do (dolist (p (cdr (gethash key desired)))
                (let ((pair (cons derived-key (car p))))
                  (multiple-value-bind (name seen) (gethash pair wanted)
-                   ;; A pair two derived claims share keeps the own
-                   ;; store's NIL over a name, else the first (S3-P3).
+                   ;; Same rule as within a solution set (S3-P3).
                    (setf (gethash pair wanted)
-                         (if seen (and name (cdr p)) (cdr p)))))))
+                         (if seen
+                             (%merge-store-name name (cdr p))
+                             (cdr p)))))))
     ;; One record per pair: a pair already kept is a duplicate and goes
     ;; with the records the derivation no longer asks for, as does a
     ;; record under this producer that is not a DERIVED-FROM at all.
