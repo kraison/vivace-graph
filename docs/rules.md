@@ -241,8 +241,23 @@ the family contributes nothing; the own store still refuses, as slice 1
 documented. The trap is the engine's, not ours: inside a read-write
 transaction on one store every read of another signals
 `cross-graph-transaction-error` (GH #53), so bind the scope outside a
-transaction. Full section, and `run-rule`'s `:scope`, in slice 3
-(GH #332).
+transaction. Full section in slice 3 (GH #332); `run-rule`'s `:scope`
+is under "Running a rule".
+
+**A snapshot hides an insert, not a delete.** Secondary-index
+*membership* is not snapshot-versioned: `%ix-release` removes the entry
+outright, post-durability, and `index-lookup`'s only snapshot-aware
+step is resolving an id it has already found. So under a read snapshot
+a claim inserted after it is correctly invisible -- and a claim deleted
+after it is invisible too, though the snapshot's epoch predates the
+delete. Not new with a scope: equally true of a single-store run
+(recon note O1).
+
+**A cross-store evaluation runs under no transaction at all.**
+`run-rule` opens its write transaction only after the body has been
+evaluated, so `*transaction*` is `nil` throughout it. A Lisp caller
+who reaches for `claims-touching` there gets no transaction overlay
+either -- the same committed state the functors read (recon note B9).
 
 ## Tests and CI
 
@@ -368,10 +383,13 @@ the reason a stored rule's write is refused.
 
 ## Running a rule
 
-`graph-db.rules:run-rule (graph rule) => rule-report` derives `rule`
-afresh and reconciles the result with its previous derivation, in **one
-transaction** (spec §7). `rule` is a `rule` record, a `rule-spec`, or a
+`graph-db.rules:run-rule (graph rule &key scope) => rule-report`
+derives `rule` afresh and reconciles the result with its previous
+derivation (spec §7). `rule` is a `rule` record, a `rule-spec`, or a
 name -- looked up in the store first, then among the `def-rule`s.
+Without a `scope`, or with one naming only `graph`, it is **one
+transaction**; with another store in it the body is evaluated first and
+only the reconcile is transactional (see `:scope` below).
 
 **Reconcile, not sweep-then-insert (ruling P10).** `run-rule` evaluates
 the body first, then compares the identities it derived against the
@@ -421,6 +439,51 @@ defaults -- `run-rule` signals a plain error rather than walking a
 family unbounded. `*rules-max-solutions*` (100000) caps the collected
 solutions; past it the run is refused rather than silently truncated.
 
+**`:scope` -- the stores the body may read (spec §10, GH #332).** A
+list of open stores. `graph` is put first whatever the caller wrote,
+and a store named twice is read once: named twice it would answer every
+route twice and so double every solution. The rule **writes `graph`
+alone** -- neither a derived claim nor a `derivation` record ever lands
+in another store. `nil`, or a scope of `graph` alone, is slice 2
+exactly.
+
+The two paths differ in *where* the body runs, and the engine forces
+the difference: inside a read-write transaction on A, every read of B
+signals `cross-graph-transaction-error`, snapshot or no snapshot
+(GH #53).
+
+- **`nil`, or `graph` alone.** The body is evaluated inside the write
+  transaction, as slice 2 had it, and that transaction serialises the
+  run against concurrent writers.
+- **Another store in scope.** The body is evaluated *before* the write
+  transaction, under one composed read snapshot per store in scope
+  (own store first); the reconcile then runs in `graph`'s transaction
+  as before. Each store is internally consistent, but the run is
+  **not** serialised against a premise committed after the snapshots
+  were taken -- the next run sees such a premise, this one does not.
+
+Under a shared system clock (`open-system-clock`, GH #168) those
+snapshots take their epochs from one counter, so the epochs are
+*comparable*, and equal when nothing commits between the two
+acquisitions. Without a shared clock each store is consistent on its
+own and the epochs are not comparable at all. The engine deliberately
+provides no single instant across stores
+(`call-with-read-snapshot`'s own docstring, GH #53), so neither does
+this.
+
+**The retry.** `call-with-transaction` re-invokes its thunk on a
+`validation-conflict`. With a foreign store in scope only the reconcile
+is inside that thunk, so a cross-store **evaluation is not repeated** on
+a conflict -- the retry reconciles the same solution set. The
+single-store path re-evaluates, as slice 2 did. Either way the report's
+counts are per attempt and never cumulative.
+
+A store in a scope must be **keyword-named**: `method` (below) is
+`(string-downcase (symbol-name (graph-name g)))` and nothing in
+`make-graph` coerces the name (recon note B5). A scope holding
+something that is not an open store signals, before the rule is even
+resolved.
+
 **The report** (`rule-report`):
 
 | field | meaning |
@@ -453,7 +516,8 @@ family cases name is tagged `:rule`, not with its own class name.
 one unwinds the transaction, so **the previous derivation stands
 untouched** -- `derived`, `kept` and `swept` all read 0 on a
 `:refused` report. Only an operator error signals: no resource bound,
-or no rule of that name in the store or the image.
+no rule of that name in the store or the image, or a `:scope` that is
+not a list of open stores.
 
 ## Validity of a derived claim
 
@@ -499,6 +563,29 @@ longer asked for is deleted. **One record per pair**: the records
 pair already kept, or a record under that producer whose relation is
 not `derived-from`, is swept with them.
 
+**`method` names the premise's store (spec §10, GH #332).** A record
+whose premise came from another store in the scope carries that store's
+name -- the downcased graph name, cl-llm's `store-name` convention --
+and one whose premise is in the rule's own store carries `nil`. A kept
+record's `method` is **refreshed** to the store its premise now comes
+from, in the same `copy`/`save` as its `rule-version`. Refreshed and
+not swept-and-rewritten: `method` is *not* part of the family's
+identity tuple, so rewriting a record whose pair is unchanged would
+collide on `def-unique` exactly as the reconcile order above avoids
+for the claims themselves.
+
+That `method` is outside the identity tuple has a second consequence:
+two stores holding one identity key contribute **one** record. The
+rule's own store wins, else the first store in scope order, and the
+other store's name is lost.
+
+The reconcile never touches a node from another store. A premise leaves
+the evaluation as `(identity-key . store-name)`, both computed inside
+the snapshot that read it -- a node `index-lookup` returns under a
+snapshot skips `ensure-node-bytes`, so reading its slots once the
+snapshot has exited reads that store's heap with no read pin in force
+(recon note C4).
+
 Both reads filter the records on `derived-from`, so a `derivation`
 record of another relation -- one a foreign writer left under the
 producer, which the next run sweeps -- is never read as provenance.
@@ -517,11 +604,13 @@ kraison/blackboard's.
 
 ## `run-rules`
 
-`graph-db.rules:run-rules (graph) => list of rule-report` runs every
-enabled rule the store can run, in dependency order: a rule that reads
-relation R runs after every rule that derives R (spec §7). Cycles were
-refused at compile, so the order always exists; ties keep the order the
-rules came in.
+`graph-db.rules:run-rules (graph &key scope) => list of rule-report`
+runs every enabled rule the store can run, passing `scope` through to
+each, in dependency order: a rule that reads relation R runs after
+every rule that derives R (spec §7). Cycles were refused at compile, so
+the order always exists; ties keep the order the rules came in. Both
+the compile and that order stay single-store, so a cycle that runs
+through another store's rules is not detected.
 
 - **A disabled rule is not in scope at all.** `rules-in-scope` filters
   on `enabled`, stored rules and `def-rule`s alike, so `run-rules`

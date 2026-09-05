@@ -187,14 +187,18 @@ spacetime/claim.lisp)."
                             (%extent-sexp-key (cdr sexp))))
         (t sexp)))
 
-(defun %refresh-kept (claim version extent)
-  "CLAIM brought to the current derivation's VERSION and EXTENT by ONE
-copy and save when either differs; the saved copy, else CLAIM.  EXTENT
-is what this run would derive, NIL under :EXTENT-POLICY :NONE and for a
-DERIVED-FROM record.  A kept temporal claim's extent START cannot move
--- the dedupe key carries it -- but its END can, and a refreshed extent
-can then overlap a sibling run, which %VALIDATE-EXTENT-DISJOINTNESS
-refuses at commit like any other (#331, docs/rules.md)."
+(defun %refresh-kept (claim version extent &optional (method nil methodp))
+  "CLAIM brought to the current derivation's VERSION, EXTENT and -- when
+METHOD is supplied -- METHOD, by ONE copy and save when any differs; the
+saved copy, else CLAIM.  EXTENT is what this run would derive, NIL under
+:EXTENT-POLICY :NONE and for a DERIVED-FROM record.  A kept temporal
+claim's extent START cannot move -- the dedupe key carries it -- but its
+END can, and a refreshed extent can then overlap a sibling run, which
+%VALIDATE-EXTENT-DISJOINTNESS refuses at commit like any other (#331,
+docs/rules.md).  METHOD is refreshed rather than the record swept and
+rewritten: MARK-DELETED releases a unique key only post-durability while
+VALIDATE-UNIQUE-CONSTRAINTS runs pre-durability, so a sweep and a
+re-insert of one identity in a transaction always collide (ruling P10)."
   (let* ((sexp (and extent (graph-db.spacetime:extent->sexp extent)))
          (extent-moved
            (not (equal (%extent-sexp-key sexp)
@@ -202,22 +206,77 @@ refuses at commit like any other (#331, docs/rules.md)."
                         (graph-db.spacetime:claim-extent-sexp claim)))))
          (version-moved
            (not (equal version
-                       (graph-db.spacetime:claim-rule-version claim)))))
-    (if (not (or extent-moved version-moved))
+                       (graph-db.spacetime:claim-rule-version claim))))
+         (method-moved
+           (and methodp
+                (not (equal method
+                            (graph-db.spacetime:claim-method claim))))))
+    (if (not (or extent-moved version-moved method-moved))
         claim
         (let ((c (graph-db:copy claim)))
           (when version-moved
             (setf (graph-db.spacetime:claim-rule-version c) version))
           (when extent-moved
             (setf (graph-db.spacetime:claim-extent c) extent))
+          (when method-moved
+            (setf (graph-db.spacetime:claim-method c) method))
           (graph-db:save c)
           c))))
+
+(defun %store-name (graph)
+  "GRAPH's name as a DERIVED-FROM record's METHOD carries it: the
+downcased graph name, cl-llm's STORE-NAME convention (spec §10).  A
+store a rule reads must be keyword-named (recon B5); signals if not."
+  (let ((name (graph-db:graph-name graph)))
+    (unless (keywordp name)
+      (error "A store a rule reads must be keyword-named; ~S is not."
+             name))
+    (string-downcase (symbol-name name))))
+
+(defun %normalize-scope (graph scope)
+  "SCOPE as RUN-RULE reads it: the open stores a body may read, GRAPH
+first and once (spec §10).  Signals on anything that is not an open
+store.  Duplicates are dropped: a store named twice would answer every
+route twice and so double every solution."
+  (dolist (g scope)
+    (unless (typep g 'graph-db::graph)
+      (error "RUN-RULE :SCOPE holds ~S, which is not an open store."
+             g)))
+  (cons graph (remove graph (remove-duplicates scope :test #'eq
+                                                     :from-end t)
+                      :test #'eq)))
+
+(defun %premise-ref (node graph)
+  "A premise as the reconcile carries it: (IDENTITY-KEY . STORE-NAME),
+STORE-NAME NIL for the rule's own GRAPH (S3-P3).  Call this INSIDE the
+snapshot NODE was read under: a node an INDEX-LOOKUP returned under a
+snapshot is not self-contained once the snapshot exits (recon C4)."
+  (let ((home (or (graph-db::node-graph node)
+                  (graph-db:resolve-node-graph (graph-db:id node)))))
+    (cons (graph-db.spacetime:claim-identity-key node)
+          (and home (not (eq home graph)) (%store-name home)))))
+
+(defun %merge-premise-refs (refs more)
+  "REFS with MORE added, one entry per identity key: a key already
+present keeps the own store's NIL over a foreign name, else the first
+seen (S3-P3).  Order is first-seen, so which records a run writes does
+not depend on hash order."
+  (let ((out refs))
+    (dolist (r more out)
+      (let ((seen (assoc (car r) out :test #'string=)))
+        (cond ((null seen) (setf out (nconc out (list r))))
+              ((and (cdr seen) (null (cdr r)))
+               (setf (cdr seen) nil)))))))
 
 (defun %desired (compiled graph report)
   "The derivation the body asks for (spec §7.3): (VALUES TABLE ORDER),
 TABLE a dedupe key -> (ARGS . PREMISES) hash and ORDER its keys in the
 order the solutions first named them; disjoint solutions counted on
-REPORT and dropped."
+REPORT and dropped.  A premise is (IDENTITY-KEY . STORE-NAME), read
+here and never as a node (S3-P3, recon C4).  Owns REPORT's disjoint
+count, hence the reset: %DERIVE cannot clear it, since a cross-store
+run evaluates once and reconciles per attempt."
+  (setf (rule-report-disjoint-premises report) 0)
   (let* ((spec (compiled-rule-spec compiled))
          (family (compiled-rule-family compiled))
          (vars (compiled-rule-vars compiled))
@@ -252,14 +311,17 @@ REPORT and dropped."
             (%premise-extent premises policy)
           (if disjoint-p
               (incf (rule-report-disjoint-premises report))
-              (let* ((key (%dedupe-key family sns skey
+              ;; The refs after %PREMISE-EXTENT and inside the
+              ;; evaluation, both on the nodes (recon C4).
+              (let* ((refs (mapcar (lambda (n) (%premise-ref n graph))
+                                   premises))
+                     (key (%dedupe-key family sns skey
                                        (compiled-rule-relation compiled)
                                        ons okey extent))
                      (entry (gethash key claims)))
                 (if entry
                     (setf (cdr entry)
-                          (union (cdr entry) premises
-                                 :key #'graph-db:id :test #'equalp))
+                          (%merge-premise-refs (cdr entry) refs))
                     (progn
                       (setf (gethash key claims)
                             (cons (list* :subject-namespace sns
@@ -268,7 +330,7 @@ REPORT and dropped."
                                          (unless unary-p
                                            (list :object-namespace ons
                                                  :object-key okey)))
-                                  premises))
+                                  (%merge-premise-refs '() refs)))
                       (push key order))))))))
     (values claims (nreverse order))))
 
@@ -323,21 +385,26 @@ every claim of the derivation that now stands."
 
 (defun %reconcile-provenance (compiled graph desired standing)
   "Spec §9 under ruling P10: one DERIVED-FROM record per (derived claim,
-premise) the derivation now asks for; records the producer wrote that it
-no longer asks for are deleted, the rest kept with their RULE-VERSION
-refreshed."
+premise) the derivation now asks for, its METHOD the premise's store
+name and NIL for the rule's own store (spec §10); records the producer
+wrote that it no longer asks for are deleted, the rest kept with their
+RULE-VERSION and METHOD refreshed -- a premise that moved store renames
+its record rather than being swept and rewritten, which would collide
+on the family's unique key (%REFRESH-KEPT)."
   (let* ((spec (compiled-rule-spec compiled))
          (producer (rule-producer (rule-spec-name spec)))
          (version (rule-spec-version spec))
-         (wanted (make-hash-table :test 'equal)))
+         (wanted (make-hash-table :test 'equal))
+         (kept (make-hash-table :test 'equal)))
     (loop for (key . claim) in standing
           for derived-key = (graph-db.spacetime:claim-identity-key claim)
           do (dolist (p (cdr (gethash key desired)))
-               (setf (gethash
-                      (cons derived-key
-                            (graph-db.spacetime:claim-identity-key p))
-                      wanted)
-                     t)))
+               (let ((pair (cons derived-key (car p))))
+                 (multiple-value-bind (name seen) (gethash pair wanted)
+                   ;; A pair two derived claims share keeps the own
+                   ;; store's NIL over a name, else the first (S3-P3).
+                   (setf (gethash pair wanted)
+                         (if seen (and name (cdr p)) (cdr p)))))))
     ;; One record per pair: a pair already kept is a duplicate and goes
     ;; with the records the derivation no longer asks for, as does a
     ;; record under this producer that is not a DERIVED-FROM at all.
@@ -345,40 +412,43 @@ refreshed."
                                                       producer))
       (let ((pair (cons (graph-db.spacetime:claim-subject-key r)
                         (graph-db.spacetime:claim-object-key r))))
-        (if (and (string= "derived-from"
-                          (graph-db.spacetime:claim-relation r))
-                 (eq t (gethash pair wanted)))
-            (progn (setf (gethash pair wanted) :kept)
-                   ;; No extent on a DERIVATION record, ever; NIL never
-                   ;; differs from the NIL it stores.
-                   (%refresh-kept r version nil))
-            (graph-db:mark-deleted r))))
-    (maphash (lambda (pair state)
-               (when (eq state t)
+        (multiple-value-bind (name wanted-p) (gethash pair wanted)
+          (if (and wanted-p
+                   (not (gethash pair kept))
+                   (string= "derived-from"
+                            (graph-db.spacetime:claim-relation r)))
+              (progn (setf (gethash pair kept) t)
+                     ;; No extent on a DERIVATION record, ever; NIL never
+                     ;; differs from the NIL it stores.
+                     (%refresh-kept r version nil name))
+              (graph-db:mark-deleted r)))))
+    (maphash (lambda (pair name)
+               (unless (gethash pair kept)
                  (make-derivation-binary
                   :graph graph :subject-namespace :claim
                   :subject-key (car pair) :relation "derived-from"
                   :object-namespace :claim :object-key (cdr pair)
                   :producer producer :rule-version version
-                  :standing :inferred)))
+                  :method name :standing :inferred)))
              wanted)))
 
-(defun %derive (compiled graph report)
-  "Spec §7 as ruling P10 has it, inside the transaction: evaluate, then
-reconcile the claims and their provenance against what stands.  The
-four counts are REPORT's, so an attempt starts by clearing them:
+(defun %derive (compiled graph report desired order)
+  "Spec §7 as ruling P10 has it, inside the transaction: reconcile the
+claims DESIRED/ORDER name, and their provenance, against what stands.
+The three counts are REPORT's, so an attempt starts by clearing them:
 CALL-WITH-TRANSACTION re-invokes its thunk on VALIDATION-CONFLICT
 (*MAXIMUM-TRANSACTION-ATTEMPTS*, transactions.lisp) and a retry must
-report what it did, not what it and every earlier attempt did."
+report what it did, not what it and every earlier attempt did.  On a
+retry only this runs: RUN-RULE's caller computed DESIRED/ORDER, and a
+cross-store evaluation is never repeated (S3-P2).  The disjoint count
+is %DESIRED's for the same reason."
   (setf (rule-report-derived report) 0
         (rule-report-kept report) 0
-        (rule-report-swept report) 0
-        (rule-report-disjoint-premises report) 0)
-  (multiple-value-bind (desired order) (%desired compiled graph report)
-    (let ((standing (%reconcile-claims compiled graph report desired
-                                       order)))
-      (%reconcile-provenance compiled graph desired standing)
-      report)))
+        (rule-report-swept report) 0)
+  (let ((standing (%reconcile-claims compiled graph report desired
+                                     order)))
+    (%reconcile-provenance compiled graph desired standing)
+    report))
 
 ;;; Refusals
 
@@ -407,15 +477,41 @@ rather than a fourth kind of tag."
      (%parent-of (graph-db:vcv-class-name c)))
     (t :rule)))
 
-(defun run-rule (graph rule)
+(defun %under-snapshots (graphs thunk)
+  "THUNK under one composed read snapshot per graph in GRAPHS (GH #53).
+Each store is internally consistent; under a shared system clock the
+epochs come from one counter, so they are comparable and equal when
+nothing commits between the acquisitions (#168, recon C2).  Without one
+they are not comparable at all."
+  (if (null graphs)
+      (funcall thunk)
+      (graph-db:call-with-read-snapshot
+       (lambda () (%under-snapshots (rest graphs) thunk))
+       (first graphs))))
+
+(defun run-rule (graph rule &key scope)
   "Derive RULE afresh and reconcile the result with its previous
-derivation, in one transaction (spec §7, ruling P10).  RULE is a RULE
-record, a RULE-SPEC, or a name (stored first, then DEF-RULE).
-=> RULE-REPORT.  A refusal of any kind -- compile, the rails, effects, a
-commit constraint, a missing extent -- is reported, never signalled, and
+derivation (spec §7, ruling P10).  RULE is a RULE record, a RULE-SPEC,
+or a name (stored first, then DEF-RULE).  SCOPE (spec §10) is the open
+stores the body may read, GRAPH put first and once; the rule writes
+GRAPH alone.  => RULE-REPORT.
+
+NIL or (GRAPH) is S2 exactly: evaluation and reconcile in one
+transaction.  With another store in SCOPE the body is evaluated BEFORE
+the write transaction, under %UNDER-SNAPSHOTS, because a read-write
+transaction refuses every read of another store (S3-P2, GH #53).  The
+trap: that evaluation is not serialised against a premise committed
+after its snapshots -- the next run sees such a premise, this one does
+not.
+
+A refusal of any kind -- compile, the rails, effects, a commit
+constraint, a missing extent -- is reported, never signalled, and
 unwinds the whole run so the previous derivation stands; an operator
-error (no resource bound, no such rule) signals."
-  (let* ((spec (%resolve-rule graph rule))
+error (no resource bound, no such rule, a SCOPE that is not open
+stores) signals."
+  (let* ((scope (%normalize-scope graph scope))
+         (foreign (rest scope))
+         (spec (%resolve-rule graph rule))
          (report (%make-rule-report :rule-name (rule-spec-name spec)
                                     :version (rule-spec-version spec)))
          (start (get-internal-real-time))
@@ -450,8 +546,18 @@ error (no resource bound, no such rule) signals."
         (let ((family (graph-db.spacetime:claim-family-parent
                        (compiled-rule-family compiled))))
           (handler-case
-              (graph-db:with-transaction (:graph graph)
-                (%derive compiled graph report))
+              (flet ((evaluate ()
+                       (let ((graph-db::*claim-scope* scope))
+                         (%desired compiled graph report))))
+                (if foreign
+                    (multiple-value-bind (desired order)
+                        (%under-snapshots scope #'evaluate)
+                      (graph-db:with-transaction (:graph graph)
+                        (%derive compiled graph report desired order)))
+                    (graph-db:with-transaction (:graph graph)
+                      (multiple-value-bind (desired order) (evaluate)
+                        (%derive compiled graph report desired
+                                 order)))))
             (rule-run-refusal (c)
               (refuse (rule-run-refusal-tag c)
                       (rule-run-refusal-text c)))
@@ -516,12 +622,15 @@ compiler should have refused."
         (push ready done)))
     (nreverse done)))
 
-(defun run-rules (graph)
+(defun run-rules (graph &key scope)
   "Every enabled rule GRAPH can run -- its stored rules, plus the
 DEF-RULEs whose family it carries (ruling P8) -- each through RUN-RULE in
-dependency order (spec §7).  A rule that does not compile is reported
-:REFUSED and skipped; the rest still run.  => the reports, the refused
-ones first and then the rest in the order run."
+dependency order (spec §7), with SCOPE (spec §10) passed through to
+every one.  A rule that does not compile is reported :REFUSED and
+skipped; the rest still run.  => the reports, the refused ones first and
+then the rest in the order run.  Compile and the dependency order stay
+single-store, so a cycle through another store's rules is not detected
+(S3-P5)."
   (let ((reports '())
         (compiled '()))
     (dolist (spec (rules-in-scope graph))
@@ -536,7 +645,8 @@ ones first and then the rest in the order run."
                                          (rule-compile-error-reason c))))
                   reports)))))
     (dolist (c (%dependency-order (nreverse compiled)))
-      (push (run-rule graph (compiled-rule-spec c)) reports))
+      (push (run-rule graph (compiled-rule-spec c) :scope scope)
+            reports))
     (nreverse reports)))
 
 ;;; Provenance reads (spec §9)
