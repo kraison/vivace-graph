@@ -172,7 +172,6 @@ from the store is its own transaction's id."
   "Part 1's reader must survive the REAPED-CLAIM structs :AS-OF mixes
 into a result list."
   (with-clocked-stores (a b)
-    (declare (ignorable b))
     (%tx a (lambda () (%unary a #'make-ea-claim-unary "r1")))
     (let ((c (%one a 'ea-claim "r1")))
       (is (integerp (claim-commit-epoch c)) "control: a live version")
@@ -338,7 +337,6 @@ live version's CLAIM-COMMIT-EPOCH is E2."
   "The downstream filters already guard on REAPED-CLAIM-P, so :CURRENT
 and :AT apply to the RESOLVED version exactly as they do under :AS-OF."
   (with-clocked-stores (a b)
-    (declare (ignorable b))
     (let* ((old (exact-interval (ts 2022 1 1) (ts 2022 3 31)))
            (new (exact-interval (ts 2022 1 1) (ts 2022 6 30)))
            (e1 (%tx a (lambda ()
@@ -521,7 +519,6 @@ the same store -> NIL.  Both exhaust the chain identically; only the
 oldest retained REVISION tells them apart, so the second case is the
 non-vacuity control for the first."
   (with-clocked-stores (a b)
-    (declare (ignorable b))
     (let ((e1 (%tx a (lambda () (%unary a #'make-ek-claim-unary "kr")))))
       (dotimes (i 2)
         (%tx a (lambda ()
@@ -587,7 +584,6 @@ so the premise does not depend on run order."
   "Passing both axes signals rather than silently preferring one, on
 both readers."
   (with-clocked-stores (a b)
-    (declare (ignorable b))
     (let ((now (graph-db.spacetime::%st-now)))
       (signals simple-error
         (claims-touching a 'ea-claim :region "r1" :role :subject
@@ -602,7 +598,6 @@ both readers."
   "The producer index takes the same resolver: E1 answers the old
 extent, E2 the new one."
   (with-clocked-stores (a b)
-    (declare (ignorable b))
     (let* ((old (exact-interval (ts 2022 1 1) (ts 2022 3 31)))
            (new (exact-interval (ts 2022 1 1) (ts 2022 6 30)))
            (e1 (%tx a (lambda ()
@@ -770,7 +765,6 @@ Append to `tests/spacetime/epoch-tests.lisp`:
 MARK-DELETED later is gone from the endpoint index and :AS-OF-EPOCH E1
 does not return it.  The read before the delete is the control."
   (with-clocked-stores (a b)
-    (declare (ignorable b))
     (let ((e1 (%tx a (lambda () (%unary a #'make-ea-claim-unary "r1")))))
       (is (= 1 (length (claims-touching a 'ea-claim :region "r1"
                                         :role :subject :as-of-epoch e1)))
