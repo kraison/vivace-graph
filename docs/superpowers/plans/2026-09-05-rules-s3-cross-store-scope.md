@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** A rule declared in store A reads every store in a scope the operator hands `run-rule` and writes only A; a premise from another store is named in its `derived-from` record's `method` slot; the reads of a cross-store run resolve at one instant under the shared clock.
+**Goal:** A rule declared in store A reads every store in a scope the operator hands `run-rule` and writes only A; a premise from another store is named in its `derived-from` record's `method` slot; the reads of a cross-store run resolve in one comparable epoch space under the shared clock (equal epochs in a quiescent image; recon C2 — the engine provides no single instant across stores).
 
-**Architecture:** One special, `graph-db::*claim-scope*`, bound by `run-rule` for the body's evaluation and read by S1's `claim/7` and `claim-producer/2`, which iterate every store in it per route (a store whose schema lacks the family contributes nothing). Because a read-write transaction on A refuses every read of B (the GH #53 contract, `transactions.lisp`'s transactional `lookup-object` method), a run whose scope holds a foreign store evaluates its body **before** the write transaction, under composed `call-with-read-snapshot`s of every store in scope — one instant when `*system-clock*` is set, per-store consistency otherwise — and then reconciles inside A's transaction exactly as S2 does; a single-store scope keeps S2's inside-the-transaction evaluation unchanged. Premises leave the evaluation as identity keys plus store names, never as nodes, so the reconcile touches no foreign store. `premises-of` resolves a premise in the store its record names when that store is in the scope the caller passes.
+**Architecture:** One special, `graph-db::*claim-scope*`, bound by `run-rule` for the body's evaluation and read by S1's `claim/7` and `claim-producer/2`, which iterate every store in it per route (a store whose schema lacks the family contributes nothing). Because a read-write transaction on A refuses every read of B (the GH #53 contract, `transactions.lisp`'s transactional `lookup-object` method), a run whose scope holds a foreign store evaluates its body **before** the write transaction, under composed `call-with-read-snapshot`s of every store in scope — one comparable epoch space when the stores share a system clock, equal epochs in a quiescent image (recon C2); per-store consistency and no comparability otherwise — and then reconciles inside A's transaction exactly as S2 does; a single-store scope keeps S2's inside-the-transaction evaluation unchanged. Premises leave the evaluation as identity keys plus store names, never as nodes, so the reconcile touches no foreign store. `premises-of` resolves a premise in the store its record names when that store is in the scope the caller passes.
 
 **Tech Stack:** SBCL 2.6.6, ASDF, FiveAM, `graph-db/rules` (S1+S2), `graph-db/spacetime`, `graph-db/query`, the system clock (`system-clock.lisp`, #168).
 
@@ -39,10 +39,10 @@
 Order of authority while executing: spec > these > the recon note > the task text.
 
 - **S3-P1 — scope is a run-time argument, and the special is `graph-db::*claim-scope*`.** `run-rule graph rule &key scope` and `run-rules graph &key scope`; `scope` is a list of open graphs, `graph` is put first if absent, and the rule writes only `graph` (spec §10). During evaluation `run-rule` binds `*claim-scope*` to that list; `claim/7` and `claim-producer/2` iterate it per route, own store first, and with it NIL behave exactly as S1 shipped them. A Lisp caller may bind it around a raw `select`. Cost if wrong: a scope that should have been a record slot must be threaded by every caller; reversible by adding a slot later.
-- **S3-P2 — a cross-store run evaluates before its transaction, under composed snapshots.** The engine's read-resolution rule is exhaustive: inside a read-write transaction on A, any read of B signals `cross-graph-transaction-error`, snapshot or no snapshot (`transactions.lisp`, `lookup-object`'s transactional method; `tests/multi-graph-tests.lisp` `read-write-transaction-blocks-a-foreign-read-even-under-a-snapshot`). So when the scope holds a store other than `graph`, `run-rule` evaluates the body inside nested `call-with-read-snapshot`s of every store in scope (own store included) and only then opens the write transaction for the reconcile. Under `*system-clock*` those snapshots are one instant (#168, #94); without a clock each store is internally consistent and there is no single instant (#53), documented. A single-store scope keeps S2's path unchanged. **Cost if wrong:** a cross-store run is not serialised against concurrent premise writes — a premise committed after the snapshots is seen by the next run, not this one, with no conflict raised. Single-store runs keep S2's serialisation.
-- **S3-P3 — a premise leaves evaluation as `(identity-key . store-name)`, never as a node.** `%desired` records for each solution the premises' `claim-identity-key` and the name of the store they came from (`node-graph`, set by the engine on every node a lookup returns; `resolve-node-graph` is the fallback), so the reconcile — which runs inside A's transaction — reads no foreign node. `store-name` is cl-llm's convention: `(string-downcase (symbol-name (graph-name g)))`. The `derived-from` record's `method` slot is that name when the premise's store is not the rule's store, NIL otherwise (spec §10). Two stores holding one identity key contribute one record (the family's `def-unique` tuple excludes `method`), the rule's own store preferred, else the first in scope order. Cost: one store name lost in that corner; recorded.
+- **S3-P2 — a cross-store run evaluates before its transaction, under composed snapshots.** The engine's read-resolution rule is exhaustive: inside a read-write transaction on A, any read of B signals `cross-graph-transaction-error`, snapshot or no snapshot (`transactions.lisp`, `lookup-object`'s transactional method; `tests/multi-graph-tests.lisp` `read-write-transaction-blocks-a-foreign-read-even-under-a-snapshot`). So when the scope holds a store other than `graph`, `run-rule` evaluates the body inside nested `call-with-read-snapshot`s of every store in scope (own store included) and only then opens the write transaction for the reconcile. Under a shared clock those snapshots take epochs from one counter — equal in a quiescent image, comparable always (#168); the engine deliberately provides no single instant across stores (`call-with-read-snapshot`'s docstring, #53; recon C2), so no doc or test claims one. Without a clock each store is internally consistent and the epochs are not even comparable. A single-store scope keeps S2's path unchanged. **Cost if wrong:** a cross-store run is not serialised against concurrent premise writes — a premise committed after the snapshots is seen by the next run, not this one, with no conflict raised. Single-store runs keep S2's serialisation.
+- **S3-P3 — a premise leaves evaluation as `(identity-key . store-name)`, never as a node.** `%desired` records for each solution the premises' `claim-identity-key` and the name of the store they came from (`node-graph`, set by the engine on every node a lookup returns; `resolve-node-graph` is the fallback), so the reconcile — which runs inside A's transaction — reads no foreign node. The binding reason is the read pin, not the cross-graph error (recon C4): a node `index-lookup` returns under a snapshot skips `ensure-node-bytes`, so reading its slots after the snapshot's extent reads B's heap unpinned. Everything the reconcile needs from a premise (identity key, store name; the extent is consumed by `%premise-extent` inside the same extent) is computed inside the snapshot; nodes never leave it — a rule for every later change too. `store-name` is cl-llm's convention: `(string-downcase (symbol-name (graph-name g)))`. The `derived-from` record's `method` slot is that name when the premise's store is not the rule's store, NIL otherwise (spec §10). Two stores holding one identity key contribute one record (the family's `def-unique` tuple excludes `method`), the rule's own store preferred, else the first in scope order. Cost: one store name lost in that corner; recorded.
 - **S3-P4 — `premises-of graph claim &key (scope (list graph))` resolves in the named store when it is in scope, else drops the premise.** A record naming no store resolves in `graph`. Mirrors cl-llm's `%resolve-in` (`:absent` for a store out of scope). `dependents-of` is unchanged: the records live in the rule's store, and a premise from any store is looked up by its identity key. Cost: a caller who forgets the scope sees fewer premises, never wrong ones.
-- **S3-P5 — compile stays single-store.** The guard validates a rule's text against its own store's schema and the cycle graph is over the rule's own store (spec §6); a family read from a foreign store must be declared under the rule's store's name too (`def-claim-classes fam :store-a` and `:store-b` — the registry is per family symbol, the indexes per store, S2 recon A4). A store in scope whose schema lacks a family a goal names simply contributes nothing (the `query-precondition-error` `%producer-candidates` already swallows). Cost: consumers declare shared families under both names; a cross-store cycle (A reads what B's rule derives and vice versa) is not detected — recorded as a known limit for #333.
+- **S3-P5 — compile stays single-store.** The guard validates a rule's text against its own store's schema and the cycle graph is over the rule's own store (spec §6); a family read from a foreign store must be declared under the rule's store's name too (`def-claim-classes fam :store-a` and `:store-b` — the registry is per family symbol, the indexes per store, S2 recon A4). A foreign store in scope whose schema lacks a family a goal names contributes nothing: Task 1's `%scope-lookup` swallows the `query-precondition-error` `%require-index` signals, per foreign store and per route, as `%producer-candidates` and `%claim-by-identity-key` already do (recon C1 — `claim/7`'s bare `index-lookup` calls signal today). The rule's OWN store keeps S1's behaviour and still signals (ruling S3-R1), so a single-store goal on a family the store does not index stays the ill-typed refusal S1 documented. Cost: consumers declare shared families under both names; a cross-store cycle (A reads what B's rule derives and vice versa) is not detected — recorded as a known limit for #333.
 - **S3-P6 — the unrouted walk under scope walks every store, and the refusal is unchanged.** `%unbound-claim-scan` maps every store in scope when no bound is in effect; under a bound it refuses exactly as S1 does. No new behaviour on the guarded surface.
 
 ---
@@ -68,7 +68,7 @@ Nine assumptions, each to be confirmed or refuted from source in the `rules-s3` 
 - [ ] **B1** `index-lookup graph …` on a graph other than the open transaction's signals `cross-graph-transaction-error` from `lookup-object`'s transactional method (`transactions.lisp` ~:319-323), reached through `%node-by-id` (`spatial-query.lisp:37`, `lookup-vertex :graph graph`). Confirm the path and that no route in `index-lookup` bypasses it.
 - [ ] **B2** Outside any transaction, nested `call-with-read-snapshot` on graphs A and B register both in `*read-snapshots*` (`transactions.lisp` ~:3355-3372), and `index-lookup` on either resolves through its own snapshot (`lookup-object`'s null-transaction method ~:294). `run-query-goals`' `select :snapshot t` inherits an enclosing snapshot of the same graph rather than opening a second (`call-with-read-snapshot`'s docstring: "An enclosing snapshot of the SAME graph is inherited"). Confirm from the code, not the docstring.
 - [ ] **B3** Every node `index-lookup` returns has `node-graph` set to the graph it was looked up in (`finalize-node` `primitive-node.lisp:208-212`, `ensure-node-bytes` `:216-225`, `lookup-node`'s path). Name any path that returns a node with `node-graph` NIL.
-- [ ] **B4** Reading a claim's slots (the `claim-*` accessors, `claim-identity-key`, `claim-extent`) on a node whose `node-graph` is B, while a read-write transaction on A is open, performs no `lookup-object` and so cannot signal the cross-graph error — check `slot-value-using-class :around` (`clos.lisp:38-43`) and `maybe-init-node-data` (`primitive-node.lisp:300-322`, reads the heap of `node-home-graph`). If any lazy slot read can call `lookup-object`, S3-P3 must also materialise the premise's extent sexp during evaluation; say which.
+- [ ] **B4** Reading a claim's slots (the `claim-*` accessors, `claim-identity-key`, `claim-extent`) on a node whose `node-graph` is B, while a read-write transaction on A is open, performs no `lookup-object` and so cannot signal the cross-graph error — check `slot-value-using-class :around` (`primitive-node.lisp:506-516`; `clos.lisp` is in no system and never loads, recon C3) and `maybe-init-node-data` (`primitive-node.lisp:300-322`, reads the heap of `node-home-graph`). If any lazy slot read can call `lookup-object`, S3-P3 must also materialise the premise's extent sexp during evaluation; say which.
 - [ ] **B5** `graph-name graph` is the keyword `make-graph` was given; `lookup-graph` keys `*graphs*` on it (`graph-class.lisp:3-12`, `:511`); `resolve-node-graph` (`interface.lisp:7`) returns `(values graph status …)`. Confirm the keyword shape and the downcased-string convention cl-llm's `store-name` uses (`~/work/cl-llm/memory/schema.lisp:49-51`).
 - [ ] **B6** A second `(def-claim-classes rt-claim :graph-db-rules-b)` after the S1 declaration for `:graph-db-rules-test`: the `claim-family` struct is re-registered under the same parent symbol with the same class names; `def-index`/`def-unique`/`def-value-constraint` are registered under the new graph name without unregistering the old (S2 recon A4); the constructors' default store rebinds to B (S2 recon C2). Confirm nothing in `def-claim-classes` clears the first store's registrations (`spacetime/claim.lisp:376-484`).
 - [ ] **B7** The clock in a test: `open-system-clock (namestring dir)` then `make-graph name dir :system-clock clock` for each store, `close-graph` both, `close-system-clock` last (`tests/system-clock-tests.lisp:395-420`). Confirm `make-graph`'s `:system-clock` keyword and that `*system-clock*` need not be bound for the composed snapshots to share an instant (what `call-with-read-snapshot` reads: the graph's attached clock or the special?). Quote the site.
@@ -137,7 +137,8 @@ web version 3 valid Jul 1 - Sep 30 (scan-c).  Returns nothing."
 
 (defmacro with-clocked-stores ((a b) &body body)
   "WITH-TWO-STORES under one system clock opened in a scratch directory,
-so the two stores' snapshots share an instant (#168)."
+so the two stores' snapshot epochs come from one counter (#168) -- equal
+in a quiescent image, never guaranteed one instant (recon C2)."
   (let ((cdir (gensym "CLOCK")) (clock (gensym "CLOCK"))
         (da (gensym "DIR-A")) (db (gensym "DIR-B")))
     `(let* ((,cdir (graph-db-test-scratch:make-scratch-directory
@@ -272,12 +273,17 @@ CROSS-GRAPH-TRANSACTION-ERROR (GH #53) -- bind it outside one.")
   (or *claim-scope* (list *graph*)))
 
 (defun %scope-lookup (class-name slots value)
-  "INDEX-LOOKUP over every store in scope, in scope order; a store whose
-schema does not carry CLASS-NAME contributes nothing, which is what
-QUERY-PRECONDITION-ERROR means here (as %PRODUCER-CANDIDATES reads it)."
-  (loop for g in (%scope-graphs)
-        append (handler-case (index-lookup g class-name slots value)
-                 (query-precondition-error () '()))))
+  "INDEX-LOOKUP over every store in scope, in scope order.  A FOREIGN
+store whose schema does not carry CLASS-NAME contributes nothing --
+QUERY-PRECONDITION-ERROR read as %PRODUCER-CANDIDATES reads it -- while
+the own store (first) still signals, so a single-store goal keeps S1's
+ill-typed refusal (ruling S3-R1, recon C1)."
+  (let ((graphs (%scope-graphs)))
+    (append (index-lookup (first graphs) class-name slots value)
+            (loop for g in (rest graphs)
+                  append (handler-case
+                             (index-lookup g class-name slots value)
+                           (query-precondition-error () '()))))))
 ```
 
 Then in `claim/7` replace the four `index-lookup` calls with `%scope-lookup` (drop the `g` argument), and make `%unbound-claim-scan` take no graph, walking `(%scope-graphs)` after its refusal check:
@@ -413,10 +419,11 @@ deployments (A, Feb 1 - Jun 30 and Aug 1 - Sep 30) and h2's (A, May)."
       (is (= 3 (graph-db.rules:rule-report-derived (first reports)))))))
 
 (test a-cross-store-run-under-one-clock-derives
-  "Under a shared clock the composed snapshots are one instant (#168).
-Observable here: the run works and derives from both stores; the
-instant itself is the engine's property, pinned by
-tests/multi-graph-tests.lisp."
+  "Under a shared clock the composed snapshots take epochs from one
+counter (#168).  Observable here: the run works and derives from both
+stores.  Nothing asserts one instant -- the engine provides none across
+stores (recon C2), and a test of it would pass vacuously in a quiescent
+suite."
   (with-clocked-stores (a b)
     (seed a)
     (seed-b b)
@@ -474,8 +481,8 @@ In `%desired`: premises become `(mapcar (lambda (n) (%premise-ref n graph)) …)
   "...  SCOPE (spec §10): the open graphs the body reads, GRAPH put first;
 NIL or (GRAPH) is S2 exactly.  With a foreign store in SCOPE the body is
 evaluated BEFORE the write transaction, under one read snapshot per
-store -- one instant when the stores share a system clock, else each
-store consistent on its own (GH #53) -- because a read-write transaction
+store -- epochs from one counter when the stores share a system clock, else
+each store consistent on its own and incomparable (GH #53, recon C2) -- because a read-write transaction
 refuses every read of another store (S3-P2).  ..."
   ...
   (let* ((scope (%normalize-scope graph scope))
@@ -506,7 +513,7 @@ refuses every read of another store (S3-P2).  ..."
 
 - [ ] **Step 4: GREEN**, record the count; spacetime and query suites once.
 
-- [ ] **Step 5: Docs** — "Running a rule": the `:scope` keyword, S3-P2's two paths and their consistency (one instant under the clock, per-store without, not serialised against concurrent premise writes in the foreign case), the retry note. "Provenance": `method` names the premise's store, NIL for the rule's own; the collision corner.
+- [ ] **Step 5: Docs** — "Running a rule": the `:scope` keyword, S3-P2's two paths and their consistency (one comparable epoch space under the clock, equal in a quiescent image, never a guaranteed instant; per-store and incomparable without; not serialised against concurrent premise writes in the foreign case), the retry note; recon O1 in "What the functors do not see": secondary-index membership is not snapshot-versioned, so a claim deleted after a snapshot is invisible to it too (pre-existing, single-store as well); recon B9's corollary: during a cross-store evaluation `*transaction*` is NIL, so a body reaching for `claims-touching` sees no transaction overlay; recon B5: a store in a scope must be keyword-named (`%store-name` takes `symbol-name`). "Provenance": `method` names the premise's store, NIL for the rule's own; the collision corner.
 
 - [ ] **Step 6: Commit** — `feat(rules): run-rule reads a scope of stores under composed snapshots and writes its own (#332)`.
 
@@ -546,7 +553,7 @@ refuses every read of another store (S3-P2).  ..."
 
 - [ ] **Step 2: RED**; **Step 3:** `premises-of graph claim &key (scope (list graph))`: for each `derived-from` record, `(claim-method r)` NIL → resolve in `graph`; a name → `(find name scope :key #'%store-name :test #'string=)` → resolve there, else drop. `%claim-by-identity-key` already takes the graph. `dependents-of`: no change beyond the docstring. **Step 4: GREEN**, count.
 
-- [ ] **Step 5: `docs/rules.md`** — new section "Cross-store scope (GH #332)" after "Provenance": what a scope is, own store first, writes only the own store, the schema rule (S3-P5, families declared under both names), the two evaluation paths and the clock (S3-P2), `method` and `premises-of :scope` (S3-P3/P4), the walk (S3-P6), the transaction trap for Lisp callers, the known limit (no cross-store cycle detection, #333). Read the whole file once against the shipped code. `CHANGELOG.md` entry under Added. The decision record with S3-P1..P6 and every execution ruling from the ledger, in the S2 file's shape, stating they were taken without Kevin and which deviate from the spec (none deviate; S3-P2 refines §7's "one transaction" for the cross-store case, forced by GH #53 — say so). One closing line in the S2 handoff pointing at this branch.
+- [ ] **Step 5: `docs/rules.md`** — new section "Cross-store scope (GH #332)" after "Provenance": what a scope is, own store first, writes only the own store, the schema rule (S3-P5, families declared under both names), the two evaluation paths and the clock as C2 has it (S3-P2), `method` and `premises-of :scope` (S3-P3/P4), the walk (S3-P6), the transaction trap for Lisp callers, the known limit (no cross-store cycle detection, #333). Read the whole file once against the shipped code. `CHANGELOG.md` entry under Added. The decision record with S3-P1..P6 and every execution ruling from the ledger, in the S2 file's shape, stating they were taken without Kevin and which deviate from the spec (none deviate; S3-P2 refines §7's "one transaction" for the cross-store case, forced by GH #53 — say so). One closing line in the S2 handoff pointing at this branch.
 
 - [ ] **Step 6: Runs** — rules, query, spacetime, gui in the foreground (each under 10 minutes); the full `graph-db` is the controller's, detached. Record every `Did N checks.`.
 
