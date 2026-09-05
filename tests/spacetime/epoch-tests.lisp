@@ -106,3 +106,67 @@ explicitly so the premise does not depend on run order."
                (is (integerp (claim-commit-epoch (%one g 'ea-claim "r1")))))
           (ignore-errors (close-graph g))
           (collect-garbage))))))
+
+(test as-of-epoch-selects-the-version-committed-at-or-before
+  "#347 part 2 (recon C2): create at E1, commit in B, update the extent
+at E2.  :AS-OF-EPOCH E1 -> old extent; E2 -> new; EB, B's epoch between
+them, -> old.  The E2 case fails against a strict < comparison, the one
+the engine's own snapshot predicate uses."
+  (with-clocked-stores (a b)
+    (let* ((old (exact-interval (ts 2022 1 1) (ts 2022 3 31)))
+           (new (exact-interval (ts 2022 1 1) (ts 2022 6 30)))
+           (e1 (%tx a (lambda ()
+                        (%unary a #'make-ea-claim-unary "r1" :extent old))))
+           (eb (%tx b (lambda () (%unary b #'make-eb-claim-unary "x"))))
+           (e2 (%tx a (lambda ()
+                        (let ((k (graph-db:copy (%one a 'ea-claim "r1"))))
+                          (setf (claim-extent k) new)
+                          (graph-db:save k))))))
+      (is (< e1 eb e2) "control: B's commit sits between E1 and E2")
+      (flet ((at (e)
+               (claims-touching a 'ea-claim :region "r1" :role :subject
+                                :as-of-epoch e)))
+        (is (= 1 (length (at e1))))
+        (is (extent-equals-p old (claim-extent (first (at e1)))))
+        (is (extent-equals-p new (claim-extent (first (at e2)))))
+        (is (extent-equals-p old (claim-extent (first (at eb)))))
+        (is (null (at (1- e1))) "not yet created one epoch earlier")))))
+
+(test as-of-epoch-drops-a-claim-retracted-at-or-before
+  "#347 part 2 (recon E4): a retraction is a version whose epoch is the
+retracting transaction's id.  Create at E1, retract at E2: E1 and EB
+(B's epoch between them) return the claim, E2 returns NIL, and the
+live version's CLAIM-COMMIT-EPOCH is E2."
+  (with-clocked-stores (a b)
+    (let* ((e1 (%tx a (lambda () (%unary a #'make-ea-claim-unary "r1"))))
+           (eb (%tx b (lambda () (%unary b #'make-eb-claim-unary "x"))))
+           (e2 (%tx a (lambda () (retract-claim (%one a 'ea-claim "r1"))))))
+      (is (< e1 eb e2) "control: B's commit sits between E1 and E2")
+      (flet ((at (e)
+               (claims-touching a 'ea-claim :region "r1" :role :subject
+                                :as-of-epoch e)))
+        (is (= 1 (length (at e1))))
+        (is (claim-current-p (first (at e1))))
+        (is (= 1 (length (at eb))))
+        (is (null (at e2)))
+        (is (= e2 (claim-commit-epoch (%one a 'ea-claim "r1"))))))))
+
+(test as-of-epoch-composes-with-current-and-at
+  "The downstream filters already guard on REAPED-CLAIM-P, so :CURRENT
+and :AT apply to the RESOLVED version exactly as they do under :AS-OF."
+  (with-clocked-stores (a b)
+    (let* ((old (exact-interval (ts 2022 1 1) (ts 2022 3 31)))
+           (new (exact-interval (ts 2022 1 1) (ts 2022 6 30)))
+           (e1 (%tx a (lambda ()
+                        (%unary a #'make-ea-claim-unary "r1" :extent old))))
+           (e2 (%tx a (lambda ()
+                        (let ((k (graph-db:copy (%one a 'ea-claim "r1"))))
+                          (setf (claim-extent k) new)
+                          (graph-db:save k))))))
+      (is (null (claims-touching a 'ea-claim :region "r1" :role :subject
+                                 :as-of-epoch e1 :at (ts 2022 5 1)))
+          "May is outside the E1 version's validity")
+      (is (= 1 (length (claims-touching a 'ea-claim :region "r1"
+                                        :role :subject
+                                        :as-of-epoch e2 :at (ts 2022 5 1)
+                                        :current t)))))))

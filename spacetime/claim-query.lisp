@@ -194,6 +194,27 @@ Walks VERTEX-HISTORY newest-first over the family's retained chain."
                 nil)                    ; did not exist yet
                (t (%make-reaped-claim (graph-db:id claim)))))))))
 
+(defun %claim-as-of-epoch (graph claim epoch)
+  "The version of CLAIM live at EPOCH -- committed at or before it and
+not retracted at or before it -- or NIL when there is none (created
+after EPOCH, or retracted by then), or a REAPED-CLAIM when versions of
+that age existed but are past the family's :KEEP-REVISIONS window.
+Walks VERTEX-HISTORY newest-first comparing each version's own commit
+epoch with <=; RESOLVE-VERSION-AT-EPOCH is a strict snapshot-start
+predicate and would drop the commit made AT EPOCH (#347 recon C2, C3).
+A retraction is a version, so CLAIM-CURRENT-P on the selected version
+is the whole retraction test (recon E4)."
+  (let* ((history (graph-db:vertex-history graph (graph-db:id claim)))
+         (resolved (loop for (version . e) in history
+                         when (<= e epoch) return version)))
+    (cond (resolved (and (claim-current-p resolved) resolved))
+          ((null history) nil)
+          ;; Nothing old enough.  Reaping severs the chain, so only the
+          ;; oldest retained REVISION tells created-after-EPOCH (0: it
+          ;; is the create) from reaped (> 0) -- recon C4.
+          ((zerop (graph-db:revision (car (car (last history))))) nil)
+          (t (%make-reaped-claim (graph-db:id claim))))))
+
 (defun %paginate (list limit offset)
   "LIST cut to OFFSET/LIMIT; second value T when entries existed past the
 cut (the REST envelope's one-past-the-cap rule, GH #302)."
@@ -231,7 +252,7 @@ added.  ALL itself outside a transaction.  The commit view is the same
 
 (defun claims-touching (graph claim-class namespace key
                         &key (role :either) current at during
-                             relation limit offset as-of)
+                             relation limit offset as-of as-of-epoch)
   "Claims in GRAPH naming (NAMESPACE, KEY) as subject, object, or either.
 CLAIM-CLASS is the PARENT class name; one call covers both arities.  Answers
 from the claim graph's own indexes -- no cross-graph read, no snapshot, which
@@ -259,6 +280,15 @@ version.  :AT/:DURING then filter the RESOLVED version's validity.  No
 argument or result is an epoch; the mapping is the per-version stamp in
 the claim's own data, so replicas answer from their own applied history.
 
+:AS-OF-EPOCH (an integer) answers on the same axis by commit epoch (GH
+#347): each claim is the version whose committing transaction id is the
+newest at or below it, dropped when that version is retracted, and a
+REAPED-CLAIM when older versions existed but are past :KEEP-REVISIONS
+-- told from \"created after\" by the oldest retained REVISION.  Epochs
+compare across stores only while the stores share one SYSTEM-CLOCK; a
+clockless store signals EPOCH-AXIS-UNAVAILABLE.  One of :AS-OF or
+:AS-OF-EPOCH, not both.
+
 :RELATION (a canonical string) restricts to one relation; on the subject
 side it rides the (subject-namespace subject-key relation) index (GH
 #302), on the object side it filters the endpoint candidates.  :LIMIT /
@@ -268,8 +298,9 @@ more claims existed past the cut (NIL without :LIMIT).
 Inside an open transaction the answer is what THAT transaction will
 commit (GH #324): its own retractions, updates and new claims are
 visible, so retract-then-assert on one series reads correctly before
-the commit.  :AS-OF is the exception -- it answers committed history
-only, since an uncommitted change is not yet history.
+the commit.  :AS-OF and :AS-OF-EPOCH are the exceptions -- they answer
+committed history only; an uncommitted change is not yet history and
+has no epoch at all.
 
 An out-of-range ROLE signals rather than silently returning NIL -- NIL is
 also the correct answer for \"no claims touch this endpoint\", and this
@@ -279,6 +310,8 @@ subsystem exists to keep those two cases from being confused."
   (check-type during (or null temporal-extent))
   (when (and at during)
     (error "Pass only one of :AT or :DURING, not both."))
+  (when (and as-of as-of-epoch)
+    (error "Pass only one of :AS-OF or :AS-OF-EPOCH, not both."))
   (let* ((probe (cond (at (make-instant (exact-bound at)))
                       (during during)))
          (family (claim-family claim-class))
@@ -302,24 +335,33 @@ subsystem exists to keep those two cases from being confused."
                    (remove-duplicates (append subjects objects)
                                       :key #'graph-db:id :test #'equalp)
                    (or subjects objects))))
-      (if as-of
-          (setf all (loop for c in all
-                          for v = (%claim-as-of graph c as-of)
-                          when v collect v))
-          (setf all (%overlay-transaction
-                     graph all family
-                     (lambda (c)
-                       (or (and (member role '(:subject :either))
-                                (equal namespace
-                                       (claim-subject-namespace c))
-                                (equal key (claim-subject-key c))
-                                (or (null relation)
-                                    (equal relation (claim-relation c))))
-                           (and (member role '(:object :either))
-                                (typep c (claim-family-binary family))
-                                (equal namespace
-                                       (claim-object-namespace c))
-                                (equal key (claim-object-key c))))))))
+      ;; The overlay is for the neither-axis arm only: an uncommitted
+      ;; write has no epoch (#347 recon C6).
+      (cond (as-of
+             (setf all (loop for c in all
+                             for v = (%claim-as-of graph c as-of)
+                             when v collect v)))
+            (as-of-epoch
+             (setf all (loop for c in all
+                             for v = (%claim-as-of-epoch graph c
+                                                         as-of-epoch)
+                             when v collect v)))
+            (t
+             (setf all (%overlay-transaction
+                        graph all family
+                        (lambda (c)
+                          (or (and (member role '(:subject :either))
+                                   (equal namespace
+                                          (claim-subject-namespace c))
+                                   (equal key (claim-subject-key c))
+                                   (or (null relation)
+                                       (equal relation
+                                              (claim-relation c))))
+                              (and (member role '(:object :either))
+                                   (typep c (claim-family-binary family))
+                                   (equal namespace
+                                          (claim-object-namespace c))
+                                   (equal key (claim-object-key c)))))))))
       (when current
         (setf all (remove-if-not (lambda (c)
                                    (or (reaped-claim-p c)
