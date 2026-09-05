@@ -551,6 +551,12 @@ refuses every read of another store (S3-P2).  ..."
         (is (= 1 (length (graph-db.rules:dependents-of a premise))))))))
 ```
 
+- [ ] **Step 1b: Task 1's deferred minors** (ledger, review of e726cb3), in `rules/facts.lisp`, `tests/rules/scope-tests.lisp` and `docs/rules.md`:
+  - a cross-store test of the subject-only route: with scope `(a b)`, `(claim ?c rt-claim "host" "h1" ?r ?ons ?a)` answers objects `cache`, `db`, `web` (h1 runs web and db in A, cache in B);
+  - a test that the walk skips a store lacking the family: with scope `(a b)` and no bound, `(select-count (?c) (claim ?c rtu-claim ?s ?k ?r ?o ?ok))` counts A's rtu-claims only (write one first) and signals nothing;
+  - `%scope-lookup`'s docstring gains the wrong-arity caveat `%producer-candidates` carries (the same `query-precondition-error` is what a wrong component count signals, so the swallow is safe only at the known arity);
+  - the "What the functors do not see" paragraph: "every route" → the three indexed routes and the walk; the bound-`?c` route and the empty fast paths read no store.
+
 - [ ] **Step 2: RED**; **Step 3:** `premises-of graph claim &key (scope (list graph))`: for each `derived-from` record, `(claim-method r)` NIL → resolve in `graph`; a name → `(find name scope :key #'%store-name :test #'string=)` → resolve there, else drop. `%claim-by-identity-key` already takes the graph. `dependents-of`: no change beyond the docstring. **Step 4: GREEN**, count.
 
 - [ ] **Step 5: `docs/rules.md`** — new section "Cross-store scope (GH #332)" after "Provenance": what a scope is, own store first, writes only the own store, the schema rule (S3-P5, families declared under both names), the two evaluation paths and the clock as C2 has it (S3-P2), `method` and `premises-of :scope` (S3-P3/P4), the walk (S3-P6), the transaction trap for Lisp callers, the known limit (no cross-store cycle detection, #333). Read the whole file once against the shipped code. `CHANGELOG.md` entry under Added. The decision record with S3-P1..P6 and every execution ruling from the ledger, in the S2 file's shape, stating they were taken without Kevin and which deviate from the spec (none deviate; S3-P2 refines §7's "one transaction" for the cross-store case, forced by GH #53 — say so). One closing line in the S2 handoff pointing at this branch.
