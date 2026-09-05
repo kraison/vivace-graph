@@ -6,7 +6,8 @@ taken during execution, without Kevin in the loop, after a
 source-verified recon pass; each carries the cost of being wrong as it
 was stated at the time. Nothing here is re-derived or improved —
 where a ruling deviates from the spec, this file is the deviation
-record.
+record. Numbered as in the session notes; the gaps are rulings that
+were routine and not transcribed, so this is a subset, not the whole.
 
 Order of authority while S1 ran: spec > these rulings > the recon's
 API facts > the task brief.
@@ -286,7 +287,7 @@ surface.
 Three items the final whole-branch review saw and deliberately did not
 fix here: `rules/facts.lisp`'s unbound-`?c` gate folds an explicit NIL
 into "unbound" and the correct `(var-p (var-deref ?c))` belongs to
-S2's first touch; `prolog-cost-unbounded-error`'s report text tells
+S2's first touch (landed in S2 as `%unbound-p`, #331); `prolog-cost-unbounded-error`'s report text tells
 the caller to pass `:allow-cost-unbounded t`, which R18 explains does
 not work for `claim/7`, and fixing it means touching core that spec §3
 forbids for this slice (kraison/vivace-graph#334);

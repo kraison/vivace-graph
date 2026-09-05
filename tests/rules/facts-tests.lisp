@@ -381,3 +381,21 @@ query already gets, rather than a refusal the caller opted out of."
     (signals graph-db.query:prolog-ill-typed-error
       (graph-db.query:run-guarded-prolog
        "(claim ?c rt-claim-unary \"host\" \"h1\" ?r ?a ?b)" g))))
+
+;; S1's deferred gate ("Deferred out of S1"): a ?C bound to NIL is a
+;; bound non-node and fails the goal, not the generator's unbound case.
+;; Both answer zero rows, so the refusal is what separates them -- with
+;; ?C bound to NIL there is nothing to refuse.
+(test a-nil-c-is-bound-not-unbound
+  (with-rules-graph (g)
+    (seed g)
+    (is (zerop (select (:count t :max-inferences 1000) ()
+                 (claim-producer nil "scan-a"))))
+    (is (zerop (select (:count t :max-inferences 1000) (?p)
+                 (claim-producer nil ?p))))
+    ;; Control: ?C really unbound is the unroutable case, and with a
+    ;; producer name it really generates.
+    (signals graph-db::prolog-cost-unbounded-error
+      (select (:max-inferences 1000) (?c ?p) (claim-producer ?c ?p)))
+    (is (= 2 (select (:count t :max-inferences 1000) (?c)
+               (claim-producer ?c "scan-b"))))))

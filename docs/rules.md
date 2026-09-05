@@ -5,10 +5,14 @@ versioned producer: claims derived from other claims, validated like
 any other write, readable back with their provenance. The design is
 `docs/superpowers/specs/2026-09-04-rules-as-producers-design.md`.
 
-**Slice 1 (GH #330) is all of it today**: the Prolog view of claims,
-seven global functors a `select` or a guarded free-text query can read
-claims as facts through. The rule record, `compile-rule` and `run-rule`
-are slice 2 (GH #331). Nothing here writes.
+**Slice 1 (GH #330)** is the Prolog view of claims: seven global
+functors a `select`, or a guarded free-text query, reads claims as
+facts through. **Slice 2 (GH #331)** is the rule itself -- the stored
+`rule` record and the `derivation` provenance family
+(`def-rules-schema`), `def-rule` as the in-image escape hatch,
+`compile-rule`, and `run-rule` / `run-rules` -- from "The store's rule
+schema" down. Slice 1 only reads; `run-rule` is the one thing here
+that writes, and it writes claims like any other producer.
 
 ## Loading it
 
@@ -89,7 +93,8 @@ guard the schema's own canonical symbol is what reaches the goal.
   extent never matches. A malformed instant **fails the goal** rather
   than signalling, so a caller cannot tell a bad timestamp from no
   match.
-- `claim-producer/2` with `?c` unbound and `?p` a producer name
+- `claim-producer/2` with `?c` **unbound** -- not bound to NIL, which
+  is a bound non-node and simply fails -- and `?p` a producer name
   generates from the producer index of **every** claim family in the
   image, so pair it with a `claim/7` goal to restrict a family. **Goal
   order is load-bearing**: the `claim-producer` goal must come
@@ -100,8 +105,9 @@ guard the schema's own canonical symbol is what reaches the goal.
   generate from and no walk to fall back to. Under a resource bound it
   signals `prolog-cost-unbounded-error`, exactly as an unrouted
   `claim/7` does; with no bound in effect it fails, answering nothing.
-  A bound `?p` naming no producer is the empty answer instead, the way
-  an unresolvable namespace is.
+  A bound `?p` that is a string naming no producer is the empty
+  answer; a `?p` bound to NIL is not a producer name and takes the
+  neither-bound path.
 - A non-node `?c` fails every filter; none of them signals.
 
 ## Two examples
@@ -203,6 +209,12 @@ property, not a per-functor one.
   type names the guard admits but no family is keyed on, so
   `host-claim-unary` is the shape a caller gets this from.
 - **An unknown namespace** is the empty fast path above, not an error.
+- **A rule that does not compile** signals
+  `graph-db.rules:rule-compile-error`, a
+  `graph-db:constraint-violation` -- deterministic, so retrying the
+  same write against the same schema is refused again.
+  `rule-compile-error-rule` is the rule's name,
+  `rule-compile-error-reason` the sentence saying what is wrong.
 
 ## What the functors do not see
 
@@ -214,6 +226,12 @@ do not compensate. Uniform across every route, so a query inside a
 Slice 2's `run-rule` derives claims inside the transaction it also
 reads in, so it is the first caller this bites (GH #331).
 
+This is also why the cycle check is strict rather than a fixpoint: **a
+body cannot see the sweep**, nor the claims the same run constructs, so
+a rule that read its own relation would read the *previous* run's
+derivation and one `run-rule` would never settle. `compile-rule`
+refuses that instead of iterating (GH #331).
+
 ## Tests and CI
 
 FiveAM system `graph-db/rules-test` (`tests/rules/`), on-disk stores,
@@ -224,3 +242,289 @@ an image that loads `graph-db/rules` **and** `graph-db/gui-test` fails
 against a hand-reviewed list and the gui lane loads no rules. Classify
 the seven functors there if you build such an image; never weaken the
 check.
+
+## The store's rule schema (GH #331)
+
+`graph-db.rules:def-rules-schema (graph-name)` declares the store's
+`rule` record (`name version family head body extent-policy enabled`)
+and the `derivation` claim family, both per store like any `def-source`
+or `def-claim-classes` call. `name` is the identity key -- one live
+`rule` per name -- so a new version is `copy`, `setf rule-version`,
+`save`, not a second write. A second `def-rules-schema` call (a
+multi-store image) rebinds `make-rule`'s default store, so every
+constructor call after that must pass `:graph` explicitly.
+
+`name` and `version` are canonical strings (`[a-z0-9-]+`) and
+`extent-policy` is one of `:premises` / `:none`; both are commit-time
+constraints, so a raw slot write is refused too.
+
+A store that never evaluated it holds no rules, and says so rather than
+erring: `run-rules` on such a store reports nothing, and `run-rule` by
+name says there is no such rule rather than reaching an index this
+schema does not carry.
+
+Once a store has evaluated it, **`graph-db/rules` must be loaded before
+every later `open-graph` of that store**: `rule` and the `derivation`
+classes are this system's, and a persisted node type with no CLOS class
+in the image is `schema-classes-not-loaded` at open (`schema.lisp`,
+GH #144).
+
+## Compiling a rule
+
+`graph-db.rules:compile-rule (graph rule &key others)` turns a `rule`
+record -- or a `rule-spec`, which is what `def-rule` registers -- into
+a `compiled-rule`, or signals `rule-compile-error` (spec §6). Head and
+body go through the guard as one text, so a variable shared between
+them reads as one symbol.
+
+**The head is exactly one `claim/7` pattern.** Written out,
+`(claim ?c family sns skey rel ons okey)`:
+
+- A second goal in the head, or any other functor, is refused.
+- `?c` is an unbound variable that must not appear in the body: it
+  names the claim the rule derives.
+- `family` is the rule's own `family` slot, spelled as the schema's
+  parent class name.
+- `rel` is a literal canonical relation (`[a-z0-9-]+`). A variable
+  there is refused -- a rule must say what it derives.
+- The namespaces are canonical strings, interned as keywords at
+  compile time, or body variables; the keys are strings or body
+  variables. A head variable the body does not bind is refused.
+- The object pair is both `nil` (a unary claim) or both given.
+
+**The body is guarded exactly as free text is** -- the same character
+screen, the same functor whitelist, the same refusals
+`run-guarded-prolog` gives (`query/guard.lisp`). Two consequences:
+
+- **No colon anywhere in the rule text.** The screen refuses `:`
+  before the reader runs, so a body can name no keyword and no
+  package-qualified symbol. Namespaces and standings are written as
+  the lowercase wire strings the functors answer in (`"host"`,
+  `"inferred"`).
+- **A bare `?` is refused, in the head as well as the body.** Read
+  into the guard's scratch package every `?` in one text is the *same*
+  named variable, not the engine's anonymous one, so all of them would
+  have to unify. `compile-rule` refuses it rather than let a rule mean
+  something other than it reads (recon note A10,
+  `docs/superpowers/notes/2026-09-05-rules-s2-engine-api-facts.md`).
+  The head is scanned separately from the body, so the "bound by the
+  body" check still sees only body variables.
+
+An effecting functor such as `retract` is **not** a compile refusal:
+there is no static effect registry, so the guard admits the goal and
+running it is what refuses (same note, A16).
+
+**Generators move to the front (ruling P5).** A body goal
+`(claim-producer ?v "p")` -- variable first, literal producer second --
+generates from the producer index, so `compile-rule` runs it before
+the rest of the body and a later `claim/7` on `?v` takes its node
+route instead of walking the family. Every other goal keeps its order;
+`(claim-producer ?p ?who)` is a filter and is left where it was.
+
+**Recursion is refused, and the cycle is named (ruling P6).** The
+cycle graph is over relation names: a rule's head relation points at
+every relation its body reads, and so does every other enabled rule in
+scope -- the store's enabled rules plus every enabled `def-rule`. A
+path from the head relation back to itself is refused, spelling the
+path (`deriving "y" closes a cycle: y -> x -> y`). A body `claim/7`
+that leaves its relation unbound reads *every* relation, its own
+included, so it is always a one-node cycle; that refusal says to bind
+the relation.
+
+**A name belongs to one source.** A stored `rule` and a `def-rule` of
+the same name is a collision, refused whichever arrives second.
+
+**A `rule` write that does not compile is refused at commit** (ruling
+P3). `%validate-rule-writes` sits on `graph-db:*commit-validators*`
+and compiles every written `rule` against the store as the commit will
+leave it -- the cycle check included -- so the store never holds a
+rule that could not run when it was written. `enabled nil` is not an
+exemption: a disabled rule is compiled, only not run. The validator is
+inert until some store has evaluated `def-rules-schema`, which is what
+makes the `rule` class.
+
+### `def-rule`, the in-image escape hatch
+
+`(def-rule "web-hosts" :version "1" :family rt-claim :head ... :body
+...)` registers a rule in the image rather than in a store (spec §5).
+`family` is the parent class symbol, unevaluated; every other argument
+is evaluated. `undef-rule` forgets one and `find-def-rule` returns its
+`rule-spec`. A `def-rule` is compiled per store, when it runs, because
+the cycle check needs that store's other rules -- but it constrains
+the cycle graph of every store in the image, so a `def-rule` can be
+the reason a stored rule's write is refused.
+
+## Running a rule
+
+`graph-db.rules:run-rule (graph rule) => rule-report` derives `rule`
+afresh and reconciles the result with its previous derivation, in **one
+transaction** (spec §7). `rule` is a `rule` record, a `rule-spec`, or a
+name -- looked up in the store first, then among the `def-rule`s.
+
+**Reconcile, not sweep-then-insert (ruling P10).** `run-rule` evaluates
+the body first, then compares the identities it derived against the
+claims `rule/<name>` already holds:
+
+- an identity derived again is **kept** -- the same node, so its id and
+  its version chain survive -- with its `rule-version` **and its
+  validity extent** brought to what this run derives, in one
+  `copy`/`save` when either moved. A kept claim's extent follows its
+  premises: a premise's open end that has since closed, an extent
+  change under `:premises` in a non-temporal family, or a rule moved
+  from `:extent-policy :none` to `:premises`, all reach the kept claim
+  rather than waiting for something to sweep it. The extent *start*
+  cannot move -- the dedupe key carries it for a temporal family -- and
+  a refreshed extent that overlaps a sibling run is refused at commit
+  like any other;
+- an identity no longer derived is **swept** (`mark-deleted`);
+- an identity not held before is **derived** (constructed).
+
+The order matters and is not a preference. `mark-deleted` releases a
+unique key only *post*-durability, while `validate-unique-constraints`
+runs *pre*-durability, so a sweep and a re-insert of an unchanged claim
+in one transaction always collide under `def-unique` (recon note C1,
+`tests/spacetime/claim-query-tests.lisp`). Deriving first and keeping
+what is unchanged has no such collision, and it is sound because a body
+reads the committed store either way (recon note A6).
+
+A **retracted** derived claim whose identity is derived again stays
+retracted: keeping is not re-assertion. `run-rule` writes no
+transaction extent, so `retract-claim`'s closed period stands until
+something re-asserts it.
+
+**Duplicates collapse.** Two solutions with the same head endpoints and
+relation are one claim; for a temporal family the extent *start* joins
+that key, exactly as `claim-identity-key` does -- so two solutions that
+differ only in extent **kind** (an instant at T against an interval
+starting at T) collapse too, which is what the family's own identity
+rule would have forced anyway (recon note C5, ruling P11).
+
+**The rails, always (ruling P4).** The body runs through
+`run-query-goals`: `:effects nil`, one snapshot (inherited from the
+open transaction), and a resource bound. `*rules-max-inferences*` and
+`*rules-timeout*` are the operator's; `nil` on either falls back to the
+DSL's `*query-default-max-inferences*` / `*query-default-timeout*`.
+If the *effective* pair is `nil` -- both rule variables and both DSL
+defaults -- `run-rule` signals a plain error rather than walking a
+family unbounded. `*rules-max-solutions*` (100000) caps the collected
+solutions; past it the run is refused rather than silently truncated.
+
+**The report** (`rule-report`):
+
+| field | meaning |
+|---|---|
+| `rule-name`, `version` | the rule as run |
+| `outcome` | `:derived` or `:refused` |
+| `derived`, `kept`, `swept` | the reconcile's three counts |
+| `disjoint-premises` | solutions dropped: premises never held at once |
+| `refusals` | a list of `(tag . text)` |
+| `inferences` | the count at the last solution |
+| `elapsed` | seconds |
+
+A refusal's `tag` is a **claim family name** for a refusal the commit or
+a constructor raised (`extent-disjointness-violation`,
+`unique-constraint-violation`, `missing-claim-identity-component`),
+else one of:
+
+- `:rule` -- the rule's own fault: it no longer compiles, its family is
+  not in this store, an effecting goal was refused at run
+  (`prolog-permission-error`, recon note A16), or a head term is not a
+  namespace or key this image knows;
+- `:budget` -- the rails: the inference budget, the timeout, or a goal
+  refused as `cost-unbounded`;
+- `:solutions` -- the `*rules-max-solutions*` cap.
+
+The vocabulary is closed: a `constraint-violation` none of the three
+family cases name is tagged `:rule`, not with its own class name.
+
+**Nothing refuses by signalling.** Every refusal is reported, and every
+one unwinds the transaction, so **the previous derivation stands
+untouched** -- `derived`, `kept` and `swept` all read 0 on a
+`:refused` report. Only an operator error signals: no resource bound,
+or no rule of that name in the store or the image.
+
+## Validity of a derived claim
+
+Under `:extent-policy :premises` (the default) a derived claim's
+validity extent is the **intersection** of the validity extents of its
+premises -- the claims bound to the `?c` variables of the body's
+`claim/7` goals for that solution (spec §8). `extent-intersection`
+(cl-temporal-extent 0.3.0) does the work, with `:semantics :validity`
+and `:standing :inferred`. A premise with no extent contributes
+nothing; if no premise has one, the derived claim has none.
+
+- An **empty** intersection means the premises never held at once. No
+  claim is derived for that solution and `disjoint-premises` counts it.
+- A **temporal** family with no extent to attach refuses at
+  construction (`missing-claim-identity-component`), reported with the
+  family as the tag.
+
+`:extent-policy :none` derives claims with no extent at all, for a
+non-temporal family.
+
+**The policy is orthogonal to the family's temporality (ruling P7).**
+`:premises` on a *non*-temporal family still intersects and still drops
+the disjoint solutions -- the extent is attached, it simply plays no
+part in that family's identity, so two solutions differing only in
+extent collapse to one claim. **The first solution's extent is the one
+kept** (ruling T4-R3): the premises of the collapsed solutions are
+unioned, and their extents are not re-intersected. Re-intersecting
+would narrow a claim's validity by the accident of how many ways it was
+derived, which is not what "the intersection of its premises" means for
+a claim derived twice over.
+
+## Provenance
+
+Every (derived claim, premise) pair is one binary claim of the
+`derivation` family (spec §9): subject `(:claim . <derived identity
+key>)`, relation `"derived-from"`, object `(:claim . <premise identity
+key>)`, producer `rule/<name>`, the rule's `rule-version`, standing
+`:inferred`. Identity keys, not node ids, so provenance survives a
+premise's retraction and regeneration. The records reconcile exactly as
+the claims do: a pair still asked for is kept and re-versioned, one no
+longer asked for is deleted. **One record per pair**: the records
+`rule/<name>` holds are the rule's alone, so a second record naming a
+pair already kept, or a record under that producer whose relation is
+not `derived-from`, is swept with them.
+
+Both reads filter the records on `derived-from`, so a `derivation`
+record of another relation -- one a foreign writer left under the
+producer, which the next run sweeps -- is never read as provenance.
+
+- `(premises-of graph claim) => claims` -- the claims `claim` was
+  derived from. A premise whose identity no longer exists in the store
+  is dropped rather than faked.
+- `(dependents-of graph claim &key current) => claims` -- every derived
+  claim whose provenance names `claim`. With `:current`, only those
+  still believed.
+
+**Retracting a premise does not re-derive anything.** Its dependents
+stay current and stay findable through `dependents-of`; deciding what
+to do about them is the caller's, and in a multi-agent setting
+kraison/blackboard's.
+
+## `run-rules`
+
+`graph-db.rules:run-rules (graph) => list of rule-report` runs every
+enabled rule the store can run, in dependency order: a rule that reads
+relation R runs after every rule that derives R (spec §7). Cycles were
+refused at compile, so the order always exists; ties keep the order the
+rules came in.
+
+- **A disabled rule is not in scope at all.** `rules-in-scope` filters
+  on `enabled`, stored rules and `def-rule`s alike, so `run-rules`
+  neither compiles a disabled rule nor counts it in the cycle graph --
+  and a rule it would otherwise have made cyclic compiles fine while it
+  stays disabled (ruling T3-R5). The one place `enabled` buys no
+  exemption is the *write*: `%validate-rule-writes` compiles every
+  `rule` record it commits, disabled or not, so a disabled rule is
+  still a rule that could run.
+- **A `def-rule` runs only where the store carries its family (ruling
+  P8).** `*def-rules*` is image-wide; a rule whose family this store
+  never declared is skipped silently, because it is not this store's
+  rule. `run-rule` called on it directly still answers -- with a
+  `:refused` report tagged `:rule`.
+- **A rule that no longer compiles is reported and skipped**, never
+  refused at open. A `def-rule` registered after a store's rules were
+  written can close a cycle with one of them; both then read
+  `:refused` with a `:rule` tag and every other rule still runs.

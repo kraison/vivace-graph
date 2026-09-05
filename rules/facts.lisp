@@ -160,6 +160,14 @@ refused as cost-unbounded under a resource bound (GH #285, spec §4)."
     (dolist (claim candidates)
       (%unify-claim claim ?c ?sns ?skey ?rel ?ons ?okey family cont))))
 
+(defun %unbound-p (x)
+  "X is an unbound Prolog variable -- not a bound NIL, which
+%PROLOG-INDEX-BOUND folds into the same value (S1's deferred gate,
+docs/superpowers/decisions/2026-09-04-rules-s1-rulings.md)."
+  ;; VAR-DEREF writes the place it is given; here that place is this
+  ;; function's own parameter binding, as in PRINT-VAR (prologc.lisp).
+  (var-p (var-deref x)))
+
 (defun %claim-arg (x)
   "X's value when it is a node, else NIL -- every CLAIM-* filter fails on
 NIL rather than signalling.  A node of another type is out of contract:
@@ -251,22 +259,27 @@ and this filters.  With neither bound there is no index to generate from
 and no walk to fall back to, so the goal is refused as cost-unbounded
 under a resource bound and answers nothing without one -- or with
 :ALLOW-COST-UNBOUNDED, which buys that same silence rather than a walk,
-there being none to buy (spec §4, GH #334, docs/rules.md)."
+there being none to buy.  Unbound means unbound: a ?C bound to NIL is a
+bound non-node, so it filters and fails (spec §4, GH #334,
+docs/rules.md)."
   (let ((c (%claim-arg ?c))
-        (c-arg (%prolog-index-bound ?c))
+        (unbound (%unbound-p ?c))
         (p (%prolog-index-bound ?p)))
     (cond (c (%yield (?p (graph-db.spacetime:claim-producer c))
                (funcall cont)))
-          ;; %CLAIM-ARG is NIL for a bound non-node too, and generating
-          ;; there is a whole cross-family lookup that then unifies with
-          ;; nothing, past %TICK's reach.
-          ((and (null c-arg) (stringp p))
+          ;; %CLAIM-ARG is NIL for a bound non-node too -- an explicit
+          ;; NIL included -- and generating there is a whole
+          ;; cross-family lookup that then unifies with nothing, past
+          ;; %TICK's reach.
+          ((and unbound (stringp p))
            (dolist (claim (%producer-candidates *graph* p))
              (%yield (?c claim) (funcall cont))))
           ;; Nothing bound routes nowhere, so CLAIM/7's refusal rather
-          ;; than silence.  A bound ?P that names no producer still
-          ;; answers empty, as an unresolvable namespace does.
-          ((and (null c-arg) (null p)
+          ;; than silence.  A bound ?P that is a string naming no
+          ;; producer still answers empty, as an unresolvable namespace
+          ;; does; a ?P bound to NIL is not a producer name and lands
+          ;; here.
+          ((and unbound (null p)
                 (not *allow-cost-unbounded*)
                 (or *inference-budget* *query-deadline*))
            (error 'prolog-cost-unbounded-error

@@ -12,4 +12,29 @@
 ;;;; an unknown functor (docs/rules.md).
 
 (defpackage #:graph-db.rules
-  (:use #:cl))
+  (:use #:cl)
+  (:export
+   ;; the store schema (spec §5, §9)
+   #:def-rules-schema #:rule #:make-rule #:rule-p #:rule-name
+   #:rule-version #:rule-family #:rule-head #:rule-body
+   #:rule-extent-policy #:rule-enabled #:derivation
+   ;; the in-image escape hatch (spec §5)
+   #:def-rule #:undef-rule #:find-def-rule #:rule-spec #:rule-spec-p
+   #:rule-spec-name #:rule-spec-version #:rule-spec-family
+   #:rule-spec-head #:rule-spec-body #:rule-spec-extent-policy
+   #:rule-spec-enabled
+   ;; compiling (spec §6)
+   #:compile-rule #:compiled-rule #:compiled-rule-p #:compiled-rule-spec
+   #:compiled-rule-relation #:compiled-rule-reads
+   #:rule-compile-error #:rule-compile-error-rule
+   #:rule-compile-error-reason
+   ;; running (spec §7)
+   #:run-rule #:run-rules
+   #:*rules-max-inferences* #:*rules-timeout* #:*rules-max-solutions*
+   #:rule-report #:rule-report-p #:rule-report-rule-name
+   #:rule-report-version #:rule-report-outcome #:rule-report-derived
+   #:rule-report-kept #:rule-report-swept #:rule-report-disjoint-premises
+   #:rule-report-refusals #:rule-report-inferences
+   #:rule-report-elapsed
+   ;; provenance (spec §9)
+   #:premises-of #:dependents-of))
