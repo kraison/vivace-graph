@@ -1046,7 +1046,7 @@ them leaves the relation unbound (ruling P6)."
   (let ((reads '()))
     (dolist (goal goals (nreverse reads))
       (when (%engine-goal-p goal "CLAIM" 7)
-        (let ((rel (fifth goal)))
+        (let ((rel (sixth goal)))
           (if (stringp rel)
               (pushnew rel reads :test #'string=)
               (return-from %body-reads :any)))))))
