@@ -47,6 +47,8 @@ Each deviates from or refines the spec; each is reversible; none was put to Kevi
 - **P6 — the recursion graph is over relation names, and an unbound relation reads everything.** Spec §6 keys the graph on relations. A body `claim/7` whose relation argument is a variable reads every relation, so it gets an edge to every head relation in scope, its own included — such a rule is always the one-node cycle and is refused with a message saying to bind the relation. Families are ignored in the graph (a rule deriving relation R in family F1 that reads R in F2 is refused): conservative, and spec-literal.
 - **P7 — a solution's extent is intersected whatever the family's temporality.** Spec §8 states the `:premises` policy for temporal families. Applying it to a non-temporal family too costs nothing and records the validity the premises had; the derived claim's identity ignores the extent there, so duplicates collapse by endpoints alone and the first solution's extent is kept. `:none` derives no extent anywhere.
 - **P8 — `run-rules graph` includes a `def-rule` only when the store carries its family.** `def-rule`s are image-wide; a family the store's schema does not declare cannot be swept or derived into (`query-precondition-error` from the producer index). Filter by `(graph-db.query:schema-type-names graph :vertex)`; a def-rule that is filtered out is not reported. `run-rule` on such a rule by name is refused with tag `:rule`.
+- **P10 (from recon C1) — `run-rule` reconciles, it does not sweep-then-insert.** `validate-unique-constraints` reads the committed unique index before durability and only skips the *deleting* write, so a `mark-deleted` followed by a fresh claim with the same identity tuple in ONE transaction always collides (`tests/spacetime/claim-query-tests.lisp:128-140` asserts exactly that; design §6.4 splits the transactions for this reason). Spec §7's "sweep-then-insert in one transaction" is therefore unbuildable as written. `run-rule` instead derives first (the body reads the committed store, recon A6, so order does not change the answer), keys every solution by identity, and then, in the same transaction: keeps every existing claim of the producer whose identity is re-derived (refreshing its `rule-version` by copy/save when the version changed), marks deleted every existing claim no longer derived, and constructs only the new identities; the `derived-from` records are reconciled the same way. The report gains `kept`. Atomicity holds; unchanged claims keep their node id and version chain, which is better provenance than the spec asked for. **Cost if wrong:** a retracted derived claim whose identity is re-derived is kept retracted, not re-asserted — a retraction is someone's deliberate act; the operator deletes it and reruns.
+- **P11 (from recon C5) — two solutions differing only in extent KIND collapse.** `claim-identity-key` keys a temporal family on the extent START alone, so an instant at T and an interval starting at T are one identity; the dedupe follows the identity, the first solution's extent is kept.
 - **P9 — `extent-intersection` takes standing, semantics and precision from keywords, defaulting to A's standing and semantics and the coarser precision.** The library must not assume `:inferred`; the rules caller passes `:semantics :validity :standing :inferred`. An instant on either side gives an instant (the point narrowed to the other extent's hull); a result that is certainly empty (`extents-disjoint-p`) is NIL. Fuzzy bounds combine coordinate-wise: the later start (max of earliests, max of latests), the earlier end (min of both), `:unbounded` read as −∞ in an earliest and +∞ in a latest.
 
 ---
@@ -420,7 +422,7 @@ Check the exact form the `qt-links` edge functor takes in `tests/query/guard-tes
    #:*rules-max-inferences* #:*rules-timeout* #:*rules-max-solutions*
    #:rule-report #:rule-report-p #:rule-report-rule-name
    #:rule-report-version #:rule-report-outcome #:rule-report-derived
-   #:rule-report-swept #:rule-report-disjoint-premises
+   #:rule-report-kept #:rule-report-swept #:rule-report-disjoint-premises
    #:rule-report-refusals #:rule-report-inferences
    #:rule-report-elapsed
    ;; provenance (spec §9)
@@ -448,9 +450,9 @@ class's name as a string, HEAD and BODY guarded Prolog text."
   `(progn
      (graph-db.spacetime:def-source rule ,graph-name
          ((name :type string
-                :check graph-db.spacetime::canonical-relation-p)
+                :check graph-db.spacetime:canonical-relation-p)
           (version :type string
-                   :check graph-db.spacetime::canonical-relation-p)
+                   :check graph-db.spacetime:canonical-relation-p)
           (family :type string)
           (head :type string)
           (body :type string)
@@ -470,7 +472,7 @@ class's name as a string, HEAD and BODY guarded Prolog text."
      ',graph-name))
 ```
 
-Recon A2 decides `::` vs `:` on `canonical-relation-p`; A3 decides whether `:type string` slots need `:initform`. The `derivation` family is non-temporal (spec §9); its claims are binary, subject and object both namespace `:claim`.
+Recon C7: `canonical-relation-p` is exported, single colon. Recon C2: a second `def-rules-schema` rebinds `make-rule`'s default store, so every constructor call passes `:graph` (the tests already do) and `docs/rules.md` says so. The `derivation` family is non-temporal (spec §9); its claims are binary, subject and object both namespace `:claim`.
 
 - [ ] **Step 5: ASDF** — in `graph-db.asd`, `graph-db/rules` `:components ((:file "package") (:file "facts") (:file "schema") (:file "compile") (:file "run"))` — add `schema` now and the other two in Tasks 3/4 as their files appear (a listed file that does not exist breaks the load). `graph-db/rules-test` components: `package suite facts-tests schema-tests` (+ `compile-tests`, `run-tests` later). Change `graph-db/spacetime`'s `(:version :cl-temporal-extent "0.2.0")` to `"0.3.0"` and update the S1 description string of `graph-db/rules` to "Claims as Prolog facts, and rules as versioned producers.  docs/rules.md; GH #304."
 
@@ -679,7 +681,8 @@ Docs travel with code: add to `docs/rules.md` a one-paragraph "Slice 2" placehol
        (is-true c "compiled when it should have been refused")
        (when c
          (is (search ,reason-substring
-                     (graph-db.rules:rule-compile-error-reason c))
+                     (graph-db.rules:rule-compile-error-reason c)
+                     :test #'char-equal)
              "reason ~S does not mention ~S"
              (graph-db.rules:rule-compile-error-reason c)
              ,reason-substring)))))
@@ -710,9 +713,12 @@ Docs travel with code: add to `docs/rules.md` a one-paragraph "Slice 2" placehol
 
 (test the-body-goes-through-the-guard
   ;; An effecting functor, a package-qualified name, an unknown name.
-  (refuses "retract" :name "r" :version "1" :family "rt-claim"
+  (refuses "not a registered" :name "r" :version "1" :family "rt-claim"
            :head *web-hosts-head*
-           :body "(claim ?p rt-claim \"host\" ?h \"runs\" \"app\" \"web\") (retract ?p)")
+           :body "(claim ?p rt-claim \"host\" ?h \"runs\" \"app\" \"web\") (no-such-functor ?p)")
+  (refuses "bare ?" :name "r" :version "1" :family "rt-claim"
+           :head *web-hosts-head*
+           :body "(claim ?p rt-claim \"host\" ?h \"runs\" \"app\" ?)")
   (refuses "package-qualified" :name "r" :version "1" :family "rt-claim"
            :head *web-hosts-head*
            :body "(claim ?p graph-db::rt-claim \"host\" ?h \"runs\" \"app\" \"web\")")
@@ -742,8 +748,10 @@ Docs travel with code: add to `docs/rules.md` a one-paragraph "Slice 2" placehol
                (graph-db.rules:rule-compile-error (c) c))))
       (is-true c)
       (when c
-        (is (search "x" (graph-db.rules:rule-compile-error-reason c)))
-        (is (search "y" (graph-db.rules:rule-compile-error-reason c)))))
+        (is (search "x" (graph-db.rules:rule-compile-error-reason c)
+                    :test #'char-equal))
+        (is (search "y" (graph-db.rules:rule-compile-error-reason c)
+                    :test #'char-equal))))
     ;; The refused write left nothing behind.
     (is (null (graph-db:index-lookup g 'graph-db.rules:rule
                                      '(graph-db.rules::name) "b")))
@@ -781,13 +789,14 @@ Docs travel with code: add to `docs/rules.md` a one-paragraph "Slice 2" placehol
   (with-rules-graph (g)
     (signals graph-db.rules:rule-compile-error
       (write-rule g :name "bad" :version "1" :family "rt-claim"
-                  :head *web-hosts-head* :body "(retract ?p)"))
+                  :head *web-hosts-head* :body "(no-such-functor ?p)"))
     (is (null (graph-db:index-lookup g 'graph-db.rules:rule
                                      '(graph-db.rules::name) "bad")))
     ;; A disabled rule still has to compile (spec §6: compiled, not run).
     (signals graph-db.rules:rule-compile-error
       (write-rule g :name "bad" :version "1" :family "rt-claim"
-                  :enabled nil :head *web-hosts-head* :body "(retract ?p)"))))
+                  :enabled nil :head *web-hosts-head*
+                  :body "(no-such-functor ?p)"))))
 
 (test claim-producer-generators-move-to-the-front
   "Ruling P5: (claim-producer ?v \"p\") is a generator and runs first."
@@ -913,11 +922,14 @@ relations the body reads or :ANY."
   (graph-db::variable-p x))
 
 (defun %engine-goal-p (goal name arity)
-  "GOAL is a call of the engine functor NAME/ARITY, by the canonical
-symbol the guard rebuilds a head into."
+  "GOAL is a call of the functor NAME/ARITY, by the canonical symbol the
+guard rebuilds a head into: NAME interned where S1 homed CLAIM/7
+(rules/facts.lisp), so this follows the functors if they ever move
+(recon C3)."
   (and (consp goal)
        (symbolp (first goal))
-       (eq (symbol-package (first goal)) (find-package :graph-db))
+       (eq (symbol-package (first goal))
+           (symbol-package 'graph-db:claim/7))
        (string= (symbol-name (first goal)) name)
        (= arity (1- (length goal)))))
 
@@ -940,11 +952,16 @@ text, which here is a refusal in its own words."
     (graph-db.query:prolog-guard-error (c)
       (%refuse spec "head: ~A" (graph-db.query:prolog-guard-error-reason c)))))
 
-(defun %body-variables (goals)
-  "Every ?variable in GOALS, once each."
+(defun %body-variables (spec goals)
+  "Every ?variable in GOALS, once each.  A bare ? is refused: read into
+the guard's scratch package it is one NAMED variable shared by every
+goal that writes it, not the engine's anonymous one (recon A10)."
   (let ((vars '()))
     (labels ((walk (x)
-               (cond ((%variable-p x) (pushnew x vars))
+               (cond ((and (%variable-p x) (string= (symbol-name x) "?"))
+                      (%refuse spec "a bare ? is one shared variable ~
+here, not an anonymous one: name it"))
+                     ((%variable-p x) (pushnew x vars))
                      ((consp x) (walk (car x)) (walk (cdr x))))))
       (walk goals))
     vars))
@@ -1144,7 +1161,7 @@ stored rule and a DEF-RULE is a collision, refused."
       (declare (ignore vars))
       (let* ((head (first goals))
              (body (%order-body (rest goals)))
-             (body-vars (%body-variables body)))
+             (body-vars (%body-variables spec body)))
         (when (null body)
           (%refuse spec "the body is empty"))
         (let* ((parsed (%parse-head spec head body-vars))
@@ -1183,7 +1200,7 @@ a rule that cannot run is never stored (spec §6, ruling P3)."
 (pushnew '%validate-rule-writes graph-db:*commit-validators*)
 ```
 
-Recon items that bear on this file: A1 (the condition superclass), A8 (`view-writes`, `view-old-node`, `view-node`, `writes`, `node`), A10–A11 (variables and canonical heads), A13 (the validator region). `%stored-rules`' `map-vertices` keeps `:record-reads` at its default: the rule set is small and a commit racing a rule edit *should* conflict.
+Recon items that bear on this file: A1 (the condition superclass, `globals.lisp:465`), A8 (`view-writes`, `view-old-node`, `view-node`, `writes`, `graph-db::node`), A10–A11 (variables and canonical heads), A13 (the validator region — ruling T3-R1: the validator guards text under the manager lock; rule writes are rare and the scratch package's name race is a 64-retry counter, so the cost is milliseconds per rule commit, accepted). Recon C4: rule text can contain no colon at all, so refusal messages and examples never suggest a keyword. Recon A16: no static effect registry exists, so an effecting body goal is a run refusal (PF2); the `(retract ?p)` cases in this task's tests use `(no-such-functor ?p)` instead, and Task 4 tests `retract` at run. `%stored-rules`' `map-vertices` keeps `:record-reads` at its default: the rule set is small and a commit racing a rule edit *should* conflict.
 
 - [ ] **Step 4: Run to verify they pass** — rules suite green; record the count. If `the-head-must-be-one-claim-pattern`'s `"?c"` case fails because the guard refuses a bound-`?c` head differently, read the refusal text and match the test's substring to the real message — the test names the mechanism, the wording is the implementation's.
 
@@ -1205,8 +1222,8 @@ git commit -m "feat(rules): compile-rule through the guard, recursion refused, b
 - Modify: `graph-db.asd` (add both files), `docs/rules.md` ("Running" and "Provenance" subsections)
 
 **Interfaces:**
-- Consumes: `compile-rule`, `compiled-rule-*`, `rule-spec-*`, `rules-in-scope`, `find-def-rule`, `%stored-rules`; `temporal-extent:extent-intersection`; `graph-db::run-query-goals`; `graph-db.spacetime:delete-claims-by-producer`, `claim-identity-key`, `split-claim-identity-key`, `claims-touching`, `claim-extent`, `extent->sexp`, `extent-sexp-start-key`, `claim-current-p`; `graph-db::%namespace-keyword` (S1, `rules/facts.lisp`).
-- Produces: `*rules-max-inferences*`, `*rules-timeout*`, `*rules-max-solutions*`; `(defstruct rule-report rule-name version outcome derived swept disjoint-premises refusals inferences elapsed)`; `(run-rule graph rule) => rule-report`; `(run-rules graph) => list`; `(premises-of graph claim) => claims`; `(dependents-of graph claim &key current) => claims`; `(rule-producer name) => "rule/NAME"`.
+- Consumes: `compile-rule`, `compiled-rule-*`, `rule-spec-*`, `rules-in-scope`, `find-def-rule`, `%stored-rules`; `temporal-extent:extent-intersection` called through its own package (recon A9: spacetime does not re-export it and need not); `graph-db::run-query-goals`; `graph-db.spacetime:delete-claims-by-producer`, `claim-identity-key`, `split-claim-identity-key`, `claims-touching`, `claim-extent`, `extent->sexp`, `extent-sexp-start-key`, `claim-current-p`; `graph-db::%namespace-keyword` (S1, `rules/facts.lisp`).
+- Produces: `*rules-max-inferences*`, `*rules-timeout*`, `*rules-max-solutions*`; `(defstruct rule-report rule-name version outcome derived kept swept disjoint-premises refusals inferences elapsed)`; `(run-rule graph rule) => rule-report`; `(run-rules graph) => list`; `(premises-of graph claim) => claims`; `(dependents-of graph claim &key current) => claims`; `(rule-producer name) => "rule/NAME"`.
 
 - [ ] **Step 1: Failing tests** — `tests/rules/run-tests.lisp`:
 
@@ -1264,11 +1281,19 @@ git commit -m "feat(rules): compile-rule through the guard, recursion refused, b
         (mark-deleted (first (claims-touching g 'rt-claim :host "h2"
                                               :role :subject
                                               :relation "runs"))))
-      (let ((report (graph-db.rules:run-rule g r)))
-        (is (= 2 (graph-db.rules:rule-report-swept report)))
-        (is (= 1 (graph-db.rules:rule-report-derived report)))
+      (let ((before (graph-db:id (find "h1" (derived g 'rt-claim "web-hosts")
+                                       :key #'claim-object-key
+                                       :test #'string=)))
+            (report (graph-db.rules:run-rule g r)))
+        ;; Ruling P10: h1 is re-derived and kept -- same node -- h2 is
+        ;; not and is swept; nothing is constructed.
+        (is (= 1 (graph-db.rules:rule-report-kept report)))
+        (is (= 1 (graph-db.rules:rule-report-swept report)))
+        (is (= 0 (graph-db.rules:rule-report-derived report)))
         (is (equal '("h1") (mapcar #'claim-object-key
                                    (derived g 'rt-claim "web-hosts"))))
+        (is (equalp before (graph-db:id (first (derived g 'rt-claim
+                                                        "web-hosts")))))
         ;; The old derivation records went with the old claims.
         (is (= 1 (length (claims-by-producer
                           g 'graph-db.rules:derivation
@@ -1285,7 +1310,10 @@ git commit -m "feat(rules): compile-rule through the guard, recursion refused, b
           (save c)))
       (let ((report (graph-db.rules:run-rule g "web-hosts")))
         (is (string= "2" (graph-db.rules:rule-report-version report)))
-        (is (= 2 (graph-db.rules:rule-report-derived report))))
+        ;; Ruling P10: the identities are unchanged, so the claims are
+        ;; kept and their version refreshed, not rebuilt.
+        (is (= 2 (graph-db.rules:rule-report-kept report)))
+        (is (= 0 (graph-db.rules:rule-report-derived report))))
       (let ((claims (derived g 'rt-claim "web-hosts")))
         (is (= 2 (length claims)))
         (is (every (lambda (c) (string= "2" (claim-rule-version c))) claims))
@@ -1431,7 +1459,8 @@ Jan-Mar and 2 Apr-Dec; h2 is deployed in May only."
       (is (eq :refused (graph-db.rules:rule-report-outcome report)))
       (is (= 0 (graph-db.rules:rule-report-derived report)))
       (is (equal 'rtt-claim (car (first (graph-db.rules:rule-report-refusals report)))))
-      (is (search "extent" (cdr (first (graph-db.rules:rule-report-refusals report)))))
+      (is (search "extent" (cdr (first (graph-db.rules:rule-report-refusals report)))
+                  :test #'char-equal))
       (is (null (derived g 'rtt-claim "no-extent"))))))
 
 (test a-refused-derivation-leaves-the-previous-one-intact
@@ -1460,7 +1489,8 @@ Jan-Mar and 2 Apr-Dec; h2 is deployed in May only."
           (is (eq 'rtt-claim
                   (car (first (graph-db.rules:rule-report-refusals report)))))
           (is (search "overlapping"
-                      (cdr (first (graph-db.rules:rule-report-refusals report))))))
+                      (cdr (first (graph-db.rules:rule-report-refusals report)))
+                      :test #'char-equal)))
         (is (equal (sort (copy-list before) #'string<)
                    (sort (mapcar #'claim-identity-key
                                  (derived g 'rtt-claim "host-version"))
@@ -1482,7 +1512,8 @@ read set."
       (is (eq :refused (graph-db.rules:rule-report-outcome report)))
       (is (eq :budget (car (first (graph-db.rules:rule-report-refusals report)))))
       (is (search "cost-unbounded"
-                  (cdr (first (graph-db.rules:rule-report-refusals report))))))
+                  (cdr (first (graph-db.rules:rule-report-refusals report)))
+                  :test #'char-equal)))
     ;; Control: the same rule with the producer generator in front routes.
     (let ((report (graph-db.rules:run-rule
                    g (write-rule g :name "routed" :version "1"
@@ -1501,6 +1532,27 @@ read set."
           (graph-db.rules:*rules-timeout* nil))
       (signals error (graph-db.rules:run-rule g "routed")))))
 
+(test an-effecting-body-goal-is-refused-at-run
+  "Recon A16 / ruling PF2: the guard has no static effect registry, so
+(retract ?p) compiles and is refused when the goal runs with effects
+off; the report names the rule, not the budget."
+  (with-rules-graph (g)
+    (seed g)
+    (let ((report (graph-db.rules:run-rule
+                   g (write-rule g :name "effecting" :version "1"
+                                 :family "rt-claim"
+                                 :head *web-hosts-head*
+                                 :body "(claim ?p rt-claim \"host\" ?h \"runs\" \"app\" \"web\") (retract ?p)"))))
+      (is (eq :refused (graph-db.rules:rule-report-outcome report)))
+      (is (eq :rule (car (first (graph-db.rules:rule-report-refusals report)))))
+      (is (search "permitted"
+                  (cdr (first (graph-db.rules:rule-report-refusals report)))
+                  :test #'char-equal))
+      ;; And nothing was retracted: the premise is still current.
+      (is (every #'claim-current-p
+                 (claims-touching g 'rt-claim :host "h1" :role :subject
+                                  :relation "runs"))))))
+
 (test a-stored-rule-and-a-def-rule-with-one-text-derive-one-set
   (with-rules-graph (g)
     (seed g)
@@ -1517,7 +1569,8 @@ read set."
         :head *web-hosts-head* :body *web-hosts-body*)
       (unwind-protect
            (let ((report (graph-db.rules:run-rule g "web-hosts")))
-             (is (= 2 (graph-db.rules:rule-report-swept report)))
+             (is (= 2 (graph-db.rules:rule-report-kept report)))
+             (is (= 0 (graph-db.rules:rule-report-swept report)))
              (is (equal stored
                         (sort (mapcar #'claim-identity-key
                                       (derived g 'rt-claim "web-hosts"))
@@ -1638,12 +1691,15 @@ silently truncated.")
 
 (defstruct (rule-report (:constructor %make-rule-report))
   "What one RUN-RULE did (spec §7).  OUTCOME is :DERIVED or :REFUSED;
-on :REFUSED the transaction unwound, the sweep included, so DERIVED
-and SWEPT are 0 and the previous derivation stands.  REFUSALS is a
+DERIVED counts claims constructed this run, KEPT the previous
+derivation's claims whose identity was derived again (ruling P10),
+SWEPT the ones that were not and are now deleted; on :REFUSED the
+transaction unwound, so all three are 0 and the previous derivation
+stands.  REFUSALS is a
 list of (TAG . TEXT): TAG a claim family name for a commit refusal,
 else :RULE (compile), :BUDGET (the rails), :SOLUTIONS (the cap).
 INFERENCES is the count at the last solution; ELAPSED is seconds."
-  rule-name version (outcome :derived) (derived 0) (swept 0)
+  rule-name version (outcome :derived) (derived 0) (kept 0) (swept 0)
   (disjoint-premises 0) (refusals '()) (inferences 0) (elapsed 0))
 
 (defun rule-producer (name)
@@ -1766,91 +1822,165 @@ constant here."
                                  (if unary-p "UNARY" "BINARY"))
                          (symbol-package parent)))))
 
-(defun %derive (compiled graph report)
-  "Spec §7.3-§7.4, inside the transaction: one claim per distinct
-solution, one DERIVED-FROM record per (claim, premise)."
+(defun %existing-key (claim family)
+  "An existing claim's dedupe key, the same shape %DEDUPE-KEY gives a
+solution, so the two match by EQUAL."
+  (let* ((binary (typep claim (graph-db.spacetime:claim-family-binary
+                               family)))
+         (sexp (graph-db.spacetime:claim-extent-sexp claim)))
+    (list (graph-db.spacetime:claim-subject-namespace claim)
+          (graph-db.spacetime:claim-subject-key claim)
+          (graph-db.spacetime:claim-relation claim)
+          (and binary (graph-db.spacetime:claim-object-namespace claim))
+          (and binary (graph-db.spacetime:claim-object-key claim))
+          (and (graph-db.spacetime:claim-family-temporal-p family)
+               sexp
+               (graph-db.spacetime:extent-sexp-start-key sexp)))))
+
+(defun %refresh-version (claim version)
+  "CLAIM's RULE-VERSION brought to VERSION by copy and save when it
+differs; the saved copy, else CLAIM."
+  (if (equal version (graph-db.spacetime:claim-rule-version claim))
+      claim
+      (let ((c (graph-db:copy claim)))
+        (setf (graph-db.spacetime:claim-rule-version c) version)
+        (graph-db:save c)
+        c)))
+
+(defun %desired (compiled graph report)
+  "The derivation the body asks for (spec §7.3): a hash table, dedupe
+key -> (ARGS . PREMISES), in an ORDER list of keys; disjoint solutions
+counted on REPORT and dropped."
   (let* ((spec (compiled-rule-spec compiled))
          (family (compiled-rule-family compiled))
          (vars (compiled-rule-vars compiled))
-         (producer (rule-producer (rule-spec-name spec)))
-         (version (rule-spec-version spec))
          (policy (rule-spec-extent-policy spec))
          (unary-p (compiled-rule-unary-p compiled))
-         (claims (make-hash-table :test 'equal))   ; dedupe key -> (args . premises)
+         (claims (make-hash-table :test 'equal))
          (order '()))
     (dolist (row (%solutions compiled graph report))
-      (let* ((premises (remove-if-not #'graph-db::node-p
-                                      (mapcar (lambda (v) (%term-value v row vars))
-                                              (compiled-rule-premise-vars compiled))))
+      (let* ((premises (remove-if-not
+                        #'graph-db::node-p
+                        (mapcar (lambda (v) (%term-value v row vars))
+                                (compiled-rule-premise-vars compiled))))
              (sns (%namespace (%term-value (compiled-rule-head-sns compiled)
-                                           row vars) "subject"))
+                                           row vars)
+                              "subject"))
              (skey (%key (%term-value (compiled-rule-head-skey compiled)
-                                      row vars) "subject"))
+                                      row vars)
+                         "subject"))
              (ons (and (not unary-p)
-                       (%namespace (%term-value (compiled-rule-head-ons compiled)
-                                                row vars) "object")))
+                       (%namespace (%term-value
+                                    (compiled-rule-head-ons compiled)
+                                    row vars)
+                                   "object")))
              (okey (and (not unary-p)
                         (%key (%term-value (compiled-rule-head-okey compiled)
-                                           row vars) "object"))))
+                                           row vars)
+                              "object"))))
         (multiple-value-bind (extent disjoint-p)
             (%premise-extent premises policy)
           (if disjoint-p
               (incf (rule-report-disjoint-premises report))
-              (let ((key (%dedupe-key family sns skey
-                                      (compiled-rule-relation compiled)
-                                      ons okey extent)))
-                (let ((entry (gethash key claims)))
-                  (if entry
-                      (setf (cdr entry)
-                            (union (cdr entry) premises
-                                   :key #'graph-db:id :test #'equalp))
-                      (progn
-                        (setf (gethash key claims)
-                              (cons (list :subject-namespace sns
-                                          :subject-key skey
-                                          :object-namespace ons
-                                          :object-key okey
-                                          :extent extent)
-                                    premises))
-                        (push key order)))))))))
-    (let ((ctor (%constructor family unary-p)))
-      (dolist (key (nreverse order))
-        (destructuring-bind (args . premises) (gethash key claims)
-          (let* ((claim (apply ctor :graph graph
+              (let* ((key (%dedupe-key family sns skey
+                                       (compiled-rule-relation compiled)
+                                       ons okey extent))
+                     (entry (gethash key claims)))
+                (if entry
+                    (setf (cdr entry)
+                          (union (cdr entry) premises
+                                 :key #'graph-db:id :test #'equalp))
+                    (progn
+                      (setf (gethash key claims)
+                            (cons (list :subject-namespace sns
+                                        :subject-key skey
+                                        :object-namespace ons
+                                        :object-key okey
+                                        :extent extent)
+                                  premises))
+                      (push key order))))))))
+    (values claims (nreverse order))))
+
+(defun %reconcile-claims (compiled graph report desired order)
+  "Ruling P10, inside the transaction: the producer's existing claims
+kept when re-derived (version refreshed), deleted when not; new
+identities constructed.  => alist of (dedupe key . claim) for every
+claim of the derivation that now stands."
+  (let* ((spec (compiled-rule-spec compiled))
+         (family (compiled-rule-family compiled))
+         (producer (rule-producer (rule-spec-name spec)))
+         (version (rule-spec-version spec))
+         (parent (graph-db.spacetime:claim-family-parent family))
+         (standing '()))
+    (dolist (c (graph-db.spacetime:claims-by-producer graph parent producer))
+      (let ((key (%existing-key c family)))
+        (cond ((and (gethash key desired)
+                    (not (assoc key standing :test #'equal)))
+               (incf (rule-report-kept report))
+               (push (cons key (%refresh-version c version)) standing))
+              (t
+               (graph-db:mark-deleted c)
+               (incf (rule-report-swept report))))))
+    (let ((ctor (%constructor family (compiled-rule-unary-p compiled))))
+      (dolist (key order)
+        (unless (assoc key standing :test #'equal)
+          (let* ((args (car (gethash key desired)))
+                 (claim (apply ctor :graph graph
                                :relation (compiled-rule-relation compiled)
                                :producer producer :rule-version version
                                :standing :inferred
-                               (if unary-p
+                               (if (compiled-rule-unary-p compiled)
                                    (list :subject-namespace
                                          (getf args :subject-namespace)
-                                         :subject-key (getf args :subject-key)
+                                         :subject-key
+                                         (getf args :subject-key)
                                          :extent (getf args :extent))
-                                   args)))
-                 (derived-key (graph-db.spacetime:claim-identity-key claim))
-                 (seen '()))
+                                   args))))
             (incf (rule-report-derived report))
-            (dolist (p premises)
-              (let ((pkey (graph-db.spacetime:claim-identity-key p)))
-                (unless (member pkey seen :test #'string=)
-                  (push pkey seen)
-                  (make-derivation-binary
-                   :graph graph :subject-namespace :claim
-                   :subject-key derived-key :relation "derived-from"
-                   :object-namespace :claim :object-key pkey
-                   :producer producer :rule-version version
-                   :standing :inferred))))))))
-    report))
+            (push (cons key claim) standing)))))
+    standing))
 
-(defun %sweep (compiled graph report)
-  "Spec §7.1: the rule's previous claims and their derivation records."
+(defun %reconcile-provenance (compiled graph desired standing)
+  "Spec §9 under ruling P10: one DERIVED-FROM record per (derived claim,
+premise) that the derivation now asks for; records the producer wrote
+that it no longer asks for are deleted, the rest kept with their
+RULE-VERSION refreshed."
   (let* ((spec (compiled-rule-spec compiled))
          (producer (rule-producer (rule-spec-name spec)))
-         (parent (graph-db.spacetime:claim-family-parent
-                  (compiled-rule-family compiled))))
-    (setf (rule-report-swept report)
-          (graph-db.spacetime:delete-claims-by-producer graph parent producer))
-    (graph-db.spacetime:delete-claims-by-producer graph 'derivation producer)
-    report))
+         (version (rule-spec-version spec))
+         (wanted (make-hash-table :test 'equal)))
+    (loop for (key . claim) in standing
+          for derived-key = (graph-db.spacetime:claim-identity-key claim)
+          do (dolist (p (cdr (gethash key desired)))
+               (setf (gethash (cons derived-key
+                                    (graph-db.spacetime:claim-identity-key p))
+                              wanted)
+                     t)))
+    (dolist (r (graph-db.spacetime:claims-by-producer graph 'derivation
+                                                      producer))
+      (let ((pair (cons (graph-db.spacetime:claim-subject-key r)
+                        (graph-db.spacetime:claim-object-key r))))
+        (if (gethash pair wanted)
+            (progn (setf (gethash pair wanted) :kept)
+                   (%refresh-version r version))
+            (graph-db:mark-deleted r))))
+    (maphash (lambda (pair state)
+               (when (eq state t)
+                 (make-derivation-binary
+                  :graph graph :subject-namespace :claim
+                  :subject-key (car pair) :relation "derived-from"
+                  :object-namespace :claim :object-key (cdr pair)
+                  :producer producer :rule-version version
+                  :standing :inferred)))
+             wanted)))
+
+(defun %derive (compiled graph report)
+  "Spec §7 as ruling P10 has it, inside the transaction: evaluate, then
+reconcile the claims and their provenance against what stands."
+  (multiple-value-bind (desired order) (%desired compiled graph report)
+    (let ((standing (%reconcile-claims compiled graph report desired order)))
+      (%reconcile-provenance compiled graph desired standing)
+      report)))
 
 (defun %violation-family (c)
   "The claim family a commit refusal names, as the report's tag, else
@@ -1874,8 +2004,8 @@ itself."
     (if f (graph-db.spacetime:claim-family-parent f) class-name)))
 
 (defun run-rule (graph rule)
-  "Sweep RULE's previous derivation and derive afresh, in one
-transaction (spec §7).  RULE is a RULE record, a RULE-SPEC, or a name
+  "Derive RULE afresh and reconcile the result with its previous
+derivation, in one transaction (spec §7, ruling P10).  RULE is a RULE record, a RULE-SPEC, or a name
 (stored first, then DEF-RULE).  => RULE-REPORT.  A refusal of any kind
 -- compile, the rails, a commit constraint, a missing extent -- is
 reported, never signalled, and unwinds the whole run so the previous
@@ -1888,6 +2018,7 @@ signals."
     (flet ((refuse (tag text)
              (setf (rule-report-outcome report) :refused
                    (rule-report-derived report) 0
+                   (rule-report-kept report) 0
                    (rule-report-swept report) 0
                    (rule-report-disjoint-premises report) 0)
              (setf (rule-report-refusals report)
@@ -1901,12 +2032,13 @@ signals."
                                    (graph-db:graph-name graph)
                                    (rule-spec-family spec))))
             (graph-db:with-transaction (:graph graph)
-              (%sweep compiled graph report)
               (%derive compiled graph report)))
         (rule-compile-error (c)
           (refuse :rule (rule-compile-error-reason c)))
         (rule-run-refusal (c)
           (refuse (rule-run-refusal-tag c) (rule-run-refusal-text c)))
+        (graph-db::prolog-permission-error (c)
+          (refuse :rule (princ-to-string c)))
         (graph-db:prolog-error (c)
           (refuse :budget (princ-to-string c)))
         (graph-db:constraint-violation (c)
@@ -2038,11 +2170,11 @@ With CURRENT, only dependents still believed.  Nothing is re-derived."
         claims)))
 ```
 
-Notes for the implementer: `%claim-by-identity-key` borrows S1's `graph-db::+claim-subject-relation-index-slots+` so the slot symbols are spacetime's (ruling R3). `graph-db::node-p` is internal. `alexandria` is a `graph-db/core` dependency. `%solutions` reads `graph-db::*inference-count*` inside the callback because `select` rebinds it for the query's extent. `%parent-of` handles the arity subclass a `unique-constraint-violation` names. If `run-query-goals`' `:limit` cap turns out to be applied through `*query-default-limit*` only (recon A5), drop the `:limit` argument.
+Notes for the implementer: `prolog-permission-error` is defined in `prologc.lisp` beside `*allowed-effects*` (check its export; write `graph-db::` if not exported) and must be handled BEFORE `prolog-error`, its superclass. `%claim-by-identity-key` borrows S1's `graph-db::+claim-subject-relation-index-slots+` so the slot symbols are spacetime's (ruling R3). `graph-db::node-p` is internal. `alexandria` is a `graph-db/core` dependency. `%solutions` reads `graph-db::*inference-count*` inside the callback because `select` rebinds it for the query's extent. `%parent-of` handles the arity subclass a `unique-constraint-violation` names. If `run-query-goals`' `:limit` cap turns out to be applied through `*query-default-limit*` only (recon A5), drop the `:limit` argument.
 
 - [ ] **Step 4: Run to verify they pass** — rules suite green; record the count. Then run `graph-db/spacetime-test` (653/0) and `graph-db/query-test` too: `%validate-rule-writes` is on the image-wide validator list and must be inert for stores without rules.
 
-- [ ] **Step 5: Docs** — `docs/rules.md`: "Running a rule" (the transaction, the sweep, the rails and P4, the report fields and tags, what refuses and that the previous derivation stands, duplicates, `*rules-max-solutions*`), "Validity" (§8 as shipped, P7), "Provenance" (`derivation` family shape, `premises-of`, `dependents-of`, that a retracted premise's dependents are findable and nothing is re-derived), "run-rules" (order, P8, disabled rules, compile failures reported). The "What the functors do not see" paragraph gains its S2 sentence: a body cannot see the sweep, which is why the cycle check is strict.
+- [ ] **Step 5: Docs** — `docs/rules.md`: "Running a rule" (the transaction, the reconcile per ruling P10 -- kept, swept, derived -- and that a retracted derived claim stays retracted, the rails and P4, the report fields and tags, what refuses and that the previous derivation stands, duplicates, `*rules-max-solutions*`), "Validity" (§8 as shipped, P7), "Provenance" (`derivation` family shape, `premises-of`, `dependents-of`, that a retracted premise's dependents are findable and nothing is re-derived), "run-rules" (order, P8, disabled rules, compile failures reported). The "What the functors do not see" paragraph gains its S2 sentence: a body cannot see the sweep, which is why the cycle check is strict.
 
 - [ ] **Step 6: Commit**
 
@@ -2116,7 +2248,7 @@ git commit -m "docs(rules): S2 contract, decision record, the S1 nits; explicit-
 
 - §5 rule record: Task 2 (`def-rules-schema`, slots, facets, value constraint) — with P1 on version records. `def-rule`: Task 3. "A stored rule and a `def-rule` with the same text derive identical claims": Task 4's test.
 - §6 compile: Task 3 — guard, head shape, recursion with the cycle named, one-node case, compile on write (P3); compile on open replaced by P2 and tested (`run-rules-reports-a-rule-that-no-longer-compiles-and-the-store-opens`).
-- §7 run: Task 4 — sweep both families, rails with effects off and one snapshot, duplicates collapse, provenance, refusal unwinds with the report naming the rule; `run-rules` in dependency order; report fields.
+- §7 run: Task 4 — reconcile both families (ruling P10, recon C1), rails with effects off and one snapshot, duplicates collapse, provenance, refusal unwinds with the report naming the rule; `run-rules` in dependency order; report fields plus `kept`.
 - §8 validity: Task 1 (`extent-intersection`) and Task 4 (`%premise-extent`, `disjoint-premises`, the temporal refusal).
 - §9 provenance: Task 4 (`derivation` shape, `premises-of`, `dependents-of`).
 - §11 S2 tests: each bullet has a named test in Task 4, plus Task 3's compile refusals.
