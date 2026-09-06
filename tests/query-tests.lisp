@@ -131,7 +131,13 @@ pairs.  With A->B and A->C, both pairs are sourced from A."
     (is (equal '(:fail)
                (select-flat (?v) (is-a ?p g-person)
                             (node-slot-value ?p name "F")
-                            (node-slot-value ?p age ?v))))))
+                            (node-slot-value ?p age ?v))))
+    (is (equal '((:age :fail) (:name "F"))
+               (sort (select (:flat nil) (?s ?v)
+                             (is-a ?p g-person) (node-slot-value ?p name "F")
+                             (node-slot-value ?p ?s ?v))
+                     #'string< :key #'first))
+        "a :fail-valued slot enumerates through the unbound-slot path")))
 
 (test node-slot-value-with-an-unbound-node-finds-vertices-by-slot
   "GH #351: no IS-A needed to look a vertex up by a slot value, and a

@@ -183,6 +183,21 @@ Two things a new caller reliably gets wrong first:
   screen refuses `:` textually so that `READ` can never intern into
   `graph-db` or a schema package from client text.
 
+Three things `node-slot-value/3` does that the bare functor list does
+not say (GH #351):
+
+- **A keyword-valued slot is filtered by a string.** The screen admits
+  no keyword spelling, so `(node-slot-value ?i kind "widget")` matches
+  a slot holding `:widget`, case-insensitively; so does `(= ?k
+  "WIDGET")` after binding. Two strings stay case-sensitive.
+- **An unbound node enumerates.** `(node-slot-value ?i label "b")`
+  alone finds every vertex whose type declares `label` with that
+  value; no `is-a` needed. A vertex whose type lacks the slot is
+  skipped, never read as null.
+- **An unbound slot lists the slots.** `(node-slot-value ?i ?s ?v)`
+  yields one row per data slot of the vertex's type, `?s` the slot
+  name as a keyword and `?v` its value or null.
+
 ## Callers
 
 `graph-db/rules` is a caller of `guard-query-text`: `compile-rule`
