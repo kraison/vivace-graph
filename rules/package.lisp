@@ -26,6 +26,7 @@
    ;; compiling (spec §6)
    #:compile-rule #:compiled-rule #:compiled-rule-p #:compiled-rule-spec
    #:compiled-rule-relation #:compiled-rule-reads
+   #:compiled-rule-stratum #:compiled-rule-stratum-relations
    #:rule-compile-error #:rule-compile-error-rule
    #:rule-compile-error-reason
    ;; running (spec §7)

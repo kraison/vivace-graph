@@ -474,24 +474,26 @@ gives the stored two -- so the schedule under test is deterministic."
 
 (defparameter *derives-x*
   "(claim ?c rt-claim \"app\" \"web\" \"x\" \"host\" ?h)")
-(defparameter *reads-x*
-  "(claim ?p rt-claim \"app\" \"web\" \"x\" \"host\" ?h)")
-(defparameter *derives-y*
-  "(claim ?c rt-claim \"app\" \"web\" \"y\" \"host\" ?h)")
 (defparameter *reads-y*
   "(claim ?p rt-claim \"app\" \"web\" \"y\" \"host\" ?h)")
+(defparameter *derives-y*
+  "(claim ?c rt-claim \"app\" \"web\" \"y\" \"host\" ?h)")
+(defparameter *reads-runs-not-y*
+  "(claim ?p rt-claim \"host\" ?h \"runs\" \"app\" ?a)
+   (not (claim ?q rt-claim \"app\" ?a \"y\" \"host\" ?h))")
 
 (test run-rules-reports-a-rule-that-no-longer-compiles-and-the-store-opens
   "Spec §6: a rule that fails to compile is reported and skipped, never
-refused at open.  Here a DEF-RULE added after the write closes a cycle
-with a stored rule."
+refused at open.  GH #333: a cycle is a stratum now, not a refusal, so
+this exercises the other refusal a DEF-RULE only meets at RUN-RULES (it
+is never validated at registration): a NOT over its own head relation."
   (with-rules-graph-dir (g dir)
     (seed g)
     (write-rule g :name "a" :version "1" :family "rt-claim"
                 :head *derives-x* :body *reads-y*)
     (write-web-hosts g)
     (graph-db.rules:def-rule "b" :version "1" :family rt-claim
-      :head *derives-y* :body *reads-x*)
+      :head *derives-y* :body *reads-runs-not-y*)
     (unwind-protect
          (progn
            (close-graph g)
@@ -500,14 +502,14 @@ with a stored rule."
                   (let* ((graph-db:*graph* g2)
                          (reports (graph-db.rules:run-rules g2)))
                     (is (= 3 (length reports)))
-                    (is (eq :refused
+                    (is (eq :derived
                             (graph-db.rules:rule-report-outcome
                              (report-named "a" reports))))
-                    (is (eq :rule
-                            (refusal-tag (report-named "a" reports))))
                     (is (eq :refused
                             (graph-db.rules:rule-report-outcome
                              (report-named "b" reports))))
+                    (is (eq :rule
+                            (refusal-tag (report-named "b" reports))))
                     (is (eq :derived
                             (graph-db.rules:rule-report-outcome
                              (report-named "web-hosts" reports))))
