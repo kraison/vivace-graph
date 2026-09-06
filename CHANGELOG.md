@@ -254,6 +254,20 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Fixed
 
+- **`node-slot-value/3` enumerates, bounded, and fails cleanly on
+  ill-typed terms** (#351): an unbound node now enumerates -- a full
+  scan of every vertex of every type, one inference charged per vertex
+  against `:max-inferences`/`:timeout`, same as `is-a/2`'s
+  both-unbound arm -- and an unbound slot lists a bound node's data
+  slots. A non-symbol slot term, or a bound non-node value with an
+  unbound slot, now fails the goal instead of signalling an uncaught
+  `TYPE-ERROR` or `NO-APPLICABLE-METHOD` (a guard-classified 500). A
+  string now unifies with a keyword of the same name,
+  case-insensitively (a keyword-valued slot has no keyword spelling on
+  the guarded surface, so a string stands in for one); `==/2` and
+  `setof`/`bagof` share `prolog-equal` with `=/2`, so they see the same
+  equality.
+
 - **`graph-db/rules`' refusals now honour `:allow-cost-unbounded`**
   (#334, follow-up to #330): `claim/7`'s family walk and
   `claim-producer/2`'s neither-bound case refuse from their own bodies,

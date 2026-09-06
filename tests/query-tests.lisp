@@ -156,3 +156,18 @@ vertex whose type lacks the slot is skipped rather than read as NIL."
     ;; Both unbound: every vertex, every slot.  3 vertices x 2 slots
     ;; (name, age) + 1 x title = 7 rows.
     (is (= 7 (select-count () (node-slot-value ?p ?s ?v))))))
+
+(test node-slot-value-with-a-non-symbol-slot-fails
+  "GH #351: a string/number SLOT is not a slot name; the goal fails
+rather than signaling TYPE-ERROR out of the guard."
+  (with-test-graph (g)
+    (with-transaction () (make-g-person :name "A"))
+    (is (null (select-flat (?v) (is-a ?p g-person)
+                           (node-slot-value ?p "name" ?v))))))
+
+(test node-slot-value-on-a-non-node-with-an-unbound-slot-fails
+  "GH #351: SLOT unbound against a bound non-node value has no class
+of data slots to enumerate; the goal fails rather than aborting."
+  (with-test-graph (g)
+    (declare (ignore g))
+    (is (null (select-flat (?s) (= ?l "x") (node-slot-value ?l ?s ?v))))))

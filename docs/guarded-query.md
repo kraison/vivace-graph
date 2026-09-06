@@ -192,8 +192,13 @@ not say (GH #351):
   "WIDGET")` after binding. Two strings stay case-sensitive.
 - **An unbound node enumerates.** `(node-slot-value ?i label "b")`
   alone finds every vertex whose type declares `label` with that
-  value; no `is-a` needed. A vertex whose type lacks the slot is
-  skipped, never read as null.
+  value; no `is-a` needed. This is a full scan of every vertex of
+  every type, one inference charged per vertex visited against
+  `:max-inferences`/`:timeout`, same as `is-a/2`'s both-unbound arm.
+  A vertex whose type lacks the slot is skipped, never read as null;
+  by contrast, a vertex bound earlier in the query (by `is-a`, say)
+  whose type lacks the slot still reads that slot as null -- only the
+  enumeration skips.
 - **An unbound slot lists the slots.** `(node-slot-value ?i ?s ?v)`
   yields one row per data slot of the vertex's type, `?s` the slot
   name as a keyword and `?v` its value or null.

@@ -903,7 +903,7 @@ VivaceGraph provides a rich set of built-in predicates to use as goals in your q
 **** Slot and Property Predicates
 | Predicate                                   | Description                                                     |
 |---------------------------------------------+-----------------------------------------------------------------|
-| ~(node-slot-value ?node slot-name ?value)~  | Unifies ~?value~ with the value of the node's slot.             |
+| ~(node-slot-value ?node slot-name ?value)~  | Unifies ~?value~ with the value of the node's slot. An unbound ~?node~ enumerates every vertex declaring the slot; an unbound ~slot-name~ lists the node's slots (GH #351). |
 | ~(weight ?edge ?weight)~                    | Unifies ~?weight~ with the edge's weight (same as the 3-arg version). |
 
 *Example:* Find the text of all posts, along with their timestamp.

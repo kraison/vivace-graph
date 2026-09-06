@@ -168,7 +168,7 @@ guard refuses every keyword spelling, and a string now unifies."
       (is (= 1 (length rows)) "case-insensitive through =/2 too"))))
 
 (test node-slot-value-needs-no-is-a-through-the-guard
-  "GH #351: the guarded runner reaches the enumeration; the ?c column
+  "GH #351: the guarded runner reaches the enumeration; the ?i column
 holds the node id as a string, as any node cell does."
   (with-query-graph (g)
     (seed g)
@@ -176,4 +176,36 @@ holds the node id as a string, as any node cell does."
         (q g "(node-slot-value ?i label \"b\") (node-slot-value ?i rank ?r)")
       (is (equal '("i" "r") columns))
       (is (= 1 (length rows)))
+      (is (stringp (first (first rows))))
       (is (= 2 (second (first rows)))))))
+
+(test node-slot-value-with-a-non-symbol-slot-is-zero-rows-not-an-error
+  "GH #351: a string SLOT through the enumeration arm is not a slot
+name; the guard sees zero rows, not a TYPE-ERROR server fault."
+  (with-query-graph (g)
+    (seed g)
+    (multiple-value-bind (columns rows)
+        (q g "(node-slot-value ?i \"label\" ?v)")
+      (is (equal '("i" "v") columns))
+      (is (null rows)))))
+
+(test node-slot-value-unbound-slot-enumeration-through-the-guard
+  "GH #351: the guarded runner reaches the unbound-slot arm too --
+3 QT-ITEMs x 2 data slots (LABEL, RANK) is 6 rows, each ?s a keyword."
+  (with-query-graph (g)
+    (seed g)
+    (multiple-value-bind (columns rows)
+        (q g "(is-a ?i qt-item) (node-slot-value ?i ?s ?v)")
+      (is (equal '("i" "s" "v") columns))
+      (is (= 6 (length rows)))
+      (is (every (lambda (row) (keywordp (second row))) rows)))))
+
+(test an-unbound-node-enumeration-ticks-the-budget
+  "GH #351: the enumeration arm visits every vertex through UNIFY,
+which fails for each non-matching one without calling CONT -- so it
+must %TICK per vertex itself, or :MAX-INFERENCES can never interrupt
+a scan that never reaches a goal boundary."
+  (with-query-graph (g)
+    (seed g)
+    (signals graph-db:prolog-resource-error
+      (q g "(node-slot-value ?i label \"nowhere\")" :max-inferences 1))))

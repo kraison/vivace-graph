@@ -424,4 +424,6 @@ both orders, case-insensitively.  Two strings stay case-sensitive."
     (is (equal '("foo") (select-flat (?x) (= ?x "foo") (= ?x :foo))))
     (is (null (select-flat (?x) (= ?x :foo) (= ?x "bar"))))
     (is (null (select-flat (?x) (= ?x "foo") (= ?x "FOO")))
-        "control: two strings stay case-sensitive")))
+        "control: two strings stay case-sensitive")
+    (is (equal '(:foo) (select-flat (?x) (= ?x :foo) (== ?x "FOO")))
+        "==/2 shares PROLOG-EQUAL with =/2, so it unifies too (#351)")))

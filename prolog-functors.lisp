@@ -861,29 +861,45 @@ must keep its own errors."
       (values nil nil))))
 
 (defun %node-has-slot-p (node slot)
-  "SLOT (a symbol from any package) names a data slot of NODE's type."
-  (member (symbol-name slot) (data-slots (class-of node))
-          :key #'symbol-name :test #'string=))
+  "SLOT (a symbol from any package) names a data slot of NODE's type.
+NIL, not an error, when SLOT is not a symbol at all (GH #351)."
+  (and (symbolp slot)
+       (member (symbol-name slot) (data-slots (class-of node))
+               :key #'symbol-name :test #'string=)))
 
 (defun %unify-slot (node slot var cont)
   "The bound-node cases of NODE-SLOT-VALUE/3 (GH #351): SLOT bound
-reads it; SLOT unbound yields every data slot, keyword-named."
+reads it; SLOT unbound yields every data slot, keyword-named.  The
+unbound-slot arm requires NODE to be a NODE-P (DATA-SLOTS has no
+method for any other class); a non-node NODE, or a non-symbol bound
+SLOT, fails the goal rather than reading."
   (cond ((var-p slot)
-         (dolist (s (data-slots (class-of node)))
-           (let ((old-trail (fill-pointer *trail*)))
-             (multiple-value-bind (value read-p) (%slot-value-guarded node s)
-               (when read-p
-                 (when (and (unify slot (intern (symbol-name s) :keyword))
-                            (unify var value))
-                   (funcall cont))))
-             (undo-bindings old-trail))))
-        (t
+         (when (node-p node)
+           (dolist (s (data-slots (class-of node)))
+             (let ((old-trail (fill-pointer *trail*)))
+               (multiple-value-bind (value read-p)
+                   (%slot-value-guarded node s)
+                 (when read-p
+                   (when (and (unify slot (intern (symbol-name s) :keyword))
+                              (unify var value))
+                     (funcall cont))))
+               (undo-bindings old-trail)))))
+        ((symbolp slot)
          (multiple-value-bind (value read-p) (%slot-value-guarded node slot)
            (when read-p
              (when (unify var value)
                (funcall cont)))))))
 
 (def-global-prolog-functor node-slot-value/3 (node slot var cont)
+  "NODE-SLOT-VALUE(node, slot, value) (GH #351).  NODE bound, SLOT
+bound: unifies VALUE with that data slot's reading.  NODE bound, SLOT
+unbound: one solution per data slot, SLOT keyword-named.  NODE
+unbound: a full scan of every vertex of every type -- one inference
+per vertex against :MAX-INFERENCES/:TIMEOUT, same as IS-A/2's
+both-unbound arm -- unifying NODE with each and recursing on SLOT as
+above; a vertex whose type lacks a bound SLOT is skipped, not read as
+NIL.  Trap: NODE unbound is O(every vertex), never call it unbounded
+on a free-text surface without a resource budget."
   (setq node (var-deref node)
         slot (var-deref slot)
         var (var-deref var))
@@ -896,6 +912,11 @@ reads it; SLOT unbound yields every data slot, keyword-named."
         (when (lookup-node-type-by-id type-id :vertex)
           (map-vertices
            (lambda (vertex)
+             ;; One inference per vertex visited: UNIFY fails silently
+             ;; for most, so without this %TICK a bound scan never
+             ;; hits a goal boundary and the budget can't stop it
+             ;; (GH #351).
+             (%tick)
              (when (or (var-p slot) (%node-has-slot-p vertex slot))
                (let ((old-trail (fill-pointer *trail*)))
                  (when (unify node vertex)
