@@ -618,36 +618,56 @@ store's rule, and its text names types this schema does not have."
   (or (eq (rule-spec-source spec) :stored)
       (%graph-declares-p graph (rule-spec-family spec))))
 
-(defun %dependency-order (compiled-rules)
-  "COMPILED-RULES sorted so a rule runs after EVERY rule deriving a
-relation it reads (spec §7).  Ready means no rule still PENDING derives
-anything it reads: one producer of a relation having run is not enough,
-since a reader scheduled between two producers of one relation sees
-half its premises.  Cycles were refused at compile, so a pending set
-always holds a ready rule; ties keep the input order."
-  (let ((pending (copy-list compiled-rules))
+(defun %strata-of (compiled-rules)
+  "COMPILED-RULES grouped by stratum, input order kept inside and
+between groups (first appearance).  Each group grows by splicing onto
+its own tail, which already leaves it in input order -- an extra
+per-group NREVERSE here would silently undo that (GH #333)."
+  (let ((groups '()))
+    (dolist (c compiled-rules (nreverse groups))
+      (let ((key (compiled-rule-stratum c)))
+        (let ((g (find key groups :key (lambda (grp)
+                                         (compiled-rule-stratum
+                                          (first grp)))
+                                  :test #'equal)))
+          (if g
+              (setf (cdr (last g)) (list c))
+              (push (list c) groups)))))))
+
+(defun %stratum-reads (stratum)
+  "The relations STRATUM's rules read outside the stratum."
+  (let ((own (compiled-rule-stratum-relations (first stratum))))
+    (remove-duplicates
+     (loop for c in stratum
+           append (set-difference (compiled-rule-reads c) own
+                                  :test #'string=))
+     :test #'string=)))
+
+(defun %strata-order (compiled-rules)
+  "COMPILED-RULES as strata, sorted so a stratum runs after EVERY
+stratum deriving a relation it reads outside itself (spec §2); ties
+keep input order.  Strata are the compiler's SCCs, so a pending set
+always holds a ready one."
+  (let ((pending (%strata-of compiled-rules))
         (done '()))
     (loop while pending do
-      (let ((ready (find-if
-                    (lambda (c)
-                      (let ((reads (compiled-rule-reads c)))
-                        (when (eq reads :any)
-                          (error "RUN-RULES: compile-rule admits no ~
-:any reads, but ~S has them."
-                                 (rule-spec-name (compiled-rule-spec c))))
-                        (every (lambda (r)
-                                 (notany
-                                  (lambda (o)
-                                    (string=
-                                     r (compiled-rule-relation o)))
-                                  pending))
-                               reads)))
-                    pending)))
+      (let ((ready
+              (find-if
+               (lambda (s)
+                 (every (lambda (r)
+                          (notany
+                           (lambda (o)
+                             (and (not (eq o s))
+                                  (member r (compiled-rule-stratum-relations
+                                             (first o))
+                                          :test #'string=)))
+                           pending))
+                        (%stratum-reads s)))
+               pending)))
         (unless ready
-          (error "RUN-RULES: no runnable rule among ~S -- a cycle the ~
-compiler should have refused."
-                 (mapcar (lambda (c)
-                           (rule-spec-name (compiled-rule-spec c)))
+          (error "RUN-RULES: no runnable stratum among ~S -- the ~
+compiler's strata disagree with the reads."
+                 (mapcar (lambda (s) (compiled-rule-stratum (first s)))
                          pending)))
         (setf pending (remove ready pending))
         (push ready done)))
@@ -655,14 +675,15 @@ compiler should have refused."
 
 (defun run-rules (graph &key scope)
   "Every enabled rule GRAPH can run -- its stored rules, plus the
-DEF-RULEs whose family it carries (ruling P8) -- each through RUN-RULE in
-dependency order (spec §7), with SCOPE (spec §10) normalised once here
-and passed to every one -- so a scope that is not open stores signals
-even when no rule is runnable.  A rule that does not compile is
-reported :REFUSED and skipped; the rest still run.  => the reports, the
-refused ones first and then the rest in the order run.  Compile and the
-dependency order stay single-store, so a cycle through another store's
-rules is not detected (S3-P5)."
+DEF-RULEs whose family it carries (ruling P8) -- in strata order (GH
+#333): each stratum's rules run one by one through RUN-RULE, in the
+stratum's input order, with SCOPE (spec §10) normalised once here and
+passed to every one -- so a scope that is not open stores signals even
+when no rule is runnable.  A rule that does not compile is reported
+:REFUSED and skipped; the rest still run.  => the reports, the refused
+ones first and then the rest in the order run.  Compile and the strata
+order stay single-store, so a cycle through another store's rules is
+not detected (S3-P5)."
   (let ((scope (%normalize-scope graph scope))
         (reports '())
         (compiled '()))
@@ -677,9 +698,10 @@ rules is not detected (S3-P5)."
                    :refusals (list (cons :rule
                                          (rule-compile-error-reason c))))
                   reports)))))
-    (dolist (c (%dependency-order (nreverse compiled)))
-      (push (run-rule graph (compiled-rule-spec c) :scope scope)
-            reports))
+    (dolist (stratum (%strata-order (nreverse compiled)))
+      (dolist (c stratum)
+        (push (run-rule graph (compiled-rule-spec c) :scope scope)
+              reports)))
     (nreverse reports)))
 
 ;;; Provenance reads (spec §9)

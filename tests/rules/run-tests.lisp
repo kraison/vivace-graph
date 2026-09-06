@@ -846,3 +846,23 @@ derives two, h1 and h2."
       (is (eq 'rtu-claim (refusal-tag report)))
       (is (search "unique" (refusal-text report) :test #'char-equal))
       (is (null (derived g 'rtu-claim "rtu-hosts"))))))
+
+(test run-rules-orders-a-recursive-stratum-after-its-base-producer
+  "GH #333: a and b derive each other's reads (one stratum) and both
+read z; z-maker must run first, and the stratum's two rules keep input
+order.  Task 4 makes the stratum derive; here only the order is under
+test, so bodies that find nothing are fine."
+  (with-rules-graph (g)
+    (seed g)
+    (write-rule g :name "a" :version "1" :family "rt-claim"
+                :head *head-x* :body *body-y-and-z*)
+    (write-rule g :name "b" :version "1" :family "rt-claim"
+                :head *head-y* :body *body-x*)
+    (write-rule g :name "z-maker" :version "1" :family "rt-claim"
+                :head *head-z* :body *web-hosts-body*)
+    (let ((names (mapcar #'graph-db.rules:rule-report-rule-name
+                         (graph-db.rules:run-rules g))))
+      ;; Stored rules come back in index order, not write order, so
+      ;; only the stratum boundary is asserted.
+      (is (string= "z-maker" (first names)))
+      (is (equal '("a" "b") (sort (copy-list (rest names)) #'string<))))))

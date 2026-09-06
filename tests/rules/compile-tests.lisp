@@ -18,6 +18,9 @@
   "(claim ?p rt-claim \"app\" \"web\" \"x\" \"host\" ?h)")
 (defparameter *body-y*
   "(claim ?p rt-claim \"app\" \"web\" \"y\" \"host\" ?h)")
+(defparameter *body-y-and-z*
+  "(claim ?p rt-claim \"app\" \"web\" \"y\" \"host\" ?h)
+   (claim ?q rt-claim \"app\" \"web\" \"z\" \"host\" ?h)")
 (defparameter *body-z*
   "(claim ?p rt-claim \"app\" \"web\" \"z\" \"host\" ?h)")
 
