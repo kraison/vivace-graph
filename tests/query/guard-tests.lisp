@@ -147,3 +147,22 @@ package nor IS-A/2 from the schema's."
       (graph-db.query:guard-query-text "(no-such-functor ?x)" g))
     (signals graph-db.query:prolog-guard-error
       (graph-db.query:guard-query-text "(is-a ?p graph-db::vertex)" g))))
+
+(test a-keyword-slot-is-filtered-by-a-string
+  "GH #351: RANK is untyped, so an item can hold a keyword there; the
+guard refuses every keyword spelling, and a string now unifies."
+  (with-query-graph (g)
+    (with-transaction ((graph-db::transaction-manager g))
+      (graph-db/query-test.schema::make-qt-item :graph g :label "k"
+                                                 :rank :high)
+      (graph-db/query-test.schema::make-qt-item :graph g :label "n"
+                                                 :rank 1))
+    (let ((rows (nth-value 1 (q g "(is-a ?i qt-item)
+                                   (node-slot-value ?i rank \"high\")
+                                   (node-slot-value ?i label ?l)"))))
+      (is (= 1 (length rows)))
+      (is (string= "k" (second (first rows)))))
+    (let ((rows (nth-value 1 (q g "(is-a ?i qt-item)
+                                   (node-slot-value ?i rank ?r)
+                                   (= ?r \"HIGH\")"))))
+      (is (= 1 (length rows)) "case-insensitive through =/2 too"))))
