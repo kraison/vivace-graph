@@ -849,21 +849,43 @@ a vertex" functor))))
                             (undo-bindings old-trail)))
                         class-name view-name)))
 
+(defun %slot-value-guarded (node slot)
+  "NODE's SLOT, or :FAIL on a read error.  Guards ONLY the read: the
+continuation is the rest of the query and must keep its own errors."
+  (handler-case (node-slot-value node slot)
+    (error (c)
+      (log:error "Problem reading (node-slot-value ~A ~A): ~A"
+                 node slot c)
+      :fail)))
+
+(defun %node-has-slot-p (node slot)
+  "SLOT (a symbol from any package) names a data slot of NODE's type."
+  (member (symbol-name slot) (data-slots (class-of node))
+          :key #'symbol-name :test #'string=))
+
+(defun %unify-slot (node slot var cont)
+  "The bound-node cases of NODE-SLOT-VALUE/3 (GH #351): SLOT bound
+reads it; SLOT unbound yields every data slot, keyword-named."
+  (cond ((var-p slot)
+         (dolist (s (data-slots (class-of node)))
+           (let ((old-trail (fill-pointer *trail*))
+                 (value (%slot-value-guarded node s)))
+             (unless (eq value :fail)
+               (when (and (unify slot (intern (symbol-name s) :keyword))
+                          (unify var value))
+                 (funcall cont)))
+             (undo-bindings old-trail))))
+        (t
+         (let ((value (%slot-value-guarded node slot)))
+           (unless (eq value :fail)
+             (when (unify var value)
+               (funcall cont)))))))
+
 (def-global-prolog-functor node-slot-value/3 (node slot var cont)
   (setq node (var-deref node)
         slot (var-deref slot)
         var (var-deref var))
-  ;; Guard ONLY the slot read -- not (funcall cont).  The continuation is the
-  ;; rest of the query; wrapping it here would swallow any error a downstream
-  ;; goal signals (e.g. a prolog-permission-error from a denied write, or a
-  ;; prolog-resource-error), silently turning it into a non-match.
-  (let ((value (handler-case (node-slot-value node slot)
-                 (error (c)
-                   (log:error "Problem reading (node-slot-value ~A ~A): ~A"
-                              node slot c)
-                   (return-from node-slot-value/3 nil)))))
-    (when (unify var value)
-      (funcall cont))))
+  (%unify-slot node slot var cont))
 
 (def-global-prolog-functor weight/2 (edge var cont)
   (setq edge (var-deref edge)

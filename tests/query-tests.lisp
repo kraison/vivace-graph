@@ -114,3 +114,14 @@ pairs.  With A->B and A->C, both pairs are sourced from A."
         (let ((targets (mapcar (lambda (pair) (id (second pair))) pairs)))
           (is-true (member bid targets :test #'equalp))
           (is-true (member cid targets :test #'equalp)))))))
+
+(test node-slot-value-with-an-unbound-slot-lists-the-slots
+  "GH #351: (node-slot-value ?p ?s ?v) yields one row per data slot of
+?p's type, ?s a keyword, ?v the value or NIL; an inherited slot counts."
+  (with-test-graph (g)
+    (with-transaction ()
+      (make-g-employee :name "E" :title "boss"))
+    (let ((rows (select (:flat nil) (?s ?v)
+                        (is-a ?p g-employee) (node-slot-value ?p ?s ?v))))
+      (is (equal '((:age nil) (:name "E") (:title "boss"))
+                 (sort (copy-list rows) #'string< :key #'first))))))
