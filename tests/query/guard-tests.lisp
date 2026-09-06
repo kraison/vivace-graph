@@ -147,3 +147,65 @@ package nor IS-A/2 from the schema's."
       (graph-db.query:guard-query-text "(no-such-functor ?x)" g))
     (signals graph-db.query:prolog-guard-error
       (graph-db.query:guard-query-text "(is-a ?p graph-db::vertex)" g))))
+
+(test a-keyword-slot-is-filtered-by-a-string
+  "GH #351: RANK is untyped, so an item can hold a keyword there; the
+guard refuses every keyword spelling, and a string now unifies."
+  (with-query-graph (g)
+    (with-transaction ((graph-db::transaction-manager g))
+      (graph-db/query-test.schema::make-qt-item :graph g :label "k"
+                                                 :rank :high)
+      (graph-db/query-test.schema::make-qt-item :graph g :label "n"
+                                                 :rank 1))
+    (let ((rows (nth-value 1 (q g "(is-a ?i qt-item)
+                                   (node-slot-value ?i rank \"high\")
+                                   (node-slot-value ?i label ?l)"))))
+      (is (= 1 (length rows)))
+      (is (string= "k" (second (first rows)))))
+    (let ((rows (nth-value 1 (q g "(is-a ?i qt-item)
+                                   (node-slot-value ?i rank ?r)
+                                   (= ?r \"HIGH\")"))))
+      (is (= 1 (length rows)) "case-insensitive through =/2 too"))))
+
+(test node-slot-value-needs-no-is-a-through-the-guard
+  "GH #351: the guarded runner reaches the enumeration; the ?i column
+holds the node id as a string, as any node cell does."
+  (with-query-graph (g)
+    (seed g)
+    (multiple-value-bind (columns rows)
+        (q g "(node-slot-value ?i label \"b\") (node-slot-value ?i rank ?r)")
+      (is (equal '("i" "r") columns))
+      (is (= 1 (length rows)))
+      (is (stringp (first (first rows))))
+      (is (= 2 (second (first rows)))))))
+
+(test node-slot-value-with-a-non-symbol-slot-is-zero-rows-not-an-error
+  "GH #351: a string SLOT through the enumeration arm is not a slot
+name; the guard sees zero rows, not a TYPE-ERROR server fault."
+  (with-query-graph (g)
+    (seed g)
+    (multiple-value-bind (columns rows)
+        (q g "(node-slot-value ?i \"label\" ?v)")
+      (is (equal '("i" "v") columns))
+      (is (null rows)))))
+
+(test node-slot-value-unbound-slot-enumeration-through-the-guard
+  "GH #351: the guarded runner reaches the unbound-slot arm too --
+3 QT-ITEMs x 2 data slots (LABEL, RANK) is 6 rows, each ?s a keyword."
+  (with-query-graph (g)
+    (seed g)
+    (multiple-value-bind (columns rows)
+        (q g "(is-a ?i qt-item) (node-slot-value ?i ?s ?v)")
+      (is (equal '("i" "s" "v") columns))
+      (is (= 6 (length rows)))
+      (is (every (lambda (row) (keywordp (second row))) rows)))))
+
+(test an-unbound-node-enumeration-ticks-the-budget
+  "GH #351: the enumeration arm visits every vertex through UNIFY,
+which fails for each non-matching one without calling CONT -- so it
+must %TICK per vertex itself, or :MAX-INFERENCES can never interrupt
+a scan that never reaches a goal boundary."
+  (with-query-graph (g)
+    (seed g)
+    (signals graph-db:prolog-resource-error
+      (q g "(node-slot-value ?i label \"nowhere\")" :max-inferences 1))))

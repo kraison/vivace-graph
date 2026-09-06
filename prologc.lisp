@@ -119,6 +119,14 @@ present, so an error from the continuation after Goal succeeds is not caught.")
  Specialize this for new types that will be stored in the db.")
   (:method ((x number) (y number)) (= x y))
   (:method ((x string) (y string)) (string= x y))
+  ;; A keyword-valued slot has no keyword spelling in a guarded query
+  ;; (the screen refuses every colon), so a string stands in for one,
+  ;; case-insensitively; two strings stay STRING= (GH #351).
+  ;; KEYWORD is a type, not a class: dispatch on SYMBOL.
+  (:method ((x string) (y symbol))
+    (if (keywordp y) (string-equal x (symbol-name y)) (call-next-method)))
+  (:method ((x symbol) (y string))
+    (if (keywordp x) (string-equal (symbol-name x) y) (call-next-method)))
   (:method ((x character) (y character)) (char= x y))
   (:method ((x timestamp) (y timestamp)) (timestamp= x y))
   ;;(:method ((x timestamp) (y integer)) (= (timestamp-to-universal x) y))

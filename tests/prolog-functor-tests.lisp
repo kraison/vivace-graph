@@ -412,3 +412,18 @@ gains no user clause and stays the registered global (#322)."
       (when (and own (graph-db::lookup-functor own))
         (graph-db::delete-functor (graph-db::lookup-functor own)))
       (when pkg (delete-package pkg)))))
+
+(test a-string-unifies-with-a-keyword-case-insensitively
+  "GH #351: a keyword-valued slot can only be filtered by a string --
+the guard admits no keyword spelling -- so \"foo\" and :FOO unify, in
+both orders, case-insensitively.  Two strings stay case-sensitive."
+  (with-test-graph (g)
+    (declare (ignore g))
+    (is (equal '(:foo) (select-flat (?x) (= ?x :foo) (= ?x "foo"))))
+    (is (equal '(:foo) (select-flat (?x) (= ?x :foo) (= ?x "FOO"))))
+    (is (equal '("foo") (select-flat (?x) (= ?x "foo") (= ?x :foo))))
+    (is (null (select-flat (?x) (= ?x :foo) (= ?x "bar"))))
+    (is (null (select-flat (?x) (= ?x "foo") (= ?x "FOO")))
+        "control: two strings stay case-sensitive")
+    (is (equal '(:foo) (select-flat (?x) (= ?x :foo) (== ?x "FOO")))
+        "==/2 shares PROLOG-EQUAL with =/2, so it unifies too (#351)")))
