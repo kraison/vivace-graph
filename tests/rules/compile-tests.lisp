@@ -171,6 +171,20 @@ whichever is written first; a third reading elsewhere is its own."
       ;; its own reads.
       (is (equal '("a" "b" "c") (graph-db.rules:compiled-rule-stratum c))))))
 
+(test compile-rule-resolves-a-def-rule-by-name
+  "GH #333: RULE-SPEC-OF's string branch checks the store before the
+image, like %RESOLVE-RULE (run.lisp); a name might name only a
+def-rule."
+  (with-rules-graph (g)
+    (graph-db.rules:def-rule "only-in-image" :version "1"
+      :family rt-claim :head *head-y* :body *body-x*)
+    (unwind-protect
+         (let ((c (graph-db.rules:compile-rule g "only-in-image")))
+           (is (eq :def-rule
+                   (graph-db.rules::rule-spec-source
+                    (graph-db.rules:compiled-rule-spec c)))))
+      (graph-db.rules:undef-rule "only-in-image"))))
+
 (test a-def-rule-collides-by-name
   (with-rules-graph (g)
     (graph-db.rules:def-rule "b" :version "1" :family rt-claim
@@ -290,3 +304,13 @@ has no fixpoint; refused naming the relation."
                   :head *head-y* :body *body-not-z*))
     (is (equal '("b") (graph-db.rules:compiled-rule-stratum
                        (graph-db.rules:compile-rule g "b"))))))
+
+(defparameter *body-not-unbound*
+  "(claim ?p rt-claim \"host\" ?h \"runs\" \"app\" ?a)
+   (not (claim ?q rt-claim \"app\" ?a ?r \"host\" ?h))")
+
+(test a-negated-unbound-relation-is-refused
+  "GH #333: a NOT's relation left unbound reads everything there too
+(P6), the same refusal as a positive :ANY read."
+  (refuses "bind the relation" :name "r" :version "1" :family "rt-claim"
+           :head *head-x* :body *body-not-unbound*))

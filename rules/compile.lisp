@@ -61,8 +61,10 @@ store's other rules.  Returns NAME."
 
 (defun rule-spec-of (thing &optional graph)
   "THING as a RULE-SPEC: a RULE record is read into one, a spec passes,
-and a string names a stored rule of GRAPH -- so a caller with only the
-name a prior COMPILE-RULE stored can re-compile it (GH #333)."
+and a string names a rule of GRAPH's store, else a DEF-RULE, in that
+order -- the same order %RESOLVE-RULE (run.lisp) uses -- so a caller
+with only the name a prior COMPILE-RULE stored can re-compile it
+(GH #333)."
   (etypecase thing
     (rule-spec thing)
     (rule (%make-rule-spec :name (rule-name thing)
@@ -73,13 +75,15 @@ name a prior COMPILE-RULE stored can re-compile it (GH #333)."
                            :enabled (rule-enabled thing)
                            :source :stored))
     (string
-     (let ((r (and graph (%graph-declares-p graph 'rule)
-                   (first (graph-db:index-lookup
-                           graph 'rule '(name) thing)))))
-       (if (and r (not (graph-db:deleted-p r)))
-           (rule-spec-of r)
-           (error "No stored rule named ~S in ~(~S~)."
-                  thing (and graph (graph-db:graph-name graph))))))))
+     (let ((stored (and graph (%graph-declares-p graph 'rule)
+                        (first (graph-db:index-lookup
+                                graph 'rule '(name) thing)))))
+       (cond ((and stored (not (graph-db:deleted-p stored)))
+              (rule-spec-of stored))
+             ((find-def-rule thing))
+             (t (error "No rule named ~S in ~(~S~) or the image."
+                       thing
+                       (and graph (graph-db:graph-name graph)))))))))
 
 (define-condition rule-compile-error (graph-db:constraint-violation)
   ((rule :initarg :rule :reader rule-compile-error-rule)
@@ -373,7 +377,7 @@ second goal as a read, which over-constrains rather than under-."
 
 (defun %strata (relation reads graph others)
   "The stratum RELATION belongs to over READS and OTHERS' edges (spec
-SS2): (values RULE-NAMES RELATIONS), both sorted.  The strongly
+§2): (values RULE-NAMES RELATIONS), both sorted.  The strongly
 connected component of the relation graph, by a DFS from RELATION
 forward and one over the reversed edges; the stratum's rules are every
 rule in OTHERS deriving a component relation, plus this one."
@@ -384,7 +388,10 @@ rule in OTHERS deriving a component relation, plus this one."
         (when e
           (push e edges)
           (push (cons (car e) (rule-spec-name o)) derivers))))
-    (labels ((succ (rel)
+    (labels (;; An :ANY edge contributes none here: an unvalidated
+             ;; other rule is an isolated node for stratification and
+             ;; is refused on its own compile, not here (GH #333).
+             (succ (rel)
                (loop for e in edges when (string= (car e) rel)
                      append (if (eq (cdr e) :any) '() (cdr e))))
              (pred (rel)
