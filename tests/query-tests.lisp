@@ -120,8 +120,33 @@ pairs.  With A->B and A->C, both pairs are sourced from A."
 ?p's type, ?s a keyword, ?v the value or NIL; an inherited slot counts."
   (with-test-graph (g)
     (with-transaction ()
-      (make-g-employee :name "E" :title "boss"))
+      (make-g-employee :name "E" :title "boss")
+      (make-g-person :name "F" :age :fail))
     (let ((rows (select (:flat nil) (?s ?v)
                         (is-a ?p g-employee) (node-slot-value ?p ?s ?v))))
       (is (equal '((:age nil) (:name "E") (:title "boss"))
-                 (sort (copy-list rows) #'string< :key #'first))))))
+                 (sort (copy-list rows) #'string< :key #'first))))
+    ;; :FAIL is now a legitimate slot value: the read-error sentinel is
+    ;; two values, not the keyword :FAIL (GH #351).
+    (is (equal '(:fail)
+               (select-flat (?v) (is-a ?p g-person)
+                            (node-slot-value ?p name "F")
+                            (node-slot-value ?p age ?v))))))
+
+(test node-slot-value-with-an-unbound-node-finds-vertices-by-slot
+  "GH #351: no IS-A needed to look a vertex up by a slot value, and a
+vertex whose type lacks the slot is skipped rather than read as NIL."
+  (with-test-graph (g)
+    (with-transaction ()
+      (make-g-person :name "A")
+      (make-g-person :name "B")
+      (make-g-employee :name "C" :title "boss"))
+    (let ((found (select-flat (?p) (node-slot-value ?p name "B"))))
+      (is (= 1 (length found)))
+      (is (string= "B" (slot-value (first found) 'name))))
+    ;; TITLE is declared on g-employee only: two persons are skipped.
+    (is (equal '("boss")
+               (select-flat (?t) (node-slot-value ?p title ?t))))
+    ;; Both unbound: every vertex, every slot.  3 vertices x 2 slots
+    ;; (name, age) + 1 x title = 7 rows.
+    (is (= 7 (select-count () (node-slot-value ?p ?s ?v))))))

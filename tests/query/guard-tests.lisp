@@ -166,3 +166,14 @@ guard refuses every keyword spelling, and a string now unifies."
                                    (node-slot-value ?i rank ?r)
                                    (= ?r \"HIGH\")"))))
       (is (= 1 (length rows)) "case-insensitive through =/2 too"))))
+
+(test node-slot-value-needs-no-is-a-through-the-guard
+  "GH #351: the guarded runner reaches the enumeration; the ?c column
+holds the node id as a string, as any node cell does."
+  (with-query-graph (g)
+    (seed g)
+    (multiple-value-bind (columns rows)
+        (q g "(node-slot-value ?i label \"b\") (node-slot-value ?i rank ?r)")
+      (is (equal '("i" "r") columns))
+      (is (= 1 (length rows)))
+      (is (= 2 (second (first rows)))))))

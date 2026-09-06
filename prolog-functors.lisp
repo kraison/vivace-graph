@@ -850,13 +850,15 @@ a vertex" functor))))
                         class-name view-name)))
 
 (defun %slot-value-guarded (node slot)
-  "NODE's SLOT, or :FAIL on a read error.  Guards ONLY the read: the
-continuation is the rest of the query and must keep its own errors."
-  (handler-case (node-slot-value node slot)
+  "Two values: NODE's SLOT and T, or NIL and NIL on a read error --
+not the keyword :FAIL, which a slot may legitimately hold (GH #351).
+Guards ONLY the read: the continuation is the rest of the query and
+must keep its own errors."
+  (handler-case (values (node-slot-value node slot) t)
     (error (c)
       (log:error "Problem reading (node-slot-value ~A ~A): ~A"
                  node slot c)
-      :fail)))
+      (values nil nil))))
 
 (defun %node-has-slot-p (node slot)
   "SLOT (a symbol from any package) names a data slot of NODE's type."
@@ -868,16 +870,16 @@ continuation is the rest of the query and must keep its own errors."
 reads it; SLOT unbound yields every data slot, keyword-named."
   (cond ((var-p slot)
          (dolist (s (data-slots (class-of node)))
-           (let ((old-trail (fill-pointer *trail*))
-                 (value (%slot-value-guarded node s)))
-             (unless (eq value :fail)
-               (when (and (unify slot (intern (symbol-name s) :keyword))
-                          (unify var value))
-                 (funcall cont)))
+           (let ((old-trail (fill-pointer *trail*)))
+             (multiple-value-bind (value read-p) (%slot-value-guarded node s)
+               (when read-p
+                 (when (and (unify slot (intern (symbol-name s) :keyword))
+                            (unify var value))
+                   (funcall cont))))
              (undo-bindings old-trail))))
         (t
-         (let ((value (%slot-value-guarded node slot)))
-           (unless (eq value :fail)
+         (multiple-value-bind (value read-p) (%slot-value-guarded node slot)
+           (when read-p
              (when (unify var value)
                (funcall cont)))))))
 
@@ -885,7 +887,22 @@ reads it; SLOT unbound yields every data slot, keyword-named."
   (setq node (var-deref node)
         slot (var-deref slot)
         var (var-deref var))
-  (%unify-slot node slot var cont))
+  (if (var-p node)
+      ;; Enumerate as IS-A/2's both-unbound arm does: per-type scans,
+      ;; each through LOOKUP-VERTEX, so a snapshot reader sees its own
+      ;; epoch.  A vertex whose type lacks a bound SLOT is skipped, not
+      ;; read as NIL (GH #351).
+      (dolist (type-id (list-vertex-types *graph*))
+        (when (lookup-node-type-by-id type-id :vertex)
+          (map-vertices
+           (lambda (vertex)
+             (when (or (var-p slot) (%node-has-slot-p vertex slot))
+               (let ((old-trail (fill-pointer *trail*)))
+                 (when (unify node vertex)
+                   (%unify-slot vertex slot var cont))
+                 (undo-bindings old-trail))))
+           *graph* :vertex-type type-id :include-subclasses-p nil)))
+      (%unify-slot node slot var cont)))
 
 (def-global-prolog-functor weight/2 (edge var cont)
   (setq edge (var-deref edge)

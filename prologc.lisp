@@ -122,7 +122,7 @@ present, so an error from the continuation after Goal succeeds is not caught.")
   ;; A keyword-valued slot has no keyword spelling in a guarded query
   ;; (the screen refuses every colon), so a string stands in for one,
   ;; case-insensitively; two strings stay STRING= (GH #351).
-  ;; KEYWORD is a type, not a class: dispatch on SYMBOL (GH #351).
+  ;; KEYWORD is a type, not a class: dispatch on SYMBOL.
   (:method ((x string) (y symbol))
     (if (keywordp y) (string-equal x (symbol-name y)) (call-next-method)))
   (:method ((x symbol) (y string))
