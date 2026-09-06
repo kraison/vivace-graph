@@ -399,3 +399,33 @@ query already gets, rather than a refusal the caller opted out of."
       (select (:max-inferences 1000) (?c ?p) (claim-producer ?c ?p)))
     (is (= 2 (select (:count t :max-inferences 1000) (?c)
                (claim-producer ?c "scan-b"))))))
+
+(test rule-delta-generates-the-bound-delta-and-nothing-else
+  "GH #333: the fixpoint's internal generator.  Unbound *RULE-DELTA*
+answers nothing; bound, it yields exactly the listed claims of the
+named relation, and filters a bound ?c by membership."
+  (with-rules-graph (g)
+    (seed g)
+    (let* ((runs (claims-touching g 'rt-claim :host "h1" :role :subject
+                                  :relation "runs"))
+           (web (find "web" runs :key #'claim-object-key :test #'string=))
+           (table (make-hash-table :test 'equal)))
+      (is (= 2 (length runs)))
+      (setf (gethash "runs" table) (list web))
+      (is (null (select-flat (?c) (graph-db::rule-delta ?c "runs"))))
+      (let ((graph-db:*rule-delta* table))
+        (is (equal (list web)
+                   (select-flat (?c) (graph-db::rule-delta ?c "runs"))))
+        (is (null (select-flat (?c) (graph-db::rule-delta ?c "other"))))
+        ;; A bound ?c is a membership test: web is in the delta, db not.
+        (is (= 1 (select-count ()
+                   (claim ?c rt-claim "host" "h1" "runs" "app" "web")
+                   (graph-db::rule-delta ?c "runs"))))
+        (is (= 0 (select-count ()
+                   (claim ?c rt-claim "host" "h1" "runs" "app" "db")
+                   (graph-db::rule-delta ?c "runs"))))
+        ;; Composes with claim/7 as a filter: the delta claim's endpoints.
+        (is (equal '("web")
+                   (select-flat (?a)
+                     (graph-db::rule-delta ?c "runs")
+                     (claim ?c rt-claim "host" "h1" "runs" "app" ?a))))))))

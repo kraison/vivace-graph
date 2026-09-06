@@ -34,6 +34,12 @@ evaluation; a Lisp caller may bind it around a SELECT.  Trap: inside a
 read-write transaction every read of another store is the engine's
 CROSS-GRAPH-TRANSACTION-ERROR (GH #53) -- bind it outside one.")
 
+(defvar *rule-delta* nil
+  "NIL, or an EQUAL hash table relation -> list of claim nodes: the
+claims a fixpoint round derived new, which RULE-DELTA/2 generates for
+the next round (GH #333).  Bound by RUN-RULES around a recursive
+stratum; never by a query.")
+
 (defun %scope-graphs ()
   "The stores in scope, own store first: *CLAIM-SCOPE*, or *GRAPH*
 alone when it is NIL."
@@ -324,3 +330,17 @@ docs/rules.md)."
                 (or *inference-budget* *query-deadline*))
            (error 'prolog-cost-unbounded-error
                   :functor 'claim-producer/2)))))
+
+(def-global-prolog-functor rule-delta/2 (?c ?rel cont)
+  "?C over *RULE-DELTA*'s claims of relation ?REL (a string); a bound
+?C succeeds only when it is one of them.  Nothing without a delta
+bound.  Withheld from free text (*PROLOG-EXCLUDED-PREDICATES*): a rule
+body cannot name it, the fixpoint loop injects it (GH #333)."
+  (let ((c (%claim-arg ?c))
+        (unbound (%unbound-p ?c))
+        (rel (%prolog-index-bound ?rel)))
+    (when (and *rule-delta* (stringp rel))
+      (let ((claims (gethash rel *rule-delta*)))
+        (cond (c (when (member c claims) (funcall cont)))
+              (unbound (dolist (claim claims)
+                         (%yield (?c claim) (funcall cont)))))))))

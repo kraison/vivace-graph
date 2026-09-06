@@ -479,6 +479,9 @@
            #:compile-body
            #:args
            #:*prolog-global-functors*
+           ;; GH #333: the fixpoint's delta, bound by RUN-RULES around
+           ;; a recursive stratum for RULE-DELTA/2 to generate over.
+           #:*rule-delta*
            #:deref-exp
            #:unify
            #:select

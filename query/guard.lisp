@@ -244,18 +244,23 @@ Splits at the LAST slash, so /=/2 reads as (\"/=\" . 2)."
 
 (defparameter *prolog-excluded-predicates*
   '("%COMMIT" "CALL" "CATCH" "FINDALL" "BAGOF" "SETOF" "MAP-QUERY"
-    "SELECT" "SHOW-PROLOG-VARS")
+    "SELECT" "SHOW-PROLOG-VARS"
+    ;; GH #333: the fixpoint's internal generator, injected by
+    ;; RUN-RULES.
+    "RULE-DELTA")
   "Predicate names withheld from free text at EVERY arity, whatever the
 registries say.
 
-All but the first are the runtime meta-call family: each hands a term to
-%SOLVE, which builds a functor symbol from that term's head at run time
-(prolog-functors.lisp:229).  For a STRING head that is an INTERN of
-unvetted data -- graph content, reached through a variable -- into the
-live schema package, which is the one way a fully whitelisted query
-could still grow the image.  SELECT/2 and SHOW-PROLOG-VARS/2 are
+All but the first and last are the runtime meta-call family: each hands
+a term to %SOLVE, which builds a functor symbol from that term's head at
+run time (prolog-functors.lisp:229).  For a STRING head that is an
+INTERN of unvetted data -- graph content, reached through a variable --
+into the live schema package, which is the one way a fully whitelisted
+query could still grow the image.  SELECT/2 and SHOW-PROLOG-VARS/2 are
 result-collection machinery and a REPL printer, neither a predicate.
-%COMMIT is an internal cut barrier taking compiler gensyms (GH #279).")
+%COMMIT is an internal cut barrier taking compiler gensyms (GH #279).
+RULE-DELTA/2 reads *RULE-DELTA*, which only RUN-RULES binds, around a
+recursive stratum -- never from a query (GH #333).")
 
 (defparameter *prolog-goal-argument-control*
   '("AND" "OR" "NOT" "ONCE" "IF" "FORALL")

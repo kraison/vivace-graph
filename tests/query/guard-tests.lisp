@@ -209,3 +209,9 @@ a scan that never reaches a goal boundary."
     (seed g)
     (signals graph-db:prolog-resource-error
       (q g "(node-slot-value ?i label \"nowhere\")" :max-inferences 1))))
+
+(test rule-delta-is-withheld-from-free-text
+  "GH #333: the fixpoint's generator is not a query surface."
+  (with-query-graph (g)
+    (signals graph-db.query:prolog-guard-error
+      (q g "(rule-delta ?c \"x\")"))))
