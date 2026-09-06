@@ -40,6 +40,15 @@ claims a fixpoint round derived new, which RULE-DELTA/2 generates for
 the next round (GH #333).  Bound by RUN-RULES around a recursive
 stratum; never by a query.")
 
+(defvar *claim-exclude-producers* nil
+  "NIL, or a list of producer strings CLAIM/7's index and scan routes
+must not answer from: a fixpoint round reads base facts plus the
+delta, never the stratum's own prior output, since that output is
+exactly what this round's reconcile may still sweep (GH #333).  Bound
+by %RUN-STRATUM around every round, round 0 included.  Never applies
+to a bound ?C -- that is how the delta itself, and any other caller
+holding a node already, keeps working.")
+
 (defun %scope-graphs ()
   "The stores in scope, own store first: *CLAIM-SCOPE*, or *GRAPH*
 alone when it is NIL."
@@ -60,6 +69,17 @@ arities."
                   append (handler-case
                              (index-lookup g class-name slots value)
                            (query-precondition-error () '()))))))
+
+(defun %exclude-producers (candidates)
+  "CANDIDATES with any claim whose producer is in
+*CLAIM-EXCLUDE-PRODUCERS* removed.  Applied only at CLAIM/7's index
+and scan routes, never to a bound ?C (GH #333)."
+  (if *claim-exclude-producers*
+      (remove-if (lambda (claim)
+                   (member (graph-db.spacetime:claim-producer claim)
+                           *claim-exclude-producers* :test #'string=))
+                 candidates)
+      candidates))
 
 (defun %keyword-string (keyword)
   "A keyword as the lowercase string the wire uses (spec §4)."
@@ -181,15 +201,18 @@ GH #332)."
          (candidates
            (cond ((node-p c) (list c))
                  ((and sns skey rel)
-                  (%scope-lookup parent
-                                 +claim-subject-relation-index-slots+
-                                 (list sns skey rel)))
+                  (%exclude-producers
+                   (%scope-lookup parent
+                                  +claim-subject-relation-index-slots+
+                                  (list sns skey rel))))
                  ((and sns skey)
-                  (%scope-lookup parent +claim-subject-index-slots+
-                                 (list sns skey)))
+                  (%exclude-producers
+                   (%scope-lookup parent +claim-subject-index-slots+
+                                  (list sns skey))))
                  ((and ons okey)
-                  (%scope-lookup binary +claim-object-index-slots+
-                                 (list ons okey)))
+                  (%exclude-producers
+                   (%scope-lookup binary +claim-object-index-slots+
+                                  (list ons okey))))
                  ;; A bound namespace argument naming no keyword of this
                  ;; image -- a name no claim was recorded under, a
                  ;; non-wire spelling, a non-string: no solutions, and
@@ -197,7 +220,7 @@ GH #332)."
                  ;; the guard's budget refuses instead (spec §4).
                  ((and sns-arg (null sns)) '())
                  ((and ons-arg (null ons)) '())
-                 (t (%unbound-claim-scan family)))))
+                 (t (%exclude-producers (%unbound-claim-scan family))))))
     (dolist (claim candidates)
       (%unify-claim claim ?c ?sns ?skey ?rel ?ons ?okey family cont))))
 
@@ -316,8 +339,12 @@ docs/rules.md)."
           ;; %CLAIM-ARG is NIL for a bound non-node too -- an explicit
           ;; NIL included -- and generating there is a whole
           ;; cross-family lookup that then unifies with nothing, past
-          ;; %TICK's reach.
-          ((and unbound (stringp p))
+          ;; %TICK's reach.  Generating (not filtering, above) skips an
+          ;; excluded producer the same way CLAIM/7's routes do
+          ;; (GH #333).
+          ((and unbound (stringp p)
+                (not (member p *claim-exclude-producers*
+                             :test #'string=)))
            (dolist (claim (%producer-candidates p))
              (%yield (?c claim) (funcall cont))))
           ;; Nothing bound routes nowhere, so CLAIM/7's refusal rather

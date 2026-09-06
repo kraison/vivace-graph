@@ -32,10 +32,11 @@
    ;; running (spec §7)
    #:run-rule #:run-rules
    #:*rules-max-inferences* #:*rules-timeout* #:*rules-max-solutions*
+   #:*rules-max-rounds*
    #:rule-report #:rule-report-p #:rule-report-rule-name
    #:rule-report-version #:rule-report-outcome #:rule-report-derived
    #:rule-report-kept #:rule-report-swept #:rule-report-disjoint-premises
    #:rule-report-refusals #:rule-report-inferences
-   #:rule-report-elapsed
+   #:rule-report-elapsed #:rule-report-rounds #:rule-report-stratum
    ;; provenance (spec §9)
    #:premises-of #:dependents-of))

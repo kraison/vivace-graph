@@ -482,6 +482,9 @@
            ;; GH #333: the fixpoint's delta, bound by RUN-RULES around
            ;; a recursive stratum for RULE-DELTA/2 to generate over.
            #:*rule-delta*
+           ;; GH #333: producers a fixpoint round's CLAIM/7 must not
+           ;; answer from, bound by %RUN-STRATUM around every round.
+           #:*claim-exclude-producers*
            #:deref-exp
            #:unify
            #:select
