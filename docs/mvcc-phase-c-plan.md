@@ -115,7 +115,24 @@ wire carries logical ops (id + serialized data + op kind). Each node builds its
 own correct entry epochs the same way it already builds its own version chains.
 The reaper runs independently per node.
 
-### OPEN ISSUE (flagged for a near-term separate discussion)
+### Epoch portability — DECIDED 2026-09-06: time-travel is node-local
+
+**Decision (Kevin, 2026-09-06, GH #116):** an as-of query is meaningful only
+against the node it is issued to. The local epoch stays the ordering and
+reclamation authority; no replicated commit timestamp and no epoch map are
+added. Recorded because nothing in the programme asks a replica for history:
+the cl-llm memory image is one process holding one store on one clock and
+its as-of reads (cl-llm#53) stay inside it; #347 already made epochs
+comparable only across stores on one `system-clock`, with no single read
+instant across stores (GH #53); sitrep mirrors into one store on one node;
+the blackboard design (kraison/blackboard#1) has every principal talking to
+one store over the claim API. If a consumer ever needs replica-portable
+history, the first candidate below is the additive upgrade path: a
+replicated commit timestamp used for addressing only, beside the local
+epoch, never replacing it. C-3 (#115) proceeds as a node-local API and
+documents the limitation. #116 stays open as the deferred record.
+
+The analysis that led here, kept for the record:
 
 Because epochs are **node-local counters**, an epoch value is **not portable
 across replicas**: epoch `E` on the master is a different point in history than
@@ -124,7 +141,7 @@ resolves against its own epochs) but it **breaks a replica-portable time-travel
 API** (C-3): "give me the graph as-of E" means different things on different
 nodes, and "as-of a wall-clock time T" has no local mapping.
 
-Candidate directions to discuss before C-3 ships (NOT decided here):
+Candidate directions that were on the table (the third was chosen):
 - a **logical/wall-clock commit timestamp** stamped alongside the local epoch
   (replicated as data, used only for as-of *addressing*, never for ordering /
   reaper gating);
@@ -133,8 +150,7 @@ Candidate directions to discuss before C-3 ships (NOT decided here):
 - declare time-travel **node-local only** (an as-of query is meaningful only
   against the node you issue it to) and document it.
 
-C-1 and C-2 do **not** depend on resolving this; only C-3's cross-replica
-semantics do. Hold a design conversation before starting C-3.
+C-1 and C-2 do **not** depend on this; C-3 ships node-local.
 
 ## Scope / boundaries (LOCKED)
 
@@ -255,9 +271,9 @@ Once entries carry epochs and nodes carry chains, "as-of" is mostly surface:
    `with-as-of` macro pinning a graph epoch for an extent.
 2. `select` `:as-of` option (parallels the existing `:snapshot t`), wrapping the
    query in an as-of read snapshot.
-3. **BLOCKED ON the replication open issue above** for any cross-replica
-   semantics. A node-local as-of API can ship without resolving it (document the
-   limitation); a replica-portable / wall-clock as-of cannot.
+3. Node-local only (DECIDED 2026-09-06, GH #116): the API documents that an
+   as-of epoch names a point in the issuing node's own history. A
+   replica-portable / wall-clock as-of is deferred with #116.
 4. Validate: as-of reads reconstruct historical membership + values within the
    retained window; beyond `keep-revisions` the API reports "reaped" rather than
    lying.
@@ -290,8 +306,8 @@ cross-impl matrix (SBCL/CCL/ECL on odm) + the two-process replication harness
 
 1. **Migration** — DECIDED: forced snapshot+replay, storage-version bump,
    migrate-me error. (Kevin, 2026-06-21.)
-2. **Replication / epoch portability** — OPEN, flagged above; hold a design
-   conversation before C-3.
+2. **Replication / epoch portability** — DECIDED: time-travel is node-local;
+   replica-portable addressing deferred with GH #116. (Kevin, 2026-09-06.)
 3. **Untyped-lhash SI** — DECIDED: out of scope, boundary locked. (Kevin.)
 4. **birth-epoch store vs reconstruct** — DECIDED via the C-spike decision gate
    (measure before locking the C-1 header). (Kevin.)
