@@ -319,3 +319,50 @@ below."
       (is (null (claims-touching a 'ea-claim :region "r1" :role :subject
                                  :as-of-epoch e1))
           "born already retracted: absent at its own creating epoch"))))
+
+(test as-of-snapshots-compose-across-clocked-stores
+  "Spec §6 composition: WITH-AS-OF on two stores under one clock
+holds one entry per store, each answering at its own epoch; both are
+gone after."
+  (with-clocked-stores (a b)
+    (let* ((e1 (%tx a (lambda () (%unary a #'make-ea-claim-unary "r1"))))
+           (eb (%tx b (lambda () (%unary b #'make-eb-claim-unary "x"))))
+           (e2 (%tx a (lambda ()
+                        (retract-claim (%one a 'ea-claim "r1"))))))
+      (is (< e1 eb e2) "control")
+      (graph-db:with-as-of ((a) e1)
+        (graph-db:with-as-of ((b) (1- eb))
+          (is (= 2 (hash-table-count graph-db:*read-snapshots*)))
+          (is (claim-current-p (%one a 'ea-claim "r1"))
+              "A at E1: not yet retracted")
+          (is (null (claims-touching b 'eb-claim :region "x"
+                                     :role :subject))
+              "B one epoch before its claim: absent")))
+      (is (null graph-db:*read-snapshots*) "both entries released")
+      (is (not (claim-current-p (%one a 'ea-claim "r1")))
+          "live: retracted"))))
+
+(test claim-reads-under-as-of-agree-with-the-epoch-axis
+  "Spec §3.6: under WITH-AS-OF a claim created after E drops out,
+one retracted after E reads as its version at E, and :AS-OF-EPOCH on
+the same store picks the same version (CLAIM-COMMIT-EPOCH agrees)."
+  (with-clocked-stores (a b)
+    (let* ((e1 (%tx a (lambda () (%unary a #'make-ea-claim-unary "r1"))))
+           (eb (%tx b (lambda () (%unary b #'make-eb-claim-unary "x"))))
+           (e2 (%tx a (lambda ()
+                        (retract-claim (%one a 'ea-claim "r1"))))))
+      (declare (ignorable eb))
+      (graph-db:with-as-of ((a) (1- e1))
+        (is (null (claims-touching a 'ea-claim :region "r1"
+                                   :role :subject))
+            "created after E: dropped"))
+      (graph-db:with-as-of ((a) e1)
+        (let ((snap (%one a 'ea-claim "r1"))
+              (axis (first (claims-touching a 'ea-claim :region "r1"
+                                            :role :subject
+                                            :as-of-epoch e1))))
+          (is (claim-current-p snap) "the version at E1 is unretracted")
+          (is (= e1 (claim-commit-epoch snap)))
+          (is (= (claim-commit-epoch snap) (claim-commit-epoch axis))
+              "the snapshot and the epoch axis choose the same version")))
+      (is (= e2 (claim-commit-epoch (%one a 'ea-claim "r1"))) "live: E2"))))

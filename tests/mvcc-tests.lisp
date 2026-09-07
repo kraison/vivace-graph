@@ -275,6 +275,13 @@ before -- nothing is invented for it."
       (setf (slot-value c 'age) new-age)
       (save c))))
 
+(defun bump-since (eid new-since)
+  "Update edge EID's SINCE inside a transaction (a versioning write)."
+  (with-transaction ()
+    (let ((c (copy (lookup-edge eid))))
+      (setf (slot-value c 'since) new-since)
+      (save c))))
+
 (test versioned-update-retains-then-reaps-prior-version
   "An update archives the prior version (prev-pointer chain grows), and the lazy
 epoch-gated reaper keeps the chain bounded (keep=0 => a single retained version
@@ -534,3 +541,411 @@ before and after the interleaved insert is identical."
           (ignore-errors (graph-db::remove-transaction txn tm)))))
     ;; outside the snapshot, the new vertex is of course visible
     (is (= 2 (select-count (?p) (is-a ?p g-person))))))
+
+;;; ---------------------------------------------------------------------------
+;;; GH #115: node-local time travel (spec 2026-09-07)
+;;; ---------------------------------------------------------------------------
+
+(defun %epoch-of (thunk)
+  "Run THUNK in a transaction on *GRAPH*; the committed epoch."
+  (graph-db::transaction-id
+   (with-transaction () (funcall thunk) graph-db:*transaction*)))
+
+(defmacro with-kept-graph ((g keep) &body body)
+  "A fresh integration graph with :KEEP-REVISIONS KEEP, *GRAPH* bound."
+  (let ((dir (gensym "DIR")))
+    `(with-temp-directory (,dir)
+       (let ((,g (make-graph *integration-graph-name* (namestring ,dir)
+                             :buffer-pool-size 1000 :keep-revisions ,keep)))
+         (unwind-protect (let ((*graph* ,g)) ,@body)
+           (close-graph ,g :snapshot-p nil)
+           (collect-garbage))))))
+
+(test as-of-answers-the-version-live-at-each-epoch
+  "Spec §2, R2: an as-of read is inclusive -- the version whose commit
+epoch is the newest at or below E -- and NIL before the node existed."
+  (with-kept-graph (g 3)
+    (let (id e0 e1 e2 e3)
+      (setq e0 (%epoch-of (lambda () (make-g-person :name "seed" :age 0))))
+      (setq e1 (%epoch-of
+                (lambda () (setq id (id (make-g-person :name "p" :age 0))))))
+      (bump-age id 1) (setq e2 (latest-epoch g))
+      (bump-age id 2) (setq e3 (latest-epoch g))
+      (is (= e1 (1+ e0)) "control: consecutive commits, no clock")
+      (is (= e3 (1+ e2))
+          "LATEST-EPOCH tracks each new commit, not just the first")
+      (with-as-of ((g) e0)
+        (is (null (lookup-vertex id)) "before creation: absent"))
+      (with-as-of ((g) e1)
+        (is (= 0 (slot-value (lookup-vertex id) 'age))
+            "inclusive at the creating epoch"))
+      (with-as-of ((g) e2)
+        (is (= 1 (slot-value (lookup-vertex id) 'age))))
+      (with-as-of ((g) e3)
+        (is (= 2 (slot-value (lookup-vertex id) 'age))))
+      (is (= 2 (slot-value (lookup-vertex id) 'age))
+          "outside the extent the live version answers"))))
+
+(test as-of-reads-are-repeatable-across-a-concurrent-commit
+  "Spec §3.1: reads inside one extent resolve at one epoch even when a
+transaction commits an update meanwhile."
+  (with-kept-graph (g 3)
+    (let (id e)
+      (setq e (%epoch-of
+               (lambda () (setq id (id (make-g-person :name "p" :age 0))))))
+      (with-as-of ((g) e)
+        (is (= 0 (slot-value (lookup-vertex id) 'age)))
+        (bump-age id 7)
+        (is (= 0 (slot-value (lookup-vertex id) 'age))
+            "the concurrent update is invisible at E")))))
+
+(test as-of-refuses-what-it-cannot-answer
+  "Spec §2.2: the refusals, each by reason; the same epoch inherits and a
+plain snapshot inside an as-of extent inherits it."
+  (with-test-graph (g)
+    (let (id e)
+      (setq e (%epoch-of
+               (lambda () (setq id (id (make-g-person :name "p" :age 0))))))
+      (flet ((reason (thunk)
+               (handler-case (progn (funcall thunk) nil)
+                 (as-of-refused (c) (as-of-refused-reason c)))))
+        (is (eq :no-version-history
+                (reason
+                 (lambda ()
+                   (let ((bare (make-instance 'graph-db::graph)))
+                     (with-as-of ((bare) e) nil)))))
+            "no transaction manager yet: refused, not silently live")
+        (is (eq :future-epoch
+                (reason (lambda () (with-as-of ((g) (1+ e)) nil)))))
+        (is (eq :read-write-transaction
+                (reason (lambda ()
+                          (with-transaction () (with-as-of ((g) e) nil))))))
+        (is (eq :snapshot-active
+                (reason (lambda ()
+                          (with-as-of ((g) e)
+                            (with-as-of ((g) (1- e)) nil))))))
+        (is (eq :snapshot-active
+                (reason (lambda ()
+                          (graph-db:with-read-snapshot (g)
+                            (with-as-of ((g) e) nil))))))
+        (is (null (reason (lambda ()
+                            (with-as-of ((g) e) (with-as-of ((g) e) nil)))))
+            "the same epoch inherits")
+        (is (null (reason (lambda ()
+                            (with-as-of ((g) e)
+                              (graph-db:with-read-snapshot (g) nil)))))
+            "a plain snapshot inside an as-of extent inherits it")))))
+
+(test as-of-snapshot-holds-the-reaper-floor
+  "Spec §2.3: an open as-of extent retains the versions live at E, as a
+held read pin does (READ-PIN-RETAINS-VERSIONS-UNTIL-RELEASED); after the
+extent the chain returns to steady state."
+  (with-test-graph (g)
+    (let (id e)
+      (setq e (%epoch-of
+               (lambda () (setq id (id (make-g-person :name "p" :age 0))))))
+      (flet ((live () (graph-db::lookup-node (graph-db::vertex-table g) id g)))
+        (with-as-of ((g) e)
+          (bump-age id 1) (bump-age id 2) (bump-age id 3)
+          (is (>= (version-chain-length (live) g) 2)
+              "an open as-of extent keeps prior versions from being reaped"))
+        (bump-age id 4) (bump-age id 5)
+        (is (= 1 (version-chain-length (live) g))
+            "after the extent the chain returns to steady-state size")))))
+
+(test as-of-reports-a-reaped-version-instead-of-lying
+  "Spec §3.2, R4: with :KEEP-REVISIONS 1 and three updates the chain holds
+the live version and one archived; an epoch older than that signals
+VERSION-REAPED-ERROR naming the oldest retained epoch, :IF-REAPED :SKIP
+answers NIL and counts, and the retained epoch still answers."
+  (with-kept-graph (g 1)
+    (let (id e1 e2 e3 e4)
+      (setq e1 (%epoch-of
+                (lambda () (setq id (id (make-g-person :name "p" :age 0))))))
+      (bump-age id 1) (setq e2 (latest-epoch g))
+      (bump-age id 2) (setq e3 (latest-epoch g))
+      (bump-age id 3) (setq e4 (latest-epoch g))
+      (let ((c (handler-case (with-as-of ((g) e1) (lookup-vertex id) nil)
+                 (version-reaped-error (c) c))))
+        (is (typep c 'version-reaped-error) "as-of E1 is reaped")
+        (when (typep c 'version-reaped-error)
+          (is (= e3 (version-reaped-oldest-epoch c))
+              "the oldest retained version is the one committed at E3")
+          (is (= 2 (version-reaped-oldest-revision c)))
+          (is (= e1 (version-reaped-epoch c))))
+        ;; GH #115: the unwind must not strand the reaper floor.
+        (is (null (graph-db::reap-safe-floor
+                   (graph-db::transaction-manager g)))
+            "the signalled exit released the transaction and the pin"))
+      (signals version-reaped-error (with-as-of ((g) e2) (lookup-vertex id)))
+      (with-as-of ((g) e1 :if-reaped :skip)
+        (is (null (lookup-vertex id)) ":skip answers NIL")
+        (is (= 1 (as-of-skipped-count g)) "and counts the skip"))
+      (is (null (as-of-skipped-count g)) "no count outside an extent")
+      (with-as-of ((g) e3)
+        (is (= 2 (slot-value (lookup-vertex id) 'age)) "E3 is retained"))
+      (with-as-of ((g) e4)
+        (is (= 3 (slot-value (lookup-vertex id) 'age)))))))
+
+(test keep-revisions-zero-is-no-time-travel
+  "Spec §3.2 (as ruled in the plan): the default :KEEP-REVISIONS 0 keeps
+the live version and the one lagging version the committing transaction's
+own floor retains; two updates later the creation epoch is reaped, and so
+is an epoch before the node existed, because revision 0 is gone (the
+documented limit, spec §3.2)."
+  (with-test-graph (g)
+    (let (id e0 e1)
+      (setq e0 (%epoch-of (lambda () (make-g-person :name "seed" :age 0))))
+      (setq e1 (%epoch-of
+                (lambda () (setq id (id (make-g-person :name "p" :age 0))))))
+      (bump-age id 1) (bump-age id 2)
+      (signals version-reaped-error (with-as-of ((g) e1) (lookup-vertex id)))
+      ;; With revision 0 gone, "created after E0" is unknowable: the
+      ;; read reports reaped, the documented limit (spec §3.2).  The
+      ;; "before creation is NIL" case lives in
+      ;; AS-OF-ANSWERS-THE-VERSION-LIVE-AT-EACH-EPOCH, whose chain is intact.
+      (signals version-reaped-error
+        (with-as-of ((g) e0) (lookup-vertex id))))))
+
+(defun %names-at (g e)
+  "The NAMEs of G's G-PERSON vertices as of epoch E, sorted.  Runs a
+typed scan inside a fresh as-of extent, so E must be nameable."
+  (with-as-of ((g) e)
+    (sort (map-vertices (lambda (v) (slot-value v 'name)) g
+                        :collect-p t :vertex-type 'g-person)
+          #'string<)))
+
+(test as-of-typed-scan-reconstructs-membership-both-ways
+  "Spec §3.3, the lookup path (§3.1, §3.2) reached through a typed scan:
+at E the scan excludes a vertex created after E and includes one deleted
+after E; at the deletion epoch it is gone.  A soft delete leaves its
+type-index entry unflagged in the chain, so this holds without the
+tombstone walk -- AS-OF-WALKS-COMPACTION-TOMBSTONES covers that.  The
+case SNAPSHOT-HIDES-NODES-CREATED-AFTER-START never covered."
+  (with-kept-graph (g 3)
+    (let (b e-mid e-del)
+      (with-transaction () (make-g-person :name "a" :age 1))
+      (setq e-mid (%epoch-of
+                   (lambda () (setq b (id (make-g-person :name "b" :age 2))))))
+      (with-transaction () (make-g-person :name "c" :age 3))
+      (setq e-del (%epoch-of (lambda () (mark-deleted (lookup-vertex b)))))
+      (is (equal '("a" "b") (%names-at g e-mid))
+          "c not yet created, b not yet deleted")
+      (is (equal '("a" "c") (%names-at g e-del))
+          "at the deletion epoch b is gone (inclusive)")
+      (is (equal '("a" "c") (%names-at g (latest-epoch g))))
+      (with-as-of ((g) e-mid)
+        (is (= 1 (select-count (?p) (is-a ?p g-person)
+                               (node-slot-value ?p name "b")))
+            "is-a/2 enumerates through the same scan")))))
+
+(test as-of-adjacency-reconstructs-edges-and-endpoints
+  "Spec §3.3, the same lookup path reached through adjacency:
+OUTGOING-EDGES at E excludes an edge created after E, includes one
+deleted after E, and an edge whose endpoint was deleted after E is
+active at E.  Soft-deleted ve/vev entries stay unflagged in the chain,
+so this too holds without the tombstone walk --
+AS-OF-WALKS-COMPACTED-ADJACENCY-TOMBSTONES covers that."
+  (with-kept-graph (g 3)
+    ;; B is bound for symmetry with A and C; only the vertex it names is
+    ;; used, hence IGNORABLE.
+    (let (a b c e-mid e-del)
+      (declare (ignorable b))
+      (with-transaction ()
+        (let ((va (make-g-person :name "a" :age 1))
+              (vb (make-g-person :name "b" :age 2))
+              (vc (make-g-person :name "c" :age 3)))
+          (setq a (id va) b (id vb) c (id vc))
+          (make-g-knows :from va :to vb :since 1)))
+      (setq e-mid (latest-epoch g))
+      (with-transaction ()
+        (make-g-knows :from (lookup-vertex a) :to (lookup-vertex c) :since 2))
+      (setq e-del (%epoch-of
+                   (lambda ()
+                     (mark-deleted
+                      (find 1 (outgoing-edges (lookup-vertex a))
+                            :key (lambda (ed) (slot-value ed 'since))))
+                     (mark-deleted (lookup-vertex c)))))
+      (flet ((sinces-at (e)
+               (with-as-of ((g) e)
+                 (sort (mapcar (lambda (ed) (slot-value ed 'since))
+                               (outgoing-edges (lookup-vertex a)))
+                       #'<))))
+        (is (equal '(1) (sinces-at e-mid)) "the second edge is not yet born")
+        (is (equal '(1 2) (sinces-at (1- e-del)))
+            "both born, neither deleted")
+        (is (equal '() (sinces-at e-del))
+            "at E-DEL the first edge is deleted and the second's endpoint
+c is deleted, so neither is active")
+        (is (equal '() (sinces-at (latest-epoch g))))))))
+
+(test as-of-refuses-the-untyped-scan
+  "Spec R6: the raw lhash walk reads live versions; under a named epoch it
+is refused rather than answering live."
+  (with-test-graph (g)
+    (with-transaction () (make-g-person :name "a" :age 1))
+    (let ((e (latest-epoch g)))
+      (is (eq :untyped-scan
+              (handler-case
+                  (with-as-of ((g) e) (map-vertices #'identity g) nil)
+                (as-of-refused (c) (as-of-refused-reason c)))))
+      (is (eq :untyped-scan
+              (handler-case
+                  (with-as-of ((g) e) (map-edges #'identity g) nil)
+                (as-of-refused (c) (as-of-refused-reason c)))))
+      ;; GH #115: a refusal unwinds before the pin is taken, and leaves
+      ;; no floor behind either.
+      (is (null (graph-db::reap-safe-floor
+                 (graph-db::transaction-manager g)))
+          "the signalled exit released the transaction and the pin"))))
+
+(test as-of-walks-compaction-tombstones
+  "Spec §3.3, the tombstone walk itself: COMPACT-VERTICES de-indexes a
+soft-deleted vertex by flagging its type-index pcons -- MARK-PCONS-DELETED
+leaves the cell in the chain -- so membership at E survives compaction
+only because an as-of scan passes :INCLUDE-DELETED-P T at the index-list
+level.  Drop that flag and the first assertion goes red."
+  (with-kept-graph (g 3)
+    (let (b e-mid)
+      (with-transaction () (make-g-person :name "a" :age 1))
+      (with-transaction ()
+        (setq b (id (make-g-person :name "b" :age 2))))
+      (setq e-mid (latest-epoch g))
+      (with-transaction () (mark-deleted (lookup-vertex b)))
+      ;; Outside any as-of extent: COMPACT-VERTICES drives the untyped
+      ;; scan, which an as-of snapshot refuses (R6).
+      (compact-vertices g)
+      (is (equal '("a" "b") (%names-at g e-mid))
+          "b's FLAGGED type-index entry is still membership at E")
+      (is (equal '("a") (%names-at g (latest-epoch g)))
+          "control: at the latest epoch b resolves deleted and is gone"))))
+
+(test as-of-walks-compacted-adjacency-tombstones
+  "Spec §3.3 for edges: COMPACT-EDGES de-indexes a soft-deleted edge by
+flagging its type/ve/vev pcons, so at E the edge is found again only
+through the as-of :INCLUDE-DELETED-P T walk of the index list.  One
+assertion per index that walk covers -- ve (adjacency), type, vev
+(endpoint pair) -- plus EDGE-EXISTS-P's own vev walk."
+  (with-kept-graph (g 3)
+    (let (a b e-mid)
+      (with-transaction ()
+        (let ((va (make-g-person :name "a" :age 1))
+              (vb (make-g-person :name "b" :age 2)))
+          (setq a (id va) b (id vb))
+          (make-g-knows :from va :to vb :since 1)))
+      (setq e-mid (latest-epoch g))
+      (with-transaction ()
+        (mark-deleted (first (outgoing-edges (lookup-vertex a)))))
+      ;; Outside any as-of extent, as COMPACT-VERTICES above.
+      (compact-edges g)
+      (flet ((sinces (&rest args)
+               (mapcar (lambda (ed) (slot-value ed 'since))
+                       (apply #'map-edges #'identity g :collect-p t args))))
+        (with-as-of ((g) e-mid)
+          (is (equal '(1) (sinces :vertex (lookup-vertex a)
+                                  :direction :out))
+              "ve index: the FLAGGED entry is still adjacency at E")
+          (is (equal '(1) (sinces :edge-type 'g-knows))
+              "type index: the same edge, through the typed scan")
+          (is (equal '(1) (sinces :from-vertex (lookup-vertex a)
+                                  :to-vertex (lookup-vertex b)))
+              "vev index: the same edge, through the endpoint pair")
+          (is (not (null (edge-exists-p 'g-knows (lookup-vertex a)
+                                        (lookup-vertex b))))
+              "EDGE-EXISTS-P walks the flagged vev entry too"))
+        (with-as-of ((g) (latest-epoch g))
+          (is (equal '() (sinces :vertex (lookup-vertex a)
+                                 :direction :out))
+              "control: at the latest epoch the edge resolves deleted")
+          (is (null (edge-exists-p 'g-knows (lookup-vertex a)
+                                   (lookup-vertex b)))
+              "control: EDGE-EXISTS-P agrees at the latest epoch"))))))
+
+(test per-call-as-of-opens-a-snapshot-for-the-call
+  "Spec §3.4: :AS-OF on a lookup or scan answers at E for that call, the
+result outlives the call, and inside an as-of extent at the same epoch it
+inherits."
+  (with-kept-graph (g 3)
+    (let (id e1)
+      (setq e1 (%epoch-of
+                (lambda () (setq id (id (make-g-person :name "p" :age 0))))))
+      (bump-age id 5)
+      (let ((old (lookup-vertex id :as-of e1)))
+        (is (= 0 (slot-value old 'age)) "the version at E1, materialised")
+        (is (null graph-db:*read-snapshots*) "the snapshot closed"))
+      (is (= 5 (slot-value (lookup-vertex id) 'age)))
+      (is (equal '(0) (map-vertices (lambda (v) (slot-value v 'age)) g
+                                    :collect-p t :vertex-type 'g-person
+                                    :as-of e1)))
+      (with-as-of ((g) e1)
+        (is (= 0 (slot-value (lookup-vertex id :as-of e1) 'age))
+            "same epoch inherits"))
+      (signals as-of-refused (lookup-vertex id :as-of (1+ (latest-epoch g))))
+      (signals as-of-refused
+        (with-as-of ((g) e1) (lookup-vertex id :as-of (latest-epoch g)))))))
+
+(test per-call-as-of-on-lookup-edge-and-map-edges
+  "Spec §3.4, the edge twin of the vertex case: :AS-OF on LOOKUP-EDGE and
+MAP-EDGES answers at E for that call and the result outlives the call;
+LOOKUP-EDGE refuses a future epoch, same as LOOKUP-VERTEX."
+  (with-kept-graph (g 3)
+    (let (eid e1)
+      (setq e1 (%epoch-of
+                (lambda ()
+                  (let ((a (make-g-person :name "a"))
+                        (b (make-g-person :name "b")))
+                    (setq eid
+                          (id (make-g-knows :from a :to b :since 0)))))))
+      (bump-since eid 5)
+      (let ((old (lookup-edge eid :as-of e1)))
+        (is (= 0 (slot-value old 'since)) "the version at E1, materialised")
+        (is (null graph-db:*read-snapshots*) "the snapshot closed"))
+      (is (= 5 (slot-value (lookup-edge eid) 'since)))
+      (is (equal '(0) (map-edges (lambda (e) (slot-value e 'since)) g
+                                 :collect-p t :edge-type 'g-knows
+                                 :as-of e1)))
+      (signals as-of-refused
+        (lookup-edge eid :as-of (1+ (latest-epoch g)))))))
+
+(test select-as-of-runs-the-query-at-an-epoch
+  "Spec §3.5: SELECT :AS-OF E parallels :SNAPSHOT T and equals the same
+query run at E; both together is a macroexpansion-time error."
+  (with-kept-graph (g 3)
+    (let (e1)
+      (setq e1 (%epoch-of (lambda () (make-g-person :name "a" :age 1))))
+      (with-transaction () (make-g-person :name "b" :age 2))
+      (is (= 1 (length (select (:as-of e1) (?p) (is-a ?p g-person)))))
+      (is (= 2 (select-count (?p) (is-a ?p g-person))))
+      (is (equal '("a")
+                 (select (:as-of e1 :flat t) (?n)
+                   (is-a ?p g-person) (node-slot-value ?p name ?n))))
+      (signals error
+        (macroexpand-1 '(select (:snapshot t :as-of 1) (?p)
+                          (is-a ?p g-person)))))))
+
+(test edge-and-node-history-walk-the-chain-newest-first
+  "Spec §4: EDGE-HISTORY is VERTEX-HISTORY's edge twin; NODE-HISTORY
+dispatches on the node's class; entries are (VERSION . COMMIT-EPOCH)
+newest first."
+  (with-kept-graph (g 3)
+    (let (aid eid e1 e2)
+      (setq e1 (%epoch-of
+                (lambda ()
+                  (let ((a (make-g-person :name "a" :age 1))
+                        (b (make-g-person :name "b" :age 2)))
+                    (setq aid (id a))
+                    (setq eid (id (make-g-knows :from a :to b :since 1)))))))
+      (setq e2 (%epoch-of
+                (lambda ()
+                  (let ((c (copy (lookup-edge eid))))
+                    (setf (slot-value c 'since) 2)
+                    (save c)))))
+      (let ((h (edge-history g eid)))
+        (is (= 2 (length h)))
+        (is (equal (list e2 e1) (mapcar #'cdr h)) "newest first")
+        (is (equal '(2 1) (mapcar (lambda (p) (slot-value (car p) 'since)) h)))
+        (is (equal (mapcar #'cdr h)
+                   (mapcar #'cdr (node-history (lookup-edge eid))))))
+      (is (equal (mapcar #'cdr (vertex-history g aid))
+                 (mapcar #'cdr (node-history (lookup-vertex aid)))))
+      (is (= 1 (length (edge-history g eid :limit 1)))))))

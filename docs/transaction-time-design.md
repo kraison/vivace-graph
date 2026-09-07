@@ -33,6 +33,9 @@ Nothing that reads a claim today changes: a tenant declaring neither axis
 stays fully supported, and `claim-extent` and every existing consumer behave
 exactly as before.
 
+The engine-level read of a whole graph as of an epoch is `with-as-of`
+(`docs/time-travel.md`, GH #115).
+
 ## Why an interval, not an instant
 
 The transaction value is stored as a full interval (`semantics :transaction`)

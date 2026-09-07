@@ -1221,3 +1221,12 @@ must be undone on unwind -- including a non-local exit (GH #53)."
         (is (not (null (gethash ga graph-db:*read-snapshots*)))
             "the outer snapshot's own entry must survive its inner one"))
       gc)))
+
+(test as-of-is-refused-on-a-memory-graph
+  "Spec R7: the in-memory backend keeps no version chains, so it has no
+history to travel; refused by reason, before the epoch is even checked."
+  (with-mem-graph (g)
+    (is (eq :no-version-history
+            (handler-case (graph-db:with-as-of ((g) 0) nil)
+              (graph-db:as-of-refused (c)
+                (graph-db:as-of-refused-reason c)))))))

@@ -138,14 +138,32 @@
                      :value-deserializer 'deserialize-edge-head)))
     table))
 
-(defmethod lookup-edge ((id string) &key (graph *graph*))
-  (lookup-edge (read-id-array-from-string id) :graph graph))
+(defmethod lookup-edge ((id string) &key (graph *graph*) as-of
+                                      (if-reaped :error))
+  (lookup-edge (read-id-array-from-string id)
+               :graph graph :as-of as-of :if-reaped if-reaped))
 
-(defmethod lookup-edge ((id array) &key (graph *graph*))
+(defmethod lookup-edge ((id array) &key (graph *graph*) as-of
+                                     (if-reaped :error))
   "Return the edge with the given ID (a 16-byte id array or its string form) in
 GRAPH, or NIL if none.  Returns it regardless of its deleted flag; the
-generated LOOKUP-<type> functions filter deleted edges."
-  (lookup-object id (edge-table graph) *transaction* graph))
+generated LOOKUP-<type> functions filter deleted edges.
+
+:AS-OF EPOCH answers at that epoch under a per-call snapshot (GH #115, spec
+§3.4; see WITH-AS-OF for the refusals); the result is materialised so it is
+safe to READ after the call.  TRAP: never SAVE a copy of an as-of result --
+COPY-NODE registers the archived version as the old node and the save
+archives it over the live head, cutting the chain.  To restore an old
+value, COPY the LIVE node and SETF its slots from what you read."
+  (if as-of
+      (call-with-read-snapshot
+       (lambda ()
+         (let ((e (lookup-object id (edge-table graph) *transaction*
+                                 graph)))
+           (when e (ensure-node-bytes e graph))
+           e))
+       graph :as-of as-of :if-reaped if-reaped)
+      (lookup-object id (edge-table graph) *transaction* graph)))
 
 (defmethod add-to-ve-index ((edge edge) (graph graph) &key unless-present)
   (let ((in-ve-key (make-ve-key :id (to edge) :type-id (type-id edge)))
@@ -385,12 +403,15 @@ graph-class.lisp."
                (when (and edge (written-p edge)
                           (active-edge-p edge :graph graph))
                  (return-from edge-exists-p edge))))
-           index-list))))))
+           index-list
+           ;; Under an as-of snapshot, tombstoned entries too: each id
+           ;; resolves at E (GH #115 spec §3.3).
+           :include-deleted-p (not (null (%as-of-snapshot graph)))))))))
 
 (defun map-edges (fn graph &key collect-p edge-type include-edge-types vertex
                              direction include-deleted-p to-vertex from-vertex
                              exclude-edge-types (include-subclasses-p t)
-                             (record-reads t))
+                             (record-reads t) as-of (if-reaped :error))
   "Call FN on edges of GRAPH.
 
 Narrow the set with :EDGE-TYPE (a single type name or numeric type-id) and/or
@@ -413,7 +434,29 @@ walks the raw edge lhash, which reads LIVE edge versions and so BYPASSES MVCC
 snapshot isolation -- intended for back-end / admin passes run while the graph is
 quiescent.  Every typed or adjacency scan goes through an index + LOOKUP-EDGE and
 is snapshot-consistent.  (Generic, type-0 edges appear only in this untyped scan;
-typed/adjacency scans skip the 0 sentinel, as they always have.)"
+typed/adjacency scans skip the 0 sentinel, as they always have.)  Under an as-of
+snapshot (WITH-AS-OF, GH #115) the untyped scan is refused.
+
+:AS-OF EPOCH runs the whole call under a fresh per-call snapshot of GRAPH
+at EPOCH (GH #115, spec §3.4); an enclosing as-of extent on GRAPH at the
+same epoch is inherited instead.  :IF-REAPED as CALL-WITH-READ-SNAPSHOT.
+Under an as-of snapshot a typed scan visits every entry ever indexed under
+the type, tombstones included, and under the default :IF-REAPED :ERROR it
+signals VERSION-REAPED-ERROR for any visited node whose version at EPOCH
+was reaped; :IF-REAPED :SKIP skips those reads and counts them
+(AS-OF-SKIPPED-COUNT)."
+  (when as-of                           ; GH #115 spec §3.4
+    (return-from map-edges
+      (call-with-read-snapshot
+       (lambda ()
+         (map-edges fn graph :collect-p collect-p :edge-type edge-type
+                    :include-edge-types include-edge-types :vertex vertex
+                    :direction direction :include-deleted-p include-deleted-p
+                    :to-vertex to-vertex :from-vertex from-vertex
+                    :exclude-edge-types exclude-edge-types
+                    :include-subclasses-p include-subclasses-p
+                    :record-reads record-reads))
+       graph :as-of as-of :if-reaped if-reaped)))
   ;; Bind *GRAPH* to GRAPH so the value-deserializer (deserialize-edge-head)
   ;; resolves type-ids against the right schema even when mapping a graph that
   ;; isn't the current *GRAPH* (see the note in MAP-VERTICES).
@@ -442,63 +485,81 @@ typed/adjacency scans skip the 0 sentinel, as they always have.)"
                                               :graph graph)
                        (list-edge-types graph))))
     (with-read-pin (graph) ; retain whatever versions this scan observes
-      (flet ((emit (edge)
-               (when (and edge (written-p edge)
-                          ;; Explicit :GRAPH, not dynamic *GRAPH* --
-                          ;; the wrong-graph pattern (GH #208 unit).
-                          (or include-deleted-p
-                              (active-edge-p edge :graph graph)))
-                 (if collect-p (push (funcall fn edge) result) (funcall fn edge))))
-             (keep-type (tid) (and (plusp tid) (not (member tid excluded)))))
-        (cond
-          ;; a specific endpoint pair -> vev-index per type-id
-          ((and to-vertex from-vertex)
-           (dolist (tid type-ids)
-             (when (keep-type tid)
-               (let* ((vev-key (make-vev-key :in-id (id to-vertex)
-                                             :out-id (id from-vertex)
-                                             :type-id tid))
-                      (il (lookup-vev-index-list vev-key graph)))
-                 (when il
-                   (map-index-list
-                    (lambda (eid) (emit (lookup-edge eid :graph graph))) il))))))
-          ;; a vertex's adjacent edges -> ve-index (in/out) per type-id
-          (vertex
-           (dolist (tid type-ids)
-             (when (keep-type tid)
-               (let* ((ve-key (make-ve-key :id (id vertex) :type-id tid))
-                      (il (cond ((eq direction :out)
-                                 (lookup-ve-out-index-list ve-key graph))
-                                ((eq direction :in)
-                                 (lookup-ve-in-index-list ve-key graph))
-                                (t (error "Unknown direction: ~S" direction)))))
-                 (when il
-                   (map-index-list
-                    (lambda (eid) (emit (lookup-edge eid :graph graph))) il))))))
-          ;; typed, no adjacency -> type-index per type-id
-          (requested
-           (dolist (tid type-ids)
-             (when (keep-type tid)
-               (let ((il (get-type-index-list (edge-index graph) tid)))
-                 (when il
-                   (map-index-list
-                    (lambda (eid) (emit (lookup-edge eid :graph graph))) il))))))
-          ;; fully untyped -> live lhash scan (see NOTE); per-edge exclude
-          (t
-           (map-lhash
-            #'(lambda (pair)
-                (let ((edge (cdr pair)))
-                  (when (and edge (written-p edge)
-                             ;; Explicit :GRAPH -- see EMIT above.
-                             (or include-deleted-p
-                                 (active-edge-p edge :graph graph))
-                             (not (member (type-id edge) excluded)))
-                    (setf (id edge) (car pair))
-                    ;; The deserializer builds these; a side-effect scan never
-                    ;; sees ENSURE-NODE-BYTES (GH #53).
-                    (setf (node-graph edge) graph)
-                    (if collect-p (push (funcall fn edge) result) (funcall fn edge)))))
-            (edge-table graph))))))
+      ;; GH #115 spec §3.3: membership at E is the tombstone walk.  Under
+      ;; as-of each index walk visits tombstoned entries too -- every id
+      ;; resolves at E, and EMIT's filter runs on THAT version.
+      (let ((as-of (%as-of-snapshot graph)))
+        (flet ((emit (edge)
+                 (when (and edge (written-p edge)
+                            ;; Explicit :GRAPH, not dynamic *GRAPH* --
+                            ;; the wrong-graph pattern (GH #208 unit).
+                            (or include-deleted-p
+                                (active-edge-p edge :graph graph)))
+                   (if collect-p
+                       (push (funcall fn edge) result)
+                       (funcall fn edge))))
+               (keep-type (tid)
+                 (and (plusp tid) (not (member tid excluded)))))
+          (cond
+            ;; a specific endpoint pair -> vev-index per type-id
+            ((and to-vertex from-vertex)
+             (dolist (tid type-ids)
+               (when (keep-type tid)
+                 (let* ((vev-key (make-vev-key :in-id (id to-vertex)
+                                               :out-id (id from-vertex)
+                                               :type-id tid))
+                        (il (lookup-vev-index-list vev-key graph)))
+                   (when il
+                     (map-index-list
+                      (lambda (eid) (emit (lookup-edge eid :graph graph)))
+                      il :include-deleted-p (not (null as-of))))))))
+            ;; a vertex's adjacent edges -> ve-index (in/out) per type-id
+            (vertex
+             (dolist (tid type-ids)
+               (when (keep-type tid)
+                 (let* ((ve-key (make-ve-key :id (id vertex) :type-id tid))
+                        (il (cond ((eq direction :out)
+                                   (lookup-ve-out-index-list ve-key graph))
+                                  ((eq direction :in)
+                                   (lookup-ve-in-index-list ve-key graph))
+                                  (t (error "Unknown direction: ~S"
+                                            direction)))))
+                   (when il
+                     (map-index-list
+                      (lambda (eid) (emit (lookup-edge eid :graph graph)))
+                      il :include-deleted-p (not (null as-of))))))))
+            ;; typed, no adjacency -> type-index per type-id
+            (requested
+             (dolist (tid type-ids)
+               (when (keep-type tid)
+                 (let ((il (get-type-index-list (edge-index graph) tid)))
+                   (when il
+                     (map-index-list
+                      (lambda (eid) (emit (lookup-edge eid :graph graph)))
+                      il :include-deleted-p (not (null as-of))))))))
+            ;; fully untyped -> live lhash scan (see NOTE); per-edge
+            ;; exclude.  Refused under an as-of snapshot (GH #115, R6).
+            (t
+             (when as-of
+               (error 'as-of-refused :graph graph
+                                     :epoch (as-of-epoch as-of)
+                                     :reason :untyped-scan))
+             (map-lhash
+              #'(lambda (pair)
+                  (let ((edge (cdr pair)))
+                    (when (and edge (written-p edge)
+                               ;; Explicit :GRAPH -- see EMIT above.
+                               (or include-deleted-p
+                                   (active-edge-p edge :graph graph))
+                               (not (member (type-id edge) excluded)))
+                      (setf (id edge) (car pair))
+                      ;; The deserializer builds these; a side-effect
+                      ;; scan never sees ENSURE-NODE-BYTES (GH #53).
+                      (setf (node-graph edge) graph)
+                      (if collect-p
+                          (push (funcall fn edge) result)
+                          (funcall fn edge)))))
+              (edge-table graph)))))))
     (when collect-p (nreverse result))))
 
 (defmethod outgoing-edges ((vertex vertex) &key (graph *graph*) edge-type

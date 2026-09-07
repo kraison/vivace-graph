@@ -250,6 +250,22 @@
                 #:lookup-vertex
                 #:lookup-edge
                 #:vertex-history
+                #:edge-history               ; GH #115
+                #:node-history               ; GH #115
+                #:with-as-of                 ; GH #115
+                #:latest-epoch
+                #:as-of-refused
+                #:as-of-refused-reason
+                #:as-of-skipped-count
+                #:version-reaped-error
+                #:version-reaped-epoch
+                #:version-reaped-oldest-epoch
+                #:version-reaped-oldest-revision
+                ;; compaction: flags the index pcons the as-of walk
+                ;; must still visit (GH #115 spec §3.3)
+                #:compact-vertices
+                #:compact-edges
+                #:edge-exists-p
                 #:outgoing-edges
                 #:incoming-edges
                 #:traverse
