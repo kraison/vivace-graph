@@ -546,3 +546,77 @@ resolve-in-GRAPH fallback answers it instead of NIL."
       (let ((premise (first (claims-touching b 'rt-claim :host "h3"
                                              :role :subject))))
         (is (= 1 (length (graph-db.rules:dependents-of a premise))))))))
+
+;;; The cross-store fixpoint (S4, GH #333).
+
+(test a-closure-whose-base-lives-in-a-foreign-store-reaches-the-fixpoint
+  "GH #333, spec SS3: the base relation is in B, the closure is derived
+into A; each round evaluates under snapshots and commits on A."
+  (with-two-stores (a b)
+    (with-transaction ((graph-db::transaction-manager b))
+      (dolist (pair '(("a" . "b") ("b" . "c") ("c" . "d")))
+        (make-rt-claim-binary :graph b :subject-namespace :node
+                              :subject-key (car pair) :relation "next"
+                              :object-namespace :node
+                              :object-key (cdr pair)
+                              :producer "seed" :standing :observed)))
+    (write-closure a)
+    (let ((reports (graph-db.rules:run-rules a :scope (list a b))))
+      (is (every (lambda (r)
+                   (eq :derived (graph-db.rules:rule-report-outcome r)))
+                 reports))
+      ;; Round-counted the same way as the single-store chain of the
+      ;; same shape (fixpoint-tests.lisp
+      ;; ROUNDS-COUNT-THE-CHAIN-AND-A-ROUND-0-CLAIM-SURVIVES): round 0
+      ;; is TC-BASE's a-b b-c c-d; round 1's delta gives a-c b-d; round
+      ;; 2's gives a-d; round 3 finds nothing.  4, not 3 -- the delta
+      ;; mechanism is in-memory (RULE-DELTA/2), so committing per round
+      ;; for the cross-store path changes nothing about how many rounds
+      ;; the fixpoint takes (GH #333).
+      (is (= 4 (graph-db.rules:rule-report-rounds
+                (report-named "tc-step" reports))))
+      (is (equal '(("a" . "b") ("a" . "c") ("a" . "d")) (reaches a)))
+      ;; Provenance names the foreign premises by store.
+      (let ((p (graph-db.rules:premises-of
+                a (first (claims-touching a 'rt-claim :node "a"
+                                          :role :subject
+                                          :relation "reaches"))
+                :scope (list a b))))
+        (is (plusp (length p)))))))
+
+(test a-cross-store-refusal-keeps-derived-and-zeroes-the-rest
+  "GH #333: with the cap at 1, round 0 -- TC-BASE's full body over B's
+\"next\" claims -- commits before the cap fires at round 1, since each
+cross-store round commits in its own transaction.  TC-STEP's round 0
+uses an empty delta and derives nothing, so the cap catches it with
+nothing of its own to lose; TC-BASE's round-0 commit stands.  KEPT and
+SWEPT are 0 on every refusal (%REFUSE-STRATUM): the reconcile that
+would set them never runs.  REACHES only ever asks about node \"a\", so
+of round 0's three pairs (a-b, b-c, c-d) it sees the one with \"a\" as
+subject."
+  (with-two-stores (a b)
+    (with-transaction ((graph-db::transaction-manager b))
+      (dolist (pair '(("a" . "b") ("b" . "c") ("c" . "d")))
+        (make-rt-claim-binary :graph b :subject-namespace :node
+                              :subject-key (car pair) :relation "next"
+                              :object-namespace :node
+                              :object-key (cdr pair)
+                              :producer "seed" :standing :observed)))
+    (write-closure a)
+    (let* ((graph-db.rules:*rules-max-rounds* 1)
+           (reports (graph-db.rules:run-rules a :scope (list a b)))
+           (base (report-named "tc-base" reports))
+           (step (report-named "tc-step" reports)))
+      (is (every (lambda (r)
+                   (eq :refused (graph-db.rules:rule-report-outcome r)))
+                 reports))
+      (is (eq :rounds (refusal-tag base)))
+      (is (eq :rounds (refusal-tag step)))
+      (is (search "1" (refusal-text step)))
+      (is (plusp (graph-db.rules:rule-report-derived base)))
+      (is (= 0 (graph-db.rules:rule-report-derived step)))
+      (is (= 0 (+ (graph-db.rules:rule-report-kept base)
+                  (graph-db.rules:rule-report-kept step))))
+      (is (= 0 (+ (graph-db.rules:rule-report-swept base)
+                  (graph-db.rules:rule-report-swept step))))
+      (is (equal '(("a" . "b")) (reaches a))))))
