@@ -474,24 +474,26 @@ gives the stored two -- so the schedule under test is deterministic."
 
 (defparameter *derives-x*
   "(claim ?c rt-claim \"app\" \"web\" \"x\" \"host\" ?h)")
-(defparameter *reads-x*
-  "(claim ?p rt-claim \"app\" \"web\" \"x\" \"host\" ?h)")
-(defparameter *derives-y*
-  "(claim ?c rt-claim \"app\" \"web\" \"y\" \"host\" ?h)")
 (defparameter *reads-y*
   "(claim ?p rt-claim \"app\" \"web\" \"y\" \"host\" ?h)")
+(defparameter *derives-y*
+  "(claim ?c rt-claim \"app\" \"web\" \"y\" \"host\" ?h)")
+(defparameter *reads-runs-not-y*
+  "(claim ?p rt-claim \"host\" ?h \"runs\" \"app\" ?a)
+   (not (claim ?q rt-claim \"app\" ?a \"y\" \"host\" ?h))")
 
 (test run-rules-reports-a-rule-that-no-longer-compiles-and-the-store-opens
   "Spec §6: a rule that fails to compile is reported and skipped, never
-refused at open.  Here a DEF-RULE added after the write closes a cycle
-with a stored rule."
+refused at open.  GH #333: a cycle is a stratum now, not a refusal, so
+this exercises the other refusal a DEF-RULE only meets at RUN-RULES (it
+is never validated at registration): a NOT over its own head relation."
   (with-rules-graph-dir (g dir)
     (seed g)
     (write-rule g :name "a" :version "1" :family "rt-claim"
                 :head *derives-x* :body *reads-y*)
     (write-web-hosts g)
     (graph-db.rules:def-rule "b" :version "1" :family rt-claim
-      :head *derives-y* :body *reads-x*)
+      :head *derives-y* :body *reads-runs-not-y*)
     (unwind-protect
          (progn
            (close-graph g)
@@ -500,14 +502,14 @@ with a stored rule."
                   (let* ((graph-db:*graph* g2)
                          (reports (graph-db.rules:run-rules g2)))
                     (is (= 3 (length reports)))
-                    (is (eq :refused
+                    (is (eq :derived
                             (graph-db.rules:rule-report-outcome
                              (report-named "a" reports))))
-                    (is (eq :rule
-                            (refusal-tag (report-named "a" reports))))
                     (is (eq :refused
                             (graph-db.rules:rule-report-outcome
                              (report-named "b" reports))))
+                    (is (eq :rule
+                            (refusal-tag (report-named "b" reports))))
                     (is (eq :derived
                             (graph-db.rules:rule-report-outcome
                              (report-named "web-hosts" reports))))
@@ -844,3 +846,85 @@ derives two, h1 and h2."
       (is (eq 'rtu-claim (refusal-tag report)))
       (is (search "unique" (refusal-text report) :test #'char-equal))
       (is (null (derived g 'rtu-claim "rtu-hosts"))))))
+
+(test run-rules-orders-a-recursive-stratum-after-its-base-producer
+  "GH #333: a and b derive each other's reads (one stratum) and both
+read z; z-maker must run first, and the stratum's two rules keep input
+order.  Task 4 makes the stratum derive; here only the order is under
+test, so bodies that find nothing are fine."
+  (with-rules-graph (g)
+    (seed g)
+    (write-rule g :name "a" :version "1" :family "rt-claim"
+                :head *head-x* :body *body-y-and-z*)
+    (write-rule g :name "b" :version "1" :family "rt-claim"
+                :head *head-y* :body *body-x*)
+    (write-rule g :name "z-maker" :version "1" :family "rt-claim"
+                :head *head-z* :body *web-hosts-body*)
+    (let ((names (mapcar #'graph-db.rules:rule-report-rule-name
+                         (graph-db.rules:run-rules g))))
+      ;; Stored rules come back in index order, not write order, so
+      ;; only the stratum boundary is asserted.
+      (is (string= "z-maker" (first names)))
+      (is (equal '("a" "b") (sort (copy-list (rest names)) #'string<))))))
+
+;;; Stratified negation orders the strata (GH #333, C2).
+
+(defparameter *head-app-y*
+  "(claim ?c rt-claim \"app\" ?a \"y\" \"host\" ?h)")
+(defparameter *head-app-z*
+  "(claim ?c rt-claim \"app\" ?a \"z\" \"host\" ?h)")
+(defparameter *body-runs-scan-a*
+  "(claim-producer ?p \"scan-a\")
+   (claim ?p rt-claim \"host\" ?h \"runs\" \"app\" ?a)")
+(defparameter *body-runs-not-z*
+  "(claim-producer ?p \"scan-a\")
+   (claim ?p rt-claim \"host\" ?h \"runs\" \"app\" ?a)
+   (not (claim ?q rt-claim \"app\" ?a \"z\" \"host\" ?h))")
+
+(defun stratum-names (strata)
+  "The rule names of each stratum in STRATA, in order."
+  (mapcar (lambda (s)
+            (mapcar (lambda (c)
+                      (graph-db.rules:rule-spec-name
+                       (graph-db.rules:compiled-rule-spec c)))
+                    s))
+          strata))
+
+(test a-negating-stratum-runs-after-the-stratum-it-negates
+  "C2: NOT-Z reads \"z\" only under a NOT, so unless %STRATUM-READS
+counts the negative reads the two strata are unordered and input order
+decides.  Z-MAKER must run first: NOT-Z derives a \"y\" for every app
+with no \"z\", and Z-MAKER gives both of SEED's SCAN-A apps one, so
+ONE run must leave \"y\" empty."
+  (with-rules-graph (g)
+    (seed g)
+    (write-rule g :name "z-maker" :version "1" :family "rt-claim"
+                :head *head-app-z* :body *body-runs-scan-a*)
+    (write-rule g :name "not-z" :version "1" :family "rt-claim"
+                :head *head-app-y* :body *body-runs-not-z*)
+    ;; Deterministic whatever order the rule index answers in: the
+    ;; negating stratum is ordered second even when handed first.
+    (let ((zm (graph-db.rules:compile-rule g "z-maker"))
+          (nz (graph-db.rules:compile-rule g "not-z")))
+      (is (equal '("z")
+                 (graph-db.rules:compiled-rule-negative-reads nz)))
+      (is (equal '(("z-maker") ("not-z"))
+                 (stratum-names
+                  (graph-db.rules::%strata-order (list nz zm))))))
+    (is (equal '("z-maker" "not-z")
+               (mapcar #'graph-db.rules:rule-report-rule-name
+                       (graph-db.rules:run-rules g))))
+    (is (= 2 (length (derived g 'rt-claim "z-maker"))))
+    (is (null (derived g 'rt-claim "not-z")))))
+
+(test a-plain-runs-report-names-its-own-stratum
+  "M1: RULE-REPORT-STRATUM reads the same off the fixpoint path -- the
+rules of this rule's stratum, its own name alone for a rule that
+shares one with nobody."
+  (with-rules-graph (g)
+    (seed g)
+    (let ((report (graph-db.rules:run-rule g (write-web-hosts g))))
+      (is (eq :derived (graph-db.rules:rule-report-outcome report)))
+      (is (equal '("web-hosts")
+                 (graph-db.rules:rule-report-stratum report)))
+      (is (= 1 (graph-db.rules:rule-report-rounds report))))))

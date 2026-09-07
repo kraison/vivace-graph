@@ -59,8 +59,12 @@ store's other rules.  Returns NAME."
   "The DEF-RULE NAME's RULE-SPEC, or NIL."
   (values (gethash name *def-rules*)))
 
-(defun rule-spec-of (thing)
-  "THING as a RULE-SPEC: a RULE record is read into one, a spec passes."
+(defun rule-spec-of (thing &optional graph)
+  "THING as a RULE-SPEC: a RULE record is read into one, a spec passes,
+and a string names a rule of GRAPH's store, else a DEF-RULE, in that
+order -- the same order %RESOLVE-RULE (run.lisp) uses -- so a caller
+with only the name a prior COMPILE-RULE stored can re-compile it
+(GH #333)."
   (etypecase thing
     (rule-spec thing)
     (rule (%make-rule-spec :name (rule-name thing)
@@ -69,7 +73,17 @@ store's other rules.  Returns NAME."
                            :head (rule-head thing) :body (rule-body thing)
                            :extent-policy (rule-extent-policy thing)
                            :enabled (rule-enabled thing)
-                           :source :stored))))
+                           :source :stored))
+    (string
+     (let ((stored (and graph (%graph-declares-p graph 'rule)
+                        (first (graph-db:index-lookup
+                                graph 'rule '(name) thing)))))
+       (cond ((and stored (not (graph-db:deleted-p stored)))
+              (rule-spec-of stored))
+             ((find-def-rule thing))
+             (t (error "No rule named ~S in ~(~S~) or the image."
+                       thing
+                       (and graph (graph-db:graph-name graph)))))))))
 
 (define-condition rule-compile-error (graph-db:constraint-violation)
   ((rule :initarg :rule :reader rule-compile-error-rule)
@@ -92,11 +106,18 @@ CONSTRAINT-VIOLATION, because a RULE write is refused at commit with it
 HEAD-* are the head's argument terms -- a keyword (namespace), a string
 (key or relation), NIL, or a body variable.  VARS is SELECT's variable
 list, PREMISE-VARS the ?c of every body CLAIM/7 goal, READS the
-relations the body reads -- never :ANY, which %CHECK-CYCLE refuses
-before this struct is built."
+relations the body reads -- never :ANY, which COMPILE-RULE refuses
+before this struct is built -- and NEGATIVE-READS the subset of them
+read under a NOT, which orders this rule's stratum after the one
+deriving them (%STRATUM-READS, run.lisp, GH #333).  STRATUM is the
+sorted names of the rules whose head relations are mutually reachable
+with this one's (its own name always), STRATUM-RELATIONS the sorted
+relations they derive; a rule is recursive when a body CLAIM/7 goal has
+an unbound ?c and a relation in STRATUM-RELATIONS (%RECURSIVE-GOAL-P,
+run.lisp, GH #333)."
   spec family relation
   head-c head-sns head-skey head-ons head-okey unary-p
-  vars premise-vars goals reads)
+  vars premise-vars goals reads negative-reads stratum stratum-relations)
 
 ;;; Reading the text
 
@@ -266,6 +287,29 @@ them leaves the relation unbound (ruling P6)."
               (pushnew rel reads :test #'string=)
               (return-from %body-reads :any)))))))
 
+(defun %not-goal-p (goal)
+  "(not G): the guard admits only a full goal as G."
+  (and (consp goal) (symbolp (first goal))
+       (string= (symbol-name (first goal)) "NOT")
+       (= 2 (length goal))))
+
+(defun %negative-reads (goals)
+  "The relations read under a NOT, at any nesting; :ANY when one is
+unbound there (GH #333)."
+  (let ((reads '()))
+    (labels ((walk (goal negated)
+               (cond ((%not-goal-p goal) (walk (second goal) t))
+                     ((and negated (%engine-goal-p goal "CLAIM" 7))
+                      (let ((rel (sixth goal)))
+                        (if (stringp rel)
+                            (pushnew rel reads :test #'string=)
+                            (return-from %negative-reads :any))))
+                     ((and (consp goal) (rest goal))
+                      (dolist (sub (rest goal))
+                        (when (consp sub) (walk sub negated)))))))
+      (dolist (goal goals) (walk goal nil)))
+    (nreverse reads)))
+
 (defun %premise-vars (goals)
   (loop for goal in goals
         when (and (%engine-goal-p goal "CLAIM" 7)
@@ -322,63 +366,79 @@ RUN-RULES is what filters by family (ruling P8)."
                 when (rule-spec-enabled spec) collect spec)))
 
 (defun %edges (spec graph)
-  "SPEC's (head-relation . reads) for the cycle graph, or NIL when the
-spec's text does not guard -- such a rule cannot run and constrains
-nothing.  Only the FIRST goal is read as the head: a DEF-RULE is never
-validated at registration, so a two-goal head there contributes its
-second goal as a read, which over-constrains rather than under-."
+  "SPEC's (head-relation . reads) for the dependency graph, or NIL when
+the spec's text does not guard -- such a rule cannot run and constrains
+nothing.  READS is what the body reads positively AND under a NOT: a
+negated read is a dependency like any other, so a cycle another rule
+closes only through negation reaches the SCC search here exactly as
+this rule's own does (COMPILE-RULE, GH #333).  :ANY on either side
+makes the whole edge :ANY, which %STRATA reads as an isolated node.
+Only the FIRST goal is read as the head: a DEF-RULE is never validated
+at registration, so a two-goal head there contributes its second goal
+as a read, which over-constrains rather than under-."
   (handler-case
       (multiple-value-bind (vars goals) (%guard spec graph)
         (declare (ignore vars))
         (let ((head (first goals)))
           (when (%engine-goal-p head "CLAIM" 7)
-            (cons (sixth head) (%body-reads (rest goals))))))
+            (let ((reads (%body-reads (rest goals)))
+                  (negative (%negative-reads (rest goals))))
+              (cons (sixth head)
+                    (if (or (eq reads :any) (eq negative :any))
+                        :any
+                        (union reads negative :test #'string=)))))))
     (rule-compile-error () nil)))
 
-(defun %check-cycle (spec relation reads graph others)
-  "Refuse when SPEC's head RELATION reaches itself through READS and
-OTHERS' edges (spec §6), naming the path.  :ANY reads every head
-relation in scope, the rule's own included (ruling P6)."
-  (let* ((edges (list (cons relation reads)))
-         (heads (list relation)))
+(defun %strata (relation reads graph others)
+  "The stratum RELATION belongs to over READS and OTHERS' edges (spec
+§2): (values RULE-NAMES RELATIONS), both sorted.  The strongly
+connected component of the relation graph, by a DFS from RELATION
+forward and one over the reversed edges; the stratum's rules are every
+rule in OTHERS deriving a component relation, plus this one."
+  (let ((edges (list (cons relation reads)))
+        (derivers (list (cons relation nil))))
     (dolist (o others)
       (let ((e (%edges o graph)))
         (when e
           (push e edges)
-          (pushnew (car e) heads :test #'string=))))
-    (labels ((successors (rel)
-               (let ((out '()))
-                 (dolist (e edges out)
-                   (when (string= (car e) rel)
-                     (setf out (union out (if (eq (cdr e) :any)
-                                              heads
-                                              (cdr e))
-                                      :test #'string=))))))
-             (path-to (target from seen)
-               (dolist (next (successors from))
-                 (cond ((string= next target)
-                        (return (list next)))
-                       ((not (member next seen :test #'string=))
-                        (let ((p (path-to target next (cons next seen))))
-                          (when p (return (cons next p)))))))))
-      (when (eq reads :any)
-        (%refuse spec "a body claim/7 goal leaves its relation unbound, ~
-so the rule reads every relation, its own ~S included: bind the relation"
-                 relation))
-      (let ((path (path-to relation relation (list relation))))
-        (when path
-          (%refuse spec "deriving ~S closes a cycle: ~{~A~^ -> ~}"
-                   relation (cons relation path)))))))
+          (push (cons (car e) (rule-spec-name o)) derivers))))
+    (labels (;; An :ANY edge contributes none here: an unvalidated
+             ;; other rule is an isolated node for stratification and
+             ;; is refused on its own compile, not here (GH #333).
+             (succ (rel)
+               (loop for e in edges when (string= (car e) rel)
+                     append (if (eq (cdr e) :any) '() (cdr e))))
+             (pred (rel)
+               (loop for e in edges
+                     when (and (listp (cdr e))
+                               (member rel (cdr e) :test #'string=))
+                       collect (car e)))
+             (reach (start next)
+               (let ((seen (list start)) (stack (list start)))
+                 (loop while stack do
+                   (dolist (n (funcall next (pop stack)))
+                     (unless (member n seen :test #'string=)
+                       (push n seen) (push n stack))))
+                 seen)))
+      (let* ((component (intersection (reach relation #'succ)
+                                      (reach relation #'pred)
+                                      :test #'string=))
+             (names (loop for (rel . name) in derivers
+                          when (and name
+                                    (member rel component :test #'string=))
+                            collect name)))
+        (values (sort (copy-list names) #'string<)
+                (sort (copy-list component) #'string<))))))
 
 (defun compile-rule (graph rule &key (others nil others-p))
-  "RULE (a RULE record or a RULE-SPEC) compiled against GRAPH's schema
-and the rules in scope (spec §6): head and body through the guard, the
-head checked as one claim/7 pattern, claim-producer generators moved
-to the front (P5), recursion refused over every rule in OTHERS --
-default RULES-IN-SCOPE minus this one -- with the cycle named.
-=> COMPILED-RULE; signals RULE-COMPILE-ERROR.  A name held by both a
-stored rule and a DEF-RULE is a collision, refused."
-  (let* ((spec (rule-spec-of rule))
+  "RULE (a RULE record, a RULE-SPEC, or a stored rule's name) compiled
+against GRAPH's schema and the rules in scope (spec §6): head and body
+through the guard, the head checked as one claim/7 pattern,
+claim-producer generators moved to the front (P5), STRATUM computed
+over every rule in OTHERS -- default RULES-IN-SCOPE minus this one
+(GH #333).  => COMPILED-RULE; signals RULE-COMPILE-ERROR.  A name held
+by both a stored rule and a DEF-RULE is a collision, refused."
+  (let* ((spec (rule-spec-of rule graph))
          (name (rule-spec-name spec))
          (others (remove name
                          (if others-p others (rules-in-scope graph))
@@ -407,13 +467,39 @@ stored rule and a DEF-RULE is a collision, refused."
                                                (getf parsed :head-skey)
                                                (getf parsed :head-ons)
                                                (getf parsed :head-okey)))))
-          (%check-cycle spec (getf parsed :relation) reads graph others)
-          (apply #'%make-compiled-rule
-                 :spec spec
-                 :vars (remove-duplicates (append head-vars premise-vars))
-                 :premise-vars premise-vars
-                 :goals body :reads reads
-                 parsed))))))
+          (when (eq reads :any)
+            (%refuse spec "a body claim/7 goal leaves its relation ~
+unbound, so the rule reads every relation, its own ~S included: bind ~
+the relation" (getf parsed :relation)))
+          (let ((negative (%negative-reads body)))
+            (when (eq negative :any)
+              (%refuse spec "a negated claim/7 goal leaves its relation ~
+unbound: bind the relation"))
+            (multiple-value-bind (stratum relations)
+                ;; A NOT's target joins the SCC search, here for this
+                ;; rule and in %EDGES for every other, so a cycle
+                ;; closed only through negation is detected wherever
+                ;; it runs (GH #333: that is what makes it
+                ;; unstratifiable, and the refusal below names it).
+                (%strata (getf parsed :relation)
+                         (union reads negative :test #'string=)
+                         graph others)
+              (let ((bad (intersection negative relations
+                                       :test #'string=)))
+                (when bad
+                  (%refuse spec "negation over the rule's own stratum ~
+~{~A~^, ~}: a NOT may read only an earlier stratum" bad)))
+              (apply #'%make-compiled-rule
+                     :spec spec
+                     :vars (remove-duplicates
+                            (append head-vars premise-vars))
+                     :premise-vars premise-vars
+                     :goals body :reads reads
+                     :negative-reads negative
+                     :stratum (sort (cons name (copy-list stratum))
+                                    #'string<)
+                     :stratum-relations relations
+                     parsed))))))))
 
 ;;; The write validator (ruling P3)
 

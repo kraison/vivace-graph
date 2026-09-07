@@ -399,3 +399,63 @@ query already gets, rather than a refusal the caller opted out of."
       (select (:max-inferences 1000) (?c ?p) (claim-producer ?c ?p)))
     (is (= 2 (select (:count t :max-inferences 1000) (?c)
                (claim-producer ?c "scan-b"))))))
+
+(test rule-delta-generates-the-bound-delta-and-nothing-else
+  "GH #333: the fixpoint's internal generator.  Unbound *RULE-DELTA*
+answers nothing; bound, it yields exactly the listed claims of the
+named relation, and filters a bound ?c by membership."
+  (with-rules-graph (g)
+    (seed g)
+    (let* ((runs (claims-touching g 'rt-claim :host "h1" :role :subject
+                                  :relation "runs"))
+           (web (find "web" runs :key #'claim-object-key :test #'string=))
+           (table (make-hash-table :test 'equal)))
+      (is (= 2 (length runs)))
+      (setf (gethash "runs" table) (list web))
+      (is (null (select-flat (?c) (graph-db::rule-delta ?c "runs"))))
+      (let ((graph-db:*rule-delta* table))
+        (is (equal (list web)
+                   (select-flat (?c) (graph-db::rule-delta ?c "runs"))))
+        (is (null (select-flat (?c) (graph-db::rule-delta ?c "other"))))
+        ;; A bound ?c is a membership test: web is in the delta, db not.
+        (is (= 1 (select-count ()
+                   (claim ?c rt-claim "host" "h1" "runs" "app" "web")
+                   (graph-db::rule-delta ?c "runs"))))
+        (is (= 0 (select-count ()
+                   (claim ?c rt-claim "host" "h1" "runs" "app" "db")
+                   (graph-db::rule-delta ?c "runs"))))
+        ;; Composes with claim/7 as a filter: the delta claim's endpoints.
+        (is (equal '("web")
+                   (select-flat (?a)
+                     (graph-db::rule-delta ?c "runs")
+                     (claim ?c rt-claim "host" "h1" "runs" "app" ?a))))))))
+
+(test the-exclusion-is-scoped-to-the-producers-own-relation
+  "M3 (GH #333): *CLAIM-EXCLUDE-PRODUCERS* holds (producer . relation)
+pairs, so a fixpoint round that must not answer from its producer's
+\"runs\" claims still reads that same producer's claims of every OTHER
+relation -- the DERIVATION records a body may join on among them.
+SEED gives \"scan-a\" two \"runs\" claims and two \"version\" ones."
+  (with-rules-graph (g)
+    (seed g)
+    (is (= 4 (select-count (?c) (claim-producer ?c "scan-a"))))
+    (let ((graph-db:*claim-exclude-producers*
+            (list (cons "scan-a" "runs"))))
+      ;; The generator drops the excluded relation and keeps the rest.
+      (is (equal '("version" "version")
+                 (select-flat (?r)
+                   (claim-producer ?c "scan-a")
+                   (claim-relation ?c ?r))))
+      ;; So does the subject-relation route.
+      (is (null (select-flat (?a)
+                  (claim ?p rt-claim "host" "h1" "runs" "app" ?a))))
+      (is (equal '("1" "2")
+                 (sort (select-flat (?v)
+                         (claim ?p rtt-claim "app" "web" "version"
+                                "ver" ?v))
+                       #'string<))))
+    ;; Control: unbound, the same three reads answer in full.
+    (is (equal '("db" "web")
+               (sort (select-flat (?a)
+                       (claim ?p rt-claim "host" "h1" "runs" "app" ?a))
+                     #'string<)))))

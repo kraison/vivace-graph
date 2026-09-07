@@ -479,6 +479,18 @@
            #:compile-body
            #:args
            #:*prolog-global-functors*
+           ;; GH #333: the fixpoint's delta, bound by RUN-RULES around
+           ;; a recursive stratum for RULE-DELTA/2 to generate over.
+           #:*rule-delta*
+           ;; GH #333: producers a fixpoint round's CLAIM/7 must not
+           ;; answer from, bound by %RUN-STRATUM around every round.
+           #:*claim-exclude-producers*
+           ;; GH #333, C1: a fixpoint run's own derivation, indexed
+           ;; like CLAIM/7's routes so a rule with more than one
+           ;; recursive goal still sees its other goal's answers.
+           #:derived-index #:make-derived-index #:derived-index-by-subject
+           #:derived-index-by-object #:derived-index-all
+           #:*claim-derived-this-run*
            #:deref-exp
            #:unify
            #:select

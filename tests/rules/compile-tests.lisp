@@ -12,10 +12,15 @@
   "(claim ?c rt-claim \"app\" \"web\" \"x\" \"host\" ?h)")
 (defparameter *head-y*
   "(claim ?c rt-claim \"app\" \"web\" \"y\" \"host\" ?h)")
+(defparameter *head-z*
+  "(claim ?c rt-claim \"app\" \"web\" \"z\" \"host\" ?h)")
 (defparameter *body-x*
   "(claim ?p rt-claim \"app\" \"web\" \"x\" \"host\" ?h)")
 (defparameter *body-y*
   "(claim ?p rt-claim \"app\" \"web\" \"y\" \"host\" ?h)")
+(defparameter *body-y-and-z*
+  "(claim ?p rt-claim \"app\" \"web\" \"y\" \"host\" ?h)
+   (claim ?q rt-claim \"app\" \"web\" \"z\" \"host\" ?h)")
 (defparameter *body-z*
   "(claim ?p rt-claim \"app\" \"web\" \"z\" \"host\" ?h)")
 
@@ -133,39 +138,57 @@
   (refuses "empty" :name "r" :version "1" :family "rt-claim"
            :head *web-hosts-head* :body "   "))
 
-(test a-rule-that-reads-its-own-relation-is-refused
-  (refuses "cycle" :name "r" :version "1" :family "rt-claim"
-           :head *head-runs* :body *web-hosts-body*)
-  ;; An unbound relation reads everything, its own included (P6).
+(test a-rule-that-reads-its-own-relation-compiles-as-its-own-stratum
+  "GH #333: recursion is a stratum, not a refusal; an unbound relation
+still reads everything and is refused (P6)."
+  (with-rules-graph (g)
+    (let ((c (graph-db.rules:compile-rule
+              g (graph-db.rules::%make-rule-spec
+                 :name "r" :version "1" :family "rt-claim"
+                 :head *head-runs* :body *web-hosts-body*
+                 :extent-policy :premises :enabled t :source :stored))))
+      (is (equal '("r") (graph-db.rules:compiled-rule-stratum c)))
+      (is (equal '("runs")
+                 (graph-db.rules:compiled-rule-stratum-relations c)))))
+  ;; A separate graph: WITH-RULES-GRAPH and REFUSES both open one under
+  ;; *GRAPH-NAME*, and only one may be open at a time (GH #169, #209).
   (refuses "bind the relation" :name "r" :version "1" :family "rt-claim"
            :head *web-hosts-head* :body *body-relation-var*))
 
-(test a-cycle-across-two-rules-is-refused-and-named
+(test a-cycle-across-two-rules-is-one-stratum
+  "GH #333: two rules deriving each other's reads share a stratum,
+whichever is written first; a third reading elsewhere is its own."
   (with-rules-graph (g)
     (write-rule g :name "a" :version "1" :family "rt-claim"
                 :head *head-x* :body *body-y*)
-    (let ((c (handler-case
-                 (progn
-                   (write-rule g :name "b" :version "1"
-                               :family "rt-claim"
-                               :head *head-y* :body *body-x*)
-                   nil)
-               (graph-db.rules:rule-compile-error (c) c))))
-      (is-true c)
-      (when c
-        (is (search "x" (graph-db.rules:rule-compile-error-reason c)
-                    :test #'char-equal))
-        (is (search "y" (graph-db.rules:rule-compile-error-reason c)
-                    :test #'char-equal))))
-    ;; The refused write left nothing behind.
-    (is (null (graph-db:index-lookup g 'graph-db.rules:rule
-                                     '(graph-db.rules::name) "b")))
-    ;; Control: b reading a third relation is not a cycle.
-    (finishes
-      (write-rule g :name "b" :version "1" :family "rt-claim"
-                  :head *head-y* :body *body-z*))))
+    (write-rule g :name "b" :version "1" :family "rt-claim"
+                :head *head-y* :body *body-x*)
+    (write-rule g :name "c" :version "1" :family "rt-claim"
+                :head *head-y* :body *body-z*)
+    (let ((a (graph-db.rules:compile-rule g "a"))
+          (c (graph-db.rules:compile-rule g "c")))
+      (is (equal '("a" "b" "c") (graph-db.rules:compiled-rule-stratum a)))
+      (is (equal '("x" "y")
+                 (graph-db.rules:compiled-rule-stratum-relations a)))
+      ;; c derives y too, so it is in the stratum by relation, not by
+      ;; its own reads.
+      (is (equal '("a" "b" "c") (graph-db.rules:compiled-rule-stratum c))))))
 
-(test a-def-rule-joins-the-cycle-graph-and-collides-by-name
+(test compile-rule-resolves-a-def-rule-by-name
+  "GH #333: RULE-SPEC-OF's string branch checks the store before the
+image, like %RESOLVE-RULE (run.lisp); a name might name only a
+def-rule."
+  (with-rules-graph (g)
+    (graph-db.rules:def-rule "only-in-image" :version "1"
+      :family rt-claim :head *head-y* :body *body-x*)
+    (unwind-protect
+         (let ((c (graph-db.rules:compile-rule g "only-in-image")))
+           (is (eq :def-rule
+                   (graph-db.rules::rule-spec-source
+                    (graph-db.rules:compiled-rule-spec c)))))
+      (graph-db.rules:undef-rule "only-in-image"))))
+
+(test a-def-rule-collides-by-name
   (with-rules-graph (g)
     (graph-db.rules:def-rule "b" :version "1" :family rt-claim
       :head *head-y* :body *body-x*)
@@ -173,9 +196,6 @@
          (progn
            (is (graph-db.rules:rule-spec-p
                 (graph-db.rules:find-def-rule "b")))
-           (signals graph-db.rules:rule-compile-error
-             (write-rule g :name "a" :version "1" :family "rt-claim"
-                         :head *head-x* :body *body-y*))
            ;; Same name as a def-rule: a collision, whatever the text.
            (signals graph-db.rules:rule-compile-error
              (write-rule g :name "b" :version "1" :family "rt-claim"
@@ -218,23 +238,12 @@
              (goals (graph-db.rules::compiled-rule-goals d)))
         (is (string= "CLAIM" (symbol-name (first (first goals)))))))))
 
-(test two-mutually-cyclic-rules-in-one-transaction-are-refused
-  "The create-through-the-view branch of %STORED-RULES: neither record
-is committed, so only VIEW-WRITES can show one rule the other."
+(test two-mutually-recursive-rules-in-one-transaction-share-a-stratum
+  "GH #333: the create-through-the-view branch of %STORED-RULES --
+neither record is committed, so only VIEW-WRITES can show one rule the
+other -- lets each rule see the other for stratification, so both
+commit into one stratum rather than refusing."
   (with-rules-graph (g)
-    (signals graph-db.rules:rule-compile-error
-      (with-transaction ((graph-db::transaction-manager g))
-        (graph-db.rules:make-rule :graph g :name "a" :version "1"
-                                  :family "rt-claim"
-                                  :head *head-x* :body *body-y*)
-        (graph-db.rules:make-rule :graph g :name "b" :version "1"
-                                  :family "rt-claim"
-                                  :head *head-y* :body *body-x*)))
-    (is (null (graph-db:index-lookup g 'graph-db.rules:rule
-                                     '(graph-db.rules::name) "a")))
-    (is (null (graph-db:index-lookup g 'graph-db.rules:rule
-                                     '(graph-db.rules::name) "b")))
-    ;; Control: the same pair with b reading a third relation commits.
     (finishes
       (with-transaction ((graph-db::transaction-manager g))
         (graph-db.rules:make-rule :graph g :name "a" :version "1"
@@ -242,8 +251,99 @@ is committed, so only VIEW-WRITES can show one rule the other."
                                   :head *head-x* :body *body-y*)
         (graph-db.rules:make-rule :graph g :name "b" :version "1"
                                   :family "rt-claim"
+                                  :head *head-y* :body *body-x*)))
+    (is (equal '("a" "b")
+               (graph-db.rules:compiled-rule-stratum
+                (graph-db.rules:compile-rule g "a"))))
+    ;; Control: the same pair with b reading a third relation commits
+    ;; as two separate strata.
+    (finishes
+      (with-transaction ((graph-db::transaction-manager g))
+        (graph-db.rules:make-rule :graph g :name "c" :version "1"
+                                  :family "rt-claim"
+                                  :head *head-x* :body *body-y*)
+        (graph-db.rules:make-rule :graph g :name "d" :version "1"
+                                  :family "rt-claim"
                                   :head *head-y* :body *body-z*)))
-    (is (= 2 (length (graph-db:map-vertices #'identity g
+    (is (= 4 (length (graph-db:map-vertices #'identity g
                                             :vertex-type
                                             'graph-db.rules:rule
                                             :collect-p t))))))
+
+(defparameter *body-not-x*
+  "(claim ?p rt-claim \"host\" ?h \"runs\" \"app\" ?a)
+   (not (claim ?q rt-claim \"app\" ?a \"x\" \"host\" ?h))")
+(defparameter *body-not-y*
+  "(claim ?p rt-claim \"host\" ?h \"runs\" \"app\" ?a)
+   (not (claim ?q rt-claim \"app\" ?a \"y\" \"host\" ?h))")
+(defparameter *body-not-z*
+  "(claim ?p rt-claim \"host\" ?h \"runs\" \"app\" ?a)
+   (not (claim ?q rt-claim \"app\" ?a \"z\" \"host\" ?h))")
+
+(test negation-over-the-rules-own-stratum-is-refused
+  "GH #333: a NOT whose goal reads a relation the rule's stratum derives
+has no fixpoint; refused naming the relation."
+  (with-rules-graph (g)
+    (write-rule g :name "a" :version "1" :family "rt-claim"
+                :head *head-x* :body *body-y*)
+    (let ((c (handler-case
+                 (progn (write-rule g :name "b" :version "1"
+                                    :family "rt-claim"
+                                    :head *head-y* :body *body-not-x*)
+                        nil)
+               (graph-db.rules:rule-compile-error (c) c))))
+      (is-true c)
+      (when c
+        (is (search "negation over the rule's own stratum"
+                    (graph-db.rules:rule-compile-error-reason c)))
+        (is (search "x" (graph-db.rules:rule-compile-error-reason c)))))))
+
+(test negation-over-an-earlier-stratum-compiles
+  (with-rules-graph (g)
+    (write-rule g :name "z-maker" :version "1" :family "rt-claim"
+                :head *head-z* :body *web-hosts-body*)
+    (finishes
+      (write-rule g :name "b" :version "1" :family "rt-claim"
+                  :head *head-y* :body *body-not-z*))
+    (is (equal '("b") (graph-db.rules:compiled-rule-stratum
+                       (graph-db.rules:compile-rule g "b"))))))
+
+(test another-rules-negated-read-joins-the-dependency-graph
+  "GH #333: %EDGES hands every OTHER rule's negated reads to the SCC
+search, exactly as COMPILE-RULE hands a rule its own -- so the cycle
+x -> y -> x that N closes only through its NOT is one stratum, not two,
+and A knows it is in it.  N is a def-rule here because a stored rule
+closing that cycle is refused at write, while a def-rule is never
+validated at registration."
+  (with-rules-graph (g)
+    (write-rule g :name "a" :version "1" :family "rt-claim"
+                :head *head-x* :body *body-y*)
+    (graph-db.rules:def-rule "n" :version "1" :family rt-claim
+      :head *head-y* :body *body-not-x*)
+    (unwind-protect
+         (let ((a (graph-db.rules:compile-rule g "a")))
+           (is (equal '("a" "n")
+                      (graph-db.rules:compiled-rule-stratum a)))
+           (is (equal '("x" "y")
+                      (graph-db.rules:compiled-rule-stratum-relations
+                       a)))
+           ;; N is the unstratifiable one, and its own compile says so.
+           (let ((c (handler-case
+                        (progn (graph-db.rules:compile-rule g "n") nil)
+                      (graph-db.rules:rule-compile-error (c) c))))
+             (is-true c)
+             (when c
+               (is (search "negation over the rule's own stratum"
+                           (graph-db.rules:rule-compile-error-reason
+                            c))))))
+      (graph-db.rules:undef-rule "n"))))
+
+(defparameter *body-not-unbound*
+  "(claim ?p rt-claim \"host\" ?h \"runs\" \"app\" ?a)
+   (not (claim ?q rt-claim \"app\" ?a ?r \"host\" ?h))")
+
+(test a-negated-unbound-relation-is-refused
+  "GH #333: a NOT's relation left unbound reads everything there too
+(P6), the same refusal as a positive :ANY read."
+  (refuses "bind the relation" :name "r" :version "1" :family "rt-claim"
+           :head *head-x* :body *body-not-unbound*))

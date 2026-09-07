@@ -26,15 +26,18 @@
    ;; compiling (spec §6)
    #:compile-rule #:compiled-rule #:compiled-rule-p #:compiled-rule-spec
    #:compiled-rule-relation #:compiled-rule-reads
+   #:compiled-rule-negative-reads
+   #:compiled-rule-stratum #:compiled-rule-stratum-relations
    #:rule-compile-error #:rule-compile-error-rule
    #:rule-compile-error-reason
    ;; running (spec §7)
    #:run-rule #:run-rules
    #:*rules-max-inferences* #:*rules-timeout* #:*rules-max-solutions*
+   #:*rules-max-rounds*
    #:rule-report #:rule-report-p #:rule-report-rule-name
    #:rule-report-version #:rule-report-outcome #:rule-report-derived
    #:rule-report-kept #:rule-report-swept #:rule-report-disjoint-premises
    #:rule-report-refusals #:rule-report-inferences
-   #:rule-report-elapsed
+   #:rule-report-elapsed #:rule-report-rounds #:rule-report-stratum
    ;; provenance (spec §9)
    #:premises-of #:dependents-of))

@@ -102,11 +102,13 @@ afterwards, so a rule can name only what a guarded query can name.
   is `rule-compile-error` naming the head.
 - The body is one or more goals. Effects are off: a body that names a
   `:write`, `:eval` or `:io` functor is refused by the guard as today.
-- **Recursion is refused** until #122: the compiler builds the graph
-  from each rule's head relation to the relations its body's `claim/7`
-  goals read, over every enabled rule in the store plus the `def-rule`
-  registry, and refuses a rule that closes a cycle, naming the cycle.
-  A rule that reads its own head relation is the one-node case.
+- **Recursion is a stratum** since GH #333: see
+  `2026-09-06-recursive-rules-fixpoint-design.md`; what is refused is
+  unstratified negation and an unbound relation. The compiler builds
+  the graph from each rule's head relation to the relations its body's
+  `claim/7` goals read, over every enabled rule in the store plus the
+  `def-rule` registry. A rule that reads its own head relation is the
+  one-node case.
 - Compilation runs on `open-graph` for every stored rule (a rule that
   fails to compile is logged and disabled, never refused at open, so a
   store with one bad rule still opens) and on every rule write.
@@ -216,11 +218,12 @@ FiveAM system `graph-db/rules-test`, on-disk stores, subprocess only:
 
 ## 12. Out of scope
 
-Tabling and recursive rules (#122; slice 4 follows it); incremental
-re-derivation on premise commit (kraison/blackboard#5); a rule editor
-in the GUI; rules over vertex slots that are not claims (a body may
-read them with the schema functors, but only claims are derived);
-negation as failure beyond what the engine's `not/1` already offers.
+Tabling for `select` (#122); recursive rules are slice 4 (#333);
+incremental re-derivation on premise commit (kraison/blackboard#5); a
+rule editor in the GUI; rules over vertex slots that are not claims (a
+body may read them with the schema functors, but only claims are
+derived); negation as failure beyond what the engine's `not/1` already
+offers.
 
 ## 13. Dependencies and findings
 
