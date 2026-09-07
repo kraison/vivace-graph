@@ -94,6 +94,22 @@ between releases; cutting a release renames it to the new version and dates it.
   scope inside one outright, as an operator error rather than a report.
   `docs/rules.md`.
 
+- **Recursive rules** (#333, Phase 3 unit 1 of #122): a rule may read
+  its own head relation. `compile-rule` computes strata (SCCs of the
+  relation dependency graph) instead of refusing a cycle, and refuses
+  only unstratified negation and an unbound relation; `run-rules`
+  runs a recursive stratum to a semi-naive fixpoint -- rounds over the
+  previous round's new claims through the internal `rule-delta/2`
+  generator, withheld from free text -- and sweeps once at the
+  fixpoint. A round's `claim/7` reads exclude the stratum's own
+  producers, round 0 included, so the fixpoint recomputes the
+  derivation from scratch rather than reading a previous run's own
+  output as a premise; what that exclusion removes, an index of the
+  run's own derivation so far restores to every recursive goal, not
+  only the one the delta feeds. `rule-report` gains `rounds` and
+  `stratum`; `*rules-max-rounds*` caps a stratum. Single-store strata
+  are one transaction; cross-store strata commit per round.
+
 - **`graph-db/query`, a web-free subsystem for guarded queries** (#322):
   the JSON pattern DSL moves out of the `graph-db` web system and the
   free-text Prolog guard moves out of `graph-db/gui`, both into a
