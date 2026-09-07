@@ -95,3 +95,23 @@ an unknown family signals as CLAIMS-TOUCHING does."
     (signals unknown-claim-family (claim-namespaces g 'no-such-family))
     (is (equal '(:ns) (claim-namespaces g 'ct-claim))
         "control: the same call without the axis answers")))
+
+(test vocabulary-under-an-as-of-extent-confirms-names-at-that-epoch
+  "Spec §4.5, R7: an open WITH-AS-OF extent is not refused; index
+membership is live, so a claim created after E still has an entry, but
+it resolves to nothing at E and its name is not listed.  The same call
+outside the extent lists it (control)."
+  (with-claim-graph (g)
+    (with-transaction () (%ns-u :ns "a"))
+    (let ((e (graph-db:latest-epoch g)))
+      (with-transaction () (%ns-u :later "z"))
+      (is (equal '(:later :ns) (claim-namespaces g 'ct-claim)) "control")
+      (graph-db:with-as-of ((g) e)
+        (is (equal '(:ns) (claim-namespaces g 'ct-claim))
+            "the entry is live, the claim is absent at E: dropped")
+        (is (equal '(("r" . 2)) (claim-relations g 'ct-claim :counts t))
+            "counts are entry counts, the documented live-membership
+bound; :current t resolves")
+        (is (equal '(("r" . 1))
+                   (claim-relations g 'ct-claim :counts t :current t))
+            "under :current each entry is resolved; the absent one drops")))))
