@@ -129,8 +129,9 @@ would loop; the fixpoint terminates."
 the identity set equals what a full re-evaluation each round gives.
 Naive mode is only a valid reference here because it runs SECOND, over
 a closure the delta-based run already committed: it reads the
-relation directly rather than through RULE-DELTA/2, so on a from-
-scratch run it would only ever see round 0's own output (GH #333)."
+relation directly rather than through RULE-DELTA/2, and an index read
+does not see the open transaction's own writes, so on a from-scratch
+single-store run it would see NONE of its own output (GH #333)."
   (with-rules-graph (g)
     (link g "a" "b") (link g "b" "c") (link g "c" "d") (link g "d" "b")
     (write-closure g)
@@ -446,3 +447,45 @@ round alone would report one."
         (is (= 2 (graph-db.rules:rule-report-disjoint-premises step)))
         (is (= 0 (graph-db.rules:rule-report-disjoint-premises
                   base)))))))
+
+(test run-rule-on-a-lone-self-recursive-rule-runs-its-fixpoint
+  "A self-recursive rule's stratum can be the rule alone, and RUN-RULE
+must resolve its members anyway -- a stratum of one is a stratum, and
+%RUN-STRATUM given none dereferences NIL.  With no base rule TC-STEP's
+closure starts from the curator's observed \"reaches\" c-d: round 0
+reaches b-d over next b-c, round 1 a-d over next a-b."
+  (with-rules-graph (g)
+    (link g "a" "b") (link g "b" "c")
+    (observe-reaches g "c" "d")
+    (write-rule g :name "tc-step" :version "1" :family "rt-claim"
+                :head *tc-base-head* :body *tc-step-body*)
+    (let ((report (graph-db.rules:run-rule g "tc-step")))
+      (is (eq :derived (graph-db.rules:rule-report-outcome report)))
+      (is (equal '("tc-step")
+                 (graph-db.rules:rule-report-stratum report)))
+      (is (= 3 (graph-db.rules:rule-report-rounds report)))
+      (is (= 2 (graph-db.rules:rule-report-derived report)))
+      (is (equal '("d") (reaches-from g "a")))
+      (is (equal '("d") (reaches-from g "b"))))))
+
+(test the-round-0-seed-answers-a-retracted-base-fact
+  "The seed matches what CLAIM/7 answers, retracted claims included:
+the goal a variant substitutes has to answer what the goal it replaces
+would, or which of two recursive goals the fixpoint feeds would change
+what the rule means.  A body that wants currency says CLAIM-CURRENT --
+TC-STEP's does, of its \"next\" premise and not of its \"reaches\"
+one, so the retracted c-d still carries the closure."
+  (with-rules-graph (g)
+    (link g "a" "b") (link g "b" "c")
+    (observe-reaches g "c" "d")
+    (with-transaction ((graph-db::transaction-manager g))
+      (retract-claim (first (claims-touching g 'rt-claim :node "c"
+                                             :role :subject
+                                             :relation "reaches"))))
+    (write-rule g :name "tc-step" :version "1" :family "rt-claim"
+                :head *tc-base-head* :body *tc-step-body*)
+    (let ((report (graph-db.rules:run-rule g "tc-step")))
+      (is (eq :derived (graph-db.rules:rule-report-outcome report)))
+      (is (= 2 (graph-db.rules:rule-report-derived report)))
+      (is (equal '("d") (reaches-from g "a")))
+      (is (equal '("d") (reaches-from g "b"))))))

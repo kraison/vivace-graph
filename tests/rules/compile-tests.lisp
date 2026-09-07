@@ -308,6 +308,36 @@ has no fixpoint; refused naming the relation."
     (is (equal '("b") (graph-db.rules:compiled-rule-stratum
                        (graph-db.rules:compile-rule g "b"))))))
 
+(test another-rules-negated-read-joins-the-dependency-graph
+  "GH #333: %EDGES hands every OTHER rule's negated reads to the SCC
+search, exactly as COMPILE-RULE hands a rule its own -- so the cycle
+x -> y -> x that N closes only through its NOT is one stratum, not two,
+and A knows it is in it.  N is a def-rule here because a stored rule
+closing that cycle is refused at write, while a def-rule is never
+validated at registration."
+  (with-rules-graph (g)
+    (write-rule g :name "a" :version "1" :family "rt-claim"
+                :head *head-x* :body *body-y*)
+    (graph-db.rules:def-rule "n" :version "1" :family rt-claim
+      :head *head-y* :body *body-not-x*)
+    (unwind-protect
+         (let ((a (graph-db.rules:compile-rule g "a")))
+           (is (equal '("a" "n")
+                      (graph-db.rules:compiled-rule-stratum a)))
+           (is (equal '("x" "y")
+                      (graph-db.rules:compiled-rule-stratum-relations
+                       a)))
+           ;; N is the unstratifiable one, and its own compile says so.
+           (let ((c (handler-case
+                        (progn (graph-db.rules:compile-rule g "n") nil)
+                      (graph-db.rules:rule-compile-error (c) c))))
+             (is-true c)
+             (when c
+               (is (search "negation over the rule's own stratum"
+                           (graph-db.rules:rule-compile-error-reason
+                            c))))))
+      (graph-db.rules:undef-rule "n"))))
+
 (defparameter *body-not-unbound*
   "(claim ?p rt-claim \"host\" ?h \"runs\" \"app\" ?a)
    (not (claim ?q rt-claim \"app\" ?a ?r \"host\" ?h))")

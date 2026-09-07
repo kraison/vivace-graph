@@ -31,7 +31,7 @@ that refuses and one that answers.
 | R7 | A round's `claim/7` reads of the stratum's own relations exclude the stratum's producers, round 0 included; the delta's bound `?c` is never filtered. | Round 0 must be base-only and every round must recompute the derivation from scratch, or a stale closure from a previous run becomes its own premise. |
 | R8 | The run's own derivation so far (kept claims and this run's constructions alike) is indexed like `claim/7`'s own routes and unioned into a plain read's candidates, and into `claim-producer/2`'s generator for an excluded producer; the delta's bound `?c` is unaffected. | A rule with two or more recursive goals must see every other goal's derivation this run, not only the one goal the delta substitutes into. |
 | R9 | A recursive rule runs its body variants only, every round including round 0; a stratum member with no recursive goal runs its full body once, at round 0. | An empty round-0 delta then answers nothing at no cost, so an unanchored two-goal closure is not refused as cost-unbounded. |
-| R10 | Round 0's delta is **seeded** with the stratum's base facts: every current claim of a stratum relation, in every store in scope, whose producer is none of the stratum's. They are indexed into the run's own derivation too, and are never `existing`, never derived, never swept. | R9's trade: a recursive rule reads the delta where its body reads the relation, so a base fact of that relation — an observation, another producer's claim — would otherwise be a premise for nothing, and the closure would answer over rule-derived facts alone. |
+| R10 | Round 0's delta is **seeded** with the stratum's base facts: every claim of a stratum relation, in every store in scope, whose producer is none of the stratum's — retracted claims included, exactly as `claim/7` answers them, and not indexed into the run's own derivation. They are never `existing`, never derived, never swept. | R9's trade: a recursive rule reads the delta where its body reads the relation, so a base fact of that relation — an observation, another producer's claim — would otherwise be a premise for nothing. The delta goal must answer what the goal it replaces would, or which recursive goal a variant substitutes would change the rule's meaning; and a base fact is not the stratum's output, so no exclusion hides it from a plain read and indexing it would answer it twice. |
 
 ## 2. Strata (compile time, `rules/compile.lisp`)
 
@@ -106,17 +106,21 @@ stratum together, in **rounds**:
   the others, since the delta generator answers for one goal position
   per variant -- an incomplete fixpoint.
 - **Round 0's delta is the stratum's base facts** (R10), not empty:
-  every current claim of a stratum relation, in every store in scope,
-  whose producer is none of the stratum's — found by one typed family
-  walk per family the stratum derives into, per store, per stratum
-  run (`%unbound-claim-scan`'s shape without its cost-unbounded
-  refusal, this being the loop's own walk and not a goal a budget
-  must preempt; a per-relation index would retire it,
+  every claim of a stratum relation, in every store in scope, whose
+  producer is none of the stratum's — retracted ones included, since
+  the goal a variant substitutes must answer what the goal it
+  replaces would. Found by one typed family walk per family the
+  stratum derives into, per store, per stratum run
+  (`%unbound-claim-scan`'s shape without its cost-unbounded refusal,
+  this being the loop's own walk and not a goal a budget must
+  preempt; a per-relation index would retire it,
   kraison/vivace-graph#350's sibling). Under a cross-store scope the
   walk runs under the same snapshots as round 0's evaluation. A
   seeded claim is a premise like any other and is never the
   producer's, so no reconcile keeps or sweeps it; the exclusion is by
-  producer, so plain reads see these facts in every round anyway.
+  producer, so plain reads see these facts in every round anyway —
+  which is also why the seed is **not** indexed into the run's own
+  derivation, where it would answer every base fact twice.
 - **A round's delta** is every identity first derived this run,
   whether constructed just now or already standing from before (kept,
   its node reused); it is written as it is found, per round, so the

@@ -366,17 +366,27 @@ RUN-RULES is what filters by family (ruling P8)."
                 when (rule-spec-enabled spec) collect spec)))
 
 (defun %edges (spec graph)
-  "SPEC's (head-relation . reads) for the cycle graph, or NIL when the
-spec's text does not guard -- such a rule cannot run and constrains
-nothing.  Only the FIRST goal is read as the head: a DEF-RULE is never
-validated at registration, so a two-goal head there contributes its
-second goal as a read, which over-constrains rather than under-."
+  "SPEC's (head-relation . reads) for the dependency graph, or NIL when
+the spec's text does not guard -- such a rule cannot run and constrains
+nothing.  READS is what the body reads positively AND under a NOT: a
+negated read is a dependency like any other, so a cycle another rule
+closes only through negation reaches the SCC search here exactly as
+this rule's own does (COMPILE-RULE, GH #333).  :ANY on either side
+makes the whole edge :ANY, which %STRATA reads as an isolated node.
+Only the FIRST goal is read as the head: a DEF-RULE is never validated
+at registration, so a two-goal head there contributes its second goal
+as a read, which over-constrains rather than under-."
   (handler-case
       (multiple-value-bind (vars goals) (%guard spec graph)
         (declare (ignore vars))
         (let ((head (first goals)))
           (when (%engine-goal-p head "CLAIM" 7)
-            (cons (sixth head) (%body-reads (rest goals))))))
+            (let ((reads (%body-reads (rest goals)))
+                  (negative (%negative-reads (rest goals))))
+              (cons (sixth head)
+                    (if (or (eq reads :any) (eq negative :any))
+                        :any
+                        (union reads negative :test #'string=)))))))
     (rule-compile-error () nil)))
 
 (defun %strata (relation reads graph others)
@@ -466,9 +476,11 @@ the relation" (getf parsed :relation)))
               (%refuse spec "a negated claim/7 goal leaves its relation ~
 unbound: bind the relation"))
             (multiple-value-bind (stratum relations)
-                ;; A NOT's target must join the SCC search too, or a
-                ;; cycle closed only through negation goes undetected
-                ;; (GH #333: this is what makes it unstratifiable).
+                ;; A NOT's target joins the SCC search, here for this
+                ;; rule and in %EDGES for every other, so a cycle
+                ;; closed only through negation is detected wherever
+                ;; it runs (GH #333: that is what makes it
+                ;; unstratifiable, and the refusal below names it).
                 (%strata (getf parsed :relation)
                          (union reads negative :test #'string=)
                          graph others)

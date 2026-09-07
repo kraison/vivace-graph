@@ -670,40 +670,47 @@ run (GH #333, C1)."
                  (graph-db:derived-index-by-object idx))))
       (push c (graph-db:derived-index-all idx)))))
 
-(defun %stratum-base-facts (scope stratum producers table)
-  "The stratum's BASE facts: every current claim of one of the
-stratum's relations, in every store in SCOPE, whose producer is none
-of PRODUCERS' -- what round 0's delta is seeded with, and what TABLE
-(the run's derived index) is extended with, so a recursive goal, which
-reads the delta and never the relation, still sees the facts its
-closure starts from (ruling R10, spec §3, GH #333).  => an EQUAL hash
-relation -> claims.  A seeded claim is a premise like any other and is
-never the producer's, so no reconcile ever keeps or sweeps it.
+(defun %stratum-base-facts (scope stratum producers)
+  "The stratum's BASE facts: every claim of one of the stratum's
+relations, in every store in SCOPE, whose producer is none of
+PRODUCERS' -- what round 0's delta is seeded with, so a recursive
+goal, which reads the delta and never the relation, still sees the
+facts its closure starts from (ruling R10, spec §3, GH #333).
+=> an EQUAL hash relation -> claims.
+
+Retracted claims included, as CLAIM/7 answers them: the goal a variant
+substitutes must answer what the goal it replaces would, or which
+recursive goal the fixpoint feeds would change the rule's meaning; a
+body that wants currency says CLAIM-CURRENT, exactly as it must of a
+plain read.  The seed is NOT indexed into *CLAIM-DERIVED-THIS-RUN*: a
+base fact is not the stratum's own output, so no exclusion hides it
+from a plain read, and indexing it would answer it twice.  A seeded
+claim is a premise like any other and is never the producer's, so no
+reconcile ever keeps or sweeps it.
+
 Cost: one typed family walk per family the stratum derives into, per
 store, per stratum run -- the shape %UNBOUND-CLAIM-SCAN uses, without
 its cost-unbounded refusal, this being the loop's own walk and not a
 goal a budget must preempt; a per-relation index would retire it
-(kraison/vivace-graph#350's sibling).  Trap: call it under the same
-snapshots as the round that reads it."
+(kraison/vivace-graph#350's sibling).  Traps: call it under the same
+snapshots as the round that reads it, and note MAP-VERTICES records
+its reads, so on the single-store path the whole family joins the
+write transaction's read set (docs/rules.md)."
   (let ((seed (make-hash-table :test 'equal))
         (relations (compiled-rule-stratum-relations (first stratum))))
     (dolist (family (remove-duplicates
                      (mapcar #'compiled-rule-family stratum))
                     seed)
-      (let ((parent (graph-db.spacetime:claim-family-parent family))
-            (binary (graph-db.spacetime:claim-family-binary family)))
+      (let ((parent (graph-db.spacetime:claim-family-parent family)))
         (dolist (g scope)
           (dolist (c (graph-db:map-vertices #'identity g
                                             :vertex-type parent
                                             :collect-p t))
             (let ((rel (graph-db.spacetime:claim-relation c)))
               (when (and (member rel relations :test #'string=)
-                         (graph-db.spacetime:claim-current-p c)
                          (not (assoc (graph-db.spacetime:claim-producer c)
                                      producers :test #'string=)))
-                (push c (gethash rel seed))
-                (%index-derived-claims table rel (list c)
-                                       (not (typep c binary)))))))))))
+                (push c (gethash rel seed))))))))))
 
 (defstruct (%stratum-run (:constructor %make-stratum-run))
   "One rule's state while %RUN-STRATUM iterates it to a fixpoint (GH
@@ -772,7 +779,10 @@ Round 0's delta is not empty but the stratum's BASE facts
 (%STRATUM-BASE-FACTS, ruling R10): a recursive rule reads the delta
 where its body reads the relation, so without the seed a base fact of
 that relation -- one no rule of the stratum wrote -- would be a
-premise for nothing.
+premise for nothing.  The seed matches what a plain CLAIM/7 read would
+answer, retracted claims included, and is not indexed into
+*CLAIM-DERIVED-THIS-RUN*: no exclusion hides a base fact from a plain
+read, so indexing it would answer it twice.
 
 A round's delta is every identity FIRST DERIVED this run, whether
 constructed or already standing (%ROUND-DELTA); claims are written
@@ -964,8 +974,8 @@ stratum but no CLAIM/7 goal there can carry the fixpoint delta"
              ;; Inside EVALUATE-ROUND, hence under the cross-store
              ;; path's snapshots, like the evaluation that reads it.
              (when (and (zerop round) (not *rules-naive-rounds*))
-               (setf delta (%stratum-base-facts scope stratum producers
-                                                derived-table)))
+               (setf delta (%stratum-base-facts scope stratum
+                                                producers)))
              (evaluate-phase))
            (one-round ()
              (let* ((base-derived
@@ -1129,12 +1139,15 @@ caller's transaction) signals."
         ;; recursive and RUN-RULE must agree, or RUN-RULE on the
         ;; non-recursive member of a recursive stratum (the base case
         ;; of a closure) would derive that member alone and report no
-        ;; stratum.  A one-name stratum is its own only member, so the
-        ;; common path compiles nothing extra (GH #333).
+        ;; stratum.  MEMBERS is resolved whenever the rule is itself
+        ;; recursive OR its stratum names more than it: a SELF-
+        ;; recursive rule alone in its stratum still needs its member
+        ;; list, since %RUN-STRATUM given none has no first rule to
+        ;; read the stratum's relations from (GH #333).
         (let* ((names (compiled-rule-stratum compiled))
                (broken nil)
                (members
-                 (when (rest names)
+                 (when (or (%compiled-recursive-p compiled) (rest names))
                    (remove-if-not
                     (lambda (s)
                       (and (member (rule-spec-name s) names
@@ -1147,6 +1160,8 @@ caller's transaction) signals."
                ;; is recorded rather than signalled: it refuses the
                ;; stratum path (an absent member makes the fixpoint
                ;; incomplete, M8) and is irrelevant to the plain one.
+               ;; Every member is compiled before the path is chosen --
+               ;; recursiveness is a property of the compiled rule.
                (others
                  (loop for s in members
                        for c = (handler-case (compile-rule graph s)
@@ -1156,23 +1171,35 @@ caller's transaction) signals."
                        when c collect c)))
           ;; M1: the field reads the same on every path -- the rules of
           ;; this rule's stratum, its own name alone for a rule that
-          ;; shares one with nobody.  Set before the paths diverge, so
-          ;; a refusal carries it too; the fixpoint path answers
-          ;; %RUN-STRATUM's own report, which sets it the same way.
+          ;; shares one with nobody.  Set once COMPILED exists, so
+          ;; every refusal after the compile carries it; a rule refused
+          ;; before that (disabled, no such family) has no stratum to
+          ;; report.  The fixpoint path answers %RUN-STRATUM's own
+          ;; report, which sets it the same way.
           (setf (rule-report-stratum report) names)
           (if (some #'%compiled-recursive-p (or others (list compiled)))
-              (if broken
-                  (refuse :rule (rule-compile-error-reason broken))
-                  (setf report
-                        (or (find (rule-spec-name spec)
-                                  (%run-stratum graph others scope)
-                                  :key #'rule-report-rule-name
-                                  :test #'string=)
-                            (progn
-                              (refuse
-                               :rule
-                               "rule is not runnable in this store")
-                              report))))
+              (cond
+                (broken (refuse :rule (rule-compile-error-reason broken)))
+                ;; Never %RUN-STRATUM without the rule that was asked
+                ;; for: a stratum missing its own member is not a
+                ;; smaller fixpoint, it is a wrong one.
+                ((not (find (rule-spec-name spec) others
+                            :key (lambda (c)
+                                   (rule-spec-name
+                                    (compiled-rule-spec c)))
+                            :test #'string=))
+                 (refuse :rule "rule is not runnable in this store"))
+                (t
+                 (setf report
+                       (or (find (rule-spec-name spec)
+                                 (%run-stratum graph others scope)
+                                 :key #'rule-report-rule-name
+                                 :test #'string=)
+                           (progn
+                             (refuse
+                              :rule
+                              "rule is not runnable in this store")
+                             report)))))
             (let ((family (graph-db.spacetime:claim-family-parent
                           (compiled-rule-family compiled))))
               (handler-case

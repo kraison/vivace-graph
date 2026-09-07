@@ -750,17 +750,28 @@ the stratum together, in **rounds**:
   seed a `reaches` claim somebody observed -- one no rule of the
   stratum wrote -- would be a premise for nothing and the closure
   would answer over rule-derived facts alone. Before round 0 the loop
-  collects every current claim of a stratum relation, in every store
-  in scope, whose producer is none of the stratum's, and hands them
-  to round 0 as its delta. They are premises like any other; they are
-  never the producer's claims, so no reconcile keeps or sweeps them.
+  collects every claim of a stratum relation, in every store in
+  scope, whose producer is none of the stratum's, and hands them to
+  round 0 as its delta. **Current or not**, as `claim/7` answers
+  them: the goal a variant substitutes has to answer what the goal it
+  replaces would, or which of two recursive goals the fixpoint feeds
+  would change what the rule means -- a body that wants currency says
+  `claim-current`, exactly as it must of a plain read. They are
+  premises like any other; they are never the producer's claims, so
+  no reconcile keeps or sweeps them, and they are **not** added to
+  the run's own derivation index -- nothing excludes a base fact from
+  a plain read, so indexing it would answer it twice.
   The cost is one typed family walk per family the stratum derives
   into, per store, per stratum run -- the shape `claim/7`'s own
   fallback walk uses, minus the cost-unbounded refusal, this being
-  the loop's own walk and not a goal a budget must preempt. A
-  per-relation index would retire it (kraison/vivace-graph#350's
-  sibling). Under a cross-store scope the walk runs under round 0's
-  own snapshots.
+  the loop's own walk and not a goal a budget must preempt -- and
+  that walk **records its reads**, so on the single-store path the
+  whole family joins the write transaction's read set: the
+  scan-and-write shape the engine warns falls back to the global lock
+  under a concurrent writer (`map-vertices`, GH #92). Both belong in
+  the measurement; a per-relation index would retire them
+  (kraison/vivace-graph#350's sibling). Under a cross-store scope the
+  walk runs under round 0's own snapshots.
 - **A plain read of a stratum's own relation excludes the stratum's
   producers** (`*claim-exclude-producers*`, bound around every round,
   round 0 included). Round 0 sees base facts only, and a later
@@ -793,9 +804,11 @@ the stratum together, in **rounds**:
   it is the premise of everything a later round derives from it.
 - `*rules-naive-rounds*` re-evaluates every rule in full each round
   instead of running the variants: a **debugging switch**, and a
-  reference only over a closure a semi-naive run already committed --
-  a from-scratch naive run reads the relation directly rather than
-  through the delta, and so only ever sees round 0's own output.
+  reference only over a closure a semi-naive run already committed.
+  A from-scratch single-store naive run sees **none** of its own
+  output -- it reads the relation directly rather than through the
+  delta, and an index read does not see the open transaction's own
+  writes -- so it is no oracle for a fixpoint it has to build.
 - The sweep of claims no longer derived, and provenance, happen once
   per rule, at the fixpoint -- so a claim derived in an early round is
   never swept by a later one.
@@ -824,8 +837,10 @@ the report does not say which rule's own goal signalled it.
 `run-rule` on one rule of a recursive stratum runs the whole stratum
 and returns that rule's report -- on **any** member, the base case of
 a closure included: what decides is whether the stratum is recursive,
-not whether the named rule is. A member that no longer compiles
-refuses the whole call (above).
+not whether the named rule is. Deciding that costs a compile of every
+member of the rule's stratum, since recursiveness is a property of the
+compiled rule; a member that does not compile refuses the whole call
+(above).
 
 `select` and the guarded query surface are unchanged: a recursive
 `<-` predicate there still runs top-down under the resource bounds
