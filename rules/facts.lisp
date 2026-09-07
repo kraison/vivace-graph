@@ -47,7 +47,55 @@ delta, never the stratum's own prior output, since that output is
 exactly what this round's reconcile may still sweep (GH #333).  Bound
 by %RUN-STRATUM around every round, round 0 included.  Never applies
 to a bound ?C -- that is how the delta itself, and any other caller
-holding a node already, keeps working.")
+holding a node already, keeps working.  Scoped by PRODUCER, not by
+relation: safe only because one producer writes one relation, which
+every RULE-PRODUCER-named producer does.")
+
+(defstruct (derived-index (:constructor make-derived-index))
+  "One fixpoint round's own derivation of one relation, indexed like
+CLAIM/7's routes so a rule with more than one recursive goal can see
+what its other goal already derived this run (GH #333, C1): BY-SUBJECT
+and BY-OBJECT are EQUAL hashes (namespace-keyword . key) -> claim
+nodes; ALL is every one of them, for the unindexed scan route."
+  (by-subject (make-hash-table :test 'equal))
+  (by-object (make-hash-table :test 'equal))
+  (all '()))
+
+(defvar *claim-derived-this-run* nil
+  "NIL, or an EQUAL hash table relation-string -> DERIVED-INDEX: one
+fixpoint run's own derivation so far, unioned into CLAIM/7's index and
+scan candidates (never the bound-?C route) so a rule with more than
+one recursive goal still sees what its OTHER goal derived earlier this
+run -- a plain read otherwise only sees state committed before the
+run started (GH #333).  Bound by %RUN-STRATUM around every round.")
+
+(defun %derived-by-subject (rel key)
+  "Claims *CLAIM-DERIVED-THIS-RUN* holds with subject KEY -- a
+(namespace . key) pair -- and relation REL, or across every relation
+when REL is NIL (the subject-only route does not know the relation
+either): CLAIM/7's index sees only committed claims, so this unions in
+what this run has itself derived (GH #333)."
+  (when *claim-derived-this-run*
+    (if rel
+        (let ((idx (gethash rel *claim-derived-this-run*)))
+          (and idx (gethash key (derived-index-by-subject idx))))
+        (loop for idx being the hash-values of *claim-derived-this-run*
+              append (gethash key (derived-index-by-subject idx))))))
+
+(defun %derived-by-object (key)
+  "Claims derived this run with object KEY, across every relation --
+the object index CLAIM/7 substitutes for is not relation-scoped either
+(GH #333)."
+  (when *claim-derived-this-run*
+    (loop for idx being the hash-values of *claim-derived-this-run*
+          append (gethash key (derived-index-by-object idx)))))
+
+(defun %derived-all ()
+  "Every claim derived this run, across every relation: the unindexed
+scan route's own union (GH #333)."
+  (when *claim-derived-this-run*
+    (loop for idx being the hash-values of *claim-derived-this-run*
+          append (derived-index-all idx))))
 
 (defun %scope-graphs ()
   "The stores in scope, own store first: *CLAIM-SCOPE*, or *GRAPH*
@@ -198,21 +246,30 @@ GH #332)."
          (skey (%prolog-index-bound ?skey))
          (okey (%prolog-index-bound ?okey))
          (rel (%prolog-index-bound ?rel))
+         ;; Each indexed/scan route unions in this run's own
+         ;; derivation, keyed like the index it substitutes for
+         ;; (GH #333, C1); over-inclusion is safe, %UNIFY-CLAIM
+         ;; re-filters every candidate below.
          (candidates
            (cond ((node-p c) (list c))
                  ((and sns skey rel)
-                  (%exclude-producers
-                   (%scope-lookup parent
-                                  +claim-subject-relation-index-slots+
-                                  (list sns skey rel))))
+                  (append (%exclude-producers
+                           (%scope-lookup
+                            parent +claim-subject-relation-index-slots+
+                            (list sns skey rel)))
+                          (%derived-by-subject rel (cons sns skey))))
                  ((and sns skey)
-                  (%exclude-producers
-                   (%scope-lookup parent +claim-subject-index-slots+
-                                  (list sns skey))))
+                  (append (%exclude-producers
+                           (%scope-lookup parent
+                                          +claim-subject-index-slots+
+                                          (list sns skey)))
+                          (%derived-by-subject nil (cons sns skey))))
                  ((and ons okey)
-                  (%exclude-producers
-                   (%scope-lookup binary +claim-object-index-slots+
-                                  (list ons okey))))
+                  (append (%exclude-producers
+                           (%scope-lookup binary
+                                          +claim-object-index-slots+
+                                          (list ons okey)))
+                          (%derived-by-object (cons ons okey))))
                  ;; A bound namespace argument naming no keyword of this
                  ;; image -- a name no claim was recorded under, a
                  ;; non-wire spelling, a non-string: no solutions, and
@@ -220,7 +277,9 @@ GH #332)."
                  ;; the guard's budget refuses instead (spec §4).
                  ((and sns-arg (null sns)) '())
                  ((and ons-arg (null ons)) '())
-                 (t (%exclude-producers (%unbound-claim-scan family))))))
+                 (t (append (%exclude-producers
+                             (%unbound-claim-scan family))
+                            (%derived-all))))))
     (dolist (claim candidates)
       (%unify-claim claim ?c ?sns ?skey ?rel ?ons ?okey family cont))))
 
@@ -339,14 +398,18 @@ docs/rules.md)."
           ;; %CLAIM-ARG is NIL for a bound non-node too -- an explicit
           ;; NIL included -- and generating there is a whole
           ;; cross-family lookup that then unifies with nothing, past
-          ;; %TICK's reach.  Generating (not filtering, above) skips an
-          ;; excluded producer the same way CLAIM/7's routes do
-          ;; (GH #333).
-          ((and unbound (stringp p)
-                (not (member p *claim-exclude-producers*
-                             :test #'string=)))
-           (dolist (claim (%producer-candidates p))
-             (%yield (?c claim) (funcall cont))))
+          ;; %TICK's reach.  An excluded producer generates from this
+          ;; run's own derivation instead of the index -- symmetric
+          ;; with CLAIM/7's routes, which union it in rather than
+          ;; answering nothing (GH #333, C1).
+          ((and unbound (stringp p))
+           (if (member p *claim-exclude-producers* :test #'string=)
+               (dolist (claim (%derived-all))
+                 (when (string= p (graph-db.spacetime:claim-producer
+                                   claim))
+                   (%yield (?c claim) (funcall cont))))
+               (dolist (claim (%producer-candidates p))
+                 (%yield (?c claim) (funcall cont)))))
           ;; Nothing bound routes nowhere, so CLAIM/7's refusal rather
           ;; than silence.  A bound ?P that is a string naming no
           ;; producer still answers empty, as an unresolvable namespace

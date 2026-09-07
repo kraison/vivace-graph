@@ -32,6 +32,25 @@
    (claim-producer ?p \"seed\")
    (claim-current ?p)
    (claim ?q rt-claim \"node\" ?m \"reaches\" \"node\" ?b)")
+;; Doubly recursive: composes "reaches" with "reaches" instead of
+;; "next" with "reaches".  Anchored -- ?a comes from a "next" edge --
+;; so both recursive goals are index-routed (subject+relation bound):
+;; neither hits %UNBOUND-CLAIM-SCAN, isolating C1 (two-or-more
+;; recursive goals derive nothing) from I1 (an unrouted goal refuses).
+(defparameter *tc-step2-body*
+  "(claim ?p rt-claim \"node\" ?a \"next\" \"node\" ?z)
+   (claim-producer ?p \"seed\")
+   (claim-current ?p)
+   (claim ?q rt-claim \"node\" ?a \"reaches\" \"node\" ?m)
+   (claim ?r rt-claim \"node\" ?m \"reaches\" \"node\" ?b)")
+;; Unanchored: neither "reaches" goal's subject is bound by anything
+;; but the other, so a plain (round 0, pre-I1) evaluation would hit
+;; %UNBOUND-CLAIM-SCAN and refuse as cost-unbounded (GH #285) -- I1
+;; makes round 0 use the delta variant too, whose RULE-DELTA/2 goal
+;; fails first (an empty delta) and never reaches the scan.
+(defparameter *tc-step-unanchored-body*
+  "(claim ?q rt-claim \"node\" ?a \"reaches\" \"node\" ?m)
+   (claim ?r rt-claim \"node\" ?m \"reaches\" \"node\" ?b)")
 
 (defun write-closure (g)
   "The two-rule transitive closure of \"next\" into \"reaches\"."
@@ -86,7 +105,11 @@ would loop; the fixpoint terminates."
 
 (test the-semi-naive-delta-derives-what-naive-re-evaluation-derives
   "The delta variants are an optimisation, never a different answer:
-the identity set equals what a full re-evaluation each round gives."
+the identity set equals what a full re-evaluation each round gives.
+Naive mode is only a valid reference here because it runs SECOND, over
+a closure the delta-based run already committed: it reads the
+relation directly rather than through RULE-DELTA/2, so on a from-
+scratch run it would only ever see round 0's own output (GH #333)."
   (with-rules-graph (g)
     (link g "a" "b") (link g "b" "c") (link g "c" "d") (link g "d" "b")
     (write-closure g)
@@ -183,3 +206,72 @@ the identity set equals what a full re-evaluation each round gives."
                         (report-named "tc-step" reports))))
       (is (eq :budget (refusal-tag (report-named "tc-step" reports))))
       (is (= 2 (length (reaches g)))))))
+
+(test two-recursive-goals-still-reach-the-whole-closure
+  "C1: a rule with more than one recursive CLAIM/7 goal must still
+reach the whole closure -- %VARIANTS substitutes one recursive goal at
+a time, so the OTHER stays a plain read; without
+*CLAIM-DERIVED-THIS-RUN* that plain read is excluded and finds
+nothing, every round, forever."
+  (with-rules-graph (g)
+    (link g "a" "b") (link g "b" "c") (link g "c" "d")
+    (write-rule g :name "tc-base" :version "1" :family "rt-claim"
+                :head *tc-base-head* :body *tc-base-body*)
+    (write-rule g :name "tc-step" :version "1" :family "rt-claim"
+                :head *tc-base-head* :body *tc-step2-body*)
+    (let* ((reports (graph-db.rules:run-rules g))
+           (step (report-named "tc-step" reports)))
+      (is (eq :derived (graph-db.rules:rule-report-outcome step)))
+      (is (= 3 (graph-db.rules:rule-report-derived step)))
+      (is (= 4 (graph-db.rules:rule-report-rounds step)))
+      (is (equal '(("a" . "b") ("a" . "c") ("a" . "d")) (reaches g))))))
+
+(test the-unanchored-closure-step-is-not-refused
+  "I1: round 0 must run a recursive rule's %VARIANTS too, not its
+literal body -- an empty delta fails the RULE-DELTA/2 goal before
+CLAIM/7 ever reaches the unbound scan, so an unanchored T(x,z) :-
+T(x,y), T(y,z) style step compiles and runs instead of refusing as
+cost-unbounded (GH #285)."
+  (with-rules-graph (g)
+    (link g "a" "b") (link g "b" "c") (link g "c" "d")
+    (write-rule g :name "tc-base" :version "1" :family "rt-claim"
+                :head *tc-base-head* :body *tc-base-body*)
+    (write-rule g :name "tc-step" :version "1" :family "rt-claim"
+                :head *tc-base-head* :body *tc-step-unanchored-body*)
+    (let ((reports (graph-db.rules:run-rules g)))
+      (is (every (lambda (r)
+                   (eq :derived (graph-db.rules:rule-report-outcome r)))
+                 reports))
+      (is (equal '(("a" . "b") ("a" . "c") ("a" . "d")) (reaches g))))))
+
+(test run-rule-on-a-disabled-rule-is-refused-and-writes-nothing
+  "I2: a disabled rule must never derive via RUN-RULE, checked before
+any compile, whether or not it turns out to read its own stratum."
+  (with-rules-graph (g)
+    (link g "a" "b") (link g "b" "c") (link g "c" "d")
+    (write-rule g :name "tc-base" :version "1" :family "rt-claim"
+                :enabled nil :head *tc-base-head* :body *tc-base-body*)
+    (write-rule g :name "tc-step" :version "1" :family "rt-claim"
+                :head *tc-base-head* :body *tc-step-body*)
+    (let ((report (graph-db.rules:run-rule g "tc-base")))
+      (is (eq :refused (graph-db.rules:rule-report-outcome report)))
+      (is (eq :rule (refusal-tag report)))
+      (is (null (reaches g))))))
+
+(test run-rule-on-a-disabled-recursive-rule-is-refused
+  "The deeper case I2 names in its prose: TC-STEP disabled but still
+structurally part of TC-BASE's stratum, so run-rule's recursive path
+must refuse it rather than fall back to a stale, all-zero :DERIVED
+report -- TC-STEP is absent from RULES-IN-SCOPE (disabled), so the
+member search that used to feed %RUN-STRATUM silently excluded the
+very rule being asked for."
+  (with-rules-graph (g)
+    (link g "a" "b") (link g "b" "c") (link g "c" "d")
+    (write-rule g :name "tc-base" :version "1" :family "rt-claim"
+                :head *tc-base-head* :body *tc-base-body*)
+    (write-rule g :name "tc-step" :version "1" :family "rt-claim"
+                :enabled nil :head *tc-base-head* :body *tc-step-body*)
+    (let ((report (graph-db.rules:run-rule g "tc-step")))
+      (is (eq :refused (graph-db.rules:rule-report-outcome report)))
+      (is (eq :rule (refusal-tag report)))
+      (is (null (reaches g))))))
