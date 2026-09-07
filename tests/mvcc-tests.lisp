@@ -275,6 +275,13 @@ before -- nothing is invented for it."
       (setf (slot-value c 'age) new-age)
       (save c))))
 
+(defun bump-since (eid new-since)
+  "Update edge EID's SINCE inside a transaction (a versioning write)."
+  (with-transaction ()
+    (let ((c (copy (lookup-edge eid))))
+      (setf (slot-value c 'since) new-since)
+      (save c))))
+
 (test versioned-update-retains-then-reaps-prior-version
   "An update archives the prior version (prev-pointer chain grows), and the lazy
 epoch-gated reaper keeps the chain bounded (keep=0 => a single retained version
@@ -867,3 +874,26 @@ inherits."
       (signals as-of-refused (lookup-vertex id :as-of (1+ (latest-epoch g))))
       (signals as-of-refused
         (with-as-of ((g) e1) (lookup-vertex id :as-of (latest-epoch g)))))))
+
+(test per-call-as-of-on-lookup-edge-and-map-edges
+  "Spec §3.4, the edge twin of the vertex case: :AS-OF on LOOKUP-EDGE and
+MAP-EDGES answers at E for that call and the result outlives the call;
+LOOKUP-EDGE refuses a future epoch, same as LOOKUP-VERTEX."
+  (with-kept-graph (g 3)
+    (let (eid e1)
+      (setq e1 (%epoch-of
+                (lambda ()
+                  (let ((a (make-g-person :name "a"))
+                        (b (make-g-person :name "b")))
+                    (setq eid
+                          (id (make-g-knows :from a :to b :since 0)))))))
+      (bump-since eid 5)
+      (let ((old (lookup-edge eid :as-of e1)))
+        (is (= 0 (slot-value old 'since)) "the version at E1, materialised")
+        (is (null graph-db:*read-snapshots*) "the snapshot closed"))
+      (is (= 5 (slot-value (lookup-edge eid) 'since)))
+      (is (equal '(0) (map-edges (lambda (e) (slot-value e 'since)) g
+                                 :collect-p t :edge-type 'g-knows
+                                 :as-of e1)))
+      (signals as-of-refused
+        (lookup-edge eid :as-of (1+ (latest-epoch g)))))))
