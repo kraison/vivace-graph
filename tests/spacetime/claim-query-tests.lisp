@@ -272,3 +272,32 @@ retraction does not rewrite history the transaction may yet abandon."
                                      :as-of then)))
           (is (= 1 (length hist)))
           (is (claim-current-p (first hist))))))))
+
+(test the-relation-index-answers-and-survives-reopen
+  "GH #350 spec §3: DEF-CLAIM-CLASSES declares a (RELATION) index named
+CLAIM-RELATION on the parent; it answers INDEX-LOOKUP on a fresh family
+and again after close and reopen (the sidecar round trip)."
+  (with-temp-directory (dir)
+    (let ((path (namestring dir)))
+      (let ((g (make-graph *claim-graph-name* path :buffer-pool-size 1000)))
+        (unwind-protect
+             (let ((graph-db:*graph* g))
+               (with-transaction ()
+                 (make-u :subject "a" :relation "likes")
+                 (make-b :subject "a" :object "b" :relation "knows")
+                 (make-u :subject "c" :relation "likes"))
+               (is (= 2 (length (graph-db:index-lookup
+                                 g 'ct-claim
+                                 '(graph-db.spacetime::relation) "likes"))))
+               (is (= 1 (length (graph-db:index-lookup
+                                 g 'ct-claim
+                                 '(graph-db.spacetime::relation) "knows")))))
+          (close-graph g)))
+      (let ((g2 (open-graph *claim-graph-name* path)))
+        (unwind-protect
+             (let ((graph-db:*graph* g2))
+               (is (= 2 (length (graph-db:index-lookup
+                                 g2 'ct-claim
+                                 '(graph-db.spacetime::relation) "likes")))))
+          (ignore-errors (close-graph g2 :snapshot-p nil))
+          (collect-garbage))))))

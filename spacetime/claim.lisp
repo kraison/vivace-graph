@@ -448,6 +448,9 @@ declaration names, so flipping the flag re-declares rather than stacks."
        (graph-db:def-index ,parent (subject-namespace subject-key
                                     relation)
            ,graph-name :name claim-subject-relation)
+       ;; The vocabulary listing skips to distinct relations (GH #350).
+       (graph-db:def-index ,parent (relation) ,graph-name
+                           :name claim-relation)
        (fmakunbound ',(intern (format nil "MAKE-~A" parent) home))
        ;; DEF-VERTEX redefines each raw constructor on every expansion, so
        ;; this cannot double-wrap on a re-evaluated DEF-CLAIM-CLASSES form.

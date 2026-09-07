@@ -1031,3 +1031,14 @@ INDEX-LOOKUP does."
                           :prefix t)))
     (signals query-precondition-error
       (index-count g 'ix-claim '(ns key rel) '("ops")))))
+
+(test def-index-declared-on-an-open-graph-indexes-existing-instances
+  "GH #350 spec §3: a DEF-INDEX evaluated while the graph is open builds
+over the instances already stored -- the relation index's no-migration
+contract."
+  (with-ix-graph (g)
+    (with-transaction () (make-ix-claim :ns "ops" :key "e1" :rel "late"))
+    (def-index ix-claim (rel) :graph-db-index-test :name ix-late-rel)
+    (unwind-protect
+         (is (= 1 (length (index-lookup g 'ix-claim '(rel) "late"))))
+      (undef-index ix-claim :graph-db-index-test :name ix-late-rel))))
