@@ -565,7 +565,8 @@ epoch is the newest at or below E -- and NIL before the node existed."
       (bump-age id 1) (setq e2 (latest-epoch g))
       (bump-age id 2) (setq e3 (latest-epoch g))
       (is (= e1 (1+ e0)) "control: consecutive commits, no clock")
-      (is (= e3 (latest-epoch g)) "LATEST-EPOCH names the newest commit")
+      (is (= e3 (1+ e2))
+          "LATEST-EPOCH tracks each new commit, not just the first")
       (with-as-of ((g) e0)
         (is (null (lookup-vertex id)) "before creation: absent"))
       (with-as-of ((g) e1)
@@ -601,6 +602,12 @@ plain snapshot inside an as-of extent inherits it."
       (flet ((reason (thunk)
                (handler-case (progn (funcall thunk) nil)
                  (as-of-refused (c) (as-of-refused-reason c)))))
+        (is (eq :no-version-history
+                (reason
+                 (lambda ()
+                   (let ((bare (make-instance 'graph-db::graph)))
+                     (with-as-of ((bare) e) nil)))))
+            "no transaction manager yet: refused, not silently live")
         (is (eq :future-epoch
                 (reason (lambda () (with-as-of ((g) (1+ e)) nil)))))
         (is (eq :read-write-transaction

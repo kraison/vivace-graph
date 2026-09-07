@@ -3385,9 +3385,11 @@ same epoch inherits), on a memory graph, or before GRAPH has a manager.
 :IF-REAPED (:ERROR, or :SKIP) says what a read of a version reaped past
 :KEEP-REVISIONS does -- see VERSION-REAPED-ERROR."
   ;; &OPTIONAL GRAPH before &KEY is the brief's interface (GH #115); every
-  ;; caller supplies GRAPH positionally when passing keys, so SBCL's
-  ;; mixed-lambda-list style-warning does not apply here.
-  (declare (sb-ext:muffle-conditions style-warning))
+  ;; caller supplies GRAPH positionally when passing keys, so this one
+  ;; SBCL lambda-list warning is a false positive -- muffle only it, not
+  ;; STYLE-WARNING broadly, so real warnings in the body still surface.
+  (declare (sb-ext:muffle-conditions
+            sb-kernel:&optional-and-&key-in-lambda-list))
   (let ((tm (and graph
                  (slot-boundp graph 'transaction-manager)
                  (transaction-manager graph))))
