@@ -897,3 +897,19 @@ LOOKUP-EDGE refuses a future epoch, same as LOOKUP-VERTEX."
                                  :as-of e1)))
       (signals as-of-refused
         (lookup-edge eid :as-of (1+ (latest-epoch g)))))))
+
+(test select-as-of-runs-the-query-at-an-epoch
+  "Spec §3.5: SELECT :AS-OF E parallels :SNAPSHOT T and equals the same
+query run at E; both together is a macroexpansion-time error."
+  (with-kept-graph (g 3)
+    (let (e1)
+      (setq e1 (%epoch-of (lambda () (make-g-person :name "a" :age 1))))
+      (with-transaction () (make-g-person :name "b" :age 2))
+      (is (= 1 (length (select (:as-of e1) (?p) (is-a ?p g-person)))))
+      (is (= 2 (select-count (?p) (is-a ?p g-person))))
+      (is (equal '("a")
+                 (select (:as-of e1 :flat t) (?n)
+                   (is-a ?p g-person) (node-slot-value ?p name ?n))))
+      (signals error
+        (macroexpand-1 '(select (:snapshot t :as-of 1) (?p)
+                          (is-a ?p g-person)))))))

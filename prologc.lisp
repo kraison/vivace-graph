@@ -1067,6 +1067,8 @@ of solutions instead of the list, consing nothing per solution (see
 SELECT-COUNT).  :SNAPSHOT t runs the query under one consistent MVCC read
 snapshot, so all of its reads resolve at a single epoch -- stable against
 concurrent writers (it inherits an enclosing transaction if one is active).
+:AS-OF EPOCH runs the query as of that epoch (GH #115, WITH-AS-OF) -- exclusive
+with :SNAPSHOT; :IF-REAPED :SKIP skips reaped versions instead of signalling.
 :CALLBACK FN streams each result row to FN as it is produced (consing nothing
 onto a result list) and returns the number of rows -- for unbounded or very
 large result sets.  Returns a list of solutions (or, with :COUNT or :CALLBACK, a
@@ -1130,14 +1132,28 @@ SELECT-FIRST for common shorthands."
                        (undefined-function (condition)
                          (error 'prolog-error :reason condition))))))
               (set-functor-fn *functor* func)
-              ,(if (cdr (assoc :snapshot options))
-                   ;; Run the query under one consistent MVCC read snapshot:
-                   ;; all reads resolve at a single epoch (lock-free, stable
-                   ;; against concurrent writers).  Inherits an enclosing
-                   ;; transaction if one is already active.
-                   `(call-with-read-snapshot
-                     (lambda () (funcall func #'prolog-ignore)) *graph*)
-                   `(funcall func #'prolog-ignore)))
+              ,(let ((as-of (cdr (assoc :as-of options)))
+                     (snapshot (cdr (assoc :snapshot options))))
+                 (when (and as-of snapshot)
+                   (error ":SNAPSHOT and :AS-OF are exclusive on SELECT ~
+(GH #115)"))
+                 (cond
+                   (as-of
+                    ;; GH #115: the query at a named epoch.
+                    `(call-with-read-snapshot
+                      (lambda () (funcall func #'prolog-ignore)) *graph*
+                      :as-of ,as-of
+                      :if-reaped ,(or (cdr (assoc :if-reaped options))
+                                      :error)))
+                   (snapshot
+                    ;; Run the query under one consistent MVCC read
+                    ;; snapshot: all reads resolve at a single epoch
+                    ;; (lock-free, stable against concurrent writers).
+                    ;; Inherits an enclosing transaction if one is
+                    ;; already active.
+                    `(call-with-read-snapshot
+                      (lambda () (funcall func #'prolog-ignore)) *graph*))
+                   (t `(funcall func #'prolog-ignore)))))
          (progn
            (delete-functor functor)
            (release-prolog-symbol top-level-query)))
