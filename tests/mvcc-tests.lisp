@@ -672,7 +672,11 @@ answers NIL and counts, and the retained epoch still answers."
           (is (= e3 (version-reaped-oldest-epoch c))
               "the oldest retained version is the one committed at E3")
           (is (= 2 (version-reaped-oldest-revision c)))
-          (is (= e1 (version-reaped-epoch c)))))
+          (is (= e1 (version-reaped-epoch c))))
+        ;; GH #115: the unwind must not strand the reaper floor.
+        (is (null (graph-db::reap-safe-floor
+                   (graph-db::transaction-manager g)))
+            "the signalled exit released the transaction and the pin"))
       (signals version-reaped-error (with-as-of ((g) e2) (lookup-vertex id)))
       (with-as-of ((g) e1 :if-reaped :skip)
         (is (null (lookup-vertex id)) ":skip answers NIL")
@@ -788,7 +792,12 @@ is refused rather than answering live."
       (is (eq :untyped-scan
               (handler-case
                   (with-as-of ((g) e) (map-edges #'identity g) nil)
-                (as-of-refused (c) (as-of-refused-reason c))))))))
+                (as-of-refused (c) (as-of-refused-reason c)))))
+      ;; GH #115: a refusal unwinds before the pin is taken, and leaves
+      ;; no floor behind either.
+      (is (null (graph-db::reap-safe-floor
+                 (graph-db::transaction-manager g)))
+          "the signalled exit released the transaction and the pin"))))
 
 (test as-of-walks-compaction-tombstones
   "Spec §3.3, the tombstone walk itself: COMPACT-VERTICES de-indexes a

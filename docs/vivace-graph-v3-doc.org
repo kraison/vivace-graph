@@ -2932,14 +2932,25 @@ that on an updated node cannot be answered. Rather than silently
 substituting a newer version, the engine signals
 ~version-reaped-error~, naming the id, the epoch asked for, and the
 oldest epoch it still retains; ~:if-reaped :skip~ on the extent skips
-such nodes instead and counts them via ~as-of-skipped-count~. An epoch
-is node-local (#116): it names a point in this node's own history and
-is not portable to a replica. An as-of read is refused
+such reads instead and counts the *reads*, not the nodes, via
+~as-of-skipped-count~ — nothing caches a NIL, so two reads of one reaped
+id count 2. An epoch is node-local (#116): it names a point in this
+node's own history and is not portable to a replica. An as-of read is refused
 (~as-of-refused~) for a future epoch, from inside a read-write
 transaction, from inside a snapshot already open at another epoch, for
 an untyped scan, and on a graph with no version history (the in-memory
-backend, or a graph with no transaction manager yet). See
-~docs/time-travel.md~ for the full API and its bounds.
+backend, or a graph with no transaction manager yet).
+
+A ~select~ with ~:as-of~ snapshots ~*graph*~ only, exactly as ~:snapshot
+t~ does: a query that touches a second store reads that store *live*
+unless the ~select~ is nested inside that store's own ~with-as-of~.
+
+An as-of result is materialised, so it is safe to *read* after the call
+— but never *save* a copy of one: ~copy-node~ registers the archived
+version as the old node and the commit then archives it over the live
+head, cutting the chain. To restore an old value, read it as of the
+epoch, then copy the *live* node and set its slots from what you read.
+See ~docs/time-travel.md~ for the full API and its bounds.
 
 *** Migrating an older graph to v3 (~migrate-graph~)
 

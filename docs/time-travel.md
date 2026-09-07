@@ -20,6 +20,10 @@ share one system clock.
     (select (:as-of epoch) (?u) (is-a ?u user))
     (latest-epoch graph)                      ; the newest epoch you may name
 
+`select :as-of` snapshots `*graph*` only, exactly as `:snapshot t` does:
+a query that touches a second store reads that store **live** unless the
+`select` is nested inside that store's own `with-as-of`.
+
 Inside the extent every read of GRAPH resolves to the version whose
 commit epoch is the newest **at or below** EPOCH (inclusive, as
 `claims-touching :as-of-epoch` reads it). A node created after EPOCH
@@ -42,11 +46,12 @@ The default `:keep-revisions 0` keeps the live version and one lagging
 version; an as-of read older than that on an updated node cannot be
 answered. The engine says so rather than substituting a newer version:
 `version-reaped-error` names the id, the epoch asked for, and the oldest
-retained epoch. `:if-reaped :skip` on the extent skips such nodes and
-counts them (`as-of-skipped-count`). Absence is told from reaping by the
-oldest retained version's `revision`: 0 means the node was created
-after the epoch. Once that creation version is itself reaped the two
-cannot be told apart, and the read reports reaped.
+retained epoch. `:if-reaped :skip` on the extent skips such reads and
+counts the *reads*, not the nodes (`as-of-skipped-count`): nothing caches
+a NIL, so two reads of one reaped id count 2. Absence is told from
+reaping by the oldest retained version's `revision`: 0 means the node was
+created after the epoch. Once that creation version is itself reaped the
+two cannot be told apart, and the read reports reaped.
 
 Under `:if-reaped :error` (the default) a typed scan or `select` at an
 epoch can itself signal `version-reaped-error` for any visited node
@@ -64,6 +69,12 @@ versions newest first as `(version . commit-epoch)`. A history never
 signals; an oldest entry with `revision` above 0 means the chain was cut.
 
 ## Bounds
+
+An as-of result is safe to **read** after the call, not to save. Saving a
+copy of one corrupts the version chain: `copy-node` registers the archived
+version as the old node, and the commit then archives that archived head
+over the live head. To restore an old value, read it as of the epoch, then
+copy the **live** node and set its slots from what you read.
 
 - Value indexes (slot indexes, the spacetime endpoint and producer
   indexes) keep live membership (#345): a node hard-removed from one

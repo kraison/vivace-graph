@@ -151,7 +151,10 @@ generated LOOKUP-<type> functions filter deleted edges.
 
 :AS-OF EPOCH answers at that epoch under a per-call snapshot (GH #115, spec
 §3.4; see WITH-AS-OF for the refusals); the result is materialised so it is
-safe to use after the call."
+safe to READ after the call.  TRAP: never SAVE a copy of an as-of result --
+COPY-NODE registers the archived version as the old node and the save
+archives it over the live head, cutting the chain.  To restore an old
+value, COPY the LIVE node and SETF its slots from what you read."
   (if as-of
       (call-with-read-snapshot
        (lambda ()
@@ -436,7 +439,12 @@ snapshot (WITH-AS-OF, GH #115) the untyped scan is refused.
 
 :AS-OF EPOCH runs the whole call under a fresh per-call snapshot of GRAPH
 at EPOCH (GH #115, spec §3.4); an enclosing as-of extent on GRAPH at the
-same epoch is inherited instead.  :IF-REAPED as CALL-WITH-READ-SNAPSHOT."
+same epoch is inherited instead.  :IF-REAPED as CALL-WITH-READ-SNAPSHOT.
+Under an as-of snapshot a typed scan visits every entry ever indexed under
+the type, tombstones included, and under the default :IF-REAPED :ERROR it
+signals VERSION-REAPED-ERROR for any visited node whose version at EPOCH
+was reaped; :IF-REAPED :SKIP skips those reads and counts them
+(AS-OF-SKIPPED-COUNT)."
   (when as-of                           ; GH #115 spec §3.4
     (return-from map-edges
       (call-with-read-snapshot

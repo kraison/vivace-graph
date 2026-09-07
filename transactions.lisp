@@ -249,11 +249,19 @@ detach aborted and the store resumes its prior accepting state."
   (:documentation "An as-of read the store cannot answer (GH #115, spec
 §2.2).  REASON: :FUTURE-EPOCH, :READ-WRITE-TRANSACTION, :SNAPSHOT-ACTIVE,
 :UNTYPED-SCAN or :NO-VERSION-HISTORY.")
+  ;; :NO-VERSION-HISTORY can fire with no graph at all, or with a bare
+  ;; graph whose GRAPH-NAME is still unbound, so name it only when it is
+  ;; safe to read -- printing the condition must never signal (GH #115).
+  ;; TYPE-OF, not the object: PRINT-OBJECT on a graph reads GRAPH-NAME
+  ;; too (graph-class.lisp), so printing it would signal in that case.
   (:report (lambda (c s)
-             (format s "as-of ~A refused on ~A: ~A"
-                     (as-of-refused-epoch c)
-                     (graph-name (as-of-refused-graph c))
-                     (as-of-refused-reason c)))))
+             (let ((g (as-of-refused-graph c)))
+               (format s "as-of ~A refused on ~A: ~A"
+                       (as-of-refused-epoch c)
+                       (cond ((null g) g)
+                             ((slot-boundp g 'graph-name) (graph-name g))
+                             (t (type-of g)))
+                       (as-of-refused-reason c))))))
 
 ;;; Transaction manager
 (defgeneric create-transaction (transaction-manager
@@ -3446,6 +3454,9 @@ same epoch inherits), on a memory graph, or before GRAPH has a manager.
   ;; caller supplies GRAPH positionally when passing keys, so this one
   ;; SBCL lambda-list warning is a false positive -- muffle only it, not
   ;; STYLE-WARNING broadly, so real warnings in the body still surface.
+  ;; #+SBCL guards the READ: the SB-KERNEL symbol does not exist on ECL
+  ;; or CCL, where an unguarded declare breaks loading graph-db.
+  #+sbcl
   (declare (sb-ext:muffle-conditions
             sb-kernel:&optional-and-&key-in-lambda-list))
   (let ((tm (and graph
