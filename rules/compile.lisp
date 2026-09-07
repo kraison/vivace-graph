@@ -110,7 +110,8 @@ relations the body reads -- never :ANY, which COMPILE-RULE refuses
 before this struct is built.  STRATUM is the sorted names of the rules
 whose head relations are mutually reachable with this one's (its own
 name always), STRATUM-RELATIONS the sorted relations they derive; a
-rule is recursive when READS meets STRATUM-RELATIONS (GH #333)."
+rule is recursive when a body CLAIM/7 goal has an unbound ?c and a
+relation in STRATUM-RELATIONS (%RECURSIVE-GOAL-P, run.lisp, GH #333)."
   spec family relation
   head-c head-sns head-skey head-ons head-okey unary-p
   vars premise-vars goals reads stratum stratum-relations)

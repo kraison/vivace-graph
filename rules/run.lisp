@@ -36,11 +36,16 @@ delta variants: the test reference for the semi-naive answer.")
 turned into a report entry; never escapes."))
 
 (defstruct (rule-report (:constructor %make-rule-report))
-  "What one RUN-RULE did (spec §7).  OUTCOME is :DERIVED or :REFUSED;
+  "What one RUN-RULE did (spec §7).  OUTCOME is :DERIVED or :REFUSED.
 DERIVED counts claims constructed this run, KEPT the previous
-derivation's claims whose identity was derived again (ruling P10), SWEPT
-the ones that were not and are now deleted; on :REFUSED the transaction
-unwound, so all three are 0 and the previous derivation stands.
+derivation's claims whose identity was derived again (ruling P10),
+SWEPT the ones that were not and are now deleted.  On :REFUSED, all
+three are 0 when the transaction unwound (single-store, or a
+non-recursive rule) and the previous derivation stands; on the
+cross-store recursive path, earlier rounds may already have committed,
+so DERIVED counts what they wrote and ROUNDS names how many, while
+KEPT and SWEPT stay 0 -- the fixpoint reconcile that would set them is
+itself inside the transaction that unwound (GH #333, I3).
 REFUSALS is a list of (TAG . TEXT): TAG a claim family name for a commit
 refusal, else :RULE (compile, effects, ill-typed head), :BUDGET (the
 rails) or :SOLUTIONS (the cap).  INFERENCES is the count at the last
@@ -581,8 +586,8 @@ without being recursive -- ROUTED and WALKER (run-tests.lisp) is
 exactly that -- so stratum SIZE alone is not the test."
   (let ((own (compiled-rule-stratum-relations compiled)))
     (and (some (lambda (g) (%recursive-goal-p g own))
-              (compiled-rule-goals compiled))
-        t)))
+               (compiled-rule-goals compiled))
+         t)))
 
 (defun %merge-desired (into order-head order-tail table order)
   "TABLE/ORDER merged into INTO (a dedupe-key hash) and the
@@ -690,17 +695,20 @@ constructing, and what %RECONCILE-CLAIMS later sweeps or keeps
 (defun %refuse-stratum (runs tag text foreign)
   "Every RUN's report refused with TAG/TEXT: a refusal anywhere in a
 stratum stops the whole stratum, the previous derivation standing.
-Single-store: the whole transaction unwound, so DERIVED/KEPT/SWEPT are
-0.  Cross-store: earlier rounds already committed, so what they wrote
-stands and stays counted; ROUNDS (set by the caller after this) names
-how many (I3, spec §4, GH #333)."
+KEPT and SWEPT are always 0 here: FINISH-RUN's reconcile (the only
+place either is set) is itself inside the transaction that just
+unwound, on both paths, so its DECF never ran either.  Single-store:
+the whole transaction unwound, so DERIVED is 0 too.  Cross-store:
+earlier rounds already committed, so DERIVED keeps what they wrote;
+ROUNDS (set by the caller after this) names how many (I3, spec §4,
+GH #333)."
   (dolist (run runs)
     (let ((r (%stratum-run-report run)))
-      (setf (rule-report-outcome r) :refused)
+      (setf (rule-report-outcome r) :refused
+            (rule-report-kept r) 0
+            (rule-report-swept r) 0)
       (unless foreign
-        (setf (rule-report-derived r) 0
-              (rule-report-kept r) 0
-              (rule-report-swept r) 0))
+        (setf (rule-report-derived r) 0))
       (setf (rule-report-refusals r) (list (cons tag text))))))
 
 (defun %run-stratum (graph stratum scope)
@@ -726,52 +734,87 @@ them; the sweep and provenance rewrite happen once, at the fixpoint
 (I4: in the same PER-RULE step, so a refusal there is tagged, not an
 escape).
 
-Single-store: the whole run is ONE transaction; every mutable table is
-rebuilt at the top of RUN-TO-FIXPOINT, which runs inside it, so a
-VALIDATION-CONFLICT retry starts genuinely from scratch (I5).  A
-refusal leaves the previous derivation standing exactly as a refused
-RUN-RULE does, and DERIVED/KEPT/SWEPT report 0 (%REFUSE-STRATUM).
+RUNS itself -- one %STRATUM-RUN per rule, so REPORT exists for every
+rule of STRATUM -- is built once, before any of this: a signal while
+building it would otherwise leave %REFUSE-STRATUM nothing to mark and
+RUN-RULES no report at all for the stratum.  Single-store: the whole
+run is ONE transaction; every mutable per-run table (and each
+report's own counters) is reset at the top of RUN-TO-FIXPOINT, which
+runs inside it, so a VALIDATION-CONFLICT retry starts genuinely from
+scratch (I5).  A refusal leaves the previous derivation standing
+exactly as a refused RUN-RULE does, and DERIVED/KEPT/SWEPT report 0
+(%REFUSE-STRATUM).
 Cross-store: each round evaluates under %UNDER-SNAPSHOTS and commits
 in its own transaction, since a foreign read inside a transaction is
 refused (GH #53); ONE-ROUND snapshots each report's DERIVED before a
 round's construction and %ROUND-DELTA reports only that round's own
 count, so a round's retry sets DERIVED idempotently instead of
-re-incrementing it (I5).  A refusal there leaves the committed rounds
-standing and their counts intact (I3); the report's ROUNDS names how
-many.  => one RULE-REPORT per rule of STRATUM, in its input order."
+re-incrementing it (I5).  A refusal there leaves the committed rounds'
+claims standing and DERIVED counting them, but KEPT and SWEPT report 0
+-- FINISH-RUN's reconcile, the only place either is set, is itself
+inside the transaction that just unwound (I3); the report's ROUNDS
+names how many rounds ran.  => one RULE-REPORT per rule of STRATUM, in
+its input order."
   (let* ((foreign (rest scope))
          (producers (mapcar (lambda (c)
                               (rule-producer
                                (rule-spec-name (compiled-rule-spec c))))
-                            stratum)))
+                            stratum))
+         ;; Built once, before the retried thunk: a signal while
+         ;; building RUNS would otherwise leave %REFUSE-STRATUM
+         ;; nothing to mark for this rule, and RUN-RULES no report at
+         ;; all for the stratum (GH #333).  Pure construction -- no
+         ;; call here can itself signal -- so RUNS is always complete.
+         (runs (mapcar (lambda (c)
+                         (%make-stratum-run
+                          :compiled c
+                          :report (%make-rule-report
+                                   :rule-name (rule-spec-name
+                                               (compiled-rule-spec c))
+                                   :version (rule-spec-version
+                                             (compiled-rule-spec c))
+                                   :stratum (compiled-rule-stratum c))
+                          :family (graph-db.spacetime:claim-family-parent
+                                   (compiled-rule-family c))))
+                       stratum)))
     (%check-no-foreign-read-in-transaction "RUN-RULES" foreign)
-    (let* ((runs nil)
-           (derived-table nil)
+    (let* ((derived-table nil)
            (start (get-internal-real-time))
            (delta nil)
            (round 0))
       (labels
-          ((new-stratum-run (c)
+          ((check-recursive-goals ()
              ;; M2's safety net: %COMPILED-RECURSIVE-P and %VARIANTS
              ;; share one criterion (%RECURSIVE-GOAL-P), so this
              ;; should be unreachable; kept in case a future goal
-             ;; shape splits them again.
-             (when (and (%compiled-recursive-p c) (null (%variants c)))
-               (error 'rule-run-refusal :tag :rule
-                      :text (format nil "~(~A~) reads its own ~
+             ;; shape splits them again.  RUNS already has a report
+             ;; for every rule by now, so this can safely signal.
+             (dolist (run runs)
+               (let ((c (%stratum-run-compiled run)))
+                 (when (and (%compiled-recursive-p c)
+                            (null (%variants c)))
+                   (error 'rule-run-refusal :tag :rule
+                          :text (format nil "~(~A~) reads its own ~
 stratum but no CLAIM/7 goal there can carry the fixpoint delta"
-                                    (compiled-rule-relation c))))
-             (%make-stratum-run
-              :compiled c
-              :report (%make-rule-report
-                       :rule-name (rule-spec-name
-                                   (compiled-rule-spec c))
-                       :version (rule-spec-version
-                                 (compiled-rule-spec c))
-                       :stratum (compiled-rule-stratum c))
-              :family (graph-db.spacetime:claim-family-parent
-                       (compiled-rule-family c))
-              :existing (%seeded-existing graph c)))
+                                        (compiled-rule-relation c)))))))
+           (reset-run (run)
+             ;; I5: every mutable per-run table, and this rule's own
+             ;; report counters, reset here -- inside the retried
+             ;; thunk -- so a VALIDATION-CONFLICT retry starts
+             ;; genuinely from scratch.  COMPILED/REPORT/FAMILY, set
+             ;; once when RUNS was built, are untouched.
+             (setf (%stratum-run-existing run)
+                   (%seeded-existing graph (%stratum-run-compiled run))
+                   (%stratum-run-desired run) (make-hash-table :test 'equal)
+                   (%stratum-run-order run) '()
+                   (%stratum-run-order-tail run) nil
+                   (%stratum-run-new-keys run) '())
+             (let ((report (%stratum-run-report run)))
+               (setf (rule-report-outcome report) :derived
+                     (rule-report-derived report) 0
+                     (rule-report-kept report) 0
+                     (rule-report-swept report) 0
+                     (rule-report-refusals report) '())))
            (goal-lists (run)
              (let* ((c (%stratum-run-compiled run))
                     (variants (%variants c)))
@@ -788,7 +831,7 @@ stratum but no CLAIM/7 goal there can carry the fixpoint delta"
                    (graph-db::*claim-derived-this-run*
                      (unless *rules-naive-rounds* derived-table)))
                (%desired (%stratum-run-compiled run) graph
-                        (%stratum-run-report run) goals)))
+                         (%stratum-run-report run) goals)))
            (per-rule (run thunk)
              ;; A refusal names RUN's own family, the tag RUN-RULE uses
              ;; for the same condition (GH #333).
@@ -846,7 +889,7 @@ stratum but no CLAIM/7 goal there can carry the fixpoint delta"
                       (mapcar (lambda (r)
                                 (rule-report-derived
                                  (%stratum-run-report r)))
-                             runs))
+                              runs))
                     (next
                       (if foreign
                           (progn
@@ -880,13 +923,13 @@ stratum but no CLAIM/7 goal there can carry the fixpoint delta"
              (decf (rule-report-kept (%stratum-run-report run))
                    (rule-report-derived (%stratum-run-report run))))
            (run-to-fixpoint ()
-             ;; I5: rebuilt here, inside the transaction thunk (the
-             ;; one transaction for single-store; ONE-ROUND handles
-             ;; the cross-store per-round reset), so a
-             ;; VALIDATION-CONFLICT retry starts genuinely from
-             ;; scratch.
-             (setf runs (mapcar #'new-stratum-run stratum)
-                   derived-table (make-hash-table :test 'equal)
+             (check-recursive-goals)
+             ;; I5: reset here, inside the transaction thunk (the one
+             ;; transaction for single-store; ONE-ROUND handles the
+             ;; cross-store per-round reset), so a VALIDATION-CONFLICT
+             ;; retry starts genuinely from scratch.
+             (mapc #'reset-run runs)
+             (setf derived-table (make-hash-table :test 'equal)
                    round 0
                    delta nil)
              (loop
@@ -909,7 +952,7 @@ rounds" *rules-max-rounds*)))
                   (run-to-fixpoint)))
           (rule-run-refusal (c)
             (%refuse-stratum runs (rule-run-refusal-tag c)
-                            (rule-run-refusal-text c) foreign))
+                             (rule-run-refusal-text c) foreign))
           ;; Before PROLOG-ERROR, its superclass (recon A16, PF2).
           (graph-db:prolog-permission-error (c)
             (%refuse-stratum runs :rule (princ-to-string c) foreign))
@@ -917,7 +960,7 @@ rounds" *rules-max-rounds*)))
             (%refuse-stratum runs :budget (princ-to-string c) foreign))
           (graph-db:constraint-violation (c)
             (%refuse-stratum runs (%violation-family c)
-                            (princ-to-string c) foreign))
+                             (princ-to-string c) foreign))
           (graph-db:query-precondition-error (c)
             (%refuse-stratum runs :rule (princ-to-string c) foreign)))
         (dolist (run runs)
@@ -1007,7 +1050,7 @@ caller's transaction) signals."
                      (remove-if-not
                       (lambda (s)
                         (and (member (rule-spec-name s) names
-                                    :test #'string=)
+                                     :test #'string=)
                              (%runnable-spec-p graph s)))
                       (rules-in-scope graph))))
               (handler-case
@@ -1015,9 +1058,9 @@ caller's transaction) signals."
                                         members)))
                     (setf report
                           (or (find (rule-spec-name spec)
-                                   (%run-stratum graph others scope)
-                                   :key #'rule-report-rule-name
-                                   :test #'string=)
+                                    (%run-stratum graph others scope)
+                                    :key #'rule-report-rule-name
+                                    :test #'string=)
                              (progn
                                (refuse
                                 :rule

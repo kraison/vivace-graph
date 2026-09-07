@@ -396,7 +396,10 @@ derivation (spec §7). `rule` is a `rule` record, a `rule-spec`, or a
 name -- looked up in the store first, then among the `def-rule`s.
 Without a `scope`, or with one naming only `graph`, it is **one
 transaction**; with another store in it the body is evaluated first and
-only the reconcile is transactional (see `:scope` below).
+only the reconcile is transactional (see `:scope` below). `run-rule` on
+a disabled rule, or a `def-rule` whose family this store lacks, is a
+`:refused` report tagged `:rule` -- on every path, whether or not the
+rule is part of a recursive stratum (GH #333).
 
 **Reconcile, not sweep-then-insert (ruling P10).** `run-rule` evaluates
 the body first, then compares the identities it derived against the
@@ -529,15 +532,22 @@ The vocabulary is closed: a `constraint-violation` none of the three
 family cases name is tagged `:rule`, not with its own class name.
 
 **Nothing refuses by signalling.** Every refusal is reported and
-**the previous derivation stands untouched** -- `derived`, `kept` and
-`swept` all read 0 on a `:refused` report. A refusal raised inside the
-write transaction unwinds it; one raised during a cross-store
-evaluation unwinds the composed snapshots instead, no transaction being
-open yet. The report is the same either way, and neither path wrote
-anything. Only an operator error signals: no resource bound, no rule of
-that name in the store or the image, a `:scope` that is not a list of
-open, keyword-named stores, or a foreign store in `:scope` inside the
-caller's transaction.
+**the previous derivation stands untouched.** For a single rule, or a
+recursive stratum's single-store run, `derived`, `kept` and `swept`
+all read 0 on a `:refused` report: a refusal raised inside the write
+transaction unwinds it; one raised during a cross-store evaluation
+unwinds the composed snapshots instead, no transaction being open yet;
+the report is the same either way, and neither path wrote anything.
+A recursive stratum's cross-store run is the one exception: each
+round commits in its own transaction, so a refusal partway through
+leaves earlier rounds' claims standing -- `derived` counts what they
+wrote and `rounds` names how many, while `kept` and `swept` still read
+0, since the fixpoint's reconcile (the only place either is set) is
+itself inside the transaction that just unwound. Only an operator
+error signals: no resource bound, no rule of that name in the store or
+the image, a `:scope` that is not a list of open, keyword-named
+stores, or a foreign store in `:scope` inside the caller's
+transaction.
 
 ## Validity of a derived claim
 
