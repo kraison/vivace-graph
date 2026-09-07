@@ -175,12 +175,18 @@ transaction will commit, through `make-commit-view` as
   added at its place in index order;
 - confirmation (R7, §4.3) resolves through `view-node`, so a name whose
   claims the transaction deleted, or under `:current` retracted, drops;
-- a count is the index count adjusted by the transaction's writes under
-  that name: created claims add, deleted claims subtract, and under
-  `:current` retracted claims subtract.
+- a count is resolved, not adjusted: every committed entry in the name's
+  index range is resolved through `view-node` and counted if it survives
+  and, under `:current`, is current; the claims the transaction created
+  under that name are then added.
 
-The adjustment walks `view-writes` once per call and is bounded by the
-write set.
+`index-count` is the fast path for outside a transaction without
+`:current` only. Inside a transaction, or with `:current`, a `:counts`
+call therefore walks the name's whole index range, resolving every entry,
+and scans `view-writes` once per name: linear in the family's entries,
+not merely in the transaction's writes. A write-set adjustment -- the
+index count corrected by the writes under the name, O(entries + writes)
+but with no per-entry resolution -- is a follow-up, not what ships.
 
 ### 4.5 Refusals and bounds
 

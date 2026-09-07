@@ -1115,7 +1115,9 @@ walk prefixes of ~D" (slot-index-slot-names six) n arity)))
   "Number of entries in the index on CLASS-NAME.SLOT-NAME whose tuple
 equals VALUE, or with PREFIX T starts with it; 0 when none.  Same VALUE
 and PREFIX rules as INDEX-LOOKUP.  Entries, not live nodes: inside an
-open transaction this is the committed membership (GH #350)."
+open transaction this is the committed membership (GH #350).  Trap: it
+is O(range size) -- a count of a large prefix walks every entry under
+it."
   (let* ((*graph* graph)
          (six (%require-index graph class-name slot-name)))
     (if (null six)

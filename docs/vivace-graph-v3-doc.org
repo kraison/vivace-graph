@@ -5922,13 +5922,17 @@ indexes, in index order, without walking its claims:
 #+END_SRC
 
 ~:counts t~ makes each entry ~(name . count)~; under ~:role :either~
-the count sums the subject and object roles. Without ~:current~ a
-count is an index-range size (entries, no resolution), which under an
-open ~with-as-of~ extent still counts a claim created after the
-epoch; ~:current t~ resolves each entry. The default lists every name
-the indexes hold, retracted claims included -- they are the
-record of what was believed; ~:current t~ keeps a name only if a claim
-under it is current, and counts only those. Inside an open
+the count sums the subject and object roles. Outside a transaction and
+without ~:current~ a count is an index-range size (entries, no
+resolution), which under an open ~with-as-of~ extent still counts a
+claim created after the epoch; ~:current t~ resolves each entry.
+Inside an open transaction every count resolves its range through the
+commit view -- ~:current~ or not -- and adds the claims the
+transaction created under the name, so a count there costs a walk of
+that name's entries. The default lists every name the indexes hold,
+retracted claims included -- they are the record of what was believed;
+~:current t~ keeps a name only if a claim under it is current, and
+counts only those. Inside an open
 transaction the answer is what that transaction will commit, as
 ~claims-touching~ does. Names come from index membership, which is
 live: ~:as-of~ and ~:as-of-epoch~ are refused, and an open
