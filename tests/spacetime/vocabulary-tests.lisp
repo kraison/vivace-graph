@@ -193,3 +193,27 @@ adjusted by the transaction's own writes, under the default and under
                  (claim-keys g 'ct-claim :ns :counts t :current t)))
       (is (equal '(("r" . 3)) (claim-relations g 'ct-claim :counts t))
           "the created claim's relation counts before commit"))))
+
+(test vocabulary-in-a-transaction-sees-a-created-binary-claim-s-object
+  "Spec §4.4, R5, the object role: a binary claim created in the open
+transaction contributes its object endpoint to the object-role listing
+and its subject to the subject role; under :EITHER a claim whose two
+namespaces are equal is counted once per role."
+  (with-claim-graph (g)
+    (with-transaction () (%ns-u :ns "a"))
+    (with-transaction ()
+      (%ns-b :ns "s" :other "o")
+      (%ns-b :same "x" :same "y")
+      (is (equal '(:other :same)
+                 (claim-namespaces g 'ct-claim :role :object))
+          "object namespaces of created binary claims are listed")
+      (is (equal '("o") (claim-keys g 'ct-claim :other))
+          "the object key under :other comes from the created pass")
+      (is (equal '("x" "y") (claim-keys g 'ct-claim :same))
+          "subject and object keys under one namespace, merged")
+      (is (equal '((:ns . 2) (:other . 1) (:same . 2))
+                 (claim-namespaces g 'ct-claim :counts t))
+          ":either sums subject and object roles of created claims"))
+    (is (equal '((:ns . 2) (:other . 1) (:same . 2))
+               (claim-namespaces g 'ct-claim :counts t))
+        "after commit the index agrees")))
