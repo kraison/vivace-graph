@@ -250,6 +250,8 @@
                 #:lookup-vertex
                 #:lookup-edge
                 #:vertex-history
+                #:edge-history               ; GH #115
+                #:node-history               ; GH #115
                 #:with-as-of                 ; GH #115
                 #:latest-epoch
                 #:as-of-refused

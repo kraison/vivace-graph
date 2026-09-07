@@ -726,6 +726,34 @@ VERSION-REAPED-ERROR, or count and skip (GH #115, spec §3.2)."
 ;;; (or to :LIMIT) and handed to a caller -- the supported way to read what
 ;;; KEEP-REVISIONS retains.
 
+(defun %node-history (graph id table deserializer &key limit)
+  "VERTEX-HISTORY / EDGE-HISTORY: the retained versions of ID in TABLE,
+newest first, archived heads read with DESERIALIZER (GH #115 spec §4)."
+  (when (and limit (<= limit 0))
+    (return-from %node-history nil))
+  (let ((*graph* graph)   ; DESERIALIZE-VERTEX-HEAD/-EDGE-HEAD resolve the
+                          ; node type through *GRAPH*, not through an argument.
+        (key (if (stringp id) (read-id-array-from-string id) id)))
+    (with-read-pin (graph)
+      (let ((live (lookup-node table key graph)))
+        (when (node-p live)
+          (ensure-node-bytes live graph)
+          (maybe-init-node-data live :graph graph)
+          (let ((history (list (cons live (commit-epoch live))))
+                (count 1)
+                (p (prev-pointer live)))
+            (loop
+              (when (or (zerop p) (and limit (>= count limit)))
+                (return))
+              (let ((version (funcall deserializer (heap graph) p)))
+                (setf (id version) key)
+                (ensure-node-bytes version graph)
+                (maybe-init-node-data version :graph graph)
+                (push (cons version (commit-epoch version)) history)
+                (incf count)
+                (setf p (prev-pointer version))))
+            (nreverse history)))))))
+
 (defun vertex-history (graph id &key limit)
   "Return the retained versions of the vertex ID in GRAPH as a list of
 \(VERSION . COMMIT-EPOCH) conses, NEWEST FIRST.  The live version is included
@@ -762,30 +790,24 @@ than that floor remain reclaimable, so a history walk that races a concurrent
 UPDATE of the SAME vertex may see its deep tail cut short -- the same
 truncation KEEP-REVISIONS can cause, and indistinguishable from it.  Quiescent
 vertices (the normal case for ingested source records) are unaffected."
-  (when (and limit (<= limit 0))
-    (return-from vertex-history nil))
-  (let ((*graph* graph)   ; DESERIALIZE-VERTEX-HEAD resolves the node type
-                          ; through *GRAPH*, not through an argument.
-        (key (if (stringp id) (read-id-array-from-string id) id)))
-    (with-read-pin (graph)
-      (let ((live (lookup-node (vertex-table graph) key graph)))
-        (when (node-p live)
-          (ensure-node-bytes live graph)
-          (maybe-init-node-data live :graph graph)
-          (let ((history (list (cons live (commit-epoch live))))
-                (count 1)
-                (p (prev-pointer live)))
-            (loop
-              (when (or (zerop p) (and limit (>= count limit)))
-                (return))
-              (let ((version (deserialize-vertex-head (heap graph) p)))
-                (setf (id version) key)
-                (ensure-node-bytes version graph)
-                (maybe-init-node-data version :graph graph)
-                (push (cons version (commit-epoch version)) history)
-                (incf count)
-                (setf p (prev-pointer version))))
-            (nreverse history)))))))
+  (%node-history graph id (vertex-table graph) #'deserialize-vertex-head
+                 :limit limit))
+
+(defun edge-history (graph id &key limit)
+  "VERTEX-HISTORY for an edge: the retained versions of edge ID in GRAPH,
+\(VERSION . COMMIT-EPOCH) newest first, live first; NIL if none.  Same
+bounds and traps as VERTEX-HISTORY -- depth is :KEEP-REVISIONS, and a
+short history does not mean few edits (GH #115)."
+  (%node-history graph id (edge-table graph) #'deserialize-edge-head
+                 :limit limit))
+
+(defgeneric node-history (node &key limit)
+  (:documentation "VERTEX-HISTORY or EDGE-HISTORY of NODE in its home
+graph (or *GRAPH* when unstamped), by NODE's class (GH #115).")
+  (:method ((node vertex) &key limit)
+    (vertex-history (or (node-graph node) *graph*) (id node) :limit limit))
+  (:method ((node edge) &key limit)
+    (edge-history (or (node-graph node) *graph*) (id node) :limit limit)))
 
 ;;; Read-epoch pins (non-transactional reads).  A reader records the current
 ;;; epoch BEFORE it reads a node head and holds the pin until it has finished

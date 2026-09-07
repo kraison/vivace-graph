@@ -913,3 +913,30 @@ query run at E; both together is a macroexpansion-time error."
       (signals error
         (macroexpand-1 '(select (:snapshot t :as-of 1) (?p)
                           (is-a ?p g-person)))))))
+
+(test edge-and-node-history-walk-the-chain-newest-first
+  "Spec §4: EDGE-HISTORY is VERTEX-HISTORY's edge twin; NODE-HISTORY
+dispatches on the node's class; entries are (VERSION . COMMIT-EPOCH)
+newest first."
+  (with-kept-graph (g 3)
+    (let (aid eid e1 e2)
+      (setq e1 (%epoch-of
+                (lambda ()
+                  (let ((a (make-g-person :name "a" :age 1))
+                        (b (make-g-person :name "b" :age 2)))
+                    (setq aid (id a))
+                    (setq eid (id (make-g-knows :from a :to b :since 1)))))))
+      (setq e2 (%epoch-of
+                (lambda ()
+                  (let ((c (copy (lookup-edge eid))))
+                    (setf (slot-value c 'since) 2)
+                    (save c)))))
+      (let ((h (edge-history g eid)))
+        (is (= 2 (length h)))
+        (is (equal (list e2 e1) (mapcar #'cdr h)) "newest first")
+        (is (equal '(2 1) (mapcar (lambda (p) (slot-value (car p) 'since)) h)))
+        (is (equal (mapcar #'cdr h)
+                   (mapcar #'cdr (node-history (lookup-edge eid))))))
+      (is (equal (mapcar #'cdr (vertex-history g aid))
+                 (mapcar #'cdr (node-history (lookup-vertex aid)))))
+      (is (= 1 (length (edge-history g eid :limit 1)))))))
