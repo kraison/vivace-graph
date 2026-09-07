@@ -259,6 +259,11 @@
                 #:version-reaped-epoch
                 #:version-reaped-oldest-epoch
                 #:version-reaped-oldest-revision
+                ;; compaction: flags the index pcons the as-of walk
+                ;; must still visit (GH #115 spec §3.3)
+                #:compact-vertices
+                #:compact-edges
+                #:edge-exists-p
                 #:outgoing-edges
                 #:incoming-edges
                 #:traverse

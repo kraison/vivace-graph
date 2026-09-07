@@ -705,9 +705,12 @@ typed scan inside a fresh as-of extent, so E must be nameable."
           #'string<)))
 
 (test as-of-typed-scan-reconstructs-membership-both-ways
-  "Spec §3.3: at E a typed scan excludes a vertex created after E and
-includes one deleted after E; at the deletion epoch it is gone.  This is
-the case SNAPSHOT-HIDES-NODES-CREATED-AFTER-START never covered."
+  "Spec §3.3, the lookup path (§3.1, §3.2) reached through a typed scan:
+at E the scan excludes a vertex created after E and includes one deleted
+after E; at the deletion epoch it is gone.  A soft delete leaves its
+type-index entry unflagged in the chain, so this holds without the
+tombstone walk -- AS-OF-WALKS-COMPACTION-TOMBSTONES covers that.  The
+case SNAPSHOT-HIDES-NODES-CREATED-AFTER-START never covered."
   (with-kept-graph (g 3)
     (let (b e-mid e-del)
       (with-transaction () (make-g-person :name "a" :age 1))
@@ -726,9 +729,12 @@ the case SNAPSHOT-HIDES-NODES-CREATED-AFTER-START never covered."
             "is-a/2 enumerates through the same scan")))))
 
 (test as-of-adjacency-reconstructs-edges-and-endpoints
-  "Spec §3.3: OUTGOING-EDGES at E excludes an edge created after E,
-includes one deleted after E, and an edge whose endpoint was deleted
-after E is active at E."
+  "Spec §3.3, the same lookup path reached through adjacency:
+OUTGOING-EDGES at E excludes an edge created after E, includes one
+deleted after E, and an edge whose endpoint was deleted after E is
+active at E.  Soft-deleted ve/vev entries stay unflagged in the chain,
+so this too holds without the tombstone walk --
+AS-OF-WALKS-COMPACTED-ADJACENCY-TOMBSTONES covers that."
   (with-kept-graph (g 3)
     ;; B is bound for symmetry with A and C; only the vertex it names is
     ;; used, hence IGNORABLE.
@@ -776,3 +782,65 @@ is refused rather than answering live."
               (handler-case
                   (with-as-of ((g) e) (map-edges #'identity g) nil)
                 (as-of-refused (c) (as-of-refused-reason c))))))))
+
+(test as-of-walks-compaction-tombstones
+  "Spec §3.3, the tombstone walk itself: COMPACT-VERTICES de-indexes a
+soft-deleted vertex by flagging its type-index pcons -- MARK-PCONS-DELETED
+leaves the cell in the chain -- so membership at E survives compaction
+only because an as-of scan passes :INCLUDE-DELETED-P T at the index-list
+level.  Drop that flag and the first assertion goes red."
+  (with-kept-graph (g 3)
+    (let (b e-mid)
+      (with-transaction () (make-g-person :name "a" :age 1))
+      (with-transaction ()
+        (setq b (id (make-g-person :name "b" :age 2))))
+      (setq e-mid (latest-epoch g))
+      (with-transaction () (mark-deleted (lookup-vertex b)))
+      ;; Outside any as-of extent: COMPACT-VERTICES drives the untyped
+      ;; scan, which an as-of snapshot refuses (R6).
+      (compact-vertices g)
+      (is (equal '("a" "b") (%names-at g e-mid))
+          "b's FLAGGED type-index entry is still membership at E")
+      (is (equal '("a") (%names-at g (latest-epoch g)))
+          "control: at the latest epoch b resolves deleted and is gone"))))
+
+(test as-of-walks-compacted-adjacency-tombstones
+  "Spec §3.3 for edges: COMPACT-EDGES de-indexes a soft-deleted edge by
+flagging its type/ve/vev pcons, so at E the edge is found again only
+through the as-of :INCLUDE-DELETED-P T walk of the index list.  One
+assertion per index that walk covers -- ve (adjacency), type, vev
+(endpoint pair) -- plus EDGE-EXISTS-P's own vev walk."
+  (with-kept-graph (g 3)
+    (let (a b e-mid)
+      (with-transaction ()
+        (let ((va (make-g-person :name "a" :age 1))
+              (vb (make-g-person :name "b" :age 2)))
+          (setq a (id va) b (id vb))
+          (make-g-knows :from va :to vb :since 1)))
+      (setq e-mid (latest-epoch g))
+      (with-transaction ()
+        (mark-deleted (first (outgoing-edges (lookup-vertex a)))))
+      ;; Outside any as-of extent, as COMPACT-VERTICES above.
+      (compact-edges g)
+      (flet ((sinces (&rest args)
+               (mapcar (lambda (ed) (slot-value ed 'since))
+                       (apply #'map-edges #'identity g :collect-p t args))))
+        (with-as-of ((g) e-mid)
+          (is (equal '(1) (sinces :vertex (lookup-vertex a)
+                                  :direction :out))
+              "ve index: the FLAGGED entry is still adjacency at E")
+          (is (equal '(1) (sinces :edge-type 'g-knows))
+              "type index: the same edge, through the typed scan")
+          (is (equal '(1) (sinces :from-vertex (lookup-vertex a)
+                                  :to-vertex (lookup-vertex b)))
+              "vev index: the same edge, through the endpoint pair")
+          (is (not (null (edge-exists-p 'g-knows (lookup-vertex a)
+                                        (lookup-vertex b))))
+              "EDGE-EXISTS-P walks the flagged vev entry too"))
+        (with-as-of ((g) (latest-epoch g))
+          (is (equal '() (sinces :vertex (lookup-vertex a)
+                                 :direction :out))
+              "control: at the latest epoch the edge resolves deleted")
+          (is (null (edge-exists-p 'g-knows (lookup-vertex a)
+                                   (lookup-vertex b)))
+              "control: EDGE-EXISTS-P agrees at the latest epoch"))))))
