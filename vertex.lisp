@@ -206,7 +206,8 @@ the raw vertex lhash, which reads LIVE node versions and so BYPASSES MVCC
 snapshot isolation.  It is intended for back-end / admin passes (backup, GC,
 reindex) run while the graph is quiescent; a typed scan goes through the type
 index + LOOKUP-VERTEX and is snapshot-consistent.  (This is why IS-A/2 enumerates
-per-type instead of using the untyped scan.)"
+per-type instead of using the untyped scan.)  Under an as-of snapshot
+(WITH-AS-OF, GH #115) the untyped scan is refused."
   ;; :RECORD-READS NIL (GH #92): inside a read-write transaction, a scan
   ;; that records every visited node makes the transaction conflict with
   ;; ANY concurrent writer touching anything it scanned -- measured at a
@@ -231,49 +232,67 @@ per-type instead of using the untyped scan.)"
                    (lambda (node) (ensure-node-bytes node graph) (funcall user-fn node)))
                  fn)))
     (with-read-pin (graph)        ; retain whatever versions this scan observes
-      (flet ((scan-type-id (type-id)
-               (let ((index-list (get-type-index-list (vertex-index graph) type-id)))
-                 (when index-list
-                   (map-index-list
-                    (lambda (id)
-                      (let ((vertex (lookup-vertex id :graph graph)))
-                        ;; vertex can be nil if it appears in the type-index before
-                        ;; lhash-insert completes (commit race); skip it.
-                        (when (and vertex
-                                   (written-p vertex)
-                                   (or include-deleted-p (not (deleted-p vertex))))
-                          (if collect-p
-                              (push (funcall fn vertex) result)
-                              (funcall fn vertex)))))
-                    index-list)))))
-        (let ((requested (append (when vertex-type (list vertex-type))
-                                 include-vertex-types)))
-          (if requested
-              (let ((type-ids (resolve-node-type-ids
-                               requested :vertex
-                               :include-subclasses-p include-subclasses-p
-                               :graph graph))
-                    (excluded (when exclude-vertex-types
-                                (resolve-node-type-ids
-                                 exclude-vertex-types :vertex
+      ;; GH #115 spec §3.3: membership at E is the tombstone walk.
+      (let ((as-of (%as-of-snapshot graph)))
+        (flet ((scan-type-id (type-id)
+                 (let ((index-list (get-type-index-list (vertex-index graph)
+                                                        type-id)))
+                   (when index-list
+                     (map-index-list
+                      (lambda (id)
+                        (let ((vertex (lookup-vertex id :graph graph)))
+                          ;; vertex can be nil if it appears in the
+                          ;; type-index before lhash-insert completes
+                          ;; (commit race); skip it.
+                          (when (and vertex
+                                     (written-p vertex)
+                                     (or include-deleted-p
+                                         (not (deleted-p vertex))))
+                            (if collect-p
+                                (push (funcall fn vertex) result)
+                                (funcall fn vertex)))))
+                      index-list
+                      ;; Under as-of, tombstoned entries too: each id
+                      ;; resolves at E, and the deleted filter above runs
+                      ;; on THAT version.
+                      :include-deleted-p (not (null as-of)))))))
+          (let ((requested (append (when vertex-type (list vertex-type))
+                                   include-vertex-types)))
+            (if requested
+                (let ((type-ids (resolve-node-type-ids
+                                 requested :vertex
                                  :include-subclasses-p include-subclasses-p
-                                 :graph graph))))
-                (dolist (tid type-ids)
-                  (unless (member tid excluded)
-                    (scan-type-id tid))))
-              ;; fully untyped: live lhash scan (see NOTE)
-              (map-lhash #'(lambda (pair)
-                             (let ((vertex (cdr pair)))
-                               (when (and (written-p vertex)
-                                          (or include-deleted-p (not (deleted-p vertex))))
-                                 (setf (id vertex) (car pair))
-                                 ;; The deserializer builds these; a side-effect
-                                 ;; scan never sees ENSURE-NODE-BYTES (GH #53).
-                                 (setf (node-graph vertex) graph)
-                                 (if collect-p
-                                     (push (funcall fn vertex) result)
-                                     (funcall fn vertex)))))
-                         (vertex-table graph))))))
+                                 :graph graph))
+                      (excluded (when exclude-vertex-types
+                                  (resolve-node-type-ids
+                                   exclude-vertex-types :vertex
+                                   :include-subclasses-p include-subclasses-p
+                                   :graph graph))))
+                  (dolist (tid type-ids)
+                    (unless (member tid excluded)
+                      (scan-type-id tid))))
+                (progn
+                  ;; fully untyped: live lhash scan (see NOTE), refused
+                  ;; under an as-of snapshot (GH #115, R6)
+                  (when as-of
+                    (error 'as-of-refused :graph graph
+                                          :epoch (as-of-epoch as-of)
+                                          :reason :untyped-scan))
+                  (map-lhash
+                   #'(lambda (pair)
+                       (let ((vertex (cdr pair)))
+                         (when (and (written-p vertex)
+                                    (or include-deleted-p
+                                        (not (deleted-p vertex))))
+                           (setf (id vertex) (car pair))
+                           ;; The deserializer builds these; a
+                           ;; side-effect scan never sees
+                           ;; ENSURE-NODE-BYTES (GH #53).
+                           (setf (node-graph vertex) graph)
+                           (if collect-p
+                               (push (funcall fn vertex) result)
+                               (funcall fn vertex)))))
+                   (vertex-table graph))))))))
     (when collect-p (nreverse result))))
 
 (defmethod compact-vertices ((graph graph))

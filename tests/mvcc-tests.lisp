@@ -695,3 +695,84 @@ documented limit, spec §3.2)."
       ;; AS-OF-ANSWERS-THE-VERSION-LIVE-AT-EACH-EPOCH, whose chain is intact.
       (signals version-reaped-error
         (with-as-of ((g) e0) (lookup-vertex id))))))
+
+(defun %names-at (g e)
+  "The NAMEs of G's G-PERSON vertices as of epoch E, sorted.  Runs a
+typed scan inside a fresh as-of extent, so E must be nameable."
+  (with-as-of ((g) e)
+    (sort (map-vertices (lambda (v) (slot-value v 'name)) g
+                        :collect-p t :vertex-type 'g-person)
+          #'string<)))
+
+(test as-of-typed-scan-reconstructs-membership-both-ways
+  "Spec §3.3: at E a typed scan excludes a vertex created after E and
+includes one deleted after E; at the deletion epoch it is gone.  This is
+the case SNAPSHOT-HIDES-NODES-CREATED-AFTER-START never covered."
+  (with-kept-graph (g 3)
+    (let (b e-mid e-del)
+      (with-transaction () (make-g-person :name "a" :age 1))
+      (setq e-mid (%epoch-of
+                   (lambda () (setq b (id (make-g-person :name "b" :age 2))))))
+      (with-transaction () (make-g-person :name "c" :age 3))
+      (setq e-del (%epoch-of (lambda () (mark-deleted (lookup-vertex b)))))
+      (is (equal '("a" "b") (%names-at g e-mid))
+          "c not yet created, b not yet deleted")
+      (is (equal '("a" "c") (%names-at g e-del))
+          "at the deletion epoch b is gone (inclusive)")
+      (is (equal '("a" "c") (%names-at g (latest-epoch g))))
+      (with-as-of ((g) e-mid)
+        (is (= 1 (select-count (?p) (is-a ?p g-person)
+                               (node-slot-value ?p name "b")))
+            "is-a/2 enumerates through the same scan")))))
+
+(test as-of-adjacency-reconstructs-edges-and-endpoints
+  "Spec §3.3: OUTGOING-EDGES at E excludes an edge created after E,
+includes one deleted after E, and an edge whose endpoint was deleted
+after E is active at E."
+  (with-kept-graph (g 3)
+    ;; B is bound for symmetry with A and C; only the vertex it names is
+    ;; used, hence IGNORABLE.
+    (let (a b c e-mid e-del)
+      (declare (ignorable b))
+      (with-transaction ()
+        (let ((va (make-g-person :name "a" :age 1))
+              (vb (make-g-person :name "b" :age 2))
+              (vc (make-g-person :name "c" :age 3)))
+          (setq a (id va) b (id vb) c (id vc))
+          (make-g-knows :from va :to vb :since 1)))
+      (setq e-mid (latest-epoch g))
+      (with-transaction ()
+        (make-g-knows :from (lookup-vertex a) :to (lookup-vertex c) :since 2))
+      (setq e-del (%epoch-of
+                   (lambda ()
+                     (mark-deleted
+                      (find 1 (outgoing-edges (lookup-vertex a))
+                            :key (lambda (ed) (slot-value ed 'since))))
+                     (mark-deleted (lookup-vertex c)))))
+      (flet ((sinces-at (e)
+               (with-as-of ((g) e)
+                 (sort (mapcar (lambda (ed) (slot-value ed 'since))
+                               (outgoing-edges (lookup-vertex a)))
+                       #'<))))
+        (is (equal '(1) (sinces-at e-mid)) "the second edge is not yet born")
+        (is (equal '(1 2) (sinces-at (1- e-del)))
+            "both born, neither deleted")
+        (is (equal '() (sinces-at e-del))
+            "at E-DEL the first edge is deleted and the second's endpoint
+c is deleted, so neither is active")
+        (is (equal '() (sinces-at (latest-epoch g))))))))
+
+(test as-of-refuses-the-untyped-scan
+  "Spec R6: the raw lhash walk reads live versions; under a named epoch it
+is refused rather than answering live."
+  (with-test-graph (g)
+    (with-transaction () (make-g-person :name "a" :age 1))
+    (let ((e (latest-epoch g)))
+      (is (eq :untyped-scan
+              (handler-case
+                  (with-as-of ((g) e) (map-vertices #'identity g) nil)
+                (as-of-refused (c) (as-of-refused-reason c)))))
+      (is (eq :untyped-scan
+              (handler-case
+                  (with-as-of ((g) e) (map-edges #'identity g) nil)
+                (as-of-refused (c) (as-of-refused-reason c))))))))
