@@ -576,13 +576,16 @@ into A; each round evaluates under snapshots and commits on A."
       (is (= 4 (graph-db.rules:rule-report-rounds
                 (report-named "tc-step" reports))))
       (is (equal '(("a" . "b") ("a" . "c") ("a" . "d")) (reaches a)))
-      ;; Provenance names the foreign premises by store.
-      (let ((p (graph-db.rules:premises-of
-                a (first (claims-touching a 'rt-claim :node "a"
-                                          :role :subject
-                                          :relation "reaches"))
-                :scope (list a b))))
-        (is (plusp (length p)))))))
+      ;; Provenance names the foreign premises by store: the "a"-"b"
+      ;; claim TC-BASE derived directly from B's single "next" premise
+      ;; -- one claim, in B, deterministically (unlike "a"-"c" or
+      ;; "a"-"d", each with more than one premise, one of them A's own
+      ;; prior "reaches").
+      (let* ((ab (find "b" (derived a 'rt-claim "tc-base")
+                       :key #'claim-object-key :test #'string=))
+             (p (graph-db.rules:premises-of a ab :scope (list a b))))
+        (is (= 1 (length p)))
+        (is (every (lambda (n) (eq b (graph-db::node-graph n))) p))))))
 
 (test a-cross-store-refusal-keeps-derived-and-zeroes-the-rest
   "GH #333: with the cap at 1, round 0 -- TC-BASE's full body over B's
