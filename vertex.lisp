@@ -104,14 +104,29 @@
                      :value-deserializer 'deserialize-vertex-head)))
     table))
 
-(defmethod lookup-vertex ((id string) &key (graph *graph*))
-  (lookup-vertex (read-id-array-from-string id) :graph graph))
+(defmethod lookup-vertex ((id string) &key (graph *graph*) as-of
+                                        (if-reaped :error))
+  (lookup-vertex (read-id-array-from-string id)
+                 :graph graph :as-of as-of :if-reaped if-reaped))
 
-(defmethod lookup-vertex ((id array) &key (graph *graph*))
+(defmethod lookup-vertex ((id array) &key (graph *graph*) as-of
+                                       (if-reaped :error))
   "Return the vertex with the given ID (a 16-byte id array or its string form)
 in GRAPH, or NIL if none.  Returns the vertex regardless of its deleted flag;
-the generated LOOKUP-<type> functions filter deleted nodes for you."
-  (lookup-object id (vertex-table graph) *transaction* graph))
+the generated LOOKUP-<type> functions filter deleted nodes for you.
+
+:AS-OF EPOCH answers at that epoch under a per-call snapshot (GH #115, spec
+§3.4; see WITH-AS-OF for the refusals); the result is materialised so it is
+safe to use after the call."
+  (if as-of
+      (call-with-read-snapshot
+       (lambda ()
+         (let ((v (lookup-object id (vertex-table graph) *transaction*
+                                 graph)))
+           (when v (ensure-node-bytes v graph))
+           v))
+       graph :as-of as-of :if-reaped if-reaped)
+      (lookup-object id (vertex-table graph) *transaction* graph)))
 
 (defmethod add-to-type-index ((vertex vertex) (graph graph)
                               &key unless-present)
@@ -185,7 +200,7 @@ the id on a duplicate-key collision."
 (defun map-vertices (fn graph &key collect-p vertex-type include-vertex-types
                                 exclude-vertex-types include-deleted-p
                                 (include-subclasses-p t)
-                                (record-reads t))
+                                (record-reads t) as-of (if-reaped :error))
   "Call FN on vertices of GRAPH.
 
 Narrow the set with :VERTEX-TYPE (a single type name or numeric type-id) and/or
@@ -207,7 +222,22 @@ snapshot isolation.  It is intended for back-end / admin passes (backup, GC,
 reindex) run while the graph is quiescent; a typed scan goes through the type
 index + LOOKUP-VERTEX and is snapshot-consistent.  (This is why IS-A/2 enumerates
 per-type instead of using the untyped scan.)  Under an as-of snapshot
-(WITH-AS-OF, GH #115) the untyped scan is refused."
+(WITH-AS-OF, GH #115) the untyped scan is refused.
+
+:AS-OF EPOCH runs the whole call under a fresh per-call snapshot of GRAPH
+at EPOCH (GH #115, spec §3.4); an enclosing as-of extent on GRAPH at the
+same epoch is inherited instead.  :IF-REAPED as CALL-WITH-READ-SNAPSHOT."
+  (when as-of                           ; GH #115 spec §3.4
+    (return-from map-vertices
+      (call-with-read-snapshot
+       (lambda ()
+         (map-vertices fn graph :collect-p collect-p :vertex-type vertex-type
+                       :include-vertex-types include-vertex-types
+                       :exclude-vertex-types exclude-vertex-types
+                       :include-deleted-p include-deleted-p
+                       :include-subclasses-p include-subclasses-p
+                       :record-reads record-reads))
+       graph :as-of as-of :if-reaped if-reaped)))
   ;; :RECORD-READS NIL (GH #92): inside a read-write transaction, a scan
   ;; that records every visited node makes the transaction conflict with
   ;; ANY concurrent writer touching anything it scanned -- measured at a

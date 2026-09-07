@@ -844,3 +844,26 @@ assertion per index that walk covers -- ve (adjacency), type, vev
           (is (null (edge-exists-p 'g-knows (lookup-vertex a)
                                    (lookup-vertex b)))
               "control: EDGE-EXISTS-P agrees at the latest epoch"))))))
+
+(test per-call-as-of-opens-a-snapshot-for-the-call
+  "Spec §3.4: :AS-OF on a lookup or scan answers at E for that call, the
+result outlives the call, and inside an as-of extent at the same epoch it
+inherits."
+  (with-kept-graph (g 3)
+    (let (id e1)
+      (setq e1 (%epoch-of
+                (lambda () (setq id (id (make-g-person :name "p" :age 0))))))
+      (bump-age id 5)
+      (let ((old (lookup-vertex id :as-of e1)))
+        (is (= 0 (slot-value old 'age)) "the version at E1, materialised")
+        (is (null graph-db:*read-snapshots*) "the snapshot closed"))
+      (is (= 5 (slot-value (lookup-vertex id) 'age)))
+      (is (equal '(0) (map-vertices (lambda (v) (slot-value v 'age)) g
+                                    :collect-p t :vertex-type 'g-person
+                                    :as-of e1)))
+      (with-as-of ((g) e1)
+        (is (= 0 (slot-value (lookup-vertex id :as-of e1) 'age))
+            "same epoch inherits"))
+      (signals as-of-refused (lookup-vertex id :as-of (1+ (latest-epoch g))))
+      (signals as-of-refused
+        (with-as-of ((g) e1) (lookup-vertex id :as-of (latest-epoch g)))))))

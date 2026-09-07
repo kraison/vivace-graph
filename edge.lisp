@@ -138,14 +138,29 @@
                      :value-deserializer 'deserialize-edge-head)))
     table))
 
-(defmethod lookup-edge ((id string) &key (graph *graph*))
-  (lookup-edge (read-id-array-from-string id) :graph graph))
+(defmethod lookup-edge ((id string) &key (graph *graph*) as-of
+                                      (if-reaped :error))
+  (lookup-edge (read-id-array-from-string id)
+               :graph graph :as-of as-of :if-reaped if-reaped))
 
-(defmethod lookup-edge ((id array) &key (graph *graph*))
+(defmethod lookup-edge ((id array) &key (graph *graph*) as-of
+                                     (if-reaped :error))
   "Return the edge with the given ID (a 16-byte id array or its string form) in
 GRAPH, or NIL if none.  Returns it regardless of its deleted flag; the
-generated LOOKUP-<type> functions filter deleted edges."
-  (lookup-object id (edge-table graph) *transaction* graph))
+generated LOOKUP-<type> functions filter deleted edges.
+
+:AS-OF EPOCH answers at that epoch under a per-call snapshot (GH #115, spec
+§3.4; see WITH-AS-OF for the refusals); the result is materialised so it is
+safe to use after the call."
+  (if as-of
+      (call-with-read-snapshot
+       (lambda ()
+         (let ((e (lookup-object id (edge-table graph) *transaction*
+                                 graph)))
+           (when e (ensure-node-bytes e graph))
+           e))
+       graph :as-of as-of :if-reaped if-reaped)
+      (lookup-object id (edge-table graph) *transaction* graph)))
 
 (defmethod add-to-ve-index ((edge edge) (graph graph) &key unless-present)
   (let ((in-ve-key (make-ve-key :id (to edge) :type-id (type-id edge)))
@@ -393,7 +408,7 @@ graph-class.lisp."
 (defun map-edges (fn graph &key collect-p edge-type include-edge-types vertex
                              direction include-deleted-p to-vertex from-vertex
                              exclude-edge-types (include-subclasses-p t)
-                             (record-reads t))
+                             (record-reads t) as-of (if-reaped :error))
   "Call FN on edges of GRAPH.
 
 Narrow the set with :EDGE-TYPE (a single type name or numeric type-id) and/or
@@ -417,7 +432,23 @@ snapshot isolation -- intended for back-end / admin passes run while the graph i
 quiescent.  Every typed or adjacency scan goes through an index + LOOKUP-EDGE and
 is snapshot-consistent.  (Generic, type-0 edges appear only in this untyped scan;
 typed/adjacency scans skip the 0 sentinel, as they always have.)  Under an as-of
-snapshot (WITH-AS-OF, GH #115) the untyped scan is refused."
+snapshot (WITH-AS-OF, GH #115) the untyped scan is refused.
+
+:AS-OF EPOCH runs the whole call under a fresh per-call snapshot of GRAPH
+at EPOCH (GH #115, spec §3.4); an enclosing as-of extent on GRAPH at the
+same epoch is inherited instead.  :IF-REAPED as CALL-WITH-READ-SNAPSHOT."
+  (when as-of                           ; GH #115 spec §3.4
+    (return-from map-edges
+      (call-with-read-snapshot
+       (lambda ()
+         (map-edges fn graph :collect-p collect-p :edge-type edge-type
+                    :include-edge-types include-edge-types :vertex vertex
+                    :direction direction :include-deleted-p include-deleted-p
+                    :to-vertex to-vertex :from-vertex from-vertex
+                    :exclude-edge-types exclude-edge-types
+                    :include-subclasses-p include-subclasses-p
+                    :record-reads record-reads))
+       graph :as-of as-of :if-reaped if-reaped)))
   ;; Bind *GRAPH* to GRAPH so the value-deserializer (deserialize-edge-head)
   ;; resolves type-ids against the right schema even when mapping a graph that
   ;; isn't the current *GRAPH* (see the note in MAP-VERTICES).
