@@ -567,7 +567,10 @@ rather than a scan of every claim."
 ;;; every name is confirmed by resolving one live node under it (R7),
 ;;; counts are index-range sizes (R2), and :CURRENT resolves the range
 ;;; (R4).  Membership is live: an open WITH-AS-OF extent changes only
-;;; what a name's nodes resolve to (R6).
+;;; what a name's nodes resolve to (R6).  Inside an open transaction
+;;; every answer is what it will commit: committed entries resolve
+;;; through the commit view, the transaction's own creates are added
+;;; (R5, §4.4).
 ;;; ---------------------------------------------------------------------------
 
 (defun %refuse-vocabulary-axis (as-of as-of-epoch)
@@ -592,57 +595,141 @@ different classes, and the parent signals for the object slots."
 
 (defun %vocabulary-key (slots prefix)
   "PREFIX as MAP-INDEX and INDEX-COUNT take it: a scalar on a
-single-slot index, the tuple otherwise."
+single-slot index, the tuple otherwise.  Trap: a null name on a
+single-slot index gives NIL, which MAP-INDEX reads as an unbounded
+bound -- do not pass one.  Claim identity makes a null relation
+unreachable, so the walk never builds such a prefix."
   (if (= 1 (length slots)) (first prefix) prefix))
 
-(defun %name-admitted-p (graph class slots prefix current)
-  "T when a live node -- a current claim, with CURRENT -- sits under
-PREFIX (R7, R4); stops at the first."
+(defun %vocabulary-view (graph)
+  "The commit view of the open transaction on GRAPH, or NIL outside one
+\(the GH #324 rule, R5)."
+  (let ((tx graph-db::*transaction*))
+    (and tx (graph-db:make-commit-view graph tx))))
+
+(defun %view-resolve (view node)
+  "NODE as the transaction will commit it: NODE itself outside a
+transaction, its written version inside one, NIL if that write deletes
+it."
+  (if view (graph-db:view-node view (graph-db:id node)) node))
+
+(defun %claim-tuple (claim slots)
+  "CLAIM's values for the index SLOTS, in order.  Trap: the object
+accessors live on the binary class only, so CLAIM must be of the
+source's own class -- check TYPEP before calling."
+  (loop for slot in slots
+        collect (ecase slot
+                  (subject-namespace (claim-subject-namespace claim))
+                  (subject-key (claim-subject-key claim))
+                  (object-namespace (claim-object-namespace claim))
+                  (object-key (claim-object-key claim))
+                  (relation (claim-relation claim)))))
+
+(defun %created-under (view class slots prefix current)
+  "The claims of CLASS the open transaction created whose SLOTS tuple
+starts with PREFIX (NIL for any prefix) -- current ones with CURRENT.
+NIL outside a transaction: the index already holds every committed
+claim, and holds nothing of this transaction until it applies."
+  (when view
+    (let ((out '()))
+      (dolist (w (graph-db:view-writes view) (nreverse out))
+        (let ((n (graph-db:view-node view (graph-db:id w))))
+          (when (and n
+                     (typep n class)
+                     (null (graph-db:view-old-node view n))
+                     (or (null prefix)
+                         (every #'equal prefix
+                                (subseq (%claim-tuple n slots)
+                                        0 (length prefix))))
+                     (or (not current) (claim-current-p n)))
+            (push n out)))))))
+
+(defun %name-admitted-p (graph class slots prefix current view)
+  "T when a claim under PREFIX resolves live through VIEW -- current,
+with CURRENT (R7, R4); stops at the first.  Committed entries only:
+add %CREATED-UNDER for the open transaction's own claims."
   (let ((key (%vocabulary-key slots prefix)))
     (block found
       (graph-db:map-index
        (lambda (node)
-         (when (or (not current) (claim-current-p node))
-           (return-from found t)))
+         (let ((n (%view-resolve view node)))
+           (when (and n (or (not current) (claim-current-p n)))
+             (return-from found t))))
        graph class slots :start key :end key)
       nil)))
 
-(defun %name-count (graph class slots prefix current)
-  "Claims under PREFIX: the index range's size, or with CURRENT the
-current claims in it, each resolved (R2, R4)."
+(defun %name-count (graph class slots prefix current view)
+  "Claims under PREFIX as the transaction will commit them: outside a
+transaction and without CURRENT the index range's size; otherwise each
+committed entry resolved through VIEW, plus the claims the transaction
+created under PREFIX (R2, R4, spec §4.4).  Trap: the fast path counts
+entries, not live nodes."
   (let ((key (%vocabulary-key slots prefix)))
-    (if current
-        (let ((n 0))
+    (if (and (null view) (not current))
+        (graph-db:index-count graph class slots key :prefix t)
+        (let ((n (length (%created-under view class slots prefix
+                                         current))))
           (graph-db:map-index
-           (lambda (node) (when (claim-current-p node) (incf n)))
+           (lambda (node)
+             (let ((c (%view-resolve view node)))
+               (when (and c (or (not current) (claim-current-p c)))
+                 (incf n))))
            graph class slots :start key :end key)
-          n)
-        (graph-db:index-count graph class slots key :prefix t))))
+          n))))
 
 (defun %walk-names (graph class slots arity start position current counts)
   "The admitted names under (CLASS SLOTS) at ARITY from START, in index
-order: the component at POSITION of each prefix, or (NAME . COUNT) with
+order, plus the names the open transaction's created claims introduce:
+the component at POSITION of each prefix, or (NAME . COUNT) with
 COUNTS.  With START the walk stops at the first prefix whose leading
-component leaves START's."
-  (let ((names '()))
-    (block walk
-      (graph-db:map-index-prefixes
-       (lambda (prefix)
-         (when (and start (not (equal (first prefix) (first start))))
-           (return-from walk))
-         (when (%name-admitted-p graph class slots prefix current)
-           (let ((name (nth position prefix)))
-             (push (if counts
-                       (cons name (%name-count graph class slots prefix
-                                               current))
-                       name)
-                   names))))
-       graph class slots :arity arity :start start))
+component leaves START's.  Not sorted -- %MERGE-NAMES sorts, so a
+created name lands in index order."
+  (let* ((view (%vocabulary-view graph))
+         (seen '())
+         (names '()))
+    (labels ((tally (prefix)
+               (and counts
+                    (%name-count graph class slots prefix current view)))
+             (note (prefix count)
+               (push prefix seen)
+               (let ((name (nth position prefix)))
+                 (push (if counts (cons name count) name) names)))
+             (admit (prefix)
+               ;; With COUNTS the count decides admission -- 0 is
+               ;; exactly "nothing live under the name" -- so the range
+               ;; resolves once, not twice.  INDEX-COUNT counts entries
+               ;; rather than live nodes, so R7's confirmation still
+               ;; runs on that path (GH #350, spec §4.4).
+               (if counts
+                   (let ((n (tally prefix)))
+                     (when (and (plusp n)
+                                (or view current
+                                    (%name-admitted-p graph class slots
+                                                      prefix current
+                                                      view)))
+                       (note prefix n)))
+                   (when (%name-admitted-p graph class slots prefix
+                                           current view)
+                     (note prefix nil)))))
+      (block walk
+        (graph-db:map-index-prefixes
+         (lambda (prefix)
+           (when (and start (not (equal (first prefix) (first start))))
+             (return-from walk))
+           (admit prefix))
+         graph class slots :arity arity :start start))
+      ;; Names only the transaction's own creates hold (GH #324).
+      (dolist (c (%created-under view class slots start current))
+        (let ((prefix (subseq (%claim-tuple c slots) 0 arity)))
+          (unless (member prefix seen :test #'equal)
+            (note prefix (tally prefix))))))
     (nreverse names)))
 
 (defun %name-lessp (a b)
-  "Index order for two names: the engine's per-component collation, NIL
-first."
+  "Index order for two names: the engine's per-component collation.
+Total for the non-null names claim identity guarantees; LESS-THAN
+orders NIL against a symbol in one direction only, so a null name
+would not sort stably."
   (graph-db::less-than a b))
 
 (defun %merge-names (lists counts)
@@ -666,9 +753,10 @@ either, in index order, one entry per name; with COUNTS each is
 \(NAME . COUNT), the claims under it in ROLE, summed under :EITHER.
 The default lists every name the indexes hold, retracted claims
 included; :CURRENT keeps a name only if a claim under it is current
-and counts only those.  Trap: membership is live -- :AS-OF and
-:AS-OF-EPOCH are refused, and an open WITH-AS-OF extent changes only
-what a name's claims resolve to (GH #350)."
+and counts only those.  Inside an open transaction the answer is what
+that transaction will commit (GH #324).  Trap: membership is live --
+:AS-OF and :AS-OF-EPOCH are refused, and an open WITH-AS-OF extent
+changes only what a name's claims resolve to (GH #350)."
   (check-type role (member :subject :object :either))
   (%refuse-vocabulary-axis as-of as-of-epoch)
   (let ((family (claim-family claim-class)))

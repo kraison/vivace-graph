@@ -144,3 +144,52 @@ existed; nothing filed there answers NIL."
       (is (null more)))
     (signals graph-db:query-precondition-error
       (claim-keys g 'ct-claim :ns :as-of 1))))
+
+(test vocabulary-inside-a-transaction-is-what-it-will-commit
+  "Spec §4.4, R5 (the GH #324 rule): a name asserted in the open
+transaction is listed and counted; one whose only claim the
+transaction deleted is gone; a retraction in the transaction moves the
+:CURRENT answer; nothing of it is visible to the index until commit."
+  (with-claim-graph (g)
+    (with-transaction ()
+      (%ns-u :ns "a")
+      (%ns-u :other "b"))
+    (with-transaction ()
+      (%ns-u :fresh "n")
+      (is (equal '(:fresh :ns :other) (claim-namespaces g 'ct-claim))
+          "a created claim's namespace is listed before commit")
+      (is (equal '((:fresh . 1) (:ns . 1) (:other . 1))
+                 (claim-namespaces g 'ct-claim :counts t)))
+      (is (equal '("n") (claim-keys g 'ct-claim :fresh)))
+      (graph-db:mark-deleted (first (claims-touching g 'ct-claim :ns "a")))
+      (is (equal '(:fresh :other) (claim-namespaces g 'ct-claim))
+          "a name whose only claim the transaction deleted drops")
+      (retract-claim (first (claims-touching g 'ct-claim :other "b")))
+      (is (equal '(:fresh :other) (claim-namespaces g 'ct-claim))
+          "retracted, still believed once: listed by default")
+      (is (equal '(:fresh) (claim-namespaces g 'ct-claim :current t))
+          "the retraction is seen by :current before commit")
+      (is (equal '((:fresh . 1) (:other . 1))
+                 (claim-namespaces g 'ct-claim :counts t))))
+    (is (equal '(:fresh :other) (claim-namespaces g 'ct-claim))
+        "after commit the index agrees")
+    (is (equal '(:fresh) (claim-namespaces g 'ct-claim :current t)))))
+
+(test vocabulary-in-a-transaction-counts-created-and-retracted-claims
+  "Spec §4.4: inside a transaction a count is the committed count
+adjusted by the transaction's own writes, under the default and under
+:CURRENT."
+  (with-claim-graph (g)
+    (with-transaction ()
+      (%ns-u :ns "a")
+      (%ns-u :ns "b"))
+    (with-transaction ()
+      (%ns-u :ns "c")
+      (retract-claim (first (claims-touching g 'ct-claim :ns "a")))
+      (is (equal '((:ns . 3)) (claim-namespaces g 'ct-claim :counts t)))
+      (is (equal '((:ns . 2))
+                 (claim-namespaces g 'ct-claim :counts t :current t)))
+      (is (equal '(("b" . 1) ("c" . 1))
+                 (claim-keys g 'ct-claim :ns :counts t :current t)))
+      (is (equal '(("r" . 3)) (claim-relations g 'ct-claim :counts t))
+          "the created claim's relation counts before commit"))))
