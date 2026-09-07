@@ -115,3 +115,32 @@ bound; :current t resolves")
         (is (equal '(("r" . 1))
                    (claim-relations g 'ct-claim :counts t :current t))
             "under :current each entry is resolved; the absent one drops")))))
+
+(test claim-keys-lists-keys-under-a-namespace-merged-and-paged
+  "Spec §4.1-4.2: keys under NAMESPACE from both roles, merged and
+de-duplicated in index order, counted per role or summed; :LIMIT /
+:OFFSET page the merged list and the second value says whether more
+existed; nothing filed there answers NIL."
+  (with-claim-graph (g)
+    (with-transaction ()
+      (%ns-u :ns "a")
+      (%ns-b :ns "c" :ns "b")
+      (%ns-b :other "x" :ns "c")
+      (%ns-u :other "y"))
+    (is (equal '("a" "b" "c") (claim-keys g 'ct-claim :ns)))
+    (is (equal '("a" "c") (claim-keys g 'ct-claim :ns :role :subject)))
+    (is (equal '("b" "c") (claim-keys g 'ct-claim :ns :role :object)))
+    (is (equal '(("a" . 1) ("b" . 1) ("c" . 2))
+               (claim-keys g 'ct-claim :ns :counts t))
+        "c is a subject once and an object once")
+    (is (equal '("x" "y") (claim-keys g 'ct-claim :other)))
+    (is (null (claim-keys g 'ct-claim :nowhere)))
+    (multiple-value-bind (page more) (claim-keys g 'ct-claim :ns :limit 2)
+      (is (equal '("a" "b") page))
+      (is (eq t more)))
+    (multiple-value-bind (page more)
+        (claim-keys g 'ct-claim :ns :limit 2 :offset 2)
+      (is (equal '("c") page))
+      (is (null more)))
+    (signals graph-db:query-precondition-error
+      (claim-keys g 'ct-claim :ns :as-of 1))))

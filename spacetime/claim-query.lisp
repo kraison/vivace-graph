@@ -686,3 +686,22 @@ refusals as CLAIM-NAMESPACES (GH #350)."
   (let ((family (claim-family claim-class)))
     (%walk-names graph (claim-family-parent family) '(relation)
                  1 nil 0 current counts)))
+
+(defun claim-keys (graph claim-class namespace
+                   &key (role :either) current counts limit offset
+                        as-of as-of-epoch)
+  "The keys filed under NAMESPACE by CLAIM-CLASS's family in ROLE, in
+index order, one entry per key, with COUNTS as (KEY . COUNT); NIL when
+nothing is filed there.  :LIMIT / :OFFSET page the merged list; the
+second value is T when entries existed past the cut.  :CURRENT and the
+refusals as CLAIM-NAMESPACES (GH #350)."
+  (check-type role (member :subject :object :either))
+  (%refuse-vocabulary-axis as-of as-of-epoch)
+  (let ((family (claim-family claim-class)))
+    (%paginate
+     (%merge-names
+      (loop for (class slots) in (%vocabulary-sources family role)
+            collect (%walk-names graph class slots 2 (list namespace) 1
+                                 current counts))
+      counts)
+     limit offset)))

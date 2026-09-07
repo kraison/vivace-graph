@@ -51,7 +51,7 @@
    #:claim-extent-sexp #:claim-geometry
    #:claim-precision-m #:claim-fraction                 ; GH #138
    #:claim-extent #:claims-touching
-   #:claim-namespaces #:claim-relations                 ; GH #350
+   #:claim-namespaces #:claim-relations #:claim-keys     ; GH #350
    #:claim-identity-key                                ; GH #303
    #:split-claim-identity-key                          ; GH #321
    #:malformed-claim-identity-key
