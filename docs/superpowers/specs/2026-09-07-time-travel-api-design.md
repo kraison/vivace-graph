@@ -26,7 +26,7 @@ leaves C-0 through C-2 as the performance track behind it.
 
 | # | Ruling | Why |
 |---|--------|-----|
-| R1 | Build C-3 now on the existing version chains and index tombstones; C-0/C-spike/C-1/C-2 stay on #117 as a later performance track with this API unchanged. | Correctness is available today; the only thing C-1 buys the API is cost. Consumers (cl-llm#53, the blackboard) need the surface, not the speed. |
+| R1 | Build C-3 now on the existing version chains and index tombstones; C-0/C-spike/C-1/C-2 stay on #117 as a later performance track with this API unchanged. | Correctness is available today; the only thing C-1 buys the API is cost. Downstream consumers (cl-llm#53 among them) need the surface, not the speed. |
 | R2 | An as-of read is a read-only snapshot transaction started at E+1, so it is inclusive: the version live at E is the newest with commit epoch ≤ E. | Same reading of "as of E" as #347's `:as-of-epoch`; `resolve-version-at-epoch` is a strict-start predicate, so E+1 makes it inclusive without a second predicate. |
 | R3 | Node-local, per #116: an epoch names a point in the issuing node's own history. Epochs compare across stores only under one `system-clock`. | Decided; recorded again here because the API is where a caller would first expect otherwise. |
 | R4 | Absence and reaping are told apart and reaping is reported, never absorbed: the oldest retained version's `revision` is 0 for "did not exist at E" and above 0 for "existed, reaped". | #347's discriminator, promoted to the engine. A silent NIL for a reaped node is a lie about history. |
