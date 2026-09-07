@@ -559,3 +559,130 @@ rather than a scan of every claim."
              n)
       (graph-db:mark-deleted c)
       (incf n))))
+
+;;; ---------------------------------------------------------------------------
+;;; Vocabulary: what a family names (GH #350, spec 2026-09-07 §4).
+;;;
+;;; Names come from the family's ordered indexes by MAP-INDEX-PREFIXES;
+;;; every name is confirmed by resolving one live node under it (R7),
+;;; counts are index-range sizes (R2), and :CURRENT resolves the range
+;;; (R4).  Membership is live: an open WITH-AS-OF extent changes only
+;;; what a name's nodes resolve to (R6).
+;;; ---------------------------------------------------------------------------
+
+(defun %refuse-vocabulary-axis (as-of as-of-epoch)
+  "The listing answers live membership only (GH #350 R6)."
+  (when (or as-of as-of-epoch)
+    (error 'graph-db:query-precondition-error
+           :reason (format nil "The vocabulary listing has no :AS-OF / ~
+:AS-OF-EPOCH axis: index membership is live (GH #350, ~
+docs/time-travel.md Bounds)."))))
+
+(defun %vocabulary-sources (family role)
+  "The (CLASS SLOTS) pairs the walk reads for ROLE: the subject index on
+the parent, the object index on the binary class -- declared on
+different classes, and the parent signals for the object slots."
+  (ecase role
+    (:subject (list (list (claim-family-parent family)
+                          '(subject-namespace subject-key))))
+    (:object (list (list (claim-family-binary family)
+                         '(object-namespace object-key))))
+    (:either (append (%vocabulary-sources family :subject)
+                     (%vocabulary-sources family :object)))))
+
+(defun %vocabulary-key (slots prefix)
+  "PREFIX as MAP-INDEX and INDEX-COUNT take it: a scalar on a
+single-slot index, the tuple otherwise."
+  (if (= 1 (length slots)) (first prefix) prefix))
+
+(defun %name-admitted-p (graph class slots prefix current)
+  "T when a live node -- a current claim, with CURRENT -- sits under
+PREFIX (R7, R4); stops at the first."
+  (let ((key (%vocabulary-key slots prefix)))
+    (block found
+      (graph-db:map-index
+       (lambda (node)
+         (when (or (not current) (claim-current-p node))
+           (return-from found t)))
+       graph class slots :start key :end key)
+      nil)))
+
+(defun %name-count (graph class slots prefix current)
+  "Claims under PREFIX: the index range's size, or with CURRENT the
+current claims in it, each resolved (R2, R4)."
+  (let ((key (%vocabulary-key slots prefix)))
+    (if current
+        (let ((n 0))
+          (graph-db:map-index
+           (lambda (node) (when (claim-current-p node) (incf n)))
+           graph class slots :start key :end key)
+          n)
+        (graph-db:index-count graph class slots key :prefix t))))
+
+(defun %walk-names (graph class slots arity start position current counts)
+  "The admitted names under (CLASS SLOTS) at ARITY from START, in index
+order: the component at POSITION of each prefix, or (NAME . COUNT) with
+COUNTS.  With START the walk stops at the first prefix whose leading
+component leaves START's."
+  (let ((names '()))
+    (block walk
+      (graph-db:map-index-prefixes
+       (lambda (prefix)
+         (when (and start (not (equal (first prefix) (first start))))
+           (return-from walk))
+         (when (%name-admitted-p graph class slots prefix current)
+           (let ((name (nth position prefix)))
+             (push (if counts
+                       (cons name (%name-count graph class slots prefix
+                                               current))
+                       name)
+                   names))))
+       graph class slots :arity arity :start start))
+    (nreverse names)))
+
+(defun %name-lessp (a b)
+  "Index order for two names: the engine's per-component collation, NIL
+first."
+  (graph-db::less-than a b))
+
+(defun %merge-names (lists counts)
+  "LISTS, each in index order, as one list in index order without
+duplicates; with COUNTS the entries are (NAME . COUNT) and a name in
+several lists sums its counts."
+  (let ((all (stable-sort (apply #'append lists) #'%name-lessp
+                          :key (if counts #'car #'identity)))
+        (out '()))
+    (dolist (e all (nreverse out))
+      (let ((name (if counts (car e) e)))
+        (if (and out (equal name (if counts (car (first out)) (first out))))
+            (when counts (incf (cdr (first out)) (cdr e)))
+            (push (if counts (cons name (cdr e)) name) out))))))
+
+(defun claim-namespaces (graph claim-class
+                         &key (role :either) current counts
+                              as-of as-of-epoch)
+  "The namespaces CLAIM-CLASS's family names as subject, object or
+either, in index order, one entry per name; with COUNTS each is
+\(NAME . COUNT), the claims under it in ROLE, summed under :EITHER.
+The default lists every name the indexes hold, retracted claims
+included; :CURRENT keeps a name only if a claim under it is current
+and counts only those.  Trap: membership is live -- :AS-OF and
+:AS-OF-EPOCH are refused, and an open WITH-AS-OF extent changes only
+what a name's claims resolve to (GH #350)."
+  (check-type role (member :subject :object :either))
+  (%refuse-vocabulary-axis as-of as-of-epoch)
+  (let ((family (claim-family claim-class)))
+    (%merge-names
+     (loop for (class slots) in (%vocabulary-sources family role)
+           collect (%walk-names graph class slots 1 nil 0 current counts))
+     counts)))
+
+(defun claim-relations (graph claim-class
+                        &key current counts as-of as-of-epoch)
+  "The relations CLAIM-CLASS's family uses, in index order, from its
+CLAIM-RELATION index; with COUNTS, (NAME . COUNT).  :CURRENT and the
+refusals as CLAIM-NAMESPACES (GH #350)."
+  (%refuse-vocabulary-axis as-of as-of-epoch)
+  (let ((family (claim-family claim-class)))
+    (%walk-names graph (claim-family-parent family) '(relation)
+                 1 nil 0 current counts)))
