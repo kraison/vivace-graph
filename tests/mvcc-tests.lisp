@@ -645,3 +645,52 @@ extent the chain returns to steady state."
         (bump-age id 4) (bump-age id 5)
         (is (= 1 (version-chain-length (live) g))
             "after the extent the chain returns to steady-state size")))))
+
+(test as-of-reports-a-reaped-version-instead-of-lying
+  "Spec §3.2, R4: with :KEEP-REVISIONS 1 and three updates the chain holds
+the live version and one archived; an epoch older than that signals
+VERSION-REAPED-ERROR naming the oldest retained epoch, :IF-REAPED :SKIP
+answers NIL and counts, and the retained epoch still answers."
+  (with-kept-graph (g 1)
+    (let (id e1 e2 e3 e4)
+      (setq e1 (%epoch-of
+                (lambda () (setq id (id (make-g-person :name "p" :age 0))))))
+      (bump-age id 1) (setq e2 (latest-epoch g))
+      (bump-age id 2) (setq e3 (latest-epoch g))
+      (bump-age id 3) (setq e4 (latest-epoch g))
+      (let ((c (handler-case (with-as-of ((g) e1) (lookup-vertex id) nil)
+                 (version-reaped-error (c) c))))
+        (is (typep c 'version-reaped-error) "as-of E1 is reaped")
+        (when (typep c 'version-reaped-error)
+          (is (= e3 (version-reaped-oldest-epoch c))
+              "the oldest retained version is the one committed at E3")
+          (is (= 2 (version-reaped-oldest-revision c)))
+          (is (= e1 (version-reaped-epoch c)))))
+      (signals version-reaped-error (with-as-of ((g) e2) (lookup-vertex id)))
+      (with-as-of ((g) e1 :if-reaped :skip)
+        (is (null (lookup-vertex id)) ":skip answers NIL")
+        (is (= 1 (as-of-skipped-count g)) "and counts the skip"))
+      (is (null (as-of-skipped-count g)) "no count outside an extent")
+      (with-as-of ((g) e3)
+        (is (= 2 (slot-value (lookup-vertex id) 'age)) "E3 is retained"))
+      (with-as-of ((g) e4)
+        (is (= 3 (slot-value (lookup-vertex id) 'age)))))))
+
+(test keep-revisions-zero-is-no-time-travel
+  "Spec §3.2 (as ruled in the plan): the default :KEEP-REVISIONS 0 keeps
+the live version and the one lagging version the committing transaction's
+own floor retains; two updates later the creation epoch is reaped, while
+an epoch before the node existed still reads as absent (revision 0)."
+  (with-test-graph (g)
+    (let (id e0 e1)
+      (setq e0 (%epoch-of (lambda () (make-g-person :name "seed" :age 0))))
+      (setq e1 (%epoch-of
+                (lambda () (setq id (id (make-g-person :name "p" :age 0))))))
+      (bump-age id 1) (bump-age id 2)
+      (signals version-reaped-error (with-as-of ((g) e1) (lookup-vertex id)))
+      ;; With revision 0 gone, "created after E0" is unknowable: the
+      ;; read reports reaped, the documented limit (spec §3.2).  The
+      ;; "before creation is NIL" case lives in
+      ;; AS-OF-ANSWERS-THE-VERSION-LIVE-AT-EACH-EPOCH, whose chain is intact.
+      (signals version-reaped-error
+        (with-as-of ((g) e0) (lookup-vertex id))))))

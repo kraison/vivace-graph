@@ -255,6 +255,10 @@
                 #:as-of-refused
                 #:as-of-refused-reason
                 #:as-of-skipped-count
+                #:version-reaped-error
+                #:version-reaped-epoch
+                #:version-reaped-oldest-epoch
+                #:version-reaped-oldest-revision
                 #:outgoing-edges
                 #:incoming-edges
                 #:traverse

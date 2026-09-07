@@ -355,9 +355,11 @@ detach aborted and the store resumes its prior accepting state."
                 ;; are repeatable within the transaction.  Validation keys the
                 ;; read-set by id, so OCC is unaffected.
                 (when *snapshot-reads-p*
-                  (setq value (resolve-version-at-epoch
-                               value (graph transaction)
-                               (start-tx-id transaction))))
+                  (multiple-value-bind (v oldest)
+                      (resolve-version-at-epoch value (graph transaction)
+                                                (start-tx-id transaction))
+                    (setq value (or v (%as-of-unresolved transaction
+                                                         oldest)))))
                 (when value
                   ;; GH #92: a scan opting out of serializability against
                   ;; what it visits (MAP-VERTICES/MAP-EDGES :RECORD-READS
@@ -664,25 +666,59 @@ irrelevant to reaping)."
   "When true, transactional LOOKUP-OBJECT resolves the version visible at the
 transaction's start epoch (snapshot isolation).  Prototype toggle.")
 
+(define-condition version-reaped-error (error)
+  ((id :initarg :id :reader version-reaped-id)
+   (epoch :initarg :epoch :reader version-reaped-epoch)
+   (oldest-epoch :initarg :oldest-epoch :reader version-reaped-oldest-epoch)
+   (oldest-revision :initarg :oldest-revision
+                    :reader version-reaped-oldest-revision))
+  (:documentation "The version of node ID live at EPOCH existed but is
+reaped past :KEEP-REVISIONS; the oldest the store still holds committed at
+OLDEST-EPOCH with revision OLDEST-REVISION (GH #115, spec §3.2).")
+  (:report (lambda (c s)
+             (format s "version of ~A at epoch ~A is reaped; oldest ~
+retained is epoch ~A (revision ~A)"
+                     (string-id (version-reaped-id c))
+                     (version-reaped-epoch c)
+                     (version-reaped-oldest-epoch c)
+                     (version-reaped-oldest-revision c)))))
+
 (defun resolve-version-at-epoch (live-node graph epoch)
-  "Return the version of LIVE-NODE visible to a reader whose snapshot is EPOCH
-(the newest version with commit-epoch < EPOCH), or NIL if the node did not exist
-before EPOCH.  Materializes an archived version (full head + data bytes) when the
-live head is newer than EPOCH."
+  "The version of LIVE-NODE visible to a reader whose snapshot is EPOCH
+(the newest with commit-epoch < EPOCH), or NIL.  Second value, when the
+first is NIL: the oldest retained version head (the live head itself when
+it has no chain) -- its REVISION tells absent (0) from reaped (GH #115)."
   (if (< (commit-epoch live-node) epoch)
       live-node
       (let ((id (id live-node))
             (edge-p (typep live-node 'edge))
+            (oldest live-node)
             (p (prev-pointer live-node)))
         (loop
-          (when (zerop p) (return nil))   ; nothing old enough -> invisible
+          (when (zerop p) (return (values nil oldest)))
           (let ((ver (if edge-p
                          (deserialize-edge-head (heap graph) p)
                          (deserialize-vertex-head (heap graph) p))))
             (setf (id ver) id)
             (if (< (commit-epoch ver) epoch)
                 (progn (ensure-node-bytes ver graph) (return ver))
-                (setf p (prev-pointer ver))))))))
+                (setf oldest ver
+                      p (prev-pointer ver))))))))
+
+(defun %as-of-unresolved (transaction oldest)
+  "NIL for a node absent at TRANSACTION's epoch; for one whose version
+then is reaped (OLDEST's revision above 0) apply the as-of policy: signal
+VERSION-REAPED-ERROR, or count and skip (GH #115, spec §3.2)."
+  (when (and (typep transaction 'as-of-tx)
+             oldest
+             (plusp (revision oldest)))
+    (ecase (as-of-if-reaped transaction)
+      (:skip (incf (as-of-skipped transaction)) nil)
+      (:error (error 'version-reaped-error
+                     :id (id oldest)
+                     :epoch (as-of-epoch transaction)
+                     :oldest-epoch (commit-epoch oldest)
+                     :oldest-revision (revision oldest))))))
 
 ;;; --- Public read path over the retained version chain -----------------------
 ;;; The walk above exists for snapshot isolation: it stops at the first version

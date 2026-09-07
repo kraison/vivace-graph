@@ -289,6 +289,11 @@
            #:as-of-refused-graph
            #:as-of-refused-epoch
            #:as-of-refused-reason
+           #:version-reaped-error
+           #:version-reaped-id
+           #:version-reaped-epoch
+           #:version-reaped-oldest-epoch
+           #:version-reaped-oldest-revision
            #:lookup-object
            #:update-node
            #:delete-node
