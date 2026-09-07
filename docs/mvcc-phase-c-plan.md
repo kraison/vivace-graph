@@ -9,6 +9,10 @@ branch `mvcc-phase-c` off `experiment`; full SBCL suite per phase, then the
 cross-impl matrix (SBCL/CCL/ECL on odm) + the two-process replication harness,
 exactly as MVCC P1–P5 were validated.
 
+2026-09-07: C-3 shipped ahead of C-0–C-2 on the existing chains and
+tombstones (`docs/time-travel.md`, spec 2026-09-07); C-0–C-2 are the
+performance track behind an unchanged API.
+
 ## Background — what is and isn't already snapshot-consistent
 
 MVCC today gives **value** consistency but not **membership** consistency on
@@ -264,19 +268,7 @@ spike result.
 
 ### C-3 — Time-travel / history API (rides the same surface)
 
-Once entries carry epochs and nodes carry chains, "as-of" is mostly surface:
-
-1. `lookup-vertex` / `lookup-edge` `:as-of EPOCH`; `map-vertices` / `map-edges`
-   `:as-of EPOCH`; `node-history` (newest→oldest up to keep-revisions); a
-   `with-as-of` macro pinning a graph epoch for an extent.
-2. `select` `:as-of` option (parallels the existing `:snapshot t`), wrapping the
-   query in an as-of read snapshot.
-3. Node-local only (DECIDED 2026-09-06, GH #116): the API documents that an
-   as-of epoch names a point in the issuing node's own history. A
-   replica-portable / wall-clock as-of is deferred with #116.
-4. Validate: as-of reads reconstruct historical membership + values within the
-   retained window; beyond `keep-revisions` the API reports "reaped" rather than
-   lying.
+Shipped; see `docs/time-travel.md`.
 
 ---
 

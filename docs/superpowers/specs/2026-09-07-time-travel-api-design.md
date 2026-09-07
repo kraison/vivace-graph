@@ -74,7 +74,7 @@ valid epoch.
 | `:read-write-transaction` | `*transaction*` covers the graph: a read-write transaction's snapshot is its own start, and a second epoch inside it would answer two questions at once. |
 | `:snapshot-active` | `*read-snapshots*` already holds a snapshot of the graph at a different epoch, or a plain (current) snapshot. The same epoch inherits. |
 | `:untyped-scan` | an untyped `map-vertices`/`map-edges` under an as-of snapshot (R6). |
-| `:no-version-history` | the graph is a memory graph (R7). |
+| `:no-version-history` | the graph is a memory graph (R7); also a graph with no transaction manager yet. |
 
 A plain `with-read-snapshot` opened inside an as-of extent inherits the
 as-of snapshot: the graph is already snapshotted, which is today's rule.
@@ -117,9 +117,10 @@ apart, and "cannot answer" is the conservative report (#347 has the
 same). `revision` is 32 bits and wraps; after 2^32 updates to one node
 the discriminator reads a wrapped 0 as the create.
 
-A `:keep-revisions` of 0 (the default) therefore answers only at the
-latest epoch; anything older on an updated node is reaped. The docs say
-so in the first paragraph: keep-revisions is the depth of time travel.
+A `:keep-revisions` of 0 (the default) keeps the live version and the
+one lagging version the committing transaction's own floor retains, so
+it answers the latest epoch and at most one behind. The docs say so in
+the first paragraph: keep-revisions is the depth of time travel.
 
 ### 3.3 Membership
 
@@ -141,7 +142,7 @@ each id at E:
 - `active-edge-p` reads endpoints through the same lookup, so an edge
   whose endpoint was deleted after E is active at E.
 - `outgoing-edges`, `incoming-edges`, `traverse`, `edge-exists-p`, the
-  generated `lookup-<type>`/`map-<type>` functions, and the Prolog
+  generated `lookup-<type>` functions, and the Prolog
   functors that enumerate through them (`is-a/2`, `outgoing-edges/n`,
   `incoming-edges/n`, the generated edge functors) inherit all of this
   with no change of their own. `is-a/2` with the type unbound already

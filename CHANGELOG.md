@@ -13,6 +13,20 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Added
 
+- **Node-local time travel** (#115, Phase C-3): `with-as-of`, `:as-of`
+  on `lookup-vertex`/`lookup-edge`/`map-vertices`/`map-edges` and on
+  `select`, `latest-epoch`, `edge-history` and `node-history`. An as-of
+  read is a read-only snapshot started at E+1, so it answers the version
+  whose commit epoch is the newest at or below E, and membership --
+  typed scans, adjacency, the generated functors -- is reconstructed by
+  walking index tombstones. A version reaped past `:keep-revisions` is
+  reported as `version-reaped-error` (or skipped and counted under
+  `:if-reaped :skip`), never substituted; absent is told from reaped by
+  the oldest retained revision. Refused with `as-of-refused` for a
+  future epoch, inside a read-write transaction, inside a snapshot at
+  another epoch, for the untyped scan and on a memory graph. Epochs are
+  node-local (#116). No storage format change. `docs/time-travel.md`.
+
 - **`claims-touching`/`claims-by-producer` `:as-of-epoch`** (#347): a
   second resolution axis alongside `:as-of`, answering by *commit
   epoch* rather than by wall clock -- each claim comes back as the
