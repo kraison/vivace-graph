@@ -5,7 +5,8 @@ indexes, prefix ranges), #302 (the `(subject relation)` index), #324
 (reads inside a transaction see what it will commit), #345 (value
 indexes keep live membership), #115 (`with-as-of`), #160 (relations are
 canonical strings). **Date:** 2026-09-07. **Status:** approved in
-review, sections 1–4.
+review, sections 1–4; amended 2026-09-07 against the engine facts note
+(`docs/superpowers/notes/2026-09-07-claim-vocabulary-engine-facts.md`).
 
 ## 0. Problem
 
@@ -27,7 +28,7 @@ thousands of claims and will not stay fine.
 | R4 | `:current` follows `claims-touching`: the default lists every name the indexes hold, retracted claims included; `:current t` keeps a name only if a claim under it is current. | One convention across the read API, and the cheap path stays the default. |
 | R5 | Inside an open transaction the answer is what the transaction will commit, through the commit-view overlay `claims-touching` uses. | #324's rule; a listing that hides the caller's own asserts misleads the retract-then-assert idiom. |
 | R6 | `:as-of` and `:as-of-epoch` are refused in this cut. | Value indexes keep live membership (#345, `docs/time-travel.md` Bounds); an as-of listing would need the epoch-stamped index of #113. |
-| R7 | Names left only by hard-deleted claims are dropped by confirming one live node per name. | Index entries outlive their nodes as tombstones; a phantom name is a silent wrong answer. |
+| R7 | Every reported name is confirmed by resolving one live node under it. | Index membership is live while resolution goes through the MVCC read path: under an open `with-as-of` extent the resolved version can be deleted or absent while the entry stands (#345), a crash before the index sidecar is saved leaves `rebuild-secondary-indexes` authoritative, and the engine's own `index-lookup` keeps a `deleted-p` guard. A phantom name is a silent wrong answer. |
 
 ## 2. Engine: the distinct-prefix walk
 
@@ -64,24 +65,31 @@ starting with P (#107). The walk is:
 3. Stop when a cursor is empty.
 
 Each hop is one seek and one entry read, so the walk costs the number of
-distinct prefixes times log n, holding the index's read lock per hop the
-way `ix-lookup` does. It never uses `ix-map`'s open-ended path, which is
-a full scan.
+distinct prefixes times log n. The walk takes no lock of its own:
+`make-range-cursor` and `cursor-next` own whatever locking each backend
+has, and an outer lock would nest and deadlock on ECL
+(`skip-list.lisp` on nesting). A multi-hop walk is therefore not an
+atomic snapshot: entries can come and go between hops, and the
+docstring says so. It never uses `ix-map`'s open-ended path, which is a
+full scan.
 
 `index-count` is `ix-lookup`'s range, counted instead of collected.
 
 ### 2.2 Null components
 
-A tuple with a null component is stored with `+null-key+` in that
-position (#107 §"null-bearing tuples"). The walk reports such a prefix
-with NIL in that component; the caller decides what a NIL name means.
+A tuple with a null component is stored with `+null-component+` in that
+position (#107 §"null-bearing tuples"), and it sorts before every real
+value, so a null-leading prefix is the first the walk reports. The walk
+reports such a prefix with NIL in that component; a NIL in START is
+mapped the other way. The caller decides what a NIL name means.
 
-### 2.3 Tombstones
+### 2.3 Deletion
 
-A removed entry is unlinked from the ordered map (`ix-remove`), so the
-walk does not see it. What the walk cannot see is a node deleted without
-its index entries being removed; the spacetime layer's one-live-node
-confirmation (R7) covers that.
+A deleted node's entries are removed at commit apply
+(`apply-tx-write-to-secondary-indexes` on `tx-delete`), so the walk does
+not see them on the normal path. Inside an open transaction nothing has
+been applied yet, which is what §4.4 is for; the other ways an entry and
+its node can disagree are R7's.
 
 ## 3. The relation index
 
@@ -115,7 +123,10 @@ an unknown family signals what `claims-touching` signals.
 ### 4.1 Sources
 
 - Namespaces: the arity-1 prefixes of `claim-subject` (`:role :subject`)
-  and of `claim-object` (`:role :object`).
+  and of `claim-object` (`:role :object`). The subject index is declared
+  on the family's parent class and the object index on its binary class,
+  so the object walk passes `claim-family-binary`, as `claims-touching`
+  does; passing the parent signals.
 - Keys under NAMESPACE: the arity-2 prefixes of the same two indexes
   starting at `(namespace)`, stopping at the first prefix whose namespace
   differs.
@@ -134,9 +145,11 @@ of claims under that name in the requested role, and under `:either` the
 sum over both roles. A caller wanting subject and object counts apart
 calls twice, one role each; one return shape beats three.
 
-Order is index order: the collation `%index-comp-lessp` gives the slot's
-values. `claim-keys` applies `:limit` and `:offset` after the merge, so
-two calls page one deterministic list.
+Order is index order, the collation the index gives the slot's values:
+for keyword namespaces that is `string<` on the symbol name, and a string
+sorts after every symbol. `claim-keys` applies `:limit` and `:offset`
+after the merge, so two calls page one deterministic list, and returns
+`%paginate`'s second value (entries existed past the cut).
 
 ### 4.3 `:current`
 
@@ -169,8 +182,9 @@ write set.
 
 ### 4.5 Refusals and bounds
 
-`:as-of` and `:as-of-epoch` are not accepted (R6): a call passing either
-signals an `error` naming the reason. An open `with-as-of` extent on
+`:as-of` and `:as-of-epoch` are accepted in the lambda list and refused
+(R6): a call passing either signals a `query-precondition-error` naming
+the reason, the typed refusal this file uses for the epoch axis. An open `with-as-of` extent on
 GRAPH is not refused: it affects only the resolution step (confirmation,
 `:current`), while name membership is live, the value-index bound
 `docs/time-travel.md` states.
@@ -202,8 +216,8 @@ Spacetime (`tests/spacetime/`, suite `spacetime-suite`):
 - relations from a family opened over pre-existing claims (the index was
   built on open);
 - `:current t` drops a name whose only claim was retracted and counts
-  only current claims; a hard-deleted claim's name disappears without
-  `:current`;
+  only current claims; a deleted claim's name disappears without
+  `:current` (its entries are removed at commit);
 - inside a transaction, a name asserted in it is listed, one whose only
   claim it deleted is not, and counts are adjusted;
 - `:as-of` and `:as-of-epoch` are refused.
