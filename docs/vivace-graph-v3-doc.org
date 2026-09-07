@@ -5796,7 +5796,9 @@ the subject side it rides a dedicated ~(subject-namespace subject-key
 relation)~ index every family declares (~claim-subject-relation~), so a
 one-relation read of an endpoint carrying thousands of claims touches
 only that relation's rows; on the object side it filters the endpoint
-candidates. ~:LIMIT~ and ~:OFFSET~ cut the final filtered result, and
+candidates. A family also declares a fifth index, ~claim-relation~ on
+~(relation)~ alone, for walking distinct relations without an endpoint
+(vivace-graph#350). ~:LIMIT~ and ~:OFFSET~ cut the final filtered result, and
 the second return value is ~T~ exactly when more claims existed past the
 cut (~NIL~ when ~:LIMIT~ was not given) — computed by asking for one
 past the cap, the same rule the REST query envelope uses.
@@ -5904,6 +5906,36 @@ questions and vary independently — the claim's says how the claim came to
 be known, the extent's says how the *time* was known. An ~:asserted~ claim
 can carry an ~:observed~ extent, or any other combination; neither one
 determines the other.
+
+*** Vocabulary: what a family names (GH #350)
+
+Before an exact read a caller often needs to know what is there:
+which namespaces a family's claims use, which relations, which keys
+sit under a namespace. Three functions answer from the family's own
+indexes, in index order, without walking its claims:
+
+#+BEGIN_SRC lisp
+  (claim-namespaces graph 'site-claim)                 ; (:device :sym ...)
+  (claim-namespaces graph 'site-claim :role :object :counts t)
+  (claim-relations graph 'site-claim :counts t)        ; (("wifi-drop" . 12) ...)
+  (claim-keys graph 'site-claim :device :limit 50)     ; ("d1" "d42" ...), more-p
+#+END_SRC
+
+~:counts t~ makes each entry ~(name . count)~; under ~:role :either~
+the count sums the subject and object roles. Without ~:current~ a
+count is an index-range size (entries, no resolution), which under an
+open ~with-as-of~ extent still counts a claim created after the
+epoch; ~:current t~ resolves each entry. The default lists every name
+the indexes hold, retracted claims included -- they are the
+record of what was believed; ~:current t~ keeps a name only if a claim
+under it is current, and counts only those. Inside an open
+transaction the answer is what that transaction will commit, as
+~claims-touching~ does. Names come from index membership, which is
+live: ~:as-of~ and ~:as-of-epoch~ are refused, and an open
+~with-as-of~ extent changes only what a name's claims resolve to
+(Chapter 12, "Reading as of an epoch"). Distinct relations ride a fifth
+index every family declares, ~claim-relation~; a family created before
+it gets it on its next open.
 
 *** The source onboarding contract: what a source declares about itself
 

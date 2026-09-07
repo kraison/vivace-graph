@@ -6,7 +6,8 @@ indexes, prefix ranges), #302 (the `(subject relation)` index), #324
 indexes keep live membership), #115 (`with-as-of`), #160 (relations are
 canonical strings). **Date:** 2026-09-07. **Status:** approved in
 review, sections 1–4; amended 2026-09-07 against the engine facts note
-(`docs/superpowers/notes/2026-09-07-claim-vocabulary-engine-facts.md`).
+(`docs/superpowers/notes/2026-09-07-claim-vocabulary-engine-facts.md`);
+implemented on `feat/claim-vocabulary`.
 
 ## 0. Problem
 
@@ -132,9 +133,10 @@ an unknown family signals what `claims-touching` signals.
   differs.
 - Relations: the arity-1 prefixes of `claim-relation`.
 
-`:role :either` (the default) merges the subject and object streams in
-index order and drops duplicates; the merge is a two-cursor merge, not a
-sort.
+`:role :either` (the default) merges the subject and object name lists
+by the index collation and drops duplicates; the lists are short
+(distinct names, not claims), so a sort by the same collation is the
+merge.
 
 ### 4.2 Shape
 

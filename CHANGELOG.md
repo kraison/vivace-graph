@@ -13,6 +13,17 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Added
 
+- **Claim-family vocabulary** (#350): `claim-namespaces`,
+  `claim-relations` and `claim-keys` list what a family names, in
+  index order, with opt-in counts, `:current`, paging on keys, and the
+  open transaction's own writes overlaid; refused on the epoch axes
+  (membership is live). Built on two new engine primitives,
+  `map-index-prefixes` (a seek-and-skip walk of distinct leading
+  prefixes) and `index-count`, and a fifth index every family declares,
+  `claim-relation`. No storage format change; existing families build
+  the new index on next open. `docs/general-index-design.md` §6a, the
+  manual's spacetime chapter.
+
 - **Node-local time travel** (#115, Phase C-3): `with-as-of`, `:as-of`
   on `lookup-vertex`/`lookup-edge`/`map-vertices`/`map-edges` and on
   `select`, `latest-epoch`, `edge-history` and `node-history`. An as-of
