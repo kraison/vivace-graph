@@ -14,7 +14,7 @@
 
 - Lisp: spaces only, hard 80 columns, terse comments naming GH #115 or a spec section; docstrings state what/returns/trap.
 - Branch `feat/mvcc-c3` from `experiment` (1973fa6), worktree
-  `/home/raison/work/vg-c3/.worktrees/mvcc-c3` (clone `/home/raison/work/vg-c3`). Never touch `/home/raison/work/vivace-graph-v3`.
+  a dedicated worktree of a clean clone of `experiment` (`<worktree>` below; the clone directory is `<clone>`). Never build in a shared checkout.
 - Never run `pkill`, `pgrep -f`, or `kill`. One SBCL build at a time in this worktree. Never the full 15-minute suite by hand; the four suites below only. CI runs the full suite on push.
 - No storage format change (spec R5). The untyped scan and the memory graph refuse `:as-of` (R6, R7).
 - Existing tests keep passing; the baseline check counts recorded in Task 1 never drop.
@@ -28,7 +28,7 @@
 
 ## Running the suites
 
-Write once to `/home/raison/work/vg-c3/vg-115-suites.lisp` (outside the worktree, git-ignored by being outside it):
+Write once to `<clone>/vg-115-suites.lisp` (outside the worktree, git-ignored by being outside it):
 
 ```lisp
 ;; The four suites this unit touches, CI-style, in a fresh image.
@@ -59,12 +59,12 @@ Write once to `/home/raison/work/vg-c3/vg-115-suites.lisp` (outside the worktree
 Run from the worktree root:
 
 ```bash
-cd /home/raison/work/vg-c3/.worktrees/mvcc-c3
+cd <worktree>
 sbcl --dynamic-space-size 4096 --non-interactive \
   --eval '(push #p"./" asdf:*central-registry*)' \
-  --load /home/raison/work/vg-c3/vg-115-suites.lisp \
-  > /home/raison/work/vg-c3/vg-115-suites.log 2>&1; echo "exit=$?"
-grep -E "Did [0-9]+ checks|Fail:|^== " /home/raison/work/vg-c3/vg-115-suites.log
+  --load <clone>/vg-115-suites.lisp \
+  > <clone>/vg-115-suites.log 2>&1; echo "exit=$?"
+grep -E "Did [0-9]+ checks|Fail:|^== " <clone>/vg-115-suites.log
 ```
 
 A single test while iterating, in the same fresh-image style:
@@ -91,7 +91,7 @@ sbcl --dynamic-space-size 4096 --non-interactive \
 ### Task 1: Baseline
 
 **Files:**
-- Create: `/home/raison/work/vg-c3/vg-115-suites.lisp` (the runner above)
+- Create: `<clone>/vg-115-suites.lisp` (the runner above)
 
 - [ ] **Step 1: Write the runner and run it on the unchanged branch**
 
@@ -1206,4 +1206,4 @@ awk 'length > 80 {print FILENAME":"FNR}' transactions.lisp vertex.lisp edge.lisp
 
 - [ ] **Step 3: Diffstat sanity** — `git diff --stat 1973fa6..HEAD`; no test file shrinks (`git diff 1973fa6..HEAD -- tests | grep -c '^-[^-]'` explains every removed line).
 
-- [ ] **Step 4: Final whole-branch review** (SDD: most capable model), then hand the branch to Kevin for push authorisation. Not pushed by this plan.
+- [ ] **Step 4: Final whole-branch review** (SDD: most capable model), then hand the branch to the maintainer for push authorisation. Not pushed by this plan.
