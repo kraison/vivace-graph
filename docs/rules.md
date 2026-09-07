@@ -226,11 +226,13 @@ do not compensate. Uniform across every route, so a query inside a
 Slice 2's `run-rule` derives claims inside the transaction it also
 reads in, so it is the first caller this bites (GH #331).
 
-This is also why the cycle check is strict rather than a fixpoint: **a
-body cannot see the sweep**, nor the claims the same run constructs, so
-a rule that read its own relation would read the *previous* run's
-derivation and one `run-rule` would never settle. `compile-rule`
-refuses that instead of iterating (GH #331).
+This is why a rule that reads its own relation cannot be run by
+reading it: **a body cannot see the sweep**, nor the claims the same
+run constructs, so a plain read would answer from the *previous*
+run's derivation. Slice 2 refused such a rule at compile; the
+fixpoint runs it instead, feeding the recursive goal from an
+in-memory delta and excluding the stratum's own producers from the
+index routes (GH #333, "Recursive rules").
 
 **A scope widens what they read, not when.** With
 `graph-db::*claim-scope*` bound to a list of open stores -- own store
@@ -354,16 +356,19 @@ the rest of the body and a later `claim/7` on `?v` takes its node
 route instead of walking the family. Every other goal keeps its order;
 `(claim-producer ?p ?who)` is a filter and is left where it was.
 
-**Recursion is refused, and the cycle is named (ruling P6).** The
-cycle graph is over relation names: a rule's head relation points at
-every relation its body reads, and so does every other enabled rule in
-scope -- the store's enabled rules plus every enabled `def-rule`. A
-path from the head relation back to itself is refused, spelling the
-path (`deriving "y" closes a cycle: y -> x -> y`). A body `claim/7`
-that leaves its relation unbound reads *every* relation, its own
-included, so it is always a one-node cycle; that refusal says to bind
-the relation. The graph is the rule's own store's, plus the image's
-`def-rule`s -- a `:scope` does not widen it (see "Cross-store scope").
+**Recursion compiles; the cycle is a stratum (GH #333).** The
+dependency graph is over relation names: a rule's head relation points
+at every relation its body reads -- under a `not` as well -- and so
+does every other enabled rule in scope, the store's enabled rules plus
+every enabled `def-rule`. A path from the head relation back to itself
+is no longer refused: the compiler takes the strongly connected
+components and a rule's component is its **stratum** (see "Recursive
+rules"). Two things are still refused, naming the rule: a `not` whose
+goal reads a relation of the rule's own stratum, and a body `claim/7`
+that leaves its relation unbound -- it would read *every* relation,
+its own included, so that refusal says to bind the relation. The graph
+is the rule's own store's, plus the image's `def-rule`s -- a `:scope`
+does not widen it (see "Cross-store scope").
 
 **A name belongs to one source.** A stored `rule` and a `def-rule` of
 the same name is a collision, refused whichever arrives second.
@@ -371,8 +376,8 @@ the same name is a collision, refused whichever arrives second.
 **A `rule` write that does not compile is refused at commit** (ruling
 P3). `%validate-rule-writes` sits on `graph-db:*commit-validators*`
 and compiles every written `rule` against the store as the commit will
-leave it -- the cycle check included -- so the store never holds a
-rule that could not run when it was written. `enabled nil` is not an
+leave it -- the stratification checks included -- so the store never
+holds a rule that could not run when it was written. `enabled nil` is not an
 exemption: a disabled rule is compiled, only not run. The validator is
 inert until some store has evaluated `def-rules-schema`, which is what
 makes the `rule` class.
@@ -384,8 +389,8 @@ makes the `rule` class.
 `family` is the parent class symbol, unevaluated; every other argument
 is evaluated. `undef-rule` forgets one and `find-def-rule` returns its
 `rule-spec`. A `def-rule` is compiled per store, when it runs, because
-the cycle check needs that store's other rules -- but it constrains
-the cycle graph of every store in the image, so a `def-rule` can be
+the strata need that store's other rules -- but it constrains the
+dependency graph of every store in the image, so a `def-rule` can be
 the reason a stored rule's write is refused.
 
 ## Running a rule
@@ -514,6 +519,11 @@ resolved.
 | `refusals` | a list of `(tag . text)` |
 | `inferences` | the count at the last solution |
 | `elapsed` | seconds |
+| `rounds` | the fixpoint rounds run, 1 outside a recursive stratum |
+| `stratum` | its stratum's rules, its own name alone for a rule with none |
+
+Every count is a total over the run: `disjoint-premises` included,
+across each variant and round of a recursive stratum.
 
 A refusal's `tag` is a **claim family name** for a refusal the commit or
 a constructor raised (`extent-disjointness-violation`,
@@ -660,7 +670,7 @@ resolved.
 `derivation` record lands in `graph`, whatever the scope. A wider scope
 changes what the body can see and nothing about where the result goes.
 
-**Both stores declare the family.** Compile and the cycle check stay
+**Both stores declare the family.** Compile and the strata stay
 single-store (spec §6): a rule's text is validated against its own
 store's schema. So a family read from another store must be declared
 under both store names -- `(def-claim-classes fam :store-a)` and
@@ -735,13 +745,32 @@ the stratum together, in **rounds**:
   scan. A rule that merely shares the stratum -- deriving one of its
   relations without reading any of them recursively -- runs its full
   body once, at round 0, and not again.
+- **Round 0's delta is the stratum's base facts.** A recursive rule
+  reads the delta *where its body reads the relation*, so without a
+  seed a `reaches` claim somebody observed -- one no rule of the
+  stratum wrote -- would be a premise for nothing and the closure
+  would answer over rule-derived facts alone. Before round 0 the loop
+  collects every current claim of a stratum relation, in every store
+  in scope, whose producer is none of the stratum's, and hands them
+  to round 0 as its delta. They are premises like any other; they are
+  never the producer's claims, so no reconcile keeps or sweeps them.
+  The cost is one typed family walk per family the stratum derives
+  into, per store, per stratum run -- the shape `claim/7`'s own
+  fallback walk uses, minus the cost-unbounded refusal, this being
+  the loop's own walk and not a goal a budget must preempt. A
+  per-relation index would retire it (kraison/vivace-graph#350's
+  sibling). Under a cross-store scope the walk runs under round 0's
+  own snapshots.
 - **A plain read of a stratum's own relation excludes the stratum's
   producers** (`*claim-exclude-producers*`, bound around every round,
   round 0 included). Round 0 sees base facts only, and a later
   round's plain reads still cannot answer from what the stratum wrote
   on a previous run: the fixpoint recomputes the whole derivation
   from scratch every time `run-rules` runs it, so a stale closure
-  left standing from before is a premise for nothing.
+  left standing from before is a premise for nothing. The exclusion
+  is a list of `(producer . relation)` pairs, not of producers: a
+  body reading a stratum producer's `derivation` records -- another
+  family, another relation -- still sees them.
 - **What exclusion removes, the run's own derivation restores.**
   `*claim-derived-this-run*` indexes this run's derivation so far --
   claims kept from before and newly constructed alike -- the same way
@@ -759,7 +788,14 @@ the stratum together, in **rounds**:
   next round's delta and derived-this-run reads see it. The stratum
   stops at a round that derives nothing new. That is semi-naive
   evaluation: the answer is the same as re-evaluating everything each
-  round, at a fraction of the cost.
+  round, at a fraction of the cost. A kept identity is brought to
+  this run's version and extent *before* it enters the delta, since
+  it is the premise of everything a later round derives from it.
+- `*rules-naive-rounds*` re-evaluates every rule in full each round
+  instead of running the variants: a **debugging switch**, and a
+  reference only over a closure a semi-naive run already committed --
+  a from-scratch naive run reads the relation directly rather than
+  through the delta, and so only ever sees round 0's own output.
 - The sweep of claims no longer derived, and provenance, happen once
   per rule, at the fixpoint -- so a claim derived in an early round is
   never swept by a later one.
@@ -786,7 +822,10 @@ the same `:refused` outcome, carrying whichever refusal fired first --
 the report does not say which rule's own goal signalled it.
 
 `run-rule` on one rule of a recursive stratum runs the whole stratum
-and returns that rule's report.
+and returns that rule's report -- on **any** member, the base case of
+a closure included: what decides is whether the stratum is recursive,
+not whether the named rule is. A member that no longer compiles
+refuses the whole call (above).
 
 `select` and the guarded query surface are unchanged: a recursive
 `<-` predicate there still runs top-down under the resource bounds
@@ -818,9 +857,17 @@ cycle that runs through another store's rules is not detected.
   rule. `run-rule` called on it directly still answers -- with a
   `:refused` report tagged `:rule`.
 - **A rule that no longer compiles is reported and skipped**, never
-  refused at open. A `def-rule` registered after a store's rules were
-  written can put one of them in a stratum whose negation is no longer
-  stratified, or whose relation it now shares is left unbound
-  somewhere -- joining an ordinary cycle no longer refuses on its own
-  (see "Recursive rules") -- and both then read `:refused` with a
-  `:rule` tag while every other rule still runs.
+  refused at open. Each of the two compile refusals is the *offending
+  rule's own*, so a `def-rule` registered after a store's rules were
+  written refuses at most the rule that carries the fault: a `not`
+  over the rule's own stratum refuses the rule containing the `not`
+  (the new `def-rule` can be what pulled the negated relation into
+  that stratum, but the refusal is still the negating rule's), and a
+  `claim/7` goal with its relation unbound refuses the rule holding
+  that goal, in a stratum or not. A `def-rule` that merely joins a
+  stratum -- closing an ordinary cycle -- compiles, and every other
+  rule runs regardless.
+- **`run-rule` refuses a whole recursive stratum when a member does
+  not compile**, where `run-rules` reports that member and runs the
+  rest. The fixpoint needs every rule of the stratum: one missing is
+  an incomplete answer, not a smaller one.

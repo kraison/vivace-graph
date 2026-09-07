@@ -866,3 +866,65 @@ test, so bodies that find nothing are fine."
       ;; only the stratum boundary is asserted.
       (is (string= "z-maker" (first names)))
       (is (equal '("a" "b") (sort (copy-list (rest names)) #'string<))))))
+
+;;; Stratified negation orders the strata (GH #333, C2).
+
+(defparameter *head-app-y*
+  "(claim ?c rt-claim \"app\" ?a \"y\" \"host\" ?h)")
+(defparameter *head-app-z*
+  "(claim ?c rt-claim \"app\" ?a \"z\" \"host\" ?h)")
+(defparameter *body-runs-scan-a*
+  "(claim-producer ?p \"scan-a\")
+   (claim ?p rt-claim \"host\" ?h \"runs\" \"app\" ?a)")
+(defparameter *body-runs-not-z*
+  "(claim-producer ?p \"scan-a\")
+   (claim ?p rt-claim \"host\" ?h \"runs\" \"app\" ?a)
+   (not (claim ?q rt-claim \"app\" ?a \"z\" \"host\" ?h))")
+
+(defun stratum-names (strata)
+  "The rule names of each stratum in STRATA, in order."
+  (mapcar (lambda (s)
+            (mapcar (lambda (c)
+                      (graph-db.rules:rule-spec-name
+                       (graph-db.rules:compiled-rule-spec c)))
+                    s))
+          strata))
+
+(test a-negating-stratum-runs-after-the-stratum-it-negates
+  "C2: NOT-Z reads \"z\" only under a NOT, so unless %STRATUM-READS
+counts the negative reads the two strata are unordered and input order
+decides.  Z-MAKER must run first: NOT-Z derives a \"y\" for every app
+with no \"z\", and Z-MAKER gives both of SEED's SCAN-A apps one, so
+ONE run must leave \"y\" empty."
+  (with-rules-graph (g)
+    (seed g)
+    (write-rule g :name "z-maker" :version "1" :family "rt-claim"
+                :head *head-app-z* :body *body-runs-scan-a*)
+    (write-rule g :name "not-z" :version "1" :family "rt-claim"
+                :head *head-app-y* :body *body-runs-not-z*)
+    ;; Deterministic whatever order the rule index answers in: the
+    ;; negating stratum is ordered second even when handed first.
+    (let ((zm (graph-db.rules:compile-rule g "z-maker"))
+          (nz (graph-db.rules:compile-rule g "not-z")))
+      (is (equal '("z")
+                 (graph-db.rules:compiled-rule-negative-reads nz)))
+      (is (equal '(("z-maker") ("not-z"))
+                 (stratum-names
+                  (graph-db.rules::%strata-order (list nz zm))))))
+    (is (equal '("z-maker" "not-z")
+               (mapcar #'graph-db.rules:rule-report-rule-name
+                       (graph-db.rules:run-rules g))))
+    (is (= 2 (length (derived g 'rt-claim "z-maker"))))
+    (is (null (derived g 'rt-claim "not-z")))))
+
+(test a-plain-runs-report-names-its-own-stratum
+  "M1: RULE-REPORT-STRATUM reads the same off the fixpoint path -- the
+rules of this rule's stratum, its own name alone for a rule that
+shares one with nobody."
+  (with-rules-graph (g)
+    (seed g)
+    (let ((report (graph-db.rules:run-rule g (write-web-hosts g))))
+      (is (eq :derived (graph-db.rules:rule-report-outcome report)))
+      (is (equal '("web-hosts")
+                 (graph-db.rules:rule-report-stratum report)))
+      (is (= 1 (graph-db.rules:rule-report-rounds report))))))

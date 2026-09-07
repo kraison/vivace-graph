@@ -106,9 +106,16 @@ between releases; cutting a release renames it to the new version and dates it.
   derivation from scratch rather than reading a previous run's own
   output as a premise; what that exclusion removes, an index of the
   run's own derivation so far restores to every recursive goal, not
-  only the one the delta feeds. `rule-report` gains `rounds` and
-  `stratum`; `*rules-max-rounds*` caps a stratum. Single-store strata
-  are one transaction; cross-store strata commit per round.
+  only the one the delta feeds. Round 0's delta is seeded with the
+  stratum's **base facts** -- every current claim of a stratum relation
+  whose producer is none of the stratum's -- so an observed claim of a
+  derived relation is a premise like any other rather than invisible to
+  a recursive goal, which reads the delta where its body reads the
+  relation. The strata order counts a relation read under a `not`, so a
+  negating stratum runs after the one deriving what it negates.
+  `rule-report` gains `rounds` and `stratum`; `*rules-max-rounds*` caps
+  a stratum. Single-store strata are one transaction; cross-store
+  strata commit per round.
 
 - **`graph-db/query`, a web-free subsystem for guarded queries** (#322):
   the JSON pattern DSL moves out of the `graph-db` web system and the

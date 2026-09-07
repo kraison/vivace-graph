@@ -59,6 +59,27 @@
   (write-rule g :name "tc-step" :version "1" :family "rt-claim"
               :head *tc-base-head* :body *tc-step-body*))
 
+(defun observe-reaches (g from to)
+  "An OBSERVED \"reaches\" claim under producer \"curator\": a base
+fact of a stratum relation that no rule of the stratum wrote."
+  (with-transaction ((graph-db::transaction-manager g))
+    (make-rt-claim-binary :graph g :subject-namespace :node
+                          :subject-key from :relation "reaches"
+                          :object-namespace :node :object-key to
+                          :producer "curator" :standing :observed)))
+
+(defun reaches-from (g key)
+  "The distinct current \"reaches\" object keys of subject KEY,
+sorted; every producer's, the base facts included."
+  (sort (remove-duplicates
+         (mapcar #'claim-object-key
+                 (remove-if-not
+                  #'claim-current-p
+                  (claims-touching g 'rt-claim :node key :role :subject
+                                   :relation "reaches")))
+         :test #'string=)
+        #'string<))
+
 (defun reaches (g)
   "The distinct current \"reaches\" pairs, sorted.  TC-BASE and TC-STEP
 can each independently derive the same (subject . object) tuple -- a
@@ -275,3 +296,153 @@ very rule being asked for."
       (is (eq :refused (graph-db.rules:rule-report-outcome report)))
       (is (eq :rule (refusal-tag report)))
       (is (null (reaches g))))))
+
+(test a-recursive-goal-sees-a-base-fact-of-its-own-relation
+  "Ruling R10 (C1): a recursive rule runs its variants only, so its
+body reads its own relation through the delta -- and an OBSERVED
+\"reaches\" c-d that no rule wrote is a premise for nothing unless
+round 0's delta is seeded with the stratum's base facts.  Singly and
+doubly recursive alike: \"next\" a-b and b-c seeded, \"reaches\" c-d
+observed, so a reaches b, c and d, and b reaches c and d."
+  (dolist (step (list *tc-step-body* *tc-step2-body*))
+    (with-rules-graph (g)
+      (link g "a" "b") (link g "b" "c")
+      (observe-reaches g "c" "d")
+      (write-rule g :name "tc-base" :version "1" :family "rt-claim"
+                  :head *tc-base-head* :body *tc-base-body*)
+      (write-rule g :name "tc-step" :version "1" :family "rt-claim"
+                  :head *tc-base-head* :body step)
+      (let ((reports (graph-db.rules:run-rules g)))
+        (is (every (lambda (r)
+                     (eq :derived
+                         (graph-db.rules:rule-report-outcome r)))
+                   reports)))
+      (is (equal '("b" "c" "d") (reaches-from g "a")))
+      (is (equal '("c" "d") (reaches-from g "b")))
+      ;; A seeded claim is a premise, never the producer's: no
+      ;; reconcile keeps or sweeps it, and c derives nothing itself.
+      (let ((base (claims-touching g 'rt-claim :node "c" :role :subject
+                                   :relation "reaches")))
+        (is (= 1 (length base)))
+        (is (claim-current-p (first base)))
+        (is (string= "curator" (claim-producer (first base))))))))
+
+(test run-rule-on-the-non-recursive-member-runs-the-stratum
+  "I2: TC-BASE reads only \"next\", so it is not itself recursive --
+but its stratum is, and RUN-RULES runs the whole fixpoint for it.
+RUN-RULE must agree, or the base case of a closure run alone derives
+a partial answer and reports no stratum."
+  (with-rules-graph (g)
+    (link g "a" "b") (link g "b" "c")
+    (write-closure g)
+    (let ((report (graph-db.rules:run-rule g "tc-base")))
+      (is (string= "tc-base"
+                   (graph-db.rules:rule-report-rule-name report)))
+      (is (equal '("tc-base" "tc-step")
+                 (graph-db.rules:rule-report-stratum report)))
+      (is (= 3 (graph-db.rules:rule-report-rounds report)))
+      (is (equal '(("a" . "b") ("a" . "c")) (reaches g))))))
+
+;;; The temporal closure: a kept claim's extent in the delta (I1).
+
+(defparameter *tt-head*
+  "(claim ?c rtt-claim \"node\" ?a \"reaches\" \"node\" ?b)")
+(defparameter *tt-base-body*
+  "(claim ?p rtt-claim \"node\" ?a \"next\" \"node\" ?b)
+   (claim-producer ?p \"seed\")
+   (claim-current ?p)")
+(defparameter *tt-step-body*
+  "(claim ?p rtt-claim \"node\" ?a \"next\" \"node\" ?m)
+   (claim-producer ?p \"seed\")
+   (claim-current ?p)
+   (claim ?q rtt-claim \"node\" ?m \"reaches\" \"node\" ?b)")
+
+(defun tlink (g from to extent)
+  "A temporal \"next\" rtt-claim FROM -> TO over EXTENT, producer
+\"seed\"."
+  (with-transaction ((graph-db::transaction-manager g))
+    (make-rtt-claim-binary :graph g :subject-namespace :node
+                           :subject-key from :relation "next"
+                           :object-namespace :node :object-key to
+                           :producer "seed" :standing :observed
+                           :extent extent)))
+
+(defun write-temporal-closure (g)
+  "The two-rule transitive closure over the temporal family."
+  (write-rule g :name "tt-base" :version "1" :family "rtt-claim"
+              :head *tt-head* :body *tt-base-body*)
+  (write-rule g :name "tt-step" :version "1" :family "rtt-claim"
+              :head *tt-head* :body *tt-step-body*))
+
+(defun reaches-end (g from to)
+  "The end timestamp of the derived \"reaches\" FROM -> TO, or NIL."
+  (let ((c (find-if (lambda (c)
+                      (and (string= from (claim-subject-key c))
+                           (string= to (claim-object-key c))))
+                    (append (derived g 'rtt-claim "tt-base")
+                            (derived g 'rtt-claim "tt-step")))))
+    (and c (nth-value 1 (claim-bounds c)))))
+
+(test a-kept-temporal-claims-extent-follows-its-premises-in-the-delta
+  "I1: a kept identity enters the delta as the premise of everything a
+later round derives from it, so its extent must be refreshed BEFORE it
+does.  a-b, b-c, c-d all [Jan 1, Dec 31]; run; narrow b-c to
+[Jan 1, Mar 31]; run again.  a-c and a-d are derived through the kept
+b-c, so they end Mar 31 too -- with the stale extent in the delta they
+keep the Dec 31 they were first derived with."
+  (let ((wide (interval (ts 2026 1 1) (ts 2026 12 31)))
+        (narrow (interval (ts 2026 1 1) (ts 2026 3 31))))
+    (with-rules-graph (g)
+      (tlink g "a" "b" wide)
+      (tlink g "b" "c" wide)
+      (tlink g "c" "d" wide)
+      (write-temporal-closure g)
+      (graph-db.rules:run-rules g)
+      (is (local-time:timestamp= (ts 2026 12 31)
+                                 (reaches-end g "a" "c")))
+      (let ((bc (find "c" (claims-touching g 'rtt-claim :node "b"
+                                           :role :subject
+                                           :relation "next")
+                      :key #'claim-object-key :test #'string=)))
+        (with-transaction ((graph-db::transaction-manager g))
+          (let ((c (copy bc)))
+            (setf (claim-extent c) narrow)
+            (save c))))
+      (let ((reports (graph-db.rules:run-rules g)))
+        (is (every (lambda (r)
+                     (eq :derived
+                         (graph-db.rules:rule-report-outcome r)))
+                   reports)))
+      ;; Everything reached THROUGH b-c ends where b-c now ends.
+      (dolist (pair '(("a" "c") ("a" "d") ("b" "c") ("b" "d")))
+        (is (local-time:timestamp=
+             (ts 2026 3 31)
+             (reaches-end g (first pair) (second pair)))))
+      ;; a-b and c-d have no narrowed premise and stay wide.
+      (is (local-time:timestamp= (ts 2026 12 31)
+                                 (reaches-end g "a" "b")))
+      (is (local-time:timestamp= (ts 2026 12 31)
+                                 (reaches-end g "c" "d"))))))
+
+(test disjoint-premises-accumulate-over-a-stratums-rounds
+  "M2: %DESIRED owns REPORT's disjoint count and resets it per
+evaluation, so a stratum accumulates it round by round.  a-b runs
+[Jan 1, Mar 31] and b-c, c-d [Jul 1, Sep 30]: round 1 drops a-c and
+round 2 drops a-d, both premises never holding at once, and the last
+round alone would report one."
+  (let ((winter (interval (ts 2026 1 1) (ts 2026 3 31)))
+        (summer (interval (ts 2026 7 1) (ts 2026 9 30))))
+    (with-rules-graph (g)
+      (tlink g "a" "b" winter)
+      (tlink g "b" "c" summer)
+      (tlink g "c" "d" summer)
+      (write-temporal-closure g)
+      (let* ((reports (graph-db.rules:run-rules g))
+             (base (report-named "tt-base" reports))
+             (step (report-named "tt-step" reports)))
+        (is (= 3 (graph-db.rules:rule-report-rounds step)))
+        (is (= 3 (graph-db.rules:rule-report-derived base)))
+        (is (= 1 (graph-db.rules:rule-report-derived step)))
+        (is (= 2 (graph-db.rules:rule-report-disjoint-premises step)))
+        (is (= 0 (graph-db.rules:rule-report-disjoint-premises
+                  base)))))))

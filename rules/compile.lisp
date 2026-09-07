@@ -107,14 +107,17 @@ HEAD-* are the head's argument terms -- a keyword (namespace), a string
 (key or relation), NIL, or a body variable.  VARS is SELECT's variable
 list, PREMISE-VARS the ?c of every body CLAIM/7 goal, READS the
 relations the body reads -- never :ANY, which COMPILE-RULE refuses
-before this struct is built.  STRATUM is the sorted names of the rules
-whose head relations are mutually reachable with this one's (its own
-name always), STRATUM-RELATIONS the sorted relations they derive; a
-rule is recursive when a body CLAIM/7 goal has an unbound ?c and a
-relation in STRATUM-RELATIONS (%RECURSIVE-GOAL-P, run.lisp, GH #333)."
+before this struct is built -- and NEGATIVE-READS the subset of them
+read under a NOT, which orders this rule's stratum after the one
+deriving them (%STRATUM-READS, run.lisp, GH #333).  STRATUM is the
+sorted names of the rules whose head relations are mutually reachable
+with this one's (its own name always), STRATUM-RELATIONS the sorted
+relations they derive; a rule is recursive when a body CLAIM/7 goal has
+an unbound ?c and a relation in STRATUM-RELATIONS (%RECURSIVE-GOAL-P,
+run.lisp, GH #333)."
   spec family relation
   head-c head-sns head-skey head-ons head-okey unary-p
-  vars premise-vars goals reads stratum stratum-relations)
+  vars premise-vars goals reads negative-reads stratum stratum-relations)
 
 ;;; Reading the text
 
@@ -480,6 +483,7 @@ unbound: bind the relation"))
                             (append head-vars premise-vars))
                      :premise-vars premise-vars
                      :goals body :reads reads
+                     :negative-reads negative
                      :stratum (sort (cons name (copy-list stratum))
                                     #'string<)
                      :stratum-relations relations

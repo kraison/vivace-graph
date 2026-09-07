@@ -618,7 +618,11 @@ round -- resolved against EXISTING (already standing) or constructed.
 the caller passes only the keys this round added (M1), and this
 function reports a COUNT rather than incrementing REPORT's DERIVED
 itself, so a cross-store round's retry can set it idempotently
-instead of re-incrementing it (I5, GH #333)."
+instead of re-incrementing it (I5, GH #333).  Trap: a kept claim is
+brought to this run's version and extent (%REFRESH-KEPT) BEFORE it
+enters the delta -- it is a premise for every claim a later round
+derives from it, and the extent it was first derived with may no
+longer be the one its own premises give (I1)."
   (let ((ctor (%constructor (compiled-rule-family compiled)
                             (compiled-rule-unary-p compiled)))
         (producer (rule-producer (rule-spec-name
@@ -627,16 +631,19 @@ instead of re-incrementing it (I5, GH #333)."
         (constructed 0))
     (values
      (mapcar (lambda (key)
-               (or (gethash key existing)
-                   (let ((claim (apply ctor :graph graph
-                                       :relation
-                                       (compiled-rule-relation compiled)
-                                       :producer producer
-                                       :rule-version version
-                                       :standing :inferred
-                                       (car (gethash key desired)))))
-                     (incf constructed)
-                     claim)))
+               (let ((args (car (gethash key desired)))
+                     (have (gethash key existing)))
+                 (if have
+                     (%refresh-kept have version (getf args :extent))
+                     (let ((claim (apply ctor :graph graph
+                                         :relation
+                                         (compiled-rule-relation compiled)
+                                         :producer producer
+                                         :rule-version version
+                                         :standing :inferred
+                                         args)))
+                       (incf constructed)
+                       claim))))
              new-keys)
      constructed)))
 
@@ -662,6 +669,41 @@ run (GH #333, C1)."
                        (graph-db.spacetime:claim-object-key c))
                  (graph-db:derived-index-by-object idx))))
       (push c (graph-db:derived-index-all idx)))))
+
+(defun %stratum-base-facts (scope stratum producers table)
+  "The stratum's BASE facts: every current claim of one of the
+stratum's relations, in every store in SCOPE, whose producer is none
+of PRODUCERS' -- what round 0's delta is seeded with, and what TABLE
+(the run's derived index) is extended with, so a recursive goal, which
+reads the delta and never the relation, still sees the facts its
+closure starts from (ruling R10, spec §3, GH #333).  => an EQUAL hash
+relation -> claims.  A seeded claim is a premise like any other and is
+never the producer's, so no reconcile ever keeps or sweeps it.
+Cost: one typed family walk per family the stratum derives into, per
+store, per stratum run -- the shape %UNBOUND-CLAIM-SCAN uses, without
+its cost-unbounded refusal, this being the loop's own walk and not a
+goal a budget must preempt; a per-relation index would retire it
+(kraison/vivace-graph#350's sibling).  Trap: call it under the same
+snapshots as the round that reads it."
+  (let ((seed (make-hash-table :test 'equal))
+        (relations (compiled-rule-stratum-relations (first stratum))))
+    (dolist (family (remove-duplicates
+                     (mapcar #'compiled-rule-family stratum))
+                    seed)
+      (let ((parent (graph-db.spacetime:claim-family-parent family))
+            (binary (graph-db.spacetime:claim-family-binary family)))
+        (dolist (g scope)
+          (dolist (c (graph-db:map-vertices #'identity g
+                                            :vertex-type parent
+                                            :collect-p t))
+            (let ((rel (graph-db.spacetime:claim-relation c)))
+              (when (and (member rel relations :test #'string=)
+                         (graph-db.spacetime:claim-current-p c)
+                         (not (assoc (graph-db.spacetime:claim-producer c)
+                                     producers :test #'string=)))
+                (push c (gethash rel seed))
+                (%index-derived-claims table rel (list c)
+                                       (not (typep c binary)))))))))))
 
 (defstruct (%stratum-run (:constructor %make-stratum-run))
   "One rule's state while %RUN-STRATUM iterates it to a fixpoint (GH
@@ -726,6 +768,11 @@ never excluded) or a hit in *CLAIM-DERIVED-THIS-RUN* -- this run's own
 derivation so far, indexed like CLAIM/7's routes so a rule with more
 than one recursive goal still sees what its OTHER goal already
 derived this run (C1) -- bound the same way, round 0 included.
+Round 0's delta is not empty but the stratum's BASE facts
+(%STRATUM-BASE-FACTS, ruling R10): a recursive rule reads the delta
+where its body reads the relation, so without the seed a base fact of
+that relation -- one no rule of the stratum wrote -- would be a
+premise for nothing.
 
 A round's delta is every identity FIRST DERIVED this run, whether
 constructed or already standing (%ROUND-DELTA); claims are written
@@ -756,9 +803,14 @@ inside the transaction that just unwound (I3); the report's ROUNDS
 names how many rounds ran.  => one RULE-REPORT per rule of STRATUM, in
 its input order."
   (let* ((foreign (rest scope))
+         ;; (PRODUCER . RELATION) pairs: the exclusion is scoped to the
+         ;; relation each producer derives, so a body reading a stratum
+         ;; producer's DERIVATION records still sees them (M3).
          (producers (mapcar (lambda (c)
-                              (rule-producer
-                               (rule-spec-name (compiled-rule-spec c))))
+                              (cons (rule-producer
+                                     (rule-spec-name
+                                      (compiled-rule-spec c)))
+                                    (compiled-rule-relation c)))
                             stratum))
          ;; Built once, before the retried thunk: a signal while
          ;; building RUNS would otherwise leave %REFUSE-STRATUM
@@ -781,6 +833,7 @@ its input order."
     (let* ((derived-table nil)
            (start (get-internal-real-time))
            (delta nil)
+           (jobs '())
            (round 0))
       (labels
           ((check-recursive-goals ()
@@ -814,6 +867,9 @@ stratum but no CLAIM/7 goal there can carry the fixpoint delta"
                      (rule-report-derived report) 0
                      (rule-report-kept report) 0
                      (rule-report-swept report) 0
+                     ;; M2 accumulates this across variants and
+                     ;; rounds, so a retry must clear it here too.
+                     (rule-report-disjoint-premises report) 0
                      (rule-report-refusals report) '())))
            (goal-lists (run)
              (let* ((c (%stratum-run-compiled run))
@@ -846,20 +902,35 @@ stratum but no CLAIM/7 goal there can carry the fixpoint delta"
                 run
                 (lambda ()
                   (dolist (goals (goal-lists run))
-                    (multiple-value-bind (table order)
-                        (evaluate run goals)
-                      (multiple-value-bind (head tail new-keys)
-                          (%merge-desired
-                           (%stratum-run-desired run)
-                           (%stratum-run-order run)
-                           (%stratum-run-order-tail run)
-                           table order)
-                        (setf (%stratum-run-order run) head
-                              (%stratum-run-order-tail run) tail)
-                        (setf (%stratum-run-new-keys run)
-                              (append (%stratum-run-new-keys run)
-                                      new-keys)))))))))
+                    ;; M2: %DESIRED owns REPORT's disjoint count and
+                    ;; resets it per evaluation, so the total over a
+                    ;; stratum's variants and rounds is accumulated
+                    ;; here, where the rounds are.
+                    (let* ((report (%stratum-run-report run))
+                           (sofar (rule-report-disjoint-premises
+                                   report)))
+                      (multiple-value-bind (table order)
+                          (evaluate run goals)
+                        (incf (rule-report-disjoint-premises report)
+                              sofar)
+                        (multiple-value-bind (head tail new-keys)
+                            (%merge-desired
+                             (%stratum-run-desired run)
+                             (%stratum-run-order run)
+                             (%stratum-run-order-tail run)
+                             table order)
+                          (setf (%stratum-run-order run) head
+                                (%stratum-run-order-tail run) tail)
+                          (setf (%stratum-run-new-keys run)
+                                (append (%stratum-run-new-keys run)
+                                        new-keys))))))))))
            (construct-phase (base-derived)
+             ;; JOBS, not the index itself: on the cross-store path
+             ;; this runs inside a transaction that may unwind and be
+             ;; retried, and an attempt that unwound must leave no node
+             ;; in the derived index (M4, GH #333).  Cleared here so a
+             ;; retry's jobs replace the lost attempt's.
+             (setf jobs '())
              (let ((next (make-hash-table :test 'equal)))
                (loop for run in runs
                      for base in base-derived
@@ -880,10 +951,22 @@ stratum but no CLAIM/7 goal there can carry the fixpoint delta"
                             (when new
                               (setf (gethash rel next)
                                     (append (gethash rel next) new))
-                              (%index-derived-claims
-                               derived-table rel new
-                               (compiled-rule-unary-p c))))))
+                              (push (list rel
+                                          (compiled-rule-unary-p c)
+                                          new)
+                                    jobs)))))
                next))
+           (evaluate-round ()
+             ;; R10: round 0's delta is the stratum's base facts, so a
+             ;; recursive rule -- which runs its variants only, and so
+             ;; reads the delta where the body reads the relation --
+             ;; still sees the facts its closure starts from (C1).
+             ;; Inside EVALUATE-ROUND, hence under the cross-store
+             ;; path's snapshots, like the evaluation that reads it.
+             (when (and (zerop round) (not *rules-naive-rounds*))
+               (setf delta (%stratum-base-facts scope stratum producers
+                                                derived-table)))
+             (evaluate-phase))
            (one-round ()
              (let* ((base-derived
                       (mapcar (lambda (r)
@@ -893,11 +976,14 @@ stratum but no CLAIM/7 goal there can carry the fixpoint delta"
                     (next
                       (if foreign
                           (progn
-                            (%under-snapshots scope #'evaluate-phase)
+                            (%under-snapshots scope #'evaluate-round)
                             (graph-db:with-transaction (:graph graph)
                               (construct-phase base-derived)))
-                          (progn (evaluate-phase)
+                          (progn (evaluate-round)
                                  (construct-phase base-derived)))))
+               (dolist (j jobs)
+                 (%index-derived-claims derived-table (first j)
+                                        (third j) (second j)))
                (values next (plusp (hash-table-count next)))))
            (finish-run (run)
              (per-rule
@@ -1038,36 +1124,55 @@ caller's transaction) signals."
         (rule-run-refusal (c)
           (refuse (rule-run-refusal-tag c) (rule-run-refusal-text c))))
       (when compiled
-        (if (%compiled-recursive-p compiled)
-            ;; RUN-RULE on one rule of a recursive stratum runs every
-            ;; rule of it and answers this one's report (spec §4,
-            ;; GH #333).  SPEC is guaranteed enabled and runnable by
-            ;; now (above), hence a member of its own STRATUM names,
-            ;; hence found among OTHERS: a sibling's RULE-COMPILE-ERROR
-            ;; is what can still stop this (I2).
-            (let* ((names (compiled-rule-stratum compiled))
-                   (members
-                     (remove-if-not
-                      (lambda (s)
-                        (and (member (rule-spec-name s) names
-                                     :test #'string=)
-                             (%runnable-spec-p graph s)))
-                      (rules-in-scope graph))))
-              (handler-case
-                  (let ((others (mapcar (lambda (s) (compile-rule graph s))
-                                        members)))
-                    (setf report
-                          (or (find (rule-spec-name spec)
-                                    (%run-stratum graph others scope)
-                                    :key #'rule-report-rule-name
-                                    :test #'string=)
-                             (progn
-                               (refuse
-                                :rule
-                                "rule is not runnable in this store")
-                               report))))
-                (rule-compile-error (c)
-                  (refuse :rule (rule-compile-error-reason c)))))
+        ;; I2: the STRATUM decides the path, not this rule's own
+        ;; recursiveness -- RUN-RULES gates on SOME member being
+        ;; recursive and RUN-RULE must agree, or RUN-RULE on the
+        ;; non-recursive member of a recursive stratum (the base case
+        ;; of a closure) would derive that member alone and report no
+        ;; stratum.  A one-name stratum is its own only member, so the
+        ;; common path compiles nothing extra (GH #333).
+        (let* ((names (compiled-rule-stratum compiled))
+               (broken nil)
+               (members
+                 (when (rest names)
+                   (remove-if-not
+                    (lambda (s)
+                      (and (member (rule-spec-name s) names
+                                   :test #'string=)
+                           (%runnable-spec-p graph s)))
+                    (rules-in-scope graph))))
+               ;; SPEC is guaranteed enabled and runnable by now
+               ;; (above), hence a member of its own STRATUM names,
+               ;; hence among OTHERS.  A sibling that does not compile
+               ;; is recorded rather than signalled: it refuses the
+               ;; stratum path (an absent member makes the fixpoint
+               ;; incomplete, M8) and is irrelevant to the plain one.
+               (others
+                 (loop for s in members
+                       for c = (handler-case (compile-rule graph s)
+                                 (rule-compile-error (e)
+                                   (setf broken e)
+                                   nil))
+                       when c collect c)))
+          ;; M1: the field reads the same on every path -- the rules of
+          ;; this rule's stratum, its own name alone for a rule that
+          ;; shares one with nobody.  Set before the paths diverge, so
+          ;; a refusal carries it too; the fixpoint path answers
+          ;; %RUN-STRATUM's own report, which sets it the same way.
+          (setf (rule-report-stratum report) names)
+          (if (some #'%compiled-recursive-p (or others (list compiled)))
+              (if broken
+                  (refuse :rule (rule-compile-error-reason broken))
+                  (setf report
+                        (or (find (rule-spec-name spec)
+                                  (%run-stratum graph others scope)
+                                  :key #'rule-report-rule-name
+                                  :test #'string=)
+                            (progn
+                              (refuse
+                               :rule
+                               "rule is not runnable in this store")
+                              report))))
             (let ((family (graph-db.spacetime:claim-family-parent
                           (compiled-rule-family compiled))))
               (handler-case
@@ -1098,7 +1203,7 @@ caller's transaction) signals."
                 (graph-db:constraint-violation (c)
                   (refuse (%violation-family c) (princ-to-string c)))
                 (graph-db:query-precondition-error (c)
-                  (refuse :rule (princ-to-string c))))))))
+                  (refuse :rule (princ-to-string c)))))))))
     ;; M4: on the recursive path REPORT is now %RUN-STRATUM's own, a
     ;; different object than the one made above -- this deliberately
     ;; overwrites ITS elapsed with the whole RUN-RULE call's, siblings'
@@ -1135,12 +1240,19 @@ per-group NREVERSE here would silently undo that (GH #333)."
               (push (list c) groups)))))))
 
 (defun %stratum-reads (stratum)
-  "The relations STRATUM's rules read outside the stratum."
+  "The relations STRATUM's rules read outside the stratum, the ones
+read under a NOT included: a negated read is a dependency like any
+other, and the stratum deriving it must run FIRST or the negation
+answers over an empty relation and derives what a second run then
+sweeps (C2, spec §2, GH #333)."
   (let ((own (compiled-rule-stratum-relations (first stratum))))
     (remove-duplicates
      (loop for c in stratum
-           append (set-difference (compiled-rule-reads c) own
-                                  :test #'string=))
+           append (set-difference
+                   (union (compiled-rule-reads c)
+                          (compiled-rule-negative-reads c)
+                          :test #'string=)
+                   own :test #'string=))
      :test #'string=)))
 
 (defun %strata-order (compiled-rules)
