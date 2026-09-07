@@ -242,8 +242,23 @@ detach aborted and the store resumes its prior accepting state."
               a node you created is writable without a copy."
              (copying-uncommitted-node-node condition)))))
 
+(define-condition as-of-refused (error)
+  ((graph :initarg :graph :reader as-of-refused-graph)
+   (epoch :initarg :epoch :reader as-of-refused-epoch)
+   (reason :initarg :reason :reader as-of-refused-reason))
+  (:documentation "An as-of read the store cannot answer (GH #115, spec
+§2.2).  REASON: :FUTURE-EPOCH, :READ-WRITE-TRANSACTION, :SNAPSHOT-ACTIVE,
+:UNTYPED-SCAN or :NO-VERSION-HISTORY.")
+  (:report (lambda (c s)
+             (format s "as-of ~A refused on ~A: ~A"
+                     (as-of-refused-epoch c)
+                     (graph-name (as-of-refused-graph c))
+                     (as-of-refused-reason c)))))
+
 ;;; Transaction manager
-(defgeneric create-transaction (transaction-manager &key allow-read-only))
+(defgeneric create-transaction (transaction-manager
+                                &key allow-read-only start-epoch class
+                                initargs))
 (defgeneric cleanup-transaction (transaction))
 
 (defgeneric graph (object)
@@ -528,6 +543,13 @@ inside the transaction, mutate the copy, then SAVE it."
     :local-cache (make-id-table)
     :copies (make-hash-table)
     :state :init))
+
+(defclass as-of-tx (tx)
+  ((as-of-epoch :initarg :as-of-epoch :reader as-of-epoch)
+   (if-reaped :initarg :if-reaped :reader as-of-if-reaped)
+   (skipped :initform 0 :accessor as-of-skipped))
+  (:documentation "A read-only snapshot at a named epoch: START-TX-ID is
+AS-OF-EPOCH + 1 (GH #115, spec §2).  IF-REAPED is :ERROR or :SKIP."))
 
 (defmethod print-object ((transaction tx) stream)
   (print-unreadable-object (transaction stream :type t :identity t)
@@ -3276,11 +3298,15 @@ longer open (GH #171, spec R6)."
   (:method (transaction-manager)
     (incf (sequence-number transaction-manager))))
 
-(defmethod create-transaction (transaction-manager &key allow-read-only)
+(defmethod create-transaction (transaction-manager
+                               &key allow-read-only start-epoch (class 'tx)
+                               initargs)
   ;; ALLOW-READ-ONLY is CALL-WITH-READ-SNAPSHOT's escape hatch: its
   ;; bookkeeping TX is never committed, so it follows the read-pin
   ;; rule (admitted under :READ-ONLY) rather than the write rule
   ;; (refused under any non-T state) -- see PIN-READ-EPOCH (GH #170).
+  ;; START-EPOCH: an as-of snapshot starts in the past (GH #115); it may
+  ;; never start in the future, or the floor would rise above live data.
   (with-recursive-lock-held ((lock transaction-manager))
     (let ((state (accepting-p transaction-manager)))
       (unless (or (eq state t)
@@ -3291,15 +3317,20 @@ longer open (GH #171, spec R6)."
     (let* ((sequence-number (next-sequence-number transaction-manager))
            (graph (graph transaction-manager))
            (cache (cache graph))
-           (start-tx-id (tm-current-epoch transaction-manager))
-           (tx (make-instance 'tx
-                              :sequence-number sequence-number
-                              :start-tx-id start-tx-id
-                              :finish-tx-id nil
-                              :tx-id nil
-                              :transaction-manager transaction-manager
-                              :graph graph
-                              :graph-cache cache)))
+           (current (tm-current-epoch transaction-manager))
+           (start-tx-id (or start-epoch current))
+           (tx (apply #'make-instance class
+                      :sequence-number sequence-number
+                      :start-tx-id start-tx-id
+                      :finish-tx-id nil
+                      :tx-id nil
+                      :transaction-manager transaction-manager
+                      :graph graph
+                      :graph-cache cache
+                      initargs)))
+      (when (> start-tx-id current)
+        (error "start-epoch ~A is past the current epoch ~A"
+               start-tx-id current))
       (add-transaction tx transaction-manager)
       (setf (state tx) :active)
       tx)))
@@ -3321,7 +3352,8 @@ cross-graph rule lives at the read/write sites themselves, not here (GH #53)."
       *transaction*
       (and *read-snapshots* (gethash graph *read-snapshots*))))
 
-(defun call-with-read-snapshot (thunk &optional (graph *graph*))
+(defun call-with-read-snapshot (thunk &optional (graph *graph*)
+                                &key as-of (if-reaped :error))
   "Run THUNK with reads of GRAPH resolving through a fresh, read-only MVCC
 snapshot of GRAPH, so every such read resolves at one consistent epoch (a node
 committed after the snapshot started is invisible).  The snapshot transaction is
@@ -3342,48 +3374,112 @@ participating store, so store B's reaper cannot free a version store A's
 snapshot could still dereference.  Nesting composes this for free -- each
 graph's own CALL-WITH-READ-SNAPSHOT pins only its own manager, and the named
 cost (spec sec.6) is that a long cross-store query delays reaping in every
-store it touched."
+store it touched.
+
+:AS-OF EPOCH (GH #115, spec §2) opens the snapshot at EPOCH instead of now:
+a read-only transaction started at EPOCH+1, so every read resolves to the
+version whose commit epoch is the newest at or below EPOCH.  Refused with
+AS-OF-REFUSED for an epoch not yet committed, inside a read-write
+transaction on GRAPH, inside a snapshot of GRAPH at another epoch (the
+same epoch inherits), on a memory graph, or before GRAPH has a manager.
+:IF-REAPED (:ERROR, or :SKIP) says what a read of a version reaped past
+:KEEP-REVISIONS does -- see VERSION-REAPED-ERROR."
+  ;; &OPTIONAL GRAPH before &KEY is the brief's interface (GH #115); every
+  ;; caller supplies GRAPH positionally when passing keys, so SBCL's
+  ;; mixed-lambda-list style-warning does not apply here.
+  (declare (sb-ext:muffle-conditions style-warning))
   (let ((tm (and graph
                  (slot-boundp graph 'transaction-manager)
                  (transaction-manager graph))))
-    (cond
-      ((null tm) (funcall thunk))
-      ;; a read-write transaction on this graph already provides a snapshot
-      ((and *transaction* (%transaction-covers-graph-p *transaction* graph))
-       (funcall thunk))
-      ;; already snapshotted this graph -> inherit
-      ((and *read-snapshots* (gethash graph *read-snapshots*)) (funcall thunk))
-      (t
-       (let ((txn nil)
-             (pin nil)
-             (table (or *read-snapshots* (make-hash-table :test 'eq))))
-         ;; Each acquisition is covered by cleanup from the instant it
-         ;; succeeds -- a signal from PIN-READ-EPOCH after CREATE-
-         ;; TRANSACTION already registered TXN must not leak the tx
-         ;; entry (GH #181, #211).  Nested UNWIND-PROTECTs release in
-         ;; reverse acquisition order and isolate each cleanup step, so
-         ;; UNPIN runs regardless of what REMOVE-TRANSACTION later does.
-         (unwind-protect
-              (progn
-                (setq txn (create-transaction tm :allow-read-only t))
-                (unwind-protect
-                     (progn
-                       (setq pin (pin-read-epoch tm))
-                       (let ((*read-snapshots* table))
-                         (setf (gethash graph table) txn)
-                         (funcall thunk)))
-                  (when pin (unpin-read-epoch tm pin))))
-           ;; The entry must not outlive the extent: a stale snapshot
-           ;; pins the reaper's floor and retains versions forever (GH
-           ;; #53).  REMHASH is nested so REMOVE-TRANSACTION still runs
-           ;; even if REMHASH itself signals (GH #181).
-           (unwind-protect (remhash graph table)
-             (when txn (remove-transaction txn tm)))))))))
+    (flet ((refuse (reason)
+             (error 'as-of-refused :graph graph :epoch as-of
+                                   :reason reason)))
+      (when as-of
+        (let ((mem (find-class 'memory-graph-mixin nil)))
+          (when (or (null tm) (and mem (typep graph mem)))
+            (refuse :no-version-history)))
+        (when (>= as-of (tm-current-epoch tm)) (refuse :future-epoch))
+        (when (and *transaction*
+                   (%transaction-covers-graph-p *transaction* graph))
+          (refuse :read-write-transaction))
+        (let ((open (and *read-snapshots*
+                         (gethash graph *read-snapshots*))))
+          (when open
+            (if (and (typep open 'as-of-tx) (= (as-of-epoch open) as-of))
+                (return-from call-with-read-snapshot (funcall thunk))
+                (refuse :snapshot-active)))))
+      (cond
+        ((null tm) (funcall thunk))
+        ;; a read-write transaction on this graph already provides a
+        ;; snapshot
+        ((and *transaction* (%transaction-covers-graph-p *transaction* graph))
+         (funcall thunk))
+        ;; already snapshotted this graph -> inherit
+        ((and *read-snapshots* (gethash graph *read-snapshots*))
+         (funcall thunk))
+        (t
+         (let ((txn nil)
+               (pin nil)
+               (table (or *read-snapshots* (make-hash-table :test 'eq))))
+           ;; Each acquisition is covered by cleanup from the instant it
+           ;; succeeds -- a signal from PIN-READ-EPOCH after CREATE-
+           ;; TRANSACTION already registered TXN must not leak the tx
+           ;; entry (GH #181, #211).  Nested UNWIND-PROTECTs release in
+           ;; reverse acquisition order and isolate each cleanup step, so
+           ;; UNPIN runs regardless of what REMOVE-TRANSACTION later does.
+           (unwind-protect
+                (progn
+                  (setq txn
+                        (if as-of
+                            (create-transaction
+                             tm :allow-read-only t :start-epoch (1+ as-of)
+                             :class 'as-of-tx
+                             :initargs (list :as-of-epoch as-of
+                                             :if-reaped if-reaped))
+                            (create-transaction tm :allow-read-only t)))
+                  (unwind-protect
+                       (progn
+                         (setq pin (pin-read-epoch tm))
+                         (let ((*read-snapshots* table))
+                           (setf (gethash graph table) txn)
+                           (funcall thunk)))
+                    (when pin (unpin-read-epoch tm pin))))
+             ;; The entry must not outlive the extent: a stale snapshot
+             ;; pins the reaper's floor and retains versions forever (GH
+             ;; #53).  REMHASH is nested so REMOVE-TRANSACTION still runs
+             ;; even if REMHASH itself signals (GH #181).
+             (unwind-protect (remhash graph table)
+               (when txn (remove-transaction txn tm))))))))))
 
 (defmacro with-read-snapshot ((&optional (graph '*graph*)) &body body)
   "Evaluate BODY with reads of GRAPH pinned to a single consistent MVCC snapshot.
 See CALL-WITH-READ-SNAPSHOT."
   `(call-with-read-snapshot (lambda () ,@body) ,graph))
+
+(defmacro with-as-of (((&optional (graph '*graph*)) epoch
+                       &key (if-reaped :error))
+                      &body body)
+  "Evaluate BODY with reads of GRAPH resolving as of EPOCH (GH #115).
+See CALL-WITH-READ-SNAPSHOT :AS-OF."
+  `(call-with-read-snapshot (lambda () ,@body) ,graph
+                            :as-of ,epoch :if-reaped ,if-reaped))
+
+(defun latest-epoch (graph)
+  "The newest epoch an as-of read of GRAPH may name: one below the
+manager's next epoch (GH #115).  Under a system clock this is the newest
+epoch handed out to ANY store on it."
+  (1- (tm-current-epoch (transaction-manager graph))))
+
+(defun %as-of-snapshot (graph)
+  "GRAPH's open as-of snapshot transaction, or NIL (GH #115)."
+  (let ((s (and *read-snapshots* (gethash graph *read-snapshots*))))
+    (and (typep s 'as-of-tx) s)))
+
+(defun as-of-skipped-count (graph)
+  "Reads skipped as reaped inside GRAPH's open as-of extent under
+:IF-REAPED :SKIP; NIL when no as-of snapshot of GRAPH is open (GH #115)."
+  (let ((s (%as-of-snapshot graph)))
+    (and s (as-of-skipped s))))
 
 ;;; Commit sequence
 

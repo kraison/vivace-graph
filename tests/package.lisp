@@ -250,6 +250,11 @@
                 #:lookup-vertex
                 #:lookup-edge
                 #:vertex-history
+                #:with-as-of                 ; GH #115
+                #:latest-epoch
+                #:as-of-refused
+                #:as-of-refused-reason
+                #:as-of-skipped-count
                 #:outgoing-edges
                 #:incoming-edges
                 #:traverse

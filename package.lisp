@@ -281,6 +281,14 @@
            #:with-transaction
            #:with-read-snapshot
            #:call-with-read-snapshot
+           ;; GH #115: node-local time travel
+           #:with-as-of
+           #:latest-epoch
+           #:as-of-skipped-count
+           #:as-of-refused
+           #:as-of-refused-graph
+           #:as-of-refused-epoch
+           #:as-of-refused-reason
            #:lookup-object
            #:update-node
            #:delete-node

@@ -534,3 +534,107 @@ before and after the interleaved insert is identical."
           (ignore-errors (graph-db::remove-transaction txn tm)))))
     ;; outside the snapshot, the new vertex is of course visible
     (is (= 2 (select-count (?p) (is-a ?p g-person))))))
+
+;;; ---------------------------------------------------------------------------
+;;; GH #115: node-local time travel (spec 2026-09-07)
+;;; ---------------------------------------------------------------------------
+
+(defun %epoch-of (thunk)
+  "Run THUNK in a transaction on *GRAPH*; the committed epoch."
+  (graph-db::transaction-id
+   (with-transaction () (funcall thunk) graph-db:*transaction*)))
+
+(defmacro with-kept-graph ((g keep) &body body)
+  "A fresh integration graph with :KEEP-REVISIONS KEEP, *GRAPH* bound."
+  (let ((dir (gensym "DIR")))
+    `(with-temp-directory (,dir)
+       (let ((,g (make-graph *integration-graph-name* (namestring ,dir)
+                             :buffer-pool-size 1000 :keep-revisions ,keep)))
+         (unwind-protect (let ((*graph* ,g)) ,@body)
+           (close-graph ,g :snapshot-p nil)
+           (collect-garbage))))))
+
+(test as-of-answers-the-version-live-at-each-epoch
+  "Spec §2, R2: an as-of read is inclusive -- the version whose commit
+epoch is the newest at or below E -- and NIL before the node existed."
+  (with-kept-graph (g 3)
+    (let (id e0 e1 e2 e3)
+      (setq e0 (%epoch-of (lambda () (make-g-person :name "seed" :age 0))))
+      (setq e1 (%epoch-of
+                (lambda () (setq id (id (make-g-person :name "p" :age 0))))))
+      (bump-age id 1) (setq e2 (latest-epoch g))
+      (bump-age id 2) (setq e3 (latest-epoch g))
+      (is (= e1 (1+ e0)) "control: consecutive commits, no clock")
+      (is (= e3 (latest-epoch g)) "LATEST-EPOCH names the newest commit")
+      (with-as-of ((g) e0)
+        (is (null (lookup-vertex id)) "before creation: absent"))
+      (with-as-of ((g) e1)
+        (is (= 0 (slot-value (lookup-vertex id) 'age))
+            "inclusive at the creating epoch"))
+      (with-as-of ((g) e2)
+        (is (= 1 (slot-value (lookup-vertex id) 'age))))
+      (with-as-of ((g) e3)
+        (is (= 2 (slot-value (lookup-vertex id) 'age))))
+      (is (= 2 (slot-value (lookup-vertex id) 'age))
+          "outside the extent the live version answers"))))
+
+(test as-of-reads-are-repeatable-across-a-concurrent-commit
+  "Spec §3.1: reads inside one extent resolve at one epoch even when a
+transaction commits an update meanwhile."
+  (with-kept-graph (g 3)
+    (let (id e)
+      (setq e (%epoch-of
+               (lambda () (setq id (id (make-g-person :name "p" :age 0))))))
+      (with-as-of ((g) e)
+        (is (= 0 (slot-value (lookup-vertex id) 'age)))
+        (bump-age id 7)
+        (is (= 0 (slot-value (lookup-vertex id) 'age))
+            "the concurrent update is invisible at E")))))
+
+(test as-of-refuses-what-it-cannot-answer
+  "Spec §2.2: the refusals, each by reason; the same epoch inherits and a
+plain snapshot inside an as-of extent inherits it."
+  (with-test-graph (g)
+    (let (id e)
+      (setq e (%epoch-of
+               (lambda () (setq id (id (make-g-person :name "p" :age 0))))))
+      (flet ((reason (thunk)
+               (handler-case (progn (funcall thunk) nil)
+                 (as-of-refused (c) (as-of-refused-reason c)))))
+        (is (eq :future-epoch
+                (reason (lambda () (with-as-of ((g) (1+ e)) nil)))))
+        (is (eq :read-write-transaction
+                (reason (lambda ()
+                          (with-transaction () (with-as-of ((g) e) nil))))))
+        (is (eq :snapshot-active
+                (reason (lambda ()
+                          (with-as-of ((g) e)
+                            (with-as-of ((g) (1- e)) nil))))))
+        (is (eq :snapshot-active
+                (reason (lambda ()
+                          (graph-db:with-read-snapshot (g)
+                            (with-as-of ((g) e) nil))))))
+        (is (null (reason (lambda ()
+                            (with-as-of ((g) e) (with-as-of ((g) e) nil)))))
+            "the same epoch inherits")
+        (is (null (reason (lambda ()
+                            (with-as-of ((g) e)
+                              (graph-db:with-read-snapshot (g) nil)))))
+            "a plain snapshot inside an as-of extent inherits it")))))
+
+(test as-of-snapshot-holds-the-reaper-floor
+  "Spec §2.3: an open as-of extent retains the versions live at E, as a
+held read pin does (READ-PIN-RETAINS-VERSIONS-UNTIL-RELEASED); after the
+extent the chain returns to steady state."
+  (with-test-graph (g)
+    (let (id e)
+      (setq e (%epoch-of
+               (lambda () (setq id (id (make-g-person :name "p" :age 0))))))
+      (flet ((live () (graph-db::lookup-node (graph-db::vertex-table g) id g)))
+        (with-as-of ((g) e)
+          (bump-age id 1) (bump-age id 2) (bump-age id 3)
+          (is (>= (version-chain-length (live) g) 2)
+              "an open as-of extent keeps prior versions from being reaped"))
+        (bump-age id 4) (bump-age id 5)
+        (is (= 1 (version-chain-length (live) g))
+            "after the extent the chain returns to steady-state size")))))
