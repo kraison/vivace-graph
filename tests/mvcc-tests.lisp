@@ -679,8 +679,9 @@ answers NIL and counts, and the retained epoch still answers."
 (test keep-revisions-zero-is-no-time-travel
   "Spec §3.2 (as ruled in the plan): the default :KEEP-REVISIONS 0 keeps
 the live version and the one lagging version the committing transaction's
-own floor retains; two updates later the creation epoch is reaped, while
-an epoch before the node existed still reads as absent (revision 0)."
+own floor retains; two updates later the creation epoch is reaped, and so
+is an epoch before the node existed, because revision 0 is gone (the
+documented limit, spec §3.2)."
   (with-test-graph (g)
     (let (id e0 e1)
       (setq e0 (%epoch-of (lambda () (make-g-person :name "seed" :age 0))))
