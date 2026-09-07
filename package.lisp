@@ -464,6 +464,7 @@
            #:vc-violation-reason
            #:unregister-index-spec #:unregister-unique-tuple-spec
            #:index-lookup #:index-range #:map-index
+           #:map-index-prefixes #:index-count            ; GH #350
            ;; index-backed generator predicates for Prolog (GH #102)
            #:find-by-slot/4 #:find-slot-range/5
            #:rebuild-secondary-indexes #:regenerate-secondary-indexes

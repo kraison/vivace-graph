@@ -277,6 +277,10 @@
                 #:index-lookup
                 #:index-range
                 #:map-index
+                #:map-index-prefixes         ; GH #350
+                #:index-count
+                ;; the typed query error the index surface signals
+                #:query-precondition-error
                 #:def-unique
                 ;; schema retraction (GH #139, #140)
                 #:undef-index

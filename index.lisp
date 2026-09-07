@@ -1039,6 +1039,100 @@ GRAPH."
     (nreverse result)))
 
 ;;; ---------------------------------------------------------------------------
+;;; Distinct-prefix walk and counts (GH #350).
+;;;
+;;; MAP-INDEX-PREFIXES reports each distinct leading prefix once by
+;;; seek-and-skip: one range cursor per prefix, opened at the previous
+;;; prefix's high bound (%INDEX-BOUNDS with PREFIX T), which sorts past
+;;; every tuple sharing it.  Never IX-MAP's open-ended path (a full
+;;; scan).  No lock of its own -- MAKE-RANGE-CURSOR / CURSOR-NEXT own
+;;; locking per backend and nesting deadlocks on ECL (skip-list.lisp) --
+;;; so a walk is not an atomic snapshot.  Spec: docs/superpowers/specs/
+;;; 2026-09-07-claim-vocabulary-design.md §2.
+
+(defun %ix-first (six lo hi)
+  "The first entry of SIX with LO <= key <= HI as (COMPONENTS . ID), or
+NIL.  One seek and one step."
+  (let* ((cur (make-range-cursor (slot-index-skip-list six) lo hi))
+         (node (and cur (cursor-next cur :eoc))))
+    (unless (or (null node) (eql node :eoc))
+      (let ((key (%sn-key node)))
+        (cons (butlast key) (car (last key)))))))
+
+(defun %ix-prefix-out (components arity)
+  "The first ARITY of COMPONENTS, +NULL-COMPONENT+ read back as NIL."
+  (loop for v in components
+        repeat arity
+        collect (if (eq v +null-component+) nil v)))
+
+(defun %ix-start-key (six start arity)
+  "START as the canonical key a walk at ARITY begins from: NIL maps to
++NULL-COMPONENT+ and canonicalizers apply (%INDEX-KEY); the head key
+when START is NIL.  Signals on more than ARITY components."
+  (let ((n (length (slot-index-slot-names six))))
+    (if (null start)
+        (%index-head-key n)
+        (let ((vals (if (listp start) start (list start))))
+          (when (> (length vals) arity)
+            (error 'query-precondition-error
+                   :reason (format nil "A :START of ~D component(s) for ~
+a prefix walk at arity ~D" (length vals) arity)))
+          (or (%index-key six (if (= n 1) (first vals) vals))
+              ;; Full arity, every component null: still a real prefix
+              ;; here, unlike an equality lookup (GH #107).
+              (make-list (length vals)
+                         :initial-element +null-component+))))))
+
+(defun map-index-prefixes (fn graph class-name slot-name
+                           &key (arity 1) start)
+  "Call FN with each distinct leading prefix of ARITY components held by
+the index on CLASS-NAME.SLOT-NAME -- a list, NIL for a null component --
+in index order, once each.  START (a value, or a tuple of at most ARITY
+components) begins at the first prefix at or after it.  One seek per
+distinct prefix, never a scan (GH #350).  Trap: membership is live and
+a walk is not an atomic snapshot; resolve a prefix's nodes when a
+snapshot or a deletion matters."
+  (let* ((*graph* graph)
+         (six (%require-index graph class-name slot-name)))
+    (when six                   ; NIL => declared but empty => no prefixes
+      (let ((n (length (slot-index-slot-names six))))
+        (unless (<= 1 arity n)
+          (error 'query-precondition-error
+                 :reason (format nil "Index on ~S has arity ~D; cannot ~
+walk prefixes of ~D" (slot-index-slot-names six) n arity)))
+        (let ((hi (%index-tail-key n))
+              (lo (%ix-start-key six start arity)))
+          (loop
+            (let ((entry (%ix-first six lo hi)))
+              (when (null entry) (return))
+              (let ((prefix (subseq (car entry) 0 arity)))
+                (funcall fn (%ix-prefix-out prefix arity))
+                ;; Hop: PREFIX's high bound sorts past every tuple
+                ;; sharing it, so the next seek lands on the next prefix.
+                (setf lo (nth-value 1 (%index-bounds six prefix t)))))))))))
+
+(defun index-count (graph class-name slot-name value &key prefix)
+  "Number of entries in the index on CLASS-NAME.SLOT-NAME whose tuple
+equals VALUE, or with PREFIX T starts with it; 0 when none.  Same VALUE
+and PREFIX rules as INDEX-LOOKUP.  Entries, not live nodes: inside an
+open transaction this is the committed membership (GH #350)."
+  (let* ((*graph* graph)
+         (six (%require-index graph class-name slot-name)))
+    (if (null six)
+        0
+        (let ((key (%index-key six value)))
+          (if (null key)
+              0                 ; an all-null full tuple matches nothing
+              (multiple-value-bind (lo hi) (%index-bounds six key prefix)
+                (let ((cur (make-range-cursor (slot-index-skip-list six)
+                                              lo hi))
+                      (n 0))
+                  (loop for node = (cursor-next cur :eoc)
+                        until (eql node :eoc)
+                        do (incf n))
+                  n)))))))
+
+;;; ---------------------------------------------------------------------------
 ;;; Prolog surface -- index-backed GENERATOR predicates (GH #102).
 ;;;
 ;;; The index accelerated Lisp callers and was invisible to the query language,

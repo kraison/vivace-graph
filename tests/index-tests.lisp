@@ -920,3 +920,110 @@ seam -- and a re-shaped record takes the same path."
         (setf (fdefinition 'graph-db::delete-view-index) orig))
       (is (plusp freed)
           "the dropped record's pages were stranded, not reclaimed"))))
+
+;;; ---------------------------------------------------------------------------
+;;; GH #350: distinct-prefix walk and counts (spec 2026-09-07 §2)
+;;; ---------------------------------------------------------------------------
+
+(defvar *ix-seeks* nil
+  "Seek counter for %COUNT-SEEKS; NIL when not counting.")
+
+(defun %count-seeks (thunk)
+  "Run THUNK counting MAKE-RANGE-CURSOR calls -- the one seek each hop
+of the prefix walk makes -- through an :AROUND method removed afterwards.
+Returns the count.  Callers prove the probe live with a control."
+  (let* ((gf #'make-range-cursor)
+         (method (eval '(defmethod make-range-cursor :around
+                            ((index t) start end &key &allow-other-keys)
+                          (declare (ignore start end))
+                          (when *ix-seeks* (incf *ix-seeks*))
+                          (call-next-method)))))
+    (unwind-protect
+         (let ((*ix-seeks* 0))
+           (funcall thunk)
+           *ix-seeks*)
+      (remove-method gf method))))
+
+(test map-index-prefixes-reports-each-distinct-prefix-once-in-order
+  "Spec §2: each distinct leading prefix once, in index order, at arity
+1 and 2; :START begins at the first prefix at or after it."
+  (with-ix-graph (g)
+    (with-transaction ()
+      (dolist (row '(("ops" "e1" "at") ("ops" "e1" "by") ("ops" "e2" "at")
+                     ("hr" "p1" "at") ("hr" "p1" "at") ("zz" "q" "at")))
+        (make-ix-claim :ns (first row) :key (second row)
+                       :rel (third row))))
+    (flet ((walk (arity &optional start)
+             (let ((out '()))
+               (map-index-prefixes (lambda (p) (push p out)) g 'ix-claim
+                                   '(ns key rel) :arity arity :start start)
+               (nreverse out))))
+      (is (equal '(("hr") ("ops") ("zz")) (walk 1)))
+      (is (equal '(("hr" "p1") ("ops" "e1") ("ops" "e2") ("zz" "q"))
+                 (walk 2))
+          "two claims share (hr p1): one prefix")
+      (is (equal '(("ops") ("zz")) (walk 1 '("ops"))) ":start inclusive")
+      (is (equal '(("ops" "e1") ("ops" "e2") ("zz" "q"))
+                 (walk 2 '("ops")))
+          "a :start shorter than the arity starts at its first prefix")
+      (is (null (walk 1 '("zzz"))) "past the last prefix: nothing")
+      (signals query-precondition-error (walk 4))
+      (signals query-precondition-error (walk 1 '("a" "b"))))))
+
+(test map-index-prefixes-seeks-once-per-prefix
+  "Spec §2.1: seek-and-skip -- K distinct prefixes cost K+1 seeks
+whatever N is.  Control: one prefix INDEX-LOOKUP is one seek, so the
+probe fires.  Ablation, recorded in the task report: a linear hop makes
+the walk cost N+1 seeks and turns the second check red."
+  (with-ix-graph (g)
+    (with-transaction ()
+      (dotimes (i 30)
+        (make-ix-claim :ns (nth (mod i 3) '("a" "b" "c"))
+                       :key (format nil "k~D" i) :rel "r")))
+    (is (= 1 (%count-seeks
+              (lambda ()
+                (index-lookup g 'ix-claim '(ns key rel) '("a")
+                              :prefix t))))
+        "control: one range lookup is one seek")
+    (is (= 4 (%count-seeks
+              (lambda ()
+                (map-index-prefixes #'identity g 'ix-claim
+                                    '(ns key rel)))))
+        "3 prefixes over 30 entries: 3 hops plus the terminating seek")))
+
+(test map-index-prefixes-reports-a-null-component-as-nil
+  "Spec §2.2: a stored null (+NULL-COMPONENT+) reads back as NIL and
+sorts first; a NIL in :START maps the other way."
+  (with-ix-graph (g)
+    (with-transaction ()
+      (make-ix-claim :ns "ops" :key nil :rel "at")
+      (make-ix-claim :ns "ops" :key "e1" :rel "at"))
+    (flet ((walk (&optional start)
+             (let ((out '()))
+               (map-index-prefixes (lambda (p) (push p out)) g 'ix-claim
+                                   '(ns key rel) :arity 2 :start start)
+               (nreverse out))))
+      (is (equal '(("ops" nil) ("ops" "e1")) (walk)))
+      (is (equal '(("ops" nil) ("ops" "e1")) (walk '("ops" nil)))))))
+
+(test index-count-is-the-range-size
+  "Spec §2: INDEX-COUNT counts entries under a full tuple or, with
+:PREFIX T, under a prefix; 0 for an absent prefix and for a declared
+index with no entries; a short tuple without :PREFIX signals as
+INDEX-LOOKUP does."
+  (with-ix-graph (g)
+    (is (= 0 (index-count g 'ix-claim '(ns key rel) '("ops") :prefix t))
+        "declared, empty")
+    (with-transaction ()
+      (make-ix-claim :ns "ops" :key "e1" :rel "at")
+      (make-ix-claim :ns "ops" :key "e1" :rel "by")
+      (make-ix-claim :ns "ops" :key "e2" :rel "at")
+      (make-ix-claim :ns "hr" :key "p1" :rel "at"))
+    (is (= 3 (index-count g 'ix-claim '(ns key rel) '("ops") :prefix t)))
+    (is (= 2 (index-count g 'ix-claim '(ns key rel) '("ops" "e1")
+                          :prefix t)))
+    (is (= 1 (index-count g 'ix-claim '(ns key rel) '("ops" "e1" "at"))))
+    (is (= 0 (index-count g 'ix-claim '(ns key rel) '("none")
+                          :prefix t)))
+    (signals query-precondition-error
+      (index-count g 'ix-claim '(ns key rel) '("ops")))))
