@@ -147,3 +147,95 @@ pulled multi-slot tuple."
       (is (null (index-lookup g 'pi-claim '(ns key rel)
                               (list "ops" "p1" "at")))
           "released after purge"))))
+
+;;; --- counting index on the device (GH #361) ---------------------------
+
+(defun pi-live-p (node)
+  "True unless PI-CLAIM-REL is \"dead\"; the count index's CURRENT-P."
+  (not (equal (pi-claim-rel node) "dead")))
+
+(def-count-index pi-claim (ns key) :graph-db-peer-index-test
+  :name pi-count :current-p pi-live-p)
+
+(test authored-pull-counts-the-node
+  "APPLY-PEER-AUTHORED-OP maintains the device's count index (#361):
+the maintenance pass marks the map stale and COUNT-INDEX-LOOKUP
+rebuilds it (spec R8)."
+  (with-pi-device (g)
+    (graph-db::apply-peer-authored-op
+     g (pi-authored-create g 'pi-claim
+                           '((:ns . "ops") (:key . "e1") (:rel . "at"))
+                           *pi-remote-origin*))
+    (is (equal '(1 1)
+               (multiple-value-list
+                (count-index-lookup g 'pi-claim '(ns key) '("ops")))))))
+
+(test a-pulled-retraction-moves-current
+  "A TX-UPDATE over the wire whose OLD node is live and whose NEW node
+is not moves CURRENT and leaves ALL untouched (#361, spec R8)."
+  (with-pi-device (g)
+    (multiple-value-bind (op nid)
+        (pi-authored-create g 'pi-claim
+                            '((:ns . "ops") (:key . "e1") (:rel . "at"))
+                            *pi-remote-origin*)
+      (graph-db::apply-peer-authored-op g op)
+      (let* ((old (lookup-vertex nid :graph g))
+             (new (graph-db::%copy old))
+             (op2 (progn
+                    ;; DATA is a plain slot, not a guarded persistent one
+                    ;; (PI-AUTHORED-CREATE sets it the same way); a
+                    ;; SETF through the PI-CLAIM-REL accessor signals
+                    ;; MUTATING-UNREGISTERED-NODE with no *TRANSACTION*
+                    ;; bound, which %COPY (unlike COPY) does not do.
+                    (setf (graph-db::data new)
+                          '((:ns . "ops") (:key . "e1") (:rel . "dead")))
+                    (graph-db::make-peer-op
+                     :kind :authored :op-id (graph-db::gen-op-id)
+                     :origin *pi-remote-origin* :lamport 6 :tx-id 9001
+                     :writes (list (make-instance 'graph-db::tx-update
+                                                  :node new
+                                                  :old-node old))))))
+        (graph-db::apply-peer-authored-op g op2))
+      (is (equal '(1 0)
+                 (multiple-value-list
+                  (count-index-lookup g 'pi-claim '(ns key) '("ops"))))))))
+
+(test a-state-sync-re-pull-does-not-double-count
+  "Spec R8 (#361): APPLY-PEER-CREATE-WRITES binds *ADD-TO-INDEXES-
+UNLESS-PRESENT-P*, so re-applying the same create leaves the counter
+at one (stale flag set twice, one rebuild on the next lookup)."
+  (with-pi-device (g)
+    (let* ((tid (graph-db::node-type-id
+                 (graph-db::lookup-node-type-by-name
+                  'pi-claim :vertex :graph g)))
+           (n (graph-db::%make-vertex :class 'pi-claim :id (gen-id)
+                                      :type-id tid :revision 0)))
+      (setf (graph-db::data n)
+            '((:ns . "ops") (:key . "e1") (:rel . "at")))
+      (dotimes (i 2)
+        (graph-db::apply-peer-create-writes
+         g 7777 (list (make-instance 'graph-db::tx-create :node n))
+         *pi-remote-origin*)))
+    (is (equal '(1 1)
+               (multiple-value-list
+                (count-index-lookup g 'pi-claim '(ns key) '("ops")))))))
+
+(test purge-releases-the-counter
+  "PEER-PURGE-NODE subtracts the purged node's contribution (#361).
+The interleaved lookup rebuilds and clears the stale flag before the
+purge, so the final read reflects %COUNT-PURGE's own decrement rather
+than a rebuild-from-live-nodes that would mask its absence."
+  (with-pi-device (g)
+    (multiple-value-bind (op nid)
+        (pi-authored-create g 'pi-claim
+                            '((:ns . "ops") (:key . "e1") (:rel . "at"))
+                            *pi-remote-origin*)
+      (graph-db::apply-peer-authored-op g op)
+      (is (equal '(1 1)
+                 (multiple-value-list
+                  (count-index-lookup g 'pi-claim '(ns key) '("ops"))))
+          "built before the purge, stale flag now clear")
+      (graph-db::apply-peer-purge g (list nid))
+      (is (equal '(0 0)
+                 (multiple-value-list
+                  (count-index-lookup g 'pi-claim '(ns key) '("ops"))))))))
