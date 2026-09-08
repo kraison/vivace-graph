@@ -133,6 +133,12 @@ reads, so it builds committed live state whatever the caller's snapshot
 a crash between a state-sync re-pull and a close leaves a sidecar whose
 counts the crash-recovery rebuild at the next open replaces anyway.
 
+A rebuild never frees pages under a live reader: `map-count-index`
+readers hold no lock, so the rebuild builds fresh maps, swaps them into
+the registry key by key, and retires the old maps to a graph-level
+list that `close-graph` deletes. Retired pages are held until close;
+rebuilds are rare (a crash-recovered open, a re-pull).
+
 A built map carries a `built-p` mark set by the scan build; the
 install-at-open and the declaration-time build test that mark, not the
 map's presence in the registry, because the write path creates an empty
@@ -147,7 +153,8 @@ a stale root is silently wrong) and read by
 `restore-count-index-roots` at open, with records `(owner slot-names
 address backend-tag)`; the `current-p` symbol and canonicalizers are
 not stored, they are re-resolved from the live declaration at restore
-like `%owner-slot-canonicalizer`. A record whose declaration is
+like `%owner-slot-canonicalizer`. The restore marks each map
+`built-p` (the mark is not stored). A record whose declaration is
 withdrawn is reclaimed at open (#147); a missing sidecar falls to
 `rebuild-count-indexes`; `install-count-indexes` builds any declared
 index the sidecar did not cover. The memory graph has no sidecar and
