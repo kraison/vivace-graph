@@ -559,3 +559,237 @@ rather than a scan of every claim."
              n)
       (graph-db:mark-deleted c)
       (incf n))))
+
+;;; ---------------------------------------------------------------------------
+;;; Vocabulary: what a family names (GH #350, spec 2026-09-07 §4).
+;;;
+;;; Names come from the family's ordered indexes by MAP-INDEX-PREFIXES;
+;;; every name is confirmed by resolving one live node under it (R7),
+;;; counts are index-range sizes (R2), and :CURRENT resolves the range
+;;; (R4).  Membership is live: an open WITH-AS-OF extent changes only
+;;; what a name's nodes resolve to (R6).  Inside an open transaction
+;;; every answer is what it will commit: committed entries resolve
+;;; through the commit view, the transaction's own creates are added
+;;; (R5, §4.4).
+;;; ---------------------------------------------------------------------------
+
+(defun %refuse-vocabulary-axis (as-of as-of-epoch)
+  "The listing answers live membership only (GH #350 R6)."
+  (when (or as-of as-of-epoch)
+    (error 'graph-db:query-precondition-error
+           :reason (format nil "The vocabulary listing has no :AS-OF / ~
+:AS-OF-EPOCH axis: index membership is live (GH #350, ~
+docs/time-travel.md Bounds)."))))
+
+(defun %vocabulary-sources (family role)
+  "The (CLASS SLOTS) pairs the walk reads for ROLE: the subject index on
+the parent, the object index on the binary class -- declared on
+different classes, and the parent signals for the object slots."
+  (ecase role
+    (:subject (list (list (claim-family-parent family)
+                          '(subject-namespace subject-key))))
+    (:object (list (list (claim-family-binary family)
+                         '(object-namespace object-key))))
+    (:either (append (%vocabulary-sources family :subject)
+                     (%vocabulary-sources family :object)))))
+
+(defun %vocabulary-key (slots prefix)
+  "PREFIX as MAP-INDEX and INDEX-COUNT take it: a scalar on a
+single-slot index, the tuple otherwise.  Trap: a null name on a
+single-slot index gives NIL, which MAP-INDEX reads as an unbounded
+bound -- do not pass one.  Claim identity makes a null relation
+unreachable, so the walk never builds such a prefix."
+  (if (= 1 (length slots)) (first prefix) prefix))
+
+(defun %vocabulary-view (graph)
+  "The commit view of the open transaction on GRAPH, or NIL outside one
+\(the GH #324 rule, R5)."
+  (let ((tx graph-db::*transaction*))
+    (and tx (graph-db:make-commit-view graph tx))))
+
+(defun %view-resolve (view node)
+  "NODE as the transaction will commit it: NODE itself outside a
+transaction, its written version inside one, NIL if that write deletes
+it."
+  (if view (graph-db:view-node view (graph-db:id node)) node))
+
+(defun %claim-tuple (claim slots)
+  "CLAIM's values for the index SLOTS, in order.  Trap: the object
+accessors live on the binary class only, so CLAIM must be of the
+source's own class -- check TYPEP before calling."
+  (loop for slot in slots
+        collect (ecase slot
+                  (subject-namespace (claim-subject-namespace claim))
+                  (subject-key (claim-subject-key claim))
+                  (object-namespace (claim-object-namespace claim))
+                  (object-key (claim-object-key claim))
+                  (relation (claim-relation claim)))))
+
+(defun %created-under (view class slots prefix current)
+  "The claims of CLASS the open transaction created whose SLOTS tuple
+starts with PREFIX (NIL for any prefix) -- current ones with CURRENT.
+NIL outside a transaction: the index already holds every committed
+claim, and holds nothing of this transaction until it applies."
+  (when view
+    (let ((out '()))
+      (dolist (w (graph-db:view-writes view) (nreverse out))
+        (let ((n (graph-db:view-node view (graph-db:id w))))
+          (when (and n
+                     (typep n class)
+                     (null (graph-db:view-old-node view n))
+                     (or (null prefix)
+                         (every #'equal prefix
+                                (subseq (%claim-tuple n slots)
+                                        0 (length prefix))))
+                     (or (not current) (claim-current-p n)))
+            (push n out)))))))
+
+(defun %name-admitted-p (graph class slots prefix current view)
+  "T when a claim under PREFIX resolves live through VIEW -- current,
+with CURRENT (R7, R4); stops at the first.  Committed entries only:
+add %CREATED-UNDER for the open transaction's own claims."
+  (let ((key (%vocabulary-key slots prefix)))
+    (block found
+      (graph-db:map-index
+       (lambda (node)
+         (let ((n (%view-resolve view node)))
+           (when (and n (or (not current) (claim-current-p n)))
+             (return-from found t))))
+       graph class slots :start key :end key)
+      nil)))
+
+(defun %name-count (graph class slots prefix current view)
+  "Claims under PREFIX as the transaction will commit them: outside a
+transaction and without CURRENT the index range's size; otherwise each
+committed entry resolved through VIEW, plus the claims the transaction
+created under PREFIX (R2, R4, spec §4.4).  Trap: the fast path counts
+entries, not live nodes."
+  (let ((key (%vocabulary-key slots prefix)))
+    (if (and (null view) (not current))
+        (graph-db:index-count graph class slots key :prefix t)
+        (let ((n (length (%created-under view class slots prefix
+                                         current))))
+          (graph-db:map-index
+           (lambda (node)
+             (let ((c (%view-resolve view node)))
+               (when (and c (or (not current) (claim-current-p c)))
+                 (incf n))))
+           graph class slots :start key :end key)
+          n))))
+
+(defun %walk-names (graph class slots arity start position current counts)
+  "The admitted names under (CLASS SLOTS) at ARITY from START, in index
+order, plus the names the open transaction's created claims introduce:
+the component at POSITION of each prefix, or (NAME . COUNT) with
+COUNTS.  With START the walk stops at the first prefix whose leading
+component leaves START's.  Not sorted -- %MERGE-NAMES sorts, so a
+created name lands in index order."
+  (let* ((view (%vocabulary-view graph))
+         (seen '())
+         (names '()))
+    (labels ((tally (prefix)
+               (and counts
+                    (%name-count graph class slots prefix current view)))
+             (note (prefix count)
+               (push prefix seen)
+               (let ((name (nth position prefix)))
+                 (push (if counts (cons name count) name) names)))
+             (admit (prefix)
+               ;; With COUNTS the count decides admission -- 0 is
+               ;; exactly "nothing live under the name" -- so the range
+               ;; resolves once, not twice.  INDEX-COUNT counts entries
+               ;; rather than live nodes, so R7's confirmation still
+               ;; runs on that path (GH #350, spec §4.4).
+               (if counts
+                   (let ((n (tally prefix)))
+                     (when (and (plusp n)
+                                (or view current
+                                    (%name-admitted-p graph class slots
+                                                      prefix current
+                                                      view)))
+                       (note prefix n)))
+                   (when (%name-admitted-p graph class slots prefix
+                                           current view)
+                     (note prefix nil)))))
+      (block walk
+        (graph-db:map-index-prefixes
+         (lambda (prefix)
+           (when (and start (not (equal (first prefix) (first start))))
+             (return-from walk))
+           (admit prefix))
+         graph class slots :arity arity :start start))
+      ;; Names only the transaction's own creates hold (GH #324).
+      (dolist (c (%created-under view class slots start current))
+        (let ((prefix (subseq (%claim-tuple c slots) 0 arity)))
+          (unless (member prefix seen :test #'equal)
+            (note prefix (tally prefix))))))
+    (nreverse names)))
+
+(defun %name-lessp (a b)
+  "Index order for two names: the engine's per-component collation.
+Total for the non-null names claim identity guarantees; LESS-THAN
+orders NIL against a symbol in one direction only, so a null name
+would not sort stably."
+  (graph-db::less-than a b))
+
+(defun %merge-names (lists counts)
+  "LISTS, each in index order, as one list in index order without
+duplicates; with COUNTS the entries are (NAME . COUNT) and a name in
+several lists sums its counts."
+  (let ((all (stable-sort (apply #'append lists) #'%name-lessp
+                          :key (if counts #'car #'identity)))
+        (out '()))
+    (dolist (e all (nreverse out))
+      (let ((name (if counts (car e) e)))
+        (if (and out (equal name (if counts (car (first out)) (first out))))
+            (when counts (incf (cdr (first out)) (cdr e)))
+            (push (if counts (cons name (cdr e)) name) out))))))
+
+(defun claim-namespaces (graph claim-class
+                         &key (role :either) current counts
+                              as-of as-of-epoch)
+  "The namespaces CLAIM-CLASS's family names as subject, object or
+either, in index order, one entry per name; with COUNTS each is
+\(NAME . COUNT), the claims under it in ROLE, summed under :EITHER.
+The default lists every name the indexes hold, retracted claims
+included; :CURRENT keeps a name only if a claim under it is current
+and counts only those.  Inside an open transaction the answer is what
+that transaction will commit (GH #324).  Trap: membership is live --
+:AS-OF and :AS-OF-EPOCH are refused, and an open WITH-AS-OF extent
+changes only what a name's claims resolve to (GH #350)."
+  (check-type role (member :subject :object :either))
+  (%refuse-vocabulary-axis as-of as-of-epoch)
+  (let ((family (claim-family claim-class)))
+    (%merge-names
+     (loop for (class slots) in (%vocabulary-sources family role)
+           collect (%walk-names graph class slots 1 nil 0 current counts))
+     counts)))
+
+(defun claim-relations (graph claim-class
+                        &key current counts as-of as-of-epoch)
+  "The relations CLAIM-CLASS's family uses, in index order, from its
+CLAIM-RELATION index; with COUNTS, (NAME . COUNT).  :CURRENT and the
+refusals as CLAIM-NAMESPACES (GH #350)."
+  (%refuse-vocabulary-axis as-of as-of-epoch)
+  (let ((family (claim-family claim-class)))
+    (%walk-names graph (claim-family-parent family) '(relation)
+                 1 nil 0 current counts)))
+
+(defun claim-keys (graph claim-class namespace
+                   &key (role :either) current counts limit offset
+                        as-of as-of-epoch)
+  "The keys filed under NAMESPACE by CLAIM-CLASS's family in ROLE, in
+index order, one entry per key, with COUNTS as (KEY . COUNT); NIL when
+nothing is filed there.  :LIMIT / :OFFSET page the merged list; the
+second value is T when entries existed past the cut.  :CURRENT and the
+refusals as CLAIM-NAMESPACES (GH #350)."
+  (check-type role (member :subject :object :either))
+  (%refuse-vocabulary-axis as-of as-of-epoch)
+  (let ((family (claim-family claim-class)))
+    (%paginate
+     (%merge-names
+      (loop for (class slots) in (%vocabulary-sources family role)
+            collect (%walk-names graph class slots 2 (list namespace) 1
+                                 current counts))
+      counts)
+     limit offset)))

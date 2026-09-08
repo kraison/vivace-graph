@@ -272,3 +272,83 @@ retraction does not rewrite history the transaction may yet abandon."
                                      :as-of then)))
           (is (= 1 (length hist)))
           (is (claim-current-p (first hist))))))))
+
+(test the-relation-index-answers-and-survives-reopen
+  "GH #350 spec §3: DEF-CLAIM-CLASSES declares a (RELATION) index named
+CLAIM-RELATION on the parent; it answers INDEX-LOOKUP on a fresh family
+and again after close and reopen (the sidecar round trip)."
+  (with-temp-directory (dir)
+    (let ((path (namestring dir)))
+      (let ((g (make-graph *claim-graph-name* path :buffer-pool-size 1000)))
+        (unwind-protect
+             (let ((graph-db:*graph* g))
+               (with-transaction ()
+                 (make-u :subject "a" :relation "likes")
+                 (make-b :subject "a" :object "b" :relation "knows")
+                 (make-u :subject "c" :relation "likes"))
+               (is (= 2 (length (graph-db:index-lookup
+                                 g 'ct-claim
+                                 '(graph-db.spacetime::relation) "likes"))))
+               (is (= 1 (length (graph-db:index-lookup
+                                 g 'ct-claim
+                                 '(graph-db.spacetime::relation) "knows")))))
+          (close-graph g)))
+      (let ((g2 (open-graph *claim-graph-name* path)))
+        (unwind-protect
+             (let ((graph-db:*graph* g2))
+               (is (= 2 (length (graph-db:index-lookup
+                                 g2 'ct-claim
+                                 '(graph-db.spacetime::relation) "likes")))))
+          (ignore-errors (close-graph g2 :snapshot-p nil))
+          (collect-garbage))))))
+
+(test an-existing-family-gets-the-relation-index-at-its-next-open
+  "GH #350 spec §3: a family whose claims predate the CLAIM-RELATION
+declaration gets the index at its next open -- INSTALL-SECONDARY-INDEXES
+builds every declared index the sidecar does not hold, scanning the
+claims already stored.  The withdrawn open is the control: it makes the
+reconcile drop the sidecar's record, so the final assertions cannot pass
+off a restored index as a built one.  Trap: the index registry is keyed
+by graph name and shared by every test here, so the declaration is
+restored in UNWIND-PROTECT."
+  (with-temp-directory (dir)
+    (let ((path (namestring dir)))
+      (let ((g (make-graph *claim-graph-name* path :buffer-pool-size 1000)))
+        (unwind-protect
+             (let ((graph-db:*graph* g))
+               (with-transaction ()
+                 (make-u :subject "a" :relation "likes")
+                 (make-b :subject "a" :object "b" :relation "knows")))
+          (close-graph g)))
+      (graph-db:undef-index ct-claim :graph-db-claim-test
+                            :name claim-relation)
+      (unwind-protect
+           (progn
+             (let ((g2 (open-graph *claim-graph-name* path)))
+               (unwind-protect
+                    (let ((graph-db:*graph* g2))
+                      (signals graph-db:query-precondition-error
+                        (graph-db:index-lookup
+                         g2 'ct-claim
+                         '(graph-db.spacetime::relation) "likes")))
+                 (ignore-errors (close-graph g2 :snapshot-p nil))))
+             (graph-db:def-index ct-claim (graph-db.spacetime::relation)
+                 :graph-db-claim-test :name claim-relation)
+             (let ((g3 (open-graph *claim-graph-name* path)))
+               (unwind-protect
+                    (let ((graph-db:*graph* g3))
+                      (is (equal '("knows" "likes")
+                                 (claim-relations g3 'ct-claim)))
+                      (is (= 1 (length (graph-db:index-lookup
+                                        g3 'ct-claim
+                                        '(graph-db.spacetime::relation)
+                                        "likes"))))
+                      (is (= 1 (length (graph-db:index-lookup
+                                        g3 'ct-claim
+                                        '(graph-db.spacetime::relation)
+                                        "knows")))))
+                 (ignore-errors (close-graph g3 :snapshot-p nil))
+                 (collect-garbage))))
+        ;; The suite shares the registry: restore whatever the body left.
+        (graph-db:def-index ct-claim (graph-db.spacetime::relation)
+            :graph-db-claim-test :name claim-relation)))))

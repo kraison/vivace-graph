@@ -125,6 +125,24 @@ All bind `(*graph* graph)` so id resolution and any accessor reads hit the queri
 Deleted nodes are filtered (`ix-remove` runs on delete, but guard reads anyway, like
 `edge-exists-p`). Descending v1 = collect a range then `nreverse`.
 
+### 6a. Distinct-prefix walk and counts (GH #350)
+
+`map-index-prefixes fn graph class slot &key arity start` calls FN once
+per distinct leading prefix of ARITY components, in index order, NIL
+standing for a null component. It seeks: one range cursor per prefix,
+opened at the previous prefix's high bound (`%index-bounds` with
+`prefix` true), which sorts past every tuple sharing it. Cost is the
+number of distinct prefixes times log n; it never takes the open-ended
+`ix-map` path. It holds no lock of its own (the cursors do, per
+backend), so a walk is not an atomic snapshot: entries can come and go
+between hops. Membership is live — under a read snapshot or `with-as-of`
+a prefix's nodes may resolve to deleted or absent versions; callers that
+care resolve them (`graph-db/spacetime`'s vocabulary does).
+
+`index-count graph class slot value &key prefix` is the size of a
+tuple's or prefix's range, counted entries, no node resolution; 0 for an
+absent prefix or a declared-but-empty index.
+
 ## 7. Persistence & reopen
 
 Mirror `:unique` exactly (it already solved both backends):
