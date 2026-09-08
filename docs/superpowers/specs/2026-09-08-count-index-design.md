@@ -56,8 +56,9 @@ canonicalize, name, `current-p` as a symbol) in its own
 `%spec-identity` (a named declaration replaces in place; an unnamed one
 is identified by its slots), with `register-count-index-spec`,
 `unregister-count-index-spec`, `%registered-count-index-specs`, and a
-`%count-index-spec-declared-p` that fails safe towards keeping like the
-secondary one. Withdrawal warns through `%withdrawn-p` when nothing
+`%count-index-spec-declared-p` for which absence is positive evidence:
+count indexes come only from `def-count-index` (no MOP arm), so a
+sidecar record without a live declaration is reclaimed. Withdrawal warns through `%withdrawn-p` when nothing
 matched. Built objects live in a new graph slot, `count-indexes`, a
 hash keyed `(owner . slot-names)`; the key space is separate from
 `secondary-indexes`, so a family may declare both kinds on the same
@@ -123,16 +124,22 @@ and applies the create rule to every live node of each owner class
 (typed scan, deleted nodes skipped, one bad node tolerated as
 `%build-index-for-spec` tolerates it). It runs at open when the graph
 was crash-recovered (the replay precedes the sidecar restore and would
-otherwise be discarded), and lazily from `count-index-lookup` /
-`map-count-index` when the flag is set. The lazy trigger is a
+otherwise be discarded), lazily from `count-index-lookup` /
+`map-count-index` when the flag is set, and at `close-graph` when the
+flag is set, before the retired maps are freed and the roots saved —
+on a device every pull marks the maps stale, and a clean close after a
+pull with no query in between would otherwise persist under-counted
+maps that the next open restores as authoritative. The flag is cleared
+before the scan, not after: the device writer sets it without the
+manager lock, and a pull landing mid-scan must leave it set. The lazy trigger is a
 writer-class operation: it takes the transaction manager's recursive
 lock and re-checks the flag inside it, so two readers cannot free each
 other's maps and a lookup from inside an apply is safe. The scan itself
 binds the ambient transaction and read snapshots away and records no
 reads, so it builds committed live state whatever the caller's snapshot
-(R1) and pollutes no read set (GH #92). The flag is in memory only:
-a crash between a state-sync re-pull and a close leaves a sidecar whose
-counts the crash-recovery rebuild at the next open replaces anyway.
+(R1) and pollutes no read set (GH #92). The flag is in memory only: a crash between a re-pull and a close
+leaves a sidecar whose counts the crash-recovery rebuild at the next
+open replaces anyway; a clean close rebuilds first.
 
 A rebuild never frees pages under a live reader: `map-count-index`
 readers hold no lock, so the rebuild builds fresh maps, swaps them into
@@ -140,11 +147,13 @@ the registry key by key, and retires the old maps to a graph-level
 list that `close-graph` deletes. Retired pages are held until close;
 rebuilds are rare (a crash-recovered open, a re-pull).
 
-A built map carries a `built-p` mark set by the scan build; the
-install-at-open and the declaration-time build test that mark, not the
-map's presence in the registry, because the write path creates an empty
-map for a declared index the first time a commit touches it, and a map
-created that way must still be built over the nodes that preceded it.
+A built map carries a `built-p` mark set by the scan build and by the
+sidecar restore; the install-at-open and the declaration-time build test
+that mark. The write path never creates a map: a commit that finds no
+map for an applicable declaration marks the graph stale and skips it,
+so the next query rebuilds by scan. On a lazy memory graph nothing is
+ever built and a rebuild is a no-op that clears the flag: every count
+query there answers empty, the documented contract.
 
 ### 2.4 Persistence
 
@@ -152,10 +161,12 @@ A separate sidecar, `count-indexes.dat`, written by
 `save-count-index-roots` at close (unguarded, like the other two saves:
 a stale root is silently wrong) and read by
 `restore-count-index-roots` at open, with records `(owner slot-names
-address backend-tag)`; the `current-p` symbol and canonicalizers are
-not stored, they are re-resolved from the live declaration at restore
-like `%owner-slot-canonicalizer`. The restore marks each map
-`built-p` (the mark is not stored). A record whose declaration is
+address backend-tag current-p)`; canonicalizers are re-resolved from
+the live declaration at restore like `%owner-slot-canonicalizer`. A
+record whose stored `current-p` is not the live declaration's is
+treated as withdrawn — its pairs were computed under another predicate
+— and rebuilt by the install. The restore marks each map `built-p`
+(the mark is not stored). A record whose declaration is
 withdrawn is reclaimed at open (#147); a missing sidecar falls to
 `rebuild-count-indexes`; `install-count-indexes` builds any declared
 index the sidecar did not cover. The memory graph has no sidecar and
@@ -334,4 +345,6 @@ follow-up: collapse the hybrid onto the engine once the pin moves.
   add.
 - Changing `claims-touching` or its overlay (#358's other half).
 - Persisting the stale flag: a crash after a re-pull is covered by the
-  crash-recovery rebuild.
+  crash-recovery rebuild, a clean close by the close-time rebuild.
+- A narrower re-apply signal for the authored pull path (today both
+  peer applies mark the maps stale on every pull).
