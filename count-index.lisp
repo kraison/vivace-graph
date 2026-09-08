@@ -310,16 +310,37 @@ Nothing at all for a graph with no count declarations."
   (cons (count-index-spec-owner-name spec)
         (count-index-spec-slot-names spec)))
 
+(defun %retire-count-map (graph cix)
+  "Hand CIX's map to GRAPH's retired list, which CLOSE-GRAPH frees.  A
+rebuild must never free pages under a live MAP-COUNT-INDEX cursor --
+readers hold no lock (spec §2.3) -- so the swap is per key and the old
+map waits for the close.  NIL for a NIL CIX or a memory map.  Returns
+NIL."
+  (let ((sl (and cix (count-index-skip-list cix))))
+    (when (and sl (view-index-p sl))
+      (push sl (retired-count-maps graph))))
+  nil)
+
+(defun %free-retired-count-maps (graph)
+  "Free the heap pages of the maps GRAPH's rebuilds retired: CLOSE-GRAPH
+is the one moment no reader can be mid-cursor (spec §2.3).  A failure
+warns rather than aborting the close.  Returns NIL."
+  (dolist (sl (retired-count-maps graph))
+    (handler-case (delete-view-index sl)
+      (error (e)
+        (warn "could not free a retired count map: ~A" e))))
+  (setf (retired-count-maps graph) nil))
+
 (defun %count-index-reset (graph spec)
-  "Drop SPEC's map from GRAPH's registry, freeing its heap pages, and
-return a fresh empty COUNT-INDEX.  A build is authority, so it must not
-add to the partial counts a pass-materialised map already holds."
+  "Swap a FRESH empty COUNT-INDEX for SPEC into GRAPH's registry and
+return it, retiring the map it replaces (%RETIRE-COUNT-MAP).  A build is
+authority, so it must not add to the partial counts a pass-materialised
+map already holds."
   (let* ((reg (%count-registry graph))
          (key (%count-index-key spec))
          (old (gethash key reg)))
     (when old
-      (let ((sl (count-index-skip-list old)))
-        (when (and sl (view-index-p sl)) (delete-view-index sl)))
+      (%retire-count-map graph old)
       (remhash key reg))
     (%count-index-for graph spec)))
 
@@ -360,26 +381,117 @@ materialised holds only the writes it saw, so this still scans it."
         (%build-count-index-for-spec graph spec))))
 
 (defun install-count-indexes (graph)
-  "Build any declared count index missing from GRAPH's registry."
+  "Scan-build every count index declared for GRAPH that is not BUILT-P:
+one the sidecar did not cover, and one a commit pass materialised empty.
+A map already built (restored or scanned) is left alone."
   (dolist (spec (%registered-count-index-specs graph))
     (%ensure-count-index-built graph spec)))
 
 (defun rebuild-count-indexes (graph)
-  "Drop every count map and rebuild each declared one by scan, clearing
-the stale flag (R8); returns GRAPH.  Authoritative and idempotent, and
-the only repair for a re-applied write (facts X7)."
-  (when (count-indexes graph)
-    (maphash (lambda (k cix)
-               (declare (ignore k))
-               (let ((sl (count-index-skip-list cix)))
-                 (when (and sl (view-index-p sl))
-                   (delete-view-index sl))))
-             (count-indexes graph))
-    (clrhash (count-indexes graph)))
+  "Rebuild every count map GRAPH declares by scan, clearing the stale
+flag (R8); returns GRAPH.  Each map is built fresh and swapped in, the
+one it replaces retired for CLOSE-GRAPH to free -- a rebuild frees no
+pages mid-session (spec §2.3).  A map whose declaration is gone is
+retired outright.  Authoritative and idempotent, and the only repair for
+a re-applied write (facts X7)."
+  (let ((reg (count-indexes graph))
+        (undeclared '()))
+    (when reg
+      (maphash (lambda (k cix)
+                 (unless (%count-spec-for (car k) (cdr k) graph)
+                   (push (cons k cix) undeclared)))
+               reg)
+      (dolist (entry undeclared)
+        (%retire-count-map graph (cdr entry))
+        (remhash (car entry) reg))))
   (dolist (spec (%registered-count-index-specs graph))
     (%build-count-index-for-spec graph spec))
   (setf (count-indexes-stale-p graph) nil)
   graph)
+
+;;; --------------------------------------------------------------------
+;;; Persistence (spec §2.4): an own sidecar, byte-compatible with
+;;; nothing else -- the secondary one is untouched in both directions.
+;;; --------------------------------------------------------------------
+
+(defun count-index-root-file (location)
+  (format nil "~A/count-indexes.dat" location))
+
+(defun save-count-index-roots (graph)
+  "Persist (owner slot-names address backend-tag) per on-disk count map
+of GRAPH; no-op with no heap (memory) or no maps.  Called at
+CLOSE-GRAPH, unguarded like the other index saves: a stale root is
+silently wrong (GH #361).  Trap: BUILT-P is not stored -- the restore
+re-marks it, or every open would rescan and discard the sidecar."
+  (when (and (indexes graph) (count-indexes graph))
+    (let ((roots '()))
+      (maphash (lambda (k cix)
+                 (declare (ignore k))
+                 (let ((sl (count-index-skip-list cix)))
+                   (when (and sl (view-index-p sl))
+                     (push (list (count-index-owner-name cix)
+                                 (count-index-slot-names cix)
+                                 (view-index-address sl)
+                                 (view-index-backend-tag sl))
+                           roots))))
+               (count-indexes graph))
+      (%atomic-cl-store roots (count-index-root-file (location graph))))))
+
+(defun %restore-one-count-root (graph record)
+  "Reopen one sidecar RECORD of GRAPH into the count registry, or -- its
+declaration withdrawn or re-shaped -- reclaim its pages, this open being
+the moment nothing can be mid-read (GH #147).  Returns NIL."
+  (destructuring-bind (owner stored-slots address
+                       &optional (backend :skip-list)) record
+    (let* ((slot-names (%normalize-slots stored-slots))
+           (spec (%count-spec-for owner slot-names graph)))
+      (if spec
+          (let ((reg (%count-registry graph))
+                (key (cons owner slot-names)))
+            (%retire-count-map graph (gethash key reg))
+            (setf (gethash key reg)
+                  (%make-count-index
+                   :owner-name owner
+                   :slot-names slot-names
+                   ;; From the live declaration, never the file: neither
+                   ;; a function nor a predicate symbol is stored.
+                   :canonicalizers
+                   (%resolve-index-canonicalizers
+                    (count-index-spec-canonicalize spec)
+                    (length slot-names))
+                   :current-p (count-index-spec-current-p spec)
+                   ;; A restored map is complete; BUILT-P is not
+                   ;; persisted, so the restore is what marks it.
+                   :built-p t
+                   :skip-list (%open-count-skip-list graph address
+                                                     backend))))
+          (handler-case
+              (progn
+                (delete-view-index
+                 (%open-count-skip-list graph address backend))
+                (log:info "reclaimed retired count index ~A.~A (GH #147)"
+                          owner slot-names))
+            (error (e)
+              (warn "could not reclaim retired count index ~A.~A: ~A"
+                    owner slot-names e))))))
+  nil)
+
+(defun restore-count-index-roots (graph)
+  "Reopen GRAPH's count maps from the sidecar -- no node scan.  T when
+one was present and readable, the empty case included (as the secondary
+restore); NIL to fall back to REBUILD-COUNT-INDEXES.  Trap: a partial
+restore is left in place -- those maps hold valid addresses, and
+INSTALL-COUNT-INDEXES builds what the file did not cover."
+  (let ((file (count-index-root-file (location graph))))
+    (when (probe-file file)
+      (handler-case
+          (let ((records (cl-store:restore file)))
+            (dolist (r records t)
+              (%restore-one-count-root graph r)))
+        (error (e)
+          (warn "Count index sidecar ~A is unreadable (~A); rebuilding ~
+from live nodes, which are authoritative." file e)
+          nil)))))
 
 ;;; --------------------------------------------------------------------
 ;;; Queries (spec §2.5)

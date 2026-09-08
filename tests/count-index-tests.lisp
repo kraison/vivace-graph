@@ -394,3 +394,216 @@ transaction's read set is unchanged by the scan."
         (is (= before (graph-db::object-set-count
                        (graph-db::read-set *transaction*)))
             "the scan added nothing to the open read set")))))
+
+;;; --------------------------------------------------------------------
+;;; Task 4: persistence, open and close (spec §2.4)
+;;; --------------------------------------------------------------------
+
+(defun %count-builds (thunk)
+  "Run THUNK counting %BUILD-COUNT-INDEX-FOR-SPEC calls through an
+FDEFINITION swap removed afterwards; returns the count.  Callers prove
+the probe live with a control that must build."
+  (let ((builds 0)
+        (orig (fdefinition 'graph-db::%build-count-index-for-spec)))
+    (unwind-protect
+         (progn
+           (setf (fdefinition 'graph-db::%build-count-index-for-spec)
+                 (lambda (g s) (incf builds) (funcall orig g s)))
+           (funcall thunk)
+           builds)
+      (setf (fdefinition 'graph-db::%build-count-index-for-spec) orig))))
+
+(test count-index-survives-close-and-reopen
+  "Spec §2.4: the sidecar round trip -- close, reopen, same counters and
+NO scan (the probe counts zero builds; the last open is the control
+proving it fires); and a declaration the stored graph predates is built
+at open (the withdrawn open and close make the sidecar unable to
+restore it)."
+  (with-temp-directory (dir)
+    (let ((path (namestring dir)))
+      (let ((g (make-graph *ix-graph-name* path :buffer-pool-size 1000)))
+        (unwind-protect
+             (let ((*graph* g))
+               (with-transaction ()
+                 (make-ix-claim :ns "ops" :key "e1" :rel "at")
+                 (make-ix-claim :ns "ops" :key "e2" :rel "dead")))
+          (close-graph g)))
+      (let (g)
+        (is (= 0 (%count-builds
+                  (lambda ()
+                    (setq g (open-graph *ix-graph-name* path)))))
+            "the sidecar was taken: nothing scanned at open")
+        (unwind-protect
+             (let ((*graph* g))
+               (is (equal '(2 1) (%count-of g '(ns key) '("ops")))
+                   "restored from the sidecar")
+               (is (graph-db::count-index-built-p
+                    (graph-db::%require-count-index g 'ix-claim
+                                                    '(ns key)))
+                   "and the restored map is marked built"))
+          (close-graph g :snapshot-p nil)))
+      ;; Build-at-open: withdraw, open and close once (the sidecar
+      ;; record is reclaimed), re-declare, open: the map is built by
+      ;; scan.
+      (undef-count-index ix-claim :graph-db-index-test :name ix-count-rel)
+      (unwind-protect
+           (let ((g (open-graph *ix-graph-name* path)))
+             (unwind-protect
+                  (let ((*graph* g))
+                    (signals query-precondition-error
+                      (count-index-lookup g 'ix-claim '(rel) "at")))
+               (close-graph g :snapshot-p nil)))
+        (def-count-index ix-claim (rel) :graph-db-index-test
+          :name ix-count-rel))
+      (let (g)
+        (is (plusp (%count-builds
+                    (lambda ()
+                      (setq g (open-graph *ix-graph-name* path)))))
+            "control: the probe fires on the open that must build")
+        (unwind-protect
+             (let ((*graph* g))
+               (is (equal '(1 nil) (%count-of g '(rel) "at"))
+                   "built at open over the pre-existing nodes")
+               (is (equal '(1 nil) (%count-of g '(rel) "dead"))))
+          (ignore-errors (close-graph g :snapshot-p nil))
+          (collect-garbage))))))
+
+(test a-withdrawn-count-index-is-reclaimed-at-open
+  "Spec §2.4 (GH #147): a sidecar record whose declaration is withdrawn
+has its pages reclaimed at the next open -- DELETE-VIEW-INDEX is called
+for it.  The slots are (ns rel), declared nowhere else: the registry is
+keyed (owner . slot-names), so a second live declaration on the same
+slots would keep the record alive past the undef."
+  (def-count-index ix-claim (ns rel) :graph-db-index-test
+    :name ix-count-gone)
+  (with-temp-directory (dir)
+    (let ((path (namestring dir)))
+      (let ((g (make-graph *ix-graph-name* path :buffer-pool-size 1000)))
+        (unwind-protect
+             (let ((*graph* g))
+               (with-transaction ()
+                 (make-ix-claim :ns "ops" :key "e1" :rel "at")))
+          (close-graph g)))
+      (undef-count-index ix-claim :graph-db-index-test
+                         :name ix-count-gone)
+      (let* ((freed 0)
+             (old (fdefinition 'graph-db::delete-view-index)))
+        (setf (fdefinition 'graph-db::delete-view-index)
+              (lambda (ix) (incf freed) (funcall old ix)))
+        (unwind-protect
+             (let ((g (open-graph *ix-graph-name* path)))
+               (close-graph g :snapshot-p nil)
+               (collect-garbage))
+          (setf (fdefinition 'graph-db::delete-view-index) old))
+        (is (plusp freed) "the retired count map was reclaimed")))))
+
+(test a-rebuild-retires-the-old-map-and-close-frees-it
+  "Spec §2.3, last paragraph: MAP-COUNT-INDEX readers hold no lock, so a
+rebuild must build a FRESH map and swap it in -- never free pages under
+a cursor.  The old map lands on RETIRED-COUNT-MAPS and is freed by
+CLOSE-GRAPH, counted through the DELETE-VIEW-INDEX seam."
+  (with-temp-directory (dir)
+    (let ((g (make-graph *ix-graph-name* (namestring dir)
+                         :buffer-pool-size 1000)))
+      (unwind-protect
+           (let ((*graph* g))
+             (with-transaction ()
+               (make-ix-claim :ns "ops" :key "e1" :rel "at"))
+             (let ((old (graph-db::count-index-skip-list
+                         (graph-db::%require-count-index g 'ix-claim
+                                                         '(ns key))))
+                   (freed 0)
+                   (orig (fdefinition 'graph-db::delete-view-index)))
+               (unwind-protect
+                    (progn
+                      (setf (fdefinition 'graph-db::delete-view-index)
+                            (lambda (ix) (incf freed) (funcall orig ix)))
+                      (graph-db::rebuild-count-indexes g)
+                      (is (= 0 freed)
+                          "a rebuild frees no pages mid-session")
+                      (is (member old (graph-db::retired-count-maps g))
+                          "the old map is retired, not deleted")
+                      (is (not (eq old
+                                   (graph-db::count-index-skip-list
+                                    (graph-db::%require-count-index
+                                     g 'ix-claim '(ns key)))))
+                          "a fresh map answers queries")
+                      (is (equal '(1 1) (%count-of g '(ns key) '("ops")))
+                          "and it holds the rebuilt counts")
+                      (close-graph g :snapshot-p nil)
+                      (is (plusp freed) "close freed the retired map")
+                      (is (null (graph-db::retired-count-maps g))))
+                 (setf (fdefinition 'graph-db::delete-view-index)
+                       orig))))
+        (ignore-errors (close-graph g :snapshot-p nil))
+        (collect-garbage)))))
+
+(test a-stale-flag-is-repaired-before-the-first-lookup-and-saved
+  "Spec R8, facts X7: an apply under *ADD-TO-INDEXES-UNLESS-PRESENT-P*
+(what a crash-recovery replay or a device re-pull runs) counts nothing
+and flags the maps; the first lookup rebuilds by scan and counts the
+write the maps never saw, and the close saves the rebuilt maps."
+  (with-temp-directory (dir)
+    (let ((path (namestring dir)))
+      (let ((g (make-graph *ix-graph-name* path :buffer-pool-size 1000)))
+        (unwind-protect
+             (let ((*graph* g))
+               (with-transaction ()
+                 (make-ix-claim :ns "ops" :key "e1" :rel "at"))
+               (let ((graph-db::*add-to-indexes-unless-present-p* t))
+                 (with-transaction ()
+                   (make-ix-claim :ns "ops" :key "e2" :rel "at")))
+               (is (eq t (graph-db::count-indexes-stale-p g)) "flagged")
+               (is (equal '(2 2) (%count-of g '(ns key) '("ops")))
+                   "the first lookup rebuilt and counted the flagged ~
+write")
+               (is (null (graph-db::count-indexes-stale-p g))))
+          (close-graph g)))
+      (let ((g (open-graph *ix-graph-name* path)))
+        (unwind-protect
+             (let ((*graph* g))
+               (is (equal '(2 2) (%count-of g '(ns key) '("ops")))
+                   "the rebuilt maps were saved at close"))
+          (ignore-errors (close-graph g :snapshot-p nil))
+          (collect-garbage))))))
+
+(test a-crash-recovery-open-rebuilds-the-counters
+  "Spec R8, facts D20/X7: RECOVER-TRANSACTIONS replays the WAL tail
+under *ADD-TO-INDEXES-UNLESS-PRESENT-P*, which counts nothing, and the
+replay precedes the sidecar restore -- so OPEN-GRAPH must rebuild by
+scan after restoring.  The crash shape is CRASH-RECOVERY-RESEEDS-THE-
+TX-ID-WATERMARK's (detach-tests): a .committed file renamed back to
+.txn.  The probe is the assertion; the count alone would be vacuous,
+the pre-crash sidecar holding the same value."
+  (with-temp-directory (dir)
+    (let ((path (namestring dir)))
+      (let ((g (make-graph *ix-graph-name* path :buffer-pool-size 1000)))
+        (unwind-protect
+             (let ((*graph* g))
+               (with-transaction ()
+                 (make-ix-claim :ns "ops" :key "e1" :rel "at"))
+               (let ((graph-db::*delete-committed-transaction-files*
+                       nil))
+                 (with-transaction ()
+                   (make-ix-claim :ns "ops" :key "e2" :rel "at"))))
+          (close-graph g :snapshot-p nil))
+        ;; Fabricate the WAL tail: the survived .committed becomes a
+        ;; .txn RECOVER-TRANSACTIONS will replay at the next open.
+        (let* ((tx-dir (graph-db::persistent-transaction-directory g))
+               (files (directory (merge-pathnames "*.committed" tx-dir))))
+          (is (= 1 (length files))
+              "sanity: exactly one committed file survived")
+          (rename-file (first files)
+                       (make-pathname :type "txn"
+                                      :defaults (first files)))))
+      (let (g)
+        (is (plusp (%count-builds
+                    (lambda ()
+                      (setq g (open-graph *ix-graph-name* path)))))
+            "the crash-recovery open rebuilt the counters by scan")
+        (unwind-protect
+             (let ((*graph* g))
+               (is (equal '(2 2) (%count-of g '(ns key) '("ops")))
+                   "the replayed write is counted once, not twice"))
+          (ignore-errors (close-graph g :snapshot-p nil))
+          (collect-garbage))))))

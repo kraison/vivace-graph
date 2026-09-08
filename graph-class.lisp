@@ -207,6 +207,9 @@ received an UNRESOLVED-NODE marker instead (GH #169, D8)."
    (count-indexes :accessor count-indexes :initarg :count-indexes
                   :initform nil)
    (count-indexes-stale-p :accessor count-indexes-stale-p :initform nil)
+   ;; Count maps a rebuild swapped out: freed by CLOSE-GRAPH, never
+   ;; mid-session -- a MAP-COUNT-INDEX reader holds no lock (spec §2.3).
+   (retired-count-maps :accessor retired-count-maps :initform nil)
    (views-lock :accessor views-lock :initarg :views-lock
                :initform (make-recursive-lock))
    (views :accessor views :initarg :views)

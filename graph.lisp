@@ -1041,7 +1041,13 @@ policy.dat's ~S; the file wins."
           ;; index creation: crash-correctness comes from this rebuild, not from
           ;; CL-STORE I/O under the transaction-manager lock.)
           (when crash-recovery-p
-            (rebuild-spatial-indexes graph)))
+            (rebuild-spatial-indexes graph)
+            ;; Counting indexes (GH #361, R8): the replay above ran under
+            ;; *ADD-TO-INDEXES-UNLESS-PRESENT-P*, which counts nothing, and
+            ;; the restore below reopens the PRE-crash maps -- missing the
+            ;; replayed tail.  This LET closes before that restore, so the
+            ;; flag is what carries the decision to rebuild past it.
+            (setf (count-indexes-stale-p graph) t)))
         ;; Unique constraints (issue #6): reopen the persistent unique skip-lists from
         ;; the sidecar (durable, no scan); only rebuild from nodes if there is no
         ;; sidecar -- a fresh graph, or a crash before CLOSE-GRAPH saved the roots.
@@ -1054,7 +1060,16 @@ policy.dat's ~S; the file wins."
         ;; this graph existed, or added since the last close); no-op otherwise.
         (install-secondary-indexes graph)
         ;; Same for a def-unique'd multi-slot constraint (GH #107).
-        (install-unique-tuple-constraints graph))
+        (install-unique-tuple-constraints graph)
+        ;; Counting indexes (GH #361): reopen-or-rebuild like the others,
+        ;; then build any declaration the sidecar did not cover.
+        (unless (restore-count-index-roots graph)
+          (rebuild-count-indexes graph))
+        (install-count-indexes graph)
+        ;; A crash-recovery replay left the counters stale (R8, above):
+        ;; only a scan can put back what the replay did not count.
+        (when (count-indexes-stale-p graph)
+          (rebuild-count-indexes graph)))
       (when slave-p
         (setf (master-host graph) master-host))
       (when peer-role
@@ -1252,6 +1267,11 @@ a snapshot failure does NOT abort the close (GH #120)."
       ;; snapshot costs replay time; a stale index root is silently wrong.
       (save-unique-index-roots graph)
       (save-secondary-index-roots graph)
+      ;; Counting indexes (GH #361): free the maps a rebuild retired --
+      ;; this is the one moment no reader can be mid-cursor -- and only
+      ;; then persist the live maps' roots.
+      (%free-retired-count-maps graph)
+      (save-count-index-roots graph)
       ;; Spatial indexes (v3 sidecar): the addresses are already durable from
       ;; creation, but the precision histogram is only in RAM, so this close is
       ;; what makes the coarsest-precision clamp survive the reopen intact.
