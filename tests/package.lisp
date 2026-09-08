@@ -279,6 +279,11 @@
                 #:map-index
                 #:map-index-prefixes         ; GH #350
                 #:index-count
+                ;; the counting index (GH #361)
+                #:def-count-index
+                #:undef-count-index
+                #:count-index-lookup
+                #:map-count-index
                 ;; the typed query error the index surface signals
                 #:query-precondition-error
                 #:def-unique
