@@ -571,6 +571,11 @@ rather than a scan of every claim."
 ;;; every answer is what it will commit: committed entries resolve
 ;;; through the commit view, the transaction's own creates are added
 ;;; (R5, §4.4).
+;;;
+;;; GH #361 §3 (spec 2026-09-08): outside an as-of extent the answer is
+;;; a read of the family's three count indexes plus the open
+;;; transaction's delta, and no node is resolved.  The walk below stays
+;;; -- it is the only mechanism that answers at an epoch (R7).
 ;;; ---------------------------------------------------------------------------
 
 (defun %refuse-vocabulary-axis (as-of as-of-epoch)
@@ -745,6 +750,94 @@ several lists sums its counts."
             (when counts (incf (cdr (first out)) (cdr e)))
             (push (if counts (cons name (cdr e)) name) out))))))
 
+(defun %names-at (graph class slots depth prefix)
+  "The count index on (CLASS SLOTS) at DEPTH under PREFIX as
+\(NAME ALL CURRENT) triples -- NAME the last component, CURRENT 0 for
+an index with no predicate -- in index order (GH #361 §3.2)."
+  (let ((out '()))
+    (graph-db:map-count-index
+     (lambda (components all cur)
+       (push (list (car (last components)) all (or cur 0)) out))
+     graph class slots :depth depth :prefix prefix)
+    (nreverse out)))
+
+(defun %vocabulary-delta (tx class slots depth prefix)
+  "Per-name (ALL . CURRENT) adjustments TX will commit for the names at
+DEPTH under PREFIX of (CLASS SLOTS): an EQUAL table, NIL outside a
+transaction.  Bounded by the write set (GH #361 §3.3).  Trap:
+GRAPH-DB:WRITES, not the commit view -- the view keys writes by id and
+so hides the TX-CREATE of a claim created and deleted in one
+transaction, while this must predict the apply pass write for write."
+  (when tx
+    (let ((delta (make-hash-table :test 'equal)))
+      (flet ((bump (node d-all d-current)
+               (when (and node (typep node class))
+                 (let ((tuple (%claim-tuple node slots)))
+                   ;; An all-null tuple is not counted, as %COUNT-TUPLE
+                   ;; has it (count-index.lisp).
+                   (when (and (notevery #'null tuple)
+                              (every #'equal prefix tuple))
+                     (let* ((name (nth (1- depth) tuple))
+                            (cell (or (gethash name delta)
+                                      (setf (gethash name delta)
+                                            (cons 0 0)))))
+                       (incf (car cell) d-all)
+                       (incf (cdr cell) d-current)))))))
+        (dolist (w (graph-db:writes tx))
+          ;; The apply pass's arithmetic: the new version arrives, the
+          ;; old one leaves, and a deleted new version only leaves.
+          (let ((new (graph-db::node w))
+                (old (and (typep w 'graph-db::tx-update)
+                          (graph-db::old-node w))))
+            (unless (or (typep w 'graph-db::tx-delete)
+                        (graph-db:deleted-p new))
+              (bump new 1 (if (claim-current-p new) 1 0)))
+            (when old
+              (bump old -1 (if (claim-current-p old) -1 0))))))
+      delta)))
+
+(defun %counted-names (graph class slots depth prefix current counts)
+  "One source's names from its count index, the open transaction's
+delta applied: names, or (NAME . COUNT); a name whose adjusted ALL is 0
+is dropped, and under CURRENT one whose CURRENT is 0.  Not sorted --
+%MERGE-NAMES sorts, so a name the transaction introduces lands in index
+order."
+  (let ((delta (%vocabulary-delta graph-db::*transaction* class slots
+                                  depth prefix))
+        (out '()))
+    (flet ((emit (name all cur)
+             (let ((n (if current cur all)))
+               (when (plusp n)
+                 (push (if counts (cons name n) name) out)))))
+      (dolist (e (%names-at graph class slots depth prefix))
+        (destructuring-bind (name all cur) e
+          (let ((d (and delta (gethash name delta))))
+            (when d (remhash name delta))
+            (emit name (+ all (if d (car d) 0))
+                  (+ cur (if d (cdr d) 0))))))
+      ;; What is left holds only names the transaction introduces.
+      (when delta
+        (maphash (lambda (name d) (emit name (car d) (cdr d))) delta)))
+    (nreverse out)))
+
+(defun %vocabulary-1 (graph class slots depth prefix current counts)
+  "One source's names at DEPTH under PREFIX: the count path, or #350's
+walk inside an as-of extent -- the only mechanism that answers at an
+epoch (GH #361 R7)."
+  (if (graph-db::%as-of-snapshot graph)
+      (%walk-names graph class slots depth prefix (1- depth) current
+                   counts)
+      (%counted-names graph class slots depth prefix current counts)))
+
+(defun %vocabulary (graph family role depth prefix current counts)
+  "The merged names of FAMILY for ROLE at DEPTH under PREFIX, in index
+order."
+  (%merge-names
+   (loop for (class slots) in (%vocabulary-sources family role)
+         collect (%vocabulary-1 graph class slots depth prefix current
+                                counts))
+   counts))
+
 (defun claim-namespaces (graph claim-class
                          &key (role :either) current counts
                               as-of as-of-epoch)
@@ -760,20 +853,23 @@ changes only what a name's claims resolve to (GH #350)."
   (check-type role (member :subject :object :either))
   (%refuse-vocabulary-axis as-of as-of-epoch)
   (let ((family (claim-family claim-class)))
-    (%merge-names
-     (loop for (class slots) in (%vocabulary-sources family role)
-           collect (%walk-names graph class slots 1 nil 0 current counts))
-     counts)))
+    (%vocabulary graph family role 1 nil current counts)))
 
 (defun claim-relations (graph claim-class
                         &key current counts as-of as-of-epoch)
   "The relations CLAIM-CLASS's family uses, in index order, from its
-CLAIM-RELATION index; with COUNTS, (NAME . COUNT).  :CURRENT and the
+CLAIM-RELATION-COUNT index -- from CLAIM-RELATION inside an as-of
+extent (GH #361); with COUNTS, (NAME . COUNT).  :CURRENT and the
 refusals as CLAIM-NAMESPACES (GH #350)."
   (%refuse-vocabulary-axis as-of as-of-epoch)
   (let ((family (claim-family claim-class)))
-    (%walk-names graph (claim-family-parent family) '(relation)
-                 1 nil 0 current counts)))
+    ;; One source, so no merge to do -- %MERGE-NAMES is here for the
+    ;; sort alone: a relation the open transaction introduces must land
+    ;; in index order, not after the counted ones.
+    (%merge-names
+     (list (%vocabulary-1 graph (claim-family-parent family) '(relation)
+                          1 nil current counts))
+     counts)))
 
 (defun claim-keys (graph claim-class namespace
                    &key (role :either) current counts limit offset
@@ -786,10 +882,6 @@ refusals as CLAIM-NAMESPACES (GH #350)."
   (check-type role (member :subject :object :either))
   (%refuse-vocabulary-axis as-of as-of-epoch)
   (let ((family (claim-family claim-class)))
-    (%paginate
-     (%merge-names
-      (loop for (class slots) in (%vocabulary-sources family role)
-            collect (%walk-names graph class slots 2 (list namespace) 1
-                                 current counts))
-      counts)
-     limit offset)))
+    (%paginate (%vocabulary graph family role 2 (list namespace)
+                            current counts)
+               limit offset)))

@@ -834,6 +834,10 @@ be dropped outright, and %REQUIRE-INDEX reads that as \"declared, empty\"
   (rebuild-secondary-indexes graph)
   (install-secondary-indexes graph)
   (save-secondary-index-roots graph)
+  ;; The count maps move to the new backend with them and their roots
+  ;; are re-saved; the maps they replace retire to CLOSE-GRAPH (#361).
+  (rebuild-count-indexes graph)
+  (save-count-index-roots graph)
   graph)
 
 ;;; ---------------------------------------------------------------------------

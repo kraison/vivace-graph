@@ -201,6 +201,15 @@ received an UNRESOLVED-NODE marker instead (GH #169, D8)."
    ;; General ordered secondary indexes (:INDEX slot option / DEF-INDEX); keyed by
    ;; (owner-name . slot-name).  See index.lisp / docs/general-index-design.md.
    (secondary-indexes :accessor secondary-indexes :initarg :secondary-indexes :initform nil)
+   ;; Counting indexes (DEF-COUNT-INDEX, GH #361): (owner . slot-names) ->
+   ;; COUNT-INDEX; STALE-P is set by a re-applying apply and cleared by
+   ;; REBUILD-COUNT-INDEXES (spec R8).  See count-index.lisp.
+   (count-indexes :accessor count-indexes :initarg :count-indexes
+                  :initform nil)
+   (count-indexes-stale-p :accessor count-indexes-stale-p :initform nil)
+   ;; Count maps a rebuild swapped out: freed by CLOSE-GRAPH, never
+   ;; mid-session -- a MAP-COUNT-INDEX reader holds no lock (spec §2.3).
+   (retired-count-maps :accessor retired-count-maps :initform nil)
    (views-lock :accessor views-lock :initarg :views-lock
                :initform (make-recursive-lock))
    (views :accessor views :initarg :views)

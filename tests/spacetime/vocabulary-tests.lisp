@@ -217,3 +217,119 @@ namespaces are equal is counted once per role."
     (is (equal '((:ns . 2) (:other . 1) (:same . 2))
                (claim-namespaces g 'ct-claim :counts t))
         "after commit the index agrees")))
+
+;;; The count path (GH #361, spec 2026-09-08 §3).  #350's tests above
+;;; are the contract (R5); these pin the mechanism underneath them.
+
+(defvar *vt-resolutions* nil)
+
+(defun %vt-count-resolutions (thunk)
+  "LOOKUP-VERTEX calls during THUNK, through an :AROUND removed after."
+  (let* ((gf #'graph-db:lookup-vertex)
+         (method (eval '(defmethod graph-db:lookup-vertex :around
+                            ((id t) &key &allow-other-keys)
+                          (when *vt-resolutions* (incf *vt-resolutions*))
+                          (call-next-method)))))
+    (unwind-protect
+         (let ((*vt-resolutions* 0)) (funcall thunk) *vt-resolutions*)
+      (remove-method gf method))))
+
+(test a-current-listing-resolves-no-node-outside-an-as-of-extent
+  "Spec §3.2, R7: outside an as-of extent the three functions read the
+count indexes and resolve nothing, under :CURRENT and :COUNTS too, and
+under a plain WITH-READ-SNAPSHOT (which is not an as-of extent); inside
+an as-of extent they run #350's walk and do resolve.  Control: the walk
+resolves.  Ablation: routing the plain case to the walk turns the first
+check red."
+  (with-claim-graph (g)
+    (with-transaction ()
+      (dotimes (i 12) (%ns-u :ns (format nil "k~D" i)))
+      (%ns-b :ns "s" :other "o" :relation "knows"))
+    (retract-claim (first (claims-touching g 'ct-claim :ns "k3")))
+    ;; A commit builds no count map, it marks the maps stale (GH #361),
+    ;; so this first call pays the scan rebuild -- which DOES resolve.
+    ;; The probes below measure the answering path, not that repair.
+    (claim-namespaces g 'ct-claim :counts t)
+    (let ((e (graph-db:latest-epoch g)))
+      (is (= 0 (%vt-count-resolutions
+                (lambda ()
+                  (claim-namespaces g 'ct-claim :counts t :current t)
+                  (claim-keys g 'ct-claim :ns :counts t :current t)
+                  (claim-relations g 'ct-claim :counts t :current t))))
+          "the count indexes answer without a resolution")
+      (is (= 0 (%vt-count-resolutions
+                (lambda ()
+                  (graph-db:with-read-snapshot (g)
+                    (claim-namespaces g 'ct-claim :counts t :current t)
+                    (claim-keys g 'ct-claim :ns :counts t :current t)
+                    (claim-relations g 'ct-claim :counts t :current t)))))
+          "a plain read snapshot is not an as-of extent: still the ~
+count path, still no resolution")
+      (is (equal '((:ns . 13) (:other . 1))
+                 (claim-namespaces g 'ct-claim :counts t)))
+      (is (equal '((:ns . 12) (:other . 1))
+                 (claim-namespaces g 'ct-claim :counts t :current t))
+          "the retracted claim moved the current counter")
+      (is (equal '(("knows" . 1) ("r" . 11))
+                 (claim-relations g 'ct-claim :counts t :current t)))
+      (is (plusp (%vt-count-resolutions
+                  (lambda ()
+                    (graph-db:with-as-of ((g) e)
+                      (claim-namespaces g 'ct-claim :counts t :current t)))))
+          "control: inside an as-of extent the walk resolves"))))
+
+(test current-moves-on-retraction-and-a-create-then-delete
+  "Spec §3.3: inside a transaction a created claim counts, a claim
+created then MARK-DELETED in the same transaction counts nothing, and a
+retraction moves the :CURRENT count; after commit the counters agree."
+  (with-claim-graph (g)
+    (with-transaction () (%ns-u :ns "a"))
+    (with-transaction ()
+      (let ((c (%ns-u :fresh "n")))
+        (%ns-u :gone "z")
+        (graph-db:mark-deleted
+         (first (claims-touching g 'ct-claim :gone "z")))
+        (retract-claim (first (claims-touching g 'ct-claim :ns "a")))
+        (is (equal '((:fresh . 1) (:ns . 1))
+                   (claim-namespaces g 'ct-claim :counts t)))
+        (is (equal '((:fresh . 1))
+                   (claim-namespaces g 'ct-claim :counts t :current t)))
+        (is (equal '("n") (claim-keys g 'ct-claim :fresh)))
+        c))
+    (is (equal '((:fresh . 1) (:ns . 1))
+               (claim-namespaces g 'ct-claim :counts t)))
+    (is (equal '((:fresh . 1))
+               (claim-namespaces g 'ct-claim :counts t :current t)))))
+
+(test a-family-opened-over-pre-existing-claims-has-its-count-indexes
+  "Spec §3.1: a stored family builds the three count indexes at open.
+The direct COUNT-INDEX-LOOKUP is the probe: the vocabulary calls alone
+would pass on #350's walk, which needs no count map at all."
+  (with-temp-directory (dir)
+    (let ((path (namestring dir)))
+      (let ((g (make-graph *claim-graph-name* path :buffer-pool-size 1000)))
+        (unwind-protect
+             (let ((graph-db:*graph* g))
+               (with-transaction ()
+                 (%ns-u :ns "a" :relation "likes")
+                 (%ns-b :ns "b" :other "c" :relation "knows")))
+          (close-graph g)))
+      (let ((g2 (open-graph *claim-graph-name* path)))
+        (unwind-protect
+             (let ((graph-db:*graph* g2))
+               (is (equal '(("knows" . 1) ("likes" . 1))
+                          (claim-relations g2 'ct-claim :counts t)))
+               (is (equal '((:ns . 2) (:other . 1))
+                          (claim-namespaces g2 'ct-claim :counts t)))
+               ;; The slot symbols are the family macro's own, not this
+               ;; package's same-named ones (they are unexported).
+               (is (equal '(2 2)
+                          (multiple-value-list
+                           (graph-db:count-index-lookup
+                            g2 'ct-claim
+                            '(graph-db.spacetime::subject-namespace
+                              graph-db.spacetime::subject-key)
+                            '(:ns))))
+                   "the built map answers, not only the walk"))
+          (ignore-errors (close-graph g2 :snapshot-p nil))
+          (collect-garbage))))))

@@ -1023,7 +1023,8 @@ the right opener.")
                              (key-deserializer 'view-key-deserialize))
   "Create a fresh heap-backed composite-key ordered map (skip list or B+ tree) with
 the shared view/unique/spatial codec.  COMPARISON is REDUCE-COMP-LESSP,
-REDUCE-COMP-GREATERP, or (since GH #107) %INDEX-COMP-LESSP.  HEAD-KEY / TAIL-KEY
+REDUCE-COMP-GREATERP, (since GH #107) %INDEX-COMP-LESSP, or (since GH #361)
+%INDEX-VALUE-LESSP -- the count index's id-free keys.  HEAD-KEY / TAIL-KEY
 are the skip list's sentinels; they default to the arity-1 REDUCE-COMP-LESSP/
 -GREATERP pair, so the view / :unique / spatial callers that omit them are
 unaffected -- only an arity-aware caller (the general index, GH #107) need pass

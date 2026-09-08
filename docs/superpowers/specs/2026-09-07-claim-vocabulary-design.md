@@ -7,7 +7,8 @@ indexes keep live membership), #115 (`with-as-of`), #160 (relations are
 canonical strings). **Date:** 2026-09-07. **Status:** approved in
 review, sections 1–4; amended 2026-09-07 against the engine facts note
 (`docs/superpowers/notes/2026-09-07-claim-vocabulary-engine-facts.md`);
-implemented on `feat/claim-vocabulary`.
+implemented on `feat/claim-vocabulary`; mechanism superseded outside
+as-of extents by `2026-09-08-count-index-design.md`.
 
 ## 0. Problem
 

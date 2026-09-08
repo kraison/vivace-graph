@@ -137,6 +137,9 @@
                (:file "memory-graph" :depends-on ("traverse" "transactions" "graph" "mem-skip-list"))
                (:file "unique-constraint" :depends-on ("traverse" "transactions" "graph" "memory-graph" "node-class" "schema"))
                (:file "index" :depends-on ("unique-constraint" "spatial-query" "interface"))
+               ;; Counting index (GH #361): its own registry and graph
+               ;; slot, parallel to DEF-INDEX's.
+               (:file "count-index" :depends-on ("index"))
                ;; Declarative value constraints (GH #149).  After INDEX for
                ;; %SPEC-IDENTITY; no index of its own to build.
                (:file "value-constraint" :depends-on ("index"))
@@ -719,6 +722,7 @@ cl-temporal-extent."
                (:file "memory-graph-tests")
                (:file "unique-constraint-tests")
                (:file "index-tests")
+               (:file "count-index-tests")   ; GH #361
                (:file "schema-retraction-tests")   ; GH #139, #140
                (:file "index-prolog-tests")        ; GH #102
                (:file "value-constraint-tests")     ; GH #149

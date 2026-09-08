@@ -13,6 +13,21 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Added
 
+- **Counting index** (#361): `def-count-index` declares a per-prefix
+  counter pair `(all . current)` maintained at commit apply, replication
+  and purge, persisted through its own sidecar and rebuilt after a
+  re-applying apply -- at the next query, at the next open after a
+  crash-recovery replay, and at `close-graph` while the maps are still
+  stale, so a device that pulls and closes with no count query between
+  them never persists under-counted maps; `count-index-lookup` and
+  `map-count-index` read it without resolving a node. Every claim family
+  now declares three
+  (`claim-subject-count`, `claim-object-count`, `claim-relation-count`),
+  so `claim-namespaces`, `claim-keys` and `claim-relations` are lookups
+  outside an as-of extent (inside one they keep #350's walk). No node
+  format change; existing families build the maps on next open.
+  `docs/general-index-design.md` §6b.
+
 - **Claim-family vocabulary** (#350): `claim-namespaces`,
   `claim-relations` and `claim-keys` list what a family names, in
   index order, with opt-in counts, `:current`, paging on keys, and the

@@ -413,6 +413,8 @@
            #:def-unique
            ;; general ordered index (:index slot option / def-index)
            #:def-index
+           ;; counting index (GH #361)
+           #:def-count-index #:undef-count-index
            ;; schema retraction: withdraw a declaration (GH #139, #140)
            #:undef-index #:undef-unique
            #:schema-withdrawal-matched-nothing              ; GH #152
@@ -463,8 +465,10 @@
            #:vc-violation-actual #:vc-violation-expected
            #:vc-violation-reason
            #:unregister-index-spec #:unregister-unique-tuple-spec
+           #:unregister-count-index-spec                    ; GH #361
            #:index-lookup #:index-range #:map-index
            #:map-index-prefixes #:index-count            ; GH #350
+           #:count-index-lookup #:map-count-index        ; GH #361
            ;; index-backed generator predicates for Prolog (GH #102)
            #:find-by-slot/4 #:find-slot-range/5
            #:rebuild-secondary-indexes #:regenerate-secondary-indexes

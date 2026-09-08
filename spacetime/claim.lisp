@@ -448,9 +448,23 @@ declaration names, so flipping the flag re-declares rather than stacks."
        (graph-db:def-index ,parent (subject-namespace subject-key
                                     relation)
            ,graph-name :name claim-subject-relation)
-       ;; The vocabulary listing skips to distinct relations (GH #350).
+       ;; The vocabulary listing skips to distinct relations (GH #350);
+       ;; kept as the as-of path's relation source (GH #361 R6).
        (graph-db:def-index ,parent (relation) ,graph-name
                            :name claim-relation)
+       ;; Counting indexes (GH #361 §3.1): the vocabulary is a lookup.
+       ;; The object index on BINARY, like CLAIM-OBJECT above.
+       ;; CLAIM-CURRENT-P is stored as a symbol and funcalled at
+       ;; maintenance, so claim-query.lisp loading later is not a
+       ;; forward reference.
+       (graph-db:def-count-index ,parent (subject-namespace subject-key)
+           ,graph-name :name claim-subject-count
+           :current-p claim-current-p)
+       (graph-db:def-count-index ,binary (object-namespace object-key)
+           ,graph-name :name claim-object-count
+           :current-p claim-current-p)
+       (graph-db:def-count-index ,parent (relation) ,graph-name
+           :name claim-relation-count :current-p claim-current-p)
        (fmakunbound ',(intern (format nil "MAKE-~A" parent) home))
        ;; DEF-VERTEX redefines each raw constructor on every expansion, so
        ;; this cannot double-wrap on a re-evaluated DEF-CLAIM-CLASSES form.
