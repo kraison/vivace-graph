@@ -20,6 +20,11 @@ is not current."
   :name ix-count-ns-key :current-p ix-live-p)
 (def-count-index ix-claim (rel) :graph-db-index-test :name ix-count-rel)
 
+;; Declared and deliberately never built: nothing builds a count map at
+;; MAKE-GRAPH until Task 4, so this one pins spec §2.5's
+;; declared-but-unbuilt branch (facts G12).  Never pass (ns) to %CIX.
+(def-count-index ix-claim (ns) :graph-db-index-test :name ix-count-unbuilt)
+
 (defun %cix (g slots)
   "The built COUNT-INDEX for IX-CLAIM.SLOTS in G.  Nothing installs a
 count map at open until Task 4, so build it from the declaration first;
@@ -108,6 +113,40 @@ signals; a depth or prefix beyond the arity signals."
         (%entries g '(ns key) :depth 3))
       (signals query-precondition-error
         (%entries g '(ns key) :depth 1 :prefix '("a" "b"))))))
+
+(test count-index-arity-1-takes-a-list-valued-component
+  "%INDEX-KEY's arity rule (index.lisp), shared by %COUNT-QUERY-KEY: at
+arity 1 the query VALUE is the one component as-is, so a list-valued
+slot is findable by its list.  Read as a component list instead, this
+lookup would signal on the arity."
+  (with-ix-graph (g)
+    (unwind-protect
+         (progn
+           (def-count-index ix-claim (key) :graph-db-index-test
+             :name ix-count-key)
+           (let (n)
+             (with-transaction ()
+               (setq n (make-ix-claim :ns "ops" :key '("a" "b")
+                                      :rel "at")))
+             (graph-db::%count-node (%cix g '(key)) n 1 0))
+           (is (equal '(1 nil) (%count-of g '(key) '("a" "b")))
+               "the list IS the component, not a two-component tuple")
+           ;; The entry's COMPONENTS is a 1-list whose one element is
+           ;; the whole slot value.
+           (is (equal '(((("a" "b")) 1 nil)) (%entries g '(key)))))
+      (undef-count-index ix-claim :graph-db-index-test
+                         :name ix-count-key))))
+
+(test declared-but-unbuilt-count-index-answers-empty
+  "Spec §2.5, facts G12: a count index that is declared but has no built
+map answers 0 0 and calls FN zero times rather than signalling -- the
+normal state of every count index until Task 4 installs at open, and of
+a lazy memory graph forever.  IX-COUNT-UNBUILT is never given to %CIX."
+  (with-ix-graph (g)
+    (is (null (graph-db::%require-count-index g 'ix-claim '(ns)))
+        "declared but unbuilt resolves to NIL, it does not signal")
+    (is (equal '(0 0) (%count-of g '(ns) "x")))
+    (is (null (%entries g '(ns))) "MAP-COUNT-INDEX calls FN zero times")))
 
 (test count-adjust-crosses-a-serialization-boundary
   "Facts G5: SERIALIZE's integer width grows at 256 and at 65536; the

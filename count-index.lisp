@@ -86,9 +86,15 @@ and every slot exists in CLASS (as %APPLICABLE-INDEX-DESCRIPTORS)."
   "Declare a counting index on OWNER-CLASS.SLOTS in GRAPH-NAME: a
 counter pair (ALL . CURRENT) per leading prefix of each node's tuple,
 maintained at commit apply (GH #361).  CURRENT-P names a one-argument
-predicate, funcalled at maintenance; NIL keeps ALL only.  Declarative
-and idempotent like DEF-INDEX: registers, builds now if the graph is
-open.  Trap: counts are live at commit granularity (spec R1)."
+predicate, funcalled at maintenance; NIL keeps ALL only.
+:CANONICALIZE is an optional 1-arg function (symbol / #'fn / lambda
+form), or a positional list of one per slot, applied to a component
+before keying.  Declarative and idempotent like DEF-INDEX: registers,
+builds now if the graph is open.  Trap: counts are live at commit
+granularity (spec R1).  Re-evaluating an unchanged declaration is a
+no-op; to adopt a changed :CURRENT-P or :CANONICALIZE on an open graph,
+run REBUILD-COUNT-INDEXES (Task 3; the placeholder today) -- the built
+map keeps the ones it was created with."
   `(let ((spec (make-count-index-spec
                 :owner-name ',owner-class
                 :slot-names (%normalize-slots ',slots)
@@ -273,10 +279,12 @@ declared."
 (defun %count-query-key (cix value)
   "VALUE -- a value or a component list of at most CIX's arity -- as a
 canonical prefix, NIL mapped to +NULL-COMPONENT+; NIL for a full-arity
-all-null tuple (as %INDEX-KEY).  Signals on more than the arity."
+all-null tuple.  Shares %INDEX-KEY's arity rule exactly: at arity 1
+VALUE is CIX's one component as-is, even list-valued; at arity > 1 it is
+a list of up to ARITY components.  Signals on more than the arity."
   (let* ((arity (length (count-index-slot-names cix)))
          (cans (count-index-canonicalizers cix))
-         (vals (if (listp value) value (list value)))
+         (vals (if (= arity 1) (list value) value))
          (any nil)
          (key (loop for v in vals
                     for i from 0
