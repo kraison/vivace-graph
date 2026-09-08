@@ -1270,9 +1270,17 @@ a snapshot failure does NOT abort the close (GH #120)."
       ;; the sidecar saves around it (GH #361).
       (save-unique-index-roots graph)
       (save-secondary-index-roots graph)
-      ;; Counting indexes (GH #361): free the maps a rebuild retired --
-      ;; this is the one moment no reader can be mid-cursor -- and only
-      ;; then persist the live maps' roots.
+      ;; Counting indexes (GH #361, R8): a stale close would persist
+      ;; under-counted maps marked built, and the flag is not persisted.
+      ;; On a device EVERY pull marks them stale, so a pull and a clean
+      ;; close with no count query between them is the ordinary case.
+      ;; The rebuild retires the stale maps, the free below reclaims
+      ;; them, the save then persists correct roots.
+      (when (count-indexes-stale-p graph)
+        (rebuild-count-indexes graph))
+      ;; Free the maps a rebuild retired -- this is the one moment no
+      ;; reader can be mid-cursor -- and only then persist the live
+      ;; maps' roots.
       (%free-retired-count-maps graph)
       (save-count-index-roots graph)
       ;; Spatial indexes (v3 sidecar): the addresses are already durable from

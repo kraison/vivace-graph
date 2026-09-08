@@ -109,7 +109,10 @@ created with."
 
 (defmacro undef-count-index (owner-class graph-name &key slots name)
   "Withdraw a DEF-COUNT-INDEX declaration; warns when nothing matched
-(GH #152).  The built map is reclaimed at the next open."
+(GH #152).  Trap: the built map is reclaimed only at the next open (a
+REBUILD-COUNT-INDEXES drops it sooner), and until then it keeps
+answering queries -- unmaintained, the write path skipping a spec no
+longer declared."
   `(%withdrawn-p (unregister-count-index-spec ',owner-class ',graph-name
                                               :slot-names ',slots
                                               :name ',name)
@@ -119,9 +122,10 @@ created with."
 ;;; The map (spec §2.2)
 ;;; --------------------------------------------------------------------
 
-;; BUILT-P: T only after a full scan.  The commit pass materialises a
-;; map through %COUNT-INDEX-FOR and counts only the writes it sees, so
-;; registry presence is NOT builtness (GH #361).
+;; BUILT-P: T only after a full scan or a sidecar restore -- what
+;; INSTALL-COUNT-INDEXES keys on.  The write path creates no map
+;; (%COUNT-INDEX-TO-MAINTAIN), so a registered map is a built one
+;; (GH #361).
 (defstruct (count-index (:constructor %make-count-index))
   owner-name slot-names canonicalizers current-p skip-list built-p)
 
@@ -177,16 +181,20 @@ holds a half-filled map (spec §2.3)."
     (setf (count-index-skip-list cix) (make-count-skip-list graph))
     cix))
 
-(defun %count-index-for (graph spec)
-  "Get-or-create the COUNT-INDEX for SPEC in GRAPH, keyed
-(owner . slot-names) in the count registry (separate from the secondary
-one, so both kinds may share an owner and slots -- facts X1).  The WRITE
-path's entry: a build publishes its own map instead
-(%INSTALL-BUILT-COUNT-INDEX), never an empty one."
-  (let* ((reg (%count-registry graph))
-         (key (%count-index-key spec)))
-    (or (gethash key reg)
-        (setf (gethash key reg) (%make-fresh-count-index graph spec)))))
+(defun %count-index-to-maintain (graph spec)
+  "SPEC's registered COUNT-INDEX in GRAPH -- keyed (owner . slot-names),
+separate from the secondary registry so both kinds may share an owner
+and slots (facts X1) -- or NIL after marking GRAPH's maps stale.  The
+WRITE path's entry, and it creates NOTHING: a map materialised here
+would hold only the writes it saw and answer a silently wrong 0 0 for
+the rest of the population, so an unregistered spec is left to the next
+query's rebuild by scan (GH #361, spec §2.3, R8).  Only a build creates
+a map: %MAKE-FRESH-COUNT-INDEX, published by
+%INSTALL-BUILT-COUNT-INDEX."
+  (let* ((reg (count-indexes graph))
+         (cix (and reg (gethash (%count-index-key spec) reg))))
+    (cond (cix)
+          (t (setf (count-indexes-stale-p graph) t) nil))))
 
 ;;; --------------------------------------------------------------------
 ;;; Counter steps (spec §2.3)
@@ -258,15 +266,18 @@ WRITE; nothing for a write kind with no method.")
 (defmethod apply-tx-write-to-count-indexes ((write tx-create) graph)
   (let ((node (node write)))
     (dolist (spec (%count-specs-for node graph))
-      (let ((cix (%count-index-for graph spec)))
-        (%count-node cix node 1 (%current-p cix node))))))
+      (let ((cix (%count-index-to-maintain graph spec)))
+        (when cix
+          (%count-node cix node 1 (%current-p cix node)))))))
 
 (defun %count-release (node graph)
-  "Subtract NODE's contribution once, at every prefix, from each count
-index of GRAPH that applies to it."
+  "Subtract NODE's contribution once, at every prefix, from each BUILT
+count index of GRAPH that applies to it; a spec with no map is marked
+stale instead (%COUNT-INDEX-TO-MAINTAIN)."
   (dolist (spec (%count-specs-for node graph))
-    (let ((cix (%count-index-for graph spec)))
-      (%count-node cix node -1 (- (%current-p cix node))))))
+    (let ((cix (%count-index-to-maintain graph spec)))
+      (when cix
+        (%count-node cix node -1 (- (%current-p cix node)))))))
 
 (defmethod apply-tx-write-to-count-indexes ((write tx-update) graph)
   ;; A deleted NEW node is a release and nothing more, as in the
@@ -278,17 +289,18 @@ index of GRAPH that applies to it."
       (return-from apply-tx-write-to-count-indexes
         (%count-release old graph)))
     (dolist (spec (%count-specs-for new graph))
-      (let* ((cix (%count-index-for graph spec))
-             (ot (%count-tuple cix old))
-             (nt (%count-tuple cix new)))
-        (if (equal ot nt)
-            (let ((d (- (%current-p cix new) (%current-p cix old))))
-              (unless (or (zerop d) (null nt))
-                (loop for k from 1 to (length nt)
-                      do (%count-adjust cix (subseq nt 0 k) 0 d))))
-            (progn
-              (%count-node cix old -1 (- (%current-p cix old)))
-              (%count-node cix new 1 (%current-p cix new))))))))
+      (let ((cix (%count-index-to-maintain graph spec)))
+        (when cix
+          (let ((ot (%count-tuple cix old))
+                (nt (%count-tuple cix new)))
+            (if (equal ot nt)
+                (let ((d (- (%current-p cix new) (%current-p cix old))))
+                  (unless (or (zerop d) (null nt))
+                    (loop for k from 1 to (length nt)
+                          do (%count-adjust cix (subseq nt 0 k) 0 d))))
+                (progn
+                  (%count-node cix old -1 (- (%current-p cix old)))
+                  (%count-node cix new 1 (%current-p cix new))))))))))
 
 ;; TX-DELETE is a TX-UPDATE subclass: subtract the old node ONCE (the
 ;; secondary method releases twice; a counter cannot, facts C12).
@@ -383,8 +395,8 @@ GH #92)."
 
 (defun %ensure-count-index-built (graph spec)
   "SPEC's COUNT-INDEX in GRAPH, scanned unless it is already BUILT-P.
-Trap: registry presence is not builtness -- a map the commit pass
-materialised holds only the writes it saw, so this still scans it."
+Trap: BUILT-P, not registry presence, is the test -- a map left
+unmarked by anything but a scan or a restore is rebuilt here."
   (let* ((reg (count-indexes graph))
          (cix (and reg (gethash (%count-index-key spec) reg))))
     (if (and cix (count-index-built-p cix))
@@ -393,8 +405,8 @@ materialised holds only the writes it saw, so this still scans it."
 
 (defun install-count-indexes (graph)
   "Scan-build every count index declared for GRAPH that is not BUILT-P:
-one the sidecar did not cover, and one a commit pass materialised empty.
-A map already built (restored or scanned) is left alone."
+one the sidecar did not cover, or one whose declaration is new since the
+last close.  A map already built (restored or scanned) is left alone."
   (dolist (spec (%registered-count-index-specs graph))
     (%ensure-count-index-built graph spec)))
 
@@ -404,7 +416,16 @@ flag (R8); returns GRAPH.  Each map is built fresh and swapped in, the
 one it replaces retired for CLOSE-GRAPH to free -- a rebuild frees no
 pages mid-session (spec §2.3).  A map whose declaration is gone is
 retired outright.  Authoritative and idempotent, and the only repair for
-a re-applied write (facts X7)."
+a re-applied write (facts X7).  A LAZY memory graph is a no-op that
+clears the flag: it keeps no count maps and every query answers the
+declared-but-unbuilt 0 0.  Trap: the flag is cleared BEFORE the scan --
+see %COUNT-REFRESH."
+  ;; A LAZY memory graph faults nodes in on touch, so a scan would
+  ;; materialise every LZNODE blob -- the trade memory-graph.lisp makes
+  ;; for the ordered indexes too (docs/general-index-design.md §6b).
+  (when (and (typep graph 'memory-graph-mixin) (lazy-p graph))
+    (setf (count-indexes-stale-p graph) nil)
+    (return-from rebuild-count-indexes graph))
   (let ((reg (count-indexes graph))
         (undeclared '()))
     (when reg
@@ -415,9 +436,12 @@ a re-applied write (facts X7)."
       (dolist (entry undeclared)
         (%retire-count-map graph (cdr entry))
         (remhash (car entry) reg))))
+  ;; Cleared BEFORE the scan: a device writer sets the flag without the
+  ;; manager lock, so a pull landing mid-scan must survive this rebuild
+  ;; and be repaired by the next one (GH #361, R8).
+  (setf (count-indexes-stale-p graph) nil)
   (dolist (spec (%registered-count-index-specs graph))
     (%build-count-index-for-spec graph spec))
-  (setf (count-indexes-stale-p graph) nil)
   graph)
 
 ;;; --------------------------------------------------------------------
@@ -429,11 +453,13 @@ a re-applied write (facts X7)."
   (format nil "~A/count-indexes.dat" location))
 
 (defun save-count-index-roots (graph)
-  "Persist (owner slot-names address backend-tag) per on-disk count map
-of GRAPH; no-op with no heap (memory) or no maps.  Called at
+  "Persist (owner slot-names address backend-tag current-p) per on-disk
+count map of GRAPH; no-op with no heap (memory) or no maps.  Called at
 CLOSE-GRAPH, unguarded like the other index saves: a stale root is
-silently wrong (GH #361).  Trap: BUILT-P is not stored -- the restore
-re-marks it, or every open would rescan and discard the sidecar."
+silently wrong (GH #361).  CURRENT-P is the predicate SYMBOL the pairs
+were computed under, so the restore can refuse a map computed under
+another one.  Trap: BUILT-P is not stored -- the restore re-marks it, or
+every open would rescan and discard the sidecar."
   (when (and (indexes graph) (count-indexes graph))
     (let ((roots '()))
       (maphash (lambda (k cix)
@@ -443,19 +469,30 @@ re-marks it, or every open would rescan and discard the sidecar."
                      (push (list (count-index-owner-name cix)
                                  (count-index-slot-names cix)
                                  (view-index-address sl)
-                                 (view-index-backend-tag sl))
+                                 (view-index-backend-tag sl)
+                                 (count-index-current-p cix))
                            roots))))
                (count-indexes graph))
       (%atomic-cl-store roots (count-index-root-file (location graph))))))
 
 (defun %restore-one-count-root (graph record)
   "Reopen one sidecar RECORD of GRAPH into the count registry, or -- its
-declaration withdrawn or re-shaped -- reclaim its pages, this open being
-the moment nothing can be mid-read (GH #147).  Returns NIL."
+declaration withdrawn, re-shaped, or now naming a different CURRENT-P --
+reclaim its pages, this open being the moment nothing can be mid-read
+(GH #147).  Returns NIL.  Trap: a CURRENT-P mismatch is a reclaim, not a
+restore: the stored CURRENT counters were computed under the predicate
+the record names, and adopting them under the live one would answer a
+silently wrong CURRENT until something rebuilt; INSTALL-COUNT-INDEXES
+scan-builds the map instead (GH #361)."
   (destructuring-bind (owner stored-slots address
-                       &optional (backend :skip-list)) record
+                       &optional (backend :skip-list) current-p) record
     (let* ((slot-names (%normalize-slots stored-slots))
-           (spec (%count-spec-for owner slot-names graph)))
+           (declared (%count-spec-for owner slot-names graph))
+           ;; A changed CURRENT-P is a withdrawal for this record.
+           (spec (and declared
+                      (eq current-p
+                          (count-index-spec-current-p declared))
+                      declared)))
       (if spec
           (let ((reg (%count-registry graph))
                 (key (cons owner slot-names)))
@@ -480,8 +517,8 @@ the moment nothing can be mid-read (GH #147).  Returns NIL."
               (progn
                 (delete-view-index
                  (%open-count-skip-list graph address backend))
-                (log:info "reclaimed retired count index ~A.~A (GH #147)"
-                          owner slot-names))
+                (log:info "reclaimed count index ~A.~A: withdrawn or its ~
+CURRENT-P changed (GH #147, #361)" owner slot-names))
             (error (e)
               (warn "could not reclaim retired count index ~A.~A: ~A"
                     owner slot-names e))))))
@@ -490,9 +527,12 @@ the moment nothing can be mid-read (GH #147).  Returns NIL."
 (defun restore-count-index-roots (graph)
   "Reopen GRAPH's count maps from the sidecar -- no node scan.  T when
 one was present and readable, the empty case included (as the secondary
-restore); NIL to fall back to REBUILD-COUNT-INDEXES.  Trap: a partial
-restore is left in place -- those maps hold valid addresses, and
-INSTALL-COUNT-INDEXES builds what the file did not cover."
+restore); NIL to fall back to REBUILD-COUNT-INDEXES.  Trap: a failure
+part-way through the records returns NIL with the records already
+restored still registered, so the caller's REBUILD-COUNT-INDEXES
+rebuilds every map by scan and retires those (correct, not free); a file
+that simply covers fewer specs than are declared restores what it has
+and INSTALL-COUNT-INDEXES builds the rest."
   (let ((file (count-index-root-file (location graph))))
     (when (probe-file file)
       (handler-case
@@ -513,7 +553,10 @@ from live nodes, which are authoritative." file e)
 under the transaction-manager lock -- recursive, so a lookup from
 inside an apply is safe -- and re-checked inside it, so two readers
 cannot free each other's maps.  A graph with no manager yet (open,
-recovery) repairs unlocked: nothing races there."
+recovery) repairs unlocked: nothing races there.  The lock serialises
+rebuilders and the commit apply, not the device writer, which sets the
+flag outside it -- which is why REBUILD-COUNT-INDEXES clears the flag
+before its scan rather than after (GH #361)."
   (when (count-indexes-stale-p graph)
     (flet ((repair ()
              (when (count-indexes-stale-p graph)
@@ -552,15 +595,18 @@ declared."
                                    class-name slot-name
                                    (graph-name graph)))))))
 
-(defun %count-query-key (cix value)
+(defun %count-query-key (cix value &optional list-p)
   "VALUE -- a value or a component list of at most CIX's arity -- as a
 canonical prefix, NIL mapped to +NULL-COMPONENT+; NIL for a full-arity
 all-null tuple.  Shares %INDEX-KEY's arity rule exactly: at arity 1
 VALUE is CIX's one component as-is, even list-valued; at arity > 1 it is
-a list of up to ARITY components.  Signals on more than the arity."
+a list of up to ARITY components.  LIST-P reads VALUE as a component
+list at EVERY arity, which is what a :PREFIX is documented to be
+(MAP-COUNT-INDEX passes it; COUNT-INDEX-LOOKUP keeps the value rule).
+Signals on more than the arity."
   (let* ((arity (length (count-index-slot-names cix)))
          (cans (count-index-canonicalizers cix))
-         (vals (if (= arity 1) (list value) value))
+         (vals (if (and (= arity 1) (not list-p)) (list value) value))
          (any nil)
          (key (loop for v in vals
                     for i from 0
@@ -607,7 +653,9 @@ first (GH #361)."
                         &key (depth 1) prefix)
   "Call FN with (COMPONENTS ALL CURRENT) for each entry at DEPTH of the
 count index on CLASS-NAME.SLOT-NAME whose leading components equal
-PREFIX, in index order, a null component read back as NIL.  Zero calls
+PREFIX -- a component LIST at every arity, arity 1 included, unlike
+COUNT-INDEX-LOOKUP's TUPLE -- in index order, a null component read back
+as NIL.  Zero calls
 for a declared-but-empty index; signals when none is declared, or on a
 DEPTH or PREFIX beyond the arity.  Trap: not an atomic snapshot, live at
 commit granularity (GH #361)."
@@ -615,8 +663,10 @@ commit granularity (GH #361)."
     (%count-refresh graph)
     (let ((cix (%require-count-index graph class-name slot-name)))
       (when cix
+        ;; PREFIX is a component list at every arity (GH #361): the
+        ;; arity-1 value rule would wrap ("at") as one component.
         (let ((arity (length (count-index-slot-names cix)))
-              (pre (and prefix (%count-query-key cix prefix))))
+              (pre (and prefix (%count-query-key cix prefix t))))
           (unless (<= 1 depth arity)
             (error 'query-precondition-error
                    :reason (format nil "Count index on ~S has arity ~D; ~

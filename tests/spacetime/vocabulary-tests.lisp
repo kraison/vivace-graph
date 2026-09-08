@@ -236,8 +236,9 @@ namespaces are equal is counted once per role."
 
 (test a-current-listing-resolves-no-node-outside-an-as-of-extent
   "Spec §3.2, R7: outside an as-of extent the three functions read the
-count indexes and resolve nothing, under :CURRENT and :COUNTS too;
-inside one they run #350's walk and do resolve.  Control: the walk
+count indexes and resolve nothing, under :CURRENT and :COUNTS too, and
+under a plain WITH-READ-SNAPSHOT (which is not an as-of extent); inside
+an as-of extent they run #350's walk and do resolve.  Control: the walk
 resolves.  Ablation: routing the plain case to the walk turns the first
 check red."
   (with-claim-graph (g)
@@ -245,6 +246,10 @@ check red."
       (dotimes (i 12) (%ns-u :ns (format nil "k~D" i)))
       (%ns-b :ns "s" :other "o" :relation "knows"))
     (retract-claim (first (claims-touching g 'ct-claim :ns "k3")))
+    ;; A commit builds no count map, it marks the maps stale (GH #361),
+    ;; so this first call pays the scan rebuild -- which DOES resolve.
+    ;; The probes below measure the answering path, not that repair.
+    (claim-namespaces g 'ct-claim :counts t)
     (let ((e (graph-db:latest-epoch g)))
       (is (= 0 (%vt-count-resolutions
                 (lambda ()
@@ -252,6 +257,14 @@ check red."
                   (claim-keys g 'ct-claim :ns :counts t :current t)
                   (claim-relations g 'ct-claim :counts t :current t))))
           "the count indexes answer without a resolution")
+      (is (= 0 (%vt-count-resolutions
+                (lambda ()
+                  (graph-db:with-read-snapshot (g)
+                    (claim-namespaces g 'ct-claim :counts t :current t)
+                    (claim-keys g 'ct-claim :ns :counts t :current t)
+                    (claim-relations g 'ct-claim :counts t :current t)))))
+          "a plain read snapshot is not an as-of extent: still the ~
+count path, still no resolution")
       (is (equal '((:ns . 13) (:other . 1))
                  (claim-namespaces g 'ct-claim :counts t)))
       (is (equal '((:ns . 12) (:other . 1))
@@ -289,7 +302,9 @@ retraction moves the :CURRENT count; after commit the counters agree."
                (claim-namespaces g 'ct-claim :counts t :current t)))))
 
 (test a-family-opened-over-pre-existing-claims-has-its-count-indexes
-  "Spec §3.1: a stored family builds the three count indexes at open."
+  "Spec §3.1: a stored family builds the three count indexes at open.
+The direct COUNT-INDEX-LOOKUP is the probe: the vocabulary calls alone
+would pass on #350's walk, which needs no count map at all."
   (with-temp-directory (dir)
     (let ((path (namestring dir)))
       (let ((g (make-graph *claim-graph-name* path :buffer-pool-size 1000)))
@@ -305,6 +320,16 @@ retraction moves the :CURRENT count; after commit the counters agree."
                (is (equal '(("knows" . 1) ("likes" . 1))
                           (claim-relations g2 'ct-claim :counts t)))
                (is (equal '((:ns . 2) (:other . 1))
-                          (claim-namespaces g2 'ct-claim :counts t))))
+                          (claim-namespaces g2 'ct-claim :counts t)))
+               ;; The slot symbols are the family macro's own, not this
+               ;; package's same-named ones (they are unexported).
+               (is (equal '(2 2)
+                          (multiple-value-list
+                           (graph-db:count-index-lookup
+                            g2 'ct-claim
+                            '(graph-db.spacetime::subject-namespace
+                              graph-db.spacetime::subject-key)
+                            '(:ns))))
+                   "the built map answers, not only the walk"))
           (ignore-errors (close-graph g2 :snapshot-p nil))
           (collect-garbage))))))

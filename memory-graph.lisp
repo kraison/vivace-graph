@@ -1123,7 +1123,10 @@ caller's abort guard.  Returns GRAPH."
     ;; Counting indexes (GH #361) ride the same trade: no sidecar on this
     ;; backend, so they are rebuilt from the nodes here and every declared
     ;; one installed.  A LAZY graph builds none, and every count query
-    ;; answers the declared-but-unbuilt 0 0 (spec §2.4).
+    ;; answers the declared-but-unbuilt 0 0 (spec §2.4).  That contract
+    ;; is enforced in REBUILD-COUNT-INDEXES itself, which is a
+    ;; flag-clearing no-op on a lazy graph: CLOSE-GRAPH's stale rebuild
+    ;; reaches it from outside this guard (GH #361).
     (unless (lazy-p graph)
       (rebuild-secondary-indexes graph)
       (install-secondary-indexes graph)

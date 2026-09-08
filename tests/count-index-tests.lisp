@@ -26,11 +26,13 @@ is not current."
 (def-count-index ix-claim (ns) :graph-db-index-test :name ix-count-unbuilt)
 
 (defun %cix (g slots)
-  "The COUNT-INDEX for IX-CLAIM.SLOTS in G with an EMPTY map.  The
-tests below drive the counter primitives by hand, and the commit pass
-(GH #361) has already counted the fixture's nodes, so the built map is
-dropped and remade -- what is then read back is exactly the hand-driven
-contributions.  Never call it on a declaration the test wants unbuilt."
+  "The COUNT-INDEX for IX-CLAIM.SLOTS in G with an EMPTY map, registered
+by hand.  The tests below drive the counter primitives themselves, so
+any built map is dropped and remade -- what is then read back is exactly
+the hand-driven contributions.  The stale flag goes with it: a commit
+that found no map set it (GH #361), and the next lookup would otherwise
+rebuild by scan over the hand-driven map.  Never call it on a
+declaration the test wants unbuilt."
   (let* ((reg (graph-db::%count-registry g))
          (key (cons 'ix-claim slots))
          (old (gethash key reg)))
@@ -39,8 +41,10 @@ contributions.  Never call it on a declaration the test wants unbuilt."
         (when (graph-db::view-index-p sl)
           (graph-db::delete-view-index sl)))
       (remhash key reg))
-    (graph-db::%count-index-for
-     g (graph-db::%count-spec-for 'ix-claim slots g))))
+    (setf (graph-db::count-indexes-stale-p g) nil)
+    (setf (gethash key reg)
+          (graph-db::%make-fresh-count-index
+           g (graph-db::%count-spec-for 'ix-claim slots g)))))
 
 (defun %drop-count-maps (g)
   "Drop G's built count maps, freeing their heap pages: the state a
@@ -91,7 +95,9 @@ CURRENT follows CURRENT-P; an index without CURRENT-P keeps ALL only."
           "depth 1, index order (hr < ops)")
       (is (equal '((("ops" "e1") 2 1) (("ops" "e2") 1 1))
                  (%entries g '(ns key) :depth 2 :prefix '("ops"))))
-      (is (equal '((("at") 3 nil) (("dead") 1 nil)) (%entries g '(rel)))))))
+      (is (equal '((("at") 3 nil) (("dead") 1 nil)) (%entries g '(rel))))
+      (is (equal '((("at") 3 nil)) (%entries g '(rel) :prefix '("at")))
+          "a :PREFIX is a component list at arity 1 too (GH #361)"))))
 
 (test count-adjust-removes-a-key-at-zero-and-moves-current
   "Spec R4, §2.3: subtracting a node's contribution removes the key when
@@ -161,9 +167,10 @@ lookup would signal on the arity."
 
 (test declared-but-unbuilt-count-index-answers-empty
   "Spec §2.5, facts G12: a count index that is declared but has no built
-map answers 0 0 and calls FN zero times rather than signalling -- the
-normal state of every count index until Task 4 installs at open, and of
-a lazy memory graph forever.  IX-COUNT-UNBUILT is never given to %CIX."
+map answers 0 0 and calls FN zero times rather than signalling -- a lazy
+memory graph forever, and any graph whose maps nothing has built yet
+(the write path builds none, GH #361).  This graph has no writes at all,
+so nothing is stale either.  IX-COUNT-UNBUILT is never given to %CIX."
   (with-ix-graph (g)
     (is (null (graph-db::%require-count-index g 'ix-claim '(ns)))
         "declared but unbuilt resolves to NIL, it does not signal")
@@ -316,6 +323,10 @@ through the secondary index turns the second check red."
       (dotimes (i 20)
         (make-ix-claim :ns (nth (mod i 2) '("a" "b"))
                        :key (format nil "k~D" i) :rel "at")))
+    ;; The commit built no map and marked the maps stale (GH #361), so
+    ;; this first lookup pays the scan rebuild -- which DOES resolve.
+    ;; The probes below measure the answering path, not that repair.
+    (%count-of g '(ns key) '("a"))
     (is (plusp (%count-resolutions
                 (lambda () (index-lookup g 'ix-claim '(ns key rel) '("a")
                                          :prefix t))))
@@ -326,27 +337,50 @@ through the secondary index turns the second check red."
                 (count-index-lookup g 'ix-claim '(ns key) '("b")))))
         "the count index answers from the map alone")))
 
-(test a-map-the-pass-materialised-is-not-built
-  "Review of GH #361: a commit touching a declared spec with no map
-materialises one through %COUNT-INDEX-FOR and counts only that commit,
-so registry presence is NOT builtness.  INSTALL-COUNT-INDEXES must
-still scan it, and read the whole population, not the one write."
+(test a-commit-with-no-map-marks-stale-instead-of-building-one
+  "Review of GH #361: the write path creates no map -- one materialised
+there would hold only the writes it saw and answer a silently wrong 0 0
+for the rest.  A commit touching a declared spec with no map marks the
+maps stale instead, and the next lookup rebuilds by scan and reads the
+WHOLE population."
   (with-ix-graph (g)
     (with-transaction ()
       (dotimes (i 3)
         (make-ix-claim :ns "ops" :key (format nil "e~D" i) :rel "at")))
-    ;; The state a reopened graph is in until Task 4 installs at open:
+    (is (equal '(3 nil) (%count-of g '(ns) "ops")) "control: built by scan")
+    ;; The state a reopened graph is in before its maps are built:
     ;; nodes on disk, no count map.
     (%drop-count-maps g)
     (with-transaction ()
       (make-ix-claim :ns "ops" :key "e3" :rel "at"))
-    (is (equal '(1 nil) (%count-of g '(ns) "ops"))
-        "the pass counted only the commit it saw")
-    (graph-db::install-count-indexes g)
+    (is (eq t (graph-db::count-indexes-stale-p g))
+        "the commit marked the maps stale")
+    (is (null (graph-db::%require-count-index g 'ix-claim '(ns)))
+        "and materialised no map for the spec it touched")
     (is (equal '(4 nil) (%count-of g '(ns) "ops"))
-        "INSTALL scanned: the whole population, not the one write")
+        "the lookup rebuilt by scan: the population, not the one write")
     (is (equal '(4 4) (%count-of g '(ns key) '("ops")))
         "and every other declared map with it")))
+
+(test a-lazy-memory-graph-keeps-no-count-maps
+  "Spec §2.4, docs §6b (GH #361): a LAZY memory graph builds no count
+maps -- a scan would materialise every LZNODE blob, the trade
+memory-graph.lisp already makes for the ordered indexes -- so a commit
+marks them stale, REBUILD-COUNT-INDEXES only clears the flag, and every
+count query answers the declared-but-unbuilt 0 0."
+  (with-temp-directory (dir)
+    (let ((g (graph-db::make-memory-graph *ix-graph-name*
+                                          (namestring dir) :lazy t)))
+      (unwind-protect
+           (let ((*graph* g))
+             (with-transaction ()
+               (make-ix-claim :ns "ops" :key "e1" :rel "at"))
+             (is (equal '(0 0) (%count-of g '(ns key) '("ops")))
+                 "no map to ask: the declared-but-unbuilt answer")
+             (is (null (graph-db::count-indexes-stale-p g))
+                 "and the rebuild cleared the flag rather than scanning"))
+        (ignore-errors (close-graph g :snapshot-p nil))
+        (collect-garbage)))))
 
 (test an-update-whose-new-node-is-deleted-releases
   "Review of GH #361: a TX-UPDATE whose NEW node carries the deleted
@@ -515,6 +549,10 @@ CLOSE-GRAPH, counted through the DELETE-VIEW-INDEX seam."
            (let ((*graph* g))
              (with-transaction ()
                (make-ix-claim :ns "ops" :key "e1" :rel "at"))
+             ;; The commit built no map (GH #361): this lookup's scan
+             ;; rebuild is what the rebuild below then retires.
+             (is (equal '(1 1) (%count-of g '(ns key) '("ops")))
+                 "built by the first lookup")
              (let ((old (graph-db::count-index-skip-list
                          (graph-db::%require-count-index g 'ix-claim
                                                          '(ns key))))
@@ -658,3 +696,51 @@ NIL, answering the counts the scan has reached so far."
           "and the published map answers the same counts")
       (is (not (eq before (gethash key (graph-db::count-indexes g))))
           "a different map object: the swap did happen"))))
+
+(defun ix-dead-only-p (node)
+  "A second CURRENT-P for the sidecar mismatch test: the exact opposite
+of IX-LIVE-P, so an adopted counter pair is visibly wrong."
+  (equal (ix-rel node) "dead"))
+
+(test a-count-index-whose-current-p-changed-is-rebuilt-at-open
+  "Review of GH #361 (spec §2.4): the sidecar stores the CURRENT-P
+SYMBOL the pairs were computed under.  A record naming a different
+predicate than the live declaration is reclaimed rather than restored,
+so INSTALL-COUNT-INDEXES scan-builds the map under the new predicate --
+adopting the stored CURRENT counters would answer a silently wrong
+CURRENT for the life of the session.  The probe is the build count; the
+counts alone would be vacuous if the restore had simply kept them."
+  (with-temp-directory (dir)
+    (let ((path (namestring dir)))
+      (let ((g (make-graph *ix-graph-name* path :buffer-pool-size 1000)))
+        (unwind-protect
+             (let ((*graph* g))
+               (with-transaction ()
+                 (make-ix-claim :ns "ops" :key "e1" :rel "at")
+                 (make-ix-claim :ns "ops" :key "e2" :rel "dead"))
+               (is (equal '(2 1) (%count-of g '(ns key) '("ops")))
+                   "control: CURRENT under IX-LIVE-P"))
+          (close-graph g)))
+      (unwind-protect
+           (progn
+             (def-count-index ix-claim (ns key) :graph-db-index-test
+               :name ix-count-ns-key :current-p ix-dead-only-p)
+             (let (g)
+               (is (plusp
+                    (%count-builds
+                     (lambda ()
+                       (setq g (open-graph *ix-graph-name* path)))))
+                   "the record's CURRENT-P disagrees: the open builds")
+               (unwind-protect
+                    (let ((*graph* g))
+                      (is (equal '(2 1)
+                                 (%count-of g '(ns key) '("ops")))
+                          "rebuilt under the new predicate: the same ALL")
+                      (is (equal '(1 1) (%count-of g '(ns key)
+                                                   '("ops" "e2")))
+                          "and the dead claim is now the current one"))
+                 (ignore-errors (close-graph g :snapshot-p nil))
+                 (collect-garbage))))
+        ;; Put the file's own declaration back for every other test.
+        (def-count-index ix-claim (ns key) :graph-db-index-test
+          :name ix-count-ns-key :current-p ix-live-p)))))

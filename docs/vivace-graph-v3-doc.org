@@ -5944,7 +5944,10 @@ indexes existed builds them at its next open. On a device, a
 replication pull -- state-sync or an authored pull alike -- marks the
 counting indexes stale rather than counting the pulled write, so the
 first vocabulary query after a pull pays one scan rebuild before it
-goes back to answering as a lookup.
+goes back to answering as a lookup; and a clean ~close-graph~ after a
+pull rebuilds them before saving, so a device that closes without ever
+asking the vocabulary reopens with counts that are right rather than
+one pull behind.
 
 *** The source onboarding contract: what a source declares about itself
 

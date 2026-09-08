@@ -163,6 +163,18 @@ backend's update is not an upsert) and pass the old value so the
 update stays in place. The pass takes no lock: the transaction
 manager's lock and the device's single writer serialise it.
 
+The write path never *creates* a map. When a spec applies to a written
+node but has no map registered, the pass marks the graph's count maps
+stale and skips that spec; the next query rebuilds by scan. A map
+materialised at a write would hold only the writes it saw and answer a
+silently wrong `0 0` for the rest of the population. So only a build
+creates a map — a fresh unregistered one, published in one registry
+write — and a graph whose maps nothing has built yet (a fresh
+`make-graph`, or a *lazy* memory graph, which keeps none at all because
+a scan would materialise every deferred node blob) answers the
+declared-but-unbuilt `0 0` until a query pays that scan.
+`rebuild-count-indexes` is itself a flag-clearing no-op on a lazy graph.
+
 An apply that runs under `*add-to-indexes-unless-present-p*` — a
 crash-recovery replay, or either replication apply on a device
 (state-sync and authored pulls both run under the flag) — counts
@@ -177,7 +189,19 @@ lock and re-checks the flag inside it, so two readers cannot free each
 other's maps, and the scan itself unbinds the ambient transaction and
 read snapshots and records no reads, so it builds committed live state
 whatever the caller's snapshot (R1) and pollutes no read set (GH #92).
-A memory graph rebuilds at every open (nothing on a lazy graph).
+A memory graph rebuilds at every open (nothing on a lazy graph). The
+rebuild clears the stale flag *before* its scan, not after: the lock it
+takes serialises rebuilders and the commit apply, not the device
+writer, so a pull landing mid-scan must leave the flag set for the next
+query to repair rather than have it cleared out from under it.
+
+`close-graph` is the other repair point. The flag is not persisted, so
+a stale close would save under-counted maps marked built — and on a
+device *every* pull marks them stale, making a pull followed by a clean
+close with no count query between them the ordinary case, not a corner
+one. So the close rebuilds when the flag is set, before freeing the
+retired maps and saving the roots: the rebuild retires the stale maps,
+the free reclaims them, the save persists correct roots.
 
 A rebuild never frees pages under a live reader: `map-count-index`
 readers hold no lock, so a rebuild builds a fresh map unregistered,
@@ -186,9 +210,23 @@ to a list `close-graph` frees. A built map carries a `built-p` mark set
 by the scan build and by the sidecar restore; install-at-open builds
 only the maps not already marked.
 
+The sidecar record is `(owner slot-names address backend-tag
+current-p)`. `current-p` is the predicate *symbol* the stored pairs
+were computed under: at restore, a record whose `current-p` is not `eq`
+to the live declaration's is treated as withdrawn and its pages
+reclaimed, so `install-count-indexes` scan-builds the map under the new
+predicate. Adopting the stored `current` counters under another
+predicate would answer a silently wrong `current` with no way to notice
+it. `built-p` is deliberately not stored — the restore re-marks it, or
+every open would rescan and discard the sidecar.
+
 `count-index-lookup graph class slot tuple` → `(values all current)`;
 `map-count-index fn graph class slot &key depth prefix` calls FN with
 `(components all current)` in index order. Neither resolves a node.
+`tuple` follows `%index-key`'s arity rule (at arity 1 it *is* the one
+component, list-valued or not); `prefix` is a component list at every
+arity, arity 1 included — the two are canonicalised differently on
+purpose.
 Counts are live at commit granularity: a reader under a snapshot or an
 as-of extent sees later commits, and a walk is not an atomic snapshot.
 
