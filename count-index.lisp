@@ -162,23 +162,31 @@ graph.")
                              #+graph-db-ecl-sync-hash :synchronized
                              #+graph-db-ecl-sync-hash t))))
 
+(defun %make-fresh-count-index (graph spec)
+  "An empty COUNT-INDEX for SPEC with its own map, REGISTERED NOWHERE:
+what a build scans into before publishing it, so the registry never
+holds a half-filled map (spec §2.3)."
+  (let* ((slot-names (count-index-spec-slot-names spec))
+         (cix (%make-count-index
+               :owner-name (count-index-spec-owner-name spec)
+               :slot-names slot-names
+               :canonicalizers (%resolve-index-canonicalizers
+                                (count-index-spec-canonicalize spec)
+                                (length slot-names))
+               :current-p (count-index-spec-current-p spec))))
+    (setf (count-index-skip-list cix) (make-count-skip-list graph))
+    cix))
+
 (defun %count-index-for (graph spec)
   "Get-or-create the COUNT-INDEX for SPEC in GRAPH, keyed
 (owner . slot-names) in the count registry (separate from the secondary
-one, so both kinds may share an owner and slots -- facts X1)."
+one, so both kinds may share an owner and slots -- facts X1).  The WRITE
+path's entry: a build publishes its own map instead
+(%INSTALL-BUILT-COUNT-INDEX), never an empty one."
   (let* ((reg (%count-registry graph))
-         (slot-names (count-index-spec-slot-names spec))
-         (key (cons (count-index-spec-owner-name spec) slot-names)))
+         (key (%count-index-key spec)))
     (or (gethash key reg)
-        (let ((cix (%make-count-index
-                    :owner-name (count-index-spec-owner-name spec)
-                    :slot-names slot-names
-                    :canonicalizers (%resolve-index-canonicalizers
-                                     (count-index-spec-canonicalize spec)
-                                     (length slot-names))
-                    :current-p (count-index-spec-current-p spec))))
-          (setf (count-index-skip-list cix) (make-count-skip-list graph))
-          (setf (gethash key reg) cix)))))
+        (setf (gethash key reg) (%make-fresh-count-index graph spec)))))
 
 ;;; --------------------------------------------------------------------
 ;;; Counter steps (spec §2.3)
@@ -331,27 +339,30 @@ warns rather than aborting the close.  Returns NIL."
         (warn "could not free a retired count map: ~A" e))))
   (setf (retired-count-maps graph) nil))
 
-(defun %count-index-reset (graph spec)
-  "Swap a FRESH empty COUNT-INDEX for SPEC into GRAPH's registry and
-return it, retiring the map it replaces (%RETIRE-COUNT-MAP).  A build is
-authority, so it must not add to the partial counts a pass-materialised
-map already holds."
+(defun %install-built-count-index (graph spec cix)
+  "Publish the finished CIX as SPEC's map in GRAPH and retire the one it
+replaces; returns CIX.  ONE store, and the map is complete before it:
+%COUNT-REFRESH takes the manager lock only when the stale flag is set,
+so a lock-free reader must see either the old whole map or the new one
+-- never an absent key (which reads a silently wrong 0 0) nor a
+half-scanned map (spec §2.3)."
   (let* ((reg (%count-registry graph))
          (key (%count-index-key spec))
          (old (gethash key reg)))
-    (when old
-      (%retire-count-map graph old)
-      (remhash key reg))
-    (%count-index-for graph spec)))
+    (setf (gethash key reg) cix)
+    (when old (%retire-count-map graph old))
+    cix))
 
 (defun %build-count-index-for-spec (graph spec)
-  "Empty SPEC's map, rebuild it over the live nodes of its owner and
-return the COUNT-INDEX with BUILT-P set: a typed scan (subclasses
-included, as MAP-VERTICES defaults), deleted nodes skipped, one bad
-node tolerated the way %BUILD-INDEX-FOR-SPEC does.  Trap: the scan is
-authority, not a read of the caller's view -- it reads committed live
-state under no transaction and no snapshot (R1, GH #92)."
-  (let ((cix (%count-index-reset graph spec))
+  "Scan the live nodes of SPEC's owner into a FRESH unregistered map,
+mark it BUILT-P and publish it in one store (%INSTALL-BUILT-COUNT-INDEX,
+which retires the map it replaces); returns the new COUNT-INDEX.  A
+typed scan (subclasses included, as MAP-VERTICES defaults), deleted
+nodes skipped, one bad node tolerated the way %BUILD-INDEX-FOR-SPEC
+does.  Trap: the scan is authority, not a read of the caller's view --
+it reads committed live state under no transaction and no snapshot (R1,
+GH #92)."
+  (let ((cix (%make-fresh-count-index graph spec))
         (owner (count-index-spec-owner-name spec))
         ;; No ambient transaction, no as-of snapshot, no read-set
         ;; pollution: a rebuild must count what is committed, whatever
@@ -368,7 +379,7 @@ state under no transaction and no snapshot (R1, GH #92)."
           (map-vertices #'count-node graph :vertex-type owner
                                            :record-reads nil)))
     (setf (count-index-built-p cix) t)
-    cix))
+    (%install-built-count-index graph spec cix)))
 
 (defun %ensure-count-index-built (graph spec)
   "SPEC's COUNT-INDEX in GRAPH, scanned unless it is already BUILT-P.

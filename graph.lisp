@@ -1259,12 +1259,15 @@ a snapshot failure does NOT abort the close (GH #120)."
       ;; while the heap is still open, so OPEN can reopen them without a scan.
       ;; No-op on a memory graph.
       ;;
-      ;; These three are deliberately NOT guarded the way the snapshot below is
+      ;; These saves are deliberately NOT guarded the way the snapshot below is
       ;; (GH #120).  They write atomically (temp + rename, #63), so a failure
       ;; leaves the PREVIOUS sidecar naming the PREVIOUS roots; closing past
       ;; that and deleting .dirty would let the next open adopt roots that no
       ;; longer match the index, with no recovery pass to catch it.  A missing
       ;; snapshot costs replay time; a stale index root is silently wrong.
+      ;; The retired-map free among them IS guarded, on purpose: those pages
+      ;; are unreachable either way, so failing to reclaim them must not stop
+      ;; the sidecar saves around it (GH #361).
       (save-unique-index-roots graph)
       (save-secondary-index-roots graph)
       ;; Counting indexes (GH #361): free the maps a rebuild retired --

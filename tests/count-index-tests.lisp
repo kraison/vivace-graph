@@ -476,26 +476,32 @@ keyed (owner . slot-names), so a second live declaration on the same
 slots would keep the record alive past the undef."
   (def-count-index ix-claim (ns rel) :graph-db-index-test
     :name ix-count-gone)
-  (with-temp-directory (dir)
-    (let ((path (namestring dir)))
-      (let ((g (make-graph *ix-graph-name* path :buffer-pool-size 1000)))
-        (unwind-protect
-             (let ((*graph* g))
-               (with-transaction ()
-                 (make-ix-claim :ns "ops" :key "e1" :rel "at")))
-          (close-graph g)))
-      (undef-count-index ix-claim :graph-db-index-test
-                         :name ix-count-gone)
-      (let* ((freed 0)
-             (old (fdefinition 'graph-db::delete-view-index)))
-        (setf (fdefinition 'graph-db::delete-view-index)
-              (lambda (ix) (incf freed) (funcall old ix)))
-        (unwind-protect
-             (let ((g (open-graph *ix-graph-name* path)))
-               (close-graph g :snapshot-p nil)
-               (collect-garbage))
-          (setf (fdefinition 'graph-db::delete-view-index) old))
-        (is (plusp freed) "the retired count map was reclaimed")))))
+  (unwind-protect
+       (with-temp-directory (dir)
+         (let ((path (namestring dir)))
+           (let ((g (make-graph *ix-graph-name* path
+                                :buffer-pool-size 1000)))
+             (unwind-protect
+                  (let ((*graph* g))
+                    (with-transaction ()
+                      (make-ix-claim :ns "ops" :key "e1" :rel "at")))
+               (close-graph g)))
+           (undef-count-index ix-claim :graph-db-index-test
+                              :name ix-count-gone)
+           (let* ((freed 0)
+                  (old (fdefinition 'graph-db::delete-view-index)))
+             (setf (fdefinition 'graph-db::delete-view-index)
+                   (lambda (ix) (incf freed) (funcall old ix)))
+             (unwind-protect
+                  (let ((g (open-graph *ix-graph-name* path)))
+                    (close-graph g :snapshot-p nil)
+                    (collect-garbage))
+               (setf (fdefinition 'graph-db::delete-view-index) old))
+             (is (plusp freed) "the retired count map was reclaimed"))))
+    ;; The body's UNDEF is a step of the test; this is the cleanup for
+    ;; any other exit, silent so the normal path does not warn (#152).
+    (graph-db:unregister-count-index-spec 'ix-claim :graph-db-index-test
+                                          :name 'ix-count-gone)))
 
 (test a-rebuild-retires-the-old-map-and-close-frees-it
   "Spec §2.3, last paragraph: MAP-COUNT-INDEX readers hold no lock, so a
@@ -607,3 +613,48 @@ the pre-crash sidecar holding the same value."
                    "the replayed write is counted once, not twice"))
           (ignore-errors (close-graph g :snapshot-p nil))
           (collect-garbage))))))
+
+(test a-rebuild-never-registers-a-half-built-map
+  "Review round 1: the fresh map is scanned UNREGISTERED and published in
+one SETF, so a lock-free reader -- %COUNT-REFRESH takes the manager lock
+only when the stale flag is set -- sees the old whole map or the new
+one, never an absent key (a silently wrong 0 0) nor a half-scanned map.
+Probe: %COUNT-NODE fires once per node of the (ns key) scan, and at each
+call the registry must still hold the OLD map, still BUILT-P, still
+answering the old counts.  Ablation, recorded in the task report: with
+the register-then-scan shape the probe sees a different map, BUILT-P
+NIL, answering the counts the scan has reached so far."
+  (with-ix-graph (g)
+    (with-transaction ()
+      (dotimes (i 3)
+        (make-ix-claim :ns "ops" :key (format nil "e~D" i) :rel "at")))
+    (graph-db::install-count-indexes g)   ; a built map to be replaced
+    (is (equal '(3 3) (%count-of g '(ns key) '("ops"))) "control")
+    (let* ((key (cons 'ix-claim '(ns key)))
+           (before (gethash key (graph-db::count-indexes g)))
+           (seen '())
+           (orig (fdefinition 'graph-db::%count-node)))
+      (unwind-protect
+           (progn
+             (setf (fdefinition 'graph-db::%count-node)
+                   (lambda (cix node d-all d-current)
+                     (when (equal '(ns key)
+                                  (graph-db::count-index-slot-names cix))
+                       (let ((live (gethash key
+                                            (graph-db::count-indexes g))))
+                         (push (list (eq live before)
+                                     (and live
+                                          (graph-db::count-index-built-p
+                                           live))
+                                     (%count-of g '(ns key) '("ops")))
+                               seen)))
+                     (funcall orig cix node d-all d-current)))
+             (graph-db::rebuild-count-indexes g))
+        (setf (fdefinition 'graph-db::%count-node) orig))
+      (is (= 3 (length seen)) "the probe fired once per scanned node")
+      (is (every (lambda (s) (equal s (list t t '(3 3)))) seen)
+          "mid-scan the registry held the old, built, whole map")
+      (is (equal '(3 3) (%count-of g '(ns key) '("ops")))
+          "and the published map answers the same counts")
+      (is (not (eq before (gethash key (graph-db::count-indexes g))))
+          "a different map object: the swap did happen"))))
