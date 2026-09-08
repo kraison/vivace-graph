@@ -26,12 +26,21 @@ is not current."
 (def-count-index ix-claim (ns) :graph-db-index-test :name ix-count-unbuilt)
 
 (defun %cix (g slots)
-  "The built COUNT-INDEX for IX-CLAIM.SLOTS in G.  Nothing installs a
-count map at open until Task 4, so build it from the declaration first;
-the build is get-or-create, so this stays right once open does it."
-  (graph-db::%ensure-count-index-built
-   g (graph-db::%count-spec-for 'ix-claim slots g))
-  (graph-db::%require-count-index g 'ix-claim slots))
+  "The COUNT-INDEX for IX-CLAIM.SLOTS in G with an EMPTY map.  The
+tests below drive the counter primitives by hand, and the commit pass
+(GH #361) has already counted the fixture's nodes, so the built map is
+dropped and remade -- what is then read back is exactly the hand-driven
+contributions.  Never call it on a declaration the test wants unbuilt."
+  (let* ((reg (graph-db::%count-registry g))
+         (key (cons 'ix-claim slots))
+         (old (gethash key reg)))
+    (when old
+      (let ((sl (graph-db::count-index-skip-list old)))
+        (when (graph-db::view-index-p sl)
+          (graph-db::delete-view-index sl)))
+      (remhash key reg))
+    (graph-db::%count-index-for
+     g (graph-db::%count-spec-for 'ix-claim slots g))))
 
 (defun %count-of (g slots tuple)
   "(ALL CURRENT) for TUPLE, as a list."
@@ -196,3 +205,95 @@ of a withdrawn declaration is reclaimed at the next open (Task 4)."
                                    graph-db::*schema-count-metadata*))))
     (signals schema-withdrawal-matched-nothing
       (undef-count-index ix-claim :graph-db-index-test :name ix-count-tmp))))
+
+(defvar *ix-resolutions* nil
+  "Node resolutions counted by %COUNT-RESOLUTIONS; NIL when not counting.")
+
+(defun %count-resolutions (thunk)
+  "Run THUNK counting LOOKUP-VERTEX calls through an :AROUND method
+removed afterwards (the generic; an FDEFINITION swap would miss it).
+Returns the count.  Callers prove the probe live with a control."
+  (let* ((gf #'lookup-vertex)
+         (method (eval '(defmethod lookup-vertex :around
+                            ((id t) &key &allow-other-keys)
+                          (when *ix-resolutions* (incf *ix-resolutions*))
+                          (call-next-method)))))
+    (unwind-protect
+         (let ((*ix-resolutions* 0))
+           (funcall thunk)
+           *ix-resolutions*)
+      (remove-method gf method))))
+
+(test commits-maintain-the-counters
+  "Spec §2.3: a committed create counts at every prefix; a retraction-
+shaped update (predicate flip, tuple unchanged) moves CURRENT only; an
+update that changes an indexed slot moves both counters to the new
+tuple and removes the emptied old key; a delete subtracts once."
+  (with-ix-graph (g)
+    (let (a b)
+      (with-transaction ()
+        (setq a (id (make-ix-claim :ns "ops" :key "e1" :rel "at"))
+              b (id (make-ix-claim :ns "ops" :key "e2" :rel "at"))))
+      (is (equal '(2 2) (%count-of g '(ns key) '("ops"))))
+      (is (equal '(2 nil) (%count-of g '(rel) "at")))
+      (with-transaction ()
+        (let ((c (copy (lookup-vertex a))))
+          (setf (ix-rel c) "dead")
+          (save c)))
+      (is (equal '(2 1) (%count-of g '(ns key) '("ops")))
+          "the flip moved CURRENT and left ALL")
+      (is (equal '(1 nil) (%count-of g '(rel) "at")))
+      (is (equal '(1 nil) (%count-of g '(rel) "dead"))
+          "on the (rel) index the same update is a tuple move")
+      (with-transaction ()
+        (let ((c (copy (lookup-vertex b))))
+          (setf (ix-ns c) "hr")
+          (save c)))
+      (is (equal '(1 1) (%count-of g '(ns key) '("hr"))))
+      (is (equal '(1 0) (%count-of g '(ns key) '("ops"))))
+      (is (equal '(0 0) (%count-of g '(ns key) '("ops" "e2")))
+          "the moved-away key is gone")
+      (with-transaction () (mark-deleted (lookup-vertex a)))
+      (is (equal '(0 0) (%count-of g '(ns key) '("ops")))
+          "a delete subtracts once, and the key goes at zero")
+      (is (equal '(0 nil) (%count-of g '(rel) "dead"))))))
+
+(test a-re-applying-apply-marks-stale-and-a-rebuild-repairs
+  "Spec R8, facts X7: under *ADD-TO-INDEXES-UNLESS-PRESENT-P* the pass
+counts nothing and marks the maps stale; the next lookup rebuilds by
+scan, so applying the same writes twice leaves the counters equal to one
+application.  Ablation, recorded in the task report: counting anyway
+under the special leaves the stale flag NIL and reads 3 -- the commit's
+one plus both re-applications."
+  (with-ix-graph (g)
+    (let (writes)
+      (with-transaction ()
+        (make-ix-claim :ns "ops" :key "e1" :rel "at")
+        (setq writes (copy-list (graph-db::writes *transaction*))))
+      (is (equal '(1 1) (%count-of g '(ns key) '("ops"))) "control")
+      (let ((graph-db::*add-to-indexes-unless-present-p* t))
+        (graph-db::apply-tx-writes-to-count-indexes writes g)
+        (graph-db::apply-tx-writes-to-count-indexes writes g))
+      (is (eq t (graph-db::count-indexes-stale-p g)) "marked stale")
+      (is (equal '(1 1) (%count-of g '(ns key) '("ops")))
+          "the lookup rebuilt: still one")
+      (is (null (graph-db::count-indexes-stale-p g))))))
+
+(test a-listing-resolves-no-node
+  "Spec §2.5: MAP-COUNT-INDEX and COUNT-INDEX-LOOKUP never resolve a
+node.  Control: INDEX-LOOKUP resolves.  Ablation: a listing routed
+through the secondary index turns the second check red."
+  (with-ix-graph (g)
+    (with-transaction ()
+      (dotimes (i 20)
+        (make-ix-claim :ns (nth (mod i 2) '("a" "b"))
+                       :key (format nil "k~D" i) :rel "at")))
+    (is (plusp (%count-resolutions
+                (lambda () (index-lookup g 'ix-claim '(ns key rel) '("a")
+                                         :prefix t))))
+        "control: the probe counts the secondary lookup's resolutions")
+    (is (= 0 (%count-resolutions
+              (lambda ()
+                (%entries g '(ns key) :depth 2 :prefix '("a"))
+                (count-index-lookup g 'ix-claim '(ns key) '("b")))))
+        "the count index answers from the map alone")))

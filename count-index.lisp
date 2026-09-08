@@ -93,8 +93,8 @@ before keying.  Declarative and idempotent like DEF-INDEX: registers,
 builds now if the graph is open.  Trap: counts are live at commit
 granularity (spec R1).  Re-evaluating an unchanged declaration is a
 no-op; to adopt a changed :CURRENT-P or :CANONICALIZE on an open graph,
-run REBUILD-COUNT-INDEXES (Task 3; the placeholder today) -- the built
-map keeps the ones it was created with."
+run REBUILD-COUNT-INDEXES -- the built map keeps the ones it was
+created with."
   `(let ((spec (make-count-index-spec
                 :owner-name ',owner-class
                 :slot-names (%normalize-slots ',slots)
@@ -231,17 +231,122 @@ tuple; nothing for a tuple that is not countable."
             do (%count-adjust cix (subseq tuple 0 k) d-all d-current)))))
 
 ;;; --------------------------------------------------------------------
-;;; Queries (spec §2.5)
+;;; Maintenance (spec §2.3): a pass beside the secondary one at every
+;;; apply, serialised by the manager lock / the device writer (R9).
 ;;; --------------------------------------------------------------------
 
+(defgeneric apply-tx-write-to-count-indexes (write graph)
+  (:documentation "Adjust GRAPH's count indexes for one transaction
+WRITE; nothing for a write kind with no method.")
+  (:method (write graph) (declare (ignore write graph)) nil))
+
+(defun %count-specs-for (node graph)
+  "GRAPH's count specs applying to NODE's class, as a list."
+  (%applicable-count-index-specs (class-of node) graph))
+
+(defmethod apply-tx-write-to-count-indexes ((write tx-create) graph)
+  (let ((node (node write)))
+    (dolist (spec (%count-specs-for node graph))
+      (let ((cix (%count-index-for graph spec)))
+        (%count-node cix node 1 (%current-p cix node))))))
+
+(defmethod apply-tx-write-to-count-indexes ((write tx-update) graph)
+  ;; Tuple unchanged: CURRENT moves by the predicate's flip.  Tuple
+  ;; changed: the old contribution leaves, the new one arrives.
+  (let ((old (old-node write)) (new (node write)))
+    (dolist (spec (%count-specs-for new graph))
+      (let* ((cix (%count-index-for graph spec))
+             (ot (%count-tuple cix old))
+             (nt (%count-tuple cix new)))
+        (if (equal ot nt)
+            (let ((d (- (%current-p cix new) (%current-p cix old))))
+              (unless (or (zerop d) (null nt))
+                (loop for k from 1 to (length nt)
+                      do (%count-adjust cix (subseq nt 0 k) 0 d))))
+            (progn
+              (%count-node cix old -1 (- (%current-p cix old)))
+              (%count-node cix new 1 (%current-p cix new))))))))
+
+;; TX-DELETE is a TX-UPDATE subclass: subtract the old node ONCE (the
+;; secondary method releases twice; a counter cannot, facts C12).
+(defmethod apply-tx-write-to-count-indexes ((write tx-delete) graph)
+  (let ((old (old-node write)))
+    (dolist (spec (%count-specs-for old graph))
+      (let ((cix (%count-index-for graph spec)))
+        (%count-node cix old -1 (- (%current-p cix old)))))))
+
+(defun apply-tx-writes-to-count-indexes (writes graph)
+  "The count pass of an apply (GH #361).  Under *ADD-TO-INDEXES-UNLESS-
+PRESENT-P* -- crash-recovery replay and a device re-pull, which may
+apply a write twice -- it counts nothing and marks the maps stale (R8).
+Nothing at all for a graph with no count declarations."
+  (when (gethash (graph-name graph) *schema-count-metadata*)
+    (if *add-to-indexes-unless-present-p*
+        (setf (count-indexes-stale-p graph) t)
+        (dolist (write writes)
+          (apply-tx-write-to-count-indexes write graph)))))
+
+(defun %count-purge (node graph)
+  "PEER-PURGE-NODE's count release: the node leaves without a write."
+  (dolist (spec (%count-specs-for node graph))
+    (let ((cix (%count-index-for graph spec)))
+      (%count-node cix node -1 (- (%current-p cix node))))))
+
+;;; --------------------------------------------------------------------
+;;; Build, install, rebuild (spec §2.3-2.4)
+;;; --------------------------------------------------------------------
+
+(defun %build-count-index-for-spec (graph spec)
+  "Build SPEC's map over the live nodes of its owner and return the
+COUNT-INDEX: a typed scan (subclasses included, as MAP-VERTICES
+defaults), deleted nodes skipped, one bad node tolerated the way
+%BUILD-INDEX-FOR-SPEC does.  Trap: it ADDS to whatever the map already
+holds, so a caller wanting authority clears the registry first."
+  (let ((cix (%count-index-for graph spec))
+        (owner (count-index-spec-owner-name spec)))
+    (flet ((count-node (node)
+             (unless (deleted-p node)
+               (ignore-errors
+                (%count-node cix node 1 (%current-p cix node))))))
+      (if (subtypep owner 'edge)
+          (map-edges #'count-node graph :edge-type owner)
+          (map-vertices #'count-node graph :vertex-type owner)))
+    cix))
+
+(defun %ensure-count-index-built (graph spec)
+  "SPEC's COUNT-INDEX in GRAPH, built by scan unless the registry
+already holds it -- idempotent on the (owner . slot-names) key."
+  (let ((key (cons (count-index-spec-owner-name spec)
+                   (count-index-spec-slot-names spec))))
+    (or (and (count-indexes graph)
+             (gethash key (count-indexes graph)))
+        (%build-count-index-for-spec graph spec))))
+
+(defun install-count-indexes (graph)
+  "Build any declared count index missing from GRAPH's registry."
+  (dolist (spec (%registered-count-index-specs graph))
+    (%ensure-count-index-built graph spec)))
+
 (defun rebuild-count-indexes (graph)
-  "Placeholder until Task 3: clear the stale flag."
+  "Drop every count map and rebuild each declared one by scan, clearing
+the stale flag (R8); returns GRAPH.  Authoritative and idempotent, and
+the only repair for a re-applied write (facts X7)."
+  (when (count-indexes graph)
+    (maphash (lambda (k cix)
+               (declare (ignore k))
+               (let ((sl (count-index-skip-list cix)))
+                 (when (and sl (view-index-p sl))
+                   (delete-view-index sl))))
+             (count-indexes graph))
+    (clrhash (count-indexes graph)))
+  (dolist (spec (%registered-count-index-specs graph))
+    (%build-count-index-for-spec graph spec))
   (setf (count-indexes-stale-p graph) nil)
   graph)
 
-(defun %ensure-count-index-built (graph spec)
-  "Placeholder until Task 3: create the (empty) map for SPEC."
-  (%count-index-for graph spec))
+;;; --------------------------------------------------------------------
+;;; Queries (spec §2.5)
+;;; --------------------------------------------------------------------
 
 (defun %count-refresh (graph)
   "Rebuild the count maps when a re-apply left them stale (R8)."
@@ -301,24 +406,29 @@ a list of up to ARITY components.  Signals on more than the arity."
 
 (defun count-index-lookup (graph class-name slot-name tuple)
   "(VALUES ALL CURRENT) for TUPLE -- a full tuple or a leading prefix --
-in the count index on CLASS-NAME.SLOT-NAME: 0 0 for an absent name, a
-declared-but-empty index, or an all-null full tuple; CURRENT is NIL when
-the index has no CURRENT-P.  Signals QUERY-PRECONDITION-ERROR when no
-count index is declared.  Trap: live at commit granularity; a re-apply
-is repaired by a rebuild first (GH #361)."
+in the count index on CLASS-NAME.SLOT-NAME.  ALL is 0 for an absent
+name or an all-null full tuple, and CURRENT is NIL whenever the index
+has no CURRENT-P; a declared-but-unbuilt index answers 0 0, having no
+map to ask.  Signals QUERY-PRECONDITION-ERROR when none is declared.
+Trap: live at commit granularity; a re-apply is repaired by a rebuild
+first (GH #361)."
   (let ((*graph* graph))
     (%count-refresh graph)
     (let ((cix (%require-count-index graph class-name slot-name)))
       (if (null cix)
           (values 0 0)
-          (let ((key (%count-query-key cix tuple)))
+          ;; An absent name reads NIL for CURRENT on a predicate-free
+          ;; index too, so a caller need not know whether the key
+          ;; happens to exist to read the pair (GH #361).
+          (let ((zero (and (count-index-current-p cix) 0))
+                (key (%count-query-key cix tuple)))
             (if (null key)
-                (values 0 0)
+                (values 0 zero)
                 (let ((node (find-in-skip-list
                              (count-index-skip-list cix)
                              (cons (length key) key))))
                   (if (null node)
-                      (values 0 0)
+                      (values 0 zero)
                       (let ((v (%sn-value node)))
                         (values (car v) (cdr v)))))))))))
 

@@ -6,6 +6,7 @@
 (declaim (ftype (function (t t) t)
                 validate-unique-constraints apply-tx-writes-to-unique-indexes
                 apply-tx-writes-to-secondary-indexes
+                apply-tx-writes-to-count-indexes
                 validate-value-constraints validate-cardinality-constraints
                 validate-domain-range-constraints))
 
@@ -2006,6 +2007,7 @@ With no FILTER, returns WRITES unchanged."
         (apply-tx-writes-to-vector-segments writes graph)
         (apply-tx-writes-to-unique-indexes writes graph)   ; issue #6
         (apply-tx-writes-to-secondary-indexes writes graph) ; general ordered index
+        (apply-tx-writes-to-count-indexes writes graph)     ; GH #361
         (reap-old-versions writes graph)
         (persist-highest-transaction-id (transaction-id transaction) graph)))))
 
