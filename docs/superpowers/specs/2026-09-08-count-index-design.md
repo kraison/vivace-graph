@@ -10,7 +10,8 @@ will commit), #345 (value indexes keep live membership), #113
 (epoch-stamped entries, later). **Date:** 2026-09-08. **Status:**
 approved in review, sections 1–3; amended 2026-09-08 against the engine
 facts note (and R6/R7 re-ruled: the as-of path keeps #350's walk) (`docs/superpowers/notes/2026-09-08-count-index-engine-facts.md`),
-which overturned eight assumptions of the first draft (§X there).
+which overturned eight assumptions of the first draft (§X there);
+implemented on `feat/count-index`.
 
 ## 0. Problem
 

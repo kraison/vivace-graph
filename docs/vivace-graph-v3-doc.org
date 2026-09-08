@@ -5922,24 +5922,29 @@ indexes, in index order, without walking its claims:
 #+END_SRC
 
 ~:counts t~ makes each entry ~(name . count)~; under ~:role :either~
-the count sums the subject and object roles. Outside a transaction and
-without ~:current~ a count is an index-range size (entries, no
-resolution), which under an open ~with-as-of~ extent still counts a
-claim created after the epoch; ~:current t~ resolves each entry.
-Inside an open transaction every count resolves its range through the
-commit view -- ~:current~ or not -- and adds the claims the
-transaction created under the name, so a count there costs a walk of
-that name's entries. The default lists every name the indexes hold,
-retracted claims included -- they are the record of what was believed;
-~:current t~ keeps a name only if a claim under it is current, and
-counts only those. Inside an open
-transaction the answer is what that transaction will commit, as
-~claims-touching~ does. Names come from index membership, which is
-live: ~:as-of~ and ~:as-of-epoch~ are refused, and an open
-~with-as-of~ extent changes only what a name's claims resolve to
-(Chapter 12, "Reading as of an epoch"). Distinct relations ride a fifth
-index every family declares, ~claim-relation~; a family created before
-it gets it on its next open.
+the count sums the subject and object roles. Every family declares
+three counting indexes -- ~claim-subject-count~, ~claim-object-count~
+and ~claim-relation-count~ (GH #361) -- so outside an open ~with-as-of~
+extent all three functions are lookups on those indexes and resolve no
+claim: the default count is the counting index's ~all~ counter,
+~:current t~ reads its ~current~ counter, and inside an open
+transaction the transaction's own writes are overlaid on the lookup
+before it returns (GH #324), as ~claims-touching~ overlays its own.
+The default lists every name the indexes hold, retracted claims
+included -- they are the record of what was believed; ~:current t~
+keeps a name only if a claim under it is current, and counts only
+those. Names come from index membership, which is live: ~:as-of~ and
+~:as-of-epoch~ are refused as keyword arguments, and inside an open
+~with-as-of~ extent the listing falls back to the distinct-prefix walk
+of GH #350 -- the only mechanism that can answer at an epoch -- and
+costs what it cost before the counting indexes existed (Chapter 12,
+"Reading as of an epoch"). The ~claim-relation~ secondary index stays
+as that walk's relation source; a family created before the counting
+indexes existed builds them at its next open. On a device, a
+replication pull -- state-sync or an authored pull alike -- marks the
+counting indexes stale rather than counting the pulled write, so the
+first vocabulary query after a pull pays one scan rebuild before it
+goes back to answering as a lookup.
 
 *** The source onboarding contract: what a source declares about itself
 

@@ -143,6 +143,55 @@ care resolve them (`graph-db/spacetime`'s vocabulary does).
 tuple's or prefix's range, counted entries, no node resolution; 0 for an
 absent prefix or a declared-but-empty index.
 
+### 6b. Counting index (GH #361)
+
+`def-count-index owner (slots) graph-name &key name current-p
+canonicalize` declares an ordered map keyed `(depth v1 … vk)` for every
+leading prefix of a node's canonical tuple, whose value is the counter
+pair `(all . current)`; `current` counts the nodes on which CURRENT-P
+holds and is NIL when none is declared. It has its own registry
+(`*schema-count-metadata*`, the `def-unique` pattern), graph slot
+(`count-indexes`) and sidecar (`count-indexes.dat`), so a class may carry
+a secondary index and a count index on the same slots.
+
+Maintenance runs at commit apply beside the secondary pass, in the two
+replication applies and in the peer purge: a create adds at every
+prefix, a delete subtracts once, an update moves `current` by the
+predicate's flip or moves both counters when the tuple changed; a key
+is removed at zero. Counter steps are read-then-branch (the memory
+backend's update is not an upsert) and pass the old value so the
+update stays in place. The pass takes no lock: the transaction
+manager's lock and the device's single writer serialise it.
+
+An apply that runs under `*add-to-indexes-unless-present-p*` — a
+crash-recovery replay, or either replication apply on a device
+(state-sync and authored pulls both run under the flag) — counts
+nothing and marks the maps stale instead. On a device this means every
+pull marks the count maps stale, whether or not that pull's writes
+touched a count-index name, and the first count query after a pull
+rebuilds by scan; a narrower signal, limited to the authored path, is
+a follow-up, not built here. A stale map is otherwise rebuilt by scan
+at the next open (after a crash-recovery replay) or lazily on the next
+query — the lazy rebuild takes the transaction manager's recursive
+lock and re-checks the flag inside it, so two readers cannot free each
+other's maps, and the scan itself unbinds the ambient transaction and
+read snapshots and records no reads, so it builds committed live state
+whatever the caller's snapshot (R1) and pollutes no read set (GH #92).
+A memory graph rebuilds at every open (nothing on a lazy graph).
+
+A rebuild never frees pages under a live reader: `map-count-index`
+readers hold no lock, so a rebuild builds a fresh map unregistered,
+publishes it with one registry write, and retires the map it replaces
+to a list `close-graph` frees. A built map carries a `built-p` mark set
+by the scan build and by the sidecar restore; install-at-open builds
+only the maps not already marked.
+
+`count-index-lookup graph class slot tuple` → `(values all current)`;
+`map-count-index fn graph class slot &key depth prefix` calls FN with
+`(components all current)` in index order. Neither resolves a node.
+Counts are live at commit granularity: a reader under a snapshot or an
+as-of extent sees later commits, and a walk is not an atomic snapshot.
+
 ## 7. Persistence & reopen
 
 Mirror `:unique` exactly (it already solved both backends):
