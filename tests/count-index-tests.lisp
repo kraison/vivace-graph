@@ -42,6 +42,19 @@ contributions.  Never call it on a declaration the test wants unbuilt."
     (graph-db::%count-index-for
      g (graph-db::%count-spec-for 'ix-claim slots g))))
 
+(defun %drop-count-maps (g)
+  "Drop G's built count maps, freeing their heap pages: the state a
+reopened graph is in until Task 4 installs count indexes at open."
+  (let ((reg (graph-db::count-indexes g)))
+    (when reg
+      (maphash (lambda (k cix)
+                 (declare (ignore k))
+                 (let ((sl (graph-db::count-index-skip-list cix)))
+                   (when (graph-db::view-index-p sl)
+                     (graph-db::delete-view-index sl))))
+               reg)
+      (clrhash reg))))
+
 (defun %count-of (g slots tuple)
   "(ALL CURRENT) for TUPLE, as a list."
   (multiple-value-list (count-index-lookup g 'ix-claim slots tuple)))
@@ -226,43 +239,51 @@ Returns the count.  Callers prove the probe live with a control."
 
 (test commits-maintain-the-counters
   "Spec §2.3: a committed create counts at every prefix; a retraction-
-shaped update (predicate flip, tuple unchanged) moves CURRENT only; an
-update that changes an indexed slot moves both counters to the new
-tuple and removes the emptied old key; a delete subtracts once."
+shaped update (predicate flip, tuple unchanged) moves CURRENT only; a
+delete subtracts ONCE, taken while a sibling still holds the prefix up
+so a double subtraction is visible; an update that changes an indexed
+slot moves both counters and removes the emptied old key."
   (with-ix-graph (g)
     (let (a b)
       (with-transaction ()
         (setq a (id (make-ix-claim :ns "ops" :key "e1" :rel "at"))
-              b (id (make-ix-claim :ns "ops" :key "e2" :rel "at"))))
-      (is (equal '(2 2) (%count-of g '(ns key) '("ops"))))
-      (is (equal '(2 nil) (%count-of g '(rel) "at")))
+              b (id (make-ix-claim :ns "ops" :key "e2" :rel "at")))
+        (make-ix-claim :ns "ops" :key "e3" :rel "at"))
+      (is (equal '(3 3) (%count-of g '(ns key) '("ops"))))
+      (is (equal '(3 nil) (%count-of g '(rel) "at")))
       (with-transaction ()
         (let ((c (copy (lookup-vertex a))))
           (setf (ix-rel c) "dead")
           (save c)))
-      (is (equal '(2 1) (%count-of g '(ns key) '("ops")))
+      (is (equal '(3 2) (%count-of g '(ns key) '("ops")))
           "the flip moved CURRENT and left ALL")
-      (is (equal '(1 nil) (%count-of g '(rel) "at")))
+      (is (equal '(2 nil) (%count-of g '(rel) "at")))
       (is (equal '(1 nil) (%count-of g '(rel) "dead"))
           "on the (rel) index the same update is a tuple move")
+      (with-transaction () (mark-deleted (lookup-vertex a)))
+      (is (equal '(2 2) (%count-of g '(ns key) '("ops")))
+          "a delete subtracts once: subtracting twice reads (1 2)")
+      (is (equal '(0 0) (%count-of g '(ns key) '("ops" "e1")))
+          "and the emptied key is gone")
+      (is (equal '(0 nil) (%count-of g '(rel) "dead")))
       (with-transaction ()
         (let ((c (copy (lookup-vertex b))))
           (setf (ix-ns c) "hr")
           (save c)))
       (is (equal '(1 1) (%count-of g '(ns key) '("hr"))))
-      (is (equal '(1 0) (%count-of g '(ns key) '("ops"))))
+      (is (equal '(1 1) (%count-of g '(ns key) '("ops"))))
       (is (equal '(0 0) (%count-of g '(ns key) '("ops" "e2")))
           "the moved-away key is gone")
-      (with-transaction () (mark-deleted (lookup-vertex a)))
-      (is (equal '(0 0) (%count-of g '(ns key) '("ops")))
-          "a delete subtracts once, and the key goes at zero")
-      (is (equal '(0 nil) (%count-of g '(rel) "dead"))))))
+      (with-transaction () (mark-deleted (lookup-vertex b)))
+      (is (equal '(0 0) (%count-of g '(ns key) '("hr")))
+          "and a key goes at zero"))))
 
 (test a-re-applying-apply-marks-stale-and-a-rebuild-repairs
   "Spec R8, facts X7: under *ADD-TO-INDEXES-UNLESS-PRESENT-P* the pass
 counts nothing and marks the maps stale; the next lookup rebuilds by
 scan, so applying the same writes twice leaves the counters equal to one
-application.  Ablation, recorded in the task report: counting anyway
+application; the map is corrupted first, so only a real scan can put it
+back.  Ablation, recorded in the task report: counting anyway
 under the special leaves the stale flag NIL and reads 3 -- the commit's
 one plus both re-applications."
   (with-ix-graph (g)
@@ -271,12 +292,19 @@ one plus both re-applications."
         (make-ix-claim :ns "ops" :key "e1" :rel "at")
         (setq writes (copy-list (graph-db::writes *transaction*))))
       (is (equal '(1 1) (%count-of g '(ns key) '("ops"))) "control")
+      ;; Corrupt the built map by hand: a placeholder rebuild that only
+      ;; cleared the flag would leave this reading 9 9 (GH #361).
+      (graph-db::%count-adjust
+       (graph-db::%require-count-index g 'ix-claim '(ns key))
+       '("ops") 8 8)
+      (is (equal '(9 9) (%count-of g '(ns key) '("ops")))
+          "corrupted, and nothing has rebuilt yet")
       (let ((graph-db::*add-to-indexes-unless-present-p* t))
         (graph-db::apply-tx-writes-to-count-indexes writes g)
         (graph-db::apply-tx-writes-to-count-indexes writes g))
       (is (eq t (graph-db::count-indexes-stale-p g)) "marked stale")
       (is (equal '(1 1) (%count-of g '(ns key) '("ops")))
-          "the lookup rebuilt: still one")
+          "the lookup rebuilt by scan: still one, and the 8 is gone")
       (is (null (graph-db::count-indexes-stale-p g))))))
 
 (test a-listing-resolves-no-node
@@ -297,3 +325,72 @@ through the secondary index turns the second check red."
                 (%entries g '(ns key) :depth 2 :prefix '("a"))
                 (count-index-lookup g 'ix-claim '(ns key) '("b")))))
         "the count index answers from the map alone")))
+
+(test a-map-the-pass-materialised-is-not-built
+  "Review of GH #361: a commit touching a declared spec with no map
+materialises one through %COUNT-INDEX-FOR and counts only that commit,
+so registry presence is NOT builtness.  INSTALL-COUNT-INDEXES must
+still scan it, and read the whole population, not the one write."
+  (with-ix-graph (g)
+    (with-transaction ()
+      (dotimes (i 3)
+        (make-ix-claim :ns "ops" :key (format nil "e~D" i) :rel "at")))
+    ;; The state a reopened graph is in until Task 4 installs at open:
+    ;; nodes on disk, no count map.
+    (%drop-count-maps g)
+    (with-transaction ()
+      (make-ix-claim :ns "ops" :key "e3" :rel "at"))
+    (is (equal '(1 nil) (%count-of g '(ns) "ops"))
+        "the pass counted only the commit it saw")
+    (graph-db::install-count-indexes g)
+    (is (equal '(4 nil) (%count-of g '(ns) "ops"))
+        "INSTALL scanned: the whole population, not the one write")
+    (is (equal '(4 4) (%count-of g '(ns key) '("ops")))
+        "and every other declared map with it")))
+
+(test an-update-whose-new-node-is-deleted-releases
+  "Review of GH #361: a TX-UPDATE whose NEW node carries the deleted
+flag is a release and nothing more, as in the secondary method
+(index.lisp).  Without that branch the tuple is unchanged and the
+predicate has not flipped, so nothing moves and the prefix never falls."
+  (with-ix-graph (g)
+    (let (a)
+      (with-transaction ()
+        (setq a (id (make-ix-claim :ns "ops" :key "e1" :rel "at")))
+        (make-ix-claim :ns "ops" :key "e2" :rel "at"))
+      (is (equal '(2 2) (%count-of g '(ns key) '("ops"))) "control")
+      (with-transaction ()
+        (let ((c (copy (lookup-vertex a))))
+          (setf (deleted-p c) t)
+          (save c)))
+      (is (equal '(1 1) (%count-of g '(ns key) '("ops")))
+          "released, not re-counted")
+      (is (equal '(0 0) (%count-of g '(ns key) '("ops" "e1")))))))
+
+(test a-rebuild-reads-committed-state-and-pollutes-no-read-set
+  "Review of GH #361: the lazy rebuild is authority, not a read of the
+caller's view -- it scans with no ambient transaction, no read snapshot
+and :RECORD-READS NIL (R1, GH #92).  So an AS-OF extent at an older
+epoch still counts the whole committed population, and an open
+transaction's read set is unchanged by the scan."
+  (with-ix-graph (g)
+    (with-transaction ()
+      (dotimes (i 2)
+        (make-ix-claim :ns "ops" :key (format nil "a~D" i) :rel "at")))
+    (let ((old (latest-epoch g)))
+      (with-transaction ()
+        (dotimes (i 3)
+          (make-ix-claim :ns "ops" :key (format nil "b~D" i)
+                         :rel "at")))
+      (setf (graph-db::count-indexes-stale-p g) t)
+      (with-as-of ((g) old)
+        (is (equal '(5 5) (%count-of g '(ns key) '("ops")))
+            "the rebuild ignored the caller's as-of snapshot")))
+    (setf (graph-db::count-indexes-stale-p g) t)
+    (with-transaction ()
+      (let ((before (graph-db::object-set-count
+                     (graph-db::read-set *transaction*))))
+        (is (equal '(5 5) (%count-of g '(ns key) '("ops"))))
+        (is (= before (graph-db::object-set-count
+                       (graph-db::read-set *transaction*)))
+            "the scan added nothing to the open read set")))))

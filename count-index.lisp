@@ -119,8 +119,11 @@ created with."
 ;;; The map (spec §2.2)
 ;;; --------------------------------------------------------------------
 
+;; BUILT-P: T only after a full scan.  The commit pass materialises a
+;; map through %COUNT-INDEX-FOR and counts only the writes it sees, so
+;; registry presence is NOT builtness (GH #361).
 (defstruct (count-index (:constructor %make-count-index))
-  owner-name slot-names canonicalizers current-p skip-list)
+  owner-name slot-names canonicalizers current-p skip-list built-p)
 
 (defgeneric make-count-skip-list (graph)
   (:documentation "The ordered map backing a count index: keys (DEPTH
@@ -250,10 +253,22 @@ WRITE; nothing for a write kind with no method.")
       (let ((cix (%count-index-for graph spec)))
         (%count-node cix node 1 (%current-p cix node))))))
 
+(defun %count-release (node graph)
+  "Subtract NODE's contribution once, at every prefix, from each count
+index of GRAPH that applies to it."
+  (dolist (spec (%count-specs-for node graph))
+    (let ((cix (%count-index-for graph spec)))
+      (%count-node cix node -1 (- (%current-p cix node))))))
+
 (defmethod apply-tx-write-to-count-indexes ((write tx-update) graph)
-  ;; Tuple unchanged: CURRENT moves by the predicate's flip.  Tuple
-  ;; changed: the old contribution leaves, the new one arrives.
+  ;; A deleted NEW node is a release and nothing more, as in the
+  ;; secondary method (index.lisp).  Otherwise -- tuple unchanged:
+  ;; CURRENT moves by the predicate's flip; tuple changed: the old
+  ;; contribution leaves, the new one arrives.
   (let ((old (old-node write)) (new (node write)))
+    (when (deleted-p new)
+      (return-from apply-tx-write-to-count-indexes
+        (%count-release old graph)))
     (dolist (spec (%count-specs-for new graph))
       (let* ((cix (%count-index-for graph spec))
              (ot (%count-tuple cix old))
@@ -270,10 +285,7 @@ WRITE; nothing for a write kind with no method.")
 ;; TX-DELETE is a TX-UPDATE subclass: subtract the old node ONCE (the
 ;; secondary method releases twice; a counter cannot, facts C12).
 (defmethod apply-tx-write-to-count-indexes ((write tx-delete) graph)
-  (let ((old (old-node write)))
-    (dolist (spec (%count-specs-for old graph))
-      (let ((cix (%count-index-for graph spec)))
-        (%count-node cix old -1 (- (%current-p cix old)))))))
+  (%count-release (old-node write) graph))
 
 (defun apply-tx-writes-to-count-indexes (writes graph)
   "The count pass of an apply (GH #361).  Under *ADD-TO-INDEXES-UNLESS-
@@ -288,38 +300,63 @@ Nothing at all for a graph with no count declarations."
 
 (defun %count-purge (node graph)
   "PEER-PURGE-NODE's count release: the node leaves without a write."
-  (dolist (spec (%count-specs-for node graph))
-    (let ((cix (%count-index-for graph spec)))
-      (%count-node cix node -1 (- (%current-p cix node))))))
+  (%count-release node graph))
 
 ;;; --------------------------------------------------------------------
 ;;; Build, install, rebuild (spec §2.3-2.4)
 ;;; --------------------------------------------------------------------
 
+(defun %count-index-key (spec)
+  (cons (count-index-spec-owner-name spec)
+        (count-index-spec-slot-names spec)))
+
+(defun %count-index-reset (graph spec)
+  "Drop SPEC's map from GRAPH's registry, freeing its heap pages, and
+return a fresh empty COUNT-INDEX.  A build is authority, so it must not
+add to the partial counts a pass-materialised map already holds."
+  (let* ((reg (%count-registry graph))
+         (key (%count-index-key spec))
+         (old (gethash key reg)))
+    (when old
+      (let ((sl (count-index-skip-list old)))
+        (when (and sl (view-index-p sl)) (delete-view-index sl)))
+      (remhash key reg))
+    (%count-index-for graph spec)))
+
 (defun %build-count-index-for-spec (graph spec)
-  "Build SPEC's map over the live nodes of its owner and return the
-COUNT-INDEX: a typed scan (subclasses included, as MAP-VERTICES
-defaults), deleted nodes skipped, one bad node tolerated the way
-%BUILD-INDEX-FOR-SPEC does.  Trap: it ADDS to whatever the map already
-holds, so a caller wanting authority clears the registry first."
-  (let ((cix (%count-index-for graph spec))
-        (owner (count-index-spec-owner-name spec)))
+  "Empty SPEC's map, rebuild it over the live nodes of its owner and
+return the COUNT-INDEX with BUILT-P set: a typed scan (subclasses
+included, as MAP-VERTICES defaults), deleted nodes skipped, one bad
+node tolerated the way %BUILD-INDEX-FOR-SPEC does.  Trap: the scan is
+authority, not a read of the caller's view -- it reads committed live
+state under no transaction and no snapshot (R1, GH #92)."
+  (let ((cix (%count-index-reset graph spec))
+        (owner (count-index-spec-owner-name spec))
+        ;; No ambient transaction, no as-of snapshot, no read-set
+        ;; pollution: a rebuild must count what is committed, whatever
+        ;; the caller was reading (R1, GH #92).
+        (*transaction* nil)
+        (*read-snapshots* nil))
     (flet ((count-node (node)
              (unless (deleted-p node)
                (ignore-errors
                 (%count-node cix node 1 (%current-p cix node))))))
       (if (subtypep owner 'edge)
-          (map-edges #'count-node graph :edge-type owner)
-          (map-vertices #'count-node graph :vertex-type owner)))
+          (map-edges #'count-node graph :edge-type owner
+                                        :record-reads nil)
+          (map-vertices #'count-node graph :vertex-type owner
+                                           :record-reads nil)))
+    (setf (count-index-built-p cix) t)
     cix))
 
 (defun %ensure-count-index-built (graph spec)
-  "SPEC's COUNT-INDEX in GRAPH, built by scan unless the registry
-already holds it -- idempotent on the (owner . slot-names) key."
-  (let ((key (cons (count-index-spec-owner-name spec)
-                   (count-index-spec-slot-names spec))))
-    (or (and (count-indexes graph)
-             (gethash key (count-indexes graph)))
+  "SPEC's COUNT-INDEX in GRAPH, scanned unless it is already BUILT-P.
+Trap: registry presence is not builtness -- a map the commit pass
+materialised holds only the writes it saw, so this still scans it."
+  (let* ((reg (count-indexes graph))
+         (cix (and reg (gethash (%count-index-key spec) reg))))
+    (if (and cix (count-index-built-p cix))
+        cix
         (%build-count-index-for-spec graph spec))))
 
 (defun install-count-indexes (graph)
@@ -349,9 +386,20 @@ the only repair for a re-applied write (facts X7)."
 ;;; --------------------------------------------------------------------
 
 (defun %count-refresh (graph)
-  "Rebuild the count maps when a re-apply left them stale (R8)."
+  "Rebuild GRAPH's count maps when a re-apply left them stale (R8),
+under the transaction-manager lock -- recursive, so a lookup from
+inside an apply is safe -- and re-checked inside it, so two readers
+cannot free each other's maps.  A graph with no manager yet (open,
+recovery) repairs unlocked: nothing races there."
   (when (count-indexes-stale-p graph)
-    (rebuild-count-indexes graph)))
+    (flet ((repair ()
+             (when (count-indexes-stale-p graph)
+               (rebuild-count-indexes graph))))
+      (let ((tm (and (slot-boundp graph 'transaction-manager)
+                     (transaction-manager graph))))
+        (if tm
+            (with-transaction-manager-lock (tm) (repair))
+            (repair))))))
 
 (defun %require-count-index (graph class-name slot-name)
   "The COUNT-INDEX on CLASS-NAME.SLOT-NAME -- CLASS-NAME's own or an
