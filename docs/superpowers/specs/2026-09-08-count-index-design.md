@@ -123,9 +123,21 @@ and applies the create rule to every live node of each owner class
 `%build-index-for-spec` tolerates it). It runs at open when the graph
 was crash-recovered (the replay precedes the sidecar restore and would
 otherwise be discarded), and lazily from `count-index-lookup` /
-`map-count-index` when the flag is set. The flag is in memory only:
+`map-count-index` when the flag is set. The lazy trigger is a
+writer-class operation: it takes the transaction manager's recursive
+lock and re-checks the flag inside it, so two readers cannot free each
+other's maps and a lookup from inside an apply is safe. The scan itself
+binds the ambient transaction and read snapshots away and records no
+reads, so it builds committed live state whatever the caller's snapshot
+(R1) and pollutes no read set (GH #92). The flag is in memory only:
 a crash between a state-sync re-pull and a close leaves a sidecar whose
 counts the crash-recovery rebuild at the next open replaces anyway.
+
+A built map carries a `built-p` mark set by the scan build; the
+install-at-open and the declaration-time build test that mark, not the
+map's presence in the registry, because the write path creates an empty
+map for a declared index the first time a commit touches it, and a map
+created that way must still be built over the nodes that preceded it.
 
 ### 2.4 Persistence
 
