@@ -9,7 +9,7 @@ decisions:** #107 (multi-slot indexes, canonical tuples, the sidecar),
 will commit), #345 (value indexes keep live membership), #113
 (epoch-stamped entries, later). **Date:** 2026-09-08. **Status:**
 approved in review, sections 1–3; amended 2026-09-08 against the engine
-facts note (`docs/superpowers/notes/2026-09-08-count-index-engine-facts.md`),
+facts note (and R6/R7 re-ruled: the as-of path keeps #350's walk) (`docs/superpowers/notes/2026-09-08-count-index-engine-facts.md`),
 which overturned eight assumptions of the first draft (§X there).
 
 ## 0. Problem
@@ -33,8 +33,8 @@ lookup, and a count should cost nothing at read time.
 | R3 | Every leading prefix of the tuple is counted, keyed by depth first. | Namespace-level answers become lookups and the keys under a namespace one contiguous range; five in-place counter updates per claim write is small beside the index inserts a claim already pays. |
 | R4 | A key is removed when its `all` counter reaches 0. | The map's keys are then exactly the names with a committed claim, so a listing needs no filter. |
 | R5 | The three vocabulary functions keep their signatures and semantics; only their mechanism changes. | #350's tests are the contract; nothing a consumer sees moves. |
-| R6 | The unreleased `claim-relation` secondary index (#350) is withdrawn from `def-claim-classes`, by an emitted `unregister-index-spec` form, not by deleting its declaration. | The relation count index answers everything it was added for; deleting the form withdraws nothing in an image that already ran the older macro. |
-| R7 | Under an open as-of extent each name is still confirmed by one node resolution at the epoch; counts there are live (R1). | Keeps #350's as-of behaviour for names at O(names) without pretending counters are versioned. |
+| R6 | The `claim-relation` secondary index (#350) stays. | Under an as-of extent the listing runs #350's walk-and-resolve mechanism (R7), whose relation source is that index; withdrawing it would leave relations unanswerable at an epoch. |
+| R7 | Under an open as-of extent the three functions run #350's mechanism unchanged — the distinct-prefix walk with per-name resolution at the epoch, `:current` counts by resolution. Everywhere else they read the count index. | A counter is live (R1) and cannot answer at an epoch; #350's tests pin the as-of answers and R5 keeps them; the as-of listing is rare and may pay the walk. |
 | R8 | A counter is never re-applied: any apply that runs with `*add-to-indexes-unless-present-p*` true (crash-recovery replay, device state-sync re-pull) marks the graph's count indexes stale instead of counting, and a stale index is rebuilt by scan — at open after a crash-recovery replay, and lazily on the first count query otherwise. | A set index absorbs a replayed insert; a counter doubles it. Both re-apply paths announce themselves through that one special, and a scan is authoritative and idempotent. |
 | R9 | The counters are serialised by the transaction manager's lock (commit apply runs inside it) and by the device's single writer thread (the replication paths); the maintenance takes no lock of its own. | On SBCL the backend's read/write locks are no-ops; nesting one deadlocks on ECL; the two funnels already serialise every index write. |
 
@@ -176,10 +176,8 @@ outside the two serialising funnels (R9) gets no promise.
 
 ### 3.1 Declarations
 
-`def-claim-classes` emits, before its declarations,
-`(graph-db:unregister-index-spec ',parent ',graph-name :name 'claim-relation)`
-(R6; silent when nothing matched), and declares, with
-`:current-p 'claim-current-p`:
+`def-claim-classes` keeps its five secondary indexes (R6) and declares,
+with `:current-p 'claim-current-p`:
 
 | slots | owner | `:name` |
 |---|---|---|
@@ -187,9 +185,8 @@ outside the two serialising funnels (R9) gets no promise.
 | `(object-namespace object-key)` | binary | `claim-object-count` |
 | `(relation)` | parent | `claim-relation-count` |
 
-An existing family drops the `claim-relation` record at open (the
-reconciliation of #147) and builds the three count indexes over its
-claims.
+An existing family builds the three count indexes over its claims at
+next open (`install-count-indexes`).
 
 ### 3.2 The three functions
 
@@ -205,11 +202,10 @@ Signatures and semantics as #350 §4 (R5). Mechanism:
 - `claim-relations`: depth 1 over the relation count index.
 
 Names are the stored components with `+null-component+` read back as
-NIL. No node is resolved on the committed path. Of #350's helpers,
-`%refuse-vocabulary-axis`, `%vocabulary-sources`, `%vocabulary-view`,
-`%view-resolve`, `%claim-tuple`, `%name-lessp` and `%merge-names` stay;
-`%vocabulary-key`, `%name-admitted-p`, `%name-count` and `%walk-names`
-go; `%created-under` becomes a per-name delta.
+NIL. No node is resolved on the committed path. Every #350 helper stays:
+the walk path (`%walk-names` and its helpers) is the as-of mechanism
+(R7); the count path adds `%names-at` (a depth read of one count index)
+and `%vocabulary-delta` (§3.3) and dispatches on `%as-of-snapshot`.
 
 ### 3.3 Inside a transaction
 
@@ -224,20 +220,19 @@ transaction's creates are added in index order; a name whose adjusted
 
 ### 3.4 Under an as-of extent
 
-The map is live (R1). When an as-of snapshot of the graph is open
-(`graph-db::%as-of-snapshot`, unexported), each name is confirmed by
-resolving one node under it at the epoch — the subject or object
-secondary index range of #350, first live hit — and dropped when none
-resolves; O(names). Counts are the live counters and the manual says
-so. `:as-of` and `:as-of-epoch` as keyword arguments stay refused with
-`query-precondition-error`.
+The map is live (R1) and cannot answer at an epoch. When an as-of
+snapshot of the graph is open (`graph-db::%as-of-snapshot`, unexported)
+the three functions run #350's mechanism unchanged (R7): the
+distinct-prefix walk over the secondary indexes, each name confirmed by
+resolution at the epoch, `:current` counts by resolving the range. The
+manual says an as-of listing walks. `:as-of` and `:as-of-epoch` as
+keyword arguments stay refused with `query-precondition-error`.
 
 ### 3.5 What stays
 
-`map-index-prefixes` and `index-count` (#350) stay in the engine as
-general primitives; the vocabulary no longer calls them. #350's
-`claim-subject`, `claim-object`, `claim-producer` and
-`claim-subject-relation` secondary indexes are untouched.
+`map-index-prefixes` and `index-count` (#350) stay in the engine and
+remain the as-of path's primitives. All five #350 secondary indexes are
+untouched (R6).
 
 ## 4. Testing
 
@@ -276,13 +271,14 @@ coexist on one owner and slots), each test naming its mechanism:
   the counter round trip.
 
 Spacetime (`tests/spacetime/vocabulary-tests.lisp`): every #350 test
-passes unchanged (R5); new tests pin that a `:current` listing under a
-plain read snapshot resolves no node; that `current` moves on
-retraction and on a same-transaction create-then-delete; that a family
-opened over pre-existing claims lists relations from the count index
-built at open, with the withdrawn `claim-relation` record gone even
-when the old declaration was registered in the image first (R6's
-unregister); the as-of test keeps R7's confirmation honest by ablation.
+passes unchanged (R5), the as-of test included, since the as-of path is
+#350's code; new tests pin that a `:current` listing under a plain read
+snapshot resolves no node (red under an ablation that routes it to the
+walk); that `current` moves on retraction and on a same-transaction
+create-then-delete; that a family opened over pre-existing claims lists
+its vocabulary from the count indexes built at open; and that inside an
+as-of extent the walk path runs (a probe sees resolutions) while
+outside it none run.
 
 Replication (`tests/peer-index-tests.lisp`, suite `peer-index-suite`):
 an authored create, a retraction as a `tx-update` with an old node, a
@@ -299,8 +295,7 @@ CI's full SBCL suite is the gate.
 - `docs/vivace-graph-v3-doc.org`, "Vocabulary: what a family names":
   rewritten for lookups; the fifth-index sentence goes.
 - `CHANGELOG.md`: an Unreleased entry naming `def-count-index`, the
-  three family declarations, the withdrawn `claim-relation` index, and
-  the cost change.
+  three family declarations and the cost change.
 - The #350 spec gains a Status note: mechanism superseded by this spec
   for the three functions.
 
