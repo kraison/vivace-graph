@@ -5976,11 +5976,12 @@ backfill sweep links eight thousand edges in about three seconds,
 and — the surprise — a two-hop read through the edges is *slower*
 than the same read through ~claims-touching~ and ~resolve-endpoint~,
 by about 2.5× in Lisp and far more under the guarded Prolog runner.
-The cost is not the walk but the engine's per-edge endpoint
-validation (~active-edge-p~ looks up both endpoints of every edge it
-emits), which is a follow-up in the engine, not in this layer. Until
-it lands, treat the edges as what ~traverse~ and the Prolog goals
-need — topology — and keep ~claims-touching~ as the fast read.
+The suspected cost is not the walk but the engine's per-edge
+endpoint validation — ~active-edge-p~ looks up both endpoints of
+every edge it emits — tracked as an engine follow-up in GH #373 with
+the bench as its harness. Until it lands, treat the edges as what
+~traverse~ and the Prolog goals need — topology — and keep
+~claims-touching~ as the fast read.
 
 Write-time linking, unlike the sweep, is always on: a store crosses
 the schema version floor at its first linkable write, not only when
