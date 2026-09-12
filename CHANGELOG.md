@@ -13,6 +13,18 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Added
 
+- **Edges under claims** (#367, U1 #369): a claim gains a derived
+  `subject-of` / `object-of` edge to each endpoint that resolves in its
+  own store, linked in the constructor (same-store sources through the
+  index plus the transaction's own creates; anywhere else through the
+  caller-resolved `:subject-node` / `:object-node`, verified). New reads
+  `claim-endpoints`, `node-claims`, and the Prolog goals `related/3`
+  (current) and `claimed/4` (history); conditions `endpoint-link-skipped`
+  (warning) and `endpoint-mismatch`. The key slots remain the identity
+  and `claims-touching` the complete read; no store format change.
+  Cross-store traversal continuation is deferred (#368).
+  `docs/superpowers/specs/2026-09-12-edges-under-claims-design.md`.
+
 - **Counting index** (#361): `def-count-index` declares a per-prefix
   counter pair `(all . current)` maintained at commit apply, replication
   and purge, persisted through its own sidecar and rebuilt after a

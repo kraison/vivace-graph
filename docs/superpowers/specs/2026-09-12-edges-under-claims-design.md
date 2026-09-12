@@ -461,6 +461,29 @@ claim-query.lisp` (`node-claims`, `claim-endpoints`), a new
 `docs/vivace-graph-v3-doc.org` (the spacetime chapter gains "Edges
 under claims"), and this spec's Built notes as each unit lands.
 
+## Built — U1 (#369, 8c7674e)
+
+§3, §4.1–4.3, §6.1–6.3, §7 and §11's in-store bullets, on
+`feat/edges-under-claims`. Two deviations from §13's file list, both
+recorded here: the write-time linker lives in `spacetime/link.lisp`
+(U2's sweep joins it) because it needs `namespace-sources`, which loads
+after `claim.lisp`; and `node-claims` takes `:graph`, the store holding
+the claims, defaulting to the node's own — §6.1's "each claim family's
+graph" is not derivable, since a family is registered by class and a
+class is instantiable in any store (#167). Unary claims are not
+solutions of `related/3` / `claimed/4` (no object); `subject-of/2`
+reaches them. `claims-touching`'s filter tail is now `%narrow-claims`,
+shared with `node-claims`. The write-time linker's derived-link branch
+runs under one handler that `log:warn`s a failed link (GH #369) and
+never signals — the caller-verified path stays outside it, so
+`endpoint-mismatch` still fails the write. `link.lisp` reads
+`*namespace-sources*` directly, so an unregistered namespace (the
+common case for existing families) costs no condition per write. An
+unbound identity slot counts as "no key". `traverse` re-reaches the
+start vertex along a back-edge under global uniqueness, pinned in
+`tests/spacetime/endpoint-edge-tests.lisp`, as
+`tests/traverse-tests.lisp` already documents.
+
 ## 14. Traceability
 
 Programme §6.1 (two implementations) → §1, R1. Programme §6.2 (resolve
