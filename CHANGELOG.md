@@ -437,6 +437,16 @@ between releases; cutting a release renames it to the new version and dates it.
   linear hash places buckets with it; replacing that is #375 (a
   storage-format change, next major).
 
+- **The query runner interprets instead of compiling** (#373):
+  `run-query-goals` — behind `run-guarded-prolog`, the JSON pattern DSL
+  and `graph-db/rules` — evaluates the `select` form under SBCL's
+  interpreter. A native compile per request cost 18–20 ms and was ~94%
+  of a small query; interpreted solving is ~2× slower than compiled,
+  so the interpreter wins below ~20 ms of solving, i.e. nearly every
+  bounded query. Two-hop `related/3`: ~55 → ~700–1100 queries/s; a
+  500-row scan ~30 → ~50/s. SBCL only; other implementations are
+  unchanged.
+
 ## [4.0.1] - 2026-09-02
 
 ### Fixed

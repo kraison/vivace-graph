@@ -335,7 +335,13 @@ prolog's :DATA format still converts them; :RAW does not)."
                 ;; the select form is EVAL'd (null lexenv), so pass the
                 ;; callback through a special the form references
                 ;; rather than a lexical.
-                (let ((*pattern-query-callback* cb))
+                ;; Interpret the SELECT lambda, do not compile it: a
+                ;; native compile per request was ~94% of a small
+                ;; query's time, and interpreted solving still beats
+                ;; compile + compiled solving up to ~20 ms of work,
+                ;; the budget's neighbourhood (GH #373).
+                (let ((*pattern-query-callback* cb)
+                      #+sbcl (sb-ext:*evaluator-mode* :interpret))
                   (eval `(select (:effects nil :snapshot t
                                   :limit ,cap
                                   :skip ,(when (integerp skip) skip)
