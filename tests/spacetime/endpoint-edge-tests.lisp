@@ -241,13 +241,45 @@ nothing commits."
 (test retraction-keeps-the-edges-and-current-filters
   "Spec R3 / sec.4.3: RETRACT-CLAIM touches no edge; :CURRENT hides it."
   (with-ee-graph (g)
-    (let (s c)
+    (let (s c then)
       (with-transaction () (setq s (ee-thing "t-1")) (ee-thing "t-2"))
       (with-transaction () (setq c (ee-b)))
+      (setq then (local-time:now))
+      (sleep 0.01)
       (retract-claim c)
       (is (= 1 (length (node-claims s))))
+      (is (= 1 (length (node-claims s :as-of then :current t))))
       (is (null (node-claims s :current t)))
       (is-true (same-node-p s (claim-endpoints c))))))
+
+(test claim-write-survives-a-throwing-edge-constructor
+  "Spec sec.4.1/4.2: a link failure -- here, lazy SUBJECT-OF adoption
+into a store bound to no system directory, the GH #161 shape -- never
+fails the claim write."
+  (with-ee-graph (g)
+    (let (n c)
+      (with-transaction () (setq n (ee-thing "t-1")))
+      ;; Adopt EE-CLAIM-BINARY into G without linking any edge, so the
+      ;; write below reaches only lazy SUBJECT-OF adoption.
+      (with-transaction () (ee-b :subject "nope" :object "nope-too"))
+      (let ((graph-db::*system-directory* nil))
+        (with-transaction ()
+          (setq c (ee-b :subject-node n))))
+      (is (= 1 (length (claims-touching g 'ee-claim :ee-things "t-1"
+                                        :role :subject))))
+      (is (null (ee-linked-to c 'subject-of g))))))
+
+(test same-node-as-subject-and-object
+  "Spec sec.4.1: a reflexive claim's SUBJECT and OBJECT both resolve to
+one node; NODE-CLAIMS still returns the claim once (GH #369)."
+  (with-ee-graph (g)
+    (let (s c)
+      (with-transaction () (setq s (ee-thing "t-1")))
+      (with-transaction () (setq c (ee-b :subject "t-1" :object "t-1")))
+      (is (= 1 (length (node-claims s))))
+      (multiple-value-bind (cs co) (claim-endpoints c)
+        (is-true (same-node-p s cs))
+        (is-true (same-node-p s co))))))
 
 (test regeneration-drops-the-old-edges-and-links-the-new
   "Spec sec.4.3: delete, then insert; ACTIVE-EDGE-P hides the deleted
