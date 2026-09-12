@@ -8,8 +8,11 @@ resolution (#132). **Engine baseline:** `experiment` at b787516.
 engine team's review (kraison/blackboard
 `docs/superpowers/notes/2026-09-12-stores-vs-namespaces.md`): the
 consumer that motivated cross-store continuation runs one store with
-many namespaces, so R6 is reversed and U3 is deferred. Written as the
-handoff for planning and implementation; §13 is the build order.
+many namespaces, so R6 is reversed and U3 is deferred. **Corrected the
+same day** on the engine review's three mechanical findings (#367
+comment of 2026-09-12): §4.1 index visibility and class filter, §5 no
+prune, §6.1–6.2 where adjacency is indexed, §11 to match. Written as
+the handoff for planning and implementation; §13 is the build order.
 
 ---
 
@@ -121,9 +124,13 @@ For each endpoint — the subject, and for a binary claim the object:
 1. `(namespace-sources namespace)` — the source classes registered for
    the endpoint's namespace (`spacetime/resolve.lisp`, #132). None:
    stop; the claim is key-only.
-2. For each class whose `source-facets-graph` **is the transaction's
-   graph**: one `graph-db:index-lookup` on the class's identity key
-   slot for the key. A class in another store is skipped here (R5).
+2. For each class whose identity-key index **exists in the
+   transaction's graph** (`%require-index` answers; a class's default
+   store is only a default after #167, so `source-facets-graph` is not
+   the test): one `graph-db:index-lookup` on that slot for the key,
+   **plus** the transaction's own uncommitted creates of that class
+   (next paragraph). A class with no index in this store is skipped
+   here (R5).
 3. Exactly one distinct node across those classes: create the edge
    with `:from` the claim, `:to` the node, `:graph` the transaction's
    graph. Zero: no edge. More than one: no edge, and signal the
@@ -132,10 +139,17 @@ For each endpoint — the subject, and for a binary claim the object:
 **Linking never fails a claim write.** Every refusal above leaves the
 claim exactly as the first implementation would have written it.
 
-The lookup inside the transaction sees the transaction's own
-uncommitted writes through the local cache (`transactions.lisp:347`
-path), so a source and a claim about it created in one transaction
-link.
+**Same-transaction visibility.** `index-lookup` reads the persistent
+secondary index, which is maintained in the commit *apply* phase
+(`index.lisp:585-600`, "Maintenance (APPLY, post-durability)"), so it
+cannot see a source created in the transaction that is still open. The
+wrapper therefore also scans the transaction's own creates through the
+commit view — `make-commit-view` / `view-writes`
+(`value-constraint.lisp:151-179`), the overlay `claims-touching` uses
+for the same problem (GH #324) — keeping any node of a candidate class
+whose identity key is `string=` the endpoint's key. Index hits and
+overlay hits are unioned by id before step 3's count. That is what
+makes a source and a claim about it created in one transaction link.
 
 ### 4.2 Caller-resolved endpoints
 
@@ -172,7 +186,7 @@ claim node — the engine reaps a deleted node's edges through
 
 ```lisp
 (link-claim-endpoints graph &key family since limit)
-  => (values linked pruned unresolved ambiguous skipped-namespaces)
+  => (values linked unresolved ambiguous skipped-namespaces)
 ```
 
 Idempotent. `family` names one claim parent class (default: every
@@ -186,15 +200,25 @@ write transaction and a write transaction must not cross stores:
 
 1. **Read**, under `with-read-snapshot` on `graph`: collect the batch's
    claims, and for each endpoint that has no edge, `resolve-endpoint`.
-   Collect also each existing edge whose endpoint no longer resolves.
    `resolve-endpoint`'s conditions are handled here: `unknown-
    namespace` and `unopened-source-graph` skip that namespace for the
    whole call and count it; `ambiguous-endpoint` counts the claim as
    ambiguous and moves on.
 2. **Write**, one short transaction on `graph`: create the missing
-   edges; **prune** an edge only when `resolve-node-graph` on its
-   endpoint answers `:missing` — never `:detached` or `:unknown`, which
-   the namespaces design reserves for "not here now", not "gone".
+   edges.
+
+**The sweep does not prune.** A deleted source's edges are already
+invisible to every edge-based read: `active-edge-p` (`edge.lisp:373`)
+classifies the endpoint through `%active-endpoint-status` and treats
+`:found`-but-deleted and `:missing` as inactive while keeping
+`:detached`, `:unknown` and `:absent-in-store` live — the exact rule an
+earlier draft of this section restated, and one `resolve-node-graph`
+cannot express (it answers `:resolved` / `:detached` / `:unknown`,
+never `:missing`). Reclaiming the space is `compact-edges`
+(`edge.lisp:628`, `:policy :conservative` by default), which collects
+soft-deleted and `:missing` endpoints and never `:detached`. An
+operator who wants the edges gone after a regeneration runs it; the
+sweep has one job, linking, and stays idempotent for that reason.
 
 **Backfill** of an existing store is `(link-claim-endpoints graph)`.
 Nothing runs implicitly: the engine never sweeps on open.
@@ -214,17 +238,29 @@ says so.
   endpoint that is not linked; a cross-store endpoint through
   `lookup-vertex-anywhere`, so it may be an `unresolved-node` marker.
 - `(node-claims node &key family (role :either) current relation at
-  during as-of) => list of claims` — from the node's incoming edges; the
-  adjacency twin of `claims-touching`, with the same filters and the
-  same meaning for each (`spacetime/claim-query.lisp:281`). `family`
-  filters on the claim's parent class; default all.
+  during as-of) => list of claims` — from the node's incoming
+  `subject-of` / `object-of` edges; the adjacency twin of
+  `claims-touching`, with the same filters and the same meaning for
+  each (`spacetime/claim-query.lisp:281`). `family` filters on the
+  claim's parent class; default all. **Which store's adjacency:**
+  an edge's in- and out-index entries live in the *edge's* store
+  (`edge.lisp:171-173`), i.e. the claim's, never the endpoint's. So
+  `node-claims` runs `map-edges :direction :in` on each claim family's
+  graph (`family`, or every registered family) keyed by the node's id,
+  not on `(node-graph node)`. In a one-store deployment the two are
+  the same graph; the distinction is what the deferred §8 builds on.
 
 ### 6.2 `traverse`
 
 Within a store, `traverse` already walks these edges: a source's
 claims are its `:in` edges of type `subject-of` / `object-of`, and a
 claim's endpoints are its `:out` edges. Nothing to add for the in-store
-case. Across stores: §8.
+case. Two facts a caller must know: the source and the claims must be
+in one store, for the reason §6.1 gives; and `traverse` collects
+nothing without `:edge-type` — the result filter is `(typep edge
+edge-type)` (`traverse.lisp:83`), so `(traverse source :edge-type
+'(or subject-of object-of) ...)` is the form, as every existing
+`traverse` test already passes one. Across stores: §8.
 
 ### 6.3 Prolog
 
@@ -372,9 +408,16 @@ temporary stores under one system directory:
 - Regeneration: the old claim's edges are gone after its delete; the
   new claim is linked.
 - The sweep: idempotent (second run links nothing), links a claim
-  written before its source, honours `:since`, prunes only on
-  `:missing` (a deleted source) and not on a detached store, counts
-  every category, never signals.
+  written before its source, honours `:since`, counts every category,
+  never signals, and does not prune: after a source is deleted its
+  claim's edge is absent from `node-claims` and `related/3` through
+  `active-edge-p`, still present to `map-edges :include-deleted-p`,
+  and collected by `compact-edges`; a detached source's edge survives
+  all three.
+- Same-transaction visibility (§4.1): a source created and a claim
+  about it written in one transaction link — the overlay, not the
+  index, finds the source — and the same pair in two transactions
+  links through the index.
 - Traversal: within a store from source to source through a claim;
   a caller-resolved cross-store endpoint (§4.2) is linked, and a walk
   reaching it lands the far vertex (or the detached marker) in the
