@@ -95,4 +95,18 @@
    #:unopened-source-graph #:unopened-source-graph-class
    #:unopened-source-graph-graph-name
    ;; registration (GH #138)
-   #:register-geometry #:register-node))
+   #:register-geometry #:register-node
+   ;; edges under claims (GH #369)
+   #:subject-of #:object-of
+   #:make-subject-of #:make-object-of
+   #:subject-of-p #:object-of-p
+   #:lookup-subject-of #:lookup-object-of
+   #:subject-of/2 #:subject-of/3 #:object-of/2 #:object-of/3
+   #:claim-endpoints #:node-claims
+   #:endpoint-link-skipped #:endpoint-link-skipped-claim
+   #:endpoint-link-skipped-namespace #:endpoint-link-skipped-key
+   #:endpoint-link-skipped-classes
+   #:endpoint-mismatch #:endpoint-mismatch-node
+   #:endpoint-mismatch-namespace #:endpoint-mismatch-key
+   #:endpoint-mismatch-reason
+   #:related/3 #:claimed/4))

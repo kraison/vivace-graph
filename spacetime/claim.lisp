@@ -318,6 +318,14 @@ claim (design §3.1, GH #131 finding 1)."
   "Slots only BINARY-CLAIM carries.  Their absence from UNARY-CLAIM is what
 makes a unary claim unable to carry an object (design §3.1).")
 
+;;; The two shipped edge classes (GH #369, spec sec.3).  Direction is
+;;; claim -> endpoint.  No default store: MAKE-SUBJECT-OF / MAKE-
+;;; OBJECT-OF refuse without :GRAPH, and the wrapper always passes the
+;;; claim's own graph.  No slots, no identity, no index: the edge is a
+;;; cache of one resolution; the (namespace, key) slots stay the truth.
+(graph-db:def-edge subject-of () () nil)
+(graph-db:def-edge object-of () () nil)
+
 (defmacro def-claim-classes (parent graph-name
                              &key extra-slots temporal
                                   (keep-revisions (1- (expt 2 32))))
