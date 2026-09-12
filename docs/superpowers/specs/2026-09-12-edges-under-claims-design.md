@@ -519,7 +519,12 @@ edges in ~3.2 s; two-hop read via the Lisp edge path ~0.4× and via
 `related/3` under the guarded runner ~0.03× of `claims-touching` +
 `resolve-endpoint` — §9's read acceptance is NOT met at
 N=2000/M=4000/K=200. Hypothesis (engine follow-up): `active-edge-p`
-validates both endpoints of every emitted edge. Full record on #372.
+validates both endpoints of every emitted edge. Ridden, not fixed: the
+bench made `graph-db/test` load `graph-db/spacetime` and
+`cl-temporal-extent` transitively, through `graph-db/perf-test` (whose
+`check` tests `graph-db/test` already loads), so the main CI lane now
+resolves those deps -- documented in `docs/ci.md`, no system split.
+Full record on #372.
 
 ## 14. Traceability
 
