@@ -62,8 +62,9 @@ refusal), as an unbounded generator is refused elsewhere."
                           (try c)))
                       *claim-families*))
             (t (error 'graph-db:query-precondition-error
-                      :reason "related/claimed: bind the subject, the ~
-object or the relation; a scan over every claim is refused"))))))
+                      :reason
+                      (format nil "related/claimed: bind the subject, ~
+the object, or the relation (a string)")))))))
 
 (graph-db:def-global-prolog-functor related/3 (subject relation object cont)
   "(related ?subject ?relation ?object): SUBJECT and OBJECT are the
