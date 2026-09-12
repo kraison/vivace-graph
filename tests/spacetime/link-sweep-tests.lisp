@@ -172,6 +172,30 @@ not."
       (is-true (ee-linked-to c 'subject-of g))
       (is-true (ee-linked-to c 'object-of g)))))
 
+(test sweeps-on-one-graph-are-serialized
+  "GH #372: LINK-CLAIM-ENDPOINTS takes the graph's sweep lock for its
+whole body, so a second sweep waits rather than racing the first into a
+duplicate edge (the write phase's re-check cannot see a phantom)."
+  (with-ee-graph (g)
+    (ee-unlinked-b)
+    (with-transaction () (ee-thing "t-1") (ee-thing "t-2"))
+    (let ((sysdir graph-db::*system-directory*)
+          (result :never-ran)
+          (thread nil))
+      (bt:with-lock-held ((graph-db.spacetime::%sweep-lock g))
+        (setq thread
+              (bt:make-thread
+               (lambda ()
+                 (let ((graph-db:*graph* g)
+                       (graph-db::*system-directory* sysdir))
+                   (setq result (ee-sweep g))))
+               :name "ee sweep"))
+        (sleep 0.2)
+        (is-true (bt:thread-alive-p thread))
+        (is (eq :never-ran result)))
+      (bt:join-thread thread)
+      (is (equal '(2 0 0 nil nil) result)))))
+
 (test sweep-does-not-prune-a-dead-endpoints-edge
   "Spec sec.5: ACTIVE-EDGE-P hides the edge, COMPACT-EDGES reclaims it,
 the sweep leaves it alone and does not re-link a deleted source."

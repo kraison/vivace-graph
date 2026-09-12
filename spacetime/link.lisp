@@ -238,8 +238,10 @@ per ENDPOINT; the resolutions behind them are memoised per
 (defun %sweep-write (graph plan)
   "Create PLAN's edges in one transaction on GRAPH; the number committed.
 Each claim is re-checked as still present, not deleted and still
-unlinked for that edge type, which is what makes a repeated sweep
-idempotent.  A construction failure is logged, never signalled."
+unlinked for that edge type, which is what makes SEQUENTIAL sweeps
+idempotent; concurrent ones cannot happen, because LINK-CLAIM-ENDPOINTS
+holds the graph's sweep lock.  A construction failure is logged, never
+signalled."
   (if (null plan)
       0
       (handler-case
@@ -260,6 +262,21 @@ idempotent.  A construction failure is logged, never signalled."
           (log:warn "GH #372: sweep on ~A wrote nothing: ~A"
                     (graph-db:graph-name graph) c)
           0))))
+
+(defvar *sweep-locks* (make-hash-table :test 'eq)
+  "GRAPH -> lock: one LINK-CLAIM-ENDPOINTS per graph at a time (GH #372).")
+(defvar *sweep-locks-lock* (bt:make-lock "claim sweep locks"))
+
+(defun %sweep-lock (graph)
+  "GRAPH's sweep lock, made on first use.  Serializing the sweep is what
+keeps two of them from both passing the write phase's re-check and
+creating the same edge twice: the re-check reads nothing when it finds
+nothing, so OCC cannot validate it (GH #372)."
+  (bt:with-lock-held (*sweep-locks-lock*)
+    (or (gethash graph *sweep-locks*)
+        (setf (gethash graph *sweep-locks*)
+              (bt:make-lock (format nil "claim sweep ~A"
+                                    (graph-db:graph-name graph)))))))
 
 (defun link-claim-endpoints (graph &key family since limit)
   "Link every claim in GRAPH whose endpoint now resolves: the idempotent
@@ -290,16 +307,22 @@ A source deleted and re-created under the same key gains a FRESH edge at
 the next sweep; the superseded one stays hidden until COMPACT-EDGES, so
 run that after a source regeneration.
 
+Sweeps on one graph are serialized by a lock; the write phase's
+re-check makes SEQUENTIAL sweeps idempotent.  A write-time link cannot
+race the sweep on the same claim because write-time linking runs only
+when the claim is created and the sweep visits committed claims.
+
 Trap: must not be called inside a read-write transaction
 (RESOLUTION-IN-TRANSACTION); run it between transactions."
-  (let ((parents (%family-parents-in graph family)))
-    (if (null parents)
-        (values 0 0 0 '() nil)
-        (multiple-value-bind (work more)
-            (graph-db:with-read-snapshot (graph)
-              (%sweep-collect graph parents since limit))
-          (multiple-value-bind (plan unresolved ambiguous skipped)
+  (bt:with-lock-held ((%sweep-lock graph))
+    (let ((parents (%family-parents-in graph family)))
+      (if (null parents)
+          (values 0 0 0 '() nil)
+          (multiple-value-bind (work more)
               (graph-db:with-read-snapshot (graph)
-                (%sweep-resolve work))
-            (values (%sweep-write graph plan)
-                    unresolved ambiguous skipped more))))))
+                (%sweep-collect graph parents since limit))
+            (multiple-value-bind (plan unresolved ambiguous skipped)
+                (graph-db:with-read-snapshot (graph)
+                  (%sweep-resolve work))
+              (values (%sweep-write graph plan)
+                      unresolved ambiguous skipped more)))))))

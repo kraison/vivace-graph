@@ -503,7 +503,12 @@ unresolvable claims are re-collected every call. The documented
 backfill loop is `(loop while (and more-p (plusp linked)))`; `:since`
 is the cursor for a regeneration's writes. The write phase re-checks
 each claim is still present, not deleted and still unlinked, which is
-what makes a repeated sweep idempotent.
+what makes SEQUENTIAL sweeps idempotent; two sweeps on one graph cannot
+race, because `link-claim-endpoints` holds a per-graph lock for its
+whole body (the re-check records no read when it finds no edge, so OCC
+cannot validate it -- a phantom). A write-time link cannot race the
+sweep on the same claim: write-time linking runs only as the claim is
+created, and the sweep visits committed claims.
 Added beyond §5: `*link-claims-at-write*` (default T), the switch §9's
 measurement needs and a bulk loader wants. §9 was measured on a
 synthetic store of the memory tenant's shape (`bench-claim-linking`,

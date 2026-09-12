@@ -5959,7 +5959,9 @@ It reads under a snapshot, resolves each missing endpoint with
 ~resolve-endpoint~ — so it may link across stores, which write-time
 linking never does — and creates the edges in one short transaction,
 re-checking each claim is still present, not deleted and still
-unlinked, so a repeated sweep is idempotent. ~:since~ is a commit epoch
+unlinked, so a repeated sweep is idempotent. Sweeps on one graph are
+serialized by a per-graph lock, so a second call waits rather than
+racing the first into a duplicate edge. ~:since~ is a commit epoch
 (~claim-commit-epoch~), which lets an operator sweep exactly what a
 regeneration wrote; ~:limit~ bounds both the work and the scan —
 collection stops at the first claim with a missing edge past the
