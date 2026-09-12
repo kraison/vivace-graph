@@ -89,3 +89,101 @@
                         c :graph g :edge-type 'subject-of))))
       (is-true (graph-db:lookup-node-type-by-name 'subject-of :edge
                                                   :graph g)))))
+
+(defun ee-linked-to (claim edge-type g)
+  "The id the CLAIM's EDGE-TYPE edge points at, or NIL."
+  (let ((e (first (graph-db:outgoing-edges claim :graph g
+                                                 :edge-type edge-type))))
+    (and e (graph-db:to e))))
+
+(test auto-link-in-two-transactions
+  "Spec sec.4.1: sources committed first, the claim later; both link."
+  (with-ee-graph (g)
+    (let (s o c)
+      (with-transaction () (setq s (ee-thing "t-1") o (ee-thing "t-2")))
+      (with-transaction () (setq c (ee-b)))
+      (is (equalp (id s) (ee-linked-to c 'subject-of g)))
+      (is (equalp (id o) (ee-linked-to c 'object-of g))))))
+
+(test auto-link-in-one-transaction
+  "Spec sec.4.1 'Same-transaction visibility': the index cannot see the
+sources yet; the commit-view overlay must."
+  (with-ee-graph (g)
+    (let (s o c)
+      (with-transaction ()
+        (setq s (ee-thing "t-1") o (ee-thing "t-2"))
+        (setq c (ee-b)))
+      (is (equalp (id s) (ee-linked-to c 'subject-of g)))
+      (is (equalp (id o) (ee-linked-to c 'object-of g))))))
+
+(test key-only-when-nothing-resolves
+  "An unknown namespace, and a known one with no such key, both leave
+the claim key-only and legal; CLAIMS-TOUCHING still finds it."
+  (with-ee-graph (g)
+    (let (s c1 c2)
+      (with-transaction () (setq s (ee-thing "t-1")))
+      (with-transaction ()
+        (setq c1 (ee-b :object-namespace :ee-nowhere :object "x"))
+        (setq c2 (ee-b :object "t-missing")))
+      (is (equalp (id s) (ee-linked-to c1 'subject-of g)))
+      (is (null (ee-linked-to c1 'object-of g)))
+      (is (null (ee-linked-to c2 'object-of g)))
+      (is (= 2 (length (claims-touching g 'ee-claim :ee-things "t-1"
+                                        :role :subject)))))))
+
+(test ambiguity-warns-once-and-writes-unlinked
+  "Spec sec.4.1 step 3 / sec.7: two candidates -> no edge, one
+ENDPOINT-LINK-SKIPPED, the write commits."
+  (with-ee-graph (g)
+    (let ((warned 0) c)
+      (with-transaction ()
+        (ee-thing "dup")
+        (make-ee-twin :twin-id "dup"))
+      (handler-bind ((endpoint-link-skipped
+                       (lambda (w)
+                         (incf warned)
+                         (is (equal "dup" (endpoint-link-skipped-key w)))
+                         (is (= 2 (length
+                                   (endpoint-link-skipped-classes w))))
+                         (muffle-warning w))))
+        (with-transaction () (setq c (ee-b :subject "dup"))))
+      (is (= 1 warned))
+      (is (null (ee-linked-to c 'subject-of g)))
+      (is (= 1 (length (claims-touching g 'ee-claim :ee-things "dup")))))))
+
+(test caller-resolved-cross-store-endpoint-is-linked
+  "Spec sec.4.2: the object lives in another store; the caller resolved
+it before the transaction and hands it over; the edge carries a
+foreign id."
+  (with-ee-graph (g)
+    (with-source-graph (sg)
+      (declare (ignorable sg))
+      (let (n c)
+        (with-transaction ((graph-db::transaction-manager sg))
+          (setq n (make-st-report :headline "one" :report-id "r-1")))
+        (setq n (resolve-endpoint :st-reports "r-1"))
+        (is-true n)
+        (let ((graph-db:*graph* g))
+          (with-transaction ()
+            (ee-thing "t-1")
+            (setq c (ee-b :object-namespace :st-reports :object "r-1"
+                          :object-node n))))
+        (is (equalp (id n) (ee-linked-to c 'object-of g)))))))
+
+(test caller-resolved-mismatch-refuses-the-write
+  "Spec sec.4.2 step 1 / sec.7: a node that is not a source of the
+namespace, or whose key is not the claim's, is ENDPOINT-MISMATCH and
+nothing commits."
+  (with-ee-graph (g)
+    (let (s)
+      (with-transaction () (setq s (ee-thing "t-1")))
+      ;; wrong class for the namespace
+      (signals endpoint-mismatch
+        (with-transaction ()
+          (ee-b :object-namespace :st-reports :object "r-1"
+                :object-node s)))
+      ;; right class, wrong key
+      (signals endpoint-mismatch
+        (with-transaction ()
+          (ee-b :object "t-2" :object-node s)))
+      (is (null (claims-touching g 'ee-claim :ee-things "t-1"))))))

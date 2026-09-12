@@ -572,6 +572,9 @@ cl-temporal-extent."
                (:file "claim-query")
                (:file "source")
                (:file "resolve")
+               ;; Edges under claims: write-time linking (GH #369).
+               ;; After RESOLVE for NAMESPACE-SOURCES / SOURCE-CONTRACT.
+               (:file "link")
                (:file "register")
                ;; Membership disjointness (GH #157 4b): needs
                ;; claim-query's RETRACT-CLAIM/CLAIM-CURRENT-P and core's

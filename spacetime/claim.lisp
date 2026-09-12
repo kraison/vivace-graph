@@ -365,7 +365,13 @@ fast-fail with the better error site.
 joins both identity tuples (EXTENT-SEXP-START-KEY), an extent is required
 at construction and at commit, and live claims sharing a base tuple must
 have pairwise disjoint validity (spacetime/temporal.lisp).  Same
-declaration names, so flipping the flag re-declares rather than stacks."
+declaration names, so flipping the flag re-declares rather than stacks.
+
+Every MAKE-<NAME> also accepts :SUBJECT-NODE and :OBJECT-NODE, endpoint
+nodes the caller resolved BEFORE its transaction (RESOLVE-ENDPOINT);
+each is verified and linked, and a same-store endpoint not given is
+linked automatically (GH #369, spec sec.4).  Linking never fails the
+write; ENDPOINT-MISMATCH on a wrong node does."
   (let* ((home (symbol-package parent))
          (unary (intern (format nil "~A-UNARY" parent) home))
          (binary (intern (format nil "~A-BINARY" parent) home))
@@ -483,7 +489,12 @@ declaration names, so flipping the flag re-declares rather than stacks."
                  (setf (fdefinition ',ctor)
                        (lambda (&rest args)
                          (%check-claim-identity args ',identity-keys)
-                         (let ((args (%claim-encode-extent-arg args)))
+                         ;; Endpoint nodes the caller resolved (spec
+                         ;; sec.4.2); stripped before the raw ctor.
+                         (let* ((subject-node (getf args :subject-node))
+                                (object-node (getf args :object-node))
+                                (args (%strip-endpoint-node-args
+                                       (%claim-encode-extent-arg args))))
                            ,@(when temporal
                                `((unless (getf args :extent-sexp)
                                    (error 'missing-claim-identity-component
@@ -493,7 +504,11 @@ declaration names, so flipping the flag re-declares rather than stacks."
                                            (%claim-encode-transaction-arg
                                             args)))))
                              (check-standing (claim-standing c))
-                             c)))))))
+                             ;; Derived edges, in the same transaction
+                             ;; (GH #369, spec sec.4.1).
+                             (%link-claim-at-write
+                              c :subject-node subject-node
+                                :object-node object-node))))))))
           (list unary binary)
           (list +claim-identity-slots+
                 (append +claim-identity-slots+
