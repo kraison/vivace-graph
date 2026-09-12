@@ -435,3 +435,24 @@ claim's graph, so the foreign endpoint yields no row in #367."
         (is (null (ee-q g "(is-a ?s ee-thing) (related ?s ?r ?o)")))
         ;; The same-store half still solves.
         (is (= 1 (length (ee-q g "(is-a ?s ee-thing) (subject-of ?c ?s)"))))))))
+
+(test claim-endpoint-reads-one-side
+  "GH #373: CLAIM-ENDPOINT is the one-probe read behind CLAIM-ENDPOINTS --
+the same node for each role, NIL when that side is unlinked, and a role
+outside :SUBJECT / :OBJECT is a type error."
+  (with-ee-graph (g)
+    (let (s o c u)
+      (with-transaction () (setq s (ee-thing "t-1") o (ee-thing "t-2")))
+      (with-transaction ()
+        (setq c (ee-b))
+        (setq u (make-ee-claim-unary :subject-namespace :ee-things
+                                     :subject-key "t-1" :relation "u"
+                                     :producer "p" :standing :inferred)))
+      (is-true (same-node-p s (claim-endpoint c :subject)))
+      (is-true (same-node-p o (claim-endpoint c :object)))
+      (is-true (same-node-p s (claim-endpoint u :subject)))
+      (is (null (claim-endpoint u :object)))
+      (multiple-value-bind (cs co) (claim-endpoints c)
+        (is-true (same-node-p cs (claim-endpoint c :subject)))
+        (is-true (same-node-p co (claim-endpoint c :object))))
+      (signals type-error (claim-endpoint c :either)))))

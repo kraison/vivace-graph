@@ -102,7 +102,7 @@
    #:subject-of-p #:object-of-p
    #:lookup-subject-of #:lookup-object-of
    #:subject-of/2 #:subject-of/3 #:object-of/2 #:object-of/3
-   #:claim-endpoints #:node-claims
+   #:claim-endpoint #:claim-endpoints #:node-claims
    #:endpoint-link-skipped #:endpoint-link-skipped-claim
    #:endpoint-link-skipped-namespace #:endpoint-link-skipped-key
    #:endpoint-link-skipped-classes

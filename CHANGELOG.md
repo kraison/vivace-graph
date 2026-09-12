@@ -43,6 +43,11 @@ between releases; cutting a release renames it to the new version and dates it.
   read (suspected per-edge endpoint validation, #373) — details and the
   hypothesis on #372.
 
+- **`claim-endpoint`** (#373): `(claim-endpoint claim role)` reads ONE
+  linked endpoint (`:subject` or `:object`) with one adjacency probe;
+  `claim-endpoints` is now defined on top of it. A two-hop read that
+  wants only the object no longer pays for the subject's edge as well.
+
 - **Counting index** (#361): `def-count-index` declares a per-prefix
   counter pair `(all . current)` maintained at commit apply, replication
   and purge, persisted through its own sidecar and rebuilt after a
@@ -409,6 +414,38 @@ between releases; cutting a release renames it to the new version and dates it.
   orphaning every existing claim of the family. Names now derive in the
   parent symbol's package, and registering a family whose classes
   differ from the registered ones signals `claim-family-conflict`.
+
+### Changed
+
+- **Read/write statistics are sampled** (#373): `record-graph-read` and
+  `record-graph-write` now cost one fixnum increment per call and touch
+  the wall clock and the per-second histogram once every
+  `+stats-sample+` (64) calls, adding 64 to the current second's bucket.
+  Profiling the #372 edge-read bench showed the old per-lookup
+  `get-universal-time` plus synchronized-hash update was about half of
+  an adjacency read's time and a fifth of an index read's. `graph-stats`
+  keeps its shape; totals are exact to within one sample per graph, and
+  a graph read fewer than 64 times reports no reads.
+
+- **In-memory id tables hash with a fixnum fold** (#373): the node cache,
+  the ve/vev adjacency caches, `make-id-table` (the transaction read set
+  and local cache, replication and peer-streaming sets) and `sxhash-node`
+  no longer hash a 16-byte id through `%hash`, which folds it into a
+  128-bit bignum on every call. A consing-free 62-bit multiply-add fold
+  replaces it for those tables only: a cache hit measured 1811 ns → 196
+  ns in isolation. `%hash` itself is unchanged, because the on-disk
+  linear hash places buckets with it; replacing that is #375 (a
+  storage-format change, next major).
+
+- **The query runner interprets instead of compiling** (#373):
+  `run-query-goals` — behind `run-guarded-prolog`, the JSON pattern DSL
+  and `graph-db/rules` — evaluates the `select` form under SBCL's
+  interpreter. A native compile per request cost 18–20 ms and was ~94%
+  of a small query; interpreted solving is ~2× slower than compiled,
+  so the interpreter wins below ~20 ms of solving, i.e. nearly every
+  bounded query. Two-hop `related/3`: ~55 → ~700–1100 queries/s; a
+  500-row scan ~30 → ~50/s. SBCL only; other implementations are
+  unchanged.
 
 ## [4.0.1] - 2026-09-02
 

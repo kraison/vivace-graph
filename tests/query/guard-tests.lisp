@@ -215,3 +215,28 @@ a scan that never reaches a goal boundary."
   (with-query-graph (g)
     (signals graph-db.query:prolog-guard-error
       (q g "(rule-delta ?c \"x\")"))))
+
+;;; GH #373: the runner interprets the generated SELECT lambda instead of
+;;; compiling it natively -- a full SBCL compile per request was ~94% of
+;;; a small query's time.  PROBE-EVAL-MODE/1 reports the mode the query
+;;; body actually runs under.
+#+sbcl
+(graph-db:def-global-prolog-functor probe-eval-mode/1 (?mode cont)
+  "Test-only (GH #373): unify ?MODE with SB-EXT:*EVALUATOR-MODE* as seen
+from inside a running query body."
+  (let ((old (fill-pointer graph-db:*trail*)))
+    (when (graph-db:unify ?mode sb-ext:*evaluator-mode*)
+      (funcall cont))
+    (graph-db:undo-bindings old)))
+
+#+sbcl
+(test the-runner-interprets-the-query-instead-of-compiling-it
+  "GH #373: RUN-QUERY-GOALS evaluates the SELECT form under the
+interpreter, so no request pays a native compile; the query body sees
+:INTERPRET."
+  (with-query-graph (g)
+    (let ((rows '()))
+      (graph-db::run-query-goals '(?m) '((probe-eval-mode ?m)) g
+                                 :format :raw
+                                 :callback (lambda (row) (push row rows)))
+      (is (equal '((:interpret)) rows)))))

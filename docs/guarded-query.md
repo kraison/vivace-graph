@@ -42,6 +42,20 @@ snapshot, the inference/time/row bounds) -- all before deleting the
 scratch package in an `unwind-protect`, on every exit path including a
 refusal.
 
+**Execution is interpreted, not compiled** (GH #373). `select` turns the
+goals into a Lisp lambda; `run-query-goals` evaluates that form under
+SBCL's interpreter (`sb-ext:*evaluator-mode* :interpret`) instead of the
+native compiler. A native compile cost 18–20 ms per request and was
+about 94% of a small query's time; interpreted solving runs roughly 2×
+slower than compiled solving, so the interpreter wins for any query
+whose compiled solving takes under ~20 ms — which, at the runner's
+default inference budget, is nearly all of them. Measured on the #372
+bench: a two-hop `related/3` read went from ~55 to ~700–1100 queries per
+second, and a 500-row scan from ~30 to ~50 per second. The same applies
+to the JSON pattern DSL and to `graph-db/rules`, which run through the
+same function. A compiled-form cache for hot, repeated shapes is the
+Prolog engine epic's follow-up.
+
 - **Columns** are the query's `?variables` in first-appearance order,
   as camelCase wire strings without the `?` (`?min-age` becomes
   `"minAge"`, via the DSL's `%query-var-field`) -- the same spelling

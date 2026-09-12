@@ -5938,7 +5938,8 @@ record of what was believed); reads filter by currency. Deleting a
 claim or a source hides the edges through ~active-edge-p~, and
 ~compact-edges~ reclaims them.
 
-Reads over the edges — ~claim-endpoints~, ~node-claims~ (the adjacency twin
+Reads over the edges — ~claim-endpoint~ (one side, one probe),
+~claim-endpoints~, ~node-claims~ (the adjacency twin
 of ~claims-touching~, same filters), ~(traverse node :edge-type '(or
 subject-of object-of) ...)~, and the goals ~(related ?s ?r ?o)~ (current
 claims) and ~(claimed ?c ?s ?r ?o)~ (with history) — see *linked claims
@@ -6556,7 +6557,7 @@ This chapter provides a categorized reference for the most important exported sy
   A special dynamic variable that should be bound to the currently active graph instance for most operations to work correctly.
 
 - ~graph-stats (&key graph detail-p)~ ::
-  Returns an alist of performance statistics for the graph, including free memory, cache size, read/write rates, and node counts.
+  Returns an alist of performance statistics for the graph, including free memory, cache size, read/write rates, and node counts. The read and write rates are sampled: the engine counts every lookup with a fixnum increment and advances the per-second histogram once every ~+stats-sample+~ (64) calls, so totals are exact to within one sample per graph and a graph touched fewer than 64 times reports no rate at all. The per-lookup clock read this replaced was half of an adjacency read's profile (GH #373).
 
 **** Schema Definition
 - ~def-vertex (name (parent-classes) (slot-definitions) graph-name)~ ::

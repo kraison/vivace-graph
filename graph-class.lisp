@@ -229,6 +229,11 @@ received an UNRESOLVED-NODE marker instead (GH #169, D8)."
                                        #+graph-db-ecl-sync-hash :synchronized
                                        #+graph-db-ecl-sync-hash t)
                #+sbcl (make-hash-table :test 'eq :synchronized t))
+   ;; Sampling counters behind RECORD-GRAPH-READ / -WRITE: the clock and
+   ;; the synchronized histograms above are touched once per
+   ;; +STATS-SAMPLE+ calls, not once per lookup (GH #373).
+   (read-sample-counter :accessor read-sample-counter :initform 0)
+   (write-sample-counter :accessor write-sample-counter :initform 0)
    ;; The image-level epoch clock (GH #168), or NIL for this store's own
    ;; counter.  NIL is the pre-#168 behaviour and the default.  Reader
    ;; public, writer internal: ATTACH-TO-SYSTEM-CLOCK is the only entry
