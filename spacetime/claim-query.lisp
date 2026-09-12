@@ -467,7 +467,8 @@ read that sees the transaction's own writes (GH #324)."
   (let ((probe (cond (at (make-instant (exact-bound at)))
                      (during during)))
         (parent (and family (claim-family-parent (claim-family family))))
-        (claims '()))
+        (claims '())
+        (seen (make-hash-table :test 'equalp)))
     (flet ((collect (type)
              (graph-db:map-edges
               (lambda (e)
@@ -475,8 +476,8 @@ read that sees the transaction's own writes (GH #324)."
                                                  :graph graph)))
                   (when (and c
                              (or (null parent) (typep c parent))
-                             (not (find (graph-db:id c) claims
-                                        :key #'graph-db:id :test #'equalp)))
+                             (not (gethash (graph-db:id c) seen)))
+                    (setf (gethash (graph-db:id c) seen) t)
                     (push c claims))))
               graph :vertex node :direction :in :edge-type type)))
       (when (member role '(:subject :either)) (collect 'subject-of))
