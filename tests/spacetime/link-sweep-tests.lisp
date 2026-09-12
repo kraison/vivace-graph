@@ -127,3 +127,64 @@ says whether further such claims remained."
       (declare (ignore u a s))
       (is (= 2 linked))
       (is (null more)))))
+
+(test sweep-does-not-prune-a-dead-endpoints-edge
+  "Spec sec.5: ACTIVE-EDGE-P hides the edge, COMPACT-EDGES reclaims it,
+the sweep leaves it alone and does not re-link a deleted source."
+  (with-ee-graph (g)
+    (let (c o)
+      (with-transaction () (ee-thing "t-1") (setq o (ee-thing "t-2")))
+      (with-transaction () (setq c (ee-b)))
+      (is-true (ee-linked-to c 'object-of g))
+      (with-transaction () (graph-db:mark-deleted o))
+      ;; Hidden from the active read, present to the raw one.
+      (is (null (ee-linked-to c 'object-of g)))
+      (is (= 1 (length (graph-db:outgoing-edges
+                        c :graph g :edge-type 'object-of
+                        :include-deleted-p t))))
+      (is (null (nth-value 1 (claim-endpoints c))))
+      ;; The sweep sees a missing object edge, resolves nobody, prunes
+      ;; nothing.
+      (is (equal '(0 1 0 nil nil) (ee-sweep g)))
+      (is (= 1 (length (graph-db:outgoing-edges
+                        c :graph g :edge-type 'object-of
+                        :include-deleted-p t))))
+      ;; Reclaiming is COMPACT-EDGES' job.
+      (graph-db::compact-edges g)
+      (is (null (graph-db:outgoing-edges c :graph g :edge-type 'object-of
+                                            :include-deleted-p t)))
+      (is-true (ee-linked-to c 'subject-of g)))))
+
+(test sweep-skips-a-detached-source-store-and-keeps-its-edges
+  "Spec sec.5: a namespace whose source store is not open is skipped and
+counted; an existing cross-store edge survives."
+  (with-ee-graph (g)
+    (with-source-graph (sg)
+      (let (n c1 c2)
+        (with-transaction ((graph-db::transaction-manager sg))
+          (setq n (make-st-report :headline "one" :report-id "r-1")))
+        (setq n (resolve-endpoint :st-reports "r-1"))
+        (let ((graph-db:*graph* g))
+          (with-transaction ()
+            (ee-thing "t-1")
+            ;; linked across stores by the caller
+            (setq c1 (ee-b :object-namespace :st-reports :object "r-1"
+                           :object-node n))
+            ;; same endpoint, left for the sweep
+            (setq c2 (ee-b :object-namespace :st-reports :object "r-1"
+                           :relation "later"))))
+        (is-true (ee-linked-to c1 'object-of g))
+        (is (null (ee-linked-to c2 'object-of g)))
+        ;; Open: the sweep resolves across stores and links C2.
+        (is (equal '(1 0 0 nil nil) (ee-sweep g)))
+        (is (equalp (id n) (ee-linked-to c2 'object-of g)))
+        ;; Detached: a third claim cannot be resolved; the namespace is
+        ;; skipped, the two existing edges survive.
+        (let ((graph-db:*graph* g))
+          (with-transaction ()
+            (ee-b :object-namespace :st-reports :object "r-1"
+                  :relation "latest")))
+        (close-graph sg :snapshot-p nil)
+        (is (equal '(0 0 0 (:st-reports) nil) (ee-sweep g)))
+        (is-true (ee-linked-to c1 'object-of g))
+        (is-true (ee-linked-to c2 'object-of g))))))
