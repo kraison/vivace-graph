@@ -4,8 +4,12 @@
 (#110, closed 2026-08-24), the claim record (#131) and endpoint
 resolution (#132). **Engine baseline:** `experiment` at b787516.
 **Date:** 2026-09-12. **Status:** approved by the owner 2026-09-12
-(rulings R1–R6, sections 1–12). Written as the handoff for planning
-and implementation; §13 is the build order.
+(rulings R1–R6, sections 1–12); **amended the same day** after the
+engine team's review (kraison/blackboard
+`docs/superpowers/notes/2026-09-12-stores-vs-namespaces.md`): the
+consumer that motivated cross-store continuation runs one store with
+many namespaces, so R6 is reversed and U3 is deferred. Written as the
+handoff for planning and implementation; §13 is the build order.
 
 ---
 
@@ -60,7 +64,7 @@ engine's edges.
 | **R3** | **Retraction keeps the edges.** Edge-based reads filter by currency. | Nothing believed is erased; an as-of traversal must work through edges as `claims-touching :as-of` does through keys. |
 | **R4** | **One shipped pair** of edge classes in `graph-db.spacetime`, no default store, placed per claim in the claim's store. | The claim record design refused shipped classes because `def-vertex` bound a class to one store; after #167 a class is instantiable in any store and a type may have no default store (`schema.lisp:339-402`, #167 R1; #172 R4). Keeps `def-claim-classes` from growing and gives every consumer the same functors. |
 | **R5** | **Same-store auto-link in the constructor; caller-resolved endpoints for the rest.** No post-commit hooks. | `resolve-endpoint` refuses to run inside a read-write transaction (`spacetime/resolve.lisp:9`, design §4.1); a same-store `index-lookup` is legal there. Consumers keep working unchanged and opt in to cross-store links by resolving first, which the programme's §6.2 rule already asks of claim generation. |
-| **R6** | **Cross-store traversal continuation is in scope** (its own unit). | Without it a walk from a source in one store through a claim in another stops at the claim, the gap the namespaces epic left as "#170+ work" (`traverse.lisp:67-70`). |
+| **R6** | **Cross-store traversal continuation is deferred** (amended 2026-09-12; it was in scope as its own unit). | The blackboard, the consumer that asked for it, keeps one durable store with a package per principal — the engine's own criterion for a store boundary is recovery policy, write cadence or detachability, none of which separates one agent from another (namespaces design §2, §4; the review note above). Cross-store adjacency is indexed in the edge's store and costs one probe per store that might hold such edges, a cost nothing here needs to pay. The gap the namespaces epic left as "#170+ work" (`traverse.lisp:67-70`) stays its own future unit; §8 records the design for it. |
 
 ---
 
@@ -260,9 +264,15 @@ report.
 
 ---
 
-## 8. Cross-store continuation (unit U3)
+## 8. Cross-store continuation (deferred; recorded for the future unit)
 
-**`traverse`** (`traverse.lisp:37-113`) continues into any *open*
+**Deferred by the 2026-09-12 amendment (R6).** Nothing below is built
+by #367. It is kept because it was reviewed and because the engine's
+own gap is real; the unit that picks it up starts here. Within one
+store, `traverse` and the functors of §6 already do everything this
+section adds.
+
+**`traverse`** (`traverse.lisp:37-113`) would continue into any *open*
 store:
 
 - The far endpoint of an edge is fetched with `lookup-vertex-anywhere`
@@ -287,9 +297,12 @@ store:
 
 **Edge functors.** `%edge-functor/2` and `/3` (`prolog-functors.lisp:
 1106`) resolve endpoints with `lookup-vertex` on the current graph, so
-a cross-store endpoint unifies with nothing. They switch to
-`lookup-vertex-anywhere`; `related/3` and `claimed/4` are written that
-way from the start. A marker never unifies with a node variable.
+a cross-store endpoint unifies with nothing. The future unit switches
+them to `lookup-vertex-anywhere`. `related/3` and `claimed/4` (§6.3)
+use `lookup-vertex` on the claim's graph in #367; a caller-resolved
+cross-store endpoint (§4.2) is linked but does not unify until then,
+and §6.3's docstrings say so. A marker never unifies with a node
+variable.
 
 **Snapshot scope under the guarded runner.** `run-guarded-prolog`
 takes one snapshot on its graph (`query/guard.lisp`). A store entered
@@ -328,8 +341,11 @@ keys, `claim-current-p`, the temporal reads.
   `:subject-node` / `:object-node` from its `conclude` is a cl-llm
   follow-up issue, not this unit's.
 - **The second tenant** (private): unchanged.
-- **kraison/blackboard** (#4, the structure tier): resumes on top of
-  this as structure plus claims with native traversal.
+- **kraison/blackboard** (#4, the structure tier): one durable store,
+  a package per principal; resumes on top of U1 as structure plus
+  claims with native traversal. Its note
+  `docs/superpowers/notes/2026-09-12-stores-vs-namespaces.md` is the
+  record of why.
 
 ---
 
@@ -360,12 +376,13 @@ temporary stores under one system directory:
   `:missing` (a deleted source) and not on a detached store, counts
   every category, never signals.
 - Traversal: within a store from source to source through a claim;
-  across three stores with the middle one holding the claims; with the
-  third store detached, the marker lands in the results and nothing is
-  walked past it; uniqueness across stores; as-of below the watermark
-  refused.
-- Functors across stores: `subject-of/2`, `related/3`, `claimed/4`
-  with a cross-store endpoint, under the guarded runner.
+  a caller-resolved cross-store endpoint (§4.2) is linked, and a walk
+  reaching it lands the far vertex (or the detached marker) in the
+  results without walking past it — today's behaviour, pinned so the
+  deferred unit knows what it changes.
+- Functors: `subject-of/2`, `related/3`, `claimed/4` within a store
+  under the guarded runner; a cross-store endpoint does not unify
+  (pinned for the same reason).
 - The existing spacetime suite and the cl-llm memory suite pass
   unchanged (the memory suite runs in cl-llm's CI against `experiment`
   HEAD).
@@ -375,9 +392,11 @@ temporary stores under one system directory:
 ## 12. Out of scope
 
 Link on source arrival (R2); the claim as an edge and per-relation edge
-types (R1); changing any consumer's write path (cl-llm follow-up);
-as-of across stores below the watermark; running the sweep implicitly
-on open; a spatial or vector index on the new edges.
+types (R1); **cross-store traversal continuation and cross-store
+unification in the functors (R6 as amended; §8 is its design record)**;
+changing any consumer's write path (cl-llm follow-up); as-of across
+stores below the watermark; running the sweep implicitly on open; a
+spatial or vector index on the new edges.
 
 ---
 
@@ -387,15 +406,15 @@ on open; a spatial or vector index on the new edges.
 |---|---|---|
 | **U1** | §3 classes; §4 write path (auto-link, caller-resolved, conditions); §6 in-store reads and functors; §11's in-store tests | — |
 | **U2** | §5 sweep and backfill; §9 measurement; §11's sweep tests | U1 |
-| **U3** | §8 cross-store continuation in `traverse` and the functors, snapshot composition; §11's cross-store tests | U1 |
+| *U3 (deferred)* | §8 cross-store continuation in `traverse` and the functors, snapshot composition — its own future issue, not part of #367 | U1 |
 
-U2 and U3 are independent of each other. Each unit is one PR against
+#367 is U1 then U2. Each unit is one PR against
 `experiment` with its own issue as a sub-issue of #367; CI runs the
 full suite on push (`docs/ci.md`). Files touched: `spacetime/claim.lisp`
 (classes, wrapper), a new `spacetime/link.lisp` (sweep), `spacetime/
 claim-query.lisp` (`node-claims`, `claim-endpoints`), a new
-`spacetime/functors.lisp` (`related/3`, `claimed/4`), `traverse.lisp`,
-`prolog-functors.lisp` (the two lookups), `spacetime/package.lisp`,
+`spacetime/functors.lisp` (`related/3`, `claimed/4`),
+`spacetime/package.lisp`,
 `docs/vivace-graph-v3-doc.org` (the spacetime chapter gains "Edges
 under claims"), and this spec's Built notes as each unit lands.
 
