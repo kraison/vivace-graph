@@ -314,3 +314,92 @@ walked."
                                            :edge-type 'object-of)))
           (is (= 1 (length closed)))
           (is-true (graph-db:unresolved-node-p (first closed))))))))
+
+(defun ee-q (g text &rest keys)
+  "RUN-GUARDED-PROLOG on G; rows as bound (:RAW)."
+  (nth-value 1 (apply #'graph-db.query:run-guarded-prolog text g
+                      :format :raw keys)))
+
+(defun ee-seed (g)
+  "T-1 likes T-2 and knows T-3; T-2 likes T-3; one retracted T-1 hates T-3.
+G is *GRAPH* already (WITH-EE-GRAPH binds it); taken for the call site's
+readability."
+  (declare (ignorable g))
+  (let (c)
+    (with-transaction ()
+      (ee-thing "t-1") (ee-thing "t-2") (ee-thing "t-3"))
+    (with-transaction ()
+      (ee-b :subject "t-1" :object "t-2" :relation "likes")
+      (ee-b :subject "t-1" :object "t-3" :relation "knows")
+      (ee-b :subject "t-2" :object "t-3" :relation "likes")
+      (setq c (ee-b :subject "t-1" :object "t-3" :relation "hates")))
+    (retract-claim c)
+    c))
+
+(defun ee-labels (rows col)
+  (sort (mapcar (lambda (r) (ee-label (nth col r))) rows) #'string<))
+
+(test related-solves-from-a-bound-subject-current-only
+  (with-ee-graph (g)
+    (ee-seed g)
+    (let ((rows (ee-q g "(is-a ?s ee-thing)
+                         (node-slot-value ?s thing-id \"t-1\")
+                         (related ?s ?r ?o)")))
+      (is (= 2 (length rows)))
+      (is (equal '("knows" "likes") (sort (mapcar #'second rows) #'string<)))
+      (is (equal '("t-2" "t-3") (ee-labels rows 2))))))
+
+(test related-solves-from-a-bound-object
+  (with-ee-graph (g)
+    (ee-seed g)
+    (let ((rows (ee-q g "(is-a ?o ee-thing)
+                         (node-slot-value ?o thing-id \"t-3\")
+                         (related ?s ?r ?o)")))
+      ;; knows(t-1,t-3), likes(t-2,t-3); hates is retracted.  Columns
+      ;; are first-appearance order (O then S): S is col 1 (GH #369).
+      (is (= 2 (length rows)))
+      (is (equal '("t-1" "t-2") (ee-labels rows 1))))))
+
+(test related-scans-by-relation-when-only-it-is-bound
+  (with-ee-graph (g)
+    (ee-seed g)
+    (let ((rows (ee-q g "(related ?s \"likes\" ?o)")))
+      (is (= 2 (length rows)))
+      (is (equal '("t-1" "t-2") (ee-labels rows 0))))))
+
+(test related-refuses-an-unbounded-scan
+  (with-ee-graph (g)
+    (ee-seed g)
+    (signals graph-db.query:prolog-ill-typed-error
+      (ee-q g "(related ?s ?r ?o)"))))
+
+(test claimed-exposes-the-claim-and-keeps-history
+  (with-ee-graph (g)
+    (ee-seed g)
+    (let ((rows (ee-q g "(is-a ?s ee-thing)
+                         (node-slot-value ?s thing-id \"t-1\")
+                         (claimed ?c ?s ?r ?o)")))
+      ;; likes, knows, and the RETRACTED hates.  Columns are first-
+      ;; appearance order (S then C): C is col 1 (GH #369).
+      (is (= 3 (length rows)))
+      (is (every (lambda (r) (typep (second r) 'ee-claim)) rows))
+      (is (equal '("hates" "knows" "likes")
+                 (sort (mapcar #'third rows) #'string<))))))
+
+(test a-cross-store-endpoint-is-linked-but-does-not-unify
+  "Spec sec.8 as amended: the functors resolve with LOOKUP-VERTEX on the
+claim's graph, so the foreign endpoint yields no row in #367."
+  (with-ee-graph (g)
+    (with-source-graph (sg)
+      (let (n)
+        (with-transaction ((graph-db::transaction-manager sg))
+          (setq n (make-st-report :headline "one" :report-id "r-1")))
+        (setq n (resolve-endpoint :st-reports "r-1"))
+        (let ((graph-db:*graph* g))
+          (with-transaction ()
+            (ee-thing "t-1")
+            (ee-b :object-namespace :st-reports :object "r-1"
+                  :object-node n)))
+        (is (null (ee-q g "(is-a ?s ee-thing) (related ?s ?r ?o)")))
+        ;; The same-store half still solves.
+        (is (= 1 (length (ee-q g "(is-a ?s ee-thing) (subject-of ?c ?s)"))))))))

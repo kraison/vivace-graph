@@ -582,7 +582,10 @@ cl-temporal-extent."
                (:file "membership")
                ;; Temporal claim families (GH #296): the extent-overlap
                ;; validator; needs membership's post-commit overlay.
-               (:file "temporal")))
+               (:file "temporal")
+               ;; RELATED/3 and CLAIMED/4 over the endpoint edges (GH
+               ;; #369); needs claim-query's CLAIM-CURRENT-P.
+               (:file "functors")))
 
 (defsystem graph-db/spacetime-test
   :name "VivaceGraph spacetime test suite"
