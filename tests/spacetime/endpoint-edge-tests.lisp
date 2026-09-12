@@ -262,3 +262,55 @@ claim's edges, the new claim links at write."
       (with-transaction () (setq c2 (ee-b :producer "gen")))
       (is (= 1 (length (node-claims s))))
       (is-true (same-node-p s (claim-endpoints c2))))))
+
+(defun ee-ids (nodes)
+  (sort (mapcar (lambda (n) (format nil "~A" (id n))) nodes) #'string<))
+
+(test traverse-walks-source-to-source-through-a-claim
+  "Spec sec.6.2: T-1 <-subject-of- C -object-of-> T-2, both directions;
+T-1 itself is re-reached along the back-edge (global uniqueness)."
+  (with-ee-graph (g)
+    (let (s o c)
+      (with-transaction () (setq s (ee-thing "t-1") o (ee-thing "t-2")))
+      (with-transaction () (setq c (ee-b)))
+      (let ((reached (graph-db:traverse
+                      s :graph g :direction :both
+                      :edge-type '(or subject-of object-of))))
+        ;; S is re-reached along the back-edge under global uniqueness,
+        ;; as tests/traverse-tests.lisp (traverse-direction-both)
+        ;; documents.
+        (is (equal (ee-ids (list c o s)) (ee-ids reached))))
+      (is (null (graph-db:traverse s :graph g :direction :both)))
+      ;; From the claim, both endpoints are one hop out.
+      (is (equal (ee-ids (list s o))
+                 (ee-ids (graph-db:traverse
+                          c :graph g :direction :out
+                          :edge-type '(or subject-of object-of))))))))
+
+(test traverse-lands-a-cross-store-endpoint-without-walking-past-it
+  "Spec sec.11 (pinned for #368): a caller-resolved endpoint in another
+store lands in the results -- the vertex while its store is open, the
+UNRESOLVED-NODE marker once it is closed -- and nothing beyond it is
+walked."
+  (with-ee-graph (g)
+    (with-source-graph (sg)
+      (let (n c)
+        (with-transaction ((graph-db::transaction-manager sg))
+          (setq n (make-st-report :headline "one" :report-id "r-1"))
+          ;; A neighbour in the far store that a continuation WOULD reach.
+          (make-st-report :headline "two" :report-id "r-2"))
+        (setq n (resolve-endpoint :st-reports "r-1"))
+        (let ((graph-db:*graph* g))
+          (with-transaction ()
+            (ee-thing "t-1")
+            (setq c (ee-b :object-namespace :st-reports :object "r-1"
+                          :object-node n))))
+        (let ((open (graph-db:traverse c :graph g :direction :out
+                                         :edge-type 'object-of)))
+          (is (= 1 (length open)))
+          (is-true (same-node-p n (first open))))
+        (close-graph sg :snapshot-p nil)
+        (let ((closed (graph-db:traverse c :graph g :direction :out
+                                           :edge-type 'object-of)))
+          (is (= 1 (length closed)))
+          (is-true (graph-db:unresolved-node-p (first closed))))))))
