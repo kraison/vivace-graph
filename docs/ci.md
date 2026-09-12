@@ -74,7 +74,12 @@ suite's fast tier and every other lane in full (see below).
   The same holds for `graph-db/spacetime`'s six (`related/3`,
   `claimed/4`, `subject-of/2`, `subject-of/3`, `object-of/2`,
   `object-of/3`; GH #369): absent from the gui lane, present in any
-  image that loads spacetime beside the gui.
+  image that loads spacetime beside the gui.  Since GH #372 the **main**
+  lane loads `graph-db/spacetime` (and with it `cl-temporal-extent`)
+  transitively -- `graph-db/test` load-depends on `graph-db/perf-test`
+  for `perf/check-tests`, and that system's `bench-claim-linking` needs
+  a claim family -- so the main lane needs those deps resolvable; it
+  runs no gui test, so the inventory tripwire is unaffected.
 - The geos lane needs `libgeos_c` on the runner host; the suite
   SKIPS (green) where it is absent, so a green geos lane on a
   bare host proves nothing -- keep the library installed.
