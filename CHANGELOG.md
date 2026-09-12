@@ -410,6 +410,18 @@ between releases; cutting a release renames it to the new version and dates it.
   parent symbol's package, and registering a family whose classes
   differ from the registered ones signals `claim-family-conflict`.
 
+### Changed
+
+- **Read/write statistics are sampled** (#373): `record-graph-read` and
+  `record-graph-write` now cost one fixnum increment per call and touch
+  the wall clock and the per-second histogram once every
+  `+stats-sample+` (64) calls, adding 64 to the current second's bucket.
+  Profiling the #372 edge-read bench showed the old per-lookup
+  `get-universal-time` plus synchronized-hash update was about half of
+  an adjacency read's time and a fifth of an index read's. `graph-stats`
+  keeps its shape; totals are exact to within one sample per graph, and
+  a graph read fewer than 64 times reports no reads.
+
 ## [4.0.1] - 2026-09-02
 
 ### Fixed

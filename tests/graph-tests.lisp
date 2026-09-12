@@ -625,3 +625,20 @@ second value and signals nothing."
       (is (null (graph-db::graph-open-p g)))
       (is (not (dirty-file-present-p dir)))
       (collect-garbage))))
+
+(test read-stats-are-sampled-not-clocked
+  "GH #373: RECORD-GRAPH-READ is a fixnum increment per lookup; the
+per-second histogram advances by +STATS-SAMPLE+ every +STATS-SAMPLE+
+reads, so GRAPH-STATS still reports a rate and every bucket is a
+multiple of the sample size.  The clock is read once per sample, not
+once per cached lookup -- it was half of an adjacency read's profile."
+  (with-test-graph (g)
+    (let ((id (with-transaction () (id (make-g-person :name "s" :age 1))))
+          (sample graph-db::+stats-sample+))
+      (dotimes (i (* 3 sample)) (lookup-vertex id))
+      (let* ((report (graph-db::graph-reads-report g))
+             (total (reduce #'+ report :key #'cdr)))
+        (is (>= total (* 3 sample)))
+        (is (every (lambda (b) (zerop (mod (cdr b) sample))) report))
+        (is (numberp (cdr (assoc :avg-reads-per-second
+                                 (graph-db:graph-stats :graph g)))))))))
