@@ -109,4 +109,6 @@
    #:endpoint-mismatch #:endpoint-mismatch-node
    #:endpoint-mismatch-namespace #:endpoint-mismatch-key
    #:endpoint-mismatch-reason
-   #:related/3 #:claimed/4))
+   #:related/3 #:claimed/4
+   ;; the linking sweep (GH #372)
+   #:*link-claims-at-write* #:link-claim-endpoints))

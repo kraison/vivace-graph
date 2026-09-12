@@ -326,6 +326,13 @@ makes a unary claim unable to carry an object (design §3.1).")
 (graph-db:def-edge subject-of () () nil)
 (graph-db:def-edge object-of () () nil)
 
+(defvar *link-claims-at-write* t
+  "When true (the default) every MAKE-<claim> links its endpoints in the
+same transaction (spec sec.4).  Bind to NIL around a bulk load to write
+claims key-only and LINK-CLAIM-ENDPOINTS afterwards; the sec.9
+measurement toggles it (GH #372).  Trap: :SUBJECT-NODE / :OBJECT-NODE
+are then ignored, not verified.")
+
 (defmacro def-claim-classes (parent graph-name
                              &key extra-slots temporal
                                   (keep-revisions (1- (expt 2 32))))
@@ -505,10 +512,13 @@ write; ENDPOINT-MISMATCH on a wrong node does."
                                             args)))))
                              (check-standing (claim-standing c))
                              ;; Derived edges, in the same transaction
-                             ;; (GH #369, spec sec.4.1).
-                             (%link-claim-at-write
-                              c :subject-node subject-node
-                                :object-node object-node))))))))
+                             ;; (GH #369, spec sec.4.1); a bulk loader
+                             ;; may defer them to the sweep (GH #372).
+                             (if *link-claims-at-write*
+                                 (%link-claim-at-write
+                                  c :subject-node subject-node
+                                    :object-node object-node)
+                                 c))))))))
           (list unary binary)
           (list +claim-identity-slots+
                 (append +claim-identity-slots+
