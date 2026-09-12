@@ -187,3 +187,78 @@ nothing commits."
         (with-transaction ()
           (ee-b :object "t-2" :object-node s)))
       (is (null (claims-touching g 'ee-claim :ee-things "t-1"))))))
+
+(test claim-endpoints-answers-the-linked-nodes
+  (with-ee-graph (g)
+    (let (s o c u)
+      (with-transaction () (setq s (ee-thing "t-1") o (ee-thing "t-2")))
+      (with-transaction ()
+        (setq c (ee-b))
+        (setq u (make-ee-claim-unary :subject-namespace :ee-things
+                                     :subject-key "t-1" :relation "u"
+                                     :producer "p" :standing :inferred)))
+      (multiple-value-bind (cs co) (claim-endpoints c)
+        (is-true (same-node-p s cs))
+        (is-true (same-node-p o co)))
+      (multiple-value-bind (us uo) (claim-endpoints u)
+        (is-true (same-node-p s us))
+        (is (null uo)))
+      (let ((k (with-transaction () (ee-b :subject "nobody" :object "x"))))
+        (is (equal '(nil nil) (multiple-value-list (claim-endpoints k))))))))
+
+(test node-claims-is-the-adjacency-twin-of-claims-touching
+  "Spec sec.6.1: same filters, same meaning; linked claims only."
+  (with-ee-graph (g)
+    (let (s o c1 c2 c3)
+      (with-transaction () (setq s (ee-thing "t-1") o (ee-thing "t-2")))
+      (with-transaction ()
+        (setq c1 (ee-b :relation "likes"))
+        (setq c2 (ee-b :relation "knows"))
+        ;; T-2 as the SUBJECT of a claim about a key-only object.
+        (setq c3 (ee-b :subject "t-2" :object "elsewhere" :relation "r")))
+      (flet ((ids (claims) (sort (mapcar (lambda (c) (graph-db:string-id
+                                                        (id c)))
+                                          claims)
+                                 #'string<)))
+        (is (equal (ids (list c1 c2)) (ids (node-claims s))))
+        (is (equal (ids (list c1 c2 c3)) (ids (node-claims o))))
+        (is (equal (ids (list c3)) (ids (node-claims o :role :subject))))
+        (is (equal (ids (list c1 c2)) (ids (node-claims o :role :object))))
+        (is (equal (ids (list c1))
+                   (ids (node-claims s :relation "likes"))))
+        (is (equal (ids (list c1 c2))
+                   (ids (node-claims s :family 'ee-claim))))
+        (is (null (node-claims s :family 'ct-claim)))
+        ;; A key-only claim is absent here and present in CLAIMS-TOUCHING.
+        (with-transaction () (ee-b :subject "ghost"))
+        (is (null (node-claims s :relation "ghost")))
+        (is (= 1 (length (claims-touching g 'ee-claim :ee-things "ghost"))))
+        ;; Pagination.
+        (multiple-value-bind (page more) (node-claims s :limit 1)
+          (is (= 1 (length page)))
+          (is-true more))))))
+
+(test retraction-keeps-the-edges-and-current-filters
+  "Spec R3 / sec.4.3: RETRACT-CLAIM touches no edge; :CURRENT hides it."
+  (with-ee-graph (g)
+    (let (s c)
+      (with-transaction () (setq s (ee-thing "t-1")) (ee-thing "t-2"))
+      (with-transaction () (setq c (ee-b)))
+      (retract-claim c)
+      (is (= 1 (length (node-claims s))))
+      (is (null (node-claims s :current t)))
+      (is-true (same-node-p s (claim-endpoints c))))))
+
+(test regeneration-drops-the-old-edges-and-links-the-new
+  "Spec sec.4.3: delete, then insert; ACTIVE-EDGE-P hides the deleted
+claim's edges, the new claim links at write."
+  (with-ee-graph (g)
+    (let (s c2)
+      (with-transaction () (setq s (ee-thing "t-1")) (ee-thing "t-2"))
+      (with-transaction () (ee-b :producer "gen"))
+      (is (= 1 (length (node-claims s))))
+      (is (= 1 (delete-claims-by-producer g 'ee-claim "gen")))
+      (is (null (node-claims s)))
+      (with-transaction () (setq c2 (ee-b :producer "gen")))
+      (is (= 1 (length (node-claims s))))
+      (is-true (same-node-p s (claim-endpoints c2))))))
