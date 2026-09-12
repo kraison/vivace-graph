@@ -278,6 +278,38 @@ added.  ALL itself outside a transaction.  The commit view is the same
                 (push n out))))
           (nreverse out)))))
 
+(defun %narrow-claims (graph claims &key current probe relation
+                                         as-of as-of-epoch limit offset)
+  "The shared tail of CLAIMS-TOUCHING and NODE-CLAIMS (GH #369): resolve
+the transaction axis (:AS-OF / :AS-OF-EPOCH), then filter currency
+(:CURRENT), validity (PROBE, an extent), and RELATION, then paginate.
+A REAPED-CLAIM survives every filter -- it is the record that a version
+existed, not a candidate to judge (GH #300)."
+  (let ((all claims))
+    (cond (as-of
+           (setf all (loop for c in all
+                           for v = (%claim-as-of graph c as-of)
+                           when v collect v)))
+          (as-of-epoch
+           (setf all (loop for c in all
+                           for v = (%claim-as-of-epoch graph c as-of-epoch)
+                           when v collect v))))
+    (when current
+      (setf all (remove-if-not (lambda (c)
+                                 (or (reaped-claim-p c) (claim-current-p c)))
+                               all)))
+    (when probe
+      (setf all (remove-if-not (lambda (c)
+                                 (or (reaped-claim-p c)
+                                     (%claim-validity-touches-p c probe)))
+                               all)))
+    (when relation
+      (setf all (remove-if-not (lambda (c)
+                                 (or (reaped-claim-p c)
+                                     (equal relation (claim-relation c))))
+                               all)))
+    (%paginate all limit offset)))
+
 (defun claims-touching (graph claim-class namespace key
                         &key (role :either) current at during
                              relation limit offset as-of as-of-epoch)
@@ -368,49 +400,92 @@ subsystem exists to keep those two cases from being confused."
                    (or subjects objects))))
       ;; The overlay is for the neither-axis arm only: an uncommitted
       ;; write has no epoch (#347 recon C6).
-      (cond (as-of
-             (setf all (loop for c in all
-                             for v = (%claim-as-of graph c as-of)
-                             when v collect v)))
-            (as-of-epoch
-             (setf all (loop for c in all
-                             for v = (%claim-as-of-epoch graph c
-                                                         as-of-epoch)
-                             when v collect v)))
-            (t
-             (setf all (%overlay-transaction
-                        graph all family
-                        (lambda (c)
-                          (or (and (member role '(:subject :either))
-                                   (equal namespace
-                                          (claim-subject-namespace c))
-                                   (equal key (claim-subject-key c))
-                                   (or (null relation)
-                                       (equal relation
-                                              (claim-relation c))))
-                              (and (member role '(:object :either))
-                                   (typep c (claim-family-binary family))
-                                   (equal namespace
-                                          (claim-object-namespace c))
-                                   (equal key (claim-object-key c)))))))))
-      (when current
-        (setf all (remove-if-not (lambda (c)
-                                   (or (reaped-claim-p c)
-                                       (claim-current-p c)))
-                                 all)))
-      (when probe
-        (setf all (remove-if-not (lambda (c)
-                                   (or (reaped-claim-p c)
-                                       (%claim-validity-touches-p c probe)))
-                                 all)))
-      (when (and relation (member role '(:object :either)))
-        ;; The object side has no relation index; filter what the endpoint
-        ;; index already bounded (GH #302).
-        (setf all (remove-if-not (lambda (c)
-                                   (or (reaped-claim-p c)
-                                       (equal relation (claim-relation c))))
-                                 all)))
-      (%paginate all limit offset))))
+      (unless (or as-of as-of-epoch)
+        (setf all (%overlay-transaction
+                   graph all family
+                   (lambda (c)
+                     (or (and (member role '(:subject :either))
+                              (equal namespace (claim-subject-namespace c))
+                              (equal key (claim-subject-key c))
+                              (or (null relation)
+                                  (equal relation (claim-relation c))))
+                         (and (member role '(:object :either))
+                              (typep c (claim-family-binary family))
+                              (equal namespace (claim-object-namespace c))
+                              (equal key (claim-object-key c))))))))
+      ;; The subject side already rode the relation index (GH #302); only
+      ;; the object side still needs the filter.
+      (%narrow-claims graph all
+                      :current current :probe probe
+                      :relation (and (member role '(:object :either))
+                                     relation)
+                      :as-of as-of :as-of-epoch as-of-epoch
+                      :limit limit :offset offset))))
+
+;;; Edges under claims: the adjacency reads (GH #369, spec sec.6.1).
+;;; Both see LINKED claims only; CLAIMS-TOUCHING is the complete read.
+
+(defun claim-endpoints (claim &key (graph (graph-db::node-graph claim)))
+  "CLAIM's linked endpoint nodes: (VALUES SUBJECT-NODE OBJECT-NODE), from
+its outgoing SUBJECT-OF / OBJECT-OF edges in GRAPH (its own store).  NIL
+for an endpoint that is not linked -- key-only, or a unary claim's
+object.  A cross-store endpoint is read through LOOKUP-VERTEX-ANYWHERE,
+so it may be an UNRESOLVED-NODE marker while that store is detached.
+Edges created in a still-open transaction are not visible until it
+commits (adjacency is indexed at commit apply)."
+  (flet ((endpoint (type)
+           (let ((e (first (graph-db:outgoing-edges claim :graph graph
+                                                          :edge-type type))))
+             (when e
+               (graph-db:lookup-vertex-anywhere (graph-db:to e))))))
+    (values (endpoint 'subject-of) (endpoint 'object-of))))
+
+(defun node-claims (node &key (graph (graph-db::node-graph node))
+                              family (role :either) current relation
+                              at during as-of as-of-epoch limit offset)
+  "Claims linked to NODE, from its incoming SUBJECT-OF / OBJECT-OF edges
+in GRAPH -- the adjacency twin of CLAIMS-TOUCHING, with the same
+filters and the same meaning for each (GH #369, spec sec.6.1).  Linked
+claims only: a key-only claim is not here.  FAMILY (a parent class
+name) restricts to one family; default every family.
+
+GRAPH is the store holding the CLAIMS, not necessarily NODE's own --
+adjacency is indexed in the edge's store (edge.lisp, ADD-TO-VE-INDEX) --
+and defaults to NODE's store, which is the answer in a one-store
+deployment; pass the claim store when the two differ.  Inside an open
+transaction, only committed adjacency is visible; CLAIMS-TOUCHING is the
+read that sees the transaction's own writes (GH #324)."
+  (check-type role (member :subject :object :either))
+  (check-type at (or null local-time:timestamp))
+  (check-type during (or null temporal-extent))
+  (check-type as-of-epoch (or null unsigned-byte))
+  (when (and at during)
+    (error "Pass only one of :AT or :DURING, not both."))
+  (when (and as-of as-of-epoch)
+    (error "Pass only one of :AS-OF or :AS-OF-EPOCH, not both."))
+  (when as-of-epoch (%refuse-epoch-axis graph))
+  (let ((probe (cond (at (make-instant (exact-bound at)))
+                     (during during)))
+        (parent (and family (claim-family-parent (claim-family family))))
+        (claims '())
+        (seen (make-hash-table :test 'equalp)))
+    (flet ((collect (type)
+             (graph-db:map-edges
+              (lambda (e)
+                (let ((c (graph-db:lookup-vertex (graph-db:from e)
+                                                 :graph graph)))
+                  (when (and c
+                             (or (null parent) (typep c parent))
+                             (not (gethash (graph-db:id c) seen)))
+                    (setf (gethash (graph-db:id c) seen) t)
+                    (push c claims))))
+              graph :vertex node :direction :in :edge-type type)))
+      (when (member role '(:subject :either)) (collect 'subject-of))
+      (when (member role '(:object :either)) (collect 'object-of)))
+    (%narrow-claims graph (nreverse claims)
+                    :current current :probe probe :relation relation
+                    :as-of as-of :as-of-epoch as-of-epoch
+                    :limit limit :offset offset)))
 
 (defun claim-extent (claim)
   "CLAIM's TEMPORAL-EXTENT, decoded from the stored sexp, or NIL.  The stored

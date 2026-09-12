@@ -46,27 +46,33 @@ nothing (design §4)."
   (or (gethash namespace *namespace-sources*)
       (error 'unknown-namespace :namespace namespace)))
 
-(defun %unregister-old-identity (class)
-  "Remove CLASS from whatever namespace it was PREVIOUSLY registered under
-in *SOURCE-CONTRACTS*, if any.  Called before a (re-)registration, so
-re-evaluating DEF-SOURCE with a changed :IDENTITY -- ordinary practice --
-leaves *NAMESPACE-SOURCES* in step with *SOURCE-CONTRACTS* instead of
-accumulating a stale entry forever (Finding 2, GH #132 review)."
-  (let ((old (gethash class *source-contracts*)))
-    (when old
-      (let ((old-identity (source-facets-identity old)))
-        (unless (eq old-identity :none)
-          (let ((old-ns (getf old-identity :namespace)))
-            (setf (gethash old-ns *namespace-sources*)
-                  (remove class (gethash old-ns *namespace-sources*)))))))))
+(defun %unregister-old-identity (class old-contract)
+  "Remove CLASS from whatever namespace OLD-CONTRACT (its SOURCE-FACETS
+before this registration, or NIL for a first-ever one) declared, if
+any.  Takes the old contract as an argument rather than re-reading
+*SOURCE-CONTRACTS*: DEF-SOURCE's expansion writes the new contract
+before calling this (GH #369 minor 9), so the hash table no longer
+holds the old one by the time this runs."
+  (when old-contract
+    (let ((old-identity (source-facets-identity old-contract)))
+      (unless (eq old-identity :none)
+        (let ((old-ns (getf old-identity :namespace)))
+          (setf (gethash old-ns *namespace-sources*)
+                (remove class (gethash old-ns *namespace-sources*))))))))
 
-(defun %register-identity (class identity)
+(defun %register-identity (class identity
+                            &optional (old-contract
+                                       (gethash class *source-contracts*)))
   "Register CLASS under its namespace.  :NONE registers nothing: such a
 class is never an endpoint target (plan clarification).  Always drops
-CLASS's prior registration first (Finding 2, GH #132 review), so this is
-correct whether the new IDENTITY names the same namespace, a different
-one, or :NONE."
-  (%unregister-old-identity class)
+CLASS's prior registration first, from OLD-CONTRACT -- a caller that
+omits it gets whatever *SOURCE-CONTRACTS* holds for CLASS right now
+(the direct callers in source-tests.lisp); DEF-SOURCE's expansion
+passes the contract it is about to replace explicitly, since by the
+time it calls this the new one is already written (Finding 2, GH #132
+review; GH #369 minor 9).  Correct whether the new IDENTITY names the
+same namespace, a different one, or :NONE."
+  (%unregister-old-identity class old-contract)
   (unless (eq identity :none)
     (let ((ns (getf identity :namespace)))
       (pushnew class (gethash ns *namespace-sources*)))))
@@ -228,12 +234,13 @@ review) -- a source class inherits exactly as any other vertex does."
            ;; and what an unregister keyed by slot-names could not express.
            (graph-db:def-unique ,name (,(getf identity :key-slot))
              ,graph-name :name source-identity-key)))
-     (%register-identity ',name ',identity)
-     (setf (gethash ',name *source-contracts*)
-           (make-source-facets :class ',name :graph ',graph-name
-                               :identity ',identity :space ',space
-                               :time ',time :attribution ',attribution
-                               :sensitivity ',sensitivity
-                               :registration ',registration
-                               :indexed-text ',indexed-text))
+     (let ((old-contract (gethash ',name *source-contracts*)))
+       (setf (gethash ',name *source-contracts*)
+             (make-source-facets :class ',name :graph ',graph-name
+                                 :identity ',identity :space ',space
+                                 :time ',time :attribution ',attribution
+                                 :sensitivity ',sensitivity
+                                 :registration ',registration
+                                 :indexed-text ',indexed-text))
+       (%register-identity ',name ',identity old-contract))
      ',name))

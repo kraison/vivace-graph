@@ -572,6 +572,9 @@ cl-temporal-extent."
                (:file "claim-query")
                (:file "source")
                (:file "resolve")
+               ;; Edges under claims: write-time linking (GH #369).
+               ;; After RESOLVE for NAMESPACE-SOURCES / SOURCE-CONTRACT.
+               (:file "link")
                (:file "register")
                ;; Membership disjointness (GH #157 4b): needs
                ;; claim-query's RETRACT-CLAIM/CLAIM-CURRENT-P and core's
@@ -579,7 +582,10 @@ cl-temporal-extent."
                (:file "membership")
                ;; Temporal claim families (GH #296): the extent-overlap
                ;; validator; needs membership's post-commit overlay.
-               (:file "temporal")))
+               (:file "temporal")
+               ;; RELATED/3 and CLAIMED/4 over the endpoint edges (GH
+               ;; #369); needs claim-query's CLAIM-CURRENT-P.
+               (:file "functors")))
 
 (defsystem graph-db/spacetime-test
   :name "VivaceGraph spacetime test suite"
@@ -594,8 +600,10 @@ cl-temporal-extent."
   ;; without the add-on REGISTER-GEOMETRY correctly refuses to answer at
   ;; all (#138, design §6).  The GEOS-dependent test skips when libgeos_c
   ;; is absent, as tests/geos/ does.
+  ;; GRAPH-DB/QUERY: endpoint-edge-tests.lisp drives RELATED/3 and
+  ;; CLAIMED/4 through RUN-GUARDED-PROLOG (GH #369, spec sec.6.3).
   :depends-on (:graph-db/spacetime :graph-db/core :graph-db/geos
-               :graph-db/test-scratch :fiveam)
+               :graph-db/query :graph-db/test-scratch :fiveam)
   :pathname "tests/spacetime/"
   :serial t
   :components ((:file "package")
@@ -615,7 +623,8 @@ cl-temporal-extent."
                (:file "membership-tests")              ; GH #157 4b
                (:file "temporal-tests")                ; GH #296
                (:file "epoch-tests")                   ; GH #347
-               (:file "vocabulary-tests"))             ; GH #350
+               (:file "vocabulary-tests")              ; GH #350
+               (:file "endpoint-edge-tests"))            ; GH #369
   :perform (test-op (op c)
                     (unless (uiop:symbol-call :graph-db/spacetime-test
                                               :run-spacetime-tests)

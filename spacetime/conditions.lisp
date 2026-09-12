@@ -104,3 +104,34 @@ refusing to replace them with ~s"
                      (claim-family-conflict-proposed c))))
   (:documentation "A DEF-CLAIM-CLASSES for a parent already registered
 with different unary/binary classes (GH #323)."))
+
+;;; Edges under claims (GH #369, spec sec.7).
+
+(define-condition endpoint-link-skipped (warning)
+  ((claim :initarg :claim :reader endpoint-link-skipped-claim)
+   (namespace :initarg :namespace :reader endpoint-link-skipped-namespace)
+   (key :initarg :key :reader endpoint-link-skipped-key)
+   (classes :initarg :classes :reader endpoint-link-skipped-classes))
+  (:report (lambda (c s)
+             (format s "Endpoint (~S ~S) has ~D candidate nodes across ~
+~S; the claim was written unlinked (GH #369)."
+                     (endpoint-link-skipped-namespace c)
+                     (endpoint-link-skipped-key c)
+                     (length (endpoint-link-skipped-classes c))
+                     (endpoint-link-skipped-classes c)))))
+
+(define-condition endpoint-mismatch (spacetime-error)
+  ((node :initarg :node :reader endpoint-mismatch-node)
+   (namespace :initarg :namespace :reader endpoint-mismatch-namespace)
+   (key :initarg :key :reader endpoint-mismatch-key)
+   ;; :NOT-A-SOURCE or :KEY
+   (reason :initarg :reason :reader endpoint-mismatch-reason))
+  (:report (lambda (c s)
+             (format s "~A is not the endpoint (~S ~S): ~A (GH #369)."
+                     (endpoint-mismatch-node c)
+                     (endpoint-mismatch-namespace c)
+                     (endpoint-mismatch-key c)
+                     (ecase (endpoint-mismatch-reason c)
+                       (:not-a-source
+                        "its class is not a registered source of the namespace")
+                       (:key "its identity key is not the claim's"))))))

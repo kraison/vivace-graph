@@ -5437,7 +5437,9 @@ cannot see could not be created in the first place. Storing the endpoint as
 data rather than a live reference sidesteps the problem entirely — there is
 nothing left to resolve *inside* the transaction, so the cross-graph
 question never comes up. Resolving ~(namespace, key)~ back into an actual
-node is deliberately left to a later add-on; see below.
+node is the source onboarding contract's ~resolve-endpoint~ (below); from
+4.1.0 a claim also carries a *derived* edge to each endpoint that
+resolves in its own store — see "Edges under claims".
 
 Claims are defined with a macro, not shipped as ready-made classes —
 ~DEF-VERTEX~ binds a class to one graph at definition time, and class names
@@ -5906,6 +5908,50 @@ questions and vary independently — the claim's says how the claim came to
 be known, the extent's says how the *time* was known. An ~:asserted~ claim
 can carry an ~:observed~ extent, or any other combination; neither one
 determines the other.
+
+*** Edges under claims: derived adjacency to the endpoints (GH #369)
+
+The ~(namespace, key)~ slots stay the truth and ~claims-touching~ stays the
+complete read. Beside them, a claim written into a store that also holds
+its endpoint gains one edge per endpoint — ~subject-of~ to its subject's
+node, ~object-of~ to its object's — so the engine's adjacency, ~traverse~
+and Prolog can walk claim topology without an index probe per hop. Both
+edge classes are shipped by ~graph-db/spacetime~, have no slots and no
+default store, and are always placed in the claim's own store.
+
+Linking happens in the constructor, inside your transaction:
+
+- An endpoint whose namespace has a registered source (~def-source~) in
+  the *same* store is looked up by its identity key — through the index,
+  and through the transaction's own uncommitted creates, so a source and
+  a claim about it written together still link. Exactly one node: an
+  edge. None: the claim is key-only, as before. Several: no edge and an
+  ~endpoint-link-skipped~ warning.
+- An endpoint anywhere else is the caller's to resolve *before* the
+  transaction (~resolve-endpoint~ refuses to run inside one); pass it as
+  ~:subject-node~ / ~:object-node~ and the engine verifies it is a source
+  of that namespace with that key — ~endpoint-mismatch~, an error, if not.
+
+Linking never fails a claim write. Retraction keeps the edges (the
+record of what was believed); reads filter by currency. Deleting a
+claim or a source hides the edges through ~active-edge-p~, and
+~compact-edges~ reclaims them.
+
+Reads over the edges — ~claim-endpoints~, ~node-claims~ (the adjacency twin
+of ~claims-touching~, same filters), ~(traverse node :edge-type '(or
+subject-of object-of) ...)~, and the goals ~(related ?s ?r ?o)~ (current
+claims) and ~(claimed ?c ?s ?r ?o)~ (with history) — see *linked claims
+only*. Two facts to keep in mind: adjacency is indexed in the *edge's*
+store, so ~node-claims~ takes ~:graph~, the claim store, defaulting to the
+node's own; and the Prolog goals resolve endpoints in the claim's graph,
+so a caller-resolved endpoint in another store is linked but does not
+unify until cross-store continuation lands (GH #368). Backfilling a
+store written before this landed is the sweep, ~link-claim-endpoints~,
+which lands with GH #367 U2. Write-time linking, unlike the sweep, is
+always on: a store crosses the schema version floor at its first
+linkable write, not only when the sweep is run — harmless, since a
+claim store already needs its tenant's ~def-claim-classes~ types
+loaded to write claims at all.
 
 *** Vocabulary: what a family names (GH #350)
 

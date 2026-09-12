@@ -71,6 +71,10 @@ suite's fast tier and every other lane in full (see below).
   loads both subsystems WILL trip it, with a message naming the
   seven `claim*` functors.  That is the tripwire working: classify
   them, do not delete the check (`docs/rules.md`, GH #330).
+  The same holds for `graph-db/spacetime`'s six (`related/3`,
+  `claimed/4`, `subject-of/2`, `subject-of/3`, `object-of/2`,
+  `object-of/3`; GH #369): absent from the gui lane, present in any
+  image that loads spacetime beside the gui.
 - The geos lane needs `libgeos_c` on the runner host; the suite
   SKIPS (green) where it is absent, so a green geos lane on a
   bare host proves nothing -- keep the library installed.
