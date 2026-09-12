@@ -492,6 +492,11 @@ start vertex along a back-edge under global uniqueness, pinned in
 
 ## Built — U2 (#372, a109be8)
 
+_Addendum (#373):_ `claim-endpoint (claim role)` reads one linked
+endpoint with one adjacency probe; `claim-endpoints` is built on it. The
+profile showed the two-probe read paying for an endpoint the two-hop
+consumer never used.
+
 §5 and §9 on `feat/edges-under-claims-u2`. Deviations from §5's text:
 the return gains a fifth value, `more-p`, because `:limit` bounds the
 claims with a missing edge examined per call and a caller needs to

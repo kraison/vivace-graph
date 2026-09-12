@@ -43,6 +43,11 @@ between releases; cutting a release renames it to the new version and dates it.
   read (suspected per-edge endpoint validation, #373) — details and the
   hypothesis on #372.
 
+- **`claim-endpoint`** (#373): `(claim-endpoint claim role)` reads ONE
+  linked endpoint (`:subject` or `:object`) with one adjacency probe;
+  `claim-endpoints` is now defined on top of it. A two-hop read that
+  wants only the object no longer pays for the subject's edge as well.
+
 - **Counting index** (#361): `def-count-index` declares a per-prefix
   counter pair `(all . current)` maintained at commit apply, replication
   and purge, persisted through its own sidecar and rebuilt after a

@@ -5938,7 +5938,8 @@ record of what was believed); reads filter by currency. Deleting a
 claim or a source hides the edges through ~active-edge-p~, and
 ~compact-edges~ reclaims them.
 
-Reads over the edges — ~claim-endpoints~, ~node-claims~ (the adjacency twin
+Reads over the edges — ~claim-endpoint~ (one side, one probe),
+~claim-endpoints~, ~node-claims~ (the adjacency twin
 of ~claims-touching~, same filters), ~(traverse node :edge-type '(or
 subject-of object-of) ...)~, and the goals ~(related ?s ?r ?o)~ (current
 claims) and ~(claimed ?c ?s ?r ?o)~ (with history) — see *linked claims

@@ -430,19 +430,26 @@ subsystem exists to keep those two cases from being confused."
 probe behind every \"is this endpoint linked?\" read (GH #369)."
   (first (graph-db:outgoing-edges claim :graph graph :edge-type type)))
 
+(defun claim-endpoint (claim role &key (graph (graph-db::node-graph claim)))
+  "CLAIM's linked ROLE endpoint node -- :SUBJECT or :OBJECT -- from its
+outgoing SUBJECT-OF / OBJECT-OF edge in GRAPH (its own store), or NIL
+when that side is not linked: key-only, or a unary claim's object.  One
+adjacency probe; a reader that wants one side should not pay for two
+(GH #373).  A cross-store endpoint is read through
+LOOKUP-VERTEX-ANYWHERE, so it may be an UNRESOLVED-NODE marker while
+that store is detached.  Edges created in a still-open transaction are
+not visible until it commits (adjacency is indexed at commit apply)."
+  (check-type role (member :subject :object))
+  (let ((e (%linked-edge claim graph
+                         (if (eq role :subject) 'subject-of 'object-of))))
+    (when e
+      (graph-db:lookup-vertex-anywhere (graph-db:to e)))))
+
 (defun claim-endpoints (claim &key (graph (graph-db::node-graph claim)))
-  "CLAIM's linked endpoint nodes: (VALUES SUBJECT-NODE OBJECT-NODE), from
-its outgoing SUBJECT-OF / OBJECT-OF edges in GRAPH (its own store).  NIL
-for an endpoint that is not linked -- key-only, or a unary claim's
-object.  A cross-store endpoint is read through LOOKUP-VERTEX-ANYWHERE,
-so it may be an UNRESOLVED-NODE marker while that store is detached.
-Edges created in a still-open transaction are not visible until it
-commits (adjacency is indexed at commit apply)."
-  (flet ((endpoint (type)
-           (let ((e (%linked-edge claim graph type)))
-             (when e
-               (graph-db:lookup-vertex-anywhere (graph-db:to e))))))
-    (values (endpoint 'subject-of) (endpoint 'object-of))))
+  "CLAIM's linked endpoint nodes: (VALUES SUBJECT-NODE OBJECT-NODE) --
+CLAIM-ENDPOINT for both roles, with its contract for each (GH #369)."
+  (values (claim-endpoint claim :subject :graph graph)
+          (claim-endpoint claim :object :graph graph)))
 
 (defun node-claims (node &key (graph (graph-db::node-graph node))
                               family (role :either) current relation

@@ -84,6 +84,23 @@ CLAIM-ENDPOINTS per hop -- the edge path with no query runner in front."
                 (incf count)))))))
     count))
 
+(defun pb-two-hop-one-endpoint (g key)
+  "PB-TWO-HOP-NODE-CLAIMS with CLAIM-ENDPOINT :OBJECT -- one adjacency
+probe per hop instead of CLAIM-ENDPOINTS' two (GH #373).  A separate
+label, so TWO-HOP-NODE-CLAIMS stays comparable across runs."
+  (let ((count 0)
+        (s (first (graph-db:index-lookup g 'pb-thing '(thing-id) key))))
+    (when s
+      (dolist (c (graph-db.spacetime:node-claims
+                  s :graph g :role :subject :current t))
+        (let ((o (graph-db.spacetime:claim-endpoint c :object)))
+          (when o
+            (dolist (c2 (graph-db.spacetime:node-claims
+                         o :graph g :role :subject :current t))
+              (when (graph-db.spacetime:claim-endpoint c2 :object)
+                (incf count)))))))
+    count))
+
 (defun pb-two-hop-touching (g key)
   "The same neighbourhood through CLAIMS-TOUCHING plus RESOLVE-ENDPOINT
 per hop -- the first implementation's read path."
@@ -135,6 +152,8 @@ Same N/M/K on both sides."
         (setf t-node-claims
               (timed-ops ("two-hop-node-claims" k)
                 (dolist (key keys) (pb-two-hop-node-claims g key))))
+        (timed-ops ("two-hop-claim-endpoint" k)
+          (dolist (key keys) (pb-two-hop-one-endpoint g key)))
         (setf t-touching
               (timed-ops ("two-hop-claims-touching" k)
                 (dolist (key keys) (pb-two-hop-touching g key))))
