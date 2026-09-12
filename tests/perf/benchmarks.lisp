@@ -997,6 +997,7 @@ Measurement-only; always returns T."
            ;; coverage benches, batch B (GH #254)
            (bench-peer-replication)
            (bench-vector-search)
+           (bench-claim-linking)
            (write-perf-report output :tag tag))
       ;; system-dir and all bench scratch live under the shared per-run
       ;; parent; drop it whole (GH #214).
