@@ -107,7 +107,11 @@ two types in its `schema.dat`. An engine build without
 `graph-db.spacetime`'s classes refuses to open it with
 `schema-classes-not-loaded` (#144) — nothing is corrupt; load the
 subsystem. The sweep (§5) is opt-in per store, so an operator chooses
-when a store crosses that floor.
+when a store crosses that floor by running it — but write-time linking
+(§4.1) is always on, so a store crosses the floor at its first
+linkable write regardless. Harmless: a claim store already carries its
+tenant's `def-claim-classes` types, which the same build must load
+anyway.
 
 ---
 
@@ -470,10 +474,12 @@ recorded here: the write-time linker lives in `spacetime/link.lisp`
 after `claim.lisp`; and `node-claims` takes `:graph`, the store holding
 the claims, defaulting to the node's own — §6.1's "each claim family's
 graph" is not derivable, since a family is registered by class and a
-class is instantiable in any store (#167). Unary claims are not
-solutions of `related/3` / `claimed/4` (no object); `subject-of/2`
-reaches them. `claims-touching`'s filter tail is now `%narrow-claims`,
-shared with `node-claims`. The write-time linker's derived-link branch
+class is instantiable in any store (#167). `claim-endpoints` takes
+`:graph` too, defaulting to the claim's own store, for the same
+reason. Unary claims are not solutions of `related/3` / `claimed/4`
+(no object); `subject-of/2` reaches them. `claims-touching`'s filter
+tail is now `%narrow-claims`, shared with `node-claims`. The
+write-time linker's derived-link branch
 runs under one handler that `log:warn`s a failed link (GH #369) and
 never signals — the caller-verified path stays outside it, so
 `endpoint-mismatch` still fails the write. `link.lisp` reads

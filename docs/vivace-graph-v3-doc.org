@@ -5437,9 +5437,9 @@ cannot see could not be created in the first place. Storing the endpoint as
 data rather than a live reference sidesteps the problem entirely — there is
 nothing left to resolve *inside* the transaction, so the cross-graph
 question never comes up. Resolving ~(namespace, key)~ back into an actual
-node is the source onboarding contract's ~resolve-endpoint~ (below); since
-4.1 a claim also carries a *derived* edge to each endpoint that resolves
-in its own store — see "Edges under claims".
+node is the source onboarding contract's ~resolve-endpoint~ (below); from
+4.1.0 a claim also carries a *derived* edge to each endpoint that
+resolves in its own store — see "Edges under claims".
 
 Claims are defined with a macro, not shipped as ready-made classes —
 ~DEF-VERTEX~ binds a class to one graph at definition time, and class names
@@ -5945,8 +5945,13 @@ only*. Two facts to keep in mind: adjacency is indexed in the *edge's*
 store, so ~node-claims~ takes ~:graph~, the claim store, defaulting to the
 node's own; and the Prolog goals resolve endpoints in the claim's graph,
 so a caller-resolved endpoint in another store is linked but does not
-unify until cross-store continuation lands (GH #368). Backfilling a store
-written before 4.1 is the sweep, ~link-claim-endpoints~ (GH #367 U2).
+unify until cross-store continuation lands (GH #368). Backfilling a
+store written before this landed is the sweep, ~link-claim-endpoints~,
+which lands with GH #367 U2. Write-time linking, unlike the sweep, is
+always on: a store crosses the schema version floor at its first
+linkable write, not only when the sweep is run — harmless, since a
+claim store already needs its tenant's ~def-claim-classes~ types
+loaded to write claims at all.
 
 *** Vocabulary: what a family names (GH #350)
 
