@@ -5985,8 +5985,11 @@ key to the *new* record, adding a fresh edge; the superseded one stays
 hidden by ~active-edge-p~ until ~compact-edges~ reclaims it, so run
 ~compact-edges~ after a source regeneration. A bulk loader can bind
 ~*link-claims-at-write*~ to NIL, write key-only, and sweep once
-afterwards; the write-cost, sweep-cost and read-benefit numbers behind
-that trade are ~bench-claim-linking~ in the perf suite (GH #372).
+afterwards; a ~:subject-node~ / ~:object-node~ passed under that binding
+is still *verified* — ~endpoint-mismatch~ still refuses the write — and
+simply left unlinked for the sweep. The write-cost, sweep-cost and
+read-benefit numbers behind that trade are ~bench-claim-linking~ in the
+perf suite (GH #372).
 
 Measured on a synthetic store of two thousand sources and four
 thousand claims (~bench-claim-linking~ in the perf suite, GH #372):

@@ -25,6 +25,28 @@ present sources is written key-only, and no edge type is adopted."
       (let ((c2 (with-transaction () (ee-b :relation "r2"))))
         (is-true (ee-linked-to c2 'subject-of g))))))
 
+(test the-write-time-switch-still-verifies-a-given-node
+  "GH #372: the switch defers the EDGE, not the check.  With
+*LINK-CLAIMS-AT-WRITE* NIL a :SUBJECT-NODE / :OBJECT-NODE that is not
+the claim's endpoint still fails the write; the right one is written
+and left unlinked for the sweep."
+  (with-ee-graph (g)
+    (let (t1 t2 c)
+      (with-transaction () (setq t1 (ee-thing "t-1") t2 (ee-thing "t-2")))
+      (let ((*link-claims-at-write* nil))
+        ;; right class for the namespace, wrong key
+        (signals endpoint-mismatch
+          (with-transaction () (ee-b :object-node t1)))
+        ;; not a source of that namespace at all
+        (signals endpoint-mismatch
+          (with-transaction ()
+            (ee-b :object-namespace :st-reports :object "r-1"
+                  :object-node t1)))
+        (with-transaction () (setq c (ee-b :object-node t2))))
+      (is (null (ee-linked-to c 'object-of g)))
+      (is (null (ee-linked-to c 'subject-of g)))
+      (is (= 1 (length (claims-touching g 'ee-claim :ee-things "t-1")))))))
+
 (defun ee-sweep (g &rest keys)
   "LINK-CLAIM-ENDPOINTS on G; the five values as a list."
   (multiple-value-list (apply #'link-claim-endpoints g keys)))

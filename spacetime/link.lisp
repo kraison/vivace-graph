@@ -106,10 +106,29 @@ and returns NIL (spec sec.4.1 step 3)."
                   namespace key (graph-db:id claim) c)
         nil))))
 
-(defun %link-claim-at-write (claim &key subject-node object-node)
+(defun %verify-given-endpoints (claim subject-node object-node)
+  "Verify the endpoint nodes the caller gave, creating no edge: the
+*LINK-CLAIMS-AT-WRITE* NIL path, where the switch defers the edge but
+not the check (GH #372).  Returns CLAIM; ENDPOINT-MISMATCH is the
+caller's error either way."
+  (when subject-node
+    (%verify-endpoint-node subject-node (claim-subject-namespace claim)
+                           (claim-subject-key claim)))
+  (when (and object-node (%binary-claim-p claim))
+    (%verify-endpoint-node object-node (claim-object-namespace claim)
+                           (claim-object-key claim)))
+  claim)
+
+(defun %link-claim-at-write (claim &key subject-node object-node
+                                        verify-only)
   "Link CLAIM's endpoints in its own store, inside the caller's open
 transaction (spec sec.4.1-4.2).  Returns CLAIM.  Never signals an ERROR
-for the derived edge; ENDPOINT-MISMATCH is the caller's, not the edge's."
+for the derived edge; ENDPOINT-MISMATCH is the caller's, not the edge's.
+VERIFY-ONLY (write-time linking switched off) checks the given nodes --
+pure: no candidate search, no transaction, no edge."
+  (when verify-only
+    (return-from %link-claim-at-write
+      (%verify-given-endpoints claim subject-node object-node)))
   ;; NODE-GRAPH is internal to GRAPH-DB (not exported); GRAPH-DB::* is
   ;; the house idiom used elsewhere in this file for such symbols.
   (let ((graph (graph-db::node-graph claim))
