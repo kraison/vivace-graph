@@ -5958,14 +5958,31 @@ arrived later, is the sweep:
 It reads under a snapshot, resolves each missing endpoint with
 ~resolve-endpoint~ — so it may link across stores, which write-time
 linking never does — and creates the edges in one short transaction,
-re-checking each claim is still unlinked so it is idempotent. ~:since~
-is a commit epoch (~claim-commit-epoch~), which lets an operator sweep
-exactly what a regeneration wrote; ~:limit~ bounds one call's work and
-~more-p~ says whether to call again. It never prunes and never signals:
-a namespace with no registered source or a source store that is not
-open is skipped for the call and named in ~skipped-namespaces~; the
-other counts are the report. Nothing runs on open. A bulk loader can
-bind ~*link-claims-at-write*~ to NIL, write key-only, and sweep once
+re-checking each claim is still present, not deleted and still
+unlinked, so a repeated sweep is idempotent. ~:since~ is a commit epoch
+(~claim-commit-epoch~), which lets an operator sweep exactly what a
+regeneration wrote; ~:limit~ bounds both the work and the scan —
+collection stops at the first claim with a missing edge past the
+window. It never prunes and never signals: a namespace with no
+registered source or a source store that is not open is skipped for the
+call and named in ~skipped-namespaces~; the other counts are the
+report. Nothing runs on open.
+
+~more-p~ says that a claim with a missing edge exists beyond this
+call's window — *not* that progress remains. Claims that can never be
+resolved (an unregistered namespace, a key nobody holds) are
+re-collected on every call, so a window full of them returns ~linked~ 0
+with ~more-p~ T for ever. The backfill loop is therefore ~(loop while
+(and more-p (plusp linked)))~: stop when a call links nothing, then
+widen ~:limit~, fix the sources, or sweep a later ~:since~. Give a
+large backfill a ~:limit~ of a few thousand so each write transaction
+stays short.
+
+The sweep links a source that was deleted and re-created under the same
+key to the *new* record, adding a fresh edge; the superseded one stays
+hidden by ~active-edge-p~ until ~compact-edges~ reclaims it, so run
+~compact-edges~ after a source regeneration. A bulk loader can bind
+~*link-claims-at-write*~ to NIL, write key-only, and sweep once
 afterwards; the write-cost, sweep-cost and read-benefit numbers behind
 that trade are ~bench-claim-linking~ in the perf suite (GH #372).
 

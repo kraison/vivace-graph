@@ -128,6 +128,50 @@ says whether further such claims remained."
       (is (= 2 linked))
       (is (null more)))))
 
+(test sweep-more-p-does-not-mean-progress
+  "The documented loop is (AND MORE-P (PLUSP LINKED)): a window of
+permanently unresolvable claims returns LINKED 0 with MORE-P T every
+call, because each call re-collects them (GH #372)."
+  (with-ee-graph (g)
+    (dolist (r '("r1" "r2" "r3"))
+      (ee-unlinked-b :subject "ghost" :object "ghost-too" :relation r))
+    (destructuring-bind (linked u a s more) (ee-sweep g :limit 2)
+      (declare (ignore u a s))
+      (is (= 0 linked))
+      (is-true more))
+    ;; Unchanged store, same window: MORE-P alone would spin for ever.
+    (is (equal '(0 4 0 nil t) (ee-sweep g :limit 2)))))
+
+(test sweep-links-a-unary-claim
+  "A unary claim has one endpoint; the sweep links it like any other,
+and links it once."
+  (with-ee-graph (g)
+    (let (u s)
+      (let ((*link-claims-at-write* nil))
+        (with-transaction ()
+          (setq u (make-ee-claim-unary :subject-namespace :ee-things
+                                       :subject-key "t-1" :relation "u"
+                                       :producer "p"
+                                       :standing :inferred))))
+      (with-transaction () (setq s (ee-thing "t-1")))
+      (is (equal '(1 0 0 nil nil) (ee-sweep g)))
+      (multiple-value-bind (us uo) (claim-endpoints u)
+        (is-true (same-node-p s us))
+        (is (null uo)))
+      (is (equal '(0 0 0 nil nil) (ee-sweep g))))))
+
+(test sweep-links-a-retracted-claim
+  "Spec R3 / sec.4.3: history keeps its edges, so a retracted claim
+written key-only is still linked -- CLAIMED/4 reads it, RELATED/3 does
+not."
+  (with-ee-graph (g)
+    (let ((c (ee-unlinked-b)))
+      (retract-claim c)
+      (with-transaction () (ee-thing "t-1") (ee-thing "t-2"))
+      (is (equal '(2 0 0 nil nil) (ee-sweep g)))
+      (is-true (ee-linked-to c 'subject-of g))
+      (is-true (ee-linked-to c 'object-of g)))))
+
 (test sweep-does-not-prune-a-dead-endpoints-edge
   "Spec sec.5: ACTIVE-EDGE-P hides the edge, COMPACT-EDGES reclaims it,
 the sweep leaves it alone and does not re-link a deleted source."

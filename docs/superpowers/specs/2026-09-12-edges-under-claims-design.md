@@ -495,10 +495,15 @@ start vertex along a back-edge under global uniqueness, pinned in
 §5 and §9 on `feat/edges-under-claims-u2`. Deviations from §5's text:
 the return gains a fifth value, `more-p`, because `:limit` bounds the
 claims with a missing edge examined per call and a caller needs to
-know whether to call again (endpoints that stay unresolved are
-re-examined each call; `:since` is the cursor for a regeneration's
-writes); the write phase re-checks each claim is still unlinked, so two
-sweeps racing, or a sweep racing a write-time link, stay idempotent.
+know whether to call again. `:limit` bounds both the work and the
+scan: collection stops at the first claim with a missing edge past the
+window, and `more-p` means exactly "such a claim exists beyond this
+call's window" — not that progress remains, since permanently
+unresolvable claims are re-collected every call. The documented
+backfill loop is `(loop while (and more-p (plusp linked)))`; `:since`
+is the cursor for a regeneration's writes. The write phase re-checks
+each claim is still present, not deleted and still unlinked, which is
+what makes a repeated sweep idempotent.
 Added beyond §5: `*link-claims-at-write*` (default T), the switch §9's
 measurement needs and a bulk loader wants. §9 was measured on a
 synthetic store of the memory tenant's shape (`bench-claim-linking`,

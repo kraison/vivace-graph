@@ -425,6 +425,11 @@ subsystem exists to keep those two cases from being confused."
 ;;; Edges under claims: the adjacency reads (GH #369, spec sec.6.1).
 ;;; Both see LINKED claims only; CLAIMS-TOUCHING is the complete read.
 
+(defun %linked-edge (claim graph type)
+  "CLAIM's first active outgoing TYPE edge in GRAPH, or NIL -- the one
+probe behind every \"is this endpoint linked?\" read (GH #369)."
+  (first (graph-db:outgoing-edges claim :graph graph :edge-type type)))
+
 (defun claim-endpoints (claim &key (graph (graph-db::node-graph claim)))
   "CLAIM's linked endpoint nodes: (VALUES SUBJECT-NODE OBJECT-NODE), from
 its outgoing SUBJECT-OF / OBJECT-OF edges in GRAPH (its own store).  NIL
@@ -434,8 +439,7 @@ so it may be an UNRESOLVED-NODE marker while that store is detached.
 Edges created in a still-open transaction are not visible until it
 commits (adjacency is indexed at commit apply)."
   (flet ((endpoint (type)
-           (let ((e (first (graph-db:outgoing-edges claim :graph graph
-                                                          :edge-type type))))
+           (let ((e (%linked-edge claim graph type)))
              (when e
                (graph-db:lookup-vertex-anywhere (graph-db:to e))))))
     (values (endpoint 'subject-of) (endpoint 'object-of))))

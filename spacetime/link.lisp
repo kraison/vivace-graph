@@ -139,9 +139,10 @@ must never see."
 ;;; ---------------------------------------------------------------------------
 
 (defun %family-parents-in (graph family)
-  "Parent class names whose family has claims in GRAPH: FAMILY's alone
+  "Parent class names to sweep in GRAPH: FAMILY's alone
 (UNKNOWN-CLAIM-FAMILY if unregistered), else every registered family
-whose parent type is instantiated in GRAPH."
+whose parent type is defined in GRAPH's schema -- a type defined but
+never written costs one empty MAP-VERTICES."
   (if family
       (let ((parent (claim-family-parent (claim-family family))))
         (when (graph-db:lookup-node-type-by-name parent :vertex :graph graph)
@@ -159,14 +160,12 @@ whose parent type is instantiated in GRAPH."
   "The (CTOR TYPE NAMESPACE KEY) entries of CLAIM's endpoints that have
 no edge in GRAPH; a unary claim has at most one."
   (let ((out '()))
-    (unless (graph-db:outgoing-edges claim :graph graph
-                                           :edge-type 'subject-of)
+    (unless (%linked-edge claim graph 'subject-of)
       (push (list #'make-subject-of 'subject-of
                   (claim-subject-namespace claim) (claim-subject-key claim))
             out))
     (when (and (%binary-claim-p claim)
-               (null (graph-db:outgoing-edges claim :graph graph
-                                                    :edge-type 'object-of)))
+               (null (%linked-edge claim graph 'object-of)))
       (push (list #'make-object-of 'object-of
                   (claim-object-namespace claim) (claim-object-key claim))
             out))
@@ -174,86 +173,123 @@ no edge in GRAPH; a unary claim has at most one."
 
 (defun %sweep-collect (graph parents since limit)
   "Claims of PARENTS in GRAPH with a missing edge, at or above commit
-epoch SINCE, at most LIMIT of them: (VALUES ((CLAIM . MISSING)...) MORE-P).
-Runs inside the caller's read snapshot."
+epoch SINCE, at most LIMIT of them: (VALUES ((CLAIM-ID . MISSING)...)
+MORE-P).  MORE-P means a further such claim exists; the scan then STOPS
+there, so LIMIT bounds the scan as well as the work (GH #372).  Runs
+inside the caller's read snapshot: the slots are read here, and only
+ids escape the pin."
   (let ((work '()) (n 0) (more nil))
-    (dolist (parent parents)
-      (graph-db:map-vertices
-       (lambda (c)
-         (when (or (null since)
-                   (let ((e (claim-commit-epoch c))) (and e (>= e since))))
-           (let ((missing (%missing-endpoints c graph)))
-             (when missing
-               (if (and limit (>= n limit))
+    (block scan
+      (dolist (parent parents)
+        (graph-db:map-vertices
+         (lambda (c)
+           ;; No epoch = written before #347 or not yet committed:
+           ;; :SINCE cannot place it, so the window excludes it.
+           (when (or (null since)
+                     (let ((e (claim-commit-epoch c))) (and e (>= e since))))
+             (let ((missing (%missing-endpoints c graph)))
+               (when missing
+                 (when (and limit (>= n limit))
                    (setf more t)
-                   (progn (push (cons c missing) work) (incf n)))))))
-       graph :vertex-type parent))
+                   (return-from scan))
+                 (push (cons (graph-db:id c) missing) work)
+                 (incf n)))))
+         graph :vertex-type parent)))
     (values (nreverse work) more)))
+
+(defun %sweep-resolution (namespace key seen)
+  "RESOLVE-ENDPOINT for (NAMESPACE KEY), memoised in SEEN for the call:
+a node id, :NONE, :AMBIGUOUS, or :SKIP for a namespace the call must
+abandon (GH #372).  One resolution per endpoint value, however many
+claims name it."
+  (let ((cell (cons namespace key)))
+    (multiple-value-bind (hit found) (gethash cell seen)
+      (if found
+          hit
+          (setf (gethash cell seen)
+                (handler-case
+                    (let ((node (resolve-endpoint namespace key)))
+                      (if node (graph-db:id node) :none))
+                  ((or unknown-namespace unopened-source-graph) () :skip)
+                  (ambiguous-endpoint () :ambiguous)))))))
 
 (defun %sweep-resolve (work)
   "Resolve every missing endpoint in WORK: (VALUES PLAN UNRESOLVED
 AMBIGUOUS SKIPPED), PLAN a list of (CLAIM-ID CTOR TYPE NODE-ID).  A
 namespace that signals UNKNOWN-NAMESPACE or UNOPENED-SOURCE-GRAPH is
-skipped for the rest of the call (spec sec.5 step 1)."
-  (let ((plan '()) (unresolved 0) (ambiguous 0) (skipped '()))
+skipped for the rest of the call (spec sec.5 step 1).  The counts are
+per ENDPOINT; the resolutions behind them are memoised per
+(NAMESPACE . KEY)."
+  (let ((plan '()) (unresolved 0) (ambiguous 0) (skipped '())
+        (seen (make-hash-table :test 'equal)))
     (dolist (entry work)
-      (destructuring-bind (claim . missing) entry
+      (destructuring-bind (claim-id . missing) entry
         (dolist (m missing)
           (destructuring-bind (ctor type namespace key) m
             (unless (member namespace skipped)
-              (handler-case
-                  (let ((node (resolve-endpoint namespace key)))
-                    (if node
-                        (push (list (graph-db:id claim) ctor type
-                                    (graph-db:id node))
-                              plan)
-                        (incf unresolved)))
-                ((or unknown-namespace unopened-source-graph) ()
-                  (push namespace skipped))
-                (ambiguous-endpoint () (incf ambiguous))))))))
+              (let ((hit (%sweep-resolution namespace key seen)))
+                (case hit
+                  (:none (incf unresolved))
+                  (:ambiguous (incf ambiguous))
+                  (:skip (push namespace skipped))
+                  (t (push (list claim-id ctor type hit) plan)))))))))
     (values (nreverse plan) unresolved ambiguous (nreverse skipped))))
 
 (defun %sweep-write (graph plan)
   "Create PLAN's edges in one transaction on GRAPH; the number committed.
-Each claim is re-checked as still present and still unlinked for that
-edge type, so two sweeps racing, or a sweep racing a write-time link,
-stay idempotent.  A construction failure is logged, never signalled."
+Each claim is re-checked as still present, not deleted and still
+unlinked for that edge type, which is what makes a repeated sweep
+idempotent.  A construction failure is logged, never signalled."
   (if (null plan)
       0
-      (let ((n 0))
-        (handler-case
-            (graph-db:with-transaction ((graph-db::transaction-manager graph))
+      (handler-case
+          (graph-db:with-transaction (:graph graph)
+            ;; Counted INSIDE the body: a VALIDATION-CONFLICT retry
+            ;; re-runs it, and an outer counter would double (GH #372).
+            (let ((n 0))
               (dolist (step plan)
                 (destructuring-bind (claim-id ctor type node-id) step
                   (let ((c (graph-db:lookup-vertex claim-id :graph graph)))
                     (when (and c
-                               (null (graph-db:outgoing-edges
-                                      c :graph graph :edge-type type)))
+                               (not (graph-db:deleted-p c))
+                               (null (%linked-edge c graph type)))
                       (funcall ctor :from claim-id :to node-id :graph graph)
-                      (incf n))))))
-          (error (c)
-            (log:warn "GH #372: sweep on ~A wrote nothing: ~A"
-                      (graph-db:graph-name graph) c)
-            (setf n 0)))
-        n)))
+                      (incf n)))))
+              n))
+        (error (c)
+          (log:warn "GH #372: sweep on ~A wrote nothing: ~A"
+                    (graph-db:graph-name graph) c)
+          0))))
 
 (defun link-claim-endpoints (graph &key family since limit)
   "Link every claim in GRAPH whose endpoint now resolves: the idempotent
 sweep and backfill (GH #372, spec sec.5).  (VALUES LINKED UNRESOLVED
 AMBIGUOUS SKIPPED-NAMESPACES MORE-P): edges committed; endpoints with no
 node; endpoints with several; namespaces skipped for the whole call
-(unregistered, or a source store not open); whether LIMIT stopped the
-visit with work remaining.
+(unregistered, or a source store not open); whether a claim with a
+missing edge exists beyond this call's window.
 
-FAMILY is one parent class name (default: every family with claims in
-GRAPH).  SINCE is a commit epoch (CLAIM-COMMIT-EPOCH): only claims at or
-above it are visited, so a regeneration's writes can be swept alone.
-LIMIT bounds the claims WITH A MISSING EDGE examined in one call; loop
-while MORE-P, noting that endpoints that stay unresolved are examined
-again each call.
+FAMILY is one parent class name (default: every family defined in
+GRAPH's schema); an unregistered one signals UNKNOWN-CLAIM-FAMILY, the
+sweep's only caller-error signal.  SINCE is a commit epoch
+(CLAIM-COMMIT-EPOCH): only claims at or above it are visited, so a
+regeneration's writes can be swept alone.  LIMIT bounds both the work
+and the scan: collection stops at the first claim with a missing edge
+past the window.
+
+MORE-P is NOT 'progress remains'.  A window of permanently unresolvable
+claims -- an unregistered namespace, a key nobody holds -- returns
+LINKED 0 with MORE-P T for ever, because each call re-collects them.
+Loop (LOOP WHILE (AND MORE-P (PLUSP LINKED))) and stop when LINKED is
+0: widen :LIMIT, fix the sources, or use :SINCE.  A large backfill wants
+:LIMIT (a few thousand) so each write transaction stays short.
 
 Never prunes -- ACTIVE-EDGE-P hides a dead endpoint's edge and
 COMPACT-EDGES reclaims it -- and never signals for what it could not do.
+A source deleted and re-created under the same key gains a FRESH edge at
+the next sweep; the superseded one stays hidden until COMPACT-EDGES, so
+run that after a source regeneration.
+
 Trap: must not be called inside a read-write transaction
 (RESOLUTION-IN-TRANSACTION); run it between transactions."
   (let ((parents (%family-parents-in graph family)))
