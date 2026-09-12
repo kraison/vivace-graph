@@ -25,6 +25,19 @@ between releases; cutting a release renames it to the new version and dates it.
   Cross-store traversal continuation is deferred (#368).
   `docs/superpowers/specs/2026-09-12-edges-under-claims-design.md`.
 
+- **Linking sweep and backfill** (#367, U2 #372): `link-claim-endpoints`
+  links every claim whose endpoint now resolves — across stores through
+  `resolve-endpoint`, under a snapshot, then one short write
+  transaction; idempotent; `:since` a commit epoch, `:limit` with a
+  `more-p` return; never prunes (`compact-edges` reclaims), never
+  signals (its counts are the report); nothing runs on open.
+  `*link-claims-at-write*` (default T) lets a bulk load defer linking to
+  the sweep. `bench-claim-linking` in the perf suite records the spec's
+  §9 numbers; measured at bench scale, write-time linking costs ~60% of
+  claim-write throughput and the two-hop edge read is ~2.5× *slower*
+  than the index read (per-edge endpoint validation, an engine
+  follow-up) — details and the hypothesis on #372.
+
 - **Counting index** (#361): `def-count-index` declares a per-prefix
   counter pair `(all . current)` maintained at commit apply, replication
   and purge, persisted through its own sidecar and rebuilt after a

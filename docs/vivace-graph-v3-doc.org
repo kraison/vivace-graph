@@ -5915,8 +5915,9 @@ The ~(namespace, key)~ slots stay the truth and ~claims-touching~ stays the
 complete read. Beside them, a claim written into a store that also holds
 its endpoint gains one edge per endpoint — ~subject-of~ to its subject's
 node, ~object-of~ to its object's — so the engine's adjacency, ~traverse~
-and Prolog can walk claim topology without an index probe per hop. Both
-edge classes are shipped by ~graph-db/spacetime~, have no slots and no
+and Prolog can walk claim topology without an index probe per hop
+(see the measured caveat at the end of this section). Both edge
+classes are shipped by ~graph-db/spacetime~, have no slots and no
 default store, and are always placed in the claim's own store.
 
 Linking happens in the constructor, inside your transaction:
@@ -5946,12 +5947,45 @@ store, so ~node-claims~ takes ~:graph~, the claim store, defaulting to the
 node's own; and the Prolog goals resolve endpoints in the claim's graph,
 so a caller-resolved endpoint in another store is linked but does not
 unify until cross-store continuation lands (GH #368). Backfilling a
-store written before this landed is the sweep, ~link-claim-endpoints~,
-which lands with GH #367 U2. Write-time linking, unlike the sweep, is
-always on: a store crosses the schema version floor at its first
-linkable write, not only when the sweep is run — harmless, since a
-claim store already needs its tenant's ~def-claim-classes~ types
-loaded to write claims at all.
+store written before edges existed, or repairing claims whose sources
+arrived later, is the sweep:
+
+#+BEGIN_SRC lisp
+(link-claim-endpoints graph &key family since limit)
+;; => (values linked unresolved ambiguous skipped-namespaces more-p)
+#+END_SRC
+
+It reads under a snapshot, resolves each missing endpoint with
+~resolve-endpoint~ — so it may link across stores, which write-time
+linking never does — and creates the edges in one short transaction,
+re-checking each claim is still unlinked so it is idempotent. ~:since~
+is a commit epoch (~claim-commit-epoch~), which lets an operator sweep
+exactly what a regeneration wrote; ~:limit~ bounds one call's work and
+~more-p~ says whether to call again. It never prunes and never signals:
+a namespace with no registered source or a source store that is not
+open is skipped for the call and named in ~skipped-namespaces~; the
+other counts are the report. Nothing runs on open. A bulk loader can
+bind ~*link-claims-at-write*~ to NIL, write key-only, and sweep once
+afterwards; the write-cost, sweep-cost and read-benefit numbers behind
+that trade are ~bench-claim-linking~ in the perf suite (GH #372).
+
+Measured on a synthetic store of two thousand sources and four
+thousand claims (~bench-claim-linking~ in the perf suite, GH #372):
+write-time linking costs roughly 60% of claim-write throughput, the
+backfill sweep links eight thousand edges in about three seconds,
+and — the surprise — a two-hop read through the edges is *slower*
+than the same read through ~claims-touching~ and ~resolve-endpoint~,
+by about 2.5× in Lisp and far more under the guarded Prolog runner.
+The cost is not the walk but the engine's per-edge endpoint
+validation (~active-edge-p~ looks up both endpoints of every edge it
+emits), which is a follow-up in the engine, not in this layer. Until
+it lands, treat the edges as what ~traverse~ and the Prolog goals
+need — topology — and keep ~claims-touching~ as the fast read.
+
+Write-time linking, unlike the sweep, is always on: a store crosses
+the schema version floor at its first linkable write, not only when
+the sweep is run — harmless, since a claim store already needs its
+tenant's ~def-claim-classes~ types loaded to write claims at all.
 
 *** Vocabulary: what a family names (GH #350)
 

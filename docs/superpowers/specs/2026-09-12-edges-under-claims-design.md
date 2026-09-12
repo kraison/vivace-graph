@@ -490,6 +490,27 @@ start vertex along a back-edge under global uniqueness, pinned in
 `tests/spacetime/endpoint-edge-tests.lisp`, as
 `tests/traverse-tests.lisp` already documents.
 
+## Built — U2 (#372, a109be8)
+
+§5 and §9 on `feat/edges-under-claims-u2`. Deviations from §5's text:
+the return gains a fifth value, `more-p`, because `:limit` bounds the
+claims with a missing edge examined per call and a caller needs to
+know whether to call again (endpoints that stay unresolved are
+re-examined each call; `:since` is the cursor for a regeneration's
+writes); the write phase re-checks each claim is still unlinked, so two
+sweeps racing, or a sweep racing a write-time link, stay idempotent.
+Added beyond §5: `*link-claims-at-write*` (default T), the switch §9's
+measurement needs and a bulk loader wants. §9 was measured on a
+synthetic store of the memory tenant's shape (`bench-claim-linking`,
+`tests/perf/spacetime-bench.lisp`), not on the tenant's own data, which
+lives in another system; the bench is the harness a tenant run reuses.
+Measured: write cost ~0.4× throughput with linking on; sweep 8000
+edges in ~3.2 s; two-hop read via the Lisp edge path ~0.4× and via
+`related/3` under the guarded runner ~0.03× of `claims-touching` +
+`resolve-endpoint` — §9's read acceptance is NOT met at
+N=2000/M=4000/K=200. Hypothesis (engine follow-up): `active-edge-p`
+validates both endpoints of every emitted edge. Full record on #372.
+
 ## 14. Traceability
 
 Programme §6.1 (two implementations) → §1, R1. Programme §6.2 (resolve
