@@ -18,7 +18,8 @@
 (defun %uncommitted-creates (graph class slot key)
   "Nodes of CLASS this transaction creates whose SLOT is KEY -- what
 INDEX-LOOKUP cannot see, because the index is written at commit apply
-(spec sec.4.1 'Same-transaction visibility'; the #324 overlay)."
+(spec sec.4.1 'Same-transaction visibility'; the #324 overlay).  An
+unbound SLOT is 'no key', not a candidate."
   (let ((tx graph-db::*transaction*))
     (when tx
       (let ((view (graph-db:make-commit-view graph tx))
@@ -28,6 +29,7 @@ INDEX-LOOKUP cannot see, because the index is written at commit apply
             (when (and n
                        (typep n class)
                        (null (graph-db:view-old-node view n))
+                       (slot-boundp n slot)
                        (let ((v (slot-value n slot)))
                          (and (stringp v) (string= v key))))
               (push n out))))))))
@@ -36,10 +38,14 @@ INDEX-LOOKUP cannot see, because the index is written at commit apply
   "Distinct nodes in GRAPH that are registered sources of NAMESPACE with
 identity key KEY: index hits unioned with the open transaction's own
 creates.  NIL, never a signal, for an unknown namespace or a class with
-no index in GRAPH (spec sec.4.1 steps 1-2)."
+no index in GRAPH (spec sec.4.1 steps 1-2).  Reads *NAMESPACE-SOURCES*
+directly rather than NAMESPACE-SOURCES: an unregistered namespace is the
+common case on every write of an existing (non-EE) claim family, so this
+must not signal-and-catch a condition per call; NAMESPACE-SOURCES keeps
+its signalling contract for callers who want the typo check (GH #369
+review)."
   (let ((hits '()))
-    (dolist (class (handler-case (namespace-sources namespace)
-                     (unknown-namespace () nil)))
+    (dolist (class (gethash namespace *namespace-sources*))
       (let ((slot (%identity-slot class)))
         (dolist (n (handler-case
                        (graph-db:index-lookup graph class (list slot) key)
@@ -52,47 +58,54 @@ no index in GRAPH (spec sec.4.1 steps 1-2)."
 (defun %verify-endpoint-node (node namespace key)
   "Signal ENDPOINT-MISMATCH unless NODE is a registered source of
 NAMESPACE whose identity key is KEY (spec sec.4.2 step 1).  An
-UNRESOLVED-NODE marker is never a source, so it is refused too."
-  (let* ((classes (handler-case (namespace-sources namespace)
-                    (unknown-namespace () nil)))
+UNRESOLVED-NODE marker is never a source, so it is refused too; an
+unbound identity slot is a :KEY mismatch, not an error.  Reads
+*NAMESPACE-SOURCES* directly -- see %SAME-STORE-CANDIDATES."
+  (let* ((classes (gethash namespace *namespace-sources*))
          (class (find-if (lambda (c) (typep node c)) classes)))
     (unless class
       (error 'endpoint-mismatch :node node :namespace namespace :key key
                                 :reason :not-a-source))
-    (let ((v (slot-value node (%identity-slot class))))
-      (unless (and (stringp v) (string= v key))
+    (let ((slot (%identity-slot class)))
+      (unless (and (slot-boundp node slot)
+                   (let ((v (slot-value node slot)))
+                     (and (stringp v) (string= v key))))
         (error 'endpoint-mismatch :node node :namespace namespace
                                   :key key :reason :key)))
     node))
 
 (defun %link-endpoint (claim graph ctor namespace key given)
-  "Create one CTOR edge from CLAIM to its endpoint in GRAPH: GIVEN, verified,
-when the caller resolved it; else the single same-store candidate.  Zero
-candidates: nothing.  Several: ENDPOINT-LINK-SKIPPED and nothing.  The edge
-write is best-effort: SUBJECT-OF/OBJECT-OF adopt into a store lazily on
-first write, which needs *SYSTEM-DIRECTORY* (schema.lisp assign-type-id) --
-a caller's own worker thread may not have that bound, and that must not
-fail the claim write either (spec sec.4, sec.7)."
-  (let ((target
-          (cond (given (%verify-endpoint-node given namespace key))
-                (t (let ((cands (%same-store-candidates graph namespace
-                                                        key)))
-                     (cond ((null cands) nil)
-                           ((cdr cands)
-                            (warn 'endpoint-link-skipped
-                                  :claim claim :namespace namespace
-                                  :key key
-                                  :classes (remove-duplicates
-                                            (mapcar (lambda (n)
-                                                      (class-name
-                                                       (class-of n)))
-                                                    cands)))
-                            nil)
-                           (t (first cands))))))))
-    (when target
+  "Create one CTOR edge from CLAIM to its endpoint in GRAPH.  GIVEN,
+verified: a bad node is ENDPOINT-MISMATCH, uncaught here, and fails the
+write.  Without GIVEN: the single same-store candidate is linked, several
+candidates are ENDPOINT-LINK-SKIPPED, and any failure in that lookup-and-
+link path is logged and swallowed rather than failing the write (GH
+#161: a worker thread doing automatic linking may lack *SYSTEM-DIRECTORY*
+for lazy SUBJECT-OF/OBJECT-OF store adoption)."
+  (if given
+      (let ((target (%verify-endpoint-node given namespace key)))
+        (funcall ctor :from claim :to (graph-db:id target) :graph graph))
       (handler-case
-          (funcall ctor :from claim :to (graph-db:id target) :graph graph)
-        (error () nil)))))
+          (let ((cands (%same-store-candidates graph namespace key)))
+            (cond ((null cands) nil)
+                  ((cdr cands)
+                   (warn 'endpoint-link-skipped
+                         :claim claim :namespace namespace :key key
+                         :classes (remove-duplicates
+                                   (mapcar (lambda (n)
+                                             (class-name (class-of n)))
+                                           cands)))
+                   nil)
+                  (t (funcall ctor :from claim
+                                  :to (graph-db:id (first cands))
+                                  :graph graph))))
+        ;; GH #161: EIGHT-CONCURRENT-REGISTRATIONS-OF-ONE-SUBJECT-ALL-
+        ;; SUCCEED's worker threads bind *GRAPH* but not *SYSTEM-
+        ;; DIRECTORY*; never fail the claim write for it.
+        (error (c)
+          (log:warn "GH #369: endpoint (~S ~S) of claim ~A not linked: ~A"
+                    namespace key (graph-db:id claim) c)
+          nil))))
 
 (defun %link-claim-at-write (claim &key subject-node object-node)
   "Link CLAIM's endpoints in its own store, inside the caller's open
