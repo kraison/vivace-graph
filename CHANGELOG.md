@@ -422,6 +422,16 @@ between releases; cutting a release renames it to the new version and dates it.
   keeps its shape; totals are exact to within one sample per graph, and
   a graph read fewer than 64 times reports no reads.
 
+- **In-memory id tables hash with a fixnum fold** (#373): the node cache,
+  the ve/vev adjacency caches, `make-id-table` (the transaction read set
+  and local cache, replication and peer-streaming sets) and `sxhash-node`
+  no longer hash a 16-byte id through `%hash`, which folds it into a
+  128-bit bignum on every call. A consing-free 62-bit multiply-add fold
+  replaces it for those tables only: a cache hit measured 1811 ns → 196
+  ns in isolation. `%hash` itself is unchanged, because the on-disk
+  linear hash places buckets with it; replacing that is #375 (a
+  storage-format change, next major).
+
 ## [4.0.1] - 2026-09-02
 
 ### Fixed

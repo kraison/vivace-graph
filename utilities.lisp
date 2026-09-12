@@ -159,6 +159,24 @@ no native arm gets a correct answer rather than silently falling through to NIL.
 (defun gen-id ()
   (uuid:uuid-to-byte-array (uuid:make-v4-uuid)))
 
+(declaim (inline %fixnum-hash-bytes))
+(defun %fixnum-hash-bytes (bytes &optional (seed 0))
+  "A consing-free fixnum hash of BYTES (a byte vector, normally a 16-byte
+id) mixed into SEED: a 62-bit multiply-add fold.  For IN-MEMORY hash
+tables only -- the on-disk linear hash places buckets with %HASH, whose
+value is part of the store format (GH #373; replacing it is GH #375).
+Anything that is not a byte vector falls back to SXHASH."
+  (declare (optimize (speed 3) (safety 1))
+           (type (unsigned-byte 62) seed))
+  (let ((h seed))
+    (declare (type (unsigned-byte 62) h))
+    (if (typep bytes '(simple-array (unsigned-byte 8) (*)))
+        (locally (declare (type (simple-array (unsigned-byte 8) (*)) bytes))
+          (dotimes (i (length bytes) h)
+            (setf h (logand (+ (* h 1000003) (aref bytes i))
+                            #x3FFFFFFFFFFFFFFF))))
+        (logand (+ (* h 1000003) (sxhash bytes)) #x3FFFFFFFFFFFFFFF))))
+
 (defun parse-uuid-block (string start end)
   (parse-integer string :start start :end end :radix 16))
 

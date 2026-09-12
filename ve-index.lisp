@@ -48,7 +48,10 @@
       (%ve-key-equal key1 key2)))
   )
 
-(defun sxhash-ve-key (k) (sxhash (%hash k)))
+;; In-memory cache hash: the fixnum fold seeded by the type-id, not the
+;; on-disk %HASH (GH #373).
+(defun sxhash-ve-key (k)
+  (%fixnum-hash-bytes (ve-key-id k) (ve-key-type-id k)))
 #+sbcl (sb-ext:define-hash-table-test ve-key-equal sxhash-ve-key)
 (defun make-ve-cache ()
   #+ccl

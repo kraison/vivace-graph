@@ -642,3 +642,25 @@ once per cached lookup -- it was half of an adjacency read's profile."
         (is (every (lambda (b) (zerop (mod (cdr b) sample))) report))
         (is (numberp (cdr (assoc :avg-reads-per-second
                                  (graph-db:graph-stats :graph g)))))))))
+
+(test in-memory-id-hashes-are-fixnums-and-do-not-cons
+  "GH #373: the node cache, the ve/vev caches and every MAKE-ID-TABLE hash
+a 16-byte id with a consing-free fixnum fold.  %HASH -- the 128-bit
+bignum fold -- stays the on-disk bucket placement and is #375's."
+  (let* ((ids (loop repeat 512 collect (graph-db::gen-id)))
+         (hashes (mapcar #'graph-db::sxhash-id-array ids)))
+    (is (every (lambda (h) (typep h 'fixnum)) hashes))
+    (is (> (length (remove-duplicates hashes)) 500))
+    (is (= (graph-db::sxhash-id-array (first ids))
+           (graph-db::sxhash-id-array (copy-seq (first ids)))))
+    (is (typep (graph-db::sxhash-ve-key
+                (graph-db::make-ve-key :id (first ids) :type-id 7))
+               'fixnum))
+    (is (typep (graph-db::sxhash-vev-key
+                (graph-db::make-vev-key :in-id (first ids)
+                                        :out-id (second ids) :type-id 7))
+               'fixnum))
+    #+sbcl
+    (let ((before (sb-ext:get-bytes-consed)))
+      (dolist (id ids) (graph-db::sxhash-id-array id))
+      (is (< (- (sb-ext:get-bytes-consed) before) 8192)))))
