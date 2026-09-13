@@ -135,3 +135,13 @@ with different unary/binary classes (GH #323)."))
                        (:not-a-source
                         "its class is not a registered source of the namespace")
                        (:key "its identity key is not the claim's"))))))
+
+;;; REGISTER-SOURCE (GH #378).
+
+(define-condition source-store-unknown (spacetime-error)
+  ((class :initarg :class :reader source-store-unknown-class))
+  (:report (lambda (c s)
+             (format s "REGISTER-SOURCE ~S: the class has no default store ~
+and no :GRAPH-NAME was given; the contract must name the store its ~
+records live in (GH #378)."
+                     (source-store-unknown-class c)))))

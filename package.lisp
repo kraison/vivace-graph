@@ -333,6 +333,7 @@
            ;; runtime schema definition API (GH #172)
            #:ensure-namespace
            #:create-vertex-type
+           #:ensure-index #:ensure-unique        ; GH #378
            #:create-edge-type
            #:materialize-schema
            #:register-schema-function

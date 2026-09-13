@@ -48,6 +48,20 @@ between releases; cutting a release renames it to the new version and dates it.
   `claim-endpoints` is now defined on top of it. A two-hop read that
   wants only the object no longer pays for the subject's edge as well.
 
+- **`register-source`** (#378): the runtime twin of `def-source`'s
+  registration — `(register-source class facets &key graph-name)` takes a
+  class built with `create-vertex-type` and the seven facets as a plist,
+  and does what the macro's expansion does after its `def-vertex`: the
+  identity index, the named `source-identity-key` constraint, the
+  contract and the namespace registration; idempotent; nothing persisted
+  (the consumer replays its own record, as #172 R5 splits it).
+  `graph-name` defaults to the class's default store;
+  `source-store-unknown` when there is none and none is given.
+- **`ensure-index` / `ensure-unique`** (#378): runtime twins of
+  `def-index` and `def-unique`, declaring an index or a uniqueness
+  constraint from data and building it if the graph is open; the two
+  macros now expand to them.
+
 - **Counting index** (#361): `def-count-index` declares a per-prefix
   counter pair `(all . current)` maintained at commit apply, replication
   and purge, persisted through its own sidecar and rebuilt after a
