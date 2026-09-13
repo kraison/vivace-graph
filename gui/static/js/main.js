@@ -159,13 +159,13 @@ function loadStylesheet(href) {
 }
 
 async function enableProlog(capabilities) {
-  loadStylesheet("/vendor/codemirror.css");
-  await loadScript("/vendor/codemirror.js");
+  loadStylesheet("vendor/codemirror.css");
+  await loadScript("vendor/codemirror.js");
   // overlay.js is an ADDON, not part of lib/codemirror.js: without it
   // CodeMirror.overlayMode is undefined and building the vg-prolog mode
   // throws during editor construction (GH #279).
-  await loadScript("/vendor/codemirror-overlay.js");
-  await loadScript("/vendor/codemirror-commonlisp.js");
+  await loadScript("vendor/codemirror-overlay.js");
+  await loadScript("vendor/codemirror-commonlisp.js");
   const { createPrologPane } = await import("./prolog.js");
   prolog = createPrologPane({
     hostEl: document.getElementById("wb-editor"),
@@ -251,6 +251,9 @@ async function boot() {
     // not know whether the server offers it.
     console.warn("capabilities unavailable:", err.message);
   }
+  // A read-only GUI (GH #384) drops the roster's open/close verbs; the
+  // endpoints refuse them regardless, so this is display, not control.
+  if (capabilities && capabilities.readOnly) roster.setReadOnly(true);
   if (capabilities && capabilities.allowProlog && capabilities.prolog) {
     document.getElementById("wb-subtabs").hidden = false;
     try {
