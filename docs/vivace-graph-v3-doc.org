@@ -4116,6 +4116,14 @@ namespace and a class from data, driving the *same* installation path
 (~%install-node-type~) a ~def-vertex~ expansion drives, so a runtime type is
 indistinguishable from a source-defined one once built.
 
+Both constructors take ~:record-p~ (default ~t~), as ~ensure-namespace~
+does: ~nil~ writes no manifest TYPE row at creation and none when a store
+later instantiates the type, for a consumer that keeps its own record of
+its runtime types and never runs ~materialize-schema~ -- without it that
+consumer's manifest would hold type rows with no namespace rows, the
+orphan-package state ~materialize-schema~ warns about. Re-creating the
+type with the default records it again (GH #381).
+
 This section is a developer workflow in three sessions — the same shape as
 ~docs/runtime-schema-example.lisp~, which stays in the repository as the
 worked example this section summarizes.
@@ -6260,7 +6268,10 @@ in; it defaults to the class's default store and ~source-store-unknown~
 is signalled when the class has none and none is given. Nothing here is
 persisted: like ~:check~ functions under the runtime schema, the
 consumer keeps its own record of the definition and replays it at start
-(GH #378).
+(GH #378). Its inverse, ~(unregister-source class)~, takes the class out
+of its namespace and drops the contract while leaving the class, its
+index, its constraint and its records in place -- a withdrawn source's
+history stays readable, it simply no longer resolves (GH #381).
 
 *** Registration: binding geometry to a registry
 

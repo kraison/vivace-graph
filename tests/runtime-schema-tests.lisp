@@ -945,3 +945,49 @@ reloads too (GH #198)."
     (is-false (%xf-register #P"/tmp/gh198-file-b.lisp"
                             (%xf-meta 'xf-b1))
               "no clear happened, so no warning")))
+
+;;; GH #381: :RECORD-P on CREATE-VERTEX-TYPE / CREATE-EDGE-TYPE, mirroring
+;;; ENSURE-NAMESPACE.  NIL is durable for the type: no row at creation
+;;; and none when a store later instantiates it.
+
+(test record-p-nil-keeps-a-runtime-type-out-of-the-manifest
+  "A consumer that keeps its own record and never runs MATERIALIZE-SCHEMA
+must be able to leave the manifest alone -- at creation, and at the
+later store open that re-asserts every type it instantiates."
+  (with-rs-store (g)
+    g
+    (graph-db:ensure-namespace "RS-QUIET" :record-p nil)
+    (graph-db:create-vertex-type "RS-QUIET:HUSH" '((v :type integer))
+                                 :default-store :rs-store :record-p nil)
+    (graph-db:create-edge-type "RS-QUIET:HUSHED" '()
+                               :default-store :rs-store :record-p nil)
+    (graph-db:create-vertex-type "RS-QUIET:LOUD" '((v :type integer))
+                                 :default-store :rs-store)
+    ;; A type whose store is not open yet: instantiation happens at the
+    ;; store's MAKE-GRAPH below, outside any binding the creating call
+    ;; could have held.
+    (graph-db:create-vertex-type "RS-QUIET:LATER" '((v :type integer))
+                                 :default-store :rs-quiet-store
+                                 :record-p nil)
+    (flet ((type-row (name)
+             (multiple-value-bind (ns types)
+                 (graph-db::read-schema-manifest graph-db::*system-directory*)
+               (declare (ignore ns))
+               (find (intern name :rs-quiet) types
+                     :key (lambda (r) (getf r :type))))))
+      (is (null (type-row "HUSH")))
+      (is (null (type-row "HUSHED")))
+      (is-true (type-row "LOUD"))
+      (with-temp-directory (d)
+        (let ((g2 (make-graph :rs-quiet-store (namestring d)
+                              :buffer-pool-size 1000)))
+          (unwind-protect
+               (is-true (graph-db:lookup-node-type-by-name
+                         (intern "LATER" :rs-quiet) :vertex :graph g2))
+            (close-graph g2 :snapshot-p nil))))
+      (is (null (type-row "LATER")))
+      ;; Re-creating with the default records again: the mark is per
+      ;; call's intent, not forever.
+      (graph-db:create-vertex-type "RS-QUIET:HUSH" '((v :type integer))
+                                   :default-store :rs-store)
+      (is-true (type-row "HUSH")))))

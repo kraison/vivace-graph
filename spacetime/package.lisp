@@ -82,7 +82,8 @@
    #:edv-object-namespace #:edv-object-key #:edv-relation
    #:edv-conflicting-ids #:check-extent-disjointness
    ;; source onboarding contract (GH #132)
-   #:def-source #:register-source #:source-contract #:+source-facets+
+   #:def-source #:register-source #:unregister-source
+   #:source-contract #:+source-facets+
    #:source-store-unknown #:source-store-unknown-class      ; GH #378
    #:source-facets #:source-facets-p #:source-facets-class
    #:source-facets-graph #:source-facets-identity #:source-facets-space
