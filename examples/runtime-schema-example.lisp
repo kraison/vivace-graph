@@ -417,3 +417,11 @@
    :indexed-text :none))
 ;; => TELEMETRY:READING; RESOLVE-ENDPOINT :TELEMETRY-READINGS "s-17"
 ;; now finds the record written above.
+
+;;; Withdrawing the source (GH #381): the namespace stops resolving, the
+;;; contract goes; the class, its index and its records stay readable.
+;;; A consumer that keeps its own record passes :RECORD-P NIL to the type
+;;; constructors as it does to ENSURE-NAMESPACE, so the engine's manifest
+;;; never holds a TYPE row the consumer will replay itself.
+(graph-db.spacetime:unregister-source (find-class (intern "READING" :telemetry)))
+;; => TELEMETRY:READING

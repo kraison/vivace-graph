@@ -343,3 +343,8 @@ required and `%check-facet`ed as at macroexpansion. `graph-name`
 defaults to the class's default store; a class with none needs it
 explicitly (`source-store-unknown`). Nothing is persisted, by the same
 split #172 R5 made for `:check` functions.
+
+`unregister-source (class) => class-name` (GH #381) is the inverse:
+the class leaves its namespace and its contract is dropped, through
+`%unregister-old-identity`; the class, its index, its constraint and
+its records stay. Idempotent.

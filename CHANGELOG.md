@@ -62,6 +62,17 @@ between releases; cutting a release renames it to the new version and dates it.
   constraint from data and building it if the graph is open; the two
   macros now expand to them.
 
+- **`unregister-source`** (#381): the inverse of `register-source` —
+  the class leaves its namespace (`resolve-endpoint` stops answering for
+  it) and its contract is dropped; idempotent; the class, its index,
+  its constraint and its records stay.
+- **`:record-p` on `create-vertex-type` / `create-edge-type`** (#381,
+  default T), mirroring `ensure-namespace`: NIL writes no manifest TYPE
+  row at creation and none when a store later instantiates the type,
+  so a consumer that keeps its own record and never runs
+  `materialize-schema` leaves no orphan type rows. Re-creating with the
+  default records again.
+
 - **Counting index** (#361): `def-count-index` declares a per-prefix
   counter pair `(all . current)` maintained at commit apply, replication
   and purge, persisted through its own sidecar and rebuilt after a

@@ -307,3 +307,16 @@ registered on refusal.  Returns the class name (GH #378)."
   "True when KEY is a key of the plist FACETS -- present with any value,
 NIL included; only absence is missing (DEF-SOURCE's rule)."
   (loop for (k nil) on facets by #'cddr thereis (eq k key)))
+
+(defun unregister-source (class)
+  "The inverse of REGISTER-SOURCE (GH #381): take CLASS -- a name or the
+class object -- out of its namespace, so RESOLVE-ENDPOINT stops answering
+for it, and drop its contract.  The class, its identity index and
+constraint, and its records stay: a withdrawn source's history is still
+readable.  Idempotent; returns the class name."
+  (let* ((name (%class-name-of class))
+         (old (gethash name *source-contracts*)))
+    (when old
+      (%unregister-old-identity name old)
+      (remhash name *source-contracts*))
+    name))

@@ -592,3 +592,21 @@ namespace leaves nothing under the old one."
   (signals unknown-namespace (namespace-sources :rs-a))
   ;; and back to the fixture's namespace for the other tests
   (register-source 'rs-thing *rs-facets*))
+
+(test unregister-source-withdraws-the-namespace-and-keeps-the-class
+  "GH #381: the inverse of REGISTER-SOURCE.  The namespace stops
+resolving and the contract is gone; the class, its index and its
+records stay readable; idempotent; a class object is accepted."
+  (rs-define)
+  (register-source 'rs-thing *rs-facets*)
+  (with-source-graph (g)
+    (with-transaction ()
+      (funcall 'make-rs-thing :label "one" :thing-id "u-1"))
+    (is (eq 'rs-thing (unregister-source 'rs-thing)))
+    (signals unknown-namespace (namespace-sources :rs-things))
+    (signals not-a-source (source-contract 'rs-thing))
+    (is-true (find-class 'rs-thing nil))
+    (is (= 1 (length (graph-db:index-lookup g 'rs-thing '(thing-id) "u-1"))))
+    (is (eq 'rs-thing (unregister-source (find-class 'rs-thing))))
+    (register-source 'rs-thing *rs-facets*)
+    (is (string= "one" (rs-label (resolve-endpoint :rs-things "u-1"))))))
