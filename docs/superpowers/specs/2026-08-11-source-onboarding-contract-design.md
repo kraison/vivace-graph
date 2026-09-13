@@ -328,3 +328,18 @@ exactly one node or to nothing.
 No change to any file in `graph-db/core`. No existing consumer's version floor
 moves; the floor applies only to a consumer that wants to
 `:depends-on (:graph-db/spacetime)`, which S1a already established.
+
+## Built — runtime registration (GH #378, 2026-09-13)
+
+`register-source (class facets &key graph-name) => class-name` is the
+runtime twin of `def-source`'s registration, for a consumer that builds
+source classes with `create-vertex-type` (#172) and replays its own
+schema record at start. It performs the macro's tail from data: the
+identity index and the named `source-identity-key` constraint (through
+the new core twins `ensure-index` / `ensure-unique`, which `def-index`
+and `def-unique` now expand to), the contract, and `%register-identity`
+with the old contract, so re-registration replaces. All seven facets are
+required and `%check-facet`ed as at macroexpansion. `graph-name`
+defaults to the class's default store; a class with none needs it
+explicitly (`source-store-unknown`). Nothing is persisted, by the same
+split #172 R5 made for `:check` functions.

@@ -244,3 +244,66 @@ review) -- a source class inherits exactly as any other vertex does."
                                  :indexed-text ',indexed-text))
        (%register-identity ',name ',identity old-contract))
      ',name))
+
+;;; REGISTER-SOURCE: the runtime twin of DEF-SOURCE's registration (GH
+;;; #378), the way CREATE-VERTEX-TYPE twins DEF-VERTEX (#172).  Nothing is
+;;; persisted -- the consumer keeps its own record and replays it.
+
+(defun %class-name-of (class)
+  "CLASS as a class name: a symbol as given, a CLASS object's name."
+  (etypecase class
+    (symbol class)
+    (class (class-name class))))
+
+(defun %class-default-store (name)
+  "NAME's registered default store, or NIL when it has none (#172 R4)."
+  (let ((meta (graph-db::%find-registered-node-type name :vertex)))
+    (and meta (graph-db::node-type-graph-name meta))))
+
+(defun register-source (class facets &key graph-name)
+  "Register CLASS -- an existing vertex class name, or the class object
+CREATE-VERTEX-TYPE returned -- as a source with FACETS, a plist of all
+seven facets as DEF-SOURCE takes them.  Does what the macro's expansion
+does after its DEF-VERTEX: the identity index and the named
+SOURCE-IDENTITY-KEY constraint when :IDENTITY is not :NONE, the contract,
+and the namespace registration; idempotent, replacing an earlier
+registration of CLASS as the macro does.  GRAPH-NAME is the store the
+records live in, defaulting to the class's default store;
+SOURCE-STORE-UNKNOWN when neither exists.  A missing facet is
+MISSING-SOURCE-FACET, a malformed one INVALID-SOURCE-FACET, and nothing is
+registered on refusal.  Returns the class name (GH #378)."
+  (let* ((name (%class-name-of class))
+         (missing (loop for key in +source-facets+
+                        unless (%facet-present-p facets key) collect key)))
+    (when missing
+      (error 'missing-source-facet :name name :facets missing))
+    (dolist (key +source-facets+)
+      (%check-facet key (getf facets key)))
+    (let ((store (or graph-name (%class-default-store name)))
+          (identity (getf facets :identity)))
+      (unless store
+        (error 'source-store-unknown :class name))
+      (unless (eq identity :none)
+        (let ((slot (getf identity :key-slot)))
+          (graph-db:ensure-index name (list slot) store)
+          ;; Named, so a changed :KEY-SLOT replaces the constraint --
+          ;; the macro's own reason (GH #139).
+          (graph-db:ensure-unique name (list slot) store
+                                  :name 'source-identity-key)))
+      (let ((old-contract (gethash name *source-contracts*)))
+        (setf (gethash name *source-contracts*)
+              (make-source-facets :class name :graph store
+                                  :identity identity
+                                  :space (getf facets :space)
+                                  :time (getf facets :time)
+                                  :attribution (getf facets :attribution)
+                                  :sensitivity (getf facets :sensitivity)
+                                  :registration (getf facets :registration)
+                                  :indexed-text (getf facets :indexed-text)))
+        (%register-identity name identity old-contract))
+      name)))
+
+(defun %facet-present-p (facets key)
+  "True when KEY is a key of the plist FACETS -- present with any value,
+NIL included; only absence is missing (DEF-SOURCE's rule)."
+  (loop for (k nil) on facets by #'cddr thereis (eq k key)))

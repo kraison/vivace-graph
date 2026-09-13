@@ -897,15 +897,24 @@ definition.  SLOT may also be a list of slot names for a composite /
 multi-slot (tuple) index, keyed left to right (GH #107).  Re-evaluating
 an unchanged DEF-INDEX is a no-op; to adopt a changed :CANONICALIZE, force a rebuild
 with REGENERATE-SECONDARY-INDEXES."
-  `(let ((spec (make-index-spec :owner-name ',owner-class
-                                :slot-names (%normalize-slots ',slot)
-                                :graph-name ',graph-name
-                                :name ',name
-                                :canonicalize ,(when canonicalize `',canonicalize))))
-     (register-index-spec spec)
-     (let ((g (lookup-graph ',graph-name)))
-       (when g (%ensure-index-built g spec)))
-     spec))
+  `(ensure-index ',owner-class ',slot ',graph-name
+                 :canonicalize ,(when canonicalize `',canonicalize)
+                 :name ',name))
+
+(defun ensure-index (owner-class slots graph-name &key canonicalize name)
+  "Runtime twin of DEF-INDEX (GH #378): declare an ordered secondary
+index on OWNER-CLASS's SLOTS (a slot name or a list) in GRAPH-NAME from
+data, building it now if the graph is open.  Idempotent; returns the
+INDEX-SPEC.  The macro expands to this."
+  (let ((spec (make-index-spec :owner-name owner-class
+                               :slot-names (%normalize-slots slots)
+                               :graph-name graph-name
+                               :name name
+                               :canonicalize canonicalize)))
+    (register-index-spec spec)
+    (let ((g (lookup-graph graph-name)))
+      (when g (%ensure-index-built g spec)))
+    spec))
 
 (defmacro undef-index (owner-class graph-name &key slots name)
   "Withdraw a DEF-INDEX declaration, by :NAME or by :SLOTS:

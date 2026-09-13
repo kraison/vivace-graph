@@ -563,17 +563,29 @@ identity), exactly (LENGTH SLOTS) long -- signalled otherwise
 
 A PARALLEL macro, not a DEF-INDEX flag: a flag would silently switch the
 null semantics a reader would assume were unchanged (GH #107)."
-  `(let ((spec (make-unique-tuple-spec
-                :owner-name ',owner-class
-                :slot-names (%normalize-slots ',slots)
-                :graph-name ',graph-name
-                :name ',name
-                :canonicalize ,(when canonicalize `',canonicalize)
-                :scope ,(or scope :local))))
-     (register-unique-tuple-spec spec)
-     (let ((g (lookup-graph ',graph-name)))
-       (when g (%ensure-unique-tuple-built g spec :strict-p t)))
-     spec))
+  `(ensure-unique ',owner-class ',slots ',graph-name
+                  :canonicalize ,(when canonicalize `',canonicalize)
+                  :scope ,(or scope :local)
+                  :name ',name))
+
+(defun ensure-unique (owner-class slots graph-name
+                      &key canonicalize (scope :local) name)
+  "Runtime twin of DEF-UNIQUE (GH #378): declare the uniqueness
+constraint on OWNER-CLASS's SLOTS tuple in GRAPH-NAME from data, building
+it now -- STRICTLY, a pre-existing duplicate signals -- if the graph is
+open.  Idempotent; returns the UNIQUE-TUPLE-SPEC.  The macro expands to
+this."
+  (let ((spec (make-unique-tuple-spec
+               :owner-name owner-class
+               :slot-names (%normalize-slots slots)
+               :graph-name graph-name
+               :name name
+               :canonicalize canonicalize
+               :scope scope)))
+    (register-unique-tuple-spec spec)
+    (let ((g (lookup-graph graph-name)))
+      (when g (%ensure-unique-tuple-built g spec :strict-p t)))
+    spec))
 
 (defmacro undef-unique (owner-class graph-name &key slots name)
   "Withdraw a DEF-UNIQUE declaration, by :NAME or by :SLOTS:

@@ -488,3 +488,107 @@ facets are optional rather than merely defaulted (design §3)."
      :registration
      '(:relation "registered-at" :method "centroid-within"
        :rule-version "r/1"))))
+
+;;; REGISTER-SOURCE: the runtime twin of DEF-SOURCE's registration
+;;; (GH #378).  The class comes from CREATE-VERTEX-TYPE (#172); the facets
+;;; are data; nothing is persisted -- the consumer replays.
+
+(defparameter *rs-facets*
+  '(:identity     (:namespace :rs-things :key-slot thing-id)
+    :space        :none
+    :time         :none
+    :attribution  (:licence "CC0-1.0" :citation "RS fixtures")
+    :sensitivity  (:class :public)
+    :registration :none
+    :indexed-text :none))
+
+(defun rs-facets-without (key)
+  (alexandria:remove-from-plist *rs-facets* key))
+
+(defun rs-facets-with (key value)
+  (list* key value (rs-facets-without key)))
+
+(defun rs-define ()
+  "A runtime vertex class RS-THING in the source graph, as a consumer
+replaying its own schema record would build it."
+  (graph-db:create-vertex-type 'rs-thing
+                               '((label :initarg :label :accessor rs-label)
+                                 (thing-id :initarg :thing-id
+                                           :accessor rs-thing-id))
+                               :default-store *source-graph-name*))
+
+(test register-source-registers-contract-index-constraint-and-namespace
+  "GH #378: what DEF-SOURCE's expansion does after DEF-VERTEX, from data:
+the contract, the identity index, the named unique constraint, and the
+namespace registration -- so RESOLVE-ENDPOINT finds the record and a
+duplicate key cannot commit."
+  (rs-define)
+  (is (eq 'rs-thing (register-source 'rs-thing *rs-facets*)))
+  (let ((c (source-contract 'rs-thing)))
+    (is (eq 'rs-thing (source-facets-class c)))
+    (is (eq *source-graph-name* (source-facets-graph c)))
+    (is (equal '(:namespace :rs-things :key-slot thing-id)
+               (source-facets-identity c))))
+  (is (member 'rs-thing (namespace-sources :rs-things)))
+  (with-source-graph (g)
+    (with-transaction ()
+      (funcall 'make-rs-thing :label "one" :thing-id "k-1"))
+    (is (string= "one" (rs-label (resolve-endpoint :rs-things "k-1"))))
+    (is (= 1 (length (graph-db:index-lookup g 'rs-thing '(thing-id) "k-1"))))
+    (signals graph-db:unique-constraint-violation
+      (with-transaction ()
+        (funcall 'make-rs-thing :label "two" :thing-id "k-1")))))
+
+(test register-source-checks-the-facets-as-the-macro-does
+  "GH #378: a missing facet is MISSING-SOURCE-FACET naming it; a malformed
+one is INVALID-SOURCE-FACET; nothing is registered on refusal."
+  (rs-define)
+  (handler-case (progn (register-source 'rs-thing
+                                        (rs-facets-without :time))
+                       (is-true nil "expected MISSING-SOURCE-FACET"))
+    (missing-source-facet (c)
+      (is (equal '(:time)
+                 (graph-db.spacetime::missing-source-facet-facets c)))))
+  (signals invalid-source-facet
+    (register-source 'rs-thing
+      (rs-facets-with :identity
+                      '(:namespace :rs-bad))))
+  (signals unknown-namespace (namespace-sources :rs-bad)))
+
+(test register-source-accepts-the-class-object-and-needs-a-store
+  "GH #378: CREATE-VERTEX-TYPE returns the class; that is accepted as
+CLASS.  A class with no default store needs :GRAPH-NAME, else
+SOURCE-STORE-UNKNOWN."
+  (let ((class (rs-define)))
+    (is (eq 'rs-thing (register-source class *rs-facets*))))
+  (let ((homeless (graph-db:create-vertex-type
+                   'rs-homeless '((thing-id :initarg :thing-id)))))
+    (signals source-store-unknown
+      (register-source homeless
+                       (rs-facets-with :identity
+                                       '(:namespace :rs-homeless
+                                         :key-slot thing-id))))
+    (is (eq 'rs-homeless
+            (register-source homeless
+                             (rs-facets-with :identity
+                                             '(:namespace :rs-homeless
+                                               :key-slot thing-id))
+                             :graph-name *source-graph-name*)))
+    (is (eq *source-graph-name*
+            (source-facets-graph (source-contract 'rs-homeless))))))
+
+(test register-source-re-registration-moves-the-namespace
+  "GH #378 mirrors the DEF-SOURCE case: re-registering under a new
+namespace leaves nothing under the old one."
+  (rs-define)
+  (register-source 'rs-thing
+    (rs-facets-with :identity
+                    '(:namespace :rs-a :key-slot thing-id)))
+  (is (member 'rs-thing (namespace-sources :rs-a)))
+  (register-source 'rs-thing
+    (rs-facets-with :identity
+                    '(:namespace :rs-b :key-slot thing-id)))
+  (is (member 'rs-thing (namespace-sources :rs-b)))
+  (signals unknown-namespace (namespace-sources :rs-a))
+  ;; and back to the fixture's namespace for the other tests
+  (register-source 'rs-thing *rs-facets*))

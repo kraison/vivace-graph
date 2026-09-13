@@ -4109,7 +4109,9 @@ Sometimes the type's name and shape only exist at runtime — an ETL that
 discovers a new record shape, an operator adding a type without a deploy —
 and a macro cannot help, because the data is not there yet when the form
 would need to be read. #172 adds a functional twin of the same machinery:
-~ensure-namespace~ and ~create-vertex-type~/~create-edge-type~ build a
+~ensure-namespace~ and ~create-vertex-type~/~create-edge-type~ (and, for
+their indexes and constraints, ~ensure-index~/~ensure-unique~, plus
+~register-source~ for a source's contract, GH #378) build a
 namespace and a class from data, driving the *same* installation path
 (~%install-node-type~) a ~def-vertex~ expansion drives, so a runtime type is
 indistinguishable from a source-defined one once built.
@@ -6236,6 +6238,29 @@ registration exists to provide.
 carries ~:INFERRED~, because a registration is derived by computation.
 See "Registration: binding geometry to a registry" below for what
 reads this facet.
+
+**** Registering a source at run time (~register-source~)
+
+A consumer that lets its users define source types while running builds
+the class with ~create-vertex-type~ and then registers it as a source
+from data rather than a macro form:
+
+#+BEGIN_SRC lisp
+(register-source class facets &key graph-name) ; => class name
+#+END_SRC
+
+~class~ is the class name or the class object ~create-vertex-type~
+returned; ~facets~ is a plist of all seven facets exactly as ~def-source~
+takes them. It does what the macro's expansion does after its
+~def-vertex~: the identity index and the named ~source-identity-key~
+constraint when ~:identity~ is not ~:none~, the contract, and the
+namespace registration. Re-registering replaces the earlier contract, as
+re-evaluating the macro does. ~graph-name~ is the store the records live
+in; it defaults to the class's default store and ~source-store-unknown~
+is signalled when the class has none and none is given. Nothing here is
+persisted: like ~:check~ functions under the runtime schema, the
+consumer keeps its own record of the definition and replays it at start
+(GH #378).
 
 *** Registration: binding geometry to a registry
 

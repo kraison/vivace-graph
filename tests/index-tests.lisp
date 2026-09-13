@@ -1042,3 +1042,28 @@ contract."
     (unwind-protect
          (is (= 1 (length (index-lookup g 'ix-claim '(rel) "late"))))
       (undef-index ix-claim :graph-db-index-test :name ix-late-rel))))
+
+;;; ENSURE-INDEX / ENSURE-UNIQUE: the runtime twins of DEF-INDEX and
+;;; DEF-UNIQUE (GH #378), on a class of their own so the unique constraint
+;;; cannot touch the duplicates other tests write on purpose.
+
+(def-vertex ix-rt ()
+  ((a :initarg :a :accessor ix-rt-a)
+   (b :initarg :b :accessor ix-rt-b))
+  :graph-db-index-test)
+
+(test ensure-index-and-ensure-unique-are-the-runtime-twins
+  "GH #378: a consumer replaying runtime types declares indexes and
+uniqueness from data.  ENSURE-INDEX builds the index on an open graph
+and is idempotent; ENSURE-UNIQUE enforces at commit under its :NAME."
+  (with-ix-graph (g)
+    (is-true (graph-db:ensure-index 'ix-rt '(a) *ix-graph-name*))
+    (is-true (graph-db:ensure-index 'ix-rt '(a) *ix-graph-name*))
+    (is-true (graph-db:ensure-unique 'ix-rt '(b) *ix-graph-name*
+                                     :name 'ix-rt-b-unique))
+    (with-transaction ()
+      (make-ix-rt :a "x" :b 1)
+      (make-ix-rt :a "y" :b 2))
+    (is (= 1 (length (graph-db:index-lookup g 'ix-rt '(a) "x"))))
+    (signals graph-db:unique-constraint-violation
+      (with-transaction () (make-ix-rt :a "z" :b 1)))))
