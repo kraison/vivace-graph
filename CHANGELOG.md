@@ -13,6 +13,20 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Added
 
+- **GUI mountable under a host application's listener** (#384):
+  `graph-db.gui:make-gui-app` returns the clack app `start-gui` serves
+  (API routes, static tree with the body-size refusal, `index.html` at
+  the root) without starting a server, so a host that already runs a
+  clack listener in the image mounts it under a prefix with
+  `(lack:builder (:mount "/gui" (make-gui-app)) host-app)`. The
+  frontend's asset and API URLs are prefix-relative and a slashless
+  mount root redirects to the trailing-slash form. `:allow-prolog`
+  also accepts a function of the clack request environment, decided
+  per request; `:read-only t` refuses the open/close verbs with `403
+  read-only` and reports `readOnly` in `/api/capabilities`, which the
+  roster reads to drop its verbs. `gui-static-root` is exported.
+  `start-gui` gains `:read-only`.
+
 - **Edges under claims** (#367, U1 #369): a claim gains a derived
   `subject-of` / `object-of` edge to each endpoint that resolves in its
   own store, linked in the constructor (same-store sources through the

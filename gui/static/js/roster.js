@@ -12,6 +12,7 @@ export function createRosterPane({ listEl, refreshBtn, errorStrip,
   let graphs = [];
   let selected = null;
   let busy = false;
+  let readOnly = false;   // GH #384: no open/close verbs when set
 
   function showError(message) {
     errorText.textContent = message;
@@ -59,16 +60,18 @@ export function createRosterPane({ listEl, refreshBtn, errorStrip,
       badge.className = "badge" + (g.open ? " open" : "");
       badge.textContent = g.open ? "open" : "closed";
 
-      const verb = document.createElement("button");
-      verb.type = "button";
-      verb.textContent = g.open ? "Close" : "Open";
-      verb.disabled = busy;
-      verb.addEventListener("click", (ev) => {
-        ev.stopPropagation();
-        runVerb(g.name, g.open ? "close" : "open");
-      });
-
-      li.append(block, badge, verb);
+      li.append(block, badge);
+      if (!readOnly) {
+        const verb = document.createElement("button");
+        verb.type = "button";
+        verb.textContent = g.open ? "Close" : "Open";
+        verb.disabled = busy;
+        verb.addEventListener("click", (ev) => {
+          ev.stopPropagation();
+          runVerb(g.name, g.open ? "close" : "open");
+        });
+        li.appendChild(verb);
+      }
       li.addEventListener("click", () => onSelect(g.name));
       listEl.appendChild(li);
     }
@@ -114,6 +117,10 @@ export function createRosterPane({ listEl, refreshBtn, errorStrip,
 
   refreshBtn.addEventListener("click", () => refresh());
 
-  return { refresh, setSelected, showError,
+  function setReadOnly(flag) {
+    readOnly = Boolean(flag);
+  }
+
+  return { refresh, setSelected, setReadOnly, showError,
            getGraph: (name) => graphs.find((g) => g.name === name) };
 }

@@ -1970,9 +1970,10 @@ trustworthy (GH #279)."
     (nreverse acc)))
 
 (defun %vendor-scripts-main-loads ()
-  "The /vendor/*.js files main.js loads, as bare filenames."
+  "The vendor/*.js files main.js loads, as bare filenames (the path is
+prefix-relative since GH #384, so no leading slash)."
   (mapcar (lambda (path) (subseq path (1+ (position #\/ path :from-end t))))
-          (%matches "/vendor/[A-Za-z0-9._-]+\\.js"
+          (%matches "[\"'`]vendor/[A-Za-z0-9._-]+\\.js"
                     (%static-file "js/main.js"))))
 
 (defun %codemirror-entry-points ()
@@ -2143,3 +2144,159 @@ surfaces share."
         (is (= kw (package-symbol-count :keyword))
             "KEYWORD gained ~D symbol(s)"
             (- (package-symbol-count :keyword) kw))))))
+
+;;; ---------------------------------------------------------------------
+;;; Mounting under a host listener (GH #384).  MAKE-GUI-APP is the app
+;;; without the server; a host mounts it under a prefix of its own
+;;; clack listener.  Every path -- static, index.html's asset URLs, the
+;;; SPA's API calls -- must then resolve under that prefix.
+;;; ---------------------------------------------------------------------
+
+(defun gui-graph-named (json wire)
+  "The roster entry named WIRE out of a decoded /api/graphs body."
+  (find wire (jref json :graphs)
+        :key (lambda (g) (jref g :name)) :test #'string=))
+
+(test mounted-app-serves-under-the-prefix
+  "Mounted at /gui, the page, an asset and the API answer under the
+prefix; everything outside it -- the same paths at the site root
+included -- is the host's."
+  (with-gui-fixture ()
+    (with-mounted-gui ()
+      (multiple-value-bind (json status ctype raw) (gui-request "/gui/")
+        (declare (ignore json))
+        (is (= 200 status))
+        (is (eql 0 (search "text/html" ctype)))
+        (is (search "VivaceGraph GUI" raw)))
+      (multiple-value-bind (json status ctype)
+          (gui-request "/gui/css/gui.css")
+        (declare (ignore json))
+        (is (= 200 status))
+        (is (eql 0 (search "text/css" ctype))))
+      (multiple-value-bind (json status) (gui-request "/gui/api/graphs")
+        (is (= 200 status))
+        (is-true (gui-graph-named json "gui-test-graph")))
+      (multiple-value-bind (json status)
+          (gui-request "/gui/api/graphs/gui-test-graph/stats")
+        (is (= 200 status))
+        (is (= 4 (jref json :vertex-count))))
+      (dolist (path '("/" "/css/gui.css" "/api/graphs" "/guide"))
+        (multiple-value-bind (json status ctype raw) (gui-request path)
+          (declare (ignore json ctype))
+          (is (= 200 status))
+          (is (string= *host-body* raw)
+              "~A reached the GUI instead of the host" path))))))
+
+(test mounted-root-redirects-to-a-trailing-slash
+  "The bare mount root is sent to itself with a trailing slash, query
+string kept: the page's relative asset and API URLs resolve under the
+mount only from a directory URL.  The standalone / never redirects."
+  (with-mounted-gui ()
+    (multiple-value-bind (json status ctype raw headers)
+        (gui-request "/gui" :redirect nil)
+      (declare (ignore json ctype raw))
+      (is (= 301 status))
+      (is (equal "/gui/" (cdr (assoc :location headers)))))
+    (multiple-value-bind (json status ctype raw headers)
+        (gui-request "/gui?graph=x" :redirect nil)
+      (declare (ignore json ctype raw))
+      (is (= 301 status))
+      (is (equal "/gui/?graph=x" (cdr (assoc :location headers)))))
+    ;; Following it lands on the page.
+    (multiple-value-bind (json status ctype raw) (gui-request "/gui")
+      (declare (ignore json ctype))
+      (is (= 200 status))
+      (is (search "VivaceGraph GUI" raw))))
+  (with-gui-server ()
+    (multiple-value-bind (json status ctype raw)
+        (gui-request "/" :redirect nil)
+      (declare (ignore json ctype))
+      (is (= 200 status))
+      (is (search "VivaceGraph GUI" raw)))))
+
+(test frontend-urls-are-prefix-relative
+  "No frontend source names an asset or API path from the site root:
+under a mount an absolute /api/... or /js/... reaches the host, not
+the GUI.  Read out of the sources, so a new absolute path fails here
+before anyone mounts the app."
+  (let ((root (asdf:system-relative-pathname :graph-db/gui
+                                             "gui/static/")))
+    (dolist (file (cons "index.html"
+                        (mapcar (lambda (p)
+                                  (format nil "js/~A.js"
+                                          (pathname-name p)))
+                                (directory (merge-pathnames "js/*.js"
+                                                            root)))))
+      (let ((hits (%matches "[\"'`]/(?:api|css|js|vendor)/"
+                            (%static-file file))))
+        (is (null hits) "~A names site-root paths: ~S" file hits)))))
+
+(test read-only-refuses-the-management-verbs
+  "READ-ONLY: close and open answer 403 read-only from the ENDPOINT
+before touching the graph -- it stays open -- reads still answer, and
+/api/capabilities reports readOnly so the roster can drop its verbs.
+Both entry points carry the flag; the default reports false."
+  (with-gui-fixture ()
+    (with-mounted-gui (:read-only t)
+      (multiple-value-bind (json status)
+          (gui-request "/gui/api/graphs/gui-test-graph/close"
+                       :method :post)
+        (is (= 403 status))
+        (is (string= "read-only" (jref json :error))))
+      (multiple-value-bind (json status)
+          (gui-request "/gui/api/graphs/gui-test-graph/open"
+                       :method :post)
+        (is (= 403 status))
+        (is (string= "read-only" (jref json :error))))
+      (multiple-value-bind (json status)
+          (gui-request "/gui/api/graphs/gui-test-graph/stats")
+        (is (= 200 status))
+        (is (= 4 (jref json :vertex-count))))
+      (multiple-value-bind (json status ctype raw)
+          (gui-request "/gui/api/capabilities")
+        (declare (ignore ctype))
+        (is (= 200 status))
+        (is-true (jref json :read-only))
+        (is-true (search "\"readOnly\":true" raw)
+                 "capabilities did not spell readOnly camelCase")))
+    (with-gui-server (:read-only t)
+      (multiple-value-bind (json status)
+          (gui-request "/api/graphs/gui-test-graph/close" :method :post)
+        (is (= 403 status))
+        (is (string= "read-only" (jref json :error)))))
+    (with-gui-server ()
+      (multiple-value-bind (json status) (gui-request "/api/capabilities")
+        (is (= 200 status))
+        (is-false (jref json :read-only))))))
+
+(test allow-prolog-function-gates-per-request
+  "ALLOW-PROLOG as a function of the clack ENV is decided per request:
+on one app, a visitor carrying the header sees the capability and runs
+a query; one without is refused, at the endpoint."
+  (with-gui-fixture ()
+    (with-mounted-gui (:allow-prolog
+                       (lambda (env)
+                         (gethash "x-gui-operator" (getf env :headers))))
+      (let ((operator '(("X-Gui-Operator" . "yes")))
+            (path "/gui/api/graphs/gui-test-graph/prolog"))
+        (multiple-value-bind (json status)
+            (gui-request "/gui/api/capabilities" :headers operator)
+          (is (= 200 status))
+          (is-true (jref json :allow-prolog))
+          (is-true (jref (jref json :prolog) :functors)))
+        (multiple-value-bind (json status)
+            (gui-request "/gui/api/capabilities")
+          (is (= 200 status))
+          (is-false (jref json :allow-prolog))
+          (is-false (jref json :prolog)))
+        (multiple-value-bind (json status)
+            (gui-request path :method :post :headers operator
+                              :content (prolog-body *legit-query*))
+          (is (= 200 status))
+          (is (= 2 (jref json :row-count)))
+          (is (equal '("Alice" "Bob") (rows-of json :n))))
+        (multiple-value-bind (json status)
+            (gui-request path :method :post
+                              :content (prolog-body *legit-query*))
+          (is (= 403 status))
+          (is (string= "prolog-disabled" (jref json :error))))))))

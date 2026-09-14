@@ -315,8 +315,11 @@ and read-only neighborhood exploration."
   ;; :cl-ppcre is already in the image (graph-db/core depends on it) --
   ;; declared because the vendored-asset test scans the frontend sources
   ;; for CodeMirror entry points with it (GH #279).
+  ;; :lack and :lack-middleware-mount: the mount tests build the host
+  ;; arrangement of GH #384 with LACK:BUILDER.
   :depends-on (:graph-db/gui :graph-db/test-scratch :fiveam :drakma
-               :usocket :flexi-streams :bordeaux-threads :cl-ppcre)
+               :usocket :flexi-streams :bordeaux-threads :cl-ppcre
+               :lack :lack-middleware-mount)
   :pathname "tests/gui/"
   :serial t
   :components ((:file "package")

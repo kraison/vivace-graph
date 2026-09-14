@@ -10,4 +10,8 @@
   (:use #:cl)
   (:export #:start-gui
            #:stop-gui
-           #:*gui-port*))
+           #:*gui-port*
+           ;; The app without the server, for mounting under a host
+           ;; listener (GH #384).
+           #:make-gui-app
+           #:gui-static-root))

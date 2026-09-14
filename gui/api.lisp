@@ -207,51 +207,66 @@ name, location, open/closed -- no stats."
 ;; CLOSE-GRAPH itself is untouched.
 (defvar *gui-rw-lock* (graph-db::make-rw-lock))
 
+(defvar *read-only* nil
+  "True when THIS REQUEST must refuse the open/close verbs.  Bound
+around each request by the app MAKE-GUI-APP builds, from its
+:READ-ONLY (GH #384).")
+
+(defmacro with-write-verb (() &body body)
+  "Run BODY, a management verb, unless this request is read-only: then
+answer 403 read-only instead (GH #384)."
+  `(if *read-only*
+       (gui-error 403 "read-only"
+                  "This GUI is read-only; open and close are refused")
+       (progn ,@body)))
+
 (def-gui-handler api-open-graph (params)
-  (let ((wire (param params :name)))
-    (graph-db::with-write-lock (*gui-rw-lock*)
-      (let ((open (find-open-graph wire)))
-        (if open
-            (%json-response (list (cons :name wire) (cons :open t)
-                                  (cons :status "already-open")))
-            (let ((entry (find-roster-entry wire)))
-              (cond
-                ((null entry)
-                 (gui-error 404 "unknown-graph"
-                            (format nil "Unknown graph ~A" wire)))
-                ((null (roster-entry-location entry))
-                 (gui-error 404 "no-recorded-location"
-                            (format nil "No recorded location for ~
+  (with-write-verb ()
+    (let ((wire (param params :name)))
+      (graph-db::with-write-lock (*gui-rw-lock*)
+        (let ((open (find-open-graph wire)))
+          (if open
+              (%json-response (list (cons :name wire) (cons :open t)
+                                    (cons :status "already-open")))
+              (let ((entry (find-roster-entry wire)))
+                (cond
+                  ((null entry)
+                   (gui-error 404 "unknown-graph"
+                              (format nil "Unknown graph ~A" wire)))
+                  ((null (roster-entry-location entry))
+                   (gui-error 404 "no-recorded-location"
+                              (format nil "No recorded location for ~
 graph ~A; the GUI opens stores only at their roster location" wire)))
-                ((not (uiop:directory-exists-p
-                       (roster-entry-location entry)))
-                 (gui-error 404 "location-missing"
-                            (format nil "Recorded location ~A for ~
+                  ((not (uiop:directory-exists-p
+                         (roster-entry-location entry)))
+                   (gui-error 404 "location-missing"
+                              (format nil "Recorded location ~A for ~
 graph ~A no longer exists"
-                                    (roster-entry-location entry)
-                                    wire)))
-                (t
-                 ;; Strictly at the recorded location -- no free-form
-                 ;; paths.  A dirty store signals STORE-NOT-CLOSED-
-                 ;; CLEANLY-ERROR, which DEF-GUI-HANDLER maps to 409.
-                 (graph-db:open-graph (roster-entry-name entry)
-                                      (roster-entry-location entry))
-                 (%json-response
-                  (list (cons :name wire) (cons :open t)
-                        (cons :status "opened")))))))))))
+                                      (roster-entry-location entry)
+                                      wire)))
+                  (t
+                   ;; Strictly at the recorded location -- no free-form
+                   ;; paths.  A dirty store signals STORE-NOT-CLOSED-
+                   ;; CLEANLY-ERROR, which DEF-GUI-HANDLER maps to 409.
+                   (graph-db:open-graph (roster-entry-name entry)
+                                        (roster-entry-location entry))
+                   (%json-response
+                    (list (cons :name wire) (cons :open t)
+                          (cons :status "opened"))))))))))))
 
 (def-gui-handler api-close-graph (params)
-  (let ((wire (param params :name)))
-    (graph-db::with-write-lock (*gui-rw-lock*)
-      (let ((graph (find-open-graph wire)))
-        (if graph
-            (progn
-              (graph-db:close-graph graph)
-              (%json-response (list (cons :name wire)
-                                    (cons :open (%bool nil))
-                                    (cons :status "closed"))))
-            (gui-error 409 "not-open"
-                       (format nil "Graph ~A is not open" wire)))))))
+  (with-write-verb ()
+    (let ((wire (param params :name)))
+      (graph-db::with-write-lock (*gui-rw-lock*)
+        (let ((graph (find-open-graph wire)))
+          (if graph
+              (progn
+                (graph-db:close-graph graph)
+                (%json-response (list (cons :name wire)
+                                      (cons :open (%bool nil))
+                                      (cons :status "closed"))))
+              (gui-error 409 "not-open"
+                         (format nil "Graph ~A is not open" wire))))))))
 
 ;;; ---------------------------------------------------------------------
 ;;; Read endpoints.  Each resolves its graph per request; a closed or

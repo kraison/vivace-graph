@@ -9,10 +9,11 @@
 ;;; ---------------------------------------------------------------------
 
 (defvar *allow-prolog* nil
-  "True when the running GUI accepts free-text Prolog.  START-GUI sets
-it from :ALLOW-PROLOG (default NIL) each time it actually starts a
-server; calling START-GUI against an already-running GUI changes
-nothing, this included.  Restart to change the flag.")
+  "True when THIS REQUEST accepts free-text Prolog.  Bound around each
+request by the app MAKE-GUI-APP builds, from its :ALLOW-PROLOG -- a
+boolean, or a function of the clack ENV (GH #384); START-GUI passes
+its own :ALLOW-PROLOG through and, being idempotent, fixes it only
+when it actually starts a server.")
 
 (defparameter *prolog-internal-error-message*
   "An internal error occurred while running the query."
@@ -33,6 +34,9 @@ The detail goes to the log under an UNEXPECTED label (GH #279).")
 (def-gui-handler api-capabilities (params)
   (%json-response
    (list (cons :allow-prolog (%bool *allow-prolog*))
+         ;; The roster drops its open/close verbs on a read-only GUI
+         ;; (GH #384); the endpoints refuse them regardless.
+         (cons :read-only (%bool *read-only*))
          (cons :prolog
                (if *allow-prolog*
                    (%obj

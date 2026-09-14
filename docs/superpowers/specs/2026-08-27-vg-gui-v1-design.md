@@ -132,3 +132,15 @@ Execution per unit follows the repo's established method: implementer
 → independent review → fix rounds → controller fresh-image gate →
 diff review → push on approval. SBCL only (ECL demoted per standing
 directive).
+
+## Amendments
+
+- **2026-09-13 (#384)**: the app is exported without the server as
+  `make-gui-app (&key static-root allow-prolog read-only)`, so a host
+  mounts it under a prefix of its own listener with `lack:builder`
+  `:mount`. Frontend URLs became prefix-relative and a slashless mount
+  root redirects to the trailing-slash form. `:allow-prolog` also
+  takes a function of the request environment (per-request gating);
+  `:read-only` refuses the open/close verbs and is reported in
+  `/api/capabilities`. Decision 6 stands for the standalone server;
+  under a mount the host supplies identity in front of the app.

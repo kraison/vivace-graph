@@ -2238,6 +2238,47 @@ exactly what ~/types~ and ~/stats~ emit — digits included
 (~minAge~) is still accepted whenever a name carries an uppercase
 letter (vivace-graph#281).
 
+**** Mounting under a host application (GH #384)
+
+~start-gui~ starts its own listener. A host application that already
+runs a clack listener in the same image — an engine store is
+single-process, so any cockpit over a live store runs in the image
+that holds it — mounts the GUI under a prefix of its own instead:
+
+#+BEGIN_SRC lisp
+  (lack:builder
+   (:mount "/gui" (graph-db.gui:make-gui-app))
+   host-app)
+#+END_SRC
+
+~make-gui-app~ returns the clack application ~start-gui~ serves — a
+function of the request environment: ~/api/*~ through the API routes,
+everything else through the static tree with the request-body-size
+refusal, ~index.html~ at the mount's root. Its paths are relative to
+its own root, and the frontend names its assets and the API by
+relative URL, so the same build serves at ~/~ and under ~/gui/~. A
+request for the bare mount root (~/gui~) is redirected to ~/gui/~
+first: relative URLs resolve under the mount only from a directory
+URL. Keyword arguments:
+
+- ~:static-root~ — the asset directory; defaults to
+  ~(graph-db.gui:gui-static-root)~, the ~gui/static/~ of the loaded
+  source tree.
+- ~:allow-prolog~ — ~t~, or a *function of the clack environment*
+  decided per request, so a host admits the free-text Prolog
+  workbench for some visitors only (the identity the host puts in
+  front of the mount is what the function reads — a header, a
+  session). The value is bound around every request, shadowing any
+  outer binding of the flag.
+- ~:read-only~ — refuse the open/close verbs with ~403 read-only~ at
+  the endpoints; ~/api/capabilities~ reports ~readOnly: true~ and the
+  roster drops its Open/Close buttons.
+
+~start-gui~ takes the same ~:allow-prolog~ and ~:read-only~ and passes
+them through. Localhost remains the security boundary of the
+standalone server; under a mount the host supplies identity in front
+of it.
+
 **** Free-text Prolog (opt-in, GH #279)
 
 The builder above reads no user text at all. A second surface inside
@@ -2249,7 +2290,9 @@ therefore off unless asked for:
 #+END_SRC
 
 ~start-gui~ is idempotent, so it sets the flag only when it actually
-starts a server; restart to change it. With the flag off, ~POST
+starts a server; restart to change it. A GUI mounted through
+~make-gui-app~ can decide it per request instead (GH #384, above).
+With the flag off, ~POST
 /api/graphs/:name/prolog~ answers ~403 prolog-disabled~ *before it
 resolves the graph* — the flag is enforced at the endpoint, and the UI
 hiding the sub-tab is decoration, not the control. A frontend learns

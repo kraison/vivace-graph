@@ -8,7 +8,8 @@
 (in-package #:graph-db.gui)
 
 (defvar *gui-port* 4270)
-(defvar *gui-app* nil)
+(defvar *gui-app* nil
+  "The clack app START-GUI is serving (MAKE-GUI-APP's), or NIL.")
 (defvar *gui-handler* nil
   "The running clack handler, or NIL when the GUI is stopped.")
 
@@ -104,9 +105,34 @@ this runs before the ningle app is entered at all."
                              (format nil "Request body is ~D bytes; ~
 the limit is ~D" length *max-request-body-bytes*))))))))
 
+(defun %request-path (env)
+  "The URI path the client sent, before any mount stripped its prefix:
+:REQUEST-URI minus the query string."
+  (let ((uri (or (getf env :request-uri) "")))
+    (subseq uri 0 (or (position #\? uri) (length uri)))))
+
+(defun %slash-redirect (env)
+  "301 to the request path plus a trailing slash, or NIL when it has
+one.  index.html names its assets and the API by RELATIVE URL, so a
+mount under a host listener resolves them under the mount (GH #384) --
+which holds only while the page's own URL ends in a slash, so the bare
+mount root (/gui) is sent to /gui/ first.  A standalone GUI's / always
+has its slash and never takes this branch."
+  (let ((path (%request-path env))
+        (query (getf env :query-string)))
+    (unless (or (zerop (length path))
+                (char= (char path (1- (length path))) #\/))
+      (list 301
+            (list :location (if (and query (plusp (length query)))
+                                (format nil "~A/?~A" path query)
+                                (format nil "~A/" path))
+                  :content-type "text/plain")
+            (list "")))))
+
 (defun %gui-dispatch (env ningle-fn root)
   "Route ENV: /api/* to the ningle app, everything else (GET/HEAD) to
-the static tree, with index.html at /.
+the static tree, with index.html at / (a slashless mount root is
+redirected there first, see %SLASH-REDIRECT).
 
 An over-large body is refused here, ahead of both.  413 rather than 400
 because for once the request ENTITY really is what is too large -- the
@@ -126,7 +152,8 @@ outcome that is already safe."
        (%too-large-response length))
       ((and (member (getf env :request-method) '(:get :head))
             (not (eql 0 (search "/api/" path))))
-       (or (%static-response path root)
+       (or (and (string= path "/") (%slash-redirect env))
+           (%static-response path root)
            '(404 (:content-type "text/plain") ("not found"))))
       (t (funcall ningle-fn env)))))
 
@@ -174,8 +201,38 @@ outcome that is already safe."
           'api-graph-prolog)
     app))
 
+(defun %allow-prolog-p (allow-prolog env)
+  "ALLOW-PROLOG decided for this request: a function is called on the
+clack ENV; anything else is a generalized boolean."
+  (and (if (functionp allow-prolog)
+           (funcall allow-prolog env)
+           allow-prolog)
+       t))
+
+(defun make-gui-app (&key (static-root (gui-static-root))
+                          allow-prolog read-only)
+  "A clack application -- a function of ENV -- serving what START-GUI
+serves: /api/* through the ningle routes, everything else through the
+static tree under STATIC-ROOT with the body-size refusal, index.html
+at the root.  Every path is relative to the app's own root, so a host
+running its own listener mounts it under a prefix (GH #384):
+
+  (lack:builder (:mount \"/gui\" (graph-db.gui:make-gui-app)) host-app)
+
+ALLOW-PROLOG opens the free-text Prolog endpoint: T for every request,
+or a function of the clack ENV, decided per request -- how a host
+admits the workbench for some visitors only.  READ-ONLY refuses the
+open/close verbs with 403 read-only and says so in /api/capabilities.
+Both are bound around each request, so an outer binding of
+*ALLOW-PROLOG* is shadowed: pass a function instead."
+  (let ((ningle-fn (lack.component:to-app (%make-gui-app))))
+    (lambda (env)
+      (let ((*allow-prolog* (%allow-prolog-p allow-prolog env))
+            (*read-only* (and read-only t)))
+        (%gui-dispatch env ningle-fn static-root)))))
+
 (defun start-gui (&key (port *gui-port*) (bind "127.0.0.1")
-                       (allow-prolog nil))
+                       allow-prolog read-only)
   "Start the GUI HTTP server on PORT, bound to BIND (loopback by
 default -- localhost is the v1 security boundary).  A non-loopback
 BIND serves the UNAUTHENTICATED API and open/close verbs to that
@@ -189,21 +246,19 @@ whitelisted against the live functor registries and this graph's
 schema before it compiles (gui/prolog.lisp), and it runs on the same
 read-only, bounded rails as the structured builder -- but it is still
 the only surface that reads client text, so it is off unless asked
-for.  Being idempotent, START-GUI sets the flag only when it actually
-starts a server: restart to change it."
+for.  READ-ONLY refuses the open/close verbs.  Both are MAKE-GUI-APP's
+and, START-GUI being idempotent, take effect only when it actually
+starts a server: restart to change them."
   (or *gui-handler*
-      (let* ((app (%make-gui-app))
-             (root (gui-static-root))
-             (ningle-fn (lack.component:to-app app)))
+      (let ((app (make-gui-app :allow-prolog allow-prolog
+                               :read-only read-only)))
         (setq *gui-app* app)
         (setq *gui-port* port)
-        (setq *allow-prolog* (and allow-prolog t))
         (setq *gui-handler*
               ;; :debug nil -- a handler bug must never put a backtrace
               ;; in the browser; api.lisp logs details via log4cl.
-              (clack:clackup
-               (lambda (env) (%gui-dispatch env ningle-fn root))
-               :port port :address bind :debug nil :silent t)))))
+              (clack:clackup app :port port :address bind
+                             :debug nil :silent t)))))
 
 (defun stop-gui ()
   "Stop the GUI server.  Idempotent: a no-op when not running.
