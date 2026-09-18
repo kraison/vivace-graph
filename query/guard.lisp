@@ -680,14 +680,20 @@ cut recorded."
 is no room, so an exactly-full page reads as truncated (GH #278)."
   (if (< cap graph-db::*query-default-limit*) (1+ cap) cap))
 
-(defun %run-guarded-goals (vars goals graph probe)
-  "The already-guarded query's rows, RAW, at most PROBE of them, with
-the GUI's three-way condition contract (GH #279).  No :PACKAGE is
-passed -- each head resolves in its own package (GH #322)."
+(defun %clamp-offset (offset)
+  "OFFSET as the DSL's :SKIP: a positive integer passes, anything else
+is no offset (GH #387)."
+  (and (integerp offset) (plusp offset) offset))
+
+(defun %run-guarded-goals (vars goals graph probe &optional skip)
+  "The already-guarded query's rows, RAW, at most PROBE of them after
+the first SKIP, with the GUI's three-way condition contract (GH #279).
+No :PACKAGE is passed -- each head resolves in its own package (GH
+#322)."
   (handler-case
       (let ((rows '()))
         (graph-db::run-query-goals
-         vars goals graph :limit probe :format :raw
+         vars goals graph :limit probe :skip skip :format :raw
          :callback (lambda (row) (push row rows)))
         (nreverse rows))
     (graph-db:prolog-error (c) (error c))
@@ -702,20 +708,23 @@ passed -- each head resolves in its own package (GH #322)."
                         (type-of c) c)
              (error 'prolog-server-fault))))))
 
-(defun run-guarded-prolog (text graph &key limit max-inferences timeout
-                                            (format :data))
+(defun run-guarded-prolog (text graph &key limit offset max-inferences
+                                            timeout (format :data))
   "Screen, read, guard and run TEXT against GRAPH; (VALUES COLUMNS ROWS
 TRUNCATED-P).  COLUMNS are the variables in first-appearance order as
 camelCase wire spelling; ROWS one list per solution, cells JSON-shaped
 under :DATA (a node is its id string; strings, numbers, T, NIL pass) or
-as bound under :RAW.  LIMIT is clamped to *QUERY-DEFAULT-LIMIT*;
-MAX-INFERENCES and TIMEOUT bind the DSL's budgets for this call.
-Refusals signal PROLOG-GUARD-ERROR; see the header for the rest of the
-condition contract (spec SS4, GH #322)."
+as bound under :RAW.  LIMIT is clamped to *QUERY-DEFAULT-LIMIT*; OFFSET
+skips that many solutions first, so pages are LIMIT-sized windows on
+one solution order (GH #387) -- the skipped solutions are still
+produced and still count against the budgets, which MAX-INFERENCES and
+TIMEOUT bind for this call.  Refusals signal PROLOG-GUARD-ERROR; see
+the header for the rest of the condition contract (spec SS4, GH #322)."
   (check-type format (member :data :raw))
   (let* ((scratch (%make-scratch-package))
          (cap (%clamp-cap limit))
          (probe (%probe cap))
+         (skip (%clamp-offset offset))
          (graph-db::*query-default-max-inferences*
            (or max-inferences graph-db::*query-default-max-inferences*))
          (graph-db::*query-default-timeout*
@@ -723,7 +732,7 @@ condition contract (spec SS4, GH #322)."
     (unwind-protect
          (multiple-value-bind (vars goals)
              (%read-guarded-forms text scratch (%guard-context graph scratch))
-           (let* ((rows (%run-guarded-goals vars goals graph probe))
+           (let* ((rows (%run-guarded-goals vars goals graph probe skip))
                   (n (length rows))
                   (truncated (if (> probe cap) (> n cap) (>= n cap)))
                   (shown (if (> n cap) (subseq rows 0 cap) rows)))

@@ -5,10 +5,12 @@ versioned producer: claims derived from other claims, validated like
 any other write, readable back with their provenance. The design is
 `docs/superpowers/specs/2026-09-04-rules-as-producers-design.md`.
 
-**Slice 1 (GH #330)** is the Prolog view of claims: seven global
+**Slice 1 (GH #330)** is the Prolog view of claims: the global
 functors a `select`, or a guarded free-text query, reads claims as
-facts through. **Slice 2 (GH #331)** is the rule itself -- the stored
-`rule` record and the `derivation` provenance family
+facts through (seven at first; GH #388 added the extent functors and
+the instant comparisons, GH #389 the vocabulary routes). **Slice 2
+(GH #331)** is the rule itself -- the stored `rule` record and the
+`derivation` provenance family
 (`def-rules-schema`), `def-rule` as the in-image escape hatch,
 `compile-rule`, and `run-rule` / `run-rules` -- from "The store's rule
 schema" down. Slice 1 only reads; `run-rule` is the one thing here
@@ -32,16 +34,18 @@ cost-unbounded rule below.
 ## Why the functors are homed in `graph-db`
 
 The subsystem's package is `graph-db.rules` (spec §3), but
-`rules/facts.lisp` is `(in-package #:graph-db)` and the seven
-`name/arity` symbols -- `claim/7`, `claim-current/1`,
-`claim-valid-at/2`, `claim-producer/2`, `claim-standing/2`,
-`claim-relation/2`, `claim-rule-version/2` -- are `graph-db` exports.
+`rules/facts.lisp` is `(in-package #:graph-db)` and the `name/arity`
+symbols -- `claim/7`, `claim-current/1`, `claim-valid-at/2`,
+`claim-valid-from/2`, `claim-valid-to/2`, `claim-recorded-at/2`,
+`claim-producer/2`, `claim-standing/2`, `claim-relation/2`,
+`claim-rule-version/2`, and `instant</2`, `instant>/2`, `instant<=/2`,
+`instant>=/2`, `instant=/2` -- are `graph-db` exports.
 
 `def-global-prolog-functor` splices the name as read and exports it
 from `*package*`; the engine's `make-functor-symbol` resolves a goal
 head first in the head symbol's own package and then in `graph-db`. A
 functor homed anywhere else is unreachable from a raw `select` written
-in any other package, so every consumer would have to import seven
+in any other package, so every consumer would have to import a dozen
 `name/arity` symbols to write one goal. Homing them in `graph-db` is
 what "global Prolog functor" already means here -- every entry in the
 registry is `graph-db`-homed except the per-schema edge functors.
@@ -54,8 +58,12 @@ pathname and its `graph-db.rules` package are unchanged.
 ```lisp
 (claim ?c family ?sns ?skey ?rel ?ons ?okey)
 (claim-current ?c)          (claim-valid-at ?c instant)
+(claim-valid-from ?c ?from) (claim-valid-to ?c ?to)
+(claim-recorded-at ?c ?at)
 (claim-producer ?c ?p)      (claim-standing ?c ?s)
 (claim-relation ?c ?r)      (claim-rule-version ?c ?v)
+(instant< ?a ?b) (instant> ?a ?b) (instant<= ?a ?b) (instant>= ?a ?b)
+(instant= ?a ?b)
 ```
 
 | functor | answers |
@@ -63,10 +71,14 @@ pathname and its `graph-db.rules` package are unchanged.
 | `claim/7` | a claim of `family`, and its endpoints |
 | `claim-current/1` | true while the transaction period is open |
 | `claim-valid-at/2` | true when the validity extent covers `instant` |
+| `claim-valid-from/2` | the validity start, as an instant string (GH #388) |
+| `claim-valid-to/2` | the validity end, as an instant string, or NIL when open |
+| `claim-recorded-at/2` | when the claim was recorded, as an instant string |
 | `claim-producer/2` | the producer -- also a generator, below |
 | `claim-standing/2` | the standing, as a lowercase string |
 | `claim-relation/2` | the relation |
 | `claim-rule-version/2` | the rule version, or NIL |
+| `instant</2` and friends | order two instants by value (GH #388) |
 
 `family` is the **parent** class name a `def-claim-classes` registered,
 never an arity subclass. The registry is `eq`-keyed on the symbol as
@@ -85,14 +97,41 @@ guard the schema's own canonical symbol is what reaches the goal.
 - **A unary claim binds `?ons` and `?okey` to NIL.**
 - **Retracted claims are generated**, matching `claims-touching`'s
   default. `claim-current/1` is the goal that means "still believed".
+  It does **not** mean "currently valid": a claim whose validity a
+  successor closed is not retracted and still passes. "Held now" is
+  `claim-valid-at/2` with the present instant (GH #388).
 - `claim-rule-version/2` answers NIL as a **solution**, not a failure,
   so a claim no rule wrote is still returned.
-- `claim-valid-at/2` takes an ISO-8601 string or a `local-time`
-  timestamp, and shares `claims-touching :at`'s own predicate and
-  probe so the two cannot diverge (spec §11). A claim with no validity
-  extent never matches. A malformed instant **fails the goal** rather
-  than signalling, so a caller cannot tell a bad timestamp from no
-  match.
+- `claim-valid-at/2` takes an RFC 3339 / ISO-8601 string or a
+  `local-time` timestamp, and shares `claims-touching :at`'s own
+  predicate and probe so the two cannot diverge (spec §11). A claim
+  with no validity extent never matches. A malformed instant -- a
+  string that does not parse, or a number -- **signals**
+  `query-precondition-error`, which `run-guarded-prolog` answers as
+  `prolog-ill-typed-error` (GH #388; before it, the goal failed
+  silently and a bad timestamp looked like no match).
+- `claim-valid-from/2` and `claim-valid-to/2` (GH #388) bind the
+  validity extent's two ends as **strings in one spelling**: RFC 3339,
+  UTC, nanosecond precision, 30 characters --
+  `"2026-01-01T00:00:00.000000000Z"` -- so any two answers order
+  lexically in time order and cross a wire unchanged. A fuzzy bound
+  answers its outer edge (the earliest start, the latest end), the
+  envelope `claim-valid-at/2`'s "possibly contains" already uses; an
+  unbounded edge -- an open end -- answers NIL as a **solution**, so
+  `(claim-valid-to ?c nil)` selects the open-ended claims. A claim
+  with no extent fails both.
+- `claim-recorded-at/2` binds the start of the claim's transaction
+  extent in the same spelling -- when it was recorded, not when it
+  became true -- or NIL for a claim predating the transaction-time
+  axis (GH #148). With `instant>/2` it is a change feed: every claim
+  recorded after the last instant a reader saw.
+- `instant</2`, `instant>/2`, `instant<=/2`, `instant>=/2`,
+  `instant=/2` compare two instants **by value**, each a string in any
+  RFC 3339 spelling or a timestamp, so a client's `"2026-02-01"`
+  compares correctly against the functors' 30-character answer -- the
+  plain `</2` on two strings is lexical (GH #387) and right only when
+  both sides share one spelling. An unbound or NIL side fails; a
+  malformed one signals as `claim-valid-at/2` does.
 - `claim-producer/2` with `?c` **unbound** -- not bound to NIL, which
   is a bound non-node and simply fails -- and `?p` a producer name
   generates from the producer index of **every** claim family in the
@@ -147,7 +186,23 @@ Raw, in the image, from any package:
 | subject namespace and key | the subject index |
 | object namespace and key | the object index |
 | a namespace naming no keyword this image recorded | empty, at once |
+| subject namespace, key unbound (relation bound or not) | the vocabulary route: keys from the vocabulary index, each key's claims from the subject (-relation) index (GH #389) |
+| object namespace, key unbound | the vocabulary route on the object side |
 | none of the above | the family walk -- see below |
+
+**The vocabulary routes (GH #389).** "Every claim about a subject in
+namespace N" is the natural question of a claim store, and until
+GH #389 it fell to the walk. Now `claim/7` reads the keys filed under
+the namespace from the vocabulary index (`claim-keys`, GH #350) --
+cost proportional to the number of *keys*, never of claims -- and
+generates each key's claims from the same index the bound-key routes
+read, in ascending key order. It is bounded where the walk is not:
+the work between two `%tick`s is one key's claims, so a budget
+preempts between keys; no up-front pricing refuses a large namespace,
+because the first page of it is exactly what paging (`:offset`, GH
+#387) is for. Both namespaces bound and neither key takes the subject
+side. Keys with no claim of a bound relation cost one empty lookup
+each.
 
 **The empty fast path is not a refusal.** A bound namespace argument
 that resolves to no keyword -- a name no claim was recorded under, a
@@ -156,9 +211,10 @@ interns nothing; query text cannot grow the `KEYWORD` package.
 
 **Any shape the table does not route reaches the walk** -- the walk is
 the `cond`'s last clause, not a nothing-bound special case. A bound
-namespace this image recorded, with an unbound key, a bound key with an
-unbound namespace, and a non-node `?c` with nothing else bound all land
-there. A namespace that resolves to nothing is the row above instead.
+key with an unbound namespace, and a non-node `?c` with nothing else
+bound, land there. A namespace that resolves to nothing is the empty
+row instead; one that resolves, with its key unbound, is the
+vocabulary route (GH #389).
 
 **A bound key with an unbound namespace has no route.** The namespace
 is the leading slot of both endpoint indexes and an index is only
@@ -200,6 +256,30 @@ That classifies a whole functor, and `%excluded-predicate-p` would
 then withhold `claim` from free text entirely -- breaking the guarded
 surface this slice exists to provide. Unboundedness here is a per-goal
 property, not a per-functor one.
+
+## Solution order (GH #387)
+
+Solutions come in goal-execution order: the first goal's solutions in
+the order its route produces them, and for each, the second goal's,
+depth-first. `claim/7`'s routes produce, in this order:
+
+- the stores in scope, own store first (`*claim-scope*`);
+- within a store, for the vocabulary routes, keys in **ascending index
+  order** (the engine's collation, `string<` for string keys);
+- within one key -- or for the bound-key routes -- that key's claims
+  in the index's own order, which is stable while the store is
+  unchanged but not otherwise specified;
+- this run's own derivation last (the fixpoint's delta, GH #333).
+
+The order is stable across calls while no write lands, which is what
+makes `run-guarded-prolog`'s `:offset` a usable page (GH #387); a
+write between two pages can shift a row across the boundary. A caller
+who wants a boundary a write cannot move pages by **key** instead: on
+a vocabulary route, `(> ?k "last-key-seen")` after the `claim/7` goal
+-- `>/2` orders two strings lexically since GH #387 -- restarts after
+that key, at the price of generating the earlier keys' claims and
+discarding them. Neither offset nor key bound is a snapshot cursor;
+`docs/guarded-query.md` "Paging" has the trade-off.
 
 ## Unknown names
 
@@ -275,8 +355,8 @@ its own `sbcl` process -- CI lane `rules suite` in
 an image that loads `graph-db/rules` **and** `graph-db/gui-test` fails
 `prolog-functor-inventory-is-pinned`, because that check is an equality
 against a hand-reviewed list and the gui lane loads no rules. Classify
-the seven functors there if you build such an image; never weaken the
-check.
+the rules functors there (the `claim*` and `instant*` families) if you
+build such an image; never weaken the check.
 
 ## The store's rule schema (GH #331)
 

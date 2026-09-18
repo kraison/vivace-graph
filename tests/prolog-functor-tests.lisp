@@ -30,6 +30,20 @@
     (is (equal '(5) (select-flat (?x) (= ?x 5) (/= ?x 6))))
     (is (null         (select-flat (?x) (= ?x 5) (/= ?x 5))))))
 
+(test string-comparison-functors
+  "GH #387: the four order functors compare two strings lexically; a
+string against a number fails rather than signalling."
+  (with-test-graph (g)
+    (declare (ignore g))
+    (is (equal '("b") (select-flat (?x) (= ?x "b") (< ?x "c"))))
+    (is (null         (select-flat (?x) (= ?x "b") (< ?x "a"))))
+    (is (equal '("b") (select-flat (?x) (= ?x "b") (> ?x "a"))))
+    (is (equal '("b") (select-flat (?x) (= ?x "b") (>= ?x "b"))))
+    (is (equal '("b") (select-flat (?x) (= ?x "b") (<= ?x "b"))))
+    (is (null         (select-flat (?x) (= ?x "b") (<= ?x "a"))))
+    (is (null         (select-flat (?x) (= ?x "b") (< ?x 3))))
+    (is (null         (select-flat (?x) (= ?x 3) (< ?x "b"))))))
+
 (test numeric-comparison-functors
   "</2 >/2 <=/2 >=/2 compare bound numbers."
   (with-test-graph (g)

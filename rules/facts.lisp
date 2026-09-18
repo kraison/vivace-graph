@@ -242,6 +242,49 @@ refusal and this one answer to one value."
           append (map-vertices #'identity g :vertex-type parent
                                             :collect-p t))))
 
+(defun %scope-keys (family role namespace)
+  "The keys filed under NAMESPACE in ROLE by FAMILY, over every store in
+scope, merged in index order (the engine's collation, ascending).  Read
+from the vocabulary index (CLAIM-KEYS, GH #350), so the cost is the
+number of keys, never the number of claims.  Same store rule as
+%SCOPE-LOOKUP: a foreign store lacking the family contributes nothing,
+the own store still signals."
+  (let ((graphs (%scope-graphs))
+        (class (graph-db.spacetime:claim-family-parent family)))
+    (flet ((keys (g) (values (graph-db.spacetime:claim-keys
+                              g class namespace :role role))))
+      (graph-db.spacetime::%merge-names
+       (cons (keys (first graphs))
+             (loop for g in (rest graphs)
+                   collect (handler-case (keys g)
+                             (query-precondition-error () '()))))
+       nil))))
+
+(defun %namespace-route (family role namespace rel emit)
+  "GH #389: every claim whose ROLE endpoint sits in NAMESPACE, key by
+key -- the keys from the vocabulary index, each key's claims from the
+same subject or object index the bound-key routes read, in ascending
+key order.  Bounded, unlike the walk: the work between two %TICKs is
+one key's claims, so a budget preempts between keys.  This run's own
+derivation follows, unfiltered; %UNIFY-CLAIM re-filters (GH #333)."
+  (let ((parent (graph-db.spacetime:claim-family-parent family))
+        (binary (graph-db.spacetime:claim-family-binary family)))
+    (dolist (key (%scope-keys family role namespace))
+      (mapc emit
+            (%exclude-producers
+             (ecase role
+               (:subject
+                (if rel
+                    (%scope-lookup parent
+                                   +claim-subject-relation-index-slots+
+                                   (list namespace key rel))
+                    (%scope-lookup parent +claim-subject-index-slots+
+                                   (list namespace key))))
+               (:object
+                (%scope-lookup binary +claim-object-index-slots+
+                               (list namespace key)))))))
+    (mapc emit (%derived-all))))
+
 (def-global-prolog-functor claim/7
     (?c ?family ?sns ?skey ?rel ?ons ?okey cont)
   "Claims of ?FAMILY (a parent class name) as facts: subject namespace
@@ -249,14 +292,15 @@ and key, relation, object namespace and key.  A namespace answers as the
 lowercase wire string, or as the keyword when the argument was already
 bound to one; a unary claim's object pair is NIL.  Generates from the
 subject index when the subject is bound, the object index when the object
-is, the producer index through CLAIM-PRODUCER/2 in the same body.  A
-bound namespace naming no keyword answers empty; every other goal the
-routes miss reaches the COND's last clause, which walks the family or is
-refused as cost-unbounded under a resource bound (GH #285, spec §4).
-The three indexed routes and the walk read every store in
-*CLAIM-SCOPE*, own store first, or *GRAPH* alone when it is NIL; a
-bound ?C and the empty fast paths read no store at all (spec §10,
-GH #332)."
+is, the producer index through CLAIM-PRODUCER/2 in the same body; a
+namespace bound without its key generates key by key from the
+vocabulary index (GH #389).  A bound namespace naming no keyword answers
+empty; every other goal the routes miss reaches the COND's last clause,
+which walks the family or is refused as cost-unbounded under a resource
+bound (GH #285, spec §4).  The indexed routes and the walk read every
+store in *CLAIM-SCOPE*, own store first, or *GRAPH* alone when it is
+NIL; a bound ?C and the empty fast paths read no store at all (spec
+§10, GH #332).  Solution order: docs/rules.md \"Solution order\"."
   (let* ((family (%family-or-ill-typed ?family))
          (parent (graph-db.spacetime:claim-family-parent family))
          (binary (graph-db.spacetime:claim-family-binary family))
@@ -267,43 +311,51 @@ GH #332)."
          (ons (%namespace-keyword ons-arg))
          (skey (%prolog-index-bound ?skey))
          (okey (%prolog-index-bound ?okey))
-         (rel (%prolog-index-bound ?rel))
-         ;; Each indexed/scan route unions in this run's own
-         ;; derivation, keyed like the index it substitutes for
-         ;; (GH #333, C1); over-inclusion is safe, %UNIFY-CLAIM
-         ;; re-filters every candidate below.
-         (candidates
-           (cond ((node-p c) (list c))
-                 ((and sns skey rel)
-                  (append (%exclude-producers
-                           (%scope-lookup
-                            parent +claim-subject-relation-index-slots+
-                            (list sns skey rel)))
-                          (%derived-by-subject rel (cons sns skey))))
-                 ((and sns skey)
-                  (append (%exclude-producers
-                           (%scope-lookup parent
-                                          +claim-subject-index-slots+
-                                          (list sns skey)))
-                          (%derived-by-subject nil (cons sns skey))))
-                 ((and ons okey)
-                  (append (%exclude-producers
-                           (%scope-lookup binary
-                                          +claim-object-index-slots+
-                                          (list ons okey)))
-                          (%derived-by-object (cons ons okey))))
-                 ;; A bound namespace argument naming no keyword of this
-                 ;; image -- a name no claim was recorded under, a
-                 ;; non-wire spelling, a non-string: no solutions, and
-                 ;; nothing interned.  Not the walk below, which under
-                 ;; the guard's budget refuses instead (spec §4).
-                 ((and sns-arg (null sns)) '())
-                 ((and ons-arg (null ons)) '())
-                 (t (append (%exclude-producers
-                             (%unbound-claim-scan family))
-                            (%derived-all))))))
-    (dolist (claim candidates)
-      (%unify-claim claim ?c ?sns ?skey ?rel ?ons ?okey family cont))))
+         (rel (%prolog-index-bound ?rel)))
+    ;; Each indexed/scan route unions in this run's own derivation,
+    ;; keyed like the index it substitutes for (GH #333, C1);
+    ;; over-inclusion is safe, %UNIFY-CLAIM re-filters every candidate.
+    (flet ((emit (claim)
+             (%unify-claim claim ?c ?sns ?skey ?rel ?ons ?okey family
+                           cont)))
+      (cond ((node-p c) (emit c))
+            ((and sns skey rel)
+             (mapc #'emit
+                   (append (%exclude-producers
+                            (%scope-lookup
+                             parent +claim-subject-relation-index-slots+
+                             (list sns skey rel)))
+                           (%derived-by-subject rel (cons sns skey)))))
+            ((and sns skey)
+             (mapc #'emit
+                   (append (%exclude-producers
+                            (%scope-lookup parent
+                                           +claim-subject-index-slots+
+                                           (list sns skey)))
+                           (%derived-by-subject nil (cons sns skey)))))
+            ((and ons okey)
+             (mapc #'emit
+                   (append (%exclude-producers
+                            (%scope-lookup binary
+                                           +claim-object-index-slots+
+                                           (list ons okey)))
+                           (%derived-by-object (cons ons okey)))))
+            ;; A bound namespace argument naming no keyword of this
+            ;; image -- a name no claim was recorded under, a non-wire
+            ;; spelling, a non-string: no solutions, and nothing
+            ;; interned.  Not the walk below, which under the guard's
+            ;; budget refuses instead (spec §4).
+            ((and sns-arg (null sns)) nil)
+            ((and ons-arg (null ons)) nil)
+            ;; A namespace without its key: the vocabulary routes
+            ;; (GH #389).  Subject first, so a goal binding both
+            ;; namespaces and neither key enumerates subjects.
+            (sns (%namespace-route family :subject sns rel #'emit))
+            (ons (%namespace-route family :object ons nil #'emit))
+            (t (mapc #'emit
+                     (append (%exclude-producers
+                              (%unbound-claim-scan family))
+                             (%derived-all))))))))
 
 (defun %unbound-p (x)
   "X is an unbound Prolog variable -- not a bound NIL, which
@@ -325,19 +377,104 @@ classifies as ill-typed input (spec §4)."
   "True while ?C's transaction period is open -- a claim RETRACT-CLAIM has
 closed is filtered out.  Claims are generated retracted-and-all, matching
 CLAIMS-TOUCHING's default, so this is the goal that says \"still
-believed\" (spec §4)."
+believed\" (spec §4).  Trap: not \"currently valid\" -- a claim whose
+validity a successor closed still passes; that is CLAIM-VALID-AT/2 with
+the present instant (GH #388)."
   (let ((c (%claim-arg ?c)))
     (when (and c (graph-db.spacetime:claim-current-p c))
       (funcall cont))))
 
 (defun %instant-arg (x)
-  "X as a LOCAL-TIME timestamp: a timestamp passes, an ISO-8601 string is
-parsed, everything else -- an unparsable string included -- is NIL, so a
-malformed instant fails the goal instead of signalling."
+  "X as a LOCAL-TIME timestamp: a timestamp passes, an RFC 3339 /
+ISO-8601 string is parsed, an unbound or NIL X is NIL and fails the
+goal.  Anything else -- a string that does not parse, a number -- is
+QUERY-PRECONDITION-ERROR, which the guarded runner answers as ill-typed:
+a bad instant must be visible, not an empty answer (GH #388)."
   (let ((v (%prolog-index-bound x)))
-    (cond ((typep v 'local-time:timestamp) v)
-          ((stringp v) (ignore-errors (local-time:parse-timestring v)))
-          (t nil))))
+    (cond ((null v) nil)
+          ((typep v 'local-time:timestamp) v)
+          ((and (stringp v)
+                (ignore-errors (local-time:parse-timestring v))))
+          (t (error 'query-precondition-error
+                    :reason (format nil "~S is not an RFC 3339 instant"
+                                    v))))))
+
+(defparameter +instant-format+
+  '((:year 4) #\- (:month 2) #\- (:day 2) #\T
+    (:hour 2) #\: (:min 2) #\: (:sec 2) #\. (:nsec 9) #\Z)
+  "How the extent functors spell an instant: RFC 3339, UTC, nanosecond
+precision, 30 characters -- one spelling, so two answers order
+lexically in time order (GH #388).")
+
+(defun %instant-string (timestamp)
+  (local-time:format-timestring nil timestamp :format +instant-format+
+                                              :timezone local-time:+utc-zone+))
+
+(defun %bound-edge (bound edge)
+  "BOUND's :EARLIEST or :LATEST edge as an instant string, or NIL when
+that edge is :UNBOUNDED."
+  (let ((ts (ecase edge
+              (:earliest (graph-db.spacetime:bound-earliest bound))
+              (:latest (graph-db.spacetime:bound-latest bound)))))
+    (and (typep ts 'local-time:timestamp) (%instant-string ts))))
+
+(def-global-prolog-functor claim-valid-from/2 (?c ?from cont)
+  "?C's validity start as an instant string (+INSTANT-FORMAT+) -- the
+EARLIEST edge of a fuzzy start, NIL when that edge is unbounded; a claim
+with no extent fails.  The outer envelope, as CLAIM-VALID-AT/2's
+\"possibly contains\" is (GH #388)."
+  (let* ((c (%claim-arg ?c))
+         (e (and c (graph-db.spacetime:claim-extent c))))
+    (when e
+      (%yield (?from (%bound-edge (graph-db.spacetime:extent-start e)
+                                  :earliest))
+        (funcall cont)))))
+
+(def-global-prolog-functor claim-valid-to/2 (?c ?to cont)
+  "?C's validity end as an instant string -- the LATEST edge of a fuzzy
+end, NIL for an open end; a claim with no extent fails (GH #388)."
+  (let* ((c (%claim-arg ?c))
+         (e (and c (graph-db.spacetime:claim-extent c))))
+    (when e
+      (%yield (?to (%bound-edge (graph-db.spacetime:extent-end e)
+                                :latest))
+        (funcall cont)))))
+
+(def-global-prolog-functor claim-recorded-at/2 (?c ?at cont)
+  "When ?C was recorded, as an instant string: the start of its
+transaction extent.  NIL -- a solution -- when the claim predates the
+transaction-time axis or that start is unbounded, so a change feed can
+still list it (GH #388, #148)."
+  (let ((c (%claim-arg ?c)))
+    (when c
+      (let ((at (graph-db.spacetime:claim-recorded-at c)))
+        (%yield (?at (and (typep at 'local-time:timestamp)
+                          (%instant-string at)))
+          (funcall cont))))))
+
+;; INSTANT</2 and friends compare two instants -- strings in any RFC
+;; 3339 spelling, or timestamps -- by value, where </2 on two strings is
+;; lexical and so only right for one fixed spelling (GH #388).  An
+;; unbound side fails; a malformed one signals, as %INSTANT-ARG says.
+(defmacro %def-instant-compare (name op doc)
+  `(def-global-prolog-functor ,name (?a ?b cont)
+     ,doc
+     (let ((a (%instant-arg ?a))
+           (b (%instant-arg ?b)))
+       (when (and a b (,op a b))
+         (funcall cont)))))
+
+(%def-instant-compare instant</2 local-time:timestamp<
+  "True when instant ?A is before ?B (GH #388).")
+(%def-instant-compare instant>/2 local-time:timestamp>
+  "True when instant ?A is after ?B (GH #388).")
+(%def-instant-compare instant<=/2 local-time:timestamp<=
+  "True when instant ?A is not after ?B (GH #388).")
+(%def-instant-compare instant>=/2 local-time:timestamp>=
+  "True when instant ?A is not before ?B (GH #388).")
+(%def-instant-compare instant=/2 local-time:timestamp=
+  "True when ?A and ?B name the same instant, whatever their spelling
+\(GH #388).")
 
 (def-global-prolog-functor claim-valid-at/2 (?c ?at cont)
   "True when ?C's validity extent possibly contains ?AT (an ISO-8601

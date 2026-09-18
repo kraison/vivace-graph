@@ -623,3 +623,38 @@ subject."
       (is (= 0 (+ (graph-db.rules:rule-report-swept base)
                   (graph-db.rules:rule-report-swept step))))
       (is (equal '(("a" . "b")) (reaches a))))))
+
+(test the-vocabulary-route-reads-every-store-in-scope
+  "GH #389: subject namespace bound, key unbound, over A and B -- the
+keys of both stores merged in index order, each key's claims from
+every store."
+  (with-two-stores (a b)
+    (seed a)
+    (seed-b b)
+    (is (equal '("h1" "h1" "h2" "h2")
+               (select-flat (?k)
+                 (claim ?c rt-claim "host" ?k ?r ?ons ?o))))
+    (let ((graph-db::*claim-scope* (list a b)))
+      (let ((rows (select (:max-inferences 1000) (?k ?o)
+                    (claim ?c rt-claim "host" ?k ?r ?ons ?o))))
+        (is (equal '("h1" "h1" "h1" "h2" "h2" "h3")
+                   (mapcar #'first rows)))
+        (is (equal '("cache" "db" "web")
+                   (sort (loop for (k o) in rows
+                               when (string= k "h1") collect o)
+                         #'string<)))))))
+
+(test the-vocabulary-route-skips-a-store-that-lacks-the-family
+  "rtu-claim is declared for A only; B in scope adds no keys and
+refuses nothing, as %SCOPE-LOOKUP has it (S3-P5, GH #389)."
+  (with-two-stores (a b)
+    (seed a)
+    (with-transaction ((graph-db::transaction-manager a))
+      (make-rtu-claim-binary :graph a :subject-namespace :app
+                             :subject-key "web" :relation "owned-by"
+                             :object-namespace :team :object-key "t1"
+                             :producer "scan-a" :standing :observed))
+    (let ((graph-db::*claim-scope* (list a b)))
+      (is (equal '(("web" "t1"))
+                 (select (:max-inferences 1000) (?k ?t)
+                   (claim ?c rtu-claim "app" ?k "owned-by" "team" ?t)))))))

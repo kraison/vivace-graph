@@ -99,31 +99,34 @@ derives from this, single source)."
   "Checks inequality of the values of two prolog variables."
   (if (not (deref-equal ?arg1 ?arg2)) (funcall cont)))
 
+;; The four order functors compare two numbers numerically and two
+;; strings lexically (STRING<'s order); any other pair fails.  Strings
+;; are what lets a caller page an indexed route by bounding its key
+;; (GH #387, docs/guarded-query.md "Solution order").
+(defun %ordered-p (num-op string-op a b)
+  (cond ((and (numberp a) (numberp b)) (funcall num-op a b))
+        ((and (stringp a) (stringp b)) (and (funcall string-op a b) t))
+        (t nil)))
+
 (def-global-prolog-functor >/2 (?arg1 ?arg2 cont)
-  "Prolog greater than functor."
-  (if (and (numberp (var-deref ?arg1)) (numberp (var-deref ?arg2))
-           (> ?arg1 ?arg2))
-      (funcall cont)))
+  "Prolog greater than: two numbers, or two strings lexically."
+  (when (%ordered-p #'> #'string> (var-deref ?arg1) (var-deref ?arg2))
+    (funcall cont)))
 
 (def-global-prolog-functor </2 (?arg1 ?arg2 cont)
-  "Prolog less than functor."
-  (if (and (numberp (var-deref ?arg1)) (numberp (var-deref ?arg2))
-           (< ?arg1 ?arg2))
-      (funcall cont)))
+  "Prolog less than: two numbers, or two strings lexically."
+  (when (%ordered-p #'< #'string< (var-deref ?arg1) (var-deref ?arg2))
+    (funcall cont)))
 
 (def-global-prolog-functor >=/2 (?arg1 ?arg2 cont)
-  "Prolog greater than or equal to functor."
-  (if (and (numberp (var-deref ?arg1))
-           (numberp (var-deref ?arg2))
-           (>= ?arg1 ?arg2))
-      (funcall cont)))
+  "Prolog greater than or equal: two numbers, or two strings lexically."
+  (when (%ordered-p #'>= #'string>= (var-deref ?arg1) (var-deref ?arg2))
+    (funcall cont)))
 
 (def-global-prolog-functor <=/2 (?arg1 ?arg2 cont)
-  "Prolog less than or equal to functor."
-  (if (and (numberp (var-deref ?arg1))
-           (numberp (var-deref ?arg2))
-           (<= ?arg1 ?arg2))
-      (funcall cont)))
+  "Prolog less than or equal: two numbers, or two strings lexically."
+  (when (%ordered-p #'<= #'string<= (var-deref ?arg1) (var-deref ?arg2))
+    (funcall cont)))
 
 (def-global-prolog-functor numberp/1 (x cont)
   (when (numberp (var-deref x))

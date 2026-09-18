@@ -59,6 +59,54 @@
       (is (= 3 (length rows)))
       (is (null truncated)))))
 
+(test offset-pages-one-solution-order
+  "GH #387: :OFFSET skips solutions, so LIMIT-sized windows at
+successive offsets concatenate to the unpaged answer in its order;
+TRUNCATED-P is per page.  A bad offset is no offset."
+  (with-query-graph (g)
+    (seed g)
+    (let ((all (nth-value 1 (q g "(is-a ?i qt-item)"))))
+      (is (= 3 (length all)))
+      (multiple-value-bind (columns rows truncated)
+          (q g "(is-a ?i qt-item)" :limit 2)
+        (declare (ignore columns))
+        (is (equal (subseq all 0 2) rows))
+        (is (eq t truncated)))
+      (multiple-value-bind (columns rows truncated)
+          (q g "(is-a ?i qt-item)" :limit 2 :offset 2)
+        (declare (ignore columns))
+        (is (equal (subseq all 2) rows))
+        (is (null truncated)))
+      (multiple-value-bind (columns rows truncated)
+          (q g "(is-a ?i qt-item)" :offset 3)
+        (declare (ignore columns))
+        (is (null rows))
+        (is (null truncated)))
+      (is (equal all (nth-value 1 (q g "(is-a ?i qt-item)" :offset 0))))
+      (is (equal all (nth-value 1 (q g "(is-a ?i qt-item)" :offset -4))))
+      (is (equal all (nth-value 1 (q g "(is-a ?i qt-item)"
+                                     :offset "two")))))))
+
+(test a-string-bound-pages-by-key
+  "GH #387's third option: </2 and >/2 order two strings lexically, so a
+caller pages an indexed route by bounding the last key it saw."
+  (with-query-graph (g)
+    (seed g)
+    (is (equal '("b" "c")
+               (mapcar #'second
+                       (nth-value 1 (q g "(is-a ?i qt-item)
+                                          (node-slot-value ?i label ?l)
+                                          (> ?l \"a\")")))))
+    (is (equal '("a")
+               (mapcar #'second
+                       (nth-value 1 (q g "(is-a ?i qt-item)
+                                          (node-slot-value ?i label ?l)
+                                          (< ?l \"b\")")))))
+    ;; A string against a number is neither order: the goal fails.
+    (is (null (nth-value 1 (q g "(is-a ?i qt-item)
+                                 (node-slot-value ?i label ?l)
+                                 (> ?l 0)"))))))
+
 (test each-screened-token-is-refused-and-its-absence-accepted
   (with-query-graph (g)
     (seed g)

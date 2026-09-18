@@ -233,3 +233,18 @@ offers.
   rather than reaching for internals.
 - Findings against the engine surfaced while building go to their own
   issues and are listed here when a slice lands.
+
+## 14. Amendments
+
+- **2026-09-18 (#389)**: `claim/7` gained two routes -- a bound
+  namespace with its key unbound, on either side -- generating keys
+  from the vocabulary index (#350) and each key's claims from the
+  existing endpoint indexes. §4's route table and the cost-unbounded
+  rule stand; the walk is now reached only by a bound key without its
+  namespace or by nothing bound.
+- **2026-09-18 (#388)**: `claim-valid-from/2`, `claim-valid-to/2`,
+  `claim-recorded-at/2` (RFC 3339 UTC strings, nanosecond precision;
+  NIL for an unbounded edge) and `instant</2`, `instant>/2`,
+  `instant<=/2`, `instant>=/2`, `instant=/2` (by value). A malformed
+  instant signals `query-precondition-error` instead of failing the
+  goal, reversing §4's silent-failure choice.
