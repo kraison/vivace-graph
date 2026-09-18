@@ -69,7 +69,8 @@ suite's fast tier and every other lane in full (see below).
   depend on `graph-db/rules`, so the rules functors are absent from
   the gui lane and the list must not name them -- but an image that
   loads both subsystems WILL trip it, with a message naming the
-  seven `claim*` functors.  That is the tripwire working: classify
+  rules functors (the `claim*` family, and since GH #388 the
+  `instant*` comparisons).  That is the tripwire working: classify
   them, do not delete the check (`docs/rules.md`, GH #330).
   The same holds for `graph-db/spacetime`'s six (`related/3`,
   `claimed/4`, `subject-of/2`, `subject-of/3`, `object-of/2`,

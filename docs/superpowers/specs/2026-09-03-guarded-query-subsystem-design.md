@@ -221,3 +221,12 @@ issues.
 
 What the guard admits (the whitelist, the exclusions, the control
 words); the DSL's JSON schema; REST routes; the GUI's frontend.
+
+## 11. Amendments
+
+- **2026-09-18 (#387)**: `run-guarded-prolog` takes `:offset` (the
+  DSL's `:skip`), and `</2` / `>/2` / `<=/2` / `>=/2` order two strings
+  lexically, so a caller pages by offset or by bounding a key. The
+  solution order is documented per route (`docs/rules.md`). Chosen
+  over a resumable cursor, which needs a suspended run holding its
+  snapshot per token; `docs/guarded-query.md` "Paging".

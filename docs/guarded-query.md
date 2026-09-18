@@ -29,7 +29,7 @@ in `graph-db` as before.
 ## `run-guarded-prolog`
 
 ```lisp
-(run-guarded-prolog text graph &key limit max-inferences timeout
+(run-guarded-prolog text graph &key limit offset max-inferences timeout
                                      (format :data))
   => (values columns rows truncated-p)
 ```
@@ -97,12 +97,53 @@ the cap. At the ceiling -- `limit` omitted or `>=
 (`%probe`), so an exactly-full page there reads as `truncated-p` `t`
 too; only a page short of 1000 rows is `nil` at the ceiling.
 
+## Paging (GH #387)
+
+`offset` (default none) skips that many solutions before the first
+row is kept, so `limit`-sized windows at offsets 0, `limit`,
+2·`limit`, ... concatenate to the unpaged answer in its order, and
+`truncated-p` is per page: `t` while a further page exists. A
+non-positive or non-integer `offset` is no offset.
+
+```lisp
+(run-guarded-prolog text graph :limit 100)              ; page 1
+(run-guarded-prolog text graph :limit 100 :offset 100)  ; page 2
+```
+
+What this is and is not:
+
+- **The order is the engine's solution order** -- goal-execution
+  order, each route's own order within a goal -- documented per route
+  in `docs/rules.md` "Solution order" for `claim/7` (stores in scope,
+  then ascending key, then a key's claims in index order). It is
+  stable while no write lands; a write between two pages can move a
+  row across a page boundary, the ordinary offset trade-off. A caller
+  who needs a boundary a write cannot move bounds a **key** instead:
+  `</2` and `>/2` order two strings lexically since GH #387, so
+  `(> ?k "last-key-seen")` after an indexed goal restarts after that
+  key.
+- **Offset re-does the skipped work.** The skipped solutions are still
+  produced -- and still count against `max-inferences` and `timeout`,
+  which bind per call -- so a deep page of a large answer costs what
+  every page before it cost. Size the budget for the deepest page, or
+  page by key, whose cost is the discarded keys' claims rather than
+  every earlier solution.
+- **Not a snapshot cursor.** Each call runs under its own read
+  snapshot; nothing is held between pages, so nothing expires and
+  nothing needs a token. A resumable cursor -- a suspended run holding
+  its snapshot for the life of a token -- is the alternative the issue
+  named first and is not built: it means a thread per open cursor
+  holding a read pin, with an expiry policy the engine does not have
+  today. Offset plus key bounding covers the paging a service exposes
+  now; the cursor stays open as a design question on #387's thread.
+
 ## The condition contract
 
 | what happened | signaled as | caller sees | logged |
 |---|---|---|---|
 | guard refusal (bad char, unregistered functor, qualified or string head, ...) | `prolog-guard-error` | `prolog-guard-error-reason`, names the token, client-safe | no |
 | engine's own reviewed conditions (`prolog-error` family, `query-param-error`) | passed through unchanged | the original condition and report | no |
+| a goal refused as cost-unbounded (`prolog-cost-unbounded-error`, a `prolog-error`; GH #285) | passed through unchanged | the report names the functor and says the budget cannot bound it -- handle it before the generic `prolog-error` clause, or it reads as a malformed goal (GH #389) | no |
 | ill-typed goal arguments | `prolog-ill-typed-error` | fixed text, "ill-typed query" | yes, "ill-typed query" label |
 | anything else -- an engine defect | `prolog-server-fault` | fixed text, "internal error" | yes, "UNEXPECTED SERVER FAULT" label |
 

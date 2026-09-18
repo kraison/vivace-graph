@@ -313,10 +313,12 @@ extent."
 
 (defparameter *walker-head*
   "(claim ?c rt-claim \"host\" ?h \"has-app\" \"app\" ?a)")
+;; The subject namespace is a variable: a bound one routes through the
+;; vocabulary index since GH #389, and this body must NOT route.
 (defparameter *walker-body*
-  "(claim ?p rt-claim \"host\" ?h \"runs\" ?ons ?a)")
+  "(claim ?p rt-claim ?hns ?h \"runs\" ?ons ?a)")
 (defparameter *routed-body*
-  "(claim ?p rt-claim \"host\" ?h \"runs\" ?ons ?a)
+  "(claim ?p rt-claim ?hns ?h \"runs\" ?ons ?a)
    (claim-producer ?p \"scan-a\")")
 
 (test an-unrouted-body-goal-is-refused-not-walked

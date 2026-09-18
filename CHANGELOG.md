@@ -13,6 +13,38 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Added
 
+- **`claim/7` routes a bound namespace without its key** (#389): the
+  keys under the namespace come from the vocabulary index (#350) and
+  each key's claims from the subject or object index, in ascending
+  key order, so "every claim about namespace N" (with or without a
+  relation) is an indexed, budget-preemptible route instead of a
+  family walk refused as cost-unbounded. Both endpoint sides.
+  `docs/rules.md` "Routes" and "Solution order".
+
+- **The claim extent as facts** (#388): `claim-valid-from/2`,
+  `claim-valid-to/2` and `claim-recorded-at/2` bind RFC 3339 UTC
+  strings at nanosecond precision (one spelling, so they order
+  lexically and cross a wire); an open end answers NIL as a solution.
+  `instant</2`, `instant>/2`, `instant<=/2`, `instant>=/2` and
+  `instant=/2` compare instants by value in any RFC 3339 spelling.
+  `docs/rules.md` says beside `claim-current/1` that it does not mean
+  "currently valid".
+
+- **Paging in the guarded runner** (#387): `run-guarded-prolog` takes
+  `:offset`, so `:limit`-sized windows page one solution order, and
+  the order is documented per `claim/7` route. `</2`, `>/2`, `<=/2`
+  and `>=/2` order two strings lexically, so a caller can also page an
+  indexed route by bounding the last key seen. Not a snapshot cursor;
+  `docs/guarded-query.md` "Paging" has the trade-off.
+
+### Changed
+
+- **A malformed instant is an error, not an empty answer** (#388):
+  `claim-valid-at/2` (and the new instant functors) signal
+  `query-precondition-error` -- `prolog-ill-typed-error` through the
+  guarded runner -- for a string that does not parse or a non-string,
+  where the goal used to fail silently.
+
 - **GUI mountable under a host application's listener** (#384):
   `graph-db.gui:make-gui-app` returns the clack app `start-gui` serves
   (API routes, static tree with the body-size refusal, `index.html` at

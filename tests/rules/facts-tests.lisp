@@ -117,9 +117,10 @@ gets the walk under a budget, the same answer an unbudgeted query gives."
 (test an-unrouted-goal-is-refused-under-a-bound
   (with-rules-graph (g)
     (seed g)
-    (signals graph-db::prolog-cost-unbounded-error
-      (select (:max-inferences 1000) (?c)
-        (claim ?c rt-claim "host" ?k ?r ?a ?b)))
+    ;; A namespace without its key routed nowhere until GH #389; it is
+    ;; the vocabulary route now, and answers under the same budget.
+    (is (= 4 (select (:count t :max-inferences 1000) (?c)
+               (claim ?c rt-claim "host" ?k ?r ?a ?b))))
     (signals graph-db::prolog-cost-unbounded-error
       (select (:max-inferences 1000) (?c)
         (claim ?c rt-claim ?ns "h1" ?r ?a ?b)))
@@ -174,11 +175,11 @@ gets the walk under a budget, the same answer an unbudgeted query gives."
     ;; A claim with no extent never matches.
     (is (null (select-flat (?c) (claim ?c rt-claim "host" "h1" ?r ?a ?b)
                                 (claim-valid-at ?c "2026-02-15T00:00:00Z"))))
-    ;; A malformed instant fails the goal; reaching here at all is the
-    ;; assertion that it did not signal.
-    (is (null (select-flat (?v) (claim ?c rtt-claim "app" "web"
-                                       "version" "ver" ?v)
-                                (claim-valid-at ?c "not-a-timestamp"))))
+    ;; A malformed instant signals since GH #388 (it failed silently
+    ;; before): a-malformed-instant-is-an-error-a-caller-can-see.
+    (signals graph-db:query-precondition-error
+      (select-flat (?v) (claim ?c rtt-claim "app" "web" "version" "ver" ?v)
+                        (claim-valid-at ?c "not-a-timestamp")))
     ;; %INSTANT-ARG's timestamp branch: a Lisp caller passes a
     ;; LOCAL-TIME timestamp, not the wire string, and gets the same row.
     (is (equal '("1")
@@ -459,3 +460,226 @@ SEED gives \"scan-a\" two \"runs\" claims and two \"version\" ones."
                (sort (select-flat (?a)
                        (claim ?p rt-claim "host" "h1" "runs" "app" ?a))
                      #'string<)))))
+
+;;; ---------------------------------------------------------------------
+;;; The vocabulary routes: a namespace bound without its key (GH #389).
+;;; Every goal runs under a budget, so the walk would refuse and only
+;;; the route can answer (see the file header).
+;;; ---------------------------------------------------------------------
+
+(test a-bound-subject-namespace-generates-key-by-key
+  "Subject namespace bound, key unbound: every claim about a subject in
+the namespace, keys in ascending index order, each key's claims
+together -- the documented solution order (docs/rules.md)."
+  (with-rules-graph (g)
+    (seed g)
+    (let ((rows (select (:max-inferences 1000) (?k ?r ?o)
+                  (claim ?c rt-claim "host" ?k ?r ?ons ?o))))
+      (is (= 4 (length rows)))
+      (is (equal '("h1" "h1" "h2" "h2") (mapcar #'first rows)))
+      (is (member '("h2" "reachable" nil) rows :test #'equal))
+      (is (equal '("db" "web")
+                 (sort (loop for (k r o) in rows
+                             when (string= k "h1") collect o)
+                       #'string<))))))
+
+(test a-bound-subject-namespace-and-relation-generate-key-by-key
+  (with-rules-graph (g)
+    (seed g)
+    (let ((rows (select (:max-inferences 1000) (?k ?o)
+                  (claim ?c rt-claim "host" ?k "runs" "app" ?o))))
+      (is (= 3 (length rows)))
+      (is (equal '("h1" "h1" "h2") (mapcar #'first rows))))))
+
+(test a-bound-object-namespace-generates-key-by-key
+  "The mirror: object namespace bound, key unbound, from the object
+index -- binary claims only, since a unary claim has no object."
+  (with-rules-graph (g)
+    (seed g)
+    (let ((rows (select (:max-inferences 1000) (?s ?o)
+                  (claim ?c rt-claim ?sns ?s ?r "app" ?o))))
+      (is (= 3 (length rows)))
+      (is (equal '("db" "web" "web") (mapcar #'second rows)))
+      (is (equal '("h1" "h1" "h2")
+                 (sort (mapcar #'first rows) #'string<))))))
+
+(test both-namespaces-bound-without-keys-take-the-subject-route
+  (with-rules-graph (g)
+    (seed g)
+    (is (equal '(("h1" "db") ("h1" "web") ("h2" "web"))
+               (sort (select (:max-inferences 1000) (?s ?o)
+                       (claim ?c rt-claim "host" ?s "runs" "app" ?o))
+                     #'string< :key #'second)))))
+
+(test an-unresolvable-namespace-without-a-key-is-still-the-empty-path
+  "The empty fast path precedes the vocabulary routes: a name no claim
+was recorded under answers nothing and interns nothing."
+  (with-rules-graph (g)
+    (seed g)
+    (is (null (select (:max-inferences 1000) (?k)
+                (claim ?c rt-claim "never-here" ?k ?r ?ons ?o))))
+    (is (null (find-symbol "NEVER-HERE" :keyword)))))
+
+(test a-bound-key-without-its-namespace-still-has-no-route
+  "docs/rules.md: the namespace leads both endpoint indexes, so a key
+alone falls to the walk and refuses under a budget -- unchanged by
+GH #389."
+  (with-rules-graph (g)
+    (seed g)
+    (signals graph-db::prolog-cost-unbounded-error
+      (select (:max-inferences 1000) (?ns)
+        (claim ?c rt-claim ?ns "h1" ?r ?ons ?o)))))
+
+(test the-vocabulary-route-answers-through-the-guard
+  (with-rules-graph (g)
+    (seed g)
+    (multiple-value-bind (columns rows)
+        (graph-db.query:run-guarded-prolog
+         "(claim ?c rt-claim \"host\" ?k \"runs\" ?ons ?o)" g)
+      (is (equal '("c" "k" "ons" "o") columns))
+      (is (= 3 (length rows))))))
+
+;;; ---------------------------------------------------------------------
+;;; The extent as facts: CLAIM-VALID-FROM/2, CLAIM-VALID-TO/2,
+;;; CLAIM-RECORDED-AT/2, and the instant comparisons (GH #388).
+;;; ---------------------------------------------------------------------
+
+(test claim-valid-from-and-to-answer-instant-strings
+  "Both ends of web's version 1 as RFC 3339 UTC strings at nanosecond
+precision -- the one spelling, 30 characters -- and a claim with no
+extent fails both."
+  (with-rules-graph (g)
+    (seed g)
+    (is (equal '(("2026-01-01T00:00:00.000000000Z"
+                  "2026-03-31T00:00:00.000000000Z"))
+               (select (:max-inferences 1000) (?from ?to)
+                 (claim ?c rtt-claim "app" "web" "version" "ver" "1")
+                 (claim-valid-from ?c ?from)
+                 (claim-valid-to ?c ?to))))
+    (is (null (select-flat (?from)
+                (claim ?c rt-claim "host" "h1" ?r ?a ?b)
+                (claim-valid-from ?c ?from))))
+    (is (null (select-flat (?to)
+                (claim ?c rt-claim "host" "h1" ?r ?a ?b)
+                (claim-valid-to ?c ?to))))
+    ;; The strings sort lexically in time order: version 1 before 2.
+    (is (equal '(("1" "2026-01-01T00:00:00.000000000Z")
+                 ("2" "2026-04-01T00:00:00.000000000Z"))
+               (sort (select (:max-inferences 1000) (?v ?from)
+                       (claim ?c rtt-claim "app" "web" "version" "ver" ?v)
+                       (claim-valid-from ?c ?from))
+                     #'string< :key #'second)))))
+
+(test an-open-end-answers-nil-and-a-fuzzy-edge-its-envelope
+  (with-rules-graph (g)
+    (with-transaction ((graph-db::transaction-manager g))
+      (make-rtt-claim-binary
+       :graph g :subject-namespace :app :subject-key "api"
+       :relation "version" :object-namespace :ver :object-key "9"
+       :producer "scan-a" :standing :observed
+       :extent (make-interval (make-bound (ts 2026 1 1) (ts 2026 1 31))
+                              (unknown-bound)
+                              :semantics :validity :standing :asserted)))
+    (is (equal '(("2026-01-01T00:00:00.000000000Z" nil))
+               (select (:max-inferences 1000) (?from ?to)
+                 (claim ?c rtt-claim "app" "api" "version" "ver" "9")
+                 (claim-valid-from ?c ?from)
+                 (claim-valid-to ?c ?to))))
+    ;; NIL is a solution, so a bound NIL selects the open-ended claims.
+    (is (equal '("9")
+               (select-flat (?v)
+                 (claim ?c rtt-claim "app" "api" "version" "ver" ?v)
+                 (claim-valid-to ?c nil))))))
+
+(test the-instant-comparisons-compare-by-value
+  "INSTANT</2 and friends parse both sides, so a client's short spelling
+compares correctly against the functors' long one -- which a lexical
+</2 would get wrong at the 20th character."
+  (with-rules-graph (g)
+    (seed g)
+    (is (equal '("1")
+               (select-flat (?v)
+                 (claim ?c rtt-claim "app" "web" "version" "ver" ?v)
+                 (claim-valid-from ?c ?from)
+                 (instant< ?from "2026-02-01T00:00:00Z"))))
+    (is (equal '("2")
+               (select-flat (?v)
+                 (claim ?c rtt-claim "app" "web" "version" "ver" ?v)
+                 (claim-valid-from ?c ?from)
+                 (instant>= ?from "2026-04-01T00:00:00Z"))))
+    (is (equal '("1" "2")
+               (sort (select-flat (?v)
+                       (claim ?c rtt-claim "app" "web" "version" "ver" ?v)
+                       (claim-valid-to ?c ?to)
+                       (instant> ?to "2026-03-30T00:00:00Z"))
+                     #'string<)))
+    (is (equal '("1")
+               (select-flat (?v)
+                 (claim ?c rtt-claim "app" "web" "version" "ver" ?v)
+                 (claim-valid-to ?c ?to)
+                 (instant<= ?to "2026-03-31T00:00:00Z"))))
+    ;; Same instant, two spellings.
+    (is (equal '("1")
+               (select-flat (?v)
+                 (claim ?c rtt-claim "app" "web" "version" "ver" ?v)
+                 (claim-valid-from ?c ?from)
+                 (instant= ?from "2026-01-01T00:00:00Z"))))
+    ;; A NIL side -- an open end -- fails, it does not signal.
+    (is (null (select-flat (?x) (= ?x 1)
+                                (instant< nil "2026-01-01T00:00:00Z"))))))
+
+(test a-malformed-instant-is-an-error-a-caller-can-see
+  "GH #388 reverses GH #330's silent failure: a string that does not
+parse, or a non-string, signals QUERY-PRECONDITION-ERROR, which the
+guarded runner answers as ill-typed rather than as zero rows."
+  (with-rules-graph (g)
+    (seed g)
+    (signals graph-db:query-precondition-error
+      (select-flat (?v) (claim ?c rtt-claim "app" "web" "version" "ver" ?v)
+                        (claim-valid-at ?c "not-a-timestamp")))
+    (signals graph-db:query-precondition-error
+      (select-flat (?v) (claim ?c rtt-claim "app" "web" "version" "ver" ?v)
+                        (claim-valid-from ?c ?from)
+                        (instant< ?from "yesterday")))
+    (signals graph-db:query-precondition-error
+      (select-flat (?x) (= ?x 1) (instant< 5 "2026-01-01T00:00:00Z")))
+    (signals graph-db.query:prolog-ill-typed-error
+      (graph-db.query:run-guarded-prolog
+       "(claim ?c rtt-claim \"app\" \"web\" \"version\" \"ver\" ?v)
+        (claim-valid-at ?c \"not-a-timestamp\")"
+       g))
+    ;; The instant functors are admitted by the guard, as every
+    ;; registered functor is.
+    (multiple-value-bind (columns rows)
+        (graph-db.query:run-guarded-prolog
+         "(claim ?c rtt-claim \"app\" \"web\" \"version\" \"ver\" ?v)
+          (claim-valid-from ?c ?from) (instant< ?from \"2026-02-01\")"
+         g)
+      (is (equal '("c" "v" "from") columns))
+      (is (equal '("1") (mapcar #'second rows))))))
+
+(test claim-recorded-at-answers-the-transaction-start
+  "The start of the transaction extent, in the extent functors' one
+spelling, so a change feed is a CLAIM-RECORDED-AT / INSTANT> pair.  The
+NIL arm -- a claim predating the transaction-time axis (GH #148) -- has
+no fixture: every store this suite makes carries the axis."
+  (with-rules-graph (g)
+    (seed g)
+    (let ((ats (select-flat (?at)
+                 (claim ?c rt-claim "host" "h1" ?r ?ons ?o)
+                 (claim-recorded-at ?c ?at))))
+      (is (= 2 (length ats)))
+      (is (every (lambda (at) (and (stringp at) (= 30 (length at)))) ats))
+      ;; Recorded just now, so after the fixture's own dates, and the
+      ;; same answer through the value comparison.
+      (is (every (lambda (at) (string> at "2026-09-01")) ats))
+      (is (equal '("db" "web")
+                 (sort (select-flat (?o)
+                         (claim ?c rt-claim "host" "h1" ?r ?ons ?o)
+                         (claim-recorded-at ?c ?at)
+                         (instant> ?at "2026-09-01T00:00:00Z"))
+                       #'string<)))
+      (is (null (select-flat (?o)
+                  (claim ?c rt-claim "host" "h1" ?r ?ons ?o)
+                  (claim-recorded-at ?c ?at)
+                  (instant< ?at "2026-09-01T00:00:00Z")))))))
