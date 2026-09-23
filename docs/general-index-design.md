@@ -307,3 +307,9 @@ need general indexes to survive a lazy reopen.
 Multi-slot/composite keys (codec already polymorphic — `less-than` orders lists); true
 reverse-streaming cursors (`cursor-prev` / doubly-linked leaves); automatic index selection
 in the Prolog compiler; `:type`-driven order-preserving on-disk key encoding.
+
+An ordered index per claim family on the transaction extent's touched-at
+instant (the end when closed, else the start -- what `claim-touched-at/2`
+answers), maintained at creation and at `retract-claim`'s close, so a
+change-feed cursor goal is a range scan from the cursor rather than a walk
+of the namespace's history (GH #392, from #391).

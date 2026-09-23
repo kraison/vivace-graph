@@ -236,6 +236,12 @@ offers.
 
 ## 14. Amendments
 
+- **2026-09-23 (#391)**: `claim-retracted-at/2` (the transaction
+  extent's end, NIL while open) and `claim-touched-at/2` (the later of
+  recorded-at and retracted-at), in `claim-recorded-at/2`'s spelling,
+  because `retract-claim` records nothing a recorded-at cursor can
+  see. The index that would make a cursor goal proportional to what
+  changed is deferred to #392.
 - **2026-09-18 (#389)**: `claim/7` gained two routes -- a bound
   namespace with its key unbound, on either side -- generating keys
   from the vocabulary index (#350) and each key's claims from the
