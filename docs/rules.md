@@ -37,6 +37,7 @@ The subsystem's package is `graph-db.rules` (spec §3), but
 `rules/facts.lisp` is `(in-package #:graph-db)` and the `name/arity`
 symbols -- `claim/7`, `claim-current/1`, `claim-valid-at/2`,
 `claim-valid-from/2`, `claim-valid-to/2`, `claim-recorded-at/2`,
+`claim-retracted-at/2`, `claim-touched-at/2`,
 `claim-producer/2`, `claim-standing/2`, `claim-relation/2`,
 `claim-rule-version/2`, and `instant</2`, `instant>/2`, `instant<=/2`,
 `instant>=/2`, `instant=/2` -- are `graph-db` exports.
@@ -59,7 +60,8 @@ pathname and its `graph-db.rules` package are unchanged.
 (claim ?c family ?sns ?skey ?rel ?ons ?okey)
 (claim-current ?c)          (claim-valid-at ?c instant)
 (claim-valid-from ?c ?from) (claim-valid-to ?c ?to)
-(claim-recorded-at ?c ?at)
+(claim-recorded-at ?c ?at)  (claim-retracted-at ?c ?at)
+(claim-touched-at ?c ?at)
 (claim-producer ?c ?p)      (claim-standing ?c ?s)
 (claim-relation ?c ?r)      (claim-rule-version ?c ?v)
 (instant< ?a ?b) (instant> ?a ?b) (instant<= ?a ?b) (instant>= ?a ?b)
@@ -74,6 +76,8 @@ pathname and its `graph-db.rules` package are unchanged.
 | `claim-valid-from/2` | the validity start, as an instant string (GH #388) |
 | `claim-valid-to/2` | the validity end, as an instant string, or NIL when open |
 | `claim-recorded-at/2` | when the claim was recorded, as an instant string |
+| `claim-retracted-at/2` | when it was retracted, as an instant string, or NIL while open (GH #391) |
+| `claim-touched-at/2` | the later of the two: the one cursor a change feed needs |
 | `claim-producer/2` | the producer -- also a generator, below |
 | `claim-standing/2` | the standing, as a lowercase string |
 | `claim-relation/2` | the relation |
@@ -98,8 +102,11 @@ guard the schema's own canonical symbol is what reaches the goal.
 - **Retracted claims are generated**, matching `claims-touching`'s
   default. `claim-current/1` is the goal that means "still believed".
   It does **not** mean "currently valid": a claim whose validity a
-  successor closed is not retracted and still passes. "Held now" is
-  `claim-valid-at/2` with the present instant (GH #388).
+  successor closed is not retracted and still passes. Nor does
+  `claim-valid-at/2` mean "held now": it reads validity only, so a
+  retracted claim still answers it. "Held now" is **both** --
+  `claim-current/1` and `claim-valid-at/2` with the present instant
+  (GH #388, #391).
 - `claim-rule-version/2` answers NIL as a **solution**, not a failure,
   so a claim no rule wrote is still returned.
 - `claim-valid-at/2` takes an RFC 3339 / ISO-8601 string or a
@@ -124,7 +131,24 @@ guard the schema's own canonical symbol is what reaches the goal.
   extent in the same spelling -- when it was recorded, not when it
   became true -- or NIL for a claim predating the transaction-time
   axis (GH #148). With `instant>/2` it is a change feed: every claim
-  recorded after the last instant a reader saw.
+  recorded after the last instant a reader saw -- but not every
+  change. `retract-claim` closes the transaction period in place and
+  records nothing new, so a retraction is invisible to a cursor on
+  `claim-recorded-at/2` alone (GH #391).
+- `claim-retracted-at/2` (GH #391) binds the transaction extent's
+  **end** in the same spelling: the instant `retract-claim` closed the
+  period, the latest edge of a fuzzy end, or NIL as a **solution**
+  while it is open -- so `(claim-retracted-at ?c nil)` selects the
+  open claims, and with `instant>/2` it is the retraction feed.
+- `claim-touched-at/2` (GH #391) binds the later of the two: the
+  retracted-at when the period is closed, the recorded-at otherwise
+  (an end never precedes its start). One cursor sees every write that
+  moves a claim's transaction record -- record, supersession,
+  cross-producer outdating, retraction -- so a reader keeps one
+  per-namespace cursor instead of a cursor plus a periodic full
+  re-read. Both goals still visit every claim of the namespace under
+  `max-inferences`; an index that makes the cursor goal proportional
+  to what changed is #392.
 - `instant</2`, `instant>/2`, `instant<=/2`, `instant>=/2`,
   `instant=/2` compare two instants **by value**, each a string in any
   RFC 3339 spelling or a timestamp, so a client's `"2026-02-01"`

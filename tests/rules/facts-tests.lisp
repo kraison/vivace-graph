@@ -683,3 +683,71 @@ no fixture: every store this suite makes carries the axis."
                   (claim ?c rt-claim "host" "h1" ?r ?ons ?o)
                   (claim-recorded-at ?c ?at)
                   (instant< ?at "2026-09-01T00:00:00Z")))))))
+
+;; GH #391: a retraction writes nothing new, so a change feed cursored
+;; on CLAIM-RECORDED-AT/2 cannot see it.  CLAIM-RETRACTED-AT/2 binds the
+;; transaction END in the same spelling; CLAIM-TOUCHED-AT/2 the later of
+;; the two, the single cursor a feed wants.  The retraction is stamped a
+;; second past the cursor so the order is fixed, not a race on NOW.
+(defvar *cursor* nil "The feed cursor, special so LISP/2 can read it.")
+
+(test claim-retracted-at-answers-the-transaction-end
+  (with-rules-graph (g)
+    (seed g)
+    ;; Open: NIL is a solution, and selects every open claim.
+    (is (= 2 (select-count (?c) (claim ?c rt-claim "host" "h2" ?r ?a ?b)
+                                (claim-retracted-at ?c nil))))
+    (let ((*cursor* (local-time:now))
+          (c (first (claims-touching g 'rt-claim :host "h2" :role :subject
+                                     :relation "reachable"))))
+      (retract-claim c :at (local-time:timestamp+ *cursor* 1 :sec))
+      (is (= 1 (select-count (?c) (claim ?c rt-claim "host" "h2" ?r ?a ?b)
+                                  (claim-retracted-at ?c nil))))
+      (let ((ats (select-flat (?at)
+                   (claim ?c rt-claim "host" "h2" "reachable" ?a ?b)
+                   (claim-retracted-at ?c ?at))))
+        (is (= 1 (length ats)))
+        (is (and (stringp (first ats)) (= 30 (length (first ats))))))
+      ;; The feed: retracted after the cursor is exactly the retraction,
+      ;; and the recorded-at feed on the same cursor sees nothing -- the
+      ;; blind spot the functor exists for.
+      (is (equal '("reachable")
+                 (select-flat (?r) (claim ?c rt-claim "host" "h2" ?r ?a ?b)
+                                   (claim-retracted-at ?c ?at)
+                                   (lisp ?cur *cursor*)
+                                   (instant> ?at ?cur))))
+      (is (null (select-flat (?r) (claim ?c rt-claim "host" "h2" ?r ?a ?b)
+                                  (claim-recorded-at ?c ?at)
+                                  (lisp ?cur *cursor*)
+                                  (instant> ?at ?cur)))))))
+
+(test claim-touched-at-is-the-later-of-recorded-and-retracted
+  (with-rules-graph (g)
+    (seed g)
+    (let ((*cursor* (local-time:now))
+          (c (first (claims-touching g 'rt-claim :host "h2" :role :subject
+                                     :relation "reachable"))))
+      ;; Open: touched-at is recorded-at, for every claim.
+      (is (= 2 (select-count (?c) (claim ?c rt-claim "host" "h2" ?r ?a ?b)
+                                  (claim-touched-at ?c ?t)
+                                  (claim-recorded-at ?c ?at)
+                                  (instant= ?t ?at))))
+      (retract-claim c :at (local-time:timestamp+ *cursor* 1 :sec))
+      ;; Closed: touched-at is retracted-at; the open one is unchanged.
+      (is (equal '("reachable")
+                 (select-flat (?r) (claim ?c rt-claim "host" "h2" ?r ?a ?b)
+                                   (claim-touched-at ?c ?t)
+                                   (claim-retracted-at ?c ?at)
+                                   (instant= ?t ?at))))
+      (is (equal '("runs")
+                 (select-flat (?r) (claim ?c rt-claim "host" "h2" ?r ?a ?b)
+                                   (claim-touched-at ?c ?t)
+                                   (claim-retracted-at ?c nil)
+                                   (claim-recorded-at ?c ?at)
+                                   (instant= ?t ?at))))
+      ;; One cursor, one goal, both kinds of change.
+      (is (equal '("reachable")
+                 (select-flat (?r) (claim ?c rt-claim "host" "h2" ?r ?a ?b)
+                                   (claim-touched-at ?c ?t)
+                                   (lisp ?cur *cursor*)
+                                   (instant> ?t ?cur)))))))

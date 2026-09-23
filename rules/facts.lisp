@@ -452,6 +452,37 @@ still list it (GH #388, #148)."
                           (%instant-string at)))
           (funcall cont))))))
 
+(defun %claim-retracted-at (claim)
+  "CLAIM's transaction END as an instant string -- the LATEST edge of a
+fuzzy end -- or NIL while the period is open or the claim predates the
+axis (never retracted, as CLAIM-CURRENT-P reads it)."
+  (let ((e (graph-db.spacetime:claim-transaction-extent claim)))
+    (and e (%bound-edge (graph-db.spacetime:extent-end e) :latest))))
+
+(def-global-prolog-functor claim-retracted-at/2 (?c ?at cont)
+  "When ?C was retracted, as an instant string: the end of its
+transaction extent, which RETRACT-CLAIM closes.  NIL -- a solution --
+while the period is open, so (CLAIM-RETRACTED-AT ?C NIL) selects the
+open claims.  A retraction records nothing CLAIM-RECORDED-AT/2 can see;
+this is the goal that makes it visible to a cursor (GH #391)."
+  (let ((c (%claim-arg ?c)))
+    (when c
+      (%yield (?at (%claim-retracted-at c))
+        (funcall cont)))))
+
+(def-global-prolog-functor claim-touched-at/2 (?c ?at cont)
+  "The last instant ?C's transaction record changed: its retracted-at
+when the period is closed, its recorded-at otherwise -- the end never
+precedes the start.  One cursor for a change feed that must see both
+records and retractions.  NIL as for CLAIM-RECORDED-AT/2 (GH #391)."
+  (let ((c (%claim-arg ?c)))
+    (when c
+      (%yield (?at (or (%claim-retracted-at c)
+                       (let ((at (graph-db.spacetime:claim-recorded-at c)))
+                         (and (typep at 'local-time:timestamp)
+                              (%instant-string at)))))
+        (funcall cont)))))
+
 ;; INSTANT</2 and friends compare two instants -- strings in any RFC
 ;; 3339 spelling, or timestamps -- by value, where </2 on two strings is
 ;; lexical and so only right for one fixed spelling (GH #388).  An

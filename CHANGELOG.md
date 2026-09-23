@@ -13,6 +13,17 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Added
 
+- **A retraction is visible to a change-feed cursor** (#391):
+  `claim-retracted-at/2` binds the transaction extent's end in the
+  same 30-character spelling as `claim-recorded-at/2`, NIL as a
+  solution while open; `claim-touched-at/2` binds the later of the
+  two, so one cursor sees records and retractions alike and the
+  periodic full re-read a reader kept only to notice retractions goes
+  away. `docs/rules.md` also says beside `claim-valid-at/2` that "held
+  now" needs `claim-current/1` as well. An index on the touched-at
+  instant, so the cursor goal costs what changed rather than what
+  exists, is #392.
+
 - **`claim/7` routes a bound namespace without its key** (#389): the
   keys under the namespace come from the vocabulary index (#350) and
   each key's claims from the subject or object index, in ascending
