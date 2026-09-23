@@ -126,6 +126,20 @@ not the keyword ~S" key v)))
                  ((not (and (symbolp v) v))
                   (bad (format nil "~S must be a symbol, not ~S" key v))))
                v))
+           (req-scope (key)
+             "A required sub-key naming a spatial SCOPE: a class name, or
+a non-empty proper list of class names -- what REGISTER-GEOMETRY takes.
+:ALL is refused: a registry must be named (GH #394)."
+             (let ((v (req key)))
+               (flet ((class-name-p (x)
+                        (and x (symbolp x) (not (keywordp x)))))
+                 (unless (or (class-name-p v)
+                             (and (consp v)
+                                  (null (cdr (last v)))
+                                  (every #'class-name-p v)))
+                   (bad (format nil "~S must be a class name or a ~
+non-empty list of class names, not ~S" key v))))
+               v))
            (req-keyword (key)
              "A required sub-key whose value must be a keyword."
              (let ((v (req key)))
@@ -171,7 +185,7 @@ not the keyword ~S" key v)))
         ;; :METHOD for every record (cl-llm#13 unit 2, vivace-graph#138
         ;; task 6b).
         (:registration
-         (req-symbol :registry)
+         (req-scope :registry)
          (req-keyword :registry-namespace)
          (req-symbol :claim-class)
          (req-string :producer)

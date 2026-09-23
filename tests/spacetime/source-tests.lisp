@@ -489,6 +489,46 @@ facets are optional rather than merely defaulted (design §3)."
      '(:relation "registered-at" :method "centroid-within"
        :rule-version "r/1"))))
 
+(test registry-accepts-a-list-of-region-classes
+  ;; GH #394: REGISTER-GEOMETRY takes a scope -- a class or a list of
+  ;; them -- and REGISTER-NODE passes the facet's :REGISTRY through, so
+  ;; the validator must accept what the consumer accepts.
+  (finishes
+    (macroexpand-1
+     `(def-source st-two-registry-src :graph-db-source-test
+          ((a :initarg :a))
+        :identity :none :space :none :time :none :attribution :none
+        :sensitivity :none
+        :registration ,(list* :registry '(ct-region-a ct-region-b)
+                              (%facet-without :registry))
+        :indexed-text :none)))
+  (is (equal '(ct-region-a ct-region-b)
+             (getf (graph-db.spacetime::%check-facet
+                    :registration
+                    (list* :registry '(ct-region-a ct-region-b)
+                           (%facet-without :registry)))
+                   :registry))))
+
+(test registry-list-must-hold-only-class-names
+  (signals invalid-source-facet
+    (graph-db.spacetime::%check-facet
+     :registration
+     (list* :registry '(ct-region-a :not-a-class)
+            (%facet-without :registry))))
+  (signals invalid-source-facet
+    (graph-db.spacetime::%check-facet
+     :registration
+     (list* :registry '() (%facet-without :registry))))
+  (signals invalid-source-facet
+    (graph-db.spacetime::%check-facet
+     :registration
+     (list* :registry '(ct-region-a . ct-region-b)
+            (%facet-without :registry))))
+  (signals invalid-source-facet
+    (graph-db.spacetime::%check-facet
+     :registration
+     (list* :registry :all (%facet-without :registry)))))
+
 ;;; REGISTER-SOURCE: the runtime twin of DEF-SOURCE's registration
 ;;; (GH #378).  The class comes from CREATE-VERTEX-TYPE (#172); the facets
 ;;; are data; nothing is persisted -- the consumer replays.
