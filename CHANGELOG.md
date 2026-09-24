@@ -13,6 +13,12 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Added
 
+- **`DEF-SOURCE`'s `:registry` accepts a list of region classes** (#394):
+  a `:registration` facet's `:registry` may now be a class name or a
+  non-empty proper list of class names — the scope `REGISTER-GEOMETRY`
+  already takes and `REGISTER-NODE` hands it unchanged. `:ALL` is
+  refused: a registry must be named.
+
 - **A retraction is visible to a change-feed cursor** (#391):
   `claim-retracted-at/2` binds the transaction extent's end in the
   same 30-character spelling as `claim-recorded-at/2`, NIL as a

@@ -6247,7 +6247,8 @@ Every key but the ~:NONE~ escape is required, same as every other
 facet:
 
 #+BEGIN_SRC lisp
-  :registration (:registry <class>          ; a DEF-SOURCE class
+  :registration (:registry <class or (class ...)> ; a scope, per
+                                                    ; REGISTER-GEOMETRY
                  :registry-namespace <kw>    ; where its regions live
                  :claim-class <symbol>       ; a DEF-CLAIM-CLASSES parent
                  :producer <string>          ; who wrote the claim
