@@ -41,6 +41,25 @@ subdirectories, **5,154 checks** as of 2026-08-31. Run a suite through ASDF:
 with "Heap exhausted, game over" partway in — `make-graph`'s type index eagerly builds
 131,072 index-lists, and a suite creates many graphs in one image.
 
+Three traps when running tests here:
+
+- **Don't `fiveam:run!` a suite directly.** Its fixture setup lives in the
+  test system's `:perform`, which binds `graph-db::*system-directory*` and
+  `graph-db::*type-registry*`; without it every test fails at `make-graph`
+  with `SYSTEM-DIRECTORY-REQUIRED`. To iterate on one suite, replicate that
+  binding (`graph-db-test-scratch:make-scratch-directory`).
+- **The node cache hides identity bugs.** While it is on, two lookups of
+  one node return the same object, so `eq`, `eql` or `equal` on nodes, ids
+  or CLOS-valued slots passes by accident. A test that depends on two
+  lookups agreeing binds `graph-db::*cache-enabled*` to nil (house style:
+  `tests/multi-graph-tests.lisp`, `tests/skip-list-tests.lisp`).
+- **One FASL cache per checkout.** Two SBCL builds of the same tree at once
+  corrupt `~/.cache/common-lisp/sbcl-*/<checkout>/`, and so can a FASL left
+  from breaking and restoring a file; a correct tree then reports red. If
+  the check *count* changes, not just the pass/fail split, delete that
+  directory and rebuild. During a red/green loop run only the tests under
+  test: CI runs the full suite on every push (`docs/ci.md`).
+
 Two perf measurement systems coexist — `tests/perf/` (throughput trends, "did it
 get slower?") vs `profiling/` ("why is it slow?" — sprof/sb-profile harness).
 The split and how to run each is Chapter 19 of `docs/vivace-graph-v3-doc.org`;
