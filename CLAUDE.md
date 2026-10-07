@@ -104,6 +104,46 @@ Scratch locations differ between the two generations of tests:
   `/var/tmp/` (e.g. `/var/tmp/graph/`); clean those up between runs if state
   seems stale — nothing sweeps them.
 
+## Working in this repo
+
+- **Push to `experiment` in batches.** Each push runs the full suite on the
+  self-hosted CI runners (about 35 minutes, plus queue), so let several
+  finished units ride one push. Run the affected subsystem's suite locally
+  before each commit, read CI's verdict with `gh run list` (`docs/ci.md`),
+  and never run the full suite by hand.
+- **PRs merge into `experiment`, but the default branch is `master`,** so
+  `Closes #N` in a PR body never fires: close the issue by hand with the
+  landing SHA (PR #393).
+- **A worktree loads the main checkout's code** unless told otherwise:
+  Quicklisp's `local-projects` links `graph-db.asd` to the main checkout. In
+  an image started in a `.worktrees/` tree, first run
+  `(asdf:initialize-source-registry '(:source-registry (:tree "<worktree>/")
+  :inherit-configuration))`. Register the main checkout with `:directory`,
+  not `:tree`, or the nested worktrees' `.asd` files get picked up
+  (`tests/README.md`).
+- **ECL is not release-gating.** Verify on SBCL, catch ECL up in dedicated
+  sessions, and say when it was skipped. Support stays: don't remove
+  `#+ecl` arms. ECL's default GC heap cap (4 GB) is below what the suites
+  need (`STORAGE-EXHAUSTED`); raise it early with
+  `(ext:set-limit 'ext:heap-size 0)`.
+- **Engine traps:**
+  - a special variable that an earlier-compiled file binds must be
+    `defvar`ed in `globals.lisp` or earlier in `graph-db.asd`'s chain; a
+    later `defvar` leaves those bindings lexical and silently inert
+    (`*record-reads*`, GH #92);
+  - FiveAM test names are symbols, and the main suite's files share the
+    `graph-db/test` package, so a reused name silently replaces the first
+    test: grep `tests/` before naming one (90de8e8);
+  - a test that swaps an engine function with `(setf fdefinition)` needs it
+    declaimed `notinline`, or ECL compiles same-file calls directly and the
+    swap never fires (`mmap.lisp`, 2277ee8);
+  - the peer replication wire (`serialize.lisp`'s tag-length-value encoding
+    with its tags in `globals.lisp`, the packet framing, the node-head
+    layout and the plist handshake) is a frozen contract that non-Lisp
+    peers decode byte for byte. Change it only with a
+    `*peer-protocol-version*` bump agreed with its consumers (manual Ch16,
+    PR #217).
+
 ## Architecture (bottom-up)
 
 The system is layered. Lower layers know nothing of graph semantics; higher layers build on them.
@@ -125,7 +165,7 @@ Each graph is a directory. `make-graph`/`open-graph` create/expect: `heap.dat`, 
 
 ### Defining and using a graph (public API shape)
 
-- Schema is defined with `def-vertex` / `def-edge` (CLOS-like, with typed slots and single inheritance), associated with a named graph. See `examples/example.lisp`.
+- Schema is defined with `def-vertex` / `def-edge` (CLOS-like, with typed slots; single inheritance by convention, though several parents are accepted), associated with a named graph. See `examples/example.lisp`.
 - `def-view` defines secondary indexes; the `:map` lambda calls `yield`, and an optional `:reduce` lambda makes it a map-reduce view. Query views with `invoke-graph-view` / `map-view` / `map-reduced-view`.
 - All mutations go through `with-transaction`. `make-<type>` constructors, `save`, `update-node`, `delete-node`/`mark-deleted` operate inside a transaction.
 - `*graph*` is the dynamically-bound "current graph" used by most operations when no explicit graph is passed.
