@@ -46,8 +46,7 @@ Three traps when running tests here:
 - **Don't `fiveam:run!` a suite directly.** Its fixture setup lives in the
   test system's `:perform`, which binds `graph-db::*system-directory*` and
   `graph-db::*type-registry*`; without it every test fails at `make-graph`
-  with `SYSTEM-DIRECTORY-REQUIRED`. To iterate on one suite, replicate that
-  binding (`graph-db-test-scratch:make-scratch-directory`).
+  with `SYSTEM-DIRECTORY-REQUIRED`. To iterate on one suite, `tests/run-suite.sh SUITE`.
 - **The node cache hides identity bugs.** While it is on, two lookups of
   one node return the same object, so `eq`, `eql` or `equal` on nodes, ids
   or CLOS-valued slots passes by accident. A test that depends on two
