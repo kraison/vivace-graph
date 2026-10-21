@@ -752,6 +752,7 @@ cl-temporal-extent."
                (:file "open-hygiene-tests")    ; GH #222, #224
                (:file "scratch-cleanup-tests")  ; GH #214
                (:file "ci-tiering-tests")       ; GH #340
+               (:file "codebase-notes-tests")
                (:file "perf/check-tests"))      ; GH #253
   :perform (test-op (op c)
                     (unless (uiop:symbol-call :graph-db/test :run-tests)
