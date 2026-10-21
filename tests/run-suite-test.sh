@@ -19,7 +19,7 @@ ok() { echo "ok   $*"; }
 fail() { echo "FAIL $*"; fails=$((fails + 1)); }
 
 # 1. A real suite runs green and reports a pass count.
-out="$(bash "$RUN" geohash-suite 2>&1)"
+out="$("$RUN" geohash-suite 2>&1)"
 code=$?
 if [ "$code" -eq 0 ] && printf '%s\n' "$out" | grep -q 'Pass:'; then
   ok "geohash-suite exits 0 and output contains 'Pass:'"
@@ -38,7 +38,7 @@ else
 fi
 
 # 3. An unknown suite is refused, not silently reported green.
-bash "$RUN" no-such-suite >/dev/null 2>&1
+"$RUN" no-such-suite >/dev/null 2>&1
 code=$?
 if [ "$code" -eq 2 ]; then
   ok "no-such-suite exits 2"
@@ -47,7 +47,7 @@ else
 fi
 
 # 4. No argument prints usage to stderr and exits 2.
-err="$(bash "$RUN" 2>&1 >/dev/null)"
+err="$("$RUN" 2>&1 >/dev/null)"
 code=$?
 if [ "$code" -eq 2 ] && printf '%s\n' "$err" | grep -qi 'usage'; then
   ok "no argument prints usage to stderr and exits 2"
