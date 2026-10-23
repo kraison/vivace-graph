@@ -13,6 +13,16 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Added
 
+- **`tests/run-suite.sh SUITE`: one suite in a fresh image** (#407).
+  It binds the system directory and type registry the way `run-tests`
+  does, where a bare `fiveam:run!` fails with `SYSTEM-DIRECTORY-REQUIRED`;
+  it is fenced to the checkout it lives in, and exits 0, 1 or 2.
+
+- **`docs/codebase-notes.md`: the core idioms and the efficient choice
+  for common accesses, with costs** (#407). `codebase-notes-suite`
+  fails when a name the note gives stops resolving or a path it gives
+  is gone.
+
 - **`DEF-SOURCE`'s `:registry` accepts a list of region classes** (#394):
   a `:registration` facet's `:registry` may now be a class name or a
   non-empty proper list of class names — the scope `REGISTER-GEOMETRY`
