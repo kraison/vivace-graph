@@ -23,6 +23,8 @@ Dependencies (bordeaux-threads, alexandria, cffi, uuid, cl-store, hunchentoot, n
 
 `examples/example.lisp` is the canonical end-to-end walkthrough (schema definition → views → ordered/unique/vector indexes → transactional inserts → queries → spatial) and is the best starting point for understanding the public API. `examples/example-spacetime.lisp` walks the spacetime claim subsystem; `examples/runtime-schema-example.lisp` documents runtime-defined types (it is documentation, not loadable). Both loadable examples are smoke-tested by loading them in a fresh image.
 
+`docs/codebase-notes.md` is the short version for writing code here: the core idioms, the efficient choice for each common access and its cost, and links to the traps. A test keeps every name it gives true.
+
 `docs/vivace-graph-v3-doc.org` is a full developer's manual (storage engine, object model, transactions, Prolog queries, views, REST, replication, backup/recovery, API reference). Originally written by Gwang-Jin Kim (@gwangjinkim) and adopted into this repo; keep it in sync when behavior changes.
 
 ## Tests
@@ -46,8 +48,7 @@ Three traps when running tests here:
 - **Don't `fiveam:run!` a suite directly.** Its fixture setup lives in the
   test system's `:perform`, which binds `graph-db::*system-directory*` and
   `graph-db::*type-registry*`; without it every test fails at `make-graph`
-  with `SYSTEM-DIRECTORY-REQUIRED`. To iterate on one suite, replicate that
-  binding (`graph-db-test-scratch:make-scratch-directory`).
+  with `SYSTEM-DIRECTORY-REQUIRED`. To iterate on one suite, `tests/run-suite.sh SUITE`.
 - **The node cache hides identity bugs.** While it is on, two lookups of
   one node return the same object, so `eq`, `eql` or `equal` on nodes, ids
   or CLOS-valued slots passes by accident. A test that depends on two
