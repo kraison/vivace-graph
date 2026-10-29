@@ -739,8 +739,7 @@ claim, and holds nothing of this transaction until it applies."
   "T when a claim under PREFIX resolves live through VIEW -- current,
 with CURRENT (R7, R4); stops at the first.  Committed entries only:
 add %CREATED-UNDER for the open transaction's own claims."
-  (let ((key (%vocabulary-key slots prefix))
-        (graph-db:*read-own-writes* nil))  ; GH #408, spec §4.6
+  (let ((key (%vocabulary-key slots prefix)))
     (block found
       (graph-db:map-index
        (lambda (node)
@@ -760,8 +759,7 @@ entries, not live nodes."
     (if (and (null view) (not current))
         (graph-db:index-count graph class slots key :prefix t)
         (let ((n (length (%created-under view class slots prefix
-                                         current)))
-              (graph-db:*read-own-writes* nil)) ; GH #408, spec §4.6
+                                         current))))
           (graph-db:map-index
            (lambda (node)
              (let ((c (%view-resolve view node)))
