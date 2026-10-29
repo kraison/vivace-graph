@@ -52,8 +52,10 @@ of scope.
 - Nothing changes for a read outside a transaction, under a read snapshot
   with no transaction, or under `:as-of`.
 - OCC validation, the write-set, the `.txn` log, replication and recovery
-  are byte-for-byte unchanged. This work touches reads only, plus the
-  three write entry points that feed the overlay.
+  are byte-for-byte unchanged. The commit path's validators keep reading
+  what they read today (§4.6). The code changes are the read paths, the
+  three write entry points that feed the overlay, and one binding in each
+  place that already composes its own overlay.
 
 **Non-goals (documented as such, each with its issue)**
 
@@ -151,12 +153,12 @@ replaced by maintained buckets (strategy D, §6) without touching a caller.
 ```
 (tx-overlay tx)                     ; the overlay object, built lazily
 (overlay-effective-write ov id)     ; the write that wins for ID, or NIL
-(overlay-created-nodes ov kind type-ids)
-   ; own live nodes of KIND (:vertex / :edge) whose type-id is in TYPE-IDS,
-   ; that the store's index does not hold: creates, never updates
+(overlay-nodes ov kind type-ids)
+   ; own live nodes of KIND (:vertex / :edge) whose type-id is in TYPE-IDS:
+   ; creates and updates, never a node whose effective write deletes it
 (overlay-edges-at ov vertex-id direction type-ids)
 (overlay-edges-between ov from-id to-id type-ids)
-   ; own live created edges matching the adjacency key
+   ; own live edges matching the adjacency key
 (overlay-index-members ov six key &key prefix lo hi)
    ; (key . node) pairs for own live nodes whose %index-tuple-key for SIX
    ; matches KEY (or PREFIX, or the [LO,HI] range)
@@ -169,16 +171,20 @@ and `add-to-object-set` replaces, so a create followed by a delete leaves a
 commit view builds its table today. Builder's choice whether to share the
 commit view's table or build a sibling; the rule must be one function.
 
-Each enumeration point then does: walk the committed index as today,
-resolving each id through `lookup-*` (layer 1 makes an updated or deleted
-node come back in its own state), then append the overlay's additions.
-Per point:
+**One rule at every enumeration point.** The committed walk skips every id
+that has an effective own write (one hash probe per id,
+`overlay-effective-write`); the overlay then supplies every own live node
+that matches the walk's shape, from its *current* state. So an own update
+is emitted once, by the overlay, at its re-derived type, endpoints or
+index key, and an own delete is emitted by neither side. The rule does not
+depend on which slots an update may change, and each ablation removes one
+call: the skip, or the supply. Per point:
 
 - **`map-vertices`, typed form** (`vertex.lisp`): after the type-id walk,
-  emit `overlay-created-nodes :vertex type-ids`. The scans' `written-p`
-  filter must not apply to these — a created node has `written-p` nil
-  until commit — so the overlay's nodes go through the deleted filter and
-  `fn` only. `include-deleted-p` applies to them as to committed nodes.
+  emit `overlay-nodes :vertex type-ids`. The scans' `written-p` filter
+  must not apply to these — a created node has `written-p` nil until
+  commit — so the overlay's nodes go through the deleted filter and `fn`
+  only. `include-deleted-p` applies to them as to committed nodes.
 - **`map-edges`, typed form** (`edge.lisp`): the same with `:edge` and the
   edge filter (`active-edge-p`, whose endpoint lookups already resolve an
   own-created endpoint through layer 1).
@@ -187,23 +193,19 @@ Per point:
   `overlay-edges-between`.
 - **`edge-exists-p`**: after the vev walk finds nothing, return the first
   of `overlay-edges-between` for the single type-id.
-- **`index-lookup`** (`index.lisp`): for each committed id, resolve
-  through layer 1, then **re-derive the key** with `%index-tuple-key` and
-  keep the node only if it still matches (the #358 rule: an own update
-  that moved the key leaves the committed entry under the old key). Then
-  append `overlay-index-members` for `key`/`prefix`. `collect-p nil`
-  short-circuits on either side.
-- **`map-index` / `index-range`**: the same re-derivation per committed
-  entry, and the overlay's members within `[start, end]` **merged in key
-  order** with the cursor walk, since `map-index` promises ascending
-  order. The comparison is the skip list's own key order
-  (`%index-key-serialize` octets, as the backend compares them); the
-  builder confirms which comparator the skip list uses and reuses it.
+- **`index-lookup`** (`index.lisp`): the committed walk skips own ids, so
+  an own update that moved its key (the #358 case) is not found under the
+  old key; `overlay-index-members` for `key`/`prefix` finds it under the
+  new one. `collect-p nil` short-circuits on either side.
+- **`map-index` / `index-range`**: the overlay's members within
+  `[start, end]` are **merged in key order** with the cursor walk, since
+  `map-index` promises ascending order. The order is the secondary skip
+  list's own: `%index-comp-lessp` over the deserialised `(v1 … vn id)`
+  list (`index.lisp`, the comparator the backend is built with), never
+  the serialised octets.
 
-An own write's node is emitted once: committed-index walk and overlay
-additions are disjoint by construction (additions are creates; a create
-has no committed entry), but the builder guards it with the id anyway,
-because `*add-to-indexes-unless-present-p*` replay paths exist.
+The builder still guards emission by id, because
+`*add-to-indexes-unless-present-p*` replay paths exist.
 
 Under `:as-of`, nothing changes: `call-with-read-snapshot` already refuses
 an as-of read inside a read-write transaction on the same graph, so the
@@ -219,17 +221,22 @@ happen. After layer 1 it can, and the current `copy-node` would register
 `tx-update` whose `old-node` is uncommitted and `apply-tx-write` archives
 the wrong pre-image. This is the #135 class of fault.
 
-Rule: in `copy-node`, when NODE is (by `eq`) the `node` of a `tx-update`
-in this transaction's write-set, register `copies[new] = (old-node that
-write)` — the committed original — so the eventual `tx-update` chains to
-the real pre-image and the write set, keyed by id, simply replaces the
-earlier update. `copy` of an own-*created* node keeps signalling
+Rule, for both `copy-node` and `delete-node`: when NODE is (by `eq`) the
+`node` of a `tx-update` in this transaction's write-set, the pre-image is
+`(old-node that-write)` — the committed original. `copy-node` registers
+`copies[new]` to it, so the eventual `tx-update` chains to the real
+pre-image and the write set, keyed by id, simply replaces the earlier
+update. `delete-node` builds its `tx-delete` with that `old-node` instead
+of its argument; without this, save-then-`mark-deleted` of the looked-up
+copy would archive an uncommitted head (cutting the version chain) and
+release the copy's *new* secondary-index key, orphaning the committed
+entry under the old one. `copy` of an own-*created* node keeps signalling
 `copying-uncommitted-node` (#135): it is already writable. A `tx-delete`'s
 node is a tombstone the generated lookups filter; copying it falls under
-the same rule as an update (it is a `tx-update` subclass) and the builder
-tests that a copy-then-save of a node deleted earlier in the transaction
-un-deletes it, which is the commit-view semantics and what the write set
-already does if the user holds the objects.
+the same rule (it is a `tx-update` subclass) and the builder tests that a
+copy-then-save of a node deleted earlier in the transaction un-deletes it,
+which is the commit-view semantics and what the write set already does if
+the user holds the objects.
 
 ### 4.5 OCC, validation, snapshot reads
 
@@ -242,7 +249,49 @@ already does if the user holds the objects.
   overlay additions were never reads.
 - `*snapshot-reads-p*` resolution never sees an own write.
 
-### 4.6 Documentation that changes with the code
+### 4.6 Code that composes its own overlay reads committed state
+
+The commit view's evaluators are hand-rolled overlays: "committed scan
+plus write-set delta". Cardinality's `view-edge-count` is `map-edges`
+plus `%overlay-edge-delta`; spacetime's `%name-count` is `map-index` plus
+`%created-under`; `validate-writes` builds a commit view from *proposed*
+writes that need not be the ambient transaction's. And `%commit` runs its
+validators inside `call-with-transaction`'s cleanup with `*transaction*`
+still bound, so every one of them would run under the new overlay and
+double-count an own edge or claim.
+
+Rule: **the engine's overlay is on for user reads and off underneath a
+commit view.** A special `*read-own-writes*`, `defvar`ed in
+`globals.lisp` (the defvar-before-bind trap) with default `t`, gates
+the reads, not the writes: own writes still go into the local cache, but
+with the switch nil the enumeration points add nothing and
+`lookup-object` passes over a cache entry that is an own write, so a
+validator sees the committed version as today. It is bound to nil:
+
+- around the validation region of `%commit`, so the commit path reads
+  exactly what it reads today, validators and `*commit-validators*` hooks
+  alike;
+- around `validate-writes` (hence `validate-transaction`), which promises
+  to answer "as `%commit` would";
+- in `view-edge-count` and `%name-count` / `%name-admitted-p`, the two
+  evaluators consumers call outside a commit.
+
+Consumers that already dedup by id (`%overlay-transaction`,
+`%post-commit-subject-claims`, link's `%same-store-candidates`) need
+nothing. Deleting the hand-rolled overlays in favour of the engine's is a
+follow-up issue, not this unit: binding the switch is mechanical and
+leaves their suites as the proof that nothing moved.
+
+Rules' `claim/7` appends index hits to `*claim-derived-this-run*` without
+a dedup (`rules/facts.lisp`), safe today because `%exclude-producers`
+drops a rule's own claims; under `*rules-naive-rounds*` (the test
+reference mode) an own derivation can now be re-found through the index
+in the same transaction. The rules suite under this change is on the
+test list; if the naive-rounds reference goes red, the fix is a dedup by
+id there, not a binding of the switch, because a rule's fixpoint *wants*
+to see its own writes.
+
+### 4.7 Documentation that changes with the code
 
 - Manual (`docs/vivace-graph-v3-doc.org`), transactions chapter: a new
   "What a transaction sees" section with the layer table, the non-goals
@@ -253,10 +302,10 @@ already does if the user holds the objects.
 - #401's contract text: the bullet "no read-your-own-writes" becomes the
   new rule with its non-goals.
 - CHANGELOG entry under unreleased.
-- Spacetime's `%overlay-transaction` and `%created-under` keep working
-  (they read the commit view, not the indexes) and may later be deleted
-  under a follow-up issue once their tests pass against the engine's
-  overlay alone. Not in this unit.
+- Spacetime's `%overlay-transaction` (dedups by id) keeps working
+  unchanged; `%name-count` and cardinality's `view-edge-count` keep
+  working under the §4.6 binding. Deleting those hand-rolled overlays in
+  favour of the engine's is a follow-up issue filed with this work.
 
 ## 5. Tests
 
@@ -272,6 +321,14 @@ removing the single overlay or cache call it protects. Beyond the table:
 - `copy` of an own update: the archived pre-image is the committed
   version (read it back through `:as-of` after commit);
 - `copy` of an own create still signals `copying-uncommitted-node`;
+- save then `mark-deleted` of the looked-up copy: the archived pre-image
+  is the committed version and the committed secondary-index entry is
+  released, not the copy's;
+- a `def-cardinality :max 1` vertex gains one edge in a transaction and
+  commits: the validator counts it once (and `validate-transaction`
+  inside the transaction agrees); the cardinality, value-constraint,
+  evaluator, spacetime and rules suites stay green, including a run with
+  `*rules-naive-rounds*`;
 - `map-index` order with own writes interleaved among committed keys;
 - a moved key: absent under the old key, present under the new, in
   `index-lookup`, `map-index` and `index-range`;
@@ -301,9 +358,12 @@ removing the single overlay or cache call it protects. Beyond the table:
 - File order: the overlay functions live where `lookup-object` can call
   nothing of them (layer 1 needs only the cache) and the scans can; a
   new file after `transactions.lisp` in `graph-db.asd`'s chain is the
-  natural place, with `index.lisp` already later in the chain. Watch the
-  `defvar`-before-bind trap (CLAUDE.md, engine traps) if any special
-  variable is introduced.
+  natural place, with `index.lisp` already later in the chain.
+  `*read-own-writes*` goes in `globals.lisp` (CLAUDE.md, engine traps).
+- Layer 1's store in `%create-node` belongs in the `tx` path only:
+  `recovery-transaction` has its own `%create-node` method and no
+  `local-cache` slot, and replay must not change. `update-node` and
+  `delete-node` already require a `tx` through `copies`.
 - Work on a branch off `experiment`, one commit per layer plus one for
   docs, pushed with the next batch; the issue closes with the landing
   SHA.
