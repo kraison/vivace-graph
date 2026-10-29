@@ -116,6 +116,7 @@
                (:file "edge" :depends-on ("vertex"))
                (:file "gc" :depends-on ("edge" "vertex" "views"))
                (:file "transactions" :depends-on ("graph-class" "type-index" "vev-index" "ve-index" "edge" "vertex" "gc" "spatial-index" "posix" "system-clock"))
+               (:file "tx-overlay" :depends-on ("transactions")) ; GH #408
                (:file "transaction-restore" :depends-on ("transactions"))
                (:file "transaction-log-streaming" :depends-on ("transactions"))
                ;; Shadow generations (GH #170): quiesce/copy/reopen a store
@@ -132,7 +133,8 @@
                (:file "prolog-functors" :depends-on ("prologc" "geometry" "geometry-ops"))
                (:file "spatial-query" :depends-on ("prolog-functors" "transactions" "spatial-index" "geometry-ops"))
                (:file "interface" :depends-on
-                      ("schema" "edge" "vertex" "views" "transactions"))
+                      ("schema" "edge" "vertex" "views" "transactions"
+                       "tx-overlay"))
                (:file "traverse" :depends-on ("interface"))
                (:file "memory-graph" :depends-on ("traverse" "transactions" "graph" "mem-skip-list"))
                (:file "unique-constraint" :depends-on ("traverse" "transactions" "graph" "memory-graph" "node-class" "schema"))
@@ -739,6 +741,7 @@ cl-temporal-extent."
                (:file "unique-constraint-tests")
                (:file "index-tests")
                (:file "count-index-tests")   ; GH #361
+               (:file "read-your-own-writes-tests") ; GH #408
                (:file "schema-retraction-tests")   ; GH #139, #140
                (:file "index-prolog-tests")        ; GH #102
                (:file "value-constraint-tests")     ; GH #149

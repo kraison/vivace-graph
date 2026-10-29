@@ -346,9 +346,15 @@ detach aborted and the store resumes its prior accepting state."
       (unless (eq graph txn-graph)
         (error 'cross-graph-transaction-error
                :node id :transaction-graph txn-graph :node-graph graph)))
-    (let ((local-cache (local-cache transaction))
-          (graph-cache (graph-cache transaction)))
-      (let ((local (gethash id local-cache)))
+    (let* ((local-cache (local-cache transaction))
+           (graph-cache (graph-cache transaction))
+           ;; GH #408 layer 1: the transaction's own write of ID sits in
+           ;; LOCAL-CACHE and answers first; with *READ-OWN-WRITES* NIL
+           ;; (underneath a commit view, spec §4.6) it is passed over
+           ;; and left in place.
+           (own (and (not *read-own-writes*)
+                     (%own-write-id-p transaction id))))
+      (let ((local (and (not own) (gethash id local-cache))))
         (if local
             local
             (let ((value (or (gethash id graph-cache)
@@ -381,7 +387,21 @@ detach aborted and the store resumes its prior accepting state."
                   ;; either way.
                   (when *record-reads*
                     (add-to-object-set value (read-set transaction)))
-                  (setf (gethash id local-cache) value)))))))))
+                  (unless own
+                    (setf (gethash id local-cache) value))
+                  value))))))))
+
+(defun %own-write-id-p (tx id)
+  "True when TX's create-set or write-set holds ID (GH #408)."
+  (or (nth-value 1 (gethash id (table (create-set tx))))
+      (nth-value 1 (gethash id (table (write-set tx))))))
+
+(defun %note-own-write (node tx)
+  "Make NODE -- which TX just created, saved or deleted -- what TX's own
+reads of its id return (GH #408 layer 1), and drop the cached overlay."
+  (setf (gethash (id node) (local-cache tx)) node
+        (%overlay-slot tx) nil)
+  node)
 
 (defgeneric write-object (object transaction))
 
@@ -498,6 +518,11 @@ inside the transaction, mutate the copy, then SAVE it."
    (local-cache
     :initarg :local-cache
     :reader local-cache)
+   (overlay
+    :initform nil
+    :accessor %overlay-slot
+    :documentation "The cached TX-OVERLAY (tx-overlay.lisp, GH #408);
+    NIL until OVERLAY-OF builds it, reset by every write.")
    (copies
     :initarg :copies
     :reader copies
@@ -2896,6 +2921,8 @@ suppression onto any OTHER graph committing on the same thread."
   (:method (node graph transaction)
     (add-to-object-set (make-instance 'tx-create :node node)
                        (create-set *transaction*))
+    (when (typep transaction 'tx)
+      (%note-own-write node transaction))
     node))
 
 (defgeneric create-node (node graph)
@@ -2925,6 +2952,17 @@ suppression onto any OTHER graph committing on the same thread."
   (ensure-transaction ((transaction-manager graph))
     (call-next-method)))
 
+(defun %committed-pre-image (node tx)
+  "NODE's committed version: the OLD-NODE of TX's update of it when NODE
+is (by EQ) that update's own copy -- what a read inside TX now returns
+(GH #408 layer 1) -- else NODE itself.  A copy or a delete chains to
+this, never to an uncommitted head (spec §4.4; the #135 fault class)."
+  (let ((w (and (typep tx 'tx)
+                (gethash (id node) (table (write-set tx))))))
+    (if (and w (typep w 'tx-update) (eq (node w) node))
+        (old-node w)
+        node)))
+
 (defgeneric copy-node (node)
   (:method ((node node))
     (maybe-init-node-data node)
@@ -2950,7 +2988,8 @@ suppression onto any OTHER graph committing on the same thread."
       ;; re-read from data-pointer (which may be freed by a concurrent commit).
       (setf (bytes new-node) (bytes node))
       (if *transaction*
-          (setf (gethash new-node (copies *transaction*)) node)
+          (setf (gethash new-node (copies *transaction*))
+                (%committed-pre-image node *transaction*))
           (warn 'no-transaction-in-progress-warning))
       new-node)))
 
@@ -2999,6 +3038,8 @@ NEW-NODE was not produced by COPY.")
                                         :node new-node
                                         :old-node old-node)
                          (write-set *transaction*))
+      (when (typep *transaction* 'tx)
+        (%note-own-write new-node *transaction*))
       new-node)))
 
 (defgeneric delete-node (node graph)
@@ -3016,18 +3057,21 @@ stops appearing in queries.  MARK-DELETED is the usual entry point.")
       (when (and home (not (eq home txn-graph)))
         (error 'cross-graph-transaction-error
                :node node :transaction-graph txn-graph :node-graph home)))
-    (let ((old-node node)
+    (let ((old-node (%committed-pre-image node *transaction*))
           ;; %COPY, not the public COPY: same dispatch (so an edge's
           ;; FROM/TO/WEIGHT survive), minus the create-set guard -- a node
           ;; created and then MARK-DELETED in this same transaction must
           ;; keep working (GH #135).
           (new-node (%copy node)))
-      (setf (bytes new-node) (bytes old-node))
+      ;; The tombstone carries NODE's bytes, as before the pre-image rule.
+      (setf (bytes new-node) (bytes node))
       (setf (deleted-p new-node) t)
       (add-to-object-set (make-instance 'tx-delete
                                         :old-node old-node
                                         :node new-node)
-                         (write-set *transaction*)))))
+                         (write-set *transaction*))
+      (when (typep *transaction* 'tx)
+        (%note-own-write new-node *transaction*)))))
 
 (defmethod delete-node :around (node graph)
   (ensure-transaction ((transaction-manager graph))
@@ -3592,23 +3636,29 @@ epoch handed out to ANY store on it."
                (setf (finish-tx-id tx) (tm-current-epoch tm))
                (unless (validate tx)
                  (error 'validation-conflict :transaction tx))
-               ;; Unique constraints (issue #6): a pre-durability check under the same
-               ;; manager lock -- a violation aborts before FINALIZE-TX-PERSISTENCE, so
-               ;; nothing is journaled (the UNWIND-PROTECT below drops the temp file).
-               (validate-unique-constraints tx (graph tx))
-               ;; Declarative value constraints (GH #149): same region, same
-               ;; reason -- a violation aborts before anything is journaled.
-               (validate-value-constraints tx (graph tx))
-               ;; Cardinality (GH #155): same region; counts the store's
-               ;; adjacency overlaid with this transaction's edge writes.
-               (validate-cardinality-constraints tx (graph tx))
-               ;; Domain and range (GH #156): same region; the other end
-               ;; is read through the commit view.
-               (validate-domain-range-constraints tx (graph tx))
-               ;; Subsystem validators (GH #157 4b): same region, same
-               ;; abort-before-durability contract.
-               (dolist (fn *commit-validators*)
-                 (funcall fn tx (graph tx)))
+               ;; The validators compose their own overlay over committed
+               ;; state, so they read with the engine's off (GH #408,
+               ;; spec §4.6).
+               (let ((*read-own-writes* nil))
+                 ;; Unique constraints (issue #6): a pre-durability check
+                 ;; under the same manager lock -- a violation aborts before
+                 ;; FINALIZE-TX-PERSISTENCE, so nothing is journaled (the
+                 ;; UNWIND-PROTECT below drops the temp file).
+                 (validate-unique-constraints tx (graph tx))
+                 ;; Declarative value constraints (GH #149): same region,
+                 ;; same reason -- a violation aborts before anything is
+                 ;; journaled.
+                 (validate-value-constraints tx (graph tx))
+                 ;; Cardinality (GH #155): same region; counts the store's
+                 ;; adjacency overlaid with this transaction's edge writes.
+                 (validate-cardinality-constraints tx (graph tx))
+                 ;; Domain and range (GH #156): same region; the other end
+                 ;; is read through the commit view.
+                 (validate-domain-range-constraints tx (graph tx))
+                 ;; Subsystem validators (GH #157 4b): same region, same
+                 ;; abort-before-durability contract.
+                 (dolist (fn *commit-validators*)
+                   (funcall fn tx (graph tx))))
                ;; Vector-segment dimension check (Task 4 fix): same pre-durability,
                ;; manager-locked region as the unique-constraint check above -- a
                ;; mismatch aborts before FINALIZE-TX-PERSISTENCE, so the node write

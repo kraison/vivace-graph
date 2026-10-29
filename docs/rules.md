@@ -322,13 +322,15 @@ discarding them. Neither offset nor key bound is a snapshot cursor;
 
 ## What the functors do not see
 
-They read the **committed** store. `index-lookup` does not see the
-writes of a transaction it runs inside, and unlike `claims-touching`
--- which overlays the open transaction's write set (GH #324) -- these
-do not compensate. Uniform across every route, so a query inside a
-`with-transaction` sees the snapshot and nothing of its own writes.
-Slice 2's `run-rule` derives claims inside the transaction it also
-reads in, so it is the first caller this bites (GH #331).
+They read the store as the open transaction will commit it: since
+GH #408 `index-lookup`, the typed scans and the adjacency walks return
+the transaction's own creates, saves and deletes on top of its
+snapshot, as `claims-touching` already did with its own overlay
+(GH #324). Entry-level reads that resolve no node (`index-count`,
+`map-index-prefixes`) and the untyped scans still read committed
+membership. Slice 2's `run-rule` derives claims inside the transaction
+it also reads in; its producer exclusion keeps a rule from re-finding
+its own derivations (GH #331, #333).
 
 This is why a rule that reads its own relation cannot be run by
 reading it: **a body cannot see the sweep**, nor the claims the same

@@ -462,6 +462,15 @@ so participates in OCC backward validation.  MAP-VERTICES/MAP-EDGES bind
 this NIL under :RECORD-READS NIL -- the explicit opt-out of
 serializability against a whole scanned corpus (GH #92).")
 
+;; GH #408.  Here for the same reason as *RECORD-READS*: vertex.lisp,
+;; edge.lisp and index.lisp consult it and cardinality.lisp binds it.
+(defvar *read-own-writes* t
+  "When true (the default), a read inside a read-write transaction sees
+the transaction's own creates, updates and deletes.  Bound NIL underneath
+a commit view -- %COMMIT's validators, VALIDATE-WRITES and the evaluators
+that add their own write-set delta -- so those read committed state
+(spec 2026-10-29-read-your-own-writes-design.md, §4.6).")
+
 (define-condition constraint-violation (error) ()
   (:documentation "Superclass of every DETERMINISTIC commit refusal: the same
 write against the same schema is refused again, however often it is retried.

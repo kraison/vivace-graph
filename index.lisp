@@ -550,6 +550,43 @@ ceiling above needs the explicit check."
                           (or (null end)   (not (%index-value-lessp end k))))
                 do (funcall fn k (car (last (%sn-key node)))))))))
 
+(defun overlay-index-members (ov six &key key prefix start end)
+  "The open transaction's own live nodes that SIX indexes, as
+\(COMPOSITE . NODE) pairs -- COMPOSITE the (v1 ... vn id) key the index
+would hold for NODE -- restricted to those whose tuple equals KEY (or
+starts with it, with PREFIX) or lies in [START, END], in the index's
+own order (GH #408, spec §4.3).  OV is a TX-OVERLAY (tx-overlay.lisp).
+The range follows IX-MAP's two paths exactly: with both bounds, the
+composite against the padded cursor bounds (so a short END takes its
+extensions); with one, %INDEX-VALUE-LESSP on the tuple (GH #413)."
+  (let* ((owner (slot-index-owner-name six))
+         (slots (slot-index-slot-names six))
+         (bounded (and start end))
+         (lo (and bounded (%index-bounds six start t)))
+         (hi (and bounded (nth-value 1 (%index-bounds six end t))))
+         (out '()))
+    (flet ((in-range-p (k c)
+             (if bounded
+                 (and (not (%index-comp-lessp c lo))
+                      (not (%index-comp-lessp hi c)))
+                 (and (or (null start)
+                          (not (%index-value-lessp k start)))
+                      (or (null end)
+                          (not (%index-value-lessp end k)))))))
+      (dolist (n (overlay-live-nodes ov))
+        (when (and (typep n owner) (%tuple-indexable-p n slots))
+          (let* ((k (%index-tuple-key six n))
+                 (c (and k (append k (list (id n))))))
+            (when (and k
+                       (if key
+                           (if prefix
+                               (and (<= (length key) (length k))
+                                    (equal key (subseq k 0 (length key))))
+                               (equal key k))
+                           (in-range-p k c)))
+              (push (cons c n) out))))))
+    (sort out #'%index-comp-lessp :key #'car)))
+
 (defun ix-count (six)
   "Number of live entries in SIX."
   (let ((cur (make-cursor (slot-index-skip-list six))) (n 0))
@@ -1015,12 +1052,24 @@ ids in GRAPH.  With COLLECT-P NIL, returns T as soon as one match is found
          (six (%require-index graph class-name slot-name)))
     (when six                            ; NIL => declared but empty => no matches
       (let ((key (%index-key six value))
-            (result '()))
+            (result '())
+            ;; GH #408: the walk skips the open transaction's own ids;
+            ;; its own matching nodes follow (spec §4.3).
+            (ov (current-overlay graph)))
         (when key
           (dolist (id (ix-lookup six key :prefix prefix))
-            (let ((node (%node-by-id id graph)))
-              (when (and node (not (deleted-p node)))
-                (if collect-p (push node result) (return-from index-lookup t))))))
+            (unless (and ov (overlay-effective-write ov id))
+              (let ((node (%node-by-id id graph)))
+                (when (and node (not (deleted-p node)))
+                  (if collect-p
+                      (push node result)
+                      (return-from index-lookup t))))))
+          (when ov
+            (dolist (m (overlay-index-members ov six :key key
+                                                     :prefix prefix))
+              (if collect-p
+                  (push (cdr m) result)
+                  (return-from index-lookup t)))))
         (when collect-p (nreverse result))))))
 
 (defun map-index (fn graph class-name slot-name &key start end)
@@ -1032,15 +1081,31 @@ bound only on the components given (GH #107).  Resolves ids in GRAPH."
   (let* ((*graph* graph)
          (six (%require-index graph class-name slot-name)))
     (when six                            ; NIL => declared but empty => nothing to map
-      (let ((skey (and start (%index-key six start)))
-            (ekey (and end   (%index-key six end))))
-        (ix-map six
-                (lambda (key id)
-                  (declare (ignore key))
-                  (let ((node (%node-by-id id graph)))
-                    (when (and node (not (deleted-p node)))
-                      (funcall fn node))))
-                :start skey :end ekey)))))
+      (let* ((skey (and start (%index-key six start)))
+             (ekey (and end   (%index-key six end)))
+             ;; GH #408: own ids are skipped in the walk and the
+             ;; transaction's own members merged in at their keys, so
+             ;; the ascending order holds (spec §4.3).
+             (ov (current-overlay graph))
+             (pending (and ov (overlay-index-members ov six :start skey
+                                                            :end ekey))))
+        (flet ((emit-own-before (composite)
+                 ;; Every pending own member sorting before COMPOSITE;
+                 ;; all of them when COMPOSITE is NIL.
+                 (loop while (and pending
+                                  (or (null composite)
+                                      (%index-comp-lessp
+                                       (car (first pending)) composite)))
+                       do (funcall fn (cdr (pop pending))))))
+          (ix-map six
+                  (lambda (key id)
+                    (unless (and ov (overlay-effective-write ov id))
+                      (let ((node (%node-by-id id graph)))
+                        (when (and node (not (deleted-p node)))
+                          (emit-own-before (append key (list id)))
+                          (funcall fn node)))))
+                  :start skey :end ekey)
+          (emit-own-before nil))))))
 
 (defun index-range (graph class-name slot-name &key start end)
   "Nodes of CLASS-NAME (and subclasses) whose SLOT-NAME is in [START,END], ascending.

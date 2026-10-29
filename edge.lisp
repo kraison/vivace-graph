@@ -392,21 +392,30 @@ graph-class.lisp."
                             (lookup-node-type-by-id edge-type :edge :graph graph))
                        (lookup-node-type-by-name edge-type :edge :graph graph))))
     (when type-meta
-      (let* ((vev-key (make-vev-key :in-id (id vertex2)
+      (let* ((type-id (node-type-id type-meta))
+             (vev-key (make-vev-key :in-id (id vertex2)
                                     :out-id (id vertex1)
-                                    :type-id (node-type-id type-meta)))
-             (index-list (lookup-vev-index-list vev-key graph)))
+                                    :type-id type-id))
+             (index-list (lookup-vev-index-list vev-key graph))
+             ;; GH #408: the walk skips the open transaction's own ids,
+             ;; the overlay supplies its own live edges (spec §4.3).
+             (ov (current-overlay graph)))
         (when index-list
           (map-index-list
            (lambda (edge-id)
-             (let ((edge (lookup-edge edge-id :graph graph)))
-               (when (and edge (written-p edge)
-                          (active-edge-p edge :graph graph))
-                 (return-from edge-exists-p edge))))
+             (unless (and ov (overlay-effective-write ov edge-id))
+               (let ((edge (lookup-edge edge-id :graph graph)))
+                 (when (and edge (written-p edge)
+                            (active-edge-p edge :graph graph))
+                   (return-from edge-exists-p edge)))))
            index-list
            ;; Under an as-of snapshot, tombstoned entries too: each id
            ;; resolves at E (GH #115 spec §3.3).
-           :include-deleted-p (not (null (%as-of-snapshot graph)))))))))
+           :include-deleted-p (not (null (%as-of-snapshot graph)))))
+        (when ov
+          (find-if (lambda (e) (active-edge-p e :graph graph))
+                   (overlay-edges-between ov (id vertex1) (id vertex2)
+                                          (list type-id))))))))
 
 (defun map-edges (fn graph &key collect-p edge-type include-edge-types vertex
                              direction include-deleted-p to-vertex from-vertex
@@ -488,7 +497,10 @@ was reaped; :IF-REAPED :SKIP skips those reads and counts them
       ;; GH #115 spec §3.3: membership at E is the tombstone walk.  Under
       ;; as-of each index walk visits tombstoned entries too -- every id
       ;; resolves at E, and EMIT's filter runs on THAT version.
-      (let ((as-of (%as-of-snapshot graph)))
+      ;; GH #408: OV as in MAP-VERTICES -- the walks skip an id the open
+      ;; transaction wrote, the overlay supplies its own live edges.
+      (let ((as-of (%as-of-snapshot graph))
+            (ov (current-overlay graph)))
         (flet ((emit (edge)
                  (when (and edge (written-p edge)
                             ;; Explicit :GRAPH, not dynamic *GRAPH* --
@@ -498,6 +510,15 @@ was reaped; :IF-REAPED :SKIP skips those reads and counts them
                    (if collect-p
                        (push (funcall fn edge) result)
                        (funcall fn edge))))
+               (emit-own (edge)
+                 ;; An own edge has no WRITTEN-P until commit.
+                 (when (or include-deleted-p
+                           (active-edge-p edge :graph graph))
+                   (if collect-p
+                       (push (funcall fn edge) result)
+                       (funcall fn edge))))
+               (own-p (eid)
+                 (and ov (overlay-effective-write ov eid)))
                (keep-type (tid)
                  (and (plusp tid) (not (member tid excluded)))))
           (cond
@@ -511,8 +532,16 @@ was reaped; :IF-REAPED :SKIP skips those reads and counts them
                         (il (lookup-vev-index-list vev-key graph)))
                    (when il
                      (map-index-list
-                      (lambda (eid) (emit (lookup-edge eid :graph graph)))
-                      il :include-deleted-p (not (null as-of))))))))
+                      (lambda (eid)
+                        (unless (own-p eid)
+                          (emit (lookup-edge eid :graph graph))))
+                      il :include-deleted-p (not (null as-of)))))))
+             (when ov
+               (mapc #'emit-own
+                     (overlay-edges-between
+                      ov (id from-vertex) (id to-vertex)
+                      (remove-if-not #'keep-type type-ids)
+                      :include-deleted-p include-deleted-p))))
             ;; a vertex's adjacent edges -> ve-index (in/out) per type-id
             (vertex
              (dolist (tid type-ids)
@@ -526,8 +555,16 @@ was reaped; :IF-REAPED :SKIP skips those reads and counts them
                                             direction)))))
                    (when il
                      (map-index-list
-                      (lambda (eid) (emit (lookup-edge eid :graph graph)))
-                      il :include-deleted-p (not (null as-of))))))))
+                      (lambda (eid)
+                        (unless (own-p eid)
+                          (emit (lookup-edge eid :graph graph))))
+                      il :include-deleted-p (not (null as-of)))))))
+             (when ov
+               (mapc #'emit-own
+                     (overlay-edges-at
+                      ov (id vertex) direction
+                      (remove-if-not #'keep-type type-ids)
+                      :include-deleted-p include-deleted-p))))
             ;; typed, no adjacency -> type-index per type-id
             (requested
              (dolist (tid type-ids)
@@ -535,8 +572,15 @@ was reaped; :IF-REAPED :SKIP skips those reads and counts them
                  (let ((il (get-type-index-list (edge-index graph) tid)))
                    (when il
                      (map-index-list
-                      (lambda (eid) (emit (lookup-edge eid :graph graph)))
-                      il :include-deleted-p (not (null as-of))))))))
+                      (lambda (eid)
+                        (unless (own-p eid)
+                          (emit (lookup-edge eid :graph graph))))
+                      il :include-deleted-p (not (null as-of)))))))
+             (when ov
+               (mapc #'emit-own
+                     (overlay-nodes ov :edge
+                                    (remove-if-not #'keep-type type-ids)
+                                    :include-deleted-p include-deleted-p))))
             ;; fully untyped -> live lhash scan (see NOTE); per-edge
             ;; exclude.  Refused under an as-of snapshot (GH #115, R6).
             (t

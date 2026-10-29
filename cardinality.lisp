@@ -175,6 +175,9 @@ created and deleted in the same transaction)."
 the store's adjacency index -- what OUTGOING-EDGES / INCOMING-EDGES
 answer, soft-deleted excluded, subtypes included -- plus the
 transaction's overlay.  In a store-only view the overlay is empty."
+  ;; Reads committed state: every caller runs with *READ-OWN-WRITES*
+  ;; already NIL (%COMMIT, VALIDATE-WRITES) or no transaction (the audit
+  ;; pass), so the delta is the only overlay (GH #408, spec §4.6).
   (+ (length (map-edges 'identity (commit-view-graph view)
                         :vertex vertex :edge-type edge-type
                         :direction direction :collect-p t))
