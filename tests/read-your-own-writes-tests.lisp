@@ -90,9 +90,12 @@ VALIDATE-WRITES, T in the transaction body (spec §4.6)."
   (ryow-both-caches ()
     (with-ryow-graph (g)
       (with-transaction ()
-        (let ((v (make-ryow-node :k "a" :tag "t")))
+        (let* ((v (make-ryow-node :k "a" :tag "t"))
+               (e (make-ryow-link :from v :to v)))
           (is (eq v (lookup-vertex (id v))))
-          (is (eq v (lookup-ryow-node (id v)))))))))
+          (is (eq v (lookup-ryow-node (id v))))
+          (is (eq e (lookup-edge (id e))))
+          (is (eq e (lookup-ryow-link (id e)))))))))
 
 (test ryow-lookup-sees-own-save-and-delete
   (ryow-both-caches ()
@@ -291,19 +294,27 @@ one edge."
   "Review focus 4: a :MAX 1 vertex gains one edge and commits; the
 validator does not see it twice (spec §4.6)."
   (with-ryow-graph (g)
-    (def-cardinality ryow-node ryow-link :graph-db-ryow-test :max 1)
     (let (a b)
       (with-transaction ()
         (setf a (make-ryow-node :k "a" :tag "t")
               b (make-ryow-node :k "b" :tag "t")))
-      (finishes
-        (with-transaction ()
-          (make-ryow-link :from a :to b)
-          (is (= 1 (length (outgoing-edges a :edge-type 'ryow-link))))
-          (is (null (graph-db::validation-report-violations
-                     (graph-db:validate-transaction g))))))
-      (signals graph-db::cardinality-violation
-        (with-transaction () (make-ryow-link :from a :to b))))))
+      ;; The declaration is keyed by graph NAME in a global registry, so
+      ;; it must not outlive this test (review finding 3).
+      (def-cardinality ryow-node ryow-link :graph-db-ryow-test :max 1)
+      (unwind-protect
+           (progn
+             (finishes
+               (with-transaction ()
+                 (make-ryow-link :from a :to b)
+                 (is (= 1 (length (outgoing-edges a :edge-type 'ryow-link))))
+                 (is (null (graph-db::validation-report-violations
+                            (graph-db:validate-transaction g))))))
+             (signals graph-db::cardinality-violation
+               (with-transaction () (make-ryow-link :from a :to b))))
+        (undef-cardinality ryow-node :graph-db-ryow-test
+                           :edge-type ryow-link))
+      ;; Withdrawn: a second link commits.
+      (finishes (with-transaction () (make-ryow-link :from a :to b))))))
 
 ;;; --- Task 6: secondary-index reads (spec §4.3) ----------------------------
 
@@ -342,6 +353,27 @@ validator does not see it twice (spec §4.6)."
         (let ((c (copy (first (index-lookup g 'ryow-node 'tag "b")))))
           (setf (ryow-node-tag c) "f") (save c))
         (is (equal '("a" "c" "e" "f") (tags "a" "f")))))))
+
+(test ryow-composite-range-with-short-bounds-keeps-own-rows
+  "Review finding 1: on a multi-slot index with both bounds given, a
+short END includes every committed extension of it (IX-MAP's bounded
+cursor pads it with the max sentinels), so the overlay must include the
+transaction's own extensions too."
+  (with-ryow-graph (g)
+    (flet ((rows (start end)
+             (mapcar (lambda (n) (list (ryow-node-k n) (ryow-node-tag n)))
+                     (index-range g 'ryow-node '(k tag)
+                                  :start start :end end))))
+      (with-transaction ()
+        (make-ryow-node :k "1" :tag "a") (make-ryow-node :k "4" :tag "z"))
+      (with-transaction ()
+        (make-ryow-node :k "2" :tag "m") (make-ryow-node :k "4" :tag "x")
+        (is (equal '(("1" "a") ("2" "m") ("4" "x") ("4" "z"))
+                   (rows '("1") '("4"))))
+        (is (equal '(("2" "m") ("4" "x") ("4" "z"))
+                   (rows '("2") '("4"))))
+        (is (equal '(("1" "a") ("2" "m"))
+                   (rows '("1") '("2"))))))))
 
 ;;; --- Task 7: OCC (spec §4.5) ----------------------------------------------
 

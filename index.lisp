@@ -554,26 +554,37 @@ ceiling above needs the explicit check."
   "The open transaction's own live nodes that SIX indexes, as
 \(COMPOSITE . NODE) pairs -- COMPOSITE the (v1 ... vn id) key the index
 would hold for NODE -- restricted to those whose tuple equals KEY (or
-starts with it, with PREFIX) or lies in [START, END] (each open when
-NIL), in the index's own order (GH #408, spec §4.3).  OV is a
-TX-OVERLAY (tx-overlay.lisp)."
-  (let ((owner (slot-index-owner-name six))
-        (slots (slot-index-slot-names six))
-        (out '()))
-    (dolist (n (overlay-live-nodes ov))
-      (when (and (typep n owner) (%tuple-indexable-p n slots))
-        (let ((k (%index-tuple-key six n)))
-          (when (and k
-                     (if key
-                         (if prefix
-                             (and (<= (length key) (length k))
-                                  (equal key (subseq k 0 (length key))))
-                             (equal key k))
-                         (and (or (null start)
-                                  (not (%index-value-lessp k start)))
-                              (or (null end)
-                                  (not (%index-value-lessp end k))))))
-            (push (cons (append k (list (id n))) n) out)))))
+starts with it, with PREFIX) or lies in [START, END], in the index's
+own order (GH #408, spec §4.3).  OV is a TX-OVERLAY (tx-overlay.lisp).
+The range follows IX-MAP's two paths exactly: with both bounds, the
+composite against the padded cursor bounds (so a short END takes its
+extensions); with one, %INDEX-VALUE-LESSP on the tuple (GH #413)."
+  (let* ((owner (slot-index-owner-name six))
+         (slots (slot-index-slot-names six))
+         (bounded (and start end))
+         (lo (and bounded (%index-bounds six start t)))
+         (hi (and bounded (nth-value 1 (%index-bounds six end t))))
+         (out '()))
+    (flet ((in-range-p (k c)
+             (if bounded
+                 (and (not (%index-comp-lessp c lo))
+                      (not (%index-comp-lessp hi c)))
+                 (and (or (null start)
+                          (not (%index-value-lessp k start)))
+                      (or (null end)
+                          (not (%index-value-lessp end k)))))))
+      (dolist (n (overlay-live-nodes ov))
+        (when (and (typep n owner) (%tuple-indexable-p n slots))
+          (let* ((k (%index-tuple-key six n))
+                 (c (and k (append k (list (id n))))))
+            (when (and k
+                       (if key
+                           (if prefix
+                               (and (<= (length key) (length k))
+                                    (equal key (subseq k 0 (length key))))
+                               (equal key k))
+                           (in-range-p k c)))
+              (push (cons c n) out))))))
     (sort out #'%index-comp-lessp :key #'car)))
 
 (defun ix-count (six)
