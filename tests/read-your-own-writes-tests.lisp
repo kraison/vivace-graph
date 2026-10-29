@@ -304,3 +304,41 @@ validator does not see it twice (spec §4.6)."
                      (graph-db:validate-transaction g))))))
       (signals graph-db::cardinality-violation
         (with-transaction () (make-ryow-link :from a :to b))))))
+
+;;; --- Task 6: secondary-index reads (spec §4.3) ----------------------------
+
+(test ryow-index-lookup-sees-create-and-moved-key
+  (ryow-both-caches ()
+    (with-ryow-graph (g)
+      (let (a)
+        (with-transaction () (setf a (make-ryow-node :k "a" :tag "old")))
+        (with-transaction ()
+          (make-ryow-node :k "b" :tag "new")
+          (let ((c (copy a))) (setf (ryow-node-tag c) "new") (save c))
+          (is (null (index-lookup g 'ryow-node 'tag "old")))
+          (is (equal '("a" "b")
+                     (sort (mapcar #'ryow-node-k
+                                   (index-lookup g 'ryow-node 'tag "new"))
+                           #'string<)))
+          (is (eq t (index-lookup g 'ryow-node 'tag "new" :collect-p nil)))
+          (is (= 1 (length (index-lookup g 'ryow-node '(k tag) '("b")
+                                         :prefix t)))))))))
+
+(test ryow-map-index-order-and-range-with-own-writes
+  (with-ryow-graph (g)
+    (flet ((tags (start end)
+             (mapcar #'ryow-node-tag
+                     (index-range g 'ryow-node 'tag :start start :end end))))
+      (with-transaction ()
+        (make-ryow-node :k "1" :tag "b") (make-ryow-node :k "2" :tag "d"))
+      (with-transaction ()
+        (make-ryow-node :k "3" :tag "a") (make-ryow-node :k "4" :tag "c")
+        (make-ryow-node :k "5" :tag "e")
+        (is (equal '("a" "b" "c" "d" "e") (tags "a" "e")))
+        (is (equal '("b" "c" "d") (tags "b" "d")))
+        ;; A committed entry whose node this transaction deleted drops out
+        ;; of the walk; a moved key is merged at its new position.
+        (mark-deleted (first (index-lookup g 'ryow-node 'tag "d")))
+        (let ((c (copy (first (index-lookup g 'ryow-node 'tag "b")))))
+          (setf (ryow-node-tag c) "f") (save c))
+        (is (equal '("a" "c" "e" "f") (tags "a" "f")))))))
