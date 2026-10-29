@@ -241,3 +241,66 @@ commits only a tombstone."
                                            :vertex-type 'ryow-node
                                            :collect-p t))))))
         (is (= 0 (links)))))))
+
+;;; --- Task 5: adjacency and EDGE-EXISTS-P (spec §4.3) ----------------------
+
+(test ryow-issue-408-drop-then-make-twice
+  "The issue's repro: replace-the-edge twice in one transaction leaves
+one edge."
+  (ryow-both-caches ()
+    (with-ryow-graph (g)
+      (let (a b)
+        (with-transaction ()
+          (setf a (make-ryow-node :k "a" :tag "t")
+                b (make-ryow-node :k "b" :tag "t")))
+        (with-transaction ()
+          (dotimes (i 2)
+            (dolist (e (map-edges #'identity g :vertex a :direction :out
+                                  :edge-type 'ryow-link :collect-p t))
+              (mark-deleted e))
+            (make-ryow-link :from a :to b)))
+        (is (= 1 (length (outgoing-edges a :edge-type 'ryow-link))))
+        (is (= 1 (length (incoming-edges b :edge-type 'ryow-link))))))))
+
+(test ryow-adjacency-in-out-between-and-exists
+  (with-ryow-graph (g)
+    (let (a b e0)
+      (with-transaction ()
+        (setf a (make-ryow-node :k "a" :tag "t")
+              b (make-ryow-node :k "b" :tag "t")
+              e0 (make-ryow-link :from b :to a)))
+      (with-transaction ()
+        (is (null (edge-exists-p 'ryow-link a b)))
+        (let ((e (make-ryow-link :from a :to b)))
+          (is (eq e (edge-exists-p 'ryow-link a b)))
+          (is (= 1 (length (incoming-edges b :edge-type 'ryow-link))))
+          (is (= 1 (length (map-edges #'identity g :from-vertex a
+                                      :to-vertex b :edge-type 'ryow-link
+                                      :collect-p t))))
+          ;; E0 is committed: the walks must skip it once deleted here,
+          ;; and supply it once under :INCLUDE-DELETED-P.
+          (mark-deleted e0)
+          (is (= 0 (length (incoming-edges a :edge-type 'ryow-link))))
+          (is (= 1 (length (incoming-edges a :edge-type 'ryow-link
+                                           :include-deleted-p t))))
+          (is (null (edge-exists-p 'ryow-link b a)))
+          (mark-deleted e)
+          (is (null (edge-exists-p 'ryow-link a b))))))))
+
+(test ryow-cardinality-counts-once
+  "Review focus 4: a :MAX 1 vertex gains one edge and commits; the
+validator does not see it twice (spec §4.6)."
+  (with-ryow-graph (g)
+    (def-cardinality ryow-node ryow-link :graph-db-ryow-test :max 1)
+    (let (a b)
+      (with-transaction ()
+        (setf a (make-ryow-node :k "a" :tag "t")
+              b (make-ryow-node :k "b" :tag "t")))
+      (finishes
+        (with-transaction ()
+          (make-ryow-link :from a :to b)
+          (is (= 1 (length (outgoing-edges a :edge-type 'ryow-link))))
+          (is (null (graph-db::validation-report-violations
+                     (graph-db:validate-transaction g))))))
+      (signals graph-db::cardinality-violation
+        (with-transaction () (make-ryow-link :from a :to b))))))
