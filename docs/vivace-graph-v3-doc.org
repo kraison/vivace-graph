@@ -756,6 +756,45 @@ The two new conditions:
 Ephemeral and meta slots are unaffected -- the guard only ever sees
 persistent slots.
 
+**** What a transaction sees (GH #408)
+
+A read inside ~with-transaction~ answers as the transaction will commit:
+its own creates, updates and deletes sit on top of the snapshot it reads
+(Chapter 10, snapshot-isolation reads), and a delete masks the committed
+node. Two layers give this. The transaction's own nodes live in its
+private local cache, which every transactional lookup consults before
+the store, so ~lookup-vertex~, ~lookup-edge~ and the generated
+~lookup-<type>~ return the created node, the saved copy or the deleted
+copy. An overlay over the write set then feeds the enumeration points:
+the typed ~map-vertices~ and ~map-edges~, the adjacency forms (so
+~outgoing-edges~, ~incoming-edges~, ~traverse~ and the Prolog functors),
+~edge-exists-p~, and ~index-lookup~, ~map-index~ and ~index-range~ on
+~:index~ and ~def-index~ slots. Each committed walk skips an id the
+transaction wrote and the overlay supplies every own live node at its
+current type, endpoints or key, so a moved index key is found under the
+new value and not the old, and ~map-index~ stays in ascending order.
+
+What stays committed-only, each with its issue: views (#7); the fully
+untyped ~map-vertices~ / ~map-edges~ lhash scans (admin paths that
+bypass MVCC as well); entry-level index reads that resolve no node,
+~index-count~ and ~map-index-prefixes~; spatial and vector-segment
+membership; unique-index membership. A nested ~with-transaction~ is an
+independent commit and sees nothing of the outer one. A read snapshot
+opened inside a transaction inherits it and so sees its writes; an
+~:as-of~ read is refused there, as before.
+
+Two rules follow from reads returning an uncommitted node. ~copy~ and
+~mark-deleted~ of a node this transaction already saved chain to the
+*committed* pre-image, never to the copy, so the version chain and the
+secondary-index entries stay right; ~copy~ of a node this transaction
+*created* still signals ~copying-uncommitted-node~ (pattern B above).
+And code that composes its own "committed state plus write-set delta"
+-- the commit view's validators in ~%commit~ and ~validate-writes~ --
+reads with the overlay off, through ~*read-own-writes*~ (default ~t~),
+so the commit path counts an own edge once. A scan inside a transaction
+costs O(pending writes) extra; ~docs/perf-baselines.md~ has the number.
+Design: ~docs/superpowers/specs/2026-10-29-read-your-own-writes-design.md~.
+
 *** Locking and Concurrency (~rw-lock.lisp~)
 
 While the transactional system uses an optimistic model for application-level data, the database still relies on low-level locks to protect the integrity of its own internal data structures. VivaceGraph implements a custom, fair *Read-Write Lock*, defined in ~rw-lock.lisp~.
@@ -2938,7 +2977,7 @@ You do not call the reaper directly; it is automatic. Its only tunable is the re
 
 *** Snapshot-isolation reads
 
-Inside a transaction, a point ~lookup~ (e.g. ~lookup-vertex~, ~lookup-edge~, or a generated ~lookup-<type>~) now returns the version that was live *as of the transaction's start* — the newest version whose ~commit-epoch~ precedes the transaction's start epoch. An update committed by a *later* transaction is therefore invisible to an in-progress one, and re-reading a node within a transaction is repeatable. The relevant older version is guaranteed to still exist because an open transaction holds the reaper's floor down.
+Inside a transaction, a point ~lookup~ (e.g. ~lookup-vertex~, ~lookup-edge~, or a generated ~lookup-<type>~) returns the transaction's own write of that node when it has one (Chapter 5, "What a transaction sees", GH #408) and otherwise the version that was live *as of the transaction's start* — the newest version whose ~commit-epoch~ precedes the transaction's start epoch. An update committed by a *later* transaction is therefore invisible to an in-progress one, and re-reading a node within a transaction is repeatable. The relevant older version is guaranteed to still exist because an open transaction holds the reaper's floor down.
 
 #+BEGIN_SRC lisp
   ;; Transaction A reads X, sees its value as of A's start, and keeps seeing

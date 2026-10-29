@@ -450,6 +450,18 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Fixed
 
+- **A read inside `with-transaction` sees the transaction's own
+  writes** (#408). Lookups, the typed and adjacency `map-vertices` /
+  `map-edges`, `edge-exists-p`, `index-lookup`, `map-index` and
+  `index-range` return the transaction's creates, saves and deletes on
+  top of its snapshot; a moved index key is found under the new value.
+  `copy` and `mark-deleted` of a node the transaction already saved chain
+  to the committed pre-image. `*read-own-writes*` (default `t`) is bound
+  nil under the commit view's validators and `validate-writes`. Still
+  committed-only: views (#7), the untyped scans, `index-count`,
+  `map-index-prefixes`, spatial and vector membership. A scan inside a
+  transaction costs O(pending writes) extra (`docs/perf-baselines.md`).
+
 - **`node-slot-value/3` enumerates, bounded, and fails cleanly on
   ill-typed terms** (#351): an unbound node now enumerates -- a full
   scan of every vertex of every type, one inference charged per vertex

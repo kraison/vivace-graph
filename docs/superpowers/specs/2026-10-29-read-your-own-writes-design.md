@@ -272,9 +272,15 @@ validator sees the committed version as today. It is bound to nil:
   exactly what it reads today, validators and `*commit-validators*` hooks
   alike;
 - around `validate-writes` (hence `validate-transaction`), which promises
-  to answer "as `%commit` would";
-- in `view-edge-count` and `%name-count` / `%name-admitted-p`, the two
-  evaluators consumers call outside a commit.
+  to answer "as `%commit` would".
+
+Those two are the only bindings. The design first listed
+`view-edge-count` and spacetime's `%name-count` / `%name-admitted-p`
+too; implementation showed both dead: every caller of the first already
+runs under one of the two bindings or with no transaction, and the
+second pair runs only under an as-of snapshot, which is refused inside
+a read-write transaction. No test could kill them, so they went
+(commits 7b3523c, bf5a68b).
 
 Consumers that already dedup by id (`%overlay-transaction`,
 `%post-commit-subject-claims`, link's `%same-store-candidates`) need
