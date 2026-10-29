@@ -83,6 +83,11 @@ which is a side effect this function promises not to have (GH #301).
 NOT run under the transaction-manager lock: the answer is advisory and
 can be stale by the time a real commit runs -- the commit path remains
 the enforcement (GH #301)."
+  ;; The commit view below is its own overlay (GH #408, spec §4.6).
+  (let ((*read-own-writes* nil))
+    (%validate-writes graph proposed-writes)))
+
+(defun %validate-writes (graph proposed-writes)
   (let* ((writes (mapcar #'%normalize-proposed-write proposed-writes))
          (ptx (make-instance '%proposed-tx :writes writes))
          (view (make-commit-view graph ptx))

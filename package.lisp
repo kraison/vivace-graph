@@ -279,6 +279,7 @@
            #:peer-type-class-not-loaded-error     ; GH #200
 
            #:with-transaction
+           #:*read-own-writes*                    ; GH #408
            #:with-read-snapshot
            #:call-with-read-snapshot
            ;; GH #115: node-local time travel

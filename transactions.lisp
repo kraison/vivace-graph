@@ -498,6 +498,11 @@ inside the transaction, mutate the copy, then SAVE it."
    (local-cache
     :initarg :local-cache
     :reader local-cache)
+   (overlay
+    :initform nil
+    :accessor %overlay-slot
+    :documentation "The cached TX-OVERLAY (tx-overlay.lisp, GH #408);
+    NIL until OVERLAY-OF builds it, reset by every write.")
    (copies
     :initarg :copies
     :reader copies
@@ -3592,23 +3597,29 @@ epoch handed out to ANY store on it."
                (setf (finish-tx-id tx) (tm-current-epoch tm))
                (unless (validate tx)
                  (error 'validation-conflict :transaction tx))
-               ;; Unique constraints (issue #6): a pre-durability check under the same
-               ;; manager lock -- a violation aborts before FINALIZE-TX-PERSISTENCE, so
-               ;; nothing is journaled (the UNWIND-PROTECT below drops the temp file).
-               (validate-unique-constraints tx (graph tx))
-               ;; Declarative value constraints (GH #149): same region, same
-               ;; reason -- a violation aborts before anything is journaled.
-               (validate-value-constraints tx (graph tx))
-               ;; Cardinality (GH #155): same region; counts the store's
-               ;; adjacency overlaid with this transaction's edge writes.
-               (validate-cardinality-constraints tx (graph tx))
-               ;; Domain and range (GH #156): same region; the other end
-               ;; is read through the commit view.
-               (validate-domain-range-constraints tx (graph tx))
-               ;; Subsystem validators (GH #157 4b): same region, same
-               ;; abort-before-durability contract.
-               (dolist (fn *commit-validators*)
-                 (funcall fn tx (graph tx)))
+               ;; The validators compose their own overlay over committed
+               ;; state, so they read with the engine's off (GH #408,
+               ;; spec §4.6).
+               (let ((*read-own-writes* nil))
+                 ;; Unique constraints (issue #6): a pre-durability check
+                 ;; under the same manager lock -- a violation aborts before
+                 ;; FINALIZE-TX-PERSISTENCE, so nothing is journaled (the
+                 ;; UNWIND-PROTECT below drops the temp file).
+                 (validate-unique-constraints tx (graph tx))
+                 ;; Declarative value constraints (GH #149): same region,
+                 ;; same reason -- a violation aborts before anything is
+                 ;; journaled.
+                 (validate-value-constraints tx (graph tx))
+                 ;; Cardinality (GH #155): same region; counts the store's
+                 ;; adjacency overlaid with this transaction's edge writes.
+                 (validate-cardinality-constraints tx (graph tx))
+                 ;; Domain and range (GH #156): same region; the other end
+                 ;; is read through the commit view.
+                 (validate-domain-range-constraints tx (graph tx))
+                 ;; Subsystem validators (GH #157 4b): same region, same
+                 ;; abort-before-durability contract.
+                 (dolist (fn *commit-validators*)
+                   (funcall fn tx (graph tx))))
                ;; Vector-segment dimension check (Task 4 fix): same pre-durability,
                ;; manager-locked region as the unique-constraint check above -- a
                ;; mismatch aborts before FINALIZE-TX-PERSISTENCE, so the node write

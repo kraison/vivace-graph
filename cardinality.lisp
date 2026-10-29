@@ -175,9 +175,10 @@ created and deleted in the same transaction)."
 the store's adjacency index -- what OUTGOING-EDGES / INCOMING-EDGES
 answer, soft-deleted excluded, subtypes included -- plus the
 transaction's overlay.  In a store-only view the overlay is empty."
-  (+ (length (map-edges 'identity (commit-view-graph view)
-                        :vertex vertex :edge-type edge-type
-                        :direction direction :collect-p t))
+  (+ (length (let ((*read-own-writes* nil)) ; GH #408, spec §4.6
+               (map-edges 'identity (commit-view-graph view)
+                          :vertex vertex :edge-type edge-type
+                          :direction direction :collect-p t)))
      (%overlay-edge-delta view (id vertex) edge-type direction)))
 
 ;;; --- Evaluation ----------------------------------------------------------
