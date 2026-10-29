@@ -201,3 +201,43 @@ focus 2)."
         (let ((c (copy (lookup-vertex (id a)))))
           (setf (deleted-p c) nil) (save c)))
       (is (lookup-ryow-node (id a))))))
+
+;;; --- Task 4: typed scans (spec §4.3) --------------------------------------
+
+(test ryow-typed-scan-sees-create-once-and-update-once
+  (ryow-both-caches ()
+    (with-ryow-graph (g)
+      (let (a)
+        (with-transaction () (setf a (make-ryow-node :k "a" :tag "t")))
+        (with-transaction ()
+          (let ((c (copy a))) (setf (ryow-node-k c) "a2") (save c))
+          (make-ryow-node :k "b" :tag "t")
+          (let ((ks (map-vertices #'ryow-node-k g :vertex-type 'ryow-node
+                                  :collect-p t)))
+            (is (equal '("a2" "b") (sort ks #'string<)))))))))
+
+(test ryow-typed-edge-scan-and-create-then-delete-invisible
+  "Review focus 1: created-then-deleted appears nowhere live, and
+commits only a tombstone."
+  (with-ryow-graph (g)
+    (flet ((links (&rest args)
+             (length (apply #'map-edges #'identity g :edge-type 'ryow-link
+                            :collect-p t args))))
+      (let (a e0)
+        (with-transaction ()
+          (setf a (make-ryow-node :k "a" :tag "t")
+                e0 (make-ryow-link :from a :to a)))
+        (with-transaction ()
+          (let ((e (make-ryow-link :from a :to a)))
+            (is (= 2 (links)))
+            (mark-deleted e)
+            (is (= 1 (links)))
+            ;; E0 is committed: the walk must skip it (it is an own
+            ;; write now) and the overlay supply it once.
+            (mark-deleted e0)
+            (is (= 0 (links)))
+            (is (= 2 (links :include-deleted-p t)))
+            (is (= 1 (length (map-vertices #'identity g
+                                           :vertex-type 'ryow-node
+                                           :collect-p t))))))
+        (is (= 0 (links)))))))

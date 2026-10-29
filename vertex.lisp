@@ -271,14 +271,22 @@ was reaped; :IF-REAPED :SKIP skips those reads and counts them
                  fn)))
     (with-read-pin (graph)        ; retain whatever versions this scan observes
       ;; GH #115 spec §3.3: membership at E is the tombstone walk.
-      (let ((as-of (%as-of-snapshot graph)))
+      ;; GH #408: OV is the open transaction's overlay (tx-overlay.lisp,
+      ;; loaded later; resolved at runtime).  The index walk skips an id
+      ;; the transaction wrote; the overlay then supplies every own live
+      ;; node of the requested types (spec §4.3).
+      (let ((as-of (%as-of-snapshot graph))
+            (ov (current-overlay graph)))
         (flet ((scan-type-id (type-id)
                  (let ((index-list (get-type-index-list (vertex-index graph)
                                                         type-id)))
                    (when index-list
                      (map-index-list
                       (lambda (id)
-                        (let ((vertex (lookup-vertex id :graph graph)))
+                        (let ((vertex (and (not (and ov
+                                                     (overlay-effective-write
+                                                      ov id)))
+                                           (lookup-vertex id :graph graph))))
                           ;; vertex can be nil if it appears in the
                           ;; type-index before lhash-insert completes
                           ;; (commit race); skip it.
@@ -308,7 +316,17 @@ was reaped; :IF-REAPED :SKIP skips those reads and counts them
                                    :graph graph))))
                   (dolist (tid type-ids)
                     (unless (member tid excluded)
-                      (scan-type-id tid))))
+                      (scan-type-id tid)))
+                  (when ov
+                    ;; Own nodes: no WRITTEN-P yet, so not the index
+                    ;; walk's filter; the deleted filter is OVERLAY-NODES'.
+                    (dolist (vertex (overlay-nodes
+                                     ov :vertex
+                                     (set-difference type-ids excluded)
+                                     :include-deleted-p include-deleted-p))
+                      (if collect-p
+                          (push (funcall fn vertex) result)
+                          (funcall fn vertex)))))
                 (progn
                   ;; fully untyped: live lhash scan (see NOTE), refused
                   ;; under an as-of snapshot (GH #115, R6)

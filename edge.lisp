@@ -488,7 +488,10 @@ was reaped; :IF-REAPED :SKIP skips those reads and counts them
       ;; GH #115 spec §3.3: membership at E is the tombstone walk.  Under
       ;; as-of each index walk visits tombstoned entries too -- every id
       ;; resolves at E, and EMIT's filter runs on THAT version.
-      (let ((as-of (%as-of-snapshot graph)))
+      ;; GH #408: OV as in MAP-VERTICES -- the walks skip an id the open
+      ;; transaction wrote, the overlay supplies its own live edges.
+      (let ((as-of (%as-of-snapshot graph))
+            (ov (current-overlay graph)))
         (flet ((emit (edge)
                  (when (and edge (written-p edge)
                             ;; Explicit :GRAPH, not dynamic *GRAPH* --
@@ -498,6 +501,15 @@ was reaped; :IF-REAPED :SKIP skips those reads and counts them
                    (if collect-p
                        (push (funcall fn edge) result)
                        (funcall fn edge))))
+               (emit-own (edge)
+                 ;; An own edge has no WRITTEN-P until commit.
+                 (when (or include-deleted-p
+                           (active-edge-p edge :graph graph))
+                   (if collect-p
+                       (push (funcall fn edge) result)
+                       (funcall fn edge))))
+               (own-p (eid)
+                 (and ov (overlay-effective-write ov eid)))
                (keep-type (tid)
                  (and (plusp tid) (not (member tid excluded)))))
           (cond
@@ -535,8 +547,15 @@ was reaped; :IF-REAPED :SKIP skips those reads and counts them
                  (let ((il (get-type-index-list (edge-index graph) tid)))
                    (when il
                      (map-index-list
-                      (lambda (eid) (emit (lookup-edge eid :graph graph)))
-                      il :include-deleted-p (not (null as-of))))))))
+                      (lambda (eid)
+                        (unless (own-p eid)
+                          (emit (lookup-edge eid :graph graph))))
+                      il :include-deleted-p (not (null as-of)))))))
+             (when ov
+               (mapc #'emit-own
+                     (overlay-nodes ov :edge
+                                    (remove-if-not #'keep-type type-ids)
+                                    :include-deleted-p include-deleted-p))))
             ;; fully untyped -> live lhash scan (see NOTE); per-edge
             ;; exclude.  Refused under an as-of snapshot (GH #115, R6).
             (t
