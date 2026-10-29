@@ -80,3 +80,57 @@ VALIDATE-WRITES, T in the transaction body (spec §4.6)."
         (is (null seen))
         (setf seen :unset))
       (is (null seen)))))
+
+;;; --- Task 2: layer 1, own writes in the local cache ----------------------
+
+(test ryow-lookup-sees-own-create
+  (ryow-both-caches ()
+    (with-ryow-graph (g)
+      (with-transaction ()
+        (let ((v (make-ryow-node :k "a" :tag "t")))
+          (is (eq v (lookup-vertex (id v))))
+          (is (eq v (lookup-ryow-node (id v)))))))))
+
+(test ryow-lookup-sees-own-save-and-delete
+  (ryow-both-caches ()
+    (with-ryow-graph (g)
+      (let (a e)
+        (with-transaction ()
+          (setf a (make-ryow-node :k "a" :tag "t")
+                e (make-ryow-link :from a :to a)))
+        (with-transaction ()
+          (let ((c (copy (lookup-vertex (id a)))))
+            (setf (ryow-node-k c) "a2")
+            (save c)
+            (is (equal "a2" (ryow-node-k (lookup-vertex (id a))))))
+          (mark-deleted (lookup-edge (id e)))
+          (is (deleted-p (lookup-edge (id e))))
+          (is (null (lookup-ryow-link (id e)))))))))
+
+(test ryow-rollback-and-nesting
+  "A non-local exit leaves nothing; an inner WITH-TRANSACTION (an
+independent commit, #401) does not see the outer's writes."
+  (with-ryow-graph (g)
+    (let (id)
+      (ignore-errors
+       (with-transaction ()
+         (setf id (id (make-ryow-node :k "x" :tag "t")))
+         (error "abort")))
+      (with-transaction () (is (null (lookup-vertex id))))
+      (with-transaction ()
+        (let ((v (make-ryow-node :k "o" :tag "t")))
+          (with-transaction ()
+            (is (null (lookup-vertex (id v))))))))))
+
+(test ryow-switch-off-reads-committed
+  "With *READ-OWN-WRITES* NIL a lookup passes over an own write
+(spec §4.6)."
+  (with-ryow-graph (g)
+    (let (a)
+      (with-transaction () (setf a (make-ryow-node :k "a" :tag "t")))
+      (with-transaction ()
+        (let ((c (copy (lookup-vertex (id a)))))
+          (setf (ryow-node-k c) "a2") (save c)
+          (let ((graph-db::*read-own-writes* nil))
+            (is (equal "a" (ryow-node-k (lookup-vertex (id a))))))
+          (is (equal "a2" (ryow-node-k (lookup-vertex (id a))))))))))

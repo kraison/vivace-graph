@@ -346,9 +346,15 @@ detach aborted and the store resumes its prior accepting state."
       (unless (eq graph txn-graph)
         (error 'cross-graph-transaction-error
                :node id :transaction-graph txn-graph :node-graph graph)))
-    (let ((local-cache (local-cache transaction))
-          (graph-cache (graph-cache transaction)))
-      (let ((local (gethash id local-cache)))
+    (let* ((local-cache (local-cache transaction))
+           (graph-cache (graph-cache transaction))
+           ;; GH #408 layer 1: the transaction's own write of ID sits in
+           ;; LOCAL-CACHE and answers first; with *READ-OWN-WRITES* NIL
+           ;; (underneath a commit view, spec §4.6) it is passed over
+           ;; and left in place.
+           (own (and (not *read-own-writes*)
+                     (%own-write-id-p transaction id))))
+      (let ((local (and (not own) (gethash id local-cache))))
         (if local
             local
             (let ((value (or (gethash id graph-cache)
@@ -381,7 +387,21 @@ detach aborted and the store resumes its prior accepting state."
                   ;; either way.
                   (when *record-reads*
                     (add-to-object-set value (read-set transaction)))
-                  (setf (gethash id local-cache) value)))))))))
+                  (unless own
+                    (setf (gethash id local-cache) value))
+                  value))))))))
+
+(defun %own-write-id-p (tx id)
+  "True when TX's create-set or write-set holds ID (GH #408)."
+  (or (nth-value 1 (gethash id (table (create-set tx))))
+      (nth-value 1 (gethash id (table (write-set tx))))))
+
+(defun %note-own-write (node tx)
+  "Make NODE -- which TX just created, saved or deleted -- what TX's own
+reads of its id return (GH #408 layer 1), and drop the cached overlay."
+  (setf (gethash (id node) (local-cache tx)) node
+        (%overlay-slot tx) nil)
+  node)
 
 (defgeneric write-object (object transaction))
 
@@ -2901,6 +2921,8 @@ suppression onto any OTHER graph committing on the same thread."
   (:method (node graph transaction)
     (add-to-object-set (make-instance 'tx-create :node node)
                        (create-set *transaction*))
+    (when (typep transaction 'tx)
+      (%note-own-write node transaction))
     node))
 
 (defgeneric create-node (node graph)
@@ -3004,6 +3026,8 @@ NEW-NODE was not produced by COPY.")
                                         :node new-node
                                         :old-node old-node)
                          (write-set *transaction*))
+      (when (typep *transaction* 'tx)
+        (%note-own-write new-node *transaction*))
       new-node)))
 
 (defgeneric delete-node (node graph)
@@ -3032,7 +3056,9 @@ stops appearing in queries.  MARK-DELETED is the usual entry point.")
       (add-to-object-set (make-instance 'tx-delete
                                         :old-node old-node
                                         :node new-node)
-                         (write-set *transaction*)))))
+                         (write-set *transaction*))
+      (when (typep *transaction* 'tx)
+        (%note-own-write new-node *transaction*)))))
 
 (defmethod delete-node :around (node graph)
   (ensure-transaction ((transaction-manager graph))
