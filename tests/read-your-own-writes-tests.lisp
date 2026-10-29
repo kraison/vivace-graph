@@ -342,3 +342,26 @@ validator does not see it twice (spec §4.6)."
         (let ((c (copy (first (index-lookup g 'ryow-node 'tag "b")))))
           (setf (ryow-node-tag c) "f") (save c))
         (is (equal '("a" "c" "e" "f") (tags "a" "f")))))))
+
+;;; --- Task 7: OCC (spec §4.5) ----------------------------------------------
+
+(test ryow-own-read-not-in-read-set
+  "Review focus 5: reading an own write adds nothing to the read-set,
+and an unrelated concurrent commit does not force a retry."
+  (with-ryow-graph (g)
+    (let ((attempts 0) a)
+      (with-transaction () (setf a (make-ryow-node :k "a" :tag "t")))
+      (with-transaction ()
+        (incf attempts)
+        (let ((c (copy a))) (setf (ryow-node-k c) "a2") (save c))
+        (lookup-vertex (id a))
+        (is (zerop (graph-db::object-set-count
+                    (graph-db::read-set graph-db::*transaction*))))
+        (when (= attempts 1)
+          (bt:join-thread
+           (bt:make-thread
+            (lambda ()
+              (let ((*graph* g))
+                (with-transaction ()
+                  (make-ryow-node :k "other" :tag "t"))))))))
+      (is (= 1 attempts)))))

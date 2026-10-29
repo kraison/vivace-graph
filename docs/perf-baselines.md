@@ -115,3 +115,15 @@ re-bless to adopt them.
 
 (The perf-suite vs `profiling/` harness split is documented separately —
 GH #255.)
+
+## Cases with a reason of their own
+
+- **`scan-in-tx` against `scan-committed`** (`bench-tx-scan`, GH #408).
+  The same 200 adjacency scans, first inside the transaction that wrote
+  1,000 edges, then after it commits. The gap is the own-write overlay:
+  O(pending writes) per scan in this unit. First measurement, odm, SBCL
+  2.6.6, generation 5, 2026-10-29: 1,695 ops/s in the transaction
+  against 5,263 committed (3.1×). If that ratio grows with the write set
+  in a real workload, the fix is maintained per-transaction buckets
+  behind the same overlay functions (spec 2026-10-29 §6), not a bigger
+  scan.
