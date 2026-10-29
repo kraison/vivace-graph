@@ -15,7 +15,10 @@
 (def-vertex ryow-node ()
   ((k :type string :accessor ryow-node-k)
    (tag :type string :accessor ryow-node-tag :index t))
-  :graph-db-ryow-test)
+  :graph-db-ryow-test
+  ;; The pre-image tests read two versions back; the reaper would
+  ;; otherwise reclaim the older one at the next commit.
+  :keep-revisions 2)
 
 (def-edge ryow-link () () :graph-db-ryow-test)
 
@@ -134,3 +137,67 @@ independent commit, #401) does not see the outer's writes."
           (let ((graph-db::*read-own-writes* nil))
             (is (equal "a" (ryow-node-k (lookup-vertex (id a))))))
           (is (equal "a2" (ryow-node-k (lookup-vertex (id a))))))))))
+
+;;; --- Task 3: copy and delete of an own write chain to the committed
+;;; pre-image (spec §4.4) -----------------------------------------------
+
+(defun ryow-epoch (g)
+  "The last committed epoch of G, for an :AS-OF read of it."
+  (graph-db:latest-epoch g))
+
+(test ryow-copy-of-own-update-chains-to-committed
+  "The archived pre-image of a save-of-a-copy-of-an-own-update is the
+committed version."
+  ;; Two committed versions first: an archived UNCOMMITTED copy still
+  ;; points at the committed data block, so only the version behind it
+  ;; shows the cut chain.
+  (with-ryow-graph (g)
+    (let (a e-v0 e0)
+      (with-transaction () (setf a (make-ryow-node :k "v0" :tag "t")))
+      (setf e-v0 (ryow-epoch g))
+      (with-transaction ()
+        (let ((c (copy a))) (setf (ryow-node-k c) "v1") (save c)))
+      (setf a (lookup-vertex (id a))      ; the live head, not the stale
+            e0 (ryow-epoch g))            ; first object
+      (with-transaction ()
+        (let ((c1 (copy a))) (setf (ryow-node-k c1) "v2") (save c1))
+        (let ((c2 (copy (lookup-vertex (id a)))))
+          (setf (ryow-node-k c2) "v3") (save c2)))
+      (is (equal "v3" (ryow-node-k (lookup-vertex (id a)))))
+      (is (equal "v1" (ryow-node-k (lookup-vertex (id a) :as-of e0))))
+      (is (equal "v0" (ryow-node-k (lookup-vertex (id a) :as-of e-v0)))))))
+
+(test ryow-copy-of-own-create-still-refused
+  (with-ryow-graph (g)
+    (with-transaction ()
+      (let ((v (make-ryow-node :k "a" :tag "t")))
+        (signals graph-db::copying-uncommitted-node
+          (copy (lookup-vertex (id v))))))))
+
+(test ryow-save-then-delete-pre-image
+  "Save then MARK-DELETED of the looked-up copy: the committed index
+entry under the old key is released and the chain is intact (review
+focus 2)."
+  (with-ryow-graph (g)
+    (let (a e0)
+      (with-transaction () (setf a (make-ryow-node :k "a" :tag "old")))
+      (setf e0 (ryow-epoch g))
+      (with-transaction ()
+        (let ((c (copy a)))
+          (setf (ryow-node-tag c) "new" (ryow-node-k c) "a2")
+          (save c))
+        (mark-deleted (lookup-vertex (id a))))
+      ;; Entries, not live nodes: the deleted filter would hide an orphan.
+      (is (= 0 (index-count g 'ryow-node 'tag "old")))
+      (is (= 0 (index-count g 'ryow-node 'tag "new")))
+      (is (equal "a" (ryow-node-k (lookup-vertex (id a) :as-of e0)))))))
+
+(test ryow-copy-of-own-delete-undeletes
+  (with-ryow-graph (g)
+    (let (a)
+      (with-transaction () (setf a (make-ryow-node :k "a" :tag "t")))
+      (with-transaction ()
+        (mark-deleted a)
+        (let ((c (copy (lookup-vertex (id a)))))
+          (setf (deleted-p c) nil) (save c)))
+      (is (lookup-ryow-node (id a))))))

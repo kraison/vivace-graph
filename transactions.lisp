@@ -2952,6 +2952,17 @@ suppression onto any OTHER graph committing on the same thread."
   (ensure-transaction ((transaction-manager graph))
     (call-next-method)))
 
+(defun %committed-pre-image (node tx)
+  "NODE's committed version: the OLD-NODE of TX's update of it when NODE
+is (by EQ) that update's own copy -- what a read inside TX now returns
+(GH #408 layer 1) -- else NODE itself.  A copy or a delete chains to
+this, never to an uncommitted head (spec §4.4; the #135 fault class)."
+  (let ((w (and (typep tx 'tx)
+                (gethash (id node) (table (write-set tx))))))
+    (if (and w (typep w 'tx-update) (eq (node w) node))
+        (old-node w)
+        node)))
+
 (defgeneric copy-node (node)
   (:method ((node node))
     (maybe-init-node-data node)
@@ -2977,7 +2988,8 @@ suppression onto any OTHER graph committing on the same thread."
       ;; re-read from data-pointer (which may be freed by a concurrent commit).
       (setf (bytes new-node) (bytes node))
       (if *transaction*
-          (setf (gethash new-node (copies *transaction*)) node)
+          (setf (gethash new-node (copies *transaction*))
+                (%committed-pre-image node *transaction*))
           (warn 'no-transaction-in-progress-warning))
       new-node)))
 
@@ -3045,13 +3057,14 @@ stops appearing in queries.  MARK-DELETED is the usual entry point.")
       (when (and home (not (eq home txn-graph)))
         (error 'cross-graph-transaction-error
                :node node :transaction-graph txn-graph :node-graph home)))
-    (let ((old-node node)
+    (let ((old-node (%committed-pre-image node *transaction*))
           ;; %COPY, not the public COPY: same dispatch (so an edge's
           ;; FROM/TO/WEIGHT survive), minus the create-set guard -- a node
           ;; created and then MARK-DELETED in this same transaction must
           ;; keep working (GH #135).
           (new-node (%copy node)))
-      (setf (bytes new-node) (bytes old-node))
+      ;; The tombstone carries NODE's bytes, as before the pre-image rule.
+      (setf (bytes new-node) (bytes node))
       (setf (deleted-p new-node) t)
       (add-to-object-set (make-instance 'tx-delete
                                         :old-node old-node
