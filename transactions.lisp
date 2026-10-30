@@ -2963,6 +2963,26 @@ this, never to an uncommitted head (spec §4.4; the #135 fault class)."
         (old-node w)
         node)))
 
+(defun %transaction-pre-image (node tx)
+  "The base a write of NODE chains to under TX: the version TX sees for
+NODE's id -- a lookup inside the transaction, then %COMMITTED-PRE-IMAGE
+of it -- not the object the caller handed in.  That object may be an
+as-of result, a history entry or a head read before TX began
+\(MARK-DELETED's own idiom); basing the write on it archived it over the
+live head and cut the chain (GH #355).  Based on the visible version,
+the save is a proper new revision and a concurrent commit is an OCC
+retry.  NODE itself when TX is not a TX, or when its id resolves to
+nothing in TX's graph (a foreign node, refused later)."
+  (if (typep tx 'tx)
+      (let* ((graph (graph tx))
+             ;; Not a read for OCC: the write set already covers the id,
+             ;; and reading an own write must add nothing (GH #408).
+             (seen (let ((*record-reads* nil))
+                     (lookup-object (id node) (tx-write-table node graph)
+                                    tx graph))))
+        (%committed-pre-image (or seen node) tx))
+      node))
+
 (defgeneric copy-node (node)
   (:method ((node node))
     (maybe-init-node-data node)
@@ -2989,7 +3009,7 @@ this, never to an uncommitted head (spec §4.4; the #135 fault class)."
       (setf (bytes new-node) (bytes node))
       (if *transaction*
           (setf (gethash new-node (copies *transaction*))
-                (%committed-pre-image node *transaction*))
+                (%transaction-pre-image node *transaction*))
           (warn 'no-transaction-in-progress-warning))
       new-node)))
 
@@ -3057,7 +3077,7 @@ stops appearing in queries.  MARK-DELETED is the usual entry point.")
       (when (and home (not (eq home txn-graph)))
         (error 'cross-graph-transaction-error
                :node node :transaction-graph txn-graph :node-graph home)))
-    (let ((old-node (%committed-pre-image node *transaction*))
+    (let ((old-node (%transaction-pre-image node *transaction*))
           ;; %COPY, not the public COPY: same dispatch (so an edge's
           ;; FROM/TO/WEIGHT survive), minus the create-set guard -- a node
           ;; created and then MARK-DELETED in this same transaction must
@@ -3615,11 +3635,11 @@ epoch handed out to ANY store on it."
 
 (defun validate-live-heads (tx graph)
   "Signal STALE-REVISION-ERROR when an update's or delete's OLD-NODE is not
-GRAPH's live head for that id -- a copy of an as-of result, a history entry
-or a head held across a later commit, which the apply would archive over
-the real head (GH #355).  Runs after OCC validation under the manager lock,
-so a mismatch cannot be a concurrent commit.  An id with no head yet (a
-node created and deleted in this transaction) is left alone."
+GRAPH's live head for that id, which the apply would archive over the real
+head (GH #355).  The safety net behind %TRANSACTION-PRE-IMAGE: runs after
+OCC validation under the manager lock, so a mismatch cannot be a
+concurrent commit, and no public path reaches it.  An id with no head yet
+\(a node created and deleted in this transaction) is left alone."
   (dolist (write (writes tx))
     (when (typep write 'tx-update)
       (let* ((old (old-node write))

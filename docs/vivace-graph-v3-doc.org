@@ -3007,7 +3007,7 @@ You do not call the reaper directly; it is automatic. Its only tunable is the re
 
 *** Snapshot-isolation reads
 
-Inside a transaction, a point ~lookup~ (e.g. ~lookup-vertex~, ~lookup-edge~, or a generated ~lookup-<type>~) returns the transaction's own write of that node when it has one (Chapter 5, "What a transaction sees", GH #408) and otherwise the version that was live *as of the transaction's start* — the newest version whose ~commit-epoch~ precedes the transaction's start epoch. An update committed by a *later* transaction is therefore invisible to an in-progress one, and re-reading a node within a transaction is repeatable. The relevant older version is guaranteed to still exist because an open transaction holds the reaper's floor down. Copy from a lookup made *inside* the transaction: a copy of an object read before the transaction began carries that object's version as the update's base, and if another transaction has updated the node meanwhile the commit refuses it with ~stale-revision-error~ rather than writing over the newer head (GH #355). Read inside, and the same situation is an OCC retry that sees the newer version.
+Inside a transaction, a point ~lookup~ (e.g. ~lookup-vertex~, ~lookup-edge~, or a generated ~lookup-<type>~) returns the transaction's own write of that node when it has one (Chapter 5, "What a transaction sees", GH #408) and otherwise the version that was live *as of the transaction's start* — the newest version whose ~commit-epoch~ precedes the transaction's start epoch. An update committed by a *later* transaction is therefore invisible to an in-progress one, and re-reading a node within a transaction is repeatable. The relevant older version is guaranteed to still exist because an open transaction holds the reaper's floor down. A write's *base* is the version the transaction sees for the node's id, whatever object ~copy~ or ~mark-deleted~ was handed: an as-of result, a history entry, or a node read before the transaction began (~mark-deleted~'s own idiom) all produce a proper new revision over the live head, and a concurrent commit is an OCC retry that sees the newer version (GH #355). The commit still refuses a base that is not the live head with ~stale-revision-error~, as a safety net no public path reaches.
 
 #+BEGIN_SRC lisp
   ;; Transaction A reads X, sees its value as of A's start, and keeps seeing
@@ -3057,12 +3057,12 @@ A ~select~ with ~:as-of~ snapshots ~*graph*~ only, exactly as ~:snapshot
 t~ does: a query that touches a second store reads that store *live*
 unless the ~select~ is nested inside that store's own ~with-as-of~.
 
-An as-of result is materialised, so it is safe to *read* after the call
-— but never *save* a copy of one: ~copy-node~ registers the archived
-version as the old node and the commit then archives it over the live
-head, cutting the chain. To restore an old value, read it as of the
-epoch, then copy the *live* node and set its slots from what you read.
-See ~docs/time-travel.md~ for the full API and its bounds.
+An as-of result is materialised, so it is safe to *read* after the call,
+and a copy of it saved inside a transaction is a new revision over the
+live head carrying the old values — the write's base is the version the
+transaction sees for the id, never the object copied (GH #355). That is
+how to restore an old value. See ~docs/time-travel.md~ for the full API
+and its bounds.
 
 *** Migrating an older graph to v3 (~migrate-graph~)
 

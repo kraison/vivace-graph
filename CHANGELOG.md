@@ -527,20 +527,18 @@ between releases; cutting a release renames it to the new version and dates it.
   `403 read-only`, so a mutating route added without the macro is
   refused all the same.
 
-- **A commit refuses to write over the live head from a stale object**
-  (#355). `copy` of an as-of result, a history entry or a head held
-  across a later commit registered that object as the update's old node,
-  and the apply archived it over the real live head: the live data block
-  and head leaked, every version in between dropped out of the chain and
-  the revision went backwards. `mark-deleted` took the same path. After
-  OCC validation, `validate-live-heads` compares each update's old node
-  with the table's head and signals `stale-revision-error` (now with the
-  stale and live revision and epoch) before anything is applied; it is
-  not retried. Copy the live node and set its slots to restore a value.
-  Consequence for concurrent writers: a copy of an object read *before*
-  its transaction began is refused once another transaction has updated
-  that node, where it used to overwrite silently. Read the node inside
-  the transaction, where a concurrent update is an OCC retry.
+- **A write's base is the version the transaction sees, never the object
+  copied** (#355). `copy` and `mark-deleted` registered the object they
+  were handed as the update's old node, and the apply archived it over
+  the live head: from an as-of result, a history entry or a node read
+  before the transaction began (`mark-deleted`'s own idiom), the live
+  data block and head leaked, every version in between dropped out of
+  the chain and the revision went backwards. `%transaction-pre-image`
+  now looks the id up inside the transaction, so every such save is a
+  proper new revision (saving a copy of an as-of result restores it) and
+  a concurrent commit is an OCC retry. `validate-live-heads` stays as a
+  safety net at commit, signalling `stale-revision-error` (now with the
+  stale and live revision and epoch) before anything is applied.
 
 - **Skip list: one cached object per address; writers no longer
   livelock** (#406). Two threads missing the node cache for one address
