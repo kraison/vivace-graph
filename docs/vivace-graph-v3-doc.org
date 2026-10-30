@@ -495,7 +495,7 @@ Beyond the primary UUID→head tables, VivaceGraph maintains *secondary ordered 
 Two interchangeable *backends* implement that abstraction:
 
 - *Skip list* (~skip-list.lisp~) — the default. A probabilistic ordered structure with O(log n) expected operations and simple, lock-friendly concurrency; range scans walk the bottom-level linked list.
-- *B+ tree* (~bplus-tree.lisp~) — a page-oriented alternative (4 KB slotted pages). On disk it beats the skip list on every operation once warm: keys are packed by the page, so a lookup touches far fewer cache lines and disk pages, range scans are sequential within a leaf, and it uses less space. It supports in-place cell edits and merge-on-delete rebalancing.
+- *B+ tree* (~bplus-tree.lisp~) — a page-oriented alternative (4 KB slotted pages), opt-in. It wins point lookup, range scan and space: keys are packed by the page, so a lookup touches far fewer cache lines and disk pages, and range scans are sequential within a leaf. It loses on insert and remove (whole-page read-modify-write; several times slower in the 2026-07 measurements, ~docs/bplus-tree-experiment.md~), and through the spatial index, whose many short per-cell prefix scans pay cursor setup each time, so prefer ~:skip-list~ for spatial-heavy graphs. It supports in-place cell edits and merge-on-delete rebalancing; the concurrency audit items (vivace-graph#319) closed in 2026-10.
 
 Both implement the same internal ordered-map protocol, so views, unique indexes and the spatial index are all *backend-agnostic* — the choice is transparent to your application code.
 
@@ -809,6 +809,47 @@ so the commit path counts an own edge once. A scan inside a transaction
 costs O(pending writes) extra; ~docs/perf-baselines.md~ has the number.
 Design: ~docs/superpowers/specs/2026-10-29-read-your-own-writes-design.md~.
 
+*** The transaction contract, in five rules (GH #401)
+
+The whole of what a caller may rely on, gathered in one place; each rule
+points at the section that explains it.
+
+1. *A transaction is one ~with-transaction~; nesting does not flatten.* A
+   nested ~with-transaction~ opens an independent transaction that commits
+   on its own, and its writes survive a rollback of the outer one. The
+   write operations -- ~make-<type>~, ~save~, ~mark-deleted~ -- join an
+   ambient transaction when one is open and wrap their own otherwise;
+   ~copy~ and ~save~ require one. The atomic unit is therefore one
+   ~with-transaction~ whose body calls the write operations directly; a
+   helper that opens its own ~with-transaction~ is a separate commit.
+
+2. *Validation is write-set driven.* A commit conflicts with another
+   transaction that committed during its lifetime and wrote a node this
+   one read or wrote ("Read/Write Sets and Validation"). An empty write set
+   never conflicts. Two transactions with disjoint write sets never
+   conflict, so OCC cannot catch a phantom or a write skew: two
+   transactions that each create a child under the same parent both
+   commit. To make them conflict, copy and save the parent in each.
+
+3. *A transaction reads what it will commit.* Its own creates, updates
+   and deletes are seen through lookups, the typed and adjacency scans,
+   ~edge-exists-p~, the secondary, unique, count, spatial and vector
+   index reads ("What a transaction sees", above). Committed-only, by
+   design: views, and the fully untyped ~map-vertices~ / ~map-edges~
+   scans. A write's base is the version the transaction sees for the
+   node's id, whatever object was copied (GH #355).
+
+4. *~with-read-snapshot~ is the consistent read, and it nests by
+   inheriting.* Every read inside it resolves at one epoch; an inner
+   snapshot of the same graph inherits the outer one, the opposite of
+   ~with-transaction~. It is the tool for a consistent export or report.
+   Index membership under it is live, not versioned (GH #345).
+
+5. *A committed write is durable without a snapshot.* The store is
+   memory-mapped and the commit writes through; the transaction log is
+   for replicas and recovery. ~snapshot~ is a separate backup
+   (Chapter 11), not part of durability.
+
 *** Locking and Concurrency (~rw-lock.lisp~)
 
 While the transactional system uses an optimistic model for application-level data, the database still relies on low-level locks to protect the integrity of its own internal data structures. VivaceGraph implements a custom, fair *Read-Write Lock*, defined in ~rw-lock.lisp~.
@@ -1102,6 +1143,8 @@ Let's create a simple predicate `(divisible-by ?x ?y)` that succeeds if the numb
           ;; Success! Call the continuation to proceed with the query.
           (funcall cont)))))
 #+END_SRC
+
+One rule for the body: never wrap ~(funcall cont)~ in ~handler-case~ or any other catch-all. The continuation runs every later goal of the query, so an error raised there — including the resource and permission refusals of the guarded runners — would be swallowed and turn into a silent non-match. Guard only the functor's own computation, and call ~cont~ outside the handler.
 
 Now we can use this new predicate directly in any query, just like a built-in one.
 
@@ -2952,6 +2995,11 @@ function carries either source straight to v3 in one call; it is a logical
 snapshot-and-replay, described in full in Chapter 12, "MVCC: Immutable
 Versioned Nodes," under "Migrating an older graph to v3."
 
+A source already in the current format is accepted too, which makes
+~migrate-graph~ a logical copy: the way to import a store into another
+system directory. Pass ~:renumber-p t~ so the copy's type-ids come from the
+destination's registry.
+
 ** Chapter 12: MVCC — Immutable Versioned Nodes
 
 VivaceGraph took early design inspiration from CouchDB, including its idea of keeping previous revisions of a document around rather than overwriting them in place. The MVCC release makes good on that idea: every update or delete now writes a *new* version of a node and *retains* the old one, chained together, until a background reaper decides it is safe to reclaim. This chapter explains how that works and the knobs you have for controlling it.
@@ -3888,6 +3936,10 @@ rather than the bare symbol name; ~:~ is not a reserved character, so a
 consumer treats the whole field as one opaque string. Qualifying by
 package is what lets two same-named types from two different packages
 share one wire table without colliding.
+
+Two facts a decoder of that table must build in. Vertex and edge type-ids come from separate counters, so one integer routinely names both a vertex type and an edge type: key on (kind, id), never on the id alone. And ~def-vertex~ accepts several superclasses (single inheritance is a convention), so the ~supers~ field is a list.
+
+Node data travels as an alist of ~(:slot . value)~ pairs, serialized as the list it is. Because ~(:k . nil)~ is ~(:k)~ and ~(:k . (a b))~ is ~(:k a b)~, a non-Lisp decoder must accept three shapes for one entry: a dotted pair (an atom value), a one-element list (the value NIL), and a longer list (a list value).
 
 **What the table contains changed with GH #186: it is the IMAGE's type
 registry, not the hub graph's schema — narrowed again to the hub's own
@@ -6735,7 +6787,7 @@ This chapter provides a categorized reference for the most important exported sy
   Constructor functions automatically generated by ~def-vertex~ and ~def-edge~. Use these to create new nodes within a transaction. For example, `(make-user :name "Alice")`.
 
 - ~lookup-vertex (id &key graph)~ ::
-  Retrieves a vertex object from the database given its 16-byte UUID or string representation.
+  Retrieves a vertex object from the database given its 16-byte UUID or string representation. The per-graph node cache is keyed by id alone, so given an edge's id this can return that cached edge; when the kind of an id is unknown, branch on the returned object's class (GH #271).
 
 - ~lookup-edge (id &key graph)~ ::
   Retrieves an edge object from the database given its ID.

@@ -99,6 +99,33 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Changed
 
+- **`tests/README.md` records the test-writing traps** (#398): a spliced
+  body breaks a leading `declare` (wrap it in `locally`), a piped SBCL
+  loses the suite's exit status, and ECL's `random` is deterministic per
+  process.
+
+- **Ten engine facts moved from a private notes store into the docs**
+  (#403): the release flow (`docs/ci.md`, "Cutting a release"); the B+
+  tree's standing (manual Chapter 3 and the experiment doc's Verdict);
+  the functor rule never to wrap `(funcall cont)` in a handler
+  (Chapter 7); type-ids per kind, list-valued supers and the three
+  shapes of an alist entry on the peer wire (Chapter 16); the node cache
+  keyed by id alone (`lookup-vertex` in the API reference);
+  `migrate-graph` as a logical copy of a current-format store
+  (Chapters 11 and the docstring); running on ECL and CCL
+  (`tests/README.md`); and the reverted 2026-06-04 CCL rw-lock trial
+  (`docs/concurrency-scaling-investigation.md`). `docs/ci.md` no longer
+  names the runner host.
+
+- **Manual Chapter 5 states the transaction contract in five rules**
+  (#401): one `with-transaction` is the atomic unit and nesting does not
+  flatten; validation is write-set driven, so phantoms and write skew
+  pass unless the parent is written; a transaction reads what it will
+  commit, with views and the untyped scans committed-only; a read
+  snapshot nests by inheriting and is the consistent read; a committed
+  write is durable without a snapshot. `docs/codebase-notes.md` points
+  at it.
+
 - **A malformed instant is an error, not an empty answer** (#388):
   `claim-valid-at/2` (and the new instant functors) signal
   `query-precondition-error` -- `prolog-ill-typed-error` through the

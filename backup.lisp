@@ -370,7 +370,10 @@ recorded location is stale after the copy and OPEN-LHASH resets it
   "Migrate a pre-current (v1 or v2) graph at OLD-LOCATION to the current (v3)
 on-disk format at NEW-LOCATION, returning (values NEW-GRAPH UNIFIED) -- the
 new, open graph, and (under :RENUMBER-P T) the types whose several ids were
-unified into one.
+unified into one.  A source already in the current format is accepted
+too: that makes this a logical copy, the way to import a store into
+another system directory (pass :RENUMBER-P T so type-ids come from the
+destination's registry).
 
 Migration is a logical snapshot + replay: OLD-LOCATION's own stamped storage
 version is read first, so the old graph is opened read-only with the head

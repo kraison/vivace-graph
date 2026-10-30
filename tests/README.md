@@ -59,3 +59,36 @@ the checkout you mean with `CL_SOURCE_REGISTRY`, e.g.:
 CL_SOURCE_REGISTRY='(:source-registry (:tree "/path/to/your/checkout/") :inherit-configuration)' \
   tests/replication/run-replication-test.sh
 ```
+
+## Running on ECL and CCL
+
+Neither is release-gating (CLAUDE.md); both are run in dedicated
+sessions. Recorded 2026-10-07 from those runs (GH #403):
+
+- **ECL.** Warm the FASL cache once from a real TTY (`ssh -tt`, or
+  `script`) before any redirected or `nohup` run: a cold build under
+  redirect fails in `run-program` with ":OUTPUT argument ... does not
+  have a file handle". Run under a pty. ECL buffers output, so a frozen
+  log does not show the current test; attach `gdb` to find it. Raise the
+  GC heap cap first: `(ext:set-limit 'ext:heap-size 0)`.
+- **CCL (Linux only).** Run with `< /dev/null` and a hard `timeout`: on
+  error CCL drops to a stdin listener, and an EOF'd listener exits 0, so
+  a crash would read as success. Keep driver scripts out of `/tmp`
+  (unverified: this looks like the `TEMPORARY-FILES:` logical pathname).
+
+## Test-writing traps
+
+Recorded from a private notes store (GH #398); CLAUDE.md holds the
+engine traps, these are the ones a test author meets.
+
+- **A `with-*` test macro that splices its body after another form
+  breaks a leading `(declare (ignore ...))`** in that body: the declare
+  is no longer at the head of a body. Wrap the spliced body in
+  `(locally ,@body)`.
+- **Drive the suite so its exit status survives.** The runners quit
+  through `uiop:quit` with the code (`tests/run-suite.sh`); a shell that
+  pipes SBCL's output (`sbcl ... | tee log`) reports the pipe's status,
+  not SBCL's, unless `set -o pipefail` is on. CI gates on that status.
+- **ECL's `random` is deterministic per process:** two runs draw the
+  same sequence, so a test that relies on random keys differing between
+  processes must seed `*random-state*` itself.
