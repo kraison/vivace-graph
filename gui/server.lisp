@@ -107,9 +107,47 @@ the limit is ~D" length *max-request-body-bytes*))))))))
 
 (defun %request-path (env)
   "The URI path the client sent, before any mount stripped its prefix:
-:REQUEST-URI minus the query string."
-  (let ((uri (or (getf env :request-uri) "")))
-    (subseq uri 0 (or (position #\? uri) (length uri)))))
+:REQUEST-URI minus the query string and minus an absolute-form scheme
+and authority.  hunchentoot strips those from its script name but hands
+the request URI over raw, so GET http://evil.example/gui used to put
+that host in the redirect's Location: an open redirect behind any proxy
+hop (GH #386).  The mount middleware drops the prefix from :PATH-INFO
+without recording it, so the path cannot be rebuilt from there."
+  (let* ((uri (or (getf env :request-uri) ""))
+         (path (subseq uri 0 (or (position #\? uri) (length uri))))
+         (scheme-end (search "://" path)))
+    (if (and scheme-end
+             (< 0 scheme-end 6)
+             (every #'alpha-char-p (subseq path 0 scheme-end)))
+        (let ((slash (position #\/ path :start (+ scheme-end 3))))
+          (if slash (subseq path slash) "/"))
+        path)))
+
+(defun %read-only-response ()
+  "403 read-only in the GUI's own {error, message} shape, built by hand
+because this answers from the dispatcher, before ningle (GH #386)."
+  (list 403
+        (list :content-type "application/json; charset=utf-8")
+        (list (json:with-explicit-encoder
+                (json:encode-json-to-string
+                 (list :object
+                       (cons :error "read-only")
+                       (cons :message "This GUI is read-only; only ~
+reads are served")))))))
+
+(defparameter *read-only-post-routes* '("query" "prolog")
+  "The /api/graphs/:name/<verb> POST routes a read-only GUI still
+serves: JSON-bodied reads that never write (GH #278, #279).")
+
+(defun %read-route-p (path)
+  "True when PATH is one of *READ-ONLY-POST-ROUTES* under /api/graphs/."
+  (let ((parts (split-sequence:split-sequence #\/ path
+                                              :remove-empty-subseqs t)))
+    (and (= 4 (length parts))
+         (string= "api" (first parts))
+         (string= "graphs" (second parts))
+         (member (fourth parts) *read-only-post-routes* :test #'string=)
+         t)))
 
 (defun %slash-redirect (env)
   "301 to the request path plus a trailing slash, or NIL when it has
@@ -150,6 +188,14 @@ outcome that is already safe."
     (cond
       ((and (integerp length) (> length *max-request-body-bytes*))
        (%too-large-response length))
+      ;; :READ-ONLY is a dispatch rail, not a per-handler courtesy
+      ;; (GH #386): nothing but GET, HEAD and the two JSON-bodied
+      ;; reads gets past here, so a mutating route added without
+      ;; WITH-WRITE-VERB is refused all the same.
+      ((and *read-only*
+            (not (member (getf env :request-method) '(:get :head)))
+            (not (%read-route-p path)))
+       (%read-only-response))
       ((and (member (getf env :request-method) '(:get :head))
             (not (eql 0 (search "/api/" path))))
        (or (and (string= path "/") (%slash-redirect env))
@@ -221,8 +267,9 @@ running its own listener mounts it under a prefix (GH #384):
 
 ALLOW-PROLOG opens the free-text Prolog endpoint: T for every request,
 or a function of the clack ENV, decided per request -- how a host
-admits the workbench for some visitors only.  READ-ONLY refuses the
-open/close verbs with 403 read-only and says so in /api/capabilities.
+admits the workbench for some visitors only.  READ-ONLY refuses every
+request but GET, HEAD and the query and Prolog POSTs with 403 read-only
+at dispatch (GH #386), and says so in /api/capabilities.
 Both are bound around each request, so an outer binding of
 *ALLOW-PROLOG* is shadowed: pass a function instead."
   (let ((ningle-fn (lack.component:to-app (%make-gui-app))))

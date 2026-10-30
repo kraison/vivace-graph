@@ -135,9 +135,20 @@ RECREATE-GRAPH's :PACKAGE-NAME."
     (t object)))
 
 (defun write-backup-plist (plist stream)
-  "Print PLIST as one readable snapshot line on STREAM."
-  (let ((*print-pretty* nil))
-    (format stream "~S~%" (backup-literalize plist))))
+  "Print PLIST as one readable snapshot line on STREAM.
+
+Printed under standard syntax, not the caller's: a caller's print level or
+length wrote # and ... into the recovery file, and a non-default float format
+demoted every double on the way back in (GH #354).  Three deliberate
+deviations: the caller's *PACKAGE* (symbols print relative to it, as
+RECREATE-GRAPH's :PACKAGE-NAME expects), *PRINT-READABLY* NIL (see the header
+of transaction-restore.lisp) and *PRINT-PRETTY* NIL."
+  (let ((package *package*))
+    (with-standard-io-syntax
+      (let ((*package* package)
+            (*print-readably* nil)
+            (*print-pretty* nil))
+        (format stream "~S~%" (backup-literalize plist))))))
 
 (defmethod backup :around ((node node) location &key include-deleted-p)
   (when (or include-deleted-p (not (deleted-p node)))

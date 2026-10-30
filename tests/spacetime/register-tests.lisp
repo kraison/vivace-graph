@@ -952,6 +952,36 @@ follow (design §4).  This branch runs on every re-ingest."
       (is (= 0.9d0 (claim-confidence c))
           "and its CONFIDENCE with it"))))
 
+(test re-registering-an-unchanged-node-does-not-mint-a-version
+  "GH #395: a second pass with nothing changed leaves the claim's
+revision and commit epoch alone, so an epoch watermark does not see
+every re-registered subject as changed; a pass that changes a value
+still writes.  The control: the same two accessors move on the third
+pass."
+  (with-region-graph (g)
+    (%make-place g "p-a" +ctr-square+)
+    (let ((n (%make-record g "s-7" (make-point 1d0 1d0))))
+      (register-node n :graph g)
+      (let* ((c1 (first (%subject-claims g :ctr-records "s-7")))
+             (rev1 (graph-db:revision c1))
+             (epoch1 (claim-commit-epoch c1)))
+        (is-true epoch1 "precondition: the first pass committed")
+        (multiple-value-bind (written evaluated) (register-node n :graph g)
+          (is-true evaluated)
+          (is (= 1 written) "the unchanged claim still counts"))
+        (let ((c2 (first (%subject-claims g :ctr-records "s-7"))))
+          (is (= rev1 (graph-db:revision c2))
+              "an unchanged re-registration minted revision ~A over ~A"
+              (graph-db:revision c2) rev1)
+          (is (eql epoch1 (claim-commit-epoch c2))
+              "an unchanged re-registration moved the commit epoch"))
+        (let ((*ctr-confidence* 0.9d0))
+          (register-node n :graph g))
+        (let ((c3 (first (%subject-claims g :ctr-records "s-7"))))
+          (is (= 0.9d0 (claim-confidence c3)))
+          (is (> (graph-db:revision c3) rev1) "a changed value still writes")
+          (is (> (claim-commit-epoch c3) epoch1)))))))
+
 (test a-moved-subject-re-registers-with-the-new-fraction
   "⚠ FRACTION is what the update branch exists for: a re-ingest whose
 geometry was corrected must overwrite the stored share, not keep the one

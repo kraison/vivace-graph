@@ -209,27 +209,56 @@ subject are few (design §4)."
                                   '(subject-namespace subject-key)
                                   (list subject-ns subject-key))))
 
+(defun %registration-unchanged-p (claim registration facet precision
+                                  confidence method)
+  "True when CLAIM is current and already carries every value this scan
+would write, so saving it would only mint a version (GH #395)."
+  (and (claim-current-p claim)
+       (equal method (claim-method claim))
+       (equal (getf facet :rule-version) (claim-rule-version claim))
+       (eql confidence (claim-confidence claim))
+       (eql precision (claim-precision-m claim))
+       (eql (getf registration :fraction) (claim-fraction claim))
+       (eq :inferred (claim-standing claim))))
+
 (defun %update-registration-claim (existing registration facet precision
                                    confidence method)
-  "Rewrite EXISTING with this scan's values, in its own transaction.  The
-COPY is INSIDE the transaction or SAVE signals MODIFYING-NON-COPY.
+  "Rewrite EXISTING with this scan's values, in its own transaction, or
+return it unsaved when nothing would change: an unchanged nightly
+re-registration must not mint a version and move CLAIM-COMMIT-EPOCH
+under an epoch watermark (GH #395).
+
+EXISTING was read outside any transaction; it is re-read INSIDE this one,
+so a concurrent registration of the same subject is an OCC retry that
+sees the winner's version, not a stale copy the commit refuses
+(GH #355, #161).  The COPY is inside the transaction or SAVE signals
+MODIFYING-NON-COPY.
 
 A RETRACTED claim (GH #162) is RE-OPENED with a fresh stamp: the fact is
 asserted again as of now, and the closed period it replaces survives only
 in MVCC -- #148's recorded limitation, no retention of superseded
 periods, not a new one."
-  (graph-db:with-transaction ()
-    (let ((c (graph-db:copy existing)))
-      (setf (claim-method c) method
-            (claim-rule-version c) (getf facet :rule-version)
-            (claim-confidence c) confidence
-            (claim-precision-m c) precision
-            (claim-fraction c) (getf registration :fraction)
-            (claim-standing c) :inferred)
-      (unless (claim-current-p c)
-        (setf (claim-transaction-extent-sexp c)
-              (extent->sexp (%open-transaction-extent (%st-now)))))
-      (graph-db:save c))))
+  (if (%registration-unchanged-p existing registration facet precision
+                                 confidence method)
+      existing
+      (graph-db:with-transaction ()
+        (let ((live (or (graph-db:lookup-vertex (graph-db:id existing))
+                        existing)))
+          (if (%registration-unchanged-p live registration facet precision
+                                         confidence method)
+              live
+              (let ((c (graph-db:copy live)))
+                (setf (claim-method c) method
+                      (claim-rule-version c) (getf facet :rule-version)
+                      (claim-confidence c) confidence
+                      (claim-precision-m c) precision
+                      (claim-fraction c) (getf registration :fraction)
+                      (claim-standing c) :inferred)
+                (unless (claim-current-p c)
+                  (setf (claim-transaction-extent-sexp c)
+                        (extent->sexp
+                         (%open-transaction-extent (%st-now)))))
+                (graph-db:save c)))))))
 
 (defun %retract-left-regions (facet subject-ns subject-key keep-keys
                               registry-graph)

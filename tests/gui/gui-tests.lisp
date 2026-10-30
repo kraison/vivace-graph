@@ -1495,22 +1495,44 @@ accumulate names that no longer exist and quietly stop meaning ~
 anything.~%~%~A"
           (length removed) removed (%inventory-guidance)))
 
+(defparameter *reviewed-spacetime-functor-inventory*
+  '("claimed/4"
+    "object-of/2"
+    "object-of/3"
+    "related/3"
+    "subject-of/2"
+    "subject-of/3")
+  "The functors graph-db/spacetime registers on top of the engine's:
+RELATED/3 and CLAIMED/4 (spacetime/functors.lisp, GH #367) and the
+edge functors DEF-EDGE generates for its two linking edge classes
+(claim.lisp).  Reviewed as the list above is: each takes nodes, a
+relation string or a claim, never a goal, so none reaches %SOLVE.
+Expected only in an image that has loaded spacetime: this suite does
+not, a service image running it may (GH #379).")
+
+(defun %expected-functor-inventory ()
+  "The reviewed inventory for THIS image: the engine's list, plus the
+spacetime list when that system is loaded."
+  (if (find-package "GRAPH-DB.SPACETIME")
+      (append *reviewed-functor-inventory*
+              *reviewed-spacetime-functor-inventory*)
+      *reviewed-functor-inventory*))
+
 (test prolog-functor-inventory-is-pinned
   "⚠ TRIPWIRE, not a behaviour test.  The guard's whitelist grows with
 the engine automatically; its exclusion lists do not.  This fails the
 moment the set of registered functors changes, so a newly added
 meta-calling predicate cannot reach free text unreviewed (GH #279)."
   (let* ((actual (registered-functor-inventory))
-         (added (sort (set-difference actual *reviewed-functor-inventory*
-                                      :test #'string=)
+         (expected (%expected-functor-inventory))
+         (added (sort (set-difference actual expected :test #'string=)
                       #'string<))
-         (removed (sort (set-difference *reviewed-functor-inventory*
-                                        actual :test #'string=)
+         (removed (sort (set-difference expected actual :test #'string=)
                         #'string<)))
     (is (null added) "~A" (%added-functor-message added))
     (is (null removed) "~A" (%removed-functor-message removed))
     ;; A passing run still says what it checked.
-    (is (= (length *reviewed-functor-inventory*) (length actual)))))
+    (is (= (length expected) (length actual)))))
 
 ;;; ---------------------------------------------------------------------
 ;;; Cost-unbounded predicates, and the error contract's own leaks
@@ -2214,6 +2236,70 @@ mount only from a directory URL.  The standalone / never redirects."
       (declare (ignore json ctype))
       (is (= 200 status))
       (is (search "VivaceGraph GUI" raw)))))
+
+(test mount-redirect-never-names-a-host
+  "GH #386: a request in absolute form -- GET http://evil.example/gui --
+is redirected to the PATH /gui/, never to the host the request line
+named.  hunchentoot strips the authority from its script name but
+leaves the request URI raw, which is where the redirect was built from:
+an open redirect for every proxy hop.  drakma sends absolute form when
+the GUI is its proxy."
+  (with-mounted-gui ()
+    (multiple-value-bind (body status headers)
+        (drakma:http-request "http://evil.example/gui"
+                             :proxy (list "127.0.0.1" *gui-test-port*)
+                             :redirect nil)
+      (declare (ignore body))
+      (is (= 301 status))
+      (is (equal "/gui/" (cdr (assoc :location headers)))
+          "Location was ~S" (cdr (assoc :location headers))))
+    (multiple-value-bind (body status headers)
+        (drakma:http-request "http://evil.example/gui?graph=x"
+                             :proxy (list "127.0.0.1" *gui-test-port*)
+                             :redirect nil)
+      (declare (ignore body))
+      (is (= 301 status))
+      (is (equal "/gui/?graph=x" (cdr (assoc :location headers)))))))
+
+(test read-only-is-a-dispatch-rail
+  "GH #386: on a read-only GUI every request that is not GET or HEAD is
+refused at dispatch -- 403 read-only, the same body the verbs answer --
+unless it is on the read list: the query and Prolog endpoints, POSTs
+that never write.  So a mutating route added without WITH-WRITE-VERB is
+still refused.  An unrouted POST is 404 when the GUI is not read-only."
+  (with-gui-fixture ()
+    (with-mounted-gui (:read-only t)
+      (multiple-value-bind (json status)
+          (gui-request "/gui/api/graphs/gui-test-graph/frobnicate"
+                       :method :post :content "{}")
+        (is (= 403 status))
+        (is (string= "read-only" (jref json :error))))
+      (multiple-value-bind (json status)
+          (gui-request "/gui/api/graphs/gui-test-graph/query"
+                       :method :post
+                       :content "{\"match\":[{\"vertex\":\"?p\",
+                                   \"type\":\"gui-person\"}],
+                       \"select\":[\"?p\"]}")
+        (is (= 200 status) "the read list admits the query endpoint")
+        (is (null (jref json :error))))
+      (multiple-value-bind (json status)
+          (gui-request "/gui/api/graphs/gui-test-graph/prolog"
+                       :method :post :content "{\"query\":\"\"}")
+        (is (= 403 status))
+        (is (string= "prolog-disabled" (jref json :error))
+            "the read list admits the Prolog endpoint; its own flag refuses")))
+    (with-mounted-gui ()
+      (multiple-value-bind (json status)
+          (gui-request "/gui/api/graphs/gui-test-graph/frobnicate"
+                       :method :post :content "{}")
+        (declare (ignore json))
+        (is (= 404 status) "not read-only: an unrouted POST is a 404")))
+    (with-gui-server (:read-only t)
+      (multiple-value-bind (json status)
+          (gui-request "/api/graphs/gui-test-graph/frobnicate"
+                       :method :post :content "{}")
+        (is (= 403 status))
+        (is (string= "read-only" (jref json :error)))))))
 
 (test frontend-urls-are-prefix-relative
   "No frontend source names an asset or API path from the site root:

@@ -13,6 +13,20 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Added
 
+- **`tests/load-examples.sh`, and a CI lane that runs it** (#417): each
+  loadable example is loaded in a fresh image with a private scratch
+  directory, and any unhandled condition fails the run. Both examples
+  take their scratch root from `GRAPH_DB_EXAMPLE_ROOT` when set, else
+  `/var/tmp/` as before, so two users on one host (a developer and the
+  CI runner) never collide. CLAUDE.md's "smoke-tested by loading them in
+  a fresh image" now names the gate that exists.
+
+- **Two tests pin that a view added to a graph with data is backfilled**
+  (#402): defined against the open graph, or registered while the graph
+  is closed and reconciled at the next open. The manual's views chapter
+  now says so, and names the one way to get an empty view: a `def-view`
+  whose graph name is not the name the graph is open under.
+
 - **`reset-vector-segment`: drop a `:vector-index` slot's segment so the
   next write recreates it at its own dimension** (#365). An emptied
   segment kept its dimension on disk and across a reopen, so re-embedding
@@ -468,6 +482,93 @@ between releases; cutting a release renames it to the new version and dates it.
   `docs/ci.md` has the numbers and the trade.
 
 ### Fixed
+
+- **Claim namespaces carry a canonical `:check`** (#327).
+  `canonical-namespace-p`, exported beside the relation and producer
+  predicates, admits a keyword whose name is uppercase `[A-Z0-9-]+`,
+  the only spelling the identity key's downcased encoding reads back as
+  the same keyword; both namespace slots check it at commit. Stored
+  claims are unaffected.
+
+- **The GUI suite's functor tripwire knows spacetime's two functors**
+  (#379): `related/3` and `claimed/4` are expected exactly when the
+  spacetime package is loaded, so a service image running the suite
+  alongside spacetime no longer trips it and the plain image is
+  unchanged.
+
+- **`register-node` leaves an unchanged claim alone** (#395). The
+  update branch copied and saved the existing claim on every pass, so a
+  nightly re-registration minted a new version and commit epoch for
+  every subject and an epoch watermark saw everything as changed.
+  `%update-registration-claim` returns the claim unsaved when it is
+  current and every value this scan would write is already there, and
+  re-reads it inside its own transaction before writing, so a
+  concurrent registration of one subject is an OCC retry rather than a
+  stale copy the commit now refuses (#355).
+
+- **The Prolog engine resolves functors under any `*print-case*` or
+  `*print-base*`** (#342). `make-functor-symbol` spelled `NAME/ARITY`
+  through `~A`, so a caller with `:downcase` bound minted `claim/7`
+  where `CLAIM/7` was registered and every goal evaluated at request
+  time (rules, the guarded runner, the query DSL) was refused as an
+  unknown functor. The name is now built from `symbol-name` and a
+  decimal arity, in `make-functor-symbol` and `new-interned-symbol`
+  alike.
+
+- **A view no longer resolves its nodes through `lookup-<class>` by
+  name** (#399). `def-view` recorded that symbol and `map-view` called
+  it per entry, so an application function of the same name silently
+  took the view over and was handed raw ids. `map-view` now reads
+  through `lookup-vertex` or `lookup-edge` by the view's class; the
+  recorded symbol stays in the persisted view record, inert, so no
+  existing view rebuilds. `:include-deleted-p` on `map-view` works as
+  documented as a result: the generated helper had hidden deleted nodes
+  before the flag could see them.
+
+- **GUI mount: the trailing-slash redirect never names a host, and
+  `:read-only` is a dispatch rail** (#386). The 301 for a bare mount
+  root was built from the raw request URI, so an absolute-form request
+  (`GET http://evil.example/gui`, the shape proxies send) answered
+  `Location: http://evil.example/gui/`, an open redirect; the scheme
+  and authority are now stripped the way hunchentoot strips them from
+  its script name. `:read-only` used to be `with-write-verb` on the two
+  management handlers; `%gui-dispatch` now refuses every request that
+  is not GET, HEAD or the query and Prolog POSTs with the same
+  `403 read-only`, so a mutating route added without the macro is
+  refused all the same.
+
+- **A write's base is the version the transaction sees, never the object
+  copied** (#355). `copy` and `mark-deleted` registered the object they
+  were handed as the update's old node, and the apply archived it over
+  the live head: from an as-of result, a history entry or a node read
+  before the transaction began (`mark-deleted`'s own idiom), the live
+  data block and head leaked, every version in between dropped out of
+  the chain and the revision went backwards. `%transaction-pre-image`
+  now looks the id up inside the transaction, so every such save is a
+  proper new revision (saving a copy of an as-of result restores it) and
+  a concurrent commit is an OCC retry. `validate-live-heads` stays as a
+  safety net at commit, signalling `stale-revision-error` (now with the
+  stale and live revision and epoch) before anything is applied.
+
+- **Skip list: one cached object per address; writers no longer
+  livelock** (#406). Two threads missing the node cache for one address
+  both built a node object and both installed it, so a splice through
+  one left the other's forward pointers stale; a writer walking the
+  stale one found the removed node, failed validation (or
+  `ok-to-delete-p`) and retried the same walk forever. The cache now
+  keeps the first object, and add and remove re-read their
+  predecessors' pointers before judging, so a writer heals from any
+  stale array. Found and fixed first in vivace-cabinet (3c97bd8).
+
+- **A snapshot no longer depends on the caller's printer or reader
+  state** (#354). `write-backup-plist` printed under whatever
+  `*print-level*`, `*print-length*`, `*print-base*` and
+  `*read-default-float-format*` the caller had bound, so a snapshot
+  taken over SWANK by a client with print limits wrote `#` and `...`
+  into the recovery file and reported success, and a double-float
+  default demoted every double on replay. Writer and reader now run
+  under `with-standard-io-syntax`, keeping only the caller's package
+  (and the restore readtable on the way in).
 
 - **Vector segments: a rebuild or close cannot unmap a segment a scan
   still holds, and a rebuild never empties the table** (#54).

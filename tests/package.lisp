@@ -255,6 +255,7 @@
                 #:with-as-of                 ; GH #115
                 #:latest-epoch
                 #:as-of-refused
+                #:stale-revision-error
                 #:as-of-refused-reason
                 #:as-of-skipped-count
                 #:version-reaped-error

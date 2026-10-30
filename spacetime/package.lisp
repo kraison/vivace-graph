@@ -66,6 +66,7 @@
    #:transaction-extent-immutable
    #:claims-by-producer #:delete-claims-by-producer   ; GH #145
    #:canonical-relation-p #:canonical-producer-p      ; GH #160
+   #:canonical-namespace-p                             ; GH #327
    #:transaction-extent-step                           ; GH #158
    ;; membership disjointness (GH #157 4b)
    #:def-disjoint-membership #:undef-disjoint-membership

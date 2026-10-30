@@ -2,12 +2,18 @@
 (in-package :graph-db)
 
 (defvar *graph-name* :test-graph)
-(defvar *graph-path* "/var/tmp/test-graph/")
+;; Scratch goes under GRAPH_DB_EXAMPLE_ROOT when set (tests/load-examples.sh
+;; gives each run a private directory), else /var/tmp/.
+(defvar *example-root*
+  (or (uiop:getenv "GRAPH_DB_EXAMPLE_ROOT") "/var/tmp/"))
+(defvar *graph-path* (concatenate 'string *example-root* "test-graph/"))
 ;; Type-ids come from the registry in *SYSTEM-DIRECTORY*; a store cannot be
 ;; opened without one (GH #186).
 (setf *system-directory*
-      (namestring (ensure-directories-exist "/var/tmp/test-graph-system/")))
-(log:config :all :sane :d :nopretty :thread :daily "/var/tmp/graph.log")
+      (namestring (ensure-directories-exist
+                   (concatenate 'string *example-root* "test-graph-system/"))))
+(log:config :all :sane :d :nopretty :thread :daily
+            (concatenate 'string *example-root* "graph.log"))
 
 ;;; Types
 (defun email-p (x)

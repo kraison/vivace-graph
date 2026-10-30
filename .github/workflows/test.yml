@@ -180,6 +180,13 @@ jobs:
                             :ignore-inherited-configuration))' \
             --eval '(ql:quickload :graph-db/gui-test :silent t)' \
             --eval '(asdf:test-system :graph-db/gui-test)'
+      # The two loadable examples, each in a fresh image with its
+      # /var/tmp scratch cleared first (GH #417): a wrong call in an
+      # example is only ever caught by loading it.
+      - name: examples load in a fresh image
+        run: |
+          CL_SOURCE_REGISTRY="$PWD//:$HOME/ci-deps-vivace-graph/cl-temporal-extent/:" \
+            tests/load-examples.sh
 
   arm64-advisory:
     # horus, when awake: an advisory lane whose value is exactly the
