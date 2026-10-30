@@ -70,11 +70,12 @@ signals; an oldest entry with `revision` above 0 means the chain was cut.
 
 ## Bounds
 
-An as-of result is safe to **read** after the call, not to save. Saving a
-copy of one corrupts the version chain: `copy-node` registers the archived
-version as the old node, and the commit then archives that archived head
-over the live head. To restore an old value, read it as of the epoch, then
-copy the **live** node and set its slots from what you read.
+An as-of result is safe to **read** after the call, not to save. A commit
+whose copy (or `mark-deleted`) came from an archived version, or from a
+head held across a later commit, signals `stale-revision-error` before
+anything is applied (#355); it is not retried. To restore an old value,
+read it as of the epoch, then copy the **live** node and set its slots
+from what you read.
 
 - Value indexes (slot indexes, the spacetime endpoint and producer
   indexes) keep live membership (#345): a node hard-removed from one

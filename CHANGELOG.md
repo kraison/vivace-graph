@@ -461,6 +461,17 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Fixed
 
+- **A commit refuses to write over the live head from a stale object**
+  (#355). `copy` of an as-of result, a history entry or a head held
+  across a later commit registered that object as the update's old node,
+  and the apply archived it over the real live head: the live data block
+  and head leaked, every version in between dropped out of the chain and
+  the revision went backwards. `mark-deleted` took the same path. After
+  OCC validation, `validate-live-heads` compares each update's old node
+  with the table's head and signals `stale-revision-error` (now with the
+  stale and live revision and epoch) before anything is applied; it is
+  not retried. Copy the live node and set its slots to restore a value.
+
 - **Skip list: one cached object per address; writers no longer
   livelock** (#406). Two threads missing the node cache for one address
   both built a node object and both installed it, so a splice through

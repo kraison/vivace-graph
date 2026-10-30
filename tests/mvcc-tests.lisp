@@ -949,3 +949,78 @@ newest first."
       (is (equal (mapcar #'cdr (vertex-history g aid))
                  (mapcar #'cdr (node-history (lookup-vertex aid)))))
       (is (= 1 (length (edge-history g eid :limit 1)))))))
+
+;;; ---------------------------------------------------------------------------
+;;; GH #355: saving a copy of a stale version must be refused at commit.
+;;;
+;;; COPY-NODE registers whatever object it copied as the update's old node,
+;;; and APPLY-TX-WRITE archives that old node and writes over the live head.
+;;; Copied from an as-of result, a history entry or a head held across a
+;;; later commit, that overwrote the live head without archiving it: blocks
+;;; leaked, the chain lost every version in between, the revision went
+;;; backwards.  The commit path now compares each update's old node with
+;;; the live head and signals STALE-REVISION-ERROR, applying nothing.
+;;; ---------------------------------------------------------------------------
+
+(defun %chain-of (g id)
+  "The (revision . commit-epoch) list of ID's retained versions, newest
+first, with the live revision first in the pair list."
+  (mapcar (lambda (p) (cons (graph-db::revision (car p)) (cdr p)))
+          (vertex-history g id)))
+
+(test saving-a-copy-of-an-as-of-version-is-refused
+  "GH #355: COPY of an as-of result, SAVE: STALE-REVISION-ERROR at commit;
+the live value, revision and history are untouched."
+  (with-kept-graph (g 3)
+    (let (id e1)
+      (setq e1 (%epoch-of
+                (lambda () (setq id (id (make-g-person :name "p" :age 0))))))
+      (bump-age id 5)
+      (bump-age id 6)
+      (let ((before (%chain-of g id))
+            (old (lookup-vertex id :as-of e1)))
+        (is (= 0 (slot-value old 'age)) "precondition: the E1 version")
+        (signals stale-revision-error
+          (with-transaction ()
+            (let ((c (copy old)))
+              (setf (slot-value c 'age) 99)
+              (save c))))
+        (is (= 6 (slot-value (lookup-vertex id) 'age)) "live value kept")
+        (is (equal before (%chain-of g id)) "history unchanged")))))
+
+(test deleting-an-as-of-version-is-refused
+  "GH #355: MARK-DELETED of an as-of result takes the same stale pre-image
+and is refused the same way."
+  (with-kept-graph (g 3)
+    (let (id e1)
+      (setq e1 (%epoch-of
+                (lambda () (setq id (id (make-g-person :name "p" :age 0))))))
+      (bump-age id 5)
+      (let ((before (%chain-of g id))
+            (old (lookup-vertex id :as-of e1)))
+        (signals stale-revision-error
+          (with-transaction () (mark-deleted old)))
+        (is-true (lookup-vertex id) "the live node is still there")
+        (is (equal before (%chain-of g id)) "history unchanged")))))
+
+(test saving-a-copy-of-a-head-held-across-a-commit-is-refused
+  "GH #355, the pre-#115 form: a live object held while a later
+transaction updates the node is stale too.  Sequential transactions never
+conflict under OCC, so only the head comparison catches it."
+  (with-kept-graph (g 3)
+    (let (id)
+      (with-transaction ()
+        (setq id (id (make-g-person :name "p" :age 0))))
+      (let ((held (lookup-vertex id)))
+        (bump-age id 5)
+        (let ((before (%chain-of g id)))
+          (signals stale-revision-error
+            (with-transaction ()
+              (let ((c (copy held)))
+                (setf (slot-value c 'age) 99)
+                (save c))))
+          (is (= 5 (slot-value (lookup-vertex id) 'age)) "live value kept")
+          (is (equal before (%chain-of g id)) "history unchanged")
+          ;; Control: a copy of the LIVE node still saves.
+          (bump-age id 7)
+          (is (= 7 (slot-value (lookup-vertex id) 'age))))))))

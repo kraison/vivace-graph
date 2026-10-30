@@ -3613,6 +3613,29 @@ epoch handed out to ANY store on it."
     (error "Transaction ~A is not active" tx))
   (setf (state tx) :aborted))
 
+(defun validate-live-heads (tx graph)
+  "Signal STALE-REVISION-ERROR when an update's or delete's OLD-NODE is not
+GRAPH's live head for that id -- a copy of an as-of result, a history entry
+or a head held across a later commit, which the apply would archive over
+the real head (GH #355).  Runs after OCC validation under the manager lock,
+so a mismatch cannot be a concurrent commit.  An id with no head yet (a
+node created and deleted in this transaction) is left alone."
+  (dolist (write (writes tx))
+    (when (typep write 'tx-update)
+      (let* ((old (old-node write))
+             (head (let ((*graph* graph))
+                     (lookup-node (tx-write-table write graph)
+                                  (id old) graph))))
+        (when (and (node-p head)
+                   (or (/= (revision head) (revision old))
+                       (/= (commit-epoch head) (commit-epoch old))))
+          (error 'stale-revision-error
+                 :instance (string-id old)
+                 :stale-revision (revision old)
+                 :stale-epoch (commit-epoch old)
+                 :current-revision (revision head)
+                 :current-epoch (commit-epoch head)))))))
+
 (defmethod %commit ((tx tx))
   (when (eql (state tx) :active)
     (let ((tm (transaction-manager tx))
@@ -3636,6 +3659,9 @@ epoch handed out to ANY store on it."
                (setf (finish-tx-id tx) (tm-current-epoch tm))
                (unless (validate tx)
                  (error 'validation-conflict :transaction tx))
+               ;; After OCC, so a mismatch is a stale object, never a
+               ;; concurrent commit (GH #355).
+               (validate-live-heads tx (graph tx))
                ;; The validators compose their own overlay over committed
                ;; state, so they read with the engine's off (GH #408,
                ;; spec §4.6).

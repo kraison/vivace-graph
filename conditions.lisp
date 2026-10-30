@@ -161,11 +161,22 @@ registry's ids on the wire while shipping the store's.  Reconcile it first ~
 
 (define-condition stale-revision-error (error)
   ((instance :initarg :instance)
-   (current-revision :initarg :current-revision))
+   (current-revision :initarg :current-revision)
+   (stale-revision :initarg :stale-revision :initform nil)
+   (current-epoch :initarg :current-epoch :initform nil)
+   (stale-epoch :initarg :stale-epoch :initform nil))
+  (:documentation "A write whose old node is not the live head: a copy of
+an as-of result, a history entry, or a head held across a later commit
+(GH #355).  Signalled at commit, before anything is applied; not retried.")
   (:report (lambda (error stream)
-             (with-slots (instance current-revision) error
-               (format stream "Attempt to update stale revision ~S of ~S."
-                       instance current-revision)))))
+             (with-slots (instance current-revision stale-revision
+                          current-epoch stale-epoch)
+                 error
+               (format stream "Attempt to update ~A from stale revision ~A ~
+(epoch ~A); the live head is revision ~A (epoch ~A).  Copy the LIVE node ~
+and set its slots from what you read."
+                       instance stale-revision stale-epoch
+                       current-revision current-epoch)))))
 
 (define-condition duplicate-key-error (error)
   ((instance :initarg :instance)
