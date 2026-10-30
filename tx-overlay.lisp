@@ -11,13 +11,15 @@
 
 (in-package #:graph-db)
 
-(defstruct (tx-overlay (:constructor %make-tx-overlay (writes)))
-  "WRITES: an id table, id -> the TX-WRITE that wins for that id."
-  writes)
+(defstruct (tx-overlay (:constructor %make-tx-overlay (writes ordered)))
+  "WRITES: an id table, id -> the TX-WRITE that wins for that id.
+ORDERED: every write in apply order, creates first (GH #411)."
+  writes ordered)
 
 (defun %build-overlay (tx)
-  (let ((h (make-id-table)))
-    (dolist (w (writes tx) (%make-tx-overlay h))
+  (let ((h (make-id-table))
+        (ordered (writes tx)))
+    (dolist (w ordered (%make-tx-overlay h ordered))
       (setf (gethash (id w) h) w))))
 
 (defun overlay-of (tx)
@@ -32,6 +34,13 @@
 (defun overlay-effective-write (ov id)
   "The TX-WRITE that wins for ID under OV, or NIL."
   (values (gethash id (tx-overlay-writes ov))))
+
+(defun overlay-writes (ov)
+  "Every TX-WRITE under OV in apply order, a create then a delete of
+one id both present.  For a reader that must predict the apply pass
+write for write -- the count index's counters -- where the id table's
+one effective write per id would hide the create (GH #411)."
+  (tx-overlay-ordered ov))
 
 (defun own-write-p (tx id)
   "True when TX has written ID."

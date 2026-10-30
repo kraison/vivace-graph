@@ -24,6 +24,13 @@
 
 (def-index ryow-node (k tag) :graph-db-ryow-test)
 
+(defun ryow-counted-p (node)
+  "The CURRENT-P of the test count index: a node tagged \"x\" is not."
+  (not (equal (ryow-node-tag node) "x")))
+
+(def-count-index ryow-node (k tag) :graph-db-ryow-test
+  :name ryow-count :current-p ryow-counted-p)
+
 (defmacro with-ryow-graph ((g) &body body)
   "A fresh on-disk graph with *GRAPH* bound to it, closed on exit."
   (let ((dir (gensym "DIR")))
@@ -452,6 +459,42 @@ prefix shared by a committed row and an own row once."
             "a :start at the prefix only the deleted row held"))
       (is (equal '(("0") ("1") ("3") ("5")) (walk 1))
           "the same once committed"))))
+
+(test ryow-count-index-reflects-own-writes
+  "GH #411: COUNT-INDEX-LOOKUP and MAP-COUNT-INDEX inside a transaction
+answer what it will commit: a create adds at every prefix (CURRENT by
+the predicate), a moved tuple leaves the old name and arrives under the
+new, a delete leaves, a name whose ALL falls to 0 is dropped and a new
+name lands at its place in the order."
+  (with-ryow-graph (g)
+    (flet ((pair (tuple)
+             (multiple-value-list
+              (count-index-lookup g 'ryow-node '(k tag) tuple)))
+           (names (&key (depth 1) prefix)
+             (let ((out '()))
+               (map-count-index (lambda (c a n) (push (list c a n) out))
+                                g 'ryow-node '(k tag)
+                                :depth depth :prefix prefix)
+               (nreverse out))))
+      (with-transaction ()
+        (make-ryow-node :k "1" :tag "a") (make-ryow-node :k "2" :tag "b"))
+      (with-transaction ()
+        (make-ryow-node :k "3" :tag "a")
+        (make-ryow-node :k "4" :tag "x")
+        (let ((c (copy (first (index-lookup g 'ryow-node 'tag "b")))))
+          (setf (ryow-node-tag c) "c") (save c))
+        (mark-deleted (first (index-lookup g 'ryow-node 'tag "a")))
+        (is (equal '(1 1) (pair '("3"))) "a create counts, and is current")
+        (is (equal '(1 0) (pair '("4"))) "a create the predicate rejects")
+        (is (equal '(0 0) (pair '("1"))) "a delete leaves")
+        (is (equal '(1 1) (pair '("2" "c"))) "a moved tuple arrives")
+        (is (equal '(0 0) (pair '("2" "b"))) "and leaves its old name")
+        (is (equal '((("2") 1 1) (("3") 1 1) (("4") 1 0)) (names))
+            "depth 1: \"1\" dropped, \"3\" and \"4\" merged in order")
+        (is (equal '((("2" "c") 1 1)) (names :depth 2 :prefix '("2")))))
+      (is (equal '((("2") 1 1) (("3") 1 1) (("4") 1 0)) (names))
+          "the same once committed")
+      (is (equal '(0 0) (pair '("1")))))))
 
 ;;; --- Task 7: OCC (spec §4.5) ----------------------------------------------
 

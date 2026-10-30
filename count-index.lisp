@@ -621,14 +621,45 @@ Signals on more than the arity."
                              (length vals))))
     (when (or any (< (length vals) arity)) key)))
 
+(defun overlay-count-delta (ov cix depth prefix)
+  "What the open transaction's writes add to CIX at DEPTH under PREFIX
+\(a canonical component list, NIL for every entry): an EQUAL table,
+components -> (D-ALL . D-CURRENT), the apply pass's arithmetic
+\(APPLY-TX-WRITE-TO-COUNT-INDEXES) run over OVERLAY-WRITES write for
+write.  Bounded by the write set (GH #411; spacetime's #361 delta,
+made general)."
+  (let ((delta (make-hash-table :test 'equal))
+        (owner (count-index-owner-name cix)))
+    (flet ((bump (node d-all d-current)
+             (when (typep node owner)
+               (let ((tuple (%count-tuple cix node)))
+                 (when (and tuple
+                            (every #'equal prefix tuple))
+                   (let* ((comps (subseq tuple 0 depth))
+                          (cell (or (gethash comps delta)
+                                    (setf (gethash comps delta)
+                                          (cons 0 0)))))
+                     (incf (car cell) d-all)
+                     (incf (cdr cell) d-current)))))))
+      (dolist (w (overlay-writes ov) delta)
+        ;; The new version arrives, the old one leaves, and a deleted
+        ;; new version only leaves.
+        (let ((new (node w))
+              (old (and (typep w 'tx-update) (old-node w))))
+          (unless (or (typep w 'tx-delete) (deleted-p new))
+            (bump new 1 (%current-p cix new)))
+          (when old
+            (bump old -1 (- (%current-p cix old)))))))))
+
 (defun count-index-lookup (graph class-name slot-name tuple)
   "(VALUES ALL CURRENT) for TUPLE -- a full tuple or a leading prefix --
 in the count index on CLASS-NAME.SLOT-NAME.  ALL is 0 for an absent
 name or an all-null full tuple, and CURRENT is NIL whenever the index
 has no CURRENT-P; a declared-but-unbuilt index answers 0 0, having no
-map to ask.  Signals QUERY-PRECONDITION-ERROR when none is declared.
-Trap: live at commit granularity; a re-apply is repaired by a rebuild
-first (GH #361)."
+map to ask.  Inside an open transaction the pair is what it will
+commit: the committed pair plus OVERLAY-COUNT-DELTA (GH #411).  Signals
+QUERY-PRECONDITION-ERROR when none is declared.  Trap: live at commit
+granularity; a re-apply is repaired by a rebuild first (GH #361)."
   (let ((*graph* graph))
     (%count-refresh graph)
     (let ((cix (%require-count-index graph class-name slot-name)))
@@ -638,16 +669,21 @@ first (GH #361)."
           ;; index too, so a caller need not know whether the key
           ;; happens to exist to read the pair (GH #361).
           (let ((zero (and (count-index-current-p cix) 0))
-                (key (%count-query-key cix tuple)))
+                (key (%count-query-key cix tuple))
+                (ov (current-overlay graph)))
             (if (null key)
                 (values 0 zero)
-                (let ((node (find-in-skip-list
-                             (count-index-skip-list cix)
-                             (cons (length key) key))))
-                  (if (null node)
-                      (values 0 zero)
-                      (let ((v (%sn-value node)))
-                        (values (car v) (cdr v)))))))))))
+                (let* ((node (find-in-skip-list
+                              (count-index-skip-list cix)
+                              (cons (length key) key)))
+                       (v (and node (%sn-value node)))
+                       (d (and ov (gethash key (overlay-count-delta
+                                                ov cix (length key)
+                                                key)))))
+                  (values (+ (if v (car v) 0) (if d (car d) 0))
+                          (and (count-index-current-p cix)
+                               (+ (if v (or (cdr v) 0) 0)
+                                  (if d (cdr d) 0)))))))))))
 
 (defun map-count-index (fn graph class-name slot-name
                         &key (depth 1) prefix)
@@ -655,10 +691,12 @@ first (GH #361)."
 count index on CLASS-NAME.SLOT-NAME whose leading components equal
 PREFIX -- a component LIST at every arity, arity 1 included, unlike
 COUNT-INDEX-LOOKUP's TUPLE -- in index order, a null component read back
-as NIL.  Zero calls
-for a declared-but-empty index; signals when none is declared, or on a
-DEPTH or PREFIX beyond the arity.  Trap: not an atomic snapshot, live at
-commit granularity (GH #361)."
+as NIL.  Zero calls for a declared-but-empty index; signals when none is
+declared, or on a DEPTH or PREFIX beyond the arity.  Inside an open
+transaction the entries are those it will commit: OVERLAY-COUNT-DELTA
+adjusts each committed pair, drops one whose ALL falls to 0 and merges
+in a new entry at its place in the order (GH #411).  Trap: not an
+atomic snapshot, live at commit granularity (GH #361)."
   (let ((*graph* graph))
     (%count-refresh graph)
     (let ((cix (%require-count-index graph class-name slot-name)))
@@ -681,9 +719,39 @@ depth ~D" (length pre) depth)))
                                (make-list (- depth (length pre))
                                           :initial-element +max-sentinel+)))
                    (cur (make-range-cursor (count-index-skip-list cix)
-                                           lo hi)))
-              (loop for node = (cursor-next cur :eoc)
-                    until (eql node :eoc)
-                    do (let ((k (%sn-key node)) (v (%sn-value node)))
-                         (funcall fn (%ix-prefix-out (rest k) depth)
-                                  (car v) (cdr v)))))))))))
+                                           lo hi))
+                   (ov (current-overlay graph))
+                   ;; GH #411: the transaction's own adjustments, in
+                   ;; the map's own order, merged in below.
+                   (pending
+                     (and ov
+                          (let ((out '()))
+                            (maphash (lambda (k d) (push (cons k d) out))
+                                     (overlay-count-delta ov cix depth pre))
+                            (sort out #'%index-value-lessp :key #'car)))))
+              (labels ((emit (comps all cur)
+                         (when (plusp all)
+                           (funcall fn (%ix-prefix-out comps depth) all
+                                    (and (count-index-current-p cix) cur))))
+                       (emit-own-before (comps)
+                         ;; Every pending entry sorting before COMPS --
+                         ;; all of them when COMPS is NIL -- is a name
+                         ;; the transaction introduces.
+                         (loop while (and pending
+                                          (or (null comps)
+                                              (%index-value-lessp
+                                               (car (first pending)) comps)))
+                               do (let ((e (pop pending)))
+                                    (emit (car e) (cadr e) (cddr e))))))
+                (loop for node = (cursor-next cur :eoc)
+                      until (eql node :eoc)
+                      do (let* ((k (rest (%sn-key node)))
+                                (v (%sn-value node))
+                                (d (progn
+                                     (emit-own-before k)
+                                     (and pending
+                                          (equal (car (first pending)) k)
+                                          (cdr (pop pending))))))
+                           (emit k (+ (car v) (if d (car d) 0))
+                                 (+ (or (cdr v) 0) (if d (cdr d) 0)))))
+                (emit-own-before nil)))))))))
