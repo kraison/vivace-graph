@@ -467,6 +467,16 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Fixed
 
+- **`register-node` leaves an unchanged claim alone** (#395). The
+  update branch copied and saved the existing claim on every pass, so a
+  nightly re-registration minted a new version and commit epoch for
+  every subject and an epoch watermark saw everything as changed.
+  `%update-registration-claim` returns the claim unsaved when it is
+  current and every value this scan would write is already there, and
+  re-reads it inside its own transaction before writing, so a
+  concurrent registration of one subject is an OCC retry rather than a
+  stale copy the commit now refuses (#355).
+
 - **The Prolog engine resolves functors under any `*print-case*` or
   `*print-base*`** (#342). `make-functor-symbol` spelled `NAME/ARITY`
   through `~A`, so a caller with `:downcase` bound minted `claim/7`
@@ -508,6 +518,10 @@ between releases; cutting a release renames it to the new version and dates it.
   with the table's head and signals `stale-revision-error` (now with the
   stale and live revision and epoch) before anything is applied; it is
   not retried. Copy the live node and set its slots to restore a value.
+  Consequence for concurrent writers: a copy of an object read *before*
+  its transaction began is refused once another transaction has updated
+  that node, where it used to overwrite silently. Read the node inside
+  the transaction, where a concurrent update is an OCC retry.
 
 - **Skip list: one cached object per address; writers no longer
   livelock** (#406). Two threads missing the node cache for one address
