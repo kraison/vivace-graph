@@ -75,3 +75,20 @@ sessions. Recorded 2026-10-07 from those runs (GH #403):
   error CCL drops to a stdin listener, and an EOF'd listener exits 0, so
   a crash would read as success. Keep driver scripts out of `/tmp`
   (unverified: this looks like the `TEMPORARY-FILES:` logical pathname).
+
+## Test-writing traps
+
+Recorded from a private notes store (GH #398); CLAUDE.md holds the
+engine traps, these are the ones a test author meets.
+
+- **A `with-*` test macro that splices its body after another form
+  breaks a leading `(declare (ignore ...))`** in that body: the declare
+  is no longer at the head of a body. Wrap the spliced body in
+  `(locally ,@body)`.
+- **Drive the suite so its exit status survives.** The runners quit
+  through `uiop:quit` with the code (`tests/run-suite.sh`); a shell that
+  pipes SBCL's output (`sbcl ... | tee log`) reports the pipe's status,
+  not SBCL's, unless `set -o pipefail` is on. CI gates on that status.
+- **ECL's `random` is deterministic per process:** two runs draw the
+  same sequence, so a test that relies on random keys differing between
+  processes must seed `*random-state*` itself.

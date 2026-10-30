@@ -77,6 +77,11 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Changed
 
+- **`tests/README.md` records the test-writing traps** (#398): a spliced
+  body breaks a leading `declare` (wrap it in `locally`), a piped SBCL
+  loses the suite's exit status, and ECL's `random` is deterministic per
+  process.
+
 - **Ten engine facts moved from a private notes store into the docs**
   (#403): the release flow (`docs/ci.md`, "Cutting a release"); the B+
   tree's standing (manual Chapter 3 and the experiment doc's Verdict);
