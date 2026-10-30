@@ -21,7 +21,7 @@ Dependencies (bordeaux-threads, alexandria, cffi, uuid, cl-store, hunchentoot, n
 
 **Component load order matters.** `graph-db.asd` encodes a strict dependency chain from the storage primitives up to the query/REST layers; if you add a file, place it in the right position and declare its `:depends-on`.
 
-`examples/example.lisp` is the canonical end-to-end walkthrough (schema definition → views → ordered/unique/vector indexes → transactional inserts → queries → spatial) and is the best starting point for understanding the public API. `examples/example-spacetime.lisp` walks the spacetime claim subsystem; `examples/runtime-schema-example.lisp` documents runtime-defined types (it is documentation, not loadable). Both loadable examples are smoke-tested by `tests/load-examples.sh`, which loads each in a fresh image with its `/var/tmp` scratch cleared first; CI runs it on every push (#417).
+`examples/example.lisp` is the canonical end-to-end walkthrough (schema definition → views → ordered/unique/vector indexes → transactional inserts → queries → spatial) and is the best starting point for understanding the public API. `examples/example-spacetime.lisp` walks the spacetime claim subsystem; `examples/runtime-schema-example.lisp` documents runtime-defined types (it is documentation, not loadable). Both loadable examples are smoke-tested by `tests/load-examples.sh`, which loads each in a fresh image with a private scratch directory (`GRAPH_DB_EXAMPLE_ROOT`, which the examples honour; `/var/tmp/` by hand); CI runs it on every push (#417).
 
 `docs/codebase-notes.md` is the short version for writing code here: the core idioms, the efficient choice for each common access and its cost, and links to the traps. A test keeps every name it gives true.
 
@@ -175,4 +175,4 @@ Each graph is a directory. `make-graph`/`open-graph` create/expect: `heap.dat`, 
 
 - The compatibility note in `README.md` (2016-12-12) records a breaking change to the UUID/hash scheme: graphs created before commit `58f87d6` are incompatible and must be re-loaded via snapshot + `replay`.
 - Concurrency uses bordeaux-threads plus a custom `rw-lock.lisp` (SBCL/LispWorks/ECL; CCL uses its native `make-read-write-lock` via shims in `utilities.lisp`); per-class and per-view rw-locks are managed via `with-write-locked-class` / `with-read-locked-class` / `with-*-locked-view-group`.
-- Logging is log4cl (`log:info`, `log:error`, …); `examples/example.lisp` shows configuring it to `/var/tmp/graph.log`.
+- Logging is log4cl (`log:info`, `log:error`, …); `examples/example.lisp` shows configuring it to `graph.log` under its scratch root (`/var/tmp/` by default).
