@@ -76,9 +76,14 @@ never the object copied, so the save is a new revision over the live head
 carrying the old values, chain intact (#355). That is how to restore an
 old value. `mark-deleted` of one deletes the live node the same way.
 
-- Value indexes (slot indexes, the spacetime endpoint and producer
-  indexes) keep live membership (#345): a node hard-removed from one
-  after the epoch is not enumerated from it.
+- Value indexes (slot indexes, the unique index, the spacetime endpoint
+  and producer indexes) keep live membership: an entry is released when
+  the delete or update is applied, not when the version it indexed is
+  reaped. So at an epoch before such a write the node is not found
+  under the value it had then. A read never answers a node under a
+  value its resolved version lacks: `index-lookup`, `map-index` and
+  `unique-lookup` check the version against the key (#345). Versioned
+  membership is phase C-1's epoch-stamped entries (#113).
 - Cost: membership at an epoch walks every entry ever indexed under a
   type, including tombstones, and resolves each id. Phase C-1 (#113)
   replaces that walk with epoch-stamped index entries; the API above

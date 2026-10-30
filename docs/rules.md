@@ -362,10 +362,10 @@ step is resolving an id it has already found. So under a read snapshot
 a claim inserted after it is correctly invisible -- and a claim deleted
 after it is invisible too, though the snapshot's epoch predates the
 delete. Not new with a scope: equally true of a single-store run
-(recon note O1). Read out of the code, not out of a live scenario --
-the note flags it as not adversarially settled, so verify by test
-before relying on it in either direction; kraison/vivace-graph#345
-tracks settling it.
+(recon note O1). Settled by test (kraison/vivace-graph#345): the
+index-backed read also checks the resolved version against the key, so
+a claim re-indexed after the snapshot is never answered under its new
+value with its old version. Versioned membership is #113's scope.
 
 **A cross-store evaluation runs under no transaction at all.**
 `run-rule` opens its write transaction only after the body has been

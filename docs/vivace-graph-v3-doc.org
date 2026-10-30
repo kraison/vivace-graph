@@ -1735,6 +1735,10 @@ A value is indexed only if it is a ~(simple-array single-float (*))~. Anything e
 
 **** Migrating an existing corpus
 
+A segment is safe to replace under readers: ~rebuild-vector-segment~ registers its finished replacement before closing the old one, a close waits for any scan in flight, and a reader that still holds a closed segment gets ~segment-closed~ and re-fetches (vivace-graph#54). A rebuild still needs no concurrent *writers*: run it with write traffic stopped.
+
+A segment's dimension is fixed when its first vector is written and kept even when every vector is cleared, so re-embedding with a model of another width needs ~reset-vector-segment~ (vivace-graph#365): clear the slot on every live node and commit, then ~(reset-vector-segment *graph* 'document 'embedding)~ drops the segment and its file; the next conforming write recreates it at the new width. It refuses with ~vector-segment-in-use~ while a live node still holds a vector.
+
 Because maintenance is on the apply path, nodes written *before* you added the ~:vector-index~ declaration were never indexed. Fill them in with ~rebuild-vector-segment-batched~, which sweeps live nodes and *adds* what is missing without disturbing what is already there:
 
 #+BEGIN_SRC lisp
@@ -5968,8 +5972,9 @@ graph — rather than answering from its private counter, while ~:as-of~
 on the same store keeps working. One of ~:as-of~ or ~:as-of-epoch~, not
 both. An uncommitted write has no epoch, so ~:as-of-epoch~ answers
 committed history only, as ~:as-of~ does. Index membership is not
-versioned (vivace-graph#345): a claim deleted after the epoch is not
-returned. A claim whose transaction period was already closed when it
+versioned (vivace-graph#345): a claim deleted or re-keyed after the epoch
+is not returned under the value it had then, and never under one its
+version at the epoch lacks; versioned membership is phase C-1 (#113). A claim whose transaction period was already closed when it
 was created — a replicated or restored belief retracted upstream —
 reads as retracted at every epoch. ~claims-by-producer~ takes
 ~:as-of-epoch~ the same way.

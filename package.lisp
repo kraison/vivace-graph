@@ -206,6 +206,9 @@
            #:rebuild-vector-segment-batched
            #:segment-scan
            #:segment-score-subset
+           #:segment-closed                     ; GH #54
+           #:reset-vector-segment               ; GH #365
+           #:vector-segment-in-use
            ;; Presize a segment's capacity up front (GH #170 Task 5) -- turns
            ;; a mid-apply VECTOR-SEGMENT-CAPACITY-EXHAUSTED into an upfront one.
            #:presize-vector-segment

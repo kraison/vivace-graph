@@ -27,6 +27,14 @@ between releases; cutting a release renames it to the new version and dates it.
   now says so, and names the one way to get an empty view: a `def-view`
   whose graph name is not the name the graph is open under.
 
+- **`reset-vector-segment`: drop a `:vector-index` slot's segment so the
+  next write recreates it at its own dimension** (#365). An emptied
+  segment kept its dimension on disk and across a reopen, so re-embedding
+  with a model of another width had no supported route. The reset
+  refuses with `vector-segment-in-use` while any live node of the owner
+  holds a vector, runs under the transaction manager's lock, and closes
+  the old segment the #54 way, so a scan in flight finishes first.
+
 - **`unique-lookup`: a public read of unique-index membership, and
   `find-by-unique/4` in Prolog** (#415). The live node holding a value
   under a `:unique` slot or a `def-unique` tuple, or NIL, with the
@@ -561,6 +569,53 @@ between releases; cutting a release renames it to the new version and dates it.
   default demoted every double on replay. Writer and reader now run
   under `with-standard-io-syntax`, keeping only the caller's package
   (and the restore readtable on the way in).
+
+- **Vector segments: a rebuild or close cannot unmap a segment a scan
+  still holds, and a rebuild never empties the table** (#54).
+  `close-vector-segment` takes the segment's write lock, so a scan in
+  flight finishes first; `segment-scan`, `segment-get` and
+  `segment-score-subset` signal the new `segment-closed` on an object
+  closed under them instead of reading unmapped memory, and
+  `vector-search` re-fetches the live segment once. `rebuild-vector-
+  segment` builds the replacement at a temporary path, renames and
+  registers it, then closes the old one. In the test, a search loop
+  during rebuilds used to fault the image; it now always answers.
+
+- **B+ tree: an update holds one lock; a cursor crosses leaves by key**
+  (#319). `update-in-skip-list` took the write lock twice, for its
+  remove and its add, and a concurrent reader found the key absent in
+  between (2,591 misses in 5,000 updates in the test); it now holds the
+  lock across both. A cursor followed the sibling link copied with its
+  page, which a merge could free and a later allocation reuse: it then
+  read another part of the tree and skipped keys. It now re-seeks from
+  the root past the last key it emitted at every crossing. The audit's
+  claim that the tree's read-write lock is not reentrant was wrong: the
+  write side re-enters for its holder on every implementation.
+
+- **B+ tree: a full page splits by bytes, not by entry count** (#404).
+  Split at the middle entry, a page of small entries could not take
+  large ones: the larger half did not fit, the encode returned NIL, the
+  write signalled a type error and the new right page leaked. The split
+  index is now where the accumulated cell bytes reach half, and both
+  halves are checked to encode before either is written.
+
+- **B+ tree: removing a key together with its value matches** (#405).
+  The stored value was compared serialized, with `equal`, which never
+  matches two octet vectors, so the value-qualified
+  `remove-from-skip-list` was a no-op on this backend. The stored value
+  is deserialized and compared with the tree's `value-equal`, as the
+  skip list compares values. Latent: nothing in the engine calls that
+  form on a B+ tree.
+
+- **An index-backed read under a snapshot never answers a node under a
+  value its version lacks** (#345). Index membership is released when a
+  write is applied, not when the version it indexed is reaped, so a
+  read snapshot could find a node under its new value and resolve the
+  old version. `index-lookup`, `map-index` and `unique-lookup` now check
+  the resolved version against the key. The other half, a node no
+  longer found under the value it had at the snapshot, is documented
+  (`docs/time-travel.md`) and is phase C-1's versioned membership
+  (#113).
 
 - **Index reads on a declared index no commit has built yet see the
   transaction's own writes** (#416). `index-lookup`, `map-index` /

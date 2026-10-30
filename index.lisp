@@ -1051,6 +1051,19 @@ is nothing to read on either side; signals as %REQUIRE-INDEX does."
       (and (current-overlay graph)
            (%overlay-only-index graph class-name slot-name))))
 
+(defun %index-hit-p (six node key &optional prefix)
+  "True when NODE, as resolved -- at a read snapshot, possibly an older
+version -- still carries KEY in SIX: the whole tuple, or its first
+components under PREFIX.  Membership is released when a write is applied,
+not when the version it indexed is reaped, so an entry can name a node
+whose version at the snapshot held another value (GH #345)."
+  (let ((k (%index-tuple-key six node)))
+    (and k
+         (if prefix
+             (and (>= (length k) (length key))
+                  (equal (subseq k 0 (length key)) key))
+             (equal k key)))))
+
 (defun index-lookup (graph class-name slot-name value
                      &key (collect-p t) prefix)
   "Nodes of CLASS-NAME (and subclasses) whose indexed slot(s) equal VALUE, via
@@ -1074,7 +1087,8 @@ ids in GRAPH.  With COLLECT-P NIL, returns T as soon as one match is found
           (dolist (id (ix-lookup six key :prefix prefix))
             (unless (and ov (overlay-effective-write ov id))
               (let ((node (%node-by-id id graph)))
-                (when (and node (not (deleted-p node)))
+                (when (and node (not (deleted-p node))
+                           (%index-hit-p six node key prefix))
                   (if collect-p
                       (push node result)
                       (return-from index-lookup t))))))
@@ -1118,7 +1132,8 @@ ids in GRAPH."
                   (lambda (key id)
                     (unless (and ov (overlay-effective-write ov id))
                       (let ((node (%node-by-id id graph)))
-                        (when (and node (not (deleted-p node)))
+                        (when (and node (not (deleted-p node))
+                                   (%index-hit-p six node key))
                           (emit-own-before (append key (list id)))
                           (funcall fn node)))))
                   :start skey :end ekey)
