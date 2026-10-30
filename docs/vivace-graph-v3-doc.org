@@ -776,14 +776,16 @@ new value and not the old, and ~map-index~ stays in ascending order.
 The entry-level reads that resolve no node follow the same rule
 (#409): ~index-count~ counts the entries the transaction will commit,
 and ~map-index-prefixes~ lists each prefix it will commit once, in
-index order.
+index order. So do the count index's ~count-index-lookup~ and
+~map-count-index~ (#411): the committed counters plus the apply pass's
+arithmetic over the transaction's writes. Spacetime's three hand-rolled
+overlays over these reads went with #411; cardinality's edge delta
+stays, because the commit view's validators read with the overlay off.
 
 What stays committed-only, each with its issue: views (#7); the fully
 untyped ~map-vertices~ / ~map-edges~ lhash scans (admin paths that
-bypass MVCC as well); the count index's ~count-index-lookup~ and
-~map-count-index~ (#411, where spacetime's own delta over them
-retires); spatial and vector-segment membership; unique-index
-membership. A nested ~with-transaction~ is an
+bypass MVCC as well); spatial and vector-segment membership;
+unique-index membership. A nested ~with-transaction~ is an
 independent commit and sees nothing of the outer one. A read snapshot
 opened inside a transaction inherits it and so sees its writes; an
 ~:as-of~ read is refused there, as before.

@@ -450,6 +450,22 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Fixed
 
+- **The count index sees the transaction's own writes, and spacetime's
+  hand-rolled overlays are gone** (#411, #358 part 1). Inside
+  `with-transaction`, `count-index-lookup` and `map-count-index` answer
+  the committed counters plus the apply pass's arithmetic over the
+  transaction's writes (`overlay-count-delta`), a name whose count falls
+  to 0 dropped and a new one merged in order. With every index read now
+  answering as the transaction will commit, spacetime's three second
+  implementations of that rule, `%overlay-transaction` under
+  `claims-touching` / `claims-by-producer`, `%created-under` under the
+  as-of vocabulary walk and `%vocabulary-delta` under the counted one,
+  are deleted; cardinality's `%overlay-edge-delta` stays, because the
+  commit view's validators read with the overlay off by design. #358
+  part 1 is pinned by a test: a committed claim whose identity slot a
+  transaction changes is listed and counted under the new name, not the
+  old, which the engine's re-derived-key rule (#408) already answered.
+
 - **`index-count` and `map-index-prefixes` see the transaction's own
   writes** (#409). Inside `with-transaction` the count is of the entries
   the transaction will commit (an own create adds one, a moved key

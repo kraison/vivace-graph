@@ -27,10 +27,10 @@ define a type and its `make-<type>` constructor; an edge takes `:from` and
 
 **A read inside the transaction sees its writes.** Lookups, typed and
 adjacency scans, `graph-db:edge-exists-p`, `graph-db:index-lookup`,
-`graph-db:index-count` and `graph-db:map-index-prefixes` return the
-transaction's own creates, saves and deletes (#408, #409). Not the
-untyped scans, the count index, views, or spatial membership.
-`graph-db:*read-own-writes*` turns it off.
+`graph-db:index-count`, `graph-db:map-index-prefixes` and
+`graph-db:count-index-lookup` return the transaction's own creates,
+saves and deletes (#408, #409, #411). Not the untyped scans, views, or
+spatial membership. `graph-db:*read-own-writes*` turns it off.
 
 **A pass over a type.** `graph-db:map-vertices` with `:vertex-type`, or
 `graph-db:map-edges` with `:edge-type`. A named type includes its subtypes

@@ -288,7 +288,11 @@ Consumers that already dedup by id (`%overlay-transaction`,
 `%post-commit-subject-claims`, link's `%same-store-candidates`) need
 nothing. Deleting the hand-rolled overlays in favour of the engine's is a
 follow-up issue, not this unit: binding the switch is mechanical and
-leaves their suites as the proof that nothing moved.
+leaves their suites as the proof that nothing moved. (Done by #411:
+spacetime's `%overlay-transaction`, `%created-under` and
+`%vocabulary-delta` are gone, the count index reads through the
+overlay; cardinality's `%overlay-edge-delta` stays, since its callers
+read with the switch off.)
 
 Rules' `claim/7` appends index hits to `*claim-derived-this-run*` without
 a dedup (`rules/facts.lisp`), safe today because `%exclude-producers`

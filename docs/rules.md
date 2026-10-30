@@ -326,10 +326,9 @@ They read the store as the open transaction will commit it: since
 GH #408 `index-lookup`, the typed scans and the adjacency walks return
 the transaction's own creates, saves and deletes on top of its
 snapshot, as `claims-touching` already did with its own overlay
-(GH #324), and since GH #409 so do `index-count` and
-`map-index-prefixes`. The count index (`count-index-lookup`,
-`map-count-index`) and the untyped scans still read committed
-membership. Slice 2's `run-rule` derives claims inside the transaction
+(GH #324), and so do `index-count` and `map-index-prefixes` (GH #409)
+and the count index (GH #411). Only the untyped scans still read
+committed membership. Slice 2's `run-rule` derives claims inside the transaction
 it also reads in; its producer exclusion keeps a rule from re-finding
 its own derivations (GH #331, #333).
 
