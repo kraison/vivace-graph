@@ -450,6 +450,17 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Fixed
 
+- **`index-count` and `map-index-prefixes` see the transaction's own
+  writes** (#409). Inside `with-transaction` the count is of the entries
+  the transaction will commit (an own create adds one, a moved key
+  leaves its old value and arrives under the new, a delete leaves), and
+  the prefix walk lists each prefix it will commit once, in index order,
+  skipping a prefix whose only rows it deleted or moved away. Same rule
+  as #408: the committed walk skips own ids, the overlay supplies the
+  own members. The count index's `count-index-lookup` and
+  `map-count-index` stay committed-only until #411, where spacetime's
+  own delta over them retires in the same step.
+
 - **A short `:end` tuple on `index-range` / `map-index` includes its
   extensions with one bound as it did with two** (#413). On a multi-slot
   index, `:end '("d")` alone dropped the `("d" ...)` rows that

@@ -394,6 +394,65 @@ include the transaction's own extensions of a short END here too."
         (is (equal '(("1" "a") ("2" "m"))
                    (rows :end '("2"))))))))
 
+;;; --- GH #409: entry-level reads that resolve no node ---------------------
+
+(test ryow-index-count-reflects-own-writes
+  "GH #409: INDEX-COUNT inside a transaction counts the entries the
+transaction will commit: an own create adds one, a moved key leaves its
+old value and arrives under the new, a delete leaves."
+  (with-ryow-graph (g)
+    (flet ((n (value) (index-count g 'ryow-node 'tag value))
+           (nk (tuple) (index-count g 'ryow-node '(k tag) tuple :prefix t)))
+      (with-transaction ()
+        (make-ryow-node :k "1" :tag "a") (make-ryow-node :k "2" :tag "b"))
+      (with-transaction ()
+        (make-ryow-node :k "3" :tag "a")
+        (is (= 2 (n "a")) "an own create counts")
+        (is (= 1 (nk '("3"))) "and under a prefix")
+        (let ((c (copy (first (index-lookup g 'ryow-node 'tag "b")))))
+          (setf (ryow-node-tag c) "c") (save c))
+        (is (= 0 (n "b")) "a moved key leaves its old value")
+        (is (= 1 (n "c")) "and arrives under the new")
+        (mark-deleted (first (index-lookup g 'ryow-node '(k tag)
+                                           '("1" "a"))))
+        (is (= 1 (n "a")) "a delete leaves")
+        (is (= 0 (nk '("1")))))
+      (is (= 1 (n "a")) "the same answers once committed")
+      (is (= 1 (n "c")))
+      (is (= 0 (n "b"))))))
+
+(test ryow-map-index-prefixes-lists-own-prefixes
+  "GH #409: MAP-INDEX-PREFIXES inside a transaction lists each prefix
+the transaction will commit once, in index order: one its creates
+introduce, not one whose only row it deleted or moved away, and a
+prefix shared by a committed row and an own row once."
+  (with-ryow-graph (g)
+    (flet ((walk (arity &optional start)
+             (let ((out '()))
+               (map-index-prefixes (lambda (p) (push p out)) g 'ryow-node
+                                   '(k tag) :arity arity :start start)
+               (nreverse out))))
+      (with-transaction ()
+        (make-ryow-node :k "1" :tag "a") (make-ryow-node :k "2" :tag "b")
+        (make-ryow-node :k "4" :tag "d"))
+      (with-transaction ()
+        (make-ryow-node :k "0" :tag "x")   ; a new first prefix
+        (make-ryow-node :k "1" :tag "z")   ; a second row under "1"
+        (make-ryow-node :k "3" :tag "y")   ; a new prefix in the middle
+        (mark-deleted (first (index-lookup g 'ryow-node '(k tag)
+                                           '("2" "b"))))
+        (let ((c (copy (first (index-lookup g 'ryow-node '(k tag)
+                                            '("4" "d"))))))
+          (setf (ryow-node-k c) "5") (save c))   ; "4" moves to "5"
+        (is (equal '(("0") ("1") ("3") ("5")) (walk 1)))
+        (is (equal '(("0" "x") ("1" "a") ("1" "z") ("3" "y") ("5" "d"))
+                   (walk 2)))
+        (is (equal '(("1") ("3") ("5")) (walk 1 '("1"))) ":start inclusive")
+        (is (equal '(("3") ("5")) (walk 1 '("2")))
+            "a :start at the prefix only the deleted row held"))
+      (is (equal '(("0") ("1") ("3") ("5")) (walk 1))
+          "the same once committed"))))
+
 ;;; --- Task 7: OCC (spec §4.5) ----------------------------------------------
 
 (test ryow-own-read-not-in-read-set

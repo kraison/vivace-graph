@@ -1113,14 +1113,18 @@ GRAPH."
 ;;; so a walk is not an atomic snapshot.  Spec: docs/superpowers/specs/
 ;;; 2026-09-07-claim-vocabulary-design.md §2.
 
-(defun %ix-first (six lo hi)
-  "The first entry of SIX with LO <= key <= HI as (COMPONENTS . ID), or
-NIL.  One seek and one step."
-  (let* ((cur (make-range-cursor (slot-index-skip-list six) lo hi))
-         (node (and cur (cursor-next cur :eoc))))
-    (unless (or (null node) (eql node :eoc))
-      (let ((key (%sn-key node)))
-        (cons (butlast key) (car (last key)))))))
+(defun %ix-first (six lo hi &optional ov)
+  "The first entry of SIX with LO <= key <= HI whose id has no effective
+write under OV (any entry when OV is NIL), as (COMPONENTS . ID), or NIL.
+One seek, and one step per own id skipped (GH #409)."
+  (let ((cur (make-range-cursor (slot-index-skip-list six) lo hi)))
+    (when cur
+      (loop for node = (cursor-next cur :eoc)
+            until (eql node :eoc)
+            do (let ((key (%sn-key node)))
+                 (unless (and ov (overlay-effective-write
+                                  ov (car (last key))))
+                   (return (cons (butlast key) (car (last key))))))))))
 
 (defun %ix-prefix-out (components arity)
   "The first ARITY of COMPONENTS, +NULL-COMPONENT+ read back as NIL."
@@ -1152,9 +1156,11 @@ a prefix walk at arity ~D" (length vals) arity)))
 the index on CLASS-NAME.SLOT-NAME -- a list, NIL for a null component --
 in index order, once each.  START (a value, or a tuple of at most ARITY
 components) begins at the first prefix at or after it.  One seek per
-distinct prefix, never a scan (GH #350).  Trap: membership is live and
-a walk is not an atomic snapshot; resolve a prefix's nodes when a
-snapshot or a deletion matters."
+distinct prefix, never a scan (GH #350).  Inside an open transaction
+the prefixes are those it will commit: the walk skips its own ids and
+its own nodes' prefixes are merged in, each once (GH #409).  Trap:
+membership is live and a walk is not an atomic snapshot; resolve a
+prefix's nodes when a snapshot or a deletion matters."
   (let* ((*graph* graph)
          (six (%require-index graph class-name slot-name)))
     (when six                   ; NIL => declared but empty => no prefixes
@@ -1163,22 +1169,44 @@ snapshot or a deletion matters."
           (error 'query-precondition-error
                  :reason (format nil "Index on ~S has arity ~D; cannot ~
 walk prefixes of ~D" (slot-index-slot-names six) n arity)))
-        (let ((hi (%index-tail-key n))
-              (lo (%ix-start-key six start arity)))
-          (loop
-            (let ((entry (%ix-first six lo hi)))
-              (when (null entry) (return))
-              (let ((prefix (subseq (car entry) 0 arity)))
-                (funcall fn (%ix-prefix-out prefix arity))
-                ;; Hop: PREFIX's high bound sorts past every tuple
-                ;; sharing it, so the next seek lands on the next prefix.
-                (setf lo (nth-value 1 (%index-bounds six prefix t)))))))))))
+        (let* ((hi (%index-tail-key n))
+               (lo (%ix-start-key six start arity))
+               ;; GH #409: the own members at or past LO, in composite
+               ;; order, merged in before each committed entry they
+               ;; precede; EMITTED collapses a prefix seen from both.
+               (ov (current-overlay graph))
+               (pending (and ov (remove-if
+                                 (lambda (m) (%index-comp-lessp (car m) lo))
+                                 (overlay-index-members ov six))))
+               (emitted nil))
+          (labels ((emit (prefix)
+                     (unless (equal prefix emitted)
+                       (setf emitted prefix)
+                       (funcall fn (%ix-prefix-out prefix arity))))
+                   (emit-own-before (composite)
+                     (loop while (and pending
+                                      (or (null composite)
+                                          (%index-comp-lessp
+                                           (car (first pending)) composite)))
+                           do (emit (subseq (car (pop pending)) 0 arity)))))
+            (loop
+              (let ((entry (%ix-first six lo hi ov)))
+                (when (null entry) (return))
+                (let ((prefix (subseq (car entry) 0 arity)))
+                  (emit-own-before (append (car entry) (list (cdr entry))))
+                  (emit prefix)
+                  ;; Hop: PREFIX's high bound sorts past every tuple
+                  ;; sharing it, so the next seek lands on the next
+                  ;; prefix.
+                  (setf lo (nth-value 1 (%index-bounds six prefix t))))))
+            (emit-own-before nil)))))))
 
 (defun index-count (graph class-name slot-name value &key prefix)
   "Number of entries in the index on CLASS-NAME.SLOT-NAME whose tuple
 equals VALUE, or with PREFIX T starts with it; 0 when none.  Same VALUE
-and PREFIX rules as INDEX-LOOKUP.  Entries, not live nodes: inside an
-open transaction this is the committed membership (GH #350).  Trap: it
+and PREFIX rules as INDEX-LOOKUP.  Entries, not live nodes; inside an
+open transaction, the entries it will commit: its own ids are skipped
+in the walk and its own matching nodes added (GH #350, #409).  Trap: it
 is O(range size) -- a count of a large prefix walks every entry under
 it."
   (let* ((*graph* graph)
@@ -1191,10 +1219,16 @@ it."
               (multiple-value-bind (lo hi) (%index-bounds six key prefix)
                 (let ((cur (make-range-cursor (slot-index-skip-list six)
                                               lo hi))
+                      (ov (current-overlay graph))
                       (n 0))
                   (loop for node = (cursor-next cur :eoc)
                         until (eql node :eoc)
-                        do (incf n))
+                        unless (and ov (overlay-effective-write
+                                        ov (car (last (%sn-key node)))))
+                          do (incf n))
+                  (when ov
+                    (incf n (length (overlay-index-members
+                                     ov six :key key :prefix prefix))))
                   n)))))))
 
 ;;; ---------------------------------------------------------------------------

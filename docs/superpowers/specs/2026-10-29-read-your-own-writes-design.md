@@ -66,7 +66,9 @@ of scope.
 - Entry-level index reads that resolve no node: `index-count`,
   `map-index-prefixes`, `index-count`'s unique and count-index cousins.
   #361 already does a write-set delta for spacetime's counts; a general
-  one is a follow-up issue filed with this work.
+  one is a follow-up issue filed with this work. (Lifted for
+  `index-count` and `map-index-prefixes` by #409; the count-index
+  cousins go with #411.)
 - Spatial and vector-segment queries, unique-index membership: their
   resolution goes through `lookup-*` and so gains value visibility for
   free; their membership stays committed-only. Follow-up issues.

@@ -773,12 +773,17 @@ the typed ~map-vertices~ and ~map-edges~, the adjacency forms (so
 transaction wrote and the overlay supplies every own live node at its
 current type, endpoints or key, so a moved index key is found under the
 new value and not the old, and ~map-index~ stays in ascending order.
+The entry-level reads that resolve no node follow the same rule
+(#409): ~index-count~ counts the entries the transaction will commit,
+and ~map-index-prefixes~ lists each prefix it will commit once, in
+index order.
 
 What stays committed-only, each with its issue: views (#7); the fully
 untyped ~map-vertices~ / ~map-edges~ lhash scans (admin paths that
-bypass MVCC as well); entry-level index reads that resolve no node,
-~index-count~ and ~map-index-prefixes~; spatial and vector-segment
-membership; unique-index membership. A nested ~with-transaction~ is an
+bypass MVCC as well); the count index's ~count-index-lookup~ and
+~map-count-index~ (#411, where spacetime's own delta over them
+retires); spatial and vector-segment membership; unique-index
+membership. A nested ~with-transaction~ is an
 independent commit and sees nothing of the outer one. A read snapshot
 opened inside a transaction inherits it and so sees its writes; an
 ~:as-of~ read is refused there, as before.
