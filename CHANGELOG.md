@@ -21,7 +21,8 @@ between releases; cutting a release renames it to the new version and dates it.
   `query-precondition-error`. It reads as the transaction will commit
   from day one: a committed holder the transaction wrote is skipped and
   its own live node holding the value is answered at its current slots,
-  whether or not the index is built.
+  whether or not the index is built. `examples/example.lisp` shows both
+  reads, and a transaction reading its own writes (#408).
 
 - **`tests/run-suite.sh SUITE`: one suite in a fresh image** (#407).
   It binds the system directory and type registry the way `run-tests`

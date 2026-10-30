@@ -27,8 +27,8 @@
 
 ;; :unique t puts the slot under a uniqueness constraint, enforced at the
 ;; commit boundary (NULL-exempt): two customers with one email cannot both
-;; commit.  (To QUERY a slot by value, give it a DEF-INDEX or a view, as
-;; below -- :unique enforces; it is not a lookup surface.)
+;; commit.  UNIQUE-LOOKUP reads the holder of a value (below); a range
+;; or ordered scan over a slot wants a DEF-INDEX or a view instead.
 (def-vertex customer (person)
   ((email :type email :unique t))
   :test-graph)
@@ -198,14 +198,38 @@
            *graph* 'product 'upc)
 
 ;; The :UNIQUE slot refuses a duplicate at commit: nothing of the
-;; failed transaction survives.  (Equality lookups on email go through
-;; the EMAIL view defined above.)
+;; failed transaction survives.
 (handler-case
     (with-transaction ()
       (make-customer :first-name "Imposter" :last-name "Blow"
                      :email "joe@blow.com"))
   (unique-constraint-violation (c)
     (format t "~&Refused, as it should be:~%~a~%" c)))
+
+;; UNIQUE-LOOKUP answers the live holder of a value, or NIL; the same
+;; read from Prolog is FIND-BY-UNIQUE (GH #415).
+(unique-lookup *graph* 'customer 'email "joe@blow.com")
+(select-flat (?c) (find-by-unique ?c customer email "jill@blow.com"))
+(unique-lookup *graph* 'customer 'email "nobody@blow.com")   ; => NIL
+
+;;; What a transaction sees ---------------------------------------------
+;;;
+;;; A read inside WITH-TRANSACTION answers what the transaction will
+;;; commit (GH #408; manual Ch5, "What a transaction sees"): its own
+;;; creates, updates and deletes sit on top of the snapshot it reads, so
+;;; a lookup, an index read, a traversal or a Prolog query finds a node
+;;; made a form earlier.  Views are the exception: they update at commit
+;;; (GH #7), so the EMAIL view above cannot see the new customer yet.
+
+(with-transaction ()
+  (let ((c (make-customer :first-name "Tess" :last-name "Blow"
+                          :email "tess@blow.com")))
+    (make-likes :from c :to (first (index-lookup *graph* 'product 'upc
+                                                 "1234567890")))
+    (list (eq c (unique-lookup *graph* 'customer 'email "tess@blow.com"))
+          (length (select-flat (?x) (is-a ?x customer)))     ; 3, not 2
+          (outgoing-edges c :edge-type 'likes)               ; the new edge
+          (lookup-customer-by-email "tess@blow.com"))))      ; NIL: a view
 
 ;; Cosine kNN over the :VECTOR-INDEX slot: the k products most similar
 ;; to a query vector, best first.
