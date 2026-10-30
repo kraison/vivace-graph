@@ -153,8 +153,15 @@ no native arm gets a correct answer rather than silently falling through to NIL.
   (and (consp list) (null (cdr list))))
 
 (defun new-interned-symbol (&rest args)
-  "Concatenate symbols or strings to form an interned symbol"
-  (intern (format nil "~{~a~}" args)))
+  "Concatenate ARGS -- symbols, strings and integers -- into an interned
+symbol.  Spelled from SYMBOL-NAME and ~D, not the printer, so a caller's
+*PRINT-CASE* or *PRINT-BASE* cannot change the name (GH #342)."
+  (intern (apply #'concatenate 'string
+                 (mapcar (lambda (arg)
+                           (if (integerp arg)
+                               (format nil "~D" arg)
+                               (string arg)))
+                         args))))
 
 (defun gen-id ()
   (uuid:uuid-to-byte-array (uuid:make-v4-uuid)))

@@ -110,6 +110,15 @@
   "WITH-IX-GRAPH on the B+ tree index backend."
   `(with-ix-graph (,g :backend :bplus-tree) ,@body))
 
+(defmacro with-ix-memory-graph ((g) &body body)
+  "A fresh in-memory graph named *IX-GRAPH-NAME*, in a temp dir."
+  (let ((dir (gensym)))
+    `(with-temp-directory (,dir)
+       (let ((,g (graph-db::make-memory-graph *ix-graph-name* (namestring ,dir))))
+         (unwind-protect (let ((*graph* ,g)) ,@body)
+           (ignore-errors (close-graph ,g :snapshot-p nil))
+           (collect-garbage))))))
+
 (defmacro with-ix-di-graph ((g) &body body)
   "A fresh on-disk graph named *IX-DI-GRAPH-NAME* (def-index-only schema)."
   (let ((dir (gensym)))
@@ -816,15 +825,6 @@ fail OPEN-GRAPH outright on a sidecar that deserialized perfectly well."
           (collect-garbage))))))
 
 ;;; --- memory backend ---------------------------------------------------------
-
-(defmacro with-ix-memory-graph ((g) &body body)
-  "A fresh in-memory graph named *IX-GRAPH-NAME*, in a temp dir."
-  (let ((dir (gensym)))
-    `(with-temp-directory (,dir)
-       (let ((,g (graph-db::make-memory-graph *ix-graph-name* (namestring ,dir))))
-         (unwind-protect (let ((*graph* ,g)) ,@body)
-           (ignore-errors (close-graph ,g :snapshot-p nil))
-           (collect-garbage))))))
 
 ;;; --- arity-aware skip-list construction (GH #107) ---------------------------
 

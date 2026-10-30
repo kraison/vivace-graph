@@ -30,6 +30,10 @@
   pointer
   skip-list
   (lock (make-rw-lock))
+  ;; The LOOKUP-<class> symbol DEF-VIEW recorded.  Still written to the
+  ;; persisted view record, but no longer called: MAP-VIEW reads through
+  ;; %VIEW-NODE-READER, so an application function of that name cannot
+  ;; take the view over (GH #399).
   lookup-fn
   ;; The (map-code . reduce-code) the cached MAP-FN/REDUCE-FN were built from, so
   ;; COMPILE-VIEW-CODE can skip a recompile that would produce identical functions
@@ -642,6 +646,21 @@ in-RAM mem-skip-list.")
            (regenerate-view graph class-name view-name)))
        (all-views graph)))
 
+(defun %view-node-reader (view)
+  "The id -> node reader for VIEW's entries: LOOKUP-EDGE for an edge
+class, LOOKUP-VERTEX otherwise, filtered to the view's class.  Not the
+recorded LOOKUP-<class> symbol, which an application function of the
+same name replaces (GH #399).  A deleted node is returned; the caller
+decides with :INCLUDE-DELETED-P."
+  (let* ((class-name (view-class-name view))
+         (class (find-class class-name nil))
+         (reader (if (and class (subtypep class 'edge))
+                     #'lookup-edge
+                     #'lookup-vertex)))
+    (lambda (id)
+      (let ((node (funcall reader id)))
+        (and (typep node class-name) node)))))
+
 (defmethod map-view (fn (class-name symbol) (view-name symbol)
                      &key (graph *graph*) key start-key end-key count skip
                        collect-p include-deleted-p write-p)
@@ -667,7 +686,7 @@ high-level lookup."
                    (error 'invalid-view-error
                           :class-name class-name
                           :view-name view-name))
-                 (let* ((lookup-fn (view-lookup-fn view))
+                 (let* ((lookup-fn (%view-node-reader view))
                         (skip-list (view-skip-list view))
                         ;; The view skip list is sorted per the view's order, and
                         ;; same-key entries are tiebroken by node id in that SAME
@@ -994,6 +1013,9 @@ Query it with INVOKE-GRAPH-VIEW, MAP-VIEW, or MAP-REDUCED-VIEW.  Example:
                   :name ',name
                   :class-name ',(first parents)
                   :graph-name ',(second parents)
+                  ;; Recorded for the persisted view record and its
+                  ;; change comparison; MAP-VIEW no longer calls it
+                  ;; (GH #399).
                   :lookup-fn ',(intern (format nil "LOOKUP-~A" (first parents)))
                   :map-code ,(fully-qualified-expression-string map-code)
                   :reduce-code ,(when reduce-code

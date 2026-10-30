@@ -186,6 +186,41 @@ every spelling the predicates refuse would otherwise be a second claim."
   (is-false (canonical-producer-p "Rule/A"))
   (is-false (canonical-producer-p "")))
 
+(test namespace-predicate-admits-only-canonical-keywords
+  "GH #327.  The identity-key encoder downcases a namespace's name and
+the splitter interns the canonical lowercase name upcased, so only a
+keyword whose name is uppercase [A-Z0-9-]+ round-trips."
+  (is-true (canonical-namespace-p :ctr-records))
+  (is-true (canonical-namespace-p :ns2))
+  (is-false (canonical-namespace-p :|Foo Bar|))
+  (is-false (canonical-namespace-p :|foo|))
+  (is-false (canonical-namespace-p :|A/B|))
+  (is-false (canonical-namespace-p "ns"))
+  (is-false (canonical-namespace-p 'ns))
+  (is-false (canonical-namespace-p nil)))
+
+(test a-non-canonical-namespace-is-refused-at-commit
+  "GH #327: the namespace slots carry the write-side rule the key
+inverse assumes; a canonical namespace still writes."
+  (with-claim-graph (g)
+    (declare (ignorable g))
+    (signals graph-db:value-constraint-violation
+      (with-transaction ()
+        (make-ct-claim-unary :subject-namespace :|Foo Bar| :subject-key "s1"
+                             :relation "r" :producer "rule-a"
+                             :standing :inferred)))
+    (signals graph-db:value-constraint-violation
+      (with-transaction ()
+        (make-ct-claim-binary :subject-namespace :ns :subject-key "s1"
+                              :relation "r" :producer "rule-a"
+                              :object-namespace :|mixed Case|
+                              :object-key "o1" :standing :inferred)))
+    (finishes
+      (with-transaction ()
+        (make-ct-claim-unary :subject-namespace :fine-ns :subject-key "s1"
+                             :relation "r" :producer "rule-a"
+                             :standing :inferred)))))
+
 (test a-non-canonical-relation-or-producer-is-refused-at-commit
   "The :CHECK declarations DEF-CLAIM-CLASSES emits, exercised through the
 constructor: a keyword and a case variant each abort the transaction, so

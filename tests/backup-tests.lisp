@@ -855,3 +855,60 @@ exactly as before, and the file self-identifies as :COMPLETE."
           (ignore-errors (close-graph g2 :snapshot-p nil))
           (collect-garbage))))))
 
+
+;;; ---------------------------------------------------------------------------
+;;; GH #354: the snapshot file must not depend on the caller's printer or
+;;; reader state.  A caller that binds print limits (a SWANK client, cl-mcp's
+;;; remote-eval) used to get a file full of # and ... that REPLAY cannot read.
+;;; ---------------------------------------------------------------------------
+
+(def-vertex bk-deep ()
+  ((nested)                             ; a list nested past any print level
+   (longvec)                            ; a general vector past any print length
+   (dbl :type double-float))
+  :graph-db-integration-test)
+
+(defparameter *bk-deep-nested*
+  '(1 (2 (3 (4 (5 (6 (7 (8 (9 (10)))))))))))
+
+(defparameter *bk-deep-longvec*
+  (coerce (loop for i from 1 to 12 collect i) 'simple-vector))
+
+(test snapshot-is-independent-of-caller-printer-state
+  "Snapshot under hostile printer and reader bindings -- print level 2,
+print length 3, downcase, double-float as the default float format --
+then replay under the standard ones: the deep list, the long vector and
+the double survive unchanged (GH #354)."
+  (with-temp-directory (dir1)
+    (with-temp-directory (dir2)
+      (let ((p1 (namestring dir1)) (p2 (namestring dir2)) vid)
+        (let ((g (make-graph *integration-graph-name* p1
+                             :buffer-pool-size 1000)))
+          (let ((*graph* g))
+            (with-transaction ()
+              (setq vid (id (make-bk-deep :nested *bk-deep-nested*
+                                          :longvec *bk-deep-longvec*
+                                          :dbl 1.0000000001d0))))
+            (let ((*print-level* 2)
+                  (*print-length* 3)
+                  (*print-case* :downcase)
+                  (*read-default-float-format* 'double-float))
+              (is (= 1 (graph-db:snapshot g)))))
+          (close-graph g :snapshot-p nil))
+        (let ((g2 (make-graph *integration-graph-name* p2
+                              :buffer-pool-size 1000)))
+          (unwind-protect
+               (let ((*graph* g2))
+                 (graph-db:replay g2 (merge-pathnames "txn-log/" dir1)
+                                  :graph-db/test)
+                 (let ((v (lookup-vertex vid)))
+                   (is-true v "the bk-deep vertex was not restored")
+                   (when v
+                     (is (equal *bk-deep-nested* (slot-value v 'nested))
+                         "nested list came back as ~S" (slot-value v 'nested))
+                     (is (equalp *bk-deep-longvec* (slot-value v 'longvec))
+                         "long vector came back as ~S" (slot-value v 'longvec))
+                     (is (eql 1.0000000001d0 (slot-value v 'dbl))
+                         "double came back as ~S" (slot-value v 'dbl)))))
+            (close-graph g2 :snapshot-p nil)
+            (collect-garbage)))))))

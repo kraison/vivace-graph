@@ -1289,6 +1289,7 @@ That's it! VivaceGraph will now automatically maintain these indexes. When you c
 
 - *A changed view is rebuilt automatically.*  If you change a view's ~:map~/~:reduce~ code or its sort order, the next reconcile detects the difference, rebuilds the index from scratch, and emits a ~log:warn~.  This is the safe default: serving queries from an index built by an *old* ~:map~ lambda would be a subtle, hard-to-find bug.
 
+- *A view added later is backfilled.*  A ~def-view~ evaluated against an open graph that already holds nodes builds its index over them at once; one evaluated while the graph is closed (a new image loading its schema) is built by the next ~open-graph~. No ~regenerate-view~ is needed for a new view (vivace-graph#402, pinned by two tests). The graph name in ~def-view~ must be the name the graph is open under, or the spec is registered under a name nothing reconciles and a query reports the graph "not loaded".
 - *Forcing a rebuild.*  Use ~regenerate-view~ to force one view, ~regenerate-all-views~ to force all of them, or pass ~:regenerate-views t~ to ~open-graph~ (or ~open-memory-graph~) to rebuild everything at open.
 
 - *Removing a view.*  Deleting a ~def-view~ form does not drop the persisted index (just as deleting a ~def-vertex~ form does not drop the persisted type).  Call ~delete-view~ to remove it explicitly.
@@ -2336,9 +2337,11 @@ URL. Keyword arguments:
   front of the mount is what the function reads — a header, a
   session). The value is bound around every request, shadowing any
   outer binding of the flag.
-- ~:read-only~ — refuse the open/close verbs with ~403 read-only~ at
-  the endpoints; ~/api/capabilities~ reports ~readOnly: true~ and the
-  roster drops its Open/Close buttons.
+- ~:read-only~ — refuse every request but GET, HEAD and the query and
+  Prolog POSTs with ~403 read-only~ at dispatch, before any handler
+  runs (vivace-graph#386); ~/api/capabilities~ reports ~readOnly~ so
+  the roster drops its open/close verbs. The open and close handlers
+  keep their own refusal as a second layer.
 
 ~start-gui~ takes the same ~:allow-prolog~ and ~:read-only~ and passes
 them through. Localhost remains the security boundary of the
@@ -2793,7 +2796,7 @@ When you call ~snapshot~, it performs several important steps to ensure a high-q
 
 2.  *Checks Data Integrity (Opt-in):* With ~:check-data-integrity-p t~, ~snapshot~ first runs a full data integrity check on the graph: it iterates through every vertex and edge, attempting to deserialize its data from the heap, and if any corruption is found the snapshot is aborted with a list of the problematic nodes. This sweep deserializes the whole graph a *second* time, which on a large graph is the larger half of the snapshot's memory cost, so since vivace-graph#119 it is *off by default* — routine snapshots (including the one ~close-graph~ takes) skip it. Run ~check-data-integrity~ directly when you want the audit; ~replay~ still verifies restored data by default.
 
-3.  *Writes the Backup File:* It then calls the lower-level ~backup~ function to serialize every node and edge in the graph into a single, human-readable text file. The file is written in a ~txn-log/in-progress/~ subdirectory and *renamed* up to its final ~snap-~ name only once complete, so an interrupted snapshot never masquerades as a real one; the first line is a format header and the last a completion trailer, which is what makes the file *verifiable* (vivace-graph#127). It lands in a subdirectory of your graph's location named `txn-log/`, with a name like `snap-<time>-<uuid>`.
+3.  *Writes the Backup File:* It then calls the lower-level ~backup~ function to serialize every node and edge in the graph into a single, human-readable text file. The file is written in a ~txn-log/in-progress/~ subdirectory and *renamed* up to its final ~snap-~ name only once complete, so an interrupted snapshot never masquerades as a real one; the first line is a format header and the last a completion trailer, which is what makes the file *verifiable* (vivace-graph#127). It lands in a subdirectory of your graph's location named `txn-log/`, with a name like `snap-<time>-<uuid>`. Every line is printed under standard I/O syntax, not the caller's: a client that binds print limits around the call (a SWANK client, cl-mcp's remote-eval) cannot truncate the file, and a non-default float format cannot change what a double reads back as (vivace-graph#354). Only the caller's ~*package*~ is kept, so symbols print relative to it as ~recreate-graph~'s ~:package-name~ expects.
 
 **** Heap sizing for snapshots
 
@@ -3004,7 +3007,7 @@ You do not call the reaper directly; it is automatic. Its only tunable is the re
 
 *** Snapshot-isolation reads
 
-Inside a transaction, a point ~lookup~ (e.g. ~lookup-vertex~, ~lookup-edge~, or a generated ~lookup-<type>~) returns the transaction's own write of that node when it has one (Chapter 5, "What a transaction sees", GH #408) and otherwise the version that was live *as of the transaction's start* — the newest version whose ~commit-epoch~ precedes the transaction's start epoch. An update committed by a *later* transaction is therefore invisible to an in-progress one, and re-reading a node within a transaction is repeatable. The relevant older version is guaranteed to still exist because an open transaction holds the reaper's floor down.
+Inside a transaction, a point ~lookup~ (e.g. ~lookup-vertex~, ~lookup-edge~, or a generated ~lookup-<type>~) returns the transaction's own write of that node when it has one (Chapter 5, "What a transaction sees", GH #408) and otherwise the version that was live *as of the transaction's start* — the newest version whose ~commit-epoch~ precedes the transaction's start epoch. An update committed by a *later* transaction is therefore invisible to an in-progress one, and re-reading a node within a transaction is repeatable. The relevant older version is guaranteed to still exist because an open transaction holds the reaper's floor down. A write's *base* is the version the transaction sees for the node's id, whatever object ~copy~ or ~mark-deleted~ was handed: an as-of result, a history entry, or a node read before the transaction began (~mark-deleted~'s own idiom) all produce a proper new revision over the live head, and a concurrent commit is an OCC retry that sees the newer version (GH #355). The commit still refuses a base that is not the live head with ~stale-revision-error~, as a safety net no public path reaches.
 
 #+BEGIN_SRC lisp
   ;; Transaction A reads X, sees its value as of A's start, and keeps seeing
@@ -3054,12 +3057,12 @@ A ~select~ with ~:as-of~ snapshots ~*graph*~ only, exactly as ~:snapshot
 t~ does: a query that touches a second store reads that store *live*
 unless the ~select~ is nested inside that store's own ~with-as-of~.
 
-An as-of result is materialised, so it is safe to *read* after the call
-— but never *save* a copy of one: ~copy-node~ registers the archived
-version as the old node and the commit then archives it over the live
-head, cutting the chain. To restore an old value, read it as of the
-epoch, then copy the *live* node and set its slots from what you read.
-See ~docs/time-travel.md~ for the full API and its bounds.
+An as-of result is materialised, so it is safe to *read* after the call,
+and a copy of it saved inside a transaction is a new revision over the
+live head carrying the old values — the write's base is the version the
+transaction sees for the id, never the object copied (GH #355). That is
+how to restore an old value. See ~docs/time-travel.md~ for the full API
+and its bounds.
 
 *** Migrating an older graph to v3 (~migrate-graph~)
 

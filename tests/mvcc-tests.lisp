@@ -949,3 +949,112 @@ newest first."
       (is (equal (mapcar #'cdr (vertex-history g aid))
                  (mapcar #'cdr (node-history (lookup-vertex aid)))))
       (is (= 1 (length (edge-history g eid :limit 1)))))))
+
+;;; ---------------------------------------------------------------------------
+;;; GH #355: a write's base is the version this transaction sees, by id.
+;;;
+;;; COPY-NODE and DELETE-NODE used to register the object they were handed
+;;; as the update's old node, and APPLY-TX-WRITE archived it over the live
+;;; head.  From an as-of result, a history entry or a head held across a
+;;; later commit -- MARK-DELETED's documented idiom reads before its own
+;;; transaction -- that leaked the live head, cut the chain and sent the
+;;; revision backwards.  The base is now the version the transaction sees
+;;; for the node's id, so every such save is a proper new revision; a
+;;; concurrent commit is an OCC retry.  VALIDATE-LIVE-HEADS stays as the
+;;; safety net behind both, reached only by subverting the copies table.
+;;; ---------------------------------------------------------------------------
+
+(defun %chain-of (g id)
+  "ID's retained versions as (revision . commit-epoch), newest first."
+  (mapcar (lambda (p) (cons (graph-db::revision (car p)) (cdr p)))
+          (vertex-history g id)))
+
+(defun %chain-sound-p (before after)
+  "AFTER is BEFORE with exactly one newer version in front: revision and
+epoch both above the old head's, and the old chain intact behind it."
+  (and (= (length after) (1+ (length before)))
+       (equal (rest after) before)
+       (> (car (first after)) (car (first before)))
+       (> (cdr (first after)) (cdr (first before)))))
+
+(test saving-a-copy-of-an-as-of-version-restores-it-as-a-new-revision
+  "GH #355: COPY of an as-of result, SAVE: the old values become a NEW
+head over the live one, chain intact, revision and epoch monotone --
+the restore the docs used to ask for by hand."
+  (with-kept-graph (g 4)
+    (let (id e1)
+      (setq e1 (%epoch-of
+                (lambda () (setq id (id (make-g-person :name "p" :age 0))))))
+      (bump-age id 5)
+      (bump-age id 6)
+      (let ((before (%chain-of g id))
+            (old (lookup-vertex id :as-of e1)))
+        (is (= 0 (slot-value old 'age)) "precondition: the E1 version")
+        (finishes
+          (with-transaction ()
+            (let ((c (copy old)))
+              (setf (slot-value c 'age) 99)
+              (save c))))
+        (is (= 99 (slot-value (lookup-vertex id) 'age)) "the save landed")
+        (is-true (%chain-sound-p before (%chain-of g id))
+                 "chain ~S -> ~S" before (%chain-of g id))))))
+
+(test deleting-an-as-of-version-deletes-the-live-node
+  "GH #355: MARK-DELETED of an as-of result deletes the node, as a new
+tombstone revision over the live head."
+  (with-kept-graph (g 3)
+    (let (id e1)
+      (setq e1 (%epoch-of
+                (lambda () (setq id (id (make-g-person :name "p" :age 0))))))
+      (bump-age id 5)
+      (let ((before (%chain-of g id))
+            (old (lookup-vertex id :as-of e1)))
+        (finishes (with-transaction () (mark-deleted old)))
+        (is-true (deleted-p (lookup-vertex id)) "the live node is deleted")
+        (is-true (%chain-sound-p before (%chain-of g id))
+                 "chain ~S -> ~S" before (%chain-of g id))))))
+
+(test saving-a-copy-of-a-head-held-across-a-commit-is-sound
+  "GH #355, the pre-#115 form and MARK-DELETED's own idiom: a live object
+held while a later transaction updates the node.  Sequential
+transactions never conflict under OCC; the base is re-read by id."
+  (with-kept-graph (g 3)
+    (let (id)
+      (with-transaction ()
+        (setq id (id (make-g-person :name "p" :age 0))))
+      (let ((held (lookup-vertex id)))
+        (bump-age id 5)
+        (let ((before (%chain-of g id)))
+          (finishes
+            (with-transaction ()
+              (let ((c (copy held)))
+                (setf (slot-value c 'age) 99)
+                (save c))))
+          (is (= 99 (slot-value (lookup-vertex id) 'age)))
+          (is-true (%chain-sound-p before (%chain-of g id))
+                   "chain ~S -> ~S" before (%chain-of g id)))
+        (let ((before (%chain-of g id)))
+          (finishes (mark-deleted held))
+          (is-true (deleted-p (lookup-vertex id)))
+          (is-true (%chain-sound-p before (%chain-of g id))))))))
+
+(test the-commit-refuses-a-stale-base-that-bypassed-the-pre-image
+  "GH #355, the safety net: a copy whose registered base is forced to an
+archived version -- unreachable through COPY and MARK-DELETED now -- is
+refused at commit with STALE-REVISION-ERROR, nothing applied."
+  (with-kept-graph (g 3)
+    (let (id e1)
+      (setq e1 (%epoch-of
+                (lambda () (setq id (id (make-g-person :name "p" :age 0))))))
+      (bump-age id 5)
+      (let ((before (%chain-of g id))
+            (old (lookup-vertex id :as-of e1)))
+        (signals stale-revision-error
+          (with-transaction ()
+            (let ((c (copy (lookup-vertex id))))
+              (setf (gethash c (graph-db::copies graph-db:*transaction*))
+                    old)
+              (setf (slot-value c 'age) 99)
+              (save c))))
+        (is (= 5 (slot-value (lookup-vertex id) 'age)) "nothing applied")
+        (is (equal before (%chain-of g id)) "history unchanged")))))

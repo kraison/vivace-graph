@@ -385,3 +385,78 @@ node caching -- which the profiler's cold-read workloads rely on."
                         (graph-db::%node-cache-vec-index
                          (graph-db::%sn-addr (find-in-skip-list sl 7)))))
             "a read with caching disabled populated the direct-mapped cache")))))
+
+;;; ---------------------------------------------------------------------------
+;;; GH #406: a stale cached predecessor must not livelock a writer.
+;;;
+;;; Concurrent cache misses once made two objects for one address (the race
+;;; itself is tests/concurrency/data-structure-tests.lisp).  These tests
+;;; build that outcome by hand -- one object in the hash cache, another in
+;;; the direct-mapped vector -- splice through one, then write through the
+;;; other.  Before the fix ADD found the removed node through the stale
+;;; pointers, failed validation and retried the same walk forever; REMOVE
+;;; found it marked and looped without ever re-reading.
+;;; ---------------------------------------------------------------------------
+
+(defun %sl-finishes-within (seconds thunk)
+  "Run THUNK in a thread.  Return its value and T when it finishes within
+SECONDS; otherwise kill the thread and return NIL and NIL."
+  (let* ((done (bt:make-semaphore))
+         (result nil)
+         (thread (bt:make-thread (lambda ()
+                                   (unwind-protect
+                                        (setq result (funcall thunk))
+                                     (bt:signal-semaphore done)))
+                                 :name "sl-watchdog")))
+    (cond ((bt:wait-on-semaphore done :timeout seconds)
+           (values result t))
+          (t (ignore-errors (bt:destroy-thread thread))
+             (values nil nil)))))
+
+(defun %call-with-stale-predecessor (fn)
+  "Keys 1 2 3; two objects for node 1 (A in the hash cache, B in the vector);
+remove 2 through B so A still points at the removed node; evict B as a
+colliding address would.  Then call FN on the list: every read of node 1
+now serves the stale A."
+  (with-temp-memory (heap)
+    (let ((sl (make-integer-skip-list heap)))
+      (dolist (k '(1 2 3)) (add-to-skip-list sl k k))
+      (clrhash (graph-db::%sl-node-cache sl))
+      (let* ((a (find-in-skip-list sl 1))
+             (addr (graph-db::%sn-addr a))
+             (idx (graph-db::%node-cache-vec-index addr))
+             (b (let ((graph-db::*cache-enabled* nil))
+                  (graph-db::read-skip-node sl addr)))
+             (node2 (graph-db::%sn-addr (find-in-skip-list sl 2))))
+        (is (eq a (gethash addr (graph-db::%sl-node-cache sl)))
+            "precondition: the cold read installed A in the hash cache")
+        (setf (aref (graph-db::%sl-node-cache-vec sl) idx) b)
+        (is-true (remove-from-skip-list sl 2))
+        (is (= node2 (aref (graph-db::%sn-pointers a) 0))
+            "precondition: A still points at the removed node")
+        (setf (aref (graph-db::%sl-node-cache-vec sl) idx) nil)
+        (funcall fn sl)))))
+
+(test a-stale-cached-predecessor-does-not-livelock-add
+  "GH #406: adding the removed key through the stale predecessor must
+finish and leave 1 2 3 in the list."
+  (%call-with-stale-predecessor
+   (lambda (sl)
+     (multiple-value-bind (node finished)
+         (%sl-finishes-within 10 (lambda () (add-to-skip-list sl 2 2)))
+       (is-true finished "add-to-skip-list did not finish in 10 s")
+       (is-true node "add-to-skip-list returned no node")
+       (when finished
+         (is (equal '((1 . 1) (2 . 2) (3 . 3)) (skip-list-to-list sl))))))))
+
+(test a-stale-cached-predecessor-does-not-livelock-remove
+  "GH #406: removing the already-removed key through the stale
+predecessor must finish and answer NIL."
+  (%call-with-stale-predecessor
+   (lambda (sl)
+     (multiple-value-bind (removed finished)
+         (%sl-finishes-within 10 (lambda () (remove-from-skip-list sl 2)))
+       (is-true finished "remove-from-skip-list did not finish in 10 s")
+       (is (null removed) "a second remove of key 2 answered ~S" removed)
+       (when finished
+         (is (equal '((1 . 1) (3 . 3)) (skip-list-to-list sl))))))))

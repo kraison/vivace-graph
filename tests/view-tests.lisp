@@ -598,3 +598,102 @@ which would make a plain map view keep behaving as a map-reduce view."
     (graph-db::compile-view-code v)
     (is (null (graph-db::view-reduce-fn v))
         "dropping :REDUCE left a stale reduce fn bound")))
+
+;;; ---------------------------------------------------------------------------
+;;; GH #399: a view must not resolve its nodes through LOOKUP-<class> by name.
+;;;
+;;; DEF-VIEW recorded that symbol and MAP-VIEW funcalled it per entry, so an
+;;; application function of the same name silently took over and was handed
+;;; raw ids.  MAP-VIEW now reads through the generic LOOKUP-VERTEX /
+;;; LOOKUP-EDGE; the recorded symbol stays in the view record, inert.
+;;; ---------------------------------------------------------------------------
+
+(def-vertex vw-clobbered ()
+  ((tag :type string))
+  :graph-db-integration-test)
+
+(test a-view-survives-an-application-function-named-lookup-type
+  "GH #399: with LOOKUP-VW-CLOBBERED replaced by an application function
+that signals, the view still answers."
+  (with-test-graph (g)
+    (def-view clobbered-by-tag :lessp
+        (vw-clobbered :graph-db-integration-test)
+      (:map (lambda (v) (yield (slot-value v 'tag) nil))))
+    (let (vid)
+      (with-transaction ()
+        (setq vid (id (make-vw-clobbered :tag "t"))))
+      (let ((original (fdefinition 'lookup-vw-clobbered)))
+        (unwind-protect
+             (progn
+               (setf (fdefinition 'lookup-vw-clobbered)
+                     (lambda (&rest args)
+                       (declare (ignore args))
+                       (error "the application's LOOKUP-VW-CLOBBERED")))
+               (let ((hits (invoke-graph-view 'vw-clobbered 'clobbered-by-tag
+                                              :key "t")))
+                 (is (= 1 (length hits)))
+                 (is (equalp vid (cdr (assoc :id (first hits)))))))
+          (setf (fdefinition 'lookup-vw-clobbered) original))))))
+
+;;; ---------------------------------------------------------------------------
+;;; GH #402: a view added to a graph that already holds data is backfilled,
+;;; in both orders -- DEF-VIEW on the open graph, and DEF-VIEW registered
+;;; while the graph is closed and reconciled by the next OPEN-GRAPH.
+;;; ---------------------------------------------------------------------------
+
+(defparameter *view402-graph-name* :graph-db-view402-test)
+
+(defun define-view402-schema ()
+  (def-vertex vw402-item () ((bucket :initarg :bucket :accessor vw402-bucket))
+    :graph-db-view402-test))
+
+(defun define-view402-view ()
+  (def-view vw402-by-bucket :lessp (vw402-item :graph-db-view402-test)
+    (:map (lambda (x) (yield (slot-value x 'bucket) nil)))))
+
+(defun view402-keys (graph)
+  (let ((*graph* graph))
+    (sort (map-view (lambda (k id v) (declare (ignore id v)) k)
+                    'vw402-item 'vw402-by-bucket :graph graph :collect-p t)
+          #'<)))
+
+(test a-view-added-to-an-open-graph-is-backfilled
+  "GH #402, order one: data first, DEF-VIEW on the open graph.  The new
+view answers every existing node at once and still after a reopen."
+  (with-temp-directory (dir)
+    (remhash *view402-graph-name* graph-db::*schema-view-metadata*)
+    (let ((path (namestring dir)))
+      (let ((g (make-graph *view402-graph-name* path :buffer-pool-size 1000)))
+        (let ((*graph* g))
+          (define-view402-schema)
+          (with-transaction () (dotimes (i 5) (make-vw402-item :bucket i)))
+          (define-view402-view)
+          (is (equal '(0 1 2 3 4) (view402-keys g)) "backfilled on define"))
+        (close-graph g :snapshot-p nil))
+      (let ((g2 (open-graph *view402-graph-name* path)))
+        (unwind-protect
+             (is (equal '(0 1 2 3 4) (view402-keys g2)) "and after a reopen")
+          (ignore-errors (close-graph g2 :snapshot-p nil))
+          (collect-garbage))))))
+
+(test a-view-registered-while-the-graph-is-closed-is-backfilled-at-open
+  "GH #402, order two: the graph holds data and is closed; DEF-VIEW runs
+with no graph open under that name (a new image loading its schema);
+OPEN-GRAPH reconciles the spec and builds the index over the data."
+  (with-temp-directory (dir)
+    (remhash *view402-graph-name* graph-db::*schema-view-metadata*)
+    (let ((path (namestring dir)))
+      (let ((g (make-graph *view402-graph-name* path :buffer-pool-size 1000)))
+        (let ((*graph* g))
+          (define-view402-schema)
+          (with-transaction () (dotimes (i 5) (make-vw402-item :bucket i))))
+        (close-graph g :snapshot-p nil))
+      (is (null (graph-db::lookup-graph *view402-graph-name*))
+          "precondition: closed")
+      (define-view402-view)
+      (let ((g2 (open-graph *view402-graph-name* path)))
+        (unwind-protect
+             (is (equal '(0 1 2 3 4) (view402-keys g2))
+                 "a view registered while closed is built at open")
+          (ignore-errors (close-graph g2 :snapshot-p nil))
+          (collect-garbage))))))

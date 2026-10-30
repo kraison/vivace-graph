@@ -151,10 +151,10 @@ generated LOOKUP-<type> functions filter deleted edges.
 
 :AS-OF EPOCH answers at that epoch under a per-call snapshot (GH #115, spec
 §3.4; see WITH-AS-OF for the refusals); the result is materialised so it is
-safe to READ after the call.  TRAP: never SAVE a copy of an as-of result --
-COPY-NODE registers the archived version as the old node and the save
-archives it over the live head, cutting the chain.  To restore an old
-value, COPY the LIVE node and SETF its slots from what you read."
+safe to READ after the call, and a COPY of it saved inside a transaction
+is a new revision over the live head carrying the old values -- the
+write's base is the version the transaction sees for the id, never the
+object copied (GH #355)."
   (if as-of
       (call-with-read-snapshot
        (lambda ()

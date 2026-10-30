@@ -172,3 +172,33 @@ no corruption or crash; final edge count must equal writers × M."
             "Expected ~D edges from hub; found ~D"
             (* writers m)
             (length (outgoing-edges (lookup-vertex hub-id))))))))
+
+;;; ---------------------------------------------------------------------------
+;;; Test 4: concurrent cache misses for one address yield ONE node object
+;;;
+;;; GH #406: two threads missing the node cache for the same address both
+;;; built an object and both installed it, so one on-disk node had two
+;;; Lisp objects in flight.  A splice through one left the other's forward
+;;; pointers stale, and writers walking the stale one retried forever
+;;; (the deterministic half is in tests/skip-list-tests.lisp).
+;;; ---------------------------------------------------------------------------
+
+(test skip-list-concurrent-cache-misses-share-one-node
+  "GH #406: four threads reading an uncached address at once must all get
+the same node object.  Repeated, because the window is narrow."
+  (with-conc-memory (heap)
+    (let* ((sl (make-conc-integer-skip-list heap))
+           (addr (graph-db::%sn-addr (add-to-skip-list sl 1 1)))
+           (n 4)
+           (mismatches 0))
+      (dotimes (round 300)
+        (let ((seen (make-array n :initial-element nil)))
+          (graph-db::invalidate-cached-skip-node sl addr)
+          (run-threads n (lambda (i)
+                           (setf (aref seen i)
+                                 (graph-db::read-skip-node sl addr))))
+          (unless (every (lambda (node) (eq node (aref seen 0))) seen)
+            (incf mismatches))))
+      (is (zerop mismatches)
+          "~D of 300 rounds built more than one object for address ~D"
+          mismatches addr))))
