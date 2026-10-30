@@ -13,6 +13,14 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Added
 
+- **`reset-vector-segment`: drop a `:vector-index` slot's segment so the
+  next write recreates it at its own dimension** (#365). An emptied
+  segment kept its dimension on disk and across a reopen, so re-embedding
+  with a model of another width had no supported route. The reset
+  refuses with `vector-segment-in-use` while any live node of the owner
+  holds a vector, runs under the transaction manager's lock, and closes
+  the old segment the #54 way, so a scan in flight finishes first.
+
 - **`unique-lookup`: a public read of unique-index membership, and
   `find-by-unique/4` in Prolog** (#415). The live node holding a value
   under a `:unique` slot or a `def-unique` tuple, or NIL, with the

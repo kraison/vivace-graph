@@ -750,6 +750,58 @@ traffic -- at open, before writes, like rebuild-spatial-indexes."
               (when old (close-vector-segment old))
               seg))))))
 
+(define-condition vector-segment-in-use (error)
+  ((owner :initarg :owner :reader vector-segment-in-use-owner)
+   (slot :initarg :slot :reader vector-segment-in-use-slot)
+   (count :initarg :count :reader vector-segment-in-use-count))
+  (:documentation "RESET-VECTOR-SEGMENT refused: live nodes still hold a
+conforming vector in the slot (GH #365).")
+  (:report (lambda (c s)
+             (format s "Vector segment (~A . ~A) is in use: ~D live node~:P ~
+still hold a vector in the slot; clear them first"
+                     (vector-segment-in-use-owner c)
+                     (vector-segment-in-use-slot c)
+                     (vector-segment-in-use-count c)))))
+
+(defun reset-vector-segment (graph class-name slot-name)
+  "Drop the (owner of CLASS-NAME, SLOT-NAME) segment so the next conforming
+write recreates it, at that write's dimension: the supported way to change
+a :VECTOR-INDEX slot's dimension, since an emptied segment keeps its
+dimension on disk and across a reopen (GH #365).  Refuses with
+VECTOR-SEGMENT-IN-USE while any live node of the owner holds a conforming
+vector -- clear them (unbound or NIL) and commit first.  Runs under the
+transaction manager's lock, so no commit interleaves; the close waits for
+a scan in flight and a reader holding the old object gets SEGMENT-CLOSED
+(GH #54).  Returns T when a segment was dropped, NIL when there was none."
+  (let* ((class (find-class class-name))
+         (owner (%vector-index-slot-owner-name class slot-name))
+         (key (cons owner slot-name))
+         (path (%segment-file graph owner slot-name)))
+    (unless (%class-declares-vector-index-p class slot-name)
+      (error 'query-precondition-error
+             :reason (format nil "~A.~A is not a :vector-index slot"
+                             class-name slot-name)))
+    ;; The function, not WITH-TRANSACTION-MANAGER-LOCK: that macro lives
+    ;; in transactions.lisp, compiled after this file.
+    (call-with-transaction-manager-lock
+     (lambda ()
+       (let ((held 0))
+         (%sweep-vector-index-owner
+          (lambda (node)
+            (unless (deleted-p node)
+              (when (%node-segment-value node slot-name)
+                (incf held))))
+          graph owner)
+         (when (plusp held)
+           (error 'vector-segment-in-use :owner owner :slot slot-name
+                                         :count held)))
+       (let ((old (gethash key (vector-segments graph))))
+         (remhash key (vector-segments graph))
+         (when old (close-vector-segment old))
+         (ignore-errors (delete-file path))
+         (and old t)))
+     (transaction-manager graph))))
+
 (defun rebuild-vector-segment-batched (graph owner-name slot-name
                                        &key (batch-size 5000) progress-fn)
   "ADDITIVELY fill the (OWNER-NAME, SLOT-NAME) segment from live nodes,

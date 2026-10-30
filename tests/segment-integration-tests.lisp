@@ -1348,3 +1348,54 @@ memory."
           (vector-search g 'si-doc 'embedding q 3)
         (is (eq :ok status))
         (is (= 3 (length hits)))))))
+
+;;; ---------------------------------------------------------------------------
+;;; GH #365: RESET-VECTOR-SEGMENT, the supported way to change a dimension.
+;;; ---------------------------------------------------------------------------
+
+(test reset-vector-segment-lets-a-new-dimension-in
+  "GH #365: an emptied segment keeps its dimension, so a write of another
+length is refused; after RESET-VECTOR-SEGMENT the next write creates the
+segment at its own dimension, and that survives a reopen.  Reset while a
+node still holds a vector is refused; reset with no segment answers NIL."
+  (with-temp-directory (dir)
+    (let ((g (make-graph *integration-graph-name* (namestring dir)
+                         :buffer-pool-size 1000))
+          id)
+      (unwind-protect
+           (let ((*graph* g))
+             (is (null (graph-db:reset-vector-segment g 'si-doc 'embedding))
+                 "no segment yet: NIL")
+             (with-transaction ()
+               (setq id (id (make-si-doc :title "a"
+                                         :embedding (%si-embedding 4 1.0)))))
+             (signals graph-db:vector-segment-in-use
+               (graph-db:reset-vector-segment g 'si-doc 'embedding))
+             (with-transaction ()
+               (let ((c (copy (lookup-vertex id))))
+                 (setf (slot-value c 'embedding) nil)
+                 (save c)))
+             (signals graph-db::vector-dimension-violation
+               (with-transaction ()
+                 (make-si-doc :title "b" :embedding (%si-embedding 8 1.0)))
+               "precondition: the emptied segment still refuses dimension 8")
+             (is-true (graph-db:reset-vector-segment g 'si-doc 'embedding))
+             (finishes
+               (with-transaction ()
+                 (make-si-doc :title "b" :embedding (%si-embedding 8 1.0))))
+             (is (= 8 (graph-db::segment-dimension
+                       (%si-segment g 'embedding)))))
+        (close-graph g :snapshot-p nil))
+      (let ((g2 (open-graph *integration-graph-name* (namestring dir))))
+        (unwind-protect
+             (let ((*graph* g2))
+               (is (= 8 (graph-db::segment-dimension
+                         (%si-segment g2 'embedding)))
+                   "the new dimension survives a reopen")
+               (multiple-value-bind (hits status)
+                   (vector-search g2 'si-doc 'embedding (%si-embedding 8 1.0)
+                                  1)
+                 (is (eq :ok status))
+                 (is (= 1 (length hits)))))
+          (close-graph g2 :snapshot-p nil)))
+      (collect-garbage))))
