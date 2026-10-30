@@ -776,7 +776,9 @@ new value and not the old, and ~map-index~ stays in ascending order.
 The entry-level reads that resolve no node follow the same rule
 (#409): ~index-count~ counts the entries the transaction will commit,
 and ~map-index-prefixes~ lists each prefix it will commit once, in
-index order. So do the count index's ~count-index-lookup~ and
+index order. All four answer the same way on a declared index no commit
+has populated yet: the overlay alone supplies the rows (#416). So do the
+count index's ~count-index-lookup~ and
 ~map-count-index~ (#411): the committed counters plus the apply pass's
 arithmetic over the transaction's writes. Spacetime's three hand-rolled
 overlays over these reads went with #411; cardinality's edge delta

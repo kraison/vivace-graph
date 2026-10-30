@@ -450,6 +450,17 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Fixed
 
+- **Index reads on a declared index no commit has built yet see the
+  transaction's own writes** (#416). `index-lookup`, `map-index` /
+  `index-range`, `index-count` and `map-index-prefixes` returned their
+  empty answer before consulting the overlay when the index existed only
+  as a declaration, so in a fresh graph the transaction that created the
+  first nodes of a class could not find them by an indexed slot. Found by
+  the rules suite once spacetime's own overlay went (#411): a second
+  `%derive` in one transaction re-made its provenance records and commit
+  refused the duplicate. The read now walks a transient index with no
+  backing map, so the overlay half runs and the committed half is empty.
+
 - **Spatial and vector-segment queries see the transaction's own
   writes** (#410). Inside `with-transaction`, `find-nodes-within`,
   `find-nodes-intersecting`, `find-nodes-near`, `find-nearest-k` and

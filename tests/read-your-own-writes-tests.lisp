@@ -496,6 +496,38 @@ name lands at its place in the order."
           "the same once committed")
       (is (equal '(0 0) (pair '("1")))))))
 
+;;; --- GH #416: a declared index no commit has built yet --------------------
+
+(test ryow-unbuilt-index-reads-own-writes
+  "GH #416: on a fresh graph nothing of the class has committed, so the
+index exists only as a declaration (%REQUIRE-INDEX answers NIL).  The
+four readers still answer the transaction's own creates.  Every index
+test above commits first, which hid the gap until spacetime's own
+overlay went (#411)."
+  (with-ryow-graph (g)
+    (with-transaction ()
+      (make-ryow-node :k "a" :tag "t") (make-ryow-node :k "b" :tag "u")
+      (is (null (graph-db::%require-index g 'ryow-node 'tag))
+          "the fixture: no index built yet")
+      (is (equal '("a") (mapcar #'ryow-node-k
+                                (index-lookup g 'ryow-node 'tag "t"))))
+      (is (eq t (index-lookup g 'ryow-node 'tag "u" :collect-p nil)))
+      (is (= 1 (length (index-lookup g 'ryow-node '(k tag) '("b")
+                                     :prefix t))))
+      (is (equal '("t" "u")
+                 (mapcar #'ryow-node-tag
+                         (index-range g 'ryow-node 'tag
+                                      :start "t" :end "u"))))
+      (is (= 1 (index-count g 'ryow-node 'tag "t")))
+      (is (= 1 (index-count g 'ryow-node '(k tag) '("b") :prefix t)))
+      (let ((out '()))
+        (map-index-prefixes (lambda (p) (push p out)) g 'ryow-node
+                            '(k tag) :arity 1)
+        (is (equal '(("a") ("b")) (nreverse out)))))
+    (is (equal '("a") (mapcar #'ryow-node-k
+                              (index-lookup g 'ryow-node 'tag "t")))
+        "the same once committed")))
+
 ;;; --- Task 7: OCC (spec §4.5) ----------------------------------------------
 
 (test ryow-own-read-not-in-read-set

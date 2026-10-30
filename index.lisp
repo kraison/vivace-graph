@@ -250,7 +250,8 @@ origin (GH #107).  This is the single input to maintenance (apply / rebuild)."
   ;; The backing ordered map: a heap skip-list / B+ tree on an on-disk graph, a
   ;; MEM-SKIP-LIST on a memory-graph -- always ordered (needed for range).  Keyed
   ;; by the flat composite (v1 ... vn id) under %INDEX-COMP-LESSP, arity-aware
-  ;; since Task 4 (GH #107).
+  ;; since Task 4 (GH #107).  NIL on the transient read-side index
+  ;; %OVERLAY-ONLY-INDEX makes (GH #416): the walkers read it as empty.
   skip-list)
 
 (defun %index-head-key (arity)
@@ -491,12 +492,14 @@ value(s)~:[~; -- pass :PREFIX T for a prefix scan~]"
 list from %INDEX-KEY: an exact match when KEY supplies SIX's full arity, or --
 with PREFIX T -- a range scan when KEY supplies fewer, matching every stored
 tuple that starts with KEY.  NIL if none.  Bounds via %INDEX-BOUNDS (GH #107)."
-  (multiple-value-bind (lo hi) (%index-bounds six key prefix)
-    (let ((cur (make-range-cursor (slot-index-skip-list six) lo hi))
-          (ids '()))
-      (loop for node = (cursor-next cur :eoc) until (eql node :eoc)
-            do (push (car (last (%sn-key node))) ids))
-      (nreverse ids))))
+  (let ((sl (slot-index-skip-list six)))
+    (when sl                      ; no map: a transient index (GH #416)
+      (multiple-value-bind (lo hi) (%index-bounds six key prefix)
+        (let ((cur (make-range-cursor sl lo hi))
+              (ids '()))
+          (loop for node = (cursor-next cur :eoc) until (eql node :eoc)
+                do (push (car (last (%sn-key node))) ids))
+          (nreverse ids))))))
 
 (defun ix-put (six key id)
   "Enter node ID under canonical tuple KEY (SIX's full-arity component list).
@@ -533,10 +536,12 @@ extensions, so the two paths disagreed on a short END (GH #107, #413)."
          (hi (if end
                  (nth-value 1 (%index-bounds six end t))
                  (%index-tail-key arity)))
-         (cur (make-range-cursor sl lo hi)))
-    (loop for node = (cursor-next cur :eoc) until (eql node :eoc)
-          do (funcall fn (butlast (%sn-key node))
-                      (car (last (%sn-key node)))))))
+         ;; No map: a transient index (GH #416).
+         (cur (and sl (make-range-cursor sl lo hi))))
+    (when cur
+      (loop for node = (cursor-next cur :eoc) until (eql node :eoc)
+            do (funcall fn (butlast (%sn-key node))
+                        (car (last (%sn-key node))))))))
 
 (defun overlay-index-members (ov six &key key prefix start end)
   "The open transaction's own live nodes that SIX indexes, as
@@ -1019,6 +1024,33 @@ result); signals only when the slot is not indexed at all (a programming error).
                                     class-name slot-name
                                     (graph-name graph)))))))
 
+(defun %overlay-only-index (graph class-name slot-name)
+  "A SLOT-INDEX for the declared index on CLASS-NAME.SLOT-NAME with no
+backing map: owner, slots and canonicalizers from the class's descriptor,
+which is all OVERLAY-INDEX-MEMBERS needs; the IX- walkers read it as
+empty.  NIL when no descriptor matches (GH #416)."
+  (let ((class (ignore-errors (find-class class-name nil)))
+        (slot-names (%normalize-slots slot-name)))
+    (when class
+      (let ((d (find slot-names
+                     (class-secondary-index-descriptors class graph)
+                     :key #'first :test #'equal)))
+        (when d
+          (%make-slot-index
+           :owner-name (second d) :slot-names (first d)
+           :canonicalizers (%resolve-index-canonicalizers
+                            (third d) (length (first d)))))))))
+
+(defun %index-for-read (graph class-name slot-name)
+  "The SLOT-INDEX a read of CLASS-NAME.SLOT-NAME walks: %REQUIRE-INDEX's,
+or -- when that is NIL (declared, nothing committed yet) and the open
+transaction has writes to show -- a transient one with no backing map,
+so the overlay half of the read still runs (GH #416).  NIL when there
+is nothing to read on either side; signals as %REQUIRE-INDEX does."
+  (or (%require-index graph class-name slot-name)
+      (and (current-overlay graph)
+           (%overlay-only-index graph class-name slot-name))))
+
 (defun index-lookup (graph class-name slot-name value
                      &key (collect-p t) prefix)
   "Nodes of CLASS-NAME (and subclasses) whose indexed slot(s) equal VALUE, via
@@ -1031,7 +1063,7 @@ tuple with a null component is still findable this way -- see
 ids in GRAPH.  With COLLECT-P NIL, returns T as soon as one match is found
 (GH #107)."
   (let* ((*graph* graph)
-         (six (%require-index graph class-name slot-name)))
+         (six (%index-for-read graph class-name slot-name)))
     (when six                            ; NIL => declared but empty => no matches
       (let ((key (%index-key six value))
             (result '())
@@ -1064,7 +1096,7 @@ extension and a short END ends after its last, so :END '(\"d\") includes
 every (\"d\" ...) row, with or without a START (GH #107, #413).  Resolves
 ids in GRAPH."
   (let* ((*graph* graph)
-         (six (%require-index graph class-name slot-name)))
+         (six (%index-for-read graph class-name slot-name)))
     (when six                            ; NIL => declared but empty => nothing to map
       (let* ((skey (and start (%index-key six start)))
              (ekey (and end   (%index-key six end)))
@@ -1117,7 +1149,8 @@ GRAPH."
   "The first entry of SIX with LO <= key <= HI whose id has no effective
 write under OV (any entry when OV is NIL), as (COMPONENTS . ID), or NIL.
 One seek, and one step per own id skipped (GH #409)."
-  (let ((cur (make-range-cursor (slot-index-skip-list six) lo hi)))
+  (let ((cur (and (slot-index-skip-list six)   ; no map: GH #416
+                  (make-range-cursor (slot-index-skip-list six) lo hi))))
     (when cur
       (loop for node = (cursor-next cur :eoc)
             until (eql node :eoc)
@@ -1162,7 +1195,7 @@ its own nodes' prefixes are merged in, each once (GH #409).  Trap:
 membership is live and a walk is not an atomic snapshot; resolve a
 prefix's nodes when a snapshot or a deletion matters."
   (let* ((*graph* graph)
-         (six (%require-index graph class-name slot-name)))
+         (six (%index-for-read graph class-name slot-name)))
     (when six                   ; NIL => declared but empty => no prefixes
       (let ((n (length (slot-index-slot-names six))))
         (unless (<= 1 arity n)
@@ -1210,22 +1243,24 @@ in the walk and its own matching nodes added (GH #350, #409).  Trap: it
 is O(range size) -- a count of a large prefix walks every entry under
 it."
   (let* ((*graph* graph)
-         (six (%require-index graph class-name slot-name)))
+         (six (%index-for-read graph class-name slot-name)))
     (if (null six)
         0
         (let ((key (%index-key six value)))
           (if (null key)
               0                 ; an all-null full tuple matches nothing
               (multiple-value-bind (lo hi) (%index-bounds six key prefix)
-                (let ((cur (make-range-cursor (slot-index-skip-list six)
-                                              lo hi))
+                (let ((cur (and (slot-index-skip-list six) ; GH #416
+                                (make-range-cursor
+                                 (slot-index-skip-list six) lo hi)))
                       (ov (current-overlay graph))
                       (n 0))
-                  (loop for node = (cursor-next cur :eoc)
-                        until (eql node :eoc)
-                        unless (and ov (overlay-effective-write
-                                        ov (car (last (%sn-key node)))))
-                          do (incf n))
+                  (when cur
+                    (loop for node = (cursor-next cur :eoc)
+                          until (eql node :eoc)
+                          unless (and ov (overlay-effective-write
+                                          ov (car (last (%sn-key node)))))
+                            do (incf n)))
                   (when ov
                     (incf n (length (overlay-index-members
                                      ov six :key key :prefix prefix))))
