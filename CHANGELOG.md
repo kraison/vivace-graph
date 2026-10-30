@@ -461,6 +461,16 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Fixed
 
+- **A view no longer resolves its nodes through `lookup-<class>` by
+  name** (#399). `def-view` recorded that symbol and `map-view` called
+  it per entry, so an application function of the same name silently
+  took the view over and was handed raw ids. `map-view` now reads
+  through `lookup-vertex` or `lookup-edge` by the view's class; the
+  recorded symbol stays in the persisted view record, inert, so no
+  existing view rebuilds. `:include-deleted-p` on `map-view` works as
+  documented as a result: the generated helper had hidden deleted nodes
+  before the flag could see them.
+
 - **GUI mount: the trailing-slash redirect never names a host, and
   `:read-only` is a dispatch rail** (#386). The 301 for a bare mount
   root was built from the raw request URI, so an absolute-form request

@@ -598,3 +598,39 @@ which would make a plain map view keep behaving as a map-reduce view."
     (graph-db::compile-view-code v)
     (is (null (graph-db::view-reduce-fn v))
         "dropping :REDUCE left a stale reduce fn bound")))
+
+;;; ---------------------------------------------------------------------------
+;;; GH #399: a view must not resolve its nodes through LOOKUP-<class> by name.
+;;;
+;;; DEF-VIEW recorded that symbol and MAP-VIEW funcalled it per entry, so an
+;;; application function of the same name silently took over and was handed
+;;; raw ids.  MAP-VIEW now reads through the generic LOOKUP-VERTEX /
+;;; LOOKUP-EDGE; the recorded symbol stays in the view record, inert.
+;;; ---------------------------------------------------------------------------
+
+(def-vertex vw-clobbered ()
+  ((tag :type string))
+  :graph-db-integration-test)
+
+(test a-view-survives-an-application-function-named-lookup-type
+  "GH #399: with LOOKUP-VW-CLOBBERED replaced by an application function
+that signals, the view still answers."
+  (with-test-graph (g)
+    (def-view clobbered-by-tag :lessp
+        (vw-clobbered :graph-db-integration-test)
+      (:map (lambda (v) (yield (slot-value v 'tag) nil))))
+    (let (vid)
+      (with-transaction ()
+        (setq vid (id (make-vw-clobbered :tag "t"))))
+      (let ((original (fdefinition 'lookup-vw-clobbered)))
+        (unwind-protect
+             (progn
+               (setf (fdefinition 'lookup-vw-clobbered)
+                     (lambda (&rest args)
+                       (declare (ignore args))
+                       (error "the application's LOOKUP-VW-CLOBBERED")))
+               (let ((hits (invoke-graph-view 'vw-clobbered 'clobbered-by-tag
+                                              :key "t")))
+                 (is (= 1 (length hits)))
+                 (is (equalp vid (cdr (assoc :id (first hits)))))))
+          (setf (fdefinition 'lookup-vw-clobbered) original))))))
