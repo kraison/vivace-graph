@@ -33,8 +33,8 @@ suite's fast tier and every other lane in full (see below).
   and compare the total against the step's own duration.
 
 - **Runners are self-hosted** (personal-account runners are
-  per-repo).  Primary: the `ma-dev` host, running as its `sitrep`
-  user under a niced systemd --user unit (`gh-runner.service`) so
+  per-repo).  Primary: a Linux host, running as a dedicated user
+  under a niced systemd --user unit (`gh-runner.service`) so
   interactive work and services always win contention.  Secondary:
   an arm64 mac lane, advisory only (`continue-on-error`) -- its
   value is the #218 class of bug, arm64-only failures.
@@ -90,3 +90,27 @@ suite's fast tier and every other lane in full (see below).
   `docs/perf-baselines.md`).  Run those deliberately.
 - Fork PRs require approval before workflows run on these machines
   (repository default; do not relax it).
+
+## Cutting a release
+
+The flow, as 4.0.0 and 4.0.1 did it (GH #403):
+
+1. Cut `release/X.Y` from `experiment`.
+2. Run the validation matrix against the branch -- SBCL and ECL on macOS
+   arm64 and Linux, CCL on Linux, every suite including
+   `concurrent-stress` -- and fix on the branch, cherry-picking each fix
+   to `experiment`. Classify every failure on the gate issue. Validate
+   on a host with a current Quicklisp dist: a stale dist hides
+   dependency rot. After an `rsync -a` of a tree, `touch` the sources,
+   or ASDF serves stale FASLs.
+3. Rename `## [Unreleased]` to `## [X.Y.Z] - date` and bump `:version`
+   in every system of `graph-db.asd`. `## [Unreleased]` also appears in
+   the CHANGELOG's preamble, so anchor the edit on the heading line.
+4. `git fetch` and reset local `master` to `origin/master`, merge, and
+   only then tag: push the tag after `master` has landed. In 4.0.0 a
+   rejected merge push still pushed the tag.
+5. Back-merge into `experiment` with a fresh `## [Unreleased]`.
+
+Only `master` carries the `claude*.yml` workflows; the merge preserves
+them. GitHub caps a release body at 125 KB, so the release notes are a
+curated summary that links `CHANGELOG.md`.
