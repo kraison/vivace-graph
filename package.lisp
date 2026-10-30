@@ -413,6 +413,7 @@
            #:regenerate-unique-indexes
            ;; multi-slot uniqueness constraint (issue #107)
            #:def-unique
+           #:unique-lookup                              ; GH #415
            ;; general ordered index (:index slot option / def-index)
            #:def-index
            ;; counting index (GH #361)
@@ -473,6 +474,7 @@
            #:count-index-lookup #:map-count-index        ; GH #361
            ;; index-backed generator predicates for Prolog (GH #102)
            #:find-by-slot/4 #:find-slot-range/5
+           #:find-by-unique/4                           ; GH #415
            #:rebuild-secondary-indexes #:regenerate-secondary-indexes
 
            #:def-view

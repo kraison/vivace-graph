@@ -588,3 +588,94 @@ for it (a heap or storage error mid-scan) are not reproducible in a test."
         "absence was recoverable: the rebuild scanned both nodes")
     (signals graph-db:unique-constraint-violation
       (with-transaction () (make-uq-claim :ns "ops" :ky "e1")))))
+
+;;; --- GH #415: UNIQUE-LOOKUP, the public read ------------------------------
+
+(test unique-lookup-single-slot-and-canonicalizer
+  "GH #415: UNIQUE-LOOKUP answers the live holder of a :UNIQUE value, or
+NIL; the canonicalizer applies to the probe; a null probe is nothing's
+value; a subclass and its owner share one answer; an undeclared slot
+signals."
+  (with-uq-graph (g)
+    (let (alice root)
+      (with-transaction ()
+        (setf alice (make-uq-user :uname "alice" :email "Alice@X.com")
+              root (make-uq-admin :uname "root" :email "r@x.com"
+                                  :level 1)))
+      (flet ((who (class slot value)
+               (let ((n (unique-lookup g class slot value)))
+                 (and n (uq-uname n)))))
+        (is (equal "alice" (who 'uq-user 'uname "alice")))
+        (is (null (who 'uq-user 'uname "bob")))
+        (is (equal "alice" (who 'uq-user 'email "ALICE@x.com"))
+            "the canonicalizer applies to the probe")
+        (is (null (who 'uq-user 'uname nil)) "null-exempt")
+        (is (equal "root" (who 'uq-admin 'uname "root"))
+            "a subclass resolves to the owner's index")
+        (is (equal "root" (who 'uq-user 'uname "root"))
+            "the owner sees the subclass's holder")
+        (signals graph-db::query-precondition-error
+          (unique-lookup g 'uq-user 'note "x"))))))
+
+(test unique-lookup-tuple
+  "GH #415: a DEF-UNIQUE tuple is probed by its component list; a null
+component matches nothing (the tuple is exempt); inside a transaction
+an own create is found, whether or not the index is built (#416)."
+  (with-uq-graph (g)
+    (flet ((ky (tuple)
+             (let ((n (unique-lookup g 'uq-claim '(ns ky) tuple)))
+               (and n (uqc-ky n)))))
+      (with-transaction ()
+        (make-uq-claim :ns "ops" :ky "e1") (make-uq-claim :ns "ops"))
+      (is (equal "e1" (ky '("ops" "e1"))))
+      (is (null (ky '("ops" "e2"))))
+      (is (null (ky '("ops" nil))))
+      (with-transaction ()
+        (make-uq-claim :ns "ops" :ky "e3")
+        (is (equal "e3" (ky '("ops" "e3"))) "an own create"))
+      (graph-db::%unregister-unique-tuple-index g 'uq-claim '(ns ky))
+      (is (null (ky '("ops" "e1")))
+          "declared but unbuilt: NIL, as INDEX-LOOKUP answers")
+      (with-transaction ()
+        (make-uq-claim :ns "ops" :ky "e4")
+        (is (equal "e4" (ky '("ops" "e4")))
+            "unbuilt, but the own create still answers")))))
+
+(test unique-lookup-sees-own-writes
+  "GH #415: inside a transaction the answer is what it will commit: an
+own create is found; a moved value is found under the new value and
+not the old (the committed holder skipped, the own copy supplied); a
+deleted holder frees its value.  *READ-OWN-WRITES* NIL reads committed
+state."
+  (with-uq-graph (g)
+    (let (alice bob)
+      (with-transaction ()
+        (setf alice (make-uq-user :uname "alice" :email "a@x.com")
+              bob (make-uq-user :uname "bob" :email "b@x.com")))
+      (flet ((who (value)
+               (let ((n (unique-lookup g 'uq-user 'uname value)))
+                 (and n (uq-uname n)))))
+        (with-transaction ()
+          (make-uq-user :uname "carol" :email "c@x.com")
+          (is (equal "carol" (who "carol")) "an own create")
+          (let ((c (copy alice))) (setf (uq-uname c) "alice2") (save c))
+          (is (null (who "alice")) "the moved value is free")
+          (is (equal "alice2" (who "alice2")) "and held under the new")
+          (mark-deleted bob)
+          (is (null (who "bob")) "a deleted holder frees its value")
+          (let ((graph-db::*read-own-writes* nil))
+            (is (null (who "carol")))
+            (is (equal "alice" (who "alice")))
+            (is (null (who "alice2")))))
+        (is (equal "alice2" (who "alice2")) "the same once committed")))))
+
+(test find-by-unique-generates-the-holder
+  "GH #415: FIND-BY-UNIQUE/4 yields the holder once, nothing for a free
+value, and signals on an undeclared slot."
+  (with-uq-graph (g)
+    (with-transaction () (make-uq-user :uname "alice" :email "a@x.com"))
+    (is (= 1 (length (select-flat (?n)
+                       (find-by-unique ?n uq-user uname "alice")))))
+    (is (null (select-flat (?n) (find-by-unique ?n uq-user uname "zed"))))
+    (signals error
+      (select-flat (?n) (find-by-unique ?n uq-user note "x")))))

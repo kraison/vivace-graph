@@ -768,8 +768,9 @@ the store, so ~lookup-vertex~, ~lookup-edge~ and the generated
 copy. An overlay over the write set then feeds the enumeration points:
 the typed ~map-vertices~ and ~map-edges~, the adjacency forms (so
 ~outgoing-edges~, ~incoming-edges~, ~traverse~ and the Prolog functors),
-~edge-exists-p~, and ~index-lookup~, ~map-index~ and ~index-range~ on
-~:index~ and ~def-index~ slots. Each committed walk skips an id the
+~edge-exists-p~, ~index-lookup~, ~map-index~ and ~index-range~ on
+~:index~ and ~def-index~ slots, and ~unique-lookup~ on a ~:unique~ slot
+or a ~def-unique~ tuple (#415). Each committed walk skips an id the
 transaction wrote and the overlay supplies every own live node at its
 current type, endpoints or key, so a moved index key is found under the
 new value and not the old, and ~map-index~ stays in ascending order.
@@ -789,9 +790,9 @@ their current geometry (~find-nodes-within~, ~find-nodes-intersecting~,
 ~find-nodes-near~, ~find-nearest-k~ and the functors) or scored by
 their current vector (~vector-search~) and merged into the answer.
 
-What stays committed-only, each with its issue: views (#7); the fully
-untyped ~map-vertices~ / ~map-edges~ lhash scans (admin paths that
-bypass MVCC as well); unique-index membership. A nested ~with-transaction~ is an
+What stays committed-only: views (#7), and the fully untyped
+~map-vertices~ / ~map-edges~ lhash scans (admin paths that bypass MVCC
+as well). A nested ~with-transaction~ is an
 independent commit and sees nothing of the outer one. A read snapshot
 opened inside a transaction inherits it and so sees its writes; an
 ~:as-of~ read is refused there, as before.
@@ -1426,6 +1427,16 @@ Handle a violation like any other condition (readers ~ucv-class-name~, ~ucv-slot
               (ucv-value c) (ucv-existing-id c))))
 #+END_SRC
 
+Read the constraint's index with ~unique-lookup~: the live node holding a value, or ~nil~ (GH #415). The canonicalizer applies to the probe, a null probe is nothing's value, and the holder may be of any class under the constraint's owner, since a parent's constraint is one index across its subclasses. A ~def-unique~ tuple is probed by its component list (see "Multi-slot (tuple) indexes and unique constraints" below). Inside a transaction the answer is what it will commit (Chapter 5, "What a transaction sees"). An undeclared slot signals ~query-precondition-error~.
+
+#+BEGIN_SRC lisp
+  (unique-lookup *graph* 'user 'username "alice")         ; the holder, or NIL
+  (unique-lookup *graph* 'user 'email "Alice@X.com")      ; canonicalized first
+  (unique-lookup *graph* 'claim '(ns key) '("ops" "e1"))  ; a def-unique tuple
+#+END_SRC
+
+From Prolog, ~(find-by-unique ?node user username "alice")~ binds ~?node~ at most once.
+
 **** Scope: uniqueness under peer replication
 
 By default a constraint is ~:scope :local~ — the value is unique within *this* graph. Global uniqueness across a whole fleet is not a coordination-free property, so peer replication (Chapter 16) offers a second scope for VivaceGraph-minted values:
@@ -1504,12 +1515,13 @@ What withdrawal does: the declaration stops being enforced or maintained immedia
 
 **** Reaching the index from Prolog
 
-Two *generating* predicates put the index in front of the query language, which for most users is the surface they actually reach for:
+Three *generating* predicates put the indexes in front of the query language, which for most users is the surface they actually reach for:
 
 #+BEGIN_SRC prolog
   (find-by-slot    ?node user email "alice@x.com")   ; equality
   (find-slot-range ?node user age 18 65)             ; ordered range, ascending
   (find-slot-range ?node user age 18 nil)            ; open above; ?end may also be left unbound
+  (find-by-unique  ?node user username "alice")      ; the unique holder, at most once (GH #415)
 #+END_SRC
 
 ⚠ These *generate* — they bind ~?node~ once per hit. That is a different shape from ~geo-within/3~, which *filters* already-bound arguments; ~find-within/3~ is the right analogue, and ~?node~ comes first for the same reason it does there. Without them, a query over an indexed slot had to generate candidates with ~is-a/2~ — every instance of the class — and filter one at a time with ~node-slot-value/3~, which is a filter and not a lookup. That is O(instances) against an O(log n) index the graph was already maintaining on every commit.

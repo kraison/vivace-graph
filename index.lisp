@@ -1318,6 +1318,20 @@ covers ?CLASS.?SLOT."
           (funcall cont))
         (undo-bindings old-trail)))))
 
+(def-global-prolog-functor find-by-unique/4 (?node ?class ?slot ?value cont)
+  "Yield the node of ?CLASS (or a subclass) holding ?VALUE under the
+unique constraint on ?CLASS.?SLOT -- at most once -- via UNIQUE-LOOKUP.
+?SLOT is a slot name or a DEF-UNIQUE slot list, ?VALUE then its
+components.  Signals if nothing declares the constraint (GH #415)."
+  (let ((node-var (var-deref ?node))
+        (node (unique-lookup *graph* (var-deref ?class) (var-deref ?slot)
+                             (var-deref ?value))))
+    (when node
+      (let ((old-trail (fill-pointer *trail*)))
+        (when (unify node-var node)
+          (funcall cont))
+        (undo-bindings old-trail)))))
+
 (def-global-prolog-functor find-slot-range/5 (?node ?class ?slot ?start ?end cont)
   "Yield each node of ?CLASS (and its subclasses) whose indexed ?SLOT lies in
 [?START, ?END], inclusive, in ascending value order.  Either bound may be NIL

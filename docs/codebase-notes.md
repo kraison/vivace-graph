@@ -27,7 +27,8 @@ define a type and its `make-<type>` constructor; an edge takes `:from` and
 
 **A read inside the transaction sees its writes.** Lookups, typed and
 adjacency scans, `graph-db:edge-exists-p`, `graph-db:index-lookup`,
-`graph-db:index-count`, `graph-db:map-index-prefixes` and
+`graph-db:unique-lookup`, `graph-db:index-count`,
+`graph-db:map-index-prefixes` and
 `graph-db:count-index-lookup`, the spatial queries and
 `graph-db:vector-search` return the transaction's own creates, saves and
 deletes (#408, #409, #410, #411). Not the untyped scans or views.
@@ -52,6 +53,10 @@ unless `:include-subclasses-p` is nil.
 **A lookup by an indexed slot.** `graph-db:index-lookup` takes the graph,
 the class, the slot and the value, and returns the matching vertices.
 `graph-db:def-index` declares the index.
+
+**A lookup by a unique value.** `graph-db:unique-lookup` takes the graph,
+the class, the slot or slot list and the value, and returns the holder
+or NIL (#415). `graph-db:def-unique` declares a tuple constraint.
 
 ## Efficient choices
 

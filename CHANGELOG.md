@@ -13,6 +13,16 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Added
 
+- **`unique-lookup`: a public read of unique-index membership, and
+  `find-by-unique/4` in Prolog** (#415). The live node holding a value
+  under a `:unique` slot or a `def-unique` tuple, or NIL, with the
+  canonicalizer applied to the probe and the null-exempt rule kept; a
+  subclass resolves to its owner's index; an undeclared slot signals
+  `query-precondition-error`. It reads as the transaction will commit
+  from day one: a committed holder the transaction wrote is skipped and
+  its own live node holding the value is answered at its current slots,
+  whether or not the index is built.
+
 - **`tests/run-suite.sh SUITE`: one suite in a fresh image** (#407).
   It binds the system directory and type registry the way `run-tests`
   does, where a bare `fiveam:run!` fails with `SYSTEM-DIRECTORY-REQUIRED`;

@@ -275,6 +275,7 @@
                 #:map-edges
                 #:def-index
                 #:index-lookup
+                #:unique-lookup
                 #:index-range
                 #:map-index
                 #:map-index-prefixes         ; GH #350
@@ -311,6 +312,7 @@
                 #:djv-offender #:check-disjointness
                 ;; index-backed generator predicates (GH #102)
                 #:find-by-slot/4
+                #:find-by-unique/4
                 #:find-slot-range/5
                 #:weight
                 #:to
