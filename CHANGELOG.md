@@ -461,6 +461,16 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Fixed
 
+- **An index-backed read under a snapshot never answers a node under a
+  value its version lacks** (#345). Index membership is released when a
+  write is applied, not when the version it indexed is reaped, so a
+  read snapshot could find a node under its new value and resolve the
+  old version. `index-lookup`, `map-index` and `unique-lookup` now check
+  the resolved version against the key. The other half, a node no
+  longer found under the value it had at the snapshot, is documented
+  (`docs/time-travel.md`) and is phase C-1's versioned membership
+  (#113).
+
 - **Index reads on a declared index no commit has built yet see the
   transaction's own writes** (#416). `index-lookup`, `map-index` /
   `index-range`, `index-count` and `map-index-prefixes` returned their

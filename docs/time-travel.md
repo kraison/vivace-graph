@@ -76,9 +76,14 @@ version as the old node, and the commit then archives that archived head
 over the live head. To restore an old value, read it as of the epoch, then
 copy the **live** node and set its slots from what you read.
 
-- Value indexes (slot indexes, the spacetime endpoint and producer
-  indexes) keep live membership (#345): a node hard-removed from one
-  after the epoch is not enumerated from it.
+- Value indexes (slot indexes, the unique index, the spacetime endpoint
+  and producer indexes) keep live membership: an entry is released when
+  the delete or update is applied, not when the version it indexed is
+  reaped. So at an epoch before such a write the node is not found
+  under the value it had then. A read never answers a node under a
+  value its resolved version lacks: `index-lookup`, `map-index` and
+  `unique-lookup` check the version against the key (#345). Versioned
+  membership is phase C-1's epoch-stamped entries (#113).
 - Cost: membership at an epoch walks every entry ever indexed under a
   type, including tombstones, and resolves each id. Phase C-1 (#113)
   replaces that walk with epoch-stamped index entries; the API above

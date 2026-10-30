@@ -5965,8 +5965,9 @@ graph — rather than answering from its private counter, while ~:as-of~
 on the same store keeps working. One of ~:as-of~ or ~:as-of-epoch~, not
 both. An uncommitted write has no epoch, so ~:as-of-epoch~ answers
 committed history only, as ~:as-of~ does. Index membership is not
-versioned (vivace-graph#345): a claim deleted after the epoch is not
-returned. A claim whose transaction period was already closed when it
+versioned (vivace-graph#345): a claim deleted or re-keyed after the epoch
+is not returned under the value it had then, and never under one its
+version at the epoch lacks; versioned membership is phase C-1 (#113). A claim whose transaction period was already closed when it
 was created — a replicated or restored belief retracted upstream —
 reads as retracted at every epoch. ~claims-by-producer~ takes
 ~:as-of-epoch~ the same way.

@@ -1113,3 +1113,60 @@ and is idempotent; ENSURE-UNIQUE enforces at commit under its :NAME."
     (is (= 1 (length (graph-db:index-lookup g 'ix-rt '(a) "x"))))
     (signals graph-db:unique-constraint-violation
       (with-transaction () (make-ix-rt :a "z" :b 1)))))
+
+;;; ---------------------------------------------------------------------------
+;;; GH #345: index membership is live, versions are not.
+;;;
+;;; %IX-RELEASE removes an entry when the delete (or the update's old value)
+;;; is applied, not when the version it indexed is reaped.  A read snapshot
+;;; opened before that write resolves the node at its own epoch, so an
+;;; index-backed read used to answer the node under its NEW value with its
+;;; OLD version's slot.  %INDEX-HIT-P now checks the resolved version still
+;;; carries the key.  The other half -- the old value no longer finds the
+;;; node at the snapshot, because its entry is gone -- is documented, and
+;;; is MVCC phase C-1's versioned membership (#113).
+;;; ---------------------------------------------------------------------------
+
+(defun %ix-write-in-another-thread (graph thunk)
+  "Run THUNK in a fresh thread with *GRAPH* bound to GRAPH, and wait: a
+write that commits while the calling thread holds a read snapshot."
+  (let ((err nil))
+    (bt:join-thread
+     (bt:make-thread (lambda ()
+                       (let ((*graph* graph))
+                         (handler-case (funcall thunk)
+                           (error (e) (setq err e)))))
+                     :name "ix-snapshot-writer"))
+    (when err (error err))))
+
+(test index-reads-under-a-snapshot-never-answer-a-key-the-version-lacks
+  "GH #345: a node re-indexed under a new value after the snapshot is
+not found under that value at the snapshot, by INDEX-LOOKUP or
+MAP-INDEX, although its id sits under it.  Control: the point lookup
+and the committed view both answer as expected."
+  (with-ix-graph (g)
+    (let (id)
+      (with-transaction ()
+        (setq id (id (make-ix-person :name "before" :age 1))))
+      (graph-db:with-read-snapshot (g)
+        (%ix-write-in-another-thread
+         g (lambda ()
+             (with-transaction ()
+               (let ((c (copy (lookup-vertex id))))
+                 (setf (ix-name c) "after")
+                 (save c)))))
+        (is (string= "before" (ix-name (lookup-vertex id)))
+            "control: the point lookup answers the snapshot's version")
+        (is (null (index-lookup g 'ix-person 'name "after"))
+            "INDEX-LOOKUP found the node under a value its version lacks")
+        (let ((hits '()))
+          (map-index (lambda (n) (push n hits)) g 'ix-person 'name
+                     :start "after" :end "after")
+          (is (null hits)
+              "MAP-INDEX emitted the node under a value its version lacks"))
+        ;; The documented gap: the old value's entry was released at
+        ;; apply, so nothing finds the node at the snapshot (#113).
+        (is (null (index-lookup g 'ix-person 'name "before"))))
+      (is (equal '("after") (ix-names (index-lookup g 'ix-person 'name
+                                                    "after")))
+          "outside the snapshot the update is visible"))))

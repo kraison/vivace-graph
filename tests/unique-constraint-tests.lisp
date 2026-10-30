@@ -679,3 +679,31 @@ value, and signals on an undeclared slot."
     (is (null (select-flat (?n) (find-by-unique ?n uq-user uname "zed"))))
     (signals error
       (select-flat (?n) (find-by-unique ?n uq-user note "x")))))
+
+(test unique-lookup-under-a-snapshot-never-answers-a-value-the-version-lacks
+  "GH #345: a holder re-keyed after the snapshot is not answered under
+the new value at the snapshot, although its id sits under it; the point
+lookup still answers the snapshot's version."
+  (with-uq-graph (g)
+    (let (id)
+      (with-transaction ()
+        (setq id (id (make-uq-user :uname "before" :email "b@x.com"))))
+      (graph-db:with-read-snapshot (g)
+        (let ((err nil))
+          (bt:join-thread
+           (bt:make-thread
+            (lambda ()
+              (let ((*graph* g))
+                (handler-case
+                    (with-transaction ()
+                      (let ((c (copy (lookup-vertex id))))
+                        (setf (uq-uname c) "after")
+                        (save c)))
+                  (error (e) (setq err e)))))))
+          (when err (error err)))
+        (is (string= "before" (uq-uname (lookup-vertex id)))
+            "control: the point lookup answers the snapshot's version")
+        (is (null (unique-lookup g 'uq-user 'uname "after"))
+            "UNIQUE-LOOKUP answered a holder under a value its version lacks"))
+      (is-true (unique-lookup g 'uq-user 'uname "after")
+               "outside the snapshot the update is visible"))))

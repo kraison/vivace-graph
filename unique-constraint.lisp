@@ -820,7 +820,13 @@ transaction's own writes (GH #415)."
             (and id
                  (not (and ov (overlay-effective-write ov id)))
                  (let ((node (%node-by-id id graph)))
-                   (and node (not (deleted-p node)) node))))
+                   ;; The version resolved at a read snapshot must still
+                   ;; hold VALUE: membership is live, versions are not
+                   ;; (GH #345).
+                   (and node (not (deleted-p node))
+                        (funcall (or (unique-index-test uix) #'equal)
+                                 key (%node-unique-key uix node graph))
+                        node))))
           (and ov
                (let ((test (or (unique-index-test uix) #'equal))
                      (owner (unique-index-owner-name uix)))
