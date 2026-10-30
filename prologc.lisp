@@ -207,6 +207,11 @@ read-only: no symbol is created or registered by asking (GH #322)."
   (or (get-functor-fn symbol)
       (nth-value 1 (gethash symbol *prolog-global-functors*))))
 
+(defun %functor-name-string (symbol arity)
+  "NAME/ARITY as a string, from SYMBOL's name (a string stands as is)
+and ARITY in decimal -- independent of the printer's bindings (GH #342)."
+  (concatenate 'string (string symbol) "/" (format nil "~D" arity)))
+
 (defun make-functor-symbol (symbol arity &key define)
   "The NAME/ARITY functor symbol for SYMBOL.  DEFINE (true only from
 the definition path -- <- via ADD-CLAUSE, and any other site minting
@@ -219,11 +224,13 @@ then in GRAPH-DB -- so a goal list whose canonical heads span the
 engine's package and a schema's resolves each in its home, and a head
 inherited from COMMON-LISP (>, atom, write) still finds the engine's
 functor.  A string SYMBOL never probes a package -- like DEFINE, it
-interns exactly as before this rule existed.  NAME is built with the
-same \"~{~a~}\" FORMAT NEW-INTERNED-SYMBOL uses (utilities.lisp:155,
-which is nothing but INTERN of that string), so every path spells the
-identical symbol (GH #322)."
-  (let ((name (format nil "~{~a~}" (list symbol '/ arity))))
+interns exactly as before this rule existed.  NAME is spelled by
+%FUNCTOR-NAME-STRING, never by the printer: a caller's *PRINT-CASE* or
+*PRINT-BASE* used to mint claim/7 where CLAIM/7 was registered and every
+goal was refused (GH #342).  NEW-INTERNED-SYMBOL (utilities.lisp) spells
+its parts the same way, so every path spells the identical symbol
+(GH #322)."
+  (let ((name (%functor-name-string symbol arity)))
     (flet ((hit (pkg)
              (and pkg
                   (let ((s (find-symbol name pkg)))

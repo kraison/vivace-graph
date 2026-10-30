@@ -441,3 +441,22 @@ both orders, case-insensitively.  Two strings stay case-sensitive."
         "control: two strings stay case-sensitive")
     (is (equal '(:foo) (select-flat (?x) (= ?x :foo) (== ?x "FOO")))
         "==/2 shares PROLOG-EQUAL with =/2, so it unifies too (#351)")))
+
+;;; ---------------------------------------------------------------------------
+;;; GH #342: the functor name must not pass through the printer.
+;;;
+;;; MAKE-FUNCTOR-SYMBOL spelled NAME/ARITY with ~A, so *PRINT-CASE*
+;;; :DOWNCASE minted claim/7 where CLAIM/7 was registered and every goal
+;;; was refused as unknown.  Compiled SELECT forms mint at compile time;
+;;; the rules, the guarded runner and the DSL evaluate at request time,
+;;; under whatever the caller has bound -- hence EVAL here.
+;;; ---------------------------------------------------------------------------
+
+(test functors-resolve-under-a-non-default-print-case-and-base
+  "GH #342: a SELECT evaluated with *PRINT-CASE* :DOWNCASE and
+*PRINT-BASE* 16 bound still finds its functors."
+  (with-test-graph (g)
+    (declare (ignore g))
+    (let ((*print-case* :downcase)
+          (*print-base* 16))
+      (is (equal '(42) (eval '(select-flat (?x) (= ?x 42) (numberp ?x))))))))

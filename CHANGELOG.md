@@ -467,6 +467,15 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Fixed
 
+- **The Prolog engine resolves functors under any `*print-case*` or
+  `*print-base*`** (#342). `make-functor-symbol` spelled `NAME/ARITY`
+  through `~A`, so a caller with `:downcase` bound minted `claim/7`
+  where `CLAIM/7` was registered and every goal evaluated at request
+  time (rules, the guarded runner, the query DSL) was refused as an
+  unknown functor. The name is now built from `symbol-name` and a
+  decimal arity, in `make-functor-symbol` and `new-interned-symbol`
+  alike.
+
 - **A view no longer resolves its nodes through `lookup-<class>` by
   name** (#399). `def-view` recorded that symbol and `map-view` called
   it per entry, so an application function of the same name silently
