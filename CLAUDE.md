@@ -21,7 +21,7 @@ Dependencies (bordeaux-threads, alexandria, cffi, uuid, cl-store, hunchentoot, n
 
 **Component load order matters.** `graph-db.asd` encodes a strict dependency chain from the storage primitives up to the query/REST layers; if you add a file, place it in the right position and declare its `:depends-on`.
 
-`examples/example.lisp` is the canonical end-to-end walkthrough (schema definition → views → ordered/unique/vector indexes → transactional inserts → queries → spatial) and is the best starting point for understanding the public API. `examples/example-spacetime.lisp` walks the spacetime claim subsystem; `examples/runtime-schema-example.lisp` documents runtime-defined types (it is documentation, not loadable). Both loadable examples are smoke-tested by loading them in a fresh image.
+`examples/example.lisp` is the canonical end-to-end walkthrough (schema definition → views → ordered/unique/vector indexes → transactional inserts → queries → spatial) and is the best starting point for understanding the public API. `examples/example-spacetime.lisp` walks the spacetime claim subsystem; `examples/runtime-schema-example.lisp` documents runtime-defined types (it is documentation, not loadable). Both loadable examples are smoke-tested by `tests/load-examples.sh`, which loads each in a fresh image with its `/var/tmp` scratch cleared first; CI runs it on every push (#417).
 
 `docs/codebase-notes.md` is the short version for writing code here: the core idioms, the efficient choice for each common access and its cost, and links to the traps. A test keeps every name it gives true.
 

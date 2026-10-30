@@ -13,6 +13,12 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Added
 
+- **`tests/load-examples.sh`, and a CI lane that runs it** (#417): each
+  loadable example is loaded in a fresh image with its `/var/tmp`
+  scratch cleared first, and any unhandled condition fails the run.
+  CLAUDE.md's "smoke-tested by loading them in a fresh image" now names
+  the gate that exists.
+
 - **Two tests pin that a view added to a graph with data is backfilled**
   (#402): defined against the open graph, or registered while the graph
   is closed and reconciled at the next open. The manual's views chapter
