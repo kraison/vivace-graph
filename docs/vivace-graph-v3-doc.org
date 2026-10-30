@@ -809,6 +809,47 @@ so the commit path counts an own edge once. A scan inside a transaction
 costs O(pending writes) extra; ~docs/perf-baselines.md~ has the number.
 Design: ~docs/superpowers/specs/2026-10-29-read-your-own-writes-design.md~.
 
+*** The transaction contract, in five rules (GH #401)
+
+The whole of what a caller may rely on, gathered in one place; each rule
+points at the section that explains it.
+
+1. *A transaction is one ~with-transaction~; nesting does not flatten.* A
+   nested ~with-transaction~ opens an independent transaction that commits
+   on its own, and its writes survive a rollback of the outer one. The
+   write operations -- ~make-<type>~, ~save~, ~mark-deleted~ -- join an
+   ambient transaction when one is open and wrap their own otherwise;
+   ~copy~ and ~save~ require one. The atomic unit is therefore one
+   ~with-transaction~ whose body calls the write operations directly; a
+   helper that opens its own ~with-transaction~ is a separate commit.
+
+2. *Validation is write-set driven.* A commit conflicts with another
+   transaction that committed during its lifetime and wrote a node this
+   one read or wrote ("Read/Write Sets and Validation"). An empty write set
+   never conflicts. Two transactions with disjoint write sets never
+   conflict, so OCC cannot catch a phantom or a write skew: two
+   transactions that each create a child under the same parent both
+   commit. To make them conflict, copy and save the parent in each.
+
+3. *A transaction reads what it will commit.* Its own creates, updates
+   and deletes are seen through lookups, the typed and adjacency scans,
+   ~edge-exists-p~, the secondary, unique, count, spatial and vector
+   index reads ("What a transaction sees", above). Committed-only, by
+   design: views, and the fully untyped ~map-vertices~ / ~map-edges~
+   scans. A write's base is the version the transaction sees for the
+   node's id, whatever object was copied (GH #355).
+
+4. *~with-read-snapshot~ is the consistent read, and it nests by
+   inheriting.* Every read inside it resolves at one epoch; an inner
+   snapshot of the same graph inherits the outer one, the opposite of
+   ~with-transaction~. It is the tool for a consistent export or report.
+   Index membership under it is live, not versioned (GH #345).
+
+5. *A committed write is durable without a snapshot.* The store is
+   memory-mapped and the commit writes through; the transaction log is
+   for replicas and recovery. ~snapshot~ is a separate backup
+   (Chapter 11), not part of durability.
+
 *** Locking and Concurrency (~rw-lock.lisp~)
 
 While the transactional system uses an optimistic model for application-level data, the database still relies on low-level locks to protect the integrity of its own internal data structures. VivaceGraph implements a custom, fair *Read-Write Lock*, defined in ~rw-lock.lisp~.

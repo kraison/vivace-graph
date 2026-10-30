@@ -6,6 +6,8 @@ Every qualified name here, such as `graph-db:map-edges`, is checked by
 `tests/codebase-notes-tests.lisp`, so a rename fails the suite. The traps
 live in `CLAUDE.md` and are linked, not copied.
 
+The transaction contract in five rules: manual Chapter 5, "The transaction contract" (#401). Read it before writing code that opens a transaction.
+
 ## Idioms
 
 **A graph needs a system directory.** `graph-db:make-graph` takes a name and

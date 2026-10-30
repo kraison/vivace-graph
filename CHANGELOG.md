@@ -77,6 +77,15 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Changed
 
+- **Manual Chapter 5 states the transaction contract in five rules**
+  (#401): one `with-transaction` is the atomic unit and nesting does not
+  flatten; validation is write-set driven, so phantoms and write skew
+  pass unless the parent is written; a transaction reads what it will
+  commit, with views and the untyped scans committed-only; a read
+  snapshot nests by inheriting and is the consistent read; a committed
+  write is durable without a snapshot. `docs/codebase-notes.md` points
+  at it.
+
 - **A malformed instant is an error, not an empty answer** (#388):
   `claim-valid-at/2` (and the new instant functors) signal
   `query-precondition-error` -- `prolog-ill-typed-error` through the
