@@ -106,6 +106,10 @@
            (ignore-errors (close-graph ,g))
            (collect-garbage))))))
 
+(defmacro with-ix-bplus-graph ((g) &body body)
+  "WITH-IX-GRAPH on the B+ tree index backend."
+  `(with-ix-graph (,g :backend :bplus-tree) ,@body))
+
 (defmacro with-ix-di-graph ((g) &body body)
   "A fresh on-disk graph named *IX-DI-GRAPH-NAME* (def-index-only schema)."
   (let ((dir (gensym)))
@@ -312,6 +316,48 @@ value component (#107)."
                                          :start (list "ops" "e1")
                                          :end   (list "ops" "e2")))
                      #'string<)))))
+
+(defun ix-ns-key-rows (g &rest range)
+  "INDEX-RANGE over IX-CLAIM's (ns key rel) index as (ns key) pairs, ascending."
+  (mapcar (lambda (n) (list (ix-ns n) (ix-key n)))
+          (apply #'index-range g 'ix-claim '(ns key rel) range)))
+
+(defmacro short-end-alone-includes-its-extensions-on (make-graph-macro)
+  "The #413 check inside MAKE-GRAPH-MACRO, one bound at a time."
+  `(,make-graph-macro (g)
+     (with-transaction ()
+       (make-ix-claim :ns "a" :key "x" :rel "at")
+       (make-ix-claim :ns "d" :key "x" :rel "at")
+       (make-ix-claim :ns "d" :key "y" :rel "at")
+       (make-ix-claim :ns "e" :key "x" :rel "at"))
+     (is (equal '(("a" "x") ("d" "x") ("d" "y"))
+                (ix-ns-key-rows g :end '("d")))
+         ":end alone, a short tuple, includes its extensions")
+     (is (equal '(("d" "x") ("d" "y") ("e" "x"))
+                (ix-ns-key-rows g :start '("d")))
+         ":start alone, a short tuple, begins at its first extension")
+     (is (equal '(("a" "x") ("d" "x") ("d" "y"))
+                (ix-ns-key-rows g :start '("a") :end '("d")))
+         "both bounds: the same rows as :end alone, below \"e\"")
+     (is (equal '(("a" "x") ("d" "x") ("d" "y") ("e" "x"))
+                (ix-ns-key-rows g))
+         "no bound: every row")))
+
+(test index-range-short-end-alone-includes-its-extensions
+  "GH #413: a short END tuple is a prefix bound, so [START, END] takes
+every stored tuple that starts with END -- whether or not START is also
+given.  Before the fix the single-bound path filtered on the bare tuple,
+under which a strict prefix sorts BEFORE its extensions, so :end '(\"d\")
+alone dropped the (\"d\" ...) rows the two-bound path returned."
+  (short-end-alone-includes-its-extensions-on with-ix-graph))
+
+(test index-range-short-end-alone-includes-its-extensions-bplus
+  "GH #413 on the B+ tree backend."
+  (short-end-alone-includes-its-extensions-on with-ix-bplus-graph))
+
+(test index-range-short-end-alone-includes-its-extensions-memory
+  "GH #413 on the memory-graph backend."
+  (short-end-alone-includes-its-extensions-on with-ix-memory-graph))
 
 (test index-range-open-ended-over-arity-start-signals
   "An over-arity :START alone (no :END) must signal -- the open-ended

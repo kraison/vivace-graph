@@ -1572,6 +1572,8 @@ This is intentional, pre-existing behavior (the single-slot backward-compatibili
 
 ~index-lookup~'s ~value~ list must supply exactly as many components as the index's arity — unless you pass ~:prefix t~, in which case a *shorter* list scans every tuple that starts with those components. This is deliberate strictness, not an oversight: a short value list without ~:prefix t~ signals rather than silently returning a superset of what you meant to ask for. Too many components is never rescued by ~:prefix t~ either — an overshoot always signals, on both ~index-lookup~ and ~index-range~.
 
+A range bound needs no ~:prefix t~: a short tuple given as ~:start~ or ~:end~ is always a prefix bound, standing for every tuple that starts with it. So ~:start '("ops")~ begins at the first ~("ops" ...)~ row and ~:end '("ops")~ ends after the last one — the window is inclusive of the prefix's extensions at both ends, whether one bound is given or both (GH #413).
+
 #+BEGIN_SRC lisp
   (index-lookup graph 'claim '(ns key rel) (list "ops"))             ; signals: too short
   (index-lookup graph 'claim '(ns key rel) (list "ops") :prefix t)   ; ok: prefix scan
@@ -6767,7 +6769,7 @@ This chapter provides a categorized reference for the most important exported sy
 - ~index-lookup (graph class slot value &key (collect-p t))~ ::
   The nodes of ~class~ (and subclasses) whose ~slot~ equals ~value~, via the ordered index (equality).  Resolves nodes in ~graph~.  A declared-but-empty index returns an empty result; an unindexed slot signals an error.
 - ~index-range (graph class slot &key start end)~ / ~map-index (function graph class slot &key start end)~ ::
-  The nodes whose ~slot~ is in ~[start,end]~ (inclusive; open-ended when ~nil~), in ascending value order — collected, or streamed to ~function~.
+  The nodes whose ~slot~ is in ~[start,end]~ (inclusive; open-ended when ~nil~), in ascending value order — collected, or streamed to ~function~.  On a multi-slot index a bound is a tuple; a short tuple is a prefix bound at either end, so a short ~end~ includes its extensions (GH #413).
 - ~regenerate-secondary-indexes (graph)~ ::
   Drops and rebuilds every ordered index on the graph's *current* index backend — the ~:index~/~def-index~ half of an in-place backend migration (paired with ~regenerate-all-views~, ~regenerate-unique-indexes~, ~regenerate-spatial-indexes~; see Chapter 3).
 

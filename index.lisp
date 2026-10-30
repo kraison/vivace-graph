@@ -342,9 +342,10 @@ EQUALP.  At n=2 this is exactly REDUCE-EQUAL."
 
 (defun %index-value-lessp (a b)
   "Lexicographic order for two VALUE-only component lists (no trailing id), by
-LESS-THAN per component; a strict prefix sorts before its extension.  Used by
-IX-MAP's open-ended range filter, where there is no id to anchor the
-%INDEX-COMP-LESSP last-position special case (GH #107)."
+LESS-THAN per component; a strict prefix sorts before its extension.  The
+count index's key order (count-index.lisp), where there is no id to anchor
+the %INDEX-COMP-LESSP last-position special case (GH #107).  Not a range
+bound's order: there a prefix stands for its extensions (IX-MAP, GH #413)."
   (loop for x in a
         for y in b
         do (cond ((less-than x y) (return t))
@@ -509,46 +510,33 @@ store NIL, not the raw id byte array (which SERIALIZE cannot round-trip)."
   (remove-from-skip-list (slot-index-skip-list six) (append key (list id))))
 
 (defun ix-map (six fn &key start end)
-  "Call FN with (KEY ID) for every entry with START <= key <= END (component-
-wise, by %INDEX-VALUE-LESSP), in ascending order; KEY is the component list,
-id excluded.  Open-ended when START/END is NIL.  START/END are tuples --
-full arity, or fewer components (a range endpoint may always be a prefix, no
-:PREFIX flag needed, unlike an equality IX-LOOKUP) -- but never MORE than the
-arity, on EITHER path: %INDEX-BOUNDS is called on each given endpoint up
-front, purely for its arity signal, before branching on which path to take.
-Without this the open-ended (single-bound) path would take an over-arity
-tuple silently: %INDEX-VALUE-LESSP's own length tie-break treats a longer
-tuple as sorting after a shorter one it shares no true prefix relationship
-with, so it would just mis-filter rows out rather than error (GH #107).
+  "Call FN with (KEY ID) for every entry with START <= key <= END, in
+ascending order; KEY is the component list, id excluded.  Open-ended when
+START/END is NIL.  START/END are tuples -- full arity, or fewer components
+(a range endpoint may always be a prefix, no :PREFIX flag needed, unlike an
+equality IX-LOOKUP) -- but never MORE than the arity, which signals.
 
-Bounded ranges (both START and END given) use a range cursor (the efficient
-path), its bounds taken from the precomputed START-BOUNDS/END-BOUNDS --
-START's low bound and END's high bound -- so a short tuple pads the same way
-a prefix IX-LOOKUP does, rather than an id-position sentinel landing in a
-value-position slot.  An open end falls back to an ordered full scan + bound
-filter on the raw (unpadded) START/END, which already tolerates a short
-tuple via %INDEX-VALUE-LESSP's own length tie-break -- only the arity
-ceiling above needs the explicit check."
+A short tuple is a prefix bound on EITHER end, whether or not the other
+bound is given: START stands for its first extension and END for its
+last, so :END '(\"d\") takes every (\"d\" ...) row.  One range cursor
+on every path makes that so by construction: the bounds come from
+%INDEX-BOUNDS with PREFIX T (START's low bound, END's high bound, padded
+with the max sentinels), and a missing bound is the index's own head or
+tail sentinel key.  Before GH #413 a single bound filtered a full scan
+with %INDEX-VALUE-LESSP, under which a strict prefix sorts BEFORE its
+extensions, so the two paths disagreed on a short END (GH #107, #413)."
   (let* ((sl (slot-index-skip-list six))
-         (start-bounds (and start (multiple-value-list
-                                    (%index-bounds six start t))))
-         (end-bounds   (and end   (multiple-value-list
-                                    (%index-bounds six end t)))))
-    (if (and start end)
-        (let ((cur (make-range-cursor sl (first start-bounds)
-                                      (second end-bounds))))
-          (loop for node = (cursor-next cur :eoc) until (eql node :eoc)
-                do (funcall fn (butlast (%sn-key node))
-                            (car (last (%sn-key node))))))
-        ;; Open-ended: ordered full scan, filtering by whatever bound is
-        ;; present.  START-BOUNDS/END-BOUNDS above already signalled on an
-        ;; over-arity tuple; their VALUES are unused here on purpose.
-        (let ((cur (make-cursor sl)))
-          (loop for node = (cursor-next cur :eoc) until (eql node :eoc)
-                for k = (butlast (%sn-key node))
-                when (and (or (null start) (not (%index-value-lessp k start)))
-                          (or (null end)   (not (%index-value-lessp end k))))
-                do (funcall fn k (car (last (%sn-key node)))))))))
+         (arity (length (slot-index-slot-names six)))
+         (lo (if start
+                 (%index-bounds six start t)
+                 (%index-head-key arity)))
+         (hi (if end
+                 (nth-value 1 (%index-bounds six end t))
+                 (%index-tail-key arity)))
+         (cur (make-range-cursor sl lo hi)))
+    (loop for node = (cursor-next cur :eoc) until (eql node :eoc)
+          do (funcall fn (butlast (%sn-key node))
+                      (car (last (%sn-key node)))))))
 
 (defun overlay-index-members (ov six &key key prefix start end)
   "The open transaction's own live nodes that SIX indexes, as
@@ -556,23 +544,17 @@ ceiling above needs the explicit check."
 would hold for NODE -- restricted to those whose tuple equals KEY (or
 starts with it, with PREFIX) or lies in [START, END], in the index's
 own order (GH #408, spec §4.3).  OV is a TX-OVERLAY (tx-overlay.lisp).
-The range follows IX-MAP's two paths exactly: with both bounds, the
-composite against the padded cursor bounds (so a short END takes its
-extensions); with one, %INDEX-VALUE-LESSP on the tuple (GH #413)."
+The range is IX-MAP's: the composite against the padded cursor bounds
+each given bound would set, so a short END takes its extensions here
+too, with one bound or both (GH #413)."
   (let* ((owner (slot-index-owner-name six))
          (slots (slot-index-slot-names six))
-         (bounded (and start end))
-         (lo (and bounded (%index-bounds six start t)))
-         (hi (and bounded (nth-value 1 (%index-bounds six end t))))
+         (lo (and start (%index-bounds six start t)))
+         (hi (and end (nth-value 1 (%index-bounds six end t))))
          (out '()))
-    (flet ((in-range-p (k c)
-             (if bounded
-                 (and (not (%index-comp-lessp c lo))
-                      (not (%index-comp-lessp hi c)))
-                 (and (or (null start)
-                          (not (%index-value-lessp k start)))
-                      (or (null end)
-                          (not (%index-value-lessp end k)))))))
+    (flet ((in-range-p (c)
+             (and (or (null lo) (not (%index-comp-lessp c lo)))
+                  (or (null hi) (not (%index-comp-lessp hi c))))))
       (dolist (n (overlay-live-nodes ov))
         (when (and (typep n owner) (%tuple-indexable-p n slots))
           (let* ((k (%index-tuple-key six n))
@@ -583,7 +565,7 @@ extensions); with one, %INDEX-VALUE-LESSP on the tuple (GH #413)."
                                (and (<= (length key) (length k))
                                     (equal key (subseq k 0 (length key))))
                                (equal key k))
-                           (in-range-p k c)))
+                           (in-range-p c)))
               (push (cons c n) out))))))
     (sort out #'%index-comp-lessp :key #'car)))
 
@@ -1077,7 +1059,10 @@ ids in GRAPH.  With COLLECT-P NIL, returns T as soon as one match is found
 [START,END] (inclusive; open-ended when NIL), in ascending value order.  START/
 END are scalars for a single-slot index; for a multi-slot index each is a
 tuple (list of component values) -- full arity, or fewer components, which
-bound only on the components given (GH #107).  Resolves ids in GRAPH."
+bound only on the components given: a short START begins at its first
+extension and a short END ends after its last, so :END '(\"d\") includes
+every (\"d\" ...) row, with or without a START (GH #107, #413).  Resolves
+ids in GRAPH."
   (let* ((*graph* graph)
          (six (%require-index graph class-name slot-name)))
     (when six                            ; NIL => declared but empty => nothing to map

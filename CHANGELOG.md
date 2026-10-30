@@ -450,6 +450,17 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Fixed
 
+- **A short `:end` tuple on `index-range` / `map-index` includes its
+  extensions with one bound as it did with two** (#413). On a multi-slot
+  index, `:end '("d")` alone dropped the `("d" ...)` rows that
+  `:start '("a") :end '("d")` returned: the single-bound path filtered a
+  full scan with the bare tuple order, under which a prefix sorts before
+  its extensions. `ix-map` now takes one range cursor on every path, the
+  index's head or tail sentinel key standing in for a missing bound, so a
+  short tuple is a prefix bound at either end whether or not the other is
+  given, and a single-bound walk seeks instead of scanning. The
+  transaction overlay follows the same bounds.
+
 - **A read inside `with-transaction` sees the transaction's own
   writes** (#408). Lookups, the typed and adjacency `map-vertices` /
   `map-edges`, `edge-exists-p`, `index-lookup`, `map-index` and

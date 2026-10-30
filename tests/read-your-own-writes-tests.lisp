@@ -375,6 +375,25 @@ transaction's own extensions too."
         (is (equal '(("1" "a") ("2" "m"))
                    (rows '("1") '("2"))))))))
 
+(test ryow-composite-range-with-one-short-bound-keeps-own-rows
+  "GH #413: with ONE bound given, a short tuple is still a prefix bound
+\(IX-MAP now takes one range cursor on either path), so the overlay must
+include the transaction's own extensions of a short END here too."
+  (with-ryow-graph (g)
+    (flet ((rows (&rest range)
+             (mapcar (lambda (n) (list (ryow-node-k n) (ryow-node-tag n)))
+                     (apply #'index-range g 'ryow-node '(k tag) range))))
+      (with-transaction ()
+        (make-ryow-node :k "1" :tag "a") (make-ryow-node :k "4" :tag "z"))
+      (with-transaction ()
+        (make-ryow-node :k "2" :tag "m") (make-ryow-node :k "4" :tag "x")
+        (is (equal '(("1" "a") ("2" "m") ("4" "x") ("4" "z"))
+                   (rows :end '("4"))))
+        (is (equal '(("4" "x") ("4" "z"))
+                   (rows :start '("4"))))
+        (is (equal '(("1" "a") ("2" "m"))
+                   (rows :end '("2"))))))))
+
 ;;; --- Task 7: OCC (spec §4.5) ----------------------------------------------
 
 (test ryow-own-read-not-in-read-set
