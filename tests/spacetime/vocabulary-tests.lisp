@@ -333,3 +333,28 @@ would pass on #350's walk, which needs no count map at all."
                    "the built map answers, not only the walk"))
           (ignore-errors (close-graph g2 :snapshot-p nil))
           (collect-garbage))))))
+
+(test an-identity-slot-update-in-a-transaction-moves-the-claim
+  "GH #358 part 1: a committed claim whose subject namespace the open
+transaction changes is listed and counted under the new name and not
+the old, by CLAIMS-TOUCHING and the vocabulary alike -- the engine's
+re-derived-key rule (GH #408, #411); the hand-rolled overlays kept it
+under the old name."
+  (with-claim-graph (g)
+    (with-transaction () (%ns-u :ns "a") (%ns-u :other "z"))
+    (with-transaction ()
+      (let ((c (graph-db::copy (first (claims-touching g 'ct-claim
+                                                       :ns "a")))))
+        (setf (claim-subject-namespace c) :moved)
+        (graph-db:save c))
+      (is (null (claims-touching g 'ct-claim :ns "a"))
+          "gone from the old endpoint before commit")
+      (is (= 1 (length (claims-touching g 'ct-claim :moved "a")))
+          "found under the new one")
+      (is (equal '(:moved :other) (claim-namespaces g 'ct-claim)))
+      (is (equal '((:moved . 1) (:other . 1))
+                 (claim-namespaces g 'ct-claim :counts t)))
+      (is (equal '("a") (claim-keys g 'ct-claim :moved))))
+    (is (equal '(:moved :other) (claim-namespaces g 'ct-claim))
+        "the same once committed")
+    (is (null (claims-touching g 'ct-claim :ns "a")))))
