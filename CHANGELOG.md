@@ -461,6 +461,16 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Fixed
 
+- **Skip list: one cached object per address; writers no longer
+  livelock** (#406). Two threads missing the node cache for one address
+  both built a node object and both installed it, so a splice through
+  one left the other's forward pointers stale; a writer walking the
+  stale one found the removed node, failed validation (or
+  `ok-to-delete-p`) and retried the same walk forever. The cache now
+  keeps the first object, and add and remove re-read their
+  predecessors' pointers before judging, so a writer heals from any
+  stale array. Found and fixed first in vivace-cabinet (3c97bd8).
+
 - **A snapshot no longer depends on the caller's printer or reader
   state** (#354). `write-backup-plist` printed under whatever
   `*print-level*`, `*print-length*`, `*print-base*` and
