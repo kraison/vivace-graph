@@ -1255,3 +1255,96 @@ committed.  Scores against (1 0 ...): d1 1.0, own 0.995, d2 0.447, d3
           (mark-deleted (lookup-vertex own))
           (is (equalp (list d2 d3) (ids 2)) "a deleted node is gone"))
         (is (equalp (list d2 d3) (ids 2)) "the same once committed")))))
+
+;;; ---------------------------------------------------------------------------
+;;; GH #54: a segment's lifetime, not only its lookup, is protected.
+;;;
+;;; REBUILD-VECTOR-SEGMENT and CLOSE-GRAPH unmapped a segment a concurrent
+;;; scan could still hold, and rebuild emptied the table for its whole
+;;; sweep.  CLOSE-VECTOR-SEGMENT now takes the segment's write lock (a scan
+;;; holds the read side), the read entry points signal SEGMENT-CLOSED on a
+;;; closed object and VECTOR-SEARCH re-fetches once, and rebuild swaps a
+;;; finished replacement in before closing the old one.
+;;; ---------------------------------------------------------------------------
+
+(defmacro with-si-graph ((g &key (docs 20)) &body body)
+  "A fresh integration graph with DOCS si-docs of dimension 8, *GRAPH* bound."
+  (let ((dir (gensym "DIR")))
+    `(with-temp-directory (,dir)
+       (let ((,g (make-graph *integration-graph-name* (namestring ,dir)
+                             :buffer-pool-size 1000)))
+         (unwind-protect
+              (let ((*graph* ,g))
+                (with-transaction ()
+                  (dotimes (i ,docs)
+                    (make-si-doc :title (format nil "d~D" i)
+                                 :embedding (%si-embedding 8 (* 1.0 i)))))
+                ,@body)
+           (close-graph ,g :snapshot-p nil)
+           (collect-garbage))))))
+
+(test rebuild-waits-for-a-scan-in-flight
+  "GH #54: a rebuild cannot unmap a segment a scan still holds.  A thread
+holds the old segment's read side for half a second; the rebuild's close
+must wait for it, and the old object is closed afterwards."
+  (with-si-graph (g)
+    (let* ((old (%si-segment g 'embedding))
+           (released nil)
+           (holder (bt:make-thread
+                    (lambda ()
+                      (graph-db::with-read-lock ((graph-db::segment-lock old))
+                        (sleep 0.5)
+                        (setq released t)))
+                    :name "si-scan-holder")))
+      (sleep 0.1)
+      (graph-db::rebuild-vector-segment g 'si-doc 'embedding)
+      (is-true released
+               "the rebuild finished while a scan still held the segment")
+      (bt:join-thread holder)
+      (is (null (graph-db::segment-mmap old)) "the old segment is closed")
+      (is (not (eq old (%si-segment g 'embedding))) "a fresh one is live"))))
+
+(test vector-search-never-sees-no-segment-during-a-rebuild
+  "GH #54: the table is never empty mid-rebuild.  A thread runs
+VECTOR-SEARCH in a loop through five rebuilds and must always get :OK
+with a full answer."
+  (with-si-graph (g)
+    (let* ((stop nil) (bad 0) (searches 0)
+           (q (%si-embedding 8 3.0))
+           (searcher (bt:make-thread
+                      (lambda ()
+                        (let ((*graph* g))
+                          (loop until stop
+                                do (multiple-value-bind (hits status)
+                                       (vector-search g 'si-doc 'embedding q 3)
+                                     (incf searches)
+                                     (unless (and (eq status :ok)
+                                                  (= 3 (length hits)))
+                                       (incf bad))))))
+                      :name "si-searcher")))
+      (dotimes (i 5)
+        (graph-db::rebuild-vector-segment g 'si-doc 'embedding))
+      (setq stop t)
+      (bt:join-thread searcher)
+      (is (plusp searches) "the searcher ran")
+      (is (zerop bad) "~D of ~D searches did not answer :OK with 3 hits"
+          bad searches))))
+
+(test a-read-on-a-closed-segment-signals-segment-closed
+  "GH #54: a reader that still holds an object a rebuild closed gets
+SEGMENT-CLOSED from every read entry point, never a read of unmapped
+memory."
+  (with-si-graph (g)
+    (let ((old (%si-segment g 'embedding))
+          (q (%si-embedding 8 3.0))
+          (id (id (first (map-vertices #'identity g :collect-p t
+                                       :vertex-type 'si-doc)))))
+      (graph-db::rebuild-vector-segment g 'si-doc 'embedding)
+      (signals graph-db:segment-closed (segment-scan old q 3))
+      (signals graph-db:segment-closed (graph-db::segment-get old id))
+      (signals graph-db:segment-closed
+        (segment-score-subset old q (list id)))
+      (multiple-value-bind (hits status)
+          (vector-search g 'si-doc 'embedding q 3)
+        (is (eq :ok status))
+        (is (= 3 (length hits)))))))

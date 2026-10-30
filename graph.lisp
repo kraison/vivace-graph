@@ -349,10 +349,23 @@ returned; with no segment yet, own hits alone answer :OK."
                     (values nil :no-segment-yet))
                    ((null segment) (values (%top-k-hits own k) :ok))
                    (t
-                    (let ((hits (segment-scan segment query-vector k
-                                              :filter (or skip filter))))
+                    (let ((hits (%scan-live-segment graph key segment
+                                                    query-vector k
+                                                    (or skip filter))))
                       (values (if own (%top-k-hits (append hits own) k) hits)
                               :ok)))))))))
+
+(defun %scan-live-segment (graph key segment query-vector k filter)
+  "SEGMENT-SCAN, re-fetching the segment once from GRAPH's table when the
+one in hand was closed under us by a rebuild or reset (GH #54).  The
+replacement is registered before the old one is closed, so one re-fetch
+finds it; a second SEGMENT-CLOSED propagates."
+  (handler-case (segment-scan segment query-vector k :filter filter)
+    (segment-closed ()
+      (let ((live (gethash key (vector-segments graph))))
+        (if (and live (not (eq live segment)))
+            (segment-scan live query-vector k :filter filter)
+            nil)))))
 
 (defstruct (%graph-open-state (:conc-name %gos-))
   "Mutable state MAKE-GRAPH/OPEN-GRAPH thread through their private

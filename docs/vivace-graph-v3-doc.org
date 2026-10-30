@@ -1734,6 +1734,8 @@ A value is indexed only if it is a ~(simple-array single-float (*))~. Anything e
 
 **** Migrating an existing corpus
 
+A segment is safe to replace under readers: ~rebuild-vector-segment~ registers its finished replacement before closing the old one, a close waits for any scan in flight, and a reader that still holds a closed segment gets ~segment-closed~ and re-fetches (vivace-graph#54). A rebuild still needs no concurrent *writers*: run it with write traffic stopped.
+
 Because maintenance is on the apply path, nodes written *before* you added the ~:vector-index~ declaration were never indexed. Fill them in with ~rebuild-vector-segment-batched~, which sweeps live nodes and *adds* what is missing without disturbing what is already there:
 
 #+BEGIN_SRC lisp

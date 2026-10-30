@@ -461,6 +461,17 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Fixed
 
+- **Vector segments: a rebuild or close cannot unmap a segment a scan
+  still holds, and a rebuild never empties the table** (#54).
+  `close-vector-segment` takes the segment's write lock, so a scan in
+  flight finishes first; `segment-scan`, `segment-get` and
+  `segment-score-subset` signal the new `segment-closed` on an object
+  closed under them instead of reading unmapped memory, and
+  `vector-search` re-fetches the live segment once. `rebuild-vector-
+  segment` builds the replacement at a temporary path, renames and
+  registers it, then closes the old one. In the test, a search loop
+  during rebuilds used to fault the image; it now always answers.
+
 - **B+ tree: an update holds one lock; a cursor crosses leaves by key**
   (#319). `update-in-skip-list` took the write lock twice, for its
   remove and its add, and a concurrent reader found the key absent in
