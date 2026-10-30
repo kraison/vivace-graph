@@ -244,7 +244,9 @@ through to TYPEP leaves such a query as correct, and as slow, as it was."
 
 (defun %resolve-spatial-scope (scope graph)
   "Resolve SCOPE -- a class name, a list of class names, or :ALL -- to
- (values INDEXES TYPE-NAMES TAGS).
+ (values INDEXES TYPE-NAMES TAGS KEYS).  KEYS is every (OWNER . SLOT) the
+scope covers, whether or not its index exists yet, or :ALL -- what the
+transaction overlay matches an own node's index key against (GH #410).
 
 INDEXES is the set of live spatial indexes to scan; TYPE-NAMES is the class list
 results must satisfy, or NIL for :ALL (no filtering); TAGS is the same filter
@@ -262,7 +264,7 @@ empty result, not a fault.
 Signals when a named class is not spatially indexed at all: that is a programming
 error, and catching it is the reason the scope is required."
   (if (eq scope :all)
-      (values (all-spatial-indexes graph) nil nil)
+      (values (all-spatial-indexes graph) nil nil :all)
       (let* ((names (if (listp scope) scope (list scope)))
              (keys (make-hash-table :test 'equalp))
              (indexes '()))
@@ -278,7 +280,8 @@ method." name (graph-name graph))))
               (setf (gethash key keys) t)
               (let ((idx (spatial-index-for graph (car key) (cdr key))))
                 (when idx (push idx indexes))))))
-        (values indexes names (%scope-type-tags names graph)))))
+        (values indexes names (%scope-type-tags names graph)
+                (loop for k being the hash-keys of keys collect k)))))
 
 (defun %scope-admits-p (node type-names)
   "True when NODE satisfies the scope's type filter (always, for :ALL)."

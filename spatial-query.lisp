@@ -59,6 +59,23 @@ historical behaviour), so results are unchanged when the add-on is absent."
           (multiple-value-bind (lat lon) (%geometry-rep-point geom)
             (geometry-contains-point-p area lon lat)))))
 
+(defun %overlay-spatial-candidates (ov keys types)
+  "The open transaction's own live nodes the apply pass will index under
+one of KEYS -- (OWNER . SLOT) pairs, or :ALL -- and that TYPES admits
+\(GH #410): the overlay's half of %DO-SCOPED-CANDIDATES, at each node's
+CURRENT geometry.  No window pre-filter: the body's exact predicate is
+the truth, and the write set is small."
+  (loop for n in (overlay-live-nodes ov)
+        when (and (%scope-admits-p n types)
+                  (multiple-value-bind (geom slot) (node-geometry n)
+                    (and geom
+                         (or (eq keys :all)
+                             (member (cons (%node-spatial-owner-name
+                                            (class-of n) slot)
+                                           slot)
+                                     keys :test #'equalp)))))
+          collect n))
+
 (defmacro %do-scoped-candidates ((node-var scope graph &key bbox radius (guard t))
                                  &body body)
   "Run BODY with NODE-VAR bound to each live, scope-admitted node whose id came
@@ -86,21 +103,29 @@ the required scope, and a payload-first guard made it reachable only when the
 payload happened to be well formed.
 
 GUARD is the payload-validity test; BBOX / RADIUS are evaluated once, after it
-passes, so they may assume a well-formed payload."
+passes, so they may assume a well-formed payload.
+
+Inside an open transaction (GH #410, the #408 rule): an id the transaction
+wrote is skipped in the index walk, and after it every own live node whose
+current geometry the apply pass will index under one of the scope's keys
+runs BODY -- not through SEEN, which the walk marks for a skipped id too."
   (let ((indexes (gensym "IX")) (types (gensym "TY")) (tags (gensym "TAGS"))
+        (keys (gensym "KEYS")) (ov (gensym "OV"))
         (seen (gensym "SEEN")) (visit (gensym "VISIT"))
         (idx (gensym "I")) (id (gensym "ID")) (win (gensym "WINDOW"))
         (a (gensym "A")) (b (gensym "B")) (c (gensym "C")) (d (gensym "D")))
-    `(multiple-value-bind (,indexes ,types ,tags)
+    `(multiple-value-bind (,indexes ,types ,tags ,keys)
          (%resolve-spatial-scope ,scope ,graph)
        (when ,guard
          (let ((,seen (make-hash-table :test 'equalp))
-               (,win ,(or bbox radius)))
+               (,win ,(or bbox radius))
+               (,ov (current-overlay ,graph)))
            (flet ((,visit (,id)
-                    (let ((,node-var (%node-by-id ,id ,graph)))
-                      (when (and ,node-var (not (deleted-p ,node-var))
-                                 (%scope-admits-p ,node-var ,types))
-                        ,@body))))
+                    (unless (and ,ov (overlay-effective-write ,ov ,id))
+                      (let ((,node-var (%node-by-id ,id ,graph)))
+                        (when (and ,node-var (not (deleted-p ,node-var))
+                                   (%scope-admits-p ,node-var ,types))
+                          ,@body)))))
              (dolist (,idx ,indexes)
                ,(if bbox
                     `(destructuring-bind (,a ,b ,c ,d) ,win
@@ -109,7 +134,11 @@ passes, so they may assume a well-formed payload."
                     `(destructuring-bind (,a ,b ,c) ,win
                        (map-spatial-index-radius #',visit ,idx ,a ,b ,c
                                                  :tags ,tags
-                                                 :seen ,seen))))))))))
+                                                 :seen ,seen))))
+             (when ,ov
+               (dolist (,node-var (%overlay-spatial-candidates ,ov ,keys
+                                                               ,types))
+                 ,@body))))))))
 
 (defun find-nodes-within (scope area &key (graph *graph*))
   "Live nodes in SCOPE whose geometry lies within AREA (a :POLYGON or
@@ -222,17 +251,24 @@ MAX-RADIUS\".  Each widening re-runs the window query, whose cost grows with the
 number of indexed nodes the window encloses (the bbox query covers a window with
 a bounded set of coarse cells and range-scans them, so empty space is free);
 widen MAX-RADIUS only if you accept scanning the larger candidate set."
-  (let ((indexes (%resolve-spatial-scope scope graph)))
+  (let ((indexes (%resolve-spatial-scope scope graph))
+        ;; GH #410: with no index built yet, the open transaction's own
+        ;; nodes can still be the answer; the default grid seeds then.
+        (ov (current-overlay graph)))
     (when (and (numberp lat) (numberp lon))
       ;; As FIND-NODES-NEAR: clamp before any float arithmetic (GH #279).
       (setf lat (clamp-latitude lat) lon (clamp-longitude lon)))
-    (when (and indexes (numberp lat) (numberp lon) (integerp k) (plusp k))
+    (when (and (or indexes ov) (numberp lat) (numberp lon) (integerp k)
+               (plusp k))
       ;; Seed off the FINEST precision in scope: with a mixed-precision scope,
       ;; seeding from a coarse index would make the very first query an enormous
       ;; sweep.  (LOOP MAXIMIZE, not REDUCE :KEY -- ANSI leaves it unspecified
       ;; whether REDUCE applies :KEY to a one-element sequence, and one index is
       ;; the common case.)
-      (let* ((prec (loop for i in indexes maximize (spatial-index-precision i)))
+      (let* ((prec (if indexes
+                       (loop for i in indexes
+                             maximize (spatial-index-precision i))
+                       7))
              ;; seed radius: the index cell's latitude extent in metres
              (r (max 1d0 (* (nth-value 1 (geohash-cell-size prec)) 111320d0)))
              (found '()))

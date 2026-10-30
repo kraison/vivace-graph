@@ -10,6 +10,11 @@
                 ;; spatial-query.lisp / spatial-registry.lisp (both load later)
                 rebuild-spatial-indexes report-degraded-spatial-indexes
                 install-spatial-indexes))
+;; transactions.lisp and tx-overlay.lisp load later too; VECTOR-SEARCH's
+;; overlay half (GH #410) calls these.
+(declaim (ftype function current-overlay overlay-effective-write
+                overlay-live-nodes node-vector-index-slots %segment-key
+                %node-segment-value))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Spatial index persistence -- the v3 sidecar.
@@ -276,6 +281,28 @@ the discrimination behind VECTOR-SEARCH's second value (GH #293)."
                    (class-direct-slots c)))
         (class-precedence-list class)))
 
+(defun %overlay-vector-hits (ov key slot-name query-vector filter)
+  "(SCORE . ID) for the open transaction's own live nodes whose SLOT-NAME
+vector the apply pass will store in the segment KEY names, scored against
+QUERY-VECTOR; FILTER as VECTOR-SEARCH's.  A vector of another length is
+left out: the commit would refuse it (GH #410)."
+  (loop for n in (overlay-live-nodes ov)
+        for v = (and (member slot-name
+                             (node-vector-index-slots (class-of n)))
+                     (equal (%segment-key n slot-name) key)
+                     (%node-segment-value n slot-name))
+        when (and v
+                  (= (length v) (length query-vector))
+                  (or (null filter) (funcall filter (id n))))
+          collect (cons (%cosine query-vector v) (id n))))
+
+(defun %top-k-hits (hits k)
+  "HITS, (SCORE . ID) conses, in the segment's ranking order, cut to K."
+  (let ((sorted (sort (copy-list hits)
+                      (lambda (a b)
+                        (%score-before-p (car a) (cdr a) (car b) (cdr b))))))
+    (subseq sorted 0 (min k (length sorted)))))
+
 (defun vector-search (graph class-name slot-name query-vector k
                       &key filter)
   "Top-K nodes of CLASS-NAME (and its subclasses) whose SLOT-NAME vector is
@@ -296,18 +323,36 @@ legitimate lazy case).
 :FILTER (GH #293) is a function of the candidate's node id, applied
 INSIDE the scan before the vector is read, so a bounded query fills K
 with in-bounds hits instead of post-filtering below K.  The filter never
-sees a node -- the segment's no-materialisation property survives."
+sees a node -- the segment's no-materialisation property survives.
+
+Inside an open transaction the answer is what it will commit (GH #410):
+the scan skips an id the transaction wrote, its own live nodes' current
+vectors are scored (%OVERLAY-VECTOR-HITS) and the K best of both are
+returned; with no segment yet, own hits alone answer :OK."
   (let* ((class (find-class class-name nil))
          (owner (and class (%vector-index-slot-owner-name class slot-name)))
-         (segment (and owner
-                       (gethash (cons owner slot-name)
-                                (vector-segments graph)))))
+         (key (cons owner slot-name))
+         (segment (and owner (gethash key (vector-segments graph)))))
     (cond ((null class) (values nil :no-such-class))
           ((not (%class-declares-vector-index-p class slot-name))
            (values nil :not-a-vector-index-slot))
-          ((null segment) (values nil :no-segment-yet))
-          (t (values (segment-scan segment query-vector k :filter filter)
-                     :ok)))))
+          (t
+           (let* ((ov (current-overlay graph))
+                  (own (and ov (%overlay-vector-hits ov key slot-name
+                                                     query-vector filter)))
+                  (skip (and ov
+                             (lambda (id)
+                               (and (not (overlay-effective-write ov id))
+                                    (or (null filter)
+                                        (funcall filter id)))))))
+             (cond ((and (null segment) (null own))
+                    (values nil :no-segment-yet))
+                   ((null segment) (values (%top-k-hits own k) :ok))
+                   (t
+                    (let ((hits (segment-scan segment query-vector k
+                                              :filter (or skip filter))))
+                      (values (if own (%top-k-hits (append hits own) k) hits)
+                              :ok)))))))))
 
 (defstruct (%graph-open-state (:conc-name %gos-))
   "Mutable state MAKE-GRAPH/OPEN-GRAPH thread through their private

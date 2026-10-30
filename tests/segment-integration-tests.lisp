@@ -1212,3 +1212,46 @@ vector-search's second value distinguishes the NIL cases."
                                                    probe 3))))))
         (close-graph g :snapshot-p nil))
       (collect-garbage))))
+
+;;; ---- GH #410: the transaction overlay ----------------------------------
+
+(defun %si-vec (&rest floats)
+  "An 8-long single-float vector from FLOATS, zero-padded."
+  (let ((v (make-array 8 :element-type 'single-float :initial-element 0.0)))
+    (loop for f in floats for i from 0
+          do (setf (aref v i) (coerce f 'single-float)))
+    v))
+
+(test vector-search-sees-own-writes
+  "GH #410: inside the transaction VECTOR-SEARCH ranks the node it created
+by its vector, the node whose vector it changed by the new one, drops the
+node it deleted, and applies :FILTER to its own hits too; the same once
+committed.  Scores against (1 0 ...): d1 1.0, own 0.995, d2 0.447, d3
+0.196, the changed d1 0."
+  (with-test-graph (g)
+    (let ((q (%si-vec 1.0)) d1 d2 d3 own)
+      (flet ((ids (k &optional filter)
+               (mapcar #'cdr (vector-search g 'si-doc 'embedding q k
+                                            :filter filter))))
+        (with-transaction ()
+          (setq d1 (id (make-si-doc :title "d1" :embedding (%si-vec 1.0)))
+                d2 (id (make-si-doc :title "d2"
+                                    :embedding (%si-vec 0.5 1.0)))
+                d3 (id (make-si-doc :title "d3"
+                                    :embedding (%si-vec 0.2 0.0 1.0)))))
+        (is (equalp (list d1 d2) (ids 2)) "committed: d1 then d2")
+        (with-transaction ()
+          (setq own (id (make-si-doc :title "o"
+                                     :embedding (%si-vec 1.0 0.1))))
+          (is (equalp (list d1 own) (ids 2))
+              "a created node ranks by its vector")
+          (let ((c (copy (lookup-vertex d1))))
+            (setf (slot-value c 'embedding) (%si-vec 0.0 0.0 0.0 1.0))
+            (save c))
+          (is (equalp (list own d2) (ids 2))
+              "a changed vector ranks by its new value")
+          (is (equalp (list d2) (ids 1 (lambda (id) (not (equalp id own)))))
+              "the filter applies to own hits too")
+          (mark-deleted (lookup-vertex own))
+          (is (equalp (list d2 d3) (ids 2)) "a deleted node is gone"))
+        (is (equalp (list d2 d3) (ids 2)) "the same once committed")))))
