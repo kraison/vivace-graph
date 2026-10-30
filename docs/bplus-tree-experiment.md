@@ -30,7 +30,8 @@ wiring is the next step; the benchmark exercises the tree directly).
   per-byte loop.
 - **Write path is correctness-first:** insert/remove **read-modify-write the whole
   page** (a page is bounded, so this is O(1) in n). Splits propagate up; a root
-  split grows height. This RMW is the reason insert/remove are slow warm (see
+  split grows height. A split point is chosen by accumulated bytes, not entry
+  count, so a page of small entries still takes large ones (GH #404). This RMW is the reason insert/remove are slow warm (see
   results) — it is the obvious first optimization, not a fundamental cost.
 - **Lazy delete:** a removed key's cell is dropped from its leaf, **no merge or
   rebalance**. Correct — separators are only lower bounds, so every leaf stays

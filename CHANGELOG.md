@@ -461,6 +461,13 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Fixed
 
+- **B+ tree: a full page splits by bytes, not by entry count** (#404).
+  Split at the middle entry, a page of small entries could not take
+  large ones: the larger half did not fit, the encode returned NIL, the
+  write signalled a type error and the new right page leaked. The split
+  index is now where the accumulated cell bytes reach half, and both
+  halves are checked to encode before either is written.
+
 - **An index-backed read under a snapshot never answers a node under a
   value its version lacks** (#345). Index membership is released when a
   write is applied, not when the version it indexed is reaped, so a

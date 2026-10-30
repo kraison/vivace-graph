@@ -593,17 +593,45 @@ entry list, or :DUP if an equal key is already present."
             (progn (push (list dkey skey child) out) (setf placed t))
             (progn (push e out) (setf rest (cdr rest))))))))
 
+(defun %bpt-split-index (leaf-p entries)
+  "Where to split ENTRIES: the first index whose earlier cells hold half
+the bytes, so a page of mixed sizes splits into two that fit (GH #404).
+Each side keeps at least one entry; an internal split keeps one each side
+of the entry that moves up."
+  (let* ((sizes (mapcar (lambda (e) (+ 2 (%bpt-entry-cell-size leaf-p e)))
+                        entries))
+         (half (/ (reduce #'+ sizes) 2))
+         (n (length entries))
+         (acc 0)
+         (i 0))
+    (dolist (s sizes)
+      (incf acc s)
+      (incf i)
+      (when (>= acc half)
+        (return)))
+    (max 1 (min i (- n (if leaf-p 1 2))))))
+
 (defun %bpt-store-or-split (tree addr leaf-p link entries)
   "Write ENTRIES back to page ADDR, splitting if they overflow.  Return :NO-SPLIT
 or (SEP-DKEY SEP-SKEY RIGHT-ADDR)."
   (let ((buf (%bpt-encode-page tree leaf-p link entries)))
     (if buf
         (progn (%bpt-write-page tree addr buf) :no-split)
-        ;; Overflow -> split.
+        ;; Overflow -> split by bytes, not by entry count: after small
+        ;; entries, a half by count of large ones still did not fit, the
+        ;; encode returned NIL and the write signalled a type error, and
+        ;; the right page leaked (GH #404).
         (let* ((n (length entries))
-               (mid (floor n 2)))
+               (mid (%bpt-split-index leaf-p entries)))
           (when (< n 2)
             (error "B+ tree: single entry too large for a ~A-byte page"
+                   (%bpt-page-size tree)))
+          (unless (and (%bpt-encode-page tree leaf-p 0
+                                         (subseq entries 0 mid))
+                       (%bpt-encode-page tree leaf-p 0
+                                         (subseq entries
+                                                 (if leaf-p mid (1+ mid)))))
+            (error "B+ tree: entries too large for two ~A-byte pages"
                    (%bpt-page-size tree)))
           (if leaf-p
               ;; Leaf split: right keeps the upper half; its first key is copied

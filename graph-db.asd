@@ -671,6 +671,7 @@ cl-temporal-extent."
                (:file "segment-tests")
                (:file "linear-hash-tests")
                (:file "skip-list-tests")
+               (:file "bplus-tree-tests")    ; GH #404, #405
                (:file "index-list-tests")
                (:file "type-index-tests")
                (:file "graph-tests")
