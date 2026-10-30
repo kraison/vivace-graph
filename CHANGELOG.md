@@ -450,6 +450,19 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Fixed
 
+- **Spatial and vector-segment queries see the transaction's own
+  writes** (#410). Inside `with-transaction`, `find-nodes-within`,
+  `find-nodes-intersecting`, `find-nodes-near`, `find-nearest-k` and
+  their Prolog functors find a node the transaction created with a
+  geometry, find a moved one at its new location only, drop a deleted
+  one, and answer a node updated in place once: the index walk skips an
+  id the transaction wrote and its own live nodes are tested at their
+  current geometry. `vector-search` likewise skips own ids in the scan,
+  scores the transaction's own vectors and returns the K best of both;
+  `:filter` applies to own hits too, and with no segment built yet own
+  hits alone answer `:ok`. Unique-index membership has no public read,
+  so #408's committed-only list is down to views and the untyped scans.
+
 - **The count index sees the transaction's own writes, and spacetime's
   hand-rolled overlays are gone** (#411, #358 part 1). Inside
   `with-transaction`, `count-index-lookup` and `map-count-index` answer

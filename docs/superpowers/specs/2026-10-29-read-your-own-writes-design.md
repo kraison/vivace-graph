@@ -71,7 +71,9 @@ of scope.
   cousins go with #411.)
 - Spatial and vector-segment queries, unique-index membership: their
   resolution goes through `lookup-*` and so gains value visibility for
-  free; their membership stays committed-only. Follow-up issues.
+  free; their membership stays committed-only. Follow-up issues. (Lifted
+  for the spatial queries and `vector-search` by #410; unique-index
+  membership has no public read.)
 - A nested `with-transaction` (an independent commit, per #401) does not
   see the outer transaction's writes. Unchanged, stated in the manual.
 - Snapshot *membership* of committed entries (#345, Phase C). Orthogonal.

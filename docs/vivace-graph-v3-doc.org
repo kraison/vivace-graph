@@ -781,11 +781,15 @@ index order. So do the count index's ~count-index-lookup~ and
 arithmetic over the transaction's writes. Spacetime's three hand-rolled
 overlays over these reads went with #411; cardinality's edge delta
 stays, because the commit view's validators read with the overlay off.
+Spatial and vector-segment membership follow too (#410): the index walk
+skips an id the transaction wrote, and its own live nodes are tested at
+their current geometry (~find-nodes-within~, ~find-nodes-intersecting~,
+~find-nodes-near~, ~find-nearest-k~ and the functors) or scored by
+their current vector (~vector-search~) and merged into the answer.
 
 What stays committed-only, each with its issue: views (#7); the fully
 untyped ~map-vertices~ / ~map-edges~ lhash scans (admin paths that
-bypass MVCC as well); spatial and vector-segment membership;
-unique-index membership. A nested ~with-transaction~ is an
+bypass MVCC as well); unique-index membership. A nested ~with-transaction~ is an
 independent commit and sees nothing of the outer one. A read snapshot
 opened inside a transaction inherits it and so sees its writes; an
 ~:as-of~ read is refused there, as before.
@@ -1650,7 +1654,7 @@ Creating a node stores its vector; updating one overwrites it (and *removes* it 
   ;;=> ((0.93 . #<16-byte id>) (0.88 . #<16-byte id>) ...)
 #+END_SRC
 
-The result is a list of ~(score . node-id)~ conses, best first — a ~single-float~ cosine score in the ~car~ and the node's 16-byte id in the ~cdr~.
+The result is a list of ~(score . node-id)~ conses, best first — a ~single-float~ cosine score in the ~car~ and the node's 16-byte id in the ~cdr~. Inside an open transaction the answer is what it will commit: the scan skips an id the transaction wrote, its own nodes' current vectors are scored, and the K best of both come back (#410).
 
 *It returns ids, not nodes, and that is the entire point.* A scan touches only the segment's id array and its contiguous block of floats; it never deserializes a node, never touches the heap, never conses one object per candidate. Materialize only the handful you actually want:
 
@@ -3231,7 +3235,7 @@ Here is a second spatial type, so the query examples below have two classes to s
 
 *** Querying
 
-Two read styles are provided, both refining the index's candidates with exact geometry math.
+Two read styles are provided, both refining the index's candidates with exact geometry math. Inside an open transaction every query answers what that transaction will commit: a node it created with a geometry is found, a moved one only at its new location, a deleted one not at all (#410; Chapter 5, "What a transaction sees").
 
 Every query takes a *scope* as its first argument: a node-class name, a list of names, or ~:all~. The scope both /selects/ which per-class indexes are scanned and /filters/ the results by type. Both halves matter — a geometry slot declared on a mixin gives its subclasses one *shared* index, so storage separation alone would not keep a sibling subclass's nodes out of the answer. Naming a class that is not spatially indexed signals an error; a class whose index simply holds nothing yet returns ~nil~, which is a legitimate empty result.
 
