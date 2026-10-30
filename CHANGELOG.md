@@ -461,6 +461,18 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Fixed
 
+- **GUI mount: the trailing-slash redirect never names a host, and
+  `:read-only` is a dispatch rail** (#386). The 301 for a bare mount
+  root was built from the raw request URI, so an absolute-form request
+  (`GET http://evil.example/gui`, the shape proxies send) answered
+  `Location: http://evil.example/gui/`, an open redirect; the scheme
+  and authority are now stripped the way hunchentoot strips them from
+  its script name. `:read-only` used to be `with-write-verb` on the two
+  management handlers; `%gui-dispatch` now refuses every request that
+  is not GET, HEAD or the query and Prolog POSTs with the same
+  `403 read-only`, so a mutating route added without the macro is
+  refused all the same.
+
 - **A commit refuses to write over the live head from a stale object**
   (#355). `copy` of an as-of result, a history entry or a head held
   across a later commit registered that object as the update's old node,

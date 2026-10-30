@@ -2215,6 +2215,70 @@ mount only from a directory URL.  The standalone / never redirects."
       (is (= 200 status))
       (is (search "VivaceGraph GUI" raw)))))
 
+(test mount-redirect-never-names-a-host
+  "GH #386: a request in absolute form -- GET http://evil.example/gui --
+is redirected to the PATH /gui/, never to the host the request line
+named.  hunchentoot strips the authority from its script name but
+leaves the request URI raw, which is where the redirect was built from:
+an open redirect for every proxy hop.  drakma sends absolute form when
+the GUI is its proxy."
+  (with-mounted-gui ()
+    (multiple-value-bind (body status headers)
+        (drakma:http-request "http://evil.example/gui"
+                             :proxy (list "127.0.0.1" *gui-test-port*)
+                             :redirect nil)
+      (declare (ignore body))
+      (is (= 301 status))
+      (is (equal "/gui/" (cdr (assoc :location headers)))
+          "Location was ~S" (cdr (assoc :location headers))))
+    (multiple-value-bind (body status headers)
+        (drakma:http-request "http://evil.example/gui?graph=x"
+                             :proxy (list "127.0.0.1" *gui-test-port*)
+                             :redirect nil)
+      (declare (ignore body))
+      (is (= 301 status))
+      (is (equal "/gui/?graph=x" (cdr (assoc :location headers)))))))
+
+(test read-only-is-a-dispatch-rail
+  "GH #386: on a read-only GUI every request that is not GET or HEAD is
+refused at dispatch -- 403 read-only, the same body the verbs answer --
+unless it is on the read list: the query and Prolog endpoints, POSTs
+that never write.  So a mutating route added without WITH-WRITE-VERB is
+still refused.  An unrouted POST is 404 when the GUI is not read-only."
+  (with-gui-fixture ()
+    (with-mounted-gui (:read-only t)
+      (multiple-value-bind (json status)
+          (gui-request "/gui/api/graphs/gui-test-graph/frobnicate"
+                       :method :post :content "{}")
+        (is (= 403 status))
+        (is (string= "read-only" (jref json :error))))
+      (multiple-value-bind (json status)
+          (gui-request "/gui/api/graphs/gui-test-graph/query"
+                       :method :post
+                       :content "{\"match\":[{\"vertex\":\"?p\",
+                                   \"type\":\"gui-person\"}],
+                       \"select\":[\"?p\"]}")
+        (is (= 200 status) "the read list admits the query endpoint")
+        (is (null (jref json :error))))
+      (multiple-value-bind (json status)
+          (gui-request "/gui/api/graphs/gui-test-graph/prolog"
+                       :method :post :content "{\"query\":\"\"}")
+        (is (= 403 status))
+        (is (string= "prolog-disabled" (jref json :error))
+            "the read list admits the Prolog endpoint; its own flag refuses")))
+    (with-mounted-gui ()
+      (multiple-value-bind (json status)
+          (gui-request "/gui/api/graphs/gui-test-graph/frobnicate"
+                       :method :post :content "{}")
+        (declare (ignore json))
+        (is (= 404 status) "not read-only: an unrouted POST is a 404")))
+    (with-gui-server (:read-only t)
+      (multiple-value-bind (json status)
+          (gui-request "/api/graphs/gui-test-graph/frobnicate"
+                       :method :post :content "{}")
+        (is (= 403 status))
+        (is (string= "read-only" (jref json :error)))))))
+
 (test frontend-urls-are-prefix-relative
   "No frontend source names an asset or API path from the site root:
 under a mount an absolute /api/... or /js/... reaches the host, not

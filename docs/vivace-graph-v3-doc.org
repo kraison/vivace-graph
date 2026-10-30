@@ -2336,9 +2336,11 @@ URL. Keyword arguments:
   front of the mount is what the function reads — a header, a
   session). The value is bound around every request, shadowing any
   outer binding of the flag.
-- ~:read-only~ — refuse the open/close verbs with ~403 read-only~ at
-  the endpoints; ~/api/capabilities~ reports ~readOnly: true~ and the
-  roster drops its Open/Close buttons.
+- ~:read-only~ — refuse every request but GET, HEAD and the query and
+  Prolog POSTs with ~403 read-only~ at dispatch, before any handler
+  runs (vivace-graph#386); ~/api/capabilities~ reports ~readOnly~ so
+  the roster drops its open/close verbs. The open and close handlers
+  keep their own refusal as a second layer.
 
 ~start-gui~ takes the same ~:allow-prolog~ and ~:read-only~ and passes
 them through. Localhost remains the security boundary of the
