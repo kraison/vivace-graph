@@ -474,6 +474,12 @@ between releases; cutting a release renames it to the new version and dates it.
   the same keyword; both namespace slots check it at commit. Stored
   claims are unaffected.
 
+- **The GUI suite's functor tripwire knows spacetime's two functors**
+  (#379): `related/3` and `claimed/4` are expected exactly when the
+  spacetime package is loaded, so a service image running the suite
+  alongside spacetime no longer trips it and the plain image is
+  unchanged.
+
 - **`register-node` leaves an unchanged claim alone** (#395). The
   update branch copied and saved the existing claim on every pass, so a
   nightly re-registration minted a new version and commit epoch for

@@ -1495,22 +1495,44 @@ accumulate names that no longer exist and quietly stop meaning ~
 anything.~%~%~A"
           (length removed) removed (%inventory-guidance)))
 
+(defparameter *reviewed-spacetime-functor-inventory*
+  '("claimed/4"
+    "object-of/2"
+    "object-of/3"
+    "related/3"
+    "subject-of/2"
+    "subject-of/3")
+  "The functors graph-db/spacetime registers on top of the engine's:
+RELATED/3 and CLAIMED/4 (spacetime/functors.lisp, GH #367) and the
+edge functors DEF-EDGE generates for its two linking edge classes
+(claim.lisp).  Reviewed as the list above is: each takes nodes, a
+relation string or a claim, never a goal, so none reaches %SOLVE.
+Expected only in an image that has loaded spacetime: this suite does
+not, a service image running it may (GH #379).")
+
+(defun %expected-functor-inventory ()
+  "The reviewed inventory for THIS image: the engine's list, plus the
+spacetime list when that system is loaded."
+  (if (find-package "GRAPH-DB.SPACETIME")
+      (append *reviewed-functor-inventory*
+              *reviewed-spacetime-functor-inventory*)
+      *reviewed-functor-inventory*))
+
 (test prolog-functor-inventory-is-pinned
   "⚠ TRIPWIRE, not a behaviour test.  The guard's whitelist grows with
 the engine automatically; its exclusion lists do not.  This fails the
 moment the set of registered functors changes, so a newly added
 meta-calling predicate cannot reach free text unreviewed (GH #279)."
   (let* ((actual (registered-functor-inventory))
-         (added (sort (set-difference actual *reviewed-functor-inventory*
-                                      :test #'string=)
+         (expected (%expected-functor-inventory))
+         (added (sort (set-difference actual expected :test #'string=)
                       #'string<))
-         (removed (sort (set-difference *reviewed-functor-inventory*
-                                        actual :test #'string=)
+         (removed (sort (set-difference expected actual :test #'string=)
                         #'string<)))
     (is (null added) "~A" (%added-functor-message added))
     (is (null removed) "~A" (%removed-functor-message removed))
     ;; A passing run still says what it checked.
-    (is (= (length *reviewed-functor-inventory*) (length actual)))))
+    (is (= (length expected) (length actual)))))
 
 ;;; ---------------------------------------------------------------------
 ;;; Cost-unbounded predicates, and the error contract's own leaks
