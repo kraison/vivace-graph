@@ -864,7 +864,13 @@ Merges underfull pages on the way up and collapses a degenerate root."
    (index :initarg :index :accessor bpc-index)          ; current slot index
    (next-addr :initarg :next-addr :accessor bpc-next-addr) ; link of sibling leaf
    (end :initarg :end :accessor bpc-end)                ; deserialized end key, or NIL
-   (bounded-p :initarg :bounded-p :accessor bpc-bounded-p)))
+   (bounded-p :initarg :bounded-p :accessor bpc-bounded-p)
+   ;; The last key emitted, and whether one was: a leaf crossing re-seeks
+   ;; past it from the root instead of following NEXT-ADDR, which was
+   ;; copied with the page and may name a leaf merged away and reused
+   ;; since (GH #319).
+   (last :initform nil :accessor bpc-last)
+   (emitted-p :initform nil :accessor bpc-emitted-p)))
 
 (defun %bpt-decode-page-entry (tree buf slot leaf-p)
   "Decode just one entry at SLOT in page BUF."
@@ -918,35 +924,65 @@ entry with key >= DKEY in the leaf that would hold DKEY."
   (%make-skip-node :key (first entry)
                    :value (funcall (%bpt-value-deserializer tree) (third entry))))
 
+(defun %bpc-cross-leaf (c)
+  "Move cursor C to the next leaf with entries; NIL at the end.  Caller
+holds the read lock.  Once a key has been emitted, re-seek past it from
+the root -- the leaf that holds the first key above the last emitted --
+rather than following the sibling link copied with the page: a writer
+between two CURSOR-NEXT calls may have merged that leaf away and reused
+its page (GH #319).  Within one crossing the links read now are fresh
+and are followed over empty leaves.  Before anything was emitted the
+copied link is all there is (an empty first leaf)."
+  (let ((tree (bpc-tree c)))
+    (multiple-value-bind (buf count link start)
+        (if (bpc-emitted-p c)
+            (%bpt-leaf-at tree (bpc-last c))
+            (if (zerop (bpc-next-addr c))
+                (return-from %bpc-cross-leaf nil)
+                (let ((buf (%bpt-read-page tree (bpc-next-addr c)
+                                           (bpc-buf c))))
+                  (values buf (buf-u16 buf +bpt-p-count-offset+)
+                          (buf-u64 buf +bpt-p-link-offset+) 0))))
+      ;; %BPT-LEAF-AT stops at the first key >= LAST; step past LAST itself
+      ;; when it is still there.
+      (when (and (bpc-emitted-p c) (< start count))
+        (let* ((slot (buf-u16 buf (+ +bpt-p-slots-offset+ (* start 2))))
+               (k (%bpt-slot-key tree buf slot)))
+          (when (bpt-key= tree k (bpc-last c))
+            (incf start))))
+      ;; Empty leaves ahead: follow the links just read, under this lock.
+      (loop while (and (>= start count) (not (zerop link)))
+            do (setf buf (%bpt-read-page tree link buf)
+                     count (buf-u16 buf +bpt-p-count-offset+)
+                     link (buf-u64 buf +bpt-p-link-offset+)
+                     start 0))
+      (if (>= start count)
+          nil
+          (progn
+            (setf (bpc-buf c) buf
+                  (bpc-count c) count
+                  (bpc-index c) start
+                  (bpc-next-addr c) link)
+            t)))))
+
 (defmethod cursor-next ((c bplus-cursor) &optional eoc)
   (with-bpt-read-lock ((bpc-tree c))
     (let ((tree (bpc-tree c)))
-      (loop
-        (when (>= (bpc-index c) (bpc-count c))
-          ;; Advance to the next leaf via the sibling link (sequential pages).
-          (if (zerop (bpc-next-addr c))
-              (return eoc)
-              (let* ((next-addr (bpc-next-addr c))
-                     ;; Crossed-from leaf's buffer is dead: reuse it
-                     ;; (GH #97) -- zero allocation per crossing.
-                     (buf (%bpt-read-page tree next-addr (bpc-buf c)))
-                     (count (buf-u16 buf +bpt-p-count-offset+))
-                     (link (buf-u64 buf +bpt-p-link-offset+)))
-                (setf (bpc-buf c) buf
-                      (bpc-count c) count
-                      (bpc-index c) 0
-                      (bpc-next-addr c) link))))
-        (if (>= (bpc-index c) (bpc-count c))
-            (when (zerop (bpc-next-addr c)) (return eoc))
-            (let* ((idx (bpc-index c))
-                   (buf (bpc-buf c))
-                   (slot (buf-u16 buf (+ +bpt-p-slots-offset+ (* idx 2))))
-                   (entry (%bpt-decode-page-entry tree buf slot t)))
-              (incf (bpc-index c))
-              (if (and (bpc-bounded-p c)
-                       (bpt-key< tree (bpc-end c) (first entry)))
-                  (return eoc)
-                  (return (%bpt-materialize tree entry)))))))))
+      (when (and (>= (bpc-index c) (bpc-count c))
+                 (not (%bpc-cross-leaf c)))
+        (return-from cursor-next eoc))
+      (let* ((idx (bpc-index c))
+             (buf (bpc-buf c))
+             (slot (buf-u16 buf (+ +bpt-p-slots-offset+ (* idx 2))))
+             (entry (%bpt-decode-page-entry tree buf slot t)))
+        (incf (bpc-index c))
+        (if (and (bpc-bounded-p c)
+                 (bpt-key< tree (bpc-end c) (first entry)))
+            eoc
+            (progn
+              (setf (bpc-last c) (first entry)
+                    (bpc-emitted-p c) t)
+              (%bpt-materialize tree entry)))))))
 
 (defmethod make-cursor ((tree bplus-tree) &key &allow-other-keys)
   (with-bpt-read-lock (tree)
@@ -1001,9 +1037,12 @@ entry with key >= DKEY in the leaf that would hold DKEY."
 
 (defmethod update-in-skip-list ((tree bplus-tree) key value &optional old-value)
   (declare (ignore old-value))
-  ;; Duplicate-free composite keys: replace = remove + add.
-  (bpt-remove tree key)
-  (add-to-skip-list tree key value))
+  ;; Duplicate-free composite keys: replace = remove + add, under ONE write
+  ;; lock so no reader sees the key absent in between (GH #319).  The
+  ;; rw-lock re-enters for its holder, so the two inner acquisitions nest.
+  (with-bpt-write-lock (tree)
+    (bpt-remove tree key)
+    (add-to-skip-list tree key value)))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Backend-agnostic view-index protocol

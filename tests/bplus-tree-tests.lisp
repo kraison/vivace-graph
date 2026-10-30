@@ -138,3 +138,80 @@ no-op."
       (is (null (bpt-value tree 9)))
       (add-to-skip-list tree 9 "v")
       (is-true (remove-from-skip-list tree 9) "no value: remove by key"))))
+
+;;; ---------------------------------------------------------------------------
+;;; GH #319: what a cursor's leaf snapshot and stale sibling link survive.
+;;; A writer may run between two CURSOR-NEXT calls (each takes the read
+;;; lock on its own), so these interleave the writes by hand.
+;;; ---------------------------------------------------------------------------
+
+(defun %bpt-drain (cursor)
+  (bpt-cursor-keys cursor))
+
+(test bplus-cursor-survives-a-split-of-its-own-leaf
+  "GH #319 (2): the cursor's leaf splits after it was copied.  Every key
+that existed when the cursor started is still visited, once, in order."
+  (with-temp-memory (heap)
+    (let* ((tree (make-integer-bplus-tree heap :page-size 256))
+           (keys (loop for k from 0 below 400 by 10 collect k)))
+      (dolist (k keys) (add-to-skip-list tree k "x"))
+      (let ((cursor (graph-db::make-cursor tree))
+            (seen '()))
+        ;; Read two entries from the first leaf, then split it.
+        (dotimes (i 2)
+          (push (graph-db::%sn-key (graph-db::cursor-next cursor :eoc))
+                seen))
+        (loop for k from 21 to 29 do (add-to-skip-list tree k "new"))
+        (loop for k from 31 to 39 do (add-to-skip-list tree k "new"))
+        (let ((rest (%bpt-drain cursor)))
+          (setq seen (append (nreverse seen) rest)))
+        (let ((old-seen (remove-if-not (lambda (k) (member k keys)) seen)))
+          (is (equal keys old-seen)
+              "pre-existing keys visited: ~S" old-seen))))))
+
+(test bplus-cursor-survives-the-next-leaf-being-merged-and-reused
+  "GH #319 (2), the stale-link hazard: the leaf the cursor's copied link
+names is merged away and its page reused for new keys elsewhere.  The
+cursor must stay in order, emit nothing that was never a key, and reach
+every new key; keys of its own copied page may still appear."
+  (with-temp-memory (heap)
+    (let* ((tree (make-integer-bplus-tree heap :page-size 256))
+           (keys (loop for k from 0 below 400 by 10 collect k))
+           (far (loop for k from 100000 below 100400 by 10 collect k)))
+      (dolist (k keys) (add-to-skip-list tree k "x"))
+      (let ((cursor (graph-db::make-cursor tree))
+            (seen '()))
+        (push (graph-db::%sn-key (graph-db::cursor-next cursor :eoc)) seen)
+        ;; Empty the tree except the first key, so every later leaf is
+        ;; merged and freed, then grow a new region far away: the freed
+        ;; pages come back as the new leaves.
+        (dolist (k (rest keys)) (remove-from-skip-list tree k))
+        (dolist (k far) (add-to-skip-list tree k "far"))
+        (let* ((all (append (nreverse seen) (%bpt-drain cursor))))
+          (is (equal all (sort (copy-list all) #'<)) "out of order: ~S" all)
+          (is (null (set-difference all (append keys far)))
+              "keys that never existed: ~S"
+              (set-difference all (append keys far)))
+          (is (null (set-difference far all))
+              "new keys skipped: ~S" (set-difference far all)))))))
+
+(test bplus-update-never-shows-the-key-absent
+  "GH #319 (1): UPDATE-IN-SKIP-LIST is remove-then-add; under two separate
+write locks a concurrent reader could find the key gone between them.
+A reader hammering the key during 5000 updates must never miss it."
+  (with-temp-memory (heap)
+    (let ((tree (make-integer-bplus-tree heap))
+          (misses 0) (done nil))
+      (add-to-skip-list tree 1 "a")
+      (let ((reader (bt:make-thread
+                     (lambda ()
+                       (loop until done
+                             do (unless (find-in-skip-list tree 1)
+                                  (incf misses))))
+                     :name "bpt-update-reader")))
+        (dotimes (i 5000)
+          (graph-db::update-in-skip-list tree 1 (if (evenp i) "b" "a")))
+        (setq done t)
+        (bt:join-thread reader))
+      (is (zerop misses) "the reader found the key absent ~D times" misses)
+      (is (equal "a" (bpt-value tree 1))))))

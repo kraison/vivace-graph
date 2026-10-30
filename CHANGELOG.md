@@ -461,6 +461,17 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Fixed
 
+- **B+ tree: an update holds one lock; a cursor crosses leaves by key**
+  (#319). `update-in-skip-list` took the write lock twice, for its
+  remove and its add, and a concurrent reader found the key absent in
+  between (2,591 misses in 5,000 updates in the test); it now holds the
+  lock across both. A cursor followed the sibling link copied with its
+  page, which a merge could free and a later allocation reuse: it then
+  read another part of the tree and skipped keys. It now re-seeks from
+  the root past the last key it emitted at every crossing. The audit's
+  claim that the tree's read-write lock is not reentrant was wrong: the
+  write side re-enters for its holder on every implementation.
+
 - **B+ tree: a full page splits by bytes, not by entry count** (#404).
   Split at the middle entry, a page of small entries could not take
   large ones: the larger half did not fit, the encode returned NIL, the
