@@ -13,6 +13,12 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Added
 
+- **Two tests pin that a view added to a graph with data is backfilled**
+  (#402): defined against the open graph, or registered while the graph
+  is closed and reconciled at the next open. The manual's views chapter
+  now says so, and names the one way to get an empty view: a `def-view`
+  whose graph name is not the name the graph is open under.
+
 - **`unique-lookup`: a public read of unique-index membership, and
   `find-by-unique/4` in Prolog** (#415). The live node holding a value
   under a `:unique` slot or a `def-unique` tuple, or NIL, with the

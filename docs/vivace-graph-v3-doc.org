@@ -1289,6 +1289,7 @@ That's it! VivaceGraph will now automatically maintain these indexes. When you c
 
 - *A changed view is rebuilt automatically.*  If you change a view's ~:map~/~:reduce~ code or its sort order, the next reconcile detects the difference, rebuilds the index from scratch, and emits a ~log:warn~.  This is the safe default: serving queries from an index built by an *old* ~:map~ lambda would be a subtle, hard-to-find bug.
 
+- *A view added later is backfilled.*  A ~def-view~ evaluated against an open graph that already holds nodes builds its index over them at once; one evaluated while the graph is closed (a new image loading its schema) is built by the next ~open-graph~. No ~regenerate-view~ is needed for a new view (vivace-graph#402, pinned by two tests). The graph name in ~def-view~ must be the name the graph is open under, or the spec is registered under a name nothing reconciles and a query reports the graph "not loaded".
 - *Forcing a rebuild.*  Use ~regenerate-view~ to force one view, ~regenerate-all-views~ to force all of them, or pass ~:regenerate-views t~ to ~open-graph~ (or ~open-memory-graph~) to rebuild everything at open.
 
 - *Removing a view.*  Deleting a ~def-view~ form does not drop the persisted index (just as deleting a ~def-vertex~ form does not drop the persisted type).  Call ~delete-view~ to remove it explicitly.
