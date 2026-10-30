@@ -461,6 +461,16 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Fixed
 
+- **A snapshot no longer depends on the caller's printer or reader
+  state** (#354). `write-backup-plist` printed under whatever
+  `*print-level*`, `*print-length*`, `*print-base*` and
+  `*read-default-float-format*` the caller had bound, so a snapshot
+  taken over SWANK by a client with print limits wrote `#` and `...`
+  into the recovery file and reported success, and a double-float
+  default demoted every double on replay. Writer and reader now run
+  under `with-standard-io-syntax`, keeping only the caller's package
+  (and the restore readtable on the way in).
+
 - **Index reads on a declared index no commit has built yet see the
   transaction's own writes** (#416). `index-lookup`, `map-index` /
   `index-range`, `index-count` and `map-index-prefixes` returned their

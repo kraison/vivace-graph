@@ -87,13 +87,22 @@ the id repair lives here and not in the reader."
 
 (defun read-n-sexps (stream n)
   "Read N s-expressions from STREAM. Returns a list of s-expressions
-as the primary value, and non-nil as the secondary value at EOF."
-  (let ((sexps '()))
-    (dotimes (i n (nreverse sexps))
-      (let ((sexp (read stream nil stream)))
-        (when (eq sexp stream)
-          (return (values (nreverse sexps) :eof)))
-        (push sexp sexps)))))
+as the primary value, and non-nil as the secondary value at EOF.
+
+Reads under standard syntax plus the caller's *PACKAGE* and *READTABLE*,
+the mirror of WRITE-BACKUP-PLIST: a caller's float format or read base
+must not reach the file any more than its print limits did (GH #354)."
+  (let ((package *package*)
+        (readtable *readtable*)
+        (sexps '()))
+    (with-standard-io-syntax
+      (let ((*package* package)
+            (*readtable* readtable))
+        (dotimes (i n (nreverse sexps))
+          (let ((sexp (read stream nil stream)))
+            (when (eq sexp stream)
+              (return (values (nreverse sexps) :eof)))
+            (push sexp sexps)))))))
 
 (defun call-for-snapshot-sexps (fun file sexp-count)
   "Call FUN with a list of SEXP-COUNT s-expressions from FILE, until
