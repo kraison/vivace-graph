@@ -75,6 +75,16 @@ string, [a-z0-9-] only.  The :CHECK behind the RELATION slot (GH #160)."
 (GH #160)."
   (%canonical-name-p value "/"))
 
+(defun canonical-namespace-p (value)
+  "True when VALUE is a canonical NAMESPACE: a keyword whose name is
+uppercase [A-Z0-9-]+, so the identity key's downcased spelling reads
+back as the same keyword (CLAIM-IDENTITY-KEY, %IDENTITY-KEY-NAMESPACE).
+The :CHECK behind both namespace slots (GH #327)."
+  (and (keywordp value)
+       (let ((name (symbol-name value)))
+         (and (string= name (string-upcase name))
+              (canonical-relation-p (string-downcase name))))))
+
 ;; Registered at load, so the :CHECK names below resolve in any image
 ;; that has this file before a tenant's DEF-CLAIM-CLASSES expands.  A
 ;; lambda, not #'..., so a redefined predicate takes effect immediately.
@@ -82,6 +92,8 @@ string, [a-z0-9-] only.  The :CHECK behind the RELATION slot (GH #160)."
  'canonical-relation-p (lambda (v) (canonical-relation-p v)))
 (graph-db:register-schema-function
  'canonical-producer-p (lambda (v) (canonical-producer-p v)))
+(graph-db:register-schema-function
+ 'canonical-namespace-p (lambda (v) (canonical-namespace-p v)))
 
 (defun %extent-open-p (e)
   (bound-unknown-p (extent-end e)))
@@ -147,7 +159,8 @@ identity tuple (GH #296, design §2.2)."
 
 (defparameter +claim-shared-slots+
   '((subject-namespace :initarg :subject-namespace
-                       :accessor claim-subject-namespace)
+                       :accessor claim-subject-namespace
+                       :check canonical-namespace-p)
     (subject-key :initarg :subject-key :accessor claim-subject-key)
     ;; Canonical strings, enforced at commit on every write path (GH #160).
     (relation :initarg :relation :accessor claim-relation
@@ -313,7 +326,8 @@ claim (design §3.1, GH #131 finding 1)."
 
 (defparameter +claim-object-slots+
   '((object-namespace :initarg :object-namespace
-                      :accessor claim-object-namespace)
+                      :accessor claim-object-namespace
+                      :check canonical-namespace-p)
     (object-key :initarg :object-key :accessor claim-object-key))
   "Slots only BINARY-CLAIM carries.  Their absence from UNARY-CLAIM is what
 makes a unary claim unable to carry an object (design §3.1).")

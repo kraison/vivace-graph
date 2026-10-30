@@ -467,6 +467,13 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Fixed
 
+- **Claim namespaces carry a canonical `:check`** (#327).
+  `canonical-namespace-p`, exported beside the relation and producer
+  predicates, admits a keyword whose name is uppercase `[A-Z0-9-]+`,
+  the only spelling the identity key's downcased encoding reads back as
+  the same keyword; both namespace slots check it at commit. Stored
+  claims are unaffected.
+
 - **`register-node` leaves an unchanged claim alone** (#395). The
   update branch copied and saved the existing claim on every pass, so a
   nightly re-registration minted a new version and commit epoch for

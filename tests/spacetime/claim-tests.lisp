@@ -130,8 +130,8 @@ weights by fraction without knowing which tenant wrote the claim, so it
 must read one accessor (design §2, cl-llm#13)."
   (with-claim-graph (g)
     (declare (ignorable g))
-    (let ((c (make-ct-claim-binary :subject-namespace "s" :subject-key "k"
-                                   :object-namespace "o" :object-key "ok"
+    (let ((c (make-ct-claim-binary :subject-namespace :s :subject-key "k"
+                                   :object-namespace :o :object-key "ok"
                                    :relation "r" :producer "p"
                                    :standing :asserted)))
       (is (null (claim-precision-m c)))
@@ -140,8 +140,8 @@ must read one accessor (design §2, cl-llm#13)."
 (test registration-outputs-survive-a-round-trip
   (with-claim-graph (g)
     (let ((key "rt-1"))
-      (make-ct-claim-binary :subject-namespace "s" :subject-key key
-                            :object-namespace "o" :object-key "ok"
+      (make-ct-claim-binary :subject-namespace :s :subject-key key
+                            :object-namespace :o :object-key "ok"
                             :relation "r" :producer "p"
                             :standing :asserted
                             :precision-m 12.5d0 :fraction 0.25d0)
@@ -149,7 +149,7 @@ must read one accessor (design §2, cl-llm#13)."
                         g 'ct-claim
                         '(graph-db.spacetime::subject-namespace
                           graph-db.spacetime::subject-key)
-                        (list "s" key)))))
+                        (list :s key)))))
         (is (= 12.5d0 (claim-precision-m c)))
         (is (= 0.25d0 (claim-fraction c)))))))
 
