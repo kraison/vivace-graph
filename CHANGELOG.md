@@ -468,6 +468,14 @@ between releases; cutting a release renames it to the new version and dates it.
   index is now where the accumulated cell bytes reach half, and both
   halves are checked to encode before either is written.
 
+- **B+ tree: removing a key together with its value matches** (#405).
+  The stored value was compared serialized, with `equal`, which never
+  matches two octet vectors, so the value-qualified
+  `remove-from-skip-list` was a no-op on this backend. The stored value
+  is deserialized and compared with the tree's `value-equal`, as the
+  skip list compares values. Latent: nothing in the engine calls that
+  form on a B+ tree.
+
 - **An index-backed read under a snapshot never answers a node under a
   value its version lacks** (#345). Index membership is released when a
   write is applied, not when the version it indexed is reaped, so a

@@ -974,9 +974,19 @@ entry with key >= DKEY in the leaf that would hold DKEY."
               (funcall (%bpt-key-serializer tree) key)
               (funcall (%bpt-value-serializer tree) value)))
 
-(defmethod remove-from-skip-list ((tree bplus-tree) key &optional (value nil value-p))
+(defmethod remove-from-skip-list ((tree bplus-tree) key
+                                  &optional (value nil value-p))
   (if value-p
-      (bpt-remove tree key (funcall (%bpt-value-serializer tree) value))
+      ;; VALUE-EQUAL is equality over VALUES, as on the skip list; the
+      ;; stored value is deserialized for it.  Compared serialized with
+      ;; EQUAL, two octet vectors never matched (GH #405).  Keys are
+      ;; unique here, so there is one candidate to deserialize.
+      (let ((veq (%bpt-value-equal tree))
+            (deser (%bpt-value-deserializer tree)))
+        (bpt-remove tree key (funcall (%bpt-value-serializer tree) value)
+                    (lambda (probe stored)
+                      (declare (ignore probe))
+                      (funcall veq value (funcall deser stored)))))
       (bpt-remove tree key)))
 
 (defmethod find-in-skip-list ((tree bplus-tree) key &optional preds succs)

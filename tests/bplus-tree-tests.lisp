@@ -121,3 +121,20 @@ failed after 12, 9 and 6 inserts on a 4096-byte page and leaked a page."
         (is (equal big (bpt-value tree 60)))
         (is (equal (loop for k from 1 to 60 collect k)
                    (bpt-cursor-keys (graph-db::make-cursor tree))))))))
+
+(test bplus-remove-by-value
+  "GH #405: removing with a value removes only when the stored value
+matches.  The stored value was compared serialized with EQUAL, which
+never matches two octet vectors, so the value-qualified remove was a
+no-op."
+  (with-temp-memory (heap)
+    (let ((tree (make-integer-bplus-tree heap)))
+      (add-to-skip-list tree 9 "v")
+      (is (null (remove-from-skip-list tree 9 "w"))
+          "a wrong value must not remove")
+      (is (equal "v" (bpt-value tree 9)))
+      (is-true (remove-from-skip-list tree 9 "v")
+               "the right value must remove")
+      (is (null (bpt-value tree 9)))
+      (add-to-skip-list tree 9 "v")
+      (is-true (remove-from-skip-list tree 9) "no value: remove by key"))))
