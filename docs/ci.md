@@ -37,7 +37,10 @@ suite's fast tier and every other lane in full (see below).
   under a niced systemd --user unit (`gh-runner.service`) so
   interactive work and services always win contention.  Secondary:
   an arm64 mac lane, advisory only (`continue-on-error`) -- its
-  value is the #218 class of bug, arm64-only failures.
+  value is the #218 class of bug, arm64-only failures.  It runs on a
+  push to `experiment` or `master`, never on a pull request; to run it
+  on a branch before merging, `gh workflow run test.yml --ref <branch>`
+  (a `workflow_dispatch` also runs the Linux suite).
 - **The habit this replaces**: running the 35-minute suite by hand
   on every change.  Local runs are the affected subsystem's suite;
   the push gets the full matrix; `experiment -> master` promotion
