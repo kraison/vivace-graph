@@ -166,23 +166,31 @@ symbol.  Spelled from SYMBOL-NAME and ~D, not the printer, so a caller's
 (defun gen-id ()
   (uuid:uuid-to-byte-array (uuid:make-v4-uuid)))
 
+;; The fold is as wide as a fixnum HERE: 62 bits on SBCL, 61 on ECL, 60
+;; on CCL.  A wider fold returns bignums, and a CCL custom-hash table
+;; misses keys whose code is a bignum (GH #424, #425).
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (defconstant +fixnum-fold-bits+ (integer-length most-positive-fixnum))
+  (defconstant +fixnum-fold-mask+ (1- (ash 1 +fixnum-fold-bits+))))
+(deftype fixnum-fold-word () `(unsigned-byte ,+fixnum-fold-bits+))
+
 (declaim (inline %fixnum-hash-bytes))
 (defun %fixnum-hash-bytes (bytes &optional (seed 0))
   "A consing-free fixnum hash of BYTES (a byte vector, normally a 16-byte
-id) mixed into SEED: a 62-bit multiply-add fold.  For IN-MEMORY hash
+id) mixed into SEED: a fixnum-wide multiply-add fold.  For IN-MEMORY hash
 tables only -- the on-disk linear hash places buckets with %HASH, whose
 value is part of the store format (GH #373; replacing it is GH #375).
 Anything that is not a byte vector falls back to SXHASH."
   (declare (optimize (speed 3) (safety 1))
-           (type (unsigned-byte 62) seed))
+           (type fixnum-fold-word seed))
   (let ((h seed))
-    (declare (type (unsigned-byte 62) h))
+    (declare (type fixnum-fold-word h))
     (if (typep bytes '(simple-array (unsigned-byte 8) (*)))
         (locally (declare (type (simple-array (unsigned-byte 8) (*)) bytes))
           (dotimes (i (length bytes) h)
             (setf h (logand (+ (* h 1000003) (aref bytes i))
-                            #x3FFFFFFFFFFFFFFF))))
-        (logand (+ (* h 1000003) (sxhash bytes)) #x3FFFFFFFFFFFFFFF))))
+                            +fixnum-fold-mask+))))
+        (logand (+ (* h 1000003) (sxhash bytes)) +fixnum-fold-mask+))))
 
 (defun parse-uuid-block (string start end)
   (parse-integer string :start start :end end :radix 16))

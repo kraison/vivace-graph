@@ -510,6 +510,16 @@ between releases; cutting a release renames it to the new version and dates it.
 
 ### Fixed
 
+- **The in-memory id fold is as wide as a fixnum on the running
+  implementation** (#424, #425, #373). `%fixnum-hash-bytes` masked to 62
+  bits, SBCL's fixnum width; CCL's is 60 and ECL's 61, so on both the fold
+  returned bignums for most ids, and a CCL custom-hash table misses a key
+  whose code is a bignum. The node cache and the transaction's tables
+  missed, a retried transaction read a superseded version (#424), and the
+  skip list installed two objects for one node (#425). The mask is now
+  `(integer-length most-positive-fixnum)` bits; SBCL's values and its
+  consing-free arithmetic are unchanged.
+
 - **Claim namespaces carry a canonical `:check`** (#327).
   `canonical-namespace-p`, exported beside the relation and producer
   predicates, admits a keyword whose name is uppercase `[A-Z0-9-]+`,
